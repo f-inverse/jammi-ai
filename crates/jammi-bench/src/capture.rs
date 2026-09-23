@@ -1,5 +1,5 @@
 //! What every leg producer captures the same way, whichever workload it
-//! serves: the per-iteration series, the files a leg hands to the next stack
+//! serves: the files a leg hands to the next stack
 //! or to the comparator, the vector rows the ladder pairs by row, the file a
 //! leg is filed as, and one process per leg.
 //!
@@ -9,54 +9,12 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::leg::{Leg, MutantStamp, Payload, Provenance};
 use crate::report::{Report, Tiers};
-
-/// The per-iteration wall-clock series of a leg: the first `warmup` recorded
-/// iterations are dropped, the rest are kept in order, in seconds — the
-/// ladder's `iter_wall_s`.
-#[derive(Debug)]
-pub struct IterationSeries {
-    warmup: usize,
-    iterations: usize,
-    recorded: usize,
-    seconds: Vec<f64>,
-}
-
-impl IterationSeries {
-    /// A series that drops `warmup` iterations and keeps the `iterations` after.
-    pub fn new(warmup: usize, iterations: usize) -> Self {
-        Self {
-            warmup,
-            iterations,
-            recorded: 0,
-            seconds: Vec::with_capacity(iterations),
-        }
-    }
-
-    /// How many iterations the producer must run: warm-up plus measured.
-    pub fn total(&self) -> usize {
-        self.warmup + self.iterations
-    }
-
-    /// Record one iteration's wall-clock, in run order.
-    pub fn record(&mut self, elapsed: Duration) {
-        if self.recorded >= self.warmup {
-            self.seconds.push(elapsed.as_secs_f64());
-        }
-        self.recorded += 1;
-    }
-
-    /// The measured series, seconds per iteration, warm-up excluded.
-    pub fn into_seconds(self) -> Vec<f64> {
-        self.seconds
-    }
-}
 
 /// One file of a leg. The sha256 is of the file's own bytes, so two legs that
 /// name the same artifact are provably reading the same input.
@@ -318,16 +276,6 @@ pub async fn legs_per_point<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn series_drops_exactly_the_warmup_and_keeps_order() {
-        let mut series = IterationSeries::new(2, 3);
-        assert_eq!(series.total(), 5);
-        for ms in [900, 800, 3, 1, 2] {
-            series.record(Duration::from_millis(ms));
-        }
-        assert_eq!(series.into_seconds(), vec![0.003, 0.001, 0.002]);
-    }
 
     #[test]
     fn artifact_is_addressed_by_its_own_bytes() {

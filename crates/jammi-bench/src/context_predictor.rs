@@ -61,7 +61,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -80,7 +80,7 @@ use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
 use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point,
-    vector_rows_digest, write_vector_rows, Artifact, IterationSeries,
+    vector_rows_digest, write_vector_rows, Artifact,
 };
 use crate::leg::{
     Facts, Leg, Measured, Measurement, Payload, Provenance, RanOn, Stations, TrajectoryPoint,
@@ -416,8 +416,6 @@ pub struct PredictorTrainParams {
     pub seed: Option<u64>,
     /// Passes over the train episodes; the committed spec's when `None`.
     pub epochs: Option<usize>,
-    /// Leading optimizer steps kept out of the timing series (they still train).
-    pub warmup_steps: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
 }
@@ -476,9 +474,8 @@ pub struct PredictorTrainRunPayload {
     pub train_episodes: usize,
     /// Held-out test episode batches scored.
     pub heldout_episodes: usize,
-    /// Leading steps excluded from the timing series.
-    pub warmup_steps: usize,
-    /// Optimizer steps timed.
+    /// Optimizer steps timed and filed: the whole run, its transient for the
+    /// ladder to cut.
     pub iters_measured: usize,
     /// The trained parameters.
     pub final_weights: Artifact,
@@ -621,13 +618,7 @@ pub async fn run_leg(
     let batch = batch_targets(&sampled.train)?;
 
     let trained = host
-        .train(
-            &config,
-            &mut varmap,
-            &predictor,
-            &sampled,
-            params.warmup_steps,
-        )
+        .train(&config, &mut varmap, &predictor, &sampled)
         .await?;
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
@@ -682,13 +673,12 @@ pub async fn run_leg(
         objective: "gaussian-crps",
         train_episodes: sampled.train.len(),
         heldout_episodes: sampled.test.len(),
-        warmup_steps: params.warmup_steps,
-        iters_measured: trained.total_steps.saturating_sub(params.warmup_steps),
+        iters_measured: trained.total_steps,
         final_weights: artifact_of(&final_path)?,
         trainer: "jammi_ai::pipeline::context_predictor::fit_context_predictor",
     };
     let measured = Measured {
-        iter_wall_s: Some(trained.steps.into_seconds()),
+        iter_wall_s: Some(trained.step_seconds),
         work: None,
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
@@ -721,8 +711,8 @@ pub async fn run_leg(
 /// What a rung's training left: the predictor's `varmap` holds the trained
 /// weights, and these are the run's observations.
 struct Trained {
-    /// Every optimizer step's wall, less the warmup.
-    steps: IterationSeries,
+    /// Every optimizer step's wall, in run order.
+    step_seconds: Vec<f64>,
     total_steps: usize,
     held_out_at_init: f64,
     /// The objective over the train episodes at init and after every epoch.
@@ -840,7 +830,6 @@ impl Host {
         varmap: &mut candle_nn::VarMap,
         predictor: &jammi_encoders::AnyContextPredictor,
         sampled: &jammi_ai::pipeline::context_predictor::SampledEpisodes,
-        warmup_steps: usize,
     ) -> Result<Trained, Box<dyn std::error::Error>> {
         match self {
             Host::InProcess { .. } => {
@@ -869,7 +858,7 @@ impl Host {
                     },
                 )?;
                 Ok(Trained {
-                    steps: step_series(&report.step_seconds, warmup_steps),
+                    step_seconds: report.step_seconds,
                     total_steps: report.total_steps,
                     held_out_at_init,
                     train_probe_series,
@@ -948,7 +937,7 @@ impl Host {
                     })
                     .collect();
                 Ok(Trained {
-                    steps: step_series(&curve.step_seconds, warmup_steps),
+                    step_seconds: curve.step_seconds,
                     total_steps: curve.total_steps,
                     held_out_at_init: *held_out_at_init,
                     train_probe_series: curve.train_scores,
@@ -977,18 +966,6 @@ struct WithTimeline {
     timeline: Option<crate::leg::Timeline>,
 }
 
-/// Every step's wall as the leg's iteration series, less the warmup.
-fn step_series(step_seconds: &[f64], warmup_steps: usize) -> IterationSeries {
-    let mut series = IterationSeries::new(
-        warmup_steps,
-        step_seconds.len().saturating_sub(warmup_steps),
-    );
-    step_seconds
-        .iter()
-        .for_each(|s| series.record(Duration::from_secs_f64(*s)));
-    series
-}
-
 /// `predictor-train-run`'s flags.
 #[derive(Debug, Clone, clap::Args)]
 pub struct PredictorTrainArgs {
@@ -1011,9 +988,6 @@ pub struct PredictorTrainArgs {
     /// Passes over the train episodes; defaults to the committed spec's.
     #[arg(long)]
     epochs: Option<usize>,
-    /// Leading optimizer steps kept out of the timing series.
-    #[arg(long, default_value_t = 2)]
-    warmup_steps: usize,
     /// Measured repeats of each seed, each in a process of its own.
     #[arg(long, default_value_t = 1)]
     takes: usize,
@@ -1033,7 +1007,6 @@ impl PredictorTrainArgs {
             architecture: self.arch.clone(),
             seed,
             epochs: self.epochs,
-            warmup_steps: self.warmup_steps,
             take,
         }
     }
@@ -1065,8 +1038,6 @@ impl PredictorTrainArgs {
                     (&self.legs_dir).into(),
                     "--rung".into(),
                     rung.as_str().into(),
-                    "--warmup-steps".into(),
-                    self.warmup_steps.to_string().into(),
                     "--take".into(),
                     take.to_string().into(),
                 ];
@@ -1464,7 +1435,6 @@ mod tests {
                 architecture: Some(architecture.to_string()),
                 seed: Some(7),
                 epochs: Some(3),
-                warmup_steps: 1,
                 take: 1,
             };
             async move { run_leg(&params).await.expect("predictor leg runs") }
@@ -1486,10 +1456,7 @@ mod tests {
                 .is_file());
             assert_eq!(first.payload.architecture, architecture);
             let steps = first.payload.train_episodes * first.payload.epochs;
-            assert_eq!(
-                first.measured.iter_wall_s.as_ref().unwrap().len(),
-                steps - 1
-            );
+            assert_eq!(first.measured.iter_wall_s.as_ref().unwrap().len(), steps);
             assert_eq!(first.measured.trajectory.len(), 3);
             assert_eq!(first.facts.train_probe_series.as_ref().unwrap().len(), 4);
             assert!(first.measured.held_out_at_init.is_some());
@@ -1549,7 +1516,6 @@ mod tests {
                 architecture: None,
                 seed: Some(seed),
                 epochs: Some(2),
-                warmup_steps: 0,
                 take: 1,
             })
             .await

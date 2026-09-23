@@ -200,9 +200,7 @@ pub struct EncodeStepParams {
     /// own `config.json` declares one. What it RESOLVED to is what a leg
     /// records, read off the loaded model.
     pub compute_precision: jammi_numerics::ComputePrecision,
-    /// Warm serves before the measured ones, per rung, discarded.
-    pub warmup: usize,
-    /// Measured serves per rung.
+    /// Serves per rung, every one timed and filed in run order.
     pub iters: usize,
     /// The device ordinal the sessions resolve on: [`CPU_HERMETIC_DEVICE`]
     /// (`-1`), or a CUDA ordinal the box must actually have.
@@ -1299,16 +1297,13 @@ pub async fn measure_legs(
     for (slot, session) in sessions.iter_mut().enumerate() {
         served[slot].first_serve_ms = session.serve(&unit).await?.0 * 1_000.0;
     }
-    for round in 0..params.warmup + params.iters {
+    for round in 0..params.iters {
         let mut order: Vec<usize> = (0..sessions.len()).collect();
         if round % 2 == 1 {
             order.reverse();
         }
         for slot in order {
             let (wall_s, phases, artifact, ran_on) = sessions[slot].serve(&unit).await?;
-            if round < params.warmup {
-                continue;
-            }
             let into = &mut served[slot];
             into.iter_wall_s.push(wall_s);
             into.phases.extend(phases);
@@ -1371,7 +1366,6 @@ pub async fn measure_legs(
             checkpoint_tokenizer_sha256: checkpoint_tokenizer_sha256.clone(),
             pooling: pooling.clone(),
             normalize: params.task == Task::Embed,
-            warmup: params.warmup,
             iters_measured: served.iter_wall_s.len(),
             checkpoint_pooling_sha256: checkpoint_pooling_sha256.clone(),
             device_requested: requested_device_label(params.gpu_device),
@@ -1622,7 +1616,6 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                 .args(["--batch-tokens", &params.batch_tokens.to_string()])
                 .args(["--partitions", &params.partitions.to_string()])
                 .args(["--compute-precision", &params.compute_precision.to_string()])
-                .args(["--warmup", &params.warmup.to_string()])
                 .args(["--iters", &params.iters.to_string()]);
             for rung in &params.rungs {
                 child.args(["--rung", rung.as_str()]);
@@ -1681,7 +1674,6 @@ mod tests {
             batch_tokens: InferenceConfig::default().batch_tokens,
             partitions: 4,
             compute_precision: jammi_numerics::ComputePrecision::F32,
-            warmup: 1,
             iters: 2,
             gpu_device: CPU_HERMETIC_DEVICE,
             exchange_dir: None,
@@ -1736,7 +1728,6 @@ mod tests {
                 "checkpoint_tokenizer_sha256",
                 "pooling",
                 "normalize",
-                "warmup",
                 "iters_measured",
                 "checkpoint_pooling_sha256",
                 "device_requested",

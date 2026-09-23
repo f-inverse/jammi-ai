@@ -116,10 +116,10 @@ def run(args, unit: str, take: int) -> list[str]:
     input_dir = args.legs_dir / "input" / unit
     rung = RUNGS[args.impl]
     stem = ll.leg_stem(rung, unit, take)
-    series = ll.IterationSeries(args.warmup, args.iterations)
-    fold_series = ll.IterationSeries(args.warmup, args.iterations)
+    iter_wall_s: list[float] = []
+    fold_iteration_s: list[float] = []
     dtype = torch.float64 if args.dtype == "f64" else torch.float32
-    for _ in range(series.total):
+    for _ in range(args.iterations):
         t0 = time.perf_counter()
         keys, x0, pairs = load_inputs(input_dir)
         if args.impl == "exact":
@@ -127,8 +127,8 @@ def run(args, unit: str, take: int) -> list[str]:
         else:
             propagated, fold_s = propagate_pyg(x0, pairs, args.hops, args.alpha)
         vectors, dim = ll.write_vector_rows(args.legs_dir, stem, keys, propagated)
-        series.record(time.perf_counter() - t0)
-        fold_series.record(fold_s)
+        iter_wall_s.append(time.perf_counter() - t0)
+        fold_iteration_s.append(fold_s)
     peak = ll.peak_rss_bytes()
 
     block = {
@@ -146,13 +146,12 @@ def run(args, unit: str, take: int) -> list[str]:
         "rung": rung,
         "unit": unit,
         "take": take,
-        "warmup": args.warmup,
-        "iters_measured": len(series.seconds),
+        "iters_measured": len(iter_wall_s),
         "operator": {"exact": f"torch.sparse.mm, {args.dtype} fold", "pyg": "torch_geometric.nn.SGConv" if args.alpha == 0.0 else "torch_geometric.nn.APPNP"}[args.impl],
-        "fold_iteration_s": fold_series.seconds,
+        "fold_iteration_s": fold_iteration_s,
         **ll.provenance(),
         # Measured.
-        "iter_wall_s": series.seconds,
+        "iter_wall_s": iter_wall_s,
         "work": len(pairs) * args.hops,
         "peak_rss_bytes": peak,
         "peak_vram_bytes": ll.NOT_MEASURED_BYTES,
@@ -171,8 +170,7 @@ def main() -> None:
     parser.add_argument("--dtype", choices=["f64", "f32"], default="f64", help="the exact fold's arithmetic")
     parser.add_argument("--hops", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.1)
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=32, help="iterations timed and filed; the ladder settles no fewer than 32")
     parser.add_argument("--takes", type=int, default=1, help="measured repeats of each unit, each in its own process")
     parser.add_argument("--take", type=int, default=1, help="the take a single unit's run is filed as")
     args = parser.parse_args()
@@ -183,7 +181,7 @@ def main() -> None:
     def argv_for(point) -> list[str]:
         unit, take = point
         argv = ["--legs-dir", str(args.legs_dir), "--unit", unit, "--impl", args.impl, "--dtype", args.dtype, "--take", str(take)]
-        for flag in ("hops", "alpha", "warmup", "iterations"):
+        for flag in ("hops", "alpha", "iterations"):
             argv += [f"--{flag}", str(getattr(args, flag))]
         return argv
 

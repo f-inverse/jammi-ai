@@ -55,7 +55,7 @@ use jammi_ai::fine_tune::graph_sampler::{
 
 use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, write_artifact,
-    write_jsonl, Artifact, IterationSeries,
+    write_jsonl, Artifact,
 };
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
 use crate::report::{Nullable, Tiers};
@@ -462,9 +462,7 @@ pub struct GraphSampleParams {
     /// The sampler configuration; `seed` is the pair table's seed and the first
     /// timed iteration's.
     pub config: GraphSampleConfig,
-    /// Untimed iterations before the series starts.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed, every one filed in run order.
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
@@ -506,9 +504,8 @@ pub struct GraphSamplePayload {
     pub hard_negatives: usize,
     /// The negative pool's excluded radius; `null` when no negative is mined.
     pub exclude_hops: Option<usize>,
-    /// Untimed iterations before the series.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed and filed: the whole run, its transient for the
+    /// ladder to cut.
     pub iters_measured: usize,
     /// Walks per sample: `node_count · walks_per_node`.
     pub walks: usize,
@@ -578,13 +575,14 @@ pub fn run_leg(
     let unit = format!("edges{}", graph.edges.len());
     let stem = leg_stem(RUNG, &unit, params.take);
 
-    let mut series = IterationSeries::new(params.warmup, params.iterations);
-    for i in 0..series.total() {
-        let sampler = graph.sampler(at_seed(i))?;
-        let start = Instant::now();
-        sampler.sample_into(|_| Ok(()))?;
-        series.record(start.elapsed());
-    }
+    let iter_wall_s = (0..params.iterations)
+        .map(|i| -> Result<f64, Box<dyn std::error::Error>> {
+            let sampler = graph.sampler(at_seed(i))?;
+            let start = Instant::now();
+            sampler.sample_into(|_| Ok(()))?;
+            Ok(start.elapsed().as_secs_f64())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
     let law = node2vec_transition_law(&graph.edges, config.return_p, config.in_out_q);
@@ -635,7 +633,6 @@ pub fn run_leg(
         edge_set_symmetric: graph.is_symmetric(),
         hard_negatives: config.hard_negatives,
         exclude_hops: (config.hard_negatives > 0).then_some(config.exclude_hops),
-        warmup: params.warmup,
         iters_measured: params.iterations,
         walks: graph.nodes.len() * config.walks_per_node,
         observation_passes: law_file.observation_passes,
@@ -644,7 +641,7 @@ pub fn run_leg(
         walker: "jammi_ai::fine_tune::graph_sampler::GraphSampler",
     };
     let measured = Measured {
-        iter_wall_s: Some(series.into_seconds()),
+        iter_wall_s: Some(iter_wall_s),
         work: Some(graph.edges.len() as f64),
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
@@ -693,9 +690,9 @@ pub struct GraphSampleArgs {
     exclude_hops: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    #[arg(long, default_value_t = 2)]
-    warmup: usize,
-    #[arg(long, default_value_t = 10)]
+    /// Iterations timed, every one filed; the default is the fewest the
+    /// ladder settles, and a shorter run files legs it refuses by name.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
     /// Measured repeats of each graph, each in a process of its own.
     #[arg(long, default_value_t = 1)]
@@ -721,7 +718,6 @@ impl GraphSampleArgs {
                 min_negatives: 1,
                 seed: self.seed,
             },
-            warmup: self.warmup,
             iterations: self.iterations,
             take,
         }
@@ -747,7 +743,6 @@ impl GraphSampleArgs {
             ("--hard-negatives", self.hard_negatives.to_string()),
             ("--exclude-hops", self.exclude_hops.to_string()),
             ("--seed", self.seed.to_string()),
-            ("--warmup", self.warmup.to_string()),
             ("--iterations", self.iterations.to_string()),
             ("--take", take.to_string()),
         ];
@@ -1314,7 +1309,6 @@ mod tests {
             legs_dir: legs_dir.to_path_buf(),
             law_dir: None,
             config,
-            warmup: 1,
             iterations: 3,
             take: 1,
         }
@@ -1419,7 +1413,7 @@ mod tests {
                 ..GraphSampleConfig::default()
             };
             let mut p = params(&graph_dir, &legs, config);
-            (p.warmup, p.iterations) = (0, 40);
+            p.iterations = 40;
             let (_, file) = run_leg(&p).unwrap();
             std::fs::copy(
                 legs.join(&file),
@@ -1467,7 +1461,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         committed.graph.write(&dir.path().join("graph")).unwrap();
         let mut p = params(&dir.path().join("graph"), &dir.path().join("legs"), config);
-        (p.warmup, p.iterations) = (0, 1);
+        p.iterations = 1;
         let (leg, _) = run_leg(&p).unwrap();
         (leg, dir)
     }

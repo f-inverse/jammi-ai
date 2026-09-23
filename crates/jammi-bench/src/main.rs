@@ -589,13 +589,11 @@ enum Command {
         /// loads at unless its own `config.json` declares one.
         #[arg(long, default_value = "f32")]
         compute_precision: jammi_numerics::ComputePrecision,
-        /// Warm serves discarded before the measured ones, per rung.
-        #[arg(long, default_value_t = 2)]
-        warmup: usize,
-        /// Measured serves per rung (even, when rungs are interleaved). The
-        /// default is the comparator's minimum series; a shorter run files
-        /// legs the speed axis refuses by name and the outcome axis reads.
-        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_SAMPLES)]
+        /// Serves per rung, every one timed and filed (even, when rungs are
+        /// interleaved). The default is the fewest the ladder settles; a
+        /// shorter run files legs the speed axis refuses by name and the
+        /// outcome axis reads.
+        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_RUN)]
         iters: usize,
         /// Leave each unit's corpus (`corpus_<rows>.parquet`) and — without
         /// `--model-dir` — the fixture checkpoint (`model/`) here, for
@@ -650,8 +648,6 @@ enum Command {
         partitions: usize,
         #[arg(long)]
         compute_precision: jammi_numerics::ComputePrecision,
-        #[arg(long)]
-        warmup: usize,
         #[arg(long)]
         iters: usize,
         #[arg(long)]
@@ -968,7 +964,6 @@ async fn main() -> std::process::ExitCode {
             batch_tokens,
             partitions,
             compute_precision,
-            warmup,
             iters,
             exchange_dir,
             legs_dir,
@@ -984,7 +979,6 @@ async fn main() -> std::process::ExitCode {
             batch_tokens,
             partitions,
             compute_precision,
-            warmup,
             iters,
             gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
             exchange_dir,
@@ -1004,7 +998,6 @@ async fn main() -> std::process::ExitCode {
             batch_tokens,
             partitions,
             compute_precision,
-            warmup,
             iters,
             exchange_dir,
             legs_dir,
@@ -1022,7 +1015,6 @@ async fn main() -> std::process::ExitCode {
                     batch_tokens,
                     partitions,
                     compute_precision,
-                    warmup,
                     iters,
                     gpu_device: cuda
                         .map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),

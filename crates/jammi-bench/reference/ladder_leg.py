@@ -8,10 +8,10 @@ level under the workload's key (`graph_sample`, `propagate`,
 (`iter_wall_s`, `work`, `peak_rss_bytes`, `peak_vram_bytes`, `outcome_digest`,
 and `vectors_file` + `vector_dim`, `law_observed`, `held_out_example_mean` +
 `trajectory` as the workload pairs its outcome), and the facts a rung's
-premises read. A producer emits legs and decides nothing; the comparison is
+premises read. A producer emits legs and decides nothing — its `iter_wall_s` is every
+iteration in run order, and where the run settled is the ladder's to find; the comparison is
 `jammi-bench ladder <workload> <legs-dir>`.
 
-* `IterationSeries` — the per-iteration wall-clock series after warm-up;
 * `peak_rss_bytes` — the kernel's high-water mark of this process's resident
   set, the same instrument the engine rungs report;
 * `artifact_of` / `write_jsonl` / `read_jsonl` — files by their sha256;
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import platform
 import resource
 import subprocess
@@ -33,25 +34,6 @@ import sys
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
-
-
-class IterationSeries:
-    """Drops the first `warmup` recorded iterations, keeps the rest in order."""
-
-    def __init__(self, warmup: int, iterations: int) -> None:
-        self.warmup = warmup
-        self.iterations = iterations
-        self._recorded = 0
-        self.seconds: list[float] = []
-
-    @property
-    def total(self) -> int:
-        return self.warmup + self.iterations
-
-    def record(self, elapsed_s: float) -> None:
-        if self._recorded >= self.warmup:
-            self.seconds.append(elapsed_s)
-        self._recorded += 1
 
 
 def peak_rss_bytes() -> dict[str, Any]:
@@ -158,6 +140,7 @@ def provenance(**extra: Any) -> dict[str, Any]:
         "platform": platform.platform(),
         "machine": platform.machine(),
         "torch_num_threads": torch.get_num_threads(),
+        "given_cpus": given_cpus(),
         "packages": package_versions("torch", "torch_geometric", "torch_cluster", "pyg-lib", "safetensors", "numpy"),
         "peak_rss_source": "VmHWM" if Path("/proc/self/status").is_file() else "getrusage.ru_maxrss",
         **extra,
@@ -178,12 +161,27 @@ def file_leg(legs_dir: Path, key: str, stem: str, block: dict[str, Any], tool: s
     return name
 
 
+def given_cpus() -> int:
+    """The CPUs this process may run on: its affinity mask where the platform
+    has one (a leg pinned with `taskset` is given exactly that set), otherwise
+    every logical CPU."""
+    return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+
+
 def legs_per_point(points: Sequence[Any], in_process: Callable[[Any], list[str]], argv_for: Callable[[Any], list[str]]) -> list[str]:
     """One leg per point, each owning its process's peak resident set: a single
     point is filed here; several are a sweep and each runs in a fresh
     interpreter, `argv_for(point)` being this script's arguments for that one
-    point. Returns every leg's file name."""
+    point. Returns every leg's file name.
+
+    A leg runs torch's intra-op pool on exactly the CPUs the process was
+    given, as the engine's pools do: torch otherwise sizes it to the machine's
+    physical cores whatever the affinity mask, and a pinned leg would
+    oversubscribe the set its engine counterpart is held to."""
     if len(points) == 1:
+        import torch
+
+        torch.set_num_threads(given_cpus())
         return in_process(points[0])
     files: list[str] = []
     for point in points:

@@ -96,15 +96,15 @@ def encode(x0, pairs, weights: list[float]):
 def run(args, unit: str, take: int) -> list[str]:
     input_dir = args.legs_dir / "input" / unit
     stem = ll.leg_stem(RUNG, unit, take)
-    series = ll.IterationSeries(args.warmup, args.iterations)
-    fold_series = ll.IterationSeries(args.warmup, args.iterations)
-    for _ in range(series.total):
+    iter_wall_s: list[float] = []
+    fold_iteration_s: list[float] = []
+    for _ in range(args.iterations):
         t0 = time.perf_counter()
         keys, x0, pairs = load_inputs(input_dir)
         encoded, fold_s = encode(x0, pairs, args.weights)
         vectors, dim = ll.write_vector_rows(args.legs_dir, stem, keys, encoded)
-        series.record(time.perf_counter() - t0)
-        fold_series.record(fold_s)
+        iter_wall_s.append(time.perf_counter() - t0)
+        fold_iteration_s.append(fold_s)
     peak = ll.peak_rss_bytes()
     hops = len(args.weights) - 1
 
@@ -126,13 +126,12 @@ def run(args, unit: str, take: int) -> list[str]:
         "rung": RUNG,
         "unit": unit,
         "take": take,
-        "warmup": args.warmup,
-        "iters_measured": len(series.seconds),
+        "iters_measured": len(iter_wall_s),
         "operator": "torch.sparse.mm, f64 fold, per-block L2 readout",
-        "fold_iteration_s": fold_series.seconds,
+        "fold_iteration_s": fold_iteration_s,
         **ll.provenance(),
         # Measured.
-        "iter_wall_s": series.seconds,
+        "iter_wall_s": iter_wall_s,
         "work": len(pairs) * hops,
         "peak_rss_bytes": peak,
         "peak_vram_bytes": ll.NOT_MEASURED_BYTES,
@@ -151,8 +150,7 @@ def main() -> None:
     parser.add_argument("--beta", type=float, default=0.0, help="the engine leg's degree exponent — identity only; the seed rows already carry it")
     parser.add_argument("--sparsity", type=float, default=3.0, help="the engine leg's projection sparsity — identity only; the seed rows already carry it")
     parser.add_argument("--seed", type=int, default=0, help="the engine leg's projection seed — identity only; the seed rows already carry it")
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=32, help="iterations timed and filed; the ladder settles no fewer than 32")
     parser.add_argument("--takes", type=int, default=1, help="measured repeats of each unit, each in its own process")
     parser.add_argument("--take", type=int, default=1, help="the take a single unit's run is filed as")
     args = parser.parse_args()
@@ -163,7 +161,7 @@ def main() -> None:
     def argv_for(point) -> list[str]:
         unit, take = point
         argv = ["--legs-dir", str(args.legs_dir), "--unit", unit, "--take", str(take), "--weights", ",".join(str(w) for w in args.weights)]
-        for flag in ("beta", "sparsity", "seed", "warmup", "iterations"):
+        for flag in ("beta", "sparsity", "seed", "iterations"):
             argv += [f"--{flag}", str(getattr(args, flag))]
         return argv
 

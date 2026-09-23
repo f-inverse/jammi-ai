@@ -788,7 +788,8 @@ engine's legs and carries its block at the top level under the workload's key
 Rust — `TrainRunPayload::IDENTITY_FIELDS`, `EncodePayload::IDENTITY_FIELDS`,
 or the list in `crates/jammi-bench/src/ladder/definition.rs`; the ladder
 refuses a leg that omits one or spells a value differently), `iter_wall_s`
-(post-warmup seconds per timed iteration, in order), `peak_rss_bytes` and
+(seconds of every iteration of the run, in order — where it settled is the
+ladder's to find), `peak_rss_bytes` and
 `peak_vram_bytes` from the same instruments the engine's legs use, and the
 outcome (`held_out_example_mean` with a `trajectory` of `held_out_mean` and
 cumulative `train_wall_s`; or `vectors_file` + `vector_dim`, little-endian

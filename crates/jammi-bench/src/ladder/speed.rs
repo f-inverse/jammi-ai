@@ -20,8 +20,8 @@
 //! a cost inside that band is reported as indistinguishable from 1.
 
 use jammi_numerics::stats::{
-    block_bootstrap_ci, geometric_mean, linear_fit, mann_kendall, median, minimum, Interval,
-    LinearFit,
+    block_bootstrap_ci, geometric_mean, linear_fit, mann_kendall, median, minimum, mser_truncation,
+    Interval, LinearFit,
 };
 
 use super::definition::{rule, Rule, RuleForce, ShapeRules, SpeedInstrument};
@@ -29,7 +29,7 @@ use super::leg::{Leg, RungLegs, Unit};
 use super::outcome::{AxisResult, Pair};
 use super::refusal::Refusal;
 use super::verdict::{
-    Bound, Direction, Judgement, Ratio, ShapeVerdict, SpeedVerdict, TimeToQuality,
+    Bound, Direction, Judgement, Ratio, Settled, ShapeVerdict, SpeedVerdict, TimeToQuality,
 };
 
 /// How an edge's cost is bounded.
@@ -62,23 +62,33 @@ pub struct TimeToQualityRule<'a> {
     pub slack: Option<f64>,
 }
 
-/// A leg's series, or why it cannot be used.
-fn series(leg: &Leg) -> Result<Option<&[f64]>, Refusal> {
-    let Some(series) = leg.measured.iter_wall_s.as_deref() else {
+/// A leg's settled series and where it settled; `None` when it carries no
+/// series; or why it cannot be used.
+type LegSeries<'a> = Result<Option<(&'a [f64], Settled)>, Refusal>;
+
+/// A leg's run, settled: its initial transient cut by MSER, and what is
+/// left long enough and steady — or why it cannot be used. The cut chooses a
+/// point and tests nothing; the trend test after it is the one decision, so
+/// a run that drifts throughout, or settles and then slows, is refused by it.
+fn series(leg: &Leg) -> LegSeries<'_> {
+    let Some(run) = leg.measured.iter_wall_s.as_deref() else {
         return Ok(None);
     };
     let name = || leg.name.to_string();
+    if run.iter().any(|t| !(t.is_finite() && *t > 0.0)) {
+        return Err(Refusal::LegUnreadable {
+            leg: name(),
+            reason: "iter_wall_s has an entry that is not a positive finite duration".into(),
+        });
+    }
+    let cut = mser_truncation(run, SpeedInstrument::TRUNCATION_BATCH)
+        .map_err(|e| Refusal::statistics(name(), e))?;
+    let series = &run[cut.at..];
     if series.len() < SpeedInstrument::MIN_SAMPLES {
         return Err(Refusal::TooFewSamples {
             leg: name(),
             got: series.len(),
             need: SpeedInstrument::MIN_SAMPLES,
-        });
-    }
-    if series.iter().any(|t| !(t.is_finite() && *t > 0.0)) {
-        return Err(Refusal::LegUnreadable {
-            leg: name(),
-            reason: "iter_wall_s has an entry that is not a positive finite duration".into(),
         });
     }
     let trend = mann_kendall(series).map_err(|e| Refusal::statistics(name(), e))?;
@@ -93,30 +103,52 @@ fn series(leg: &Leg) -> Result<Option<&[f64]>, Refusal> {
             relative_drift: relative_drift * 100.0,
         });
     }
-    Ok(Some(series))
+    Ok(Some((
+        series,
+        Settled {
+            leg: name(),
+            transient: cut.at,
+            at_limit: cut.at_limit,
+            iterations: run.len(),
+        },
+    )))
 }
 
-/// Every repeat's series for each unit of one rung: `None` when any repeat
-/// carries no series at all.
-fn rung_series<'a>(
-    rung: &'a RungLegs,
-    units: &[Unit],
-    refusals: &mut Vec<Refusal>,
-) -> Option<Vec<Vec<&'a [f64]>>> {
-    let per_unit: Vec<Option<Vec<&[f64]>>> = units
+/// One rung's settled series, read unit by unit.
+struct RungSeries<'a> {
+    /// Every repeat's settled series for each unit: `None` when any repeat
+    /// carries no usable series.
+    per_unit: Option<Vec<Vec<&'a [f64]>>>,
+    settled: Vec<Settled>,
+    refusals: Vec<Refusal>,
+}
+
+fn rung_series<'a>(rung: &'a RungLegs, units: &[Unit]) -> RungSeries<'a> {
+    let read: Vec<Vec<LegSeries<'a>>> = units
         .iter()
-        .map(|unit| {
-            rung.repeats(unit)
-                .map(|leg| {
-                    series(leg).unwrap_or_else(|refusal| {
-                        refusals.push(refusal);
-                        None
-                    })
-                })
-                .collect()
-        })
+        .map(|unit| rung.repeats(unit).map(series).collect())
         .collect();
-    per_unit.into_iter().collect()
+    RungSeries {
+        refusals: read
+            .iter()
+            .flatten()
+            .filter_map(|leg| leg.as_ref().err().cloned())
+            .collect(),
+        settled: read
+            .iter()
+            .flatten()
+            .filter_map(|leg| Some(leg.as_ref().ok()?.as_ref()?.1.clone()))
+            .collect(),
+        per_unit: read
+            .into_iter()
+            .map(|repeats| {
+                repeats
+                    .into_iter()
+                    .map(|leg| Some(leg.ok()??.0))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect(),
+    }
 }
 
 /// `location(numerator) ÷ location(denominator)` per unit, pooled over a
@@ -222,7 +254,7 @@ pub fn revision(
             return result;
         }
         Ok(None) => return result,
-        Ok(Some((cost, _))) => cost,
+        Ok(Some(measured)) => measured.ratio,
     };
     let Some(verdict) = result.verdict.as_mut() else {
         return result;
@@ -273,26 +305,45 @@ fn half_width(interval: Interval) -> f64 {
         .exp()
 }
 
-/// The cost of `upper` over `lower`, measured from their series.
-pub fn measure_cost(pair: &Pair<'_>) -> Result<Option<(Ratio, Option<f64>)>, Vec<Refusal>> {
-    let mut refusals = vec![];
-    let lower = rung_series(pair.lower, pair.units, &mut refusals);
-    let upper = rung_series(pair.upper, pair.units, &mut refusals);
+/// A pair's cost, and the settled series it was measured from.
+pub struct Cost<'a> {
+    pub ratio: Ratio,
+    /// The wider of the two rungs' own noise bands.
+    pub band: Option<f64>,
+    lower: Vec<Vec<&'a [f64]>>,
+    upper: Vec<Vec<&'a [f64]>>,
+    settled: Vec<Settled>,
+}
+
+/// The cost of `upper` over `lower`, measured from their settled series.
+pub fn measure_cost<'a>(pair: &Pair<'a>) -> Result<Option<Cost<'a>>, Vec<Refusal>> {
+    let (lower, upper) = (
+        rung_series(pair.lower, pair.units),
+        rung_series(pair.upper, pair.units),
+    );
+    let refusals: Vec<Refusal> = lower.refusals.into_iter().chain(upper.refusals).collect();
     if !refusals.is_empty() {
         return Err(refusals);
     }
-    let (Some(lower), Some(upper)) = (lower, upper) else {
+    let settled = lower.settled.into_iter().chain(upper.settled).collect();
+    let (Some(lower), Some(upper)) = (lower.per_unit, upper.per_unit) else {
         return Ok(None);
     };
     if pair.units.is_empty() {
         return Ok(None);
     }
-    let measured = ratio(&upper, &lower, pair.edge).and_then(|cost| {
+    let measured = ratio(&upper, &lower, pair.edge).and_then(|ratio| {
         let bands = [
             noise_band(&lower, pair.edge)?,
             noise_band(&upper, pair.edge)?,
         ];
-        Ok((cost, bands.into_iter().flatten().reduce(f64::max)))
+        Ok(Cost {
+            ratio,
+            band: bands.into_iter().flatten().reduce(f64::max),
+            lower,
+            upper,
+            settled,
+        })
     });
     measured.map(Some).map_err(|refusal| vec![refusal])
 }
@@ -355,7 +406,7 @@ pub fn speed(
     time_to_quality: Option<TimeToQualityRule<'_>>,
 ) -> AxisResult<SpeedVerdict> {
     let (name, force) = bound.rule();
-    let (cost, band) = match measure_cost(pair) {
+    let measured = match measure_cost(pair) {
         Err(refusals) => return AxisResult::refused(refusals),
         Ok(None) => {
             return AxisResult {
@@ -372,10 +423,11 @@ pub fn speed(
         }
         Ok(Some(measured)) => measured,
     };
+    let (cost, band) = (measured.ratio, measured.band);
     let mut judgements = vec![cost_judgement(bound, &cost, band)];
     let mut refusals = vec![];
 
-    let shape_verdict = shape_rules.and_then(|rules| match shape(pair, rules) {
+    let shape_verdict = shape_rules.and_then(|rules| match shape(pair, &measured, rules) {
         Ok(Some((verdict, judged))) => {
             judgements.extend(judged);
             Some(verdict)
@@ -438,6 +490,7 @@ pub fn speed(
     AxisResult {
         verdict: Some(SpeedVerdict {
             cost,
+            settled: measured.settled,
             noise_band: band,
             indistinguishable_from_one: band.map(|b| cost.of_medians.ln().abs() <= b.ln()),
             aa_null: None,
@@ -450,24 +503,20 @@ pub fn speed(
 }
 
 /// `time = fixed + per_work · work` for one rung: each unit's fastest
-/// iteration against the work it did.
+/// settled iteration against the work it did.
 fn fit(
     rung: &RungLegs,
     units: &[Unit],
+    series: &[Vec<&[f64]>],
     rung_name: &str,
     rules: &ShapeRules,
 ) -> Result<Option<LinearFit>, Refusal> {
     let points: Vec<(f64, f64)> = units
         .iter()
-        .filter_map(|unit| {
+        .zip(series)
+        .filter_map(|(unit, repeats)| {
             let work = rung.primary(unit)?.measured.work?;
-            let times: Vec<f64> = rung
-                .repeats(unit)
-                .filter_map(|leg| leg.measured.iter_wall_s.as_deref())
-                .flatten()
-                .copied()
-                .collect();
-            Some((work, minimum(&times).ok()?))
+            Some((work, minimum(&repeats.concat()).ok()?))
         })
         .collect();
     if points.len() < 3 {
@@ -499,6 +548,7 @@ fn fit(
 
 fn shape(
     pair: &Pair<'_>,
+    measured: &Cost<'_>,
     rules: &ShapeRules,
 ) -> Result<Option<(ShapeVerdict, Vec<Judgement>)>, Refusal> {
     let name = |rung: &RungLegs, side: &str| {
@@ -506,8 +556,20 @@ fn shape(
             .next()
             .map_or_else(|| side.to_owned(), |leg| leg.name.rung.clone())
     };
-    let lower = fit(pair.lower, pair.units, &name(pair.lower, "lower"), rules)?;
-    let upper = fit(pair.upper, pair.units, &name(pair.upper, "upper"), rules)?;
+    let lower = fit(
+        pair.lower,
+        pair.units,
+        &measured.lower,
+        &name(pair.lower, "lower"),
+        rules,
+    )?;
+    let upper = fit(
+        pair.upper,
+        pair.units,
+        &measured.upper,
+        &name(pair.upper, "upper"),
+        rules,
+    )?;
     let (Some(lower), Some(upper)) = (lower, upper) else {
         return Ok(None);
     };

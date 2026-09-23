@@ -807,6 +807,56 @@ fn a_trending_series_and_a_short_one_are_refused() {
     )));
 }
 
+/// A run that starts slow and settles is cut where it settles: the cost is
+/// read from the steady iterations, the transient named per leg.
+#[test]
+fn a_warming_start_is_cut_and_the_cost_read_from_what_settled() {
+    let warming: Vec<f64> = (0..48)
+        .map(|i| {
+            if i < 12 {
+                1.3
+            } else {
+                1.0 + 0.001 * (i % 3) as f64
+            }
+        })
+        .collect();
+    let verdict = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", warming, json!({})),
+    );
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    let speed = verdict.speed.as_ref().unwrap();
+    assert!(
+        (speed.cost.of_medians - 1.001).abs() < 1e-9,
+        "{}",
+        speed.cost.of_medians
+    );
+    let cut = speed
+        .settled
+        .iter()
+        .find(|l| l.leg.starts_with(PARTITIONED))
+        .unwrap();
+    assert_eq!(
+        (cut.transient, cut.iterations, cut.at_limit),
+        (12, 48, false)
+    );
+}
+
+/// A run that drifts throughout is cut at the half-way limit and still
+/// refused: what is left drifts too, and the trend test says so.
+#[test]
+fn a_run_that_never_settles_is_refused_on_what_is_left() {
+    let drifting: Vec<f64> = (0..64).map(|i| 1.0 + 0.01 * i as f64).collect();
+    let verdict = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", drifting, json!({})),
+    );
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::NonStationary { leg, .. } if leg.starts_with(PARTITIONED))
+    ));
+}
+
 #[test]
 fn a_hard_speed_rule_with_nothing_to_measure_is_refused() {
     // The revision edge's band rule is hard; an evidence rule with nothing
@@ -2059,8 +2109,8 @@ fn the_committed_step_sweep_reproduces_every_configs_reading() {
             units: &one,
             ..pair
         };
-        let (cost, band) = speed::measure_cost(&single).unwrap().unwrap();
-        let band = band.unwrap();
+        let measured = speed::measure_cost(&single).unwrap().unwrap();
+        let (cost, band) = (measured.ratio, measured.band.unwrap());
         let inside = cost.of_medians.ln().abs() <= band.ln();
         let non_inferior = 1.0 / cost.of_medians > 0.9;
         let ladder_reading = if inside {

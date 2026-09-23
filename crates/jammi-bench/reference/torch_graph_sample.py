@@ -156,12 +156,12 @@ def run(args, graph: Path, take: int) -> list[str]:
     cell_index = {state: i for i, (state, _) in enumerate(law)}
     next_index = {state: {x: j for j, (x, _) in enumerate(nexts)} for state, nexts in law}
 
-    series = ll.IterationSeries(args.warmup, args.iterations)
-    for i in range(series.total):
+    iter_wall_s: list[float] = []
+    for i in range(args.iterations):
         torch.manual_seed(args.seed + i)
         t0 = time.perf_counter()
         walker(start)
-        series.record(time.perf_counter() - t0)
+        iter_wall_s.append(time.perf_counter() - t0)
     peak = ll.peak_rss_bytes()
 
     # Untimed, after the peak is read: the passes the law file asks for, one
@@ -213,8 +213,7 @@ def run(args, graph: Path, take: int) -> list[str]:
         "edge_set_symmetric": symmetric,
         "hard_negatives": 0,
         "exclude_hops": None,
-        "warmup": args.warmup,
-        "iters_measured": len(series.seconds),
+        "iters_measured": len(iter_wall_s),
         "walks": int(start.numel()),
         "observation_passes": observation_passes,
         "sampled_pairs": len(pair_rows),
@@ -222,7 +221,7 @@ def run(args, graph: Path, take: int) -> list[str]:
         "walker": walker_name,
         **ll.provenance(),
         # Measured.
-        "iter_wall_s": series.seconds,
+        "iter_wall_s": iter_wall_s,
         "work": len(edges),
         "peak_rss_bytes": peak,
         "peak_vram_bytes": ll.NOT_MEASURED_BYTES,
@@ -243,8 +242,7 @@ def main() -> None:
     parser.add_argument("--return-p", type=float, default=1.0)
     parser.add_argument("--in-out-q", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=32, help="passes timed and filed; the ladder settles no fewer than 32")
     parser.add_argument("--takes", type=int, default=1, help="measured repeats of each graph, each in its own process")
     parser.add_argument("--take", type=int, default=1, help="the take a single graph's run is filed as")
     args = parser.parse_args()
@@ -256,7 +254,7 @@ def main() -> None:
         argv = ["--graph", str(graph), "--legs-dir", str(args.legs_dir), "--walker", args.walker, "--take", str(take)]
         if args.law_dir:
             argv += ["--law-dir", str(args.law_dir)]
-        for flag in ("walk_length", "walks_per_node", "return_p", "in_out_q", "seed", "warmup", "iterations"):
+        for flag in ("walk_length", "walks_per_node", "return_p", "in_out_q", "seed", "iterations"):
             argv += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
         return argv
 

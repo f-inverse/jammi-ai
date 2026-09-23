@@ -61,11 +61,10 @@
 #                           close on the same work (needs `usearch` in the torch
 #                           venv). 0: they stop at the Parquet file, and their
 #                           legs say so.
-#   ENCODE_AB_WARMUP / ENCODE_AB_ITERS
-#                           warm and measured serves per rung (defaults 2, 16;
-#                           ITERS must be even — the rungs are interleaved —
-#                           and at least the ladder's minimum series, which
-#                           `encode-step` refuses below).
+#   ENCODE_AB_ITERS         serves per rung, every one timed and filed (default
+#                           64; even — the rungs are interleaved — and at least
+#                           the ladder's minimum run, 32: the ladder cuts each
+#                           run's initial transient itself).
 #   ENCODE_AB_CUDA_ORDINAL  optional CUDA device ordinal (unset = CPU; when set,
 #                           every leg runs on it and the build is the fused GPU
 #                           stack, `cuda,jammi-encoders/flash-attn` — the same
@@ -88,8 +87,7 @@ ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
 ENCODE_AB_BATCH_TOKENS="${ENCODE_AB_BATCH_TOKENS:-16384}"
 ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
 ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
-ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
-ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-16}"
+ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-64}"
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
@@ -188,7 +186,7 @@ run_jammi_legs() {
     --partitions "$ENCODE_AB_PARTITIONS"
     --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
     --compute-precision "$ENCODE_AB_DTYPE"
-    --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --iters "$ENCODE_AB_ITERS"
     --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
   local rung
   for rung in "$@"; do cmd+=(--rung "$rung"); done
@@ -207,7 +205,7 @@ run_torch_legs() {
     --out-dir "$OUT_DIR/${label}.out" --legs-dir "$legs_dir" --sampler-bin "$BIN"
     --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
     --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
-    --dtype "$ENCODE_AB_DTYPE" --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --dtype "$ENCODE_AB_DTYPE" --iters "$ENCODE_AB_ITERS"
     --order "$order" --attn "$attn")
   [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
   [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")

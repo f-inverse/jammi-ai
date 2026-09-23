@@ -17,7 +17,7 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 
 use crate::capture::{
     cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, vector_rows_digest,
-    write_jsonl, write_vector_rows, IterationSeries,
+    write_jsonl, write_vector_rows,
 };
 use crate::graph_legs::{
     add_graph_sources, build_edges, build_features, build_nodes, materialize_features,
@@ -108,9 +108,7 @@ pub struct PropagateLegParams {
     pub alpha: f64,
     /// Where the leg, its vectors and the unit's inputs are filed.
     pub legs_dir: PathBuf,
-    /// Untimed iterations before the series.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed, every one filed in run order.
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
@@ -152,9 +150,8 @@ pub struct PropagatePayload {
     pub requested_hops: usize,
     /// The wiring rule's fan-out cap.
     pub fan_out: usize,
-    /// Untimed iterations before the series.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed and filed: the whole run, its transient for the
+    /// ladder to cut.
     pub iters_measured: usize,
     /// The implementation that propagated.
     pub operator: &'static str,
@@ -218,12 +215,13 @@ pub async fn run_leg(
     materialize_features(host.session(), &sources, &nodes, shape.dim).await?;
     let request = build_request(host.session(), &sources, params.hops, params.alpha).await?;
 
-    let mut series = IterationSeries::new(params.warmup, params.iterations);
+    // Each iteration's wall in run order, and the last one's table.
+    let mut iter_wall_s = Vec::with_capacity(params.iterations);
     let mut last = None;
-    for _ in 0..series.total() {
+    for _ in 0..params.iterations {
         let start = Instant::now();
         let table = propagate(&mut host, &request).await?;
-        series.record(start.elapsed());
+        iter_wall_s.push(start.elapsed().as_secs_f64());
         last = Some(table);
     }
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
@@ -250,12 +248,11 @@ pub async fn run_leg(
         target_partitions: params.rung.target_partitions(params.partitions),
         requested_hops: params.hops,
         fan_out: shape.fan_out,
-        warmup: params.warmup,
         iters_measured: params.iterations,
         operator: "jammi_ai::session::InferenceSession::propagate_embeddings",
     };
     let measured = Measured {
-        iter_wall_s: Some(series.into_seconds()),
+        iter_wall_s: Some(iter_wall_s),
         work: Some((edges.len() * hops) as f64),
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
@@ -300,11 +297,9 @@ pub struct PropagateArgs {
     /// vectors beside, and the inputs under `input/edges<N>/`.
     #[arg(long)]
     legs_dir: PathBuf,
-    #[arg(long, default_value_t = 1)]
-    warmup: usize,
-    /// Timed iterations; the default is the comparator's minimum series, and a
-    /// shorter run files legs the speed axis refuses by name.
-    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_SAMPLES)]
+    /// Iterations timed, every one filed; the default is the fewest the
+    /// ladder settles, and a shorter run files legs it refuses by name.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
     /// Measured repeats of each point, each in a process of its own.
     #[arg(long, default_value_t = 1)]
@@ -326,7 +321,6 @@ impl PropagateArgs {
             hops: self.hops,
             alpha: self.alpha,
             legs_dir: self.legs_dir.clone(),
-            warmup: self.warmup,
             iterations: self.iterations,
             take,
             plane: self.plane.clone().into(),
@@ -358,7 +352,6 @@ impl PropagateArgs {
                     ("--partitions", self.partitions.to_string()),
                     ("--hops", self.hops.to_string()),
                     ("--alpha", self.alpha.to_string()),
-                    ("--warmup", self.warmup.to_string()),
                     ("--iterations", self.iterations.to_string()),
                     ("--take", take.to_string()),
                 ];
@@ -416,7 +409,6 @@ mod tests {
             hops,
             alpha,
             legs_dir: legs_dir.to_path_buf(),
-            warmup: 0,
             iterations: 1,
             take: 1,
             plane: PlaneParams::default(),

@@ -355,6 +355,9 @@ pub struct TimeToQuality {
 pub struct SpeedVerdict {
     /// `upper ÷ lower` time: the layer's cost. Geometric mean over units.
     pub cost: Ratio,
+    /// Where each leg's run settled: the iterations its initial transient
+    /// took, which no number above reads.
+    pub settled: Vec<Settled>,
     /// The half-width, as a ratio, of the same rung measured against itself.
     pub noise_band: Option<f64>,
     /// The cost lies inside the noise band, whatever its point value.
@@ -364,6 +367,20 @@ pub struct SpeedVerdict {
     pub aa_null: Option<Ratio>,
     pub shape: Option<ShapeVerdict>,
     pub time_to_quality: Option<TimeToQuality>,
+}
+
+/// Where one leg's run settled.
+#[derive(Debug, Clone, Serialize)]
+pub struct Settled {
+    pub leg: String,
+    /// The iterations cut as the run's initial transient.
+    pub transient: usize,
+    /// The cut fell at the limit of the run's first half: the transient was
+    /// not seen to end, and the second half is what the stationarity test
+    /// judged.
+    pub at_limit: bool,
+    /// The iterations the run filed.
+    pub iterations: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -692,6 +709,18 @@ impl EdgeVerdict {
                     _ => String::new(),
                 }
             ));
+            if let Some((least, most)) = s.settled.iter().map(|l| l.transient).fold(
+                None,
+                |range: Option<(usize, usize)>, t| {
+                    Some(range.map_or((t, t), |(lo, hi)| (lo.min(t), hi.max(t))))
+                },
+            ) {
+                let at_limit = s.settled.iter().filter(|l| l.at_limit).count();
+                lines.push(format!(
+                    "settled: every leg's initial transient cut by MSER, {least}–{most} iterations; {at_limit} of {} legs cut at the half-way limit",
+                    s.settled.len()
+                ));
+            }
             if let Some(aa) = &s.aa_null {
                 lines.push(format!(
                     "A/A null (rebuilt/base): {:.4} by medians [{:.4}, {:.4}]",

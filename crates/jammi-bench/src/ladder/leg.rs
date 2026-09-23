@@ -455,7 +455,7 @@ mod tests {
             "tokens": 1024, "batch_size": 32, "max_sequence_length": 64, "compute_precision": "f32",
             "checkpoint_config_sha256": "c", "checkpoint_weights_sha256": "w",
             "checkpoint_weights_size_bytes": 10, "checkpoint_tokenizer_sha256": "t",
-            "pooling": "mean", "normalize": true, "warmup": 2, "iters_measured": 4,
+            "pooling": "mean", "normalize": true, "iters_measured": 4,
             "device_requested": "cpu",
             "iter_wall_s": [0.1, 0.2, 0.1, 0.1],
             "work": 16,

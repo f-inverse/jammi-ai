@@ -193,7 +193,10 @@ fn telescoping(
         units: &units,
         unclean: &unclean,
     };
-    let Some((direct_cost, _)) = speed::measure_cost(&pair)? else {
+    let Some(speed::Cost {
+        ratio: direct_cost, ..
+    }) = speed::measure_cost(&pair)?
+    else {
         return Ok(None);
     };
     // Bounds multiplied: at least as wide as the product's own interval, so

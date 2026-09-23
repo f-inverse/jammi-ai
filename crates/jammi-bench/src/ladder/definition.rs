@@ -653,8 +653,17 @@ impl Ladder {
 pub struct SpeedInstrument;
 
 impl SpeedInstrument {
-    /// Fewest post-warmup iterations a leg may carry.
+    /// Fewest settled iterations a leg may carry.
     pub const MIN_SAMPLES: usize = 16;
+    /// Fewest iterations a run files: MSER may cut up to half of a run as its
+    /// initial transient, and what is left must reach [`Self::MIN_SAMPLES`].
+    pub const MIN_RUN: usize = 2 * Self::MIN_SAMPLES;
+    /// The batch MSER cuts a run's initial transient at: White's rule on the
+    /// iterations themselves. Batch means (MSER-5) serve runs of thousands;
+    /// over the tens to hundreds of iterations a leg files, a steady run of
+    /// one-sided timing noise reaches MSER-5's half-way limit several times
+    /// as often as MSER-1's.
+    pub const TRUNCATION_BATCH: usize = 1;
     /// A series is refused as non-stationary when its Mann-Kendall test
     /// rejects at this level *and* its Theil-Sen drift over the whole series
     /// exceeds [`Self::MAX_RELATIVE_DRIFT`] of its median. Significance alone

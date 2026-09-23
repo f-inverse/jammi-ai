@@ -157,7 +157,7 @@ def run_jammi(model_dir: Path, targets: str, data_flags: list[str], work: Path) 
     done = subprocess.run(
         [
             "cargo", "run", "--quiet", "-p", "jammi-bench", "--bin", "jammi-bench", "--",
-            "finetune-run", "--arm", "fused",
+            "finetune-run",
             "--model-dir", str(model_dir),
             "--target-modules", targets,
             "--work-dir", str(work),

@@ -1203,7 +1203,7 @@ def _csv(value: str):
 
 def parse_args(argv=None):
     """`jammi-bench finetune-run`'s flags, name for name and default for
-    default, minus the jammi-only ones (`--arm`, kernel and mutant flags) and
+    default, minus the jammi-only ones (the kernel and mutant flags) and
     plus the torch-only ones (`--attn`, `--adamw-foreach`, `--initial-adapter`,
     `--dry-run`). A value this twin cannot reproduce is not a choice."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

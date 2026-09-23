@@ -70,7 +70,7 @@ file — a rename or removal fails this gate rather than silently vanishing
 the architecture from the matrix.
 
 Verbs are parsed from `ModelTask::ALL`'s enum body
-(`crates/jammi-db/src/model_task.rs`). All six current variants
+(`crates/jammi-datafusion/src/task.rs`). All six current variants
 (`TextEmbedding`, `ImageEmbedding`, `AudioEmbedding`, `Classification`,
 `Ner`, `Regression`) dispatch through `CandleModel::forward`'s per-task
 match to a real candle GPU forward — none is a CPU-only fold. The CPU-only
@@ -148,7 +148,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ANY_ENCODER = REPO_ROOT / "crates" / "jammi-encoders" / "src" / "any.rs"
-MODEL_TASK = REPO_ROOT / "crates" / "jammi-db" / "src" / "model_task.rs"
+MODEL_TASK = REPO_ROOT / "crates" / "jammi-datafusion" / "src" / "task.rs"
 CANDLE_BACKEND = REPO_ROOT / "crates" / "jammi-ai" / "src" / "model" / "backend" / "candle.rs"
 GPU_CAPABILITY_DIR = REPO_ROOT / "crates" / "jammi-ai" / "tests" / "gpu_capability"
 KERNELS_BUILD_RS = REPO_ROOT / "crates" / "jammi-kernels" / "build.rs"

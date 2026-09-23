@@ -13,6 +13,7 @@ use std::process::Stdio;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::ladder::leg::{LegName, Take};
 use crate::leg::{Leg, MutantStamp, Payload, Provenance};
 use crate::report::{Report, Tiers};
 
@@ -185,9 +186,10 @@ pub fn unique_suffix() -> String {
     )
 }
 
-/// A leg's file stem by the ladder's contract: `<rung>__<unit>__r<take>`.
-pub fn leg_stem(rung: &str, unit: &str, take: usize) -> String {
-    format!("{rung}__{unit}__r{take}")
+/// A leg's file stem by the ladder's contract: `<rung>__<unit>__<take>`,
+/// spelled by the ladder's own [`LegName`] so producer and judge cannot differ.
+pub fn leg_stem(rung: &str, unit: &str, take: Take) -> String {
+    LegName::new(rung, unit, take).to_string()
 }
 
 /// Write `report` as `<stem>.json` under `legs_dir` and return the file name.
@@ -329,6 +331,13 @@ mod tests {
 
     #[test]
     fn a_leg_stem_is_the_ladders_name() {
-        assert_eq!(leg_stem("sampler", "edges64", 2), "sampler__edges64__r2");
+        assert_eq!(
+            leg_stem("sampler", "edges64", Take::Repeat(2)),
+            "sampler__edges64__r2"
+        );
+        assert_eq!(
+            leg_stem("plan", "rows16", Take::Alone(1)),
+            "plan__rows16__a1"
+        );
     }
 }

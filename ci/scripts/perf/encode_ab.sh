@@ -13,9 +13,10 @@
 #   jammi          `jammi-bench encode-step --rung direct --rung plan --rung
 #                  plan-partitioned`: the three engine rungs INTERLEAVED in one
 #                  process per unit (the legs an edge's speed is read from),
-#                  then each rung again ALONE (`--rung <one>`, the legs its
-#                  space is read from: a shared process's high-water marks
-#                  belong to no one rung).
+#                  then each rung again ALONE (`--rung <one>`, filed as
+#                  `a<take>` beside the interleaved `r<take>` legs: the legs
+#                  its space is read from, a shared process's high-water marks
+#                  belonging to no one rung).
 #   torch-plan     `torch_encode.py --order plan --attn eager`: the reference
 #                  forwarding the chunks the engine's plan cuts — the
 #                  semantic twin, the `torch` rung.
@@ -218,9 +219,9 @@ run_torch_legs() {
 run_jammi_legs jammi-interleaved "$LEGS_PLAN" direct plan plan-partitioned
 run_torch_legs torch-plan "$LEGS_PLAN" plan eager
 run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
-run_jammi_legs jammi-direct "$LEGS_PLAN/space" direct
-run_jammi_legs jammi-plan "$LEGS_PLAN/space" plan
-run_jammi_legs jammi-plan-partitioned "$LEGS_PLAN/space" plan-partitioned
+run_jammi_legs jammi-direct "$LEGS_PLAN" direct
+run_jammi_legs jammi-plan "$LEGS_PLAN" plan
+run_jammi_legs jammi-plan-partitioned "$LEGS_PLAN" plan-partitioned
 
 # The sorted comparison sees the same engine legs beside the other torch order.
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then

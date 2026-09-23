@@ -983,6 +983,41 @@ fn time_that_is_not_a_line_in_work_is_refused_rather_than_fitted() {
     ));
 }
 
+/// Interleaved repeats share one process, so they carry no memory; each
+/// rung's memory comes from its run alone, whose time pairs with nothing.
+#[test]
+fn memory_is_read_from_the_runs_alone_and_speed_from_the_repeats() {
+    let shared = json!({
+        "peak_rss_bytes": {"value": null, "unit": "bytes"},
+        "peak_vram_bytes": {"value": null, "unit": "bytes"}
+    });
+    let alone = |rss: f64, seconds: f64| {
+        json!({
+            "peak_rss_bytes": {"value": rss, "unit": "bytes"},
+            "peak_vram_bytes": {"value": 2.0e9, "unit": "bytes"},
+            "iter_wall_s": steady(seconds)
+        })
+    };
+    let verdict = edge_verdict(
+        &encode_test_ladder(),
+        PLAN,
+        PARTITIONED,
+        &set([
+            encode_leg(PLAN, 16, "r1", steady(1.0), shared.clone()),
+            encode_leg(PARTITIONED, 16, "r1", steady(1.0), shared),
+            // Alone, the partitioned rung holds 5 % more memory — and its
+            // lone session ran twice as slow, which no speed rule may read.
+            encode_leg(PLAN, 16, "a1", steady(1.0), alone(1.0e9, 1.0)),
+            encode_leg(PARTITIONED, 16, "a1", steady(1.0), alone(1.05e9, 2.0)),
+        ]),
+        &one_size(),
+    );
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    let space = verdict.space.as_ref().unwrap();
+    assert!((space.host_ratio.unwrap() - 1.05).abs() < 1e-9);
+    assert!((verdict.speed.as_ref().unwrap().cost.of_medians - 1.0).abs() < 1e-9);
+}
+
 #[test]
 fn memory_over_budget_and_unmeasured_memory_are_reported_as_evidence() {
     let lower = || encode_leg(PLAN, 16, "r1", steady(1.0), json!({}));

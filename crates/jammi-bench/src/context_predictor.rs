@@ -82,6 +82,7 @@ use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point,
     vector_rows_digest, write_vector_rows, Artifact,
 };
+use crate::ladder::leg::Take;
 use crate::leg::{
     Facts, Leg, Measured, Measurement, Payload, Provenance, RanOn, Stations, TrajectoryPoint,
 };
@@ -582,7 +583,11 @@ pub async fn run_leg(
     };
     let rows = build_dataset(&spec);
     let unit = format!("seed{}", config.seed);
-    let stem = leg_stem(params.rung.as_str(), &unit, params.take);
+    let stem = leg_stem(
+        params.rung.as_str(),
+        &unit,
+        Take::Repeat(params.take as u32),
+    );
     let input_dir = params
         .legs_dir
         .join(INPUT_DIR)

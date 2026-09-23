@@ -59,18 +59,28 @@ impl PartialOrd for Unit {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Take {
     /// `r<N>`: the N-th measured repeat. `r1` carries the outcome; every
-    /// repeat carries time and memory.
+    /// repeat carries time, and memory when its process was its own.
     Repeat(u32),
+    /// `a<N>`: the N-th run of the rung alone in a process of its own, beside
+    /// repeats that shared theirs: it carries the rung's memory, and its time
+    /// — a session of its own drifts unlike the shared one — is paired with
+    /// nothing.
+    Alone(u32),
     /// Any other tag: a control run, never counted into a statistic.
     Control(String),
 }
 
 impl Take {
     fn parse(tag: &str) -> Self {
-        tag.strip_prefix('r')
-            .and_then(|n| n.parse().ok())
-            .filter(|n| *n >= 1)
-            .map_or_else(|| Self::Control(tag.to_owned()), Self::Repeat)
+        let numbered = |prefix: char| {
+            tag.strip_prefix(prefix)
+                .and_then(|n| n.parse::<u32>().ok())
+                .filter(|n| *n >= 1)
+        };
+        numbered('r')
+            .map(Self::Repeat)
+            .or_else(|| numbered('a').map(Self::Alone))
+            .unwrap_or_else(|| Self::Control(tag.to_owned()))
     }
 }
 
@@ -78,6 +88,7 @@ impl std::fmt::Display for Take {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Repeat(n) => write!(f, "r{n}"),
+            Self::Alone(n) => write!(f, "a{n}"),
             Self::Control(tag) => f.write_str(tag),
         }
     }
@@ -92,6 +103,16 @@ pub struct LegName {
 }
 
 impl LegName {
+    /// The name a producer files a leg under — the one spelling the ladder
+    /// parses back.
+    pub fn new(rung: impl Into<String>, unit: impl Into<String>, take: Take) -> Self {
+        Self {
+            rung: rung.into(),
+            unit: Unit(unit.into()),
+            take,
+        }
+    }
+
     pub fn parse(file_name: &str) -> Result<Self, Refusal> {
         let malformed = |reason: &str| Refusal::LegNameMalformed {
             file: file_name.to_owned(),
@@ -318,6 +339,16 @@ impl RungLegs {
             .filter(|leg| matches!(leg.name.take, Take::Repeat(_)))
     }
 
+    /// Every measured run of `unit`: its repeats and its runs alone — what
+    /// a quantity only some of them carry is read from.
+    pub fn measured(&self, unit: &Unit) -> impl Iterator<Item = &Leg> {
+        self.units
+            .get(unit)
+            .into_iter()
+            .flatten()
+            .filter(|leg| matches!(leg.name.take, Take::Repeat(_) | Take::Alone(_)))
+    }
+
     pub fn primary(&self, unit: &Unit) -> Option<&Leg> {
         self.repeats(unit)
             .find(|leg| leg.name.take == Take::Repeat(1))
@@ -417,6 +448,14 @@ mod tests {
             ("resident", "seed10")
         );
         assert_eq!(name.take, Take::Repeat(2));
+        assert_eq!(
+            LegName::parse("plan__rows16__a3.json").unwrap().take,
+            Take::Alone(3)
+        );
+        assert_eq!(
+            LegName::new("plan", "rows16", Take::Alone(3)).to_string(),
+            "plan__rows16__a3"
+        );
         assert_eq!(
             LegName::parse("resident__seed1__lr0.json").unwrap().take,
             Take::Control("lr0".into())

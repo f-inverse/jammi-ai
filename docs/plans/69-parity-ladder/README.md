@@ -366,7 +366,10 @@ A leg file is named `<rung>__<unit>__<take>.json`; the legs of the directly meas
 end-to-end pair live in the legs directory's `direct/` subdirectory; a revision edge's legs are
 filed under `<rung>@base`, `<rung>@revised` and `<rung>@rebuilt`. `unit` is one point of the
 sweep (`seed3`, `rows4096`, `b8s128d0`); `take` is `r1`, `r2`, … for measured repeats (`r1`
-carries the outcome, every repeat carries time and memory) or a control's tag (`lr0`).
+carries the outcome, every repeat carries time, and memory when its process was its own), `a1`,
+`a2`, … for a rung's runs alone beside repeats that shared one process (an interleaved encode
+session): they carry the rung's memory and nothing the speed axis pairs; or a control's tag
+(`lr0`). The space axis reads a unit's peak from every measured run that carries it.
 
 ## Sources of the method
 

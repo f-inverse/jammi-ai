@@ -1215,7 +1215,10 @@ pub async fn measure_legs(
                     &corpus_path,
                     corpus_connection(&corpus_path)?,
                     params.gpu_device,
-                    &format!("encode-{}", leg_stem(rung, row_count, take)),
+                    &format!(
+                        "encode-{}",
+                        leg_stem(rung.as_str(), row_count, take, params.rungs.len() == 1)
+                    ),
                 )
                 .await
                 .map_err(plane_err)?;
@@ -1338,9 +1341,14 @@ pub async fn measure_legs(
             )
             .into());
         }
+        // The outcome is read off the first repeat's vectors; a run alone
+        // carries its rung's memory and nothing the outcome pairs.
         let vectors = match (&artifact, &params.legs_dir, take) {
-            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) => {
-                let name = format!("{}.vectors.f32", leg_stem(session.rung, row_count, take));
+            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) if !solo => {
+                let name = format!(
+                    "{}.vectors.f32",
+                    leg_stem(session.rung.as_str(), row_count, take, solo)
+                );
                 std::fs::create_dir_all(legs_dir)?;
                 let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write(legs_dir.join(&name), bytes)?;
@@ -1438,9 +1446,20 @@ pub async fn measure_legs(
     Ok(legs)
 }
 
-/// A leg's file stem: `<rung>__rows<N>__r<take>`, the ladder's leg contract.
-fn leg_stem(rung: Rung, row_count: usize, take: usize) -> String {
-    format!("{}__rows{row_count}__r{take}", rung.as_str())
+/// A leg's file stem by the ladder's contract: a repeat when its session
+/// interleaves several rungs — the legs an edge's speed pairs — and a run
+/// alone when it serves one, the leg its rung's memory is read from.
+fn leg_stem(rung: &str, row_count: usize, take: usize, alone: bool) -> String {
+    let take = u32::try_from(take).expect("a take count fits u32");
+    crate::capture::leg_stem(
+        rung,
+        &format!("rows{row_count}"),
+        if alone {
+            crate::ladder::leg::Take::Alone(take)
+        } else {
+            crate::ladder::leg::Take::Repeat(take)
+        },
+    )
 }
 
 /// The reports one leg session prints: one per rung, the leg under
@@ -1548,20 +1567,21 @@ fn summarize(leg: &serde_json::Value, file: Option<String>) -> Option<LegSummary
 }
 
 /// File one leg's report under `legs_dir` by the ladder's leg contract
-/// (`<rung>__rows<N>__r<take>.json`), when a directory was given, and
-/// summarise it.
+/// ([`leg_stem`]), when a directory was given, and summarise it.
 fn file_leg(
     legs_dir: Option<&Path>,
     report: &serde_json::Value,
+    alone: bool,
 ) -> Result<LegSummary, Box<dyn std::error::Error>> {
     let leg = &report["tiers"]["encode_step"];
     let file = match legs_dir {
         Some(legs_dir) => {
+            let rung = leg["rung"].as_str().ok_or("a leg names its rung")?;
+            let rows = leg["rows"].as_u64().ok_or("a leg names its rows")?;
+            let take = leg["take"].as_u64().ok_or("a leg names its take")?;
             let name = format!(
-                "{}__rows{}__r{}.json",
-                leg["rung"].as_str().ok_or("a leg names its rung")?,
-                leg["rows"].as_u64().ok_or("a leg names its rows")?,
-                leg["take"].as_u64().ok_or("a leg names its take")?
+                "{}.json",
+                leg_stem(rung, usize::try_from(rows)?, usize::try_from(take)?, alone)
             );
             std::fs::create_dir_all(legs_dir)?;
             std::fs::write(legs_dir.join(&name), serde_json::to_string_pretty(report)?)?;
@@ -1650,7 +1670,7 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                     report["tiers"]["encode_step"]["peak_vram_bytes"] =
                         serde_json::to_value(&peak_vram)?;
                 }
-                legs.push(file_leg(params.legs_dir.as_deref(), report)?);
+                legs.push(file_leg(params.legs_dir.as_deref(), report, solo)?);
             }
         }
     }
@@ -2006,7 +2026,7 @@ mod tests {
         let legs_dir = tempfile::tempdir().expect("tempdir");
         let exchange = tempfile::tempdir().expect("tempdir");
         let params = EncodeStepParams {
-            rungs: vec![Rung::Direct],
+            rungs: vec![Rung::Direct, Rung::Plan],
             rows: vec![16, 32],
             takes: 2,
             legs_dir: Some(legs_dir.path().to_path_buf()),
@@ -2021,11 +2041,12 @@ mod tests {
                     .expect("leg session");
                 for report in leg_reports(legs) {
                     let report = serde_json::to_value(&report).expect("serialize");
-                    summaries.push(file_leg(params.legs_dir.as_deref(), &report).expect("file"));
+                    summaries
+                        .push(file_leg(params.legs_dir.as_deref(), &report, false).expect("file"));
                 }
             }
         }
-        assert_eq!(summaries.len(), 4);
+        assert_eq!(summaries.len(), 8);
         let fit = fit_rungs(&params.rungs, &params.rows, &summaries)[0]
             .fit_min
             .expect("two units fit two terms");
@@ -2054,6 +2075,25 @@ mod tests {
             .path()
             .join("model")
             .join("model.safetensors")
+            .exists());
+
+        // A session serving one rung alone is filed as that run alone: the
+        // leg its memory is read from, carrying no outcome vectors.
+        let alone = EncodeStepParams {
+            rungs: vec![Rung::Direct],
+            rows: vec![16],
+            takes: 1,
+            ..params
+        };
+        for report in leg_reports(measure_legs(&alone, 16, 1).await.expect("leg session")) {
+            let report = serde_json::to_value(&report).expect("serialize");
+            file_leg(alone.legs_dir.as_deref(), &report, true).expect("file");
+        }
+        let solo = read("direct__rows16__a1.json");
+        assert!(solo["tiers"]["encode_step"]["vectors_file"].is_null());
+        assert!(!legs_dir
+            .path()
+            .join("direct__rows16__a1.vectors.f32")
             .exists());
     }
 

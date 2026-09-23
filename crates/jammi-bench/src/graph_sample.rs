@@ -57,6 +57,7 @@ use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, write_artifact,
     write_jsonl, Artifact,
 };
+use crate::ladder::leg::Take;
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
 use crate::report::{Nullable, Tiers};
 
@@ -573,7 +574,7 @@ pub fn run_leg(
         ..config
     };
     let unit = format!("edges{}", graph.edges.len());
-    let stem = leg_stem(RUNG, &unit, params.take);
+    let stem = leg_stem(RUNG, &unit, Take::Repeat(params.take as u32));
 
     let iter_wall_s = (0..params.iterations)
         .map(|i| -> Result<f64, Box<dyn std::error::Error>> {

@@ -24,6 +24,7 @@ use crate::graph_legs::{
     read_sorted_vectors, EngineRung, GraphHost, GraphShape, GraphSources, DEFAULT_SHAPE,
     EDGES_FILE, INPUT_DIR, INPUT_MODEL_ID, X0_STEM,
 };
+use crate::ladder::leg::Take;
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload, Provenance};
 use crate::plane::{PlaneArgs, PlaneParams};
 use crate::report::{Nullable, Tiers};
@@ -187,7 +188,7 @@ pub async fn run_leg(
     let edges = build_edges(&nodes, shape.fan_out);
     let unit = format!("edges{}", edges.len());
     let rung = params.rung.as_str();
-    let stem = leg_stem(rung, &unit, params.take);
+    let stem = leg_stem(rung, &unit, Take::Repeat(params.take as u32));
 
     let input_dir = params.legs_dir.join(INPUT_DIR).join(&unit);
     let x0 = write_vector_rows(&input_dir, X0_STEM, &build_features(&nodes, shape.dim))?;

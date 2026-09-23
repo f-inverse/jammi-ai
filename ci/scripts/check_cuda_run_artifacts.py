@@ -4075,10 +4075,10 @@ def self_test() -> int:
             "encode_step has no torch twin"
         )
     encode_field_names = {f[0] for f in encode_tuple["fields"]}
-    if len(encode_field_names) != 23:  # 20 payload identity fields + 3 REPORT_IDENTITY_FIELDS
+    if len(encode_field_names) != 22:  # 19 payload identity fields + 3 REPORT_IDENTITY_FIELDS
         failures.append(
             f"self-test FAILED: (encode_step, jammi) identity tuple has {len(encode_field_names)} "
-            f"field(s), expected 23 (20 identity + 3 report provenance): {sorted(encode_field_names)}"
+            f"field(s), expected 22 (19 identity + 3 report provenance): {sorted(encode_field_names)}"
         )
 
     good_encode_leg = _full_leg_fixture("jammi", "c" * 40, tier_name="encode_step")

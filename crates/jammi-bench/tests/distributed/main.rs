@@ -251,12 +251,21 @@ fn filed_leg(legs_dir: &Path, stem: &str, tier: &str) -> serde_json::Value {
     report["tiers"][tier].clone()
 }
 
-fn run_encode_rung(rung: &str, legs_dir: &Path) -> serde_json::Value {
+/// The encode rungs served interleaved in one session — the session every
+/// rung's outcome is filed from, each rung's leg beside its vectors.
+#[test]
+fn every_encode_rung_serves_the_same_vectors() {
+    let legs_dir = tempfile::tempdir().expect("legs dir");
+    let rungs = ["plan", "placed", "shape-d"];
     bench(
         &[
             "encode-step",
             "--rung",
-            rung,
+            "plan",
+            "--rung",
+            "placed",
+            "--rung",
+            "shape-d",
             "--rows",
             "8",
             "--take",
@@ -266,18 +275,20 @@ fn run_encode_rung(rung: &str, legs_dir: &Path) -> serde_json::Value {
             "--iters",
             "2",
         ],
-        legs_dir,
+        legs_dir.path(),
     );
-    filed_leg(legs_dir, &format!("{rung}__rows8__r1"), "encode_step")
-}
-
-#[test]
-fn every_encode_rung_serves_the_same_vectors() {
-    let legs_dir = tempfile::tempdir().expect("legs dir");
-    let rungs = ["plan", "placed", "shape-d"];
     let legs: Vec<(&str, serde_json::Value)> = rungs
         .iter()
-        .map(|&rung| (rung, run_encode_rung(rung, legs_dir.path())))
+        .map(|&rung| {
+            (
+                rung,
+                filed_leg(
+                    legs_dir.path(),
+                    &format!("{rung}__rows8__r1"),
+                    "encode_step",
+                ),
+            )
+        })
         .collect();
     for (rung, leg) in &legs {
         eprintln!(
@@ -323,8 +334,8 @@ fn a_placed_propagation_matches_the_plan() {
             "32",
             "--rung",
             "plan,placed",
-            "--warmup",
-            "0",
+            "--take",
+            "1",
             "--iterations",
             "2",
         ],
@@ -390,8 +401,8 @@ fn every_predictor_train_run_rung_publishes_the_same_predictor() {
             "7",
             "--epochs",
             "2",
-            "--warmup-steps",
-            "0",
+            "--take",
+            "1",
         ],
         legs_dir.path(),
     );

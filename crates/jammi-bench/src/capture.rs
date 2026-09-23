@@ -255,18 +255,46 @@ async fn legs_from_fresh_process(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+/// The takes a producer measures of each point, `--take 1,2`: every take a
+/// process of its own. A run naming one take of one point — the invocation a
+/// sweep hands each of its points — is that single point, filed as that take.
+#[derive(Debug, Clone, clap::Args)]
+pub struct Takes {
+    /// The takes to measure, comma-separated, each in a process of its own;
+    /// the default is the fewest the ladder measures a rung against itself
+    /// with.
+    #[arg(
+        long = "take",
+        value_delimiter = ',',
+        default_values_t = 1..=crate::ladder::definition::SpeedInstrument::MIN_REPEATS
+    )]
+    takes: Vec<usize>,
+}
+
+impl Takes {
+    pub fn iter(&self) -> impl Iterator<Item = usize> + Clone + '_ {
+        self.takes.iter().copied()
+    }
+}
+
 /// One leg per point, each owning its process's peak resident set: a single
 /// point is filed here by `in_process`; several are a sweep and each runs in
 /// a fresh process — `args_for` names the invocation of this binary that
 /// files exactly that one point — so no point inherits an earlier point's
-/// high-water mark. Returns every leg's file name.
-pub async fn legs_per_point<P>(
+/// high-water mark. Returns every leg's file name; a sweep of no points is
+/// refused, never an empty filing.
+pub async fn legs_per_point<P, F>(
     points: &[P],
-    in_process: impl std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>>,
+    in_process: impl FnOnce(&P) -> F,
     args_for: impl Fn(&P) -> Vec<OsString>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if let [_] = points {
-        return in_process.await;
+) -> Result<Vec<String>, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>>,
+{
+    match points {
+        [] => return Err("the sweep has no points: every swept flag needs a value".into()),
+        [point] => return in_process(point).await,
+        _ => {}
     }
     let mut files = Vec::with_capacity(points.len());
     for point in points {

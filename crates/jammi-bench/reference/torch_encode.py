@@ -86,6 +86,7 @@ import sys
 import tempfile
 import time
 
+import ladder_leg as ll
 import shape_ladder
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -96,7 +97,6 @@ RUNG = "torch"
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 DRY_RUN_MODEL_DIR = os.path.join(REPO_ROOT, "cookbook", "fixtures", "tiny_bert")
 DRY_RUN_ROWS = (8, 24)
-DRY_RUN_TAKES = 2
 DRY_RUN_WORDS = ("quantum", "error", "correction", "codes", "of", "the", "ribosome", "structure")
 
 KEY_COLUMN = "_row_id"
@@ -507,7 +507,7 @@ def parse_args(argv=None):
     parser.add_argument("--exchange-dir", help="where `encode-step --exchange-dir` left corpus_<rows>.parquet")
     parser.add_argument("--out-dir", help="where this leg persists torch_vectors_<rows>.parquet (default: the exchange dir)")
     parser.add_argument("--rows", default="16,256", help="the sweep's row counts, comma-separated")
-    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each unit, each in its own process; the ladder measures a rung against itself with two")
+    ll.add_take_argument(parser)
     parser.add_argument("--seed", type=int, default=0, help="the seed the jammi leg generated the corpus with")
     parser.add_argument("--legs-dir", help="where the legs are written (<rung>__rows<N>__r<take>.json)")
     parser.add_argument("--sampler-bin", help="a jammi-bench binary whose `sample-device` wraps each leg's process")
@@ -529,8 +529,8 @@ def parse_args(argv=None):
     parser.add_argument("--leg", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.rows = [int(r) for r in args.rows.split(",")]
-    if min(args.rows + [args.batch_size, args.batch_tokens, args.iters, args.takes]) < 1:
-        parser.error("--rows, --batch-size, --batch-tokens, --iters and --takes must be >= 1")
+    if min(args.rows + [args.batch_size, args.batch_tokens, args.iters]) < 1:
+        parser.error("--rows, --batch-size, --batch-tokens and --iters must be >= 1")
     if not args.dry_run and not (args.model_dir and args.exchange_dir):
         parser.error("--model-dir and --exchange-dir are required without --dry-run")
     return args
@@ -555,7 +555,7 @@ def main(argv=None) -> int:
     with tempfile.TemporaryDirectory() as scratch:
         if args.dry_run:
             argv += ["--model-dir", DRY_RUN_MODEL_DIR, "--exchange-dir", scratch, "--rows", ",".join(map(str, DRY_RUN_ROWS))]
-            argv += ["--takes", str(DRY_RUN_TAKES), "--batch-size", "4", "--iters", "2"]
+            argv += ["--batch-size", "4", "--iters", "2"]
             args = parse_args(argv)
             for rows in args.rows:
                 write_dry_run_corpus(scratch, rows)
@@ -563,7 +563,7 @@ def main(argv=None) -> int:
         provenance = tfs.provenance(torch.device("cpu" if args.cuda is None else f"cuda:{args.cuda}"), fast_path_globals)
         legs = []
         for rows in args.rows:
-            for take in range(1, args.takes + 1):
+            for take in args.take:
                 leg = spawn_leg(args, argv, rows, take)
                 report = {"tool": "torch-encode", "dry_run": args.dry_run, "provenance": provenance, "encode_step": leg}
                 if args.legs_dir:

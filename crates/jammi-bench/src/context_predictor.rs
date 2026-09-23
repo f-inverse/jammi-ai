@@ -80,7 +80,7 @@ use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
 use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point,
-    vector_rows_digest, write_vector_rows, Artifact,
+    vector_rows_digest, write_vector_rows, Artifact, Takes,
 };
 use crate::ladder::leg::Take;
 use crate::leg::{
@@ -993,13 +993,8 @@ pub struct PredictorTrainArgs {
     /// Passes over the train episodes; defaults to the committed spec's.
     #[arg(long)]
     epochs: Option<usize>,
-    /// Measured repeats, each in a process of its own; the default is the
-    /// fewest the ladder measures a rung against itself with.
-    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_REPEATS)]
-    takes: usize,
-    /// The take a single seed's run is filed as.
-    #[arg(long, default_value_t = 1)]
-    take: usize,
+    #[command(flatten)]
+    takes: Takes,
     #[command(flatten)]
     plane: PlaneArgs,
 }
@@ -1031,14 +1026,15 @@ impl PredictorTrainArgs {
             .flat_map(|&s| {
                 self.rungs
                     .iter()
-                    .flat_map(move |&r| (1..=self.takes).map(move |t| (s, r, t)))
+                    .flat_map(move |&r| self.takes.iter().map(move |t| (s, r, t)))
             })
             .collect();
-        let (seed, rung, _) = points[0];
-        let first = self.params(seed, rung, if points.len() == 1 { self.take } else { 1 });
         let files = legs_per_point(
             &points,
-            async move { run_leg(&first).await.map(|(_, file)| vec![file]) },
+            |&(seed, rung, take)| {
+                let params = self.params(seed, rung, take);
+                async move { run_leg(&params).await.map(|(_, file)| vec![file]) }
+            },
             |&(seed, rung, take)| {
                 let mut args: Vec<std::ffi::OsString> = vec![
                     "predictor-train-run".into(),

@@ -24,9 +24,11 @@ fn bench(args: &[&str]) -> String {
 
 /// The ladder over `legs`, speed axis alone: its verdict must carry no
 /// series refusal — the producer's default run is long enough to be read.
+/// Its exit status is not the question: a tiny CPU fixture's speed edge may
+/// read red or grey, and still be read.
 fn speed_axis_reads(workload: &str, legs: &Path, from: &str, to: &str) {
     let out = tempfile::tempdir().expect("verdict dir");
-    let _ = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
+    let ladder = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
         .args(["ladder", workload])
         .arg(legs)
         .args([
@@ -42,9 +44,16 @@ fn speed_axis_reads(workload: &str, legs: &Path, from: &str, to: &str) {
         .arg(out.path())
         .output()
         .expect("run the ladder");
-    let verdict = std::fs::read_to_string(out.path().join("ladder_verdict.json"))
-        .expect("the ladder wrote its verdict");
-    let table = std::fs::read_to_string(out.path().join("ladder_table.txt")).unwrap_or_default();
+    let written = |file: &str| {
+        std::fs::read_to_string(out.path().join(file)).unwrap_or_else(|e| {
+            panic!(
+                "{workload}: the ladder wrote no {file} ({e}):\n{}",
+                String::from_utf8_lossy(&ladder.stderr)
+            )
+        })
+    };
+    let verdict = written("ladder_verdict.json");
+    let table = written("ladder_table.txt");
     assert!(
         !verdict.contains("timed iterations") && !table.contains("timed iterations"),
         "{workload}: a default run's series is too short for the speed axis:\n{table}"
@@ -103,5 +112,31 @@ fn predictor_train_run_at_its_defaults_is_read_on_the_speed_axis() {
         legs.path(),
         "in-process",
         "in-process",
+    );
+}
+
+/// A run naming one take of one point is that single point, filed as that
+/// take: the invocation a sweep hands each of its points never sweeps again.
+#[test]
+fn a_run_naming_one_take_of_one_point_files_that_leg_alone() {
+    let legs = tempfile::tempdir().expect("legs dir");
+    let filed: Vec<String> = serde_json::from_str(&bench(&[
+        "propagate",
+        "--nodes",
+        "32",
+        "--rung",
+        "plan",
+        "--take",
+        "3",
+        "--iterations",
+        "1",
+        "--legs-dir",
+        legs.path().to_str().unwrap(),
+    ]))
+    .expect("the producer prints the legs it filed");
+    assert_eq!(filed.len(), 1, "one point, one leg: {filed:?}");
+    assert!(
+        filed[0].ends_with("__r3.json"),
+        "filed as take 3: {filed:?}"
     );
 }

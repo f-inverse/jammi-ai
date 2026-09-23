@@ -317,11 +317,10 @@ def main() -> None:
     parser.add_argument("--grad-clip", type=float, required=True)
     parser.add_argument("--num-heads", type=int, required=True, help="the configuration's heads: the engine leg's identity.num_heads (a Cnp builds no attention)")
     parser.add_argument("--num-layers", type=int, required=True, help="the configuration's layers: the engine leg's identity.num_layers (only a Tnp builds them)")
-    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each seed, each in its own process; the ladder measures a rung against itself with two")
-    parser.add_argument("--take", type=int, default=1, help="the take a single seed's run is filed as")
+    ll.add_take_argument(parser)
     args = parser.parse_args()
 
-    points = [(seed, take) for seed in args.seeds for take in range(1, args.takes + 1)]
+    points = [(seed, take) for seed in args.seeds for take in args.take]
 
     def argv_for(point) -> list[str]:
         seed, take = point
@@ -330,7 +329,7 @@ def main() -> None:
             argv += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
         return argv
 
-    files = ll.legs_per_point(points, lambda point: run(args, point[0], args.take if len(points) == 1 else point[1]), argv_for)
+    files = ll.legs_per_point(points, lambda point: run(args, *point), argv_for)
     print(json.dumps(files))
 
 

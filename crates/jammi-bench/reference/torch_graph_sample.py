@@ -243,11 +243,10 @@ def main() -> None:
     parser.add_argument("--in-out-q", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iterations", type=int, default=32, help="passes timed and filed; the ladder settles no fewer than 32")
-    parser.add_argument("--takes", type=int, default=2, help="measured repeats of each graph, each in its own process; the ladder measures a rung against itself with two")
-    parser.add_argument("--take", type=int, default=1, help="the take a single graph's run is filed as")
+    ll.add_take_argument(parser)
     args = parser.parse_args()
 
-    points = [(graph, take) for graph in args.graph for take in range(1, args.takes + 1)]
+    points = [(graph, take) for graph in args.graph for take in args.take]
 
     def argv_for(point) -> list[str]:
         graph, take = point
@@ -258,7 +257,7 @@ def main() -> None:
             argv += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
         return argv
 
-    files = ll.legs_per_point(points, lambda point: run(args, point[0], args.take if len(points) == 1 else point[1]), argv_for)
+    files = ll.legs_per_point(points, lambda point: run(args, *point), argv_for)
     print(json.dumps(files))
 
 

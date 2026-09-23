@@ -568,10 +568,8 @@ enum Command {
         /// The corpus row count of each sweep unit, comma-separated.
         #[arg(long, value_delimiter = ',', default_values_t = [16, 256])]
         rows: Vec<usize>,
-        /// Measured repeats of each unit; the default is the fewest the ladder
-        /// measures a rung against itself with.
-        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_REPEATS)]
-        takes: usize,
+        #[command(flatten)]
+        takes: capture::Takes,
         /// The corpus generation seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -974,7 +972,7 @@ async fn main() -> std::process::ExitCode {
             rungs,
             model_dir,
             rows,
-            takes,
+            takes: takes.iter().collect(),
             seed,
             batch_size,
             batch_tokens,
@@ -1010,7 +1008,7 @@ async fn main() -> std::process::ExitCode {
                     rungs,
                     model_dir,
                     rows: vec![rows],
-                    takes: take,
+                    takes: vec![take],
                     seed,
                     batch_size,
                     batch_tokens,

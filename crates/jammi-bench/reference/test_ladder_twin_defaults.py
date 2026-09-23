@@ -57,9 +57,15 @@ class TwinDefaultsTest(unittest.TestCase):
                 self.assertEqual(int(default_of(twin, flag)), declared("MIN_RUN"))
 
     def test_a_twins_default_repeats_are_the_ones_a_noise_band_needs(self):
+        text = (REFERENCE / "ladder_leg.py").read_text()
+        found = re.search(r"^MIN_REPEATS = (\d+)$", text, re.MULTILINE)
+        self.assertIsNotNone(found, "ladder_leg.py no longer declares MIN_REPEATS")
+        self.assertEqual(int(found.group(1)), declared("MIN_REPEATS"))
         for twin in self.REPEATED:
             with self.subTest(twin=twin):
-                self.assertEqual(int(default_of(twin, "--takes")), declared("MIN_REPEATS"))
+                text = (REFERENCE / twin).read_text()
+                self.assertIn("ll.add_take_argument(parser)", text)
+                self.assertNotRegex(text, r'add_argument\("--takes?"')
 
     def test_the_seeded_twins_default_seeds_are_the_count_the_rule_is_stated_for(self):
         text = (REFERENCE / "torch_context_predictor.py").read_text()

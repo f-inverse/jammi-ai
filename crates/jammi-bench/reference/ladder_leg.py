@@ -18,6 +18,8 @@ iteration in run order, and where the run settled is the ladder's to find; the c
 * `read_vector_rows` / `write_vector_rows` / `vector_rows_digest` — the
   ladder's vector rows: little-endian `f32`, row-major, keys beside;
 * `file_leg` — the leg file;
+* `add_take_argument` — `--take`, the takes of each point, as the engine
+  producers' `Takes` reads it;
 * `legs_per_point` — one fresh process per point, because the resident
   high-water mark never falls.
 """
@@ -168,16 +170,45 @@ def given_cpus() -> int:
     return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
 
 
+MIN_REPEATS = 2
+"""The fewest takes the ladder measures a rung against itself with —
+`SpeedInstrument::MIN_REPEATS`, held to it by `test_ladder_twin_defaults.py`."""
+
+
+def takes(text: str) -> list[int]:
+    """`--take`'s value: comma-separated take numbers, each at least 1."""
+    parsed = [int(part) for part in text.split(",")]
+    if not parsed or min(parsed) < 1:
+        raise ValueError(f"takes are numbered from 1: {text!r}")
+    return parsed
+
+
+def add_take_argument(parser) -> None:
+    """`--take 1,2`: the takes each point is measured as, each in a process of
+    its own; the default is the fewest the ladder measures a rung against
+    itself with. A run naming one take of one point — the invocation a sweep
+    hands each point — is that single point, filed as that take."""
+    parser.add_argument(
+        "--take",
+        type=takes,
+        default=list(range(1, MIN_REPEATS + 1)),
+        help="the takes each point is measured as, comma-separated, each in its own process; the ladder measures a rung against itself with two",
+    )
+
+
 def legs_per_point(points: Sequence[Any], in_process: Callable[[Any], list[str]], argv_for: Callable[[Any], list[str]]) -> list[str]:
     """One leg per point, each owning its process's peak resident set: a single
     point is filed here; several are a sweep and each runs in a fresh
     interpreter, `argv_for(point)` being this script's arguments for that one
-    point. Returns every leg's file name.
+    point. Returns every leg's file name; a sweep of no points is refused,
+    never an empty filing.
 
     A leg runs torch's intra-op pool on exactly the CPUs the process was
     given, as the engine's pools do: torch otherwise sizes it to the machine's
     physical cores whatever the affinity mask, and a pinned leg would
     oversubscribe the set its engine counterpart is held to."""
+    if not points:
+        raise ValueError("the sweep has no points: every swept flag needs a value")
     if len(points) == 1:
         import torch
 

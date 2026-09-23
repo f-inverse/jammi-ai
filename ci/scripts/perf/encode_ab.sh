@@ -3,7 +3,7 @@
 # corpus, in one run — then the comparator. This script RUNS legs and decides
 # nothing; every ratio, budget and verdict is `jammi-bench ladder encode`'s.
 #
-# THE LEGS. Two producers, four arms, each arm run TAKES times, in a
+# THE LEGS. Two producers, four arms, each arm run once per take, in a
 # palindrome over the arms so a box that drifts over the run (a thermal or
 # clock trend) moves every arm's mean alike and cancels out of any two arms'
 # ratio:
@@ -47,7 +47,9 @@
 #                           the exchange directory, and the torch legs load it
 #                           from there — the same bytes either way.
 #   ENCODE_AB_ROWS          the sweep (default "16,1024,16384").
-#   ENCODE_AB_TAKES         measured repeats of each unit (default 2).
+#   ENCODE_AB_TAKE          the takes each unit is measured as, comma-separated;
+#                           unset, the producers' own default — the fewest
+#                           the ladder measures a rung against itself with.
 #   ENCODE_AB_PARTITIONS    N for the plan-partitioned rung (default 4).
 #   ENCODE_AB_BATCH_SIZE / ENCODE_AB_BATCH_TOKENS
 #                           the chunk budget every rung's forwards are cut
@@ -89,7 +91,7 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 ENCODE_AB_DRY_RUN="${ENCODE_AB_DRY_RUN:-0}"
 ENCODE_AB_MODEL_DIR="${ENCODE_AB_MODEL_DIR:-}"
 ENCODE_AB_ROWS="${ENCODE_AB_ROWS:-16,1024,16384}"
-ENCODE_AB_TAKES="${ENCODE_AB_TAKES:-2}"
+ENCODE_AB_TAKE="${ENCODE_AB_TAKE:-}"
 ENCODE_AB_PARTITIONS="${ENCODE_AB_PARTITIONS:-4}"
 ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
 ENCODE_AB_BATCH_TOKENS="${ENCODE_AB_BATCH_TOKENS:-16384}"
@@ -220,12 +222,13 @@ run_legs() {
 run_jammi_legs() {
   local label="$1" legs_dir="$2"; shift 2
   local -a cmd=("$BIN" encode-step --task embed
-    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --rows "$ENCODE_AB_ROWS"
     --partitions "$ENCODE_AB_PARTITIONS"
     --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
     --compute-precision "$ENCODE_AB_DTYPE"
     --iters "$ENCODE_AB_ITERS"
     --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
+  [ -n "$ENCODE_AB_TAKE" ] && cmd+=(--take "$ENCODE_AB_TAKE")
   local rung
   for rung in "$@"; do cmd+=(--rung "$rung"); done
   [ "$FLEET" = 1 ] && cmd+=(--server-bin "$SERVER_BIN")
@@ -242,11 +245,12 @@ run_torch_legs() {
   local -a cmd=("$TORCH_PY" "$REF_SCRIPT"
     --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR"
     --out-dir "$OUT_DIR/${label}.out" --legs-dir "$legs_dir" --sampler-bin "$BIN"
-    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --rows "$ENCODE_AB_ROWS"
     --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
     --dtype "$ENCODE_AB_DTYPE" --iters "$ENCODE_AB_ITERS"
     --order "$order" --attn "$attn")
   [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
+  [ -n "$ENCODE_AB_TAKE" ] && cmd+=(--take "$ENCODE_AB_TAKE")
   [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
   mkdir -p "$OUT_DIR/${label}.out"
   run_legs "$label" "${cmd[@]}"

@@ -21,7 +21,7 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 
 use crate::capture::{
     cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, vector_rows_digest,
-    write_jsonl, write_vector_rows,
+    write_jsonl, write_vector_rows, Takes,
 };
 use crate::graph_legs::{
     add_graph_sources, augmented_degrees, build_edges, build_nodes, read_sorted_vectors,
@@ -334,13 +334,8 @@ pub struct StructureArgs {
     /// ladder settles, and a shorter run files legs it refuses by name.
     #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
-    /// Measured repeats, each in a process of its own; the default is the
-    /// fewest the ladder measures a rung against itself with.
-    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_REPEATS)]
-    takes: usize,
-    /// The take a single point's run is filed as.
-    #[arg(long, default_value_t = 1)]
-    take: usize,
+    #[command(flatten)]
+    takes: Takes,
     #[command(flatten)]
     plane: PlaneArgs,
 }
@@ -372,13 +367,9 @@ impl StructureArgs {
             .flat_map(|&n| {
                 self.rungs
                     .iter()
-                    .flat_map(move |&r| (1..=self.takes).map(move |t| (n, r, t)))
+                    .flat_map(move |&r| self.takes.iter().map(move |t| (n, r, t)))
             })
             .collect();
-        let (n, rung, _) = *points
-            .first()
-            .ok_or("structure needs at least one --nodes value")?;
-        let first = self.params(n, rung, if points.len() == 1 { self.take } else { 1 });
         let weights = self
             .weights
             .iter()
@@ -387,7 +378,10 @@ impl StructureArgs {
             .join(",");
         let files = legs_per_point(
             &points,
-            async move { run_leg(&first).await.map(|(_, file)| vec![file]) },
+            |&(nodes, rung, take)| {
+                let params = self.params(nodes, rung, take);
+                async move { run_leg(&params).await.map(|(_, file)| vec![file]) }
+            },
             |&(nodes, rung, take)| {
                 let flags = [
                     ("--nodes", nodes.to_string()),

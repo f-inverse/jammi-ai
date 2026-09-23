@@ -81,9 +81,10 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("'warp'", result.stderr)
 
     def test_the_engine_rungs_run_interleaved_then_each_alone(self):
-        _, legs, _ = self.run_and_parse(ENCODE_AB_PARTITIONS="6", ENCODE_AB_ROWS="16,64", ENCODE_AB_DTYPE="bf16", ENCODE_AB_TAKES="3")
+        _, legs, _ = self.run_and_parse(ENCODE_AB_PARTITIONS="6", ENCODE_AB_ROWS="16,64", ENCODE_AB_DTYPE="bf16", ENCODE_AB_TAKE="1,2,3")
         interleaved = legs["jammi-interleaved"]
-        self.assertIn("encode-step --task embed --rows 16\\,64 --takes 3 --partitions 6 ", interleaved)
+        self.assertIn("encode-step --task embed --rows 16\\,64 --partitions 6 ", interleaved)
+        self.assertIn(" --take 1\\,2\\,3 ", interleaved)
         self.assertIn("--rung direct --rung plan --rung plan-partitioned", interleaved)
         self.assertIn("--compute-precision bf16", interleaved)
         self.assertIn(f"--legs-dir {self.out.name}/legs-plan ", interleaved)

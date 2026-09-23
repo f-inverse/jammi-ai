@@ -55,7 +55,7 @@ use jammi_ai::fine_tune::graph_sampler::{
 
 use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, write_artifact,
-    write_jsonl, Artifact,
+    write_jsonl, Artifact, Takes,
 };
 use crate::ladder::leg::Take;
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
@@ -695,13 +695,8 @@ pub struct GraphSampleArgs {
     /// ladder settles, and a shorter run files legs it refuses by name.
     #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
-    /// Measured repeats, each in a process of its own; the default is the
-    /// fewest the ladder measures a rung against itself with.
-    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_REPEATS)]
-    takes: usize,
-    /// The take a single graph's run is filed as.
-    #[arg(long, default_value_t = 1)]
-    take: usize,
+    #[command(flatten)]
+    takes: Takes,
 }
 
 impl GraphSampleArgs {
@@ -761,12 +756,14 @@ impl GraphSampleArgs {
         let points: Vec<(&Path, usize)> = self
             .graphs
             .iter()
-            .flat_map(|g| (1..=self.takes).map(move |t| (g.as_path(), t)))
+            .flat_map(|g| self.takes.iter().map(move |t| (g.as_path(), t)))
             .collect();
-        let first = self.params(points[0].0, if self.takes == 1 { self.take } else { 1 });
         let files = legs_per_point(
             &points,
-            async move { run_leg(&first).map(|(_, file)| vec![file]) },
+            |&(graph, take)| {
+                let params = self.params(graph, take);
+                async move { run_leg(&params).map(|(_, file)| vec![file]) }
+            },
             |&(graph, take)| self.child_args(graph, take),
         )
         .await?;

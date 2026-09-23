@@ -503,12 +503,12 @@ for the fine-tune reference is exactly why it is never the compared quantity.
 
 ```
 jammi-bench encode-step --rung direct --rung plan --rung plan-partitioned \
-    --model-dir /path/to/checkpoint --rows 16,1024,16384 --takes 2 \
+    --model-dir /path/to/checkpoint --rows 16,1024,16384 --take 1,2 \
     --batch-size 32 --batch-tokens 16384 --compute-precision bf16 --cuda 0 \
     --exchange-dir /tmp/x --legs-dir /tmp/legs
 python3 torch_encode.py --model-dir /path/to/checkpoint --exchange-dir /tmp/x \
     --legs-dir /tmp/legs --sampler-bin target/release/jammi-bench \
-    --rows 16,1024,16384 --takes 2 --batch-size 32 --batch-tokens 16384 \
+    --rows 16,1024,16384 --take 1,2 --batch-size 32 --batch-tokens 16384 \
     --dtype bf16 --cuda 0 --order plan --attn eager --ann-index
 jammi-bench ladder encode /tmp/legs
 ```

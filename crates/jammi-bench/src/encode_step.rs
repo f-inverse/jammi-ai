@@ -184,8 +184,8 @@ pub struct EncodeStepParams {
     pub model_dir: Option<PathBuf>,
     /// The sweep: the corpus row count of each unit.
     pub rows: Vec<usize>,
-    /// How many times each unit is measured, each in a process of its own.
-    pub takes: usize,
+    /// The takes each unit is measured as, each in a process of its own.
+    pub takes: Vec<usize>,
     /// The corpus generation seed.
     pub seed: u64,
     /// `[inference] batch_size` — the row cap of a forward chunk, on every
@@ -230,13 +230,13 @@ impl EncodeStepParams {
             self.batch_size,
             self.batch_tokens,
             self.iters,
-            self.takes,
             self.rungs.len(),
         ];
-        if self.rows.is_empty() || self.rows.contains(&0) || counts.contains(&0) {
+        let unmeasured = |sweep: &[usize]| sweep.is_empty() || sweep.contains(&0);
+        if unmeasured(&self.rows) || unmeasured(&self.takes) || counts.contains(&0) {
             return Err(format!(
                 "encode-step needs at least one rung, one row count and one take, and every row \
-                 count, the chunk budget and the measured iterations at least 1: {self:?}"
+                 count, take, the chunk budget and the measured iterations at least 1: {self:?}"
             )
             .into());
         }
@@ -1624,7 +1624,7 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
     let solo = params.rungs.len() == 1;
     let mut legs = Vec::new();
     for &row_count in &params.rows {
-        for take in 1..=params.takes {
+        for &take in &params.takes {
             let mut child = std::process::Command::new(std::env::current_exe()?);
             child
                 .arg("encode-leg")
@@ -1688,7 +1688,7 @@ mod tests {
             rungs: vec![Rung::Plan],
             model_dir: None,
             rows: vec![48],
-            takes: 1,
+            takes: vec![1],
             seed: 0,
             batch_size: 8,
             batch_tokens: InferenceConfig::default().batch_tokens,
@@ -2028,14 +2028,14 @@ mod tests {
         let params = EncodeStepParams {
             rungs: vec![Rung::Direct, Rung::Plan],
             rows: vec![16, 32],
-            takes: 2,
+            takes: vec![1, 2],
             legs_dir: Some(legs_dir.path().to_path_buf()),
             exchange_dir: Some(exchange.path().to_path_buf()),
             ..test_params()
         };
         let mut summaries = Vec::new();
         for &rows in &params.rows {
-            for take in 1..=params.takes {
+            for &take in &params.takes {
                 let legs = measure_legs(&params, rows, take)
                     .await
                     .expect("leg session");
@@ -2082,7 +2082,7 @@ mod tests {
         let alone = EncodeStepParams {
             rungs: vec![Rung::Direct],
             rows: vec![16],
-            takes: 1,
+            takes: vec![1],
             ..params
         };
         for report in leg_reports(measure_legs(&alone, 16, 1).await.expect("leg session")) {

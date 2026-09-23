@@ -55,5 +55,36 @@ class CheckpointFiles(unittest.TestCase):
             self.assertEqual(found[1], "tokenizer.json: empty")
 
 
+
+class Fetch(unittest.TestCase):
+    def test_a_directory_not_yet_whole_is_downloaded_until_it_is(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "ckpt"
+            calls = []
+
+            def download(repo, directory):
+                calls.append(repo)
+                if len(calls) == 2:
+                    write_checkpoint(directory)
+                else:
+                    (directory / "config.json").write_text("{}")
+
+            self.assertEqual(checkpoint_files.fetch("org/model", target, download), [])
+            self.assertEqual(calls, ["org/model", "org/model"], "retried once, then whole")
+
+    def test_a_whole_directory_is_never_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_checkpoint(Path(tmp))
+            self.assertEqual(checkpoint_files.fetch("org/model", Path(tmp), lambda *_: self.fail("downloaded")), [])
+
+    def test_every_attempt_failing_names_the_last_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def download(repo, directory):
+                raise OSError("network unreachable")
+
+            found = checkpoint_files.fetch("org/model", Path(tmp) / "ckpt", download)
+            self.assertEqual(found, ["download of org/model failed: network unreachable"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,11 @@
     checkpoint_files.py DIR    exit 0 when DIR is a whole checkpoint, otherwise
                                exit 1 naming every file that is missing, empty
                                or truncated
+    checkpoint_files.py --fetch REPO DIR
+                               the same, after downloading the Hugging Face
+                               repository REPO into DIR when DIR is not yet
+                               whole (three attempts; run under an interpreter
+                               with `huggingface_hub`, as the torch venv is)
 
 Both stacks load `config.json` and `model.safetensors`; the trainer and the
 serving path also tokenize, so `tokenizer.json` is as much a part of the
@@ -63,12 +68,41 @@ def defects(directory: Path) -> list[str]:
     return found
 
 
+def _snapshot_download(repo: str, directory: Path) -> None:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(repo_id=repo, local_dir=str(directory))
+
+
+def fetch(repo: str, directory: Path, download=_snapshot_download, attempts: int = 3) -> list[str]:
+    """Download `repo` into `directory` until it is a whole checkpoint, at most
+    `attempts` times; a directory already whole is left untouched. Returns
+    what the directory still lacks — empty once it is whole."""
+    found = defects(directory)
+    for _ in range(attempts if found else 0):
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            download(repo, directory)
+        except Exception as exc:  # a failed attempt is retried, and named if it is the last
+            found = [f"download of {repo} failed: {exc}"]
+            continue
+        if not (found := defects(directory)):
+            break
+    return found
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    if len(args) == 3 and args[0] == "--fetch":
+        directory = Path(args[2])
+        found = fetch(args[1], directory)
+    elif len(args) == 1:
+        directory = Path(args[0])
+        found = defects(directory)
+    else:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
-    directory = Path(sys.argv[1])
-    if found := defects(directory):
+    if found:
         print(f"{directory} is not a whole checkpoint:", file=sys.stderr)
         for line in found:
             print(f"  {line}", file=sys.stderr)

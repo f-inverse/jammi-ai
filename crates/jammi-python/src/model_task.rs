@@ -33,7 +33,7 @@ impl PyModelTask {
     }
 
     fn __str__(&self) -> &'static str {
-        self.as_db_str()
+        self.as_str()
     }
 
     fn __repr__(&self) -> String {

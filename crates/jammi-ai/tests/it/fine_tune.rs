@@ -453,7 +453,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     assert!(
         cold_session
             .model_cache()
-            .resident_models()
+            .resident_models_for_test()
             .await
             .is_empty(),
         "describing the fine-tuned model materialized it"

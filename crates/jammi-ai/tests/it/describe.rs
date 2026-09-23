@@ -70,7 +70,7 @@ async fn a_local_model_is_described_as_it_is_loaded() {
         .await
         .expect("a local model describes");
     assert!(
-        cache.resident_models().await.is_empty(),
+        cache.resident_models_for_test().await.is_empty(),
         "describing a model materializes nothing"
     );
     assert_eq!(described.identity().model_id, source.to_string());
@@ -92,7 +92,7 @@ async fn a_local_model_is_described_as_it_is_loaded() {
         "the load materialized from the description the submitter read, never a second one"
     );
     assert_eq!(
-        cache.resident_models().await,
+        cache.resident_models_for_test().await,
         vec![jammi_ai::model::ModelId::from(&source)],
         "loading is what materializes the model"
     );
@@ -117,7 +117,7 @@ async fn a_gguf_model_is_described_as_it_is_loaded() {
         .await
         .expect("a GGUF model describes");
     assert_eq!(described.quantization(), Some(WeightQuantization::Q8_0));
-    assert!(cache.resident_models().await.is_empty());
+    assert!(cache.resident_models_for_test().await.is_empty());
 
     let guard = cache
         .get_or_load(&source, ModelTask::TextEmbedding, None)
@@ -162,7 +162,7 @@ async fn planning_an_inference_holds_no_weights() {
         vector.data_type()
     );
     assert!(
-        session.model_cache().resident_models().await.is_empty(),
+        session.model_cache().resident_models_for_test().await.is_empty(),
         "planning the inference materialized the model"
     );
 }

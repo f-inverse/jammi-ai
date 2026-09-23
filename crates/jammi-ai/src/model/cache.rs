@@ -696,9 +696,11 @@ impl ModelCache {
         }
     }
 
-    /// The models resident in this process right now: one id per model
-    /// this cache holds weights for, on any device.
-    pub async fn resident_models(&self) -> Vec<ModelId> {
+    /// TEST-ONLY: the models resident in this process right now, one id per
+    /// model this cache holds weights for, on any device — what a proof that
+    /// planning materialized nothing reads. Not used by any production path.
+    #[doc(hidden)]
+    pub async fn resident_models_for_test(&self) -> Vec<ModelId> {
         let cache = self.inner.read().await;
         let mut ids: Vec<ModelId> = cache.entries.keys().map(|k| k.model_id.clone()).collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));

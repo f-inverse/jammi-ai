@@ -152,7 +152,8 @@ gpu-dev.sh — GPU development on RunPod
                                           completes/fails/times out (never misreads an
                                           unreachable pod as "still building" — see below)
   wait-job  [session] [--tree T]          block until <tree>'s detached `run` job ends,
-            [--timeout SECS]              fails (no evidence it ever ran), or times out
+            [--timeout SECS]              fails (no evidence it ever ran, past a startup
+                                          grace — RP_WAIT_GRACE_SECS, 300), or times out
   down    [session]                       terminate the pod, forget the session
   ls                                      list sessions
   reap    [hours]             ACCOUNT-WIDE: terminate every orphaned jammi-gpu*
@@ -226,7 +227,9 @@ wait-seed/wait-job poll the pod at RP_WAIT_INTERVAL_SECS (default 20s) up to
 ended AND the tree's .jammi.log exists — the job ran to completion, inspect
 the log for its own pass/fail verdict), a NAMED FAILURE (exit 1 —
 wait-seed's .jammi-seed-failed marker, or "no evidence this ever ran": no
-marker/session and, for wait-job, no .jammi.log either), or a TRANSPORT
+marker and no session once the startup grace has passed — a pod polled right
+after `up`/`run` returns may not have started its session yet, so that state
+is "not started yet" for RP_WAIT_GRACE_SECS, 300 by default), or a TRANSPORT
 FAILURE (exit 2 — RP_WAIT_MAX_TRANSPORT_FAILS consecutive unreachable polls;
 this means the pod could not be reached, never that the job/seed is still
 running). A timeout with no verdict either way exits 3.

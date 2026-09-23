@@ -1306,7 +1306,7 @@ if [ -f '${prefix}.jammi-seed-complete' ]; then
   exit 0
 fi
 echo "no seed evidence: no completion/failure marker and no running tmux session '${tmux_sess}' -- did up/shell ever start one?"
-exit 1
+exit 3
 SCRIPT
 }
 
@@ -1353,7 +1353,7 @@ if [ -f '${tree_dir}/.jammi.exit' ]; then
   exit 1
 fi
 echo "no job evidence for tree '${tree_name}': no live tmux session '${tmux_sess}' and no completion marker at ${tree_dir}/.jammi.exit -- run 'gpu-dev.sh run' first"
-exit 1
+exit 3
 SCRIPT
 }
 
@@ -2745,14 +2745,19 @@ _rp_bounded_capture() {
 # freely), until the script reports a verdict or the wall-clock TIMEOUT
 # elapses. The primitive behind gpu-dev.sh's `wait-seed`/`wait-job` verbs.
 #
-# The remote script's OWN exit code is the whole contract, and only three
+# The remote script's OWN exit code is the whole contract, and only four
 # values are legitimate: 0 (success — the thing being waited on finished
-# cleanly), 1 (a NAMED failure — a failure marker, or "no evidence this ever
-# ran"), 2 ("still running, nothing to report yet — keep polling"). Every
-# OTHER exit code — ssh's own 255 on a refused/dropped connection, a timeout
-# wrapper's 124, or literally anything else, since gpu-dev.sh never hands
-# this function a script that exits any other way on purpose — is therefore
-# unambiguous: the poll could not be answered.
+# cleanly), 1 (a NAMED failure — a failure marker), 2 ("still running,
+# nothing to report yet — keep polling"), 3 ("no evidence this ever ran":
+# neither a live session nor a marker). A 3 is a real state a pod passes
+# through right after `up`/`run` returns, before its detached session has
+# started, so it is tolerated for RP_WAIT_GRACE_SECS (default 300) from the
+# first poll and is a NAMED failure after that — a session that never
+# appeared is one that never ran. Every OTHER exit code — ssh's own 255 on a
+# refused/dropped connection, a timeout wrapper's 124, or literally anything
+# else, since gpu-dev.sh never hands this function a script that exits any
+# other way on purpose — is therefore unambiguous: the poll could not be
+# answered.
 #
 # LOAD-BEARING: an unanswerable poll is NEVER treated as rc-2's "still
 # running". A watcher that collapses "no evidence yet" and "could not check
@@ -2775,6 +2780,7 @@ _rp_bounded_capture() {
 rp_wait_poll() {
   local label="$1" script="$2" interval="$3" timeout="$4" max_fail="$5"
   local deadline=$((SECONDS + timeout)) consec=0 out rc remaining
+  local grace_deadline=$((SECONDS + ${RP_WAIT_GRACE_SECS:-300}))
   # RP_SSHO's own ConnectTimeout=10 bounds only the TCP handshake, and the
   # remote-side `timeout 20 bash -s` below bounds only a shell that has
   # already STARTED on the pod — neither one bounds the gap between them
@@ -2829,6 +2835,15 @@ rp_wait_poll() {
       0) echo "${out}"; echo "=== ${label}: SUCCESS ==="; return 0 ;;
       1) echo "::error::${label}: FAILURE — ${out}"; return 1 ;;
       2) consec=0; echo "${label}: still waiting — ${out}" ;;
+      3)
+        consec=0
+        if [ "$SECONDS" -lt "$grace_deadline" ]; then
+          echo "${label}: not started yet (within the ${RP_WAIT_GRACE_SECS:-300}s startup grace) — ${out}"
+        else
+          echo "::error::${label}: FAILURE — ${out}"
+          return 1
+        fi
+        ;;
       *)
         consec=$((consec + 1))
         echo "::warning::${label}: poll unreachable (ssh/remote exit ${rc}) — ${consec}/${max_fail} consecutive — ${out}"

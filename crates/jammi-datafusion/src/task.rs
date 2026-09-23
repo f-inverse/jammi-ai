@@ -27,7 +27,7 @@ pub enum ModelTask {
     Ner,
     /// Predict a continuous outcome as a *distribution* — a Gaussian
     /// `(mean, std)` or a set of quantiles — rather than a point
-    /// ([`DistributionAdapter`](crate::adapter::DistributionAdapter) serves
+    /// ([`DistributionAdapter`](crate::inference::adapter::DistributionAdapter) serves
     /// it). Unlike a similarity edge — a *derivation* over embeddings, which
     /// has no variant — this is a genuine model output type, so it belongs
     /// in [`Self::ALL`].

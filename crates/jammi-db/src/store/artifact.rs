@@ -500,6 +500,42 @@ impl ArtifactStore {
             .await
     }
 
+    /// The job's retained epoch checkpoints: the `retain` newest complete
+    /// bundles, whichever attempts wrote them, one per epoch, ascending by
+    /// epoch, each with its stager's claim for a finalize to publish. The
+    /// window is the job's, not an attempt's: a resumed attempt retains the
+    /// epochs its predecessors checkpointed beside its own. A bundle whose
+    /// manifest never landed is a write that did not complete, and is passed
+    /// over as [`Self::fetch_newest_checkpoint`] passes it over.
+    pub async fn retained_checkpoints(
+        &self,
+        catalog: &Catalog,
+        job_id: &str,
+        retain: NonZeroUsize,
+    ) -> Result<Vec<(usize, StagedArtifact)>> {
+        let mut epochs = std::collections::BTreeSet::new();
+        let mut retained = Vec::with_capacity(retain.get());
+        for (key, held) in self.held_checkpoints(catalog, job_id).await? {
+            if retained.len() == retain.get() {
+                break;
+            }
+            if held.state != ArtifactState::Staged || epochs.contains(&key.epoch) {
+                continue;
+            }
+            let prefix = held.claim.artifact().url();
+            match self.read_manifest(&self.handle(prefix)?, prefix).await {
+                Ok(_) => {
+                    epochs.insert(key.epoch);
+                    retained.push((key.epoch, held.claim));
+                }
+                Err(JammiError::Storage(StorageError::NotPublished { .. })) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        retained.sort_by_key(|(epoch, _)| *epoch);
+        Ok(retained)
+    }
+
     /// The prefix one epoch checkpoint of a job is written under — the one
     /// place that layout is built, so a test observing a specific epoch's
     /// write (the store's test hooks are keyed by prefix) names it through

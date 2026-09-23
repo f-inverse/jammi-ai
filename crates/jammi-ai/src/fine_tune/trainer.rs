@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::VarMap;
-use jammi_db::catalog::artifact_repo::StagedArtifact;
 use jammi_db::catalog::Catalog;
 use jammi_db::store::ArtifactStore;
 // `Digest::new`/`Digest::update`/`Digest::finalize` for
@@ -30,7 +29,8 @@ use super::optimizer::{
 use super::partition::{PartitionRule, PartitionSpec};
 use super::regression_loss::{crps_gaussian_loss, gaussian_nll_loss, pinball_loss, TargetScaler};
 use super::resume::{
-    capture_bundle, NamedMoments, RestoredCheckpoint, ResumeState, RESUME_STATE_SCHEMA_VERSION,
+    capture_bundle, CheckpointBundle, NamedMoments, RestoredCheckpoint, ResumeState,
+    RESUME_STATE_SCHEMA_VERSION,
 };
 use super::role::RunnerRole;
 use super::target::TrainingTarget;
@@ -220,6 +220,76 @@ impl EpochWall {
     }
 }
 
+/// What a run has done so far, epoch by epoch: everything its early stopping
+/// decides on and its metrics report. It crosses a resume in the checkpoint's
+/// state, so a resumed run continues the uninterrupted run's history rather
+/// than starting its own — the same stopping epoch, the same curves.
+///
+/// An epoch's wall in a checkpoint is closed when the checkpoint is captured,
+/// so it holds everything of that epoch but the upload of the checkpoint
+/// itself; the run that goes on closes it again after the upload.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunHistory {
+    /// `(epoch, avg_train_loss)`, one row per epoch run.
+    pub train_loss_curve: Vec<(usize, f64)>,
+    /// `(epoch, avg_val_loss)`, one row per epoch that measured one.
+    pub val_loss_curve: Vec<(usize, f64)>,
+    pub epoch_walls: Vec<EpochWall>,
+    /// The best monitored loss and the epoch that reached it.
+    pub best: Option<(usize, f64)>,
+    /// Epochs since `best` last improved.
+    pub patience: usize,
+}
+
+impl RunHistory {
+    /// Record `epoch`'s monitored loss: whether it is a new best, which resets
+    /// the patience, or one more epoch without improvement.
+    fn monitor(&mut self, epoch: usize, loss: f64) -> Monitored {
+        if self.best.is_none_or(|(_, best)| loss < best) {
+            self.best = Some((epoch, loss));
+            self.patience = 0;
+            Monitored::Improved
+        } else {
+            self.patience += 1;
+            Monitored::Unimproved
+        }
+    }
+
+    /// This history with `wall` closing its last epoch.
+    fn through(&self, wall: EpochWall) -> Self {
+        let mut through = self.clone();
+        through.epoch_walls.push(wall);
+        through
+    }
+}
+
+/// Whether an epoch's monitored loss is a new best.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Monitored {
+    Improved,
+    Unimproved,
+}
+
+/// Where a run starts: from scratch, or where a resume bundle left it.
+#[derive(Default)]
+struct Resumed {
+    start_epoch: usize,
+    global_step: usize,
+    history: RunHistory,
+    /// The best weights, when they are not the ones the run starts on.
+    best: Option<HashMap<String, Tensor>>,
+}
+
+/// The epoch boundary a checkpoint is taken at.
+#[derive(Clone, Copy)]
+struct EpochBoundary<'a> {
+    /// The epoch just completed.
+    epoch: usize,
+    global_step: usize,
+    /// The run's history through `epoch`.
+    history: &'a RunHistory,
+}
+
 /// Result of a completed training run.
 ///
 /// The loop trains and persists the adapter into a worker-private local
@@ -246,14 +316,6 @@ pub struct TrainingResult {
     pub total_steps: usize,
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
-    /// The epoch checkpoints this attempt staged and retains as models:
-    /// `(epoch_index, claim)` in ascending epoch order — exactly the trailing
-    /// `config.keep_last_n_checkpoints` window. Empty when that dial is
-    /// absent (every epoch's checkpoint is still written, for resume; none is
-    /// published) or when `artifact_store` was unset on the builder. The
-    /// worker's finalize publishes each and registers one catalog row per
-    /// entry.
-    pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// The wall spent in the media front end during TRAINING, on the
     /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
     /// text task and for a `ProjectionHead` target of any modality — see
@@ -293,8 +355,8 @@ pub struct TrainingResult {
     /// is a subset of its `steps`), so a caller driving several resume legs
     /// sums it across them.
     pub phase_wall: RunPhaseWall,
-    /// The same wall per epoch this call ran, in epoch order — see
-    /// [`EpochWall`].
+    /// The run's wall per epoch, in epoch order — a resumed run's includes
+    /// the epochs before the resume ([`RunHistory`]) — see [`EpochWall`].
     pub epoch_walls: Vec<EpochWall>,
 }
 
@@ -780,16 +842,8 @@ pub struct TrainingLoop {
     /// A resume bundle this run restores from before the first epoch, or `None`
     /// for a from-scratch run. When present, training starts at
     /// `state.last_completed_epoch + 1` with weights, optimizer moments, scaler,
-    /// and dropout positions restored.
+    /// dropout positions and the run's history restored.
     resume: Option<RestoredCheckpoint>,
-    /// The epoch checkpoints this attempt has staged for publishing, as
-    /// `(epoch_index, claim)` in ascending epoch order — appended at every
-    /// epoch boundary by [`Self::save_epoch_checkpoint`] when
-    /// `config.keep_last_n_checkpoints` is set. The same call retires every
-    /// epoch beyond that window once each write has landed; the trailing
-    /// window of this vector is what [`TrainingResult`] carries for the
-    /// worker's finalize to publish.
-    epoch_checkpoints: Vec<(usize, StagedArtifact)>,
     /// Accumulates [`TrainingResult::media_front_end_wall`] across the run.
     /// A `Cell`, not a plain field, because [`Self::encode_media`] takes
     /// `&self` (it is called from `&self` batch-encoding helpers) while
@@ -1088,7 +1142,6 @@ impl TrainingLoopBuilder {
             artifact_store: self.artifact_store,
             catalog,
             resume: self.resume,
-            epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
             phase_wall: RunPhaseWall::default(),
             epoch_limit: self.epoch_limit,
@@ -1596,37 +1649,35 @@ impl TrainingLoop {
             .bind_agreement(&super::optimizer::sorted_trainable_var_names(&self.varmap))?;
 
         // Restore from a discovered resume bundle (weights + optimizer moments +
-        // scaler + dropout positions). The persisted scaler is authoritative — it
-        // overrides the just-computed one so a source mutated between crash and
-        // resume cannot perturb the de-standardisation. Returns the epoch the
-        // resumed run starts at (`last_completed + 1`) and its step counter.
-        let (start_epoch, mut global_step) = match self.resume.take() {
+        // scaler + dropout positions + the run's history). The persisted scaler
+        // is authoritative — it overrides the just-computed one so a source
+        // mutated between crash and resume cannot perturb the
+        // de-standardisation.
+        let Resumed {
+            start_epoch,
+            mut global_step,
+            mut history,
+            best,
+        } = match self.resume.take() {
             Some(restored) => {
                 let started = Instant::now();
-                let resumed_at =
+                let resumed =
                     self.restore_from_checkpoint(restored, &mut optimizer, &optim_param_names)?;
                 self.phase_wall.checkpoints += started.elapsed();
-                resumed_at
+                resumed
             }
-            None => (0, 0),
+            None => Resumed::default(),
         };
-        let mut best_val_loss = f64::MAX;
-        let mut patience_counter = 0;
-        // `(epoch, avg_train_loss)` / `(epoch, avg_val_loss)` rows, one push per
-        // epoch actually run — folded into `metrics_json` below as
-        // `train_loss_curve` / `val_loss_curve`. Mirrors exactly
+        // The history's curves grow one row per epoch run, pushed from exactly
         // what `tracing::info!("Epoch complete", ...)` below emits for the
         // GPU-capability suite's own `loss_capture` tracing layer to read back
-        // (the `gpu_capability` suite's `harness::loss_capture`), so
-        // the persisted curve and that test harness's captured curve are the
-        // SAME numbers, never two independently-computed ones that could drift.
+        // (the `gpu_capability` suite's `harness::loss_capture`), so the
+        // persisted curve and that test harness's captured curve are the SAME
+        // numbers, never two independently-computed ones that could drift.
         // `val_loss_curve` only ever grows when this run's `early_stopping_
         // metric` is `ValLoss` (see `avg_val_loss`'s own `None`-sentinel doc
         // below) — an early-stopped run's curves are correctly SHORTER than
         // `self.config.epochs`, since `break` below stops pushing further rows.
-        let mut train_loss_curve: Vec<(usize, f64)> = Vec::new();
-        let mut val_loss_curve: Vec<(usize, f64)> = Vec::new();
-        let mut epoch_walls: Vec<EpochWall> = Vec::new();
         let dispatches_before = KernelDispatches::snapshot();
         // Train into a fresh worker-private tempdir, never a shared path: two
         // workers on the same `job_id` must not share a training-time file.
@@ -1639,6 +1690,12 @@ impl TrainingLoop {
             .prefix("train-")
             .tempdir_in(&self.artifact_dir)?;
         let checkpoint_dir = artifact_tmp.path().to_path_buf();
+        // A resumed run's best weights are where the run's own would be, so
+        // the run ends on them exactly as an uninterrupted run does.
+        if let Some(best) = best {
+            candle_core::safetensors::save(&best, Self::best_weights_path(&checkpoint_dir))
+                .map_err(|e| JammiError::FineTune(format!("resume: write best weights: {e}")))?;
+        }
 
         // Hard negatives mined from the current model, re-mined every
         // `refresh_every` epochs. Held across epochs so a non-refresh epoch
@@ -2074,9 +2131,9 @@ impl TrainingLoop {
             // `tracing::info!` below, so both read the exact same `avg_train_loss`
             // / `avg_val_loss` values `loss_capture`'s tracing layer captures
             // from that event.
-            train_loss_curve.push((epoch, avg_train_loss));
+            history.train_loss_curve.push((epoch, avg_train_loss));
             if let Some(v) = avg_val_loss {
-                val_loss_curve.push((epoch, v));
+                history.val_loss_curve.push((epoch, v));
             }
 
             // Decide which loss to monitor for early stopping.
@@ -2109,27 +2166,25 @@ impl TrainingLoop {
             Self::refuse_nonfinite_params(&trainable_vars, epoch)?;
 
             // Early stopping on the chosen metric.
-            let stop_early = if monitor_loss < best_val_loss {
-                best_val_loss = monitor_loss;
-                patience_counter = 0;
-                let started = Instant::now();
-                self.save_tagged_weights(&checkpoint_dir, "best")?;
-                self.phase_wall.checkpoints += started.elapsed();
-                false
-            } else {
-                patience_counter += 1;
-                patience_counter >= self.config.early_stopping_patience
+            let stop_early = match history.monitor(epoch, monitor_loss) {
+                Monitored::Improved => {
+                    let started = Instant::now();
+                    self.save_scratch_weights(&Self::best_weights_path(&checkpoint_dir))?;
+                    self.phase_wall.checkpoints += started.elapsed();
+                    false
+                }
+                Monitored::Unimproved => history.patience >= self.config.early_stopping_patience,
             };
             if stop_early {
                 tracing::info!(
                     epoch,
-                    patience_counter,
-                    best_loss = best_val_loss,
+                    patience_counter = history.patience,
+                    best_loss = ?history.best,
                     monitor_label,
                     "Early stopping: no improvement for {} epochs",
-                    patience_counter
+                    history.patience
                 );
-                epoch_walls.push(EpochWall::closing(
+                history.epoch_walls.push(EpochWall::closing(
                     epoch,
                     epoch_started,
                     phases_before_epoch,
@@ -2151,17 +2206,27 @@ impl TrainingLoop {
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
                 let started = Instant::now();
+                let through = history.through(EpochWall::closing(
+                    epoch,
+                    epoch_started,
+                    phases_before_epoch,
+                    self.phase_wall,
+                    step_walls.clone(),
+                ));
                 self.save_epoch_checkpoint(
                     call,
                     &checkpoint_dir,
-                    epoch,
-                    global_step,
+                    EpochBoundary {
+                        epoch,
+                        global_step,
+                        history: &through,
+                    },
                     &optimizer,
                     &optim_param_names,
                 )?;
                 self.phase_wall.checkpoints += started.elapsed();
             }
-            epoch_walls.push(EpochWall::closing(
+            history.epoch_walls.push(EpochWall::closing(
                 epoch,
                 epoch_started,
                 phases_before_epoch,
@@ -2171,9 +2236,18 @@ impl TrainingLoop {
         }
         let kernel_dispatches = dispatches_before.delta_to(&KernelDispatches::snapshot());
 
+        // A run whose history holds no epoch — none trained here, none
+        // carried in from a resume — has no result to finalize.
+        let Some((_, final_loss)) = history.best else {
+            return Err(JammiError::FineTune(format!(
+                "the run trained no epoch: epochs {start_epoch}..{end_epoch}, and no history \
+                 was resumed"
+            )));
+        };
+
         // Restore best checkpoint before saving final adapter
         let final_adapter_started = Instant::now();
-        let best_path = checkpoint_dir.join("checkpoint_best.safetensors");
+        let best_path = Self::best_weights_path(&checkpoint_dir);
         if best_path.exists() {
             self.load_weights(&best_path)?;
         }
@@ -2222,13 +2296,13 @@ impl TrainingLoop {
             )
         };
         let mut metrics = serde_json::json!({
-            "final_loss": best_val_loss,
+            "final_loss": final_loss,
             "early_stopping_metric": early_stopping_metric_label,
             "total_steps": global_step,
             "started_at": started_at,
             "completed_at": completed_at,
-            "train_loss_curve": curve_json(&train_loss_curve),
-            "epoch_walls": epoch_walls,
+            "train_loss_curve": curve_json(&history.train_loss_curve),
+            "epoch_walls": &history.epoch_walls,
             // Measured on a media task, absent on a text one — never a zero
             // that claims a front end was timed where none exists.
             "media_front_end_wall_s": match self.task {
@@ -2243,20 +2317,19 @@ impl TrainingLoop {
                 "fired": jammi_kernels::admission::disabled_ops_fired(),
             },
         });
-        if !val_loss_curve.is_empty() {
-            metrics["val_loss_curve"] = curve_json(&val_loss_curve);
+        if !history.val_loss_curve.is_empty() {
+            metrics["val_loss_curve"] = curve_json(&history.val_loss_curve);
         }
         let metrics_json = metrics.to_string();
 
         Ok(TrainingResult {
             artifact_dir: artifact_tmp,
-            final_loss: best_val_loss,
+            final_loss,
             total_steps: global_step,
             metrics_json,
-            epoch_checkpoints: self.take_retained_epoch_checkpoints(),
             media_front_end_wall: self.media_front_end_wall.get(),
             phase_wall: self.phase_wall,
-            epoch_walls,
+            epoch_walls: history.epoch_walls,
         })
     }
 
@@ -4780,13 +4853,25 @@ impl TrainingLoop {
     fn capture_checkpoint_bundle(
         &self,
         call: &BlockingCall,
-        scratch_dir: &Path,
-        last_completed_epoch: usize,
-        global_step: usize,
+        checkpoint_dir: &Path,
+        boundary: EpochBoundary<'_>,
         optimizer: &AdamW,
         optim_param_names: &[String],
     ) -> Result<Vec<(String, bytes::Bytes)>> {
         let weights = self.target.named_trainable_weights()?;
+        // The best weights ride the bundle only when they are not this
+        // epoch's: a resumed run ends on them, and the attempt that reached
+        // them keeps them nowhere a successor can read.
+        let best = match boundary.history.best {
+            Some((best_epoch, _)) if best_epoch != boundary.epoch => Some(
+                candle_core::safetensors::load(
+                    Self::best_weights_path(checkpoint_dir),
+                    &self.device,
+                )
+                .map_err(|e| JammiError::FineTune(format!("checkpoint: read best weights: {e}")))?,
+            ),
+            _ => None,
+        };
         let regression_form = self.target_scaler.map(|_| self.regression_form());
         let saved = self
             .target
@@ -4798,14 +4883,29 @@ impl TrainingLoop {
         let dropout_positions = self.gather_dropout_positions(call)?;
         let state = ResumeState {
             schema_version: RESUME_STATE_SCHEMA_VERSION,
-            last_completed_epoch,
-            global_step,
+            last_completed_epoch: boundary.epoch,
+            global_step: boundary.global_step,
             step_t,
             seed: self.config.seed,
             scaler: self.target_scaler.map(|s| (s.mean(), s.std())),
             dropout_positions,
+            history: boundary.history.clone(),
         };
-        capture_bundle(scratch_dir, &weights, &saved, &moments, &state)
+        capture_bundle(
+            &checkpoint_dir.join(Self::CHECKPOINT_SCRATCH),
+            &CheckpointBundle {
+                weights: &weights,
+                adapter_config: &saved,
+                moments: &moments,
+                best: best.as_ref(),
+                state: &state,
+            },
+        )
+    }
+
+    /// Where a run keeps its best monitored epoch's weights.
+    fn best_weights_path(checkpoint_dir: &Path) -> PathBuf {
+        checkpoint_dir.join("checkpoint_best.safetensors")
     }
 
     /// Stage the just-completed `epoch`'s checkpoint under its own prefix,
@@ -4841,20 +4941,18 @@ impl TrainingLoop {
         &mut self,
         call: &BlockingCall,
         checkpoint_dir: &Path,
-        epoch: usize,
-        global_step: usize,
+        boundary: EpochBoundary<'_>,
         optimizer: &AdamW,
         optim_param_names: &[String],
     ) -> Result<()> {
         let Some(store) = self.artifact_store.clone() else {
             return Ok(());
         };
-        let scratch = checkpoint_dir.join(Self::CHECKPOINT_SCRATCH);
+        let epoch = boundary.epoch;
         let bundle = self.capture_checkpoint_bundle(
             call,
-            &scratch,
-            epoch,
-            global_step,
+            checkpoint_dir,
+            boundary,
             optimizer,
             optim_param_names,
         )?;
@@ -4862,16 +4960,13 @@ impl TrainingLoop {
             return Ok(());
         }
         let runtime = tokio::runtime::Handle::current();
-        let staged = runtime.block_on(store.stage_checkpoint(
+        runtime.block_on(store.stage_checkpoint(
             &self.catalog,
             &self.job_id,
             self.attempt,
             epoch,
             &bundle,
         ))?;
-        if self.config.keep_last_n_checkpoints.is_some() {
-            self.epoch_checkpoints.push((epoch, staged));
-        }
         match runtime.block_on(store.retire_checkpoints_beyond(
             &self.catalog,
             &self.job_id,
@@ -4919,24 +5014,10 @@ impl TrainingLoop {
             .unwrap_or(NonZeroUsize::MIN)
     }
 
-    /// The trailing retention window of the checkpoints this attempt staged
-    /// — what its finalize publishes. The store retired every epoch beyond
-    /// the window as the newer ones landed, so the older entries name
-    /// nothing a finalize could publish and are left out; whatever a failed
-    /// retirement left behind is the job's finisher's to reclaim.
-    fn take_retained_epoch_checkpoints(&mut self) -> Vec<(usize, StagedArtifact)> {
-        let held = std::mem::take(&mut self.epoch_checkpoints);
-        let window = self
-            .config
-            .keep_last_n_checkpoints
-            .map_or(0, |keep| keep as usize);
-        let stale = held.len().saturating_sub(window);
-        held.into_iter().skip(stale).collect()
-    }
-
     /// Restore weights, optimizer moments (BY NAME), the scaler, and the dropout
-    /// positions from a discovered resume bundle, and return the epoch the resumed
-    /// run starts at (`last_completed + 1`) and its step counter.
+    /// positions from a discovered resume bundle, and return where the resumed
+    /// run starts: its first epoch (`last_completed + 1`), its step counter, the
+    /// run's history, and the best weights when they are not the restored ones.
     ///
     /// The optimizer moments are reordered from the persisted name→moment map into
     /// the optimizer's positional order via `optim_param_names` (this process's
@@ -4948,11 +5029,12 @@ impl TrainingLoop {
         restored: RestoredCheckpoint,
         optimizer: &mut AdamW,
         optim_param_names: &[String],
-    ) -> Result<(usize, usize)> {
+    ) -> Result<Resumed> {
         let RestoredCheckpoint {
             weights,
             moments,
             state,
+            best,
         } = restored;
 
         // Restore weights by writing into the registered `Var`s in place (by
@@ -5019,7 +5101,12 @@ impl TrainingLoop {
         self.target
             .restore_dropout_positions(&this_rank_positions)?;
 
-        Ok((state.last_completed_epoch + 1, state.global_step))
+        Ok(Resumed {
+            start_epoch: state.last_completed_epoch + 1,
+            global_step: state.global_step,
+            history: state.history,
+            best,
+        })
     }
 }
 
@@ -7799,7 +7886,9 @@ mod last_step_run_harness {
                         seed: config.seed,
                         scaler: None,
                         dropout_positions: HashMap::new(),
+                        history: crate::fine_tune::trainer::RunHistory::default(),
                     },
+                    best: None,
                 });
             }
             (builder.build().unwrap(), dir)
@@ -8911,7 +9000,8 @@ mod gang_determinism_oracle {
     /// doc for why a shrunk config would give a different LR schedule), from
     /// scratch or resuming from `durable`'s existing checkpoint if `job_id`
     /// already has one. `cancel_after_step` simulates a crash partway through, when
-    /// set. Returns rank 0's final trainable weights.
+    /// set. Returns rank 0's final trainable weights and, when it completed,
+    /// its result.
     ///
     /// `lora_dropout`: `0.0` for `w2_twice_is_byte_identical`/
     /// `resume_after_a_kill_matches_an_uninterrupted_run`; `> 0.0` for
@@ -8934,7 +9024,7 @@ mod gang_determinism_oracle {
         durable: &Arc<Durable>,
         cancel_after_step: Option<usize>,
         epoch_limit: Option<usize>,
-    ) -> HashMap<String, Tensor> {
+    ) -> GangRun {
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
         let mut handles = Vec::new();
         for rank in 0..2u32 {
@@ -8962,23 +9052,37 @@ mod gang_determinism_oracle {
                 },
             ));
         }
-        let mut rank0_weights = None;
+        let mut rank0 = None;
         for (rank, handle) in handles.into_iter().enumerate() {
             let (result, loop_) = handle.join().unwrap();
-            if cancel_after_step.is_some() {
+            let result = if cancel_after_step.is_some() {
                 let err = result.expect_err("a cancelled leg must return the cancellation Err");
                 assert!(
                     err.to_string().contains("training cancelled"),
                     "rank {rank}: expected the cooperative-cancellation error, got: {err}"
                 );
+                None
             } else {
-                result.unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}"));
-            }
+                Some(
+                    result
+                        .unwrap_or_else(|e| panic!("rank {rank} must complete cleanly, got: {e}")),
+                )
+            };
             if rank == 0 {
-                rank0_weights = Some(loop_.target.named_trainable_weights().unwrap());
+                rank0 = Some(GangRun {
+                    weights: loop_.target.named_trainable_weights().unwrap(),
+                    result,
+                });
             }
         }
-        rank0_weights.expect("rank 0 must have run")
+        rank0.expect("rank 0 must have run")
+    }
+
+    /// What [`drive_gang`] returns of rank 0.
+    struct GangRun {
+        weights: HashMap<String, Tensor>,
+        /// `None` for a leg cancelled to simulate a crash.
+        result: Option<TrainingResult>,
     }
 
     /// Two independent from-scratch gangs (same seed, same data) produce
@@ -8999,8 +9103,8 @@ mod gang_determinism_oracle {
         let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, &durable_a, None, None);
         let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, &durable_b, None, None);
         assert_eq!(
-            weight_bytes(&weights_a),
-            weight_bytes(&weights_b),
+            weight_bytes(&weights_a.weights),
+            weight_bytes(&weights_b.weights),
             "two independent W=2 runs from the same seed/data must produce byte-identical \
              final weights"
         );
@@ -9037,8 +9141,8 @@ mod gang_determinism_oracle {
             None,
         );
         assert_eq!(
-            weight_bytes(&weights_a),
-            weight_bytes(&weights_b),
+            weight_bytes(&weights_a.weights),
+            weight_bytes(&weights_b.weights),
             "two independent W=2 runs from the same seed/data must produce byte-identical \
              final weights, even with a per-rank dropout mask installed"
         );
@@ -9069,6 +9173,95 @@ mod gang_determinism_oracle {
     /// scratch and match "uninterrupted" for the wrong reason — that
     /// mutation would then pass, which is why the kill goes through
     /// `cancel_after_step` at the full horizon.
+    /// The run-level record a result carries: the train-loss curve, the
+    /// epochs the walls close, and the final loss.
+    fn run_record(result: &TrainingResult) -> (serde_json::Value, Vec<usize>, f64) {
+        let metrics: serde_json::Value = serde_json::from_str(&result.metrics_json).unwrap();
+        (
+            metrics["train_loss_curve"].clone(),
+            result.epoch_walls.iter().map(|w| w.epoch).collect(),
+            result.final_loss,
+        )
+    }
+
+    /// A run stopped at an epoch boundary and resumed reports the run, not
+    /// the epochs after the resume: the same train-loss curve, the same best
+    /// loss, and a wall for every epoch — its early stopping reads the same
+    /// history an uninterrupted run's does.
+    #[test]
+    fn a_resumed_run_continues_the_runs_history() {
+        const TOTAL_EPOCHS: usize = 3;
+        let whole = durable("history-whole");
+        let uninterrupted = drive_gang(
+            "whole",
+            "history-whole",
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            &whole,
+            None,
+            None,
+        )
+        .result
+        .unwrap();
+
+        let job_id = "history-resumed";
+        let sliced = durable(job_id);
+        drive_gang(
+            "first",
+            job_id,
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            &sliced,
+            None,
+            Some(2),
+        );
+        let resumed = drive_gang("rest", job_id, TOTAL_EPOCHS, 0.0, 8, &sliced, None, None)
+            .result
+            .unwrap();
+
+        let (curve, walls, final_loss) = run_record(&resumed);
+        assert_eq!((curve, final_loss), {
+            let (curve, _, final_loss) = run_record(&uninterrupted);
+            (curve, final_loss)
+        });
+        assert_eq!(walls, vec![0, 1, 2]);
+    }
+
+    /// An attempt that resumes after the last epoch — its predecessor trained
+    /// the run and was reclaimed before its finalize — runs no epoch and still
+    /// reports the whole run and ends on the run's best weights, rather than
+    /// a result with no trajectory.
+    #[test]
+    fn a_resume_with_no_epoch_left_reports_the_whole_run() {
+        const TOTAL_EPOCHS: usize = 3;
+        let job_id = "history-at-end";
+        let backend = durable(job_id);
+        let trained = drive_gang(
+            "trained",
+            job_id,
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            &backend,
+            None,
+            None,
+        );
+        let again = drive_gang("again", job_id, TOTAL_EPOCHS, 0.0, 8, &backend, None, None);
+        let again_result = again.result.unwrap();
+
+        assert_eq!(
+            run_record(&again_result),
+            run_record(&trained.result.unwrap())
+        );
+        assert_eq!(
+            weight_bytes(&again.weights),
+            weight_bytes(&trained.weights),
+            "the resumed attempt ends on the run's weights"
+        );
+    }
+
     #[test]
     fn resume_after_a_kill_matches_an_uninterrupted_run() {
         const TOTAL_EPOCHS: usize = 3;
@@ -9119,8 +9312,8 @@ mod gang_determinism_oracle {
         );
 
         assert_eq!(
-            weight_bytes(&uninterrupted),
-            weight_bytes(&resumed),
+            weight_bytes(&uninterrupted.weights),
+            weight_bytes(&resumed.weights),
             "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
              epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte"
         );
@@ -9173,8 +9366,8 @@ mod gang_determinism_oracle {
             .expect("at least one slice");
 
         assert_eq!(
-            weight_bytes(&unsliced),
-            weight_bytes(&sliced),
+            weight_bytes(&unsliced.weights),
+            weight_bytes(&sliced.weights),
             "{TOTAL_EPOCHS} one-epoch slices at config.epochs = {TOTAL_EPOCHS} must match the \
              uninterrupted run byte-for-byte"
         );
@@ -9241,8 +9434,8 @@ mod gang_determinism_oracle {
         );
 
         assert_eq!(
-            weight_bytes(&uninterrupted),
-            weight_bytes(&resumed),
+            weight_bytes(&uninterrupted.weights),
+            weight_bytes(&resumed.weights),
             "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
              epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte, even \
              when the two ranks' own dropout-position counts diverge (a real zero-row-rank step)"
@@ -12294,8 +12487,11 @@ mod resume_invariant {
             loop_.capture_checkpoint_bundle(
                 &call,
                 scratch,
-                last_completed_epoch,
-                global_step,
+                crate::fine_tune::trainer::EpochBoundary {
+                    epoch: last_completed_epoch,
+                    global_step,
+                    history: &crate::fine_tune::trainer::RunHistory::default(),
+                },
                 opt,
                 names,
             )
@@ -12461,7 +12657,7 @@ mod resume_invariant {
             &device,
         )
         .unwrap();
-        let (start_epoch, _gstep) = {
+        let start_epoch = {
             // Borrow the loop mutably to restore weights/scaler/dropout, and the
             // opt to restore moments — the exact `restore_from_checkpoint` routine.
             let mut rl = resume_loop;
@@ -12509,7 +12705,7 @@ mod resume_invariant {
                  uninterrupted run's — a reset moment, lost step_t, recomputed \
                  scaler, or desynced dropout stream would diverge here"
             );
-            se
+            se.start_epoch
         };
         assert_eq!(start_epoch, K, "resume starts at last_completed + 1");
     }
@@ -12775,6 +12971,7 @@ mod resume_invariant {
             seed: 42,
             scaler: None,
             dropout_positions: HashMap::new(),
+            history: crate::fine_tune::trainer::RunHistory::default(),
         };
         let winner_bundle = vec![
             (

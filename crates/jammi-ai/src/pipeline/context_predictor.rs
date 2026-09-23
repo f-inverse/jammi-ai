@@ -1067,7 +1067,7 @@ impl InferenceSession {
             // The episodic in-context-predictor path has no per-epoch
             // checkpointing (per-epoch checkpoints are fine-tune-specific) —
             // nothing to register.
-            epoch_checkpoints: Vec::new(),
+            retained_checkpoints: None,
             // `ProducingDescriptor::FineTune` covers only the column-source
             // `TrainingSpec::FineTune` kind (its own doc); a context
             // predictor's model row carries no materialization.

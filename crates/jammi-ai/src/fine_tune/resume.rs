@@ -23,8 +23,14 @@
 //! - **`resume_state.json`** — `(epoch, global_step, step_t, seed)`, the
 //!   `TargetScaler`'s `(μ, σ)` (persisted, *never* recomputed on resume — a
 //!   recompute over re-read rows would diverge if the source changed by a hair),
-//!   and each dropout stream's draw position (so a resumed run replays the same
-//!   masks the uninterrupted run drew).
+//!   each dropout stream's draw position (so a resumed run replays the same
+//!   masks the uninterrupted run drew), and the run's history so far — its
+//!   loss curves, epoch walls, best monitored loss and patience — so a resumed
+//!   run stops early where the uninterrupted run would and reports the whole
+//!   run, not the epochs after the resume.
+//! - **Best weights** (`best.safetensors`) — the weights at the best monitored
+//!   epoch, when that is not the checkpoint's own epoch: the run ends on them,
+//!   and they live nowhere else once the attempt that reached them is gone.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,22 +42,27 @@ use serde::{Deserialize, Serialize};
 use jammi_db::error::{JammiError, Result};
 use jammi_lora::{ADAPTER_CONFIG_FILE, ADAPTER_WEIGHTS_FILE};
 
+use super::trainer::RunHistory;
+
 /// The optimiser-moments safetensors file inside a resume bundle. Each parameter
 /// `{name}` contributes `{name}.m` (first moment) and `{name}.v` (second moment).
 const MOMENTS_FILE: &str = "optimizer.safetensors";
 /// The run-state JSON inside a resume bundle.
 const STATE_FILE: &str = "resume_state.json";
+/// The best monitored epoch's weights inside a resume bundle, present only
+/// when that epoch is not the one the bundle was taken at.
+const BEST_WEIGHTS_FILE: &str = "best.safetensors";
 
 /// The current [`ResumeState`] schema version. Bumped whenever a field's
 /// UNIT or MEANING changes in a way that would silently mis-restore a
-/// checkpoint of another version if read as this schema. Version 2 stores
+/// checkpoint of another version if read as this schema. Version 3 stores
 /// `dropout_positions` per RANK as per-FORWARD Philox counters (see that
-/// field's doc). A bundle of any other version — including one with NO
+/// field's doc) and carries the run's `history`. A bundle of any other version — including one with NO
 /// `schema_version` field — is refused typed by
 /// [`ResumeState::check_schema_version`]: this crate ships no reader for
 /// any other shape, and a resume that silently restarted from scratch
 /// would discard the trajectory the job's checkpoints exist to preserve.
-pub const RESUME_STATE_SCHEMA_VERSION: u32 = 2;
+pub const RESUME_STATE_SCHEMA_VERSION: u32 = 3;
 
 /// The version an ABSENT `schema_version` key parses as (`#[serde(default)]`
 /// on [`ResumeState::schema_version`]) — a checkpoint with no version field.
@@ -117,6 +128,10 @@ pub struct ResumeState {
     /// [`RESUME_STATE_SCHEMA_VERSION`] exists and a bundle of another
     /// version is refused typed.
     pub dropout_positions: HashMap<u32, HashMap<String, u64>>,
+    /// The run's history through `last_completed_epoch`: what a resumed run
+    /// continues, so its early stopping and its reported curves and walls
+    /// are the uninterrupted run's.
+    pub history: RunHistory,
 }
 
 impl ResumeState {
@@ -158,6 +173,22 @@ pub struct RestoredCheckpoint {
     pub moments: NamedMoments,
     /// The persisted run state.
     pub state: ResumeState,
+    /// The best monitored epoch's weights, when that epoch is not the
+    /// bundle's own; `None` means `weights` are the best so far.
+    pub best: Option<HashMap<String, Tensor>>,
+}
+
+/// One epoch's checkpoint, as [`capture_bundle`] serialises it.
+pub struct CheckpointBundle<'a, C> {
+    /// LoRA A/B tensors keyed as `named_trainable_weights` produces them.
+    pub weights: &'a HashMap<String, Tensor>,
+    /// The adapter's own metadata, saved beside `weights`.
+    pub adapter_config: &'a C,
+    /// Per-parameter AdamW moments, keyed by the same names.
+    pub moments: &'a NamedMoments,
+    /// The best monitored epoch's weights, when not this epoch's.
+    pub best: Option<&'a HashMap<String, Tensor>>,
+    pub state: &'a ResumeState,
 }
 
 /// Serialise one epoch's checkpoint to `(name, bytes)` pairs ready for
@@ -167,19 +198,17 @@ pub struct RestoredCheckpoint {
 /// is, so the bundle loads for inference by the same path; then the AdamW
 /// `moments`, keyed by the *same* parameter names (the trainer correlates
 /// positions to names from the single `all_vars()` snapshot before calling
-/// this), and the run `state` a resume restores. The safetensors files are
-/// serialised through a scratch dir (candle serialises tensors only to a
-/// path), then read back as bytes.
+/// this), the best weights when they are not this epoch's, and the run
+/// `state` a resume restores. The safetensors files are serialised through a
+/// scratch dir (candle serialises tensors only to a path), then read back as
+/// bytes.
 pub fn capture_bundle<C: Serialize>(
     scratch_dir: &Path,
-    weights: &HashMap<String, Tensor>,
-    adapter_config: &C,
-    moments: &NamedMoments,
-    state: &ResumeState,
+    bundle: &CheckpointBundle<'_, C>,
 ) -> Result<Vec<(String, Bytes)>> {
     std::fs::create_dir_all(scratch_dir)?;
 
-    jammi_lora::save_adapter(scratch_dir, weights, adapter_config)
+    jammi_lora::save_adapter(scratch_dir, bundle.weights, bundle.adapter_config)
         .map_err(|e| JammiError::FineTune(format!("checkpoint: save adapter: {e}")))?;
     let weights_path = scratch_dir.join(ADAPTER_WEIGHTS_FILE);
     let adapter_config_path = scratch_dir.join(ADAPTER_CONFIG_FILE);
@@ -187,19 +216,37 @@ pub fn capture_bundle<C: Serialize>(
     // Flatten the per-parameter moment pair into a single name-keyed map:
     // `{name}.m` / `{name}.v`. The `.m`/`.v` suffix cannot collide with a real
     // parameter name because every adapter tensor ends in `.lora_a` / `.lora_b`.
-    let mut moment_tensors: HashMap<String, Tensor> = HashMap::with_capacity(moments.len() * 2);
-    for (name, (m, v)) in moments {
-        moment_tensors.insert(format!("{name}.m"), m.clone());
-        moment_tensors.insert(format!("{name}.v"), v.clone());
-    }
+    let moment_tensors: HashMap<String, Tensor> = bundle
+        .moments
+        .iter()
+        .flat_map(|(name, (m, v))| {
+            [
+                (format!("{name}.m"), m.clone()),
+                (format!("{name}.v"), v.clone()),
+            ]
+        })
+        .collect();
     let moments_path = scratch_dir.join(MOMENTS_FILE);
     candle_core::safetensors::save(&moment_tensors, &moments_path)
         .map_err(|e| JammiError::FineTune(format!("resume: save moments: {e}")))?;
 
-    let state_bytes = serde_json::to_vec(state)
+    let state_bytes = serde_json::to_vec(bundle.state)
         .map_err(|e| JammiError::FineTune(format!("resume: serialize state: {e}")))?;
 
-    Ok(vec![
+    let best = bundle
+        .best
+        .map(|best| -> Result<(String, Bytes)> {
+            let path = scratch_dir.join(BEST_WEIGHTS_FILE);
+            candle_core::safetensors::save(best, &path)
+                .map_err(|e| JammiError::FineTune(format!("resume: save best weights: {e}")))?;
+            Ok((
+                BEST_WEIGHTS_FILE.to_string(),
+                Bytes::from(std::fs::read(&path)?),
+            ))
+        })
+        .transpose()?;
+
+    Ok([
         (
             ADAPTER_WEIGHTS_FILE.to_string(),
             Bytes::from(std::fs::read(&weights_path)?),
@@ -213,7 +260,10 @@ pub fn capture_bundle<C: Serialize>(
             Bytes::from(std::fs::read(&moments_path)?),
         ),
         (STATE_FILE.to_string(), Bytes::from(state_bytes)),
-    ])
+    ]
+    .into_iter()
+    .chain(best)
+    .collect())
 }
 
 /// Load a resume bundle from a fetched [`jammi_db::store::LocalArtifact`]
@@ -237,10 +287,18 @@ pub fn load_bundle(dir: &Path, device: &Device) -> Result<RestoredCheckpoint> {
         .map_err(|e| JammiError::FineTune(format!("resume: load moments: {e}")))?;
     let moments = pair_moments(moment_tensors)?;
 
+    let best_path = dir.join(BEST_WEIGHTS_FILE);
+    let best = best_path
+        .exists()
+        .then(|| candle_core::safetensors::load(&best_path, device))
+        .transpose()
+        .map_err(|e| JammiError::FineTune(format!("resume: load best weights: {e}")))?;
+
     Ok(RestoredCheckpoint {
         weights,
         moments,
         state,
+        best,
     })
 }
 
@@ -321,14 +379,38 @@ mod tests {
             seed: 42,
             scaler: Some((2017.0, 2.5)),
             dropout_positions,
+            // Three epochs run, the best at epoch 1: the bundle, taken at
+            // epoch 2, carries epoch 1's weights beside its own.
+            history: RunHistory {
+                train_loss_curve: vec![(0, 0.9), (1, 0.6), (2, 0.65)],
+                val_loss_curve: vec![(0, 0.95), (1, 0.7), (2, 0.72)],
+                epoch_walls: (0..3)
+                    .map(|epoch| crate::fine_tune::trainer::EpochWall {
+                        epoch,
+                        run_s: 2.0,
+                        steps_s: 1.5,
+                        step_walls: vec![0.5, 0.5, 0.5],
+                        validation_s: 0.3,
+                        checkpoint_s: 0.1,
+                    })
+                    .collect(),
+                best: Some((1, 0.7)),
+                patience: 1,
+            },
         };
+        let mut best = HashMap::new();
+        best.insert("projection.lora_a".to_string(), tiny(&device, 50.0));
+        best.insert("projection.lora_b".to_string(), tiny(&device, 60.0));
 
         let bundle = capture_bundle(
             scratch.path(),
-            &weights,
-            &fixture_config(),
-            &moments,
-            &state,
+            &CheckpointBundle {
+                weights: &weights,
+                adapter_config: &fixture_config(),
+                moments: &moments,
+                best: Some(&best),
+                state: &state,
+            },
         )
         .unwrap();
         // Materialise the bundle to a dir as the artifact store would, then reload.
@@ -339,6 +421,12 @@ mod tests {
         let restored = load_bundle(out.path(), &device).unwrap();
 
         assert_eq!(restored.state, state);
+        let restored_best = restored.best.as_ref().expect("the best weights round-trip");
+        for (name, t) in &best {
+            let got: Vec<f32> = restored_best[name].to_vec1().unwrap();
+            let want: Vec<f32> = t.to_vec1().unwrap();
+            assert_eq!(got, want, "best weight '{name}' did not round-trip");
+        }
         for (name, t) in &weights {
             let got: Vec<f32> = restored.weights[name].to_vec1().unwrap();
             let want: Vec<f32> = t.to_vec1().unwrap();
@@ -395,8 +483,19 @@ mod tests {
             seed: 1,
             scaler: None,
             dropout_positions: HashMap::new(),
+            history: RunHistory::default(),
         };
-        capture_bundle(scratch, &weights, &fixture_config(), &moments, &state).unwrap()
+        capture_bundle(
+            scratch,
+            &CheckpointBundle {
+                weights: &weights,
+                adapter_config: &fixture_config(),
+                moments: &moments,
+                best: None,
+                state: &state,
+            },
+        )
+        .unwrap()
     }
 
     /// The adapter metadata a checkpoint carries beside its weights; opaque
@@ -487,6 +586,7 @@ mod tests {
             seed: 1,
             scaler: None,
             dropout_positions: HashMap::new(),
+            history: RunHistory::default(),
         };
         assert!(state(RESUME_STATE_SCHEMA_VERSION)
             .check_schema_version()

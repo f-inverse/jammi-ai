@@ -2558,20 +2558,24 @@ impl JobWorker {
             }
         };
 
-        // Stop renewing this attempt's lease regardless of outcome — the
-        // job is about to reach a terminal write (or be left for reclaim),
-        // so no further renewal is wanted either way. The watcher is stopped
-        // alongside it: `CancelWatcherGuard::drop` aborting an
-        // already-finished task is a harmless no-op, and there is nothing
-        // left for it to watch once the run has returned. This explicit
-        // drop is the ordinary exit's path through the SAME `Drop` impl
-        // that also covers the extraordinary ones (a panic unwinding through
-        // this scope, or this whole `.await` being dropped out from under
-        // it by a caller aborting the task).
-        drop(hold);
+        // The run has returned, so there is nothing left for the cancel
+        // watcher to watch: `CancelWatcherGuard::drop` aborting an
+        // already-finished task is a harmless no-op. This explicit drop is
+        // the ordinary exit's path through the SAME `Drop` impl that also
+        // covers the extraordinary ones (a panic unwinding through this
+        // scope, or this whole `.await` being dropped out from under it by
+        // a caller aborting the task).
+        //
+        // The lease is NOT released here: every arm below ends in a
+        // lease-guarded terminal write — the publish's finalize, a failed
+        // or cancelled record — whose compare-and-set matches only while
+        // this attempt still holds the lease, and the publish before the
+        // finalize stages a bundle whose size and store set its duration.
+        // The keeper renews on its own thread whatever that I/O does, so
+        // the hold is dropped only once the terminal write has returned.
         drop(cancel_watcher);
 
-        match outcome {
+        let end = match outcome {
             Ok(AttemptOutput::Reused(reused)) => {
                 // The job is already `completed` (the reuse probe's own
                 // transaction wrote the terminal row, the output model's
@@ -2728,7 +2732,9 @@ impl JobWorker {
                 .await;
                 AttemptEnd::Failed { error }
             }
-        }
+        };
+        drop(hold);
+        end
     }
 
     /// Submit this attempt — `plan`, its one `PlacedAttemptExec` task, already
@@ -3083,12 +3089,14 @@ impl JobWorker {
         timeline: &AttemptTimeline,
     ) -> PublishOutcome {
         let (job_id, attempt) = (timeline.job_id.as_str(), timeline.attempt);
+        #[cfg(feature = "test-hooks")]
+        loop_test_hooks::maybe_park(job_id, loop_test_hooks::ParkPoint::BeforePublish).await;
         let store = session.artifact_store();
         let TrainedArtifact {
             dir,
             register,
             metrics,
-            epoch_checkpoints,
+            retained_checkpoints,
             materialization,
         } = artifact;
         let fail = |reason: String| {
@@ -3143,6 +3151,15 @@ impl JobWorker {
             Err(e) => return fail(format!("job metrics serialisation failed: {e}")).await,
         };
 
+        let epoch_checkpoints = match retained_checkpoints {
+            Some(retain) => match store.retained_checkpoints(catalog, job_id, retain).await {
+                Ok(retained) => retained,
+                Err(e) => {
+                    return fail(format!("listing the job's retained checkpoints: {e}")).await
+                }
+            },
+            None => Vec::new(),
+        };
         // Distinct-name catalog rows for every RETAINED epoch checkpoint:
         // never an additional VERSION of the output model's name.
         let epoch_model_ids: Vec<String> = epoch_checkpoints
@@ -3412,8 +3429,9 @@ impl JobWorker {
             attempts: attempt,
         };
         let outcome = crate::jobs::execute_compute(session, catalog, &spec, job_attempt).await;
-        drop(hold);
 
+        // Held until the terminal write below has returned: `finish_job` and
+        // the failure records match only while this attempt holds the lease.
         match outcome {
             Ok(result) => match serde_json::to_string(&result) {
                 Ok(result_json) => {
@@ -3458,6 +3476,7 @@ impl JobWorker {
                 .await;
             }
         }
+        drop(hold);
     }
 
     /// Dispatch a claimed spec to its kind's from-scratch reconstruction and
@@ -4131,7 +4150,9 @@ impl JobWorker {
                 config_json: None,
             },
             metrics: Some(training.metrics_json),
-            epoch_checkpoints: training.epoch_checkpoints,
+            retained_checkpoints: config_for_error
+                .keep_last_n_checkpoints
+                .and_then(|keep| std::num::NonZeroUsize::new(keep as usize)),
             materialization: Some(materialization),
         })
     }
@@ -4865,6 +4886,11 @@ pub mod loop_test_hooks {
         /// (`arm`'s key doubles as either a job id or an instance id — no
         /// job is claimed yet at this point).
         BeginReleaseBetweenFlipAndBump,
+        /// Inside `JobWorker::publish_and_finalize`, after the attempt has
+        /// trained and before its bundle is staged — the window the
+        /// attempt's lease must be held across, however long its publish
+        /// takes, for its finalize to land.
+        BeforePublish,
     }
 
     struct Armed {
@@ -5468,17 +5494,14 @@ pub struct TrainedArtifact {
     pub register: ModelRegistration,
     /// Run-metrics JSON recorded in the finalize CAS, or `None`.
     pub metrics: Option<String>,
-    /// The training loop's RETAINED epoch checkpoints: each entry is
-    /// `(epoch_index, claim)`, the claim on the bundle the TRAINER already
-    /// wrote that epoch's checkpoint to
-    /// (`{job_id}/_checkpoints/{attempt}/epoch_{N}/`) — a full loadable
-    /// adapter beside the run's resume state. Empty for a run that did not
-    /// opt in and for a kind that does not checkpoint per epoch (the
-    /// context-predictor path).
-    /// The worker's finalize publishes each and registers a catalog row for
-    /// it — the bytes are already complete by the time this reaches
-    /// `publish_and_finalize`.
-    pub epoch_checkpoints: Vec<(usize, StagedArtifact)>,
+    /// How many of the job's newest epoch checkpoints the finalize publishes
+    /// as models (`keep_last_n_checkpoints`), or `None` for a run that did
+    /// not opt in and for a kind that does not checkpoint per epoch (the
+    /// context-predictor path). The window is the job's: the finalize reads
+    /// the checkpoints from the store (`ArtifactStore::retained_checkpoints`),
+    /// whichever attempts wrote them, so a resumed attempt publishes its
+    /// predecessors' retained epochs beside its own.
+    pub retained_checkpoints: Option<std::num::NonZeroUsize>,
     /// `Some` for the two LoRA kinds (never a context predictor) — the
     /// model-level materialization [`JobWorker::publish_and_finalize`]
     /// writes/records.

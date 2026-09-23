@@ -169,15 +169,6 @@ impl KernelArm {
         self.off.contains(&family)
     }
 
-    /// The label a leg states as its `arm`.
-    pub fn label(&self) -> &'static str {
-        if self.off.is_empty() {
-            "fused"
-        } else {
-            "alloff"
-        }
-    }
-
     /// The `JAMMI_KERNELS_DISABLE` value for this arm on a checkpoint whose
     /// one training step consults `live`: the arm's keys, restricted to the
     /// live ones, sorted. Refused when the arm turns off a family whose
@@ -199,6 +190,17 @@ impl KernelArm {
             .map(str::to_owned)
             .collect();
         Ok(keys.into_iter().collect())
+    }
+}
+
+/// The label a leg states as its `arm`, from the op keys its process
+/// requested off: the fused cascade when none, the eager composition of the
+/// requested families otherwise.
+pub fn arm_label(requested_off: &[String]) -> &'static str {
+    if requested_off.is_empty() {
+        "fused"
+    } else {
+        "eager"
     }
 }
 

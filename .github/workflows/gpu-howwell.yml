@@ -5,7 +5,7 @@ name: GPU how-well (RunPod)
 # `jammi-bench finetune-run` per (rung, seed, take) against the committed
 # cookbook/fixtures/finetune_heldout/ fixture, judged (leg premises, identity,
 # the lr=0 control, the paired sign test and equivalence test) by
-# `jammi-bench ladder train-run` as the kernel edge of that ladder.
+# `jammi-bench ladder train-run` as the torch edge of that ladder.
 #
 # Off the merge path, same discipline gpu-prove.yml's own header states — GPU
 # minutes cost money and A100 capacity is intermittent. Fires on: the
@@ -103,7 +103,7 @@ jobs:
           # workflow_dispatch's own `lr0_seeds` input carries a
           # pre-registered default ("1,2") baked into this workflow's schema
           # above, so it is empty only when an operator EXPLICITLY clears it.
-          # The ladder refuses (INVALID) a kernel edge with no control unless
+          # The ladder refuses (INVALID) the torch edge with no control unless
           # `--waive-control` is passed, which this workflow does not
           # forward, so clearing this field makes the run INVALID by design
           # rather than silently skipping the control.

@@ -22,7 +22,7 @@ differ by exactly one layer. A ladder has as many rungs as its workload has laye
 |---|---|---|
 | `encode` | one vector per key | `torch` → `direct` (the loaded model called on the same texts, no plan) → `plan` (DataFusion, 1 partition) → `plan-partitioned` (N partitions) → `placed` (the same plan on a Ballista executor) → `shape-d` (the deployed topology: the serve through the query tier, on a compute process) |
 | `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes; on the `torch` edge, gradient agreement at shared weights | `torch` → `reference` (the engine on the training reference arm: the flash cascade and the fused AdamW step off) → `fused` |
-| `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident-reference` (the trainer over in-memory rows, reference kernels) → `resident` (the fused kernels) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) → `shape-d` (the deployed topology: the job through the query tier, on a compute process) |
+| `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident` (the trainer over in-memory rows) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) → `shape-d` (the deployed topology) |
 | `graph-sample` | a pair table, from random walks over a graph | `torch` (PyTorch Geometric's node2vec walk sampler) → `sampler` (the engine's graph sampler) |
 | `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` → `placed` |
 | `structure` | one structure vector per node, from the edge relation alone | `torch` (an exact evaluation of the engine's operator from the engine's own seed rows: the lazy walk, each block normalised then weighed) → `plan` (the engine's encoding, 1 partition) → `plan-partitioned` → `placed` |
@@ -69,22 +69,19 @@ consulted absorbing family off, until no new key appears; each step its own proc
 the disable list is read once per process). A BERT-family checkpoint has no GeGLU or RoPE seam
 to turn off and a ModernBERT one has no GELU-erf seam; the derived sets differ by exactly those
 families. An arm that turns off a family whose absorber it leaves on (RoPE without the attention
-block) is refused by name, since its key could never fire on the device. Both training ladders
-have one reference arm, `{flash attention, AdamW}` off: the two families that change the step's
-numerics and its optimizer, both live on the checkpoints the ladders run on. It goes through the
-one derivation, and each rung's premises then prove the arm from the leg's own dispatch
-counters. The composition with every family off is not a rung. Measured on an A100 80 GB in the
-campaign's setting (ModernBERT-large, bf16): at 8×128 it holds 45.1 GiB where the fused arm
-holds 3.7 GiB, and at 8×512 and 16×128 it exceeds the device, where the fused arm holds 14.5 and
-7.3 GiB. The cause is the eager composition itself: candle's autograd keeps every operator's
-output alive until the backward and materializes a gradient for every operand, frozen weights
-included, and each LoRA site's eager epilogue widens its base and low-rank outputs to `f32`
-before the add (`lora_linear_fused` off alone exceeds the device at 8×512; the eager layer norm
-alone holds 39 GiB). An arm the device cannot hold at the shapes swept controls nothing, so it
-is a diagnostic (`kernel-arm --all`) and not a rung. The census is device-independent — every
-call site consults its key before the device is looked at — and this was measured on an A100:
-the derived ModernBERT all-off set (nine keys) and the reference arm's two keys each fired
-exactly under a strict step, with no CUDA-only key.
+block) is refused by name, since its key could never fire on the device. No rung of any ladder
+turns a family off: the engine's rungs run the fused arm, every leg states it, and each rung's
+premises prove it from the leg's own dispatch counters — nothing requested off, nothing fallen
+back, the flash cascade dispatched. The arm derivation is a diagnostic. The eager composition is
+not a control: measured on an A100 80 GB in the campaign's setting (ModernBERT-large, bf16), the
+step with every family off holds 45.1 GiB at 8×128 where the fused arm holds 3.7 GiB, and at 8×512
+and 16×128 it exceeds the device, where the fused arm holds 14.5 and 7.3 GiB — candle's autograd
+keeps every operator's output alive until the backward and materializes a gradient for every
+operand, frozen weights included, and each LoRA site's eager epilogue widens its outputs to `f32`
+before the add (the LoRA site alone exceeds the device at 8×512; the eager layer norm alone holds
+39 GiB). What the kernels are worth against the eager composition is a kernel question, answered
+by the kernel tests and the gradient oracle, not a rung between torch and the product. The census
+is device-independent — every call site consults its key before the device is looked at.
 
 Because adjacent rungs differ by one layer, an edge's speed ratio *is* that layer's cost, and
 the ratios telescope: the product of the edge ratios is the end-to-end ratio against PyTorch.
@@ -181,13 +178,12 @@ the claim before any number is read. For `train-run`: the schedule is constant; 
 rows took the padded transport; the train-side probe (anchored at the untrained model) moved by
 more than its floor, in the declared direction; the held-out tie fraction is under its cap; the
 leg states its arm; and the dispatch counters prove the arm — a `resident` leg ran the fused
-kernels and the flash cascade itself, a `resident-reference` leg shows a counted fallback behind
-each kernel it disabled. A unit whose legs fail a premise is measured and reported, never
+kernels and the flash cascade itself. A unit whose legs fail a premise is measured and reported, never
 counted. Identity must agree between the two legs of a unit *and* across every leg entering the
 comparison (all but the swept field), or two halves of a sweep run under different premises
 would be averaged as one experiment.
 
-**Controls and mutants** prove the rules can fail. The kernel edge carries an `lr = 0` control
+**Controls and mutants** prove the rules can fail. The torch edge carries an `lr = 0` control
 at two seeds on both rungs: a run that cannot learn must *fail* the learning premise, and a
 control that learns, was never run at `lr = 0`, or is missing (unless the operator waives it,
 which the verdict records) refuses the edge. Same-seed repeats measure the outcome's own noise:
@@ -300,7 +296,7 @@ law, gradient structure, and a revision's own in-session noise band.
 |---|---|---|
 | every change (hermetic, CPU) | exact edges over the tiny fixtures: outcome digests equal across `direct`/`resident` … `placed` (`--axes outcome`); the kernel-arm derivation on the tiny BERT and ModernBERT fixtures; the committed campaigns and sweeps as oracles | hard |
 | nightly (hosted CPU) | exact-edge overhead ratios, fixed and per-work. Both legs of a ratio run interleaved in one process on one box, so the box's speed cancels and no absolute rate is committed | evidence until measured |
-| on demand (one GPU, one session) | the full ladder including the `torch` rung, at the shapes the performance guide reports (`ci/scripts/perf/finetune_step_ab.sh` for `train-step`); the kernel edge of `train-run` with its control and mutant columns (the how-well decision, `finetune_run_ab.sh`); the `encode` revision edge of this checkout against its merge-base with a rebuilt base as the A/A null (`gpu_inference_ab.sh`) | the `torch` edges are evidence; the kernel edge's outcome rules and the revision edge's band are hard; committed as an artifact |
+| on demand (one GPU, one session) | the full ladder including the `torch` rung, at the shapes the performance guide reports (`ci/scripts/perf/finetune_step_ab.sh` for `train-step`); the torch edge of `train-run` with its control and mutant columns (`finetune_run_ab.sh`); the `encode` revision edge of this checkout against its merge-base with a rebuilt base as the A/A null (`gpu_inference_ab.sh`) | the `torch` edges' outcome rules are hard, their speed and space bars evidence until measured; the revision edge's band is hard; committed as an artifact |
 
 The `torch` rung never decides a merge: PyTorch is not on the CI image, and a reference that
 moves with every wheel release cannot be a merge condition. It is rebuilt on the box it is
@@ -324,7 +320,7 @@ measured on, every time.
   SITES] (--off FAMILIES | --all) [--json]` derives an arm's `JAMMI_KERNELS_DISABLE` value from
   the checkpoint's census.
 - Producers are shell scripts that run legs in a balanced order and call the ladder:
-  `ci/scripts/perf/finetune_step_ab.sh` (`train-step`), `finetune_run_ab.sh` (the kernel edge
+  `ci/scripts/perf/finetune_step_ab.sh` (`train-step`), `finetune_run_ab.sh` (the torch edge
   of `train-run`), `gpu_inference_ab.sh` (the `encode` revision edge), `encode_ab.sh` (the
   `encode` rung's replicate check: the revision edge with one build on every side).
 

@@ -755,16 +755,16 @@ pooler) is refused by the tensor-set check rather than trained.
 
 ### Producing paired legs
 
-`ci/scripts/perf/finetune_run_ab.sh` with `FINETUNE_RUN_AB_TORCH=1` runs the
-`torch` arm beside `fused` and `alloff`, order-balanced within each seed
-(`fused r1, alloff r1, torch r1, torch-natural r1, torch-natural r2, torch r2, alloff r2, fused r2` — `torch` is `--width bucketed`, `torch-natural` is `--width natural`). It hands the
-torch leg the same run flags it hands the jammi legs, from one array; points
-it at the adapter the seed's first jammi leg wrote; and refuses before any leg
-unless
+`ci/scripts/perf/finetune_run_ab.sh` runs the `torch` arm beside `fused`,
+order-balanced within each seed (`fused r1, torch r1, torch-natural r1,
+torch-natural r2, torch r2, fused r2` — `torch` is `--width bucketed`,
+`torch-natural` is `--width natural`). It hands the torch leg the same run
+flags it hands the jammi legs, from one array; points it at the adapter the
+seed's first jammi leg wrote; and refuses before any leg unless
 `FINETUNE_RUN_AB_LORA_DROPOUT` is 0 and the objective is MNRL. The venv is the
-one `ci/scripts/perf/torch_venv.py` resolves. `ab_merge.py finetune-run` reads
-the `fused`/`alloff` legs only; the torch legs are evidence for a reader of
-leg files and never a merge gate.
+one `ci/scripts/perf/torch_venv.py` resolves. `jammi-bench ladder train-run`
+judges the `torch` and `resident` legs; a `torch-natural` leg is filed beside
+them as a reader's diagnostic.
 
 `--dry-run` builds a tiny random ModernBERT, a ten-word tokenizer and
 synthetic pairs, and drives the same code path on a CPU in seconds.

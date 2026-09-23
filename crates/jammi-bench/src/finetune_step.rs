@@ -242,7 +242,7 @@ pub struct FinetuneStepParams {
     pub warmup: usize,
     pub lora_rank: usize,
     pub lora_alpha: f64,
-    pub lora_dropout: f32,
+    pub lora_dropout: f64,
     pub target_modules: Vec<String>,
     pub backbone_dtype: jammi_numerics::ComputePrecision,
     /// CUDA ordinal, or `None` for CPU.
@@ -374,7 +374,7 @@ fn build_fixture(
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
         use_rslora: false,
-        lora_dropout: (params.lora_dropout > 0.0).then_some(params.lora_dropout),
+        lora_dropout: (params.lora_dropout > 0.0).then_some(params.lora_dropout as f32),
         rank_pattern: &empty_ranks,
         init_mode: jammi_lora::LoraInitMode::ZerosB,
         seed: params.seed,
@@ -835,11 +835,7 @@ fn run_with(
 
     let kernels_disabled_requested = jammi_kernels::admission::disabled_ops_requested();
     let kernels_disabled_fired = jammi_kernels::admission::disabled_ops_fired();
-    let arm = if kernels_disabled_requested.is_empty() {
-        "fused"
-    } else {
-        "alloff"
-    };
+    let arm = crate::kernel_arm::arm_label(&kernels_disabled_requested);
     let payload = TrainStepPayload {
         // Counted over pre-step + warmup + measured (the "before" snapshot
         // sits above the pre-step): `warmup + steps + 1` on a clip-on row,
@@ -855,7 +851,7 @@ fn run_with(
         seq: params.seq,
         lora_rank: params.lora_rank,
         lora_alpha: params.lora_alpha,
-        lora_dropout: params.lora_dropout as f64,
+        lora_dropout: params.lora_dropout,
         // HARDCODED, unconditionally — see `TrainStepPayload::margin`'s own
         // field doc: this tier has no `--margin` CLI flag, and the ONE call
         // site that uses this constant (`triplet_loss(&a, &p, &n, 0.3)`,
@@ -2045,7 +2041,7 @@ mod tests {
     /// deleted-field mutant (see `build_fixture`'s own comment).
     #[test]
     fn finetune_step_positive_lora_dropout_actually_changes_the_computation() {
-        fn pre_step_then_loss(lora_dropout: f32) -> f32 {
+        fn pre_step_then_loss(lora_dropout: f64) -> f32 {
             let mut params = tiny_params();
             params.lora_dropout = lora_dropout;
             let (mut encoder, mut opt, _count, blocks, mask, varmap) =

@@ -53,7 +53,7 @@ fn run_train_rung(rung: &str, fixtures: &Path, work_dir: &Path) -> serde_json::V
     let output = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
         .args(["finetune-run", "--model-dir"])
         .arg(model_dir())
-        .args(["--arm", "fused", "--rung", rung])
+        .args(["--rung", rung])
         .arg("--server-bin")
         .arg(jammi_server_binary())
         .arg("--train-jsonl")

@@ -1407,12 +1407,7 @@ pub async fn measure_legs(
                 .collect(),
             flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
             kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
-            arm: if kernels_disabled_requested.is_empty() {
-                "fused"
-            } else {
-                "alloff"
-            }
-            .to_string(),
+            arm: crate::kernel_arm::arm_label(&kernels_disabled_requested).to_string(),
             // What the serves ACTUALLY ran, off this rung's own model's
             // admission ledger — never a constant. A serve that ran eager
             // on a device that should have fused shows up here by name.

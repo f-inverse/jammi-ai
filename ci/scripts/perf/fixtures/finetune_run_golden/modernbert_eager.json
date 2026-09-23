@@ -55,7 +55,7 @@
       "early_stopping_patience": 10000,
       "early_stopping_metric": "val_loss",
       "eval_cadence": 1,
-      "arm": "alloff",
+      "arm": "eager",
       "device_name": "NVIDIA A100 80GB PCIe",
       "kernels_disabled_requested": [
         "adamw_step_fused",

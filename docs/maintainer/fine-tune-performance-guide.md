@@ -291,17 +291,15 @@ at step 0, which makes it useless as a dtype pre-flight); and `--expect-kernels-
 <keys>` turns a forced-eager leg's premise into a checked one. That last flag is what makes
 an eager twin a datum rather than an assumption: the run refuses at START unless this
 flag's value EQUALS this process's real `JAMMI_KERNELS_DISABLE` exactly (equality, not
-subset: a subset check would let an ambient or leftover env var through undetected, and
-`--arm alloff` already forces an exact-set match of its own two keys, so no legitimate leg
-names a chain key on top of alloff's pair), and refuses at the END unless no requested
-disable went unmatched AND every named key's fused dispatch counter read zero across the
-run. `--arm fused` with no `--expect-kernels-disabled` at all makes NO claim about
-`JAMMI_KERNELS_DISABLE` — an operator may legitimately run a fused leg with OTHER,
-unrelated op keys disabled, so this binary does not, and must not, refuse an unlabeled
-fused leg on that basis; the two-sided witness that a profile decision leg's fused side was
-genuinely unlabeled lives outside this binary, in the driver and merger. A leg that
-fails the alloff arm-level check or the `--expect-kernels-disabled` START/END checks exits
-non-zero and writes no row — INVALID, never a datum. The claim itself is recorded on the
+subset: a subset check would let an ambient or leftover env var through undetected), and
+refuses at the END unless no requested disable went unmatched AND every named key's fused
+dispatch counter read zero across the run. A run with no `--expect-kernels-disabled` at all
+makes NO claim about `JAMMI_KERNELS_DISABLE` — an operator may legitimately run with OTHER,
+unrelated op keys disabled, so this binary does not, and must not, refuse an unlabeled leg
+on that basis; the leg's `arm` states what the process resolved (`fused`, or `eager`) and
+the ladder's rung premise is what holds a `resident` leg to the fused arm. A leg that fails
+the `--expect-kernels-disabled` START/END checks exits non-zero and writes no row —
+INVALID, never a datum. The claim itself is recorded on the
 report as provenance (`kernels_disabled_expected`), distinct from the process-OBSERVED
 `kernels_disabled_requested`/`kernels_disabled_fired` pair it was checked against.
 

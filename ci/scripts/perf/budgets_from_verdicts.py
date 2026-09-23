@@ -44,9 +44,9 @@ import tempfile
 from pathlib import Path
 
 DECIMALS = 3
-# The verdict's kinds of difference that name a layer's cost, and the one that
+# The verdict's kind of difference that names a layer's cost, and the one that
 # names a framework's bar.
-LAYER_KINDS = ("layer", "kernel_arm")
+LAYER_KINDS = ("layer",)
 FRAMEWORK_KIND = "framework"
 
 

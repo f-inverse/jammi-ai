@@ -44,15 +44,14 @@
 //! artifact publish — are reported on their own ([`Stations`]) and never
 //! folded into an epoch's phases.
 //!
-//! ## Arm selection: provenance, not identity
+//! ## The arm is provenance, not identity
 //!
-//! The fused-vs-ALLOFF arm is selected by `JAMMI_KERNELS_DISABLE`, read once
-//! per process by `jammi_kernels::admission`; the caller sets it before
-//! invoking `jammi-bench finetune-run`, and every process a rung starts
-//! inherits it. `arm` records what the caller declared; the disable list
-//! and dispatch counters record what the training process resolved and ran.
-//! Both are provenance, never identity: the kernel edge compares across
-//! arms of one seed.
+//! Which fused-kernel families run is `JAMMI_KERNELS_DISABLE`'s to say, read
+//! once per process by `jammi_kernels::admission`; every process a rung
+//! starts inherits it. `arm` records what the process resolved — `fused`
+//! when nothing was requested off, `eager` otherwise — and the disable list
+//! and dispatch counters record what ran. All of it is provenance the
+//! ladder's rung premises prove, never identity.
 //!
 //! ## Held-out split is disjoint from the internal train/val split
 //!
@@ -118,65 +117,10 @@ use crate::leg::{
 use crate::report::TrainRunPayload;
 use crate::vram::{device_memory_probe, VramWindow};
 
-/// The fused-vs-ALLOFF arm this run was launched under — CALLER-declared
-/// PROVENANCE (see this module's own doc), never derived from a dispatch
-/// counter (mirrors [`crate::finetune_step::FinetuneStepParams::expect_kernels_disabled`]'s
-/// posture: the tier can VALIDATE what the caller claims against what the
-/// process's `JAMMI_KERNELS_DISABLE` actually resolved to, but the value
-/// itself is an intent the caller states on the command line).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Arm {
-    /// The fused cascade — no kernels forced eager.
-    Fused,
-    /// `JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused` — both
-    /// levers ALLOFF at once. There is no flash-only / adamw-only arm.
-    Alloff,
-}
-
-impl Arm {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Arm::Fused => "fused",
-            Arm::Alloff => "alloff",
-        }
-    }
-}
-
-impl std::str::FromStr for Arm {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "fused" => Ok(Arm::Fused),
-            "alloff" => Ok(Arm::Alloff),
-            other => Err(format!(
-                "--arm '{other}' is invalid: expected 'fused' or 'alloff'"
-            )),
-        }
-    }
-}
-
-/// Re-box a non-`Send` error (e.g. [`crate::finetune_step::sha256_and_len`]'s
-/// `Box<dyn Error>`) into this module's `Send + Sync` error type — needed
-/// because [`run`] is driven from `tokio::task::spawn_blocking` (it calls
-/// `Handle::current().block_on(..)` internally for catalog I/O, mirroring
-/// `fine_tune::worker::run_fine_tune_blocking`), and `spawn_blocking`
-/// requires its future's `Ok`/`Err` to be `Send`.
 fn sendify<E: std::fmt::Display>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
     e.to_string().into()
 }
 
-/// The op keys the `alloff` arm expects `JAMMI_KERNELS_DISABLE` to name —
-/// `ALLOFF=attention_block_flash,adamw_step_fused` verbatim.
-pub const ALLOFF_KEYS: [&str; 2] = ["attention_block_flash", "adamw_step_fused"];
-
-/// `--lora-init`'s CLI spelling → [`LoraInitMode`].
-///
-/// The two tokens are `jammi_lora::LoraInitMode`'s own variants in
-/// snake_case, matching the spelling `grad_oracle.rs`'s tier already
-/// serializes (`format!("{:?}").to_lowercase()` would produce `zerosb`, a
-/// token no caller can type back in — this table is explicit for exactly
-/// that reason, and [`lora_init_as_str`] below is its inverse, so the
-/// emitted report field round-trips to the flag value that produced it).
 pub fn parse_lora_init(s: &str) -> Result<LoraInitMode, String> {
     match s {
         "zeros_b" => Ok(LoraInitMode::ZerosB),
@@ -541,8 +485,6 @@ pub struct FinetuneRunParams {
     /// `tokenizer.json` — REQUIRED for the real `EncoderAdapters` target;
     /// see this module's doc).
     pub model_dir: PathBuf,
-    /// The caller-declared arm (see [`Arm`]'s own doc).
-    pub arm: Arm,
     /// Which tower of `model_dir`'s checkpoint this run trains, and hence
     /// which of the two row vectors below carries this run's data (see
     /// [`Task`]'s own doc). [`Task::Text`] is the default.
@@ -650,12 +592,10 @@ pub struct FinetuneRunParams {
     /// [`jammi_kernels::admission::parse_disable_list`] — the SAME parser
     /// the env var itself is read through, never a second one (a divergent
     /// duplicate-preserving parser would hard-fail a VALID leg). `None` is the
-    /// ordinary, unchecked case. The `fused` arm in particular
-    /// makes no claim about `JAMMI_KERNELS_DISABLE` at all when this is
-    /// `None` — an operator may legitimately run it with OTHER, unrelated
-    /// op keys disabled; the two-sided witness that a DECISION leg's
-    /// `--arm fused` run really was unlabeled (no ambient contamination)
-    /// is the driver script's and its merger's to supply, not this binary's.
+    /// ordinary, unchecked case: the run makes no claim about
+    /// `JAMMI_KERNELS_DISABLE` at all, and the leg's `arm` states what the
+    /// process resolved. The witness that a decision leg ran unlabeled (no
+    /// ambient contamination) is the driver script's to supply.
     ///
     /// When `Some`, [`run`] enforces THREE separate things a
     /// `JAMMI_KERNELS_DISABLE` leg can each fail independently — the leg is
@@ -666,11 +606,8 @@ pub struct FinetuneRunParams {
     ///    [`jammi_kernels::admission::disabled_ops_requested`] EXACTLY —
     ///    the SAME set EQUALITY
     ///    [`crate::finetune_step::FinetuneStepParams::expect_kernels_disabled`]
-    ///    uses. (Not a SUBSET check: a "combined leg" naming a chain key on
-    ///    top of [`ALLOFF_KEYS`] can never exist, because the `--arm alloff`
-    ///    arm-level check refuses anything but EXACT equality to
-    ///    `ALLOFF_KEYS`, and a subset check would hide an ambient extra
-    ///    key.) The failure mode the check exists for — a
+    ///    uses. (Not a SUBSET check: a subset check would hide an ambient
+    ///    extra key.) The failure mode the check exists for — a
     ///    dropped, mistyped, unforwarded, or ambient-contaminated env var —
     ///    is caught either way: a dropped var makes the requested set
     ///    empty, a mistyped key is absent from it, and an ambient extra key
@@ -1955,7 +1892,7 @@ impl RunContext {
         // `resident` rung trains under one exactly as a worker's attempt
         // does; the evaluation loops of every rung are built against the
         // same row.
-        let job_id = format!("finetune-run-{}-{}-{}", params.arm.as_str(), params.seed, {
+        let job_id = format!("finetune-run-{}-{}", params.seed, {
             use std::time::{SystemTime, UNIX_EPOCH};
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2607,9 +2544,9 @@ pub fn run(
             .map(str::to_owned)
             .collect(),
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
+        arm: crate::kernel_arm::arm_label(&kernels_disabled_requested).to_string(),
         kernels_disabled_requested,
         kernels_disabled_fired,
-        arm: params.arm.as_str().to_string(),
         attention_arm: resolved_attention_arm,
         mutant: MutantStamp {
             mutant_id,
@@ -2709,7 +2646,7 @@ fn validate(params: &FinetuneRunParams) -> Result<(), Box<dyn std::error::Error 
             return Err(format!(
                 "finetune-run: --zero-lr-control is a way of running the trainer below \
                  admission, which the {} rung's job path never exposes — the control leg \
-                 belongs to the resident rung, where the kernel edge is judged",
+                 belongs to the resident rung, where the torch edge is judged",
                 params.rung.as_str()
             )
             .into());
@@ -2724,24 +2661,6 @@ fn validate(params: &FinetuneRunParams) -> Result<(), Box<dyn std::error::Error 
         }
     }
     mutant_labels(params)?;
-    // The `alloff` arm's declared intent must actually be what THIS process's
-    // `JAMMI_KERNELS_DISABLE` resolved to — the env var is what every process
-    // the rung starts inherits, so a dropped or mistyped variable fails here,
-    // before any run is paid for.
-    if params.arm == Arm::Alloff {
-        let mut expected: Vec<String> = ALLOFF_KEYS.iter().map(|s| s.to_string()).collect();
-        expected.sort();
-        let requested = jammi_kernels::admission::disabled_ops_requested();
-        if requested != expected {
-            return Err(format!(
-                "finetune-run: --arm alloff requires JAMMI_KERNELS_DISABLE to resolve to exactly \
-                 {expected:?}, but this process's JAMMI_KERNELS_DISABLE resolved to {requested:?} \
-                 — the env var was dropped, mistyped, or not forwarded to this process (INVALID \
-                 run, not a datum)"
-            )
-            .into());
-        }
-    }
     // `--expect-kernels-disabled`, check (1) of 3: set EQUALITY with this
     // process's real `JAMMI_KERNELS_DISABLE`; (2) and (3) read the run's own
     // process at the end of [`run`].
@@ -3059,7 +2978,6 @@ mod tests {
         };
         FinetuneRunParams {
             model_dir: tiny_bert_model_dir(),
-            arm: Arm::Fused,
             task: Task::Text,
             train_pairs: mk(0, 4),
             heldout_pairs: mk(100, 2),

@@ -340,7 +340,7 @@ pub(super) mod tests {
     pub fn reference_facts() -> Value {
         let mut facts = fused_facts();
         for (field, value) in [
-            ("arm", json!("alloff")),
+            ("arm", json!("eager")),
             (
                 "kernels_disabled_requested",
                 json!(["adamw_step_fused", "attention_block_flash"]),
@@ -394,7 +394,7 @@ pub(super) mod tests {
 
     #[test]
     fn legs_the_real_binary_emitted_clear_their_own_arm_and_fail_the_other() {
-        let (fused, reference) = (golden("modernbert_fused"), golden("modernbert_alloff"));
+        let (fused, reference) = (golden("modernbert_fused"), golden("modernbert_eager"));
         for leg in [&fused, &reference] {
             assert!(!fails(leg, LegPremise::ConstantSchedule));
             assert!(!fails(leg, LegPremise::PaddedAdmission));
@@ -406,7 +406,7 @@ pub(super) mod tests {
         assert!(fails(&fused, REFERENCE_ARM.clone()));
         assert!(!fails(&reference, REFERENCE_ARM.clone()));
         assert!(!fails(&reference, BLOCK_RAN));
-        assert!(!fails(&reference, LegPremise::Arm("alloff")));
+        assert!(!fails(&reference, LegPremise::Arm("eager")));
         assert!(fails(&reference, FUSED_ARM.clone()));
         assert!(fails(&reference, FLASH_RAN));
     }
@@ -418,7 +418,7 @@ pub(super) mod tests {
         assert!(!fails(&reference, REFERENCE_ARM.clone()));
         assert!(fails(&reference, FUSED_ARM.clone()));
         assert!(fails(&fused, REFERENCE_ARM.clone()));
-        assert!(fails(&fused, LegPremise::Arm("alloff")));
+        assert!(fails(&fused, LegPremise::Arm("eager")));
         assert!(!fails(&fused, LegPremise::Arm("fused")));
     }
 

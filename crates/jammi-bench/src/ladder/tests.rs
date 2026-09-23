@@ -1,6 +1,6 @@
 //! The operator against synthetic legs: every rule with a leg set that
-//! passes it and one that must fail it, and the committed how-well campaign
-//! as an oracle for the paired decision.
+//! passes it and one that must fail it, and the committed sessions as
+//! oracles for the readings the ladder reproduces.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use super::definition::{Budgets, Difference, Edge, Ladder, RuleForce, Workload};
 use super::leg::{Leg, LegName, LegSet};
 use super::mutant::{self, Detection, DoseColumn, DoseLabel, DoseLadder, MutantSpec};
 use super::outcome::{CrossStackOptions, Pair};
-use super::premise::tests::{fused_facts, reference_facts};
+use super::premise::tests::fused_facts;
 use super::refusal::Refusal;
 use super::speed;
 use super::verdict::{Direction, EdgeVerdict, Judgement, OutcomeVerdict, Status};
@@ -127,10 +127,20 @@ fn refused(verdict: &EdgeVerdict, matches: impl Fn(&Refusal) -> bool) -> bool {
     verdict.refusals.iter().any(|r| matches(&r.refusal))
 }
 
-// ── the kernel edge of train-run: a seeded, paired outcome ─────────────────
+// ── the torch edge of train-run: a seeded, paired outcome ──────────────────
 
-const REFERENCE: &str = "resident-reference";
+const TORCH: &str = "torch";
 const FUSED: &str = "resident";
+
+/// What a torch leg states about its run: the schedule, the probe series,
+/// the ties, the admission — no arm and no counters, since no kernel of the
+/// engine's ran.
+fn torch_facts() -> Value {
+    json!({
+        "schedule": "constant", "admission_is_dense": false, "tie_fraction": 0.0,
+        "epochs": 3, "train_probe_series": [3.32, 2.88, 2.74, 2.52], "backbone_dtype": "bf16"
+    })
+}
 
 fn train_leg(rung: &str, facts: Value, seed: usize, take: &str, fields: Value) -> Leg {
     let base = merged(facts, json!({"seed": seed, "lr": 2e-4}));
@@ -144,7 +154,7 @@ fn train_leg(rung: &str, facts: Value, seed: usize, take: &str, fields: Value) -
 fn control_legs(seed: usize) -> [Leg; 2] {
     let stalled = json!({"lr": 0.0, "train_probe_series": [3.32, 3.32, 3.32, 3.32], "held_out_example_mean": 3.3});
     [
-        train_leg(REFERENCE, reference_facts(), seed, "lr0", stalled.clone()),
+        train_leg(TORCH, torch_facts(), seed, "lr0", stalled.clone()),
         train_leg(FUSED, fused_facts(), seed, "lr0", stalled),
     ]
 }
@@ -173,13 +183,13 @@ fn measured_fields(leg: &Leg) -> Value {
     serde_json::to_value(&leg.measured).unwrap()
 }
 
-/// One seed per difference: the reference rung's loss, and the fused rung's
-/// loss `d` above it at every epoch; controls at the first two seeds.
-fn kernel_legs(d: &[f64]) -> Vec<Leg> {
+/// One seed per difference: the torch rung's loss, and the fused rung's loss
+/// `d` above it at every epoch; controls at the first two seeds.
+fn seeded_legs(d: &[f64]) -> Vec<Leg> {
     let measured = d.iter().enumerate().flat_map(|(i, d)| {
         let (seed, loss) = (i + 1, 3.0 + 0.01 * i as f64);
         [
-            train_leg(REFERENCE, reference_facts(), seed, "r1", learning(loss)),
+            train_leg(TORCH, torch_facts(), seed, "r1", learning(loss)),
             train_leg(FUSED, fused_facts(), seed, "r1", learning(loss + d)),
         ]
     });
@@ -189,10 +199,10 @@ fn kernel_legs(d: &[f64]) -> Vec<Leg> {
         .collect()
 }
 
-fn kernel_verdict(legs: Vec<Leg>) -> EdgeVerdict {
+fn torch_verdict(legs: Vec<Leg>) -> EdgeVerdict {
     edge_verdict(
         &committed_ladder(Workload::TrainRun),
-        REFERENCE,
+        TORCH,
         FUSED,
         &set(legs),
         &outcome_only(),
@@ -207,7 +217,7 @@ fn alternating(magnitude: f64) -> Vec<f64> {
 
 #[test]
 fn small_paired_differences_are_green_non_inferior_and_equivalent() {
-    let verdict = kernel_verdict(kernel_legs(&alternating(0.004)));
+    let verdict = torch_verdict(seeded_legs(&alternating(0.004)));
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
     for rule in [
         "outcome_non_inferior",
@@ -223,7 +233,7 @@ fn a_centred_but_wide_scatter_detects_nothing_and_establishes_nothing() {
     // No direction is detected, and none of that is evidence of "no worse":
     // the interval of the mean runs past the margin on both sides, so the
     // claim is not made.
-    let verdict = kernel_verdict(kernel_legs(&alternating(0.3)));
+    let verdict = torch_verdict(seeded_legs(&alternating(0.3)));
     assert_eq!(
         judgement(&verdict, "no_directional_difference").passed,
         Some(true)
@@ -241,7 +251,7 @@ fn an_upper_rung_better_by_more_than_the_margin_is_non_inferior_and_not_equivale
     let d: Vec<f64> = (0..12)
         .map(|i| if i % 3 == 0 { 0.02 } else { -0.12 })
         .collect();
-    let verdict = kernel_verdict(kernel_legs(&d));
+    let verdict = torch_verdict(seeded_legs(&d));
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
     assert_eq!(
         judgement(&verdict, "outcome_non_inferior").passed,
@@ -254,7 +264,7 @@ fn an_upper_rung_better_by_more_than_the_margin_is_non_inferior_and_not_equivale
     );
     // The mirror image — worse by the same amount — fails the claim.
     let worse: Vec<f64> = d.iter().map(|d| -d).collect();
-    let verdict = kernel_verdict(kernel_legs(&worse));
+    let verdict = torch_verdict(seeded_legs(&worse));
     assert_eq!(
         judgement(&verdict, "outcome_non_inferior").passed,
         Some(false)
@@ -264,7 +274,7 @@ fn an_upper_rung_better_by_more_than_the_margin_is_non_inferior_and_not_equivale
 
 #[test]
 fn a_concordant_degradation_is_red_and_an_improvement_is_investigated() {
-    let worse = kernel_verdict(kernel_legs(&[0.1; 12]));
+    let worse = torch_verdict(seeded_legs(&[0.1; 12]));
     assert_eq!(worse.status, Status::Red);
     assert!(matches!(
         worse.outcome,
@@ -276,7 +286,7 @@ fn a_concordant_degradation_is_red_and_an_improvement_is_investigated() {
     ));
     // A detected improvement is non-inferior by construction and is still
     // an anomaly to investigate.
-    let better = kernel_verdict(kernel_legs(&[-0.1; 12]));
+    let better = torch_verdict(seeded_legs(&[-0.1; 12]));
     assert_eq!(
         judgement(&better, "outcome_non_inferior").passed,
         Some(true)
@@ -291,16 +301,13 @@ fn ten_of_twelve_is_not_a_direction_and_eleven_is() {
             .map(|i| if i < positive { 0.001 } else { -0.001 })
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        kernel_verdict(kernel_legs(&signs(10))).status,
-        Status::Green
-    );
-    assert_eq!(kernel_verdict(kernel_legs(&signs(11))).status, Status::Red);
+    assert_eq!(torch_verdict(seeded_legs(&signs(10))).status, Status::Green);
+    assert_eq!(torch_verdict(seeded_legs(&signs(11))).status, Status::Red);
 }
 
 #[test]
 fn a_seed_count_the_rule_is_not_stated_for_is_refused() {
-    let verdict = kernel_verdict(kernel_legs(&alternating(0.004)[..11]));
+    let verdict = torch_verdict(seeded_legs(&alternating(0.004)[..11]));
     assert_eq!(verdict.status, Status::Invalid);
     assert!(refused(&verdict, |r| matches!(
         r,
@@ -314,13 +321,13 @@ fn a_seed_count_the_rule_is_not_stated_for_is_refused() {
 
 #[test]
 fn a_leg_that_fails_a_premise_is_measured_but_not_counted() {
-    let mut legs = kernel_legs(&alternating(0.004));
+    let mut legs = seeded_legs(&alternating(0.004));
     let flat = merged(
         learning(3.0),
         json!({"train_probe_series": [3.3, 3.3, 3.3, 3.3]}),
     );
     legs[1] = train_leg(FUSED, fused_facts(), 1, "r1", flat);
-    let verdict = kernel_verdict(legs);
+    let verdict = torch_verdict(legs);
     assert_eq!(verdict.status, Status::Invalid);
     assert!(refused(&verdict, |r| matches!(
         r,
@@ -343,9 +350,9 @@ fn a_leg_that_fails_a_premise_is_measured_but_not_counted() {
 
 #[test]
 fn a_missing_leg_is_refused_by_name() {
-    let mut legs = kernel_legs(&alternating(0.004));
+    let mut legs = seeded_legs(&alternating(0.004));
     legs.remove(1);
-    let verdict = kernel_verdict(legs);
+    let verdict = torch_verdict(legs);
     assert!(refused(
         &verdict,
         |r| matches!(r, Refusal::MissingLeg { rung, unit, .. } if rung == FUSED && unit == "seed1")
@@ -356,7 +363,7 @@ fn a_missing_leg_is_refused_by_name() {
 fn legs_that_disagree_on_identity_are_refused_even_when_each_seed_agrees_with_itself() {
     // Seeds 7..12 ran against another held-out fixture, on both rungs: every
     // seed's own pair agrees, and the sweep is still two experiments.
-    let legs = kernel_legs(&alternating(0.004))
+    let legs = seeded_legs(&alternating(0.004))
         .into_iter()
         .map(|l| {
             let seed: usize = l.name.unit.as_str()[4..].parse().unwrap();
@@ -364,7 +371,7 @@ fn legs_that_disagree_on_identity_are_refused_even_when_each_seed_agrees_with_it
                 let facts = if l.name.rung == FUSED {
                     fused_facts()
                 } else {
-                    reference_facts()
+                    torch_facts()
                 };
                 let fields = merged(
                     measured_fields(&l),
@@ -376,7 +383,7 @@ fn legs_that_disagree_on_identity_are_refused_even_when_each_seed_agrees_with_it
             }
         })
         .collect();
-    let verdict = kernel_verdict(legs);
+    let verdict = torch_verdict(legs);
     assert!(refused(
         &verdict,
         |r| matches!(r, Refusal::IdentityDisagreement { field, .. } if field == "heldout_pairs_sha256")
@@ -385,10 +392,10 @@ fn legs_that_disagree_on_identity_are_refused_even_when_each_seed_agrees_with_it
 
 #[test]
 fn an_identity_field_a_leg_does_not_state_is_refused() {
-    let mut legs = kernel_legs(&alternating(0.004));
+    let mut legs = seeded_legs(&alternating(0.004));
     let fields = merged(learning(3.0), json!({"lora_rank": null}));
-    legs[0] = train_leg(REFERENCE, reference_facts(), 1, "r1", fields);
-    let verdict = kernel_verdict(legs);
+    legs[0] = train_leg(TORCH, torch_facts(), 1, "r1", fields);
+    let verdict = torch_verdict(legs);
     assert!(refused(
         &verdict,
         |r| matches!(r, Refusal::IdentityMissing { field, .. } if field == "lora_rank")
@@ -397,18 +404,18 @@ fn an_identity_field_a_leg_does_not_state_is_refused() {
 
 #[test]
 fn a_repeat_further_from_its_first_run_than_the_seeds_are_from_each_other_is_refused() {
-    let mut legs = kernel_legs(&alternating(0.004));
+    let mut legs = seeded_legs(&alternating(0.004));
     legs.push(train_leg(FUSED, fused_facts(), 3, "r2", learning(9.0)));
-    let verdict = kernel_verdict(legs);
+    let verdict = torch_verdict(legs);
     assert!(refused(
         &verdict,
         |r| matches!(r, Refusal::RepeatExceedsSpread { unit, .. } if unit == "seed3")
     ));
 
-    let mut legs = kernel_legs(&alternating(0.004));
+    let mut legs = seeded_legs(&alternating(0.004));
     let same = measured_fields(&legs[5]);
     legs.push(train_leg(FUSED, fused_facts(), 3, "r2", same));
-    assert_eq!(kernel_verdict(legs).status, Status::Green);
+    assert_eq!(torch_verdict(legs).status, Status::Green);
 }
 
 /// The margin is not chosen: it is half the learning effect the reference
@@ -416,7 +423,7 @@ fn a_repeat_further_from_its_first_run_than_the_seeds_are_from_each_other_is_ref
 /// of the reference's improvement from its untrained loss.
 #[test]
 fn the_margin_is_half_the_reference_rungs_established_learning_effect() {
-    let verdict = kernel_verdict(kernel_legs(&alternating(0.004)));
+    let verdict = torch_verdict(seeded_legs(&alternating(0.004)));
     let Some(OutcomeVerdict::SeededLoss {
         assay: Some(assay),
         per_unit,
@@ -442,7 +449,7 @@ fn the_margin_is_half_the_reference_rungs_established_learning_effect() {
 /// at the judged point.
 #[test]
 fn the_judged_point_is_the_reference_rungs_minimum_not_its_final_epoch() {
-    let legs = kernel_legs(&alternating(0.004))
+    let legs = seeded_legs(&alternating(0.004))
         .into_iter()
         .map(|l| {
             if l.name.rung != FUSED || l.name.take.to_string() != "r1" {
@@ -455,7 +462,7 @@ fn the_judged_point_is_the_reference_rungs_minimum_not_its_final_epoch() {
             train_leg(FUSED, fused_facts(), seed, "r1", fields)
         })
         .collect();
-    let verdict = kernel_verdict(legs);
+    let verdict = torch_verdict(legs);
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
     let Some(OutcomeVerdict::SeededLoss { per_unit, .. }) = &verdict.outcome else {
         panic!("no paired outcome");
@@ -465,19 +472,19 @@ fn the_judged_point_is_the_reference_rungs_minimum_not_its_final_epoch() {
 
 #[test]
 fn a_reference_that_did_not_record_its_untrained_loss_cannot_set_a_margin() {
-    let legs = kernel_legs(&alternating(0.004))
+    let legs = seeded_legs(&alternating(0.004))
         .into_iter()
         .map(|l| {
-            if l.name.rung != REFERENCE || l.name.take.to_string() != "r1" {
+            if l.name.rung != TORCH || l.name.take.to_string() != "r1" {
                 return l;
             }
             let seed: usize = l.name.unit.as_str()[4..].parse().unwrap();
             let mut fields = measured_fields(&l);
             fields.as_object_mut().unwrap().remove("held_out_at_init");
-            train_leg(REFERENCE, reference_facts(), seed, "r1", fields)
+            train_leg(TORCH, torch_facts(), seed, "r1", fields)
         })
         .collect();
-    let verdict = kernel_verdict(legs);
+    let verdict = torch_verdict(legs);
     assert_eq!(verdict.status, Status::Invalid);
     assert!(refused(&verdict, |r| matches!(
         r,
@@ -490,11 +497,11 @@ fn a_reference_that_did_not_record_its_untrained_loss_cannot_set_a_margin() {
 
 #[test]
 fn the_control_must_be_run_must_be_a_control_and_must_not_learn() {
-    let without: Vec<Leg> = kernel_legs(&alternating(0.004))
+    let without: Vec<Leg> = seeded_legs(&alternating(0.004))
         .into_iter()
         .filter(|l| l.name.take.to_string() != "lr0")
         .collect();
-    let verdict = kernel_verdict(without.clone());
+    let verdict = torch_verdict(without.clone());
     assert!(refused(&verdict, |r| matches!(
         r,
         Refusal::ControlMissing {
@@ -509,7 +516,7 @@ fn the_control_must_be_run_must_be_a_control_and_must_not_learn() {
     waived.cross_stack.waive_control = true;
     let verdict = edge_verdict(
         &committed_ladder(Workload::TrainRun),
-        REFERENCE,
+        TORCH,
         FUSED,
         &set(without.clone()),
         &waived,
@@ -522,15 +529,9 @@ fn the_control_must_be_run_must_be_a_control_and_must_not_learn() {
     let control = |fields: Value| {
         let mut legs = without.clone();
         legs.extend(control_legs(2));
-        legs.push(train_leg(
-            REFERENCE,
-            reference_facts(),
-            1,
-            "lr0",
-            fields.clone(),
-        ));
+        legs.push(train_leg(TORCH, torch_facts(), 1, "lr0", fields.clone()));
         legs.push(train_leg(FUSED, fused_facts(), 1, "lr0", fields));
-        kernel_verdict(legs)
+        torch_verdict(legs)
     };
     let learned = control(json!({"lr": 0.0, "held_out_example_mean": 3.3}));
     assert!(refused(
@@ -1217,38 +1218,11 @@ fn a_law_the_legs_did_not_run_under_is_refused() {
 
 const STEP_UNIT: &str = "b8s128d0";
 
-/// The counted facts of a leg on the step ladder's `reference` rung: the
-/// flash cascade declined and the attention block behind it, AdamW eager,
-/// every other family fused.
-fn reference_arm_facts() -> Value {
-    let mut facts = fused_facts();
-    for (field, value) in [
-        ("arm", json!("alloff")),
-        ("attention_arm", json!("eager")),
-        (
-            "kernels_disabled_requested",
-            json!(["adamw_step_fused", "attention_block_flash"]),
-        ),
-        (
-            "kernels_disabled_fired",
-            json!(["adamw_step_fused", "attention_block_flash"]),
-        ),
-        ("adamw_fused_dispatches", json!(0)),
-        ("adamw_eager_dispatches", json!(26208)),
-        ("attention_block_flash_fused_dispatches", json!(0)),
-        ("attention_block_flash_declined_dispatches", json!(3276)),
-        ("attention_block_fused_dispatches", json!(3276)),
-    ] {
-        facts[field] = value;
-    }
-    facts
-}
-
 /// A leg of the step ladder: a `torch` leg carries no counted facts, a
-/// `reference` leg proves the reference arm.
+/// `fused` leg proves the fused arm and the flash cascade.
 fn step_leg(rung: &str, take: &str, fields: Value) -> Leg {
-    let facts = if rung == "reference" {
-        reference_arm_facts()
+    let facts = if rung == "fused" {
+        fused_facts()
     } else {
         json!({"backbone_dtype": "bf16"})
     };
@@ -1284,7 +1258,7 @@ fn step_repeats() -> Vec<Leg> {
     let timed = || json!({"warmup": 5, "steps_measured": 20, "max_grad_norm": 1.0});
     vec![
         step_leg("torch", "r1", timed()),
-        step_leg("reference", "r1", timed()),
+        step_leg("fused", "r1", timed()),
     ]
 }
 
@@ -1295,7 +1269,7 @@ const G: &[f32] = &[0.1, 0.2, 0.3];
 fn gradient_verdict(ladder: &Ladder, lower: Leg, upper: Leg) -> EdgeVerdict {
     let mut legs = step_repeats();
     legs.extend([lower, upper]);
-    edge_verdict(ladder, "torch", "reference", &set(legs), &outcome_only())
+    edge_verdict(ladder, "torch", "fused", &set(legs), &outcome_only())
 }
 
 #[test]
@@ -1307,7 +1281,7 @@ fn gradients_that_agree_at_shared_weights_pass_the_structure_and_a_zero_pair_is_
     let verdict = gradient_verdict(
         &committed_ladder(Workload::TrainStep),
         grads_leg("torch", tensors),
-        grads_leg("reference", tensors),
+        grads_leg("fused", tensors),
     );
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
     let structure = judgement(&verdict, "gradient_structure");
@@ -1342,12 +1316,12 @@ fn gradients_that_agree_at_shared_weights_pass_the_structure_and_a_zero_pair_is_
 fn a_measured_cosine_floor_judges_the_worst_tensor_as_evidence() {
     let ladder = budgeted(
         Workload::TrainStep,
-        &[("torch -> reference", "gradient_cosine_floor", 0.999)],
+        &[("torch -> fused", "gradient_cosine_floor", 0.999)],
     );
     let agreeing = gradient_verdict(
         &ladder,
         grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
-        grads_leg("reference", &[("layer.0.Wqkv.lora_b", W, G)]),
+        grads_leg("fused", &[("layer.0.Wqkv.lora_b", W, G)]),
     );
     assert_eq!(
         judgement(&agreeing, "gradient_cosine_floor").passed,
@@ -1356,10 +1330,7 @@ fn a_measured_cosine_floor_judges_the_worst_tensor_as_evidence() {
     let turned = gradient_verdict(
         &ladder,
         grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
-        grads_leg(
-            "reference",
-            &[("layer.0.Wqkv.lora_b", W, &[0.1, 0.2, -0.3])],
-        ),
+        grads_leg("fused", &[("layer.0.Wqkv.lora_b", W, &[0.1, 0.2, -0.3])]),
     );
     let floor = judgement(&turned, "gradient_cosine_floor");
     assert_eq!(
@@ -1375,7 +1346,7 @@ fn a_one_sided_zero_or_differing_weights_break_the_structure_and_fail_the_edge()
     let one_sided = gradient_verdict(
         &ladder,
         grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
-        grads_leg("reference", &[("layer.0.Wqkv.lora_b", W, ZERO)]),
+        grads_leg("fused", &[("layer.0.Wqkv.lora_b", W, ZERO)]),
     );
     assert_eq!(
         judgement(&one_sided, "gradient_structure").passed,
@@ -1385,10 +1356,7 @@ fn a_one_sided_zero_or_differing_weights_break_the_structure_and_fail_the_edge()
     let other_weights = gradient_verdict(
         &ladder,
         grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
-        grads_leg(
-            "reference",
-            &[("layer.0.Wqkv.lora_b", &[1.0, 2.0, 3.0001], G)],
-        ),
+        grads_leg("fused", &[("layer.0.Wqkv.lora_b", &[1.0, 2.0, 3.0001], G)]),
     );
     let structure = judgement(&other_weights, "gradient_structure");
     assert_eq!(structure.passed, Some(false));
@@ -1396,7 +1364,7 @@ fn a_one_sided_zero_or_differing_weights_break_the_structure_and_fail_the_edge()
     let missing_tensor = gradient_verdict(
         &ladder,
         grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]),
-        grads_leg("reference", &[("layer.0.Wo.lora_b", W, G)]),
+        grads_leg("fused", &[("layer.0.Wo.lora_b", W, G)]),
     );
     assert_eq!(missing_tensor.status, Status::Red);
 }
@@ -1407,7 +1375,7 @@ fn an_edge_asked_for_its_outcome_without_gradient_legs_is_refused() {
     let verdict = edge_verdict(
         &ladder,
         "torch",
-        "reference",
+        "fused",
         &set(step_repeats()),
         &outcome_only(),
     );
@@ -1422,10 +1390,10 @@ fn an_edge_asked_for_its_outcome_without_gradient_legs_is_refused() {
     // One side only is named.
     let mut legs = step_repeats();
     legs.push(grads_leg("torch", &[("layer.0.Wqkv.lora_b", W, G)]));
-    let verdict = edge_verdict(&ladder, "torch", "reference", &set(legs), &outcome_only());
+    let verdict = edge_verdict(&ladder, "torch", "fused", &set(legs), &outcome_only());
     assert!(refused(
         &verdict,
-        |r| matches!(r, Refusal::MissingLeg { rung, take, .. } if rung == "reference" && take == "grads")
+        |r| matches!(r, Refusal::MissingLeg { rung, take, .. } if rung == "fused" && take == "grads")
     ));
 }
 
@@ -1439,7 +1407,7 @@ fn a_gradient_leg_is_free_on_the_fields_a_single_forward_has_no_use_for_and_boun
     let free = gradient_verdict(
         &ladder,
         grads_leg("torch", tensors),
-        grads_leg("reference", tensors),
+        grads_leg("fused", tensors),
     );
     assert!(
         !refused(&free, |r| matches!(r, Refusal::IdentityDisagreement { .. })),
@@ -1447,7 +1415,7 @@ fn a_gradient_leg_is_free_on_the_fields_a_single_forward_has_no_use_for_and_boun
         free.refusals
     );
     let other_rank = step_leg(
-        "reference",
+        "fused",
         "grads",
         json!({
             "lora_rank": "other", "warmup": 0, "steps_measured": 0, "max_grad_norm": null,
@@ -1521,7 +1489,7 @@ fn two_columns_may_not_share_a_label_a_dose_or_a_patch() {
 }
 
 fn mutant_column(d: f64, stamped_patch: &str) -> DoseColumn {
-    let mut legs = kernel_legs(&alternating(0.004));
+    let mut legs = seeded_legs(&alternating(0.004));
     let stamp = json!({"mutant_id": "scaled-update", "mutant_base_sha": "base", "mutant_patch_sha256": stamped_patch});
     legs.extend((1..=12).map(|seed| {
         let loss = 3.0 + 0.01 * (seed - 1) as f64 + d;
@@ -1529,7 +1497,7 @@ fn mutant_column(d: f64, stamped_patch: &str) -> DoseColumn {
         train_leg("mutant-eps-0.50", fused_facts(), seed, "r1", fields)
     }));
     let ladder = committed_ladder(Workload::TrainRun);
-    let span = ladder.span(Some(REFERENCE), Some(FUSED)).unwrap();
+    let span = ladder.span(Some(TORCH), Some(FUSED)).unwrap();
     let spec = MutantSpec::parse(&format!("eps-0.50:{PATCH}")).unwrap();
     mutant::column(
         Workload::TrainRun,
@@ -1740,302 +1708,6 @@ fn a_rung_in_the_span_with_no_legs_is_a_missing_leg() {
         &verdict.edges[0],
         |r| matches!(r, Refusal::MissingLeg { rung, .. } if rung == PARTITIONED)
     ));
-}
-
-// ── oracle: the committed how-well campaign ────────────────────────────────
-
-fn measurements() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plans/63-how-well/measurements")
-}
-
-/// Identity fields the tier has gained since the campaign ran, at the values
-/// the campaign ran under: the defaults of flags it did not pass, and no
-/// media corpus.
-fn campaign_era_identity() -> Value {
-    json!({
-        "task": "text_embedding", "lora_init": "zeros_b", "layers_to_transform": null,
-        "train_media_sha256": null, "heldout_media_sha256": null, "max_seq_length": 64,
-        // The realized token batches were not digested when the campaign ran;
-        // one stamp on every leg says so and lets the legs share a premise.
-        "train_token_ids_sha256": "undigested-by-the-campaign",
-        "heldout_token_ids_sha256": "undigested-by-the-campaign"
-    })
-}
-
-/// The campaign's legs under this ladder's names. `stamp` is laid over each
-/// leg's block.
-fn campaign_legs(raw: &Path, rung_of: impl Fn(&str) -> Option<String>, stamp: &Value) -> Vec<Leg> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(raw)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    files.sort();
-    files
-        .iter()
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
-        .filter_map(|path| {
-            let stem = path.file_stem()?.to_str()?;
-            let (name, mut report) = (
-                rung_of(stem)?,
-                serde_json::from_slice::<Value>(&std::fs::read(path).ok()?).ok()?,
-            );
-            let block = report.pointer_mut("/tiers/finetune_run")?.as_object_mut()?;
-            block.extend(stamp.as_object().cloned().unwrap_or_default());
-            let name = LegName::parse(&format!("{name}.json")).ok()?;
-            Leg::from_report(Workload::TrainRun, name, &report, raw).ok()
-        })
-        .collect()
-}
-
-/// `seed3__alloff__r1` -> `resident-reference__seed3__r1`.
-fn main_campaign_name(stem: &str) -> Option<String> {
-    match stem.split("__").collect::<Vec<_>>().as_slice() {
-        [seed, arm, take] => {
-            let rung = if *arm == "fused" { FUSED } else { REFERENCE };
-            Some(format!("{rung}__{seed}__{take}"))
-        }
-        _ => None,
-    }
-}
-
-fn campaign_v2(stamp: &Value) -> Vec<Leg> {
-    campaign_legs(
-        &measurements().join("campaign-v2/raw"),
-        main_campaign_name,
-        stamp,
-    )
-}
-
-/// The committed campaign never evaluated the untrained model, so it cannot
-/// set a margin and the edge is refused for exactly that. Read at the
-/// pre-registered point — the reference's lowest epoch per seed, its first
-/// for ten of twelve seeds, the run overfitting from there — the two arms
-/// are seven to five with a mean difference under a hundredth: no direction,
-/// as at the run's end, where they were four to eight.
-#[test]
-fn the_committed_campaign_has_no_untrained_loss_and_finds_no_direction_at_the_judged_point() {
-    let legs = campaign_v2(&campaign_era_identity());
-    assert_eq!(
-        legs.len(),
-        12 * 4 + 2 * 2,
-        "12 seeds x 2 arms x 2 repeats, and the lr0 control at 2 seeds"
-    );
-    let verdict = kernel_verdict(legs);
-    let mut missing: Vec<&str> = verdict
-        .refusals
-        .iter()
-        .map(|r| match &r.refusal {
-            Refusal::MeasurementMissing {
-                measurement: "held_out_at_init",
-                subject,
-            } => subject.as_str(),
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    missing.sort_unstable();
-    assert_eq!(missing.len(), 12);
-    assert!(missing.iter().all(|s| s.starts_with(REFERENCE)));
-    assert_eq!(verdict.status, Status::Invalid);
-    let Some(OutcomeVerdict::SeededLoss {
-        sign_test: Some(sign),
-        mean_d: Some(mean_d),
-        per_unit,
-        clean_units,
-        critical_count,
-        direction,
-        repeat_floor,
-        control: Some(control),
-        assay: None,
-        margin_test: None,
-        ..
-    }) = verdict.outcome
-    else {
-        panic!("no paired outcome");
-    };
-    let epochs: Vec<Option<usize>> = per_unit.iter().map(|u| u.epoch).collect();
-    assert_eq!(epochs.iter().filter(|e| **e == Some(0)).count(), 10);
-    assert_eq!(epochs.iter().filter(|e| **e == Some(1)).count(), 2);
-    assert_eq!((sign.n, sign.n_pos, sign.n_neg, sign.ties), (12, 7, 5, 0));
-    assert_eq!(sign.p_value, 3172.0 / 4096.0);
-    assert!(
-        (mean_d - 0.007_766_763_369_242_35).abs() < 1e-15,
-        "{mean_d}"
-    );
-    assert_eq!(
-        (clean_units, critical_count, direction),
-        (12, Some(11), Direction::None)
-    );
-    assert_eq!(repeat_floor.max_delta, 0.0);
-    assert!((repeat_floor.spread - 0.038_397_022_443_222_434).abs() < 1e-15);
-    assert_eq!(
-        (control.units.as_slice(), control.waived),
-        (&["seed1".to_owned(), "seed2".to_owned()][..], false)
-    );
-}
-
-#[test]
-fn the_campaign_as_committed_predates_eight_identity_fields_and_is_refused_for_exactly_those() {
-    let verdict = kernel_verdict(campaign_v2(&json!({})));
-    assert_eq!(verdict.status, Status::Invalid);
-    let mut missing: Vec<&str> = verdict
-        .refusals
-        .iter()
-        .filter_map(|r| match &r.refusal {
-            Refusal::IdentityMissing { field, .. } => Some(field.as_str()),
-            _ => None,
-        })
-        .collect();
-    missing.sort_unstable();
-    assert_eq!(
-        missing,
-        [
-            "heldout_media_sha256",
-            "heldout_token_ids_sha256",
-            "layers_to_transform",
-            "lora_init",
-            "max_seq_length",
-            "task",
-            "train_media_sha256",
-            "train_token_ids_sha256"
-        ]
-    );
-}
-
-#[test]
-fn the_committed_dose_ladder_reproduces_its_columns() {
-    let report: Value = serde_json::from_slice(
-        &std::fs::read(measurements().join("dose-ladder/finetune_run_ab_report.json")).unwrap(),
-    )
-    .unwrap();
-    let specs: Vec<MutantSpec> = report["mutant_dose_ladder"]["doses"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| {
-            MutantSpec::parse(&format!(
-                "{}:{}",
-                d["dose_label"].as_str().unwrap(),
-                d["patch_sha256"].as_str().unwrap()
-            ))
-            .unwrap()
-        })
-        .collect();
-    let mut legs = campaign_v2(&campaign_era_identity());
-    // `eps-0.50__seed3` -> `mutant-eps-0.50__seed3__r1`.
-    legs.extend(campaign_legs(
-        &measurements().join("dose-ladder/raw"),
-        |stem| {
-            stem.split_once("__")
-                .map(|(dose, seed)| format!("mutant-{dose}__{seed}__r1"))
-        },
-        &campaign_era_identity(),
-    ));
-    let legs = set(legs);
-    let ladder = committed_ladder(Workload::TrainRun);
-    let span = ladder.span(Some(REFERENCE), Some(FUSED)).unwrap();
-    let doses = DoseLadder::fold(
-        specs
-            .iter()
-            .map(|spec| mutant::column(Workload::TrainRun, &span[0], &legs, spec, &outcome_only()))
-            .collect(),
-    );
-    let read = |c: &DoseColumn| match &c.verdict.outcome {
-        Some(OutcomeVerdict::SeededLoss {
-            sign_test: Some(s), ..
-        }) => (c.label.clone(), c.detected, s.n_pos, s.n_neg),
-        other => panic!("{}: {other:?} {:?}", c.label, c.verdict.refusals),
-    };
-    // At the judged point — the reference's first epoch for most seeds — a
-    // half-strength update has learned less and is detected as the
-    // degradation it is, on eleven of twelve seeds; a tenth-strength one is
-    // not resolved. At the run's end, where the reference had overfitted,
-    // both deflations read as improvements: the artefact of judging an
-    // overfitting run at its final epoch, not a finding about the doses.
-    assert_eq!(
-        doses.columns.iter().map(read).collect::<Vec<_>>(),
-        [
-            ("eps-0.50".to_owned(), Detection::Degradation, 11, 1),
-            ("eps-0.10".to_owned(), Detection::Undetected, 9, 3),
-            ("eps0.50".to_owned(), Detection::Undetected, 4, 8),
-        ]
-    );
-    assert_eq!(
-        doses.sensitivity,
-        Some(("eps-0.10".to_owned(), "eps-0.50".to_owned()))
-    );
-    assert!(doses.anomalies.is_empty());
-    assert!(doses.causes().is_empty());
-}
-
-/// The committed red-proof mutant — gradient ascent, declared so by its
-/// patch's sha — judged against the campaign's reference legs: all twelve
-/// pairs clean (every leg ascends, every untrained probe equals its
-/// partner's bit for bit), all twelve worse, and the proof discharged.
-#[test]
-fn the_committed_red_proof_is_detected_as_a_degradation_on_every_seed() {
-    let report: Value = serde_json::from_slice(
-        &std::fs::read(measurements().join("red-proof/dstar/finetune_run_ab_report.json")).unwrap(),
-    )
-    .unwrap();
-    let dose = &report["mutant_dose_ladder"]["doses"][0];
-    let spec = MutantSpec::parse(&format!(
-        "{}:{}",
-        dose["dose_label"].as_str().unwrap(),
-        dose["patch_sha256"].as_str().unwrap()
-    ))
-    .unwrap();
-    assert_eq!(spec.label, DoseLabel::RedProof("signflip-v2".into()));
-    let mut legs = campaign_v2(&campaign_era_identity());
-    // `signflip_v2__seed3` -> `mutant-redproof-signflip-v2__seed3__r1`.
-    legs.extend(campaign_legs(
-        &measurements().join("red-proof/raw"),
-        |stem| {
-            stem.strip_prefix("signflip_v2__")
-                .map(|seed| format!("mutant-redproof-signflip-v2__{seed}__r1"))
-        },
-        &campaign_era_identity(),
-    ));
-    let legs = set(legs);
-    let ladder = committed_ladder(Workload::TrainRun);
-    let span = ladder.span(Some(REFERENCE), Some(FUSED)).unwrap();
-    let column = mutant::column(Workload::TrainRun, &span[0], &legs, &spec, &outcome_only());
-    assert!(
-        column.verdict.refusals.is_empty(),
-        "{:#?}",
-        column.verdict.refusals
-    );
-    let Some(OutcomeVerdict::SeededLoss {
-        sign_test: Some(sign),
-        mean_d: Some(mean_d),
-        clean_units,
-        ..
-    }) = &column.verdict.outcome
-    else {
-        panic!("no paired outcome");
-    };
-    assert_eq!((*clean_units, sign.n_pos, sign.n_neg), (12, 12, 0));
-    assert_eq!(sign.p_value, 2.0 / 4096.0);
-    assert!((mean_d - 11.555_565_039_627_254).abs() < 1e-12, "{mean_d}");
-    assert_eq!(column.detected, Detection::Degradation);
-    let doses = DoseLadder::fold(vec![column]);
-    assert_eq!(doses.red_proof_proven, Some(true));
-    assert!(doses.causes().is_empty());
-
-    // The same legs filed under a patch with no declared direction are
-    // refused, and held to descent they are not clean.
-    let undeclared = MutantSpec::parse("redproof-signflip-v2:0000").unwrap();
-    let column = mutant::column(
-        Workload::TrainRun,
-        &span[0],
-        &legs,
-        &undeclared,
-        &outcome_only(),
-    );
-    assert_eq!(column.detected, Detection::Invalid);
-    assert!(refused(&column.verdict, |r| matches!(
-        r,
-        Refusal::MutantColumnInvalid { .. }
-    )));
 }
 
 // ── revision edges: one rung, two builds ───────────────────────────────────
@@ -2332,9 +2004,8 @@ fn step_facts(m: &Value, arm: &str) -> Value {
 /// reaches it: PASS is a cost outside the repeat noise band with the
 /// non-inferiority bound met; INDETERMINATE is a cost inside the band
 /// (the two repeats disagree by more than the ratio is from 1); INVALID is
-/// a refusal. The sweep has no leg of the reference rung, so the edge below
-/// it refuses every unit by name, and the end-to-end pair is read directly
-/// at every shape, as a session of its own.
+/// a refusal. The pair is also read directly at every shape, as a session of
+/// its own, and the two readings agree.
 #[test]
 fn the_committed_step_sweep_reproduces_every_configs_reading() {
     let (report, legs) = committed_step_sweep();
@@ -2398,35 +2069,19 @@ fn the_committed_step_sweep_reproduces_every_configs_reading() {
         2
     );
 
-    // The ladder over every shape: the sweep filed no leg of the reference
-    // rung, so the edge below it refuses every unit by name and nothing
-    // else. The committed sweep carries no gradient legs, so the outcome
-    // axis is left out.
+    // The ladder over every shape: the one edge, torch to fused, read on
+    // every unit. The committed sweep carries no gradient legs, so the
+    // outcome axis is left out.
     let cost_axes = axes(false, true, true, false);
-    let torch_to_reference = edge_verdict(&ladder, "torch", "reference", &legs, &cost_axes);
-    let missing: Vec<String> = torch_to_reference
-        .refusals
-        .iter()
-        .filter_map(|r| match &r.refusal {
-            Refusal::MissingLeg { rung, unit, .. } => Some(format!("{rung}/{unit}")),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        missing,
-        [
-            "reference/b16s128d0",
-            "reference/b16s128d0p05",
-            "reference/b8s128d0",
-            "reference/b8s128d0p05",
-            "reference/b8s512d0",
-            "reference/b8s512d0p05"
-        ]
+    let verdict = edge_verdict(&ladder, "torch", "fused", &legs, &cost_axes);
+    assert!(verdict.refusals.is_empty(), "{:#?}", verdict.refusals);
+    assert_eq!(verdict.units.len(), 6);
+    let speed = verdict.speed.as_ref().unwrap();
+    eprintln!(
+        "torch -> fused: cost {:.4}, host {:?}, device {:?}",
+        speed.cost.of_medians,
+        verdict.space.as_ref().unwrap().host_ratio,
+        verdict.space.as_ref().unwrap().device_ratio
     );
-    assert_eq!(
-        torch_to_reference.refusals.len(),
-        6,
-        "{:#?}",
-        torch_to_reference.refusals
-    );
+    assert_ne!(verdict.status, Status::Invalid);
 }

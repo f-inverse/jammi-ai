@@ -90,7 +90,6 @@ fn base_command_with_epochs(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args(["finetune-run", "--model-dir"])
         .arg(model_dir())
-        .args(["--arm", "fused"])
         .arg("--train-jsonl")
         .arg(&train_jsonl)
         .arg("--heldout-ids")
@@ -267,13 +266,13 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
         );
     }
 
-    // `--arm fused` was declared; the process made no kernel-disable claim.
+    // Nothing was requested off; the process made no kernel-disable claim.
     assert_eq!(obj["arm"], serde_json::json!("fused"));
 
     // GELU-erf positive-proof: `tiny_bert`'s
     // FFN (`BertIntermediate::forward`, `hidden_act: "gelu"`) calls
     // `jammi_encoders::activations::gelu_erf` in training mode at least
-    // once per layer per forward — this run's `--arm fused` and CPU F32
+    // once per layer per forward — this run's fused arm and CPU F32
     // backbone both satisfy `gelu_admission_predicate`'s domain, so the
     // fused arm must have actually dispatched, not merely registered a
     // counter that stayed at zero. A wrong registry key on the read side
@@ -284,7 +283,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     // bug, not merely that the field is present in the JSON.
     assert!(
         obj["gelu_fused_dispatches"].as_u64().unwrap_or(0) > 0,
-        "expected gelu_fused_dispatches > 0 for a tiny_bert --arm fused CPU F32 run: {:?}",
+        "expected gelu_fused_dispatches > 0 for a tiny_bert fused-arm CPU F32 run: {:?}",
         obj["gelu_fused_dispatches"]
     );
 

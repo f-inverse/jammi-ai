@@ -109,7 +109,7 @@ fn media_command(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args(["finetune-run", "--model-dir"])
         .arg(model_dir)
-        .args(["--arm", "fused", "--task", task])
+        .args(["--task", task])
         .arg("--train-jsonl")
         .arg(&jsonl)
         .arg("--heldout-ids")

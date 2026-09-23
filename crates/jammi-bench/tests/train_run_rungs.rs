@@ -65,7 +65,7 @@ fn run_rung(
     let output = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
         .args(["finetune-run", "--model-dir"])
         .arg(model_dir())
-        .args(["--arm", "fused", "--rung", rung])
+        .args(["--rung", rung])
         .arg("--train-jsonl")
         .arg(&fixture.train_jsonl)
         .arg("--heldout-ids")

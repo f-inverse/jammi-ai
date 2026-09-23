@@ -110,12 +110,6 @@ struct FinetuneRunArgs {
     /// `tokenizer.json`.
     #[arg(long)]
     model_dir: PathBuf,
-    /// `fused` or `alloff` — CALLER-declared (see `finetune_run::Arm`'s
-    /// doc); the caller is responsible for setting
-    /// `JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused`
-    /// itself before invoking this binary for the `alloff` arm.
-    #[arg(long)]
-    arm: String,
     /// Which TOWER of `--model-dir`'s checkpoint to fine-tune:
     /// `text_embedding` (the default), `image_embedding` (an
     /// OpenCLIP vision tower), or `audio_embedding` (an HF-CLAP HTSAT audio
@@ -695,7 +689,7 @@ enum Command {
         #[arg(long, default_value_t = 16.0)]
         lora_alpha: f64,
         #[arg(long, default_value_t = 0.05)]
-        lora_dropout: f32,
+        lora_dropout: f64,
         /// Comma-separated LoRA target selectors.
         #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
         target_modules: String,
@@ -1127,7 +1121,6 @@ async fn main() -> std::process::ExitCode {
         Command::FinetuneRun(args) => {
             let FinetuneRunArgs {
                 model_dir,
-                arm,
                 task,
                 train_jsonl,
                 heldout_ids,
@@ -1170,13 +1163,6 @@ async fn main() -> std::process::ExitCode {
             } = *args;
             let rung = match rung.parse::<finetune_run::Rung>() {
                 Ok(r) => r,
-                Err(e) => {
-                    eprintln!("finetune-run: {e}");
-                    return std::process::ExitCode::FAILURE;
-                }
-            };
-            let arm = match arm.parse::<finetune_run::Arm>() {
-                Ok(a) => a,
                 Err(e) => {
                     eprintln!("finetune-run: {e}");
                     return std::process::ExitCode::FAILURE;
@@ -1296,7 +1282,6 @@ async fn main() -> std::process::ExitCode {
             };
             let params = finetune_run::FinetuneRunParams {
                 model_dir,
-                arm,
                 task,
                 train_pairs,
                 heldout_pairs,

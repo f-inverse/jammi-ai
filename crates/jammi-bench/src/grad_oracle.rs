@@ -3,7 +3,7 @@
 //!
 //! ## Why gradients, not losses
 //!
-//! [`crate::finetune_step`] and the `train-step` ladder's kernel edge over
+//! [`crate::finetune_step`] and the `train-step` ladder's torch edge over
 //! it prove fused-vs-eager equivalence: same jammi build, one kernel path
 //! forced on or off. That is evidence about fusion, not about learning —
 //! if jammi's eager path itself computed a wrong gradient, both arms would
@@ -276,11 +276,7 @@ pub fn run(params: &GradOracleParams) -> Result<Leg<TrainStepPayload>, Box<dyn s
         );
     }
 
-    let arm = if kernels_disabled_requested.is_empty() {
-        "fused"
-    } else {
-        "alloff"
-    };
+    let arm = crate::kernel_arm::arm_label(&kernels_disabled_requested);
     let not_timed = || Measurement::not_yet_measured("s");
     let payload = TrainStepPayload {
         device: device_label,

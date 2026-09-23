@@ -175,11 +175,6 @@ pub fn cross_stack(
     claims: Claims,
 ) -> AxisResult<OutcomeVerdict> {
     match rules {
-        CrossStackOutcome::None => AxisResult {
-            verdict: None,
-            judgements: vec![],
-            refusals: vec![],
-        },
         CrossStackOutcome::RowAgreement { metric, force } => row_agreement(pair, *metric, *force),
         CrossStackOutcome::GradientAgreement {
             take,

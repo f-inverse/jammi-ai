@@ -60,9 +60,13 @@ see `finetune_run.rs`'s
 `fused_dispatch_proof_gate_passes_bert_counted_eager_head16_shape`). BERT has
 no fused RoPE/GEGLU kernel, so those pairs read `0 / 0`.
 
-## `modernbert_fused.json` / `modernbert_alloff.json` — A100
+## `modernbert_fused.json` / `modernbert_eager.json` — A100
 
-The `fused_r1`/`alloff_r1` legs of one `finetune_run_ab.sh` run
+The `fused_r1`/`alloff_r1` legs of one `finetune_run_ab.sh` run (an `alloff` arm
+that script had then: the flash cascade and the fused AdamW step requested off;
+the leg's `arm` field reads `eager`, the label the binary emits for a process
+with families off — the one field of `modernbert_eager.json` that differs from
+the source leg)
 (`FINETUNE_RUN_AB_SEEDS=1`, `MODEL_DIR` = `answerdotai/ModernBERT-large`,
 `head_dim == 64`), built `--features cuda,jammi-encoders/flash-attn`
 (`flash_compiled: true` on both legs) at
@@ -85,11 +89,11 @@ premise is clean.
 | golden file | sha256 (== the source leg's sha256) | source leg |
 |---|---|---|
 | `modernbert_fused.json` | `0f3a0cdefb0494136fbb2ae7a73660c693680c0e1b1b62dafa9f505cfdc1d412` | `raw/seed1__fused__r1.json` |
-| `modernbert_alloff.json` | `66131ef2705f8681f0acf036bc997bc3170ff7f15f42b1b0467d8c7515b57e98` | `raw/seed1__alloff__r1.json` |
+| `modernbert_eager.json` | `66131ef2705f8681f0acf036bc997bc3170ff7f15f42b1b0467d8c7515b57e98` (the source leg's) | `raw/seed1__alloff__r1.json` |
 
 Dispatch counters (fused / declined-or-eager):
 
-| base | `modernbert_fused.json` | `modernbert_alloff.json` |
+| base | `modernbert_fused.json` | `modernbert_eager.json` |
 |---|---|---|
 | `ln` | 6669 / 0 | 6669 / 0 |
 | `rope` | 0 / 0 (absorbed) | 0 / 0 (absorbed) |

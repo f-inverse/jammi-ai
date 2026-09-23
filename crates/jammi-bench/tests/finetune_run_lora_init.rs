@@ -69,7 +69,6 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args(["finetune-run", "--model-dir"])
         .arg(model_dir())
-        .args(["--arm", "fused"])
         .arg("--train-jsonl")
         .arg(&train_jsonl)
         .arg("--heldout-ids")

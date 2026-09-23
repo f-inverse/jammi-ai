@@ -46,25 +46,21 @@ class TrainStepProducer(unittest.TestCase):
         self.assertEqual(
             legs,
             [
-                "reference__b8s128d0__r1",
                 "fused__b8s128d0__r1",
                 "torch__b8s128d0__r1",
                 "torch__b8s128d0__r2",
                 "fused__b8s128d0__r2",
-                "reference__b8s128d0__r2",
-                "reference__b8s512d0p05__r1",
                 "fused__b8s512d0p05__r1",
                 "torch__b8s512d0p05__r1",
                 "torch__b8s512d0p05__r2",
                 "fused__b8s512d0p05__r2",
-                "reference__b8s512d0p05__r2",
             ],
         )
         self.assertIn("ladder train-step", out)
         self.assertRegex(out, r"--axes speed\\?,space")
-        # The reference arm's disable list is derived, never typed: the dry
-        # run prints the placeholder the derivation would replace.
-        self.assertNotIn("layer_norm_fused,", out)
+        # Every jammi leg claims the fused arm: nothing requested off.
+        for argv in re.findall(r"^--- fused__\S+: (.*)$", out, flags=re.M):
+            self.assertIn("--expect-kernels-disabled ''", argv)
 
 
 class EncodeRevisionProducer(unittest.TestCase):

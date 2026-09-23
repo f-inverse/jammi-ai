@@ -268,12 +268,7 @@ pub fn cpu_provenance() -> Provenance {
             .collect(),
         flash_compiled: jammi_kernels::admission::FLASH_COMPILED,
         kernels_disabled_fired: jammi_kernels::admission::disabled_ops_fired(),
-        arm: if kernels_disabled_requested.is_empty() {
-            "fused"
-        } else {
-            "alloff"
-        }
-        .to_string(),
+        arm: crate::kernel_arm::arm_label(&kernels_disabled_requested).to_string(),
         // The graph workloads' attention is the eager composition.
         attention_arm: "eager".to_string(),
         kernels_disabled_requested,

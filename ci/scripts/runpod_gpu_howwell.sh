@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # how-well GPU driver: rents a real A100 (sm_80), clones the
 # checkout at GIT_REF onto it, and runs `ci/scripts/perf/finetune_run_ab.sh`
-# remotely — the producer of the `train-run` ladder's kernel edge, executed
+# remotely — the producer of the `train-run` ladder's torch edge, executed
 # against a live checkpoint. Shared deploy/run/teardown
 # lives in runpod_lib.sh, the same machinery `runpod_gpu_prove.sh` already
 # uses (rp_sweep/rp_init/rp_deploy_live_a100/rp_run_remote) — this script is
@@ -139,11 +139,17 @@ fi
   || { echo "::error::'pip install --no-deps -e cookbook/book' into /root/howwell-venv failed -- refusing." >&2; exit 1; }
 echo "::endgroup::"
 
-echo "::group::how-well A/B (finetune_run_ab.sh)"
+echo "::group::torch venv (torch_venv.py --provision)"
+python3 ci/scripts/perf/torch_venv.py --provision \
+  || { echo "::error::the torch venv could not be provisioned on this pod -- refusing before any leg." >&2; exit 1; }
+echo "::endgroup::"
+
+echo "::group::train-run, torch edge (finetune_run_ab.sh)"
 MODEL_DIR="${HOWWELL_MODEL_DIR}" \
   FINETUNE_RUN_AB_SEEDS="${HOWWELL_SEEDS}" \
   FINETUNE_RUN_AB_OBJECTIVE="${HOWWELL_OBJECTIVE}" \
   FINETUNE_RUN_AB_LR0_SEEDS="${HOWWELL_LR0_SEEDS}" \
+  FINETUNE_RUN_AB_LORA_DROPOUT=0 \
   FINETUNE_RUN_AB_PROVISION_PYTHON=/root/howwell-venv/bin/python3 \
   bash ci/scripts/perf/finetune_run_ab.sh
 rc=\$?
@@ -183,7 +189,7 @@ else
 fi
 
 # --- surface the ladder's status by NAME, with every cause it names: the
-# verdict's `status` already folds the kernel edge, every refusal and the
+# verdict's `status` already folds the torch edge, every refusal and the
 # mutant columns, and `causes` says which. Defensive: if the remote's own exit
 # code somehow read 0 despite a non-GREEN status, force non-zero here rather
 # than let a mismatch pass silently.

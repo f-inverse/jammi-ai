@@ -249,9 +249,6 @@ pub enum Difference {
     /// The rung below runs in a reference framework; this rung is the
     /// engine's lowest stack of the workload.
     Framework { reference: &'static str },
-    /// The same engine, with these fused-kernel families off below and on
-    /// above.
-    KernelArm { families_on: Vec<KernelFamily> },
     /// One engine layer, added above.
     Layer { name: &'static str },
     /// The same rung, built from another revision of the engine.
@@ -259,22 +256,9 @@ pub enum Difference {
 }
 
 impl Difference {
-    fn kernel_arm(below: &KernelArm, above: &KernelArm) -> Self {
-        Self::KernelArm {
-            families_on: below.off.difference(&above.off).copied().collect(),
-        }
-    }
-
     pub fn describe(&self) -> String {
         match self {
             Self::Framework { reference } => format!("the engine against {reference}"),
-            Self::KernelArm { families_on } => {
-                let names: Vec<String> = families_on
-                    .iter()
-                    .map(super::verdict::serde_plain)
-                    .collect();
-                format!("the fused kernels {}", names.join(", "))
-            }
             Self::Layer { name } => (*name).to_owned(),
             Self::Revision => "another revision of the engine".to_owned(),
         }
@@ -301,18 +285,13 @@ impl Rung {
         }
     }
 
-    /// A jammi training rung on `arm`: besides `premises`, its legs must
-    /// state the arm and prove it by their dispatch counters, and dispatch
-    /// `must_run` fused.
-    fn on_arm(
-        name: &str,
-        arm: KernelArm,
-        must_run: &[KernelFamily],
-        premises: Vec<LegPremise>,
-    ) -> Self {
+    /// A jammi training rung: besides `premises`, its legs must state the
+    /// fused arm and prove it by their dispatch counters — no family
+    /// requested off, none fallen back — and dispatch `must_run` fused.
+    fn fused(name: &str, must_run: &[KernelFamily], premises: Vec<LegPremise>) -> Self {
         let mut premises = premises;
-        premises.push(LegPremise::Arm(arm.label()));
-        premises.push(LegPremise::KernelArm(arm));
+        premises.push(LegPremise::Arm("fused"));
+        premises.push(LegPremise::KernelArm(KernelArm::fused()));
         premises.extend(must_run.iter().map(|f| LegPremise::Dispatched(*f)));
         Self::new(name, premises)
     }
@@ -462,9 +441,6 @@ pub enum CrossStackOutcome {
         /// a tensor one side lacks, weights that differ — counts.
         structure: RuleForce,
     },
-    /// The artifact is a cost, not a result: a step over synthetic inputs
-    /// has no outcome to compare.
-    None,
 }
 
 /// The take gradient legs are filed under.
@@ -792,17 +768,6 @@ impl<'a> EdgeRules<'a> {
 const TORCH: &str = "torch";
 const PYTORCH: &str = "PyTorch";
 
-/// The reference arm of both training ladders: the two families the fused
-/// kernels are judged against, both live on the checkpoints they run on.
-/// The composition with every family off is not a rung — the eager
-/// composition keeps every intermediate of every site alive for the
-/// backward and widens each LoRA epilogue to `f32`, so at the shapes the
-/// ladders sweep it exceeds a device the fused arm fits in twelve times
-/// over; an arm the device cannot hold controls nothing.
-fn training_reference_arm() -> KernelArm {
-    KernelArm::off([KernelFamily::FlashAttention, KernelFamily::AdamW])
-}
-
 fn train_run_ladder(budgets: &Budgets) -> Ladder {
     let w = Workload::TrainRun;
     let learns = || {
@@ -813,53 +778,29 @@ fn train_run_ladder(budgets: &Budgets) -> Ladder {
             LegPremise::PaddedAdmission,
         ]
     };
-    let fused = |name| {
-        Rung::on_arm(
-            name,
-            KernelArm::fused(),
-            &[KernelFamily::FlashAttention],
-            learns(),
-        )
-    };
-    let reference_arm = training_reference_arm();
+    let fused = |name| Rung::fused(name, &[KernelFamily::FlashAttention], learns());
     let mut streamed = fused("streamed");
     streamed.flat_host_memory = Some(EdgeRules::flat_host_memory(budgets, w, "streamed"));
     Ladder {
         workload: w,
         reference: Rung::new(TORCH, learns()),
-        cross_stack: vec![
-            (
-                Rung::on_arm(
-                    "resident-reference",
-                    reference_arm.clone(),
-                    &[KernelFamily::AttentionBlock],
-                    learns(),
+        cross_stack: vec![(
+            fused("resident"),
+            Difference::Framework { reference: PYTORCH },
+            EdgeRules::of(budgets, w, TORCH, "resident").cross_stack(
+                seeded_loss(
+                    Some(ControlRule {
+                        take: "lr0",
+                        field: "lr",
+                        value: 0.0,
+                        required_units: 2,
+                    }),
+                    RuleForce::Hard,
                 ),
-                Difference::Framework { reference: PYTORCH },
-                EdgeRules::of(budgets, w, TORCH, "resident-reference").cross_stack(
-                    seeded_loss(None, RuleForce::Evidence),
-                    false,
-                    true,
-                ),
+                false,
+                true,
             ),
-            (
-                fused("resident"),
-                Difference::kernel_arm(&reference_arm, &KernelArm::fused()),
-                EdgeRules::of(budgets, w, "resident-reference", "resident").cross_stack(
-                    seeded_loss(
-                        Some(ControlRule {
-                            take: "lr0",
-                            field: "lr",
-                            value: 0.0,
-                            required_units: 2,
-                        }),
-                        RuleForce::Hard,
-                    ),
-                    false,
-                    true,
-                ),
-            ),
-        ],
+        )],
         exact: vec![
             (
                 streamed,
@@ -886,52 +827,25 @@ fn train_run_ladder(budgets: &Budgets) -> Ladder {
     }
 }
 
-/// One optimizer step over a synthetic batch, swept over shapes: the step's
-/// cost against PyTorch's, and what every fused kernel together is worth.
-/// The outcome of the framework edge is gradient agreement at shared
-/// weights, read off the edge's `grads` take.
 fn train_step_ladder(budgets: &Budgets) -> Ladder {
     let w = Workload::TrainStep;
-    let reference_arm = training_reference_arm();
-    let torch_edge = EdgeRules::of(budgets, w, TORCH, "reference");
+    let torch_edge = EdgeRules::of(budgets, w, TORCH, "fused");
     Ladder {
         workload: w,
         reference: Rung::new(TORCH, vec![]),
-        cross_stack: vec![
-            (
-                Rung::on_arm(
-                    "reference",
-                    reference_arm.clone(),
-                    &[KernelFamily::AttentionBlock],
-                    vec![],
-                ),
-                Difference::Framework { reference: PYTORCH },
-                torch_edge.cross_stack(
-                    CrossStackOutcome::GradientAgreement {
-                        take: GRADIENTS_TAKE,
-                        cosine_floor: torch_edge
-                            .rule(rule::GRADIENT_COSINE_FLOOR, RuleForce::Evidence),
-                        structure: RuleForce::Hard,
-                    },
-                    false,
-                    false,
-                ),
+        cross_stack: vec![(
+            Rung::fused("fused", &[KernelFamily::FlashAttention], vec![]),
+            Difference::Framework { reference: PYTORCH },
+            torch_edge.cross_stack(
+                CrossStackOutcome::GradientAgreement {
+                    take: GRADIENTS_TAKE,
+                    cosine_floor: torch_edge.rule(rule::GRADIENT_COSINE_FLOOR, RuleForce::Evidence),
+                    structure: RuleForce::Hard,
+                },
+                false,
+                false,
             ),
-            (
-                Rung::on_arm(
-                    "fused",
-                    KernelArm::fused(),
-                    &[KernelFamily::FlashAttention],
-                    vec![],
-                ),
-                Difference::kernel_arm(&reference_arm, &KernelArm::fused()),
-                EdgeRules::of(budgets, w, "reference", "fused").cross_stack(
-                    CrossStackOutcome::None,
-                    false,
-                    false,
-                ),
-            ),
-        ],
+        )],
         exact: vec![],
     }
 }
@@ -1172,26 +1086,10 @@ mod tests {
             for edge in ladder.edges() {
                 match (edge.kind(), edge.difference()) {
                     (EdgeKind::CrossStack(_), Difference::Framework { .. })
-                    | (EdgeKind::CrossStack(_), Difference::KernelArm { .. })
                     | (EdgeKind::Exact(_), Difference::Layer { .. }) => {}
                     (kind, difference) => panic!("{}: {kind:?} with {difference:?}", edge.name()),
                 }
             }
-        }
-    }
-
-    #[test]
-    fn a_kernel_arm_difference_names_the_families_switched_on() {
-        // Both training ladders judge the fused kernels against one arm.
-        for workload in [Workload::TrainRun, Workload::TrainStep] {
-            let ladder = workload.ladder_with(&Budgets::committed());
-            assert_eq!(
-                *ladder.edges()[1].difference(),
-                Difference::KernelArm {
-                    families_on: vec![KernelFamily::FlashAttention, KernelFamily::AdamW],
-                },
-                "{workload:?}"
-            );
         }
     }
 
@@ -1220,12 +1118,10 @@ mod tests {
     #[test]
     fn a_span_is_contiguous_and_refuses_unknown_or_empty_ranges() {
         let ladder = Workload::TrainRun.ladder_with(&Budgets::committed());
-        let span = ladder
-            .span(Some("resident-reference"), Some("resident"))
-            .unwrap();
+        let span = ladder.span(Some("torch"), Some("resident")).unwrap();
         assert_eq!(span.len(), 1);
-        assert_eq!(span[0].name(), "resident-reference -> resident");
-        assert_eq!(ladder.span(None, None).unwrap().len(), 5);
+        assert_eq!(span[0].name(), "torch -> resident");
+        assert_eq!(ladder.span(None, None).unwrap().len(), 4);
         assert!(matches!(
             ladder.span(Some("nope"), None),
             Err(Refusal::UnknownRung { .. })
@@ -1239,7 +1135,7 @@ mod tests {
     #[test]
     fn ladders_are_as_long_as_their_workload_needs() {
         let lengths: Vec<usize> = ladders().map(|l| l.rungs().count()).collect();
-        assert_eq!(lengths, [6, 3, 6, 2, 5, 4, 4]);
+        assert_eq!(lengths, [6, 2, 5, 2, 5, 4, 4]);
     }
 
     #[test]

@@ -201,8 +201,8 @@ pub struct Provenance {
     pub kernels_disabled_requested: Vec<String>,
     /// Which of those keys disabled a live dispatch, sorted.
     pub kernels_disabled_fired: Vec<String>,
-    /// The kernel arm the leg claims — `fused`, or `alloff` for an arm with
-    /// families off — which its dispatch counters prove.
+    /// The kernel arm the leg claims — `fused`, or `eager` for a process
+    /// with families off — which its dispatch counters prove.
     pub arm: String,
     /// The attention reference class the leg resolved to: `eager` or
     /// `fused`.

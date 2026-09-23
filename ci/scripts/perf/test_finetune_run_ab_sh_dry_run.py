@@ -161,6 +161,11 @@ class DefaultDryRun(unittest.TestCase):
         self.assertNotIn(None, work_dirs)
         self.assertEqual(len(set(work_dirs)), len(work_dirs), "two legs would share one work dir")
 
+    def test_the_device_is_soaked_before_the_first_timed_leg(self):
+        lines = [line for line in self.result.stdout.splitlines() if line.startswith("--- ")]
+        self.assertTrue(lines[0].startswith("--- soak: seed1 fused"), lines[0])
+        self.assertNotIn("soak", {repeat for _seed, _arm, repeat in self.legs})
+
     def test_no_leg_names_a_kernel_arm(self):
         for key, argv in self.legs.items():
             self.assertNotIn("--arm", argv, key)

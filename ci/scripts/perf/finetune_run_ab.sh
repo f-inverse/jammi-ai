@@ -64,9 +64,12 @@
 # by default -- override with FINETUNE_RUN_AB_SEEDS (a
 # comma-separated list, no spaces).
 #
-# LEG ORDER, per seed: fused r1, torch r1, torch-natural r1, torch-natural
-# r2, torch r2, fused r2 — each arm's two repeats sit symmetrically about the
-# middle of the seed's block (A, T, N, N, T, A; never A, A, T, T), so a first-order
+# LEG ORDER: one untimed soak of the first seed's fused job first, so the
+# device is at its steady state before anything is timed (a cold device's
+# first sustained run drifts over its own series). Then, per seed: fused r1,
+# torch r1, torch-natural r1, torch-natural r2, torch r2, fused r2 — each
+# arm's two repeats sit symmetrically about the middle of the seed's block
+# (A, T, N, N, T, A; never A, A, T, T), so a first-order
 # clock/thermal drift across the block shifts every arm's r1/r2 mean by the
 # same amount instead of landing on whichever arm ran last. Same rationale
 # as `finetune_ab.sh`'s "ORDER-BALANCED BAR LEGS". FINETUNE_RUN_AB_ARMS
@@ -601,6 +604,21 @@ run_leg() {
   fi
   return 0
 }
+
+# The device is brought to its steady state before the first timed leg: one
+# untimed run of the first seed's fused job, filed nowhere. A cold device's
+# clocks settle during its first sustained run, and a leg timed across that
+# settling drifts over its own series, which the ladder refuses as
+# non-stationary; the soak absorbs it, on every session alike.
+if arm_selected fused; then
+  soak_dir="$OUT_DIR/work/soak"
+  mkdir -p "$soak_dir"
+  printf -- '--- soak: seed%s fused (untimed, not filed)\n' "${SEEDS[0]}"
+  if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
+    run_leg "${SEEDS[0]}" fused soak "$soak_dir" >/dev/null
+    rm -f "$RAW_DIR"/resident__seed"${SEEDS[0]}"__soak.*
+  fi
+fi
 
 # One seed's legs, in run order -- see "LEG ORDER" in the header.
 SEED_LEGS=(fused:r1 torch:r1 torch-natural:r1 torch-natural:r2 torch:r2 fused:r2)

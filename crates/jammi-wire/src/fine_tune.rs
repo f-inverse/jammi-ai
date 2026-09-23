@@ -248,7 +248,8 @@ pub struct FineTuneConfig {
     pub epochs: usize,
     /// Micro-batch size. Default: 8.
     pub batch_size: usize,
-    /// Maximum sequence length for tokenization. Default: 512.
+    /// Maximum sequence length for tokenization. Default:
+    /// [`DEFAULT_MAX_SEQ_LENGTH`].
     pub max_seq_length: usize,
     /// Loss function for embedding fine-tuning. Auto-selected from data format if None.
     pub embedding_loss: Option<EmbeddingLoss>,
@@ -482,6 +483,12 @@ where
     Ok(v)
 }
 
+/// [`FineTuneConfig::max_seq_length`]'s default — the truncation length a
+/// fine-tune gets when its spec names none. A named constant so that an
+/// instrument measuring the trainer can default to the regime users actually
+/// run in, rather than to a second literal that drifts from this one.
+pub const DEFAULT_MAX_SEQ_LENGTH: usize = 512;
+
 impl Default for FineTuneConfig {
     fn default() -> Self {
         Self {
@@ -491,7 +498,7 @@ impl Default for FineTuneConfig {
             learning_rate: 2e-4,
             epochs: 3,
             batch_size: 8,
-            max_seq_length: 512,
+            max_seq_length: DEFAULT_MAX_SEQ_LENGTH,
             embedding_loss: None,
             classification_loss: None,
             regression_loss: None,

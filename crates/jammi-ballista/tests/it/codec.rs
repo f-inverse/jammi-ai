@@ -9,7 +9,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
 use jammi_ai::model::ModelTask;
-use jammi_ai::operator::inference_exec::InferenceExec;
+use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
 use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
@@ -187,8 +187,8 @@ async fn codec_never_rewrites_device_kind() {
     );
 }
 
-/// `NumberedInputExec` carries its one construction input, the row order, in
-/// both of its forms.
+/// `NumberedInputExec` carries its construction inputs — the row order in
+/// both of its forms, and the spec its rows are costed and chunked by.
 #[tokio::test]
 async fn numbered_input_exec_round_trips() {
     let session = session().await;
@@ -200,10 +200,17 @@ async fn numbered_input_exec_round_trips() {
             key_column: "id".into(),
         },
     ] {
+        let spec = InferenceSpec {
+            content_columns: vec!["id".into()],
+            key_column: "id".into(),
+            ..crate::text_embedding_spec(ComputeDeviceKind::Cpu, 2)
+        };
         let node: Arc<dyn ExecutionPlan> = Arc::new(
             NumberedInputExec::try_new(
                 two_col_scan("id", "_content_hash", &["b", "a"]),
                 order.clone(),
+                spec.clone(),
+                session.inference_runtime(),
             )
             .unwrap(),
         );
@@ -213,6 +220,7 @@ async fn numbered_input_exec_round_trips() {
         let decoded = codec.try_decode(&buf, &inputs, &ctx).unwrap();
         let decoded = decoded.downcast_ref::<NumberedInputExec>().unwrap();
         assert_eq!(decoded.order(), &order);
+        assert_eq!(decoded.spec(), &spec);
         assert_eq!(decoded.schema(), node.schema());
     }
 }
@@ -236,20 +244,20 @@ async fn key_check_exec_round_trips() {
 }
 
 #[tokio::test]
-async fn gang_exec_round_trips() {
+async fn placed_attempt_round_trips() {
     let session = session().await;
-    let descriptor = jammi_ai::operator::gang_exec::GangDescriptor {
+    let descriptor = jammi_ai::operator::placed_attempt_exec::PlacedAttempt {
         job_id: "job-1".to_string(),
         attempt: 3,
-        world: 2,
         submitter: "instance-a".to_string(),
         // Deliberately NOT the session's own kind (Cpu): the wire must
         // carry exactly what was constructed, never the decoding session's
         // own default (the same "codec never rewrites device_kind" rule
         // `InferenceExec` round-trips under).
         device_kind: ComputeDeviceKind::Cuda,
+        claimed_at: chrono::Utc::now(),
     };
-    let node = jammi_ai::operator::gang_exec::GangExec::new(descriptor.clone());
+    let node = jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec::new(descriptor.clone());
     let node: Arc<dyn ExecutionPlan> = Arc::new(node);
 
     let codec = JammiCodec::new(&session);
@@ -260,12 +268,12 @@ async fn gang_exec_round_trips() {
     let ctx = session.context().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
     let decoded = decoded
-        .downcast_ref::<jammi_ai::operator::gang_exec::GangExec>()
+        .downcast_ref::<jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec>()
         .unwrap();
     assert_eq!(decoded.descriptor().job_id, descriptor.job_id);
     assert_eq!(decoded.descriptor().attempt, descriptor.attempt);
-    assert_eq!(decoded.descriptor().world, descriptor.world);
     assert_eq!(decoded.descriptor().submitter, descriptor.submitter);
+    assert_eq!(decoded.descriptor().claimed_at, descriptor.claimed_at);
     assert_eq!(
         decoded.descriptor().device_kind,
         descriptor.device_kind,
@@ -310,6 +318,117 @@ async fn asof_join_exec_round_trips() {
     assert_eq!(
         serde_json::to_value(decoded.spec()).unwrap(),
         serde_json::to_value(&spec).unwrap(),
+    );
+}
+
+/// The three propagation operators each carry their spec as JSON, one child
+/// the generic way — the `AsofJoinExec` shape. The plan is the one the verb
+/// builds (`propagation_plan`, the single plan-building site), walked for
+/// its operators; each is decoded over its own child and compared by spec.
+#[tokio::test]
+async fn graph_propagation_operators_round_trip() {
+    use jammi_ai::pipeline::graph_neighbourhood::EdgeDirection;
+    use jammi_ai::pipeline::graph_propagation::hop::HopFoldExec;
+    use jammi_ai::pipeline::graph_propagation::plan::{
+        adjacency_relation, emit_plan, hop_plan, EdgeRead, Emit, FeatureSource, HopInput,
+        HopPlanSpec,
+    };
+    use jammi_ai::pipeline::graph_propagation::readout::{BlockReadout, ReadoutExec};
+    use jammi_ai::pipeline::graph_propagation::seed::SeedSpec;
+    use jammi_ai::pipeline::graph_propagation::state::InitialStateExec;
+    use jammi_ai::pipeline::graph_propagation::{PropagationOutput, PropagationWeighting};
+
+    let session = session().await;
+    let codec = JammiCodec::new(&session);
+    let ctx = session.context().out_of_core(8 * 3 * 8);
+    let edges = ctx
+        .sql("SELECT 'a' AS _src, 'b' AS _dst UNION ALL SELECT 'b', 'c'")
+        .await
+        .unwrap();
+    let readout = BlockReadout::lower(
+        &PropagationOutput::WeightedSum {
+            weights: vec![0.0, 1.0],
+        },
+        1,
+    )
+    .unwrap();
+    let seed = FeatureSource::StructuralSeed(SeedSpec::new(1, 8, 3.0, 0.0).unwrap());
+    let adjacency = adjacency_relation(
+        EdgeRead {
+            edges,
+            weighted: false,
+            direction: EdgeDirection::Undirected,
+            weighting: PropagationWeighting::Uniform,
+        },
+        &seed,
+    )
+    .unwrap();
+    let spec = HopPlanSpec {
+        adjacency,
+        weighting: PropagationWeighting::Uniform,
+        alpha: 0.0,
+        readout: readout.clone(),
+        block: Some(1),
+    };
+    let stage = hop_plan(&ctx, HopInput::Features(seed), &spec)
+        .await
+        .unwrap();
+    let plan = emit_plan(
+        stage,
+        readout,
+        Emit {
+            dimensions: 8,
+            source_id: "ledger",
+            model_id: "graph_structure",
+        },
+    )
+    .unwrap();
+
+    // Every node of the plan — an explicit work-stack, the plan being as
+    // deep as its hops.
+    let mut pending = vec![plan];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        pending.extend(node.children().into_iter().cloned());
+        let is_ours = node.downcast_ref::<InitialStateExec>().is_some()
+            || node.downcast_ref::<HopFoldExec>().is_some()
+            || node.downcast_ref::<ReadoutExec>().is_some();
+        if !is_ours {
+            continue;
+        }
+        seen.insert(node.name().to_string());
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+        assert_eq!(&buf[0..4], &[0x07, b'J', b'M', b'B'], "magic prefix");
+        let inputs: Vec<Arc<dyn ExecutionPlan>> = node.children().into_iter().cloned().collect();
+        let task_ctx = session.context().task_ctx();
+        let decoded = codec.try_decode(&buf, &inputs, &task_ctx).unwrap();
+        let spec_of = |node: &Arc<dyn ExecutionPlan>| -> serde_json::Value {
+            if let Some(exec) = node.downcast_ref::<InitialStateExec>() {
+                serde_json::to_value(exec.spec()).unwrap()
+            } else if let Some(exec) = node.downcast_ref::<HopFoldExec>() {
+                serde_json::to_value(exec.spec()).unwrap()
+            } else {
+                serde_json::to_value(node.downcast_ref::<ReadoutExec>().unwrap().spec()).unwrap()
+            }
+        };
+        assert_eq!(
+            spec_of(&node),
+            spec_of(&decoded),
+            "{} spec survives the wire",
+            node.name()
+        );
+        assert_eq!(
+            decoded.schema(),
+            node.schema(),
+            "{} schema survives the wire",
+            node.name()
+        );
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["HopFoldExec", "InitialStateExec", "ReadoutExec"],
+        "the plan carries all three operators"
     );
 }
 
@@ -478,7 +597,7 @@ async fn a_plan_fanned_out_four_ways_is_admitted_and_staged() {
     let shuffle = stages[1]
         .shuffle_output_partitioning()
         .expect("the numbered input is written through a hash shuffle");
-    assert_eq!(shuffle.to_string(), "Hash([_ordinal@1 / 8], 4)", "{all}");
+    assert_eq!(shuffle.to_string(), "Hash([_chunk@2], 4)", "{all}");
 
     assert_eq!(
         stages[2].input_partition_count(),
@@ -793,6 +912,7 @@ async fn result_table_sink_exec_round_trips_and_arrives_placed() {
         kind: SinkKind::Embeddings {
             dimensions: 4,
             ann: *store.ann_config(),
+            segment_rows: std::num::NonZeroUsize::new(4096).unwrap(),
             checkpoint_interval: 2,
         },
     };

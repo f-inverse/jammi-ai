@@ -1,6 +1,8 @@
 //! Shared test helpers for jammi-db and jammi-ai integration tests.
 
 pub mod child;
+pub mod fleet;
+pub mod meta_dataset;
 pub mod source_universe;
 
 use std::path::{Path, PathBuf};
@@ -172,7 +174,7 @@ pub fn unique_suffix() -> String {
 /// later. Never `bind(:0)`-then-release, and never a fixed number above the
 /// floor: both hand out a port from the kernel's ephemeral range, the same
 /// range every outgoing `connect()` this test process makes (Postgres,
-/// MinIO) draws its local port from, so the port can be taken by a client
+/// the S3 store) draws its local port from, so the port can be taken by a client
 /// socket before the child binds it ("failed to bind OSS server listeners:
 /// Address already in use"). Ports come from a range BELOW every platform's
 /// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick

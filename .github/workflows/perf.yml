@@ -1,7 +1,7 @@
 name: Performance regression (early warning)
 
 # The nightly performance-SLO early-warning lane: runs the CPU-hermetic `*-scale`
-# bench subcommands and asserts each exits 0 against its committed same-box
+# bench subcommands and asserts each exits 0 against its committed
 # baseline. Each tier's exit code IS the gate — a structural throughput
 # regression (a path that went quadratic, a serialized parallel section, a
 # dropped fast path) collapses the measured rate below the committed floor
@@ -90,24 +90,25 @@ jobs:
         # ephemeral checkout so the derived floor (`baseline·(1−0.30)`) is
         # unreachable, run the tier, and assert it exits NON-ZERO. A future
         # reader thus knows the lane is not decorative — the exit-code gate is
-        # wired through. graph-train-scale is the cheapest tier (pure CPU
-        # sampling, no model load), so this stays fast and hermetic. The
+        # wired through. train-scale is the cheapest tier left with a rate gate
+        # (one GradCache step over synthetic pairs on the CPU), so this stays
+        # fast and hermetic. The
         # checkout is discarded with the runner; restoring the file is belt-and
         # -braces so a later step never sees the perturbation.
         shell: bash
         run: |
           set -euo pipefail
-          baseline=crates/jammi-bench/baselines/graph_train.json
+          baseline=crates/jammi-bench/baselines/training.json
           # Restore via cp/mv, NOT git: a bare `git` in a container `run:` step
           # hits "fatal: detected dubious ownership" (exit 128) — the safe.directory
           # actions/checkout sets isn't visible here. The ephemeral checkout is
           # discarded with the runner anyway; this keeps the perturbation local.
           cp "$baseline" "$baseline.orig"
-          python3 ci/scripts/perf/inflate_baseline.py "$baseline"
-          if ./target/release/jammi-bench graph-train-scale; then
+          python3 ci/scripts/perf/inflate_baseline.py "$baseline" pairs_per_s
+          if ./target/release/jammi-bench train-scale; then
             mv -f "$baseline.orig" "$baseline"
-            echo "::error::teeth-proof FAILED — graph-train-scale exited 0 against a 100x-inflated baseline; the workflow rate gate is decorative"
+            echo "::error::teeth-proof FAILED — train-scale exited 0 against a 100x-inflated baseline; the workflow rate gate is decorative"
             exit 1
           fi
           mv -f "$baseline.orig" "$baseline"
-          echo "teeth-proof held: graph-train-scale exited non-zero against the inflated baseline (the gate has teeth)"
+          echo "teeth-proof held: train-scale exited non-zero against the inflated baseline (the gate has teeth)"

@@ -81,6 +81,7 @@ docs/plans/*
 !docs/plans/66-tower-profile/
 !docs/plans/67-distributed-training/
 !docs/plans/68-compute-tier-substrate/
+!docs/plans/69-parity-ladder/
 docs/superpowers/
 docs/IMPLEMENTATION.md
 docs/specs/
@@ -99,9 +100,9 @@ cookbook/fixtures/finetune_heldout/train_pairs.jsonl
 /scratchpad/
 /scratch-worktrees/
 
-# The PyTorch/PEFT reference venv `ci/scripts/perf/finetune_ab.sh` provisions
-# on the pod (crates/jammi-bench/reference/README.md's own `.venv-torch-ref`
-# convention) and the A/B sweep's merged report + table it writes.
+# The PyTorch/PEFT reference venv the ladder's producers provision on the pod
+# (crates/jammi-bench/reference/README.md's own `.venv-torch-ref` convention)
+# and the verdicts and legs they write.
 .venv-torch-ref/
 .ab-report/
 

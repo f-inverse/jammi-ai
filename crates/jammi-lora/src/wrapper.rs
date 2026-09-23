@@ -64,8 +64,8 @@ impl MaybeLoraLinear {
     /// pair is empty" — this answers the structural question directly.
     ///
     /// A `true` here does NOT by itself mean the fused kernel runs: the
-    /// adapted site still takes its own admission decision per TRAINING
-    /// forward (and takes none at all in eval), and a
+    /// adapted site still takes its own admission decision on every
+    /// forward, whatever the mode, and a
     /// [`FrozenBase::Quantized`] base never reaches the fused seam at all
     /// (see [`crate::LoraLinear::forward`]'s own doc). It means exactly that
     /// this site is an adapted one.
@@ -125,19 +125,31 @@ impl MaybeLoraLinear {
         }
     }
 
-    /// Restore the LoRA A and B tensors from a `{prefix}.lora_a` /
-    /// `{prefix}.lora_b` pair in `weights`. Missing keys are silently ignored
-    /// — the caller controls which prefixes they expect to populate. No-op on
-    /// `Frozen`.
-    pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>, prefix: &str) {
+    /// Whether a training forward draws dropout — see
+    /// [`LoraLinear::set_dropout`]; no-op on `Frozen`.
+    pub fn set_dropout(&mut self, enabled: bool) {
         if let Self::Lora(l) = self {
-            if let Some(a) = weights.get(&format!("{prefix}.lora_a")) {
-                l.lora_a = a.clone();
-            }
-            if let Some(b) = weights.get(&format!("{prefix}.lora_b")) {
-                l.lora_b = b.clone();
-            }
+            l.set_dropout(enabled);
         }
+    }
+
+    /// Restore the LoRA A and B tensors from a `{prefix}.lora_a` /
+    /// `{prefix}.lora_b` pair in `weights` — see [`LoraLinear::load_weights`]
+    /// for how a trainable leaf keeps its identity. Missing keys are silently
+    /// ignored — the caller controls which prefixes they expect to populate.
+    /// No-op on `Frozen`.
+    pub fn load_weights(
+        &mut self,
+        weights: &HashMap<String, Tensor>,
+        prefix: &str,
+    ) -> Result<(), LoraError> {
+        if let Self::Lora(l) = self {
+            l.load_weights(
+                weights.get(&format!("{prefix}.lora_a")),
+                weights.get(&format!("{prefix}.lora_b")),
+            )?;
+        }
+        Ok(())
     }
 
     /// Insert this layer's dropout-stream position keyed `{prefix}.dropout` into

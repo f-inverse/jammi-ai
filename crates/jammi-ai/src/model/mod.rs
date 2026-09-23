@@ -153,6 +153,7 @@ pub enum WeightsFormat {
 /// Re-exported from `jammi_db` so the engine — which owns the catalog
 /// tables that persist this — and `jammi_ai` agree on the variant set and
 /// on-disk spelling without `jammi_db` depending on `jammi_ai`.
+pub use backend::candle::PreparedInput;
 pub use jammi_db::ModelTask;
 
 /// Where the tokenizer for a resolved model lives, and what shape it is.
@@ -404,6 +405,29 @@ impl LoadedModel {
         }
     }
 
+    /// The token-sequence bound the loaded text forward truncates its
+    /// tokenization to (`backend::candle::CandleTextForward::max_sequence_length`).
+    /// A consumer that counts the tokens a serve actually forwards must
+    /// truncate at this bound, read off the loaded model, never at a value
+    /// re-derived from `config.json`. `None` when the loaded model has no
+    /// text forward (a CLAP audio tower) or for the ORT backend.
+    pub fn max_sequence_length(&self) -> Option<usize> {
+        match self {
+            LoadedModel::Candle(m) => m.max_sequence_length(),
+            LoadedModel::Ort(_) => None,
+        }
+    }
+
+    /// Every kernel admission decision this model's forwards have taken
+    /// since it was loaded — `CandleModel::kernel_admission`. The ORT
+    /// backend dispatches no jammi kernel, so its ledger is empty.
+    pub fn kernel_admission(&self) -> jammi_kernels::admission::AdmissionLedger {
+        match self {
+            LoadedModel::Candle(m) => m.kernel_admission(),
+            LoadedModel::Ort(_) => jammi_kernels::admission::AdmissionLedger::default(),
+        }
+    }
+
     /// The model's content digest: a SHA-256 fold of the
     /// resolved model directory's config / `1_Pooling/config.json` /
     /// tokenizer / weights bytes, computed once at load time by
@@ -563,15 +587,50 @@ impl LoadedModel {
         }
     }
 
-    /// Run forward pass on Arrow content columns. Returns raw output.
-    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+    /// The cost of every row of `content` under `task`: its length along the
+    /// axis a forward pads. See [`CandleModel::row_costs`].
+    pub fn row_costs(&self, content: &[ArrayRef], task: ModelTask) -> Result<Vec<u32>> {
         match self {
-            LoadedModel::Candle(m) => m.forward(content, task),
-            LoadedModel::Ort(_) => Err(JammiError::Inference(
-                "ORT forward pass not available in this build".into(),
-            )),
+            LoadedModel::Candle(m) => m.row_costs(content, task),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
         }
     }
+
+    /// The ladder a forward under `task` pads its rows on. See
+    /// [`CandleModel::shape_ladder`].
+    pub fn shape_ladder(&self, task: ModelTask) -> Result<jammi_numerics::ShapeLadder> {
+        match self {
+            LoadedModel::Candle(m) => m.shape_ladder(task),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
+        }
+    }
+
+    /// The host half of a forward: prepare `content` for the device. See
+    /// [`CandleModel::prepare`].
+    pub fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> Result<PreparedInput> {
+        match self {
+            LoadedModel::Candle(m) => m.prepare(content, task),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
+        }
+    }
+
+    /// The device half of a forward: run the model over a prepared input.
+    pub fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
+        match self {
+            LoadedModel::Candle(m) => m.forward_prepared(input),
+            LoadedModel::Ort(_) => Err(ort_unavailable()),
+        }
+    }
+
+    /// [`Self::prepare`] then [`Self::forward_prepared`], with no device
+    /// admission between: the single-row query encoders' call.
+    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+        self.forward_prepared(self.prepare(content, task)?)
+    }
+}
+
+fn ort_unavailable() -> JammiError {
+    JammiError::Inference("ORT forward pass not available in this build".into())
 }
 
 /// RAII guard that decrements ref count on drop.

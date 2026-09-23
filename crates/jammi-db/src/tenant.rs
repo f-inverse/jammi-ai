@@ -77,7 +77,7 @@ impl From<TenantId> for String {
 /// Read by [`crate::tenant_scope::TenantScopeAnalyzerRule`] during plan
 /// analysis to inject `tenant_id = $current OR tenant_id IS NULL` predicates
 /// on every scanned table whose schema declares the column; read by
-/// [`crate::catalog::backend::Transaction::set_tenant`] to bind a tenant for
+/// `crate::catalog::backend::Transaction::set_tenant` to bind a tenant for
 /// the duration of one transaction (used by the mutable-table sink to enforce
 /// the write-side guard).
 ///

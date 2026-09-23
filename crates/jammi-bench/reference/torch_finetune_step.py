@@ -87,9 +87,9 @@ section — the LoRA adapters are not equivalently initialized unless
 `--lora-init jammi`, a "jammi trajectory diverges from torch trajectory"
 observation conflates at least three variables (init distribution,
 attention-kernel arithmetic, framework reduction order) and proves nothing
-about correctness on its own; it is printed by `finetune_ab.sh`'s table as a
-same-data, cost-fixture ratio precisely so a large divergence is VISIBLE, not
-so it is read as a quality regression.
+about correctness on its own; it is recorded as a same-data, cost-fixture
+ratio precisely so a large divergence is VISIBLE, not so it is read as a
+quality regression.
 
 LoRA INIT IS NOT A MATCH BY DEFAULT — read before comparing loss curves.
 peft's default init (`init_lora_weights=True`) draws `A` from PyTorch's
@@ -159,54 +159,26 @@ poll — sampling `memory_allocated()` once per step was measured to land at
 the deterministic TROUGH of each step (after backward+step+the `.item()`
 sync, when every saved activation is already freed): 403 KiB captured of a
 9087 KiB in-step peak, ~4.4%, systematically, on both measured steps). Both
-VRAM fields below come from one `torch.cuda.reset_peak_memory_stats()`
-call made once, before the warmup+measured loop starts, and one
-`torch.cuda.max_memory_allocated()` read after it ends — a continuous
-high-water mark that cannot miss an intra-step spike the way a discrete poll
-(a per-step read, or jammi's own 25ms `nvidia-smi` interval) can.
+The compared column, `peak_vram_bytes`, is the engine's own instrument
+(`vram.VramWindow`, shared by every twin): the whole-device `memory.used`
+figure `nvidia-smi` reports, polled every 25 ms over the untimed pre-step
+and the warmup+measured loop, reduced to the high-water mark above a
+baseline read when the window opens — after the model, adapter and
+optimizer are built, before any step, where `finetune_step.rs` opens its
+own. The pool figure both sides read never shrinks between steps, so the
+window has to open before the first step or it starts at that step's own
+high-water mark. One asymmetry, stated: candle allocates AdamW's moments
+eagerly at construction, so they sit in jammi's baseline; torch allocates
+them lazily on the first step, so they land inside this window — for a LoRA
+adapter, tens of MB.
 
-jammi's `peak_vram_bytes` is a whole-device `nvidia-smi` poll
-(`nvidia_smi_memory_used`), sampled every 25ms (`VramSampler::start`) over
-the ENTIRE warmup+measured loop, then reduced via
-`peak.saturating_sub(baseline)` (`VramSampler::finish`) against a baseline
-snapshot (`vram_baseline` in `run_with`) taken
-once right after the model+optimizer are built (before the loop starts) — at
-which point candle's `AdamW::new` has
-ALREADY allocated the (zero-initialized) first/second moment tensors, since
-candle allocates them eagerly at construction. Torch's `AdamW`, by contrast,
-allocates its `exp_avg`/`exp_avg_sq` state LAZILY on the first `step()` call
-(measured: 0 state tensors before the first step, 48 after, on a tiny test
-model) — so a baseline taken right after `torch.optim.AdamW(...)` returns
-would NOT yet include the moments, and their first-step allocation would
-land INSIDE the measured delta instead of being absorbed into the baseline
-the way jammi's is. To make the baseline honestly comparable, this script
-runs ONE UNTIMED optimizer step (forward + backward + `optimizer.step()`,
-via `_step_once`, not counted in `--warmup`/`--steps` and not part of any
-reported timing) BEFORE taking the baseline snapshot — forcing the lazy
-moments into existence first, the honest equivalent of candle's eager
-allocation. (Side effect, stated plainly: this means the model has already
-taken one real gradient step before the officially-reported `--warmup`
-step 0 begins. Irrelevant to cost/VRAM measurement — activation shapes and
-optimizer-state sizes do not depend on the weights' actual values — and this
-script never reports or interprets the loss value, so no reported number is
-affected.)
+The allocator's own counters ride beside it as provenance, never as the
+compared column:
 
-* **`peak_vram_delta_bytes`** — the field COMPARABLE to jammi's
-  `peak_vram_bytes` column. Same window (the entire warmup+measured loop,
-  reset happens once before it starts), same baseline convention (a
-  `torch.cuda.memory_allocated()` snapshot taken after model+optimizer
-  construction AND after the one untimed moment-warmup step described
-  above, recorded separately as `peak_vram_baseline_bytes`).
-  `peak_vram_delta_bytes = max_memory_allocated() - peak_vram_baseline_bytes`
-  after the loop. RESIDUAL ASYMMETRY, stated rather than papered over: this
-  is a CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval
-  discrete poll. A continuous tracker cannot miss an intra-step spike a
-  25ms poll can straddle — so `peak_vram_delta_bytes` may legitimately read
-  HIGHER than jammi's `peak_vram_bytes` even when the underlying activation
-  footprint is identical, purely from the sampling-method difference, not
-  from a real workload difference. Do not read a gap between the two as a
-  regression without checking which side the sampling-method asymmetry
-  would push it.
+* **`peak_vram_delta_bytes`** — `torch.cuda.max_memory_allocated()` over the
+  timed loop, above a `memory_allocated()` snapshot taken after the untimed
+  pre-step (`peak_vram_baseline_bytes`): live bytes, a continuous high-water
+  mark, of the loop alone.
 * **`peak_vram_absolute_bytes`** — the SAME continuous high-water mark, over
   the SAME window, WITHOUT the baseline subtraction: raw bytes live at the
   peak (model weights + LoRA adapters + optimizer moments + the peak
@@ -286,6 +258,8 @@ import sys
 import tempfile
 import time
 
+import vram
+
 MASK64 = (1 << 64) - 1
 LCG_MUL = 6364136223846793005
 LCG_INC = 1442695040888963407
@@ -352,7 +326,12 @@ def pool_and_normalize(hidden, attention_mask):
     masked = hidden * mask.to(hidden.dtype)
     summed = masked.sum(dim=1)
     count = mask.sum(dim=1).clamp(min=1.0)
-    pooled = summed / count.to(hidden.dtype)
+    return l2_normalize(summed / count.to(hidden.dtype))
+
+
+def l2_normalize(pooled):
+    """Literal port of `pooling.rs::l2_normalize`: unit rows under L2, in
+    `pooled`'s own dtype, with the dtype-exact floor above."""
     norm = pooled.pow(2).sum(dim=-1, keepdim=True).sqrt().clamp(min=norm_floor(pooled.dtype))
     return pooled / norm
 
@@ -408,12 +387,33 @@ def prefix_mask(lengths, seq: int, device):
     return mask
 
 
+class CudaUnavailable(RuntimeError):
+    """A CUDA device was asked for and this process cannot use it."""
+
+
 def pick_device(cuda_ordinal):
+    """The device every reference producer runs on: the CPU when no ordinal
+    was asked for, the asked-for CUDA device otherwise — refused by name when
+    it cannot be used, never replaced by the CPU. A reference leg that fell
+    back to the CPU would be timed, filed and compared as the GPU leg it was
+    asked to be."""
     import torch
 
-    if cuda_ordinal is not None and torch.cuda.is_available():
-        return torch.device(f"cuda:{cuda_ordinal}")
-    return torch.device("cpu")
+    if cuda_ordinal is None:
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        raise CudaUnavailable(
+            f"--cuda {cuda_ordinal} was requested and torch.cuda.is_available() is False: torch "
+            f"{torch.__version__} is built for CUDA {torch.version.cuda}; a wheel newer than the "
+            "driver supports reads exactly this way (ci/scripts/perf/torch_venv.py --provision "
+            "installs the wheel index the driver supports)"
+        )
+    if cuda_ordinal >= torch.cuda.device_count():
+        raise CudaUnavailable(
+            f"--cuda {cuda_ordinal} was requested and this process sees "
+            f"{torch.cuda.device_count()} CUDA device(s)"
+        )
+    return torch.device(f"cuda:{cuda_ordinal}")
 
 
 def pin_fast_path_globals():
@@ -426,17 +426,30 @@ def pin_fast_path_globals():
     on a CPU-only run (they simply have no effect there), so this always
     runs, not just on CUDA.
     """
+    # cuBLAS reads its workspace setting when its handle is created, at the
+    # first CUDA matmul, so the value is set before torch is imported; it is
+    # the setting PyTorch's reproducibility notes name for deterministic
+    # cuBLAS, and `use_deterministic_algorithms` refuses to run without it.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     import torch
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision("highest")
+    # A reference whose same-seed repeats disagree is not a measurement: the
+    # ladder's noise floor reads a rung's repeats, and jammi's repeats are
+    # bit-identical. Deterministic algorithms give the fused attention
+    # backward its deterministic form and refuse any op that has none, so a
+    # repeat that differs is a defect, never noise.
+    torch.use_deterministic_algorithms(True, warn_only=False)
     return {
         "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+        "cublas_workspace_config": os.environ["CUBLAS_WORKSPACE_CONFIG"],
     }
 
 
@@ -515,99 +528,6 @@ def provenance(device, fast_path_globals):
         info["device_name"] = torch.cuda.get_device_name(device)
         info["nvidia_driver_version"] = nvidia_smi_field("driver_version")
     return info
-
-
-# This producer's own identity-completeness
-# list: the SAME shape `FinetuneStepTier::IDENTITY_FIELDS` /
-# `GradOracleReport::IDENTITY_FIELDS` carry on the Rust side
-# (`crates/jammi-bench/src/report.rs`, `grad_oracle.rs`), for THIS producer.
-# The entries `ab_merge.py`'s own `FINETUNE_IDENTITY_FIELDS` compares
-# (imported from `identity_fields.py`) — present here at whichever placement this
-# producer's own report actually uses (`report["args"][field]` for the three
-# named in `ab_merge.py`'s `_TORCH_ARGS_LEVEL_FIELDS`, `report["finetune_step"]
-# [field]` for the rest — see that module's own doc) — plus 14
-# identity-completeness additions this producer alone carries: five environment/
-# version facts (`torch_version`, `torch_cuda_version`, `transformers_version`,
-# `peft_version`, `python_version`), the attention/compile/LoRA-init
-# determinants this producer's own `--attn`/`--lora-init` CLI flags resolve
-# (`attn_implementation`, `sdpa_backend_probe`, `reference_compile_resolved`,
-# `lora_init`), `adamw_foreach` (torch's own multi-tensor-vs-loop optimizer
-# fast path, the torch peer of jammi's `adamw_fused_dispatches`), and three
-# provenance fields this function (`provenance`, above) itself fills:
-# `fast_path_globals`, `device_name`, `git_rev`.
-#
-# `provenance`'s own `if device.type == "cuda":` guard (immediately above)
-# governs THREE fields, not one:
-# `device_name` (:476, initialised `None`, filled only under that guard) and
-# `torch_cuda_version` (:471, `torch.version.cuda` — `None` on a CPU-only
-# torch build regardless of THIS run's `--cuda` flag, since it reflects how
-# the installed torch package itself was compiled). All three are nullable
-# entries (`TORCH_IDENTITY_FIELDS_NULL_MEANS` below): `null` on any of them
-# means "this run had no CUDA device" / "this torch install has no CUDA
-# support", never "this producer predates the field".
-#
-# Three MORE fields are independently nullable,
-# each governed by its OWN separate guard (not the CUDA one above) — `git_rev`
-# (:441-452, `None` when `git` is not on `PATH`, this file is not inside a
-# git worktree, or the subprocess times out — mirrors `grad_oracle.rs`'s own
-# `git_rev` field, which is likewise `None` when the baked `build_sha`
-# resolved to `"unknown"`), `transformers_version` / `peft_version` (:472-473,
-# `getattr(transformers/peft, "__version__", None)` — `None` when that
-# OPTIONAL package (imported inside a `try`/`except ImportError` a few lines
-# above `info = {...}`) is not installed at all, never "this producer
-# predates the field"). See `TORCH_IDENTITY_FIELDS_NULL_MEANS`, immediately
-# below, for the full six-entry nullable set and each one's declared meaning
-# — every `TORCH_IDENTITY_FIELDS` entry NOT listed there is `NonNull`.
-TORCH_IDENTITY_FIELDS = (
-    "seed",
-    "batch",
-    "seq",
-    "lora_rank",
-    "lora_alpha",
-    "lora_dropout",
-    "margin",
-    "target_modules",
-    "batched_forward",
-    # IDENTITY: always present, dense or
-    # padded -- see this producer's own `report["finetune_step"]["row_lengths"]`
-    # emission site, and jammi's `FinetuneStepTier::row_lengths` doc for the
-    # cross-producer meaning.
-    "row_lengths",
-    "backbone_dtype",
-    "steps_measured",
-    "checkpoint_config_sha256",
-    "checkpoint_weights_sha256",
-    "checkpoint_weights_size_bytes",
-    "torch_version",
-    "torch_cuda_version",
-    "transformers_version",
-    "peft_version",
-    "python_version",
-    "attn_implementation",
-    "sdpa_backend_probe",
-    "reference_compile_resolved",
-    "lora_init",
-    "adamw_foreach",
-    "fast_path_globals",
-    "device_name",
-    "nvidia_driver_version",
-    "git_rev",
-)
-
-# Field -> what a `null`/absent reading on THIS producer means. Every
-# `TORCH_IDENTITY_FIELDS` entry not listed here is `NonNull` (a null/absent
-# reading is itself a finding, mirroring the Rust `Nullable::NonNull` class).
-# `git_rev`/`transformers_version`/`peft_version` sit beside the CUDA-guard
-# trio below — each has its OWN independent reason to
-# read `null` (see the doc paragraph directly above `TORCH_IDENTITY_FIELDS`).
-TORCH_IDENTITY_FIELDS_NULL_MEANS = {
-    "nvidia_driver_version": "no CUDA",
-    "device_name": "no CUDA",
-    "torch_cuda_version": "no CUDA (this torch install has no CUDA support)",
-    "git_rev": "git unavailable (not on PATH, not a git worktree, or the subprocess timed out)",
-    "transformers_version": "transformers not installed",
-    "peft_version": "peft not installed",
-}
 
 
 def build_dry_run_checkpoint(tmp_dir: str) -> str:
@@ -797,20 +717,20 @@ def forward_hidden(model, input_ids, attention_mask):
 # (scores never materialised) — the throughput-reference class jammi's own
 # fused whole-attention-block CustomOp sits in. `"eager"` is the OTHER class
 # (materialised scores + softmax; the semantic reference). See
-# `ci/scripts/perf/identity_fields.py`'s `attention_arm` entry.
+# the leg's provenance `attention_arm`.
 _FUSED_ATTN_IMPLEMENTATIONS = frozenset({"sdpa", "flash_attention_2", "flash_attention_3", "flex_attention"})
 
 
 def attention_arm_of(resolved_attn_implementation):
     """The attention REFERENCE CLASS this run's model actually resolved to
-    (`identity_fields.FINETUNE_IDENTITY_FIELDS`'s `attention_arm`): the
+    (the leg's provenance `attention_arm`): the
     RESOLVED implementation, never `--attn` as requested, so a config that
     silently fell back reads as what ran. `"eager"` → `"eager"`; every HF
     fused-kernel implementation → `"fused"`; anything else (including the
     `"absent"` sentinel `run()` records when a config carries no
     `_attn_implementation` at all) passes through VERBATIM — an unknown
-    string must MISMATCH jammi's `"eager"`/`"fused"` loudly in
-    `ab_merge.leg_premise_violations`, never be guessed into a class.
+    string must MISMATCH jammi's `"eager"`/`"fused"` loudly, never be
+    guessed into a class.
     """
     if resolved_attn_implementation == "eager":
         return "eager"
@@ -853,17 +773,15 @@ def _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, tr
     could silently drift from it. `args.max_grad_norm is None` (the
     default) skips clipping entirely — mirrors jammi's own `--max-grad-norm`
     CLI flag (`crates/jammi-bench/src/main.rs`) absent-by-default.
-    `max_grad_norm` is a member of the SHARED identity set
-    (`ci/scripts/perf/identity_fields.py`'s `FINETUNE_IDENTITY_FIELDS`), so
-    `ab_merge.py`'s generic `leg_premise_violations` refuses a jammi/torch
-    A/B row where the two legs' values differ (a clip-on leg against a
-    clip-off leg is a different step, not a comparable one).
+    `max_grad_norm` is an identity field of the `train-step` workload
+    (`TrainStepPayload::IDENTITY_FIELDS`), so the ladder refuses an edge
+    whose legs' values differ (a clip-on leg against a clip-off leg is a
+    different step, not a comparable one).
 
     `clip_counter`: a one-key dict (`{"clip_invocations": int}`) this
     function increments on EVERY `clip_grad_norm_` call it makes — the
     COUNTED fact `run()` reports as `finetune_step.clip_invocations`
-    (jammi's twin is `finetune_step.rs`'s `CLIP_INVOCATIONS` delta), which
-    `ab_merge.clip_fact_violations` cross-checks against `max_grad_norm`.
+    (jammi's twin is `finetune_step.rs`'s `CLIP_INVOCATIONS` delta).
     Counts the pre-loop call and every warmup/measured loop iteration alike,
     exactly as jammi's counter does.
     """
@@ -1067,7 +985,7 @@ def run(args):
 
     fast_path_globals = pin_fast_path_globals()
 
-    device = pick_device(None if args.dry_run else args.cuda)
+    device = pick_device(args.cuda)
     is_cuda = device.type == "cuda"
 
     if args.dtype == "amp-fp16" and not is_cuda:
@@ -1184,6 +1102,15 @@ def run(args):
         # window jammi's `finetune_step.rs` snapshots its `CLIP_INVOCATIONS`
         # delta over (see `_step_once`'s own doc).
         clip_counter = {"clip_invocations": 0}
+        # The device-memory window opens HERE, before the untimed pre-step —
+        # where `finetune_step.rs` opens its own (`VramWindow::open` after
+        # `build_fixture`, before its pre-step). The pool figure both sides
+        # read never shrinks between steps, so a window opened after a step
+        # would start at that step's own high-water mark and report next to
+        # nothing. Torch allocates AdamW's moments lazily on this first
+        # step, so they land inside the window here where candle's eager
+        # ones sit in jammi's baseline: for a LoRA adapter, tens of MB.
+        device_window = vram.VramWindow(args.cuda) if is_cuda else None
         _step_once(model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable, clip_counter)
         reference_compile_after_first_forward = getattr(
             model.config, "reference_compile", "absent"
@@ -1201,14 +1128,10 @@ def run(args):
 
         vram_baseline_bytes = None
         if is_cuda:
+            # The allocator's own counters, as provenance beside the compared
+            # column: a live-bytes baseline after the moments exist, then a
+            # continuous high-water mark over the timed loop.
             vram_baseline_bytes = torch.cuda.memory_allocated(device)
-            # Single reset, right here — before the timed warmup+measured
-            # loop starts, matching the window jammi's own background
-            # sampler covers (finetune_step.rs starts its VramSampler right
-            # after this same "model+optimizer resident" point). Continuous
-            # high-water tracking from here on; no further resets, so no
-            # intra-step spike can be missed the way a discrete per-step or
-            # per-25ms poll could miss one.
             torch.cuda.reset_peak_memory_stats(device)
 
         times = []
@@ -1223,9 +1146,11 @@ def run(args):
                 times.append(elapsed)
                 losses.append(loss_val)
 
+        iter_wall_s = list(times)
         times.sort()
         p50 = times[len(times) // 2]
         mean = sum(times) / len(times)
+        peak_vram_bytes = device_window.close() if device_window is not None else None
         peak_vram_absolute = torch.cuda.max_memory_allocated(device) if is_cuda else None
         peak_vram_delta = (
             (peak_vram_absolute - vram_baseline_bytes) if is_cuda else None
@@ -1258,8 +1183,12 @@ def run(args):
             },
             "finetune_step": {
                 "device": str(device),
+                "seed": args.seed,
+                "lora_alpha": args.lora_alpha,
+                "margin": args.margin,
+                "warmup": args.warmup,
                 "backbone_dtype": args.dtype,
-                # Same placement as jammi's own FinetuneStepTier -- IDENTITY,
+                # Same placement as jammi's own TrainStepPayload -- IDENTITY,
                 # see checkpoint_identity's own doc.
                 **checkpoint_identity_fields,
                 "attn_implementation": resolved_attn_implementation,
@@ -1276,9 +1205,8 @@ def run(args):
                     t.strip() for t in args.target_modules.split(",") if t.strip()
                 ],
                 "batched_forward": args.batched_forward,
-                # IDENTITY (a member of identity_fields.py's
-                # FINETUNE_IDENTITY_FIELDS): same
-                # placement as jammi's own FinetuneStepTier::row_lengths -- see
+                # IDENTITY (TrainStepPayload::IDENTITY_FIELDS): same
+                # placement as jammi's own TrainStepPayload::row_lengths -- see
                 # that field's own doc. DENSE-LEG VALUE (args.row_lengths is
                 # None): `[seq] * batch`,
                 # matching jammi's own dense-leg convention exactly. NEVER
@@ -1287,28 +1215,28 @@ def run(args):
                 if args.row_lengths is not None
                 else [args.seq] * args.batch,
                 # `None` (never omitted) when `--max-grad-norm` was not supplied,
-                # mirroring jammi's own FinetuneStepTier::max_grad_norm field doc
+                # mirroring jammi's own TrainStepPayload::max_grad_norm field doc
                 # (deliberately not skip_serializing_if=is_none): every report from
-                # this build carries an opinion on clipping. A member of the SHARED
-                # identity set (`ci/scripts/perf/identity_fields.py`'s
-                # `FINETUNE_IDENTITY_FIELDS`, where `null` is declared a VALUE for
-                # this field) — `ab_merge.py`'s generic `leg_premise_violations`
-                # refuses a row whose jammi and torch legs differ here.
+                # this build carries an opinion on clipping. An identity field
+                # where `null` is declared a VALUE — the ladder refuses an edge
+                # whose jammi and torch legs differ here.
                 "max_grad_norm": args.max_grad_norm,
                 # The COUNTED fact behind the clip row (jammi's twin is
-                # `FinetuneStepTier::clip_invocations`): how many times this
+                # `TrainStepPayload::clip_invocations`): how many times this
                 # process actually called `torch.nn.utils.clip_grad_norm_` —
                 # pre-step + warmup + measured — `0` whenever `max_grad_norm` is
-                # `None`. `ab_merge.clip_fact_violations` refuses a leg whose
-                # request and count disagree in kind.
+                # `None`.
                 "clip_invocations": clip_counter["clip_invocations"],
                 # Identity: the attention REFERENCE CLASS this run resolved to
                 # (`"eager"` | `"fused"`), from the RESOLVED implementation
                 # `attn_implementation` above records raw — see
-                # `attention_arm_of`'s own doc and `identity_fields.py`'s entry.
+                # `attention_arm_of`'s own doc.
                 "attention_arm": attention_arm_of(resolved_attn_implementation),
                 "trainable_tensors": len(trainable),
                 "steps_measured": len(times),
+                # Post-warmup wall seconds of each timed step, in run order:
+                # what the ladder's speed axis reads.
+                "iter_wall_s": iter_wall_s,
                 "losses": losses,
                 "loss_first": losses[0],
                 "loss_last": losses[-1],
@@ -1327,6 +1255,10 @@ def run(args):
                 "steps_per_s": {"value": 1.0 / p50, "unit": "steps/s"},
                 "triplets_per_s": {"value": args.batch / p50, "unit": "triplets/s"},
                 "peak_rss_bytes": {"value": peak_rss_bytes(), "unit": "bytes"},
+                # Peak whole-device memory above the resident baseline, by the
+                # one window every rung is measured with (`vram.VramWindow`);
+                # the allocator's own figures follow as provenance.
+                "peak_vram_bytes": {"value": peak_vram_bytes, "unit": "bytes"},
                 "peak_vram_baseline_bytes": {
                     "value": float(vram_baseline_bytes)
                     if vram_baseline_bytes is not None
@@ -1456,9 +1388,8 @@ def parse_args(argv=None):
         "before the optimizer step (AMP: after scaler.unscale_). Mirrors jammi's own "
         "--max-grad-norm (crates/jammi-bench/src/main.rs), absent by default — omitting "
         "this flag skips clipping entirely. Must be finite and > 0.0 when supplied. "
-        "max_grad_norm is a shared identity field (ci/scripts/perf/identity_fields.py's "
-        "FINETUNE_IDENTITY_FIELDS), so ci/scripts/perf/ab_merge.py refuses an A/B row "
-        "where the jammi and torch legs' values differ; a config run with jammi's own "
+        "max_grad_norm is an identity field of the train-step workload, so the ladder "
+        "refuses an edge where the jammi and torch legs' values differ; a config run with jammi's own "
         "default (max_grad_norm = 1.0, FineTuneConfig's shipped default) must pass "
         "--max-grad-norm 1.0 here too.",
     )
@@ -1469,8 +1400,8 @@ def parse_args(argv=None):
         help="Comma-separated per-row REAL (non-pad) lengths for a genuinely "
         "right-padded batch -- one int per row, --batch entries total, each in "
         "1..=--seq. Omit for this script's dense behaviour "
-        "(an all-ones mask). row_lengths is a shared identity field "
-        "(ci/scripts/perf/identity_fields.py's FINETUNE_IDENTITY_FIELDS): two "
+        "(an all-ones mask). row_lengths is an identity field of the train-step "
+        "workload: two "
         "legs differing here ran a different padding structure over the SAME "
         "(batch, seq) shape and are not comparable. Mirrors jammi's own "
         "--row-lengths (crates/jammi-bench/src/main.rs).",

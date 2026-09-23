@@ -1,0 +1,116 @@
+{
+  "workload": "graph-sample",
+  "from": "torch",
+  "to": "sampler",
+  "edges": [
+    {
+      "edge": "torch -> sampler",
+      "difference": {
+        "kind": "framework",
+        "reference": "PyTorch Geometric's node2vec random-walk sampler"
+      },
+      "units": [
+        "edges4224",
+        "edges16896",
+        "edges67584"
+      ],
+      "outcome": null,
+      "speed": null,
+      "space": {
+        "host_ratio": 0.29431056139822637,
+        "device_ratio": null,
+        "host_slope": {
+          "intercept": 176076117.33333334,
+          "slope": 486.7878787878788,
+          "residual_rms": 178801.3343226374,
+          "n": 3
+        }
+      },
+      "judgements": [
+        {
+          "rule": "law_goodness_of_fit",
+          "force": "hard",
+          "bound": {
+            "source": "level",
+            "alpha": 0.001
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "the law could not be tested"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.2943 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        },
+        {
+          "rule": "host_memory_flat_in_work",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "486.7879 against UNBUDGETED"
+        }
+      ],
+      "refusals": [
+        {
+          "kind": "statistics",
+          "context": "edge torch -> sampler law fit",
+          "reason": "invalid input: cell 661: smallest expected count 4.900 is below 5: too sparse for the chi-square approximation",
+          "message": "edge torch -> sampler law fit: invalid input: cell 661: smallest expected count 4.900 is below 5: too sparse for the chi-square approximation"
+        },
+        {
+          "kind": "statistics",
+          "context": "edge torch -> sampler law fit",
+          "reason": "invalid input: cell 544: smallest expected count 4.900 is below 5: too sparse for the chi-square approximation",
+          "message": "edge torch -> sampler law fit: invalid input: cell 544: smallest expected count 4.900 is below 5: too sparse for the chi-square approximation"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "torch__edges16896__r1",
+          "p_value": 0.000994988423066001,
+          "relative_drift": 5.198716583994367,
+          "message": "leg torch__edges16896__r1: the time series is not stationary (trend p = 9.950e-4, drift +5.20% of the median over the series)"
+        },
+        {
+          "kind": "non_stationary",
+          "leg": "sampler__edges16896__r1",
+          "p_value": 0.00026356866717347494,
+          "relative_drift": -4.537008750991031,
+          "message": "leg sampler__edges16896__r1: the time series is not stationary (trend p = 2.636e-4, drift -4.54% of the median over the series)"
+        },
+        {
+          "kind": "measurement_missing",
+          "subject": "torch -> sampler",
+          "measurement": "law_goodness_of_fit",
+          "message": "torch -> sampler: law_goodness_of_fit is not measured, and a hard rule needs it"
+        }
+      ],
+      "status": "INVALID"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [],
+  "causes": [
+    "edge torch -> sampler is INVALID"
+  ],
+  "status": "INVALID"
+}

@@ -65,7 +65,7 @@ pub(crate) fn restore_task_error(e: DataFusionError) -> DataFusionError {
 /// CPU is a kind too; the refusal names every kind the live executors do
 /// list, none when none is live); a plan requiring no kind finds no live
 /// executor at all; every eligible executor is one the plan excludes (a
-/// gang's own submitter). The same rules `placement::DevicePlacement`
+/// placed training attempt's own submitter). The same rules `placement::DevicePlacement`
 /// binds by, so a plan admitted here is one the binder can bind.
 pub fn unheld_by(
     requirements: &PlanRequirements,
@@ -215,7 +215,7 @@ mod tests {
     /// The admission table: an empty inventory, a kind no live executor
     /// lists, an inventory whose only eligible executor is the plan's own
     /// submitter, and the admitted shapes — a plan requiring nothing, a
-    /// plan whose kind a peer lists, a gang with a peer of its kind.
+    /// plan whose kind a peer lists, a placed attempt with a peer of its kind.
     #[test]
     fn unheld_by_reads_the_requirements_against_the_live_inventory() {
         let cpu_peer = executor("peer", &["cpu"]);
@@ -226,7 +226,7 @@ mod tests {
             device_kind: Some(ComputeDeviceKind::Cuda),
             excluded_executor: None,
         };
-        let cuda_gang = PlanRequirements {
+        let cuda_attempt = PlanRequirements {
             device_kind: Some(ComputeDeviceKind::Cuda),
             excluded_executor: Some("self".to_string()),
         };
@@ -249,12 +249,12 @@ mod tests {
         );
         assert_eq!(unheld_by(&cuda, &[&cpu_peer, &cuda_self]), None);
         assert_eq!(
-            unheld_by(&cuda_gang, &[&cpu_peer, &cuda_self]),
+            unheld_by(&cuda_attempt, &[&cpu_peer, &cuda_self]),
             Some(Unheld::OnlyTheSubmitter {
                 submitter: "self".to_string(),
             })
         );
-        assert_eq!(unheld_by(&cuda_gang, &[&cuda_self, &cuda_peer]), None);
+        assert_eq!(unheld_by(&cuda_attempt, &[&cuda_self, &cuda_peer]), None);
     }
 
     /// The string a placed refusal reaches this client as, once every hop

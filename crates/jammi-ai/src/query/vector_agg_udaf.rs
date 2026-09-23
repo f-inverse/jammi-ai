@@ -26,16 +26,15 @@
 //! (`vector_max` *is* exact and so byte-stable, but the additive arms are the
 //! ones callers reach for.) A caller that needs a reproducible, byte-identical
 //! reduction must fold over a *fixed* order it imposes itself — which the
-//! streaming SQL aggregate cannot guarantee. `fold_vectors_in_order` is that
-//! fixed-order reduction, exposed (crate-internal) for exactly such callers; the
-//! streaming accumulator below applies the identical per-lane operator without
-//! the order guarantee.
+//! streaming SQL aggregate cannot guarantee. The graph-propagation hop
+//! (`crate::pipeline::graph_propagation::hop`) is such a caller: it requires its
+//! input hash-partitioned and sorted, and folds each group in one pass through
+//! `VectorReduce::fold_lanes` — the identical per-lane operator the streaming
+//! accumulator below applies without the order guarantee.
 //!
 //! One reduction operator, three SQL names: the three functions share a single
-//! `VectorAggAccumulator` parameterised by [`VectorReduce`], and that
-//! accumulator folds through the same `fold_vectors_in_order` primitive a
-//! fixed-order caller uses. Adding a fourth reduction is a new enum arm and a
-//! new registration, not a new accumulator.
+//! `VectorAggAccumulator` parameterised by [`VectorReduce`]. Adding a fourth
+//! reduction is a new enum arm and a new registration, not a new accumulator.
 
 use std::sync::Arc;
 
@@ -91,10 +90,10 @@ impl VectorReduce {
     }
 
     /// Fold one `width`-wide vector, read lane-by-lane from `value`, into the
-    /// running `lanes`. The single element-wise reduction loop both
-    /// [`fold_vectors_in_order`] and the streaming accumulator descend through,
-    /// so there is one lane operator across the fixed-order and streaming paths.
-    fn fold_lanes(self, lanes: &mut [f64], value: impl Fn(usize) -> f64) {
+    /// running `lanes`. The single element-wise reduction loop both the
+    /// streaming accumulator and a fixed-order caller descend through, so
+    /// there is one lane operator across the two paths.
+    pub(crate) fn fold_lanes(self, lanes: &mut [f64], value: impl Fn(usize) -> f64) {
         for (offset, acc) in lanes.iter_mut().enumerate() {
             *acc = self.fold(*acc, value(offset));
         }
@@ -108,50 +107,6 @@ impl VectorReduce {
             VectorReduce::Sum | VectorReduce::Max => acc,
         }
     }
-}
-
-/// Fold an **ordered** sequence of equal-width vectors into one `dimensions`-wide
-/// `f64` result under `reduce`, folding in iteration order. Lanes fold in `f64`
-/// regardless of the input lane type (`f32` for the SQL vector columns, `f64` for
-/// a caller that already works in `f64`), so an `f64`-precision caller stays
-/// lossless.
-///
-/// This is the single element-wise reduction in the engine: the streaming
-/// [`VectorAggAccumulator`] folds through the same lane operator (so the SQL UDAF
-/// and a direct caller apply the identical per-lane reduction), and a caller that
-/// needs a byte-identical reduction the streaming aggregate cannot guarantee
-/// (because a parallel plan fixes neither the fold nor the merge order, and `f64`
-/// `+` is non-associative) calls this directly over a canonical order it imposes
-/// itself.
-///
-/// `Mean` divides each lane by the number of vectors folded; an empty sequence
-/// yields the reduction's identity in every lane (and `Mean` of nothing is left
-/// at identity rather than dividing by zero). Every input vector must be exactly
-/// `dimensions` wide — equal width is the contract, the same one the SQL UDAF
-/// enforces at plan time.
-pub(crate) fn fold_vectors_in_order<V, T>(
-    vectors: impl IntoIterator<Item = V>,
-    reduce: VectorReduce,
-    dimensions: usize,
-) -> Vec<f64>
-where
-    V: AsRef<[T]>,
-    T: Copy + Into<f64>,
-{
-    let mut lanes = vec![reduce.identity(); dimensions];
-    let mut count: u64 = 0;
-    for vector in vectors {
-        let vector = vector.as_ref();
-        reduce.fold_lanes(&mut lanes, |offset| vector[offset].into());
-        count += 1;
-    }
-    if count == 0 {
-        return lanes;
-    }
-    lanes
-        .iter()
-        .map(|&acc| reduce.finalize(acc, count))
-        .collect()
 }
 
 /// The three vector-aggregation [`AggregateUDF`]s, for a session to install
@@ -539,7 +494,7 @@ mod tests {
     /// merge orders can disagree in the last bit. The guarantee is *value*
     /// equality up to `f64` rounding (a tiny tolerance), not byte-identity — the
     /// honest semantics the module doc states, and the reason a caller needing
-    /// reproducibility folds over a fixed order via [`fold_vectors_in_order`].
+    /// reproducibility folds over a fixed order it imposes itself.
     #[test]
     fn multi_partition_merge_is_approximately_equal() {
         // Magnitudes spread wide enough that summation order is observable in
@@ -609,44 +564,6 @@ mod tests {
         let count_state = state[1].to_array().unwrap();
         left.merge_batch(&[acc_state, count_state]).unwrap();
         finalize(&mut left)
-    }
-
-    /// The exposed fixed-order primitive folds an ordered sequence to the same
-    /// value the streaming SQL aggregate produces over the same rows (they share
-    /// one lane operator) — and folding the SAME order twice is byte-identical,
-    /// which is the reproducibility a fixed-order caller relies on.
-    #[tokio::test]
-    async fn fold_vectors_in_order_matches_udaf_and_is_fixed_order_stable() {
-        let rows = sample_rows();
-        for (name, reduce) in [
-            ("vector_sum", VectorReduce::Sum),
-            ("vector_mean", VectorReduce::Mean),
-            ("vector_max", VectorReduce::Max),
-        ] {
-            let via_udaf = run_reduce(name, &rows, 4).await;
-            let via_primitive: Vec<f32> =
-                fold_vectors_in_order(rows.iter().map(Vec::as_slice), reduce, 4)
-                    .iter()
-                    .map(|&x| x as f32)
-                    .collect();
-            assert_eq!(
-                via_udaf, via_primitive,
-                "{name}: the shared primitive disagrees with the SQL aggregate"
-            );
-            // Folding the identical order again is bit-for-bit reproducible.
-            let again: Vec<f32> = fold_vectors_in_order(rows.iter().map(Vec::as_slice), reduce, 4)
-                .iter()
-                .map(|&x| x as f32)
-                .collect();
-            assert_eq!(
-                via_primitive
-                    .iter()
-                    .map(|f| f.to_bits())
-                    .collect::<Vec<_>>(),
-                again.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
-                "{name}: fixed-order fold is not byte-identical"
-            );
-        }
     }
 
     #[tokio::test]

@@ -88,6 +88,7 @@ use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSource
 use crate::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput as AiPropagationOutput,
 };
+use crate::pipeline::graph_structure::StructureRequest;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::session::InferenceSession;
 
@@ -347,15 +348,51 @@ impl InferenceSession {
                 dimensions: _,
             } => {
                 let edge_source_ref = EdgeSourceRef::from_binding(edge_source);
-                let request = PropagateRequest::new(table.source_id.clone(), edge_source_ref)
+                let mut request = PropagateRequest::new(table.source_id.clone(), edge_source_ref)
                     .with_embedding_table(source_table)
                     .with_direction(edge_direction_from_manifest(direction))
                     .with_hops(hops)
                     .with_weighting(propagation_weighting_from_manifest(weighting))
                     .with_alpha(f64::from_bits(alpha_bits))
                     .with_output(propagation_output_from_manifest(output));
+                // The recorded depth is the one that ran, under whatever cap
+                // the original request carried: the replay's cap must admit it.
+                request.hop_cap = request.hop_cap.max(hops);
                 let (record, outcome) = self
                     .propagate_embeddings(&request, CachePolicy::Bypass)
+                    .await?;
+                Ok((record.table_name, outcome))
+            }
+            ProducingDescriptor::GraphStructure {
+                edge_source,
+                kernel_id: _,
+                direction,
+                weighting,
+                seed,
+                dimensions,
+                sparsity_bits,
+                beta_bits,
+                weight_bits,
+            } => {
+                let weights: Vec<f64> = weight_bits.into_iter().map(f64::from_bits).collect();
+                let mut request = StructureRequest::new(
+                    table.source_id.clone(),
+                    EdgeSourceRef::from_binding(edge_source),
+                )
+                .with_direction(edge_direction_from_manifest(direction))
+                .with_weighting(propagation_weighting_from_manifest(weighting))
+                .with_dimensions(dimensions)
+                .with_beta(f64::from_bits(beta_bits))
+                .with_sparsity(f64::from_bits(sparsity_bits))
+                .with_seed(seed);
+                // As for a propagation: the recorded depth ran, so the cap admits it.
+                request.hop_cap = request.hop_cap.max(weights.len().saturating_sub(1));
+                request.weights = weights;
+                // The key provenance is the table's own, not a descriptor
+                // determinant: it changes no vector.
+                request.key_column = table.key_column.clone();
+                let (record, outcome) = self
+                    .generate_structure_embeddings(&request, CachePolicy::Bypass)
                     .await?;
                 Ok((record.table_name, outcome))
             }
@@ -1264,6 +1301,9 @@ fn propagation_output_from_manifest(output: PropagationOutput) -> AiPropagationO
     match output {
         PropagationOutput::Final => AiPropagationOutput::Final,
         PropagationOutput::JumpingKnowledge => AiPropagationOutput::JumpingKnowledge,
+        PropagationOutput::WeightedSum { weight_bits } => AiPropagationOutput::WeightedSum {
+            weights: weight_bits.into_iter().map(f64::from_bits).collect(),
+        },
     }
 }
 

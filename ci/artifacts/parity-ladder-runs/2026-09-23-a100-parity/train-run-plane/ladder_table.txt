@@ -1,0 +1,32 @@
+# train-run ladder, resident -> shape-d
+
+## resident -> streamed  [GREEN]  — the job path: training-set table, streaming loader
+outcome digests equal on 1/1 unit(s)
+cost (upper/lower time): 1.0012 by minima, 1.0007 by medians [0.9952, 1.0076] — INDETERMINATE: inside the x1.0179 noise band
+space (upper/lower): host Some(1.059883022612147) device Some(1.0504497053654502) host bytes per unit of work None
+  [n/m ] evidence overhead_budget against UNBUDGETED — upper/lower time at most 1.0076, budget UNBUDGETED
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 1.0599 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — 1.0504 against UNBUDGETED
+  [n/m ] evidence host_memory_flat_in_work against UNBUDGETED — not measured on every leg
+
+## streamed -> placed  [INVALID]  — the same job as a gang on an executor
+outcome digests equal on 0/0 unit(s)
+space (upper/lower): host None device None host bytes per unit of work None
+  [n/m ] evidence overhead_budget against no bound — no leg carries iter_wall_s
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — not measured on every leg
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: rung "placed" has no r1 leg for unit "seed1"
+
+## placed -> shape-d  [INVALID]  — the deployed topology: the job through the query tier, on a compute process
+outcome digests equal on 0/0 unit(s)
+space (upper/lower): host None device None host bytes per unit of work None
+  [n/m ] evidence overhead_budget against no bound — no leg carries iter_wall_s
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — not measured on every leg
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: rung "placed" has no r1 leg for unit "seed1"
+
+REFUSED: leg placed__seed1__r1: unreadable — EOF while parsing a value at line 1 column 0
+REFUSED: leg placed__seed1__r2: unreadable — EOF while parsing a value at line 1 column 0
+
+causes: edge streamed -> placed is INVALID; edge placed -> shape-d is INVALID; leg placed__seed1__r1: unreadable — EOF while parsing a value at line 1 column 0; leg placed__seed1__r2: unreadable — EOF while parsing a value at line 1 column 0
+status: INVALID

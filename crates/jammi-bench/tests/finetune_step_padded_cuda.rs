@@ -64,7 +64,7 @@ fn model_dir() -> PathBuf {
 /// cascade's fixed dtype domain), a genuinely padded `--row-lengths`, and
 /// `--cuda 0`. `steps`/`warmup` deliberately small (`1`/`0`) — this is a
 /// correctness/dispatch-shape leg, not a throughput sweep; a committed
-/// artifact uses `stacked_sweep.sh`'s own step/warmup counts.
+/// artifact uses `finetune_step_ab.sh`'s own step/warmup counts.
 fn padded_command(model_dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args([
@@ -197,18 +197,13 @@ fn a5_padded_block_arm_vram_baseline_leg() {
 ///     agree on pad-row gradients even in a fully correct implementation —
 ///     never read a divergence there as a bug without checking this first.
 /// (c) ASYMMETRIC PER-FORWARD SYNC COST, attributed here rather than left
-///     as an unstated confound inside either arm's step-time number: this
-///     leg's `flash` arm passes `Some(row_lengths)` into
-///     `forward_with_lengths` (the trusted-lengths path), which does not
-///     trust `is_prefix` on faith. Every time
-///     the flash admission cascade actually reaches
+///     as an unstated confound inside either arm's step-time number: every
+///     time the flash admission cascade actually reaches
 ///     `resolve_lengths_and_prefix` (i.e. every forward on this leg's
 ///     `flash` arm, which clears every cheaper capability/domain gate
-///     first), `trusted_lengths_agree_with_mask` pays exactly ONE device
-///     reduction + ONE D2H `to_vec1` sync — the SAME sync class the
-///     mask-derived path's `compute_lengths_and_prefix` already pays, per that function's own
-///     doc — to prove the host-supplied `row_lengths` really agrees with
-///     the device-side mask before `is_prefix = true` is ever returned.
+///     first), `compute_lengths_and_prefix` pays exactly ONE device
+///     reduction + ONE D2H `to_vec1` sync to read the row lengths and the
+///     prefix structure off the mask.
 ///     This leg's `block` arm pays NONE of that: `JAMMI_KERNELS_DISABLE=
 ///     attention_block_flash` makes `admit_cascade`'s `op_is_disabled`
 ///     check fire FIRST, before
@@ -217,10 +212,9 @@ fn a5_padded_block_arm_vram_baseline_leg() {
 ///     step-time numbers are therefore NOT sync-symmetric: the `flash` arm
 ///     carries one extra device reduction + D2H round-trip per forward that
 ///     the `block` arm structurally cannot pay. This is not a benchmark
-///     artifact to subtract out — the validation is part of the flash arm's
-///     real production cost on the public `forward_with_lengths` edge (it
-///     exists to catch a lying `trusted_lengths` before it drives
-///     `unpad_gather_indices`/`repad_rows`) — so it rides inside the flash
+///     artifact to subtract out — the read is part of the flash arm's real
+///     production cost (it is what drives `unpad_gather_indices`/
+///     `repad_rows`) — so it rides inside the flash
 ///     arm's measured `s_per_step_p50` by design; a reader comparing the
 ///     two arms' step times must account for it explicitly rather than
 ///     assume both pay the same mask-path sync cost.

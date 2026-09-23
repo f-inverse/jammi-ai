@@ -2,7 +2,8 @@
 # A test either runs its assertions or is not selected. One that needs
 # something the host may lack is selected by the lane that offers it — a
 # `live-*` (or `unprivileged-tests`) cargo feature, a pytest marker, a guard's
-# `needs` and `lane` in `ci/guards.toml` — and acquires it or fails naming it.
+# `needs` in `ci/guards.toml`, a script test's `# lane:` line — and acquires
+# it or fails naming it.
 # Two signatures of a test that instead reads green when its resource is
 # missing, or of a lane or doc describing one:
 #

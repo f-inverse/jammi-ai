@@ -158,29 +158,33 @@ contributor must pass; add one when it protects something, and delete it when it
 
 The checks that need no build live in one list, `ci/guards.toml`: each entry names its command,
 the property it holds, and the paths that can affect it. One runner executes them, in CI and
-locally alike, so a guard that passes on your machine passes in CI:
+locally alike, so a guard that passes on your machine passes in CI. A guard runs its assertions
+or is not selected: it declares what it `needs` of its host, the runner provides that before
+running it, and a need still missing fails the run by name.
 
 ```bash
 ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main   # the guards your change can affect
 ci/dev.sh python3 ci/scripts/run_guards.py                      # all of them
 ```
 
-A guard runs its assertions or is not selected: it declares what it `needs` of its host, the runner
-provides that before running it, and a need still missing fails the run by name. A guard whose
-host no command can make of the CI image — a workspace build beside a PyTorch venv — declares a
-`lane` too, and only a run on such a host selects it:
+A test of one of the repository's own scripts — a `test_*` file under `ci/`, a script's own
+`--self-test` — is not a guard; one runner discovers and runs those, selected when the change
+touches the scripts. A script test whose host no command can make of the CI image — a
+workspace build beside a PyTorch venv — declares a `lane` on its first lines, and only a run
+naming that lane selects it:
 
 ```bash
-python3 ci/scripts/run_guards.py --lane torch-host
+ci/dev.sh python3 ci/scripts/run_script_tests.py --base origin/main
+python3 ci/scripts/run_script_tests.py --lane torch-host
 ```
 
 The lanes CI runs against a service — the Postgres arms, the distributed lane over Postgres and
-MinIO — run locally the same way, with the sidecars the workflows declare started for that run
+the S3-class store — run locally the same way, with the backends the workflows declare provided for that run
 alone and removed when it exits:
 
 ```bash
 ci/dev.sh --with pg cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
-ci/dev.sh --with pg,minio cargo test -p jammi-ballista --features live-distributed-tests --test distributed -- --test-threads=1
+ci/dev.sh --with pg,s3 cargo test -p jammi-ballista --features live-distributed-tests --test distributed -- --test-threads=1
 ci/dev.sh --gc          # remove whatever earlier runs left behind, keeping the build caches
 ```
 

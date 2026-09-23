@@ -6,7 +6,8 @@
 //! token's final representation is decoded to the predictive head — the
 //! prior-fitted-network / TabPFN-style point of the spectrum.
 //!
-//! Tokens carry **no positional encoding**, so the set is order-free: permuting
+//! Each block is pre-normalised (see [`TnpLayer`]) and a final norm precedes the
+//! head. Tokens carry **no positional encoding**, so the set is order-free: permuting
 //! the context tokens permutes the attention rows/columns identically and leaves
 //! the target token's output unchanged (permutation-invariance over context).
 //!
@@ -19,23 +20,43 @@
 //! leaves the target attending only to itself — finite, no NaN.
 
 use candle_core::{DType, Tensor};
-use candle_nn::{linear, Linear, Module, VarBuilder};
+use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
 
 use super::{
     attention, linear_over_seq, presence_to_additive_mask, ContextEpisode, ContextPredictorConfig,
     Mlp,
 };
 use crate::error::EncoderError;
+use crate::layer_norm::LayerNorm;
 
-/// One pre-norm-free transformer block: masked self-attention + residual, then
-/// an MLP + residual. Layer norm is omitted deliberately — the family's blocks
-/// are small and the residual MLP keeps the forward well-conditioned for the
-/// synthetic-tensor tests; the math that matters (masked attention) is shared
-/// with the encoders' verified primitive.
+/// The layer norms' epsilon — PyTorch's `nn.LayerNorm` default, which GPT-2's
+/// blocks use.
+const NORM_EPS: f64 = 1e-5;
+
+/// One pre-norm transformer block: `tokens + attn(norm(tokens))`, then
+/// `tokens + mlp(norm(tokens))` — the Pre-LN placement (Xiong et al. 2020, *On
+/// Layer Normalization in the Transformer Architecture*; GPT-2's).
+///
+/// The normalisation is an invariant of the member, not a tuning choice. A
+/// residual stack without it amplifies rounding: over 180 optimizer steps at a
+/// learning rate of `5e-3`, the same two-layer stack without these norms turned
+/// a one-ulp difference in one weight into a loss difference of `1.9e-1`
+/// (×10 every ~23 steps, in `f32` and in `f64` alike), so two trainings from
+/// identical weights and batches could not be paired beyond a few dozen steps
+/// — not across stacks, not even against a one-ulp copy of themselves. The
+/// key projection carries **no bias**: every key of a block goes through it,
+/// so a key bias adds the same `q·b` to every score of a query's row, and
+/// softmax discards a per-row constant — the bias cannot change the output,
+/// its true gradient is zero, and Adam would walk its rounding residue at full
+/// size. `AttnCnp`'s key projection keeps its bias: its prior key is not
+/// projected, so there the bias does move the prior's score against the
+/// members'.
 struct TnpLayer {
+    attn_norm: LayerNorm,
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
+    mlp_norm: LayerNorm,
     mlp: Mlp,
     num_heads: usize,
 }
@@ -43,9 +64,11 @@ struct TnpLayer {
 impl TnpLayer {
     fn new(hidden: usize, num_heads: usize, vb: VarBuilder) -> Result<Self, EncoderError> {
         Ok(Self {
+            attn_norm: LayerNorm::new(hidden, NORM_EPS, true, vb.pp("attn_norm"))?,
             q_proj: linear(hidden, hidden, vb.pp("q"))?,
-            k_proj: linear(hidden, hidden, vb.pp("k"))?,
+            k_proj: linear_no_bias(hidden, hidden, vb.pp("k"))?,
             v_proj: linear(hidden, hidden, vb.pp("v"))?,
+            mlp_norm: LayerNorm::new(hidden, NORM_EPS, true, vb.pp("mlp_norm"))?,
             mlp: Mlp::new(hidden, hidden, hidden, vb.pp("mlp"))?,
             num_heads,
         })
@@ -53,12 +76,13 @@ impl TnpLayer {
 
     /// `tokens`: `[B, S, hidden]`; `mask`: additive `[B, 1, 1, S]`.
     fn forward(&self, tokens: &Tensor, mask: &Tensor) -> Result<Tensor, EncoderError> {
-        let q = self.q_proj.forward(tokens)?;
-        let k = self.k_proj.forward(tokens)?;
-        let v = self.v_proj.forward(tokens)?;
+        let normed = self.attn_norm.forward(tokens)?;
+        let q = self.q_proj.forward(&normed)?;
+        let k = self.k_proj.forward(&normed)?;
+        let v = self.v_proj.forward(&normed)?;
         let attended = attention::multi_head_attention(&q, &k, &v, Some(mask), self.num_heads)?;
         let tokens = (tokens + attended)?;
-        let ff = self.mlp.forward(&tokens)?;
+        let ff = self.mlp.forward(&self.mlp_norm.forward(&tokens)?)?;
         Ok((&tokens + ff)?)
     }
 
@@ -72,6 +96,10 @@ impl TnpLayer {
             if let Some(b) = proj.bias() {
                 p.push(b);
             }
+        }
+        for norm in [&self.attn_norm, &self.mlp_norm] {
+            p.push(norm.weight());
+            p.extend(norm.bias());
         }
         p.extend(self.mlp.trainable_params());
         p
@@ -89,6 +117,8 @@ pub struct Tnp {
     /// `[1, 1, hidden]`.
     query_marker: Tensor,
     layers: Vec<TnpLayer>,
+    /// The final norm before the head (the Pre-LN transformer's closing norm).
+    final_norm: LayerNorm,
     /// Decodes the target token's final representation to the head.
     head: Mlp,
 }
@@ -117,6 +147,7 @@ impl Tnp {
                 vb.pp(format!("layer.{n}")),
             )?);
         }
+        let final_norm = LayerNorm::new(cfg.hidden_dim, NORM_EPS, true, vb.pp("final_norm"))?;
         let head = Mlp::new(
             cfg.hidden_dim,
             cfg.hidden_dim,
@@ -128,6 +159,7 @@ impl Tnp {
             target_embed,
             query_marker,
             layers,
+            final_norm,
             head,
         })
     }
@@ -167,9 +199,9 @@ impl Tnp {
         }
         debug_assert_eq!(hidden.dim(1)?, k + 1);
 
-        // Read the target token (position 0) and decode it.
+        // Read the target token (position 0), norm it, and decode it.
         let target_out = hidden.narrow(1, 0, 1)?.squeeze(1)?; // [B, hidden]
-        self.head.forward(&target_out)
+        self.head.forward(&self.final_norm.forward(&target_out)?)
     }
 
     /// Embedding, marker, layer, and head parameters.
@@ -187,6 +219,8 @@ impl Tnp {
         for layer in &self.layers {
             p.extend(layer.trainable_params());
         }
+        p.push(self.final_norm.weight());
+        p.extend(self.final_norm.bias());
         p.extend(self.head.trainable_params());
         p
     }
@@ -214,6 +248,7 @@ mod tests {
     /// order-free.
     #[test]
     fn permutation_invariant_over_context() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let ep = episode(3, 4, 3, 1, &device);
         let base = model.forward(&ep).unwrap();
@@ -241,6 +276,7 @@ mod tests {
     /// head, no NaN over the masked attention rows.
     #[test]
     fn empty_context_is_finite() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let mut ep = episode(3, 4, 3, 1, &device);
         ep.presence = Tensor::zeros((3, 4), DType::F32, &device).unwrap();
@@ -257,6 +293,7 @@ mod tests {
     /// `k = 0` (no context tokens) is finite — only the target token in the set.
     #[test]
     fn zero_k_context_is_finite() {
+        let _seam = crate::test_support::seam_counter_lock();
         let (model, _vm, device) = build(2);
         let target_x = Tensor::randn(0f32, 1.0, (3, 3), &device).unwrap();
         let context_x = Tensor::zeros((3, 0, 3), DType::F32, &device).unwrap();
@@ -277,5 +314,58 @@ mod tests {
             .unwrap()
             .iter()
             .all(|x| x.is_finite()));
+    }
+
+    /// The parameter set is exactly the pre-norm block's: biased `q`/`v`, a
+    /// bias-free `k` (softmax discards the per-row constant a key bias would
+    /// add), a norm before the attention and one before the MLP, and a final
+    /// norm — every one of them trainable.
+    #[test]
+    fn parameter_set_is_the_pre_norm_blocks() {
+        let (model, varmap, _device) = build(2);
+        let mut names: Vec<String> = varmap.data().lock().unwrap().keys().cloned().collect();
+        names.sort();
+        for expected in [
+            "layer.0.k.weight",
+            "layer.0.q.bias",
+            "layer.0.attn_norm.weight",
+            "layer.0.attn_norm.bias",
+            "layer.0.mlp_norm.weight",
+            "layer.1.mlp_norm.bias",
+            "final_norm.weight",
+            "final_norm.bias",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        assert!(!names.iter().any(|n| n.ends_with(".k.bias")), "{names:?}");
+        assert_eq!(model.trainable_params().len(), names.len());
+    }
+
+    /// A loss over the head reaches every parameter through the norms —
+    /// nothing is left without a gradient.
+    #[test]
+    fn backward_reaches_every_parameter() {
+        // The forward reaches the fused LayerNorm seam, whose process-wide
+        // dispatch counters every writer serialises on.
+        let _seam = crate::test_support::seam_counter_lock();
+        let (model, varmap, device) = build(2);
+        let ep = episode(3, 4, 3, 1, &device);
+        let loss = model
+            .forward(&ep)
+            .unwrap()
+            .sqr()
+            .unwrap()
+            .mean_all()
+            .unwrap();
+        let grads = loss.backward().unwrap();
+        for (name, var) in varmap.data().lock().unwrap().iter() {
+            assert!(
+                grads.get(var.as_tensor()).is_some(),
+                "{name} received no gradient"
+            );
+        }
     }
 }

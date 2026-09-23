@@ -1,4 +1,6 @@
-use jammi_numerics::stats::{bootstrap_ci, mann_whitney_u, sign_test, welch_t_test};
+use jammi_numerics::stats::{
+    bootstrap_ci, mann_whitney_u, sign_test, sign_test_critical_count, welch_t_test,
+};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -434,4 +436,54 @@ fn sign_test_is_invariant_to_input_order() {
     assert_eq!(a.n_neg, b.n_neg);
     assert_eq!(a.ties, b.ties);
     assert_eq!(a.p_value.to_bits(), b.p_value.to_bits());
+}
+
+/// The (12, 11) cell: 11 of 12 is the least concordance significant at
+/// 0.0064 (`2 * 13 / 4096 = 0.006348`), and 10 of 12 is not (`2 * 79 / 4096 =
+/// 0.0386`).
+#[test]
+fn sign_test_critical_count_n12_at_the_0064_level_is_11() {
+    assert_eq!(sign_test_critical_count(12, 0.0064).unwrap(), Some(11));
+    assert_eq!(sign_test_critical_count(12, 0.04).unwrap(), Some(10));
+    // One hair under the (12, 11) tail: only a clean sweep is significant.
+    assert_eq!(sign_test_critical_count(12, 0.0063).unwrap(), Some(12));
+}
+
+/// The count agrees with the test it is derived from: a sample with exactly
+/// the critical count of one sign is significant, one fewer is not.
+#[test]
+fn sign_test_critical_count_agrees_with_sign_test_at_every_n() {
+    for n in 1..=40_usize {
+        for alpha in [0.05, 0.01, 0.0064] {
+            let critical = sign_test_critical_count(n, alpha).unwrap();
+            let p_at = |k: usize| {
+                let diffs: Vec<f64> = (0..n).map(|i| if i < k { 1.0 } else { -1.0 }).collect();
+                sign_test(&diffs).unwrap().p_value
+            };
+            match critical {
+                Some(k) => {
+                    assert!(p_at(k) <= alpha, "n={n} alpha={alpha} k={k}");
+                    assert!(k * 2 > n);
+                    if (k - 1) * 2 > n {
+                        assert!(p_at(k - 1) > alpha, "n={n} alpha={alpha} k-1={}", k - 1);
+                    }
+                }
+                None => assert!(p_at(n) > alpha, "n={n} alpha={alpha}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn sign_test_critical_count_is_none_when_n_is_too_small() {
+    // n = 5: a clean sweep has p = 2 / 32 = 0.0625 > 0.05.
+    assert_eq!(sign_test_critical_count(5, 0.05).unwrap(), None);
+    assert_eq!(sign_test_critical_count(6, 0.05).unwrap(), Some(6));
+}
+
+#[test]
+fn sign_test_critical_count_refuses_bad_input() {
+    assert!(sign_test_critical_count(0, 0.05).is_err());
+    assert!(sign_test_critical_count(12, 0.0).is_err());
+    assert!(sign_test_critical_count(12, 1.0).is_err());
 }

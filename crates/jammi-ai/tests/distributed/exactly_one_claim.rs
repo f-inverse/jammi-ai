@@ -94,7 +94,7 @@ async fn one_job_n_workers_exactly_one_wins() {
     );
 
     // The committed served pointer is set (the finalize CAS wrote it) and roots
-    // under this run's MinIO prefix — the winner's artifact, on the shared bucket.
+    // under this run's S3 prefix — the winner's artifact, on the shared bucket.
     let model = models
         .iter()
         .find(|m| m.model_id == expected_model)
@@ -106,7 +106,7 @@ async fn one_job_n_workers_exactly_one_wins() {
         .to_string();
     assert!(
         artifact.starts_with(&result_root),
-        "the committed artifact {artifact:?} roots under this run's MinIO prefix {result_root:?}"
+        "the committed artifact {artifact:?} roots under this run's S3 prefix {result_root:?}"
     );
 
     drop(fleet);

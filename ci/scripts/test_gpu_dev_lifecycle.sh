@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: ssh-keygen, jq, tmux, flock
 # Mocks-only, no-network regression suite for the dev-pod lifecycle: the
 # repo's own tooling must never terminate a pod it does not own, and must
 # never leak one it rented. Covers:
@@ -1432,17 +1433,38 @@ fi
 G7E_SESSION="wjE"; write_meta "$G7E_SESSION" "pod-wjE" "8"
 G7E_DIR="$SANDBOX/g7e-ssh"; mkdir -p "$G7E_DIR"
 write_ssh_resp "$G7E_DIR" 1 0                                     # require_pod liveness
-write_ssh_resp "$G7E_DIR" 2 1 "no job evidence for tree 'jammi-ai': no live tmux session and no .jammi.log"
+write_ssh_resp "$G7E_DIR" 2 3 "no job evidence for tree 'jammi-ai': no live tmux session and no .jammi.log"
+write_ssh_resp "$G7E_DIR" 3 3 "no job evidence for tree 'jammi-ai': no live tmux session and no .jammi.log"
 rm -f "$SANDBOX/g7e-counter"
 MOCK_SSH_CALL_COUNTER="$SANDBOX/g7e-counter" MOCK_SSH_RESPONSES_DIR="$G7E_DIR" \
-  RP_WAIT_INTERVAL_SECS=1 \
+  RP_WAIT_INTERVAL_SECS=1 RP_WAIT_GRACE_SECS=1 \
   PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-job "$G7E_SESSION" --timeout 10 \
   >"$SANDBOX/out-g7e.log" 2>&1
 g7e_rc=$?
-if [ "$g7e_rc" -ne 0 ] && grep -q "no job evidence" "$SANDBOX/out-g7e.log"; then
-  ok "wait-job: no-evidence path (never ran) exits non-zero naming it"
+if [ "$g7e_rc" -ne 0 ] && grep -q "no job evidence" "$SANDBOX/out-g7e.log" && grep -q "FAILURE" "$SANDBOX/out-g7e.log"; then
+  ok "wait-job: no-evidence past the startup grace exits non-zero naming it"
 else
-  bad "wait-job: expected rc!=0 + 'no job evidence' (got rc=$g7e_rc): $(cat "$SANDBOX/out-g7e.log")"
+  bad "wait-job: expected rc!=0 + 'no job evidence' after the grace (got rc=$g7e_rc): $(cat "$SANDBOX/out-g7e.log")"
+fi
+
+# --- 7e2: wait-job "no evidence" INSIDE the startup grace is "not started
+# yet", and a verdict that follows is read as such -- a pod polled right after
+# `run` returns has no session yet.
+G7E2_SESSION="wjE2"; write_meta "$G7E2_SESSION" "pod-wjE2" "8"
+G7E2_DIR="$SANDBOX/g7e2-ssh"; mkdir -p "$G7E2_DIR"
+write_ssh_resp "$G7E2_DIR" 1 0                                    # require_pod liveness
+write_ssh_resp "$G7E2_DIR" 2 3 "no job evidence for tree 'jammi-ai': no live tmux session and no completion marker"
+write_ssh_resp "$G7E2_DIR" 3 0 "job finished successfully (rc=0)"
+rm -f "$SANDBOX/g7e2-counter"
+MOCK_SSH_CALL_COUNTER="$SANDBOX/g7e2-counter" MOCK_SSH_RESPONSES_DIR="$G7E2_DIR" \
+  RP_WAIT_INTERVAL_SECS=1 \
+  PATH="$WAITBIN:$PATH" bash "$DIR/gpu-dev.sh" wait-job "$G7E2_SESSION" --timeout 10 \
+  >"$SANDBOX/out-g7e2.log" 2>&1
+g7e2_rc=$?
+if [ "$g7e2_rc" -eq 0 ] && grep -q "not started yet" "$SANDBOX/out-g7e2.log" && grep -q "SUCCESS" "$SANDBOX/out-g7e2.log"; then
+  ok "wait-job: no-evidence inside the startup grace keeps polling and reads the verdict that follows"
+else
+  bad "wait-job: expected 'not started yet' then SUCCESS rc=0 (got rc=$g7e2_rc): $(cat "$SANDBOX/out-g7e2.log")"
 fi
 
 # --- 7f: wait-seed/wait-job honour the SAME RP_SESSION-vs-positional
@@ -1520,8 +1542,8 @@ fi
 # they drive rp_seed_wait_script/rp_job_wait_script/
 # rp_job_wrapper_with_marker_lines directly, sourcing runpod_lib.sh, exactly
 # like Group 0/5's own function-level tests above). Both tools are declared
-# needs of this suite's guard in ci/guards.toml; a host missing either one
-# fails here, naming it.
+# needs of this suite (its `# needs:` line, `ci/needs.toml`); a host missing
+# either one fails here, naming it.
 g8_missing=""
 for g8_tool in tmux flock; do
   command -v "$g8_tool" >/dev/null 2>&1 || g8_missing="${g8_missing:+$g8_missing, }$g8_tool"
@@ -1648,14 +1670,14 @@ if [ -z "$g8_missing" ]; then
     SESSSTALE="jammi-g8-stale-$$"; tmux kill-session -t "=${SESSSTALE}" 2>/dev/null
     script_stale="$(rp_job_wait_script "$TREES" "$SESSSTALE" "stale-tree")"
     out_stale="$(bash -c "$script_stale" 2>&1)"; rc_stale=$?
-    if [ "$rc_stale" -eq 1 ] && printf '%s' "$out_stale" | grep -qi "no job evidence"; then
+    if [ "$rc_stale" -eq 3 ] && printf '%s' "$out_stale" | grep -qi "no job evidence"; then
       record PASS "g8g-stale-log-no-marker-reads-no-evidence-not-SUCCESS"
     else
       record FAIL "g8g-stale-log-no-marker-reads-no-evidence-not-SUCCESS (rc=$rc_stale out=$out_stale)"
     fi
   )
 else
-  bad "Group 8 (state-lattice legs): ${g8_missing} not found on PATH -- this suite's guard declares tmux and flock as needs (ci/guards.toml); run it where they are provided (ci/dev.sh)"
+  bad "Group 8 (state-lattice legs): ${g8_missing} not found on PATH -- this suite's `# needs:` line declares tmux and flock (ci/needs.toml); run it where they are provided (ci/dev.sh)"
 fi
 
 # ── tally ────────────────────────────────────────────────────────────────

@@ -491,23 +491,23 @@ pub enum JammiError {
         wire_kinds(held)
     )]
     DeviceKindUnheld {
-        /// The kind the plan's own `InferenceExec`/`GangExec` stamps.
+        /// The kind the plan's own `InferenceExec`/`PlacedAttemptExec` stamps.
         required: crate::store::manifest::ComputeDeviceKind,
         /// The kinds the holder lists, distinct and in wire order.
         held: Vec<crate::store::manifest::ComputeDeviceKind>,
     },
 
-    /// A stage whose plan carries a gang was planned at more than one
-    /// partition: one gang is one task, never a fan-out of the coordinator
-    /// body. Refused by the executor before the stage runs. An engine
+    /// A stage whose plan carries a placed training attempt was planned at
+    /// more than one partition: one attempt is one task, never a fan-out of
+    /// its body. Refused by the executor before the stage runs. An engine
     /// invariant — the submitter's plan, or the scheduler's planning of it
     /// — never a caller condition, so this maps to gRPC `Internal`.
     #[error(
-        "gang for job `{job_id}` was planned at {partitions} partitions; a gang stage is one \
-         partition"
+        "placed attempt of job `{job_id}` was planned at {partitions} partitions; a placed \
+         attempt's stage is one partition"
     )]
-    GangFanOut {
-        /// The gang descriptor's own fine-tune job id.
+    PlacedAttemptFanOut {
+        /// The placed attempt's own training job id.
         job_id: String,
         /// The partition count the stage was planned at.
         partitions: u64,
@@ -515,7 +515,7 @@ pub enum JammiError {
 
     /// Catch-all for errors that don't fit another variant.
     /// The compute plane cannot hold a plan a caller required it to hold —
-    /// a claimed gang's one task — right now: no live executor, none of the
+    /// a claimed training attempt's one task — right now: no live executor, none of the
     /// kind the plan requires, only the plan's own submitter, or a plan the
     /// wire cannot carry. A runtime state of the plane, never a fault in
     /// the plan or its caller; a materialization runs in-process on the
@@ -756,7 +756,8 @@ impl From<serde_json::Error> for JammiError {
     }
 }
 
-/// Best-effort recovery of a `GreedyMemoryPool`/`FairSpillPool`'s configured
+/// Best-effort recovery of a bounded pool's (the session's `ActiveSpillPool`,
+/// or DataFusion's `GreedyMemoryPool`/`FairSpillPool`) configured
 /// byte limit from its own `Display` impl embedded in a `ResourcesExhausted`
 /// message (`"…pool_size: <value> <unit>…"`, `<value>` rounded to one
 /// decimal place and `<unit>` one of `B`/`KB`/`MB`/`GB`/`TB`, binary-based —

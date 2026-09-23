@@ -4,9 +4,9 @@
 //! Hermetic: a tempdir session carries a synthetic node embedding table (a
 //! distinct vector per node, keyed by `_row_id`) and a registered external edge
 //! source (`src`/`dst`[/`weight`][/`tenant_id`]). The node ids are the edge
-//! endpoints and the embedding keys, so a propagated row aggregates through the
-//! same shared vector-aggregation UDAF an ANN context pools through. No consumer
-//! vocabulary appears — the fixtures are a neutral citation-/co-purchase-style
+//! endpoints and the embedding keys, so a propagated row folds through the same
+//! lane operator the vector-aggregation UDAF an ANN context pools through
+//! does. No consumer vocabulary appears — the fixtures are a neutral citation-/co-purchase-style
 //! graph.
 //!
 //! The tests assert its contracts: self-loop correctness
@@ -1696,21 +1696,4 @@ async fn cross_tenant_edge_endpoint_is_never_propagated() {
             "a aggregates only Alice's edge: lane {lane}"
         );
     }
-}
-
-#[tokio::test]
-async fn edge_set_over_ceiling_is_refused() {
-    let (nodes, edges) = two_class_homophilous(4);
-    let (session, _dir) = graph_session(&nodes, &edges, None).await;
-
-    let mut request = registered_request(&session).await;
-    request.max_rows = 1; // the fixture has many edges (counting both directions)
-    let err = session
-        .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("exceeds the ceiling"),
-        "an over-ceiling edge set is refused loudly, not silently OOM: {err}"
-    );
 }

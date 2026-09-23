@@ -29,7 +29,7 @@ impl OutputAdapter for EmbeddingAdapter {
         )]
     }
 
-    fn adapt(&self, output: &BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
+    fn adapt(&self, output: BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>> {
         if row_count == 0 {
             let field = Arc::new(Field::new("item", DataType::Float32, false));
             let empty = FixedSizeListArray::new(
@@ -41,9 +41,17 @@ impl OutputAdapter for EmbeddingAdapter {
             return Ok(vec![Arc::new(empty)]);
         }
 
-        let flat_values = output.float_outputs.first().ok_or_else(|| {
-            JammiError::Inference("embedding adapter: backend emitted no float head".into())
-        })?;
+        let BackendOutput {
+            mut float_outputs,
+            row_status,
+            ..
+        } = output;
+        if float_outputs.is_empty() {
+            return Err(JammiError::Inference(
+                "embedding adapter: backend emitted no float head".into(),
+            ));
+        }
+        let flat_values = float_outputs.swap_remove(0);
         // `row_count * self.dimensions` with a raw multiply can silently
         // overflow on an adversarial `row_count`/`dimensions` pair; the
         // checked multiply refuses by name instead (mirrors
@@ -67,15 +75,15 @@ impl OutputAdapter for EmbeddingAdapter {
         // when the null buffer's length disagrees with the values array's
         // row count. Refuse by name here, before construction, rather than
         // let a malformed `row_status` abort the process below.
-        if output.row_status.len() != row_count {
+        if row_status.len() != row_count {
             return Err(JammiError::Inference(format!(
                 "embedding adapter: row_status has {} entries, expected one per row \
                  ({row_count})",
-                output.row_status.len()
+                row_status.len()
             )));
         }
-        let values_array = Float32Array::from(flat_values.clone());
-        let nulls = NullBuffer::from(output.row_status.clone());
+        let values_array = Float32Array::from(flat_values);
+        let nulls = NullBuffer::from(row_status);
         let field = Arc::new(Field::new("item", DataType::Float32, false));
         let array = FixedSizeListArray::new(
             field,
@@ -116,7 +124,7 @@ mod tests {
             row_errors: vec![String::new(), String::new()],
             shapes: vec![(2, 3)],
         };
-        let err = EmbeddingAdapter::new(3).adapt(&out, 2).unwrap_err();
+        let err = EmbeddingAdapter::new(3).adapt(out.clone(), 2).unwrap_err();
         assert!(err.to_string().contains("no float head"), "{err}");
     }
 
@@ -136,7 +144,7 @@ mod tests {
             row_errors: vec![String::new(), String::new()],
             shapes: vec![(2, 3)],
         };
-        let err = EmbeddingAdapter::new(3).adapt(&out, 2).unwrap_err();
+        let err = EmbeddingAdapter::new(3).adapt(out.clone(), 2).unwrap_err();
         assert!(err.to_string().contains("rows"), "{err}");
     }
 
@@ -156,7 +164,7 @@ mod tests {
             shapes: vec![(usize::MAX, 3)],
         };
         let err = EmbeddingAdapter::new(3)
-            .adapt(&out, usize::MAX)
+            .adapt(out.clone(), usize::MAX)
             .unwrap_err();
         assert!(err.to_string().contains("overflow"), "{err}");
     }
@@ -171,14 +179,14 @@ mod tests {
     #[test]
     fn adapt_refuses_a_row_status_length_mismatch_before_building_the_array() {
         let out = two_rows_dim3(vec![true]); // one short of row_count(2)
-        let err = EmbeddingAdapter::new(3).adapt(&out, 2).unwrap_err();
+        let err = EmbeddingAdapter::new(3).adapt(out.clone(), 2).unwrap_err();
         assert!(err.to_string().contains("row_status"), "{err}");
     }
 
     #[test]
     fn adapt_builds_a_consistent_array_on_the_happy_path() {
         let out = two_rows_dim3(vec![true, false]);
-        let cols = EmbeddingAdapter::new(3).adapt(&out, 2).unwrap();
+        let cols = EmbeddingAdapter::new(3).adapt(out.clone(), 2).unwrap();
         let array = cols[0]
             .as_any()
             .downcast_ref::<FixedSizeListArray>()

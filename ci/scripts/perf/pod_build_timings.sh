@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Pod build-substrate timing producer — runs ON A LIVE POD, never in CI. A
-# maintainer runs it on a live pod and commits the JSON it writes (to
-# JAMMI_BUILD_TIMINGS_OUT, never stdout — see Usage below) under
-# ci/artifacts/pod-build-timings/ (e.g. 20260827T183928Z-bc27e75.json). No
-# doc in this repo may cite a number this producer measures except from a
-# committed JSON (docs/maintainer/dev-gpu.md and pod-build-guide.md §4 cite
-# that file).
+# maintainer runs it on a live pod and keeps the JSON it writes (to
+# JAMMI_BUILD_TIMINGS_OUT, never stdout — see Usage below) as that pod's
+# record; docs/maintainer/dev-gpu.md and pod-build-guide.md §4 quote one
+# such run's sizes and walls.
 #
 # Measures, in order:
 #   (i)   seed + marker + manifest cross-check (iii) — builds the seed via
@@ -82,8 +80,7 @@
 # Writes the result JSON to JAMMI_BUILD_TIMINGS_OUT, never stdout: this
 # script's own progress markers (`::group::`/`::endgroup::` and every
 # intermediate status line) go to stdout, so redirecting stdout into the
-# artifact would corrupt it. The caller copies JAMMI_BUILD_TIMINGS_OUT to
-# ci/artifacts/pod-build-timings/<ts>-<sha>.json and commits it.
+# artifact would corrupt it. The caller keeps JAMMI_BUILD_TIMINGS_OUT.
 # Progress/status goes to stdout/stderr, safe to watch live or log
 # verbatim.
 #
@@ -645,4 +642,4 @@ elif [ "$byte_equal" != "true" ]; then
   echo "::warning::byte-equality FAILED (iv) — see diff below" >&2
   echo "$byte_equal_diff" >&2
 fi
-echo "pipeline complete: result JSON written to ${JAMMI_BUILD_TIMINGS_OUT} — copy it to ci/artifacts/pod-build-timings/<ts>-<sha7>.json and commit it (see this file's header)." >&2
+echo "pipeline complete: result JSON written to ${JAMMI_BUILD_TIMINGS_OUT}." >&2

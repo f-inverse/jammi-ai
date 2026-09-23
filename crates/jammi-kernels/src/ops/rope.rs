@@ -46,7 +46,7 @@
 //! genuinely irregular row/table pairing is refused, not silently
 //! misindexed), enforced on every call, both devices.
 //!
-//! This is also WHY `RotaryEmbedding::apply_training` in `jammi-encoders`
+//! This is also WHY `RotaryEmbedding::apply` in `jammi-encoders`
 //! pays a real `x.contiguous()` copy on its hot path: Q/K reach RoPE as a
 //! `transpose(1, 2)` VIEW whose axis order this op's `%period` model
 //! cannot address without materializing it into the row-major layout the

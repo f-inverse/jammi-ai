@@ -89,6 +89,41 @@ let model_id = job.model_id(); // the spec's `model_id`, now registered
 # Ok(()) }
 ```
 
+A run is a function of the spec and the rows it reads: `seed` fixes both the
+train/test task partition and the predictor's initial weights, so the same
+job publishes the same weights on whichever process trains it. That process
+is the worker that claims the job — or, when the claimant is a client of a
+[compute plane](./reference-topologies.md#shape-d--disaggregated), an
+executor of the claimant's device kind the attempt is placed on as one task,
+exactly as a fine-tune's is. The executor reads the source and its embedding
+table through the shared catalog and result root and publishes through the
+same artifact store; an executor lost mid-run costs the attempt, and the
+successor trains the job anew (the kind keeps no epoch checkpoint to resume
+from).
+
+`seed` fixes both random choices a training makes: which tasks are held out,
+and the predictor's initial weights, which are drawn from a stream keyed by the
+seed and each parameter's name rather than from the process's random state. Two
+trainings at one seed start from byte-identical parameters on any machine.
+
+That is also what makes a training comparable across stacks.
+`jammi-bench predictor-train-run` samples the episodes through the engine,
+writes them and the seeded initial weights to files, trains with the engine's own
+fit, and files a leg per seed — every optimizer step's wall-clock, the held-out
+loss at init and after every epoch, and the trained head's output on the
+held-out tasks — for `jammi-bench ladder predictor-train-run` to compare;
+`crates/jammi-bench/reference/torch_context_predictor.py` loads the same two
+files and trains a PyTorch twin of the same member — every operation of `Cnp`,
+`AttnCnp` and `Tnp` in the engine's order — over the same batches, so the two
+loss trajectories differ by numerics alone. How far numerics alone can carry two
+trajectories apart is a property of the member and the learning rate, measured
+and recorded in `crates/jammi-bench/reference/README.md`. `Tnp`'s blocks are
+pre-normalised (a LayerNorm before the attention, one before the MLP, one before
+the head) for exactly that reason: without the norms the two stacked residual
+blocks amplified a one-ulp difference in one weight to a loss difference of
+order `1e-1` within 180 steps; with them the member is as pairable as the
+mean-pooled one (`1e-3` at 180 steps, its weights within `3e-7`).
+
 The objective is one of the proper scores the
 [distributional head](./distributional-inference.md) uses — no new loss code. A
 `PredictiveHead::Gaussian` serves `(mean, std)`; a `PredictiveHead::Quantile`

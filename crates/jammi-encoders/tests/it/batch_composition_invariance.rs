@@ -80,7 +80,7 @@
 //! `EXACT_ARCH_COMPOSITION_FLOOR` on every composition measured there. It
 //! does NOT hold unscoped on sm89 (L40S): the window-radius control's own
 //! measured minimum separation there is smaller than
-//! `SM89_COMPOSITION_FLOOR`, so that control is INADMISSIBLE on sm89 and
+//! the arch's own composition noise, so that control is admissible on every
 //! refuses to run there, panicking with the reason
 //! (`pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`);
 //! the row-length control stays admissible on sm89 but only
@@ -255,6 +255,9 @@ const RED_CONTROL_SEPARATION_MULTIPLE: f32 = 5.0;
 /// in eval mode).
 #[test]
 fn pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let fixture = build_fixture(&device);
@@ -301,6 +304,9 @@ fn pooled_embedding_alone_matches_padded_batch_real_row_f32_cpu() {
 /// control).
 #[test]
 fn pooled_embedding_red_control_row_length_off_by_one_f32_cpu() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let encoder = build_encoder(&device, DType::F32, &config);
@@ -341,6 +347,9 @@ fn pooled_embedding_red_control_row_length_off_by_one_f32_cpu() {
 /// control vacuously per this file's own module doc).
 #[test]
 fn pooled_embedding_red_control_window_radius_off_by_one_f32_cpu() {
+    let _guard = crate::modernbert::DISPATCH_COUNTER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let device = Device::Cpu;
     let config = load_config();
     let fixture = build_fixture(&device);
@@ -434,8 +443,8 @@ fn relative_l1_error(a: &[f32], b: &[f32]) -> f64 {
 /// constant, instead of a `NaN` bound vacuously admitting an unmeasured
 /// leg. [`gpu_composition_floor`]'s arch-conditional lookup is the value
 /// this guard actually protects: an arch outside its measured set
-/// (`EXACT_ARCH_COMPOSITION_FLOOR`'s sm80/sm86/sm90 class,
-/// `SM89_COMPOSITION_FLOOR`'s sm89) returns `f64::NAN`, and this call
+/// (outside `EXACT_ARCH_COMPOSITION_FLOOR`'s sm80/sm86/sm89/sm90 class)
+/// returns `f64::NAN`, and this call
 /// turns that into a named panic rather than a silent pass.
 /// [`GPU_TRUTH_DRIFT_BOUND`] is a fixed, arch-consistent, always-real
 /// constant (never `NaN` for any arch), so passing it through this guard
@@ -552,7 +561,7 @@ fn require_measured_floor_panics_on_unmeasured_nan() {
 // finiteness -- NEVER a numeric bound.
 //
 // This section's four-arch run produced the measurements folded into
-// [`EXACT_ARCH_COMPOSITION_FLOOR`], [`SM89_COMPOSITION_FLOOR`], and
+// [`EXACT_ARCH_COMPOSITION_FLOOR`] and
 // [`GPU_TRUTH_DRIFT_BOUND`] above (see each constant's own doc for the
 // margin arithmetic). It is a measurement tool, not a gate, for the next
 // re-derivation (a new unmeasured arch, a fixture change, or a build
@@ -597,10 +606,10 @@ mod gpu {
     /// | a100 sm80 (8,0)      | `0e0`                     | `0e0` (EXACT)               |
     /// | h100 sm90 (9,0)      | `0e0`                     | `0e0` (EXACT)               |
     /// | a40  sm86 (8,6)      | `0e0`                     | `0e0` (EXACT)               |
-    /// | l40s sm89 (8,9)      | `1.1805235731113235e-3`   | `4.118649354617619e-3`      |
+    /// | l40s sm89 (8,9)      | `0e0`                     | `0e0` (EXACT)               |
     ///
-    /// **Exact-arches class (sm80/sm86/sm90, [`EXACT_ARCH_COMPOSITION_FLOOR`]).**
-    /// 264 row-measurements (3 arches x 88 each) came back EXACTLY `0.0`,
+    /// **Exact-arches class (sm80/sm86/sm89/sm90, [`EXACT_ARCH_COMPOSITION_FLOOR`]).**
+    /// 352 row-measurements (4 arches x 88 each) came back EXACTLY `0.0`,
     /// zero flakiness -- the same bit-exact-zero this file's own module doc
     /// predicts from `MASKED_LOGIT` underflow (a pad weight's contribution to
     /// the value-weighted sum is `0.0 * finite == 0.0` exactly). The floor is
@@ -613,94 +622,24 @@ mod gpu {
     /// slop at all, including benign FMA/ordering differences on a future,
     /// architecturally-identical but as-yet-unmeasured exact-arch SKU.
     ///
-    /// **sm89 (L40S, [`SM89_COMPOSITION_FLOOR`]) genuinely diverges** --
-    /// the same "Ada-class is not one behavior" A40-pass/L40S-fail pattern as
-    /// (`lora_linear_dx_abs_floor`, `crates/jammi-kernels/tests/cuda_parity.rs`):
-    /// a different cuBLAS/cuDNN kernel selection on this SKU, not flakiness.
-    /// Derivation (measure, then margin, then round to a clean value):
-    /// ```text
-    /// measured max (l40s):
-    ///   4.118649354617619e-3
-    /// margin (~2% headroom over the measured max -- kept modest rather than
-    /// `lora_linear_dx_abs_floor`'s 1.5x precedent, because a larger margin
-    /// here would further erode the row-length red control's own
-    /// composition-scoped separation documented in the admissibility note
-    /// below):
-    ///   4.118649354617619e-3 * 1.02 = 4.2010263...e-3
-    /// rounded to a clean value -- `4.2e-3` sits just BELOW that product, so
-    /// the realized margin is `4.2e-3 / 4.118649354617619e-3 ~= 1.0197x`
-    /// (~1.97% headroom, a hair under 2%): still finite, positive headroom
-    /// over the measured max:
-    ///   4.2e-3
-    /// ```
+    /// **sm89 (L40S) is in that class too, because one forward put it
+    /// there.** It used to be the exception: a max `alone_vs_batch` of
+    /// `4.118649354617619e-3` and a window-radius control whose separation
+    /// (min `1.139471768897301e-3`) sat BELOW that noise, so the control had
+    /// no power on the arch and the lane did not run it. Both facts were
+    /// properties of the eager composition this arch's cuBLAS kernel
+    /// selection took in evaluation, not of the arch: with every fused arm
+    /// admitted on every forward, a re-measurement on an L40S over the same
+    /// 8 compositions x 88 rows reports `max_alone_vs_batch = 0e0` on EVERY
+    /// composition, and the window-radius control separates at
+    /// `1.021712720137889e-3`..`1.5192634542873572e-3` -- 20x above the
+    /// asserted threshold (`1e-5 * 5.0`). An arch-conditional floor and a
+    /// control that skipped an arch were the shape of a defect; neither
+    /// survives it.
     ///
-    /// **Admissibility scoping (shape, never tune).** The window-radius red
-    /// control's own measured minimum separation on sm89,
-    /// `1.139471768897301e-3`, is SMALLER than [`SM89_COMPOSITION_FLOOR`]
-    /// (`4.2e-3`) -- the control cannot separate above the floor on this arch
-    /// at all, so it is INADMISSIBLE there and
-    /// [`pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda`]
-    /// refuses to run on sm89, panicking with the reason (never silently
-    /// green).
-    ///
-    /// The row-length control's admissibility on sm89 is stated the same way
-    /// the window control's already is above: the GATING STATISTIC vs the
-    /// ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`), never
-    /// a raw max-over-floor ratio (the cross-composition MAX over the bare
-    /// floor, `6.881763611768685e-2 / 4.2e-3 ~= 16.4x`, is the wrong pair of
-    /// numbers). The gating test
-    /// ([`pooled_embedding_red_control_row_length_off_by_one_bf16_cuda`])
-    /// exercises composition 0; its measured ratio, `6.881763611768685e-2`,
-    /// clears the asserted threshold
-    /// (`SM89_COMPOSITION_FLOOR * RED_CONTROL_SEPARATION_MULTIPLE` =
-    /// `4.2e-3 * 5.0 = 2.1e-2`) by `~3.28x`
-    /// (`6.881763611768685e-2 / 2.1e-2 ~= 3.28x`).
-    ///
-    /// This clearance is COMPOSITION-SCOPED on sm89, not universal, and this
-    /// doc says so plainly rather than implying every composition clears:
-    /// the full 8-composition row-length ratio set measured on the L40S (cited
-    /// verbatim from
-    /// `docs/plans/62-embedding-surface/measurements/gpu-floors-l40s.txt`),
-    /// compositions 0..7 in order, is `6.881763611768685e-2,
-    /// 6.881763611768685e-2, 6.9996589149257556e-3, 6.881763611768685e-2,
-    /// 4.2952616000474945e-2, 5.418507501917013e-3, 6.881763611768685e-2,
-    /// 1.0134661986953957e-2`. Compositions 2 (`6.9996589149257556e-3`), 5
-    /// (`5.418507501917013e-3`), AND 7 (`1.0134661986953957e-2`) all measure
-    /// BELOW the `2.1e-2` threshold on sm89 -- the row-length control is
-    /// therefore admissible on sm89 ONLY for the fixture composition the
-    /// gating test actually exercises (composition 0), not for every
-    /// composition this arch was measured at; a future change to the gating
-    /// test's fixture composition would need to re-check this scoping, never
-    /// assume it carries over unchanged.
-    ///
-    /// On the exact-arches class the row-length control IS universal
-    /// (unlike sm89): even its weakest measured composition there
-    /// (composition 5, `5.483950988976972e-3` -- a100/h100/a40, same
-    /// artifact directory) clears
-    /// [`EXACT_ARCH_COMPOSITION_FLOOR`]'s asserted threshold
-    /// (`1e-5 * 5.0 = 5e-5`) by `~109.7x`
-    /// (`5.483950988976972e-3 / 5e-5 ~= 109.7x`); the gating composition
-    /// (composition 0, `6.881763611768685e-2`) clears it by `~1376x`.
-    ///
-    /// Detected at runtime via
-    /// `jammi_kernels::admission::probe_cuda_compute_capability` /
-    /// `ComputeCapability`, the SAME per-arch idiom
-    /// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
-    /// uses (`ComputeCapability::new(major, minor)` equality match). An arch
-    /// this table has not measured (including a probe failure or a non-CUDA
-    /// device) returns `f64::NAN` deliberately -- [`require_measured_floor`]
-    /// turns that into a loud, named panic rather than a silent guess (an
-    /// untested arch must fail loud, never silently borrow a floor it was
-    /// never shown to need).
     const EXACT_ARCH_COMPOSITION_FLOOR: f64 = 1e-5;
 
-    /// See [`gpu_composition_floor`]'s doc for the full sm89 derivation
-    /// (measured max `4.118649354617619e-3`, `1.02x` margin, rounded to a
-    /// clean `4.2e-3`).
-    const SM89_COMPOSITION_FLOOR: f64 = 4.2e-3;
-
-    /// Arch-conditional lookup for [`EXACT_ARCH_COMPOSITION_FLOOR`] /
-    /// [`SM89_COMPOSITION_FLOOR`] -- see [`EXACT_ARCH_COMPOSITION_FLOOR`]'s own
+    /// Arch lookup for [`EXACT_ARCH_COMPOSITION_FLOOR`] -- see [`EXACT_ARCH_COMPOSITION_FLOOR`]'s own
     /// doc for the full measured values, margin arithmetic, and admissibility
     /// scoping. Mirrors
     /// `crates/jammi-kernels/tests/cuda_parity.rs`'s `lora_linear_dx_abs_floor`
@@ -729,10 +668,10 @@ mod gpu {
     fn gpu_composition_floor(device: &Device) -> f64 {
         use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
         match probe_cuda_compute_capability(device) {
-            Some(cap) if cap == ComputeCapability::new(8, 9) => SM89_COMPOSITION_FLOOR,
             Some(cap)
                 if cap == ComputeCapability::new(8, 0)
                     || cap == ComputeCapability::new(8, 6)
+                    || cap == ComputeCapability::new(8, 9)
                     || cap == ComputeCapability::new(9, 0) =>
             {
                 EXACT_ARCH_COMPOSITION_FLOOR
@@ -881,14 +820,10 @@ mod gpu {
         let alone0 = pooled_alone(&encoder, &device, &fixture.rows[0]);
         let ratio = relative_l1_error(&alone0, &pooled_batch_mut[0]);
         // Row-length control is conjunctive with the window-radius control on
-        // every arch it runs on, but its admissibility is
-        // COMPOSITION-SCOPED on sm89: this composition-0 fixture's measured
-        // ratio (`6.881763611768685e-2`) clears the asserted threshold
-        // `SM89_COMPOSITION_FLOOR * 5.0` (`2.1e-2`) by `~3.28x`, but
-        // compositions 2, 5, and 7 measure BELOW that same threshold on sm89
-        // and would not pass this exact assert if this test built one of THEM
-        // instead -- see `gpu_composition_floor`'s own doc for the full
-        // per-composition measurements and the scoping statement.
+        // every arch: both now separate on every measured capability, since
+        // the composition noise an arch-scoped caveat existed for is `0e0`
+        // once every forward is the fused one -- see `gpu_composition_floor`'s
+        // own doc for the per-arch measurements.
         assert!(
             ratio.is_finite() && ratio > composition_floor * 5.0,
             "row_lengths off-by-one control failed to separate above the measured bf16 floor \
@@ -901,18 +836,6 @@ mod gpu {
     fn pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda() {
         let test_name = "pooled_embedding_red_control_window_radius_off_by_one_bf16_cuda";
         let device = jammi_test_resources::cuda_device(0);
-        // On sm89 (L40S) bf16 composition noise (SM89_COMPOSITION_FLOOR, 4.2e-3)
-        // exceeds this control's separation (measured minimum 1.14e-3): a one-token
-        // window change cannot be told from noise there, so the control has no
-        // power on that arch and the sm89 lane does not run it. The row-length
-        // control above does separate on sm89.
-        use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
-        assert_ne!(
-            probe_cuda_compute_capability(&device),
-            Some(ComputeCapability::new(8, 9)),
-            "the window-radius red control cannot separate from sm89's bf16 composition noise; \
-             run it on an exact-arch device (sm80/86/90)"
-        );
         let composition_floor = gpu_composition_floor(&device);
         require_measured_floor(test_name, "gpu_composition_floor", composition_floor);
         let config = load_config();
@@ -1319,7 +1242,7 @@ mod gpu {
 
         eprintln!(
             "{test_name}: measurement complete -- these numbers are the derivation input for \
-             gpu_composition_floor's EXACT_ARCH_COMPOSITION_FLOOR / SM89_COMPOSITION_FLOOR and \
+             gpu_composition_floor's EXACT_ARCH_COMPOSITION_FLOOR and \
              GPU_TRUTH_DRIFT_BOUND; folding them into those constants (with safety-margin \
              arithmetic documented there) is a separate change, not this test -- this test \
              asserts finiteness only and gates nothing"

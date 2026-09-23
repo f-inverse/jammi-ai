@@ -16,15 +16,17 @@ pub const ORDINAL_COLUMN: &str = "_ordinal";
 
 /// Common prefix columns on every inference output.
 ///
-/// `_ordinal` is the row's position in the input order, 0-based and
-/// contiguous over the whole input. `InferenceExec` reads it as a required
-/// input column and carries it through unchanged, so it is one global
-/// sequence at every partition count.
+/// `_ordinal` is the row's position in the input's order — key order for a
+/// keyed input, arrival order otherwise — 0-based and contiguous over the
+/// whole input. `InferenceExec` reads it as a required input column and
+/// carries it through unchanged, so it is one global sequence at every
+/// partition count, and the plan above the model puts its output back in
+/// that order.
 ///
-/// It exists so a caller can read the result table back in the SAME order
-/// the model actually produced it (`ORDER BY _row_id, _ordinal`) even when
-/// `_row_id` carries duplicate or non-monotonic keys, and even when the
-/// underlying Parquet scan reorders row groups on read. Embedding tables
+/// It exists so a caller can read the result table back in the input's
+/// order (`ORDER BY _row_id, _ordinal`) even when `_row_id` carries
+/// duplicate or non-monotonic keys, and even when the underlying Parquet
+/// scan reorders row groups on read. Embedding tables
 /// carry no `_ordinal` — their read-backs are keyed by `_row_id` alone, per
 /// [`crate::pipeline::embedding::EmbeddingPipeline`]'s schema.
 pub fn common_prefix_fields() -> Vec<Field> {

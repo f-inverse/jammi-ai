@@ -234,6 +234,28 @@ impl Default for GraphSampleConfig {
 }
 
 impl GraphSampleConfig {
+    /// Validate the knobs for a sample that will be *trained on*: everything
+    /// [`Self::validate`] checks, and `hard_negatives <= 1`.
+    ///
+    /// A training row is one anchor, one positive and at most one explicit hard
+    /// negative, so a sample mining more per pair has nowhere to put them: the
+    /// extra negatives would be mined, paid for in the RNG stream, and never
+    /// trained. Emitting one row per negative instead would repeat the same
+    /// `(anchor, positive)` inside a batch, where the in-batch objective scores
+    /// the repeat as a negative of itself. The sampler itself mines any count
+    /// for a caller that reads [`SampledPair::hard_negatives`] directly.
+    pub fn validate_for_training(&self) -> Result<()> {
+        self.validate()?;
+        if self.hard_negatives > 1 {
+            return Err(JammiError::FineTune(format!(
+                "graph hard_negatives must be 0 or 1 for a fine-tune (was {}): a training row \
+                 carries one explicit hard negative beside its in-batch negatives",
+                self.hard_negatives
+            )));
+        }
+        Ok(())
+    }
+
     /// Validate the knobs; returns an error naming the first invalid field.
     pub fn validate(&self) -> Result<()> {
         if self.walk_length == 0 {
@@ -284,10 +306,16 @@ impl GraphSampleConfig {
 /// structure-mined hard negatives (empty when `hard_negatives == 0`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampledPair {
+    /// Anchor node id.
+    pub anchor_id: String,
     /// Anchor node text.
     pub anchor: String,
+    /// Co-walk positive node id.
+    pub positive_id: String,
     /// Co-walk positive node text.
     pub positive: String,
+    /// Structure-aware hard-negative node ids, parallel to `hard_negatives`.
+    pub hard_negative_ids: Vec<String>,
     /// Structure-aware hard-negative node texts (k-hop-but-not-neighbour).
     pub hard_negatives: Vec<String>,
 }
@@ -491,16 +519,39 @@ impl GraphSampler {
     /// false-negative guard). A node with no out-edges contributes no pairs (it
     /// has no graph structure to learn from). `emit` returning `Err` stops
     /// sampling immediately and propagates that error.
-    pub fn sample_into(&self, mut emit: impl FnMut(SampledPair) -> Result<()>) -> Result<()> {
+    pub fn sample_into(&self, emit: impl FnMut(SampledPair) -> Result<()>) -> Result<()> {
+        self.sample_observing_walks(|_| Ok(()), emit)
+    }
+
+    /// [`Self::sample_into`], additionally handing every biased walk to
+    /// `on_walk` — the visited node ids in order, the start included — before
+    /// that walk's rows reach `emit`. The rows and their order are exactly
+    /// [`Self::sample_into`]'s: observing a walk draws nothing from the RNG.
+    ///
+    /// The walks are the sampler's random process itself, where the rows are a
+    /// projection of it (distinct co-walk nodes, in text): a caller building a
+    /// skip-gram walk corpus, or checking the walk against node2vec's
+    /// second-order transition law `π(x | t, v) ∝ α_pq(t, x)`, reads them here.
+    /// `on_walk` returning `Err` stops sampling immediately and propagates
+    /// that error.
+    pub fn sample_observing_walks(
+        &self,
+        mut on_walk: impl FnMut(&[String]) -> Result<()>,
+        mut emit: impl FnMut(SampledPair) -> Result<()>,
+    ) -> Result<()> {
         let mut rng = SplitMix64::new(self.config.seed);
         let mut any = false;
 
         for start in &self.node_ids {
             // The anchor's protected neighbourhood: excluded from its negatives.
-            let excluded = self.k_hop_neighbourhood(start);
+            // Enumerated only when negatives are mined at all — a pairs-only
+            // config never reads it, and the bounded BFS is per-anchor work.
+            let excluded =
+                (self.config.hard_negatives > 0).then(|| self.k_hop_neighbourhood(start));
 
             for _ in 0..self.config.walks_per_node {
                 let walk = self.biased_walk(start, &mut rng);
+                on_walk(&walk)?;
                 // Distinct co-walk nodes (excluding the anchor itself) are the
                 // positives. Dedup keeps the pair set from being dominated by
                 // self-loops on dense walks.
@@ -509,7 +560,8 @@ impl GraphSampler {
                     if visited == start || !seen.insert(visited.clone()) {
                         continue;
                     }
-                    let negatives = self.sample_negatives(start, visited, &excluded, &mut rng);
+                    let negatives =
+                        self.sample_negatives(start, visited, excluded.as_ref(), &mut rng);
                     // An empty negative pool under a config
                     // that DEMANDS hard negatives is refused HERE, at sample
                     // time, naming the anchor — never emitted as a row with
@@ -529,12 +581,15 @@ impl GraphSampler {
                     }
                     any = true;
                     emit(SampledPair {
+                        anchor_id: start.clone(),
                         anchor: self.text_of(start)?,
+                        positive_id: visited.clone(),
                         positive: self.text_of(visited)?,
                         hard_negatives: negatives
                             .iter()
                             .map(|id| self.text_of(id))
                             .collect::<Result<Vec<_>>>()?,
+                        hard_negative_ids: negatives,
                     })?;
                 }
             }
@@ -658,16 +713,17 @@ impl GraphSampler {
     /// "reachable but not a neighbour" siblings that sharpen the discrimination,
     /// while the k-hop exclusion keeps a likely-missing-edge node out of the
     /// pool. Returns fewer than requested only when the safe pool is smaller.
+    /// `excluded` is `None` exactly when the config mines no negatives.
     fn sample_negatives(
         &self,
         anchor: &str,
         positive: &str,
-        excluded: &HashSet<String>,
+        excluded: Option<&HashSet<String>>,
         rng: &mut SplitMix64,
     ) -> Vec<String> {
-        if self.config.hard_negatives == 0 {
+        let Some(excluded) = excluded else {
             return Vec::new();
-        }
+        };
         // Candidates: every node not in the anchor's protected neighbourhood and
         // not the positive. Iterated over the stable id order for determinism.
         let candidates: Vec<&String> = self
@@ -770,6 +826,73 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    /// Observing the walks changes nothing about the rows: the observed run
+    /// emits exactly `sample`'s rows, hands over one walk per `(node, walk)`
+    /// slot, and every walk starts at its anchor and follows declared edges.
+    #[test]
+    fn observed_walks_are_the_walks_the_rows_were_cut_from() {
+        let (nodes, edges) = two_community_graph();
+        let edge_set: HashSet<(String, String)> = edges
+            .iter()
+            .map(|e| (e.src.clone(), e.dst.clone()))
+            .collect();
+        let node_count = nodes.len();
+        let config = GraphSampleConfig {
+            seed: 11,
+            ..GraphSampleConfig::default()
+        };
+        let sampler = GraphSampler::build(nodes, edges, config).unwrap();
+
+        let mut walks: Vec<Vec<String>> = Vec::new();
+        let mut rows = Vec::new();
+        sampler
+            .sample_observing_walks(
+                |walk| {
+                    walks.push(walk.to_vec());
+                    Ok(())
+                },
+                |pair| {
+                    rows.push(pair);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(rows, sampler.sample().unwrap());
+        assert_eq!(walks.len(), node_count * config.walks_per_node);
+        for walk in &walks {
+            assert_eq!(walk.len(), config.walk_length + 1);
+            for step in walk.windows(2) {
+                assert!(
+                    edge_set.contains(&(step[0].clone(), step[1].clone())),
+                    "walk step {step:?} is not a declared edge"
+                );
+            }
+        }
+        let starts: Vec<&String> = walks
+            .iter()
+            .step_by(config.walks_per_node)
+            .map(|w| &w[0])
+            .collect();
+        assert_eq!(starts, sampler.node_ids.iter().collect::<Vec<_>>());
+    }
+
+    /// A sample that will be trained on holds at most one hard negative per
+    /// pair; the sampler itself mines any count.
+    #[test]
+    fn training_validation_refuses_more_than_one_hard_negative() {
+        let mined = |hard_negatives| GraphSampleConfig {
+            hard_negatives,
+            ..GraphSampleConfig::default()
+        };
+        for trainable in [0, 1] {
+            mined(trainable).validate_for_training().unwrap();
+        }
+        mined(2).validate().unwrap();
+        let err = mined(2).validate_for_training().unwrap_err();
+        assert!(format!("{err}").contains("0 or 1"), "{err}");
     }
 
     #[test]

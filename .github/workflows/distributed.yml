@@ -2,11 +2,11 @@ name: Distributed validation
 
 # The multi-process distributed-validation lane: N `jammi-server` worker
 # processes claiming from a shared Postgres catalog + a shared object store
-# (MinIO), proving the durable-worker fleet-safety properties under real
+# (the lane's S3-class store), proving the durable-worker fleet-safety properties under real
 # distribution.
 #
 # One job, three matrix legs split by failure character (each leg re-provisions
-# its own Postgres + MinIO so they stay independent):
+# its own Postgres + S3 store so they stay independent):
 #
 #   * `deterministic` — the claim-correctness tests (exactly-one claim,
 #     cross-tenant isolation). Their outcome is decided by Postgres locking,
@@ -50,21 +50,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Pinned MinIO + mc versions, fetched from each project's GitHub release
-  # (an immutable, per-release asset) and verified against the checksum the
-  # release publishes, so the lane is reproducible and no "latest" reshuffle
-  # can change the binary under us. `dl.min.io`'s versioned `archive/` URLs
-  # answer 410 since 2025-09 (MinIO withdrew binary hosting there), which is
-  # why the GitHub release is the source; the `actions/cache` step below means
-  # a GitHub outage on a re-run can't red the lane either.
-  MINIO_RELEASE: "RELEASE.2025-09-07T16-13-09Z"
-  MINIO_SHA256: "7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f"
-  MC_RELEASE: "RELEASE.2025-08-13T08-35-41Z"
-  MC_SHA256: "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891"
 
 jobs:
   distributed:
-    name: ${{ matrix.display }} (Postgres + MinIO)
+    name: ${{ matrix.display }} (Postgres + S3 store)
     runs-on: ubuntu-latest
     strategy:
       # One leg's failure must not cancel the other — they carry independent
@@ -100,7 +89,8 @@ jobs:
           # The Ballista compute-plane lane: a real three(+)-process
           # `jammi-server` fleet with `[ballista]` roles configured, proving
           # embedding-across-two-executors (at a fan-out of one and of four),
-          # placed-gang-completes-elsewhere,
+          # placed-gang-completes-elsewhere, a context predictor placed on an
+          # executor that claims nothing (byte-identical to in-process),
           # killed-executor-mid-gang reclaim, scheduler restart, two
           # schedulers over one catalog, the device-less/KIND-MATCH refusal,
           # a placed task's typed failure (a refused null key classifying as
@@ -124,6 +114,7 @@ jobs:
               embedding_job_across_two_executors_matches_in_process
               embedding_job_fanned_out_four_ways_matches_in_process
               placed_gang_completes_on_a_registered_executor_other_than_the_submitter
+              a_context_predictor_job_completes_on_an_executor_that_claims_nothing
               a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_its_slot
               killed_executor_mid_gang_leaves_the_row_for_reclaim_then_a_successor_completes
               scheduler_restart_keeps_executors_and_serves_a_new_job
@@ -135,9 +126,25 @@ jobs:
               select_over_flight_sql_on_a_client_never_submits_a_compute_job
               routed_create_table_as_refusing_a_null_key_raises_the_in_process_error
               embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in_process
+              graph_jobs_on_a_client_run_on_an_executor_and_match_in_process
               killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_identical_table
               list_workers_and_compute_executor_devices_report_registered_devices
               free_port_stays_below_the_ephemeral_floor_and_never_repeats
+          # The ladder's rungs above the in-process ones: every train-run
+          # rung publishes one adapter digest, every encode rung serves one
+          # vectors digest, a placed propagation writes the plan's vectors
+          # and every predictor-train-run rung publishes one predictor, on
+          # fleets the bench spawns through the same facility the ballista
+          # lane spawns its own.
+          - name: rungs
+            display: Ladder rungs on a fleet (placed, shape-d)
+            crate: jammi-bench
+            advisory: false
+            tests: >-
+              every_train_run_rung_publishes_the_same_adapter
+              every_encode_rung_serves_the_same_vectors
+              a_placed_propagation_matches_the_plan
+              every_predictor_train_run_rung_publishes_the_same_predictor
     continue-on-error: ${{ matrix.advisory }}
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
@@ -159,68 +166,37 @@ jobs:
       # Service container is reachable at `postgres` from the job container
       # (same Docker network); the catalog connects via sqlx::PgPool.
       JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
-      # MinIO runs in-job (see the setup step) and binds 127.0.0.1:9000 inside
-      # the job container, so the harness and the spawned workers all reach it
-      # on localhost. `allow_http` is on for the plain-HTTP endpoint.
-      JAMMI_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-      JAMMI_TEST_S3_BUCKET: jammi-dist
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
-      AWS_REGION: us-east-1
+      # The S3-class store runs in-job (see the start step) and binds
+      # 127.0.0.1:9000 inside the job container, so the harness and the spawned
+      # workers all reach it on localhost; its endpoint, bucket and credentials
+      # enter the environment from `ci/scripts/s3_test_store.sh env`.
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      - name: Cache the pinned MinIO + mc binaries
-        id: minio-cache
+      - name: Cache the pinned S3 store binary
         uses: actions/cache@v4
         with:
-          path: /opt/minio-bin
-          key: minio-${{ env.MINIO_RELEASE }}-${{ env.MINIO_SHA256 }}-mc-${{ env.MC_RELEASE }}-${{ env.MC_SHA256 }}
+          path: /opt/s3-test-store
+          key: s3-test-store-${{ hashFiles('ci/scripts/s3_test_store.sh') }}
 
-      - name: Download the pinned MinIO + mc binaries (cache miss)
-        if: steps.minio-cache.outputs.cache-hit != 'true'
-        # Pull the exact pinned release assets from GitHub and verify each
-        # against the checksum that release publishes. On a cache hit this step
-        # is skipped entirely, so a GitHub outage on a re-run cannot red the lane.
+      - name: Start the S3-class store
+        # GHA `services:` cannot start a gateway over a directory that already
+        # holds the lane's bucket, so the store runs in-job from the pinned
+        # binary — the one definition `ci/dev.sh --with s3` and a GPU pod run
+        # too — and the lane's variables come from that script, never a second
+        # spelling here.
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /opt/minio-bin
-          curl -fsSL "https://github.com/minio/minio/releases/download/${MINIO_RELEASE}/minio.linux-amd64.${MINIO_RELEASE}" -o /opt/minio-bin/minio
-          echo "${MINIO_SHA256}  /opt/minio-bin/minio" | sha256sum -c -
-          curl -fsSL "https://github.com/minio/mc/releases/download/${MC_RELEASE}/mc.linux-amd64.${MC_RELEASE}" -o /opt/minio-bin/mc
-          echo "${MC_SHA256}  /opt/minio-bin/mc" | sha256sum -c -
-          chmod +x /opt/minio-bin/minio /opt/minio-bin/mc
-
-      - name: Start MinIO + create the bucket
-        # GHA `services:` cannot pass `server /data` to the MinIO image's
-        # entrypoint, so — mirroring how `test-broker` runs the NATS tarball
-        # directly — we run the cached MinIO binary in the background, wait for
-        # its readiness probe, then `mc mb` the bucket the lane roots artifacts
-        # under.
-        run: |
-          install -m 0755 /opt/minio-bin/minio /usr/local/bin/minio
-          install -m 0755 /opt/minio-bin/mc /usr/local/bin/mc
-          mkdir -p /tmp/minio-data
-          MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
-            minio server /tmp/minio-data --address 127.0.0.1:9000 >/tmp/minio.log 2>&1 &
-          # Readiness wait on the MinIO health endpoint (mirrors the NATS lane's
-          # health-poll loop).
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
-              echo "minio ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:9000/minio/health/live
-          mc alias set local http://127.0.0.1:9000 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY"
-          mc mb --ignore-existing "local/${JAMMI_TEST_S3_BUCKET}"
+          export JAMMI_S3_STORE_DIR=/opt/s3-test-store
+          ci/scripts/s3_test_store.sh start --addr 127.0.0.1:9000 --data /tmp/s3-test-store
+          ci/scripts/s3_test_store.sh env --addr 127.0.0.1:9000 >> "$GITHUB_ENV"
 
       - name: Require the distributed backends (no hollow green)
         # The harness early-returns to a silent pass when any of these is unset
         # (`Backends::from_env_or_skip` → None, harness.rs). On this lane the
-        # backends are always provisioned (Postgres service + in-job MinIO), so a
+        # backends are always provisioned (Postgres service + the in-job S3 store), so a
         # missing var means the lane is misconfigured, not legitimately skipped —
         # fail loudly instead of reporting a green run that exercised nothing.
         shell: bash
@@ -240,7 +216,7 @@ jobs:
         # binary next to the test executable under `{target}/{profile}/`. Build
         # it explicitly so it exists before the harness runs. `storage-s3` is
         # required: each worker writes its trained-model artifact to the shared
-        # `s3://` MinIO root, which needs the S3 object-store driver compiled in —
+        # `s3://` store root, which needs the S3 object-store driver compiled in —
         # without it a worker claims the job, trains, then fails the publish with
         # `SchemeNotEnabled`, and the job never reaches `completed`. The driver
         # lives on the server (the CLI is a strict wire client), so the feature
@@ -264,6 +240,6 @@ jobs:
               || { echo "::error::filter '$t' ran no test"; exit 1; }
           done
 
-      - name: MinIO log (on failure)
+      - name: S3 store log (on failure)
         if: failure()
-        run: cat /tmp/minio.log || true
+        run: cat /tmp/s3-test-store/.log || true

@@ -676,7 +676,7 @@ impl OssServer {
                 .map_err(|e| ServerError::Config(e.to_string()))?;
             tracing::info!(
                 scheduler = client.scheduler_url(),
-                "[ballista.client]: claimed gangs and materializations are submitted to the \
+                "[ballista.client]: claimed training attempts and materializations are submitted to the \
                  compute plane"
             );
         }
@@ -1428,7 +1428,7 @@ impl BoundServer {
         };
 
         // `[ballista]`: DRAIN waits for the executor's own in-flight tasks
-        // before stopping it (never tear down a running placed gang, the same reason the worker guard
+        // before stopping it (never tear down a running placed attempt, the same reason the worker guard
         // above is drained rather than dropped); RELEASE stops it
         // immediately, the same "sever, don't wait" shape RELEASE gives the
         // gRPC surface. The scheduler role always stops AFTER the

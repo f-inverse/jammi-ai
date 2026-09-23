@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: cargo-registry, jq, rsync, tmux, flock, shasum, en-us-locale
 # Mocks-only, no-network regression suite for the pod build substrate:
 # the seed/clone target dirs, the timing lock, the seed-cache key manifest
 # and the pushed-tree stamp. Its first legs, (a)-(h):
@@ -48,8 +49,9 @@
 # Run: bash ci/scripts/test_pod_substrate.sh
 # Hermetic: no network, no GPU, no real RunPod account. Host tools the
 # suite runs for real (flock, tmux, rsync, jq, shasum, the en_US.UTF-8
-# locale, a warm cargo registry) are the guard's declared needs in
-# ci/guards.toml; a leg whose tool is absent fails naming it, never skips.
+# locale, a warm cargo registry) are this suite's declared needs (its
+# `# needs:` line, ci/needs.toml); a leg whose tool is absent fails naming
+# it, never skips.
 # The `(q/real-build)` leg runs a real, tiny, offline `cargo build`/`cargo
 # build --release`/`cargo clean` cycle (a two-member scratch workspace
 # under `mktemp -d`; Cargo resolves nothing beyond std), and
@@ -1902,7 +1904,7 @@ DRV
   # silently skips it as a soft "treat as absent". Structural (reaching
   # this branch live needs a real `main`-branch checkout mid-seed-build):
   # the source must `exit 1` on rc=2; only rc=1 reads "T1b skipped".
-  if grep -q 'refusing to guess .absent.; see pod_seed_cargo_metadata_frozen' "$REPO_ROOT/ci/scripts/pod_seed_target.sh"; then
+  if grep -q 'refusing to guess .absent.; see pod_seed_cargo_metadata_locked' "$REPO_ROOT/ci/scripts/pod_seed_target.sh"; then
     ok "(n/seed-helpers) T1b's rc=2 branch names the real cause and refuses to guess, rather than silently skipping"
   else
     bad "(n/seed-helpers) T1b's rc=2 branch does not name the refusal-to-guess"
@@ -2079,18 +2081,18 @@ json.dump({
     bad "(n/seed-helpers) found ${SEEDH_RAW_SITES} raw stderr-discarding cargo metadata call site(s) still in pod_seed_target.sh"
   fi
 
-  # pod_seed_cargo_metadata_frozen actually surfaces real
+  # pod_seed_cargo_metadata_locked actually surfaces real
   # stderr (never silently returns empty) — exercised against a REAL
   # broken --frozen query (no Cargo.lock at all) rather than asserted.
   SEEDH_METASH="$SANDBOX/seedh_metash"
   mkdir -p "$SEEDH_METASH"
   # shellcheck disable=SC1090
-  SEEDH_META_OUT="$( (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_frozen) 2>&1 1>/dev/null )"
+  SEEDH_META_OUT="$( (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_locked) 2>&1 1>/dev/null )"
   SEEDH_META_RC=0
   # shellcheck disable=SC1090
-  (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_frozen >/dev/null 2>/dev/null) || SEEDH_META_RC=$?
+  (cd "$SEEDH_METASH" && . "$SEEDH_SEEDSH" && pod_seed_cargo_metadata_locked >/dev/null 2>/dev/null) || SEEDH_META_RC=$?
   if [ "$SEEDH_META_RC" -eq 2 ] && [ -n "$SEEDH_META_OUT" ]; then
-    ok "(n/seed-helpers) pod_seed_cargo_metadata_frozen returns 2 and prints REAL stderr on a genuinely broken query (no silent empty string)"
+    ok "(n/seed-helpers) pod_seed_cargo_metadata_locked returns 2 and prints REAL stderr on a genuinely broken query (no silent empty string)"
   else
     bad "(n/seed-helpers) expected rc=2 with non-empty stderr on a broken metadata query (rc=$SEEDH_META_RC, stderr empty=$([ -z "$SEEDH_META_OUT" ] && echo yes || echo no))"
   fi
@@ -2189,7 +2191,7 @@ json.dump({
   # pod_sha256_of_file's own shasum-fallback branch pipes through awk.
   SEEDH_REAL_AWK="$(command -v awk 2>/dev/null || true)"
   [ -n "$SEEDH_REAL_AWK" ] && ln -sf "$SEEDH_REAL_AWK" "$SEEDH_SHASUM_ONLY/awk"
-  # shasum is a declared need of this suite's guard (ci/guards.toml
+  # shasum is a declared need of this suite (ci/needs.toml
   # [need.shasum]); the fallback leg fails, naming it, on a host without it.
   REAL_SHASUM="$(command -v shasum 2>/dev/null || true)"
   if [ -n "$REAL_SHASUM" ]; then
@@ -2201,7 +2203,7 @@ json.dump({
       bad "(n/sha256) shasum fallback hash mismatch or empty (got '$SEEDH_SHASUM_HASH', want '$SEEDH_REAL_HASH')"
     fi
   else
-    bad "(n/sha256) the shasum fallback leg needs shasum on PATH (ci/guards.toml need 'shasum': perl-Digest-SHA); it is absent on this host"
+    bad "(n/sha256) the shasum fallback leg needs shasum on PATH (ci/needs.toml need 'shasum': perl-Digest-SHA); it is absent on this host"
   fi
 }
 
@@ -3140,7 +3142,7 @@ pod_push_manifest_sha256 "\$1"
 DRV
   chmod +x "$V_MANIFEST_DRIVER"
 
-  # en_US.UTF-8 is a declared need of this suite's guard (ci/guards.toml
+  # en_US.UTF-8 is a declared need of this suite (ci/needs.toml
   # [need.en-us-locale]). glibc lists it as `en_US.utf8`, macOS as
   # `en_US.UTF-8`; both answer to LC_ALL=en_US.UTF-8. V_LOCALES is captured
   # and fed to grep as a here-string, never piped into `grep -q`, whose
@@ -3148,7 +3150,7 @@ DRV
   # false "not found".
   V_LOCALES="$(locale -a 2>/dev/null)"
   if ! grep -qixE 'en_US\.utf-?8' <<<"$V_LOCALES"; then
-    bad "(v/push locale) the cross-locale legs need the en_US.UTF-8 locale (ci/guards.toml need 'en-us-locale': glibc-langpack-en); this host's locale -a does not list it"
+    bad "(v/push locale) the cross-locale legs need the en_US.UTF-8 locale (ci/needs.toml need 'en-us-locale': glibc-langpack-en); this host's locale -a does not list it"
   fi
 
   V_SHA_C="$(LC_ALL=C bash "$V_MANIFEST_DRIVER" "$V_CLONE1" 2>/dev/null)"
@@ -3639,7 +3641,7 @@ PY
   ( cd "$REPO_ROOT" && cargo package --list -p jammi-kernels --allow-dirty --offline ) > "$W_PKG_LIST" 2>"$W_PKG_ERR"
   w_pkg_rc=$?
   if [ "$w_pkg_rc" -ne 0 ]; then
-    bad "(w/cutlass tarball-golden) cargo package --list --offline failed (rc=$w_pkg_rc); it needs the warm registry ci/guards.toml's 'cargo-registry' need provides (cargo fetch --locked): $(cat "$W_PKG_ERR")"
+    bad "(w/cutlass tarball-golden) cargo package --list --offline failed (rc=$w_pkg_rc); it needs the warm registry ci/needs.toml's 'cargo-registry' need provides (cargo fetch --locked): $(cat "$W_PKG_ERR")"
   elif [ ! -s "$W_PKG_LIST" ]; then
     bad "(w/cutlass tarball-golden) cargo package --list produced EMPTY output — an empty tarball listing is a FAIL, never a vacuous pass"
   else
@@ -4178,7 +4180,7 @@ PY
 # count-1 candidate order (unchanged), the count>1 order (SXM4 first) —
 # plus a fifth, SET-shaped leg: no lane other than the reviewed two below
 # sets RP_GPU_COUNT anywhere, so every EXISTING lane (gpu-prove,
-# gpu-perf-ab, gpu-dev, howwell) still deploys `gpuCount: 1`. That leg's
+# gpu-dev, howwell) still deploys `gpuCount: 1`. That leg's
 # set is DERIVED (`git ls-files` over ci/scripts + .github/workflows, then
 # grep), never a hand list, so a future lane that starts setting the
 # variable reds here instead of silently changing three other lanes'

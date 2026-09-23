@@ -285,11 +285,22 @@ pod_seed_capture_build_output() { # $1=seed target dir $2=dest capture dir $3=pr
 # metadata JSON to stdout on success; prints nothing to stdout and returns
 # 2 on failure (callers already treat "no valid metadata" as "could not
 # determine", never as a hand-asserted "genuinely absent").
-pod_seed_cargo_metadata_frozen() {
+pod_seed_cargo_metadata_locked() {
   local out err
   err="$(mktemp)"
-  if ! out="$(cargo metadata --frozen --format-version 1 "$@" 2>"$err")" || [ -z "$out" ]; then
-    echo "::error::cargo metadata --frozen --format-version 1 $* failed (or produced no output) — real stderr:" >&2
+  # `--locked`, not `--frozen`. The property this call protects is that the
+  # resolution is EXACTLY what `Cargo.lock` pins — never a silently different
+  # dependency set — and `--locked` is that property. `--frozen` adds
+  # "and never reach the network", which is not a determinism guarantee at
+  # all: it only holds when the pod's registry cache already happens to
+  # contain every pinned crate. A pushed branch that ADDS a dependency edge
+  # (any integration branch does) leaves the cache short, and `--frozen`
+  # fails with "cannot update the lock file ... because --locked was passed"
+  # — a pod that cannot seed a tree whose lock is perfectly correct. The
+  # lock still rules: a lock that disagrees with the manifests is refused
+  # here exactly as before, and nothing may rewrite it.
+  if ! out="$(cargo metadata --locked --format-version 1 "$@" 2>"$err")" || [ -z "$out" ]; then
+    echo "::error::cargo metadata --locked --format-version 1 $* failed (or produced no output) — real stderr:" >&2
     cat "$err" >&2
     rm -f "$err"
     return 2
@@ -299,7 +310,7 @@ pod_seed_cargo_metadata_frozen() {
 }
 
 pod_seed_pkg_has_feature() { # $1=pkg $2=feature
-  pod_seed_cargo_metadata_frozen | python3 -c '
+  pod_seed_cargo_metadata_locked | python3 -c '
 import sys, json
 pkg, feat = sys.argv[1], sys.argv[2]
 try:
@@ -367,7 +378,7 @@ pod_seed_assert_member_free() { # $1=target_dir $2=tree_dir (optional; default .
     echo "::error::pod_seed_assert_member_free: ${target_dir} has NEITHER debug/ NOR release/ — this is not a built CARGO_TARGET_DIR at all, so 'member-free' is meaningless (a vacuous pass), not a genuine check" >&2
     return 2
   fi
-  meta="$(cd "$tree_dir" && pod_seed_cargo_metadata_frozen)"
+  meta="$(cd "$tree_dir" && pod_seed_cargo_metadata_locked)"
   if [ -z "$meta" ]; then
     echo "::error::pod_seed_assert_member_free: cargo metadata produced no output from ${tree_dir} — registry not fetched?" >&2
     return 2
@@ -448,7 +459,7 @@ pod_seed_scan_all_vendored_buildrs() { # $1=manifest-toml $2=mode(all|rerun_only
   names_file="$(mktemp)"
   pod_seed_manifest_names "$manifest" > "$names_file"
 
-  local meta; meta="$(pod_seed_cargo_metadata_frozen --features jammi-kernels/cuda)"
+  local meta; meta="$(pod_seed_cargo_metadata_locked --features jammi-kernels/cuda)"
   if [ -z "$meta" ]; then
     # Self-heal once: a bare/fresh checkout with
     # no registry fetch yet is the ordinary shape on a maintainer's machine
@@ -467,7 +478,7 @@ pod_seed_scan_all_vendored_buildrs() { # $1=manifest-toml $2=mode(all|rerun_only
     # branches cite the ACTUAL command that failed.
     fetch_rc=0
     cargo fetch --locked >&2 2>&1 || fetch_rc=$?
-    meta="$(pod_seed_cargo_metadata_frozen --features jammi-kernels/cuda)"
+    meta="$(pod_seed_cargo_metadata_locked --features jammi-kernels/cuda)"
   fi
   if [ -z "$meta" ]; then
     if [ "${fetch_rc:-0}" != 0 ]; then
@@ -791,7 +802,7 @@ pod_seed_target_main() {
       # "absent" — abort the whole seed loudly instead,
       # naming the ambiguity, so a broken metadata query can never
       # silently downgrade what the seed actually contains.
-      echo "::error::could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_cargo_metadata_frozen's own ::error:: above for the real cause" >&2
+      echo "::error::could not determine whether jammi-kernels declares flash-attn (cargo metadata query failed or the package was not found) — refusing to guess 'absent'; see pod_seed_cargo_metadata_locked's own ::error:: above for the real cause" >&2
       exit 1
     fi
 
@@ -820,7 +831,7 @@ pod_seed_target_main() {
     [ -z "$leftover" ] || { echo "::error::incremental/ not empty after rm -rf: $leftover"; exit 1; }
 
     echo "=== asserting no non-member path/patch package (cargo metadata) ==="
-    pod_seed_cargo_metadata_frozen | python3 -c '
+    pod_seed_cargo_metadata_locked | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 members = set(d["workspace_members"])

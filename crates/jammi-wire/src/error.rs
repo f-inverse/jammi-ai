@@ -37,7 +37,7 @@
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
 //! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`,
-//! `DeviceKindUnheld`, `GangFanOut`, `Unheld`, `ExecutorLost`) reconstructs exactly,
+//! `DeviceKindUnheld`, `PlacedAttemptFanOut`, `Unheld`, `ExecutorLost`) reconstructs exactly,
 //! field for field — `tests::every_owned_shape_variant_round_trips_to_itself`
 //! is the completeness proof, backed by an exhaustive match with no catch-all
 //! so a NEW owned-shape variant fails to compile here until it is listed. So
@@ -278,8 +278,8 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                     held: held.iter().map(|k| k.wire_str().to_string()).collect(),
                 })
             }
-            JammiError::GangFanOut { job_id, partitions } => {
-                Variant::GangFanOut(pb::GangFanOutError {
+            JammiError::PlacedAttemptFanOut { job_id, partitions } => {
+                Variant::PlacedAttemptFanOut(pb::PlacedAttemptFanOutError {
                     job_id: job_id.clone(),
                     partitions: *partitions,
                 })
@@ -468,7 +468,7 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
                 _ => JammiError::Other(message.to_string()),
             }
         }
-        Some(Variant::GangFanOut(e)) => JammiError::GangFanOut {
+        Some(Variant::PlacedAttemptFanOut(e)) => JammiError::PlacedAttemptFanOut {
             job_id: e.job_id,
             partitions: e.partitions,
         },
@@ -1286,7 +1286,7 @@ mod tests {
             | JammiError::EmptyTrainingSet { .. }
             | JammiError::ResourcesExhausted { .. }
             | JammiError::DeviceKindUnheld { .. }
-            | JammiError::GangFanOut { .. }
+            | JammiError::PlacedAttemptFanOut { .. }
             | JammiError::Unheld(_)
             | JammiError::ExecutorLost { .. }
             | JammiError::Other(_) => {}
@@ -1410,7 +1410,7 @@ mod tests {
                 required: ComputeDeviceKind::Cuda,
                 held: vec![ComputeDeviceKind::Cpu, ComputeDeviceKind::Metal],
             },
-            JammiError::GangFanOut {
+            JammiError::PlacedAttemptFanOut {
                 job_id: "job-fine-tune-1".into(),
                 partitions: 4,
             },

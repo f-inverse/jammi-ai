@@ -46,11 +46,18 @@ the emit box.
 | Verb | Bench tier | Named scale | Committed baseline | Threshold | Gated quantity |
 |------|-----------|-------------|--------------------|-----------|----------------|
 | `fine_tune` | `train-scale` | 1 536 in-batch-negative pairs, one GradCache backward + AdamW step, `Device::Cpu` | 180.0 pairs/s | 30% rel. drop | throughput (pairs/s) |
-| `fine_tune_graph` | `graph-train-scale` | 8 communities × 64 nodes, biased-walk sampler (walk length 4, 4 walks/node) | 6 418.1 pairs/s | 30% rel. drop | sampled-pairs/s throughput (+ a portable determinism digest) |
-| `train_context_predictor` | `context-predictor-scale` | CNP over 8 tasks × 18 rows, 30 epochs | 21.29 episode-steps/s | 30% rel. drop | meta-training throughput (+ a same-box predict digest) |
-| `generate_embeddings` | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer BERT bundle, `Device::Cpu` | 333.6 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box embed digest) |
-| `infer` (classification) | `model-inference-scale` | 16 rows over a tiny 32-dim 1-layer ModernBERT classifier bundle, `Device::Cpu` | 207.0 rows/s | 30% rel. drop | coarse serving throughput (+ a same-box infer digest) |
 | `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (frozen sidecar) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **recall fraction** (not a rate) — `measured >= floor`, an inequality gate whose absolute margin absorbs cross-box float drift; the fraction is bit-for-bit only on the same box |
+
+### The serving path is not a row here
+
+`generate_embeddings` and `infer` are the `encode` workload, measured as a
+ladder of rungs (`jammi-bench encode-step`: the loaded model called directly,
+the serving plan at one partition, the plan at N) rather than as a committed
+rate: a rows/s through a tiny model gates nothing on a box faster than the one
+that committed it. Each layer's cost is the ratio of two legs measured
+interleaved in one process on one box, judged by `jammi-bench ladder encode`
+against a dimensionless budget. See `crates/jammi-bench/src/encode_step.rs`
+and `crates/jammi-bench/reference/README.md`.
 
 ### The reference box
 
@@ -81,23 +88,17 @@ own definition:
 What stays portable is the *shape* of the gate (a measured rate must not fall
 more than a fixed fraction below the committed baseline; a measured recall must
 not fall below the committed floor) — that is the sense of "portable" in the
-quote above: the floor travels to another box, not the bits. Of the digests
-above, only the `fine_tune_graph` sampled-pair-set checksum is portable
-bit-for-bit: the pair selection is a seeded integer stream (its scalar `f64`
-roulette arithmetic is neither contracted nor reordered by Rust) and the
-checksum is an FNV-1a fold over the selected node-text bytes, so any box
-re-derives it exactly. The **recall fraction** is not in that class — it is
-scoped like the float digests. Recall-set membership is decided by an `f32`
+quote above: the floor travels to another box, not the bits. The **recall
+fraction** is scoped like the float digests. Recall-set membership is decided by an `f32`
 cosine reduction (the exact oracle's `cosine_distance`, a sequential `f32`
 accumulation over the dot product and norms), so the fraction is bit-for-bit
 only on the same box; across boxes or architectures a near-tie can move a
 neighbour in or out of the top-k, and the recall SLO is an inequality gate
 (`measured >= floor`) whose absolute margin (0.04) absorbs that small float
-drift — never a bit-for-bit equality. The predict/embed/infer digests fold an
-`f32` forward, and an `f32` reduction is NOT bit-identical across CPUs
-(SIMD/FMA contraction and BLAS reduction order differ by machine), so those
-three are a same-box property: each is re-derived on the box that ran it, not
-asserted equal across boxes. So the
+drift — never a bit-for-bit equality. An `f32` forward's digest — the `encode`
+workload's `outcome_digest`, held equal across its rungs on one box — is a
+same-box property: re-derived on the box that ran it, never asserted equal
+across boxes. So the
 rate rows above are meaningful only against the reference box; do not read
 them as a throughput your hardware must hit. The release-tag gate is the
 authoritative reading because it runs on a same-box-ish runner; the nightly lane
@@ -112,3 +113,29 @@ or never bite (set loose), exactly the failure mode the relative-drop *rate*
 threshold is designed around. Latency is therefore **out of scope** here. The
 representative full-scale serving numbers (the GPU-model rates that latency would
 ride on) are captured off-box in the cookbook's A/B split, not gated in CI.
+
+## The graph-learning workloads are measured as legs, not rate tiers
+
+`fine_tune_graph`'s sampler, `propagate_embeddings` and
+`train_context_predictor` carry no committed rate. A committed absolute rate is
+a property of one box; what these three are compared on is a *ratio* between two
+implementations of the same workload measured together on one box, which needs
+no committed number at all. Each is a **leg producer**: a `jammi-bench`
+subcommand (`graph-sample`, `propagate`, `predictor-train-run`) that runs the
+engine's own code path and files what it measured as the ladder's leg — the
+warm per-iteration time series, the process's peak resident set, and the
+outcome (a digest and the file it digests, the walks' counts against the law,
+a held-out trajectory) — with a PyTorch counterpart under
+`crates/jammi-bench/reference/` that reads the same input files and files the
+same fields. A producer judges nothing; `jammi-bench ladder <workload>` does.
+
+What is asserted on every change, hermetically, is the part that is a property
+of the code and not of the box:
+
+| Workload | Held on every change |
+|----------|----------------------|
+| `graph-sample` | The pair table the sampler draws over the committed synthetic graph reproduces the committed digest **on any machine** (a seeded integer stream and a scalar `f64` roulette; the digest folds node text only), and a different seed or walk length moves it. Over many seeded walks every `(previous, current)` state's next-node frequencies sit within sampling error of node2vec's analytic transition law `π(x | t, v) ∝ α_pq(t, x) · w(v, x)`. |
+| `propagate` | Two folds of one fixture agree bit for bit on the running box; so do `target_partitions = 1` and `4`; one hop fewer, one more, or a different `α` moves the digest. The output is `f32`, so no digest is committed. |
+| `predictor-train-run` | The predictor's initial weights are a pure function of the run seed; the served predictor over the committed trained weights predicts the committed targets to the same bits twice on the running box, and a wrong `context_k` moves them. |
+| graph fine-tune, training half | A resident fine-tune over the pair table `graph-pairs` writes and a `fine_tune_graph` job over the same graph, configuration and seed train the byte-identical adapter (at `lora_dropout = 0`; with dropout the job's pre-training acceleration probe has already consumed one mask draw per LoRA layer). |
+

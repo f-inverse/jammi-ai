@@ -25,7 +25,7 @@ use datafusion::prelude::SessionContext;
 
 use jammi_db::config::BallistaSchedulerConfig;
 
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
 use jammi_ballista::roles::{host_client, host_executor, host_scheduler};
@@ -329,17 +329,17 @@ async fn executor_waits_for_a_scheduler_that_binds_later() {
     scheduler.stop().await;
 }
 
-/// The client role's plane admits a claimant's own gang from LIVE
+/// The client role's plane admits a claimant's own attempt from LIVE
 /// executors only — the binder's and the submit edge's own predicate —
-/// and never on the gang's own submitter: no row at all, a row a dead
+/// and never on the attempt's own submitter: no row at all, a row a dead
 /// executor left behind (stale `heartbeat_at`), and a live row that is
-/// this instance's own all refuse it; a live peer of the gang's kind holds
+/// this instance's own all refuse it; a live peer of the attempt's kind holds
 /// it. Mutation: drop `executor_is_live` from `client::unheld` and the
 /// stale row reads as a peer; drop the exclusion and the instance's own
 /// row does. Hosts a scheduler and NO executor (nothing here touches the
 /// executor's process-wide `TERMINATING` flag).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
+async fn the_plane_admits_a_placed_attempt_on_a_live_peer_of_its_kind_only() {
     let session = session().await;
     let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
         .await
@@ -356,12 +356,12 @@ async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
         .compute_plane()
         .plane()
         .expect("host_client installs the compute plane");
-    let gang: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(GangDescriptor {
+    let attempt: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(PlacedAttempt {
         job_id: "job-admission".to_string(),
         attempt: 1,
-        world: 2,
         submitter: session.instance_id().to_string(),
         device_kind: session.compute_device().kind(),
+        claimed_at: chrono::Utc::now(),
     }));
     let kind = session.compute_device().kind();
     let none_of_kind = Some(Unheld::NoExecutorOfKind {
@@ -369,7 +369,7 @@ async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
         held: vec![],
     });
     assert_eq!(
-        plane.unheld(&gang).await.unwrap(),
+        plane.unheld(&attempt).await.unwrap(),
         none_of_kind,
         "no executor registered at all: nothing to place on"
     );
@@ -399,7 +399,7 @@ async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
         .await
         .unwrap();
     assert_eq!(
-        plane.unheld(&gang).await.unwrap(),
+        plane.unheld(&attempt).await.unwrap(),
         none_of_kind,
         "a row a dead executor left behind is not a peer"
     );
@@ -413,11 +413,11 @@ async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
         .await
         .unwrap();
     assert_eq!(
-        plane.unheld(&gang).await.unwrap(),
+        plane.unheld(&attempt).await.unwrap(),
         Some(Unheld::OnlyTheSubmitter {
             submitter: own_id.clone()
         }),
-        "a gang never lands on its own submitter"
+        "a placed attempt never lands on its own submitter"
     );
 
     let live_id = format!("live-peer-{}", jammi_test_utils::unique_suffix());
@@ -429,9 +429,9 @@ async fn the_plane_admits_a_gang_on_a_live_peer_of_its_kind_only() {
         .await
         .unwrap();
     assert_eq!(
-        plane.unheld(&gang).await.unwrap(),
+        plane.unheld(&attempt).await.unwrap(),
         None,
-        "a live registered executor of the gang's kind other than this instance holds it"
+        "a live registered executor of the attempt's kind other than this instance holds it"
     );
 
     catalog.remove_compute_executor(&stale_id).await.ok();

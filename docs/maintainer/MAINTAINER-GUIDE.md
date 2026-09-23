@@ -68,7 +68,7 @@ edges, by design — not a discrepancy.
 ```
 jammi-admin -> jammi-db, jammi-wire
 jammi-ai -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
-jammi-ballista -> jammi-ai, jammi-db, jammi-test-utils, jammi-wire
+jammi-ballista -> jammi-ai, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
 jammi-cli -> jammi-admin, jammi-db
 jammi-client -> jammi-admin, jammi-db, jammi-wire
@@ -82,7 +82,6 @@ jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-db, j
 jammi-test-resources
 jammi-test-utils -> jammi-db, jammi-test-resources
 jammi-wire -> jammi-db, jammi-lora, jammi-numerics
-probed-ops-index -> jammi-kernels
 symbol-index
 ```
 <!-- END GENERATED: dep-dag -->
@@ -156,12 +155,21 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
 - **`jammi-ballista` depends on `jammi-ai`/`jammi-db`/`jammi-wire`, never the
   reverse.** The seams the engine exposes — `jammi-db`'s `ComputePlane`
   (`crates/jammi-db/src/compute_plane.rs`, the one submit client) and
-  `jammi-ai`'s `PlacedGangRunner` (`HostAdmission`, `crates/jammi-ai/src/
+  `jammi-ai`'s `PlacedAttemptRunner` (`HostAdmission`, `crates/jammi-ai/src/
   fine_tune/worker.rs`) — are INSTALLED by `jammi-ballista`'s roles, never
   called from their own dependency graphs — the same shape `MemberDialer`
   already uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
   (no cargo feature): roles are `[ballista]` config, decided at runtime
   [§2.8f].
+- **`jammi-bench` depends on `jammi-ballista`, `jammi-test-utils`, `jammi-client`
+  and `jammi-admin` only behind its `plane` feature** (`crates/jammi-bench/
+  Cargo.toml`): the ladder's `placed` and `shape-d` rungs host the plane's roles
+  in the bench process (`crate::plane::encode_host`) and spawn or join fleets of
+  `jammi-server` processes (`jammi_test_utils::fleet`, the ONE facility the
+  distributed lane launches its fleets through), submitting a shape-d job over
+  the public client as a user would. The default bench build carries none of
+  it; the edges point from the measurement consumer into the engine, never
+  back, as every bench edge does.
 - **`jammi-python` depends on `jammi-ai`, `jammi-db`, `jammi-lora`** — no
   client-substrate crate. Local-only; its remote arm is the bundled pure-Python
   `jammi` (`crates/jammi-python/src/lib.rs`, the module setup), so the
@@ -326,7 +334,7 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `CatalogService` | `Reconcile` | `grpc/catalog.rs` (`CatalogService::reconcile`; `all = true` gated by `AdminAuthorizer` [§2.8]) |
 | `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search` | `grpc/embedding.rs` |
 | `InferenceService` | `Infer`/`Predict` | `grpc/inference.rs` |
-| `PipelineService` | `BuildNeighborGraph`/`PropagateEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
+| `PipelineService` | `BuildNeighborGraph`/`PropagateEmbeddings`/`GenerateStructureEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
 | `PipelineService` | `AsofJoin` | `grpc/pipeline.rs` (`PipelineService::asof_join`) |
 | `PipelineService` | `Recompute` | `grpc/pipeline.rs` (`PipelineService::recompute`) |
 | `AuditService` | `AuditLog`/`AuditFetchByQueryId`/`AuditFetchRecent` | `grpc/audit.rs` |
@@ -1415,8 +1423,12 @@ them.
   under `CachePolicy::Use`, reusing an exact prior materialisation keyed on the
   descriptor + the source table's digest; `CachePolicy::Bypass` (default) always
   rebuilds. The returned `CacheOutcome` reports which path ran.
+- **`GenerateStructureEmbeddings`** → `InferenceSession::generate_structure_embeddings`
+  (`crates/jammi-ai/src/pipeline/graph_structure.rs`). The same propagation plan
+  with a generated `X⁽⁰⁾` (the structural seed) and a weighted-sum readout;
+  materialises through the same funnel as a propagation.
 - **`PropagateEmbeddings`** → `InferenceSession::propagate_embeddings`
-  (`crates/jammi-ai/src/pipeline/graph_propagation.rs`, an `impl InferenceSession`
+  (`crates/jammi-ai/src/pipeline/graph_propagation/mod.rs`, an `impl InferenceSession`
   block in the pipeline module, **not** session.rs). Iterates `X⁽⁰⁾` over a declared
   graph and materialises a new searchable embedding table with a sidecar,
   `derived_from` the source. Returns the table handle + `CacheOutcome`.
@@ -2152,6 +2164,7 @@ CI if the guide and the code diverge:
 - `Embedding` — a model embedding over a source's columns.
 - `NeighborGraph` — a k-NN edge relation derived from an embedding table.
 - `GraphPropagation` — K hops of feature propagation over a neighbor graph.
+- `GraphStructure` — an embedding table generated from an edge relation alone: a structural seed propagated over its graph and read out as a weighted sum of the per-hop blocks.
 - `ContextSet` — per-target pooled context vectors materialised as an embedding table.
 - `AsofJoin` — a point-in-time temporal join, each spine row matched as-of within its group.
 - `TrainingSet` — the rows a training run reads, projected from a source relation and committed in one canonical full-tuple order; replayed by re-materializing.
@@ -2308,9 +2321,11 @@ staleness→recompute loop — that is the platform's, not the engine's
   `gelu_seam_calls_per_forward` counts calls to `activations::gelu_erf` per forward (`0` for
   ModernBERT's GeGLU FFN and for both OpenCLIP towers' `quick_gelu`, which have no fused seam
   at all — two different reasons for the same zero, both stated on the field's own doc). Every
-  count is per ONE forward at `training == true`: each seam short-circuits before any
-  admission decision in eval, so **an eval forward contributes `0` to both sides of the
-  equation** rather than counting as "all eager". `FinetuneRunTier::fusible_site_census`
+  count is per ONE forward, whatever the mode: each seam admits on tensor state on every
+  forward, so **the equation's multiplier is the run's `forwards_measured`** — the forwards
+  the run's own training loop took, its training steps and its validation pass, the window
+  its dispatch counters are taken over; the tier's own scoring of the published checkpoints
+  happens outside both, and a rung whose trainer ran behind the job path reports no count. `FinetuneRunTier::fusible_site_census`
   (`crates/jammi-bench/src/report.rs`) records the census as bench PROVENANCE, never
   IDENTITY — it is a structural property of the build, not a caller premise two legs must
   agree on.
@@ -2378,21 +2393,12 @@ staleness→recompute loop — that is the platform's, not the engine's
 - **Every fusible activation goes through the house seam** — a tower never calls
   `Tensor::gelu_erf()` directly. HTSAT's two GELU-erf sites (each Swin block's MLP in
   `SwinBlock::forward`, and the projection head's `"gelu"` arm in
-  `ClapAudioProjection::forward_unnormalized_with_training`) both route through
-  `crate::activations::gelu_erf(x, training)` — the same seam `BertIntermediate::forward`
+  `ClapAudioProjection::forward_unnormalized`) both route through
+  `crate::activations::gelu_erf(x)` — the same seam `BertIntermediate::forward`
   and `DistilBertFfn::forward` use, and the reason `gelu_erf_fused` is reachable on this
-  tower with no new kernel work. The seam's contract carries over unchanged: `training ==
-  false` is the unchanged eager call byte for byte, so eval bytes and every golden-parity /
-  bits-snapshot row taken in eval are what they were before the seam existed, while
-  `training == true` makes fused-vs-eager a COUNTED admission decision on tensor state
-  (dtype, contiguity, device, non-emptiness), never on model identity. The `training` flag
-  is a call-chain PARAMETER sourced from `HtsatAudio::set_training`'s single stored flag and
-  threaded to both sites, never a per-sub-struct stored copy — a stored copy is exactly how
-  a seam ends up dispatching on a flag the model's own forward has already moved past. The
-  two flag-less public entry points (`HtsatAudioEncoder::forward_spine`,
-  `ClapAudioProjection::forward_unnormalized`) are eval conveniences defined as their
-  `_with_training(.., false)` twins, for boundary-parity harnesses that hold no flag of
-  their own. Both sites report to ONE process-wide `gelu_erf_fused` registry entry, so a
+  tower with no new kernel work. The seam makes fused-vs-eager a COUNTED admission decision
+  on tensor state (dtype, contiguity, device, non-emptiness) on every forward, never on
+  model identity or mode. Both sites report to ONE process-wide `gelu_erf_fused` registry entry, so a
   full-tower forward's counter delta is their SUM — one per Swin block, plus one more when
   `projection_hidden_act == "gelu"`; the tower's own module doc carries that arithmetic and
   the per-site oracles (including the `"relu"` negative control) that pin it.
@@ -2428,8 +2434,8 @@ staleness→recompute loop — that is the platform's, not the engine's
   `Max` pooling uses `-1e30`, never `-inf` (`-inf*0 = NaN`).
 - **Internal helpers:** `extended_attention_mask` (`crates/jammi-encoders/src/mask.rs`,
   additive `0.0`/`-10000.0`); dual-path `LayerNorm`
-  (`crates/jammi-encoders/src/layer_norm.rs`, fused kernel in eval, gradient-safe
-  primitive path in training).
+  (`crates/jammi-encoders/src/layer_norm.rs`, the fused kernel on every forward, its
+  own backward inside the op).
 
 ### 2.6 LoRA & fine-tuning (`jammi-lora` + `jammi-ai/fine_tune`)
 
@@ -2752,21 +2758,21 @@ outcome through the shared mechanism:
   bench run is required to show (a fallback there is a hard error, not a quiet
   eager number wearing a fused label).
 
-**Training-only gate, eval bit-identity.** Every fused op's call site gates on
-`self.training` (or the crate-level `training: bool`), never merely on the
-domain check passing: eval/serving *always* runs the pre-existing eager
-composition, unconditionally — the fused arm is a NEW branch added for
-`(bias.is_none(), training == true)`
-(LayerNorm; `crates/jammi-encoders/src/layer_norm.rs`) or `self.training`
-(RoPE, softmax, GeGLU in
-`crates/jammi-encoders/src/modernbert.rs`; the LoRA epilogue in
-`crates/jammi-lora/src/lora_linear.rs::LoraLinear::forward`), never a
-rewrite of the existing eval path. Each site's own
-`eval_mode_*_is_bit_identical_regardless_of_fused_eligibility`-style test pins
-this: eval's output values are byte-for-byte unchanged by the fused kernel's
-existence. Outside its own domain, the training arm falls back to the *same*
-eager function eval uses, so a domain miss and eval-mode are one code path, not
-two independently-maintained ones.
+**One forward, admitted on tensor state.** Every fused op's call site admits on
+its domain check alone — device, dtype, contiguity, shape — never on a mode
+flag: training, evaluation and serving run the same forward and take the same
+fused arms (LayerNorm; `crates/jammi-encoders/src/layer_norm.rs`; RoPE,
+softmax, GeGLU and the attention cascade in
+`crates/jammi-encoders/src/modernbert.rs`; the LoRA site in
+`crates/jammi-lora/src/lora_linear.rs::LoraLinear::forward`). What differs
+between a training step and an evaluation or a serve is two PARAMETERS of that
+forward, both held at the LoRA sites: whether dropout is drawn
+(`set_training` / `set_dropout`) and whether the trainable leaves enter the tape
+(`set_training`; detached otherwise, so an evaluation retains no graph). Each
+site's own `*_whatever_the_mode` test pins the dispatch, and an adapter-free
+model's output is bit-identical across the mode toggle. Outside its own domain
+a seam falls back to the eager composition, counted — a domain miss is one
+code path in every mode, never a second one.
 
 **The eval doctrine: parity/golden lanes.** `jammi-encoders` carries two
 feature-gated oracle suites — `tests/parity.rs`
@@ -2830,7 +2836,7 @@ disclosed choice against a named upstream reference, not this crate's own
   not an enum policy, so it gets its own doctrine.** Folds `1/sqrt(head_dim)`
   into the fused softmax op (`scale * scores + mask`, applied strictly before
   the mask add — see `ops/softmax.rs`'s module doc's "scale semantics"
-  section), so ModernBERT's training arm retains no separate `Op::Affine`
+  section), so ModernBERT's attention cascade retains no separate `Op::Affine`
   node per layer. The field is PRIVATE (unlike `fully_masked`, whose
   `FullyMaskedPolicy` has no invalid inhabitant): the only way to set it is
   `SoftmaxLastDimFused::with_scale(scale: f32) -> Result<Self, KernelError>`,
@@ -2840,7 +2846,7 @@ disclosed choice against a named upstream reference, not this crate's own
   `softmax_admission_predicate` gains a `scale_finite_positive` clause so a
   bad scale becomes a counted eager fallback at the call site (Fallback mode)
   or `KernelError::StrictModeFallback` (Strict mode), never a `with_scale`
-  refusal surfacing from inside the training arm.
+  refusal surfacing from inside the cascade.
 - **The relative-with-floor bf16 metric.** Every bf16 oracle bounds divergence
   as `|a - b| <= REL_TOL * max(|a|, |b|) + ABS_FLOOR` (each op's own
   `bf16_close`/equivalent, e.g. `tests/geglu_oracles.rs`), never bit-exact
@@ -2851,45 +2857,25 @@ disclosed choice against a named upstream reference, not this crate's own
   not the norm) are stated as such per op (e.g. the LoRA epilogue's
   `(F32,F32)`/`(BF16,F32)` pair — see `ops/scaled_cast_add.rs`'s module doc).
 
-**How to run the A/B.**
-`ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_ab.sh`
-(or directly over ssh once the checkout is on the pod) —
-never a CI job (no GPU on the CI image). It sweeps `{b8 s128, b8 s512, b16
-s128} x {dropout 0, dropout 0.05}` across jammi-eager / jammi-fused
-(`JAMMI_KERNELS_STRICT=1`) / torch-eager / torch-sdpa legs, emitting one
-table (s/step, triplets/s, peak VRAM, the fused dispatch counters, the ratio
-vs torch-sdpa, PASS/FAIL/INDETERMINATE against the throughput bar) — see the
-script's own header for the full env-var surface (`MODEL_DIR`,
-`AB_STEPS`/`AB_WARMUP`, `AB_DRY_RUN`, …). **One binary, no ref-switching:**
-every leg — jammi-eager INCLUDED — runs off the SAME tip binary, built ONCE
-at the start (`build_binary()`, `--features cuda,jammi-encoders/flash-attn`).
-jammi-eager is the tip binary with every fused op forced eager via
-`JAMMI_KERNELS_DISABLE=$JAMMI_EAGER_DISABLE_OP_KEYS` (TEN op keys, including
-`mem_efficient_attention`, a live per-layer
-`admit_cascade`/once-per-forward `op_disabled` site, and
-`gelu_erf_fused`, a live standalone `admit` site in
-`crate::activations::gelu_erf` —
-`ci/scripts/perf/test_finetune_ab_disable_op_keys.py` sweeps the set
-mechanically against the real call graph, so an eleventh key cannot be
-missed) under `JAMMI_KERNELS_STRICT=1` (disable wins over Strict) plus
-`--expect-kernels-disabled` as a negative control — never "the pre-fusion
-commit", and never a second build. Both `jammi-fused` legs ALSO pass
-`--expect-kernels-disabled ""` — an empty expectation, hard-failing on
-any ambient `JAMMI_KERNELS_DISABLE` leaking into the process. **Order-balanced
-bar legs:** the two legs the throughput bar gates on (jammi-fused,
-torch-sdpa) each run TWICE per config in a fixed A,B,B,A interleaving
-(mirrors `gpu_inference_ab.sh`'s own documented drift rationale), gated by a
-`TWO_RUN_PROTOCOL_MARKER` file the script writes before any leg runs —
-when present, `ab_merge.py` requires all four bar legs and refuses
-(`INVALID`) a genuinely MISSING one, rather than silently degrading to the
-single-pair estimator an absent marker (an older `raw_dir`) selects.
-`ab_merge.py` computes the MIN of the two resulting pair ratios (the
-estimator least favourable to jammi) as the bar ratio, reports
-`INDETERMINATE` — never PASS/FAIL — when the two pair ratios disagree too
-much relative to the 0.9 bar, and separately cross-checks `jammi-fused` vs
-`jammi-fused-2` (and the torch-sdpa pair) for premise drift ACROSS the two
-runs, independent of the same-run premise checks each pair already
-gets.
+**How to run the step-level comparison.**
+`ci/scripts/gpu-dev.sh run <session> bash ci/scripts/perf/finetune_step_ab.sh`
+(or directly over ssh once the checkout is on the pod) — never a CI job (no
+GPU on the CI image). It is the producer of the `train-step` ladder
+(`docs/plans/69-parity-ladder/README.md`): per shape it runs the every-family-off
+reference step, the fused step, the PyTorch step twice and the two jammi steps
+again in a balanced order, files each as `<rung>__<shape>__<take>.json`, and
+`jammi-bench ladder train-step` judges the two edges — `torch → reference` and
+`reference → fused` — on speed and space, with the interval on the ratio of
+medians and each rung's repeats measuring the noise band a ratio must leave
+to be read as anything but INDETERMINATE. **One binary, no ref-switching:**
+every jammi leg runs off the binary built once at the start
+(`--features cuda,jammi-encoders/flash-attn`). The reference arm is that
+binary with every fused-kernel family off through `JAMMI_KERNELS_DISABLE`,
+whose value `jammi-bench kernel-arm --all` derives per checkpoint from the
+keys one training step consults — never a list typed into the script — and
+each leg's own dispatch counters are what the ladder's rung premises read to
+prove the arm it was filed under. `FINETUNE_STEP_AB_SHAPES` names the shapes
+(`batch:seq:dropout`, comma-separated).
 
 ### 2.6b The training-set loader: committed order, the session memory pool, and the residency bound (`jammi-db` + `jammi-ai/fine_tune`)
 
@@ -4040,7 +4026,7 @@ but the attempt is `Published` only once every member's session has ended
 `Outcome{Trained{artifact_digest}}` with rank 0's OWN adapter digest
 (`Peer::collect_member_ends` reads each link, under the gang deadline, for
 its `Outcome`/`Aborted`/close; `reconcile_member_ends` compares against
-`adapter_files_digest` over the files rank 0 is about to publish): a
+`artifact_files_digest` over the files rank 0 is about to publish): a
 member's `Failed{reason}` or a differing digest is `TrainingFailed` (the
 job's own terminal failure, nothing published), an `Aborted{reason}` is
 `MemberAborted`, a closed or silent stream a `LinkFault`; (8) every member
@@ -4196,7 +4182,7 @@ site, §2.8c) as `RunnerRole::Rank { rank }`: the same target construction,
 seed split and acceleration probe as rank 0, no persisted report, no
 checkpoint write, no job-row write, no publish. Its natural end is the
 session's one terminal event — `Outcome{Trained{artifact_digest}}`, the
-digest of the adapter files it holds (`adapter_files_digest`, the ONE
+digest of the adapter files it holds (`artifact_files_digest`, the ONE
 function both sides compute over the file set `publish_artifact`
 publishes), or `Outcome{Failed{reason}}` — which the coordinator consumes
 in §2.8d's step (7): `Published` only on every member's `Trained` with rank
@@ -4221,7 +4207,7 @@ with the rest of the workspace, no cargo feature — a process's role is
 
 - **`JammiCodec`** (`codec.rs`, `PhysicalExtensionCodec`) — encodes
   `InferenceExec`/`NumberedInputExec`/`AnnSearchExec`/`AsofJoinExec`/
-  `KeyCheckExec`/`GangExec` as prost messages of a package it compiles itself, `jammi.ballista.v1`
+  `KeyCheckExec`/`PlacedAttemptExec` as prost messages of a package it compiles itself, `jammi.ballista.v1`
   (`build.rs`) — **not** part of the frozen `jammi.v1.*` surface [§1.3]:
   this package crosses a scheduler/executor boundary INSIDE one cluster's
   own processes, never a client/server wire a foreign consumer decodes, so
@@ -4236,9 +4222,9 @@ with the rest of the workspace, no cargo feature — a process's role is
   `Weak` reference).
 - **`JammiExecutionEngine`** (`engine.rs`) wraps Ballista's
   `DefaultExecutionEngine` and adds two duties before delegating: a stage
-  containing a `GangExec` must be single-partition (one gang mechanism,
-  never a multi-partition fan-out); a stage whose required device kind (an
-  `InferenceExec`'s or a `GangExec`'s stamped `device_kind`) differs from this executor's own
+  containing a `PlacedAttemptExec` must be single-partition (one attempt is one
+  task, never a multi-partition fan-out); a stage whose required device kind (an
+  `InferenceExec`'s or a `PlacedAttemptExec`'s stamped `device_kind`) differs from this executor's own
   `InferenceSession::compute_device()` is refused typed (device
   pinning), never silently run on the wrong device.
 - **Roles** (`roles.rs`): `host_scheduler`/`host_executor` build a
@@ -4253,13 +4239,13 @@ with the rest of the workspace, no cargo feature — a process's role is
   there is no knob, the catalog-backed pair is the shipped scheduler,
   never the in-memory one. The client role installs the session's
   `jammi_db::compute_plane::ComputePlane` over `client.rs`; the executor
-  role installs `PlacedGangRunner` and writes this process's own device
+  role installs `PlacedAttemptRunner` and writes this process's own device
   claim to its `compute_executors` row right after registering.
 - **Client** (`client.rs`) — the one submit client, the two verbs the
   client role's `ComputePlane` makes: `unheld`, the admission — a pure
   predicate (`unheld_by`) over the plan's own requirements
   (`engine::plan_requirements`: the device KIND a node is stamped with,
-  `InferenceExec::device_kind` or `GangDescriptor::device_kind`, "cpu" is a
+  `InferenceExec::device_kind` or `PlacedAttempt::device_kind`, "cpu" is a
   kind too; and a gang's own submitter as the executor it must not land
   on) and the LIVE inventory, refusing typed BEFORE submitting when no
   live registered executor can hold the plan, reading the same catalog
@@ -4286,30 +4272,35 @@ with the rest of the workspace, no cargo feature — a process's role is
   reclaim, never revived by Ballista.
 - **`DevicePlacement`** (`placement.rs`, `TaskDistributionPolicy::Custom`)
   — round-robin over executor slots with three refinements: never binds a
-  `GangExec` stage to the executor equal to its own `submitter` (deadlock
+  `PlacedAttemptExec` stage to the executor equal to its own `submitter` (deadlock
   avoidance); a stage binds only to an executor whose OWN registered
-  devices list its `GangDescriptor.device_kind`/`InferenceExec::
+  devices list its `PlacedAttempt.device_kind`/`InferenceExec::
   device_kind()` (a CPU-stamped stage binds a CPU executor, never only a
-  GPU refinement); a `GangExec` stage whose job row is already
+  GPU refinement); a `PlacedAttemptExec` stage whose job row is already
   `claimed_by` a DIFFERENT executor is never bound at all (the bind-time
   half of the re-launch guard, §2.8g below).
 
-### 2.8g The placed gang — `transfer_claim` and the hand-off arms
+### 2.8g The placed training attempt — `transfer_claim` and the hand-off arms
 
-Under Ballista placement a `Peer` gang runs as ONE task,
-`GangExec { job_id, attempt, world, submitter, device_kind }`
-(`crates/jammi-ai/src/operator/gang_exec.rs`), placed by the scheduler on a
-device-bearing executor other than the submitter. The claimant submits it
+Under Ballista placement a claimed training attempt of ANY kind — a
+`fine_tune` of any world size, a `graph_fine_tune`, a `context_predictor` —
+runs as ONE task, `PlacedAttemptExec { job_id, attempt, submitter,
+device_kind }` (`crates/jammi-ai/src/operator/placed_attempt_exec.rs`), placed
+by the scheduler on an executor of the claimant's device kind other than the
+submitter. Where an attempt runs is a property of the attempt; how many ranks
+share it is the spec's `world_size`, which the descriptor does not carry —
+the executor re-derives the run, its kind and its topology from the job's
+row. The claimant submits the task
 through the session's `ComputePlane` (installed by the client role) — the
-same seam a materialization's plan goes through, the gang's admission
+same seam a materialization's plan goes through, the attempt's admission
 being the plan's own requirements — and the executor runs it through one
 more `HostAdmission` seam beside `MemberDialer` [§2.8a],
-`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedGangRunner` (installed
+`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedAttemptRunner` (installed
 by the executor role) — `jammi-ai` never depends on `jammi-ballista`.
 
 **The submitting host's holder.** `Holder` (`worker.rs`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs`): a claimant that is submitting its gang (the move precedes the submit) or is
+(`worker.rs`): a claimant that is submitting its attempt (the move precedes the submit) or is
 awaiting its stream runs no compute for that attempt, so it can still serve
 a `RunRank` session for some OTHER attempt — `HostAdmission::
 try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a
@@ -4338,14 +4329,17 @@ must FAIL a transfer, the opposite of how a reclaim sweep reads that same
 `NULL`). `attempts`/`releases` are untouched by design: a hand-off is zero
 net attempts, never a re-claim.
 
-`run_placed_gang` (`crates/jammi-ai/src/fine_tune/worker.rs`, called from the
-executor role's `PlacedGangRunner`) — (i) takes this host's job slot
+`run_placed_attempt` (`crates/jammi-ai/src/fine_tune/worker.rs`, called from the
+executor role's `PlacedAttemptRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,
 ); (ii) `transfer_claim`s the row from the descriptor's submitter to
 this instance at the SAME `attempts`; (iii) runs `run_claimed_job_under`
-VERBATIM as `LeaseHolder::Coordinator` — the SAME body a `Peer` gang's own
-claimant runs — so the published bytes are the same as a `Peer` gang's; (iv) maps the
+VERBATIM under the holder `lease_holder_for` derives on THIS host — the SAME
+body the attempt's claimant would run for the row's kind — so the published
+bytes are the in-process run's (a context predictor's initial weights are a
+function of the spec's seed, `pipeline/seeded_init.rs`, which is what makes
+that hold for a kind with no seeded LoRA init); (iv) maps the
 body's `AttemptEnd` to `PlacedOutcome`
 (`Trained`/`Reused`; `Failed` is a typed `Err` carrying the attempt's own
 error, which the row already records and which reaches the submitter as the
@@ -4355,9 +4349,9 @@ own `task_max_failures = 0` never re-runs it — jammi's own reclaim, from a
 future claim, is the only path back). The writer table (`worker.rs`'s module doc, "Runner roles and the
 job-row writers") states this as two more rows: the SUBMITTER after
 `HandedOff` writes NOTHING (the row and its lease-keeper registration are
-the placed executor's now); the EXECUTOR running `run_placed_gang` writes
-as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
-[§2.8e].
+the placed executor's now); the EXECUTOR running `run_placed_attempt` writes
+as the holder derived on its own host — the same body as every
+`LeaseHolder`-gated site above it [§2.8e].
 
 ### 2.9 Numerics (`jammi-numerics`)
 
@@ -4459,9 +4453,10 @@ as `Coordinator` — the same body as every `LeaseHolder`-gated site above it
 production driver. It creates the row, then writes through the ONE node every result-table
 producer roots in — `jammi_db::store::ResultTableSinkExec` (`crates/jammi-db/src/store/sink.rs`),
 via `ResultStore::write_result_table` — over the inference plan: the sink filters OK rows into
-the embedding schema, `add`s each vector to a `SidecarIndex`, checkpoints the row every
-`checkpoint_interval` batches, appends the built index as the table's first segment, and
-reports one summary batch (`input_rows`, `rows`, `segment_id`); the pipeline then `finish`es
+the embedding schema, hands their vectors to a `SegmentBuilder` (segments of
+`embedding.index_segment_rows` consecutive rows, each built on its own thread in row order),
+checkpoints the row every `checkpoint_interval` batches, appends the built segments in order,
+and reports one summary batch (`input_rows`, `rows`, `segment_ids`); the pipeline then `finish`es
 the row with the manifest. Where the sink runs is decided when it is polled: under a session
 carrying a `ComputePlane` that holds the plan it submits itself whole and the executor writes
 the bytes under the row's lease — `SinkLease::take` transfers the row from the submitter's
@@ -5334,9 +5329,9 @@ auto-available to every encoder.)
   normalization silently corrupts cosine similarity.
 - **`.contiguous()` after `transpose` is load-bearing** (candle upstream issues) — the comments
   say "must not be removed".
-- **`set_training` must toggle LayerNorms too** — eval uses the fused kernel (no defined
-  backward); training needs the slow primitive path. Forgetting one yields a working forward but a
-  silently-broken backward.
+- **`set_training` governs the LoRA sites only** — dropout and whether the trainable leaves
+  enter the tape; every fused seam admits on tensor state whatever the mode. A GradCache pass
+  wants dropout off WITH the tape: `set_dropout(false)`, never `set_training(false)`.
 - **Site-name strings are a persistence ABI.** `named_trainable_weights` keys are the adapter
   safetensors keys; the `…lora_sites` helper names (used by dropout-resume) and the inlined
   `named_weights`/`load_weights` prefixes are maintained **independently** — a rename must be

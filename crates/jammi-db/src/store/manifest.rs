@@ -638,6 +638,38 @@ pub enum ProducingDescriptor {
         /// The output embedding width.
         dimensions: usize,
     },
+    /// Graph-structure output: an embedding table generated from an edge
+    /// relation alone — a structural seed propagated over the graph it was
+    /// drawn from and read out as a weighted sum of the per-hop blocks.
+    /// (`generate_structure_embeddings`.)
+    ///
+    /// The edge relation is the one input, anchored in
+    /// [`MaterializationManifest::input_anchors`] and recorded here by its full
+    /// binding. Every other field changes a vector: the seed's determinants
+    /// (`seed`, `dimensions`, `sparsity_bits`, `beta_bits`), the walk
+    /// `direction` and `weighting`, and the readout `weight_bits` — whose length is also the
+    /// depth (`weight_bits.len() − 1` hops).
+    GraphStructure {
+        /// The edge relation the structure was read from, with its full
+        /// column bindings.
+        edge_source: EdgeSourceBinding,
+        /// The encoding kernel's canonical id.
+        kernel_id: String,
+        /// Edge-direction the walk followed.
+        direction: PropagationDirection,
+        /// The walk operator's weighting.
+        weighting: PropagationWeighting,
+        /// The seed every node's projection stream is keyed by.
+        seed: u64,
+        /// The embedding width.
+        dimensions: usize,
+        /// The projection's sparsity `s`, by its IEEE-754 bit pattern.
+        sparsity_bits: u64,
+        /// The degree exponent `β`, by its IEEE-754 bit pattern.
+        beta_bits: u64,
+        /// The readout weight of each block `0..=K`, by bit pattern.
+        weight_bits: Vec<u64>,
+    },
     /// Context-set output: per-target pooled context vectors materialised as a
     /// new embedding table. The real producer is the
     /// `assemble_context`→`materialize_context` pair — `materialize_context` is a
@@ -1104,13 +1136,19 @@ pub enum PropagationWeighting {
 /// [`ProducingDescriptor::GraphPropagation`] — the transport-neutral mirror of
 /// the AI crate's `PropagationOutput`. Changes the output dimensionality, so it
 /// is part of the definition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PropagationOutput {
     /// Only the final `X⁽ᴷ⁾` block — a `d`-dim table in the input's space.
     Final,
     /// The per-hop blocks concatenated (Jumping Knowledge) — `(K+1)·d`-dim.
     JumpingKnowledge,
+    /// The weighted sum of the L2-normalised per-hop blocks — `d`-dim.
+    WeightedSum {
+        /// The weight of each block `0..=K`, by its IEEE-754 bit pattern
+        /// (`f64::to_bits`) so the descriptor stays bit-exact and `Eq`.
+        weight_bits: Vec<u64>,
+    },
 }
 
 /// The pooling reduction recorded in [`ProducingDescriptor::ContextSet`] — the
@@ -2570,7 +2608,7 @@ mod tests {
             hops: p.hops,
             alpha_bits: p.alpha_bits,
             weighting: p.weighting,
-            output: p.output,
+            output: p.output.clone(),
             dimensions: p.dimensions,
         }
     }

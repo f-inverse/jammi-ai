@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use std::collections::HashMap;
 
@@ -53,20 +54,171 @@ fn per_micro_batch_host_read_count() -> u64 {
     PER_MICRO_BATCH_HOST_READ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Test-only call counters for `encode_texts`'s `EncoderAdapters`-branch
-/// dispatch between [`tokenize_and_bucket`] (train) and
-/// [`tokenize_natural_width`] (eval). Both functions return SELF-CONSISTENT `(rows, cols)` pairs
-/// (a caller cannot tell, from `encode_texts`'s pooled `[rows, hidden]`
-/// output alone, which one actually ran — bucketing is deliberately
-/// output-invariant), so a black-box test cannot observe the routing
-/// decision from the return value. Mirrors
-/// [`PER_MICRO_BATCH_HOST_READ_COUNT`]'s own role just above: a test cannot
-/// observe the internal path taken directly, so this is the structural
-/// proxy.
+/// Test-only call counter for `encode_texts`'s `EncoderAdapters` branch
+/// reaching [`tokenize_and_bucket`] — in training AND evaluation mode.
+/// Padding is deliberately output-invariant, so a caller cannot tell from
+/// `encode_texts`'s pooled `[rows, hidden]` output whether a batch was
+/// padded to the ladder or left at its natural width; a black-box test
+/// cannot observe it from the return value. Mirrors
+/// [`PER_MICRO_BATCH_HOST_READ_COUNT`]'s own role just above: the
+/// structural proxy for a path a test cannot observe directly.
 #[cfg(test)]
 static BUCKETED_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static NATURAL_TOKENIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Where one [`TrainingLoop::run`] call's wall-clock went, each phase timed
+/// directly around the work it names. A run is not only training steps: it
+/// also evaluates a validation split and reads and writes checkpoints, and a
+/// single wall around the whole call cannot say how much of it was which —
+/// so a reader comparing training cost would be comparing checkpoint I/O too.
+///
+/// The phases are disjoint and do not sum to the call's wall: what is left
+/// over (the train/validation split, building the optimizer, the epoch-end
+/// finite-parameter check, assembling metrics) is small and belongs to none
+/// of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RunPhaseWall {
+    /// The step loop: tokenization or media decode, forward, loss, backward,
+    /// clip and optimizer step for every batch — the trailing accumulation
+    /// flush and, when enabled, the epoch's hard-negative refresh included —
+    /// with the device synchronized before the span closes so
+    /// launched work is charged to the epoch that launched it. Step
+    /// checkpoints written from inside the loop are charged to
+    /// [`Self::checkpoints`], not here.
+    pub steps: std::time::Duration,
+    /// The per-epoch validation pass. Zero when the run monitors
+    /// `train_loss`, which skips it.
+    pub validation: std::time::Duration,
+    /// Every checkpoint read and write: the resume restore, step and "best"
+    /// adapter writes, the durable epoch bundle (artifact store and catalog
+    /// included), the best-adapter reload, the final adapter.
+    pub checkpoints: std::time::Duration,
+}
+
+/// One epoch of a run: its wall whole and by phase, in seconds — the
+/// per-epoch resolution of [`RunPhaseWall`]. `run_s` runs from the epoch's
+/// first statement to its durable checkpoint's return, so the epochs of a run
+/// are contiguous and their walls sum to the run's less what precedes the
+/// first epoch and follows the last (the split, the optimizer build, a resume
+/// restore, the final adapter save). Carried in the run metrics as
+/// `epoch_walls`, so whoever reads a job's metrics can see where each epoch's
+/// time went wherever the job ran.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EpochWall {
+    /// 0-based epoch index.
+    pub epoch: usize,
+    /// The whole epoch.
+    pub run_s: f64,
+    /// [`RunPhaseWall::steps`]' share of this epoch.
+    pub steps_s: f64,
+    /// Every optimizer step of this epoch, in order: the wall from the end
+    /// of the previous step (or the step span's start) to the end of this
+    /// one, checkpoint writes excluded as in `steps_s`. A training run's
+    /// timed iteration is its optimizer step, so a reader of the run's
+    /// speed has a per-iteration series and not one number per epoch.
+    pub step_walls: Vec<f64>,
+    /// [`RunPhaseWall::validation`]'s share of this epoch.
+    pub validation_s: f64,
+    /// [`RunPhaseWall::checkpoints`]' share of this epoch.
+    pub checkpoint_s: f64,
+}
+
+/// How many times each kernel dispatch site ran fused, eager, or (a cascade)
+/// declined, by the op name its site admits under — the process-wide
+/// admission counters (`jammi_kernels::admission`) read over a window.
+/// Carried in the run metrics as `kernel_dispatches`, the window being the
+/// run's epoch loop: what the acceleration report predicts from a probe, this
+/// states from the run itself. The counters are the process's, so a run that
+/// shares its process with another concurrent run counts both.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelDispatches(pub std::collections::BTreeMap<String, KernelDispatchCount>);
+
+/// One op's counts over a window. `declined` is a cascade's alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelDispatchCount {
+    pub fused: u64,
+    pub eager: u64,
+    #[serde(default)]
+    pub declined: u64,
+}
+
+impl KernelDispatches {
+    /// Every registered op's counts now.
+    pub fn snapshot() -> Self {
+        let plain = jammi_kernels::admission::snapshot_all()
+            .into_iter()
+            .map(|(op, s)| {
+                let count = KernelDispatchCount {
+                    fused: s.fused,
+                    eager: s.eager,
+                    declined: 0,
+                };
+                (op.to_string(), count)
+            });
+        // The cascade sites, from the engine's own probed-op table: a
+        // cascade counter is keyed by its registry key, never enumerated by
+        // hand here.
+        let cascades = jammi_kernels::admission::PROBED_OPS
+            .iter()
+            .filter(|op| op.kind() == jammi_kernels::admission::ProbedOpKind::Cascade)
+            .flat_map(|op| op.all_registry_keys())
+            .map(|key| {
+                let s = jammi_kernels::admission::cascade_counters_for(key).snapshot();
+                let count = KernelDispatchCount {
+                    fused: s.fused,
+                    eager: s.eager,
+                    declined: s.declined,
+                };
+                (key.to_string(), count)
+            });
+        Self(plain.chain(cascades).collect())
+    }
+
+    /// What was dispatched between `self` and the later snapshot `after`. An
+    /// op first registered inside the window counts from zero.
+    pub fn delta_to(&self, after: &Self) -> Self {
+        Self(
+            after
+                .0
+                .iter()
+                .map(|(op, now)| {
+                    let then = self.0.get(op).copied().unwrap_or_default();
+                    let count = KernelDispatchCount {
+                        fused: now.fused.saturating_sub(then.fused),
+                        eager: now.eager.saturating_sub(then.eager),
+                        declined: now.declined.saturating_sub(then.declined),
+                    };
+                    (op.clone(), count)
+                })
+                .collect(),
+        )
+    }
+
+    /// `op`'s counts, zero when it never registered.
+    pub fn of(&self, op: &str) -> KernelDispatchCount {
+        self.0.get(op).copied().unwrap_or_default()
+    }
+}
+
+impl EpochWall {
+    /// The epoch that began at `started` with the run's phases at `before`
+    /// and ends now with them at `after`.
+    fn closing(
+        epoch: usize,
+        started: Instant,
+        before: RunPhaseWall,
+        after: RunPhaseWall,
+        step_walls: Vec<f64>,
+    ) -> Self {
+        Self {
+            epoch,
+            run_s: started.elapsed().as_secs_f64(),
+            steps_s: (after.steps - before.steps).as_secs_f64(),
+            step_walls,
+            validation_s: (after.validation - before.validation).as_secs_f64(),
+            checkpoint_s: (after.checkpoints - before.checkpoints).as_secs_f64(),
+        }
+    }
+}
 
 /// Result of a completed training run.
 ///
@@ -136,6 +288,14 @@ pub struct TrainingResult {
     /// field across those calls itself, it is never carried over from a
     /// prior leg. `Duration::ZERO` by default.
     pub media_front_end_wall: std::time::Duration,
+    /// This call's wall-clock by phase — see [`RunPhaseWall`]. Reset at the
+    /// start of every `run` call, like [`Self::media_front_end_wall`] (which
+    /// is a subset of its `steps`), so a caller driving several resume legs
+    /// sums it across them.
+    pub phase_wall: RunPhaseWall,
+    /// The same wall per epoch this call ran, in epoch order — see
+    /// [`EpochWall`].
+    pub epoch_walls: Vec<EpochWall>,
 }
 
 /// Compute the learning rate for a given step.
@@ -166,6 +326,28 @@ pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f
     lr.max(0.0)
 }
 
+/// The learning rate a run's optimizer steps are APPLIED at.
+///
+/// A property of the run, not of the job: `FineTuneConfig::learning_rate` is
+/// a request-edge field and must be positive there, because a submitted job
+/// that cannot learn is a mistake. A negative control is not a job anyone
+/// submits — it is a valid job RUN with its updates nulled, so that whatever
+/// an instrument reads off a trained run (a loss that moved, a probe that
+/// fell) can be shown to read exactly nothing when nothing was learned. It is
+/// therefore set on the builder ([`TrainingLoopBuilder::applied_learning_rate`]),
+/// below admission, and never reachable from a spec.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AppliedLearningRate {
+    /// [`compute_lr`] over the job's own config — every ordinary run.
+    #[default]
+    Scheduled,
+    /// Zero at every step. The whole loop still runs — forward, loss,
+    /// backward, clip, the optimizer step and its moment updates, validation,
+    /// checkpoints — and no trainable tensor moves: AdamW's update and its
+    /// decoupled weight decay are both scaled by the rate.
+    Zero,
+}
+
 /// Mutable per-epoch state passed into [`TrainingLoop::process_batch_loss`].
 ///
 /// All five fields are borrowed mutably so the function can update batch
@@ -174,6 +356,11 @@ struct EpochState<'a> {
     batch_count: &'a mut usize,
     epoch_loss: &'a mut f64,
     accumulated_grads: &'a mut GradStore,
+    /// This epoch's optimizer-step walls so far ([`EpochWall::step_walls`]).
+    step_walls: &'a mut Vec<f64>,
+    /// When the last optimizer step ended (or the step span began, or a
+    /// checkpoint write inside it ended): the start of the next step's wall.
+    last_step_at: &'a mut Instant,
     /// Whether a micro-batch has been merged into `accumulated_grads` since
     /// the last optimizer step (i.e. whether the epoch-end flush has
     /// anything pending). Deliberately independent of whether
@@ -612,6 +799,18 @@ pub struct TrainingLoop {
     /// into the returned [`TrainingResult`] at the end — see that field's
     /// own doc for the exact boundary and the per-`run`-call reset contract.
     media_front_end_wall: std::cell::Cell<std::time::Duration>,
+    /// Accumulates [`TrainingResult::phase_wall`]. A plain field: every phase
+    /// is charged from [`Self::run`] or [`Self::process_batch_loss`], both of
+    /// which hold `&mut self`. Reset at the start of every [`Self::run`] call.
+    phase_wall: RunPhaseWall,
+    /// See [`TrainingLoopBuilder::epoch_limit`]. `None` runs to
+    /// `config.epochs`.
+    epoch_limit: Option<usize>,
+    /// See [`AppliedLearningRate`].
+    applied_learning_rate: AppliedLearningRate,
+    /// Every encoder forward this loop has run — training, validation and
+    /// held-out passes alike — see [`Self::encoder_forwards`].
+    encoder_forwards: std::cell::Cell<u64>,
     /// This rank's identity and step context inside the gang.
     /// [`TrainingLoopBuilder::build`] defaults this to [`RankContext::
     /// single_rank`] when the builder's own `rank_context` is never set, so
@@ -666,6 +865,10 @@ pub struct TrainingLoopBuilder {
     cancel: Arc<AtomicBool>,
     artifact_store: Option<Arc<ArtifactStore>>,
     resume: Option<RestoredCheckpoint>,
+    /// See [`Self::epoch_limit`].
+    epoch_limit: Option<usize>,
+    /// See [`AppliedLearningRate`]. Defaults to `Scheduled`.
+    applied_learning_rate: AppliedLearningRate,
     /// See [`TrainingLoop::rank_ctx`]. `None` until [`Self::rank_context`] is
     /// called; [`Self::build`] defaults it to [`RankContext::single_rank`]
     /// over `config.batch_size` — the W=1 shape.
@@ -697,6 +900,8 @@ impl TrainingLoopBuilder {
             cancel: Arc::new(AtomicBool::new(false)),
             artifact_store: None,
             resume: None,
+            epoch_limit: None,
+            applied_learning_rate: AppliedLearningRate::default(),
             rank_ctx: None,
             runner_role: None,
         }
@@ -735,6 +940,29 @@ impl TrainingLoopBuilder {
     /// persisted epoch boundary instead of starting fresh.
     pub fn resume(mut self, restored: RestoredCheckpoint) -> Self {
         self.resume = Some(restored);
+        self
+    }
+
+    /// Return from [`TrainingLoop::run`] once epochs `0..epochs` are done,
+    /// even when `config.epochs` asks for more — a run taken in slices, each
+    /// slice ending on a durable epoch checkpoint the next one resumes from.
+    ///
+    /// The limit is an ABSOLUTE epoch count, like `config.epochs`, and it
+    /// bounds only how far THIS call goes. Everything derived from the run's
+    /// length — the LR schedule's horizon, the step-checkpoint cadence, which
+    /// step is the run's last — still comes from `config.epochs`, so a sliced
+    /// run follows the same schedule as an uninterrupted one. Shortening
+    /// `config.epochs` to stop early would instead compress the schedule into
+    /// each slice. A limit at or above `config.epochs` changes nothing.
+    pub fn epoch_limit(mut self, epochs: usize) -> Self {
+        self.epoch_limit = Some(epochs);
+        self
+    }
+
+    /// Set the rate this run's optimizer steps are applied at — see
+    /// [`AppliedLearningRate`]. Omit it for every ordinary run.
+    pub fn applied_learning_rate(mut self, rate: AppliedLearningRate) -> Self {
+        self.applied_learning_rate = rate;
         self
     }
 
@@ -862,6 +1090,10 @@ impl TrainingLoopBuilder {
             resume: self.resume,
             epoch_checkpoints: Vec::new(),
             media_front_end_wall: std::cell::Cell::new(std::time::Duration::ZERO),
+            phase_wall: RunPhaseWall::default(),
+            epoch_limit: self.epoch_limit,
+            applied_learning_rate: self.applied_learning_rate,
+            encoder_forwards: std::cell::Cell::new(0),
             rank_ctx,
             role,
             #[cfg(test)]
@@ -879,35 +1111,41 @@ impl TrainingLoopBuilder {
 }
 
 /// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding, then
-/// rounds the batch's natural width UP to
-/// [`jammi_numerics::bucket_seq_len`]'s bucket ladder and extends every row
-/// to that bucketed width — see `crate::fine_tune::batch_bucket`'s module
-/// doc for the mechanism/rationale this closes. Returns the bucketed
-/// [`BatchEncoding`] alongside the row count and the bucketed column width
-/// actually produced, so a caller can build a `[rows, cols]` tensor directly
-/// without recomputing either.
+/// extends every row to the ladder's rung for the batch's natural width
+/// ([`jammi_numerics::ShapeLadder`]) — the padding
+/// that bounds the count of distinct tensor shapes a non-caching CUDA
+/// allocator sees across the unbounded sequence of training-step batches
+/// (see that type's module doc). Returns the padded
+/// [`BatchEncoding`](crate::model::tokenizer::BatchEncoding)
+/// alongside the row count and the width actually produced, so a caller can
+/// build a `[rows, cols]` tensor directly without recomputing either.
 ///
-/// **TRAINING-STEP path only**: [`TrainingLoop::encode_texts`]'s
-/// `EncoderAdapters` branch calls this ONLY while `self.training_mode` is
-/// `true`; see [`tokenize_natural_width`]'s doc for the sibling eval-time
-/// path and why bucket-UP padding is wrong there. Bucketing exists to bound
-/// the COUNT of distinct tensor shapes a non-caching CUDA allocator sees
-/// across the UNBOUNDED sequence of per-training-step batches — an eval pass
-/// is not that path.
+/// Every text batch the run encodes — a training step's and an evaluation
+/// pass's alike — takes its width from this one ladder, so a run presents
+/// the device with the ladder's shapes and no others. An evaluation pass at
+/// natural width would add one distinct shape per distinct held-out batch
+/// width; `cudarc`'s pooled allocations never shrink, so those shapes are
+/// resident for the rest of the run at a cost of tens of gigabytes on a
+/// varied held-out split, and the padded positions are fully masked either
+/// way (`encode_texts_output_is_bucket_invariant_at_the_real_call_site`).
 ///
-/// Factored out of [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch
-/// (its only caller) — not merely inlined there — so a unit test can drive
-/// the PRODUCTION tokenize+bucket step directly and assert its bucketed
-/// shape without duplicating the decision: deleting either
-/// `pad_rows_to_bucket` call below turns
-/// `encode_texts_bucketing_oracle::tokenize_and_bucket_pads_every_row_to_the_bucket_ladder`
-/// red (rows stay at their natural, unbucketed width, so `cols` no longer
-/// matches every row's actual length).
-/// `pinned_rung`: the rung-pinning option
-/// (`batch_bucket::resolve_bucket_rung`'s own doc has the full "why") —
-/// `None` at the sole production call site, which never has another rank's
-/// shape to agree with.
-fn tokenize_and_bucket(
+/// Factored out of `TrainingLoop::encode_texts`'s `EncoderAdapters` branch
+/// so a unit test, and a caller reproducing a pass's batches, drive the
+/// PRODUCTION tokenize-and-pad step directly without duplicating the
+/// decision.
+///
+/// `pinned_rung` overrides the batch's own rung outright. No production
+/// call site sets it: a gang's cross-rank gather concatenates each rank's
+/// POOLED `[rows, hidden]` output along the row axis, never the sequence
+/// axis this rung governs, so two ranks padded to two different rungs still
+/// gather cleanly. It is a real, callable parameter for a caller that wants
+/// to bound the distinct-shape count across ranks (an allocator concern,
+/// not a gather-correctness one).
+///
+/// Public so a caller outside the trainer can reproduce EXACTLY the token
+/// batches a pass feeds the encoder — to digest or inspect them — through
+/// this function rather than by re-deriving its truncate/pad composition.
+pub fn tokenize_and_bucket(
     tokenizer: &crate::model::tokenizer::TokenizerWrapper,
     texts: &[String],
     effective_max: usize,
@@ -917,75 +1155,12 @@ fn tokenize_and_bucket(
     BUCKETED_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
     let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
     let mut encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
-
     let rows = encoding.input_ids.len();
-    let natural_cols = encoding.input_ids.first().map_or(0, |v| v.len());
-    // Round this batch's own (tokenizer `BatchLongest`) natural
-    // width UP to a small, fixed bucket ladder — see
-    // `crate::fine_tune::batch_bucket`'s module doc for why an UNBOUNDED
-    // count of distinct per-step tensor shapes fragments/grows cudarc's
-    // non-caching CUDA allocator, and why extending the SAME trailing-zero
-    // padding contract `BatchLongest` already relies on (pad id `0`, mask
-    // `0`) is output-invariant. Every dtype/objective through this ONE
-    // `EncoderAdapters` TRAINING-STEP call site is bucketed uniformly —
-    // never an f16-specific knob (eval never reaches this function; see
-    // the eval-time exemption above).
-    let cols = crate::fine_tune::batch_bucket::resolve_bucket_rung(
-        natural_cols,
-        effective_max,
-        pinned_rung,
-    );
-    crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.input_ids, cols, 0);
-    crate::fine_tune::batch_bucket::pad_rows_to_bucket(&mut encoding.attention_masks, cols, 0);
-
-    Ok((encoding, rows, cols))
-}
-
-/// Tokenizes `texts` via `tokenizer`'s own `BatchLongest` padding WITHOUT any
-/// further bucket-rounding — every row is exactly the batch's own natural
-/// (tokenizer `BatchLongest`) width.
-///
-/// **EVAL path only**: [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
-/// branch calls this while `self.training_mode` is `false` — i.e. inside
-/// [`TrainingLoop::with_dropout_disabled`]'s bracket
-/// ([`TrainingLoop::evaluate`]/[`TrainingLoop::evaluate_held_out`]).
-///
-/// **The bound this exemption relies on**: the allocator hazard is the COUNT
-/// of DISTINCT tensor shapes a non-caching CUDA allocator (`cudarc`) is ever
-/// asked to satisfy, and a held-out split with batches of several natural
-/// widths presents that many shapes in a SINGLE pass, regardless of
-/// `eval_cadence` — so "eval runs infrequently" is not the bound. The bound
-/// is that the held-out/val partition is DETERMINISTIC — the same rows, in
-/// the same batch order, on every pass ([`TrainingLoop::evaluate_held_out`]'s
-/// own `example_ids` contract) — so eval re-presents the IDENTICAL sequence
-/// of natural widths every time. Its distinct-shape contribution is paid
-/// EXACTLY ONCE per run (cudarc never returns a reserved block to the OS, so
-/// every later pass's widths are already-seen repeats), never growing
-/// per-step or per-epoch the way the training step's churn would.
-///
-/// Limitation: that one-time set's SIZE is caller-dependent — bounded by the
-/// held-out split's own natural-width diversity (up to one distinct width
-/// per batch, not the bucket ladder's ~11 rungs). A held-out split
-/// large/varied enough to present many distinct widths is not bounded by
-/// anything in this module.
-///
-/// Rounding an eval batch's real width UP to the run's `max_seq_length`
-/// bucket regardless of its content (e.g. a 321-token held-out batch padded
-/// to the 512 bucket, a `~2.5x` softmax-intermediate blow-up:
-/// `512² / 321² ≈ 2.5`) pays a real memory cost for a shape-count benefit
-/// eval's deterministic, paid-once partition does not need, and OOMs a
-/// `--batch 8 --max-seq-length 512` bf16 run that fits at natural width.
-fn tokenize_natural_width(
-    tokenizer: &crate::model::tokenizer::TokenizerWrapper,
-    texts: &[String],
-    effective_max: usize,
-) -> Result<(crate::model::tokenizer::BatchEncoding, usize, usize)> {
-    #[cfg(test)]
-    NATURAL_TOKENIZE_CALLS.fetch_add(1, Ordering::Relaxed);
-    let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-    let encoding = tokenizer.encode_batch(&text_refs, Some(effective_max))?;
-    let rows = encoding.input_ids.len();
-    let cols = encoding.input_ids.first().map_or(0, |v| v.len());
+    // Every dtype/objective through this ONE call site is padded uniformly —
+    // never an f16-specific knob.
+    let cols = pinned_rung
+        .unwrap_or_else(|| jammi_numerics::ShapeLadder::new(effective_max).width(encoding.seq_len));
+    encoding.pad_to(cols);
     Ok((encoding, rows, cols))
 }
 
@@ -1018,6 +1193,7 @@ impl TrainingLoop {
         // multiple resume legs through separate `run` calls sums this field
         // across legs itself, it is never carried over from a prior one.
         self.media_front_end_wall.set(std::time::Duration::ZERO);
+        self.phase_wall = RunPhaseWall::default();
 
         // The claim already set the status to `running` and stamped the
         // lease; the generalised `jobs` schema has no separate "record
@@ -1426,7 +1602,11 @@ impl TrainingLoop {
         // resumed run starts at (`last_completed + 1`) and its step counter.
         let (start_epoch, mut global_step) = match self.resume.take() {
             Some(restored) => {
-                self.restore_from_checkpoint(restored, &mut optimizer, &optim_param_names)?
+                let started = Instant::now();
+                let resumed_at =
+                    self.restore_from_checkpoint(restored, &mut optimizer, &optim_param_names)?;
+                self.phase_wall.checkpoints += started.elapsed();
+                resumed_at
             }
             None => (0, 0),
         };
@@ -1446,6 +1626,8 @@ impl TrainingLoop {
         // `self.config.epochs`, since `break` below stops pushing further rows.
         let mut train_loss_curve: Vec<(usize, f64)> = Vec::new();
         let mut val_loss_curve: Vec<(usize, f64)> = Vec::new();
+        let mut epoch_walls: Vec<EpochWall> = Vec::new();
+        let dispatches_before = KernelDispatches::snapshot();
         // Train into a fresh worker-private tempdir, never a shared path: two
         // workers on the same `job_id` must not share a training-time file.
         // Checkpoints and the final adapter land here; the worker publishes the
@@ -1490,7 +1672,14 @@ impl TrainingLoop {
         // tiny scalar constants `clip_gradients` materializes (`.minimum
         // (1.0)`; see `optimizer::clip_gradients`'s doc for that op count).
 
-        for epoch in start_epoch..self.config.epochs {
+        // This call's last epoch (exclusive): the whole run's, unless the
+        // caller is taking the run in slices (`TrainingLoopBuilder::
+        // epoch_limit`). Only the loop bound reads it — every horizon above
+        // was derived from `config.epochs`.
+        let end_epoch = self
+            .epoch_limit
+            .map_or(self.config.epochs, |limit| limit.min(self.config.epochs));
+        for epoch in start_epoch..end_epoch {
             // Cooperative cancellation: the worker's heartbeat sets this when the
             // lease is lost. Bail at the epoch boundary, leaving the job for
             // lease-based reclaim rather than recording a (wrong) terminal status.
@@ -1499,6 +1688,8 @@ impl TrainingLoop {
                     "training cancelled: lease lost before epoch boundary".into(),
                 ));
             }
+            let epoch_started = Instant::now();
+            let phases_before_epoch = self.phase_wall;
             let mut epoch_loss = 0.0;
             let mut batch_count = 0;
             // Accumulated gradients across micro-batches, merged in
@@ -1513,6 +1704,17 @@ impl TrainingLoop {
             // `f64` exactly once, at the epoch boundary below (see
             // `Self::accumulate_sim_stats`'s and `SimStats`'s docs).
             let mut sim_stats: Option<SimStats> = None;
+
+            // The step-loop span (`RunPhaseWall::steps`) opens here and
+            // closes after the trailing flush below. Checkpoint writes made
+            // from inside it are charged to `phase_wall.checkpoints` as they
+            // happen, so the span's own share is its wall less what that
+            // counter gained meanwhile — two nested host spans, an exact
+            // subtraction.
+            let steps_started = Instant::now();
+            let checkpoints_before_steps = self.phase_wall.checkpoints;
+            let mut step_walls: Vec<f64> = Vec::new();
+            let mut last_step_at = steps_started;
 
             // Re-mine hard negatives at refresh boundaries. Mining replaces the
             // epoch's data with (anchor, positive, mined-negative) triplets fed
@@ -1556,6 +1758,8 @@ impl TrainingLoop {
                                     accumulated_grads: &mut accumulated_grads,
                                     grads_pending: &mut grads_pending,
                                     global_step: &mut global_step,
+                                    step_walls: &mut step_walls,
+                                    last_step_at: &mut last_step_at,
                                 },
                                 StepContext {
                                     trainable_vars: &trainable_vars,
@@ -1572,7 +1776,7 @@ impl TrainingLoop {
                         // GradCache path: the whole dataset is one in-batch-negative
                         // batch, chunked at `batch_size` for memory. One optimiser step
                         // per epoch over the full negative pool.
-                        let lr = compute_lr(&self.config, global_step, total_steps);
+                        let lr = self.learning_rate_at(global_step, total_steps);
                         optimizer.set_learning_rate(lr);
                         let loss_val = self.run_gradcache_epoch(
                             epoch_loader,
@@ -1584,8 +1788,14 @@ impl TrainingLoop {
                         epoch_loss += loss_val;
                         batch_count += 1;
                         global_step += 1;
+                        let stepped_at = Instant::now();
+                        step_walls.push((stepped_at - last_step_at).as_secs_f64());
+                        last_step_at = stepped_at;
                         if checkpoint_interval > 0 && global_step % checkpoint_interval == 0 {
+                            let started = Instant::now();
                             self.save_step_weights(&checkpoint_dir, global_step)?;
+                            self.phase_wall.checkpoints += started.elapsed();
+                            last_step_at = Instant::now();
                         }
                     } else {
                         // Production path: encode text through the target, then
@@ -1644,6 +1854,8 @@ impl TrainingLoop {
                                     accumulated_grads: &mut accumulated_grads,
                                     grads_pending: &mut grads_pending,
                                     global_step: &mut global_step,
+                                    step_walls: &mut step_walls,
+                                    last_step_at: &mut last_step_at,
                                 },
                                 StepContext {
                                     trainable_vars: &trainable_vars,
@@ -1705,6 +1917,8 @@ impl TrainingLoop {
                                 accumulated_grads: &mut accumulated_grads,
                                 grads_pending: &mut grads_pending,
                                 global_step: &mut global_step,
+                                step_walls: &mut step_walls,
+                                last_step_at: &mut last_step_at,
                             },
                             StepContext {
                                 trainable_vars: &trainable_vars,
@@ -1733,7 +1947,7 @@ impl TrainingLoop {
             // for consistency with the other two call sites rather than
             // because this arm needs the distinction.
             if grads_pending {
-                let lr = compute_lr(&self.config, global_step, total_steps);
+                let lr = self.learning_rate_at(global_step, total_steps);
                 optimizer.set_learning_rate(lr);
                 // `last_step_horizon` carries the whole run's ACTUAL
                 // optimizer-step horizon for the arm this run takes (see the
@@ -1763,6 +1977,9 @@ impl TrainingLoop {
                     is_last_step,
                 )?;
                 global_step += 1;
+                // The epoch's last step: its wall closes the series, and the
+                // next epoch's step span starts the mark afresh.
+                step_walls.push(last_step_at.elapsed().as_secs_f64());
                 // The flush is an optimizer step like any other, so it sits
                 // on the same step-checkpoint cadence as the in-window steps
                 // in `process_batch_loss` and the GradCache arm — the
@@ -1770,9 +1987,21 @@ impl TrainingLoop {
                 // multiple of `grad_accum` must not be the one step that
                 // skips its checkpoint.
                 if checkpoint_interval > 0 && global_step.is_multiple_of(checkpoint_interval) {
+                    let started = Instant::now();
                     self.save_step_weights(&checkpoint_dir, global_step)?;
+                    self.phase_wall.checkpoints += started.elapsed();
                 }
             }
+
+            // Close the step-loop span on a synchronized device: kernels are
+            // launched asynchronously, and without this the epoch's last
+            // launches would be paid for by whichever phase reads the device
+            // next.
+            self.device
+                .synchronize()
+                .map_err(|e| JammiError::FineTune(format!("epoch-end device sync: {e}")))?;
+            let checkpoints_in_steps = self.phase_wall.checkpoints - checkpoints_before_steps;
+            self.phase_wall.steps += steps_started.elapsed().saturating_sub(checkpoints_in_steps);
 
             let avg_train_loss = epoch_loss / batch_count.max(1) as f64;
             // The ONE host read for the whole epoch's sim stats — every
@@ -1801,6 +2030,7 @@ impl TrainingLoop {
             // `None` when no validation pass ran. Not `0.0`: a sentinel that
             // shares a type with a real measurement is a measurement everywhere
             // downstream.
+            let validation_started = Instant::now();
             let avg_val_loss: Option<f64> = match self.config.early_stopping_metric {
                 EarlyStoppingMetric::TrainLoss => None,
                 EarlyStoppingMetric::ValLoss => {
@@ -1816,16 +2046,29 @@ impl TrainingLoop {
                     // already-resident `val_loader` — `evaluate_streamed`
                     // folds it through the SAME per-batch loss accumulation
                     // `evaluate` uses.
-                    match &source {
+                    let validation_t0 = std::time::Instant::now();
+                    let loss = match &source {
                         Source::Resident { val_loader, .. } => {
-                            Some(self.with_dropout_disabled(|loop_| loop_.evaluate(val_loader))?)
+                            self.with_dropout_disabled(|loop_| loop_.evaluate(val_loader))?
                         }
-                        Source::Streamed(streamed) => Some(
-                            self.with_dropout_disabled(|loop_| loop_.evaluate_streamed(streamed))?,
-                        ),
-                    }
+                        Source::Streamed(streamed) => {
+                            self.with_dropout_disabled(|loop_| loop_.evaluate_streamed(streamed))?
+                        }
+                    };
+                    tracing::info!(
+                        epoch = epoch + 1,
+                        wall_s = validation_t0.elapsed().as_secs_f64(),
+                        val_loss = loss,
+                        "Validation complete"
+                    );
+                    Some(loss)
                 }
             };
+            // Charged only when a pass ran: a `train_loss` run's validation
+            // wall is exactly zero, not the cost of a `match`.
+            if avg_val_loss.is_some() {
+                self.phase_wall.validation += validation_started.elapsed();
+            }
 
             // Accumulate this epoch's row into the run-level curves BEFORE the
             // `tracing::info!` below, so both read the exact same `avg_train_loss`
@@ -1845,7 +2088,7 @@ impl TrainingLoop {
                 ),
             };
 
-            let lr = compute_lr(&self.config, global_step, total_steps);
+            let lr = self.learning_rate_at(global_step, total_steps);
             tracing::info!(
                 epoch,
                 avg_train_loss,
@@ -1866,23 +2109,34 @@ impl TrainingLoop {
             Self::refuse_nonfinite_params(&trainable_vars, epoch)?;
 
             // Early stopping on the chosen metric.
-            if monitor_loss < best_val_loss {
+            let stop_early = if monitor_loss < best_val_loss {
                 best_val_loss = monitor_loss;
                 patience_counter = 0;
+                let started = Instant::now();
                 self.save_tagged_weights(&checkpoint_dir, "best")?;
+                self.phase_wall.checkpoints += started.elapsed();
+                false
             } else {
                 patience_counter += 1;
-                if patience_counter >= self.config.early_stopping_patience {
-                    tracing::info!(
-                        epoch,
-                        patience_counter,
-                        best_loss = best_val_loss,
-                        monitor_label,
-                        "Early stopping: no improvement for {} epochs",
-                        patience_counter
-                    );
-                    break;
-                }
+                patience_counter >= self.config.early_stopping_patience
+            };
+            if stop_early {
+                tracing::info!(
+                    epoch,
+                    patience_counter,
+                    best_loss = best_val_loss,
+                    monitor_label,
+                    "Early stopping: no improvement for {} epochs",
+                    patience_counter
+                );
+                epoch_walls.push(EpochWall::closing(
+                    epoch,
+                    epoch_started,
+                    phases_before_epoch,
+                    self.phase_wall,
+                    std::mem::take(&mut step_walls),
+                ));
+                break;
             }
 
             // The epoch's durable checkpoint. Gated on the lease: a worker
@@ -1896,6 +2150,7 @@ impl TrainingLoop {
             // finalize will publish.
             // A `None` store disables durable checkpointing (trainer-internal tests).
             if !self.cancel.load(Ordering::Relaxed) {
+                let started = Instant::now();
                 self.save_epoch_checkpoint(
                     call,
                     &checkpoint_dir,
@@ -1904,13 +2159,23 @@ impl TrainingLoop {
                     &optimizer,
                     &optim_param_names,
                 )?;
+                self.phase_wall.checkpoints += started.elapsed();
             }
+            epoch_walls.push(EpochWall::closing(
+                epoch,
+                epoch_started,
+                phases_before_epoch,
+                self.phase_wall,
+                std::mem::take(&mut step_walls),
+            ));
         }
+        let kernel_dispatches = dispatches_before.delta_to(&KernelDispatches::snapshot());
 
         // Restore best checkpoint before saving final adapter
+        let final_adapter_started = Instant::now();
         let best_path = checkpoint_dir.join("checkpoint_best.safetensors");
         if best_path.exists() {
-            self.load_checkpoint(&best_path)?;
+            self.load_weights(&best_path)?;
         }
 
         // Save the final adapter — both target variants persist their
@@ -1925,6 +2190,7 @@ impl TrainingLoop {
             .saved_adapter(&self.config, self.target_scaler, regression_form);
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
+        self.phase_wall.checkpoints += final_adapter_started.elapsed();
 
         // The loop does not write the terminal status, register the output
         // model, or publish the artifact to the object store. All three are the
@@ -1962,6 +2228,20 @@ impl TrainingLoop {
             "started_at": started_at,
             "completed_at": completed_at,
             "train_loss_curve": curve_json(&train_loss_curve),
+            "epoch_walls": epoch_walls,
+            // Measured on a media task, absent on a text one — never a zero
+            // that claims a front end was timed where none exists.
+            "media_front_end_wall_s": match self.task {
+                ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
+                    Some(self.media_front_end_wall.get().as_secs_f64())
+                }
+                _ => None,
+            },
+            "kernel_dispatches": kernel_dispatches,
+            "kernels_disabled": {
+                "requested": jammi_kernels::admission::disabled_ops_requested(),
+                "fired": jammi_kernels::admission::disabled_ops_fired(),
+            },
         });
         if !val_loss_curve.is_empty() {
             metrics["val_loss_curve"] = curve_json(&val_loss_curve);
@@ -1975,7 +2255,20 @@ impl TrainingLoop {
             metrics_json,
             epoch_checkpoints: self.take_retained_epoch_checkpoints(),
             media_front_end_wall: self.media_front_end_wall.get(),
+            phase_wall: self.phase_wall,
+            epoch_walls,
         })
+    }
+
+    /// The rate the optimizer step at `step` of a `horizon`-step run is
+    /// applied at — the ONE place the loop reads a learning rate, so the
+    /// step, the trailing flush, the GradCache arm and the epoch log cannot
+    /// disagree about it.
+    fn learning_rate_at(&self, step: usize, horizon: usize) -> f64 {
+        match self.applied_learning_rate {
+            AppliedLearningRate::Scheduled => compute_lr(&self.config, step, horizon),
+            AppliedLearningRate::Zero => 0.0,
+        }
     }
 
     /// Whether this run should mine hard negatives: `mine` is on, the objective
@@ -2180,7 +2473,11 @@ impl TrainingLoop {
         // and dropout off is what makes them agree. Routed through
         // `Self::set_training` so `self.training_mode`
         // never drifts from the target's real mode.
-        self.set_training(false);
+        // Dropout off, tape on: the cache's two encodes of one row must
+        // agree bit for bit, and the chunk re-encode must still reach the
+        // adapters' gradients — `set_dropout`, never `set_training`, which
+        // would also detach the trainable leaves.
+        self.target.set_dropout(false);
 
         // Immutable-borrow region: the encode closures borrow `self`, so no
         // `&mut self` call may appear until they are dropped at the block end.
@@ -2246,7 +2543,7 @@ impl TrainingLoop {
             Ok((grads, loss_val))
         })();
 
-        self.set_training(true);
+        self.target.set_dropout(true);
         let (grads, loss_val) = outcome?;
         #[cfg(test)]
         let grads = self.poke_after_backward(global_step + 1, grads, trainable_vars)?;
@@ -2345,29 +2642,13 @@ impl TrainingLoop {
                     .max_seq_length()
                     .map_err(|e| JammiError::FineTune(format!("{e}")))?;
                 let effective_max = self.config.max_seq_length.min(encoder_max);
-                // Bucket-UP padding is a TRAINING-STEP-only concern (see
-                // `tokenize_natural_width`'s doc for the full argument; "eval
-                // runs infrequently" bounds passes, not distinct shapes) —
-                // it bounds the allocator's distinct-shape count against an
-                // UNBOUNDED-across-the-run sequence of per-step batches.
-                // Eval (`self.training_mode == false`, set by
-                // `with_dropout_disabled`'s bracket around
-                // `evaluate`/`evaluate_held_out`) instead re-presents the
-                // SAME deterministic held-out partition's width sequence on
-                // every pass, so its distinct-shape contribution is paid
-                // ONCE per run, not per-step — bucketing it up buys no
-                // allocator-stability benefit that determinism doesn't
-                // already provide, at a real memory cost (the measured OOM
-                // `tokenize_natural_width`'s own doc cites). A held-out split
-                // wide/varied enough to present many distinct widths in that
-                // one-time set is not bounded here.
-                let (encoding, rows, cols) = if self.training_mode {
-                    // `None`: no other rank's rung to agree with (see
-                    // `tokenize_and_bucket`'s own doc).
-                    tokenize_and_bucket(tokenizer, texts, effective_max, None)?
-                } else {
-                    tokenize_natural_width(tokenizer, texts, effective_max)?
-                };
+                // One ladder for every batch of the run, a training step's
+                // or an evaluation pass's: the run's shape set is the
+                // ladder's rungs at `config.batch_size` rows and nothing
+                // else (see `tokenize_and_bucket`). `None`: no other rank's
+                // rung to agree with.
+                let (encoding, rows, cols) =
+                    tokenize_and_bucket(tokenizer, texts, effective_max, None)?;
 
                 let input_ids = Tensor::from_vec(
                     encoding
@@ -2391,11 +2672,24 @@ impl TrainingLoop {
                 )
                 .map_err(|e| JammiError::FineTune(format!("attention_mask tensor: {e}")))?;
 
+                self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward(&input_ids, &attention_mask)
                     .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
             }
         }
+    }
+
+    /// How many encoder forwards this loop has run on an `EncoderAdapters`
+    /// target, over its whole life: every training step's joined forward
+    /// AND every validation or held-out forward — the multiplier a fused-
+    /// kernel profile's positive-proof equation (`fused + eager == calls x
+    /// forwards`, `jammi_encoders::FusibleSiteCensus`) needs, since every
+    /// forward takes the same admission decisions whatever the mode. `0`
+    /// on a `ProjectionHead` target, whose frozen base model serves through
+    /// the inference backend.
+    pub fn encoder_forwards(&self) -> u64 {
+        self.encoder_forwards.get()
     }
 
     /// Encode a slice of encoded MEDIA items (audio clips or images) into a
@@ -2441,7 +2735,7 @@ impl TrainingLoop {
             }
             TrainingTarget::EncoderAdapters(state) => {
                 let encoder = &state.encoder;
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let input = match self.task {
                     ModelTask::AudioEmbedding => self.audio_encoder_input(base, encoder, items)?,
                     ModelTask::ImageEmbedding => self.image_encoder_input(encoder, items)?,
@@ -2454,6 +2748,7 @@ impl TrainingLoop {
                     }
                 };
                 self.record_media_front_end_wall(started.elapsed());
+                self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward_input(&input.as_input())
                     .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
@@ -3165,7 +3460,7 @@ impl TrainingLoop {
 
         // Optimizer step every N micro-batches.
         if (*epoch.batch_count).is_multiple_of(self.config.gradient_accumulation_steps) {
-            let lr = compute_lr(&self.config, *epoch.global_step, ctx.lr_horizon);
+            let lr = self.learning_rate_at(*epoch.global_step, ctx.lr_horizon);
             ctx.optimizer.set_learning_rate(lr);
 
             // Only the accumulation-window arm reaches this function (the
@@ -3210,12 +3505,20 @@ impl TrainingLoop {
             *epoch.grads_pending = false;
 
             *epoch.global_step += 1;
+            let stepped_at = Instant::now();
+            epoch
+                .step_walls
+                .push((stepped_at - *epoch.last_step_at).as_secs_f64());
+            *epoch.last_step_at = stepped_at;
 
             // Checkpoint
             if ctx.checkpoint_interval > 0
                 && (*epoch.global_step).is_multiple_of(ctx.checkpoint_interval)
             {
+                let started = Instant::now();
                 self.save_step_weights(ctx.checkpoint_dir, *epoch.global_step)?;
+                self.phase_wall.checkpoints += started.elapsed();
+                *epoch.last_step_at = Instant::now();
             }
         }
 
@@ -4349,13 +4652,14 @@ impl TrainingLoop {
             .map_err(|e| JammiError::FineTune(format!("Save checkpoint: {e}")))
     }
 
-    /// Load a checkpoint, restoring LoRA weights in place.
-    fn load_checkpoint(&mut self, path: &Path) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
+    /// Set this loop's trainable weights from the safetensors file at `path`
+    /// — a run's `checkpoint_best`, an epoch checkpoint's or a published
+    /// adapter's `adapter.safetensors` — in place, by name, so a loop built
+    /// fresh from the same spec evaluates ([`Self::evaluate_held_out`]) the
+    /// weights a run ended on without running.
+    pub fn load_weights(&mut self, path: &Path) -> Result<()> {
         let weights = candle_core::safetensors::load(path, &self.device)
-            .map_err(|e| JammiError::FineTune(format!("Load checkpoint: {e}")))?;
+            .map_err(|e| JammiError::FineTune(format!("load weights {}: {e}", path.display())))?;
         self.target.load_weights(&weights)
     }
 
@@ -6685,6 +6989,8 @@ mod host_read_discipline {
 
         let loss_before = per_micro_batch_host_read_count();
         let clip_before = crate::fine_tune::optimizer::sync_read_count();
+        let mut step_walls: Vec<f64> = Vec::new();
+        let mut last_step_at = std::time::Instant::now();
         crate::fine_tune::collective::witness(|call| {
             loop_
                 .process_batch_loss(
@@ -6696,6 +7002,8 @@ mod host_read_discipline {
                         accumulated_grads: &mut accumulated_grads,
                         grads_pending: &mut grads_pending,
                         global_step: &mut global_step,
+                        step_walls: &mut step_walls,
+                        last_step_at: &mut last_step_at,
                     },
                     StepContext {
                         trainable_vars: &trainable_vars,
@@ -8532,6 +8840,7 @@ mod gang_determinism_oracle {
         rank_ctx: RankContext,
         durable: Arc<Durable>,
         cancel_after_step: Option<usize>,
+        epoch_limit: Option<usize>,
     ) -> (jammi_db::error::Result<TrainingResult>, TrainingLoop) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -8574,6 +8883,9 @@ mod gang_determinism_oracle {
             {
                 builder = builder
                     .resume(super::super::resume::load_bundle(local.dir(), &device).unwrap());
+            }
+            if let Some(epochs) = epoch_limit {
+                builder = builder.epoch_limit(epochs);
             }
             builder.build().unwrap()
         });
@@ -8621,6 +8933,7 @@ mod gang_determinism_oracle {
         train_rows: usize,
         durable: &Arc<Durable>,
         cancel_after_step: Option<usize>,
+        epoch_limit: Option<usize>,
     ) -> HashMap<String, Tensor> {
         let gang = LocalGang::new(vec![Device::Cpu, Device::Cpu]).unwrap();
         let mut handles = Vec::new();
@@ -8644,6 +8957,7 @@ mod gang_determinism_oracle {
                         rank_ctx,
                         durable,
                         cancel_after_step,
+                        epoch_limit,
                     )
                 },
             ));
@@ -8682,8 +8996,8 @@ mod gang_determinism_oracle {
     fn w2_twice_is_byte_identical() {
         let durable_a = durable("det-job-a");
         let durable_b = durable("det-job-b");
-        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, &durable_a, None);
-        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, &durable_b, None);
+        let weights_a = drive_gang("det-a", "det-job-a", 2, 0.0, 8, &durable_a, None, None);
+        let weights_b = drive_gang("det-b", "det-job-b", 2, 0.0, 8, &durable_b, None, None);
         assert_eq!(
             weight_bytes(&weights_a),
             weight_bytes(&weights_b),
@@ -8702,8 +9016,26 @@ mod gang_determinism_oracle {
     fn w2_twice_is_byte_identical_with_dropout() {
         let durable_a = durable("det-drop-job-a");
         let durable_b = durable("det-drop-job-b");
-        let weights_a = drive_gang("det-drop-a", "det-drop-job-a", 2, 0.3, 8, &durable_a, None);
-        let weights_b = drive_gang("det-drop-b", "det-drop-job-b", 2, 0.3, 8, &durable_b, None);
+        let weights_a = drive_gang(
+            "det-drop-a",
+            "det-drop-job-a",
+            2,
+            0.3,
+            8,
+            &durable_a,
+            None,
+            None,
+        );
+        let weights_b = drive_gang(
+            "det-drop-b",
+            "det-drop-job-b",
+            2,
+            0.3,
+            8,
+            &durable_b,
+            None,
+            None,
+        );
         assert_eq!(
             weight_bytes(&weights_a),
             weight_bytes(&weights_b),
@@ -8753,6 +9085,7 @@ mod gang_determinism_oracle {
             8,
             &uninterrupted_durable,
             None,
+            None,
         );
 
         // ── Killed after KILL_AFTER_EPOCHS, then resumed to TOTAL_EPOCHS,
@@ -8772,6 +9105,7 @@ mod gang_determinism_oracle {
             // completion but its OWN save is skipped, so exactly epochs
             // `0..KILL_AFTER_EPOCHS` end up durable.
             Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+            None,
         );
         let resumed = drive_gang(
             "resumed",
@@ -8781,6 +9115,7 @@ mod gang_determinism_oracle {
             8,
             &resume_durable,
             None,
+            None,
         );
 
         assert_eq!(
@@ -8788,6 +9123,60 @@ mod gang_determinism_oracle {
             weight_bytes(&resumed),
             "a gang killed after epoch {KILL_AFTER_EPOCHS} and resumed to {TOTAL_EPOCHS} \
              epochs must match an uninterrupted {TOTAL_EPOCHS}-epoch run byte-for-byte"
+        );
+    }
+
+    /// A run taken in slices — `epoch_limit` 1, then 2, then 3, every call at
+    /// the SAME `config.epochs` and resuming from the previous slice's durable
+    /// checkpoint — ends on the weights an uninterrupted run ends on, byte
+    /// for byte.
+    ///
+    /// The config's schedule is cosine decay (`FineTuneConfig::default`'s,
+    /// which `gang_config_with_dropout` keeps), so this bites on the
+    /// horizon: a limit implemented by shortening `config.epochs` per slice
+    /// would compress the decay into each slice and land on different
+    /// weights. Each slice's returned step count is the run's absolute
+    /// counter, which is what lets a caller read the run's total off the last
+    /// slice instead of summing them.
+    #[test]
+    fn a_run_sliced_by_epoch_limit_matches_an_uninterrupted_run() {
+        const TOTAL_EPOCHS: usize = 3;
+
+        let unsliced_durable = durable("det-job-unsliced");
+        let unsliced = drive_gang(
+            "unsliced",
+            "det-job-unsliced",
+            TOTAL_EPOCHS,
+            0.0,
+            8,
+            &unsliced_durable,
+            None,
+            None,
+        );
+
+        let job_id = "det-job-sliced";
+        let sliced_durable = durable(job_id);
+        // Every slice runs, in order; the weights kept are the last slice's.
+        let sliced = (1..=TOTAL_EPOCHS)
+            .fold(None, |_previous, limit| {
+                Some(drive_gang(
+                    "sliced",
+                    job_id,
+                    TOTAL_EPOCHS,
+                    0.0,
+                    8,
+                    &sliced_durable,
+                    None,
+                    Some(limit),
+                ))
+            })
+            .expect("at least one slice");
+
+        assert_eq!(
+            weight_bytes(&unsliced),
+            weight_bytes(&sliced),
+            "{TOTAL_EPOCHS} one-epoch slices at config.epochs = {TOTAL_EPOCHS} must match the \
+             uninterrupted run byte-for-byte"
         );
     }
 
@@ -8825,6 +9214,7 @@ mod gang_determinism_oracle {
             TRAIN_ROWS,
             &uninterrupted_durable,
             None,
+            None,
         );
 
         let job_id = "det-job-resume-drop";
@@ -8837,6 +9227,7 @@ mod gang_determinism_oracle {
             TRAIN_ROWS,
             &resume_durable,
             Some(KILL_AFTER_EPOCHS * STEPS_PER_EPOCH + 1),
+            None,
         );
         let resumed = drive_gang(
             "resumed-drop",
@@ -8845,6 +9236,7 @@ mod gang_determinism_oracle {
             LORA_DROPOUT,
             TRAIN_ROWS,
             &resume_durable,
+            None,
             None,
         );
 
@@ -9658,7 +10050,7 @@ mod standardization_contract {
                 Box::new(DistributionAdapter::quantile(levels.clone()).unwrap())
             }
         };
-        let cols = adapter.adapt(&output, n).unwrap();
+        let cols = adapter.adapt(output.clone(), n).unwrap();
         use arrow::array::{Array, Float32Array};
         cols.iter()
             .map(|c| {
@@ -9705,7 +10097,7 @@ mod standardization_contract {
         };
         // Production serve path: the σ_y-scaled adapter (the number serving emits).
         let cols = DistributionAdapter::gaussian_scaled(scaler.std() as f32)
-            .adapt(&output, n)
+            .adapt(output.clone(), n)
             .unwrap();
         let served = cols[1].as_any().downcast_ref::<Float32Array>().unwrap();
         (0..n).map(|i| (sigma_z_ref[i], served.value(i))).collect()
@@ -10983,7 +11375,7 @@ mod standardization_contract {
             };
             // MUTANT: gaussian_scaled(1.0) instead of gaussian_scaled(scaler.std()).
             let cols = DistributionAdapter::gaussian_scaled(1.0_f32)
-                .adapt(&output, n)
+                .adapt(output.clone(), n)
                 .unwrap();
             let served_sigma_mutant = cols[1]
                 .as_any()
@@ -12122,13 +12514,18 @@ mod resume_invariant {
         assert_eq!(start_epoch, K, "resume starts at last_completed + 1");
     }
 
-    /// Non-vacuity of assertion (2): a WEIGHTS-ONLY restore (zero optimizer
-    /// moments + `step_t` reset to 0) passes assertion (1) on the weights but
-    /// DIVERGES on the next-N steps — exactly the silent moment-reset the invariant
-    /// must catch. This stubs the broken restore and observes (2) fail, proving the
-    /// full test above is not passing trivially.
+    /// Non-vacuity of assertion (2): a resume that restores NOTHING — a
+    /// fresh loop at the same seed, no weights, no moments, no stream — runs
+    /// its next-N steps from the initial weights and DIVERGES from the
+    /// uninterrupted run, so (2)'s byte-equality is a claim a broken resume
+    /// can fail. (Finer perturbations are invisible on this fixture: its
+    /// gradient is the same on every step, and Adam's bias-corrected,
+    /// normalised update of a constant gradient is the same whatever the
+    /// moments hold or which dropout mask scaled it — so neither a moment
+    /// reset nor a lost stream position moves a byte here; the weights
+    /// themselves are the term this control perturbs.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn weights_only_restore_diverges_on_next_steps() {
+    async fn a_resume_that_restores_nothing_diverges_on_next_steps() {
         const K: usize = 6;
         const N: usize = 5;
         let device = Device::Cpu;
@@ -12171,17 +12568,16 @@ mod resume_invariant {
         }
         let w_ref = ref_loop.target.named_trainable_weights().unwrap();
 
-        // BROKEN resume: restore ONLY the weights, scaler, and dropout — leave the
-        // optimizer at zero moments and step_t = 0 (the weights-only checkpoint).
-        let (mut wo_loop, wo_varmap) =
+        // BROKEN resume: nothing restored — the loop starts over from its
+        // seed's initial weights, zero moments and stream positions at 0.
+        let (wo_loop, wo_varmap) =
             build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
-        wo_loop.target.load_weights(&bundle.weights).unwrap();
-        // This harness is always single-rank, so the gathered map holds
-        // exactly rank 0's entry.
-        wo_loop
-            .target
-            .restore_dropout_positions(&bundle.state.dropout_positions[&0u32])
-            .unwrap();
+        assert_ne!(
+            weight_bytes(&wo_loop.target.named_trainable_weights().unwrap()),
+            weight_bytes(&bundle.weights),
+            "the uninterrupted run's {K} steps must have moved the weights, or nothing below \
+             can diverge"
+        );
         let (mut wo_opt, _wo_names) = build_opt(&wo_varmap, &wo_loop); // fresh zero moments
         for _ in 0..N {
             step_epoch(&wo_loop, &mut wo_opt, &feats, &targets);
@@ -12191,9 +12587,104 @@ mod resume_invariant {
         assert_ne!(
             weight_bytes(&w_wo),
             weight_bytes(&w_ref),
-            "a weights-only restore (zero moments + step_t reset) MUST diverge on \
-             the next-{N} steps — if it matched, assertion (2) would be vacuous"
+            "a resume that restores nothing MUST diverge on the next-{N} steps — if it \
+             matched, assertion (2) would be vacuous"
         );
+    }
+
+    /// A restore keeps the trainable leaves' identity: after
+    /// `load_weights`, the target reads the restored bytes AND a later step
+    /// still moves them — the `VarMap`'s `Var`s, the optimizer's parameters
+    /// and the head's sites are one storage. Under a restore that REPLACED
+    /// the sites' tensors, the optimizer would step `Var`s the head no
+    /// longer read, the second leg below would train nothing, and the
+    /// weights would sit at the bundle forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn train_then_restore_then_train_again_moves_the_restored_weights() {
+        const K: usize = 3;
+        const N: usize = 3;
+        let device = Device::Cpu;
+        let n = YEARS.len();
+        let targets = Tensor::from_vec(YEARS.to_vec(), (n,), &device).unwrap();
+        let feats = features(n, &device);
+        let store = file_store();
+
+        let (mut src_loop, src_varmap) =
+            build_three_layer_loop(11, &targets, &device, Arc::clone(&store), None, "src-job")
+                .await;
+        let (mut src_opt, src_names) = build_opt(&src_varmap, &src_loop);
+        for _ in 0..K {
+            step_epoch(&src_loop, &mut src_opt, &feats, &targets);
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let src_catalog = persist(
+            &store,
+            "src-job",
+            &mut src_loop,
+            scratch.path(),
+            K - 1,
+            K,
+            &src_opt,
+            &src_names,
+        )
+        .await;
+        let bundle = load_bundle(
+            store
+                .fetch_newest_checkpoint(&src_catalog, "src-job")
+                .await
+                .unwrap()
+                .unwrap()
+                .dir(),
+            &device,
+        )
+        .unwrap();
+
+        let (mut loop_, varmap) =
+            build_three_layer_loop(23, &targets, &device, Arc::clone(&store), None, "dst-job")
+                .await;
+        let (mut opt, _) = build_opt(&varmap, &loop_);
+        for _ in 0..K {
+            step_epoch(&loop_, &mut opt, &feats, &targets);
+        }
+        loop_.target.load_weights(&bundle.weights).unwrap();
+        assert_eq!(
+            weight_bytes(&loop_.target.named_trainable_weights().unwrap()),
+            weight_bytes(&bundle.weights),
+            "right after the restore the target reads the bundle's bytes"
+        );
+        for _ in 0..N {
+            step_epoch(&loop_, &mut opt, &feats, &targets);
+        }
+        let after = loop_.target.named_trainable_weights().unwrap();
+        assert_ne!(
+            weight_bytes(&after),
+            weight_bytes(&bundle.weights),
+            "{N} steps after the restore the weights the target reads must have moved"
+        );
+        for (name, tensor) in &after {
+            let var = varmap
+                .data()
+                .lock()
+                .unwrap()
+                .get(name.as_str())
+                .cloned()
+                .or_else(|| {
+                    varmap
+                        .data()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(k, _)| name.ends_with(k.as_str()) || k.ends_with(name.as_str()))
+                        .map(|(_, v)| v.clone())
+                })
+                .unwrap_or_else(|| panic!("{name}: no Var in the run's VarMap"));
+            let a: Vec<f32> = tensor.flatten_all().unwrap().to_vec1().unwrap();
+            let b: Vec<f32> = var.as_tensor().flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(
+                a, b,
+                "{name}: the target and the optimizer's Var must be one storage"
+            );
+        }
     }
 
     /// R3 (the validation half): a validation pass — `set_training(false)`, a
@@ -12506,6 +12997,66 @@ mod held_out_eval_tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// One two-epoch `run` over the mixed fixture, split one batch to train
+    /// and one to validation, monitoring `metric`: the phases it reports and
+    /// the wall of the whole call.
+    async fn phase_wall_of(
+        metric: super::super::EarlyStoppingMetric,
+    ) -> (super::RunPhaseWall, std::time::Duration) {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            epochs: 2,
+            validation_fraction: 0.5,
+            early_stopping_metric: metric,
+            early_stopping_patience: 10_000,
+            warmup_steps: 0,
+            ..mnrl_config(2)
+        };
+        let mut loop_ = minimal_pairs_loop(&device, config).await;
+        let (loader, _example_ids) = mixed_pairs_fixture(&device);
+        crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            let started = std::time::Instant::now();
+            let result = loop_
+                .run(
+                    &call,
+                    crate::fine_tune::source::TrainingSource::Resident(loader),
+                )
+                .expect("the precomputed pairs run must complete");
+            (result.phase_wall, started.elapsed())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// `TrainingResult::phase_wall` names where a run's wall went: steps and
+    /// checkpoint I/O are always paid (every run writes its final adapter),
+    /// validation only when the run monitors `val_loss`, and the three are
+    /// disjoint spans inside the call, so together they cannot exceed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_reports_its_wall_by_phase() {
+        use std::time::Duration;
+
+        let (monitored, monitored_total) =
+            phase_wall_of(super::super::EarlyStoppingMetric::ValLoss).await;
+        assert!(monitored.steps > Duration::ZERO, "{monitored:?}");
+        assert!(monitored.checkpoints > Duration::ZERO, "{monitored:?}");
+        assert!(monitored.validation > Duration::ZERO, "{monitored:?}");
+        assert!(
+            monitored.steps + monitored.validation + monitored.checkpoints <= monitored_total,
+            "disjoint phases of one call cannot exceed its wall: {monitored:?} vs \
+             {monitored_total:?}"
+        );
+
+        let (unmonitored, _total) =
+            phase_wall_of(super::super::EarlyStoppingMetric::TrainLoss).await;
+        assert_eq!(
+            unmonitored.validation,
+            Duration::ZERO,
+            "a train_loss run skips the validation pass, so it has no validation wall at all"
+        );
+        assert!(unmonitored.steps > Duration::ZERO, "{unmonitored:?}");
     }
 
     /// Sum-consistency: `sum(per_example.loss) == mean * count`, targeting
@@ -13660,15 +14211,15 @@ mod media_front_end_wall_tests {
 
 /// A production-call-site oracle for sequence-length bucketing.
 ///
-/// `crate::fine_tune::batch_bucket`'s own unit tests call
-/// `pad_rows_to_bucket`/`bucket_seq_len` directly — none of them drive
-/// [`TrainingLoop::encode_texts`]'s `EncoderAdapters` branch, the ONLY
-/// production call site (via this file's own `tokenize_and_bucket`, its
-/// sole caller), so deleting both `pad_rows_to_bucket` calls there would
+/// `jammi_numerics::ShapeLadder`'s and `BatchEncoding::pad_to`'s own unit
+/// tests never drive [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
+/// branch, the ONLY production call site (via this file's own
+/// `tokenize_and_bucket`, its sole caller), so an unwired call site would
 /// pass them. This module covers the call site:
-/// `tokenize_and_bucket_pads_every_row_to_the_bucket_ladder` drives `tokenize_and_bucket` itself against a real
-/// tokenizer and asserts the returned rows are actually padded to the
-/// bucket ladder (failing if either `pad_rows_to_bucket` call is deleted), and
+/// `tokenize_and_bucket_pads_every_row_to_the_bucket_ladder` drives
+/// `tokenize_and_bucket` itself against a real tokenizer and asserts the
+/// returned rows are actually padded to the ladder (failing if the `pad_to`
+/// call is deleted), and
 /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site` proves
 /// that padding does not move the real, production `encode_texts` output
 /// versus an independently-built natural-width forward pass.
@@ -13689,11 +14240,10 @@ mod encode_texts_bucketing_oracle {
     use crate::fine_tune::optimizer;
     use crate::model::{LoadedModel, ModelSource, ModelTask};
 
-    // The three tests below all call into `tokenize_and_bucket`/
-    // `tokenize_natural_width` (directly, or indirectly via
-    // `TrainingLoop::encode_texts`'s `EncoderAdapters` branch), which
-    // increment the process-wide `BUCKETED_TOKENIZE_CALLS`/
-    // `NATURAL_TOKENIZE_CALLS` test-only counters (c) reads. `cargo test`
+    // The tests below all call into `tokenize_and_bucket` (directly, or
+    // indirectly via `TrainingLoop::encode_texts`'s `EncoderAdapters`
+    // branch), which increments the process-wide
+    // `BUCKETED_TOKENIZE_CALLS` test-only counter (c) reads. `cargo test`
     // runs tests in parallel threads within the SAME process, so an
     // unmarked set racing on those counters would be flaky — `#[serial(..)]`
     // under a shared key forces them to run one at a time relative to each
@@ -13737,12 +14287,12 @@ mod encode_texts_bucketing_oracle {
 
     /// Two rows whose tokenizer-emitted natural width (after `[CLS]`/`[SEP]`
     /// and WordPiece per-letter tokens, then the batch's own `BatchLongest`
-    /// intra-batch padding) lands strictly between two `bucket_seq_len`
-    /// rungs — verified in the test below via the SAME decision
+    /// intra-batch padding) lands strictly between two ladder rungs —
+    /// verified in the test below via the SAME decision
     /// `tokenize_and_bucket` uses, never hand-asserted: `"a b c d e f g h
     /// i"` tokenizes to `[CLS] a b c d e f g h i [SEP]` = 11 tokens, and
-    /// `bucket_seq_len(11, 128) == 16` (`> 11`, so this batch genuinely
-    /// exercises padding).
+    /// the ladder pads 11 to 16 (`> 11`, so this batch
+    /// genuinely exercises padding).
     fn ragged_texts() -> Vec<String> {
         vec!["a b c d e f g h i".to_string(), "a".to_string()]
     }
@@ -13750,14 +14300,14 @@ mod encode_texts_bucketing_oracle {
     /// (a) The production oracle: calling `tokenize_and_bucket` — the exact
     /// helper `TrainingLoop::encode_texts`'s `EncoderAdapters` branch calls,
     /// its only caller — against a real tokenizer must return rows extended
-    /// to `bucket_seq_len`'s ladder, strictly wider than the batch's own
+    /// to the ladder, strictly wider than the batch's own
     /// natural (tokenizer `BatchLongest`) width.
     ///
-    /// Mutation: deleting either `pad_rows_to_bucket` call inside
-    /// `tokenize_and_bucket` leaves every row at its natural width, so
-    /// `row.len() == cols` fails below (`cols` is still computed from
-    /// `bucket_seq_len` independently of whether the rows were actually
-    /// extended to it — the assertion cannot pass vacuously).
+    /// Mutation: deleting the `pad_to` call inside `tokenize_and_bucket`
+    /// leaves every row at its natural width, so `row.len() == cols` fails
+    /// below (`cols` is still computed from the ladder independently of
+    /// whether the rows were actually extended to it — the assertion cannot
+    /// pass vacuously).
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
     async fn tokenize_and_bucket_pads_every_row_to_the_bucket_ladder() {
@@ -13785,8 +14335,8 @@ mod encode_texts_bucketing_oracle {
         );
         assert_eq!(
             cols,
-            jammi_numerics::bucket_seq_len(natural_cols, EFFECTIVE_MAX),
-            "cols must be the bucket_seq_len decision for this batch's own natural width"
+            jammi_numerics::ShapeLadder::new(EFFECTIVE_MAX).width(natural_cols),
+            "cols must be the ladder's decision for this batch's own natural width"
         );
         for (i, row) in encoding.input_ids.iter().enumerate() {
             assert_eq!(
@@ -13814,8 +14364,7 @@ mod encode_texts_bucketing_oracle {
     /// The rung-pinning option, at the production call site: a
     /// `Some(rung)` wins outright over this batch's own natural width — the
     /// plumbing a cross-rank rung agreement would use, proven here through
-    /// `tokenize_and_bucket` itself (not just `resolve_bucket_rung` in
-    /// isolation), against a real tokenizer, at both a rung ABOVE and BELOW
+    /// `tokenize_and_bucket` itself, against a real tokenizer, at both a rung ABOVE and BELOW
     /// what the batch's own natural width would otherwise resolve to.
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
@@ -13845,11 +14394,11 @@ mod encode_texts_bucketing_oracle {
         // natural width, so the pin does not become a truncation. The pin
         // is the batch's own natural width itself — computed here from the
         // SAME fixture via a separate, unbucketed `encode_batch` call (never
-        // hand-picked, e.g. `MIN_BUCKET_LEN`, which can fall BELOW the
+        // hand-picked, e.g. the ladder's first rung, which can fall BELOW the
         // natural width for a given fixture and silently skip this arm) —
         // so `lower_rung >= natural_cols` holds by construction (equality)
-        // and `lower_rung < unpinned_cols` follows from `bucket_seq_len`
-        // always rounding UP past a non-bucket-aligned natural width
+        // and `lower_rung < unpinned_cols` follows from the ladder
+        // always rounding UP past a non-rung-aligned natural width
         // (asserted below, not merely assumed, so this arm can never
         // silently not execute).
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -13893,9 +14442,8 @@ mod encode_texts_bucketing_oracle {
     /// `hidden_size=32` F32 accumulation error over an attention softmax
     /// reduction whose extra (fully-masked) columns still enter the
     /// max/sum reduction before their `exp()` drives them to ~0 — looser
-    /// than `batch_bucket.rs`'s own `1e-5` (a hand-built fixture with a
-    /// narrower padded tail, 8 vs this fixture's 16) to account for the
-    /// wider padded tail here, and orders of magnitude tighter than any
+    /// to account for the padded tail here (16 columns for an 11-token
+    /// batch), and orders of magnitude tighter than any
     /// real bug (a wrong mask, wrong pad id, or a divisor that counted
     /// padding) would produce, which collapses agreement completely.
     #[tokio::test(flavor = "multi_thread")]
@@ -13973,25 +14521,21 @@ mod encode_texts_bucketing_oracle {
         }
     }
 
-    /// (c) The eval-width dispatch: `encode_texts`'s `EncoderAdapters` branch must
-    /// dispatch to [`super::tokenize_and_bucket`] while `self.training_mode
-    /// == true` and to [`super::tokenize_natural_width`] while it is
-    /// `false` — proven via the process-wide call counters
-    /// ([`super::BUCKETED_TOKENIZE_CALLS`]/[`super::NATURAL_TOKENIZE_CALLS`])
-    /// since both functions are, by design, output-invariant (bucketing a
-    /// batch does not change its pooled result — test (b) above), so a
-    /// black-box comparison of `encode_texts`'s RETURN VALUE cannot tell
-    /// which path actually ran.
+    /// (c) Every mode pads to the ladder: `encode_texts`'s `EncoderAdapters`
+    /// branch reaches [`super::tokenize_and_bucket`] while
+    /// `self.training_mode` is `true` AND while it is `false` (the state
+    /// `evaluate`/`evaluate_held_out` run in), proven via the process-wide
+    /// call counter ([`super::BUCKETED_TOKENIZE_CALLS`]) since padding is,
+    /// by design, output-invariant (test (b) above), so a black-box
+    /// comparison of `encode_texts`'s RETURN VALUE cannot tell whether an
+    /// evaluation batch was padded or left at its natural width.
     ///
-    /// Mutation: hard-coding `encode_texts`'s `EncoderAdapters` branch to
-    /// always call `tokenize_and_bucket` (dropping the `if
-    /// self.training_mode` dispatch) fails this test at its eval-mode
-    /// counter assertions — `NATURAL_TOKENIZE_CALLS` would
-    /// stay at its pre-call snapshot while `BUCKETED_TOKENIZE_CALLS` moves
-    /// instead.
+    /// Mutation: routing eval-mode batches to a natural-width tokenisation
+    /// leaves the counter at its pre-call snapshot after the eval-mode call
+    /// and fails the second assertion.
     #[tokio::test(flavor = "multi_thread")]
     #[serial(tokenize_dispatch_calls)]
-    async fn encode_texts_dispatches_on_training_mode_between_bucketed_and_natural_tokenize() {
+    async fn encode_texts_pads_to_the_ladder_in_training_and_evaluation_mode() {
         use std::sync::atomic::Ordering;
 
         let device = Device::Cpu;
@@ -14015,123 +14559,37 @@ mod encode_texts_bucketing_oracle {
         );
 
         let texts = ragged_texts();
+        for training_mode in [true, false] {
+            // Eval mode is entered via the SAME production seam
+            // `evaluate`/`evaluate_held_out` use (`with_dropout_disabled` ->
+            // `set_training(false)`), never a raw field write.
+            loop_.set_training(training_mode);
+            let before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
+            loop_
+                .encode_texts(&texts)
+                .expect("encode_texts must succeed in either mode");
+            assert_eq!(
+                super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
+                before + 1,
+                "training_mode={training_mode}: encode_texts must pad to the ladder exactly once"
+            );
+        }
 
-        // Train mode (the loop's own post-`build` state): must dispatch to
-        // `tokenize_and_bucket`, never `tokenize_natural_width`.
-        let bucketed_before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        let natural_before = super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        loop_
-            .encode_texts(&texts)
-            .expect("train-mode encode_texts must succeed");
-        assert_eq!(
-            super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            bucketed_before + 1,
-            "train-mode encode_texts must call tokenize_and_bucket exactly once"
-        );
-        assert_eq!(
-            super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            natural_before,
-            "train-mode encode_texts must NOT call tokenize_natural_width"
-        );
-
-        // Flip to eval mode via the SAME production seam
-        // `evaluate`/`evaluate_held_out` use (`with_dropout_disabled` ->
-        // `set_training(false)`), never a raw field write.
-        loop_.set_training(false);
-        let bucketed_before = super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        let natural_before = super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed);
-        loop_
-            .encode_texts(&texts)
-            .expect("eval-mode encode_texts must succeed");
-        assert_eq!(
-            super::NATURAL_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            natural_before + 1,
-            "eval-mode encode_texts must call tokenize_natural_width exactly once"
-        );
-        assert_eq!(
-            super::BUCKETED_TOKENIZE_CALLS.load(Ordering::Relaxed),
-            bucketed_before,
-            "eval-mode encode_texts must NOT call tokenize_and_bucket (bucketing an eval \
-             batch up to the run's max_seq_length bucket OOMs a shape that fits at natural \
-             width; see tokenize_natural_width's own doc)"
-        );
-
-        // Sanity: this fixture's texts really do produce a bucket/natural
-        // gap, so the counters above are distinguishing a REAL difference,
-        // not two paths that happen to coincide for this input.
+        // Sanity: this fixture's texts really do produce a ladder/natural
+        // gap, so the padded width the run presents differs from the width
+        // a natural-width tokenisation would have.
         let tokenizer = tokenizer_of(&base_model);
-        let (_, _, bucketed_cols) =
+        let (_, _, ladder_cols) =
             super::tokenize_and_bucket(tokenizer, &texts, EFFECTIVE_MAX, None).unwrap();
-        let (_, _, natural_cols) =
-            super::tokenize_natural_width(tokenizer, &texts, EFFECTIVE_MAX).unwrap();
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let natural_cols = tokenizer
+            .encode_batch(&text_refs, Some(EFFECTIVE_MAX))
+            .unwrap()
+            .seq_len;
         assert!(
-            bucketed_cols > natural_cols,
-            "fixture must produce a real bucket ({bucketed_cols}) vs natural ({natural_cols}) \
+            ladder_cols > natural_cols,
+            "fixture must produce a real ladder ({ladder_cols}) vs natural ({natural_cols}) \
              gap for this test to be meaningful"
-        );
-    }
-
-    /// (d) Pins the bound `tokenize_natural_width`'s own doc relies on —
-    /// eval's distinct-shape contribution to the allocator is
-    /// paid ONCE per run because the held-out/val partition presents the
-    /// IDENTICAL sequence of natural widths on every pass, never a
-    /// reshuffled or re-ordered one. `tokenize_natural_width` itself is a
-    /// pure function of its input texts (tokenization has no randomness),
-    /// so this cannot catch a bug INSIDE it — what it CAN catch is a caller
-    /// that fed a re-ordered/re-partitioned split across passes (which
-    /// would invalidate the "paid once" argument the doc above relies on):
-    /// encodes the SAME ordered, multi-batch split — mirroring
-    /// `evaluate_held_out`'s own fixed `example_ids` partition — batch by
-    /// batch, across two independent "passes", and asserts the per-batch
-    /// natural-width SEQUENCE is identical.
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial(tokenize_dispatch_calls)]
-    async fn eval_tokenize_natural_width_repeats_the_same_width_sequence_across_passes_over_the_same_split(
-    ) {
-        let base_model = tiny_modernbert_base_model().await;
-        let tokenizer = tokenizer_of(&base_model);
-
-        // A 3-batch split with deliberately different natural widths per
-        // batch (mirroring how a real held-out set groups rows of varying
-        // length) — a width-SEQUENCE comparison across passes is only
-        // meaningful if the sequence itself has more than one distinct
-        // value.
-        let split: Vec<Vec<String>> = vec![
-            vec!["a".to_string(), "a b".to_string()],
-            ragged_texts(),
-            vec!["a b c d e f g h i j k l m n o p".to_string()],
-        ];
-
-        let widths_for_one_pass = |split: &[Vec<String>]| -> Vec<usize> {
-            split
-                .iter()
-                .map(|batch| {
-                    let (_, _, cols) =
-                        super::tokenize_natural_width(tokenizer, batch, EFFECTIVE_MAX).unwrap();
-                    cols
-                })
-                .collect()
-        };
-
-        let pass_1 = widths_for_one_pass(&split);
-        let pass_2 = widths_for_one_pass(&split);
-        assert_eq!(
-            pass_1, pass_2,
-            "the SAME ordered split must produce the IDENTICAL per-batch natural-width \
-             sequence across repeated passes -- this determinism is what \
-             tokenize_natural_width's own doc relies on to argue eval's distinct-shape \
-             contribution is paid once per run, never once per pass"
-        );
-        // Sanity: the split's own widths actually vary, so pass_1 == pass_2
-        // is not a vacuous single-element-sequence agreement.
-        assert!(
-            pass_1
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                > 1,
-            "split fixture must present more than one distinct natural width for this test \
-             to be meaningful, got {pass_1:?}"
         );
     }
 
@@ -14152,8 +14610,8 @@ mod encode_texts_bucketing_oracle {
     /// computing the SAME loss W=1 computes over one combined batch bucketed
     /// to ITS OWN (generally different) natural width — the attention
     /// softmax over a differently-wide masked tail rounds slightly
-    /// differently depending on the padding width. This is `batch_bucket`'s
-    /// OWN already-measured padding-variance tolerance
+    /// differently depending on the padding width. This is the ladder
+    /// padding's OWN already-measured variance tolerance
     /// (`encode_texts_bucketing_oracle`'s sibling test
     /// `encode_texts_output_is_bucket_invariant_at_the_real_call_site`'s own
     /// `TOLERANCE: f32 = 1e-4`), not a bound invented for this oracle. The

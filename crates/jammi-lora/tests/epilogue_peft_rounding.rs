@@ -44,15 +44,16 @@
 //! device.
 //!
 //! THIS file is the one that drives the REAL `LoraLinear::forward` dispatch
-//! (both the fused arm, via [`jammi_kernels::ops::LowRankResidualLinear`],
-//! and the eager arm, via eval mode's unconditional `eager_epilogue` call)
-//! with a nonzero [`jammi_lora::lora_linear_fused_dispatch_snapshot`] proof
-//! — never a re-implementation of either arm's math inside this file. Both
-//! arms are compared SEPARATELY against an independently-built PEFT
-//! reference (real `candle_nn::Linear::forward` GEMMs + candle's own
-//! `Tensor` arithmetic and `to_dtype` casts — never a copy of either arm's
-//! own logic), so a defect either arm carries identically (leg (1)
-//! BLINDNESS) is still caught.
+//! of the fused arm, [`jammi_kernels::ops::LowRankResidualLinear`], with a
+//! nonzero [`jammi_lora::lora_linear_fused_dispatch_snapshot`] proof —
+//! never a re-implementation of the arm's math inside this file. The arm
+//! is compared against an independently-built PEFT reference (real
+//! `candle_nn::Linear::forward` GEMMs + candle's own `Tensor` arithmetic
+//! and `to_dtype` casts — never a copy of the arm's own logic). One forward
+//! serves training and evaluation alike, so the eager composition is not
+//! reachable here by flipping the training flag; its rounding is proven on
+//! the CPU by `fused_epilogue.rs`'s exact-fixture reconstruction and its
+//! production route by the kernel-disable oracles.
 //!
 //! ## The fixture
 //!
@@ -256,17 +257,9 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width() {
          eager would make this leg's 'fused arm' claim false"
     );
 
-    // --- EAGER ARM: eval mode always takes `eager_epilogue` unconditionally
-    // (see `LoraLinear::forward`'s own doc: "Eval/serving: always the
-    // eager composition, unconditionally") — the real production eager
-    // path, not a re-implementation.
-    lora.set_training(false);
-    let eager_out = lora.forward(&x).unwrap();
-
     let truth_v = widen_to_f32(&peft_truth);
     let mis_v = widen_to_f32(&mis_ordered);
     let fused_v = widen_to_f32(&fused_out);
-    let eager_v = widen_to_f32(&eager_out);
     let base_out_v = widen_to_f32(&reference.base_out_bf16);
     let lora_out_v: Vec<f32> = reference
         .lora_out_f32
@@ -278,7 +271,6 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width() {
     let n = truth_v.len();
     assert_eq!(n, ROWS * OUT_FEATURES);
     assert_eq!(fused_v.len(), n);
-    assert_eq!(eager_v.len(), n);
 
     // Control (d) NON-FINITE COUNTS AS MISMATCH, written affirmatively,
     // before any comparison.
@@ -287,7 +279,6 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width() {
             truth_v[i].is_finite()
                 && mis_v[i].is_finite()
                 && fused_v[i].is_finite()
-                && eager_v[i].is_finite()
                 && base_out_v[i].is_finite()
                 && lora_out_v[i].is_finite(),
             "index {i}: a non-finite value slipped through"
@@ -320,32 +311,6 @@ fn fused_and_eager_arms_both_match_the_peft_reference_at_production_width() {
         fused_v[fused_mismatches[0]],
         truth_v[fused_mismatches[0]],
     );
-    let eager_mismatches: Vec<usize> = (0..n).filter(|&i| eager_v[i] != truth_v[i]).collect();
-    assert!(
-        eager_mismatches.is_empty(),
-        "the EAGER arm does NOT match PEFT's rounding order on {}/{n} elements — \
-         first mismatch idx={} base_out={} lora_out={} eager={:?} peft_truth={:?}",
-        eager_mismatches.len(),
-        eager_mismatches[0],
-        base_out_v[eager_mismatches[0]],
-        lora_out_v[eager_mismatches[0]],
-        eager_v[eager_mismatches[0]],
-        truth_v[eager_mismatches[0]],
-    );
-
-    // Leg (1) BLINDNESS: fused and eager must ALSO be bit-identical to
-    // EACH OTHER (the same-build A/B this whole class of defect defeats
-    // when both arms carry it identically) — asserted here as a sanity
-    // check that this fixture reproduces the wiring both arms share, not
-    // as a substitute for the PEFT-reference comparisons above.
-    assert_eq!(
-        fused_v, eager_v,
-        "the fused and eager arms must agree with each other (both correctly matching PEFT) — \
-         a same-build A/B alone could not have distinguished a shared defect from a shared fix, \
-         which is exactly why this test compares BOTH arms against the independent PEFT \
-         reference above, not merely against each other"
-    );
-
     // Control (a) POWER OF THE COMPARISON: the rejected model must
     // genuinely diverge from the REAL dispatched output (re-derived here
     // from `fused_v`, not merely from the two reference formulas above).

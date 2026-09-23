@@ -135,6 +135,11 @@ enum ResultTableKind {
   // The rows a `CREATE TABLE … AS` statement produced. Data of record with no
   // ANN sidecar, excluded from embedding-table resolution.
   STATEMENT = 5;
+  // A producer's working relation (a graph propagation's adjacency snapshot,
+  // a hop's state) — held for the producer's own duration and never
+  // promoted, so it is never `ready` and no verb returns it; listed for
+  // completeness of the catalog's own kind set.
+  WORKING = 6;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and

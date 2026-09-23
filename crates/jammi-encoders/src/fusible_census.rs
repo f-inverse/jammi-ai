@@ -28,16 +28,14 @@
 //! pre-norm a family omits on layer 0, a stage with no downsample), which is
 //! the only case where a `calls` witness earns anything.
 //!
-//! # Per-forward semantics: `training == true`
+//! # Per-forward semantics: every forward, whatever the mode
 //!
-//! Every count here is per ONE forward at `training == true`. That is not a
-//! convention, it is where the seams live: each of the three admits inside a
-//! training-only arm and short-circuits before any admission decision in
-//! eval (`crate::layer_norm::LayerNorm::forward`'s eval arms,
-//! `crate::activations::gelu_erf`'s `if !training` early return,
-//! `jammi_lora::LoraLinear::forward`'s eval early return). So an EVAL forward
-//! contributes exactly `0` to BOTH the `fused` and the `eager` side of every
-//! pair — an eval pass is not "all eager", it is absent from the counters
+//! Every count here is per ONE forward, in training and out of it: each of
+//! the three seams admits on tensor state on every forward, so a validation
+//! pass, a held-out evaluation and a serve take exactly the same admission
+//! decisions a training step does. The `batches` term of the equation is
+//! therefore a count of ALL forwards in the counter window, never of
+//! training steps alone
 //! entirely, and a profile that mixed eval passes into `batches` would be
 //! comparing a count of training forwards against a count of all forwards.
 //!
@@ -116,8 +114,8 @@ pub struct FusibleSiteCensus {
     /// it actually holds rather than what a `2 * layers` formula would
     /// predict.
     ///
-    /// One instance is one admission decision per training forward: the
-    /// training arm admits ONCE per `forward` call under the single key
+    /// One instance is one admission decision per forward: the seam
+    /// admits ONCE per `forward` call under the single key
     /// `layer_norm_fused`, whether or not the norm carries a bias (bias is
     /// tensor state inside that one key, not a second key — see
     /// `crate::layer_norm::LayerNorm::forward`'s own doc).

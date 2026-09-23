@@ -11,8 +11,6 @@
 #[cfg(feature = "local")]
 pub mod adamw;
 #[cfg(feature = "local")]
-pub mod batch_bucket;
-#[cfg(feature = "local")]
 pub mod classifier;
 #[cfg(feature = "local")]
 pub mod collective;
@@ -64,7 +62,7 @@ pub mod worker;
 /// current_num_threads()` — NOT the count of threads that actually ran a
 /// given batch's chunks (effective parallelism is `min(pool, n)`, emergent
 /// and never recorded); `host.logical_cpus` already covers the machine-wide
-/// count separately. Exposed for `FinetuneRunTier.rayon_pool_threads`
+/// count separately. Exposed for `the train-run leg's `rayon_pool_threads``
 /// provenance (never identity).
 #[cfg(feature = "local")]
 pub fn media_front_end_pool_threads() -> usize {
@@ -80,5 +78,5 @@ pub fn media_front_end_pool_threads() -> usize {
 pub use jammi_wire::fine_tune::{
     ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, ExampleLoss,
     FineTuneConfig, FineTuneMethod, HardNegativeConfig, HeldOutLoss, LoraInitMode, LrSchedule,
-    RegressionLoss,
+    RegressionLoss, DEFAULT_MAX_SEQ_LENGTH,
 };

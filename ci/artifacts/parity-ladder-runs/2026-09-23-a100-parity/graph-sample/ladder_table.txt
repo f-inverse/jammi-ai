@@ -1,0 +1,16 @@
+# graph-sample ladder, torch -> sampler
+
+## torch -> sampler  [INVALID]  — the engine against PyTorch Geometric's node2vec random-walk sampler
+space (upper/lower): host Some(0.29431056139822637) device None host bytes per unit of work Some(486.7878787878788)
+  [n/m ] hard     law_goodness_of_fit against alpha 0.001 — the law could not be tested
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.2943 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  [n/m ] evidence host_memory_flat_in_work against UNBUDGETED — 486.7879 against UNBUDGETED
+  REFUSED: edge torch -> sampler law fit: invalid input: cell 661: smallest expected count 4.900 is below 5: too sparse for the chi-square approximation
+  REFUSED: edge torch -> sampler law fit: invalid input: cell 544: smallest expected count 4.900 is below 5: too sparse for the chi-square approximation
+  REFUSED: leg torch__edges16896__r1: the time series is not stationary (trend p = 9.950e-4, drift +5.20% of the median over the series)
+  REFUSED: leg sampler__edges16896__r1: the time series is not stationary (trend p = 2.636e-4, drift -4.54% of the median over the series)
+  REFUSED: torch -> sampler: law_goodness_of_fit is not measured, and a hard rule needs it
+
+causes: edge torch -> sampler is INVALID
+status: INVALID

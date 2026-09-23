@@ -51,14 +51,14 @@ use channel_repo::ChannelRepo;
 
 /// Artifact catalog for models, sources, and experiment metadata.
 ///
-/// Holds a [`BackendImpl`] enum dispatching to the concrete backend
+/// Holds a `BackendImpl` enum dispatching to the concrete backend
 /// implementation. Default deployment uses SQLite (WAL mode, single-process
 /// embedded). Multi-process server deployments construct a Postgres backend
 /// via [`Catalog::from_backend`].
 ///
 /// Tenant binding: optional. When set, every catalog write reads the bound
 /// tenant on each call, writes `tenant_id = <bound>` (NULL when Unscoped),
-/// and asserts via [`backend::Transaction::assert_tenant_matches`] before the
+/// and asserts via `backend::Transaction::assert_tenant_matches` before the
 /// underlying INSERT, as defence in depth. Reads filter to
 /// `tenant_id = <bound> OR tenant_id IS NULL`. When unbound (default), every
 /// row is written with NULL `tenant_id` and reads return every row — the
@@ -109,7 +109,7 @@ impl Catalog {
     ///
     /// Consumes the handle, but the backend is shared (`Arc`): sibling handles
     /// made by [`Catalog::pinned_to_tenant`] or
-    /// [`Catalog::from_backend`] over the same [`BackendImpl`] observe the
+    /// [`Catalog::from_backend`] over the same `BackendImpl` observe the
     /// same closed pool and will fail their next query. Closing is idempotent.
     ///
     /// Awaiting this waits for outstanding checkouts; a caller holding a live
@@ -197,7 +197,7 @@ impl Catalog {
     }
 
     /// Cheap reachability test. Delegates to
-    /// [`backend::CatalogBackend::ping`]. Returns
+    /// `backend::CatalogBackend::ping`. Returns
     /// [`backend::BackendError::Unavailable`] when the connection pool is
     /// exhausted or closed; other failures pass through as
     /// [`backend::BackendError::Sqlx`].

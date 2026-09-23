@@ -52,9 +52,11 @@ artifact_dir = "/path/to/artifacts"
 # fewer cores than it can see — the engine cannot detect that from inside.
 execution_threads = 8
 # Memory limit for the query engine's DataFusion session: this becomes the
-# byte size of a `GreedyMemoryPool` every plan and every engine-side memory
-# reservation (a training-set stream's chunk, an eager read's collected
-# batches) is bounded by. Three forms:
+# byte size of the pool every plan and every engine-side memory reservation
+# (a training-set stream's chunk, an eager read's collected batches) is
+# bounded by. An operator that can spill (a sort, a sort-merge join) is held
+# to an equal share among the spilling operators holding memory at that
+# moment, and spills at it rather than growing past it. Three forms:
 #   - "<n>%"      -- that percentage (1-100) of the HOST's total physical
 #                    memory (a Linux cgroup ceiling is honoured when it is
 #                    lower than the host total and readable), resolved once
@@ -92,10 +94,19 @@ compute_precision = "f32"
 [inference]
 # Default backend selection strategy. Default: "auto".
 default_backend = "auto"
-# Rows per model forward. Row i of an ordered input is forwarded in chunk
-# i / batch_size, whatever the fan-out below. 0 is refused at load.
-# Default: 32.
+# The chunk budget: what bounds one model forward. A forward chunk is cut
+# from the input ordered by row cost — a text row's token count, then the
+# key — under both caps, whatever the fan-out below, so rows that share a
+# forward are nearly equal in length and pad to little more than their real
+# length. batch_size is the most rows one forward takes; batch_tokens the
+# most padded tokens (the chunk's rows times the width they are padded to:
+# a multiple of 8, within an eighth of the longest row, up to the model's
+# own sequence limit) — the bound on a
+# forward's activation memory. A row longer than batch_tokens still
+# forwards alone. 0 is refused at load for either.
+# Defaults: 32 rows, 16384 tokens (32 rows of a 512-token encoder).
 batch_size = 32
+batch_tokens = 16384
 # Timeout for batch accumulation in server mode (seconds). Default: 300.
 batch_timeout_secs = 300
 # Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
@@ -103,7 +114,8 @@ max_loaded_models = 0
 # The inference fan-out: how many partitions of one plan forward chunks
 # concurrently — threads of one process, or tasks of a cluster when the plan
 # is submitted to one. The rows a model forwards together are decided by
-# batch_size alone, so the written bytes are identical at every value. The
+# the row costs and the chunk budget alone, so the written bytes are
+# identical at every value. The
 # DEVICE admits forwards — one at a time on a GPU, the core count on the CPU —
 # across every plan and partition running on it, so a fan-out wider than the
 # device admits queues rather than oversubscribes. 1 is the default and the
@@ -124,6 +136,12 @@ default_distance_metric = "cosine"
 default_index_type = "ivf_hnsw_sq"
 # Rows between embedding index checkpoints. Default: 1000.
 checkpoint_interval = 1000
+# Rows per ANN segment of a written embedding table. The segments are
+# consecutive runs of the table's rows (key order) at this budget, each built
+# on its own thread as its rows are written; a query fans out over them, so a
+# smaller budget builds sooner and wider, a larger one searches fewer graphs.
+# Default: 4096.
+index_segment_rows = 4096
 
 [fine_tuning]
 # LoRA rank for fine-tuning. Default: 8.
@@ -384,8 +402,8 @@ max_job_waits = 1024
 # scheduler and an executor on one process is the single-node cluster; a
 # process that also names itself as a client submits its own claims and
 # materializations to the scheduler it hosts, its own executor excluded
-# from a gang it submits (a claimant's host is never bound its own gang;
-# a materialization may run on it).
+# from a training attempt it submits (a claimant's host is never bound its
+# own attempt; a materialization may run on it).
 # Trust class: every listener this table opens (the scheduler's gRPC below,
 # the executor's task gRPC and Flight shuffle in `[ballista.executor]`) is
 # the peer listener's class, I-PEER -- unauthenticated, every client a jammi
@@ -437,14 +455,16 @@ max_job_waits = 1024
 # present: a result-table materialization -- `CREATE TABLE … AS`, an
 # embedding, inference, refresh, as-of join or training-set build -- runs
 # WHOLE on that scheduler's executors when a live executor holds every
-# device kind the plan requires (the same refusal the submit edge makes for
-# a placed gang): the compute AND the write, as one plan rooted in the
+# device kind the plan requires (the same admission a claimed training
+# attempt gets): the compute AND the write, as one plan rooted in the
 # result-table sink, which writes the table's bytes on the executor under
 # the row's lease (taken from this process for the write, handed back
 # after) and streams one summary back; this process then finishes the
-# catalog side. A claimed training job is placed there as one task. A plan
-# no live executor can hold -- or that the wire cannot carry -- runs in
-# this process, logged as such, never parked. A statement that serves rows
+# catalog side. A claimed training attempt of any kind -- a fine-tune, a
+# graph fine-tune, a context predictor -- is placed there as one task, on an
+# executor other than this process that lists this process's own device
+# kind. A plan no live executor can hold -- or that the wire cannot carry --
+# runs in this process, logged as such, never parked. A statement that serves rows
 # inline (a `SELECT`, a search) never leaves this process. Unset (the
 # default) means every statement and claim runs in this process.
 # The scheduler this client submits to, `host:port` -- a `SocketAddr`

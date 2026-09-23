@@ -11,10 +11,10 @@
 //!
 //! Every PURE predicate and every per-layer numeric composition
 //! (`attention_block_admission_predicate`, `mem_efficient_attention_predicate`,
-//! `softmax_admission_predicate` + `softmax_apply_training`,
-//! [`FusedAttentionMasks`]/[`TrainingMaskInputs`], `forward_memeff_attention`,
-//! `forward_eager_training_attention_composition`, and the top-level
-//! [`training_attention_cascade`] dispatcher) lives here, along with the flash
+//! `softmax_admission_predicate` + `softmax_apply`,
+//! [`FusedAttentionMasks`]/[`MaskInputs`], `forward_memeff_attention`,
+//! `forward_eager_attention_composition`, and the top-level
+//! [`attention_cascade`] dispatcher) lives here, along with the flash
 //! cascade's OUTCOME vocabulary ([`FlashDecision`]/[`CompactedBatch`]) — generic
 //! to the seam even though only `crate::modernbert` constructs a real
 //! [`FlashDecision::Fused`]. The flash TRANSPORT protocol — the
@@ -26,7 +26,7 @@
 //! (`admit_cascade("attention_block_flash", ..)`, so the counter fires for
 //! every caller, including one that never transports) and, when that
 //! decision is `Fused`, delegates to the caller's own transport via
-//! [`training_attention_cascade`]'s `on_flash_fused` callback.
+//! [`attention_cascade`]'s `on_flash_fused` callback.
 //!
 //! ## `RopeCtx`: representing "this caller has no RoPE at all", and laziness
 //!
@@ -53,7 +53,7 @@
 //! branch — never for a flash dispatch, never for the eager arm (which
 //! rotates Q/K directly via [`RopeCtx::Enabled`]'s `apply`, no pack tensor
 //! involved at all). Since a `RopeCtx` must be built BEFORE calling
-//! [`training_attention_cascade`] (whose flash check runs first and may
+//! [`attention_cascade`] (whose flash check runs first and may
 //! return before `rope` is ever consulted), an eagerly-materialized `pack`
 //! field would force that computation — and any error or lock it can
 //! raise — onto every dispatch, including the ones that never asked for
@@ -84,7 +84,7 @@
 //! ## The `Propagate` policy's bf16 divergence on a fully-masked row
 //!
 //! BERT/DistilBERT declare [`FullyMaskedPolicy::Propagate`] (not
-//! ModernBERT's `Zeros`) — see `bert::BertSelfAttention::forward_training`'s
+//! ModernBERT's `Zeros`) — see `bert::BertSelfAttention::forward`'s
 //! doc for why: it is the exact-arithmetic-equivalent, at `F32`, of the
 //! eager `softmax(scores/scale + mask)` on an all-padding row (a
 //! genuine input class — see `crate::mask::sliding_window_mask`'s doc,
@@ -130,7 +130,7 @@ use crate::error::EncoderError;
 /// The once-per-forward flash-cascade decision, decided
 /// ONCE by a caller's own whole-forward entry point (mirroring
 /// [`FusedAttentionMasks`]) and threaded per layer into
-/// [`training_attention_cascade`]. Owns the compacted batch's row
+/// [`attention_cascade`]. Owns the compacted batch's row
 /// `lengths` and the `[total]` unpad gather indices, but deliberately NOT
 /// a constructed `jammi_kernels::flash::CuSeqlens`: that type is
 /// feature-gated behind `jammi-kernels`'s `flash-attn` (not forwarded by
@@ -192,7 +192,7 @@ pub(crate) struct CompactedBatch {
 
 /// The full once-per-forward flash-cascade decision, decided ONCE by a
 /// caller's whole-forward entry point (mirroring [`FusedAttentionMasks`])
-/// and threaded per layer into [`training_attention_cascade`] — every
+/// and threaded per layer into [`attention_cascade`] — every
 /// LAYER's own `admit_cascade` call reports against it (the counters are
 /// per-dispatch, not per-forward — this type is what
 /// makes that per-layer call cheap: no layer re-derives the outcome/reason).
@@ -275,10 +275,10 @@ const _: () = assert!(MEM_EFFICIENT_CHUNK >= MEM_EFFICIENT_MIN_CHUNK);
 /// DistilBERT layer — neither architecture has a sliding-window concept).
 /// A fieldless marker, not a `half_window: usize` carrier: the actual window WIDTH the block/eager
 /// arms need lives in the already-built band tensor
-/// ([`TrainingMaskInputs::local_band`]/[`FusedAttentionMasks::local`])
+/// ([`MaskInputs::local_band`]/[`FusedAttentionMasks::local`])
 /// those arms consume, never in this type — [`forward_memeff_attention`]'s
 /// own `half_window: Option<usize>` parameter is a SEPARATE,
-/// independently-sourced value (see [`training_attention_cascade`]'s doc
+/// independently-sourced value (see [`attention_cascade`]'s doc
 /// for why the two must never be derived from each other).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LocalWindow;
@@ -296,13 +296,13 @@ type RopeApplyFn<'a> = dyn Fn(&Tensor) -> Result<Tensor, EncoderError> + 'a;
 /// inside the arm that actually consumes it (the memeff
 /// arm, and the block-fused arm's `DispatchOutcome::Fused` branch) —
 /// never for a flash dispatch and never for the eager arm. A caller must
-/// still build a `RopeCtx` BEFORE calling [`training_attention_cascade`]
+/// still build a `RopeCtx` BEFORE calling [`attention_cascade`]
 /// (whose flash check runs first and may return before ever touching
 /// `rope`), so `pack` cannot be an already-materialized `&Tensor` without
 /// forcing that materialization ahead of the flash check every time.
 /// Wrapping it as a zero-argument provider keeps construction itself
 /// free — the provider is only ever CALLED from [`forward_memeff_attention`]
-/// and the block-fused arm inside [`training_attention_cascade`] — while [`apply_rope`] (the eager
+/// and the block-fused arm inside [`attention_cascade`] — while [`apply_rope`] (the eager
 /// arm's own consumer) never calls it at all.
 type RopePackFn<'a> = dyn Fn() -> Result<Tensor, EncoderError> + 'a;
 
@@ -319,7 +319,7 @@ pub(crate) enum RopeCtx<'a> {
     /// re-derived per forward; see [`Self::pack`].
     Disabled { placeholder: &'a Tensor },
     /// RoPE is genuinely applied. `pack` is called ONLY from
-    /// [`forward_memeff_attention`] and [`training_attention_cascade`]'s
+    /// [`forward_memeff_attention`] and [`attention_cascade`]'s
     /// block-fused arm (see [`RopePackFn`]'s doc for why it is a provider,
     /// not an already-materialized tensor); `apply` rotates a Q/K tensor
     /// in the eager composition, consulted only there.
@@ -570,8 +570,8 @@ impl FusedAttentionMasks {
     }
 }
 
-/// The three mask inputs [`training_attention_cascade`] takes, bundled.
-pub(crate) struct TrainingMaskInputs<'a> {
+/// The three mask inputs [`attention_cascade`] takes, bundled.
+pub(crate) struct MaskInputs<'a> {
     pub(crate) extended: &'a Tensor,
     pub(crate) local_band: Option<&'a Tensor>,
     pub(crate) fused: Option<&'a FusedAttentionMasks>,
@@ -583,14 +583,14 @@ pub(crate) struct TrainingMaskInputs<'a> {
 /// fully-masked policy is declared once per caller at the
 /// seam edge and applies to every arm of the cascade for that caller,
 /// including this one).
-pub(crate) fn softmax_apply_training(
+pub(crate) fn softmax_apply(
     scores: &Tensor,
     mask: &Tensor,
     scores_divisor: f64,
     policy: FullyMaskedPolicy,
 ) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = softmax_admission_predicate(scores, mask, scores_divisor);
-    crate::seam_gate("attention_cascade::softmax_apply_training");
+    crate::seam_gate("attention_cascade::softmax_apply");
     let outcome = admit(
         admission_mode(),
         &SOFTMAX,
@@ -645,11 +645,11 @@ pub(crate) fn forward_memeff_attention(
 /// `rope`/`window`/`policy`/`training`. `training` keeps BOTH branches
 /// reachable (the fused-softmax training branch AND the plain eval-style
 /// two-sequential-adds branch): every real caller reaches this function
-/// through [`training_attention_cascade`] with `training: true`, but
+/// through [`attention_cascade`] with `training: true`, but
 /// `crate::modernbert`'s own unit tests call the ModernBERT method wrapper
 /// directly with either value.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn forward_eager_training_attention_composition(
+pub(crate) fn forward_eager_attention_composition(
     qkv: &Tensor,
     batch: usize,
     seq: usize,
@@ -660,7 +660,6 @@ pub(crate) fn forward_eager_training_attention_composition(
     rope: &RopeCtx<'_>,
     window: Option<LocalWindow>,
     policy: FullyMaskedPolicy,
-    training: bool,
 ) -> Result<Tensor, EncoderError> {
     let q = qkv
         .narrow(D::Minus1, 0, h * d)?
@@ -679,38 +678,21 @@ pub(crate) fn forward_eager_training_attention_composition(
     let k = apply_rope(rope, &k)?;
 
     let scale = (d as f64).sqrt();
-    // UNSCALED when training (folded into `softmax_apply_training`'s own
+    // UNSCALED when training (folded into `softmax_apply`'s own
     // `scale` instead) — see that function's doc.
     let raw_scores = crate::contiguous_matmul(&q, &k.transpose(D::Minus1, D::Minus2)?)?;
     let extended_mask = extended_mask.to_dtype(raw_scores.dtype())?;
 
-    let attn = if training {
-        let mask = match (window.is_some(), local_band) {
-            (true, Some(band)) => {
-                extended_mask.broadcast_add(&band.to_dtype(raw_scores.dtype())?)?
-            }
-            (true, None) => {
-                return Err(EncoderError::Config(
-                    "local-attention layer reached without a sliding-window band".into(),
-                ))
-            }
-            (false, _) => extended_mask,
-        };
-        softmax_apply_training(&raw_scores, &mask, scale, policy)?
-    } else {
-        let scores = (&raw_scores / scale)?;
-        let scores = scores.broadcast_add(&extended_mask)?;
-        let scores = match (window.is_some(), local_band) {
-            (true, Some(band)) => scores.broadcast_add(&band.to_dtype(scores.dtype())?)?,
-            (true, None) => {
-                return Err(EncoderError::Config(
-                    "local-attention layer reached without a sliding-window band".into(),
-                ))
-            }
-            (false, _) => scores,
-        };
-        candle_nn::ops::softmax(&scores, D::Minus1)?
+    let mask = match (window.is_some(), local_band) {
+        (true, Some(band)) => extended_mask.broadcast_add(&band.to_dtype(raw_scores.dtype())?)?,
+        (true, None) => {
+            return Err(EncoderError::Config(
+                "local-attention layer reached without a sliding-window band".into(),
+            ))
+        }
+        (false, _) => extended_mask,
     };
+    let attn = softmax_apply(&raw_scores, &mask, scale, policy)?;
 
     Ok(crate::contiguous_matmul(&attn, &v)?
         .transpose(1, 2)?
@@ -749,13 +731,13 @@ pub(crate) fn forward_eager_training_attention_composition(
 /// [`FlashDecision::outcome`] is `PredicateOutcome::Holds`, which
 /// `FlashDecision::Declined` can never be.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn training_attention_cascade(
+pub(crate) fn attention_cascade(
     qkv: &Tensor,
     batch: usize,
     seq: usize,
     h: usize,
     d: usize,
-    masks: TrainingMaskInputs<'_>,
+    masks: MaskInputs<'_>,
     flash: &FlashDecision,
     rope: &RopeCtx<'_>,
     window: Option<LocalWindow>,
@@ -771,7 +753,7 @@ pub(crate) fn training_attention_cascade(
     // `admit_cascade` writes and then returns early would bypass a check
     // placed later in this function, so the check runs before the FIRST
     // write, not merely before the LAST one.
-    crate::seam_gate("attention_cascade::training_attention_cascade");
+    crate::seam_gate("attention_cascade::attention_cascade");
     // Flash cascade: reported here for EVERY caller (dispatch decisions are
     // never silent), even one (BERT/DistilBERT) whose own
     // `flash` is always `Declined { CapabilityMiss, "flash_transport_not_wired" }`.
@@ -830,10 +812,10 @@ pub(crate) fn training_attention_cascade(
     }
     let Some(fused) = masks.fused else {
         return Err(EncoderError::Config(
-            "training-mode attention fell through to the block/eager arm without the \
+            "attention fell through to the block/eager arm without the \
              per-forward fused masks -- the caller builds them once per forward whenever \
              memeff will not handle it (mem_efficient_attention_predicate declined here too); \
-             a direct caller in training mode must supply them on this path"
+             a direct caller must supply them on this path"
                 .into(),
         ));
     };
@@ -873,7 +855,7 @@ pub(crate) fn training_attention_cascade(
             let op = AttentionBlockFused::new(1.0 / (d as f32).sqrt(), policy, rope.enabled())?;
             Ok(apply3(&qkv5, &rope_pack, mask, op)?)
         }
-        DispatchOutcome::Eager => forward_eager_training_attention_composition(
+        DispatchOutcome::Eager => forward_eager_attention_composition(
             qkv,
             batch,
             seq,
@@ -884,7 +866,6 @@ pub(crate) fn training_attention_cascade(
             rope,
             window,
             policy,
-            true,
         ),
     }
 }

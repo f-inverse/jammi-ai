@@ -12,12 +12,12 @@ duration_secs = 30
 heartbeat_secs = 10
 
 [ballista.scheduler]
-# This pod hosts the ONE Ballista scheduler: it claims a training job and
-# PLACES it on a registered compute-pod executor (configuration.md's
-# semantics: this table's presence makes a process a scheduler). No
-# `[ballista.executor]` here -- this pod never itself registers as an
-# executor, so a task it places can never be bound back to it (a task's own
-# submitter is excluded from placement in any case).
+# This pod hosts the ONE Ballista scheduler (configuration.md's semantics:
+# this table's presence makes a process a scheduler): the query tier's
+# materializations and any client-role claimant's training attempts are
+# submitted here and bound to a registered compute-pod executor. No
+# `[ballista.executor]` -- this pod runs no task -- and no
+# `[ballista.client]` -- it submits nothing of its own.
 bind = "0.0.0.0:50050"
 # The name the scheduler stamps into every task it places, which the
 # executor dials back to report the task's status: the stable Service
@@ -25,30 +25,15 @@ bind = "0.0.0.0:50050"
 # is 0.0.0.0/::).
 advertise_host = "jammi-server-scheduler"
 
-# This pod's own submissions -- the training jobs it claims below -- go to
-# the scheduler it hosts: a role names what it dials, and hosting the
-# scheduler does not name it.
-[ballista.client]
-scheduler_address = "jammi-server-scheduler:50050"
-
-# This pod claims the training kinds a placed run handles (`fine_tune`,
-# `graph_fine_tune`) and places each claimed job on a compute executor; while
-# no compute executor is registered it runs the job in-process, exactly like
-# any other worker-enabled process (the bytes are identical either way).
-# `context_predictor` has no placed arm, so it is left to the compute pods:
-# listing it here would train it on this CPU pod.
+# This pod claims nothing. A claimed training attempt -- of any kind --
+# requires the device kind of the process that claimed it: it is placed only
+# on an executor listing that kind, and trains in its claimant's own process
+# when none does. This is a CPU pod and the compute pods list `cuda`, so an
+# attempt claimed here would train here; the compute pods claim the training
+# kinds and train them on their devices.
 [worker]
-enabled = true
-kinds = ["fine_tune", "graph_fine_tune"]
+enabled = false
 
-# This pod's own peer/gang listener -- needed because a training job this
-# pod claims and runs in-process (no placement available) may still assemble
-# a multi-host gang across the compute StatefulSet's pods.
-[server]
-peer_bind = "0.0.0.0:9000"
-# The stable Service DNS name this pod is always reachable at (a single
-# replica behind a normal ClusterIP Service never needs a downward-API pod
-# name the way the compute StatefulSet's per-pod `peer_advertise` does).
-peer_advertise = "jammi-server-scheduler:9000"
 # Pure scheduler node: mounts no query-tier gRPC service.
+[server]
 services = []

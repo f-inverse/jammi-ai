@@ -7,40 +7,23 @@ SPECIFIC to the torch side: the name translation this script does that
 `grad_oracle.rs` does not need to.
 
 ============================================================================
-PROVENANCE / HONESTY (execution-provenance principle): THIS SCRIPT HAS BEEN
-RUN live on one config, on an A100 (ModernBERT-large, `--batch 8 --seq 128
---seed 42`, jammi at `e62c8a8`). That run's
-translated-name count DID match the model's own trainable-parameter count
-(the `main()` assertion described below did not fire), and its output DID
-round-trip through `compare_grad_oracle.py` against a real jammi
-`grad-oracle` dump, producing (among others) these overall cosine
-similarities: torch-eager vs torch-sdpa 0.825; torch-bf16 vs torch-f32
-0.924; jammi-f32 vs torch-f32 0.9999998 (near-perfect, as expected — f32
-has no bf16 rounding to diverge on). A separately-introduced defect on
-that same run scored 0.30-0.53. Treat those five numbers as the empirical
-anchor for picking a REAL `--cosine-floor` (see
-`compare_grad_oracle.py`'s `derive_cosine_floor` doc for why its own
-DERIVED worst-case bound, ~-0.40 at these dimensions, is far looser than
-what real bf16 noise actually costs) — not the abstractly-derived floor.
-That run ALSO surfaced that `dL/dA` is EXACTLY `0.0` on BOTH stacks for
-every `lora_a` tensor at this fresh `LoraInitMode::ZerosB` init (112 of
-224 matched tensors) — see "Structural limitation: a single fresh-init
-call tests only `dL/dB`" below — and that the weight-identity check
-(`compare_grad_oracle.py`'s `_weight_mismatches`) held on that run
-by actual agreement, not by luck of a loose bound: `max|w_jammi - w_torch|
-= 1.86e-9` over 224 tensors -- orders of magnitude inside the ULP-relative
-tolerance `compare_grad_oracle.py`'s `WEIGHT_MATCH_ULPS`/`_weight_element_tolerance`
-derive (an f32-ULP-relative bound, not a fixed absolute constant).
-
-Everything ELSE about this file beyond that one confirmed run (arbitrary
-checkpoints, other `target_modules` sets, other dtypes/ranks/batch/seq
-combinations) remains UNVERIFIED against a live run — one successful
-execution at one config is evidence the mechanism works, not a proof it
-is correct at every config this script accepts. `translate_peft_name_to_jammi`
-below still FAILS LOUDLY (raises, never silently drops a tensor) the
-moment its naming assumption is wrong for a config not yet exercised, and
-`main()` still asserts the translated name count against the model's own
-trainable-parameter count before writing anything.
+PROVENANCE: this script has been run live on one config, on an A100
+(ModernBERT-large, `--batch 8 --seq 128 --seed 42`). That run's
+translated-name count matched the model's own trainable-parameter count,
+and its dump was compared against a real jammi `grad-oracle` dump: overall
+cosine similarities torch-eager vs torch-sdpa 0.825, torch-bf16 vs
+torch-f32 0.924, jammi-f32 vs torch-f32 0.9999998; a separately introduced
+defect on the same run scored 0.30-0.53; every `lora_a` tensor's gradient
+was exactly `0.0` on both stacks (112 of 224 matched tensors — see the
+structural limitation below); the two sides' weights agreed to
+`max|w_jammi - w_torch| = 1.86e-9` over 224 tensors. Those readings are
+prose: no raw dump from that run is committed, so no measured cosine floor
+exists yet and the ladder's `gradient_cosine_floor` rule is unbudgeted
+until one is. Everything beyond that one run (other checkpoints,
+`target_modules` sets, dtypes, ranks, shapes) is unverified against a live
+run; `translate_peft_name_to_jammi` fails loudly the moment its naming
+assumption is wrong, and `main()` asserts the translated name count
+against the model's own trainable-parameter count before writing anything.
 ============================================================================
 
 STRUCTURAL LIMITATION — a single fresh-init call tests ONLY `dL/dB`:
@@ -57,10 +40,9 @@ provides ZERO evidence about whether jammi's and torch's `dL/dA`
 computations agree — a real defect specific to the `dL/dA` path (a
 transposed axis, a dropped scale factor) could NOT be caught this way; it
 would print an uninformative, structurally-guaranteed cosine of `0.0` on
-both an agreeing and a disagreeing implementation alike.
-`compare_grad_oracle.py`'s `is_vacuous_pair`/`vacuous_tensor_count`
-classify and surface exactly this case rather than let it masquerade as
-either a pass or a fail signal. Catching a real `dL/dA` defect requires AT
+both an agreeing and a disagreeing implementation alike. The ladder's
+gradient-agreement outcome classifies such a pair as vacuous — no evidence
+either way — rather than let it masquerade as a pass or a fail. Catching a real `dL/dA` defect requires AT
 LEAST one optimizer step first (moving `B` away from zero) — the
 N-step teacher-forced extension `grad_oracle.rs`'s own module doc scopes
 under "What this tier does NOT do" is what would close this gap; neither
@@ -111,10 +93,10 @@ Usage (mirrors `jammi-bench grad-oracle`'s own flags):
         --dtype bf16 --attn eager --seed 42 \\
         --lora-weights-in shared_lora.safetensors --out torch_grad.json
 
-Install: same venv `finetune_ab.sh`'s `setup_torch_venv` provisions
-(`torch`, `transformers>=4.48`, `peft`) PLUS `safetensors` (already a
-transitive dependency of both `torch` and `transformers`, so no extra
-`uv pip install` line is expected to be needed — stated, not assumed;
+Install: the venv `ci/scripts/perf/torch_venv.py --provision` makes
+(`torch`, `transformers>=4.48`, `peft`, `safetensors` — the last already a
+transitive dependency of both `torch` and `transformers`, and installed by
+name all the same — stated, not assumed;
 `main()` raises a clear `ImportError`-derived message if it is somehow
 absent rather than a bare traceback).
 """
@@ -264,6 +246,11 @@ def translate_dtype_flag_to_jammi_spelling(dtype_flag: str) -> str:
 # unchanged.
 checkpoint_identity = tfs.checkpoint_identity
 
+# The triplet margin the one forward is taken under: the margin
+# `finetune_step.rs` steps with, so a gradient leg and a timed leg of the
+# same edge state the same problem (`TrainStepPayload::margin`).
+TRIPLET_MARGIN = 0.3
+
 
 def load_lora_weights_into_model(model, path: str) -> int:
     """Load a jammi-produced (or a previous torch-produced, round-trip)
@@ -352,7 +339,7 @@ def run(args) -> dict:
     # `get_peft_model` time, so the generator must already be seeded when
     # that call happens).
     torch.manual_seed(args.seed)
-    device = tfs.pick_device(None if args.dry_run else args.cuda)
+    device = tfs.pick_device(args.cuda)
 
     dry_run_tmp = tempfile.TemporaryDirectory() if args.dry_run else contextlib.nullcontext()
     with dry_run_tmp as tmp_dir:
@@ -442,15 +429,6 @@ def _run_with_model(
 
     mask = torch.ones(args.batch, args.seq, dtype=torch.long, device=device)
     blocks = [tfs.synthetic_ids(args.batch, args.seq, config.vocab_size, args.seed + i).to(device) for i in range(3)]
-    # Same digest jammi's `grad_oracle.rs` reports as `batch_token_id_sums`
-    # (see that module's field doc): `[sum(anchor ids), sum(positive ids),
-    # sum(negative ids)]`, computed from the SAME `blocks` both the batched
-    # and unbatched forward arms below consume, so `compare_grad_oracle.py`
-    # can refuse a comparison whose two dumps ran different token content
-    # even though `synthetic_ids` is meant to be bit-identical across the
-    # two stacks for the same `(seed, vocab)`.
-    batch_token_id_sums = [int(b.sum().item()) for b in blocks]
-
     if args.batched_forward:
         joined_ids = torch.cat(blocks, dim=0)
         joined_mask = mask.repeat(3, 1)
@@ -460,7 +438,7 @@ def _run_with_model(
         a, p, n = pooled[:b], pooled[b : 2 * b], pooled[2 * b : 3 * b]
     else:
         a, p, n = (tfs.pool_and_normalize(tfs.forward_hidden(model, blk, mask), mask) for blk in blocks)
-    loss = tfs.triplet_loss(a, p, n, margin=0.3)
+    loss = tfs.triplet_loss(a, p, n, margin=TRIPLET_MARGIN)
     loss.backward()  # NO optimizer.step() -- see grad_oracle.rs's module doc for why.
 
     gradients = {}
@@ -478,6 +456,15 @@ def _run_with_model(
         weight = param.detach().float().cpu().contiguous().flatten().tolist()
         gradients[jammi_name] = {"shape": list(param.shape), "grad": grad, "weight": weight}
 
+    loss_value = float(loss.detach().float().item())
+    # A `train-step` leg (`tiers.finetune_step` in a jammi-bench report): the
+    # identity fields `TrainStepPayload::IDENTITY_FIELDS` names, spelled as
+    # `torch_finetune_step.py` spells them, plus the one measurement this
+    # oracle exists for. Filed under the `grads` take of the `train-step`
+    # ladder's `torch -> reference` edge; the ladder judges it as gradient
+    # agreement. Warmup, measured steps, dropout and the clip are the fields
+    # a single forward has no use for, and the edge lets a gradient leg
+    # differ from its timed repeats on exactly those.
     return {
         "tool": "torch_grad_oracle",
         # `None` under --dry-run, mirroring torch_finetune_step.py's own
@@ -487,56 +474,49 @@ def _run_with_model(
         # anything reads this report.
         "model_dir": None if args.dry_run else str(args.model_dir),
         "dry_run": args.dry_run,
-        "device": str(device),
-        # Base-checkpoint CONTENT identity -- see `checkpoint_identity`'s own
-        # doc and `grad_oracle.rs`'s module doc's determinant table. IDENTITY
-        # (replaces the un-comparable `model_dir` path above, which stays
-        # emitted for human debugging only).
-        **checkpoint_identity_fields,
-        # torch/transformers/peft versions, device NAME (vs. `device` above,
-        # which is the device TYPE/ordinal), git rev, and the fast-path pin
-        # state -- reuses `torch_finetune_step.py`'s own `provenance()`
-        # UNCHANGED (never a second, drifting implementation). PROVENANCE:
-        # recorded, never compared -- two producers legitimately run on
-        # different boxes/software stacks.
+        # torch/transformers/peft versions, device NAME, git rev, and the
+        # fast-path pin state -- reuses `torch_finetune_step.py`'s own
+        # `provenance()` unchanged. PROVENANCE: recorded, never compared.
         "provenance": tfs.provenance(device, fast_path_globals),
-        # What `--attn` REQUESTED vs. what HF's `AutoModel.from_pretrained`
-        # actually RESOLVED to (`model.config._attn_implementation`, which
-        # can fall back off the request -- e.g. no `flash_attention_2`
-        # package installed). PROVENANCE: jammi has no equivalent CLI lever
-        # (its own analog, WHICH KERNEL COMPOSITION actually dispatched, is
-        # the `*_fused_dispatches`/`*_eager_dispatches` MEASUREMENT fields on
-        # the jammi side -- see `grad_oracle.rs`'s module doc's determinant
-        # table for why these are not directly comparable to each other).
-        "attn_requested": args.attn,
-        "attn_implementation": resolved_attn_implementation,
-        # Emit jammi's OWN canonical spelling
-        # (`f32`/`bf16`, never `fp32`) here -- `--dtype` itself keeps torch's
-        # bare CLI-flag spelling (`fp32`, matching `torch_finetune_step.py`'s
-        # own `--dtype` convention this script's flags otherwise mirror; see
-        # this module's usage docstring), but the WRITTEN report is what
-        # `compare_grad_oracle.py`'s run-identity check actually reads, and
-        # that check's premise is IDENTICAL configuration on both sides --
-        # jammi's own producer (`grad_oracle.rs`) emits `f32`/`f16`/`bf16`
-        # (`main.rs`'s `--backbone-dtype` choices), so the spelling is fixed
-        # at this source (`compare_grad_oracle.py`'s
-        # `normalize_backbone_dtype` also accepts a dump carrying `fp32`
-        # here, but is not a substitute for the canonical spelling).
-        "backbone_dtype": translate_dtype_flag_to_jammi_spelling(args.dtype),
-        "batch": args.batch,
-        "seq": args.seq,
-        "lora_rank": args.lora_rank,
-        "lora_alpha": args.lora_alpha,
-        "target_modules": [t.strip() for t in args.target_modules.split(",") if t.strip()],
-        "batched_forward": args.batched_forward,
-        "seed": args.seed,
-        "lora_dropout": 0.0,
         "lora_weights_in": args.lora_weights_in,
         "lora_weights_out": args.lora_weights_out,
-        "trainable_tensor_count": len(gradients),
-        "batch_token_id_sums": batch_token_id_sums,
-        "loss": float(loss.detach().float().item()),
-        "gradients": gradients,
+        "tiers": {
+            "finetune_step": {
+                "device": str(device),
+                # Base-checkpoint CONTENT identity -- see `checkpoint_identity`'s
+                # own doc.
+                **checkpoint_identity_fields,
+                # What `--attn` REQUESTED vs. what HF's `AutoModel.from_pretrained`
+                # actually RESOLVED to. PROVENANCE: jammi's own analog is the
+                # dispatch counters on its side.
+                "attn_requested": args.attn,
+                "attn_implementation": resolved_attn_implementation,
+                "attention_arm": tfs.attention_arm_of(resolved_attn_implementation),
+                # jammi's OWN canonical spelling (`f32`/`bf16`, never `fp32`):
+                # the identity check's premise is IDENTICAL configuration on
+                # both sides, and jammi's producer emits `f32`/`f16`/`bf16`.
+                "backbone_dtype": translate_dtype_flag_to_jammi_spelling(args.dtype),
+                "seed": args.seed,
+                "batch": args.batch,
+                "seq": args.seq,
+                "row_lengths": [args.seq] * args.batch,
+                "lora_rank": args.lora_rank,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": 0.0,
+                "margin": TRIPLET_MARGIN,
+                "target_modules": [t.strip() for t in args.target_modules.split(",") if t.strip()],
+                "batched_forward": args.batched_forward,
+                "warmup": 0,
+                "steps_measured": 0,
+                "max_grad_norm": None,
+                "clip_invocations": 0,
+                "trainable_tensors": len(gradients),
+                "losses": [loss_value],
+                "loss_first": loss_value,
+                "loss_last": loss_value,
+                "gradients": gradients,
+            }
+        },
     }
 
 
@@ -578,7 +558,8 @@ def main(argv=None):
     report = run(args)
     with open(args.out, "w") as fh:
         json.dump(report, fh, indent=2)
-    print(f"wrote {args.out} (loss={report['loss']}, tensors={report['trainable_tensor_count']})")
+    leg = report["tiers"]["finetune_step"]
+    print(f"wrote {args.out} (loss={leg['loss_first']}, tensors={leg['trainable_tensors']})")
     return 0
 
 

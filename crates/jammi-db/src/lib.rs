@@ -15,6 +15,7 @@ pub mod ephemeral;
 pub mod error;
 pub mod evidence_channel;
 pub mod index;
+pub mod memory_pool;
 pub mod model_task;
 pub mod server_info;
 pub mod session;

@@ -1,18 +1,11 @@
-//! The three(+)-process Ballista lane's harness: spawning real `jammi-server`
-//! binaries with `[ballista]` roles configured (one hosting the scheduler +
-//! an executor, the rest hosting executors only), plus the fine-tune
-//! submission helpers (`add_training_source`, `submit_gang_fine_tune`,
-//! `JobSize`, `await_job`, `unique_source_name`,
-//! `training_pairs_url`, `tiny_bert_model`, `label_of`) ported from
-//! `crates/jammi-ai/tests/distributed/harness.rs`.
-//!
-//! `jammi-ai`'s harness is a private test module of a DIFFERENT crate,
-//! unreachable from here, so this is a reduced copy of it; the shared part
-//! belongs in `jammi-test-utils`.
+//! The three(+)-process Ballista lane's harness: the fleets it spawns
+//! (`jammi_test_utils::fleet`, the one facility every fleet on one host is
+//! launched through) and the submission and observation helpers around them
+//! (`add_training_source`, `submit_fine_tune`, `JobSize`, `await_job`,
+//! `unique_source_name`, `training_pairs_url`, `tiny_bert_model`,
+//! `label_of`).
 
-use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,486 +22,31 @@ use jammi_db::store::CachePolicy;
 use jammi_test_utils::DistributedBackends;
 use tempfile::TempDir;
 
+use jammi_test_utils::fleet::{jammi_server_binary, MAX_WORLD_SIZE};
+pub use jammi_test_utils::fleet::{BallistaRole, Fleet, ProcSpec, WorkerRole};
+
 const LEASE_SECS: u64 = 3;
 const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
-const RANK_TIMEOUT_SECS: u64 = 10;
-/// `[distributed] max_world_size` every ballista-fleet process renders; the
-/// jobs this lane submits use `world_size = 2`.
-const MAX_WORLD_SIZE: u32 = 3;
 
-/// Locate the `jammi-server` binary this workspace's `cargo build -p
-/// jammi-server --bin jammi-server --features storage-s3` produced, in the
-/// SAME `CARGO_TARGET_DIR` this test process itself was built into.
-pub fn jammi_server_binary() -> PathBuf {
-    let test_exe = std::env::current_exe().expect("current_exe for binary resolution");
-    let profile_dir = test_exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("test exe under {profile}/deps/");
-    let bin = profile_dir.join(if cfg!(windows) {
-        "jammi-server.exe"
-    } else {
-        "jammi-server"
-    });
-    assert!(
-        bin.is_file(),
-        "`jammi-server` binary not found at {}. Build it first: `cargo build -p jammi-server \
-         --bin jammi-server --features storage-s3` into this same CARGO_TARGET_DIR.",
-        bin.display()
-    );
-    bin
-}
-
-const TEST_AUDIT_MASTER_KEY: &str =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-/// This process's Ballista roles, if any: `SchedulerAndExecutor` renders
-/// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
-/// (the process names itself, so the gangs it claims are placed);
-/// `Scheduler` renders `[ballista.scheduler]` only (a scheduler that runs
-/// no task itself, so no placed task ever lands on the process the plane
-/// lives in); `Executor` renders `[ballista.executor]` only (pointed at
-/// `scheduler_port`); `Client` renders `[ballista.client]` only (a query
-/// tier whose materializations go to the scheduler at `scheduler_port`);
-/// `None` renders no `[ballista]` section at all (the plain, unplaced
-/// comparison fleet).
-#[derive(Clone, Copy)]
-pub enum BallistaRole {
-    SchedulerAndExecutor { scheduler_port: u16 },
-    Scheduler { scheduler_port: u16 },
-    Executor { scheduler_port: u16 },
-    Client { scheduler_port: u16 },
-    None,
-}
-
-impl BallistaRole {
-    /// Whether a process of this role registers a `compute_executors` row:
-    /// the roles that render `[ballista.executor]`. A client-role process
-    /// submits and hosts no executor; an unplaced one has no plane at all.
-    pub fn hosts_executor(self) -> bool {
-        matches!(
-            self,
-            BallistaRole::SchedulerAndExecutor { .. } | BallistaRole::Executor { .. }
-        )
-    }
-}
-
-/// This process's fine-tune-facing `[worker]` shape.
-#[derive(Clone, Copy)]
-pub struct WorkerRole {
-    pub enabled: bool,
-    /// `None` = `kinds = "all"`; `Some(k)` = `kinds = [k]`.
-    pub kind: Option<&'static str>,
-    pub idle_poll_secs: u64,
-}
-
-impl Default for WorkerRole {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            kind: None,
-            idle_poll_secs: IDLE_POLL_SECS,
-        }
-    }
-}
-
-/// One process's full listener/role spec.
-#[derive(Clone, Copy)]
-pub struct ProcSpec {
-    pub flight_port: u16,
-    pub health_port: u16,
-    pub peer_port: u16,
-    pub ballista: BallistaRole,
-    /// Only meaningful when `ballista` carries an executor role: this
-    /// process's own Flight-shuffle/gRPC-task listener ports.
-    pub exec_bind_port: u16,
-    pub exec_grpc_port: u16,
-    pub worker: WorkerRole,
-}
-
-impl ProcSpec {
-    pub fn fresh(ballista: BallistaRole, worker: WorkerRole) -> Self {
-        Self {
-            flight_port: jammi_test_utils::free_port(),
-            health_port: jammi_test_utils::free_port(),
-            peer_port: jammi_test_utils::free_port(),
-            ballista,
-            exec_bind_port: jammi_test_utils::free_port(),
-            exec_grpc_port: jammi_test_utils::free_port(),
-            worker,
-        }
-    }
-}
-
-fn render_toml(
+/// This lane's fleets: the workspace's own `jammi-server` build, the
+/// committed shape-d configs under the workspace root.
+pub fn spawn_fleet(
     backends: &DistributedBackends,
     result_root: &str,
-    artifact_dir: &str,
-    spec: &ProcSpec,
-) -> String {
-    let allow_http = backends.allows_http();
-    let kinds = match spec.worker.kind {
-        Some(k) => format!("kinds = [\"{k}\"]"),
-        None => "kinds = \"all\"".to_string(),
-    };
-    let mut out = format!(
-        r#"
-artifact_dir = "{artifact_dir}"
-
-[gpu]
-device = -1
-
-[catalog.postgres]
-url = "{pg_url}"
-pool_size = 8
-
-[storage]
-result_root = "{result_root}"
-
-[storage.cloud.s3]
-region = "{region}"
-endpoint = "{s3_endpoint}"
-allow_http = {allow_http}
-
-[lease]
-duration_secs = {LEASE_SECS}
-heartbeat_secs = {HEARTBEAT_SECS}
-
-[worker]
-enabled = {enabled}
-{kinds}
-idle_poll_secs = {idle_poll_secs}
-local_ranks = 1
-rank_timeout_secs = {RANK_TIMEOUT_SECS}
-
-[distributed]
-max_world_size = {MAX_WORLD_SIZE}
-
-[server]
-flight_listen = "127.0.0.1:{flight_port}"
-health_listen = "127.0.0.1:{health_port}"
-peer_bind = "127.0.0.1:{peer_port}"
-peer_advertise = "127.0.0.1:{peer_port}"
-services = []
-"#,
-        pg_url = backends.pg_url,
-        region = backends.region,
-        s3_endpoint = backends.s3_endpoint,
-        enabled = spec.worker.enabled,
-        idle_poll_secs = spec.worker.idle_poll_secs,
-        flight_port = spec.flight_port,
-        health_port = spec.health_port,
-        peer_port = spec.peer_port,
-    );
-
-    // A scheduler is bound the way a deployment binds it (every interface)
-    // and advertised by a dialable host, so every placed task's status
-    // report exercises the advertised name.
-    let scheduler_section = |scheduler_port: u16| {
-        format!(
-            "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
-             advertise_host = \"127.0.0.1\"\n"
-        )
-    };
-    match spec.ballista {
-        BallistaRole::None => {}
-        BallistaRole::Scheduler { scheduler_port } => {
-            out.push_str(&scheduler_section(scheduler_port));
-        }
-        BallistaRole::SchedulerAndExecutor { scheduler_port } => {
-            out.push_str(&scheduler_section(scheduler_port));
-            out.push_str(&format!(
-                "\n[ballista.executor]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n\
-                 bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
-                 advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
-                spec.exec_bind_port, spec.exec_grpc_port,
-            ));
-            out.push_str(&format!(
-                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
-            ));
-        }
-        BallistaRole::Executor { scheduler_port } => {
-            out.push_str(&format!(
-                "\n[ballista.executor]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n\
-                 bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
-                 advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
-                spec.exec_bind_port, spec.exec_grpc_port,
-            ));
-        }
-        BallistaRole::Client { scheduler_port } => {
-            out.push_str(&format!(
-                "\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n"
-            ));
-        }
-    }
-    out
-}
-
-/// One spawned `jammi-server` process and the scratch dir backing its
-/// config + log. Killed on drop via the owning [`Fleet`].
-pub struct WorkerProc {
-    pub label: String,
-    child: Child,
-    config_toml: String,
-    log_path: PathBuf,
-    _scratch: TempDir,
-    spec: ProcSpec,
-}
-
-impl Fleet {
-    /// The Flight SQL address of the worker labelled `label`.
-    pub fn flight_addr(&self, label: &str) -> std::net::SocketAddr {
-        let w = self
-            .workers
-            .iter()
-            .find(|w| w.label == label)
-            .unwrap_or_else(|| panic!("no worker labelled {label:?}"));
-        std::net::SocketAddr::from(([127, 0, 0, 1], w.spec.flight_port))
-    }
-}
-
-pub struct Fleet {
-    workers: Vec<WorkerProc>,
-    run_id: String,
-}
-
-impl Fleet {
-    /// Spawn one process per `specs[i]`, labelled `lane-{run_id}-{i+1}` — a
-    /// per-`Fleet` unique run id (never a fixed `lane-1`/`lane-2`/…): the
-    /// shared Postgres catalog's `workers` row lookup is by LABEL
-    /// (`harness::label_of`/`instance_id_of_label`), and a fixed label
-    /// would collide with a PRIOR test run's still-present row for the same
-    /// label (Postgres persists across the whole live-lane process, unlike
-    /// SQLite's per-test-fixture isolation) — a stale row would silently
-    /// resolve to the wrong instance.
-    pub fn spawn(backends: &DistributedBackends, result_root: &str, specs: Vec<ProcSpec>) -> Self {
-        let exe = jammi_server_binary();
-        let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-        let workers = specs
-            .into_iter()
-            .enumerate()
-            .map(|(i, spec)| {
-                spawn_one(
-                    &exe,
-                    backends,
-                    result_root,
-                    &format!("lane-{run_id}-{}", i + 1),
-                    spec,
-                )
-            })
-            .collect();
-        Self { workers, run_id }
-    }
-
-    pub fn worker_labels(&self) -> Vec<&str> {
-        self.workers.iter().map(|w| w.label.as_str()).collect()
-    }
-
-    /// The labels of the members whose role hosts an executor
-    /// ([`BallistaRole::hosts_executor`]), in spawn order — the set that
-    /// registers with the compute plane. Every one of them runs a
-    /// `[worker]`: a member is known to the shared catalog by its label
-    /// only through its `workers` row (`instance_id_of_label`), so an
-    /// executor whose worker is disabled has an executor registration no
-    /// test can tie back to it — refused here, never a 60 s timeout.
-    pub fn executor_labels(&self) -> Vec<&str> {
-        self.workers
-            .iter()
-            .filter(|w| w.spec.ballista.hosts_executor())
-            .inspect(|w| {
-                assert!(
-                    w.spec.worker.enabled,
-                    "executor-hosting member {} runs no worker: its label resolves to no \
-                     instance id; give it a worker of a kind the test never enqueues",
-                    w.label
-                )
-            })
-            .map(|w| w.label.as_str())
-            .collect()
-    }
-
-    /// The `i`-th spawned worker's label (0-indexed), in spawn order.
-    pub fn label(&self, i: usize) -> &str {
-        self.workers[i].label.as_str()
-    }
-
-    /// Spawn ONE more process into this already-running fleet, labelled
-    /// with the SAME run id (`lane-{run_id}-{n}`, `n` continuing the
-    /// existing sequence) — a LATE-joining process (e.g. the kill test's independent
-    /// reclaimer), added only after the earlier processes' own claim/
-    /// placement race has already resolved, so it plays no part in that
-    /// race. Returns the new process's own index (for `Fleet::label`).
-    pub fn spawn_more(
-        &mut self,
-        backends: &DistributedBackends,
-        result_root: &str,
-        spec: ProcSpec,
-    ) -> usize {
-        let exe = jammi_server_binary();
-        let idx = self.workers.len();
-        let label = format!("lane-{}-{}", self.run_id, idx + 1);
-        self.workers
-            .push(spawn_one(&exe, backends, result_root, &label, spec));
-        idx
-    }
-
-    /// The captured stdout+stderr log of the worker labelled `label`, read
-    /// fresh (the process may still be writing it).
-    pub fn log_contents(&self, label: &str) -> String {
-        let w = self
-            .workers
-            .iter()
-            .find(|w| w.label == label)
-            .unwrap_or_else(|| panic!("no worker labelled {label:?}"));
-        std::fs::read_to_string(&w.log_path).unwrap_or_default()
-    }
-
-    pub fn kill9(&mut self, label: &str) -> bool {
-        let Some(w) = self.workers.iter_mut().find(|w| w.label == label) else {
-            return false;
-        };
-        sigkill(&mut w.child);
-        true
-    }
-
-    /// Spawn a REPLACEMENT process at the SAME index, with the SAME spec
-    /// (same ports — a fixed `scheduler.bind` rebinds once the killed
-    /// process's listener is released). The replacement is a freshly-minted
-    /// instance (a new `instances` row): `InferenceSession::instance_id` is
-    /// minted at session construction, never externally supplied, so a
-    /// killed-then-respawned process cannot keep the OLD instance id — the
-    /// scheduler-restart test needs only the OTHER executors' registrations
-    /// and the job status rows to survive, which the shared catalog carries
-    /// regardless of the replacement's own identity.
-    pub fn respawn(&mut self, backends: &DistributedBackends, result_root: &str, label: &str) {
-        let exe = jammi_server_binary();
-        let idx = self
-            .workers
-            .iter()
-            .position(|w| w.label == label)
-            .unwrap_or_else(|| panic!("no worker labelled {label:?} to respawn"));
-        let spec = self.workers[idx].spec;
-        // The old listener may take a moment to release after SIGKILL.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                spawn_one(&exe, backends, result_root, label, spec)
-            }));
-            match probe {
-                Ok(w) => {
-                    self.workers[idx] = w;
-                    return;
-                }
-                Err(e) => {
-                    if Instant::now() >= deadline {
-                        std::panic::resume_unwind(e);
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        }
-    }
-
-    fn first_unexpected_exit(&mut self) -> Option<(String, std::process::ExitStatus)> {
-        for w in &mut self.workers {
-            if let Ok(Some(status)) = w.child.try_wait() {
-                if status.signal() == Some(libc::SIGKILL) {
-                    continue;
-                }
-                return Some((w.label.clone(), status));
-            }
-        }
-        None
-    }
-
-    pub fn dump_diagnostics(&self, context: &str) {
-        eprintln!("\n========== distributed ballista lane diagnostics: {context} ==========");
-        for w in &self.workers {
-            eprintln!("\n----- worker {} -----", w.label);
-            eprintln!("[effective jammi.toml]\n{}", w.config_toml);
-            match std::fs::read_to_string(&w.log_path) {
-                Ok(log) if log.trim().is_empty() => {
-                    eprintln!("[worker stdout+stderr] <empty> ({})", w.log_path.display())
-                }
-                Ok(log) => eprintln!("[worker stdout+stderr {}]\n{log}", w.log_path.display()),
-                Err(e) => eprintln!(
-                    "[worker stdout+stderr] <unreadable: {e}> ({})",
-                    w.log_path.display()
-                ),
-            }
-        }
-        eprintln!("========== end diagnostics: {context} ==========\n");
-    }
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        for w in &mut self.workers {
-            sigkill(&mut w.child);
-            let _ = w.child.wait();
-        }
-    }
-}
-
-fn sigkill(child: &mut Child) {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: `pid` is a child this process spawned; SIGKILL is unconditional
-    // and synchronous. A racing exit makes the call a no-op (ESRCH).
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
-    }
-}
-
-fn spawn_one(
-    exe: &Path,
-    backends: &DistributedBackends,
-    result_root: &str,
-    label: &str,
-    spec: ProcSpec,
-) -> WorkerProc {
-    let scratch = TempDir::new().expect("worker scratch dir");
-    let artifact_dir = scratch.path().join("artifacts");
-    std::fs::create_dir_all(&artifact_dir).expect("worker artifact_dir");
-
-    let config_path = scratch.path().join("jammi.toml");
-    let config_toml = render_toml(
+    specs: Vec<ProcSpec>,
+) -> Fleet {
+    Fleet::spawn(
+        &jammi_server_binary(),
+        &jammi_test_utils::workspace_root(),
         backends,
         result_root,
-        artifact_dir.to_str().expect("utf8 artifact_dir"),
-        &spec,
-    );
-    std::fs::write(&config_path, &config_toml).expect("write worker config");
-
-    let log_path = scratch.path().join("worker.log");
-    let log = std::fs::File::create(&log_path).expect("worker log file");
-    let log_err = log.try_clone().expect("clone worker log fd");
-
-    let child = Command::new(exe)
-        .arg("--config")
-        .arg(&config_path)
-        .env("JAMMI_WORKER_ID", label)
-        .env("AWS_ACCESS_KEY_ID", &backends.access_key_id)
-        .env("AWS_SECRET_ACCESS_KEY", &backends.secret_access_key)
-        .env("AWS_REGION", &backends.region)
-        .env("JAMMI_AUDIT_MASTER_KEY", TEST_AUDIT_MASTER_KEY)
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn `jammi-server` worker {label}: {e}"));
-
-    WorkerProc {
-        label: label.to_string(),
-        child,
-        config_toml,
-        log_path,
-        _scratch: scratch,
-        spec,
-    }
+        specs,
+    )
 }
 
 /// The generous terminal-state timeout — cold boot + Postgres connect +
-/// migrate + a tiny CPU LoRA fine-tune + publish to MinIO + finalize, under a
+/// migrate + a tiny CPU LoRA fine-tune + publish to the S3 store + finalize, under a
 /// 3s lease with reclaim on a crash.
 pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(150);
 pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -624,7 +162,7 @@ pub async fn await_condition(timeout: Duration, mut predicate: impl FnMut() -> b
 }
 
 /// Build the harness's own observer session against the shared Postgres +
-/// MinIO, rooted at `result_root`. `[worker] enabled = false`: it only
+/// the S3 store, rooted at `result_root`. `[worker] enabled = false`: it only
 /// submits and observes.
 pub async fn harness_session(
     backends: &DistributedBackends,
@@ -673,7 +211,7 @@ pub async fn harness_session_with(
     };
     let session = InferenceSession::open(config)
         .await
-        .expect("harness session connects to shared Postgres + MinIO");
+        .expect("harness session connects to shared Postgres + the S3 store");
     (session, dir)
 }
 
@@ -764,7 +302,7 @@ fn lane_fine_tune_config(size: JobSize) -> FineTuneConfig {
 
 /// Submit one durable `world_size`-rank LoRA fine-tune over `source`.
 /// Returns `(job_id, output_model_id)`.
-pub async fn submit_gang_fine_tune(
+pub async fn submit_fine_tune(
     session: &Arc<InferenceSession>,
     source: &str,
     size: JobSize,
@@ -790,6 +328,62 @@ pub async fn submit_gang_fine_tune(
         .await
         .expect("submit a queued gang fine-tune job to the shared catalog");
     (job.job_id.clone(), job.model_id().to_string())
+}
+
+/// Register a synthetic episodic meta-dataset as `source` — its source
+/// parquet under `dir`, its embedding table under the harness's result root
+/// — so every fleet member reads both through the shared catalog.
+pub async fn add_episodes_source(session: &Arc<InferenceSession>, dir: &Path, source: &str) {
+    use jammi_test_utils::meta_dataset;
+    let rows = meta_dataset::linear_tasks(8, 18, 321);
+    session
+        .add_source(
+            source,
+            SourceType::File,
+            meta_dataset::write_source(dir, &rows),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("register episodes source {source}: {e}"));
+    meta_dataset::materialize_embeddings(&session.result_store(), session.context(), source, &rows)
+        .await;
+}
+
+/// Submit one durable context-predictor job over `source`, registering its
+/// predictor as `model_id`. Returns the job id.
+pub async fn submit_context_predictor(
+    session: &Arc<InferenceSession>,
+    source: &str,
+    model_id: &str,
+) -> String {
+    use jammi_ai::pipeline::context_predictor::{
+        ContextArchitecture, ContextPredictorTrainConfig, GaussianObjective, PredictiveHead,
+    };
+    let spec = ContextPredictorTrainConfig {
+        model_id: model_id.to_string(),
+        architecture: ContextArchitecture::Cnp,
+        key_column: "_row_id".to_string(),
+        task_column: "task".to_string(),
+        value_column: "y".to_string(),
+        context_k: 6,
+        hidden_dim: 16,
+        num_heads: 2,
+        num_layers: 2,
+        head: PredictiveHead::Gaussian {
+            objective: GaussianObjective::Crps,
+        },
+        epochs: 8,
+        learning_rate: 0.005,
+        grad_clip: 1.0,
+        test_task_fraction: 0.25,
+        min_task_count: 4,
+        seed: 7,
+    };
+    session
+        .train_context_predictor(source, &spec)
+        .await
+        .expect("submit a queued context-predictor job to the shared catalog")
+        .job_id
+        .clone()
 }
 
 /// A 2-file parquet directory source, disjoint keys — the SAME shape

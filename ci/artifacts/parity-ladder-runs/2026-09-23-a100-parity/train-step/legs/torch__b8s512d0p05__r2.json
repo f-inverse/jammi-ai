@@ -1,0 +1,203 @@
+{
+  "tool": "torch_finetune_step",
+  "provenance": {
+    "date_utc": "2026-09-23T04:30:38.253039+00:00",
+    "git_rev": "168c71dc9e48e29414e3a76549a6cb0e8f534536",
+    "torch_version": "2.14.0+cu130",
+    "torch_cuda_version": "13.0",
+    "transformers_version": "5.17.0",
+    "peft_version": "0.21.0",
+    "python_version": "3.12.14",
+    "cuda_available": true,
+    "device_name": "NVIDIA A100 80GB PCIe",
+    "nvidia_driver_version": "580.159.04",
+    "fast_path_globals": {
+      "cuda_matmul_allow_tf32": false,
+      "cudnn_allow_tf32": false,
+      "cudnn_benchmark": false,
+      "float32_matmul_precision": "highest",
+      "deterministic_algorithms": true,
+      "cublas_workspace_config": ":4096:8"
+    }
+  },
+  "args": {
+    "model_dir": "/root/checkpoints/ModernBERT-large",
+    "dry_run": false,
+    "batch": 8,
+    "seq": 512,
+    "steps": 30,
+    "warmup": 10,
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "lora_dropout": 0.05,
+    "lora_init": "peft",
+    "target_modules": "Wqkv,Wo,Wi",
+    "dtype": "bf16",
+    "attn_requested": "sdpa",
+    "cuda": 0,
+    "seed": 42,
+    "batched_forward": true,
+    "margin": 0.3,
+    "max_grad_norm": null,
+    "adamw_foreach": false,
+    "moment_warmup_step_executed": true
+  },
+  "finetune_step": {
+    "device": "cuda:0",
+    "seed": 42,
+    "lora_alpha": 32.0,
+    "margin": 0.3,
+    "warmup": 10,
+    "backbone_dtype": "bf16",
+    "checkpoint_config_sha256": "55dca68059e98f0debf8eb63ab355c451c65b1f5d90fdca4754113fdaadd2cca",
+    "checkpoint_weights_sha256": "44510fec5d3a81a1877f225637b869495f18e55f6f23a09abb9be0acc030295f",
+    "checkpoint_weights_size_bytes": 1583544840,
+    "attn_implementation": "sdpa",
+    "sdpa_backend_probe": {
+      "flash": "ineligible: No available kernel. Aborting execution.",
+      "efficient": "ok",
+      "cudnn": "ineligible: No available kernel. Aborting execution.",
+      "sdpa_params_probe": {
+        "flash_can_use": true,
+        "efficient_can_use": true,
+        "cudnn_can_use": false,
+        "note": "debug=True only enables PyTorch's internal C++ LOG(WARNING) (a c10/glog-style sink), which writes to the process's native stderr fd outside Python's logging/warnings machinery -- not capturable as a string in this JSON field. Redirect the pod's own stderr if the specific ineligibility message text is needed; the booleans above are the reliably observable half of this probe."
+      }
+    },
+    "reference_compile_resolved": "absent",
+    "reference_compile_after_first_forward": "absent",
+    "batch": 8,
+    "seq": 512,
+    "lora_rank": 16,
+    "lora_dropout": 0.05,
+    "lora_init": "peft",
+    "lora_a_tensors_reinitialized": null,
+    "target_modules": [
+      "Wqkv",
+      "Wo",
+      "Wi"
+    ],
+    "batched_forward": true,
+    "row_lengths": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+    ],
+    "max_grad_norm": null,
+    "clip_invocations": 0,
+    "attention_arm": "fused",
+    "trainable_tensors": 224,
+    "steps_measured": 30,
+    "iter_wall_s": [
+      0.5289206234738231,
+      0.5293169589713216,
+      0.5300352107733488,
+      0.5279862759634852,
+      0.5307329017668962,
+      0.524905001744628,
+      0.5341043630614877,
+      0.5256916508078575,
+      0.526000501587987,
+      0.5326098846271634,
+      0.5291950814425945,
+      0.5259513594210148,
+      0.5239991890266538,
+      0.5230140658095479,
+      0.5244435146450996,
+      0.5276265386492014,
+      0.5242353929206729,
+      0.5252030715346336,
+      0.5228401180356741,
+      0.5253770789131522,
+      0.5231936043128371,
+      0.5245113521814346,
+      0.5295102428644896,
+      0.5238180067390203,
+      0.5235664024949074,
+      0.5247537968680263,
+      0.5245056906715035,
+      0.5283182514831424,
+      0.5256811017170548,
+      0.5262448219582438
+    ],
+    "losses": [
+      0.154296875,
+      0.1318359375,
+      0.119140625,
+      0.09814453125,
+      0.1318359375,
+      0.087890625,
+      0.1806640625,
+      0.169921875,
+      0.140625,
+      0.1787109375,
+      0.12890625,
+      0.043701171875,
+      0.03857421875,
+      0.048095703125,
+      0.03955078125,
+      0.0296630859375,
+      0.002349853515625,
+      0.033935546875,
+      0.0,
+      0.01129150390625,
+      0.0174560546875,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.004302978515625,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "loss_first": 0.154296875,
+    "loss_last": 0.0,
+    "loss_note": "cost-fixture data, not a quality result (synthetic uniform token ids) \u2014 see finetune_step.rs's module doc's 'Honesty about what is measured'. Each entry read after optimizer.step() returns; the value itself is the PRE-update loss of that step's batch (see _step_once's docstring for the placement convention shared with finetune_step.rs). PRECISION: at --dtype bf16 (every real sweep leg) this value carries only bf16's 7 explicit mantissa bits \u2014 ULP ~2^-9 \u2248 0.001953125 near 0.30 (the [0.25, 0.5) exponent bucket) \u2014 so two adjacent steps repeating the exact same float is expected quantization, not a stuck optimizer; do not read more than ~3 decimal digits of this field as meaningful.",
+    "s_per_step_p50": {
+      "value": 0.5256916508078575,
+      "unit": "s"
+    },
+    "s_per_step_mean": {
+      "value": 0.5265430684822301,
+      "unit": "s"
+    },
+    "steps_per_s": {
+      "value": 1.902255815673025,
+      "unit": "steps/s"
+    },
+    "triplets_per_s": {
+      "value": 15.2180465253842,
+      "unit": "triplets/s"
+    },
+    "peak_rss_bytes": {
+      "value": 2716237824.0,
+      "unit": "bytes"
+    },
+    "peak_vram_bytes": {
+      "value": 22563258368.0,
+      "unit": "bytes"
+    },
+    "peak_vram_baseline_bytes": {
+      "value": 971952128.0,
+      "unit": "bytes",
+      "note": "memory_allocated() snapshot taken after model+optimizer construction AND after one untimed optimizer warm-up step (so AdamW's lazily-allocated moments already exist) \u2014 the honest equivalent of candle's eager moment allocation before jammi's own baseline read."
+    },
+    "peak_vram_absolute_bytes": {
+      "value": 22522466304.0,
+      "unit": "bytes",
+      "note": "torch's continuous allocator high-water mark (reset_peak_memory_stats once before the warmup+measured loop, max_memory_allocated read after it) over the SAME window as peak_vram_delta_bytes, WITHOUT the baseline subtraction. No jammi analogue."
+    },
+    "peak_vram_delta_bytes": {
+      "value": 21550514176.0,
+      "unit": "bytes",
+      "note": "Comparable to jammi's peak_vram_bytes column: same window (warmup+measured), same baseline convention (snapshot after model+optimizer construction, moments already forced into existence). RESIDUAL ASYMMETRY: this is a CONTINUOUS allocator high-water mark; jammi's is a 25ms-interval discrete nvidia-smi poll, which can miss an intra-step spike this cannot \u2014 so this figure may legitimately read higher than jammi's for identical underlying work."
+    }
+  }
+}

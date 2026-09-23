@@ -1,11 +1,9 @@
-//! `--arm alloff` kernel-disable control for `finetune-run`, through the
-//! real compiled `jammi-bench finetune-run` CLI entry point:
-//! `finetune_step_kernel_disable.rs`'s cell 10 (the safety property) proves
-//! `finetune-step` refuses to emit a JSON tier when its declared
-//! `JAMMI_KERNELS_DISABLE` intent was dropped/mistyped/partial;
-//! `finetune_run::run` carries the SAME check for `Arm::Alloff` (`--arm
-//! alloff requires JAMMI_KERNELS_DISABLE to resolve to exactly
-//! {ALLOFF_KEYS}` — see that function's doc), and this file drives it.
+//! The `JAMMI_KERNELS_DISABLE` controls of `finetune-run`, through the real
+//! compiled `jammi-bench finetune-run` CLI entry point: a run makes no claim
+//! about the variable unless `--expect-kernels-disabled` states one, and
+//! then refuses — never emits a tier — when what the process resolved is not
+//! what was claimed (`finetune_step_kernel_disable.rs`'s cell 10 is the same
+//! safety property on `finetune-step`).
 //!
 //! Each case spawns the compiled `jammi-bench` binary as a fresh child
 //! PROCESS (`env!("CARGO_BIN_EXE_jammi-bench")`), never
@@ -16,13 +14,6 @@
 //! `std::env::set_var` test would race every other test in this crate's
 //! shared test binary for who reads that `OnceLock` first. A fresh child
 //! process side-steps it entirely.
-//!
-//! `ALLOFF_KEYS` (`finetune_run.rs`) is `attention_block_flash,adamw_step_fused`
-//! verbatim — spelled out literally here rather than
-//! imported, because this crate is `[[bin]]`-only (no `[lib]` target an
-//! integration test could `use jammi_bench::finetune_run::ALLOFF_KEYS`
-//! from), mirroring every other test file in this directory's own
-//! convention of re-deriving fixture/constant values locally.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,11 +49,11 @@ fn write_heldout_ids(dir: &Path, n: usize, offset: usize) -> PathBuf {
     path
 }
 
-/// A minimal `finetune-run` invocation, `--arm` left for the caller to
-/// append (positional last so `alloff`-vs-`fused` cases share everything
+/// A minimal `finetune-run` invocation, the environment left for the caller to
+/// append (positional last so the cases share everything
 /// else). Small enough (2 train batches, 1 held-out batch, 1 epoch) to run
 /// fast as a `cargo test` case.
-fn base_command(work_dir: &Path, fixtures_dir: &Path, arm: &str) -> Command {
+fn base_command(work_dir: &Path, fixtures_dir: &Path) -> Command {
     let train_jsonl = write_triplets_jsonl(fixtures_dir, "train.jsonl", 4, 0);
     let heldout_jsonl = write_triplets_jsonl(fixtures_dir, "heldout.jsonl", 2, 100);
     let heldout_ids = write_heldout_ids(fixtures_dir, 2, 100);
@@ -70,7 +61,6 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path, arm: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args(["finetune-run", "--model-dir"])
         .arg(model_dir())
-        .args(["--arm", arm])
         .arg("--train-jsonl")
         .arg(&train_jsonl)
         .arg("--heldout-ids")
@@ -126,148 +116,24 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path, arm: &str) -> Command {
     cmd
 }
 
-/// The safety property (mirrors `finetune_step_kernel_disable.rs`'s cell
-/// 10): `--arm alloff` with NO `JAMMI_KERNELS_DISABLE` set at all must fail
-/// the run — never emit a JSON tier as if the forced-eager arm had worked.
-/// This is the "dropped var" failure mode: an operator declares `--arm
-/// alloff` on the command line but the env var never reached this process
-/// (an unforwarded ssh/`docker -e` environment looks identical).
-#[test]
-fn alloff_without_the_env_var_set_invalidates_the_run() {
-    let work_dir = tempfile::tempdir().expect("tempdir");
-    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "alloff")
-        .env_remove("JAMMI_KERNELS_DISABLE")
-        .output()
-        .expect("spawn jammi-bench finetune-run");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "--arm alloff without JAMMI_KERNELS_DISABLE must fail the run, not emit a JSON tier — \
-         stdout={stdout} stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("attention_block_flash") && stderr.contains("adamw_step_fused"),
-        "the failure must name the required ALLOFF set so a caller can distinguish a dropped \
-         env var from every other failure mode — stderr={stderr}"
-    );
-    // Not a datum: an INVALID run must never print the report shape at all.
-    assert!(
-        !stdout.contains("finetune_run"),
-        "an INVALID run printed a JSON tier on stdout — stdout={stdout}"
-    );
-}
-
-/// The PARTIAL-disable variant of the safety property: only ONE of the two
-/// required ALLOFF op keys is named. This is the real-world failure mode a
-/// pure "was anything disabled at all" check would miss — `alloff` is a
-/// SPECIFIC two-op set, not "at least one kernel disabled".
-#[test]
-fn alloff_with_only_one_of_the_two_required_ops_invalidates_the_run() {
-    let work_dir = tempfile::tempdir().expect("tempdir");
-    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "alloff")
-        .env("JAMMI_KERNELS_DISABLE", "attention_block_flash")
-        .output()
-        .expect("spawn jammi-bench finetune-run");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "--arm alloff with only one of the two required ops disabled must fail — \
-         stdout={stdout} stderr={stderr}"
-    );
-    assert!(!stdout.contains("finetune_run"), "stdout={stdout}");
-}
-
-/// The OVER-disable variant: BOTH required ops plus an extra, unrelated
-/// real op. `alloff` names an EXACT set
-/// (`ALLOFF=attention_block_flash,adamw_step_fused`), so a superset must
-/// also be refused — a merger pairing this leg against a genuine `alloff`
-/// leg elsewhere would otherwise silently compare runs under different
-/// forced-eager conditions.
-#[test]
-fn alloff_with_an_extra_op_beyond_the_required_two_invalidates_the_run() {
-    let work_dir = tempfile::tempdir().expect("tempdir");
-    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "alloff")
-        .env(
-            "JAMMI_KERNELS_DISABLE",
-            "attention_block_flash,adamw_step_fused,layer_norm_fused",
-        )
-        .output()
-        .expect("spawn jammi-bench finetune-run");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "--arm alloff with a THIRD op disabled beyond the exact required set must fail — \
-         stdout={stdout} stderr={stderr}"
-    );
-    assert!(!stdout.contains("finetune_run"), "stdout={stdout}");
-}
-
-/// The positive control: `--arm alloff` with `JAMMI_KERNELS_DISABLE`
-/// resolving to EXACTLY the required two-op set (reordered, to prove the
-/// check is set-equality, not string-equality) must succeed, and the
-/// report's `arm`/`kernels_disabled_requested` must reflect it. Without
-/// this control, the three failing tests above would not by themselves
-/// prove the check ever lets a GENUINE alloff leg through — only that it
-/// rejects bad ones.
-#[test]
-fn alloff_with_exactly_the_required_two_ops_reordered_succeeds() {
-    let work_dir = tempfile::tempdir().expect("tempdir");
-    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "alloff")
-        .env(
-            "JAMMI_KERNELS_DISABLE",
-            "adamw_step_fused,attention_block_flash",
-        )
-        .output()
-        .expect("spawn jammi-bench finetune-run");
-
-    assert!(
-        output.status.success(),
-        "--arm alloff with exactly the required two ops (reordered) must succeed — stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let report: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("invalid JSON report: {e}\n{stdout}"));
-    let tier = &report["tiers"]["finetune_run"];
-    assert_eq!(tier["arm"], serde_json::json!("alloff"), "tier={tier}");
-    assert_eq!(
-        tier["kernels_disabled_requested"],
-        serde_json::json!(["adamw_step_fused", "attention_block_flash"]),
-        "tier={tier}"
-    );
-}
-
-/// `--arm fused` with `JAMMI_KERNELS_DISABLE` genuinely UNSET (never merely
-/// empty-string) and no `--expect-kernels-disabled` claim must succeed — the
-/// ordinary, unlabeled fused leg with nothing ambient to contaminate it. The
-/// negative-control half of this file's ALLOFF coverage: proves the
-/// `Arm::Alloff`-only check above is gated on `--arm alloff`, not firing
-/// unconditionally on every run. See
-/// `fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds`
+/// `JAMMI_KERNELS_DISABLE` genuinely UNSET (never merely empty-string) and
+/// no `--expect-kernels-disabled` claim must succeed — the ordinary,
+/// unlabeled fused leg with nothing ambient to contaminate it. See
+/// `a_run_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds`
 /// below for the companion case this control makes non-vacuous: unlike THAT
 /// case, here there is genuinely nothing disabled to name.
 #[test]
-fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
+fn a_run_never_requires_the_kernels_disable_env_var() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env_remove("JAMMI_KERNELS_DISABLE")
         .output()
         .expect("spawn jammi-bench finetune-run");
 
     assert!(
         output.status.success(),
-        "--arm fused must never require JAMMI_KERNELS_DISABLE — stderr={}",
+        "a run must never require JAMMI_KERNELS_DISABLE — stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -282,8 +148,8 @@ fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
     );
 }
 
-/// The `Arm::Fused` "makes no claim" contract, pinned directly: an unlabeled
-/// `--arm fused` leg (no `--expect-kernels-disabled`) with a NON-empty
+/// The "makes no claim" contract, pinned directly: an unlabeled leg (no
+/// `--expect-kernels-disabled`) with a NON-empty
 /// ambient `JAMMI_KERNELS_DISABLE` naming an UNRELATED op key must still
 /// succeed — `FinetuneRunParams::expect_kernels_disabled`'s own doc states
 /// the contract: "an operator may legitimately run it with OTHER, unrelated
@@ -293,32 +159,32 @@ fn fused_arm_never_hard_errors_on_a_missing_kernels_disable_env_var() {
 /// (`jammi-encoders/src/layer_norm.rs`'s admit call on the training arm), so
 /// this is not a vacuous "nothing was disabled anyway" pass: a real op was
 /// forced eager for the whole run, and the leg is still valid, because the
-/// fused arm never claimed that key was live in the first place. The
-/// two-sided witness that a DECISION leg's `--arm fused` run really was
-/// unlabeled lives OUTSIDE this binary, with the driver script and its
-/// merger.
+/// run never claimed that key was live in the first place; the leg's `arm`
+/// states `eager`, and the ladder's rung premise is what refuses it as a
+/// `resident` leg. The witness that a decision leg ran unlabeled lives
+/// OUTSIDE this binary, with the driver script.
 #[test]
-fn fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds() {
+fn a_run_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env("JAMMI_KERNELS_DISABLE", "layer_norm_fused")
         .output()
         .expect("spawn jammi-bench finetune-run");
 
     assert!(
         output.status.success(),
-        "--arm fused with no --expect-kernels-disabled must make no claim about \
+        "a run with no --expect-kernels-disabled must make no claim about \
          JAMMI_KERNELS_DISABLE and must not refuse an unrelated ambient key — stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
     let tier = tier_of(&String::from_utf8_lossy(&output.stdout));
-    assert_eq!(tier["arm"], serde_json::json!("fused"), "tier={tier}");
+    assert_eq!(tier["arm"], serde_json::json!("eager"), "tier={tier}");
     assert_eq!(
         tier["kernels_disabled_requested"],
         serde_json::json!(["layer_norm_fused"]),
-        "the report must record what was actually requested, even though the fused arm made no \
-         claim about it: tier={tier}"
+        "the report must record what was actually requested, even though the run made no claim \
+         about it: tier={tier}"
     );
 }
 
@@ -327,9 +193,8 @@ fn fused_arm_with_no_flag_and_an_unrelated_ambient_disable_still_succeeds() {
 // a forced-eager profile leg needs. Ported from `finetune-step`'s own flag
 // (`finetune_step_kernel_disable.rs`), with THREE checks instead of one:
 // (1) at START this field must equal the process's real
-// `JAMMI_KERNELS_DISABLE` EXACTLY (never a subset check: a "combined leg
-// on top of `--arm alloff`" cannot occur, since `--arm alloff`'s own
-// arm-level check forces an exact set), (2) at the END `unmatched_disables()` must be
+// `JAMMI_KERNELS_DISABLE` EXACTLY (never a subset check, which would let an
+// ambient extra key through), (2) at the END `unmatched_disables()` must be
 // empty, (3) at the END every named key's `fused` dispatch DELTA over the
 // measured epoch loop must be 0. Each case below drives exactly one of the
 // three, plus the equality semantics and the unchanged-by-default control.
@@ -359,7 +224,7 @@ fn tier_of(stdout: &str) -> serde_json::Value {
 fn expect_kernels_disabled_succeeds_and_proves_the_eager_arm_actually_ran() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env("JAMMI_KERNELS_DISABLE", "lora_linear_fused")
         .args(["--expect-kernels-disabled", "lora_linear_fused"])
         .output()
@@ -398,7 +263,7 @@ fn expect_kernels_disabled_succeeds_and_proves_the_eager_arm_actually_ran() {
 fn expect_kernels_disabled_refuses_when_the_env_var_was_dropped() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env_remove("JAMMI_KERNELS_DISABLE")
         .args(["--expect-kernels-disabled", "lora_linear_fused"])
         .output()
@@ -428,7 +293,7 @@ fn expect_kernels_disabled_refuses_when_the_env_var_was_dropped() {
 fn expect_kernels_disabled_refuses_when_the_env_names_a_different_key() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env("JAMMI_KERNELS_DISABLE", "layer_norm_fused")
         .args(["--expect-kernels-disabled", "lora_linear_fused"])
         .output()
@@ -449,14 +314,12 @@ fn expect_kernels_disabled_refuses_when_the_env_names_a_different_key() {
 /// Set equality: `--expect-kernels-disabled` naming ONE key while
 /// `JAMMI_KERNELS_DISABLE` resolves to that key PLUS an extra, unrelated
 /// one must REFUSE. A SUBSET check would let an ambient extra key through
-/// undetected — the contamination shape the flag exists to catch — and the
-/// "combined leg" a subset check would allow cannot exist (`--arm alloff`'s
-/// own arm-level check forces an EXACT set).
+/// undetected — the contamination shape the flag exists to catch.
 #[test]
 fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env(
             "JAMMI_KERNELS_DISABLE",
             "lora_linear_fused,layer_norm_fused",
@@ -496,7 +359,7 @@ fn expect_kernels_disabled_refuses_an_extra_env_key_beyond_the_claim() {
 fn expect_kernels_disabled_empty_string_refuses_against_nonempty_ambient_disable() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .args(["--expect-kernels-disabled", ""])
         .env("JAMMI_KERNELS_DISABLE", "attention_block_flash")
         .output()
@@ -528,7 +391,7 @@ fn expect_kernels_disabled_empty_string_refuses_against_nonempty_ambient_disable
 fn expect_kernels_disabled_empty_string_passes_with_clean_env() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .args(["--expect-kernels-disabled", ""])
         .env_remove("JAMMI_KERNELS_DISABLE")
         .output()
@@ -563,7 +426,7 @@ fn expect_kernels_disabled_empty_string_passes_with_clean_env() {
 fn expect_kernels_disabled_refuses_an_unmatched_disable_entry() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env(
             "JAMMI_KERNELS_DISABLE",
             "lora_linear_fused,not_a_real_op_key_at_all",
@@ -592,8 +455,8 @@ fn expect_kernels_disabled_refuses_an_unmatched_disable_entry() {
 /// even a BOGUS, non-existent op key (`disabled_ops_requested()` is a raw
 /// parse of the env var — it does not validate keys against any known op
 /// list) must still succeed and be recorded verbatim — this tier never
-/// reads `disabled_ops_requested()` for validation on an unlabeled `--arm
-/// fused` leg, only for the report's own `kernels_disabled_requested`
+/// reads `disabled_ops_requested()` for validation on an unlabeled leg,
+/// only for the report's own `kernels_disabled_requested`
 /// field, and `unmatched_disables()` is only consulted when
 /// `--expect-kernels-disabled` is `Some`. Distinguishes this arm's honest
 /// "unchecked" posture from a check that happens to work only because the
@@ -603,7 +466,7 @@ fn expect_kernels_disabled_refuses_an_unmatched_disable_entry() {
 fn without_the_flag_an_ambient_bogus_disable_entry_still_succeeds() {
     let work_dir = tempfile::tempdir().expect("tempdir");
     let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
-    let output = base_command(work_dir.path(), fixtures_dir.path(), "fused")
+    let output = base_command(work_dir.path(), fixtures_dir.path())
         .env(
             "JAMMI_KERNELS_DISABLE",
             "lora_linear_fused,not_a_real_op_key_at_all",

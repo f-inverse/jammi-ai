@@ -114,7 +114,7 @@ async fn finalize_served(
         })
         .await
         .unwrap();
-    assert!(won, "the lease holder finalizes");
+    assert!(won.is_some(), "the lease holder finalizes");
     artifact
 }
 
@@ -208,7 +208,7 @@ async fn a_won_finalize_publishes_and_attaches_in_one_transaction(backend: Backe
         })
         .await
         .unwrap();
-    assert!(won);
+    assert!(won.is_some());
 
     assert_eq!(
         catalog.get_job(&job_id).await.unwrap().status,
@@ -331,7 +331,7 @@ async fn a_lost_lease_finalize_writes_nothing_and_its_sweep_reclaims_its_bytes(
         })
         .await
         .unwrap();
-    assert!(!won, "a stale attempt does not finalize");
+    assert!(won.is_none(), "a stale attempt does not finalize");
     let job = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(job.status, JobStatus::Running.to_string());
     assert_eq!(job.claimed_by.as_deref(), Some("successor"));
@@ -405,7 +405,8 @@ async fn a_lost_lease_finalize_writes_nothing_and_its_sweep_reclaims_its_bytes(
             epoch_checkpoints: Vec::new(),
         })
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     assert_eq!(
         catalog.get_model(&name).await.unwrap().unwrap().location,
         Some(ModelLocation::Artifact(successor_ref))
@@ -485,16 +486,19 @@ async fn a_finalize_over_an_artifact_no_longer_staged_rolls_back_whole(backend: 
 }
 
 /// A retained checkpoint whose catalog name another row already occupies is
-/// skipped without failing the job — and is NOT published: it stays the
-/// attempt's own staged bundle, which the finisher's sweep reclaims, while
-/// every other checkpoint registers normally.
+/// skipped without failing the job — and is NOT published: its row is
+/// retired with the job's other unpublished checkpoints in the same
+/// transaction, and the finalize hands back the licence for its bytes,
+/// while every other checkpoint registers normally.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case(BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn a_name_occupied_checkpoint_stays_staged_for_the_sweep(backend: BackendKind) {
+async fn a_name_occupied_checkpoint_is_retired_with_the_jobs_unpublished_checkpoints(
+    backend: BackendKind,
+) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_session(backend, dir.path()).await;
     let store = store_over(dir.path(), &catalog);
@@ -522,7 +526,7 @@ async fn a_name_occupied_checkpoint_stays_staged_for_the_sweep(backend: BackendK
     let registered = stage_epoch(&store, &catalog, &job_id, attempt, 1).await;
     let (skipped_ref, registered_ref) = (skipped.artifact().clone(), registered.artifact().clone());
 
-    assert!(catalog
+    let finalized = catalog
         .finish_job_with_model(FinishJobWithModelParams {
             job_id: &job_id,
             instance_id: WORKER,
@@ -535,7 +539,8 @@ async fn a_name_occupied_checkpoint_stays_staged_for_the_sweep(backend: BackendK
             ],
         })
         .await
-        .unwrap());
+        .unwrap()
+        .expect("the lease holder finalizes");
 
     let occupant = catalog.get_model(&occupied_name).await.unwrap().unwrap();
     assert_eq!(occupant.version, 7, "the occupant is untouched");
@@ -552,23 +557,39 @@ async fn a_name_occupied_checkpoint_stays_staged_for_the_sweep(backend: BackendK
             .location,
         Some(ModelLocation::Artifact(registered_ref))
     );
+    // The instant the job is `completed`, the skipped checkpoint's row is
+    // gone and the licence for its bytes is exactly what the finalize
+    // hands back; the attempt's own sweep finds nothing.
+    assert_eq!(state_of(&catalog, &skipped_ref).await, None);
     assert_eq!(
-        state_of(&catalog, &skipped_ref).await,
-        Some(ArtifactState::Staged)
+        catalog.get_job(&job_id).await.unwrap().status,
+        JobStatus::Completed.to_string()
     );
-
-    // What the finisher's checkpoint reclaim finds is exactly the skipped
-    // checkpoint; the attempt's own sweep finds nothing.
     assert!(catalog
         .staged_artifacts_of_attempt(&job_id, attempt)
         .await
         .unwrap()
         .is_empty());
-    let held = catalog.job_scoped_artifacts(&job_id).await.unwrap();
+    assert!(catalog
+        .job_scoped_artifacts(&job_id)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(
-        held.iter().map(|h| h.claim.artifact()).collect::<Vec<_>>(),
+        finalized
+            .retired_checkpoints
+            .iter()
+            .map(|licence| licence.artifact())
+            .collect::<Vec<_>>(),
         vec![&skipped_ref]
     );
+    assert_eq!(files_in(&bundle_dir(&skipped_ref)), BUNDLE);
+    assert!(store
+        .artifact_store()
+        .delete_retired_checkpoints(&catalog, finalized.retired_checkpoints)
+        .await
+        .is_empty());
+    assert!(files_in(&bundle_dir(&skipped_ref)).is_empty());
 }
 
 /// The output row is written for exactly `(tenant, name, version)`: a peer

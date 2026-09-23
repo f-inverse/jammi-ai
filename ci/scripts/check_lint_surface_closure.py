@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: pyyaml, cargo-registry
 """Lint-surface closure gate.
 
 ## Why

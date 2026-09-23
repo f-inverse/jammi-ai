@@ -1,0 +1,82 @@
+{
+  "workload": "train-step",
+  "from": "torch",
+  "to": "fused",
+  "edges": [
+    {
+      "edge": "torch -> fused",
+      "difference": {
+        "kind": "framework",
+        "reference": "PyTorch"
+      },
+      "units": [
+        "b16s128d0",
+        "b16s128d0p05",
+        "b8s128d0",
+        "b8s128d0p05",
+        "b8s512d0",
+        "b8s512d0p05"
+      ],
+      "outcome": null,
+      "speed": {
+        "cost": {
+          "of_minima": 0.9013791628056721,
+          "of_medians": 0.8849945788522843,
+          "interval": {
+            "lower": 0.8797689842908337,
+            "upper": 0.8873676077085314
+          }
+        },
+        "noise_band": 1.0166710365585847,
+        "indistinguishable_from_one": false,
+        "aa_null": null,
+        "shape": null,
+        "time_to_quality": null
+      },
+      "space": {
+        "host_ratio": 0.7010018948536493,
+        "device_ratio": 0.7545443525389895,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "speed_non_inferiority",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "lower/upper time at least 1.1269, bar UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.7010 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.7545 against UNBUDGETED"
+        }
+      ],
+      "refusals": [],
+      "status": "GREEN"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [],
+  "causes": [],
+  "status": "GREEN"
+}

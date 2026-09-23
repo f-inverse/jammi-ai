@@ -72,11 +72,10 @@ fn base_command(work_dir: &Path, fixtures_dir: &Path, objective: &str) -> Comman
 }
 
 /// [`base_command`] with the epoch count as a parameter. `2` is the
-/// resume-cycle case most tests here drive; `1` is what the
-/// profile legs pin, and the two are NOT interchangeable for
-/// `steps_measured` — see
+/// resume-cycle case most tests here drive; `1` is the shape the profile
+/// legs pin, which
 /// [`fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run`]
-/// for the exact difference and why it matters.
+/// runs at.
 fn base_command_with_epochs(
     work_dir: &Path,
     fixtures_dir: &Path,
@@ -91,7 +90,6 @@ fn base_command_with_epochs(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_jammi-bench"));
     cmd.args(["finetune-run", "--model-dir"])
         .arg(model_dir())
-        .args(["--arm", "fused"])
         .arg("--train-jsonl")
         .arg(&train_jsonl)
         .arg("--heldout-ids")
@@ -177,7 +175,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     for field in [
         "seed",
         "batch",
-        "seq",
+        "max_seq_length",
         "lora_rank",
         "lora_alpha",
         "lora_dropout",
@@ -228,7 +226,8 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
         assert!(!v.is_null(), "provenance field {field:?} is null: {v:?}");
     }
 
-    // The endpoint fields.
+    // The endpoint fields, and the origin the endpoint is measured from.
+    assert!(obj["held_out_at_init"].as_f64().is_some());
     assert_eq!(obj["final_epoch"], serde_json::json!(1));
     assert!(obj["held_out_example_mean"].as_f64().is_some());
     assert_eq!(obj["held_out_count"], serde_json::json!(2));
@@ -267,13 +266,13 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
         );
     }
 
-    // `--arm fused` was declared; the process made no kernel-disable claim.
+    // Nothing was requested off; the process made no kernel-disable claim.
     assert_eq!(obj["arm"], serde_json::json!("fused"));
 
     // GELU-erf positive-proof: `tiny_bert`'s
     // FFN (`BertIntermediate::forward`, `hidden_act: "gelu"`) calls
     // `jammi_encoders::activations::gelu_erf` in training mode at least
-    // once per layer per forward — this run's `--arm fused` and CPU F32
+    // once per layer per forward — this run's fused arm and CPU F32
     // backbone both satisfy `gelu_admission_predicate`'s domain, so the
     // fused arm must have actually dispatched, not merely registered a
     // counter that stayed at zero. A wrong registry key on the read side
@@ -284,7 +283,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
     // bug, not merely that the field is present in the JSON.
     assert!(
         obj["gelu_fused_dispatches"].as_u64().unwrap_or(0) > 0,
-        "expected gelu_fused_dispatches > 0 for a tiny_bert --arm fused CPU F32 run: {:?}",
+        "expected gelu_fused_dispatches > 0 for a tiny_bert fused-arm CPU F32 run: {:?}",
         obj["gelu_fused_dispatches"]
     );
 
@@ -300,7 +299,7 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 
 /// The profile's POSITIVE-PROOF equation, checked LIVE on a real run: for
 /// each fusible key, `fused + eager ==
-/// <witnessed census field> × steps_measured`.
+/// <witnessed census field> × forwards_measured`.
 ///
 /// This is the assertion a profile merger applies to
 /// every pod leg, run here against the CLI's own stdout so the equation is
@@ -318,28 +317,19 @@ fn finetune_run_smoke_end_to_end_cpu_hermetic() {
 /// wrapped arms per layer (2 here — `query,value`), `embeddings + 2 per
 /// layer` LayerNorms, one GELU seam call per layer.
 ///
-/// ## The `--epochs 1` pin is LOAD-BEARING
+/// ## The `--grad-accum 1` pin
 ///
-/// `batches == steps_measured` holds only at `--epochs 1 --grad-accum 1`,
-/// which is exactly what the profile legs pin — and this test is written at
-/// that pin rather than at this file's `base_command` default of `2`
-/// BECAUSE at `--epochs 2` the equation does not hold:
-/// `steps_measured` reads `6` where the run took `4` training forwards
-/// (`lora_linear_fused_dispatches == 8` over `2` wrapped sites).
-///
-/// The cause is this tier's resume-cycle. `finetune_run::run` drives
-/// `params.epochs` single-epoch `TrainingLoop::run` legs, each configured
-/// with `epochs = epoch_idx + 1` and resumed from the previous leg's
-/// checkpoint, and sums each leg's `TrainingResult::total_steps` — but
-/// that field is the leg's own `global_step`, which a resumed leg carries
-/// forward from before the resume. So leg 0 reports `2` and leg 1 reports
-/// `4` for a run whose second epoch trained `2` batches, and the sum
-/// `6` over-counts. `steps_measured` is therefore a faithful count of
-/// TRAINING FORWARDS only when there is a single leg.
-///
-/// This is a convention pin, not a bug hunt: at `--epochs 1` (every
-/// profile leg) the two coincide exactly, which is what the
-/// assertion below proves on real output.
+/// `steps_measured` counts OPTIMIZER steps; the equation's multiplier is
+/// `forwards_measured`, every encoder forward in the counter window, which
+/// exceeds the steps by the validation, held-out and probe forwards. At
+/// `--grad-accum 1` — what the profile legs pin and what this test asserts
+/// — one step is one training forward, so the step count is the known part
+/// of that multiplier. The epoch count does not enter: the tier reads the
+/// trainer's absolute step counter off the final resume leg, so a
+/// multi-epoch run counts each step once
+/// (`finetune_run_emits_a_reproducible_pairing_surface` pins that at
+/// `--epochs 2`). This test runs at `--epochs 1`, the profile legs' own
+/// shape.
 #[test]
 fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
     let config: serde_json::Value = serde_json::from_slice(
@@ -379,22 +369,27 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
         .as_object()
         .expect("fusible_site_census must serialize as an object");
 
-    // The convention the equation is defined under, asserted rather than
-    // assumed: `--grad-accum 1` (one optimizer step is one training
-    // forward) and `--epochs 1` (one leg, so `steps_measured` is not the
-    // resume-cycle's over-counted sum — see this test's own doc). Eval
-    // forwards contribute nothing to either side of any pair (the LoRA site
-    // early-returns in eval, the house LayerNorm's fused arm is under its
-    // training branch, and the GELU seam's eval arm is the plain
-    // `Tensor::gelu_erf`), so this run's `evaluate_held_out` calls and its
-    // train probes do not appear on either side.
+    // `--grad-accum 1` (one optimizer step is one training forward) and
+    // `--epochs 1`. The equation's multiplier is `forwards_measured`: every
+    // encoder forward the RUN's own loop took, the window its dispatch
+    // counters are taken over — its training steps and its validation pass.
+    // The tier's own scoring of the published checkpoints (`held_out_at_init`,
+    // the trajectory, the train probe) happens in a loop of its own, outside
+    // that window and outside these counters.
     assert_eq!(obj["grad_accum"], serde_json::json!(1));
     assert_eq!(obj["epochs"], serde_json::json!(1));
     let steps = obj["steps_measured"].as_u64().expect("steps_measured");
+    let forwards = obj["forwards_measured"]
+        .as_u64()
+        .expect("forwards_measured");
     assert_eq!(
         steps, 2,
-        "4 train rows at --batch 2 over one epoch is 2 optimizer steps, and at --epochs 1 \
-         steps_measured is exactly that (no resume leg to double-count)"
+        "4 train rows at --batch 2 over one epoch is 2 optimizer steps"
+    );
+    assert_eq!(
+        forwards, steps,
+        "at --validation-fraction 0.0 the run's own window is its {steps} training forwards and \
+         nothing else (forwards_measured={forwards}): the tier's scoring passes are outside it"
     );
 
     for (census_field, expected_calls, fused_field, eager_field) in [
@@ -440,9 +435,9 @@ fn fusible_site_census_satisfies_the_positive_proof_equation_on_a_real_run() {
             .unwrap_or_else(|| panic!("{eager_field}"));
         assert_eq!(
             fused + eager,
-            calls * steps,
+            calls * forwards,
             "positive proof failed: {fused_field}={fused} + {eager_field}={eager} != \
-             census.{census_field}={calls} x steps_measured={steps}"
+             census.{census_field}={calls} x forwards_measured={forwards}"
         );
     }
 }
@@ -480,7 +475,7 @@ fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
     for field in [
         "seed",
         "batch",
-        "seq",
+        "max_seq_length",
         "lora_rank",
         "lora_alpha",
         "lora_dropout",
@@ -547,5 +542,230 @@ fn finetune_run_smoke_mnrl_end_to_end_cpu_hermetic() {
         3,
         "train_probe_series must carry epochs (2) + 1 entries (the init probe plus one per \
          epoch): {train_probe_series:?}"
+    );
+}
+
+/// Run the MNRL fixture and return the parsed `tiers.finetune_run` object
+/// alongside the untrained adapter the run wrote into its work dir.
+fn run_mnrl_in(scratch: &Path) -> (serde_json::Value, PathBuf) {
+    let work_dir = scratch.join("work");
+    let fixtures_dir = scratch.join("fixtures");
+    std::fs::create_dir_all(&work_dir).expect("work dir");
+    std::fs::create_dir_all(&fixtures_dir).expect("fixtures dir");
+    let output = base_command(&work_dir, &fixtures_dir, "mnrl")
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+    assert!(
+        output.status.success(),
+        "finetune-run exited non-zero: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse finetune-run report JSON");
+    (
+        report["tiers"]["finetune_run"].clone(),
+        work_dir.join("initial_adapter.safetensors"),
+    )
+}
+
+/// The surface a run in another framework pairs against: the untrained
+/// adapter it can load, the digest that proves both sides loaded the same
+/// bytes, the realized token batches, and a time axis under the held-out
+/// trajectory. Two separate processes at the same seed must agree on every
+/// one of the digests — the init is a function of `(seed, parameter name)`
+/// and tokenization of the corpus alone — or the pairing premise is false.
+#[test]
+fn finetune_run_emits_a_reproducible_pairing_surface() {
+    use sha2::{Digest, Sha256};
+
+    let first_scratch = tempfile::tempdir().expect("tempdir");
+    let second_scratch = tempfile::tempdir().expect("tempdir");
+    let (first, first_adapter) = run_mnrl_in(first_scratch.path());
+    let (second, second_adapter) = run_mnrl_in(second_scratch.path());
+
+    // The recorded digest is the digest of the file on disk.
+    let adapter_bytes = std::fs::read(&first_adapter).expect("read initial adapter");
+    assert_eq!(
+        first["initial_adapter_sha256"],
+        serde_json::json!(hex::encode(Sha256::digest(&adapter_bytes))),
+        "initial_adapter_sha256 must digest the adapter file the run wrote"
+    );
+    assert_eq!(
+        adapter_bytes,
+        std::fs::read(&second_adapter).expect("read second initial adapter"),
+        "two processes at one seed must dump byte-identical untrained adapters"
+    );
+
+    for field in ["train_token_ids_sha256", "heldout_token_ids_sha256"] {
+        let digest = first[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} must be a hex digest on a text run"));
+        assert_eq!(digest.len(), 64, "{field} is not a sha256 hex: {digest:?}");
+        assert_eq!(
+            first[field], second[field],
+            "{field} must be reproducible across processes"
+        );
+    }
+    assert_ne!(
+        first["train_token_ids_sha256"], first["heldout_token_ids_sha256"],
+        "the train and held-out token streams are different corpora"
+    );
+
+    // Each optimizer step is counted once however many resume legs the run
+    // spans: 4 train rows at `--batch 2 --grad-accum 1` is 2 steps per epoch.
+    assert_eq!(
+        first["steps_measured"],
+        serde_json::json!(4),
+        "2 epochs x 2 steps; the resumed second leg must not re-count the first leg's steps"
+    );
+
+    // The time axis: one wall per epoch, whole and by phase. The epochs'
+    // walls lie inside the run's; each epoch's phases are disjoint spans
+    // inside it; and each trajectory point carries both running sums at its
+    // epoch's end. This fixture monitors `train_loss`, so no epoch has a
+    // validation wall.
+    let walls = first["epoch_walls"].as_array().expect("epoch_walls array");
+    assert_eq!(walls.len(), 2, "one wall per epoch at --epochs 2");
+    let seconds = |wall: &serde_json::Value, field: &str| {
+        wall[field]
+            .as_f64()
+            .unwrap_or_else(|| panic!("epoch wall {field} is not a number: {wall:?}"))
+    };
+    for (epoch, wall) in walls.iter().enumerate() {
+        assert_eq!(wall["epoch"], serde_json::json!(epoch));
+        assert!(
+            seconds(wall, "steps_s") > 0.0,
+            "every epoch trains: {wall:?}"
+        );
+        assert!(
+            seconds(wall, "checkpoint_s") > 0.0,
+            "every epoch checkpoints: {wall:?}"
+        );
+        assert_eq!(seconds(wall, "validation_s"), 0.0, "{wall:?}");
+        assert!(
+            seconds(wall, "steps_s") + seconds(wall, "checkpoint_s") <= seconds(wall, "run_s"),
+            "an epoch's phases are spans inside it: {wall:?}"
+        );
+    }
+    let total = first["train_run_wall_s"]
+        .as_f64()
+        .expect("train_run_wall_s");
+    let epochs_total = walls.iter().map(|w| seconds(w, "run_s")).sum::<f64>();
+    assert!(
+        epochs_total <= total,
+        "the epochs ({epochs_total}s) lie inside the run ({total}s), which also builds the \
+         optimizer and writes the final adapter"
+    );
+    // A training run's timed iteration is its optimizer step: the series is
+    // every epoch's `step_walls` in order, one entry per measured step, and
+    // an epoch's step walls lie inside its own step span.
+    let series = first["iter_wall_s"].as_array().expect("iter_wall_s array");
+    assert_eq!(
+        series.len(),
+        first["steps_measured"].as_u64().expect("steps_measured") as usize,
+        "one iteration per optimizer step"
+    );
+    assert!(
+        series.iter().all(|w| w.as_f64().is_some_and(|w| w > 0.0)),
+        "every step's wall is a positive duration: {series:?}"
+    );
+    for wall in walls {
+        let steps: Vec<f64> = wall["step_walls"]
+            .as_array()
+            .expect("step_walls array")
+            .iter()
+            .map(|w| w.as_f64().expect("a step wall"))
+            .collect();
+        assert!(!steps.is_empty(), "every epoch steps: {wall:?}");
+        assert!(
+            steps.iter().sum::<f64>() <= seconds(wall, "steps_s") * 1.01 + 1e-3,
+            "an epoch's step walls sum to at most its step span: {wall:?}"
+        );
+    }
+    let trajectory = first["trajectory"].as_array().expect("trajectory array");
+    assert_eq!(
+        trajectory[0]["run_wall_s_cumulative"].as_f64(),
+        Some(seconds(&walls[0], "run_s"))
+    );
+    assert_eq!(
+        trajectory[1]["run_wall_s_cumulative"].as_f64(),
+        Some(epochs_total)
+    );
+    assert_eq!(
+        trajectory[1]["steps_wall_s_cumulative"].as_f64(),
+        Some(walls.iter().map(|w| seconds(w, "steps_s")).sum::<f64>())
+    );
+
+    // Host memory is the kernel's high-water mark wherever the kernel
+    // exposes one; device memory is unmeasured on a host with no device
+    // probe — absent, never a fabricated zero.
+    assert_eq!(first["peak_rss_bytes"]["unit"], serde_json::json!("bytes"));
+    if cfg!(target_os = "linux") {
+        assert!(
+            first["peak_rss_bytes"]["value"].as_f64().unwrap_or(0.0) > 0.0,
+            "VmHWM must be measured on Linux: {:?}",
+            first["peak_rss_bytes"]
+        );
+    }
+    assert_eq!(first["peak_vram_bytes"]["unit"], serde_json::json!("bytes"));
+}
+
+/// The negative control through the real CLI: `--zero-lr-control` beside the
+/// job's own positive `--lr`. The leg runs to completion, reports `lr: 0.0`,
+/// and its train probe never moves, so the learning-happened delta a reader
+/// derives (`series[0] - series[last]`) is exactly `0.0`. `--lr 0`, which is
+/// not a job anyone can submit, is refused and names the flag.
+#[test]
+fn a_zero_lr_control_leg_runs_and_reports_no_learning() {
+    let work_dir = tempfile::tempdir().expect("tempdir");
+    let fixtures_dir = tempfile::tempdir().expect("fixtures tempdir");
+    let output = base_command(work_dir.path(), fixtures_dir.path(), "mnrl")
+        .arg("--zero-lr-control")
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+    assert!(
+        output.status.success(),
+        "a control leg must run: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse finetune-run report JSON");
+    let tier = &report["tiers"]["finetune_run"];
+    assert_eq!(tier["lr"], serde_json::json!(0.0));
+    assert_eq!(tier["steps_measured"], serde_json::json!(4));
+    let series: Vec<f64> = tier["train_probe_series"]
+        .as_array()
+        .expect("train_probe_series array")
+        .iter()
+        .map(|p| p.as_f64().expect("probe is a number"))
+        .collect();
+    assert_eq!(series.len(), 3);
+    assert_eq!(
+        series[0] - series[series.len() - 1],
+        0.0,
+        "learning_happened_delta of a control leg must be exactly zero: {series:?}"
+    );
+
+    // The same command with its `--lr` value replaced by `0`.
+    let refused_work_dir = tempfile::tempdir().expect("tempdir");
+    let template = base_command(refused_work_dir.path(), fixtures_dir.path(), "mnrl");
+    let mut args: Vec<std::ffi::OsString> = template.get_args().map(Into::into).collect();
+    let lr_value = args
+        .iter()
+        .position(|arg| arg == "--lr")
+        .expect("base_command passes --lr")
+        + 1;
+    args[lr_value] = "0".into();
+    let refused = Command::new(env!("CARGO_BIN_EXE_jammi-bench"))
+        .args(args)
+        .output()
+        .expect("spawn jammi-bench finetune-run");
+    assert!(!refused.status.success(), "--lr 0 must be refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--zero-lr-control"),
+        "the refusal must name the control: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
 }

@@ -24,9 +24,7 @@ use jammi_lora::{
 };
 
 use crate::activations;
-use crate::attention_cascade::{
-    self, FlashDecision, FusedAttentionMasks, RopeCtx, TrainingMaskInputs,
-};
+use crate::attention_cascade::{self, FlashDecision, FusedAttentionMasks, MaskInputs, RopeCtx};
 use crate::error::EncoderError;
 use crate::frozen_weight_source::{validate_frozen_base_geometry, FrozenWeightLookup};
 use crate::layer_norm::LayerNorm;
@@ -98,64 +96,20 @@ struct DistilBertSelfAttention {
 }
 
 impl DistilBertSelfAttention {
-    /// Reshape `[B, S, H]` to `[B, h, S, d]` and materialise contiguously.
-    ///
-    /// The `.contiguous()` call is the canonical fix for candle's matmul
-    /// contiguity panic on transposed inputs (see candle issue #1965 /
-    /// PR #3088); it is load-bearing and must not be removed.
-    fn transpose_for_scores(&self, x: &Tensor) -> Result<Tensor, EncoderError> {
-        let mut new_shape = x.dims().to_vec();
-        new_shape.pop();
-        new_shape.push(self.num_attention_heads);
-        new_shape.push(self.attention_head_size);
-        let x = x.reshape(new_shape.as_slice())?.transpose(1, 2)?;
-        Ok(x.contiguous()?)
-    }
-
-    fn forward(&self, hidden: &Tensor, extended_mask: &Tensor) -> Result<Tensor, EncoderError> {
-        let q = self.q_lin.forward(hidden)?;
-        let k = self.k_lin.forward(hidden)?;
-        let v = self.v_lin.forward(hidden)?;
-
-        let q = self.transpose_for_scores(&q)?;
-        let k = self.transpose_for_scores(&k)?;
-        let v = self.transpose_for_scores(&v)?;
-
-        let scores =
-            (crate::contiguous_matmul(&q, &k.t()?)? / (self.attention_head_size as f64).sqrt())?;
-        // The additive mask is always built in F32 (see `extended_attention_mask`);
-        // cast to the scores' dtype so a F16/BF16 backbone can add it (a no-op
-        // when scores are already F32).
-        let extended_mask = extended_mask.to_dtype(scores.dtype())?;
-        let scores = scores.broadcast_add(&extended_mask)?;
-        let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
-
-        let context = crate::contiguous_matmul(&probs, &v)?;
-        // Re-materialise contiguously after the transpose, then collapse the
-        // head/dim trailing axes back into hidden.
-        let context = context.transpose(1, 2)?.contiguous()?;
-        let context = context.flatten_from(D::Minus2)?;
-        Ok(self.out_lin.forward(&context)?)
-    }
-
-    /// Training's arm — same shape as `crate::bert::BertSelfAttention::forward_training`:
+    /// Same shape as `crate::bert::BertSelfAttention::forward`:
     /// `qkv = Tensor::cat(&[q, k, v], D::Minus1)`, `rope`
     /// disabled, `window: None` (no sliding-window concept), `policy:
     /// Propagate`, `flash` always `Declined`. `out_lin` (DistilBERT's own
     /// attention output projection — BERT folds this into `BertSelfOutput`
     /// instead) is applied to the cascade's `[batch, seq, hidden]` output,
     /// exactly where [`Self::forward`] applies it to the eager context.
-    fn forward_training(
+    fn forward(
         &self,
         hidden: &Tensor,
         extended_mask: &Tensor,
         fused: &FusedAttentionMasks,
         flash: &FlashDecision,
     ) -> Result<Tensor, EncoderError> {
-        // No `self.training` field to assert against (as in
-        // `crate::bert::BertSelfAttention::forward_training`): this method is
-        // private with exactly one call site, itself only reachable from
-        // `DistilBert::forward_hidden`'s `self.training` branch.
         let q = self.q_lin.forward(hidden)?;
         let k = self.k_lin.forward(hidden)?;
         let v = self.v_lin.forward(hidden)?;
@@ -163,7 +117,7 @@ impl DistilBertSelfAttention {
         let (batch, seq, _) = hidden.dims3()?;
         let h = self.num_attention_heads;
         let d = self.attention_head_size;
-        let masks = TrainingMaskInputs {
+        let masks = MaskInputs {
             extended: extended_mask,
             local_band: None,
             fused: Some(fused),
@@ -171,7 +125,7 @@ impl DistilBertSelfAttention {
         let rope = RopeCtx::Disabled {
             placeholder: &self.rope_placeholder,
         };
-        let context = attention_cascade::training_attention_cascade(
+        let context = attention_cascade::attention_cascade(
             &qkv,
             batch,
             seq,
@@ -202,13 +156,9 @@ struct DistilBertFfn {
 }
 
 impl DistilBertFfn {
-    /// `training` is a PARAMETER, not a stored copy — same rationale as
-    /// `crate::bert::BertIntermediate::forward`: [`DistilBert::training`] is the single source,
-    /// threaded down through [`DistilBertLayer::forward`]/
-    /// [`DistilBertLayer::forward_training`].
-    fn forward(&self, hidden: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
+    fn forward(&self, hidden: &Tensor) -> Result<Tensor, EncoderError> {
         let mid = self.lin1.forward(hidden)?;
-        let activated = activations::gelu_erf(&mid, training)?;
+        let activated = activations::gelu_erf(&mid)?;
         Ok(self.lin2.forward(&activated)?)
     }
 }
@@ -221,39 +171,38 @@ struct DistilBertLayer {
 }
 
 impl DistilBertLayer {
-    fn forward(&self, hidden: &Tensor, extended_mask: &Tensor) -> Result<Tensor, EncoderError> {
-        // Post-LN attention: residual then LayerNorm.
-        let attn_out = self.attention.forward(hidden, extended_mask)?;
-        let attn_residual = (attn_out + hidden)?;
-        let attn_normed = self.sa_layer_norm.forward(&attn_residual)?;
-
-        // Post-LN FFN: residual then LayerNorm.
-        let ffn_out = self.ffn.forward(&attn_normed, false)?;
-        let ffn_residual = (ffn_out + &attn_normed)?;
-        self.output_layer_norm.forward(&ffn_residual)
-    }
-
-    /// `training` is threaded down to [`DistilBertFfn::forward`] as a
-    /// parameter — [`DistilBert::forward_hidden`] passes its own `self.training` here, the single
-    /// source.
-    fn forward_training(
+    fn forward(
         &self,
         hidden: &Tensor,
         extended_mask: &Tensor,
         fused: &FusedAttentionMasks,
         flash: &FlashDecision,
-        training: bool,
     ) -> Result<Tensor, EncoderError> {
+        // Post-LN attention: residual then LayerNorm.
         let attn_out = self
             .attention
-            .forward_training(hidden, extended_mask, fused, flash)?;
+            .forward(hidden, extended_mask, fused, flash)?;
         let attn_residual = (attn_out + hidden)?;
         let attn_normed = self.sa_layer_norm.forward(&attn_residual)?;
 
-        let ffn_out = self.ffn.forward(&attn_normed, training)?;
+        // Post-LN FFN: residual then LayerNorm.
+        let ffn_out = self.ffn.forward(&attn_normed)?;
         let ffn_residual = (ffn_out + &attn_normed)?;
         self.output_layer_norm.forward(&ffn_residual)
     }
+}
+
+/// The six LoRA-wrappable linear sites of one layer, in `set_training`'s
+/// order.
+fn lora_sites_mut(layer: &mut DistilBertLayer) -> [&mut MaybeLoraLinear; 6] {
+    [
+        &mut layer.attention.q_lin,
+        &mut layer.attention.k_lin,
+        &mut layer.attention.v_lin,
+        &mut layer.attention.out_lin,
+        &mut layer.ffn.lin1,
+        &mut layer.ffn.lin2,
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,8 +217,6 @@ pub struct DistilBert {
     pooling: Pooling,
     hidden_size: usize,
     max_position_embeddings: usize,
-    /// Same status as `crate::bert::Bert::training`.
-    training: bool,
 }
 
 impl DistilBert {
@@ -322,22 +269,15 @@ impl DistilBert {
 
         let mut hidden = self.embeddings.forward(input_ids)?;
         let extended = crate::mask::extended_attention_mask(mask)?;
-        if self.training {
-            // DistilBERT has no local-attention layers, so `local_band_f32`
-            // is always `None` — see `FusedAttentionMasks`'s doc.
-            let fused = FusedAttentionMasks::build(&extended, None, hidden.dtype())?;
-            let flash = FlashDecision::Declined {
-                outcome: PredicateOutcome::CapabilityMiss,
-                reason: "flash_transport_not_wired",
-            };
-            for layer in &self.layers {
-                hidden =
-                    layer.forward_training(&hidden, &extended, &fused, &flash, self.training)?;
-            }
-        } else {
-            for layer in &self.layers {
-                hidden = layer.forward(&hidden, &extended)?;
-            }
+        // DistilBERT has no local-attention layers, so `local_band_f32`
+        // is always `None` — see `FusedAttentionMasks`'s doc.
+        let fused = FusedAttentionMasks::build(&extended, None, hidden.dtype())?;
+        let flash = FlashDecision::Declined {
+            outcome: PredicateOutcome::CapabilityMiss,
+            reason: "flash_transport_not_wired",
+        };
+        for layer in &self.layers {
+            hidden = layer.forward(&hidden, &extended, &fused, &flash)?;
         }
         Ok(hidden)
     }
@@ -420,22 +360,25 @@ impl DistilBert {
         }
     }
 
-    /// Toggle training mode on every LoRA-augmented linear and every LayerNorm.
-    /// LoRA layers gate dropout; LayerNorms switch between the fused no-bwd
-    /// eval kernel and the primitive-op composition whose backward is well-
-    /// defined.
+    /// Set the training parameter on every LoRA-wrapped linear — see
+    /// `jammi_lora::LoraLinear::set_training` for the two things it governs
+    /// (dropout and the tape). Nothing else in this encoder reads it: the
+    /// forward is the same whatever the mode.
     pub fn set_training(&mut self, training: bool) {
-        self.training = training;
-        self.embeddings.layer_norm.set_training(training);
         for layer in &mut self.layers {
-            layer.attention.q_lin.set_training(training);
-            layer.attention.k_lin.set_training(training);
-            layer.attention.v_lin.set_training(training);
-            layer.attention.out_lin.set_training(training);
-            layer.sa_layer_norm.set_training(training);
-            layer.ffn.lin1.set_training(training);
-            layer.ffn.lin2.set_training(training);
-            layer.output_layer_norm.set_training(training);
+            for site in lora_sites_mut(layer) {
+                site.set_training(training);
+            }
+        }
+    }
+
+    /// Whether a training forward draws dropout at every LoRA-wrapped
+    /// linear — see `jammi_lora::LoraLinear::set_dropout`.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        for layer in &mut self.layers {
+            for site in lora_sites_mut(layer) {
+                site.set_dropout(enabled);
+            }
         }
     }
 
@@ -447,27 +390,27 @@ impl DistilBert {
             layer
                 .attention
                 .q_lin
-                .load_weights(weights, &format!("layer.{n}.q_lin"));
+                .load_weights(weights, &format!("layer.{n}.q_lin"))?;
             layer
                 .attention
                 .k_lin
-                .load_weights(weights, &format!("layer.{n}.k_lin"));
+                .load_weights(weights, &format!("layer.{n}.k_lin"))?;
             layer
                 .attention
                 .v_lin
-                .load_weights(weights, &format!("layer.{n}.v_lin"));
+                .load_weights(weights, &format!("layer.{n}.v_lin"))?;
             layer
                 .attention
                 .out_lin
-                .load_weights(weights, &format!("layer.{n}.out_lin"));
+                .load_weights(weights, &format!("layer.{n}.out_lin"))?;
             layer
                 .ffn
                 .lin1
-                .load_weights(weights, &format!("layer.{n}.lin1"));
+                .load_weights(weights, &format!("layer.{n}.lin1"))?;
             layer
                 .ffn
                 .lin2
-                .load_weights(weights, &format!("layer.{n}.lin2"));
+                .load_weights(weights, &format!("layer.{n}.lin2"))?;
         }
         Ok(())
     }
@@ -748,7 +691,6 @@ impl<'a> DistilBertBuilder<'a> {
             pooling: self.pooling,
             hidden_size: config.hidden_size,
             max_position_embeddings: config.max_position_embeddings,
-            training: false,
         })
     }
 }
@@ -895,7 +837,7 @@ mod tests {
 
         let before = crate::attention_block_dispatch_snapshot();
         let out_fused = attn
-            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .forward(&hidden, &extended, &fused_masks, &flash)
             .expect("fused training forward");
         let after = crate::attention_block_dispatch_snapshot();
         assert!(
@@ -915,7 +857,7 @@ mod tests {
         let rope = RopeCtx::Disabled {
             placeholder: &attn.rope_placeholder,
         };
-        let ctx = attention_cascade::forward_eager_training_attention_composition(
+        let ctx = attention_cascade::forward_eager_attention_composition(
             &qkv,
             b,
             s,
@@ -926,7 +868,6 @@ mod tests {
             &rope,
             None,
             FullyMaskedPolicy::Propagate,
-            true,
         )
         .expect("eager reference composition");
         let out_eager = attn.out_lin.forward(&ctx).unwrap();
@@ -966,7 +907,7 @@ mod tests {
         let flash = declined_flash();
 
         let out_fused = attn
-            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .forward(&hidden, &extended, &fused_masks, &flash)
             .expect("fused training forward on an all-padding row");
 
         let q = attn.q_lin.forward(&hidden).unwrap();
@@ -976,7 +917,7 @@ mod tests {
         let rope = RopeCtx::Disabled {
             placeholder: &attn.rope_placeholder,
         };
-        let ctx = attention_cascade::forward_eager_training_attention_composition(
+        let ctx = attention_cascade::forward_eager_attention_composition(
             &qkv,
             b,
             s,
@@ -987,7 +928,6 @@ mod tests {
             &rope,
             None,
             FullyMaskedPolicy::Propagate,
-            true,
         )
         .expect("eager reference composition on an all-padding row");
         let out_eager = attn.out_lin.forward(&ctx).unwrap();
@@ -1011,12 +951,12 @@ mod tests {
         // `FullyMaskedPolicy::Zeros` in place of `Propagate`. Batch row 1
         // must come out EXACTLY zero, and must differ from the
         // `Propagate` eager `ctx` computed above on that same row.
-        let masks_for_zeros = TrainingMaskInputs {
+        let masks_for_zeros = MaskInputs {
             extended: &extended,
             local_band: None,
             fused: Some(&fused_masks),
         };
-        let ctx_zeros = attention_cascade::training_attention_cascade(
+        let ctx_zeros = attention_cascade::attention_cascade(
             &qkv,
             b,
             s,
@@ -1113,7 +1053,7 @@ mod tests {
 
         let before = crate::attention_block_dispatch_snapshot();
         let out = attn
-            .forward_training(hidden.as_tensor(), &extended, &fused_masks, &flash)
+            .forward(hidden.as_tensor(), &extended, &fused_masks, &flash)
             .expect("fused training forward");
         let after = crate::attention_block_dispatch_snapshot();
         assert!(after.fused > before.fused, "must dispatch fused at head64");
@@ -1219,7 +1159,7 @@ mod tests {
 
         let before = crate::attention_block_dispatch_snapshot();
         let out_fused = attn
-            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .forward(&hidden, &extended, &fused_masks, &flash)
             .expect("fused training forward");
         let after = crate::attention_block_dispatch_snapshot();
         assert!(after.fused > before.fused, "must dispatch fused at head64");
@@ -1239,7 +1179,7 @@ mod tests {
         let rope = RopeCtx::Disabled {
             placeholder: &attn.rope_placeholder,
         };
-        let ctx = attention_cascade::forward_eager_training_attention_composition(
+        let ctx = attention_cascade::forward_eager_attention_composition(
             &qkv,
             b,
             s,
@@ -1250,7 +1190,6 @@ mod tests {
             &rope,
             None,
             FullyMaskedPolicy::Propagate,
-            true,
         )
         .expect("eager reference composition");
         let out_eager = attn.out_lin.forward(&ctx).unwrap();
@@ -1310,7 +1249,7 @@ mod tests {
     #[ignore = "child process of distilbert_strict_mode_on_a_refused_domain_is_a_typed_error_in_a_fresh_process"]
     fn strict_mode_child_process_body() {
         // The sole test running in this spawned child process (no real
-        // contention), but the assertion at `training_attention_cascade`'s
+        // contention), but the assertion at `attention_cascade`'s
         // own `admit()` call site is unconditional — it does not
         // know this process holds no other test, only whether this thread
         // holds the lock.
@@ -1325,7 +1264,7 @@ mod tests {
         let flash = declined_flash();
 
         let err = attn
-            .forward_training(&hidden, &extended, &fused_masks, &flash)
+            .forward(&hidden, &extended, &fused_masks, &flash)
             .expect_err("head_dim=16 under Strict must be a typed refusal, not a silent eager");
         let msg = err.to_string();
         assert!(

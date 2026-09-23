@@ -5,6 +5,315 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The parity ladder's first full session on A100s is filed and its budgets derived.**
+  `ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/` holds every ladder's legs and verdict
+  from one GPU session at one commit: `train-run` torch → resident GREEN over twelve seeds (held-out
+  loss non-inferior and equivalent within the derived margin; 0.61× PyTorch's wall by medians,
+  0.52× its device memory, 0.81× its host memory), `train-step` torch → fused GREEN at six shapes,
+  `encode` plan → plan-partitioned → placed GREEN, and the refusals the other ladders produced,
+  each with its issue. `crates/jammi-bench/budgets.json` is derived from the GREEN verdicts by
+  `ci/scripts/perf/budgets_from_verdicts.py`, which the guard checks against them.
+- **The twins pad and measure as the engine does.** The train-run twin padded its training batches
+  up a power-of-two ladder and evaluated at natural width where the engine pads every batch up
+  `ShapeLadder`; every twin that pads shares one mirror, `shape_ladder.py`, and the train-run twin's
+  `--width bucketed` leg reproduces the engine's two token digests exactly, its natural-width leg
+  filed beside it. The train-step twin filed torch's allocator high-water mark as `peak_vram_bytes`
+  against the engine's driver-pool window and opened its own window after an untimed step; both
+  twins now measure device memory through one shared window (`vram.py`), opened where the engine
+  opens its own. The twin's `epoch_walls` carry the engine's `epoch` field.
+- **The producers soak the device before the first timed leg.** The first fused leg after any idle
+  gap starts on a boosted clock and slows 3–5 % across the run, which the stationarity gate
+  refuses; `finetune_run_ab.sh` and `finetune_step_ab.sh` run the first leg once untimed, then time.
+  The train-step producer measures 30 steps after 10 of warmup.
+- **The how-well lane spreads its seeds over pods.** `runpod_gpu_howwell.sh` takes `HOWWELL_PODS`,
+  gives each pod a share of the seeds and the controls, runs the torch-host script tests on the
+  first pod before any leg, and judges the merged legs once; a pod's seed or job wait tolerates
+  "no evidence yet" for a grace period before failing.
+- **The training ladders judge the product against PyTorch and nothing else.** `train-run` is
+  torch → resident → streamed → placed → shape-d and `train-step` is torch → fused: the eager
+  rung each had between torch and the product — the engine with fused-kernel families off —
+  decided nothing about parity, cost a third of every campaign seed, and on `train-step` was the
+  edge the gradient agreement was measured on, so the fused kernels' gradients were never
+  compared to torch's. The learning-rate-zero control and the gradient agreement move onto the
+  torch edge, whose outcome rules are hard. `finetune-run` takes no `--arm`; a leg's `arm` is
+  what its process resolved, `fused` or `eager`, stated once in `kernel_arm::arm_label` and
+  proven by the rung premise. Measured on an A100 80 GB in the campaign's setting, the
+  every-family-off composition holds 45 GiB at 8×128 against the fused arm's 3.7 and exceeds
+  the device at 8×512 and 16×128: candle's autograd keeps every operator's output alive for the
+  backward and materializes a gradient for every operand, and each LoRA site's eager epilogue
+  widens to `f32`. What the kernels are worth against that composition is the kernel tests'
+  question; `kernel-arm` stays as the diagnostic that derives such an arm.
+- **A guard holds a property; a script's test is a script test.** `ci/guards.toml` keeps the
+  properties of the tree — twenty-two of them — and `ci/scripts/run_script_tests.py` discovers and
+  runs every `test_*` file and every script's own `--self-test`, selected when a change touches the
+  scripts and provided with what each names on a `# needs:` line from the one host-need table,
+  `ci/needs.toml`, that both runners share through `ci/scripts/checks.py`. The two timing guards go
+  with their committed evidence and their producer: a pod build's duration and a prove leg's
+  silences are facts about the rig, and the two timeouts they derived are stated once where they
+  are set.
+- **The per-arch flash validation is the prove lane's.** `gpu-prove.yml`'s `encoders-cuda` group
+  runs ModernBERT-large's padded flash oracle on every arch's device and the encoder-level oracles
+  on the 80GB-class ones, so one prove run at a commit is the arch validation every release already
+  gates on. The arch-set producer, its committed artifacts, the freshness guard and its waiver file
+  go; the sm_89 leg proves on a 48GB device, which the oracle needs.
+- **Every flash-oracle arm is a training forward.** The oracle grades each arm on its adapter's
+  gradient, and the one forward puts the LoRA leaves on the tape only in training mode; the F32
+  reference arm built in eval mode had no gradient to grade and the sweep panicked on every 80GB
+  device. The oracle builder has no mode parameter now, and the docs the one forward left
+  describing the eval arm describe the forward as it is.
+- **The `structure` ladder.** `jammi-bench structure` runs `generate_structure_embeddings` at
+  `plan`, `plan-partitioned` and `placed` over the synthetic graph and files each leg with the edge
+  list and the engine's own seed rows; `torch_structure.py` evaluates the engine's stated operator
+  from those rows exactly, so the edge to `plan` is row agreement and the rungs above are exact.
+  `SeedSpec::row` is the public seam the reference starts from. The synthetic graph, its sources,
+  the hermetic session and the placed host are one module, `graph_legs`, that `propagate` and
+  `structure` share.
+- **The fine-tune run producer runs one stack's legs alone.** `FINETUNE_RUN_AB_ARMS` selects which
+  arms' legs run, in the block's order; a torch leg without the fused arm pairs with the adapter an
+  earlier run wrote, and the producer refuses before any leg naming each seed whose adapter is
+  missing.
+- **A training run's timed iteration is its optimizer step.** Every `EpochWall` carries
+  `step_walls`, the wall of each optimizer step inside the epoch's step span with checkpoint writes
+  excluded, so a `train-run` leg's `iter_wall_s` is one entry per step on every rung — the in-process
+  trainer and a placed attempt through the published metrics alike — and the PyTorch twin records the
+  same series. A four-epoch run used to carry four entries, which no speed rule could read.
+- **A producer's timed series meets the comparator's minimum.** `encode-step --iters` and
+  `propagate --iterations` default to the ladder's minimum series and refuse fewer; `encode_ab.sh`
+  measures sixteen serves per rung and builds the fused GPU stack (`cuda,jammi-encoders/flash-attn`)
+  like every other GPU producer, so a serve is measured on the arms a deployment admits.
+- **The live lanes' S3-class store is one pinned, maintained definition.** MinIO's community
+  edition is archived and its binaries withdrawn; the store every live lane runs against is now
+  versitygw (Apache-2.0), a stateless S3 gateway over a directory, pinned by release and checksum
+  in `ci/scripts/s3_test_store.sh` and used from there alone: `ci/dev.sh --with s3` runs it inside
+  the run's container, `distributed.yml` starts it in-job, and a GPU pod runs the same script. A
+  bucket is a directory and an object is a file, so a failed lane's artifacts are readable on disk.
+- **A campaign's reference arm is derived on the sites its legs adapt.** The LoRA site selector
+  is one constant, `finetune_run::DEFAULT_TARGET_MODULES`, behind every `--target-modules`
+  default in `jammi-bench` and behind `kernel-arm`'s census, and `finetune_run_ab.sh` forwards
+  `FINETUNE_RUN_AB_TARGET_MODULES` to the derive and to every leg alike; the dry run prints the
+  derive so its test holds the two to the same sites.
+- **sm89 is no longer an exception in the batch-composition oracle.** One fused forward for training,
+  evaluation and serving removed the eager composition this arch's kernel selection used to take in
+  evaluation: a re-measurement on an L40S over the same 8 compositions x 88 rows reports
+  `max_alone_vs_batch = 0e0` everywhere, exactly like sm80/sm86/sm90, and the window-radius red control
+  separates 20x above its asserted threshold. The arch-conditional floor and the lane skip that existed
+  for that noise are deleted.
+- **A pod seeds any tree whose lock file is correct.** The seed resolved with `cargo metadata --frozen`, which is
+  `--locked` plus "never reach the network" — only the first is a determinism property. A branch that adds a
+  dependency edge left the pod's registry short and the seed refused to build a perfectly correct tree. Resolution
+  is now `--locked`: the lock still rules and a lock disagreeing with its manifests is still refused.
+- **One comparator for every performance claim: the parity ladder.** `jammi-bench ladder`
+  judges every adjacent pair of rungs of a workload on speed, space and outcome, and every
+  bespoke merger beside it is gone: the step-level Jammi-vs-PyTorch sweep is the `train-step`
+  ladder (`torch → reference → fused`, `ci/scripts/perf/finetune_step_ab.sh`), the
+  parent-vs-PR inference comparison is the `encode` ladder's revision edge (`--revision
+  direct`, judged against the rung's own noise band widened by an in-session A/A twin,
+  `gpu_inference_ab.sh`), and the encode replicate check is that edge with one build on
+  every side. What differs between the two legs of an edge is one typed `Difference` — a
+  framework, a kernel arm, a layer, a revision. A rung's kernel arm is a set of fused-kernel
+  families; `jammi-bench kernel-arm` derives the `JAMMI_KERNELS_DISABLE` value from the
+  checkpoint's admission census, taken to a fixpoint over absorption, so an arm never names a
+  key the checkpoint never dispatches. Every producer fills one leg type
+  (`crates/jammi-bench/src/leg.rs`: payload, provenance, measurements, facts), identity is
+  declared once per payload, and `finetune-step` and its PyTorch twin emit per-step series and
+  the same whole-device peak-memory instrument. The seeded outcome's claim is non-inferiority
+  — the upper bound of the mean paired difference under `+δ` — with two-sided equivalence
+  reported beside it; a detected improvement is investigated. Budgets with no measurement
+  behind them are evidence, never gates, and live in `definition::budget`.
+- **The cluster watcher reads the id file before rank 0's liveness**, so a rank 0 that minted
+  the id and ended inside one poll interval is no longer reported as never having started.
+- **A context predictor is placed on the compute plane like every other training kind.**
+  Placement was decided per kind — a claimed `fine_tune` or `graph_fine_tune` attempt was
+  submitted as one Ballista task, a `context_predictor` never was — so in a fleet whose
+  executors claim nothing (`[worker] kinds = []`) a predictor trained on whichever process
+  claimed it and had no route to an executor's device. Where an attempt runs and how many ranks
+  share it are independent properties: every claimed training attempt is now the same one task,
+  `jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec`, whose descriptor
+  (`PlacedAttempt { job_id, attempt, submitter, device_kind }`) names no kind and no world
+  size — the executor takes the claim over and re-derives the run from the job's row. The
+  single-rank attempt is the degenerate case of the same object. Admission
+  (`Unheld::*`), the submitter exclusion, KIND MATCH, the engine's device-kind and fan-out
+  refusals, the re-launch guard and the executor-loss path hold for every kind alike. The
+  executor reads the predictor's source and embedding table through the shared catalog and
+  result root and publishes through the same artifact store; an executor lost mid-run costs the
+  attempt and the successor trains the job anew.
+- **A context predictor's training run is a function of its spec.** Its initial weights were
+  drawn from candle's process-global RNG, so two runs of one job published different bytes.
+  They are now drawn from a SplitMix64 stream keyed by `(seed, parameter name)`
+  (`jammi_ai::pipeline::seeded_init`), in the distributions the predictor's layers name, so
+  `ContextPredictorTrainConfig::seed` fixes the task partition AND the initial weights, and a
+  placed run's published weights are byte-identical to the in-process run's.
+  reached the submitter as a string, and a placed training attempt's failure reached it as a
+  `IncompatibleFormat` refusal, never a silent fall-through. A placed training attempt's failure
+- **The placed training task is named for what it carries.** `GangExec`/`GangDescriptor`
+  (`jammi_ai::operator::gang_exec`) are `PlacedAttemptExec`/`PlacedAttempt`
+  (`jammi_ai::operator::placed_attempt_exec`), and the descriptor's informational `world` is
+  gone — nothing read it, and the row holds the spec's `world_size`. `PlacedGangRunner`,
+  `HostAdmission::{install_placed_gang_runner, placed_gang_runner}`, `placed_gang_runner()` and
+  `JobWorker::run_placed_gang` are `PlacedAttemptRunner`, `{install_placed_attempt_runner,
+  placed_attempt_runner}`, `placed_attempt_runner()` and `JobWorker::run_placed_attempt`;
+  `adapter_files_digest` is `artifact_files_digest`. On the wire, `jammi.ballista.v1`'s
+  `GangExecNode` is `PlacedAttemptExecNode` (fields `job_id`, `attempt`, `submitter`,
+  `device_kind`), and `jammi.v1`'s `JammiErrorDetail.gang_fan_out` / `GangFanOutError` is
+  `placed_attempt_fan_out` / `PlacedAttemptFanOutError` (`JammiError::PlacedAttemptFanOut`, field
+  44 as before). Both cross only between processes of one version. The submitter's hand-off log
+  line is `run_placed_attempt: submitter HandedOff after the placed attempt's stream
+  completed`; an unheld attempt logs `the claimed attempt runs in this process`.
+  "Gang" names what it always did: several ranks rendezvousing over the `Peer` collective.
+- **The `shape-d` scheduler pod claims nothing.** `overlays/shape-d/jammi-scheduler.toml` runs
+  `[worker] enabled = false` with no `[ballista.client]` and no peer listener (the Deployment
+  and its Service drop port 9000). A claimed training attempt requires its claimant's device
+  kind — placed only on an executor listing it, trained in the claimant's process otherwise —
+  so an attempt claimed on the CPU scheduler pod trained there, never on a `cuda` compute pod.
+  The compute pods claim `fine_tune`, `graph_fine_tune` and `context_predictor` and train them
+  on their devices.
+  submits its own training attempt — the one `PlacedAttemptExec` task — through the session's
+  an unheld plan somewhere else — a materialization in this process, a training attempt in its
+  claimant's own body — decides that before anything crosses the wire. The admission is a pure predicate
+  a placed training attempt, its submitter as the executor it must not land on) and the live
+  inventory; `Unheld::OnlyTheSubmitter` names the attempt whose only live peer of its kind is
+  its own submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
+  role is the one way to name where a process submits: it installs the compute plane, and a
+  process hosting a scheduler names itself when its own claims are to be placed. The scheduler decodes a
+  `AsofJoinExec`/`KeyCheckExec`/`PlacedAttemptExec` as its own `jammi.ballista.v1`
+  than silently mis-running a stage whose `InferenceExec` or `PlacedAttemptExec` names a
+  byte-for-byte. A claimed training attempt of any kind runs under placement
+  as ONE Ballista task (`PlacedAttemptExec`), placed on an executor of its
+  claimant's device kind other than its own submitter; the submitting host's `HostAdmission` holder
+  runs the exact same body the attempt's claimant runs in-process (a `Peer`
+  gang's coordinator body included), so the published bytes are identical
+  either way, per device kind. Retries are jammi's alone: the scheduler pins `task_max_failures =
+  KIND (`InferenceExec::device_kind`, `PlacedAttempt.device_kind`, both
+  the binder stops binding to a draining executor at once, and a training
+  attempt the executor is still dialled with inside its grace is refused
+  before any claim transfer.
+
+### Added
+- **`generate_structure_embeddings`: an embedding table from an edge relation alone.** For a
+  graph whose nodes carry no content an encoder could read — a transaction graph, an id-only
+  entity graph, a citation graph without abstracts — the new verb encodes structure itself: a
+  very sparse random projection row per node, keyed by `(seed, node key)` so it is a function
+  of nothing else, scaled by `d̃^β`, propagated `K` hops by the engine's random-walk operator
+  over the self-loop-augmented graph, and read out as a weighted sum of the L2-normalised
+  per-hop blocks (FastRP, Chen et al. 2019, on this engine's operator: the self-loop makes
+  every graph admissible, a bipartite one included, and an isolated node a fixed point). The
+  output is an ordinary embedding table — searchable by row key (query-by-example), cacheable
+  under `CachePolicy::Use` over a pinned edge relation, recomputable from its
+  `ProducingDescriptor::GraphStructure`, placed on the compute plane through the embedding
+  sink. On a planted-partition graph of four communities its nearest neighbours share a node's
+  community 99.2% of the time (seed alone: 22.3%, base rate 24.7%). On every surface:
+  `StructureRequest` + `InferenceSession::generate_structure_embeddings`, the `graph_structure`
+  job kind, `PipelineService.GenerateStructureEmbeddings`, `_generate_structure_embeddings_proto`,
+  the Python `Database`/`RemoteDatabase.generate_structure_embeddings`, the TS client.
+- **`PropagationOutput::WeightedSum { weights }`.** The third readout of a propagation's hop
+  history beside `Final` and `JumpingKnowledge`: each block L2-normalised, weighed, summed —
+  `PROPAGATION_OUTPUT_WEIGHTED_SUM` + `hop_weights` on the wire, `output="weighted_sum"` +
+  `hop_weights=` in Python. The three are one family (`readout.rs`), folded by one operator.
+
+### Changed
+- **A propagation runs out of core.** `propagate_embeddings` no longer loads the edge set into
+  process memory under a row ceiling (`PropagateRequest::max_rows` and
+  `DEFAULT_PROPAGATE_MAX_ROWS` are gone): a hop is now a physical plan — the edge relation
+  joined to the node state, hash-partitioned by node, sorted by `(node, neighbour)`, folded by
+  `HopFoldExec` in one pass per group — planned under `QueryContext::out_of_core` (sort-merge
+  joins, batches sized in bytes for `d`-wide rows) and written through the embedding sink, so
+  it spills, is bounded by the spill disk, refuses typed (`ResourcesExhausted`) below a hop's
+  sort reservations, and is placed on the compute plane like every other embedding producer.
+  The byte-identical contract holds across `target_partitions`, edge row orders, and spilling
+  (proved in `graph_propagation::plan::tests`); the existing hand-checked oracles reproduce
+  bit for bit. The operators cross the plane through `JammiCodec` (`InitialStateExec`,
+  `HopFoldExec`, `ReadoutExec`).
+- **A propagation reads its graph once.** The oriented, deduplicated, self-loop-augmented
+  adjacency is snapshotted at the start of a propagation as a working table
+  (`ResultTableKind::Working`, wire `WORKING = 6`) sorted by `(n, g)`, and every hop — and the
+  degrees — read the snapshot: an edge source with no version surface that moves mid-run can no
+  longer give hops that disagree, the per-hop join streams the snapshot with no sort and no
+  aggregate, and a placed hop reads it from the shared store. The table is a `building` row the
+  propagation holds under its lease and never promotes; it is aborted (row failed, bytes deleted)
+  when the propagation lands, fails or is dropped mid-flight, and reclaimed by the lease sweep when
+  its process is gone. A propagation of `K` hops runs as `K` plans — one hop each, every stage's
+  state a working table of the same kind the next stage reads, reclaimed once read — never as one
+  plan nesting the hops: every walker of a plan (the optimizer, the wire codec, the plane's stage
+  planner) recurses over its depth on a fixed stack, and a hop is deep.
+- **The session's memory pool is fair among the spilling consumers holding memory.**
+  `GreedyMemoryPool` let one sort that fit early hold `[engine] memory_limit` while it streamed
+  out, refusing the next operator's single batch; `FairSpillPool` divides the pool among the
+  consumers *registered*, which for a deep plan is every sort and join of every stage at once, so a
+  roomy pool spilled and the refusal floor grew with the plan's depth. `ActiveSpillPool`
+  (`jammi_db::memory_pool`) holds a spilling consumer to an equal share among those holding a
+  non-zero reservation: an idle one takes no share, a lone one may take the pool, two split it, and
+  a refusal is the typed `ResourcesExhausted`.
+
+### Changed
+- **A served result table is written in key order; its ANN index is built in parallel
+  segments.** The model still forwards rows in cost order, but `_ordinal` is now the row's
+  position in the input's order — key order `(key, _content_hash)` for a keyed input — and
+  the plan puts the model's output back in that order (one `SortExec` on `_ordinal` over the
+  coalesced partitions, under the session's memory pool and spilling past `[engine]
+  memory_limit` — a 10 MiB floor at every fan-out), so an embedding table is clustered by `_row_id` again: a key lookup over a
+  million-row table reads one row group of sixteen (7 ms, 3.5 MB) where the cost-ordered
+  table read all sixteen (35–82 ms, 133 MB), and a ten-key join 24 ms against 83 ms. The
+  sink hands the written rows to a `SegmentBuilder`: ANN segments of
+  `[embedding] index_segment_rows` consecutive rows (default 4096), each built on its own
+  thread in row order — an HNSW graph is a function of its insertion order, so determinism
+  is a property per segment, never per table — and appended in order; the layout is a
+  function of the rows and the budget alone, identical at every partition count and on every
+  executor (`the_written_bytes_are_identical_at_every_fan_out` now checks the segment row
+  counts and every search's answer across fan-outs). A 65536-row, 384-wide index builds in
+  1.7 s as sixteen segments where one took 23.6 s, and a 16384-row serve waits 0.2 s for
+  its last segment where it built the whole index, 1.0 s, after the last row. `compact_embeddings` rewrites a table's
+  segments at the same budget. `SinkSummary` reports `segments` (every id, in order) in place
+  of one optional `segment_id`; `SinkKind::Embeddings` carries `segment_rows`. An
+  `InferenceExec` partition that receives no rows never binds the model. The tokenizer holds
+  one truncation-configured `tokenizers::Tokenizer` per truncation length instead of cloning
+  the tokenizer — whose model cache a clone starts empty — on every call; a 64-row batch at a
+  32k BPE vocabulary tokenises in 3.1 ms where the per-call clone took 4.9 ms, the ids
+  identical. `BatchEncoding` carries no `type_ids` (no reader consumed them). The `encode`
+  ladder's `direct` rung and `torch_encode.py --order plan` (was `corpus`) forward the chunks
+  the plan cuts — the rows ordered by the model's own row costs, cut under the budget on the
+  shape ladder — so every rung's artifact is byte-identical again; `batch_tokens`
+  (`--batch-tokens`) is on the leg beside `batch_size` as an identity field, and a leg's
+  `padded_tokens` is what those chunks pad to.
+- **Forward chunks are cut by row cost under a token budget.** The model-facing input
+  (`NumberedInputExec`) now costs every row with the model's own tokenizer (one for a
+  fixed-shape image or clip), orders a keyed input by `(cost, key, _content_hash)` — the key
+  on its own type, no longer its `Utf8` rendering — and cuts the forward chunks in one pass
+  under `[inference] batch_size` rows and the new `[inference] batch_tokens` padded tokens
+  (default 16384), carrying each row's chunk as `_chunk`; the fan-out exchange hashes on
+  it. Rows that share a forward are nearly equal in length, so a variable-length corpus
+  pads to little more than its real tokens (1.08× measured, from 1.87× in key order), and
+  the token budget bounds a forward's activation memory where a row count could not. A
+  text forward pads to `jammi_numerics::ShapeLadder` — power-of-two divisions, eight rungs
+  per octave, every rung a multiple of 8, capped at the model's sequence limit: padding
+  within an eighth of the batch's natural width, 32 distinct widths up to 512 — and the
+  trainer pads every batch of a run, a training step's and an evaluation pass's alike, on
+  that same ladder (a 289-token batch runs at 320, where a power-of-two ladder ran it at
+  512, and an evaluation pass no longer adds one resident shape per distinct held-out
+  width); `ChunkBudget`/`ChunkCutter` live beside it. Tokenisation, image and
+  audio decoding (`LoadedModel::prepare`) run before the device is admitted; the forward
+  (`forward_prepared`) alone runs under it. The written bytes stay identical at every
+  partition count, under every arrival order, and on every executor; an embedding's low
+  bits move once, since its chunk-mates (hence padded width) differ from the key-order cut.
+  `OutputAdapter::adapt` takes its `BackendOutput` by value, so an embedding head's buffer
+  becomes the column without a copy.
+- **One encoder forward for training, evaluation and serving.** Every encoder (ModernBERT,
+  BERT, DistilBERT, CLIP text, OpenCLIP vision, HTSAT audio), the house LayerNorm, the GELU
+  seam, the attention cascade and the LoRA site take the same fused-or-fallback admission
+  decisions on every forward; whether a forward belongs to a training step changes only the
+  LoRA sites — on the tape and drawing dropout, or detached and dropout-free
+  (`LoraLinear::set_training`/`set_dropout`) — so a serve dispatches flash, memory-efficient
+  or block attention exactly as a training step does (426 → 1040 rows/s on an A100 at f32),
+  an evaluation pass retains no graph (a fine-tune at `--max-seq-length 512 --batch 32` that
+  ran out of 80 GB peaks at 31 GB), and one set of pinned values per architecture holds for
+  every mode. `LoraLinear::load_weights` sets the adapter's live `Var`s in place, so a
+  resumed run trains what it restored. Every forward's admission decisions are the loaded
+  model's own record (`LoadedModel::kernel_admission`, an `AdmissionLedger`), which the
+  `encode` ladder reads its `attention_arm` off — never a constant — and the fine-tune
+  worker's acceleration probe attributes its window thread-locally (`ProbeWindow`), so a
+  forward on another thread never enters it. `TrainingLoop::encoder_forwards` counts every
+  forward in a run, and the positive-proof equation's multiplier is `forwards_measured`,
+  never the optimizer step count. `LayerNorm` and the context predictor have no training
+  mode to switch.
 
 ### Fixed
 - **A placed job whose executor is lost fails typed at the loss, and its attempt has a
@@ -116,6 +425,89 @@ workspace ships every publishable crate at the same
   `Unheld::OnlyTheSubmitter` names the gang whose only live peer of its kind is its own
   submitter. `worker_devices` spells a device kind through `ComputeDeviceKind::wire_str`.
 
+### Changed
+- **The engine's serving path is one workload with rungs, not three tiers.** `jammi-bench
+  encode-step` produces the `encode` ladder's engine rungs — `--rung direct` (the loaded model
+  called on the rows, no plan), `plan` (the real verb at one partition), `plan-partitioned` (at
+  `--partitions` N) — for `--task embed|infer`, over a `--rows` sweep of a seeded
+  variable-length corpus, on CPU or `--cuda`, over `--model-dir` or the compiled-in fixture;
+  `model-inference-scale`, `rebuild-model-inference-spec` and `gpu-inference-scale`, their
+  report structs, the committed `baselines/model_inference.json`, the nightly and release
+  `run_scale_tiers.sh` row, and the pod GPU perf A/B pipeline (`gpu_inference_ab.*`,
+  `runpod_gpu_perf_ab.sh`, `gpu-perf-ab.yml`, the A/A-null band and its artifacts) are gone.
+  What they gated is a rung or leg property: a rung that is not deterministic across its
+  serves, or an `infer` rung that lost a row, is an error and never a leg; `direct`, `plan` and
+  `plan-partitioned` persist byte-identical artifacts (a hermetic test, and the ladder's outcome
+  axis); the plan's cost over the bare model is the `direct` → `plan` edge, judged by
+  `jammi-bench ladder encode` from legs served interleaved in one process. Every (unit, take)
+  runs in a child under the device-memory sampler; a leg carries its per-iteration time series
+  (`iter_wall_s`), and a `plan` leg where each serve's time went inside the result-table sink
+  (`sink_phases`: input, extract, Parquet, the wait on the segment builds, segment — the
+  sink's own `SINK_PHASES_TARGET` event — and the builds' summed thread time beside them). `EncodeStepTier` is that leg (`rung`/`partitions`/`session_rungs`/
+  `take` provenance); `jammi-bench sample-device -- CMD` wraps any process under the one
+  device-memory instrument, and the `nvidia-smi` probe names its ordinal instead of reading
+  device 0's line. `crates/jammi-bench/reference/torch_encode.py` is the `torch` rung by the
+  same leg contract (both row orders, `--ann-index`, `--sampler-bin`); `ci/scripts/perf/encode_ab.sh`
+  runs every rung's legs as a palindrome and hands each legs directory to the comparator, and
+  decides nothing. `LoadedModel::max_sequence_length` exposes the truncation bound the loaded
+  text forward applies.
+
+### Added
+- **The graph-learning workloads are measured as legs, with PyTorch rungs.** `jammi-bench
+  graph-sample`, `propagate` and `predictor-train-run` each run the engine's own code path —
+  the biased-walk sampler over a graph directory, `propagate_embeddings` at `target_partitions`
+  1 and N over a size sweep, context-predictor meta-training from seeded initial weights — and
+  file one leg per point under `--legs-dir` as the ladder reads it (`<rung>__<unit>__r<take>.json`,
+  the block under `graph_sample` / `propagate` / `predictor_train_run`, each payload declaring its
+  identity once): the warm per-iteration series, the work, the two memory peaks, the outcome
+  digest, vectors as little-endian `f32` rows, the walks' second-order transition counts as
+  `law_observed` against the unit's law file the sampler writes from node2vec's analytic law
+  (`graph_sample::node2vec_transition_law`), a predictor's held-out trajectory anchored at init;
+  a sweep runs one process per point, and `jammi-bench ladder graph-sample | propagate |
+  predictor-train-run` reaches its law, row-agreement and seeded-loss verdicts over them.
+  `graph-pairs` writes the pair table a `fine_tune_graph` job trains on, in its `_ordinal` order,
+  in the triplet row shape `finetune-run --train-jsonl` reads; `graph-fixture` writes the
+  committed synthetic graph at any size. `crates/jammi-bench/reference/{torch_graph_sample,
+  torch_propagate, torch_context_predictor}.py` are the PyTorch rungs over the same files (the
+  predictor twin covers every member, `--arch Cnp | AttnCnp | Tnp`), with
+  every reproduced and differing aspect stated in each script and the README; the `torch graph
+  rungs` guard (`torch-host` lane) holds each against an oracle. `cookbook/fixtures/
+  tiny_citation_graph/` is a small graph with declared citation edges over the cookbook corpus.
+- **`GraphSampler::sample_observing_walks`** hands every biased walk to a caller before its rows
+  are emitted; `SampledPair` carries node ids beside text. `parallel_train::train_loop` reports
+  every step's loss and wall-clock. `jammi_lora::{gaussian_for_param, uniform_for_param}` are the
+  seeded per-parameter draws; `context_predictor::{build_context_predictor,
+  fit_context_predictor}` are the training job's build and optimisation halves.
+
+### Changed
+- **`Tnp` is a Pre-LN transformer.** Each block normalises its tokens before the attention and
+  before the MLP (`layer.N.attn_norm`, `layer.N.mlp_norm`, biased LayerNorm, eps `1e-5`, the
+  encoders' one LayerNorm) and a `final_norm` precedes the head — the placement of Xiong et al.
+  2020. Measured: the un-normalised blocks amplified one ulp in one weight to a loss difference
+  of `1.9e-1` within 180 steps at the committed learning rate, so two trainings from identical
+  inputs could not be paired; with the norms the gap is `3e-3` and the weights agree to `3e-7`.
+  `AnyContextPredictor::set_training` switches the norms between their fused eval forward and
+  their gradient-carrying training forward; `fit_context_predictor` holds training mode for the
+  loop. A `Tnp` weight bundle without the norm tensors does not load.
+- **`Tnp`'s key projection carries no bias.** Every key of a block passes through it, so a key
+  bias adds one constant to a whole softmax row and cannot change the output; its gradient is
+  rounding residue that Adam turned into a full-size random walk of a parameter that meant
+  nothing. `layer.N.k.bias` is no longer registered; a `Tnp` weight bundle holding it does not
+  load.
+- **A context predictor's initial weights are a pure function of `seed`.** Every linear layer is
+  drawn from a stream keyed by the seed and the parameter's name, never from the process's random
+  state, so two trainings at one seed start from byte-identical parameters on any machine.
+- **A graph fine-tune refuses `hard_negatives > 1`** at admission (`GraphSampleConfig::
+  validate_for_training`): a training row carries one explicit hard negative, so more would be
+  mined and never trained. The sampler itself still mines any count.
+- **The `graph-train-scale`, `propagate-scale` and `context-predictor-scale` tiers, their
+  committed same-box rates and `f32` digests, and `baselines/{graph_train,propagate}.json` are
+  gone**, subsumed by the legs above. What they held stays hermetic: the sampler's cross-machine
+  pair digest (`baselines/graph_sample.json`) with its seed and walk-length teeth, propagation's
+  same-machine determinism across partitions with its hop and `α` teeth, and the served
+  predictor's same-machine digest over the committed weight bundle with its `context_k` teeth.
+  `run_scale_tiers.sh` runs the remaining tiers; the perf workflow's teeth-proof inflates
+  `model_inference.json`.
 ### Added
 - **The result-table sink is the plan node the compute plane carries.**
   `jammi_db::store::ResultTableSinkExec` roots every result-table materialization — an

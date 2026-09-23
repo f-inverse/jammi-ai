@@ -1,0 +1,224 @@
+{
+  "workload": "encode",
+  "from": "plan",
+  "to": "placed",
+  "edges": [
+    {
+      "edge": "plan -> plan-partitioned",
+      "difference": {
+        "kind": "layer",
+        "name": "the same plan, N partitions"
+      },
+      "units": [
+        "rows16",
+        "rows1024",
+        "rows16384"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 3,
+        "units": 3
+      },
+      "speed": {
+        "cost": {
+          "of_minima": 0.9792679610395992,
+          "of_medians": 0.9483028885957416,
+          "interval": {
+            "lower": 0.9227600550318528,
+            "upper": 0.9682925927682904
+          }
+        },
+        "noise_band": 1.0595311245585257,
+        "indistinguishable_from_one": true,
+        "aa_null": null,
+        "shape": {
+          "lower": {
+            "intercept": 0.07664481682416868,
+            "slope": 0.0006222191159623217,
+            "residual_rms": 0.05354670930131083,
+            "n": 3
+          },
+          "upper": {
+            "intercept": 0.08006980679286713,
+            "slope": 0.0005767240226481518,
+            "residual_rms": 0.05445769406226727,
+            "n": 3
+          },
+          "fixed_work_equivalent": 5.504475643441729,
+          "per_work_ratio": 0.9268825207277547
+        },
+        "time_to_quality": null
+      },
+      "space": {
+        "host_ratio": null,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "overhead_budget",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "upper/lower time at most 0.9683, budget UNBUDGETED"
+        },
+        {
+          "rule": "fixed_cost",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "the layer's fixed cost is worth 5.5 units of work, budget UNBUDGETED"
+        },
+        {
+          "rule": "per_work_cost",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "per-work cost x0.9269, budget UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [],
+      "status": "GREEN"
+    },
+    {
+      "edge": "plan-partitioned -> placed",
+      "difference": {
+        "kind": "layer",
+        "name": "the same plan on a Ballista executor"
+      },
+      "units": [
+        "rows16",
+        "rows1024",
+        "rows16384"
+      ],
+      "outcome": {
+        "kind": "digest",
+        "units_equal": 3,
+        "units": 3
+      },
+      "speed": {
+        "cost": {
+          "of_minima": 1.4269692472599758,
+          "of_medians": 1.608743073027391,
+          "interval": {
+            "lower": 1.5911118479011497,
+            "upper": 1.644546544634131
+          }
+        },
+        "noise_band": 1.0595311245585257,
+        "indistinguishable_from_one": false,
+        "aa_null": null,
+        "shape": {
+          "lower": {
+            "intercept": 0.08006980679286713,
+            "slope": 0.0005767240226481518,
+            "residual_rms": 0.05445769406226727,
+            "n": 3
+          },
+          "upper": {
+            "intercept": 0.10834376161352255,
+            "slope": 0.0006260722598231997,
+            "residual_rms": 0.04894060786948331,
+            "n": 3
+          },
+          "fixed_work_equivalent": 49.02510336023373,
+          "per_work_ratio": 1.085566467213304
+        },
+        "time_to_quality": null
+      },
+      "space": {
+        "host_ratio": null,
+        "device_ratio": null,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "overhead_budget",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "upper/lower time at most 1.6445, budget UNBUDGETED"
+        },
+        {
+          "rule": "fixed_cost",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "the layer's fixed cost is worth 49.0 units of work, budget UNBUDGETED"
+        },
+        {
+          "rule": "per_work_cost",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "per-work cost x1.0856, budget UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "not measured on every leg"
+        }
+      ],
+      "refusals": [],
+      "status": "GREEN"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [],
+  "causes": [],
+  "status": "GREEN"
+}

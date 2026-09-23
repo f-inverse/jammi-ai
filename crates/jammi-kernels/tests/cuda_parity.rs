@@ -385,7 +385,7 @@ const F32_GELU_ERF_LIBM_ULPS: f32 = 8.0;
 /// Total `< 1 + 2 = 3` ULPs of the output. `k = 3`.
 ///
 /// This is NOT an ad-hoc widening: at `k = 2` the a100 (`compute_cap 8.0`)
-/// and l40s (`8.9`) arch-set artifacts BOTH measure worst `Δ/bound`
+/// and l40s (`8.9`) device runs BOTH measure worst `Δ/bound`
 /// EXACTLY `1.0` on `geglu_parity_multi_block_exact_multiple_of_block_size`
 /// — a bound sitting precisely on its own worst case, i.e. one library
 /// revision from a false RED — and the 2-ULP delta they measure is the
@@ -5832,8 +5832,7 @@ fn bf16_round_bound(value: f64) -> f64 {
 /// Sweep results (both blocks, both arches — identical within each arch):
 /// - **sm89 (L40S)**: worst element index `244121`, `diff = 1.2832888`,
 ///   `bound = 1.0417905` (at the prior `abs_floor = 1.0`),
-///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over; measured by
-///   `crates/jammi-kernels/artifacts/cuda-runs/2026-08-28-m3-arch-set-80a451a-l40s.json`),
+///   `ratio = 1.231811` (FAILED all 40 — `23.2%` over, measured on an L40S),
 ///   `required_floor = 1.2414983` (the TRUE minimal sufficient floor for
 ///   this element, independent of whatever `abs_floor` is in effect — see
 ///   the test body's own `max_required_floor` for the exact,

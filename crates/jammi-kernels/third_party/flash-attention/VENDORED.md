@@ -259,9 +259,10 @@ parity leg exists on that exact arch; `build.rs::VALIDATED_SMS` is the
 actual admitted set every fence reads, and this table is the evidence
 pointer for each of its entries — the single source to cross-check when
 reasoning about what has ACTUALLY been proven, as opposed to merely
-compiled). Per-arch evidence lives in
-`crates/jammi-kernels/artifacts/cuda-runs/*-arch-set-*-{a100-sxm4,a40,l40s,h100-hbm3}.json`
-(e.g. `2026-09-02-446-arch-set-7567b25-a40.json`).
+compiled). The evidence is the prove lane (`gpu-prove.yml`): its
+`encoders-cuda` group runs the padded flash oracle on every arch's device and
+the encoder-level oracles on the 80GB-class ones, and every release gates on
+that lane's verdict for the commit it ships.
 
 | arch | compute cap | bwd tile path | GPU parity leg | status |
 |---|---|---|---|---|
@@ -270,7 +271,7 @@ compiled). Per-arch evidence lives in
 | sm89 (L40S) | `(8, 9)` | 64×128 | Same leg set/coverage as sm86 (A40) — identical 64×128 tile class | **VALIDATED for flash-attn admission**, same coverage caveat and `lora_linear` cross-reference as sm86 |
 | sm90 (H100) | `(9, 0)` | 128×128 | Full four-gencode-build suite, ALL legs, INCLUDING the 80GB-class encoder-level tests (the H100 SKUs used are 80GB-class, above the VRAM floor) | **VALIDATED** — fully green, also proves the `sm_90` gencode loads at all (a genuinely different major, not merely a forward-compat question) |
 
-This table's own truth is enforced standing, not merely asserted once and trusted forever: `ci/scripts/check_arch_validation_freshness.py` re-demands the evidence above on every CI run — it requires each `VALIDATED_SMS` entry to have a committed, GREEN, ancestor-sha artifact under `crates/jammi-kernels/artifacts/cuda-runs/` (the discriminator is exactly the `compute_cap <major>.<minor>` substring each `box` field above carries) whose evidence predates no later change to `build.rs`, `src/flash/`, this directory (including this file), or `src/admission.rs`; a later change to any of those without a fresh GPU pass turns a VALIDATED cell red on the next CI run rather than leaving it silently stale.
+This table's own truth is the prove lane's: a release of a commit whose lane did not run green on one of these arches does not ship.
 
 ### `ptxas -v` register/spill counts
 

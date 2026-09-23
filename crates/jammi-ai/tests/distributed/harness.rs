@@ -50,7 +50,7 @@ const RANK_TIMEOUT_SECS: u64 = 10;
 /// (`shared_config`).
 const MAX_WORLD_SIZE: u32 = 2;
 
-/// Build the harness's own session against the shared Postgres + MinIO,
+/// Build the harness's own session against the shared Postgres + the S3 store,
 /// rooted at `result_root`. It runs `[worker] enabled = false` and spawns no
 /// worker, so it only submits queued jobs and observes — the spawned children
 /// do the claiming.
@@ -65,12 +65,12 @@ pub async fn harness_session(
     let config = shared_config(backends, result_root, dir.path());
     let session = InferenceSession::open(config)
         .await
-        .expect("harness session connects to shared Postgres + MinIO");
+        .expect("harness session connects to shared Postgres + the S3 store");
     (session, dir)
 }
 
 /// The config the harness session and the spawned workers share: the same
-/// Postgres catalog, the same MinIO-backed `result_root`, the same short worker
+/// Postgres catalog, the same store-backed `result_root`, the same short worker
 /// timing. `artifact_dir` is per-process local scratch (fetch cache, logs); the
 /// durable state lives entirely in the shared catalog + object store.
 fn shared_config(
@@ -178,7 +178,7 @@ impl Fleet {
     /// Spawn `n` `jammi-server` workers, each with a distinct `JAMMI_WORKER_ID`
     /// (`worker-1`..`worker-n`), distinct gRPC + health ports, the shared
     /// catalog + `result_root`, the short worker timing, and `[worker] enabled`
-    /// (Shape D's compute node: `services = []`, the worker on). The MinIO
+    /// (Shape D's compute node: `services = []`, the worker on). The store's
     /// credentials are passed through the child env so the
     /// worker's S3 driver authenticates exactly as the harness session does.
     /// Every job-shaped test's own placement stays [`PlacementKnob::Local`]
@@ -374,9 +374,9 @@ fn spawn_worker(
         .arg("--config")
         .arg(&config_path)
         .env("JAMMI_WORKER_ID", worker_id)
-        // The S3 driver authenticates from these (MinIO creds). The harness
+        // The S3 driver authenticates from these (the store's creds). The harness
         // session reads the same root with the same creds, so write-on-worker /
-        // read-on-harness round-trips over real MinIO.
+        // read-on-harness round-trips over the real S3 store.
         .env("AWS_ACCESS_KEY_ID", &backends.access_key_id)
         .env("AWS_SECRET_ACCESS_KEY", &backends.secret_access_key)
         .env("AWS_REGION", &backends.region)
@@ -428,7 +428,7 @@ impl WorkerPorts {
 
 /// Render a worker's `jammi.toml`. The S3 secrets are deliberately absent — they
 /// arrive as `AWS_*` env on the child — so the rendered file carries no
-/// credential. `allow_http` lets the S3 driver talk plain HTTP to MinIO.
+/// credential. `allow_http` lets the S3 driver talk plain HTTP to the store.
 fn worker_toml(
     result_root: &str,
     pg_url: &str,
@@ -535,7 +535,7 @@ fn jammi_server_binary() -> PathBuf {
 
 /// The generous terminal-state timeout: spawned workers must boot (process
 /// start + Postgres connect + migrate + tier mount), poll, claim, run a tiny
-/// CPU LoRA fine-tune, publish to MinIO, and finalize — all under a 3 s lease
+/// CPU LoRA fine-tune, publish to the S3 store, and finalize — all under a 3 s lease
 /// with reclaim on a crash. 120 s comfortably covers a cold CI runner while
 /// still failing fast on a genuinely stuck fleet.
 /// The bound is a generous backstop against a wedged or starved machine,

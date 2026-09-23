@@ -25,7 +25,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::{
     asof_join_from_proto, assemble_context_request_from_proto, assemble_context_to_proto,
     build_neighbor_graph_from_proto, propagate_request_from_proto, recompute_from_proto,
-    recompute_report_to_proto,
+    recompute_report_to_proto, structure_request_from_proto,
 };
 use jammi_db::error::JammiError;
 use tonic::{Request, Response, Status};
@@ -34,7 +34,8 @@ use crate::grpc::proto::embedding::ResultTable;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineService;
 use crate::grpc::proto::pipeline::{
     AsofJoinRequest, AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
-    PropagateEmbeddingsRequest, RecomputeReport as ProtoRecomputeReport, RecomputeRequest,
+    GenerateStructureEmbeddingsRequest, PropagateEmbeddingsRequest,
+    RecomputeReport as ProtoRecomputeReport, RecomputeRequest,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
@@ -89,6 +90,28 @@ impl PipelineService for PipelineServer {
 
         let (record, outcome) = scoped(&self.session, tenant, || async {
             self.session.propagate_embeddings(&req, cache).await
+        })
+        .await
+        .map_err(map_engine_error)?;
+
+        Ok(Response::new(jammi_wire::result_table_with_outcome(
+            record,
+            jammi_wire::cache_outcome_to_proto(&outcome),
+        )))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn generate_structure_embeddings(
+        &self,
+        request: Request<GenerateStructureEmbeddingsRequest>,
+    ) -> Result<Response<ResultTable>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let (req, cache) = structure_request_from_proto(request.into_inner())?;
+
+        let (record, outcome) = scoped(&self.session, tenant, || async {
+            self.session
+                .generate_structure_embeddings(&req, cache)
+                .await
         })
         .await
         .map_err(map_engine_error)?;

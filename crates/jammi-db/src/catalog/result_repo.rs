@@ -48,6 +48,16 @@ pub enum ResultTableKind {
     /// record like [`AsofJoin`](Self::AsofJoin): no ANN sidecar, excluded
     /// from embedding-table resolution, named by the statement.
     Statement,
+    /// A producer's working relation — a graph propagation's adjacency
+    /// snapshot, or the state one of its hops hands the next. Not data of
+    /// record: the producer that writes it holds the `building` row for as
+    /// long as it reads the relation, reads the Parquet back through the
+    /// handle, and never promotes it — so the row ends `failed` and its
+    /// bytes are reclaimed by the lifecycle every unpromoted `building` row
+    /// has (the writer's abort, its handle's drop, or the lease sweep once
+    /// its process is gone). No ANN sidecar, and never `ready`, so no
+    /// resolution can select it.
+    Working,
 }
 
 impl ResultTableKind {
@@ -75,6 +85,7 @@ impl ResultTableKind {
             Self::AsofJoin => "asof_join",
             Self::TrainingSet => "training_set",
             Self::Statement => "statement",
+            Self::Working => "working",
         }
     }
 

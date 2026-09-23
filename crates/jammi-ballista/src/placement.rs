@@ -5,13 +5,13 @@
 //! Round-robin over executor slots, with three refinements over plain
 //! round-robin:
 //!
-//! 1. A stage whose plan contains a `GangExec` is never bound to the
+//! 1. A stage whose plan contains a `PlacedAttemptExec` is never bound to the
 //!    executor whose id equals the descriptor's own `submitter` instance id
 //!    — the submitter's own host holds a rank/job admission for the whole
-//!    await, so binding the gang task back to it would
+//!    await, so binding the attempt's task back to it would
 //!    deadlock the placed run against itself.
 //! 2. KIND MATCH: a stage
-//!    whose plan carries a required device kind — a `GangExec` (its
+//!    whose plan carries a required device kind — a `PlacedAttemptExec` (its
 //!    descriptor's own stamped `device_kind`, CPU included) or an
 //!    `InferenceExec` (its `spec().device_kind`) —
 //!    [`crate::engine::required_device_kind`], the ONE predicate this policy
@@ -22,18 +22,18 @@
 //!    a join through `workers.instance_id`, see that method's doc). A stage
 //!    carrying no device kind (a plain scan/shuffle stage) is unconstrained
 //!    by this refinement. The predicate is KIND MATCH, never "is this
-//!    GPU-bound": a gang's kind is a property of its DESCRIPTOR, not of the
-//!    node type — a CPU-stamped gang must bind to a CPU executor, exactly
+//!    GPU-bound": a placed attempt's kind is a property of its DESCRIPTOR, not of the
+//!    node type — a CPU-stamped attempt must bind to a CPU executor, exactly
 //!    as a CPU-stamped `InferenceExec` does.
-//! 3. A `GangExec` stage whose job row is already `claimed_by` an executor
+//! 3. A `PlacedAttemptExec` stage whose job row is already `claimed_by` an executor
 //!    OTHER than this stage's own submitter is never bound to ANY slot —
 //!    the bind-time half of the re-launch guard (`transfer_claim` is the
 //!    other half): Ballista's own reset-on-
-//!    `ExecutorLost` can re-offer a gang's task for binding after the
+//!    `ExecutorLost` can re-offer an attempt's task for binding after the
 //!    original launch already transferred the claim, and this predicate
 //!    refuses that second launch before it ever reaches an executor. A job
 //!    row this policy cannot read (deleted mid-round, or a genuine fault)
-//!    is folded into the SAME refusal — never bind a gang task whose
+//!    is folded into the SAME refusal — never bind an attempt's task whose
 //!    ownership cannot be verified.
 //!
 //! The slot CAS ([`jammi_db::catalog::Catalog::bind_compute_slots`]) happens
@@ -142,10 +142,10 @@ impl DistributionPolicy for DevicePlacement {
             .into_iter()
             .collect();
 
-        // Refinement 3's row-read cache, keyed by the FINE-TUNE catalog
-        // job_id (`GangDescriptor::job_id`, read lazily below — never
-        // Ballista's own `JobId`, see `gang_descriptor_of`'s doc) so a
-        // job with multiple runnable gang stages across rounds reads its
+        // Refinement 3's row-read cache, keyed by the TRAINING job's catalog
+        // job_id (`PlacedAttempt::job_id`, read lazily below — never
+        // Ballista's own `JobId`, see `placed_attempt_of`'s doc) so a
+        // job with multiple runnable placed-attempt stages across rounds reads its
         // row at most once per `bind_tasks` call. `None` (unclaimed,
         // should not occur for a `running` row but is not itself a fault)
         // never triggers the guard; an unreadable row is folded into
@@ -166,10 +166,10 @@ impl DistributionPolicy for DevicePlacement {
             let mut black_list: Vec<usize> = Vec::new();
             while let Some((stage, task_id_gen)) = graph.fetch_running_stage(&black_list) {
                 // Refinement 3's re-launch guard reads the descriptor's OWN
-                // fine-tune job id (`crate::engine::gang_descriptor_of`'s
+                // training job id (`crate::engine::placed_attempt_of`'s
                 // doc), never the outer loop's Ballista `JobId`.
-                let gang_descriptor = crate::engine::gang_descriptor_of(&stage.plan).cloned();
-                if let Some(descriptor) = &gang_descriptor {
+                let placed_attempt = crate::engine::placed_attempt_of(&stage.plan).cloned();
+                if let Some(descriptor) = &placed_attempt {
                     let claim = match claim_of.get(&descriptor.job_id) {
                         Some(cached) => cached.clone(),
                         None => {
@@ -192,7 +192,7 @@ impl DistributionPolicy for DevicePlacement {
                                 stage_id = stage.stage_id,
                                 submitter = %descriptor.submitter,
                                 claimed_by = %claimant,
-                                "jammi-ballista DevicePlacement: refusing to bind a GangExec \
+                                "jammi-ballista DevicePlacement: refusing to bind a PlacedAttemptExec \
                                  whose job row is already claimed by another instance — the \
                                  re-launch guard"
                             );
@@ -201,7 +201,7 @@ impl DistributionPolicy for DevicePlacement {
                         }
                     }
                 }
-                let gang_submitter = gang_descriptor.as_ref().map(|d| d.submitter.clone());
+                let attempt_submitter = placed_attempt.as_ref().map(|d| d.submitter.clone());
                 let required_kind = crate::engine::required_device_kind(&stage.plan);
                 let runnable_partitions: Vec<usize> = stage
                     .task_infos
@@ -223,7 +223,7 @@ impl DistributionPolicy for DevicePlacement {
                         }
                         let executor_id = slots[idx].executor_id.clone();
                         let eligible = slots[idx].slots > 0
-                            && gang_submitter.as_deref() != Some(executor_id.as_str())
+                            && attempt_submitter.as_deref() != Some(executor_id.as_str())
                             && match required_kind {
                                 None => true,
                                 Some(kind) => executor_devices
@@ -272,7 +272,7 @@ impl DistributionPolicy for DevicePlacement {
                             stage_id = stage.stage_id,
                             partition_id,
                             executor_id = %executor_id,
-                            gang_submitter = ?gang_submitter,
+                            attempt_submitter = ?attempt_submitter,
                             required_kind = ?required_kind,
                             "{BOUND_TASK_LOG}"
                         );

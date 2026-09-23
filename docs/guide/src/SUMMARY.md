@@ -27,6 +27,7 @@
 - [Semantic Search](./semantic-search.md)
 - [Build a Similarity Graph](./build-neighbor-graph.md)
 - [Propagate Embeddings over a Graph (Decoupled GNN)](./graph-propagation.md)
+- [Embed a Graph's Structure (You Have Only a Graph)](./graph-structure.md)
 - [Hybrid Retrieval: Lexical (BM25) + Reciprocal-Rank Fusion](./hybrid-retrieval.md)
 - [Assemble a Context Set for Conditioned Prediction](./assemble-context.md)
 - [Condition a Prediction on Declared-Edge Context (Bring Your Own Graph)](./graph-context.md)

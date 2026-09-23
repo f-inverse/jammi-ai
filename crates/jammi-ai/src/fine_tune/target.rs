@@ -72,6 +72,20 @@ impl TrainingTarget {
         }
     }
 
+    /// Whether a training forward draws dropout at the trainable sites —
+    /// `jammi_lora::LoraLinear::set_dropout`: `false` keeps the tape but draws
+    /// no mask, the forward a gradient cache's two encodes of one row need.
+    pub fn set_dropout(&mut self, enabled: bool) {
+        match self {
+            Self::ProjectionHead { head } => {
+                for (_, layer) in head.layers.iter_mut() {
+                    layer.set_dropout(enabled);
+                }
+            }
+            Self::EncoderAdapters(state) => state.encoder.set_dropout(enabled),
+        }
+    }
+
     /// Collect all trainable A/B tensors as a CPU-side `HashMap` ready for
     /// safetensors serialisation. Keys follow the convention each variant
     /// uses to label its trainable sites.
@@ -103,18 +117,20 @@ impl TrainingTarget {
     }
 
     /// Apply a previously-saved `HashMap<key, tensor>` back into the target's
-    /// trainable sites. Used to restore the best checkpoint at end of
-    /// training.
+    /// trainable sites, in place: the trainable leaves keep their identity
+    /// (see `jammi_lora::LoraLinear::load_weights`), so a loop that trains
+    /// again after a restore still moves the weights the sites read. Used to
+    /// restore the best checkpoint at end of training.
     pub fn load_weights(&mut self, weights: &HashMap<String, Tensor>) -> Result<()> {
         match self {
             Self::ProjectionHead { head } => {
                 for (name, layer) in head.layers.iter_mut() {
-                    if let Some(a) = weights.get(&format!("{name}.lora_a")) {
-                        layer.lora_a = a.clone();
-                    }
-                    if let Some(b) = weights.get(&format!("{name}.lora_b")) {
-                        layer.lora_b = b.clone();
-                    }
+                    layer
+                        .load_weights(
+                            weights.get(&format!("{name}.lora_a")),
+                            weights.get(&format!("{name}.lora_b")),
+                        )
+                        .map_err(|e| JammiError::FineTune(format!("Head load weights: {e}")))?;
                 }
                 Ok(())
             }

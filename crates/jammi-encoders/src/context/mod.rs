@@ -321,6 +321,7 @@ mod tests {
     /// shape behind all three architectures.
     #[test]
     fn forward_shape_is_batch_by_head_width() {
+        let _seam = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         for arch in [
             ContextArchitecture::Cnp,
@@ -354,6 +355,7 @@ mod tests {
     /// wired. Checked for all three members.
     #[test]
     fn gradients_flow_to_every_trainable_param() {
+        let _seam = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         for arch in [
             ContextArchitecture::Cnp,

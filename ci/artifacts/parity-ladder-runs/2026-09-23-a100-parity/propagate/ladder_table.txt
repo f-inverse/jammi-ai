@@ -1,0 +1,39 @@
+# propagate ladder, torch -> placed
+
+## torch -> torch-geometric  [GREEN]  — the engine against exact propagation by sparse matrix product
+row relative_error: worst 2.060e-7 over 43008 rows, bound 3.453e-4, 0 beyond
+cost (upper/lower time): 0.6928 by minima, 0.9483 by medians [0.8619, 1.0449] — INDETERMINATE: inside the x1.2720 noise band
+shape: fixed cost worth -7629.0 units of work, per-work cost x0.8734
+space (upper/lower): host Some(1.4115241782617738) device None host bytes per unit of work None
+  [pass] evidence row_agreement against 0.000345 (derived) — worst row 2.060e-7 against 3.453e-4
+  [n/m ] evidence speed_non_inferiority against UNBUDGETED — lower/upper time at least 0.9570, bar UNBUDGETED
+  [n/m ] evidence fixed_cost against UNBUDGETED — the layer's fixed cost is worth -7629.0 units of work, budget UNBUDGETED
+  [n/m ] evidence per_work_cost against UNBUDGETED — per-work cost x0.8734, budget UNBUDGETED
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 1.4115 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+
+## torch-geometric -> plan  [INVALID]  — the engine against PyTorch Geometric's propagation layer
+row relative_error: worst 2.060e-7 over 43008 rows, bound 3.453e-4, 0 beyond
+space (upper/lower): host Some(0.5929115018989487) device None host bytes per unit of work None
+  [pass] evidence row_agreement against 0.000345 (derived) — worst row 2.060e-7 against 3.453e-4
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.5929 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: leg plan__edges81920__r1: the time series is not stationary (trend p = 3.699e-3, drift -8.29% of the median over the series)
+
+## plan -> plan-partitioned  [INVALID]  — the same plan, N partitions
+outcome digests equal on 3/3 unit(s)
+space (upper/lower): host Some(0.9471385392080041) device None host bytes per unit of work None
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.9471 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: leg plan__edges81920__r1: the time series is not stationary (trend p = 3.699e-3, drift -8.29% of the median over the series)
+  REFUSED: leg plan-partitioned__edges5120__r2: the time series is not stationary (trend p = 1.251e-3, drift +10.92% of the median over the series)
+
+## plan-partitioned -> placed  [INVALID]  — the same plan on a Ballista executor
+outcome digests equal on 3/3 unit(s)
+space (upper/lower): host Some(0.5134883203842644) device None host bytes per unit of work None
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.5135 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: leg plan-partitioned__edges5120__r2: the time series is not stationary (trend p = 1.251e-3, drift +10.92% of the median over the series)
+
+causes: edge torch-geometric -> plan is INVALID; edge plan -> plan-partitioned is INVALID; edge plan-partitioned -> placed is INVALID
+status: INVALID

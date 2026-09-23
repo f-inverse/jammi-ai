@@ -107,46 +107,26 @@ fn dispatch_gelu_erf_fused(x: &Tensor) -> Result<Tensor, EncoderError> {
     )?)
 }
 
-/// The GELU-erf seam: `training == false` calls the unchanged
-/// `x.gelu_erf()` directly (no admission machinery at all — eval's output
-/// is exactly what it always was, byte-for-byte); `training == true` admits
-/// `gelu_erf_fused` on [`gelu_admission_predicate`]'s domain and dispatches
-/// to [`dispatch_gelu_erf_fused`] (the real `GeluErfFused` `CustomOp1` — see
-/// that function's own doc) or the same unchanged eager call, recording
-/// which happened either way. Wired at `BertIntermediate::forward`'s
-/// `activations::gelu_erf(&hidden, training)`, `DistilBertFfn::forward`'s
-/// `activations::gelu_erf(&mid, training)`), and `crate::htsat_audio`'s two
-/// sites (`SwinBlock::forward`'s MLP and
-/// `ClapAudioProjection::forward_unnormalized_with_training`'s `"gelu"`
-/// arm; see that module's own doc, "Every fusible activation goes through
-/// the house seam", for the flag thread and the exact per-forward
-/// dispatch-count oracles).
+/// The GELU-erf seam: admits `gelu_erf_fused` on [`gelu_admission_predicate`]'s
+/// domain and dispatches to [`dispatch_gelu_erf_fused`] (the real
+/// `GeluErfFused` `CustomOp1` — see that function's own doc) or the eager
+/// `x.gelu_erf()` call, recording which happened either way. Wired at
+/// `BertIntermediate::forward`, `DistilBertFfn::forward`, and
+/// `crate::htsat_audio`'s two sites (`SwinBlock::forward`'s MLP and
+/// `ClapAudioProjection::forward_unnormalized`'s `"gelu"` arm; see that
+/// module's own doc, "Every fusible activation goes through the house seam",
+/// for the exact per-forward dispatch-count oracles). All four report to the
+/// SAME process-wide `gelu_erf_fused` registry entry, so a counter delta over
+/// a full HTSAT forward is the SUM of its two site classes — `sum(depths)`
+/// MLP dispatches plus one projection dispatch when `projection_hidden_act ==
+/// "gelu"`; that tower's own module doc carries the arithmetic and the
+/// oracles that pin it.
 ///
-/// ALL FOUR sites receive `training` as a call-chain PARAMETER, never a
-/// per-sub-struct stored copy, so this seam always sees the SAME value the
-/// model's own forward dispatched on: `Bert::training`/`DistilBert::training` thread
-/// theirs through `BertLayer`/`DistilBertLayer`, and `HtsatAudio`'s single
-/// stored flag threads through
-/// `htsat_audio::HtsatAudioEncoder::forward_spine_with_training` to each
-/// `SwinBlock::forward` and directly to
-/// `htsat_audio::ClapAudioProjection::forward_unnormalized_with_training`.
-/// (HTSAT's flag-less `forward_spine`/`forward_unnormalized` are EVAL
-/// conveniences defined as `_with_training(.., false)` for boundary-parity
-/// harnesses that hold no flag of their own.) All four report to the SAME
-/// process-wide `gelu_erf_fused` registry entry, so a counter delta over a
-/// full HTSAT forward is the SUM of its two site classes —
-/// `sum(depths)` MLP dispatches plus one projection dispatch when
-/// `projection_hidden_act == "gelu"`; that tower's own module doc carries
-/// the arithmetic and the oracles that pin it.
-///
-/// **Not wired**: `crate::context`'s GELU site has no train/eval split. The GeGLU eager reference
-/// arm (`crate::modernbert::geglu_apply_training`'s own `gate.gelu_erf()?`
+/// **Not wired**: `crate::context`'s GELU site. The GeGLU eager reference
+/// arm (`crate::modernbert::geglu_apply`'s own `gate.gelu_erf()?`
 /// call) and `quick_gelu` (above) are architecturally different
 /// activations, out of this seam's scope entirely.
-pub(crate) fn gelu_erf(x: &Tensor, training: bool) -> Result<Tensor, EncoderError> {
-    if !training {
-        return Ok(x.gelu_erf()?);
-    }
+pub(crate) fn gelu_erf(x: &Tensor) -> Result<Tensor, EncoderError> {
     let (holds, predicate) = gelu_admission_predicate(x);
     crate::seam_gate("activations::gelu_erf");
     let outcome = admit(
@@ -166,18 +146,6 @@ pub(crate) fn gelu_erf(x: &Tensor, training: bool) -> Result<Tensor, EncoderErro
 mod tests {
     use super::*;
     use candle_core::Device;
-
-    #[test]
-    fn gelu_erf_eval_matches_plain_gelu_erf_bit_identical() {
-        let device = Device::Cpu;
-        let x = Tensor::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 2.0], (5,), &device).unwrap();
-        let got = gelu_erf(&x, false).unwrap().to_vec1::<f32>().unwrap();
-        let want = x.gelu_erf().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(
-            got, want,
-            "eval must be byte-for-byte the plain gelu_erf call"
-        );
-    }
 
     #[test]
     fn gelu_admission_predicate_accepts_contiguous_f32_cpu() {
@@ -244,7 +212,7 @@ mod tests {
         let device = Device::Cpu;
         let x = Tensor::zeros((2, 4), DType::BF16, &device).unwrap();
         let before = gelu_snapshot_locked(&_lock);
-        let err = gelu_erf(&x, true)
+        let err = gelu_erf(&x)
             .expect_err("CPU BF16 under Strict must be a typed refusal, not a silent eager");
         let after = gelu_snapshot_locked(&_lock);
         let msg = err.to_string();
@@ -265,7 +233,7 @@ mod tests {
     /// `got == want` here is a genuine numeric proof, not merely a counter
     /// proof.
     #[test]
-    fn gelu_erf_training_admits_fused_on_a_supported_shape_and_matches_eager_value() {
+    fn gelu_erf_admits_fused_on_a_supported_shape_and_matches_eager_value() {
         // Two-sided under the crate-shared counter lock: this test reads the SAME process-wide
         // `gelu_erf_fused` registry every other GELU/attention counter test in this crate
         // reads, so it must serialize against them the same way
@@ -274,7 +242,7 @@ mod tests {
         let device = Device::Cpu;
         let x = Tensor::from_slice(&[-2.0f32, -0.5, 0.0, 0.5, 2.0], (5,), &device).unwrap();
         let before = gelu_snapshot_locked(&_lock);
-        let got = gelu_erf(&x, true).unwrap().to_vec1::<f32>().unwrap();
+        let got = gelu_erf(&x).unwrap().to_vec1::<f32>().unwrap();
         let after = gelu_snapshot_locked(&_lock);
         let want = x.gelu_erf().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got, want);
@@ -289,7 +257,7 @@ mod tests {
     }
 
     /// The crate's own two-sided GELU counter oracle, exercising the real
-    /// fused kernel: `gelu_erf(x, true)` on a head64-shaped (`h=2, d=64`), sign-mixed
+    /// fused kernel: `gelu_erf(x)` on a head64-shaped (`h=2, d=64`), sign-mixed
     /// production-amplitude fixture must (a) bump `gelu_fused_dispatches`,
     /// and (b) produce hidden states BIT-IDENTICAL to the unchanged eager
     /// `x.gelu_erf()` call — CPU F32 is `GeluErfFused`'s own documented
@@ -304,7 +272,7 @@ mod tests {
     /// switch (`JAMMI_KERNELS_DISABLE`). Two-sided under the crate-shared
     /// counter lock.
     #[test]
-    fn gelu_erf_training_fused_forward_is_bit_identical_to_eager_on_head64_fixture() {
+    fn gelu_erf_fused_forward_is_bit_identical_to_eager_on_head64_fixture() {
         let _lock = crate::test_support::seam_counter_lock();
         let device = Device::Cpu;
         // head64-shaped fixture: b=2, s=5, h=2, d=64 attention output width
@@ -325,7 +293,7 @@ mod tests {
         let x = Tensor::from_slice(&v, (b, s, intermediate), &device).unwrap();
 
         let before = gelu_snapshot_locked(&_lock);
-        let fused_out: Vec<f32> = gelu_erf(&x, true)
+        let fused_out: Vec<f32> = gelu_erf(&x)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -419,8 +387,7 @@ mod tests {
     /// divergence is a real fused-vs-eager GELU numeric difference
     /// reaching the LoRA gradient, never a fixture difference.
     #[test]
-    fn gelu_erf_training_fused_backward_matches_eager_on_lora_targeted_dense_within_condition_aware_bound(
-    ) {
+    fn gelu_erf_fused_backward_matches_eager_on_lora_targeted_dense_within_condition_aware_bound() {
         use candle_nn::{Linear, VarBuilder, VarMap};
         use jammi_lora::{FrozenBase, LoraInitMode, LoraLinear};
 
@@ -464,7 +431,7 @@ mod tests {
 
         // Fused arm: through the real seam, admission included.
         let before = gelu_snapshot_locked(&_lock);
-        let out_fused = gelu_erf(&hidden, true).unwrap();
+        let out_fused = gelu_erf(&hidden).unwrap();
         let after = gelu_snapshot_locked(&_lock);
         assert!(
             after.fused > before.fused,

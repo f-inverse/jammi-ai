@@ -152,7 +152,8 @@ gpu-dev.sh — GPU development on RunPod
                                           completes/fails/times out (never misreads an
                                           unreachable pod as "still building" — see below)
   wait-job  [session] [--tree T]          block until <tree>'s detached `run` job ends,
-            [--timeout SECS]              fails (no evidence it ever ran), or times out
+            [--timeout SECS]              fails (no evidence it ever ran, past a startup
+                                          grace — RP_WAIT_GRACE_SECS, 300), or times out
   down    [session]                       terminate the pod, forget the session
   ls                                      list sessions
   reap    [hours]             ACCOUNT-WIDE: terminate every orphaned jammi-gpu*
@@ -226,7 +227,9 @@ wait-seed/wait-job poll the pod at RP_WAIT_INTERVAL_SECS (default 20s) up to
 ended AND the tree's .jammi.log exists — the job ran to completion, inspect
 the log for its own pass/fail verdict), a NAMED FAILURE (exit 1 —
 wait-seed's .jammi-seed-failed marker, or "no evidence this ever ran": no
-marker/session and, for wait-job, no .jammi.log either), or a TRANSPORT
+marker and no session once the startup grace has passed — a pod polled right
+after `up`/`run` returns may not have started its session yet, so that state
+is "not started yet" for RP_WAIT_GRACE_SECS, 300 by default), or a TRANSPORT
 FAILURE (exit 2 — RP_WAIT_MAX_TRANSPORT_FAILS consecutive unreachable polls;
 this means the pod could not be reached, never that the job/seed is still
 running). A timeout with no verdict either way exits 3.
@@ -240,9 +243,8 @@ Env: RUNPOD_API_KEY (or ~/.config/runpod/key), RP_IMAGE,
      Disk sizing once the seed/clone substrate is in use: RP_DISK_GB >= 25
      (base) + S_src + S_seed + N*S_clone (one clone per tree this pod hosts);
      the S_src/S_seed/S_clone byte counts are MEASURED by
-     ci/scripts/perf/pod_build_timings.sh, not guessed — see
-     docs/maintainer/dev-gpu.md, which cites the committed JSON under
-     ci/artifacts/pod-build-timings/ (src/seed/clone ≈ 3.6/7.8/8.1 GB). Add 3 GB per OTHER concurrent agent target
+     ci/scripts/perf/pod_build_timings.sh, not guessed (src/seed/clone
+     ≈ 3.6/7.8/8.1 GB on an A100 pod). Add 3 GB per OTHER concurrent agent target
      dir + 2 GB per `cargo mutants` job — a mutation-testing session wants
      >= 120 GB (RP_DISK_GB=150).
      RP_ALLOW_ROOT_MISMATCH (push/run/target only — see above).

@@ -161,7 +161,7 @@ async fn train_and_publish(
         })
         .await
         .unwrap();
-    assert!(won);
+    assert!(won.is_some());
     artifact
 }
 
@@ -235,10 +235,10 @@ async fn a_hit_completes_the_job_against_the_newest_published_match(backend: Bac
     let newer = train_and_publish(&store, &catalog, &newer_job, attempt, &definition).await;
 
     let (job_id, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
-    assert_eq!(
+    assert!(matches!(
         reuse(&catalog, &job_id, attempt, &definition).await,
-        ReuseFinish::Reused(newer.clone())
-    );
+        ReuseFinish::Reused { artifact, .. } if artifact == newer
+    ));
 
     let job = catalog.get_job(&job_id).await.unwrap();
     assert_eq!(job.status, JobStatus::Completed.to_string());
@@ -446,7 +446,9 @@ async fn a_lost_lease_hit_writes_nothing_and_leaves_the_bytes_intact(backend: Ba
         })
         .await
         .unwrap();
-    assert_eq!(successor, ReuseFinish::Reused(artifact.clone()));
+    assert!(
+        matches!(successor, ReuseFinish::Reused { artifact: reused, .. } if reused == artifact)
+    );
     assert_eq!(
         location_of(&catalog, &name).await,
         Some(ModelLocation::Artifact(artifact))
@@ -488,10 +490,10 @@ async fn a_hit_is_scoped_to_the_own_tenant_and_global_and_its_reference_guards_t
     let (global_job, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
     let global =
         train_and_publish(&store_global, &catalog, &global_job, attempt, &definition).await;
-    assert_eq!(
+    assert!(matches!(
         reuse(&cat_a, &a_job, a_attempt, &definition).await,
-        ReuseFinish::Reused(global.clone())
-    );
+        ReuseFinish::Reused { artifact, .. } if artifact == global
+    ));
     assert_ne!(global, b_artifact);
     let a_name = output_name(&a_job);
     assert_eq!(
@@ -567,10 +569,10 @@ async fn deleting_either_row_leaves_the_other_loadable_and_the_reap_waits_for_bo
     let (producer_job, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
     let artifact = train_and_publish(&store, &catalog, &producer_job, attempt, &definition).await;
     let (reuser_job, attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
-    assert_eq!(
+    assert!(matches!(
         reuse(&catalog, &reuser_job, attempt, &definition).await,
-        ReuseFinish::Reused(artifact.clone())
-    );
+        ReuseFinish::Reused { artifact: reused, .. } if reused == artifact
+    ));
     backdate_artifact(&catalog, &artifact, Duration::from_secs(7 * 86_400)).await;
     let producer = output_name(&producer_job);
     let reuser = output_name(&reuser_job);
@@ -652,7 +654,12 @@ async fn an_attach_and_a_reclaim_over_the_same_artifact_never_both_win(backend: 
         let (attach, reclaim) = (attach.await.unwrap(), reclaim.await.unwrap());
 
         match (attach, reclaim) {
-            (ReuseFinish::Reused(reused), ReclaimDecision::Referenced) => {
+            (
+                ReuseFinish::Reused {
+                    artifact: reused, ..
+                },
+                ReclaimDecision::Referenced,
+            ) => {
                 assert_eq!(reused, artifact, "round {round}");
                 assert_eq!(
                     location_of(&catalog, &output_name(&reuser_job)).await,

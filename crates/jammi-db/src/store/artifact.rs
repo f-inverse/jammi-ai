@@ -135,6 +135,11 @@ struct Manifest {
 }
 
 impl Manifest {
+    /// Every entry's name, in manifest order.
+    fn file_names(&self) -> Vec<String> {
+        self.files.iter().map(|entry| entry.name.clone()).collect()
+    }
+
     /// The content-address of the whole bundle: sha256 over each entry's
     /// `name` + `sha256` in manifest order. Two bundles with identical file
     /// names and bytes hash equal, so the local cache dir is shared across
@@ -158,12 +163,22 @@ impl Manifest {
 #[derive(Debug, Clone)]
 pub struct LocalArtifact {
     dir: PathBuf,
+    /// The bundle's files, as its manifest names them, in manifest order.
+    files: Vec<String>,
 }
 
 impl LocalArtifact {
     /// The local directory holding the verified artifact files.
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// The bundle's files, by name, in manifest order. Exactly the files
+    /// the bundle was published from: the directory may hold more (the
+    /// manifest itself, an attestation written after it) when the bundle is
+    /// served in place.
+    pub fn file_names(&self) -> &[String] {
+        &self.files
     }
 }
 
@@ -348,6 +363,7 @@ impl ArtifactStore {
             self.verify_files(&handle, prefix, &manifest).await?;
             return Ok(LocalArtifact {
                 dir: PathBuf::from(prefix.path()),
+                files: manifest.file_names(),
             });
         }
 
@@ -356,7 +372,10 @@ impl ArtifactStore {
         // Cache hit: the dir was published by a prior fetch's atomic rename, so
         // it is complete by construction.
         if cache_dir.is_dir() {
-            return Ok(LocalArtifact { dir: cache_dir });
+            return Ok(LocalArtifact {
+                dir: cache_dir,
+                files: manifest.file_names(),
+            });
         }
 
         // Download into a sibling tempdir, verifying each file, then atomically
@@ -375,9 +394,16 @@ impl ArtifactStore {
         // Atomic publish. A concurrent fetch may have won the race and already
         // renamed an identical bundle into place (same content-hash) — that is a
         // benign loss; the existing dir is byte-identical, so keep it.
+        let files = manifest.file_names();
         match std::fs::rename(tmp.path(), &cache_dir) {
-            Ok(()) => Ok(LocalArtifact { dir: cache_dir }),
-            Err(_) if cache_dir.is_dir() => Ok(LocalArtifact { dir: cache_dir }),
+            Ok(()) => Ok(LocalArtifact {
+                dir: cache_dir,
+                files,
+            }),
+            Err(_) if cache_dir.is_dir() => Ok(LocalArtifact {
+                dir: cache_dir,
+                files,
+            }),
             Err(e) => Err(e.into()),
         }
     }
@@ -424,8 +450,9 @@ impl ArtifactStore {
     /// A checkpoint belongs to the JOB — attempt N+1 resumes from attempt N's
     /// progress — so every epoch's artifact is staged job-scoped: protected
     /// while the job is non-terminal, published by a finalize that retains it
-    /// as a model, and otherwise reclaimed once the job ends
-    /// ([`Self::reclaim_checkpoints`]).
+    /// as a model, and otherwise retired by the finalize's own transaction,
+    /// its bytes deleted under the licence that transaction mints
+    /// ([`Self::delete_retired_checkpoints`]).
     ///
     /// This is the write, and only the write: it adds one epoch and touches
     /// no other. Keeping the job to its retention window is the writer's
@@ -460,8 +487,8 @@ impl ArtifactStore {
     /// write in flight, since an epoch is held only once its manifest has
     /// landed. Returns the artifacts left unsettled — a reclaim that was
     /// refused or failed, each logged with its cause — which the next
-    /// retirement retries and the job's end ([`Self::reclaim_checkpoints`])
-    /// converges. An error is the listing itself failing.
+    /// retirement retries and the job's finalize retires. An error is the
+    /// listing itself failing.
     pub async fn retire_checkpoints_beyond(
         &self,
         catalog: &Catalog,
@@ -490,12 +517,33 @@ impl ArtifactStore {
         )
     }
 
-    /// Reclaim every checkpoint of `job_id` a finalize did not publish, as
-    /// the job's own stager — what the job's finisher calls once the job is
-    /// terminal and no attempt will read a checkpoint again. Returns the
-    /// artifacts left unsettled: a reclaim that was refused or failed (each
-    /// logged with its cause), which a reconcile pass converges. An error is
-    /// the listing itself failing.
+    /// Delete the bytes of every checkpoint a finalize retired, under the
+    /// licences its terminal transaction minted
+    /// ([`crate::catalog::jobs_repo::Finalized`]). Returns the artifacts
+    /// left unsettled — a delete that failed, logged with its cause — whose
+    /// bytes are the strays a reconcile pass adopts.
+    pub async fn delete_retired_checkpoints(
+        &self,
+        catalog: &Catalog,
+        licences: Vec<ReclaimLicence>,
+    ) -> Vec<ArtifactRef> {
+        let mut unsettled = Vec::new();
+        for licence in licences {
+            let artifact = licence.artifact().clone();
+            if let Err(e) = self.reclaim(catalog, licence, &[]).await {
+                tracing::debug!(%artifact, error = %e, "checkpoint delete failed");
+                unsettled.push(artifact);
+            }
+        }
+        unsettled
+    }
+
+    /// Reclaim every checkpoint of `job_id` the catalog still holds, as the
+    /// job's own stager — for a job that ended without a finalize, whose
+    /// terminal write retires no checkpoint row. Returns the artifacts left
+    /// unsettled: a reclaim that was refused or failed (each logged with its
+    /// cause), which a reconcile pass converges. An error is the listing
+    /// itself failing.
     pub async fn reclaim_checkpoints(
         &self,
         catalog: &Catalog,

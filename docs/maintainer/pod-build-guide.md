@@ -131,10 +131,8 @@ racing `up`/`down` on the same alias can terminate an unrelated pod
    `RP_DISK_GB="${RP_DISK_GB:-60}"`, `ci/scripts/runpod_lib.sh`) must cover `>= 25 (base) + S_src + S_seed +
    N*S_clone` (one clone per tree the pod hosts) — the exact `S_src`/
    `S_seed`/`S_clone` byte counts are measured by
-   `ci/scripts/perf/pod_build_timings.sh` and committed at
-   `ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`
-   (§4 below): ≈ 3.6 / 7.8 / 8.1 GB (decimal, from the artifact's exact
-   byte fields) — the default 60 GB covers base + src + seed + two
+   `ci/scripts/perf/pod_build_timings.sh` (§4 below): ≈ 3.6 / 7.8 / 8.1 GB
+   (decimal) — the default 60 GB covers base + src + seed + two
    clones (≈ 52.7 GB); a third tree computes to ≈ 60.9 GB, over the
    default, so a pod hosting 3+ trees sizes up (`RP_DISK_GB=70`+). A mutation-testing session (copy-mode `cargo mutants`, one full
    workspace+target copy per job) wants `RP_DISK_GB >= 120` —
@@ -435,12 +433,9 @@ ssh -F ~/.config/runpod/ssh_config jammi-a100 \
 a lock-held tmux pane — see §6). Common failure classes and their meaning
 are in §8.
 
-**Time budget.** The committed producer JSON is
-`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`
-(`ci/scripts/perf/pod_build_timings.sh` run on a live A100-SXM4 pod at
-`bc27e75`; the script never runs in CI — `POD, never in CI`
-(`ci/scripts/perf/pod_build_timings.sh`), in its own module doc). It pins
-the per-job walls:
+**Time budget.** The producer's JSON (`ci/scripts/perf/pod_build_timings.sh`
+run on a live A100-SXM4 pod; the script never runs in CI — `POD, never in
+CI`, in its own module doc) records the per-job walls:
 seed→clone copy 2 s, member-only clone build 69 s, cold build from an
 empty target dir 243 s, FA2 leg 122 s, plus the `S_src`/`S_seed`/`S_clone`
 byte counts the `RP_DISK_GB` formula cites (see dev-gpu.md). The **full
@@ -994,13 +989,9 @@ JAMMI_BUILD_TIMINGS_OUT=/root/pod-build-timings.json \
   bash ci/scripts/perf/pod_build_timings.sh
 ```
 
-then copy the JSON to `ci/artifacts/pod-build-timings/<ts>-<sha7>.json` and
-commit it — `copy it to ci/artifacts/pod-build-timings/<ts>-<sha7>.json and commit it`
-(`ci/scripts/perf/pod_build_timings.sh`), the script's own closing
-instruction. The first such committed run is
-`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`, the
-producer this document's §4 walls and `dev-gpu.md`'s `RP_DISK_GB` S values
-cite.
+The JSON it writes is the operator's record of that pod's build substrate;
+this document's §4 walls and `dev-gpu.md`'s `RP_DISK_GB` S values come from
+one such run on an A100-SXM4 pod.
 
 **Contamination.** The lock serializes only jammi's own timing-sensitive
 producers on the same pod; it does nothing about an unrelated foreign build
@@ -1131,7 +1122,7 @@ exists) a `test_pod_substrate.sh` leg.
 | 5 | `git rev-parse HEAD:<path>` on a missing path fails with empty output | The **bare** form echoes its own argument text to stdout (rc=128) — `git rev-parse HEAD:no/such/path` literally prints `HEAD:no/such/path` | A bogus literal string becomes `cutlass_gitlink`/an expected pin, read as a real (but wrong) value | `cutlass_gitlink="$(git -C "$repo" rev-parse --verify --quiet` (`ci/scripts/pod_push_stamp.sh`); `git rev-parse HEAD:<gitlink-path>` (`ci/scripts/pod_provision_cutlass.sh`) — every call site uses `--verify --quiet`, silent on a miss |
 | 6 | `stat -f FORMAT` means "use this format string" | On GNU coreutils, `-f` means "display file **system** status" (the opposite of BSD) — a BSD-style call there prints a multi-line, live `Free:`-block-bearing status report to stdout before failing | `manifest_sha256` diverged nondeterministically between two hosts building the identical bundle | `pod_push_stat_mode` (`ci/scripts/pod_push_stamp.sh`) — flavour detected once via `if stat --version >/dev/null 2>&1; then` (`ci/scripts/pod_push_stamp.sh`), memoized |
 | 7 | Pushing files as `root@pod` leaves them root-owned | `rsync -a` preserves owner/group from the **laptop's** own uid (e.g. 501) unless told not to | `git`, run as root inside the pushed tree, refuses "detected dubious ownership" | `rsync -azc --no-times --no-owner --no-group --delete` (`ci/scripts/gpu-dev.sh`) |
-| 8 | `cargo metadata --frozen` "just works" once `Cargo.lock` exists | `cargo metadata` (unlike `cargo build`) resolves the **full cross-platform** graph by default, needing source for platform-conditional crates never otherwise fetched | Seed pipeline died on "failed to download android_system_properties ... --frozen was specified" *after* T1–T3 had already succeeded | `cargo metadata --locked --format-version 1` (`ci/scripts/pod_seed_target.sh`), the one-time network-allowed priming call before every `--frozen` call; `pod_seed_cargo_metadata_frozen` (`ci/scripts/pod_seed_target.sh`) captures real stderr, never discards it |
+| 8 | `cargo metadata --frozen` is how you pin a resolution | `--frozen` is `--locked` PLUS "never reach the network"; only the first is a determinism property. A tree whose `Cargo.lock` names a crate the pod's registry cache lacks — every branch that adds a dependency edge — fails with `cannot update the lock file ... because --locked was passed`, so a pod cannot seed a perfectly correct tree | Seed pipeline died on five of five pods the first time an integration branch was pushed | `pod_seed_cargo_metadata_locked` resolves with `--locked`: the lock still rules and a lock disagreeing with the manifests is still refused, but a pinned crate may be fetched |
 | 9 | A zero-byte captured `build/<pkg>-*/output` file means "captured at the wrong moment" | Cargo creates that file for **every** build script it runs, regardless of whether the script prints anything — a real no-op script legitimately produces zero bytes | Treating it as an error flags legitimate zero-byte captures (chrono-tz, esaxx-rs, pulldown-cmark, rustls, scratch, snap, stacker, prometheus) as errors, aborting every real seed build | `pod_seed_check_stdout_subset` (`ci/scripts/pod_seed_target.sh`), whose own doc records that `cargo creates a` (`ci/scripts/pod_seed_target.sh`) zero-byte file legitimately; leg `(l)` of `ci/scripts/test_pod_substrate.sh`, including a revert-RED control for the per-file empty-is-an-error rule |
 | 10 | Two builds of the identical tree on the same box produce byte-identical linked binaries | mold 2.35.1 / clang 21's ThinLTO codegen embeds local-symbol suffixes (`anon.<h>.N.llvm.<hash>`) that differ between two builds of the **same** tree | `release/jammi-bench` (467 differing symbols) made the byte-equality leg read `false` even though every deterministic artifact (`*.ptx`, `.rlib`/`.rmeta`) matched | `the FINAL LINKED BINARY` (`ci/scripts/perf/pod_build_timings.sh`) and `"byte_equal_scope": {` (`ci/scripts/perf/pod_build_timings.sh`) — the linked binary is explicitly excluded, never silently dropped from the claim |
 | 11 | `push --tree <name>`'s rsync destination is reachable | rsync creates only the LAST path component of its own destination — nothing in the pod bootstrap or the build-substrate seed provisions `/root/trees` itself | The very FIRST `push` for a name no session has ever pushed before fails outright on a fresh pod: `rsync: mkdir "/root/trees/<name>" failed: No such file or directory (2)` | `rp_push_ensure_parent` (`ci/scripts/runpod_lib.sh`), a bounded, idempotent remote `mkdir -p` on the parent called before every push at `rp_push_ensure_parent "$TREE_DIR" \` (`ci/scripts/gpu-dev.sh`); leg `(y)` of `ci/scripts/test_pod_substrate.sh` |
@@ -1249,8 +1240,7 @@ unrelated to the CUDA toolchain. Extending it requires
   the main-only flash-attn leg, T2 `cargo test --no-run` for the CI prove
   lane's own suites, T3 clippy.
 - **A2** — the pod-build-substrate acceptance measurement produced by
-  `ci/scripts/perf/pod_build_timings.sh`, committed under
-  `ci/artifacts/pod-build-timings/` once run.
+  `ci/scripts/perf/pod_build_timings.sh`.
 - **`.jammi-seed-complete` / `.jammi-seed-failed`** — the seed's completion
   and failure markers, sitting beside (not inside) the seed's own
   `CARGO_TARGET_DIR`.

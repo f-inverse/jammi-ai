@@ -183,9 +183,45 @@ correct gradient. Keep `world_size <= [worker] local_ranks`.
 | `walk_length` (`L`) | How far a positive can be. `1` = 1-hop only; `>1` = community structure. |
 | `return_p` (`p`) | Large `p` discourages backtracking. |
 | `in_out_q` (`q`) | `q < 1` explores outward (DFS-like); `q > 1` stays local (BFS-like). |
-| `graph_hard_negatives` | Structure-mined hard negatives per pair. `0` = in-batch only. |
+| `graph_hard_negatives` | Structure-mined hard negatives per pair: `0` = in-batch only, `1` = one explicit negative beside them. A larger value is refused — a training row carries one explicit negative, so the extra ones would be mined and never trained. |
 | `exclude_hops` | Hops of the anchor's neighbourhood excluded from its negatives (false-negative guard). |
 | `min_negatives` | Minimum negative pool — guards against contrastive collapse on a tiny graph. |
+
+## What the walk is, and how it is checked
+
+The walk is node2vec's second-order chain. Standing on `v` having arrived from
+`t`, the next node `x` is drawn with probability
+
+```text
+π(x | t, v) ∝ α_pq(t, x) · w(v, x)      α = 1/p  if x = t
+                                            1    if x is adjacent to t
+                                            1/q  otherwise
+```
+
+where `w(v, x)` is how many times the edge `v → x` is listed (`1` on a simple
+graph), the first step — which has no `t` — is drawn `∝ w(v, x)`, "adjacent to
+`t`" means an edge joins the two in either direction, and a node with no
+out-edge ends its walk. Walks follow edge rows as directed, so an undirected
+relation lists both directions.
+
+`jammi-bench graph-sample` files the evidence for that law rather than
+asserting it: the walks' raw transition counts for every
+`(previous, current, next)` as a leg's `law_observed`, beside the analytic
+probabilities of the same graph written as the unit's law file. The engine's tests hold every state's observed frequencies within
+sampling error of the law on a graph that exercises all three `α` branches; the
+PyTorch reference (`crates/jammi-bench/reference/torch_graph_sample.py`, over
+`torch_cluster.random_walk`) emits the same counts over the same graph file.
+
+A graph fine-tune is two things in sequence — sample the graph into a pair
+table, train on the table — and the table is where the two are cut apart.
+`jammi-bench graph-pairs` writes exactly the rows a job at the same sampler
+configuration trains on, in the same order, so any other trainer can be handed
+byte-identical input; a resident fine-tune over that file and the
+`fine_tune_graph` job train the byte-identical adapter at `lora_dropout = 0`.
+(With dropout the job's pre-training acceleration probe has already drawn one
+mask per LoRA layer, so its mask stream sits one draw ahead.)
+`cookbook/fixtures/tiny_citation_graph/` is a small committed graph with declared
+citation edges to try this on.
 
 ## Compose with propagation
 
@@ -194,6 +230,9 @@ Both graph fine-tune and embedding
 naively double-counts the same smoothing. The recommended order is **propagate
 first, then fine-tune the head** (the SGC/APPNP decoupling) — not two independent
 smoothing passes.
+
+Both need node text. A graph whose nodes have none — ids and edges only — is
+embedded from its [structure alone](./graph-structure.md) instead.
 
 ## Did it work? The circularity check
 

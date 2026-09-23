@@ -69,7 +69,7 @@ use crate::pipeline::context_set::{
     ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
 };
 use crate::pipeline::graph_neighbourhood::EdgeGather;
-use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
+use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig, ParallelTrainReport};
 use crate::predict::conformal::{ConformalModel, IntervalScore};
 use crate::session::InferenceSession;
 
@@ -263,7 +263,9 @@ pub struct ContextPredictorTrainConfig {
     /// meta-overfitting guard. A meta-dataset below this is rejected rather than
     /// run into memorisation.
     pub min_task_count: usize,
-    /// Seed for the deterministic train/test **task** partition.
+    /// Seed for the deterministic train/test **task** partition and for the
+    /// predictor's initial weights: a run is a function of the spec and the
+    /// rows it reads.
     pub seed: u64,
 }
 
@@ -318,6 +320,67 @@ pub struct EpisodeBatch {
     /// Held-out target outcomes, `[B]` — the `y` each target's context-conditioned
     /// head predicts.
     pub target_y: Tensor,
+}
+
+/// What a context-predictor training job reports about its run, as the
+/// job's `metrics`: the fit's step walls and the objective over the train
+/// and held-out episodes at the untrained model and after every epoch —
+/// the learning curve a reader scores the published predictor against
+/// without re-running the fit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPredictorMetrics {
+    /// When the fit began and ended, so a reader can place the job path's
+    /// stations around it.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+    /// Mean loss across the final epoch's batches.
+    pub final_loss: f64,
+    /// Optimizer steps taken.
+    pub total_steps: usize,
+    /// Every step's wall-clock in seconds, in step order.
+    pub step_seconds: Vec<f64>,
+    /// The objective over the train episodes: at the untrained model, then
+    /// after every epoch (`epochs + 1` entries).
+    pub train_scores: Vec<f64>,
+    /// The objective over the held-out episodes at the same points; empty
+    /// when the split held out no task.
+    pub held_out_scores: Vec<f64>,
+}
+
+/// The objective over both episode sets as training moves the predictor.
+struct LearningCurve {
+    train: Vec<f64>,
+    held_out: Vec<f64>,
+}
+
+impl LearningCurve {
+    fn at_init(
+        spec: &ContextPredictorTrainConfig,
+        predictor: &AnyContextPredictor,
+        sampled: &SampledEpisodes,
+    ) -> Result<Self> {
+        let mut curve = Self {
+            train: Vec::with_capacity(spec.epochs + 1),
+            held_out: Vec::with_capacity(spec.epochs + 1),
+        };
+        curve.after_epoch(spec, predictor, sampled)?;
+        Ok(curve)
+    }
+
+    fn after_epoch(
+        &mut self,
+        spec: &ContextPredictorTrainConfig,
+        predictor: &AnyContextPredictor,
+        sampled: &SampledEpisodes,
+    ) -> Result<()> {
+        self.train
+            .push(score_episodes(spec, predictor, &sampled.train)?);
+        if !sampled.test.is_empty() {
+            self.held_out
+                .push(score_episodes(spec, predictor, &sampled.test)?);
+        }
+        Ok(())
+    }
 }
 
 /// The sampled meta-dataset: the train episodes the predictor optimises over and
@@ -696,29 +759,28 @@ impl InferenceSession {
             .get();
         let device = crate::model::backend::candle::select_device(self.device_config())?;
 
-        let varmap = VarMap::new();
-        let predictor = build_predictor(spec, feature_dim, &varmap, &device)?;
-
-        let train_config = ParallelTrainConfig {
-            epochs: spec.epochs,
-            learning_rate: spec.learning_rate,
-            weight_decay: 0.0,
-            grad_clip: spec.grad_clip,
-        };
-        train_loop(
+        let (varmap, predictor) = build_context_predictor(spec, feature_dim, &device)?;
+        let started_at = chrono::Utc::now();
+        let mut curve = LearningCurve::at_init(spec, &predictor, &sampled)?;
+        let report = fit_context_predictor(
+            spec,
             &varmap,
+            &predictor,
             &sampled.train,
-            &train_config,
             cancel,
-            |batch: &EpisodeBatch| {
-                predictor
-                    .forward(&batch.episode)
-                    .map_err(|e| JammiError::FineTune(format!("context predictor forward: {e}")))
-            },
-            |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
+            |trained, _| curve.after_epoch(spec, trained, &sampled),
         )?;
+        let metrics = ContextPredictorMetrics {
+            started_at,
+            completed_at: chrono::Utc::now(),
+            final_loss: report.final_loss,
+            total_steps: report.total_steps,
+            step_seconds: report.step_seconds,
+            train_scores: curve.train,
+            held_out_scores: curve.held_out,
+        };
 
-        self.persist_predictor(spec, &table, &sampled.scaler, &varmap)
+        self.persist_predictor(spec, &table, &sampled.scaler, &varmap, &metrics)
     }
 
     /// Build one [`EpisodeBatch`] per task — every target row in the task, each
@@ -953,6 +1015,7 @@ impl InferenceSession {
         table: &ResultTableRecord,
         scaler: &TargetScaler,
         varmap: &VarMap,
+        metrics: &ContextPredictorMetrics,
     ) -> Result<crate::fine_tune::worker::TrainedArtifact> {
         let scratch = self.inner_config().artifact_dir.join("context_predictors");
         std::fs::create_dir_all(&scratch)?;
@@ -1000,7 +1063,7 @@ impl InferenceSession {
                 base_model_id: Some(table.model_id.clone()),
                 config_json: Some(config_json),
             },
-            metrics: None,
+            metrics: Some(serde_json::to_string(metrics)?),
             // The episodic in-context-predictor path has no per-epoch
             // checkpointing (per-epoch checkpoints are fine-tune-specific) —
             // nothing to register.
@@ -1654,7 +1717,7 @@ fn distribution_from_head(head: &Tensor, form: &DistributionForm) -> Result<Pred
         row_errors: vec![String::new()],
         shapes: vec![(1, head.dim(1).unwrap_or(0))],
     };
-    let columns = adapter.adapt(&output, 1)?;
+    let columns = adapter.adapt(output, 1)?;
 
     use arrow::array::Float32Array;
     let col_f32 = |i: usize| -> Result<f32> {
@@ -2099,15 +2162,22 @@ fn pad_episode(
     })
 }
 
-/// Build the [`AnyContextPredictor`] the spec selects into `varmap`, with the
-/// feature dim taken from the resolved embedding table and the head width from
-/// the configured output.
-fn build_predictor(
+/// Build the [`AnyContextPredictor`] the spec selects, untrained, with every
+/// initial weight a pure function of `spec.seed`
+/// (`crate::pipeline::seeded_init`): the layers draw from a stream keyed by
+/// the seed and each parameter's name, never from the process's random state,
+/// so two builds at one seed hold byte-identical parameters on any machine —
+/// the family's learned tokens at zero and its norms at scale one, shift zero,
+/// as their own init hints say. With the seeded task split a training run is a
+/// function of the spec and the rows it reads, on whichever process trains it.
+///
+/// The feature dim comes from the resolved embedding table and the head width
+/// from the configured output.
+pub fn build_context_predictor(
     spec: &ContextPredictorTrainConfig,
     feature_dim: usize,
-    varmap: &VarMap,
     device: &Device,
-) -> Result<AnyContextPredictor> {
+) -> Result<(VarMap, AnyContextPredictor)> {
     let cfg = ContextPredictorConfig {
         architecture: spec.architecture,
         context_k: spec.context_k,
@@ -2118,9 +2188,85 @@ fn build_predictor(
         num_layers: spec.num_layers,
         head_width: spec.head.head_width(),
     };
-    let vb = VarBuilder::from_varmap(varmap, DType::F32, device);
-    AnyContextPredictor::new(&cfg, vb)
-        .map_err(|e| JammiError::FineTune(format!("build context predictor: {e}")))
+    let varmap = VarMap::new();
+    let vb =
+        crate::pipeline::seeded_init::seeded_var_builder(&varmap, spec.seed, DType::F32, device);
+    let predictor = AnyContextPredictor::new(&cfg, vb)
+        .map_err(|e| JammiError::FineTune(format!("build context predictor: {e}")))?;
+    Ok((varmap, predictor))
+}
+
+/// Meta-train `predictor` (whose parameters live in `varmap`) over `episodes`
+/// for `spec.epochs`: one AdamW step per episode batch, the head scored by the
+/// spec's proper-scoring objective. The report carries every step's loss and
+/// wall-clock. This is the whole optimisation of a context-predictor training
+/// job; the job adds only episode sampling before it and persistence after.
+///
+/// `after_epoch(predictor, n)` runs when epoch `n` (from 1) has taken its
+/// last step, with the predictor as it then stands — a caller's held-out
+/// probe reads the same forward the steps ran.
+pub fn fit_context_predictor(
+    spec: &ContextPredictorTrainConfig,
+    varmap: &VarMap,
+    predictor: &AnyContextPredictor,
+    episodes: &[EpisodeBatch],
+    cancel: &std::sync::atomic::AtomicBool,
+    mut after_epoch: impl FnMut(&AnyContextPredictor, usize) -> Result<()>,
+) -> Result<ParallelTrainReport> {
+    let train_config = ParallelTrainConfig {
+        epochs: spec.epochs,
+        learning_rate: spec.learning_rate,
+        weight_decay: 0.0,
+        grad_clip: spec.grad_clip,
+    };
+    let trained = predictor;
+    let report = train_loop(
+        varmap,
+        episodes,
+        &train_config,
+        cancel,
+        |batch: &EpisodeBatch| {
+            trained
+                .forward(&batch.episode)
+                .map_err(|e| JammiError::FineTune(format!("context predictor forward: {e}")))
+        },
+        |preds, batch: &EpisodeBatch| spec.head.score(preds, &batch.target_y),
+        |epoch| after_epoch(trained, epoch),
+    );
+    report
+}
+
+/// The mean of `spec`'s objective over every target of `episodes` — each
+/// batch's score weighted by its target count — at the parameters as they
+/// stand, with no gradient. A probe, never a step.
+pub fn score_episodes(
+    spec: &ContextPredictorTrainConfig,
+    predictor: &AnyContextPredictor,
+    episodes: &[EpisodeBatch],
+) -> Result<f64> {
+    let mut total = 0.0;
+    let mut targets = 0usize;
+    for batch in episodes {
+        let preds = predictor
+            .forward(&batch.episode)
+            .map_err(|e| JammiError::FineTune(format!("context predictor forward: {e}")))?
+            .detach();
+        let count = batch
+            .target_y
+            .dims1()
+            .map_err(|e| JammiError::FineTune(format!("target_y dims: {e}")))?;
+        let score = spec
+            .head
+            .score(&preds, &batch.target_y)?
+            .to_scalar::<f32>()
+            .map_err(|e| JammiError::FineTune(format!("score scalar: {e}")))?;
+        total += f64::from(score) * count as f64;
+        targets += count;
+    }
+    if targets == 0 {
+        return Err(JammiError::FineTune("no targets to score".into()));
+    }
+    Ok(total / targets as f64)
 }
 
 #[cfg(test)]
@@ -2279,9 +2425,9 @@ mod tests {
         EpisodeBatch { episode, target_y }
     }
 
-    /// Randomise a freshly built predictor off its zero-init so the head is
-    /// non-degenerate (the same as the pipeline trainer's fresh varmap), assigning
-    /// the deterministic `Rng(1234)` stream to the variables **in sorted key
+    /// Overwrite a freshly built predictor's parameters — learned tokens
+    /// included — with small values from the deterministic `Rng(1234)` stream,
+    /// assigned to the variables **in sorted key
     /// order**. The order matters: `VarMap::data()` is a `HashMap`, so iterating
     /// `.values()` directly permutes which variable receives which slice of the rng
     /// stream non-deterministically run-to-run — which the standardised path
@@ -2312,8 +2458,7 @@ mod tests {
         scaler: Option<&TargetScaler>,
         device: &Device,
     ) -> (f32, f32) {
-        let varmap = VarMap::new();
-        let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
+        let (varmap, predictor) = build_context_predictor(spec, FEATURE_DIM, device).unwrap();
         randomize_init(&varmap, device);
         let config = ParallelTrainConfig {
             epochs: spec.epochs,
@@ -2332,6 +2477,7 @@ mod tests {
                     .map_err(|e| JammiError::FineTune(format!("{e}")))
             },
             |preds, b: &EpisodeBatch| spec.head.score(preds, &b.target_y),
+            |_| Ok(()),
         )
         .unwrap();
 
@@ -2367,8 +2513,7 @@ mod tests {
             PredictiveHead::Quantile { levels } => levels.clone(),
             PredictiveHead::Gaussian { .. } => unreachable!("quantile spec"),
         };
-        let varmap = VarMap::new();
-        let predictor = build_predictor(spec, FEATURE_DIM, &varmap, device).unwrap();
+        let (varmap, predictor) = build_context_predictor(spec, FEATURE_DIM, device).unwrap();
         randomize_init(&varmap, device);
         let config = ParallelTrainConfig {
             epochs: spec.epochs,
@@ -2387,6 +2532,7 @@ mod tests {
                     .map_err(|e| JammiError::FineTune(format!("{e}")))
             },
             |preds, b: &EpisodeBatch| spec.head.score(preds, &b.target_y),
+            |_| Ok(()),
         )
         .unwrap();
 
@@ -2588,5 +2734,40 @@ mod tests {
              exercising the standardisation bug (the fit above would not depend on \
              the TargetScaler reparameterisation)"
         );
+    }
+
+    /// The initial weights are a pure function of the seed: two builds at one
+    /// seed are byte-identical, a different seed moves them, and no linear layer
+    /// is left at zero.
+    #[test]
+    fn initial_weights_are_a_pure_function_of_the_seed() {
+        let device = Device::Cpu;
+        let snapshot = |seed: u64| -> Vec<(String, Vec<f32>)> {
+            let spec = ContextPredictorTrainConfig {
+                seed,
+                ..high_offset_spec()
+            };
+            let (varmap, _) = build_context_predictor(&spec, FEATURE_DIM, &device).unwrap();
+            let data = varmap.data().lock().unwrap();
+            let mut vars: Vec<(String, Vec<f32>)> = data
+                .iter()
+                .map(|(name, var)| {
+                    (
+                        name.clone(),
+                        var.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    )
+                })
+                .collect();
+            vars.sort_by(|a, b| a.0.cmp(&b.0));
+            vars
+        };
+        let first = snapshot(7);
+        assert_eq!(first, snapshot(7));
+        assert_ne!(first, snapshot(8));
+        for (name, values) in &first {
+            if name.ends_with(".weight") || name.ends_with(".bias") {
+                assert!(values.iter().any(|v| *v != 0.0), "{name} was left at zero");
+            }
+        }
     }
 }

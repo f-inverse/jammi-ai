@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use super::artifact_repo::{
     probe_published_artifact, publish_staged_artifact, ArtifactRef, MaterializationSummary,
-    PublishingArtifact, StagedArtifact,
+    PublishingArtifact, ReclaimLicence, StagedArtifact, REFERENCED,
 };
 use super::backend::{BackendError, BackendKind, Row, SqlValue, Transaction, TxOptions};
 use super::instance::{
@@ -47,7 +47,7 @@ use super::lease::{
     canonical_stamp_now, instance_liveness_margin, lease_deadline_expr, lease_expired_clause,
     lease_live_clause, stale_before_clause, CanonicalStampColumn,
 };
-use super::status::{JobExecution, JobStatus};
+use super::status::{ArtifactState, JobExecution, JobStatus};
 use super::Catalog;
 use crate::error::{JammiError, Result};
 use crate::store::manifest::{DefinitionHash, InputAnchor, PinnedAnchors};
@@ -749,13 +749,29 @@ pub struct FinishJobReusingArtifactParams<'a> {
     pub result: ReusedResult,
 }
 
+/// A won finalize: the job is `completed`, and these are the licences to
+/// delete the bytes of every checkpoint the same transaction retired — the
+/// job's own staged checkpoints no finalize published. The rows went with
+/// the job's terminal state, so a `completed` observer never finds a
+/// checkpoint row the job did not keep; the bytes go under the licences,
+/// and bytes a finisher never got to are the strays a reconcile pass adopts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Finalized {
+    pub retired_checkpoints: Vec<ReclaimLicence>,
+}
+
 /// What [`Catalog::finish_job_reusing_artifact`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ReuseFinish {
     /// The job is `completed` and its output model references this already
     /// `published` artifact. The reference is all the caller gains: it names
     /// bytes another writer produced, and nothing here can reclaim them.
-    Reused(ArtifactRef),
+    /// The job's own checkpoints from earlier attempts are retired exactly
+    /// as a producing finalize retires them.
+    Reused {
+        artifact: ArtifactRef,
+        finalized: Finalized,
+    },
     /// No `published` artifact matches; nothing was written.
     Miss,
     /// An artifact matched but the attempt guard did not; nothing was
@@ -815,6 +831,48 @@ impl CompleteJob {
             .await?;
         Ok(updated == 1)
     }
+}
+
+/// Retire every checkpoint row of `job_id` the finalize did not publish —
+/// `staged` or `reclaiming`, referenced by no `models` row — inside the
+/// terminal transaction, and mint the licence to delete each one's bytes.
+/// A retained checkpoint is `published` by the time this runs and is not
+/// touched; a checkpoint whose registration was skipped is retired like any
+/// other.
+async fn retire_unpublished_checkpoints(
+    tx: &mut Transaction<'_>,
+    job_id: &str,
+) -> std::result::Result<Vec<ReclaimLicence>, BackendError> {
+    let select = format!(
+        "SELECT prefix FROM model_artifacts \
+         WHERE staging_job_id = $1 AND staging_attempt IS NULL \
+           AND state IN ($2, $3) AND NOT {REFERENCED} \
+         ORDER BY prefix"
+    );
+    let prefixes = tx
+        .query(
+            &select,
+            &[
+                SqlValue::TextOwned(job_id.to_string()),
+                SqlValue::Text(ArtifactState::Staged.as_db_str()),
+                SqlValue::Text(ArtifactState::Reclaiming.as_db_str()),
+            ],
+            |row| row.get::<String>("prefix"),
+        )
+        .await?;
+    let mut licences = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        tx.execute(
+            "DELETE FROM model_artifacts WHERE prefix = $1",
+            &[SqlValue::TextOwned(prefix.clone())],
+        )
+        .await?;
+        let artifact = ArtifactRef::parse(&prefix)
+            .and_then(ReclaimLicence::mint)
+            .map_err(|e| BackendError::Execution(e.to_string()))?;
+        licences.push(artifact);
+    }
+    Ok(licences)
 }
 
 /// Everything [`Catalog::finish_job_with_model`]'s transaction binds, owned,
@@ -1496,7 +1554,7 @@ impl Catalog {
         Ok(updated == 1)
     }
 
-    /// The placed-gang hand-off: move `job_id`'s claim from `from_instance` to `to_instance` —
+    /// The placed-attempt hand-off: move `job_id`'s claim from `from_instance` to `to_instance` —
     /// `claimed_by = $to`, a fresh `lease` deadline, `updated_at` — WITHOUT
     /// touching `attempts` or `releases` (zero net attempts: this is a
     /// hand-off, never a re-claim). `Ok(false)` when the guard misses:
@@ -1603,14 +1661,17 @@ impl Catalog {
     /// 2. only if that matched: the output artifact flips `staged →
     ///    published`, its materialization summary recorded on the artifact
     ///    row, and the output `models` row is upserted referencing it;
-    /// 3. the same publish-and-attach for every retained epoch checkpoint.
+    /// 3. the same publish-and-attach for every retained epoch checkpoint;
+    /// 4. every other checkpoint row of the job — the ones a resume could
+    ///    have read, now never needed again — retired, with one
+    ///    [`ReclaimLicence`] minted per row for its bytes.
     ///
-    /// Returns `true` when the caller held the lease and is the sole
-    /// finisher, `false` when the job CAS matched nothing (the lease was
-    /// lost, the row is not `running`, or `attempts` is stale) — in which
-    /// case NOTHING is written: no `models` row, no published artifact. The
-    /// caller's bundles stay `staged` for it to reclaim, and the job is left
-    /// for [`Self::reclaim_expired_jobs`].
+    /// Returns the [`Finalized`] licences when the caller held the lease and
+    /// is the sole finisher, `None` when the job CAS matched nothing (the
+    /// lease was lost, the row is not `running`, or `attempts` is stale) —
+    /// in which case NOTHING is written: no `models` row, no published
+    /// artifact, no retired row. The caller's bundles stay `staged` for it
+    /// to reclaim, and the job is left for [`Self::reclaim_expired_jobs`].
     ///
     /// An artifact that is not the caller's own `staged` bundle (reclaimed,
     /// already published, staged by another writer), or a `models` write that
@@ -1631,12 +1692,15 @@ impl Catalog {
     ///
     /// An epoch checkpoint whose catalog NAME is already occupied by another
     /// row is skipped (logged), never failing the whole job over one name
-    /// collision. A skipped checkpoint is NOT published: its artifact stays
-    /// `staged` and the finisher's own sweep reclaims it. The pre-check is by
+    /// collision. A skipped checkpoint is NOT published: its row is retired
+    /// with the job's other unpublished checkpoints. The pre-check is by
     /// NAME ALONE (every version, tenant-strict) — a same-name row at another
     /// version would otherwise SHADOW the checkpoint from every reader via
     /// `ORDER BY version DESC` resolution.
-    pub async fn finish_job_with_model(&self, p: FinishJobWithModelParams<'_>) -> Result<bool> {
+    pub async fn finish_job_with_model(
+        &self,
+        p: FinishJobWithModelParams<'_>,
+    ) -> Result<Option<Finalized>> {
         let tenant = self.current_tenant();
         let job_id_for_error = p.job_id.to_string();
         let plan = std::sync::Arc::new(FinalizePlan {
@@ -1660,7 +1724,7 @@ impl Catalog {
                     // the attempt that wins the job-row CAS publishes or
                     // attaches anything.
                     if !plan.job.run(tx, &plan.result).await? {
-                        return Ok(false);
+                        return Ok(None);
                     }
                     tx.assert_tenant_matches(tenant, "models")?;
                     let tenant_val = SqlValue::from(tenant.map(|t| t.to_string()));
@@ -1685,14 +1749,18 @@ impl Catalog {
                                 occupied_name = %checkpoint.row.name,
                                 skipped_artifact = %checkpoint.artifact.prefix(),
                                 "epoch-checkpoint catalog name already occupied by another \
-                                 row; skipping registration — the checkpoint stays staged for \
-                                 the finisher's sweep to reclaim"
+                                 row; skipping registration — the checkpoint is retired with \
+                                 the job's other unpublished checkpoints"
                             );
                             continue;
                         }
                         checkpoint.publish_and_attach(tx, &tenant_val).await?;
                     }
-                    Ok(true)
+                    let retired_checkpoints =
+                        retire_unpublished_checkpoints(tx, &plan.job.job_id).await?;
+                    Ok(Some(Finalized {
+                        retired_checkpoints,
+                    }))
                 })
             })
             .await;
@@ -1719,7 +1787,9 @@ impl Catalog {
     /// 2. the attempt-guarded job CAS (`running -> completed`), recording
     ///    the payload `result` renders for the matched artifact. A guard
     ///    miss is [`ReuseFinish::LostLease`], and nothing is written;
-    /// 3. the output `models` row upserted referencing the matched artifact.
+    /// 3. the output `models` row upserted referencing the matched artifact;
+    /// 4. the job's own checkpoints from earlier attempts retired, as in
+    ///    [`Self::finish_job_with_model`].
     ///
     /// The probe reads the artifact row the attach then references, so under
     /// `Serializable` this transaction and the reclaim compare-and-set
@@ -1766,7 +1836,14 @@ impl Catalog {
                     plan.output
                         .attach(tx, &tenant_val, artifact.url().as_str())
                         .await?;
-                    Ok(ReuseFinish::Reused(artifact))
+                    let retired_checkpoints =
+                        retire_unpublished_checkpoints(tx, &plan.job.job_id).await?;
+                    Ok(ReuseFinish::Reused {
+                        artifact,
+                        finalized: Finalized {
+                            retired_checkpoints,
+                        },
+                    })
                 })
             })
             .await;

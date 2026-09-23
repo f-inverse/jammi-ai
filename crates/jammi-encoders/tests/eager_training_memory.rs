@@ -99,11 +99,10 @@
 //! inside this crate's per-op eager arms can reduce the count without changing the
 //! computation (padding an intermediate inside `LayerNorm::slow` would inject values into a
 //! mean/variance reduction). Canonicalising shapes is only sound before tokens reach the
-//! encoder, at the trainer's batch construction: `jammi-ai`'s
-//! `fine_tune::batch_bucket`, wired at `TrainingLoop::encode_texts`, rounds each batch's
-//! natural width up to a small, fixed power-of-two ladder, and the f16 run at the
-//! reference shape completes at a flat 44.3 GB with it. The bucket decision itself
-//! (`bucket_seq_len`/`MIN_BUCKET_LEN`) lives in `jammi_numerics`, below both crates, so
+//! encoder, at the trainer's batch construction: `jammi-ai`'s `TrainingLoop::encode_texts`
+//! rounds each batch's natural width up to a small, fixed ladder of widths, and the f16
+//! run at the reference shape completes at a flat 44.3 GB with it. The ladder itself
+//! (`jammi_numerics::ShapeLadder`) lives in `jammi_numerics`, below both crates, so
 //! [`variable_shape_bucketed_steps_complete_with_bounded_memory`] calls the identical
 //! decision at this seam without depending on `jammi-ai`.
 //!
@@ -768,13 +767,13 @@ fn run_leg_fixed_shape_same_step_count(
     }
 }
 
-/// The cap [`jammi_numerics::bucket_seq_len`] rounds each step's raw
+/// The cap [`jammi_numerics::ShapeLadder`] rounds each step's raw
 /// length up against — [`REFERENCE_SEQ`] (`128`), the `jammi-ai`
 /// trainer's `effective_max` at the reference shape, where the f16 run
 /// completes at a flat 44.3 GB.
 ///
 /// **A cap of `512` ([`VARIABLE_SHAPE_SEQS`]'s raw maximum) does not pass
-/// this leg**: bucketing to `{64, 128, 256, 512}` still visits `256`/`512`,
+/// this leg**: the ladder to 512 still visits widths above `128` up to `512`,
 /// each of which costs tens of GB at this harness's shape (28-layer
 /// ModernBERT-large, 3-forward eager LoRA backward), and the leg runs out
 /// of memory after 3 steps. Bucketing bounds the COUNT of distinct shapes
@@ -790,18 +789,17 @@ const VARIABLE_SHAPE_BUCKET_CAP: usize = REFERENCE_SEQ;
 /// trainer's own tokenizer call, `tokenizer.encode_batch(&text_refs,
 /// Some(effective_max))`, which truncates BEFORE any bucketing ever runs —
 /// `crates/jammi-ai/src/fine_tune/trainer.rs`), then rounded UP through
-/// `jammi_numerics::bucket_seq_len` (the SAME candle-free decision that
-/// trainer calls next, via `crates/jammi-ai/src/fine_tune/batch_bucket.rs`)
-/// BEFORE any tensor is constructed. The extra `(bucketed_len - raw_len)`
-/// tail positions are padded with token id `0` and attention-mask `0` —
-/// the SAME trivial extend-with-zeros contract `jammi-ai`'s own
-/// `pad_rows_to_bucket` implements, re-stated inline here (a few lines)
-/// rather than IMPORTED, since `jammi-encoders` must not depend on
-/// `jammi-ai` (the wrong dependency direction for this workspace — only
-/// the candle-free bucket DECISION is shared, via `jammi-numerics`, never
-/// the row-mutation helper). Truncate-then-bucket at `REFERENCE_SEQ` collapses
+/// `jammi_numerics::ShapeLadder` (the SAME candle-free
+/// decision that trainer calls next) BEFORE any tensor is constructed. The
+/// extra `(bucketed_len - raw_len)` tail positions are padded with token id
+/// `0` and attention-mask `0` — the SAME trivial extend-with-zeros contract
+/// `jammi-ai`'s own `BatchEncoding::pad_to` implements, re-stated inline
+/// here (a few lines) rather than IMPORTED, since `jammi-encoders` must not
+/// depend on `jammi-ai` (the wrong dependency direction for this workspace —
+/// only the candle-free ladder DECISION is shared, via `jammi-numerics`,
+/// never the row-mutation helper). Truncate-then-bucket at `REFERENCE_SEQ` collapses
 /// `VARIABLE_SHAPE_SEQS`'s 11 raw values (many `> REFERENCE_SEQ`) down to
-/// just `{64, 128}` (2 distinct shapes, both already known-safe from the
+/// just `{64, 104, 128}` (3 distinct shapes, none wider than the
 /// fixed-shape control), and the leg completes where the unbucketed cycle
 /// runs out of memory.
 fn run_leg_variable_shape_bucketed(
@@ -823,7 +821,7 @@ fn run_leg_variable_shape_bucketed(
     // A row's ids/mask at the BUCKETED width: the first `raw_len` columns
     // are real synthetic content (mirroring `synthetic_ids`'s own hash),
     // the remaining `bucketed_len - raw_len` columns are pad id `0` /
-    // mask `0` — exactly `pad_rows_to_bucket`'s own contract, restated for
+    // mask `0` — exactly `BatchEncoding::pad_to`'s own contract, restated for
     // a flat `(batch, bucketed_len)` tensor build.
     let build_bucketed = |raw_len: usize, bucketed_len: usize, salt: u32| -> (Tensor, Tensor) {
         let mut ids: Vec<u32> = Vec::with_capacity(REFERENCE_BATCH * bucketed_len);
@@ -855,11 +853,12 @@ fn run_leg_variable_shape_bucketed(
         // Truncate FIRST (mirroring `tokenizer.encode_batch(&text_refs,
         // Some(effective_max))`'s own truncation, which the real trainer
         // runs BEFORE any bucketing) — a raw length above the cap is not a
-        // `bucket_seq_len` domain violation the caller silently walks into,
+        // ladder domain violation the caller silently walks into,
         // it is the SAME "already truncated to max_seq_length" precondition
         // that function's own doc states.
         let raw_len = VARIABLE_SHAPE_SEQS[step % VARIABLE_SHAPE_SEQS.len()].min(REFERENCE_SEQ);
-        let bucketed_len = jammi_numerics::bucket_seq_len(raw_len, VARIABLE_SHAPE_BUCKET_CAP);
+        let bucketed_len =
+            jammi_numerics::ShapeLadder::new(VARIABLE_SHAPE_BUCKET_CAP).width(raw_len);
         let (anchor_ids, anchor_mask) = build_bucketed(raw_len, bucketed_len, 1);
         let (positive_ids, _positive_mask) = build_bucketed(raw_len, bucketed_len, 2);
         let (negative_ids, _negative_mask) = build_bucketed(raw_len, bucketed_len, 3);
@@ -962,17 +961,17 @@ fn steady_state_drop_mib(outcome: &LegOutcome) -> Option<f64> {
 /// with each step's raw length first truncated to
 /// [`VARIABLE_SHAPE_BUCKET_CAP`] (`REFERENCE_SEQ`, as the trainer's
 /// tokenizer truncates with `Some(effective_max)`) and then rounded up
-/// through `jammi_numerics::bucket_seq_len`, the same candle-free decision
-/// `jammi-ai`'s trainer calls at batch construction
-/// (`fine_tune::batch_bucket`). The 11 raw lengths (most
-/// `> REFERENCE_SEQ`) collapse to `{64, 128}`. This proves the bound at the
+/// through `jammi_numerics::ShapeLadder`, the same
+/// candle-free decision `jammi-ai`'s trainer calls at batch construction.
+/// The 11 raw lengths (most
+/// `> REFERENCE_SEQ`) collapse to `{64, 104, 128}`. This proves the bound at the
 /// `jammi-encoders` library seam directly, at `max_seq_length =
 /// REFERENCE_SEQ`; bucketing bounds shape COUNT, not shape AMPLITUDE (see
 /// [`VARIABLE_SHAPE_BUCKET_CAP`]).
 ///
 /// Asserts BOTH: (a) every one of `VARIABLE_SHAPE_STEPS` steps completes
 /// with a finite loss (never merely "did not panic"), and (b) the bucketed
-/// leg reaches a steady state: both buckets appear within the first cycle
+/// leg reaches a steady state: every bucket appears within the first cycle
 /// of [`VARIABLE_SHAPE_SEQS`], so from the end of that cycle to the end of
 /// the run no new shape is ever seen and free memory must not drop further
 /// than the driver's allocation granularity allows

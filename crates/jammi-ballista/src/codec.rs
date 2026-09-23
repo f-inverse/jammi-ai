@@ -55,18 +55,22 @@ use ballista_core::serde::BallistaPhysicalExtensionCodec;
 use jammi_ai::inference::adapter::DistributionForm;
 use jammi_ai::model::{BackendType, ModelSource, ModelTask};
 use jammi_ai::operator::ann_search_exec::AnnSearchExec;
-use jammi_ai::operator::gang_exec::{GangDescriptor, GangExec};
 use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
 use jammi_ai::operator::key_check_exec::KeyCheckExec;
 use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
+use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
+use jammi_ai::pipeline::graph_propagation::hop::{HopFoldExec, HopSpec};
+use jammi_ai::pipeline::graph_propagation::readout::{ReadoutExec, ReadoutSpec};
+use jammi_ai::pipeline::graph_propagation::state::{InitialStateExec, InitialStateSpec};
 use jammi_ai::session::InferenceSession;
 use jammi_db::error::JammiError;
 use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
+use jammi_numerics::ChunkBudget;
 
 use crate::error::Error;
 
@@ -92,9 +96,12 @@ pub enum NodeTag {
     AnnSearch = 1,
     AsofJoin = 2,
     KeyCheck = 3,
-    Gang = 4,
+    PlacedAttempt = 4,
     NumberedInput = 5,
     ResultTableSink = 6,
+    InitialState = 7,
+    HopFold = 8,
+    Readout = 9,
 }
 
 /// The codec `jammi-ballista`'s scheduler and executor roles both install.
@@ -170,10 +177,34 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::AnnSearch as u8 => decode_ann_search(body, &session),
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
-            t if t == NodeTag::Gang as u8 => decode_gang(body),
-            t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs),
+            t if t == NodeTag::PlacedAttempt as u8 => decode_placed_attempt(body),
+            t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs, &session),
             t if t == NodeTag::ResultTableSink as u8 => {
                 decode_result_table_sink(body, inputs, &session)
+            }
+            t if t == NodeTag::InitialState as u8 => {
+                decode_one_child::<pb::InitialStateExecNode, InitialStateSpec, _>(
+                    body,
+                    inputs,
+                    "InitialStateExecNode",
+                    |input, spec| Ok(Arc::new(InitialStateExec::try_new(input, spec)?)),
+                )
+            }
+            t if t == NodeTag::HopFold as u8 => {
+                decode_one_child::<pb::HopFoldExecNode, HopSpec, _>(
+                    body,
+                    inputs,
+                    "HopFoldExecNode",
+                    |input, spec| Ok(Arc::new(HopFoldExec::try_new(input, spec)?)),
+                )
+            }
+            t if t == NodeTag::Readout as u8 => {
+                decode_one_child::<pb::ReadoutExecNode, ReadoutSpec, _>(
+                    body,
+                    inputs,
+                    "ReadoutExecNode",
+                    |input, spec| Ok(Arc::new(ReadoutExec::try_new(input, spec)?)),
+                )
             }
             other => Err(Error::Decode(format!("unknown jammi node tag {other}")).into_df_error()),
         }
@@ -192,14 +223,29 @@ impl PhysicalExtensionCodec for JammiCodec {
         if let Some(exec) = node.downcast_ref::<KeyCheckExec>() {
             return encode_key_check(exec, buf);
         }
-        if let Some(exec) = node.downcast_ref::<GangExec>() {
-            return encode_gang(exec, buf);
+        if let Some(exec) = node.downcast_ref::<PlacedAttemptExec>() {
+            return encode_placed_attempt(exec, buf);
         }
         if let Some(exec) = node.downcast_ref::<NumberedInputExec>() {
             return encode_numbered_input(exec, buf);
         }
         if let Some(exec) = node.downcast_ref::<ResultTableSinkExec>() {
             return encode_result_table_sink(exec, buf);
+        }
+        if let Some(exec) = node.downcast_ref::<InitialStateExec>() {
+            return encode_spec(NodeTag::InitialState, exec.spec(), buf, |spec_json| {
+                pb::InitialStateExecNode { spec_json }
+            });
+        }
+        if let Some(exec) = node.downcast_ref::<HopFoldExec>() {
+            return encode_spec(NodeTag::HopFold, exec.spec(), buf, |spec_json| {
+                pb::HopFoldExecNode { spec_json }
+            });
+        }
+        if let Some(exec) = node.downcast_ref::<ReadoutExec>() {
+            return encode_spec(NodeTag::Readout, exec.spec(), buf, |spec_json| {
+                pb::ReadoutExecNode { spec_json }
+            });
         }
         // Not one of ours — delegate to Ballista's own codec (shuffle
         // reader/writer, unresolved shuffle, ...). A node NEITHER codec
@@ -263,7 +309,16 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
 }
 
 fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let spec = exec.spec();
+    let msg = spec_to_proto(exec.spec())?;
+    buf.extend_from_slice(&MAGIC);
+    buf.push(NodeTag::Inference as u8);
+    msg.encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// `spec` as the wire descriptor both `InferenceExecNode` and
+/// `NumberedInputExecNode` carry.
+fn spec_to_proto(spec: &InferenceSpec) -> DfResult<pb::InferenceExecNode> {
     let source = match &spec.source {
         ModelSource::HuggingFace(id) => pb::model_source::Source::HuggingFace(id.clone()),
         ModelSource::Local(path) => {
@@ -279,7 +334,8 @@ fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
         key_column: spec.key_column.clone(),
         source_id: spec.source_id.clone(),
         backend_json: spec.backend.as_ref().map(to_json_string).transpose()?,
-        batch_size: spec.batch_size.get() as u64,
+        batch_size: spec.chunk.rows.get() as u64,
+        batch_tokens: spec.chunk.tokens.get() as u64,
         embedding_dim: spec.embedding_dim.map(|d| d as u64),
         regression_form_json: spec
             .regression_form
@@ -292,10 +348,7 @@ fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
         device_kind: device_kind_str(spec.device_kind).to_string(),
         partitions: spec.partitions.get() as u64,
     };
-    buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::Inference as u8);
-    msg.encode(buf)
-        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+    Ok(msg)
 }
 
 /// A wire count that must be at least one.
@@ -322,6 +375,16 @@ fn decode_inference(
         .first()
         .cloned()
         .ok_or_else(|| Error::Decode("InferenceExecNode: no input".into()).into_df_error())?;
+    // The same constructor `with_new_children` uses, bound to the DECODING
+    // session's model cache and observer.
+    Ok(Arc::new(InferenceExec::bind(
+        input,
+        spec_from_proto(msg)?,
+        session.inference_runtime(),
+    )?))
+}
+
+fn spec_from_proto(msg: pb::InferenceExecNode) -> DfResult<InferenceSpec> {
     let source = match msg.source.and_then(|s| s.source) {
         Some(pb::model_source::Source::HuggingFace(id)) => ModelSource::hf(id),
         Some(pb::model_source::Source::Local(p)) => ModelSource::local(p),
@@ -341,7 +404,10 @@ fn decode_inference(
             .as_deref()
             .map(from_json_str::<BackendType>)
             .transpose()?,
-        batch_size: non_zero("batch_size", msg.batch_size)?,
+        chunk: ChunkBudget {
+            rows: non_zero("batch_size", msg.batch_size)?,
+            tokens: non_zero("batch_tokens", msg.batch_tokens)?,
+        },
         embedding_dim: msg.embedding_dim.map(|d| d as usize),
         regression_form: msg
             .regression_form_json
@@ -352,13 +418,7 @@ fn decode_inference(
         device_kind: device_kind_from_str(&msg.device_kind)?,
         partitions: non_zero("partitions", msg.partitions)?,
     };
-    // The same constructor `with_new_children` uses, bound to the DECODING
-    // session's model cache and observer.
-    Ok(Arc::new(InferenceExec::bind(
-        input,
-        spec,
-        session.inference_runtime(),
-    )?))
+    Ok(spec)
 }
 
 fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResult<()> {
@@ -367,6 +427,7 @@ fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResul
             RowOrder::Keyed { key_column } => Some(key_column.clone()),
             RowOrder::Arrival => None,
         },
+        spec: Some(spec_to_proto(exec.spec())?),
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::NumberedInput as u8);
@@ -377,6 +438,7 @@ fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResul
 fn decode_numbered_input(
     body: &[u8],
     inputs: &[Arc<dyn ExecutionPlan>],
+    session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
     let msg = pb::NumberedInputExecNode::decode(body)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
@@ -389,7 +451,15 @@ fn decode_numbered_input(
         .map_or(RowOrder::Arrival, |key_column| RowOrder::Keyed {
             key_column,
         });
-    Ok(Arc::new(NumberedInputExec::try_new(input, order)?))
+    let spec = msg.spec.ok_or_else(|| {
+        Error::Decode("NumberedInputExecNode: missing spec".into()).into_df_error()
+    })?;
+    Ok(Arc::new(NumberedInputExec::try_new(
+        input,
+        order,
+        spec_from_proto(spec)?,
+        session.inference_runtime(),
+    )?))
 }
 
 fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {
@@ -525,6 +595,69 @@ fn decode_asof(body: &[u8], inputs: &[Arc<dyn ExecutionPlan>]) -> DfResult<Arc<d
     Ok(Arc::new(node))
 }
 
+/// Encode a node carried by its `serde` spec alone under `tag`: the spec as
+/// JSON inside the message `wrap` builds.
+fn encode_spec<M: prost::Message>(
+    tag: NodeTag,
+    spec: &impl serde::Serialize,
+    buf: &mut Vec<u8>,
+    wrap: impl FnOnce(Vec<u8>) -> M,
+) -> DfResult<()> {
+    let spec_json =
+        serde_json::to_vec(spec).map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    buf.extend_from_slice(&MAGIC);
+    buf.push(tag as u8);
+    wrap(spec_json)
+        .encode(buf)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
+}
+
+/// The spec bytes a spec-only message carries.
+trait SpecJson {
+    fn spec_json(&self) -> &[u8];
+}
+
+impl SpecJson for pb::InitialStateExecNode {
+    fn spec_json(&self) -> &[u8] {
+        &self.spec_json
+    }
+}
+
+impl SpecJson for pb::HopFoldExecNode {
+    fn spec_json(&self) -> &[u8] {
+        &self.spec_json
+    }
+}
+
+impl SpecJson for pb::ReadoutExecNode {
+    fn spec_json(&self) -> &[u8] {
+        &self.spec_json
+    }
+}
+
+/// Decode a one-child node carried by its `serde` spec alone: the message
+/// `M`, its spec `S`, and the node `build` binds over the first input.
+fn decode_one_child<M, S, B>(
+    body: &[u8],
+    inputs: &[Arc<dyn ExecutionPlan>],
+    name: &str,
+    build: B,
+) -> DfResult<Arc<dyn ExecutionPlan>>
+where
+    M: prost::Message + Default + SpecJson,
+    S: serde::de::DeserializeOwned,
+    B: FnOnce(Arc<dyn ExecutionPlan>, S) -> DfResult<Arc<dyn ExecutionPlan>>,
+{
+    let msg = M::decode(body).map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let spec: S = serde_json::from_slice(msg.spec_json())
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let input = inputs
+        .first()
+        .cloned()
+        .ok_or_else(|| Error::Decode(format!("{name}: no input")).into_df_error())?;
+    build(input, spec)
+}
+
 fn encode_key_check(exec: &KeyCheckExec, buf: &mut Vec<u8>) -> DfResult<()> {
     let msg = pb::KeyCheckExecNode {
         key_column: exec.key_column().to_string(),
@@ -549,32 +682,36 @@ fn decode_key_check(
     Ok(Arc::new(node))
 }
 
-fn encode_gang(exec: &GangExec, buf: &mut Vec<u8>) -> DfResult<()> {
+fn encode_placed_attempt(exec: &PlacedAttemptExec, buf: &mut Vec<u8>) -> DfResult<()> {
     let d = exec.descriptor();
-    let msg = pb::GangExecNode {
+    let msg = pb::PlacedAttemptExecNode {
         job_id: d.job_id.clone(),
         attempt: d.attempt,
-        world: d.world,
         submitter: d.submitter.clone(),
         device_kind: device_kind_str(d.device_kind).to_string(),
+        claimed_at: d.claimed_at.to_rfc3339(),
     };
     buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::Gang as u8);
+    buf.push(NodeTag::PlacedAttempt as u8);
     msg.encode(buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
-fn decode_gang(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let msg =
-        pb::GangExecNode::decode(body).map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
-    let descriptor = GangDescriptor {
+fn decode_placed_attempt(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let msg = pb::PlacedAttemptExecNode::decode(body)
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
+    let descriptor = PlacedAttempt {
         job_id: msg.job_id,
         attempt: msg.attempt,
-        world: msg.world,
         submitter: msg.submitter,
         device_kind: device_kind_from_str(&msg.device_kind)?,
+        claimed_at: chrono::DateTime::parse_from_rfc3339(&msg.claimed_at)
+            .map_err(|e| {
+                Error::Decode(format!("PlacedAttemptExecNode: claimed_at: {e}")).into_df_error()
+            })?
+            .with_timezone(&chrono::Utc),
     };
-    Ok(Arc::new(GangExec::new(descriptor)))
+    Ok(Arc::new(PlacedAttemptExec::new(descriptor)))
 }
 
 /// The sink crosses as its spec; the node that arrives is PLACED — it

@@ -891,8 +891,8 @@ mod root_identity_tests {
                 ..S3Config::default()
             })
         };
-        let a = s3(Some("https://minio-a.local:9000"));
-        let b = s3(Some("https://minio-b.local:9000"));
+        let a = s3(Some("https://store-a.local:9000"));
+        let b = s3(Some("https://store-b.local:9000"));
         let with = |cloud: &CloudConfig| {
             RootIdentity::of("s3://bucket/prefix", Some(cloud), &no_env())
                 .unwrap()
@@ -900,7 +900,7 @@ mod root_identity_tests {
                 .to_string()
         };
         assert_ne!(with(&a), with(&b));
-        assert_eq!(with(&a), with(&s3(Some("https://minio-a.local:9000"))));
+        assert_eq!(with(&a), with(&s3(Some("https://store-a.local:9000"))));
         assert_ne!(
             with(&a),
             id("s3://bucket/prefix"),
@@ -1049,34 +1049,34 @@ mod root_identity_tests {
         };
         let default = s3(&[]);
         for spelling in ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_ENDPOINT_URL_S3"] {
-            let with = s3(&[(spelling, "https://minio-a.local:9000")]);
+            let with = s3(&[(spelling, "https://store-a.local:9000")]);
             assert_ne!(
                 with, default,
                 "{spelling}: an endpoint vs the service default"
             );
             assert!(
-                with.ends_with("@bucket_endpoint=https://minio-a.local:9000/bucket"),
+                with.ends_with("@bucket_endpoint=https://store-a.local:9000/bucket"),
                 "{spelling}: {with}"
             );
         }
         assert_ne!(
-            s3(&[("AWS_ENDPOINT_URL", "https://minio-a.local:9000")]),
-            s3(&[("AWS_ENDPOINT_URL", "https://minio-b.local:9000")]),
+            s3(&[("AWS_ENDPOINT_URL", "https://store-a.local:9000")]),
+            s3(&[("AWS_ENDPOINT_URL", "https://store-b.local:9000")]),
             "two endpoints: two locations"
         );
         // Config on top of the environment, as the builder applies it.
         let configured = CloudConfig::S3(S3Config {
-            endpoint: Some("https://minio-cfg.local:9000".to_string()),
+            endpoint: Some("https://store-cfg.local:9000".to_string()),
             ..S3Config::default()
         });
         assert!(RootIdentity::of(
             "s3://bucket/prefix",
             Some(&configured),
-            &seeds(&[("AWS_ENDPOINT_URL", "https://minio-env")])
+            &seeds(&[("AWS_ENDPOINT_URL", "https://store-env")])
         )
         .unwrap()
         .as_str()
-        .ends_with("@bucket_endpoint=https://minio-cfg.local:9000/bucket"));
+        .ends_with("@bucket_endpoint=https://store-cfg.local:9000/bucket"));
         let azure = |vars: &[(&str, &str)]| {
             RootIdentity::of("azure://container/prefix", None, &seeds(vars))
                 .unwrap()

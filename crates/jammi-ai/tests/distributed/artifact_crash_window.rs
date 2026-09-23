@@ -1,7 +1,7 @@
-//! Property 3 — the artifact crash-window on REAL MinIO (#22 cross-host
+//! Property 3 — the artifact crash-window on a REAL S3 store (#22 cross-host
 //! validation).
 //!
-//! Two facets, both over a real S3-compatible object store (MinIO), not a local
+//! Two facets, both over a real S3-compatible object store (the lane's store), not a local
 //! `file://` root:
 //!
 //! (a) **write-on-A / read-on-B**: an artifact a worker process publishes to the
@@ -129,14 +129,14 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
     );
 
     // (a) write-on-worker / read-on-harness: the harness — a separate process
-    // and S3 driver — fetches the committed artifact from MinIO, verifies its
+    // and S3 driver — fetches the committed artifact from the store, verifies its
     // manifest (sha256), and finds the non-empty LoRA adapter. This is the real
     // cross-host reload the local-FS `it` tests cannot exercise.
     let local = session
         .artifact_store()
         .fetch_artifact(&prefix)
         .await
-        .expect("the winner's artifact fetches from MinIO and verifies its manifest");
+        .expect("the winner's artifact fetches from the store and verifies its manifest");
     let adapter = local.dir().join("adapter.safetensors");
     assert!(
         adapter.is_file() && std::fs::metadata(&adapter).unwrap().len() > 0,
@@ -147,7 +147,7 @@ async fn crash_between_publish_and_finalize_commits_only_the_winner() {
 }
 
 /// The simpler facet of (a) on its own, with no crash: a single worker completes
-/// a job, publishes to MinIO, and the harness (a different process) reloads the
+/// a job, publishes to the S3 store, and the harness (a different process) reloads the
 /// bytes. Isolating this from the crash path proves the cross-host round-trip
 /// independently of reclaim, so a failure here points squarely at the
 /// object-store path rather than the lease machinery.
@@ -193,7 +193,7 @@ async fn artifact_written_on_worker_is_readable_by_a_different_client() {
         .artifact_store()
         .fetch_artifact(&prefix)
         .await
-        .expect("worker-written artifact is readable by the harness over MinIO");
+        .expect("worker-written artifact is readable by the harness over the store");
     let adapter = local.dir().join("adapter.safetensors");
     assert!(
         adapter.is_file() && std::fs::metadata(&adapter).unwrap().len() > 0,

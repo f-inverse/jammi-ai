@@ -17,7 +17,7 @@
 //!
 //! Dependency direction: this crate depends on `jammi-ai`/`jammi-db`/
 //! `jammi-wire`; neither `jammi-ai` nor `jammi-db` depends on it. The
-//! `ComputePlane` seam `jammi-db` exposes and the `PlacedGangRunner` seam
+//! `ComputePlane` seam `jammi-db` exposes and the `PlacedAttemptRunner` seam
 //! `jammi-ai` exposes are INSTALLED by this crate's roles
 //! (`roles::host_client`/`roles::host_executor`), never called from their
 //! own dependency graphs — the same shape `MemberDialer` already uses

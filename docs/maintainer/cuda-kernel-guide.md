@@ -221,7 +221,7 @@ each with a live instance in `crates/jammi-kernels/tests/cuda_parity.rs`:
    measured, 384 of 1024 elements do on this file's own fixture — so `|Δact| <= 1 ulp(act)`, a
    relative `2^-mantissa`, which `act·up` carries into `out` as up to **2** ULPs of `out`, on top
    of ROUND 2's own <=1. Derived `k = 3`, not the column's 2; see
-   `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`. At `k = 2` both the sm_80 and sm_89 arch-set artifacts
+   `GEGLU_FWD_ROUND1_PROPAGATION_ULPS`. At `k = 2` both sm_80 and sm_89
    measured worst `Δ/bound` of exactly `1.0` — a bound resting on its own worst case.
 2. **When an op's two arms are fed DIFFERENT (each individually within-bound) inputs, the output
    allowance must include those inputs' difference times the op's own sensitivity.** A CPU-vs-CUDA
@@ -312,8 +312,8 @@ because it was a small share of runtime. An isolated number alone is not a resul
   report "Fresh" for MUTATED sources and scores every mutant against unmutated artifacts — a whole
   run was invalidated that way.
 * Copy mode duplicates the workspace + target per job. Budget `~25 GB + S_src + S_seed +
-  N*S_clone` once the build-substrate seed/clone is in use (S values pending —
-  `ci/scripts/perf/pod_build_timings.sh` is the producer) `+ 3 GB/other agent + 2 GB/mutants
+  N*S_clone` once the build-substrate seed/clone is in use (`ci/scripts/perf/pod_build_timings.sh`
+  measures the S values; ≈ 3.6/7.8/8.1 GB on an A100 pod) `+ 3 GB/other agent + 2 GB/mutants
   job`; a mutation session wants a pod ≥ 120 GB (`RP_DISK_GB=... ci/scripts/gpu-dev.sh up`).
 * `tests/cuda_parity.rs` is `required-features = ["cuda"]`, so no CPU-only gate compiles it. Whatever
   you put there is checked by the pod lane alone — say so rather than implying local green covers it.

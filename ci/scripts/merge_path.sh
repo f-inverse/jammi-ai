@@ -8,8 +8,9 @@
 # Stages, in order:
 #   static   fmt, the clippy surfaces the `check` job lints, rustdoc -D warnings, the guide build
 #            (ci.yml `check`, docs.yml `build`)
-#   guards   the guards this change can affect (`ci/guards.toml`), through the
-#            same runner ci.yml's `guard` job calls
+#   guards   the guards this change can affect (`ci/guards.toml`) and the
+#            script tests it can affect, through the same runners ci.yml's
+#            `guard` job calls
 #   index    ci.yml's `symbol-index-gates` steps (the guards that build a
 #            workspace crate), each step's `run:` block executed WHOLE (a
 #            multi-line guard split into lines is never evaluated)
@@ -202,6 +203,7 @@ fi
 # ---------------------------------------------------------------- guards
 if stage_wanted guards; then
   run guards "run_guards.py --base $BASE_REF" python3 ci/scripts/run_guards.py --base "$BASE_SHA"
+  run guards "run_script_tests.py --base $BASE_REF" python3 ci/scripts/run_script_tests.py --base "$BASE_SHA"
 fi
 
 # ---------------------------------------------------------------- index

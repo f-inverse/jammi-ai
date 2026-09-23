@@ -1,0 +1,289 @@
+{
+  "workload": "train-run",
+  "from": "torch",
+  "to": "resident",
+  "edges": [
+    {
+      "edge": "torch -> resident",
+      "difference": {
+        "kind": "framework",
+        "reference": "PyTorch"
+      },
+      "units": [
+        "seed1",
+        "seed2",
+        "seed3",
+        "seed4",
+        "seed5",
+        "seed6",
+        "seed7",
+        "seed8",
+        "seed9",
+        "seed10",
+        "seed11",
+        "seed12"
+      ],
+      "outcome": {
+        "kind": "seeded_loss",
+        "judged_at": "reference_minimum",
+        "per_unit": [
+          {
+            "unit": "seed1",
+            "epoch": 3,
+            "lower": 3.121194437146187,
+            "upper": 3.1435068026185036,
+            "d": 0.022312365472316742,
+            "reference_improvement": 0.3169027119874954,
+            "clean": true
+          },
+          {
+            "unit": "seed2",
+            "epoch": 3,
+            "lower": 3.127739541232586,
+            "upper": 3.133130043745041,
+            "d": 0.005390502512454987,
+            "reference_improvement": 0.31035760790109634,
+            "clean": true
+          },
+          {
+            "unit": "seed3",
+            "epoch": 3,
+            "lower": 3.1317579597234726,
+            "upper": 3.1306036859750748,
+            "d": -0.0011542737483978271,
+            "reference_improvement": 0.30633918941020966,
+            "clean": true
+          },
+          {
+            "unit": "seed4",
+            "epoch": 3,
+            "lower": 3.12564929574728,
+            "upper": 3.1428735181689262,
+            "d": 0.017224222421646118,
+            "reference_improvement": 0.31244785338640213,
+            "clean": true
+          },
+          {
+            "unit": "seed5",
+            "epoch": 3,
+            "lower": 3.1252099499106407,
+            "upper": 3.1365823075175285,
+            "d": 0.011372357606887817,
+            "reference_improvement": 0.31288719922304153,
+            "clean": true
+          },
+          {
+            "unit": "seed6",
+            "epoch": 2,
+            "lower": 3.1444450989365578,
+            "upper": 3.1533545181155205,
+            "d": 0.008909419178962708,
+            "reference_improvement": 0.2936520501971245,
+            "clean": true
+          },
+          {
+            "unit": "seed7",
+            "epoch": 3,
+            "lower": 3.122938223183155,
+            "upper": 3.1541584879159927,
+            "d": 0.031220264732837677,
+            "reference_improvement": 0.3151589259505272,
+            "clean": true
+          },
+          {
+            "unit": "seed8",
+            "epoch": 3,
+            "lower": 3.1286308467388153,
+            "upper": 3.137381635606289,
+            "d": 0.008750788867473602,
+            "reference_improvement": 0.30946630239486694,
+            "clean": true
+          },
+          {
+            "unit": "seed9",
+            "epoch": 3,
+            "lower": 3.129449710249901,
+            "upper": 3.12941887229681,
+            "d": -0.000030837953090667725,
+            "reference_improvement": 0.30864743888378143,
+            "clean": true
+          },
+          {
+            "unit": "seed10",
+            "epoch": 3,
+            "lower": 3.127456918358803,
+            "upper": 3.13899502158165,
+            "d": 0.011538103222846985,
+            "reference_improvement": 0.31064023077487946,
+            "clean": true
+          },
+          {
+            "unit": "seed11",
+            "epoch": 3,
+            "lower": 3.122726984322071,
+            "upper": 3.131531499326229,
+            "d": 0.00880451500415802,
+            "reference_improvement": 0.3153701648116112,
+            "clean": true
+          },
+          {
+            "unit": "seed12",
+            "epoch": 3,
+            "lower": 3.1394126564264297,
+            "upper": 3.141307272017002,
+            "d": 0.0018946155905723572,
+            "reference_improvement": 0.2986844927072525,
+            "clean": true
+          }
+        ],
+        "clean_units": 12,
+        "sign_test": {
+          "n": 12,
+          "n_pos": 10,
+          "n_neg": 2,
+          "ties": 0,
+          "p_value": 0.03857421875
+        },
+        "critical_count": 11,
+        "mean_d": 0.01051933690905571,
+        "direction": "none",
+        "assay": {
+          "mean_improvement": 0.3092128473023574,
+          "interval": {
+            "lower": 0.3059111498296261,
+            "upper": 0.31218735749522847
+          },
+          "established_effect": 0.3059111498296261,
+          "delta": 0.15295557491481304,
+          "sensitive": true
+        },
+        "margin_test": {
+          "mean": 0.01051933690905571,
+          "interval": {
+            "lower": 0.006417248398065567,
+            "upper": 0.015037855754295984
+          },
+          "delta": 0.15295557491481304,
+          "below_upper_margin": true,
+          "above_lower_margin": true
+        },
+        "repeat_floor": {
+          "max_delta": 0.0,
+          "spread": 0.008996551659945484
+        },
+        "control": {
+          "units": [
+            "seed1",
+            "seed2"
+          ],
+          "waived": false
+        }
+      },
+      "speed": {
+        "cost": {
+          "of_minima": 0.6245160588549957,
+          "of_medians": 0.6060324975866832,
+          "interval": {
+            "lower": 0.6053213830960898,
+            "upper": 0.6067644168918925
+          }
+        },
+        "noise_band": 1.0082503269532974,
+        "indistinguishable_from_one": false,
+        "aa_null": null,
+        "shape": null,
+        "time_to_quality": {
+          "ratio": 1.9999192650466522,
+          "unreached": []
+        }
+      },
+      "space": {
+        "host_ratio": 0.8051291554527505,
+        "device_ratio": 0.5156301551694484,
+        "host_slope": null
+      },
+      "judgements": [
+        {
+          "rule": "no_directional_difference",
+          "force": "hard",
+          "bound": {
+            "source": "level",
+            "alpha": 0.0064
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "10 of 12 higher, 2 lower; Some(11) needed either way at alpha 0.0064"
+        },
+        {
+          "rule": "outcome_non_inferior",
+          "force": "hard",
+          "bound": {
+            "source": "derived",
+            "value": 0.15295557491481304
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "mean d in [0.006417, 0.015038] against an upper bound below +0.152956"
+        },
+        {
+          "rule": "equivalent_within_delta",
+          "force": "evidence",
+          "bound": {
+            "source": "derived",
+            "value": 0.15295557491481304
+          },
+          "passed": true,
+          "direction": "none",
+          "detail": "mean d in [0.006417, 0.015038] against ±0.152956"
+        },
+        {
+          "rule": "speed_non_inferiority",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "lower/upper time at least 1.6481, bar UNBUDGETED"
+        },
+        {
+          "rule": "time_to_quality",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "lower/upper seconds to target Some(1.9999192650466522), bar UNBUDGETED"
+        },
+        {
+          "rule": "host_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.8051 against UNBUDGETED"
+        },
+        {
+          "rule": "device_memory_ratio",
+          "force": "evidence",
+          "bound": {
+            "source": "unbudgeted"
+          },
+          "passed": null,
+          "direction": "none",
+          "detail": "0.5156 against UNBUDGETED"
+        }
+      ],
+      "refusals": [],
+      "status": "GREEN"
+    }
+  ],
+  "telescoping": null,
+  "dose_ladder": null,
+  "refusals": [],
+  "causes": [],
+  "status": "GREEN"
+}

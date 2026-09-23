@@ -120,7 +120,7 @@
 //! | 12 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
 //! | 13 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
 //! | 14 | placed hand-off: the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
-//! | 15 | placed hand-off: the EXECUTOR, running [`JobWorker::run_placed_gang`] | writes as `Coordinator` (`run_claimed_job_under(.., placed = true)` is the SAME body as row 13 and every row above it) |
+//! | 15 | placed hand-off: the EXECUTOR, running [`JobWorker::run_placed_attempt`] | writes as the holder [`lease_holder_for`] derives on ITS host (`run_claimed_job_under(.., placed = true)` is the SAME body as every training row above) |
 //!
 //! `finish_job` (the compute arm's CAS) is reachable only from
 //! `run_claimed_compute_job`, a `LoopClaimer` by construction. The trainer's
@@ -183,7 +183,7 @@ use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
 use crate::model::ModelSource;
-use crate::operator::gang_exec::{GangDescriptor, GangExec, PlacedOutcome};
+use crate::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec, PlacedOutcome};
 use crate::session::InferenceSession;
 use jammi_wire::proto::gang::{AbortReason, Assign};
 
@@ -233,7 +233,7 @@ pub(crate) fn mint_instance_id() -> String {
 /// Every job kind this binary can execute — the vocabulary
 /// `resolve_kinds` validates `[worker] kinds` against at startup.
 /// The three training kinds dispatch through `JobWorker::run_spec`; the
-/// five compute kinds (every embedded synchronous compute verb is one of
+/// six compute kinds (every embedded synchronous compute verb is one of
 /// [`crate::jobs::ComputeSpec`]'s variants) dispatch through
 /// [`crate::jobs::execute_compute`].
 pub const COMPILED_KINDS: &[&str] = &[
@@ -242,6 +242,7 @@ pub const COMPILED_KINDS: &[&str] = &[
     "context_predictor",
     "neighbor_graph",
     "propagate",
+    "graph_structure",
     "asof_join",
     "embedding",
     "infer",
@@ -253,7 +254,7 @@ pub const COMPILED_KINDS: &[&str] = &[
 pub(crate) fn is_compute_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "neighbor_graph" | "propagate" | "asof_join" | "embedding" | "infer"
+        "neighbor_graph" | "propagate" | "graph_structure" | "asof_join" | "embedding" | "infer"
     )
 }
 
@@ -310,7 +311,7 @@ pub enum Holder {
     ClaimProbe,
     /// A loop-claimed job runs under a registered lease hold.
     JobRun,
-    /// A loop-claimed attempt is submitting its gang through the session's
+    /// A loop-claimed attempt is submitting itself through the session's
     /// installed compute plane, or awaiting its stream: this host runs no
     /// compute for `(job_id, attempt)` while it waits, so it can still
     /// serve a `RunRank` session for some OTHER attempt —
@@ -359,11 +360,11 @@ pub struct HostAdmission {
     /// ([`CoordinatorEnd::HostCannotCoordinate`]). Write-once: a second
     /// install is refused, never a silent swap under a running body.
     dialer: OnceLock<Arc<dyn MemberDialer>>,
-    /// Installed ONCE by the EXECUTOR role: how `GangExec::execute` — which
+    /// Installed ONCE by the EXECUTOR role: how `PlacedAttemptExec::execute` — which
     /// runs with only a Ballista `TaskContext` in hand, never a session —
-    /// reaches this process's coordinator body (see [`placed_gang_runner`]'s
+    /// reaches this process's training body (see [`placed_attempt_runner`]'s
     /// doc for the process-global seam this backs).
-    placed_gang_runner: OnceLock<Arc<dyn PlacedGangRunner>>,
+    placed_attempt_runner: OnceLock<Arc<dyn PlacedAttemptRunner>>,
     /// The single claim-loop slot: `0` (free) or
     /// a nonzero GENERATION id — the id [`HostAdmission::try_claim_loop`]
     /// handed out to whichever [`EmbeddedWorker`] currently owns the slot.
@@ -405,36 +406,36 @@ pub struct HostAdmission {
 }
 
 /// The process-global weak link to whichever session's [`HostAdmission`]
-/// installed a [`PlacedGangRunner`] — set the one time
-/// [`HostAdmission::install_placed_gang_runner`] succeeds anywhere in this
+/// installed a [`PlacedAttemptRunner`] — set the one time
+/// [`HostAdmission::install_placed_attempt_runner`] succeeds anywhere in this
 /// process, never a second, independent global (see
-/// `crate::operator::gang_exec`'s module doc for the refutation of a
+/// `crate::operator::placed_attempt_exec`'s module doc for the refutation of a
 /// `TaskContext`-extension alternative).
-static PLACED_GANG_HOST: OnceLock<Weak<HostAdmission>> = OnceLock::new();
+static PLACED_ATTEMPT_HOST: OnceLock<Weak<HostAdmission>> = OnceLock::new();
 
-/// The process's installed [`PlacedGangRunner`], if this process's session
+/// The process's installed [`PlacedAttemptRunner`], if this process's session
 /// hosts a Ballista executor — the ONLY way
-/// `GangExec::execute` reaches it, since its
+/// `PlacedAttemptExec::execute` reaches it, since its
 /// `execute` runs with no session in hand. `None` both when no session on
 /// this process ever installed one, and when the installing session has
 /// since dropped (the weak upgrade fails).
-pub fn placed_gang_runner() -> Option<Arc<dyn PlacedGangRunner>> {
-    PLACED_GANG_HOST
+pub fn placed_attempt_runner() -> Option<Arc<dyn PlacedAttemptRunner>> {
+    PLACED_ATTEMPT_HOST
         .get()
         .and_then(Weak::upgrade)
-        .and_then(|admission| admission.placed_gang_runner())
+        .and_then(|admission| admission.placed_attempt_runner())
 }
 
-/// Run a placed gang's coordinator body on THIS process — installed by the
-/// EXECUTOR role through [`HostAdmission::install_placed_gang_runner`];
-/// `GangExec::execute` dispatches through it
-/// via the process-global [`placed_gang_runner`] (that function's doc states
+/// Run a placed training attempt's body on THIS process — installed by the
+/// EXECUTOR role through [`HostAdmission::install_placed_attempt_runner`];
+/// `PlacedAttemptExec::execute` dispatches through it
+/// via the process-global [`placed_attempt_runner`] (that function's doc states
 /// why: a Ballista executor's `TaskContext` carries no jammi session).
-pub trait PlacedGangRunner: Send + Sync {
+pub trait PlacedAttemptRunner: Send + Sync {
     fn run(
         &self,
-        descriptor: GangDescriptor,
-    ) -> BoxFuture<'static, Result<crate::operator::gang_exec::PlacedOutcome>>;
+        descriptor: PlacedAttempt,
+    ) -> BoxFuture<'static, Result<crate::operator::placed_attempt_exec::PlacedOutcome>>;
 }
 
 /// The coordinator's one transport seam: open `RunRank` on a member's
@@ -455,7 +456,7 @@ pub trait MemberDialer: Send + Sync {
 
 impl HostAdmission {
     /// Fresh admission state: phase `Running`, holder `Free`, no dialer, no
-    /// placed-gang seam.
+    /// placed-attempt seam.
     pub fn new(registry: Arc<InstanceRegistration>) -> Arc<Self> {
         let (phase, _) = watch::channel(WorkerPhase::Running);
         let (holder, _) = watch::channel(Holder::Free);
@@ -464,7 +465,7 @@ impl HostAdmission {
             holder,
             registry,
             dialer: OnceLock::new(),
-            placed_gang_runner: OnceLock::new(),
+            placed_attempt_runner: OnceLock::new(),
             loop_owner: AtomicU64::new(0),
             next_generation: AtomicU64::new(1),
             release_epoch: AtomicU64::new(0),
@@ -519,28 +520,31 @@ impl HostAdmission {
         self.dialer.get().cloned()
     }
 
-    /// Install the process's [`PlacedGangRunner`] — once — and, on that
+    /// Install the process's [`PlacedAttemptRunner`] — once — and, on that
     /// first install only, register this admission as the process-global
-    /// `PLACED_GANG_HOST` a body-less `GangExec::execute` reaches it
+    /// `PLACED_ATTEMPT_HOST` a body-less `PlacedAttemptExec::execute` reaches it
     /// through (`false` on a second install, the same [`MemberDialer`]
     /// shape; the global is set only alongside a WINNING install, never on
     /// a losing one).
-    pub fn install_placed_gang_runner(self: &Arc<Self>, runner: Arc<dyn PlacedGangRunner>) -> bool {
-        let installed = self.placed_gang_runner.set(runner).is_ok();
+    pub fn install_placed_attempt_runner(
+        self: &Arc<Self>,
+        runner: Arc<dyn PlacedAttemptRunner>,
+    ) -> bool {
+        let installed = self.placed_attempt_runner.set(runner).is_ok();
         if installed {
-            let _ = PLACED_GANG_HOST.set(Arc::downgrade(self));
+            let _ = PLACED_ATTEMPT_HOST.set(Arc::downgrade(self));
         }
         installed
     }
 
-    /// The installed [`PlacedGangRunner`], if this process mounted a
+    /// The installed [`PlacedAttemptRunner`], if this process mounted a
     /// Ballista executor.
-    pub fn placed_gang_runner(&self) -> Option<Arc<dyn PlacedGangRunner>> {
-        self.placed_gang_runner.get().cloned()
+    pub fn placed_attempt_runner(&self) -> Option<Arc<dyn PlacedAttemptRunner>> {
+        self.placed_attempt_runner.get().cloned()
     }
 
     /// `JobRun → Awaiting{job_id, attempt}` — the claim loop's own attempt
-    /// is about to submit a `GangDescriptor` (the move precedes the submit)
+    /// is about to submit a `PlacedAttempt` (the move precedes the submit)
     /// and then awaits its stream: this host runs no compute for the
     /// attempt meanwhile, so it can still serve a `RunRank` session
     /// ([`Self::try_hold_rank`]'s `Awaiting` arm admits exactly as `Free`
@@ -625,7 +629,7 @@ impl HostAdmission {
     /// generation.
     ///
     /// The phase flip runs strictly BEFORE the epoch bump — LOAD-BEARING,
-    /// not incidental: `run_placed_gang`'s own doc and `WorkerShared::
+    /// not incidental: `run_placed_attempt`'s own doc and `WorkerShared::
     /// for_single_run`'s (the two-catch lattice over a birth-epoch snapshot
     /// taken before `probe_claim()`) both depend on "the bump is visible ⇒
     /// the flip already happened", which only holds in THIS order. Swapping
@@ -693,9 +697,9 @@ impl HostAdmission {
     /// returning, a panic, the loop future being aborted).
     pub fn probe_claim(self: &Arc<Self>) -> Option<ClaimGuard> {
         // A host that has begun a DRAIN or RELEASE admits nothing new — the
-        // claim loop's own gate stops it claiming, and the placed-gang
-        // runner (`JobWorker::run_placed_gang`, dialled by the executor)
-        // is refused here the same way, so a gang bound to this host inside
+        // claim loop's own gate stops it claiming, and the placed-attempt
+        // runner (`JobWorker::run_placed_attempt`, dialled by the executor)
+        // is refused here the same way, so an attempt bound to this host inside
         // its termination grace is never started on a process about to
         // exit ("finish what's running, refuse what's new" holds for every
         // entry, not only the loop's).
@@ -1025,7 +1029,7 @@ impl WorkerShared {
     }
 
     /// Fresh shared state for ONE claimed-job run OUTSIDE the claim-loop
-    /// slot — `JobWorker::run_claimed_job`'s and `run_placed_gang`'s shared
+    /// slot — `JobWorker::run_claimed_job`'s and `run_placed_attempt`'s shared
     /// shape (`worker.rs`'s single private constructor for it, rather than
     /// each caller inlining its own `Self::new`): the hold sites read the
     /// session's phase/epoch, and — holding no claim probe — leave the
@@ -1037,7 +1041,7 @@ impl WorkerShared {
     /// event to align to (its record is already claimed when it is called),
     /// so it reads `admission.release_epoch()` live, right before this call,
     /// matching what a bare `phase()` read would have observed before
-    /// `WorkerShared` carried a birth snapshot at all. `run_placed_gang`
+    /// `WorkerShared` carried a birth snapshot at all. `run_placed_attempt`
     /// instead reads the epoch BEFORE its own `HostAdmission::probe_claim()`
     /// call and carries that value all the way here — every byte of work
     /// after the snapshot (`probe_claim()` itself, `Catalog::transfer_claim`,
@@ -1337,13 +1341,13 @@ pub(crate) async fn release_sweep(
     ReleaseSweep { jobs, building }
 }
 
-/// Whether `plane` holds `plan`, a claimant's own gang, right now: the
+/// Whether `plane` holds `plan`, a claimant's own attempt, right now: the
 /// plane and the plan to submit when it does; `None` — the claim runs in
 /// this process, never a submission with nowhere to land — when the plane
 /// refuses it (logged with the plane's reason) or the plane's own
 /// inventory read faults (logged: a catalog fault is not "no peer", but
-/// the in-process run is still correct). Decided BEFORE topology, from the
-/// claimant's cluster view.
+/// the in-process run is still correct). Decided before anything about how
+/// the attempt runs, from the claimant's cluster view.
 async fn placement_of(
     plane: &Arc<dyn ComputePlane>,
     plan: Arc<dyn ExecutionPlan>,
@@ -1353,14 +1357,14 @@ async fn placement_of(
         Ok(Some(why)) => {
             tracing::info!(
                 reason = %why,
-                "the claimed gang runs in this process: the compute plane cannot hold it"
+                "the claimed attempt runs in this process: the compute plane cannot hold it"
             );
             None
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "the compute plane's inventory read failed; the claimed gang runs in this process"
+                "the compute plane's inventory read failed; the claimed attempt runs in this process"
             );
             None
         }
@@ -1669,6 +1673,7 @@ pub(crate) async fn materialize_graph_training_set(
         }
     }
 
+    sample_config.validate_for_training()?;
     let sampler = GraphSampler::build(nodes, edges, sample_config)?;
     // A NAMED `MemoryConsumer` reserves the sampler's resident adjacency +
     // node-text bytes, held for THIS WHOLE FUNCTION — through the write at
@@ -2153,7 +2158,7 @@ impl JobWorker {
                     // the run re-upgrades the Weak through the `Arc` it captures.
                     // The probe guard lives across the run: `ClaimProbe → JobRun`
                     // at the hold site, `→ Free` here when the run returns.
-                    self.run_claimed_job_under(&session, record, &shared, false)
+                    self.run_claimed_job_under(&session, record, &shared, AttemptOrigin::Claimed)
                         .await;
                     drop(claim);
                 }
@@ -2288,7 +2293,7 @@ impl JobWorker {
             self.worker_id.clone(),
             self.admission.release_epoch(),
         );
-        self.run_claimed_job_under(session, record, &shared, false)
+        self.run_claimed_job_under(session, record, &shared, AttemptOrigin::Claimed)
             .await;
     }
 
@@ -2296,9 +2301,9 @@ impl JobWorker {
     /// hold sites register through [`register_job_hold_or_release`] against
     /// `shared`'s phase and account the job in `shared.in_flight`.
     ///
-    /// `placed = true` is the ONE recursion guard: a run [`Self::run_placed_gang`] is
-    /// already coordinating on THIS process never re-checks the placement
-    /// seam, however many gang listeners this process happens to host —
+    /// `placed = true` is the ONE recursion guard: a run [`Self::run_placed_attempt`] is
+    /// already running on THIS process never re-checks the placement
+    /// seam, whatever plane this process itself has installed —
     /// every OTHER caller (the claim loop, [`Self::run_claimed_job`]) passes
     /// `false`.
     async fn run_claimed_job_under(
@@ -2306,9 +2311,10 @@ impl JobWorker {
         session: &Arc<InferenceSession>,
         record: jammi_db::catalog::jobs_repo::JobRecord,
         shared: &Arc<WorkerShared>,
-        placed: bool,
+        origin: AttemptOrigin,
     ) -> AttemptEnd {
         let job_id = record.job_id.clone();
+        let timeline = AttemptTimeline::begin(&job_id, record.attempts, origin);
         // The attempt counter makes the artifact prefix unique per (job, worker,
         // attempt): a reclaimed job re-runs under a higher `attempts`, so its
         // new attempt writes to a fresh prefix and never overwrites the prior
@@ -2317,10 +2323,10 @@ impl JobWorker {
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
         if is_compute_kind(&record.kind) {
-            // Unreachable for `placed`: a `GangDescriptor` only ever names a
-            // `fine_tune`/`graph_fine_tune` attempt (the placement check
-            // below is the only producer of one) — a compute kind never
-            // reaches `run_placed_gang`.
+            // Unreachable for `placed`: a `PlacedAttempt` only ever names a
+            // training attempt (the placement check below is the only
+            // producer of one) — a compute kind never reaches
+            // `run_placed_attempt`.
             self.run_claimed_compute_job(session, &catalog, shared, &record)
                 .await;
             return AttemptEnd::LeftForReclaim;
@@ -2482,44 +2488,33 @@ impl JobWorker {
             _ => None,
         };
 
-        // Placement is decided BEFORE topology and applies to every
-        // FineTune/GraphFineTune attempt this run is not itself placed — never a
-        // `ContextPredictor`, which carries no `world_size`/gang concept at
-        // all. `world` travels as informational only: the executor decides
-        // ITS OWN topology from the spec's `world_size` and its OWN
-        // `[worker] local_ranks` when it runs `run_claimed_job_under`
-        // itself, so no materialization/loader work happens here for a
-        // placed attempt — it happens once, on whichever process actually
-        // trains.
-        let placement_world = if placed {
-            None
-        } else {
-            match &spec {
-                TrainingSpec::FineTune { common, .. } => Some(common.world_size),
-                TrainingSpec::GraphFineTune { common, .. } => Some(common.world_size),
-                TrainingSpec::ContextPredictor { .. } => None,
-            }
-        };
-        // The gang as the one task the compute plane would hold — built
+        // Where this attempt runs is decided BEFORE anything about how it
+        // runs, and for every training kind alike: placement is a property
+        // of the attempt, the rank count a property of the spec the executor
+        // reads off the row. Nothing but the attempt's coordinates travels,
+        // so no materialization/loader work happens here for a placed
+        // attempt — it happens once, on whichever process actually trains.
+        //
+        // The attempt as the one task the compute plane would hold — built
         // once here, so the admission and the submission read the same
         // plan. The required kind is the SUBMITTER's own device, never
         // re-derived from "a GPU exists somewhere": `DevicePlacement` and
         // the plane's admission bind/refuse on this exact kind, and the
         // executing session's device-kind check compares against it the
-        // same way it does for `InferenceExec`.
-        let gang = placement_world.map(|world| {
-            let descriptor = GangDescriptor {
-                job_id: job_id.clone(),
-                attempt,
-                world,
-                submitter: session.instance_id().to_string(),
-                device_kind: session.compute_device().kind(),
-            };
-            let plan: Arc<dyn ExecutionPlan> = Arc::new(GangExec::new(descriptor));
-            plan
-        });
-        let placement = match (gang, session.compute_plane().plane()) {
-            (Some(plan), Some(plane)) => placement_of(&plane, plan).await,
+        // same way it does for `InferenceExec`. An attempt that is itself
+        // placed never consults the plane: it is already where it runs.
+        let placement = match session.compute_plane().plane() {
+            Some(plane) if origin == AttemptOrigin::Claimed => {
+                let plan: Arc<dyn ExecutionPlan> =
+                    Arc::new(PlacedAttemptExec::new(PlacedAttempt {
+                        job_id: job_id.clone(),
+                        attempt,
+                        submitter: session.instance_id().to_string(),
+                        device_kind: session.compute_device().kind(),
+                        claimed_at: timeline.claimed_at,
+                    }));
+                placement_of(&plane, plan).await
+            }
             _ => None,
         };
 
@@ -2541,6 +2536,7 @@ impl JobWorker {
                                 attempt,
                                 recorded_pair,
                                 holder,
+                                &timeline,
                             )
                         })
                         .await
@@ -2555,6 +2551,7 @@ impl JobWorker {
                         attempt,
                         recorded_pair,
                         holder,
+                        &timeline,
                     )
                     .await
                 }
@@ -2577,11 +2574,11 @@ impl JobWorker {
         match outcome {
             Ok(AttemptOutput::Reused(reused)) => {
                 // The job is already `completed` (the reuse probe's own
-                // transaction wrote the terminal row and the output model's
-                // reference). This attempt staged nothing of its own, but
-                // the job's durable resume checkpoint from an earlier
-                // attempt has no live stager left, exactly as after a won
-                // finalize: the same sweep and the same reclaim.
+                // transaction wrote the terminal row, the output model's
+                // reference, and retired the job's checkpoint rows from
+                // earlier attempts). This attempt staged nothing of its
+                // own; the sweep and the licensed deletes are the same as
+                // after a won finalize.
                 tracing::info!(
                     job_id = %job_id, worker = %self.worker_id, model_id = %reused.model_id,
                     artifact = %reused.artifact, "training job completed by reuse"
@@ -2589,7 +2586,7 @@ impl JobWorker {
                 let store = session.artifact_store();
                 reclaim_unpublished_artifacts(&store, &catalog, &job_id, &self.worker_id, attempt)
                     .await;
-                reclaim_checkpoints(&store, &catalog, &job_id).await;
+                delete_retired_checkpoints(&store, &catalog, &job_id, reused.finalized).await;
                 AttemptEnd::Reused
             }
             Ok(AttemptOutput::Trained(artifact)) => {
@@ -2598,9 +2595,9 @@ impl JobWorker {
                 // bytes a member/an in-process `Peer` rank digests, so
                 // a placed run's `PlacedOutcome::Trained` carries an
                 // identical digest without a second row read.
-                let digest = adapter_files_digest(artifact.dir.path());
+                let digest = artifact_files_digest(artifact.dir.path());
                 match self
-                    .publish_and_finalize(holder, session, &catalog, &job_id, attempt, *artifact)
+                    .publish_and_finalize(holder, session, &catalog, *artifact, &timeline)
                     .await
                 {
                     PublishOutcome::Completed => match digest {
@@ -2678,12 +2675,13 @@ impl JobWorker {
                 }
             }
             Err(WorkerJobError::Abandoned(why)) => {
-                // The coordinator body already recorded the attempt's
-                // assembly outcome and settled the lease; nothing terminal
+                // Either the coordinator body already recorded the attempt's
+                // assembly outcome and settled the lease, or the attempt's
+                // placement faulted before its claim moved; nothing terminal
                 // is written here — the row is `running` for reclaim (the
                 // fleet's only requeue path). Any epoch checkpoint a run wrote before a
                 // mid-run fault is swept exactly as on the cancelled arm.
-                tracing::warn!(job_id = %job_id, worker = %self.worker_id, reason = %why, "gang attempt abandoned; left for reclaim");
+                tracing::warn!(job_id = %job_id, worker = %self.worker_id, reason = %why, "attempt abandoned; left for reclaim");
                 reclaim_unpublished_artifacts(
                     &session.artifact_store(),
                     &catalog,
@@ -2702,7 +2700,7 @@ impl JobWorker {
                 // keeper registration, are the executor's now.
                 tracing::info!(
                     job_id = %job_id, worker = %self.worker_id,
-                    "gang attempt handed off to a placed executor"
+                    "attempt handed off to a placed executor"
                 );
                 AttemptEnd::LeftForReclaim
             }
@@ -2733,7 +2731,7 @@ impl JobWorker {
         }
     }
 
-    /// Submit this attempt — `plan`, its one `GangExec` task, already
+    /// Submit this attempt — `plan`, its one `PlacedAttemptExec` task, already
     /// admitted by `plane` — through the session's compute plane and await
     /// its stream, instead of running it in-process. The submitter's exit
     /// arms are total (this function's only return values):
@@ -2792,10 +2790,10 @@ impl JobWorker {
             // refusal has two readings: a `Free` holder is a direct
             // `run_claimed_job` with no `ClaimGuard` (the documented
             // no-op arm — `Free` admits every `RunRank` dial already, so
-            // the gang can assemble and the submit proceeds); ANY other
+            // a placed gang can assemble and the submit proceeds); ANY other
             // holder (a rank held, a probe in flight, an `Awaiting` for
             // another job) would leave this host refusing every dial while
-            // its gang assembles, so the descriptor is refused BEFORE the
+            // a placed gang assembles, so the descriptor is refused BEFORE the
             // submit, typed — the row is still this instance's claim and is
             // left for reclaim.
             if holder != Holder::Free {
@@ -2834,17 +2832,19 @@ impl JobWorker {
             // submitter's `HandedOff` arm, so a spawned worker's captured
             // log (never the in-process `training_test_hooks` recorder,
             // which a multi-process harness cannot read) can confirm this
-            // process ran `run_placed_gang`/`submit_placed` and handed off.
+            // process ran `run_placed_attempt`/`submit_placed` and handed off.
             tracing::info!(
                 job_id,
                 attempt,
-                "run_placed_gang: submitter HandedOff after the placed \
-                 gang's stream completed"
+                "run_placed_attempt: submitter HandedOff after the placed \
+                 attempt's stream completed"
             );
             return Err(WorkerJobError::HandedOff);
         }
         let e = end_err.unwrap_or_else(|| {
-            JammiError::FineTune("the placed gang's stream ended with no batch and no error".into())
+            JammiError::FineTune(
+                "the placed attempt's stream ended with no batch and no error".into(),
+            )
         });
         Err(self.placed_submit_end(catalog, job_id, e).await)
     }
@@ -2886,14 +2886,16 @@ impl JobWorker {
         end
     }
 
-    /// Run a placed gang's coordinator body on THIS process — the seam
-    /// `GangExec::execute` dispatches through
-    /// as the process's installed [`PlacedGangRunner`]. Reuses
+    /// Run a placed training attempt's body on THIS process — the seam
+    /// `PlacedAttemptExec::execute` dispatches through
+    /// as the process's installed [`PlacedAttemptRunner`]. Reuses
     /// `Self::run_claimed_job_under`
-    /// VERBATIM (`placed = true`, the recursion guard) — assembly →
-    /// dispatch → rounds → publish → finalize, `LeaseHolder::Coordinator`
-    /// — the SAME body a `Peer` gang's claimant runs, so the published
-    /// bytes are the in-process `Peer` gang's. An ASSOCIATED function, not a method: the
+    /// VERBATIM (`placed = true`, the recursion guard) — the SAME body the
+    /// attempt's claimant would run for the row's kind (a context
+    /// predictor's episodic loop; a fine-tune's topology decision from THIS
+    /// host's `[worker] local_ranks`, a `Peer` gang's assembly → dispatch →
+    /// rounds included), then publish → finalize — so the published bytes
+    /// are the in-process run's. An ASSOCIATED function, not a method: the
     /// caller (the executor role, `crates/jammi-ballista`) holds only the
     /// session, never a `JobWorker`.
     ///
@@ -2936,9 +2938,9 @@ impl JobWorker {
     /// lease identity the first attempt still holds; jammi's own reclaim,
     /// from a FUTURE claim, is the only path back); (v) releases the slot on
     /// every exit arm (the claim guard's own `Drop`).
-    pub async fn run_placed_gang(
+    pub async fn run_placed_attempt(
         session: &Arc<InferenceSession>,
-        descriptor: GangDescriptor,
+        descriptor: PlacedAttempt,
     ) -> Result<PlacedOutcome> {
         let admission = session.host_admission();
         // The birth snapshot for this run's `WorkerShared`, read BEFORE
@@ -2951,26 +2953,26 @@ impl JobWorker {
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::maybe_park(
             &descriptor.job_id,
-            loop_test_hooks::ParkPoint::PlacedGangBeforeProbeClaim,
+            loop_test_hooks::ParkPoint::PlacedAttemptBeforeProbeClaim,
         )
         .await;
         let Some(claim) = admission.probe_claim() else {
             let phase = *admission.phase_receiver().borrow();
             return Err(JammiError::FineTune(if phase == WorkerPhase::Running {
-                "run_placed_gang: this host's job slot is busy (a rank is held, a loop-claimed \
+                "run_placed_attempt: this host's job slot is busy (a rank is held, a loop-claimed \
                  job already runs, or another placement is in flight)"
                     .into()
             } else {
                 format!(
-                    "run_placed_gang: this host has begun a {phase:?} and admits no new gang \
-                     (refuse what's new); the row is left with its submitter"
+                    "run_placed_attempt: this host has begun a {phase:?} and admits no new \
+                     attempt (refuse what's new); the row is left with its submitter"
                 )
             }));
         };
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::maybe_park(
             &descriptor.job_id,
-            loop_test_hooks::ParkPoint::PlacedGangBeforeTransfer,
+            loop_test_hooks::ParkPoint::PlacedAttemptBeforeTransfer,
         )
         .await;
         let catalog = session.catalog();
@@ -2995,7 +2997,7 @@ impl JobWorker {
         if !transferred {
             drop(claim);
             return Err(JammiError::FineTune(format!(
-                "run_placed_gang: the transfer for job '{}' attempt {} did not land (already \
+                "run_placed_attempt: the transfer for job '{}' attempt {} did not land (already \
                  transferred, a stale attempt, or the row moved)",
                 descriptor.job_id, descriptor.attempt
             )));
@@ -3018,7 +3020,14 @@ impl JobWorker {
         };
         let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone(), claim_epoch);
         let end = worker
-            .run_claimed_job_under(session, record, &shared, true)
+            .run_claimed_job_under(
+                session,
+                record,
+                &shared,
+                AttemptOrigin::Placed {
+                    claimed_at: descriptor.claimed_at,
+                },
+            )
             .await;
         drop(claim);
         match end {
@@ -3028,7 +3037,7 @@ impl JobWorker {
             AttemptEnd::Reused => Ok(PlacedOutcome::Reused),
             AttemptEnd::Failed { error } => Err(error),
             AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
-                "run_placed_gang: job '{}' attempt {} left running for reclaim (no terminal \
+                "run_placed_attempt: job '{}' attempt {} left running for reclaim (no terminal \
                  write)",
                 descriptor.job_id, descriptor.attempt
             ))),
@@ -3046,7 +3055,8 @@ impl JobWorker {
     /// ([`Catalog::finish_job_with_model`]): it flips the job to `completed`
     /// and — atomically, gated on that compare-and-set matching — publishes
     /// the artifact and writes the output `models` row referencing it, plus
-    /// one row per retained epoch checkpoint. The transaction matches only
+    /// one row per retained epoch checkpoint, and retires every other
+    /// checkpoint row of the job. The transaction matches only
     /// while this worker still holds the lease (`claimed_by = worker_id AND
     /// status = 'running' AND attempts = attempt`), so a worker that lost its
     /// lease writes NOTHING: no job status, no `models` row, no published
@@ -3056,10 +3066,11 @@ impl JobWorker {
     ///
     /// Every terminating arm — the winner's included — ends with
     /// [`reclaim_unpublished_artifacts`]: whatever this attempt staged and
-    /// the finalize did not publish is reclaimed. The winner then reclaims
-    /// the job's epoch checkpoints the finalize did not publish
-    /// ([`reclaim_checkpoints`]): the job is terminal, so no attempt reads
-    /// them again.
+    /// the finalize did not publish is reclaimed. The finalize's own
+    /// transaction retires the rows of the job's epoch checkpoints it did
+    /// not publish — a `completed` observer never finds one — and the winner
+    /// then deletes their bytes under the licences it was handed
+    /// ([`delete_retired_checkpoints`]).
     ///
     /// The `models` rows are written through the tenant-pinned `catalog`, so
     /// they land under the job's tenant.
@@ -3068,10 +3079,10 @@ impl JobWorker {
         holder: LeaseHolder,
         session: &Arc<InferenceSession>,
         catalog: &Arc<Catalog>,
-        job_id: &str,
-        attempt: u32,
         artifact: TrainedArtifact,
+        timeline: &AttemptTimeline,
     ) -> PublishOutcome {
+        let (job_id, attempt) = (timeline.job_id.as_str(), timeline.attempt);
         let store = session.artifact_store();
         let TrainedArtifact {
             dir,
@@ -3127,6 +3138,10 @@ impl JobWorker {
             // to attest or record.
             None => None,
         };
+        let metrics = match timeline.published().fold_into(metrics) {
+            Ok(metrics) => Some(metrics),
+            Err(e) => return fail(format!("job metrics serialisation failed: {e}")).await,
+        };
 
         // Distinct-name catalog rows for every RETAINED epoch checkpoint:
         // never an additional VERSION of the output model's name.
@@ -3181,11 +3196,11 @@ impl JobWorker {
             .await;
         reclaim_unpublished_artifacts(&store, catalog, job_id, &self.worker_id, attempt).await;
         match finished {
-            Ok(true) => {
-                reclaim_checkpoints(&store, catalog, job_id).await;
+            Ok(Some(finalized)) => {
+                delete_retired_checkpoints(&store, catalog, job_id, finalized).await;
                 PublishOutcome::Completed
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Lost the lease before finalizing: the transaction wrote
                 // nothing. Leave the job for reclaim (the re-claiming worker
                 // stages its own bundle and its finalize publishes it).
@@ -3448,7 +3463,7 @@ impl JobWorker {
     /// Dispatch a claimed spec to its kind's from-scratch reconstruction and
     /// training, returning the [`TrainedArtifact`] on success.
     #[tracing::instrument(
-        skip(self, session, catalog, spec, cancel),
+        skip(self, session, catalog, spec, cancel, timeline),
         fields(job_id = %job_id, worker_id = %self.worker_id)
     )]
     ///
@@ -3477,6 +3492,7 @@ impl JobWorker {
         attempt: u32,
         recorded_pair: Option<TrainingSetIdentityPair>,
         holder: LeaseHolder,
+        timeline: &AttemptTimeline,
     ) -> std::result::Result<AttemptOutput, WorkerJobError> {
         let kind = spec.kind();
         match spec.plan() {
@@ -3546,6 +3562,7 @@ impl JobWorker {
                     bind_training_source(session, &table, &columns, task, detected, &common)
                         .await
                         .map_err(WorkerJobError::from)?;
+                timeline.source_bound();
                 #[cfg(feature = "test-hooks")]
                 training_test_hooks::note_source_kind(
                     job_id,
@@ -3769,14 +3786,21 @@ impl JobWorker {
             .await
             .map_err(WorkerJobError::from)?;
         match finish {
-            ReuseFinish::Reused(artifact) => {
+            ReuseFinish::Reused {
+                artifact,
+                finalized,
+            } => {
                 tracing::info!(
                     job_id = %job_id,
                     worker = %self.worker_id,
                     %artifact,
                     "fine-tune completed by reusing a published artifact of the same definition"
                 );
-                Ok(Some(ReusedModel { model_id, artifact }))
+                Ok(Some(ReusedModel {
+                    model_id,
+                    artifact,
+                    finalized,
+                }))
             }
             ReuseFinish::Miss => Ok(None),
             ReuseFinish::LostLease => Err(WorkerJobError::Cancelled),
@@ -4817,22 +4841,22 @@ pub mod loop_test_hooks {
         /// and before the hold is registered — the claim→hold prologue, on
         /// both the fine-tune and the compute path.
         BeforeHold,
-        /// Inside `JobWorker::run_placed_gang`, immediately after this
+        /// Inside `JobWorker::run_placed_attempt`, immediately after this
         /// run's `WorkerShared` birth release-epoch is read and before
         /// `HostAdmission::probe_claim` itself runs — the window a RELEASE
         /// landing between the epoch snapshot and `probe_claim`'s own phase
         /// check must still be caught in, by `probe_claim` refusing typed
         /// (the epoch read precedes `probe_claim()`, never follows it).
-        PlacedGangBeforeProbeClaim,
-        /// Inside `JobWorker::run_placed_gang`, immediately after
+        PlacedAttemptBeforeProbeClaim,
+        /// Inside `JobWorker::run_placed_attempt`, immediately after
         /// `HostAdmission::probe_claim` succeeds, before
         /// `Catalog::transfer_claim`/`Catalog::get_job` — the two catalog
         /// round trips a RELEASE landing during them must still be caught
         /// across.
-        PlacedGangBeforeTransfer,
+        PlacedAttemptBeforeTransfer,
         /// Inside `HostAdmission::begin_release`, between the phase flip
         /// (→ `Releasing`) and the release-epoch bump — pins the load-
-        /// bearing order the two-catch lattice in `run_placed_gang`'s own
+        /// bearing order the two-catch lattice in `run_placed_attempt`'s own
         /// doc and `WorkerShared::for_single_run`'s depends on: while
         /// parked here the phase is already `Releasing` (a concurrent
         /// `probe_claim` refuses) but the epoch is not yet bumped (a
@@ -5409,6 +5433,9 @@ async fn fine_tune_materialization(
 struct ReusedModel {
     model_id: String,
     artifact: jammi_db::catalog::artifact_repo::ArtifactRef,
+    /// The licences for the job's own checkpoints the reusing finalize
+    /// retired.
+    finalized: jammi_db::catalog::jobs_repo::Finalized,
 }
 
 /// What one attempt of [`JobWorker::run_spec`] produced.
@@ -6407,7 +6434,7 @@ impl JobWorker {
 /// [`JobWorker::assemble_and_run`]'s step (7): read every member's end off
 /// the coordinator's links ([`Peer::collect_member_ends`], on a blocking
 /// thread under its own witness) and require each to be `Trained` with
-/// rank 0's own adapter digest ([`adapter_files_digest`] over the files
+/// rank 0's own adapter digest ([`artifact_files_digest`] over the files
 /// rank 0 is about to publish). The first member that is not ends the
 /// attempt, typed: a differing digest or a `Failed{reason}` is the run's
 /// own failure (`TrainingFailed`, recorded `failed` by the caller), an
@@ -6417,7 +6444,7 @@ async fn reconcile_member_ends(
     coordinator: &Arc<Peer>,
     artifact: &TrainedArtifact,
 ) -> std::result::Result<(), CoordinatorEnd> {
-    let own = adapter_files_digest(artifact.dir.path())
+    let own = artifact_files_digest(artifact.dir.path())
         .map_err(|e| CoordinatorEnd::TrainingFailed(format!("rank 0's adapter digest: {e}")))?;
     let peer = Arc::clone(coordinator);
     let ends = BlockingCall::spawn_blocking(move |call| peer.collect_member_ends(&call))
@@ -6453,7 +6480,8 @@ async fn reconcile_member_ends(
     Ok(())
 }
 
-/// The digest of the adapter files a rank holds after its run — exactly the
+/// The digest of the artifact files a training run holds when it ends — an
+/// adapter's, a predictor's weights and config alike — exactly the
 /// file set `publish_artifact` publishes (every regular file directly in
 /// `dir`, in name order; subdirectories are scratch and are skipped), each
 /// folded as `name`, a NUL, the byte length, the bytes. What a `Peer`
@@ -6463,23 +6491,35 @@ async fn reconcile_member_ends(
 /// the last step, so a gang that converged reports one
 /// digest. Not the store's per-file manifest hash: this is a rank-side
 /// fact about local bytes, computed by the ONE function on both sides.
-pub fn adapter_files_digest(dir: &std::path::Path) -> Result<String> {
-    use sha2::Digest;
-    let mut names: Vec<(String, std::path::PathBuf)> = Vec::new();
+pub fn artifact_files_digest(dir: &std::path::Path) -> Result<String> {
+    let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        names.push((
-            entry.file_name().to_string_lossy().into_owned(),
-            entry.path(),
-        ));
+        names.push(entry.file_name().to_string_lossy().into_owned());
     }
-    names.sort_by(|a, b| a.0.cmp(&b.0));
+    digest_named_files(dir, names)
+}
+
+/// [`artifact_files_digest`] of a published bundle: the SAME fold over the
+/// files its manifest names, so a bundle fetched back reads the digest the
+/// process that trained it computed before publishing — whether it is
+/// served in place, beside its manifest and attestation, or from a fetch
+/// cache.
+pub fn published_artifact_digest(local: &jammi_db::store::LocalArtifact) -> Result<String> {
+    digest_named_files(local.dir(), local.file_names().to_vec())
+}
+
+/// The one fold behind both digests: `names` sorted, each as its name, a
+/// NUL, its byte length and its bytes.
+fn digest_named_files(dir: &std::path::Path, mut names: Vec<String>) -> Result<String> {
+    use sha2::Digest;
+    names.sort();
     let mut hasher = sha2::Sha256::new();
-    for (name, path) in names {
-        let bytes = std::fs::read(path)?;
+    for name in names {
+        let bytes = std::fs::read(dir.join(&name))?;
         hasher.update(name.as_bytes());
         hasher.update([0u8]);
         hasher.update((bytes.len() as u64).to_le_bytes());
@@ -6521,7 +6561,7 @@ pub struct MemberAssignment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RankOutcome {
     /// The run completed; the digest of the adapter files this rank holds
-    /// ([`adapter_files_digest`]).
+    /// ([`artifact_files_digest`]).
     Trained { artifact_digest: String },
     /// A typed failure of the run itself.
     Failed { reason: String },
@@ -6765,7 +6805,7 @@ async fn member_rank_body(
     if let Some(reason) = training_test_hooks::take_member_failure(&job_id) {
         return failed(reason);
     }
-    match adapter_files_digest(training.artifact_dir.path()) {
+    match artifact_files_digest(training.artifact_dir.path()) {
         Ok(artifact_digest) => RankOutcome::Trained { artifact_digest },
         Err(e) => failed(format!("this rank's adapter digest: {e}")),
     }
@@ -6860,9 +6900,10 @@ async fn publish_artifact(
 /// attempt still holds in memory, so it is the same sweep whether the run
 /// bailed mid-training, failed to stage its final bundle, lost its finalize,
 /// or won it. The job's epoch checkpoints are not this sweep's: they belong
-/// to the job, are read by its next attempt, and are reclaimed once the job
-/// is terminal ([`reclaim_checkpoints`]). Each is reclaimed as the stager's
-/// own bundle: the reclaim compare-and-set, then the licensed byte delete.
+/// to the job, are read by its next attempt, and their rows are retired by
+/// the job's terminal transaction ([`delete_retired_checkpoints`]). Each is
+/// reclaimed as the stager's own bundle: the reclaim compare-and-set, then
+/// the licensed byte delete.
 ///
 /// Best-effort: a failure leaves the artifact in the catalog for a reconcile
 /// pass, and emits exactly ONE warning per sweep naming the failed-vs-
@@ -6910,25 +6951,27 @@ async fn reclaim_unpublished_artifacts(
     }
 }
 
-/// The job is terminal, so no attempt will read its epoch checkpoints
-/// again: whatever a finalize did not publish is reclaimed through the store
-/// ([`ArtifactStore::reclaim_checkpoints`]). Best-effort like the sweep — a
-/// refusal or failure leaves the epoch for a reconcile pass, and emits
-/// exactly ONE warning naming how many.
-async fn reclaim_checkpoints(store: &ArtifactStore, catalog: &Catalog, job_id: &str) {
-    match store.reclaim_checkpoints(catalog, job_id).await {
-        Ok(unsettled) if unsettled.is_empty() => {}
-        Ok(unsettled) => tracing::warn!(
+/// The job's terminal transaction retired the rows of every epoch
+/// checkpoint it did not publish; their bytes go now, under the licences it
+/// minted ([`ArtifactStore::delete_retired_checkpoints`]). Best-effort like
+/// the sweep — a failed delete leaves its bytes as strays for a reconcile
+/// pass, and emits exactly ONE warning naming how many.
+async fn delete_retired_checkpoints(
+    store: &ArtifactStore,
+    catalog: &Catalog,
+    job_id: &str,
+    finalized: jammi_db::catalog::jobs_repo::Finalized,
+) {
+    let unsettled = store
+        .delete_retired_checkpoints(catalog, finalized.retired_checkpoints)
+        .await;
+    if !unsettled.is_empty() {
+        tracing::warn!(
             job_id = %job_id,
             unsettled = unsettled.len(),
-            "the ended job's checkpoints were not fully reclaimed; a reconcile pass reclaims \
-             them"
-        ),
-        Err(e) => tracing::warn!(
-            job_id = %job_id,
-            error = %e,
-            "could not list the ended job's checkpoints"
-        ),
+            "the ended job's retired checkpoints were not fully deleted; a reconcile pass \
+             adopts the strays"
+        );
     }
 }
 
@@ -6979,13 +7022,13 @@ enum PublishOutcome {
 }
 
 /// What one attempt of [`JobWorker::run_claimed_job_under`] ended as — the
-/// fact [`JobWorker::run_placed_gang`] maps onto
-/// [`crate::operator::gang_exec::PlacedOutcome`] without a second row read.
+/// fact [`JobWorker::run_placed_attempt`] maps onto
+/// [`crate::operator::placed_attempt_exec::PlacedOutcome`] without a second row read.
 /// `run_claimed_job`/the claim loop discard it; both already observe every
 /// row write this type merely reports.
 enum AttemptEnd {
     /// The attempt published `completed`; this is the artifact's own digest
-    /// (`adapter_files_digest`, computed over the SAME directory
+    /// (`artifact_files_digest`, computed over the SAME directory
     /// `publish_and_finalize` just uploaded from).
     Published { artifact_digest: String },
     /// The attempt completed by reusing a published artifact: no bytes of
@@ -7017,7 +7060,10 @@ enum WorkerJobError {
     /// split ([`lease_settlement`]) — handed back (`release_job_lease`) or
     /// left to expire — either way the row stays `running` for reclaim (the
     /// fleet's only requeue path) and the next attempt
-    /// re-assembles once its cooldown passes. The string is the reason, for
+    /// re-assembles once its cooldown passes. A placed attempt of any kind
+    /// whose submission faulted BEFORE its claim moved ends the same way
+    /// ([`JobWorker::submit_placed`]): the row is still this instance's,
+    /// nothing ran, and reclaim requeues it. The string is the reason, for
     /// the log.
     Abandoned(String),
     /// The claim moved to a placed executor mid-attempt: the submitter's stream ended with at least
@@ -7029,7 +7075,7 @@ enum WorkerJobError {
     /// every other end goes through) — a heartbeat from this stale holder
     /// can never resurrect the lease (`Catalog::heartbeat_job` keys on
     /// `claimed_by`, proven by
-    /// `crates/jammi-ai/tests/it/gang_placed.rs::the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_lease`).
+    /// `crates/jammi-ai/tests/it/placed_attempt.rs::the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_lease`).
     HandedOff,
 }
 
@@ -8383,6 +8429,96 @@ async fn mark_acceleration_undetermined(
     .await;
 }
 
+/// How an attempt reached the process that runs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptOrigin {
+    /// This process's own claim.
+    Claimed,
+    /// Placed here by the claimant, which claimed it at `claimed_at` (its
+    /// clock).
+    Placed {
+        claimed_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// One attempt — which job, which attempt — and when it passed each of
+/// its stations, folded into the job's terminal metrics as `timeline` so a
+/// reader of the metrics can split the job's wall into claim, placement,
+/// source binding, training and publish wherever the attempt ran. The
+/// trainer's own `started_at`/`completed_at` sit between `source_bound_at`
+/// and `published_at`.
+///
+/// Every instant is UTC on the clock of the process that stamped it:
+/// `claimed_at` the claimant's, the rest the running process's. They are one
+/// clock unless the attempt was placed on another host, where a difference
+/// across the two carries those hosts' clock offset.
+#[derive(Debug)]
+struct AttemptTimeline {
+    job_id: String,
+    attempt: u32,
+    claimed_at: chrono::DateTime<chrono::Utc>,
+    began_at: chrono::DateTime<chrono::Utc>,
+    source_bound_at: std::sync::OnceLock<chrono::DateTime<chrono::Utc>>,
+}
+
+/// An [`AttemptTimeline`] whose artifact is published: the form the terminal
+/// metrics carry.
+#[derive(Debug, serde::Serialize)]
+struct PublishedTimeline {
+    claimed_at: chrono::DateTime<chrono::Utc>,
+    began_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_bound_at: Option<chrono::DateTime<chrono::Utc>>,
+    published_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl AttemptTimeline {
+    /// `attempt` of `job_id` begins in this process, now.
+    fn begin(job_id: &str, attempt: u32, origin: AttemptOrigin) -> Self {
+        let began_at = chrono::Utc::now();
+        Self {
+            job_id: job_id.to_string(),
+            attempt,
+            claimed_at: match origin {
+                AttemptOrigin::Claimed => began_at,
+                AttemptOrigin::Placed { claimed_at } => claimed_at,
+            },
+            began_at,
+            source_bound_at: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The training source is bound: its table materialised (or a recorded
+    /// one re-bound) and its loader or stream ready. A kind with no
+    /// training-set table never reaches this station.
+    fn source_bound(&self) {
+        self.source_bound_at.get_or_init(chrono::Utc::now);
+    }
+
+    /// The artifact is staged and attested, now.
+    fn published(&self) -> PublishedTimeline {
+        PublishedTimeline {
+            claimed_at: self.claimed_at,
+            began_at: self.began_at,
+            source_bound_at: self.source_bound_at.get().copied(),
+            published_at: chrono::Utc::now(),
+        }
+    }
+}
+
+impl PublishedTimeline {
+    /// `metrics` — the run's own metrics object, or none — with this timeline
+    /// under `timeline`.
+    fn fold_into(&self, metrics: Option<String>) -> serde_json::Result<String> {
+        let mut object = match metrics {
+            Some(metrics) => serde_json::from_str::<serde_json::Map<_, _>>(&metrics)?,
+            None => serde_json::Map::new(),
+        };
+        object.insert("timeline".to_string(), serde_json::to_value(self)?);
+        serde_json::to_string(&object)
+    }
+}
+
 /// The inputs to one blocking LoRA fine-tune run, grouped so the blocking call
 /// takes a single owned argument rather than a long positional list. Built on
 /// the async side and moved into the `spawn_blocking` closure.
@@ -8821,8 +8957,8 @@ fn validate_backbone_precision(
 // thread-local probe-capture sink `admit_inner` uses
 // (`record_probe_miss(op, predicate_name)`), not just an atomic
 // increment on `CascadeDispatchCounters`. [`flash_report`] reads that entry
-// back through `jammi_kernels::admission::probe_capture_reason_for(window,
-// "attention_block_flash")` on a decline, exactly the way
+// back through `ProbeWindow::miss_reason("attention_block_flash")` on a
+// decline, exactly the way
 // [`reason_from_probe_window`] reads it for a two-arm op — so a BERT/
 // DistilBERT job's `flash` field reads back verbatim as
 // `"flash_transport_not_wired"` rather than the coarse
@@ -8831,22 +8967,13 @@ fn validate_backbone_precision(
 // entry (the window-attribution causes [`REASON_UNAVAILABLE`] already
 // documents) — never fabricated in its place.
 //
-// **Single-worker-per-process attribution precondition**: the
-// before/after dispatch-registry delta this probe reads is attributed to
-// THIS job's own probe call, which is correct as long as no OTHER job's
-// admission-gated dispatch races the SAME registry keys on another thread of
-// the SAME process between this probe's two snapshots — true for the normal
-// one-job-at-a-time-per-worker-instance shape (`JobWorker::run_until`'s
-// claim→run→claim loop never overlaps two claims on one worker), but NOT
-// guarded against a deployment running multiple `EmbeddedWorker`/
-// `JobWorker` instances concurrently in the SAME process. A concurrent
-// job's `fused`-only dispatch on the same op during this window would read
-// as `holds: true` for THIS job too (`two_arm_holds` only collapses the
-// ambiguous BOTH-moved case, not a fused-only race). Documented here as this
-// report's attribution precondition rather than solved by a lock, since a
-// snapshot-under-lock would need to serialize EVERY admission-gated call
-// site workspace-wide to close it completely, not just the two reads this
-// function makes.
+// **Attribution is by thread, never by counter delta**: every decision
+// the report names — fused or declined — is read off THIS probe's own
+// thread-local window (`jammi_kernels::admission::ProbeWindow`), which
+// only the probing thread's forward writes. The process-wide dispatch
+// counters are not consulted: every forward in the process moves them
+// (a serve, another job, a validation pass), so a before/after delta over
+// the probe would belong to whatever ran anywhere in between.
 // =============================================================================
 
 /// This job's backbone dtype as the [`jammi_kernels::admission::DtypeClass`]
@@ -8875,9 +9002,9 @@ fn dtype_class_of(
 /// instead), and an `InternalSubkernel` row has no registry key for any probe
 /// to read a delta from at all.
 ///
-/// A candidate key is REALIZED into `ops` only if the probe actually moved
-/// its counter one way and not the other ([`two_arm_holds`]) — an op the
-/// probe never reached is omitted, never claimed as a miss.
+/// A candidate key is REALIZED into `ops` only if the probe's own window
+/// took one arm and not the other (`ProbeWindow::holds`) — an op the probe
+/// never reached is omitted, never claimed as a miss.
 fn probed_report_keys(
     dtype: jammi_kernels::admission::DtypeClass,
 ) -> Vec<(&'static str, &'static str)> {
@@ -8892,79 +9019,6 @@ fn probed_report_keys(
         .collect()
 }
 
-/// A snapshot of every two-arm dispatch registry
-/// [`jammi_kernels::admission::PROBED_OPS`] names for this job's dtype class,
-/// plus the `attention_block_flash` cascade — taken once immediately before
-/// and once immediately after the probe so a per-job report reads a DELTA
-/// (attributable to this job's own probe call) rather than the
-/// process-lifetime total (which every OTHER job sharing this process also
-/// contributes to).
-///
-/// Keyed by REGISTRY key, not by report key: `"dropout"` and
-/// `"low_rank_residual_linear"` are the same `lora_linear_fused` dispatch
-/// decision, so storing one entry per registry key is what makes that a
-/// structural fact rather than a match arm that has to remember it, and keeps
-/// the table and the snapshot from drifting apart (one struct FIELD per op
-/// would let them).
-struct AdmissionProbeSnapshot {
-    two_arm: std::collections::BTreeMap<&'static str, jammi_kernels::admission::DispatchSnapshot>,
-    attention_block_flash: jammi_kernels::admission::CascadeDispatchSnapshot,
-}
-
-impl AdmissionProbeSnapshot {
-    /// Snapshots every registry key the table names for `dtype`, straight
-    /// through `counters_for(key)` — the SAME `&'static DispatchCounters` the
-    /// kernels' own `admit()` sites accumulate into (the
-    /// `jammi_encoders::ln_dispatch_snapshot()`-style accessors are
-    /// themselves `counters_for("layer_norm_fused")` under the hood).
-    fn capture(dtype: jammi_kernels::admission::DtypeClass) -> Self {
-        let two_arm = probed_report_keys(dtype)
-            .into_iter()
-            .map(|(_, key)| (key, jammi_kernels::admission::counters_for(key).snapshot()))
-            .collect();
-        Self {
-            two_arm,
-            attention_block_flash: jammi_encoders::attention_block_flash_dispatch_snapshot(),
-        }
-    }
-
-    /// The [`jammi_kernels::admission::DispatchSnapshot`] for a REGISTRY key
-    /// this snapshot captured, or `None` for a key outside the captured dtype
-    /// class (never reached — the caller iterates [`probed_report_keys`] with
-    /// the SAME `dtype` this was captured with).
-    fn two_arm(&self, registry_key: &str) -> Option<jammi_kernels::admission::DispatchSnapshot> {
-        self.two_arm.get(registry_key).copied()
-    }
-}
-
-/// Whether a two-arm op's DELTA between `before` and `after` shows it fired
-/// fused, fired eager, or was not exercised at all: `Some(true)` (fused moved,
-/// eager did not), `Some(false)` (eager moved, fused did not), or `None`
-/// (neither moved — the probe never reached this op — or both moved, an
-/// ambiguous signal this fn never rounds up to a clean positive).
-fn two_arm_holds(
-    before: jammi_kernels::admission::DispatchSnapshot,
-    after: jammi_kernels::admission::DispatchSnapshot,
-) -> Option<bool> {
-    let fused_moved = after.fused > before.fused;
-    let eager_moved = after.eager > before.eager;
-    match (fused_moved, eager_moved) {
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        _ => None,
-    }
-}
-
-/// The `reason` written for a `holds: false` op whose OWN probe window
-/// recorded no `(op, predicate)` entry — an honest "this report cannot say",
-/// never a guess.
-///
-/// Reachable causes, all genuine: an admission-gated dispatch on ANOTHER
-/// thread moved this registry key's `eager` counter inside this probe's
-/// before/after window (the attribution precondition this section's module
-/// doc already documents), or a future admission-gated op dispatches off the
-/// probe's own thread (see
-/// [`jammi_kernels::admission::probe_capture_begin`]'s thread-locality doc).
 const REASON_UNAVAILABLE: &str = "reason_unavailable";
 
 /// The verbatim predicate key THIS probe's own capture window recorded for
@@ -8987,10 +9041,11 @@ const REASON_UNAVAILABLE: &str = "reason_unavailable";
 /// [`REASON_UNAVAILABLE`] when the window has no entry — see its doc for the
 /// causes. Never a placeholder that reads like a measured predicate.
 fn reason_from_probe_window(
-    window: &[jammi_kernels::admission::ProbeMiss],
-    registry_op_key: &str,
+    window: &jammi_kernels::admission::ProbeWindow,
+    registry_op_key: &'static str,
 ) -> String {
-    jammi_kernels::admission::probe_capture_reason_for(window, registry_op_key)
+    window
+        .miss_reason(registry_op_key)
         .unwrap_or(REASON_UNAVAILABLE)
         .to_string()
 }
@@ -9035,11 +9090,11 @@ fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::
 /// means the probe's forward pass itself errored (`"probe_forward_failed"` —
 /// a real attempt that failed, never confused with
 /// [`flash_report_no_probe_attempted`]'s "never even tried"); otherwise it
-/// reads the `attention_block_flash` cascade delta. On a decline, `window` —
+/// reads the `attention_block_flash` cascade's outcome off `window` —
 /// THIS probe's own `jammi_kernels::admission::probe_capture_begin()` capture
 /// (the same one [`reason_from_probe_window`] reads for the two-arm `ops`
-/// map) — is read back through
-/// [`jammi_kernels::admission::probe_capture_reason_for`] for the
+/// map). On a decline the reason is read back through
+/// `ProbeWindow::miss_reason` for the
 /// `"attention_block_flash"` cascade key: `admit_cascade` records every
 /// decline into that SAME sink (see this section's module doc's "The BERT/
 /// DistilBERT case" paragraph), so a BERT/DistilBERT job's
@@ -9050,9 +9105,7 @@ fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::
 fn flash_report(
     device: &candle_core::Device,
     probe_ok: bool,
-    window: &[jammi_kernels::admission::ProbeMiss],
-    before: jammi_kernels::admission::CascadeDispatchSnapshot,
-    after: jammi_kernels::admission::CascadeDispatchSnapshot,
+    window: &jammi_kernels::admission::ProbeWindow,
 ) -> serde_json::Value {
     if let Some(reason) = flash_compiled_device_reason(device) {
         return reason;
@@ -9060,33 +9113,31 @@ fn flash_report(
     if !probe_ok {
         return serde_json::json!({"holds": false, "reason": "probe_forward_failed"});
     }
-    let fused_moved = after.fused > before.fused;
-    let declined_moved = after.declined > before.declined;
-    match (fused_moved, declined_moved) {
-        (true, false) => serde_json::json!({"holds": true, "reason": "domain_ok"}),
-        (false, true) => {
+    match window.holds("attention_block_flash") {
+        Some(true) => serde_json::json!({"holds": true, "reason": "domain_ok"}),
+        Some(false) => {
             serde_json::json!({"holds": false, "reason": flash_cascade_decline_reason(window)})
         }
-        _ => serde_json::json!({"holds": false, "reason": "flash_not_exercised_by_probe"}),
+        None => serde_json::json!({"holds": false, "reason": "flash_not_exercised_by_probe"}),
     }
 }
 
-/// The reason [`flash_report`] writes for a `holds: false` `attention_block_
-/// flash` cascade delta: THIS probe's own capture window, read back for the
-/// `"attention_block_flash"` registry key exactly the way
+/// The reason [`flash_report`] writes for a `holds: false`
+/// `attention_block_flash` decline: THIS probe's own capture window, read
+/// back for the `"attention_block_flash"` registry key exactly the way
 /// [`reason_from_probe_window`] reads a two-arm op's — through
-/// [`jammi_kernels::admission::probe_capture_reason_for`], never a re-derived
-/// guess.
+/// `ProbeWindow::miss_reason`, never a re-derived guess.
 ///
-/// Deliberately its OWN fallback, not [`REASON_UNAVAILABLE`]: the counter
-/// delta already confirms a decline genuinely happened here (unlike a
-/// two-arm op's `holds: false`, which can ALSO mean "never reached" —
-/// [`two_arm_holds`]'s `None` case, which never calls this at all), so the
+/// Deliberately its OWN fallback, not [`REASON_UNAVAILABLE`]: the window
+/// already confirms a decline genuinely happened here (unlike a two-arm
+/// op's `holds: false`, which can ALSO mean "never reached" —
+/// `ProbeWindow::holds`'s `None` case, which never calls this at all), so the
 /// honest fallback for a decline whose window carries no entry is the
 /// coarser-but-still-true `"capability_or_domain_miss"`, never a claim that
 /// nothing can be said.
-fn flash_cascade_decline_reason(window: &[jammi_kernels::admission::ProbeMiss]) -> &'static str {
-    jammi_kernels::admission::probe_capture_reason_for(window, "attention_block_flash")
+fn flash_cascade_decline_reason(window: &jammi_kernels::admission::ProbeWindow) -> &'static str {
+    window
+        .miss_reason("attention_block_flash")
         .unwrap_or("capability_or_domain_miss")
 }
 
@@ -9126,14 +9177,14 @@ fn device_report_label(device: &candle_core::Device) -> String {
 /// swallowed, never propagated — a probe must never fail the training this
 /// attempt is about to run.
 ///
-/// **Disclosed, not eliminated**: this restores every trainable WEIGHT, but
-/// not the ONE dropout-mask RNG draw the probe forward already consumed
-/// (`DropoutMasks::next_key`, called once per training forward regardless of
-/// which arm dispatches) — the real run's dropout stream is shifted by
-/// exactly one draw relative to a build without this probe, at the same
-/// seed. `crate::fine_tune::adamw::AdamW`'s own moment buffers are
-/// freshly allocated inside THIS function's throwaway `AdamW` instance and
-/// never shared with the real trainer's optimizer, so they leave no residue.
+/// This function restores the WEIGHTS; the dropout streams the probe
+/// forward advanced (one `DropoutMasks::next_key` draw per LoRA site, drawn
+/// whichever arm dispatches) are restored by [`probe_acceleration`]'s own
+/// bracket around the forward, so the probe as a whole leaves the model
+/// exactly as it found it. `crate::fine_tune::adamw::AdamW`'s own moment
+/// buffers are freshly allocated inside THIS function's throwaway `AdamW`
+/// instance and never shared with the real trainer's optimizer, so they
+/// leave no residue.
 fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_core::Tensor) {
     let vars = varmap.all_vars();
     let snapshot: Option<Vec<candle_core::Tensor>> =
@@ -9206,19 +9257,35 @@ fn probe_acceleration(
     };
     let dtype = dtype_class_of(backbone_dtype);
 
-    // Every fused-kernel admission predicate this probe reads is gated on
-    // TRAINING mode (`LayerNorm::forward`'s `(bias.is_none(), training)`
-    // match; `ModernBertAttention`/`RotaryEmbedding`'s `self.training`
-    // branches) — an eval-mode forward never reaches ANY of them, fused or
-    // eager, regardless of dtype (`jammi_encoders::layer_norm::LayerNorm::
-    // forward`'s doc: "Eval (`training == false`) NEVER reaches the fused
-    // arm"). The training loop
-    // built moments later (`TrainingLoopBuilder::build`) calls
-    // `set_training(true)` unconditionally anyway, so flipping it here first
-    // changes nothing about the run this attempt actually trains.
+    // The probe's backward needs the LoRA sites on the tape, which only a
+    // training forward puts them on (every kernel admission decision is the
+    // same in either mode). The training loop built moments later
+    // (`TrainingLoopBuilder::build`) calls `set_training(true)`
+    // unconditionally anyway, so flipping it here first changes nothing
+    // about the run this attempt actually trains.
     encoder.set_training(true);
 
-    let before = AdmissionProbeSnapshot::capture(dtype);
+    // The probe forward is a TRAINING forward, so every LoRA site draws one
+    // dropout key from its counter-keyed stream. Restoring the weights alone
+    // would leave the run that follows one draw ahead of the same job run
+    // without a probe — a resident run of the same spec — and its masks, and
+    // so its adapter, would differ. The stream positions are read here and
+    // written back after the probe, unconditionally, so the probe leaves
+    // the model exactly as it found it. Not readable means no probe: the
+    // report is a courtesy and the run's trajectory is not.
+    let dropout_positions = match encoder.dropout_positions() {
+        Ok(positions) => Some(positions),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not read the encoder's dropout-stream positions before the \
+                 acceleration-report probe; skipping the probe rather than leave the run's \
+                 dropout masks shifted by it"
+            );
+            None
+        }
+    };
+
     // Arm THIS probe's own capture window before the
     // forward, and read every `holds: false` reason back out of it. The window
     // is thread-local and this whole function (forward, `Tensor::backward()`'s
@@ -9243,13 +9310,23 @@ fn probe_acceleration(
     // construction: training must be unaffected by a report-computation
     // failure).
     let probe_ok = (|| -> Option<()> {
+        let positions = dropout_positions.as_ref()?;
         let probe = encoder.probe_input(device).ok()?;
-        let output = encoder.forward_input(&probe.as_input()).ok()?;
-        run_backward_and_optimizer_probe(varmap, &output);
+        let forward = encoder.forward_input(&probe.as_input());
+        // Restored on every arm — a forward that failed partway may already
+        // have drawn for the sites it reached.
+        if let Err(e) = encoder.restore_dropout_positions(positions) {
+            tracing::warn!(
+                error = %e,
+                "failed to restore the encoder's dropout-stream positions after the \
+                 acceleration-report probe's forward — this job's dropout masks may now \
+                 differ from a run of the same spec without the probe"
+            );
+        }
+        run_backward_and_optimizer_probe(varmap, &forward.ok()?);
         Some(())
     })()
     .is_some();
-    let after = AdmissionProbeSnapshot::capture(dtype);
     // Disarmed here, not by drop: nothing after this point may contribute to
     // this job's window, and nothing before it may be lost.
     let window = capture.finish();
@@ -9257,11 +9334,7 @@ fn probe_acceleration(
     let mut ops = serde_json::Map::new();
     if probe_ok {
         for (report_key, registry_key) in probed_report_keys(dtype) {
-            let (Some(b), Some(a)) = (before.two_arm(registry_key), after.two_arm(registry_key))
-            else {
-                continue;
-            };
-            if let Some(holds) = two_arm_holds(b, a) {
+            if let Some(holds) = window.holds(registry_key) {
                 let reason = if holds {
                     "domain_ok".to_string()
                 } else {
@@ -9275,13 +9348,7 @@ fn probe_acceleration(
         }
     }
 
-    let flash = flash_report(
-        device,
-        probe_ok,
-        &window,
-        before.attention_block_flash,
-        after.attention_block_flash,
-    );
+    let flash = flash_report(device, probe_ok, &window);
     (ops, flash)
 }
 
@@ -10447,13 +10514,16 @@ mod tests {
     /// unexercised `unwrap_or`.
     #[test]
     fn reason_from_probe_window_reads_its_own_window_or_says_unavailable() {
-        let window: Vec<jammi_kernels::admission::ProbeMiss> = vec![
-            (
-                "attention_block_fused",
-                "head_dim_is_attention_block_fixed_head_dim",
-            ),
-            ("layer_norm_fused", "dtype_is_f32_bf16_or_f16"),
-        ];
+        let window = jammi_kernels::admission::ProbeWindow {
+            misses: vec![
+                (
+                    "attention_block_fused",
+                    "head_dim_is_attention_block_fixed_head_dim",
+                ),
+                ("layer_norm_fused", "dtype_is_f32_bf16_or_f16"),
+            ],
+            fused: Vec::new(),
+        };
         assert_eq!(
             reason_from_probe_window(&window, "attention_block_fused"),
             "head_dim_is_attention_block_fixed_head_dim"
@@ -10470,7 +10540,10 @@ mod tests {
              neighbouring op's predicate"
         );
         assert_eq!(
-            reason_from_probe_window(&[], "attention_block_fused"),
+            reason_from_probe_window(
+                &jammi_kernels::admission::ProbeWindow::default(),
+                "attention_block_fused"
+            ),
             REASON_UNAVAILABLE,
             "an empty window says so"
         );
@@ -10543,7 +10616,7 @@ mod tests {
     #[test]
     fn flash_cascade_decline_reason_falls_back_to_the_coarse_reason_on_an_empty_window() {
         assert_eq!(
-            flash_cascade_decline_reason(&[]),
+            flash_cascade_decline_reason(&jammi_kernels::admission::ProbeWindow::default()),
             "capability_or_domain_miss"
         );
     }
@@ -11583,6 +11656,275 @@ mod tests {
         )
     }
 
+    /// A LoRA-injected BERT encoder over the committed `tiny_bert` cookbook
+    /// fixture (safetensors + a real tokenizer), built through the worker's
+    /// own `build_encoder_adapters` at `lora_dropout` — the encoder a job of
+    /// this spec trains — registered into `varmap`.
+    async fn tiny_bert_lora_encoder(
+        varmap: &candle_nn::VarMap,
+        lora_dropout: f64,
+    ) -> jammi_encoders::AnyEncoder {
+        let dir = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let base_model_id = register_local_base_model(&catalog, &dir).await;
+        let artifact_store = gguf_test_artifact_store();
+        let hub = test_hub_source();
+        let varmap = varmap.clone();
+        let (encoder, _adapter_cfg) = tokio::task::spawn_blocking(move || {
+            let config = probe_job_config(lora_dropout);
+            build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &base_model_id,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &config,
+                dropout_seed: config.seed,
+                task: ModelTask::TextEmbedding,
+                varmap: &varmap,
+                device: &candle_core::Device::Cpu,
+                hub: &hub,
+            })
+        })
+        .await
+        .unwrap()
+        .expect("tiny_bert must build a LoRA-injected encoder");
+        encoder
+    }
+
+    /// The spec the probe tests train: dropout ON (so every LoRA site owns a
+    /// dropout stream the probe forward draws from), two short epochs,
+    /// nothing else that could differ between two runs of it.
+    fn probe_job_config(lora_dropout: f64) -> FineTuneConfig {
+        FineTuneConfig {
+            target_modules: vec!["query".to_string(), "value".to_string()],
+            lora_rank: 2,
+            lora_dropout,
+            seed: 7,
+            epochs: 2,
+            batch_size: 2,
+            validation_fraction: 0.0,
+            warmup_steps: 0,
+            learning_rate: 1e-3,
+            lr_schedule: crate::fine_tune::LrSchedule::Constant,
+            early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
+            early_stopping_patience: 10_000,
+            ..FineTuneConfig::default()
+        }
+    }
+
+    /// The acceleration probe runs one TRAINING forward, which draws one
+    /// dropout key per LoRA site. It must put every stream back where it
+    /// found it: a job whose probe ran must train on the masks a run of the
+    /// same spec without a probe draws.
+    ///
+    /// The control is the bare forward the probe wraps: on its own it
+    /// advances every site by exactly one, so the equality after the probe
+    /// is the bracket's doing, not a stream that never moved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_probe_leaves_every_dropout_stream_where_it_found_it() {
+        let device = candle_core::Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let mut encoder = tiny_bert_lora_encoder(&varmap, 0.05).await;
+        let origin = encoder.dropout_positions().unwrap();
+        assert!(
+            !origin.is_empty(),
+            "the fixture's LoRA sites must own dropout streams"
+        );
+        assert!(
+            origin.values().all(|position| *position == 0),
+            "a fresh encoder's streams start at the origin: {origin:?}"
+        );
+
+        probe_acceleration(
+            &device,
+            jammi_numerics::ComputePrecision::F32,
+            Some(&varmap),
+            Some(&mut encoder),
+        );
+        assert_eq!(
+            encoder.dropout_positions().unwrap(),
+            origin,
+            "the probe's training forward drew from every stream and must have put each \
+             one back"
+        );
+
+        let probe = encoder.probe_input(&device).unwrap();
+        encoder.forward_input(&probe.as_input()).unwrap();
+        let advanced = encoder.dropout_positions().unwrap();
+        assert!(
+            advanced.values().all(|position| *position == 1),
+            "the control: the same forward, unbracketed, advances every stream by one: \
+             {advanced:?}"
+        );
+    }
+
+    /// Every tensor of an adapter, as the bytes of its f32 values in name
+    /// order — what two runs are equal ON, not merely close. Takes the map
+    /// both a fresh target's `named_trainable_weights` and a saved
+    /// `adapter.safetensors` load to, under the same names.
+    fn adapter_bytes(weights: &HashMap<String, Tensor>) -> Vec<u8> {
+        let mut names: Vec<&String> = weights.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .flat_map(|name| {
+                weights[name]
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+            })
+            .collect()
+    }
+
+    /// `encoder` as the `EncoderAdapters` target a job of
+    /// [`probe_job_config`] trains, its adapter metadata derived from that
+    /// same config.
+    fn probe_job_target(
+        encoder: jammi_encoders::AnyEncoder,
+        config: &FineTuneConfig,
+    ) -> crate::fine_tune::target::TrainingTarget {
+        use crate::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
+
+        let adapter_cfg = jammi_lora::AdapterConfig::from_build(
+            "bert",
+            &jammi_lora::LoraBuildConfig {
+                target_modules: &config.target_modules,
+                layers_to_transform: &config.layers_to_transform,
+                lora_rank: config.lora_rank,
+                lora_alpha: config.lora_alpha,
+                use_rslora: config.use_rslora,
+                lora_dropout: Some(config.lora_dropout as f32),
+                rank_pattern: &config.rank_pattern,
+                init_mode: config.init_lora_weights,
+                seed: config.seed,
+                dropout_seed: config.seed,
+            },
+            config.backbone_dtype,
+        );
+        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+            encoder,
+            adapter_cfg,
+        }))
+    }
+
+    /// The committed `tiny_bert` fixture loaded with its tokenizer through a
+    /// real session's model cache — the base model a text run tokenizes with.
+    async fn tiny_bert_base_model() -> Arc<crate::model::LoadedModel> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = jammi_test_utils::test_config(dir.path());
+        let session = crate::session::InferenceSession::new(config).await.unwrap();
+        let source =
+            crate::model::ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+        session
+            .model_cache()
+            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .await
+            .unwrap()
+            .model
+            .clone()
+    }
+
+    /// Train `encoder` over four fixed pairs through the real `TrainingLoop`
+    /// under [`probe_job_config`] — what a job of that spec does after its
+    /// probe — and return the bytes of the `adapter.safetensors` the run
+    /// saved, the artifact a job publishes.
+    async fn train_resident(
+        encoder: jammi_encoders::AnyEncoder,
+        varmap: candle_nn::VarMap,
+        base_model: Arc<crate::model::LoadedModel>,
+        tag: &str,
+    ) -> Vec<u8> {
+        let config = probe_job_config(0.05);
+        let target = probe_job_target(encoder, &config);
+        let rows = [
+            (
+                "a short sentence about widgets",
+                "another sentence about widgets",
+            ),
+            ("gadgets are discussed here", "a note on gadgets"),
+            ("the weather was mild today", "mild weather all day"),
+            ("a recipe for bread", "how to bake bread"),
+        ];
+        let loader = crate::fine_tune::data::TrainingDataLoader::from_pairs(
+            rows.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+        let mut training_loop =
+            crate::fine_tune::trainer::TrainingLoopBuilder::new(target, varmap, config)
+                .base_model(base_model)
+                .device(candle_core::Device::Cpu)
+                .job_id(tag.to_string())
+                .catalog(catalog)
+                .artifact_dir(dir.path().to_path_buf())
+                .build()
+                .unwrap();
+        crate::fine_tune::collective::BlockingCall::spawn_blocking(move |call| {
+            let result = training_loop
+                .run(
+                    &call,
+                    crate::fine_tune::source::TrainingSource::Resident(loader),
+                )
+                .unwrap();
+            let saved = candle_core::safetensors::load(
+                result.artifact_dir.path().join("adapter.safetensors"),
+                &candle_core::Device::Cpu,
+            )
+            .unwrap();
+            adapter_bytes(&saved)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A job's adapter is the adapter a run of the same spec without the
+    /// probe trains, byte for byte, with dropout ON: the two runs below
+    /// differ only in whether the job path's probe ran on their encoder
+    /// first. Both train (their adapters leave the shared init), so the
+    /// equality is between two trajectories, not two untouched inits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_jobs_probe_does_not_move_the_adapter_it_goes_on_to_train() {
+        let device = candle_core::Device::Cpu;
+        let base_model = tiny_bert_base_model().await;
+        let config = probe_job_config(0.05);
+        let initial = adapter_bytes(
+            &probe_job_target(
+                tiny_bert_lora_encoder(&candle_nn::VarMap::new(), 0.05).await,
+                &config,
+            )
+            .named_trainable_weights()
+            .unwrap(),
+        );
+
+        let probed_varmap = candle_nn::VarMap::new();
+        let mut probed = tiny_bert_lora_encoder(&probed_varmap, 0.05).await;
+        probe_acceleration(
+            &device,
+            jammi_numerics::ComputePrecision::F32,
+            Some(&probed_varmap),
+            Some(&mut probed),
+        );
+        let job_path =
+            train_resident(probed, probed_varmap, Arc::clone(&base_model), "probed").await;
+
+        let resident_varmap = candle_nn::VarMap::new();
+        let unprobed = tiny_bert_lora_encoder(&resident_varmap, 0.05).await;
+        let resident = train_resident(unprobed, resident_varmap, base_model, "resident").await;
+
+        assert_ne!(job_path, initial, "the job-path run must have trained");
+        assert_eq!(
+            job_path, resident,
+            "a run whose encoder went through the job path's probe must train the same \
+             adapter as one that did not — at lora_dropout 0.05, a probe that left the \
+             dropout streams advanced would draw different masks from the first step on"
+        );
+    }
+
     /// A [`HubSource`] rooted at a fresh tempdir, for the `build_encoder_adapters`
     /// fixtures below whose base model is always locally registered
     /// (`artifact_path` set) — the `is_hf` HF-fallback arm this threads
@@ -11681,8 +12023,10 @@ mod tests {
     /// normalizes a bare absolute path to `file://...`), and return the
     /// exact `base_model_id` string `build_encoder_adapters` expects
     /// (`ModelSource::parse` maps an absolute path straight through to
-    /// `Local(path)`, so the catalog key IS the path string).
-    async fn register_gguf_base_model(catalog: &Arc<Catalog>, dir: &std::path::Path) -> String {
+    /// `Local(path)`, so the catalog key IS the path string). The directory's
+    /// weights format is the resolver's business, not this registrar's: a
+    /// safetensors checkpoint registers exactly like a GGUF one.
+    async fn register_local_base_model(catalog: &Arc<Catalog>, dir: &std::path::Path) -> String {
         let base_model_id = dir.to_str().unwrap().to_string();
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
@@ -11729,7 +12073,7 @@ mod tests {
 
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let base_model_id = register_gguf_base_model(&catalog, &dir).await;
+        let base_model_id = register_local_base_model(&catalog, &dir).await;
         let artifact_store = gguf_test_artifact_store();
 
         let hub = test_hub_source();
@@ -11847,7 +12191,7 @@ mod tests {
     ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
-        let base_model_id = register_gguf_base_model(&catalog, dir).await;
+        let base_model_id = register_local_base_model(&catalog, dir).await;
         let artifact_store = gguf_test_artifact_store();
         let hub = test_hub_source();
 
@@ -12170,7 +12514,7 @@ mod tests {
             config_json: None,
         };
         let retained_name = format!("{name}:epoch_1");
-        assert!(catalog
+        let finalized = catalog
             .finish_job_with_model(FinishJobWithModelParams {
                 job_id: &job_id,
                 instance_id: worker,
@@ -12188,24 +12532,36 @@ mod tests {
                 }],
             })
             .await
-            .unwrap());
+            .unwrap()
+            .expect("the lease holder finalizes");
 
-        reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
-        store
-            .fetch_artifact(unpublished.url())
-            .await
-            .expect("the attempt's sweep never reaches the job's own checkpoints");
-        reclaim_checkpoints(&store, catalog, &job_id).await;
-
-        assert!(
-            store.fetch_artifact(unpublished.url()).await.is_err(),
-            "an unpublished epoch checkpoint must be reclaimed once the job is terminal"
-        );
+        // The instant the job is `completed`, the unpublished checkpoint's
+        // row is gone: the finalize retired it in the terminal transaction
+        // and handed back the licence for its bytes.
         assert!(catalog
             .get_model_artifact(&unpublished)
             .await
             .unwrap()
             .is_none());
+        assert_eq!(
+            finalized
+                .retired_checkpoints
+                .iter()
+                .map(|l| l.artifact().clone())
+                .collect::<Vec<_>>(),
+            vec![unpublished.clone()]
+        );
+        reclaim_unpublished_artifacts(&store, catalog, &job_id, worker, attempt).await;
+        store
+            .fetch_artifact(unpublished.url())
+            .await
+            .expect("the attempt's sweep never reaches the job's own checkpoints");
+        delete_retired_checkpoints(&store, catalog, &job_id, finalized).await;
+
+        assert!(
+            store.fetch_artifact(unpublished.url()).await.is_err(),
+            "a retired epoch checkpoint's bytes go under the finalize's licence"
+        );
         for artifact in &published {
             store
                 .fetch_artifact(artifact.url())
@@ -12263,7 +12619,7 @@ mod tests {
 
     /// "Finish what's running, refuse what's new", for every entry: a host
     /// that has begun a DRAIN (or a RELEASE) admits no new claim through
-    /// `probe_claim` — the loop's gate AND the placed-gang runner's
+    /// `probe_claim` — the loop's gate AND the placed-attempt runner's
     /// admission are this one predicate. Mutation: drop the phase check at
     /// the top of `probe_claim` and the `Draining` assertion reds (the
     /// holder cell is `Free`, so the CAS alone would admit).
@@ -12283,10 +12639,10 @@ mod tests {
 
     /// Pins `begin_release`'s two statements in order: the phase flip lands
     /// strictly before the epoch bump. The two-catch lattice
-    /// `run_placed_gang`'s own doc and `WorkerShared::for_single_run`'s
+    /// `run_placed_attempt`'s own doc and `WorkerShared::for_single_run`'s
     /// depend on ("a snapshot whose epoch bump is already visible implies
     /// the flip already happened too") only holds in that order, and the
-    /// lattice's end-to-end test (`gang_placed::
+    /// lattice's end-to-end test (`placed_attempt::
     /// release_landing_between_the_epoch_read_and_probe_claim_is_still_
     /// refused`) cannot falsify the ORDER because its own RELEASE runs to
     /// full completion (both statements) inside one park, never observing
@@ -12338,7 +12694,7 @@ mod tests {
             birth_epoch,
             "the epoch must not be bumped yet while parked between the flip and the bump"
         );
-        // A concurrent `probe_claim` — exactly `run_placed_gang`'s own
+        // A concurrent `probe_claim` — exactly `run_placed_attempt`'s own
         // check, racing this window — must refuse on the phase alone, with
         // no epoch compare available to it at all.
         assert!(

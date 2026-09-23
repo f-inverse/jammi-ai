@@ -49,6 +49,7 @@ jobs:
           cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-broker-tests,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
           cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
           cargo clippy -p jammi-ballista --tests --features live-distributed-tests,live-postgres-tests -- -D warnings
+          cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
 
       # `openssl-sys` (pulled in transitively by `native-tls`, which
       # `datafusion-table-providers`'s `postgres`/`mysql` subcrates depend on
@@ -667,9 +668,10 @@ jobs:
   # check uses too: `ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main`.
   # On a pull request only the guards the change can affect run; a push to
   # main runs them all. The runner provides what a selected guard declares it
-  # needs, so nothing is installed here. This job is the CI image's lane: a
-  # guard that declares another lane needs a host no command can make of this
-  # one, and only a run on that host selects it.
+  # needs, so nothing is installed here. The tests of the repository's own
+  # scripts run beside them through their own runner, selected when the
+  # change touches the scripts; a script test that needs a host this image
+  # is not declares its lane and only a run on that host selects it.
   guard:
     name: Guards
     runs-on: ubuntu-latest
@@ -685,6 +687,8 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Run the guards
         run: python3 ci/scripts/run_guards.py ${{ github.event_name == 'pull_request' && '--base HEAD^1' || '' }}
+      - name: Test the scripts
+        run: python3 ci/scripts/run_script_tests.py ${{ github.event_name == 'pull_request' && '--base HEAD^1' || '' }}
 
   # kubeconform --strict + a pinned --kubernetes-version turn an unknown key
   # or a wrong-typed field in any deploy/kubernetes manifest into a caught CI
@@ -943,25 +947,6 @@ jobs:
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: python3 ci/scripts/check_no_consumer_names.py
-
-      # `ci/tools/probed-ops-index` is the other CI-only syn tool (the
-      # eager-disable key sweep's source of truth; the sweep itself runs
-      # below).
-      - name: Assert probed-ops-index's own fmt + clippy pass
-        if: ${{ !cancelled() }}
-        run: |
-          cargo fmt -p probed-ops-index -- --check
-          cargo clippy -p probed-ops-index --all-targets -- -D warnings
-
-      # `finetune_ab.sh`'s forced-eager disable-key enumeration: the key set
-      # is derived from the real `PROBED_OPS` table through
-      # `ci/tools/probed-ops-index` and the admit/admit_cascade call-site
-      # census through `ci/tools/symbol-index` — both real `cargo run`s, so
-      # this suite builds workspace crates, which no guard the `guard` job
-      # selects does.
-      - name: Assert the eager-disable key sweep derives from the real PROBED_OPS table
-        if: ${{ !cancelled() }}
-        run: python3 ci/scripts/perf/test_finetune_ab_disable_op_keys.py
 
   ci-summary:
     needs:

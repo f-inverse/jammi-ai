@@ -106,6 +106,42 @@ pub fn sign_test(diffs: &[f64]) -> Result<SignTestResult> {
     })
 }
 
+/// The smallest concordance count `k` for which a sign test over `n` pairs
+/// is significant at two-sided level `alpha` — the least `k` with
+/// `2 * P(X >= k) <= alpha` under `X ~ Binomial(n, 0.5)` — or `None` when
+/// even `k = n` is not (`n` is too small for that `alpha`).
+///
+/// This turns a significance level fixed in advance into the count a
+/// decision rule compares against, so the rule can be stated for a fixed
+/// number of pairs: a pair that ties is then a pair that did not concord,
+/// rather than a pair removed from the denominator.
+///
+/// # Errors
+///
+/// [`NumericsError::InvalidInput`] if `n == 0`, if `alpha` is outside
+/// `(0, 1)`, or if `n` is too large for the exact `u128` computation (see
+/// [`sign_test`]).
+pub fn sign_test_critical_count(n: usize, alpha: f64) -> Result<Option<usize>> {
+    if n == 0 {
+        return Err(NumericsError::InvalidInput(
+            "sign test critical count requires n >= 1".into(),
+        ));
+    }
+    if !(0.0 < alpha && alpha < 1.0) {
+        return Err(NumericsError::InvalidInput(format!(
+            "alpha out of range (must be in (0, 1)): {alpha}"
+        )));
+    }
+    // The tail is non-increasing in `k`, and only `k > n / 2` can be the
+    // larger of the two sign counts.
+    for k in (n / 2 + 1)..=n {
+        if exact_two_sided_tail(n, k)? <= alpha {
+            return Ok(Some(k));
+        }
+    }
+    Ok(None)
+}
+
 /// `2 * P(X >= t)` under `X ~ Binomial(n, 0.5)`, capped at `1.0`, computed as
 /// an exact ratio of `u128` integers with the division to `f64` deferred to
 /// the very last step.

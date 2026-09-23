@@ -71,6 +71,12 @@ pub struct ParallelTrainReport {
     pub final_loss: f64,
     /// Total optimizer steps taken (one per batch per epoch).
     pub total_steps: usize,
+    /// Every step's loss, in step order: the batch's loss at the parameters the
+    /// step started from, before its update.
+    pub step_losses: Vec<f64>,
+    /// Every step's wall-clock in seconds, in step order: forward, loss,
+    /// backward, clip and update.
+    pub step_seconds: Vec<f64>,
 }
 
 /// Train the parameters held in `varmap` over `batches` for `config.epochs`.
@@ -93,17 +99,23 @@ pub struct ParallelTrainReport {
 /// boundary — the worker's heartbeat sets it when the lease is lost so the loop
 /// bails (a `spawn_blocking` thread cannot be force-aborted). Pass an
 /// always-false flag for a run that cannot be cancelled.
-pub fn train_loop<B, M, L>(
+///
+/// `after_epoch(n)` runs when epoch `n` (from 1) has taken its last step — the
+/// seam a caller reads a held-out loss at, with the parameters as they stand;
+/// its error ends the run.
+pub fn train_loop<B, M, L, E>(
     varmap: &VarMap,
     batches: &[B],
     config: &ParallelTrainConfig,
     cancel: &AtomicBool,
     model_fn: M,
     loss_fn: L,
+    mut after_epoch: E,
 ) -> Result<ParallelTrainReport>
 where
     M: Fn(&B) -> Result<Tensor>,
     L: Fn(&Tensor, &B) -> Result<Tensor>,
+    E: FnMut(usize) -> Result<()>,
 {
     // Deterministic (name-sorted) order, never `VarMap::all_vars()`'s raw
     // `HashMap` iteration order — see `optimizer::sorted_trainable_vars`'s own
@@ -131,8 +143,10 @@ where
     // `DEFAULT_NORM_CHECK_INTERVAL` steps (see `optimizer::clip_and_step`'s
     // doc).
     let total_run_steps = config.epochs.saturating_mul(batches.len());
+    let mut step_losses = Vec::with_capacity(total_run_steps);
+    let mut step_seconds = Vec::with_capacity(total_run_steps);
 
-    for _epoch in 0..config.epochs {
+    for epoch in 0..config.epochs {
         if cancel.load(Ordering::Relaxed) {
             return Err(JammiError::FineTune(
                 "training cancelled: lease lost before epoch boundary".into(),
@@ -142,10 +156,13 @@ where
         let mut batch_count = 0usize;
 
         for batch in batches {
+            let step_start = std::time::Instant::now();
             let preds = model_fn(batch)?;
             let loss = loss_fn(&preds, batch)?;
 
-            epoch_loss += scalar_loss(&loss)?;
+            let step_loss = scalar_loss(&loss)?;
+            step_losses.push(step_loss);
+            epoch_loss += step_loss;
             batch_count += 1;
 
             let is_last_step = total_steps + 1 >= total_run_steps;
@@ -156,15 +173,19 @@ where
                 config.grad_clip,
                 is_last_step,
             )?;
+            step_seconds.push(step_start.elapsed().as_secs_f64());
             total_steps += 1;
         }
 
         last_epoch_loss = epoch_loss / batch_count.max(1) as f64;
+        after_epoch(epoch + 1)?;
     }
 
     Ok(ParallelTrainReport {
         final_loss: last_epoch_loss,
         total_steps,
+        step_losses,
+        step_seconds,
     })
 }
 

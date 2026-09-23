@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: pyyaml, ssh-keygen, jq
 # GPU-gang-lane fixture suite. Mocks-only: no network, no GPU, no RunPod
 # account, no pod. Shaped on `test_gpu_prove_lane.sh` (which owns the same
 # job for the prove lane) and driving the REAL objects rather than

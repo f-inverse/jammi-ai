@@ -19,6 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use thiserror::Error;
+use tracing::Instrument;
 
 use crate::tenant::TenantId;
 
@@ -125,10 +126,11 @@ impl BackendImpl {
             + 'a,
         R: Send + 'a,
     {
-        match self {
+        let transaction = match self {
             BackendImpl::Sqlite(b) => b.transaction(opts, f),
             BackendImpl::Postgres(b) => b.transaction(opts, f),
-        }
+        };
+        Box::pin(transaction.instrument(tracing::debug_span!("catalog.transaction")))
     }
 
     /// Run `f` in a `Serializable` read-write transaction, re-running it when
@@ -805,7 +807,7 @@ impl FromSqlValue for serde_json::Value {
     }
 }
 
-/// Backend-agnostic error taxonomy. Variants are populated by [`classify`]
+/// Backend-agnostic error taxonomy. Variants are populated by `classify`
 /// from raw `sqlx::Error`.
 #[derive(Debug, Clone, Error)]
 pub enum BackendError {
@@ -828,7 +830,7 @@ pub enum BackendError {
         got: Option<TenantId>,
     },
     /// A transaction-internal refusal sentinel: return this from a
-    /// [`CatalogBackend::transaction`] closure to force a ROLLBACK of every
+    /// `CatalogBackend::transaction` closure to force a ROLLBACK of every
     /// write the closure already issued, naming the row that made the whole
     /// batch unsafe to commit. `.await?`-ing the transaction call would
     /// otherwise fold this into the generic [`crate::error::JammiError::BackendDriver`]

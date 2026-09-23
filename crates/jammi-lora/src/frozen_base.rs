@@ -35,8 +35,8 @@
 //! 4. `lora_linear.rs`'s SAME `frozen_weight_gate` call site, in
 //!    `from_loaded_with_base` — the other constructor, same
 //!    [`FrozenBase::dweight_needed`] call.
-//! 5. `lora_linear.rs`'s eval-mode and eager-fallback base-dtype casts —
-//!    both now call [`FrozenBase::forward`] (the same method wrapper.rs's
+//! 5. `lora_linear.rs`'s eager-composition base-dtype cast —
+//!    it calls [`FrozenBase::forward`] (the same method wrapper.rs's
 //!    `Frozen` arm uses — one definition of "how does this base weight
 //!    turn `x` into an output", not three copies that could drift).
 //! 6. `lora_linear.rs`'s `has_bias`/admission-predicate site — stays

@@ -14,13 +14,9 @@
 //! recall curve over a committed corpus, held-out query set), `recall-sweep`,
 //! `train-scale` (fine-tune throughput + live OOM negative-control), `conformal-scale`
 //! (split-conformal coverage floor), `eval-scale` (retrieval/classification metric
-//! goldens + bootstrap order-invariance), `propagate-scale` (propagation determinism
-//! digest + latency ref), `graph-train-scale` (graph-finetune sampler throughput),
-//! `context-predictor-scale` (predictor train throughput + predict digest),
-//! `model-inference-scale` (`generate_embeddings` + `infer` output digests + coarse
-//! serving throughput), and `encode-step` (identity-audited
-//! `generate_text_embeddings` leg over a fixture with an explicit
-//! `1_Pooling/config.json`). Every committed number is a real re-derivable fold (a
+//! goldens + bootstrap order-invariance),
+//! and `encode-step` (the `encode` workload's rungs — the loaded model, the
+//! serving plan at one and at N partitions — as legs for the ladder). Every committed number is a real re-derivable fold (a
 //! `rebuild-*` subcommand reproduces it); an un-measured slot serializes as `null`,
 //! never a faked zero.
 //!
@@ -56,6 +52,7 @@
 //! subcommands on a representative box and fails on the exit code.
 
 mod cache_slo;
+mod capture;
 mod conformal;
 mod context_predictor;
 mod corpus;
@@ -64,11 +61,14 @@ mod eval;
 mod finetune_run;
 mod finetune_step;
 mod fixture;
-mod gpu_inference;
 mod grad_oracle;
-mod graph_train;
-mod model_inference;
+mod graph_legs;
+mod graph_sample;
+mod kernel_arm;
+mod ladder;
+mod leg;
 mod operator_mirror;
+mod plane;
 mod propagate;
 mod rate_gate;
 mod recall;
@@ -76,10 +76,14 @@ mod recompute_scale;
 mod report;
 mod rss;
 mod search_rss;
+mod structure;
 mod sweep;
+mod timing;
 mod train_scale;
+mod vram;
 
 use clap::{Parser, Subcommand};
+use plane::PlaneArgs;
 
 use std::path::PathBuf;
 
@@ -106,12 +110,6 @@ struct FinetuneRunArgs {
     /// `tokenizer.json`.
     #[arg(long)]
     model_dir: PathBuf,
-    /// `fused` or `alloff` — CALLER-declared (see `finetune_run::Arm`'s
-    /// doc); the caller is responsible for setting
-    /// `JAMMI_KERNELS_DISABLE=attention_block_flash,adamw_step_fused`
-    /// itself before invoking this binary for the `alloff` arm.
-    #[arg(long)]
-    arm: String,
     /// Which TOWER of `--model-dir`'s checkpoint to fine-tune:
     /// `text_embedding` (the default), `image_embedding` (an
     /// OpenCLIP vision tower), or `audio_embedding` (an HF-CLAP HTSAT audio
@@ -152,14 +150,26 @@ struct FinetuneRunArgs {
     heldout_jsonl: PathBuf,
     #[arg(long, default_value_t = 42)]
     seed: u64,
-    #[arg(long, default_value_t = 1)]
+    /// Defaults to the tier's own protocol
+    /// (`finetune_run::DEFAULT_EPOCHS`; see `DEFAULT_LEARNING_RATE`'s doc).
+    #[arg(long, default_value_t = finetune_run::DEFAULT_EPOCHS)]
     epochs: usize,
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = finetune_run::DEFAULT_EVAL_CADENCE)]
     eval_cadence: usize,
     #[arg(long, default_value_t = 32)]
     batch: usize,
-    #[arg(long, default_value_t = 2e-4)]
+    /// Defaults to the tier's own protocol
+    /// (`finetune_run::DEFAULT_LEARNING_RATE`, whose doc says why it is not
+    /// the engine's `2e-4`).
+    #[arg(long, default_value_t = finetune_run::DEFAULT_LEARNING_RATE)]
     lr: f64,
+    /// Run this job as its own negative control: every optimizer step is
+    /// applied at learning rate zero, so the whole loop runs and no trainable
+    /// tensor moves. The leg reports `lr: 0.0`. `--lr` stays the job's real,
+    /// positive rate (`--lr 0` is refused, as it is for any job) — see
+    /// `finetune_run::FinetuneRunParams::applied_learning_rate`'s doc.
+    #[arg(long, default_value_t = false)]
+    zero_lr_control: bool,
     /// `constant`, `cosine_decay`, or `linear_decay`.
     #[arg(long, default_value = "constant")]
     schedule: String,
@@ -231,7 +241,7 @@ struct FinetuneRunArgs {
     #[arg(long)]
     expect_kernels_disabled: Option<String>,
     /// Comma-separated LoRA target selectors.
-    #[arg(long, default_value = "Wqkv,Wo,Wi")]
+    #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
     target_modules: String,
     /// Optional comma-separated layer indices LoRA injection is restricted
     /// to (`jammi_lora::should_apply_lora`'s own doc: a layer must appear
@@ -243,13 +253,18 @@ struct FinetuneRunArgs {
     /// Backbone precision: f32, f16, or bf16.
     #[arg(long, default_value = "f32")]
     backbone_dtype: String,
-    #[arg(long, default_value_t = 64)]
+    /// The tokenizer's truncation length. Defaults to the ENGINE's own
+    /// default (`FineTuneConfig::max_seq_length`'s), read from the same
+    /// constant: this tier measures the trainer users run, and a shorter
+    /// bench-only default would silently measure a regime no job gets unless
+    /// it asks for it. Recorded on the leg as the identity field
+    /// `max_seq_length`.
+    #[arg(long, default_value_t = jammi_ai::fine_tune::DEFAULT_MAX_SEQ_LENGTH)]
     max_seq_length: usize,
     /// CALLER-declared premise for the report's `admission_is_dense` field
     /// (default: `false`, matching the committed fixture's padded
-    /// transport). This tier's real-text path never reaches
-    /// `forward_with_lengths`'s dense-vs-padded fork, so there is no live
-    /// signal to check this claim against — the value is recorded exactly
+    /// transport). The encoder decides dense-vs-padded per forward off the
+    /// mask and this tier reads no per-forward signal back, so the value is recorded exactly
     /// as declared, for a downstream merger to check against the fixture's
     /// own known shape (see `finetune_run::FinetuneRunParams::expect_dense`'s
     /// doc).
@@ -259,7 +274,9 @@ struct FinetuneRunArgs {
     #[arg(long)]
     cuda: Option<usize>,
     /// Scratch directory for this run's local catalog/artifact-store
-    /// state.
+    /// state. The run also writes `initial_adapter.safetensors` here — its
+    /// untrained adapter, whose sha256 it reports as
+    /// `initial_adapter_sha256` — before anything trains.
     #[arg(long)]
     work_dir: PathBuf,
     /// The mutant's own label (e.g.
@@ -280,6 +297,55 @@ struct FinetuneRunArgs {
     /// doc.
     #[arg(long)]
     mutant_patch_sha256: Option<String>,
+    /// Which rung of the train-run ladder this leg is: `resident` (the
+    /// trainer over in-memory rows), `streamed` (the job path in this
+    /// process), `placed` (the job placed on a Ballista executor in another
+    /// process) or `shape-d` (the deployed topology's role configs). The
+    /// rungs above `streamed` need `--features plane` and the plane's
+    /// backends (`JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`,
+    /// `JAMMI_TEST_S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+    #[arg(long, default_value = "resident")]
+    rung: String,
+    #[command(flatten)]
+    plane: PlaneArgs,
+}
+
+/// `fleet-env`'s flags.
+#[derive(clap::Args)]
+struct FleetEnvArgs {
+    /// `scheduler`, `query` or `compute`.
+    #[arg(long)]
+    role: String,
+    /// The store root every member shares (`s3://bucket/prefix`).
+    #[arg(long)]
+    result_root: String,
+    /// This process's artifact dir on its box.
+    #[arg(long)]
+    artifact_dir: PathBuf,
+    /// The interface this process binds (`0.0.0.0` across hosts).
+    #[arg(long, default_value = "0.0.0.0")]
+    bind_host: String,
+    /// The name other hosts dial this process by.
+    #[arg(long)]
+    advertise_host: String,
+    /// `host:port` of the fleet's scheduler.
+    #[arg(long)]
+    scheduler_address: String,
+    /// The CUDA ordinal a compute process trains on; CPU when omitted.
+    #[arg(long)]
+    device: Option<usize>,
+    #[arg(long, default_value_t = 8815)]
+    flight_port: u16,
+    #[arg(long, default_value_t = 8080)]
+    health_port: u16,
+    #[arg(long, default_value_t = 9000)]
+    peer_port: u16,
+    #[arg(long, default_value_t = 50050)]
+    scheduler_port: u16,
+    #[arg(long, default_value_t = 50051)]
+    exec_bind_port: u16,
+    #[arg(long, default_value_t = 50052)]
+    exec_grpc_port: u16,
 }
 
 #[derive(Subcommand)]
@@ -463,47 +529,6 @@ enum Command {
     /// provenance-recording rebuilder for the committed golden.
     #[command(hide = true)]
     RebuildEvalSpec,
-    /// The CPU-hermetic propagation tier: re-folds the engine's
-    /// `propagate_embeddings` (APPNP/SGC decoupled-GNN forward pass) over a
-    /// committed synthetic graph+embedding fixture and gates the DETERMINISM
-    /// contract — a committed digest of the propagated output vectors that any
-    /// box re-derives — while measuring propagation wall-time at named graph
-    /// sizes as an un-gated, machine-dependent reference. Emits the JSON report
-    /// with the `propagate` tier set and exits non-zero if the digest drifts.
-    PropagateScale,
-    /// Internal: rebuild the committed propagation spec
-    /// (`baselines/propagate.json`) from a fresh fold — folds the gated fixture
-    /// through the engine and records its output digest. Run off-box once when
-    /// the spec is established or the engine's propagation contract changes; CI
-    /// only loads and re-folds it. Not a CI step — the provenance-recording
-    /// rebuilder for the committed digest.
-    #[command(hide = true)]
-    RebuildPropagateSpec,
-    /// The CPU-hermetic graph fine-tune tier: re-samples the engine's biased-walk
-    /// graph sampler (`GraphSampler` — the data path `fine_tune_graph` threads
-    /// through) over a committed synthetic graph, gates the sampled-pair set on a
-    /// committed determinism digest any box re-derives, and gates the
-    /// sampled-pairs-per-second throughput against a committed same-box baseline.
-    /// Emits the JSON report with the `graph_train` tier set and exits non-zero if
-    /// the digest drifts or the throughput regresses.
-    GraphTrainScale,
-    /// Internal: rebuild the committed graph fine-tune spec
-    /// (`baselines/graph_train.json`) from a fresh sample — regenerates the graph,
-    /// samples it through the engine, and records the sampled-pair digest and the
-    /// same-box throughput. Run off-box once when the spec is established or the
-    /// sampler contract changes; CI only loads and re-samples it. Not a CI step —
-    /// the provenance-recording rebuilder for the committed digest + baseline.
-    #[command(hide = true)]
-    RebuildGraphTrainSpec,
-    /// The CPU-hermetic context-predictor tier: measures the engine's
-    /// `train_context_predictor` meta-training throughput (gated against a
-    /// committed same-box baseline) and gates `predict_with_context_predictor` on
-    /// a committed digest of the predicted distributions over a committed trained
-    /// weight bundle (predict is byte-deterministic given the weights + targets),
-    /// with predict wall-time as an un-gated reference. Emits the JSON report with
-    /// the `context_predictor` tier set and exits non-zero if the digest drifts or
-    /// the throughput regresses.
-    ContextPredictorScale,
     /// Internal: rebuild the committed context-predictor spec
     /// (`baselines/context_predictor.json`) and its trained weight bundle
     /// (`baselines/context_predictor_weights/`) from a fresh train + predict —
@@ -514,55 +539,127 @@ enum Command {
     /// CI step — the provenance-recording rebuilder for the committed bundle.
     #[command(hide = true)]
     RebuildContextPredictorSpec,
-    /// The CPU-hermetic model-inference tier: drives the engine's GPU-model
-    /// serving verbs `generate_text_embeddings` (the `generate_embeddings` path)
-    /// and `infer` (`Classification`) on `Device::Cpu` over tiny committed model
-    /// bundles. Each verb gates a committed determinism digest of the served
-    /// output (the portable cell anchor) and a coarse same-box serving rate. The
-    /// rate is a code-path-regression net over the tiny model, NOT the full-scale
-    /// scaling SLO — that representative number is captured off-box in the
-    /// cookbook (the A/B split). Emits the JSON report with the `model_inference`
-    /// tier set and exits non-zero if a digest drifts or a throughput regresses.
-    ModelInferenceScale,
-    /// Internal: rebuild the committed model-inference spec
-    /// (`baselines/model_inference.json`) from a fresh serve — regenerates the
-    /// corpus, serves both verbs over the committed tiny bundles
-    /// (`baselines/embed_model/`, `baselines/classifier_model/`), and records both
-    /// digests and both same-box serving baselines. Run off-box once when the spec
-    /// is established or the serving contract changes; CI only loads and
-    /// re-serves. Not a CI step — the provenance-recording rebuilder.
-    #[command(hide = true)]
-    RebuildModelInferenceSpec,
-    /// The on-GPU throughput/latency observability tier: serves both
-    /// `generate_text_embeddings` (embed) and `infer` (classification) on
-    /// `gpu.device = 0` over their own committed tiny bundles and records each
-    /// lane's sustained rows/s, p50/p99 serve latency, and cross-repeat
-    /// determinism, tagged with the concrete device that served them. The GPU
-    /// peer of `model-inference-scale`; requires the `cuda` feature and a GPU
-    /// (fails loud on a CPU fallback). An absolute rate on the ephemeral
-    /// heterogeneous prove fleet is not a property of the code, so there is no
-    /// perf gate here — the device-independent correctness contracts
-    /// (determinism, CPU↔GPU parity, and this tier's own classification
-    /// row-conservation check) are hard-gated. Emits the JSON report with the
-    /// `gpu_inference` tier set and exits non-zero on a missing CUDA device, a
-    /// serve error, or a classification lane that dropped a row.
-    GpuInferenceScale,
-    /// The identity-audited encode-step tier: drives the
-    /// engine's real `generate_text_embeddings` serving path — the SAME
-    /// `resolve -> tokenize -> forward -> pool -> normalize` path serving
-    /// uses, never a synthetic loop — over a small deterministic corpus and
-    /// a fixture model dir carrying an EXPLICIT `1_Pooling/config.json`
-    /// (never the silent mean-pooling fallback). Emits the
-    /// JSON report with the `encode_step` tier set; see
-    /// `report::EncodeStepTier`'s own doc for the declared
-    /// `IDENTITY_FIELDS`/`PROVENANCE_FIELDS` split. CPU-hermetic by default
-    /// (`Device::Cpu`); `--cuda` parameterizes the GPU device for the pod
-    /// producer, the SAME `--cuda: Option<usize>` convention `finetune-step`/
-    /// `grad-oracle` already take.
+    /// The `encode` workload's producer: the engine's serving path — rows in a
+    /// table → one artifact per key — run through a RUNG (`--rung direct`:
+    /// the loaded model on the rows, no plan; `plan`: the real verb at one
+    /// partition; `plan-partitioned`: at `--partitions` N) for a task
+    /// (`--task embed|infer`), over a `--rows` sweep, on CPU or `--cuda`, over
+    /// a `--model-dir` checkpoint or the compiled-in fixture. Every (unit,
+    /// take) is measured in a child process under the device-memory sampler;
+    /// more than one `--rung` is served interleaved in that child. Emits one
+    /// leg per rung per unit per take (`--legs-dir`, the ladder's leg
+    /// contract) and prints a summary. Every number is RECORDED; the
+    /// comparison is `jammi-bench ladder encode`'s.
     EncodeStep {
+        /// What the rows are served for.
+        #[arg(long, value_enum, default_value_t = encode_step::Task::Embed)]
+        task: encode_step::Task,
+        /// A rung of the leg session; repeat to serve several interleaved.
+        #[arg(long = "rung", value_enum, required = true)]
+        rungs: Vec<encode_step::Rung>,
         /// CUDA ordinal; omit for CPU.
         #[arg(long)]
         cuda: Option<usize>,
+        /// A local checkpoint directory (`config.json`, `model.safetensors`,
+        /// `tokenizer.json`, optionally `1_Pooling/config.json`); omit for
+        /// the task's compiled-in fixture.
+        #[arg(long)]
+        model_dir: Option<std::path::PathBuf>,
+        /// The corpus row count of each sweep unit, comma-separated.
+        #[arg(long, value_delimiter = ',', default_values_t = [16, 256])]
+        rows: Vec<usize>,
+        /// Measured repeats of each unit, each in a process of its own.
+        #[arg(long, default_value_t = 1)]
+        takes: usize,
+        /// The corpus generation seed.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// `[inference] batch_size` — the row cap of a forward chunk, every
+        /// rung.
+        #[arg(long, default_value_t = jammi_db::config::InferenceConfig::default().batch_size)]
+        batch_size: usize,
+        /// `[inference] batch_tokens` — the padded-token cap of a forward
+        /// chunk, every rung.
+        #[arg(long, default_value_t = jammi_db::config::InferenceConfig::default().batch_tokens)]
+        batch_tokens: usize,
+        /// `[inference] partitions` of the plan-partitioned rung.
+        #[arg(long, default_value_t = 4)]
+        partitions: usize,
+        /// `[gpu] compute_precision` (`f32`, `f16`, `bf16`) — what the model
+        /// loads at unless its own `config.json` declares one.
+        #[arg(long, default_value = "f32")]
+        compute_precision: jammi_numerics::ComputePrecision,
+        /// Warm serves discarded before the measured ones, per rung.
+        #[arg(long, default_value_t = 2)]
+        warmup: usize,
+        /// Measured serves per rung (even, when rungs are interleaved). The
+        /// default is the comparator's minimum series; a shorter run files
+        /// legs the speed axis refuses by name and the outcome axis reads.
+        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_SAMPLES)]
+        iters: usize,
+        /// Leave each unit's corpus (`corpus_<rows>.parquet`) and — without
+        /// `--model-dir` — the fixture checkpoint (`model/`) here, for
+        /// `reference/torch_encode.py` to read.
+        #[arg(long)]
+        exchange_dir: Option<std::path::PathBuf>,
+        /// Write the legs here, one `<rung>__rows<N>__r<take>.json` each,
+        /// a unit's first take with its vectors beside it.
+        #[arg(long)]
+        legs_dir: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        plane: PlaneArgs,
+    },
+    /// Run a command under the device-memory sampler — the one external
+    /// instrument every rung's leg, including a PyTorch reference's, reads
+    /// its `peak_vram_bytes` from — and print one JSON object: the peak, the
+    /// command's whole standard output and its exit code. Exits as the
+    /// command did.
+    SampleDevice {
+        /// CUDA ordinal to sample; omit to sample nothing (a CPU leg).
+        #[arg(long)]
+        cuda: Option<usize>,
+        /// The command and its arguments.
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
+    /// Internal: one leg session — every `--rung` over one `--rows` unit at
+    /// one `--take`, measured in THIS process — printing one report per
+    /// rung as a JSON array. `encode-step` runs one per (unit, take) under
+    /// the device-memory sampler.
+    #[command(hide = true)]
+    EncodeLeg {
+        #[arg(long, value_enum)]
+        task: encode_step::Task,
+        #[arg(long = "rung", value_enum, required = true)]
+        rungs: Vec<encode_step::Rung>,
+        #[arg(long)]
+        cuda: Option<usize>,
+        #[arg(long)]
+        model_dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        rows: usize,
+        #[arg(long)]
+        take: usize,
+        #[arg(long)]
+        seed: u64,
+        #[arg(long)]
+        batch_size: usize,
+        #[arg(long)]
+        batch_tokens: usize,
+        #[arg(long)]
+        partitions: usize,
+        #[arg(long)]
+        compute_precision: jammi_numerics::ComputePrecision,
+        #[arg(long)]
+        warmup: usize,
+        #[arg(long)]
+        iters: usize,
+        #[arg(long)]
+        exchange_dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        legs_dir: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        plane: PlaneArgs,
     },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
@@ -592,9 +689,9 @@ enum Command {
         #[arg(long, default_value_t = 16.0)]
         lora_alpha: f64,
         #[arg(long, default_value_t = 0.05)]
-        lora_dropout: f32,
+        lora_dropout: f64,
         /// Comma-separated LoRA target selectors.
-        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
         target_modules: String,
         /// Backbone precision: f32, f16, or bf16.
         #[arg(long, default_value = "f32")]
@@ -633,11 +730,9 @@ enum Command {
         /// Comma-separated per-row REAL (non-pad) lengths for a genuinely
         /// right-padded batch -- one usize per row, `--batch` entries total,
         /// each in `1..=--seq`. Omit for this tier's dense behaviour (an
-        /// all-ones mask). When supplied, every forward
-        /// routes through `ModernBert::forward_with_lengths`'s trusted-
-        /// lengths path, building the mask FROM
-        /// these lengths (row `b`'s first `lengths[b]` positions `1`, the
-        /// rest `0`) so the mask and the lengths can never disagree. See
+        /// all-ones mask). When supplied, the mask is built FROM these
+        /// lengths (row `b`'s first `lengths[b]` positions `1`, the rest
+        /// `0`) and every forward reaches the padded flash transport. See
         /// `finetune_step::FinetuneStepParams::row_lengths`'s doc.
         #[arg(long)]
         row_lengths: Option<String>,
@@ -655,16 +750,23 @@ enum Command {
     /// mirrors `jammi_ai::fine_tune::target::TrainingTarget::EncoderAdapters`'s
     /// own fix for the identical lint (see that variant's doc).
     FinetuneRun(Box<FinetuneRunArgs>),
-    /// The jammi-vs-torch LEARNING oracle: one forward+backward at
-    /// IDENTICAL LoRA weights (never an optimizer step), dumped per
-    /// trainable tensor by name (loss + f32 gradient) for
-    /// `ci/scripts/perf/compare_grad_oracle.py` to compare against a
-    /// torch-side dump by GRADIENT DIRECTION (cosine similarity), not by
-    /// loss trajectory — see `grad_oracle.rs`'s module doc for why a loss-
-    /// trajectory comparison cannot certify learning parity even with
-    /// matched optimizer-update placement. `--lora-weights-out` writes the LoRA `A`/`B`
+    /// The environment that places one shape-d role on one box, as
+    /// `KEY=VALUE` lines: the committed role config
+    /// (`deploy/kubernetes/overlays/shape-d/jammi-<role>.toml`) is run as
+    /// written with these layered over it, exactly as a one-host shape-d
+    /// fleet layers them — so a fleet across hosts is the same fleet. The
+    /// backends come from `JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`,
+    /// `JAMMI_TEST_S3_BUCKET`, `AWS_*`. Needs `--features plane`.
+    FleetEnv(Box<FleetEnvArgs>),
+    /// The jammi-vs-torch learning oracle: one forward+backward at
+    /// identical LoRA weights (never an optimizer step), emitted as a
+    /// `train-step` leg whose `gradients` carries every trainable tensor's
+    /// gradient and weight. Filed under the `grads` take of the `train-step`
+    /// ladder's `torch -> reference` edge, it is judged as gradient
+    /// agreement — direction, never loss trajectory; see `grad_oracle.rs`'s
+    /// module doc for why. `--lora-weights-out` writes the LoRA `A`/`B`
     /// values this call actually used (jammi's own internal safetensors
-    /// naming); a LATER call's `--lora-weights-in` loads them back,
+    /// naming); a later call's `--lora-weights-in` loads them back,
     /// overwriting the fresh seeded draw before the forward runs.
     GradOracle {
         /// Directory holding `config.json` + `model.safetensors`.
@@ -679,7 +781,7 @@ enum Command {
         #[arg(long, default_value_t = 32.0)]
         lora_alpha: f64,
         /// Comma-separated LoRA target selectors.
-        #[arg(long, default_value = "Wqkv,Wo,Wi")]
+        #[arg(long, default_value = finetune_run::DEFAULT_TARGET_MODULES)]
         target_modules: String,
         /// Backbone precision: f32, f16, or bf16.
         #[arg(long, default_value = "f32")]
@@ -700,7 +802,8 @@ enum Command {
         /// this safetensors file.
         #[arg(long)]
         lora_weights_out: Option<PathBuf>,
-        /// Write the gradient/loss dump (JSON) here.
+        /// Write the leg (a `grad-oracle` report with a `finetune_step`
+        /// tier) here.
         #[arg(long)]
         out: PathBuf,
     },
@@ -728,16 +831,97 @@ enum Command {
     /// `report_schema_version`) as standalone JSON — the SAME object every
     /// other subcommand's report carries at `report.provenance`
     /// (`report::Provenance::baked`, filled by `build.rs` at COMPILE time,
-    /// never read at run time). A shell producer (`stacked_sweep.sh`,
+    /// never read at run time). A shell producer (`finetune_step_ab.sh`,
     /// `proof_artifact.py`) runs this BEFORE a leg to cross-check
     /// `build_sha` against its own resolved sha, rather than discovering a
     /// stale binary only after paying for the measurement.
     #[command(hide = true)]
     Provenance,
+    /// The parity ladder: compare a workload's rungs, edge by edge, over a
+    /// directory of legs any producer emitted — this binary's own tiers for
+    /// the engine's rungs, a reference script's JSON for the reference
+    /// framework's. One operator judges every edge on speed, space and
+    /// outcome; see `ladder`'s module doc. Emits one JSON verdict and a
+    /// table, and exits non-zero on a refusal or a failed hard rule.
+    Ladder(ladder::LadderArgs),
+    /// The `graph-sample` workload's engine rung, `sampler`: sample each
+    /// `--graph` through the engine's biased-walk sampler and file one leg per
+    /// graph under `--legs-dir` (`sampler__edges<N>__r<take>.json`, the pair
+    /// table beside it, the unit's law file `edges<N>.json` under `--law-dir`)
+    /// — the warm per-iteration series, the peak resident set, the pair
+    /// table's digest and the walks' second-order transition counts in the
+    /// law's order. Several graphs are a size sweep, one process each. The
+    /// comparison is `jammi-bench ladder graph-sample`'s.
+    GraphSample(graph_sample::GraphSampleArgs),
+    /// Write the synthetic multi-community graph at a given size as a graph
+    /// directory — the input of a `graph-sample` size sweep.
+    GraphFixture(graph_sample::GraphFixtureArgs),
+    /// Sample a graph exactly as a `fine_tune_graph` job at the same sampler
+    /// configuration does and write its training set as `pairs.jsonl`, in the
+    /// job's `_ordinal` order and the row shape `finetune-run --train-jsonl`
+    /// reads — so a resident fine-tune, the graph job and a PyTorch trainer all
+    /// train on byte-identical input.
+    GraphPairs(graph_sample::GraphPairsArgs),
+    /// The `propagate` workload's engine rungs, `plan` (one partition),
+    /// `plan-partitioned` (`--partitions`) and `placed` (the same request as
+    /// a job on a fleet, its sink placed on an executor process):
+    /// `propagate_embeddings` over the synthetic graph at each `--nodes`
+    /// size, one leg and one process per point under `--legs-dir` — the warm
+    /// per-iteration series, the peak resident set, the digest of the
+    /// key-sorted propagated vectors and the vectors themselves — beside the
+    /// unit's input files the PyTorch rungs read; a placed leg records where
+    /// its sink ran. The comparison is `jammi-bench ladder propagate`'s.
+    Propagate(propagate::PropagateArgs),
+    /// The `structure` workload's engine rungs, `plan`, `plan-partitioned`
+    /// and `placed`: `generate_structure_embeddings` — an embedding table
+    /// from the edge relation alone — over the synthetic graph at each
+    /// `--nodes` size, one leg and one process per point under `--legs-dir`,
+    /// beside the unit's edge list and the engine's own seed rows, which the
+    /// PyTorch rung starts from. The comparison is `jammi-bench ladder
+    /// structure`'s.
+    Structure(structure::StructureArgs),
+    /// The `predictor-train-run` workload's engine rungs — `in-process`, and
+    /// `placed` and `shape-d` (the same training as a job on a fleet) — for
+    /// the family member `--arch` names (`Cnp`, `AttnCnp`, `Tnp`): at each
+    /// `--seeds` seed, sample the committed meta-dataset into episodes, write
+    /// them and the seeded initial weights (the files a PyTorch twin loads),
+    /// meta-train with the engine's own fit, and file one leg — every
+    /// optimizer step's wall-clock, the peak resident set, the held-out loss at
+    /// init and after every epoch, the train-side probe series, and the head's
+    /// output on every held-out target; a leg above `in-process` records
+    /// where the job ran. The comparison is
+    /// `jammi-bench ladder predictor-train-run`'s.
+    PredictorTrainRun(context_predictor::PredictorTrainArgs),
+    /// The `JAMMI_KERNELS_DISABLE` value of a kernel arm on a checkpoint:
+    /// the arm's families' keys, restricted to the keys one training step on
+    /// the checkpoint consults.
+    KernelArm(kernel_arm::KernelArmArgs),
+    /// One pass of a checkpoint's admission census under this process's
+    /// `JAMMI_KERNELS_DISABLE`, as JSON: `kernel-arm`'s child.
+    KernelCensus(kernel_arm::KernelCensusArgs),
+}
+
+/// Map a leg subcommand's outcome to the process exit code, naming the
+/// subcommand on failure.
+fn leg_exit(
+    subcommand: &str,
+    outcome: Result<(), Box<dyn std::error::Error>>,
+) -> std::process::ExitCode {
+    match outcome {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{subcommand}: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    if let Err(e) = encode_step::install_tracing() {
+        eprintln!("{e}");
+        return std::process::ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::SearchRss => run_search_rss().await,
@@ -771,16 +955,86 @@ async fn main() -> std::process::ExitCode {
         Command::EvalScale => run_eval_scale(),
         Command::RebuildConformalSpec => run_rebuild_conformal_spec(),
         Command::RebuildEvalSpec => run_rebuild_eval_spec(),
-        Command::PropagateScale => run_propagate_scale().await,
-        Command::RebuildPropagateSpec => run_rebuild_propagate_spec().await,
-        Command::GraphTrainScale => run_graph_train_scale(),
-        Command::RebuildGraphTrainSpec => run_rebuild_graph_train_spec(),
-        Command::ContextPredictorScale => run_context_predictor_scale().await,
         Command::RebuildContextPredictorSpec => run_rebuild_context_predictor_spec().await,
-        Command::ModelInferenceScale => run_model_inference_scale().await,
-        Command::RebuildModelInferenceSpec => run_rebuild_model_inference_spec().await,
-        Command::GpuInferenceScale => run_gpu_inference_scale().await,
-        Command::EncodeStep { cuda } => run_encode_step(cuda).await,
+        Command::EncodeStep {
+            task,
+            rungs,
+            cuda,
+            model_dir,
+            rows,
+            takes,
+            seed,
+            batch_size,
+            batch_tokens,
+            partitions,
+            compute_precision,
+            warmup,
+            iters,
+            exchange_dir,
+            legs_dir,
+            plane,
+        } => run_encode_step(encode_step::EncodeStepParams {
+            task,
+            rungs,
+            model_dir,
+            rows,
+            takes,
+            seed,
+            batch_size,
+            batch_tokens,
+            partitions,
+            compute_precision,
+            warmup,
+            iters,
+            gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
+            exchange_dir,
+            legs_dir,
+            plane: plane.into(),
+        }),
+        Command::SampleDevice { cuda, command } => run_sample_device(cuda, &command),
+        Command::EncodeLeg {
+            task,
+            rungs,
+            cuda,
+            model_dir,
+            rows,
+            take,
+            seed,
+            batch_size,
+            batch_tokens,
+            partitions,
+            compute_precision,
+            warmup,
+            iters,
+            exchange_dir,
+            legs_dir,
+            plane,
+        } => {
+            run_encode_leg(
+                encode_step::EncodeStepParams {
+                    task,
+                    rungs,
+                    model_dir,
+                    rows: vec![rows],
+                    takes: take,
+                    seed,
+                    batch_size,
+                    batch_tokens,
+                    partitions,
+                    compute_precision,
+                    warmup,
+                    iters,
+                    gpu_device: cuda
+                        .map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
+                    exchange_dir,
+                    legs_dir,
+                    plane: plane.into(),
+                },
+                rows,
+                take,
+            )
+            .await
+        }
         Command::FinetuneStep {
             model_dir,
             batch,
@@ -863,10 +1117,10 @@ async fn main() -> std::process::ExitCode {
                 },
             },
         }),
+        Command::FleetEnv(args) => run_fleet_env(*args),
         Command::FinetuneRun(args) => {
             let FinetuneRunArgs {
                 model_dir,
-                arm,
                 task,
                 train_jsonl,
                 heldout_ids,
@@ -876,6 +1130,7 @@ async fn main() -> std::process::ExitCode {
                 eval_cadence,
                 batch,
                 lr,
+                zero_lr_control,
                 schedule,
                 warmup_steps,
                 weight_decay,
@@ -903,9 +1158,11 @@ async fn main() -> std::process::ExitCode {
                 mutant_id,
                 mutant_base_sha,
                 mutant_patch_sha256,
+                rung,
+                plane,
             } = *args;
-            let arm = match arm.parse::<finetune_run::Arm>() {
-                Ok(a) => a,
+            let rung = match rung.parse::<finetune_run::Rung>() {
+                Ok(r) => r,
                 Err(e) => {
                     eprintln!("finetune-run: {e}");
                     return std::process::ExitCode::FAILURE;
@@ -1025,7 +1282,6 @@ async fn main() -> std::process::ExitCode {
             };
             let params = finetune_run::FinetuneRunParams {
                 model_dir,
-                arm,
                 task,
                 train_pairs,
                 heldout_pairs,
@@ -1039,6 +1295,11 @@ async fn main() -> std::process::ExitCode {
                 eval_cadence,
                 batch_size: batch,
                 learning_rate: lr,
+                applied_learning_rate: if zero_lr_control {
+                    jammi_ai::fine_tune::trainer::AppliedLearningRate::Zero
+                } else {
+                    jammi_ai::fine_tune::trainer::AppliedLearningRate::Scheduled
+                },
                 lr_schedule,
                 warmup_steps,
                 weight_decay,
@@ -1120,6 +1381,8 @@ async fn main() -> std::process::ExitCode {
                 },
                 max_seq_length,
                 expect_dense,
+                rung,
+                plane: plane.into(),
                 cuda_device: cuda,
                 work_dir,
                 mutant_id,
@@ -1175,6 +1438,15 @@ async fn main() -> std::process::ExitCode {
         Command::CacheSloScale => run_cache_slo_scale().await,
         Command::RecomputeScale => run_recompute_scale().await,
         Command::Provenance => run_provenance(),
+        Command::Ladder(args) => ladder::run(&args),
+        Command::GraphSample(args) => leg_exit("graph-sample", args.execute().await),
+        Command::GraphFixture(args) => leg_exit("graph-fixture", args.execute()),
+        Command::GraphPairs(args) => leg_exit("graph-pairs", args.execute()),
+        Command::Propagate(args) => leg_exit("propagate", args.execute().await),
+        Command::Structure(args) => leg_exit("structure", args.execute().await),
+        Command::PredictorTrainRun(args) => leg_exit("predictor-train-run", args.execute().await),
+        Command::KernelArm(args) => kernel_arm::run(&args),
+        Command::KernelCensus(args) => kernel_arm::run_census(&args),
     }
 }
 
@@ -1194,23 +1466,27 @@ fn run_provenance() -> std::process::ExitCode {
 }
 
 /// The `grad-oracle` subcommand: run one forward+backward (no optimizer
-/// step) and write the JSON gradient/loss dump to `out`. Records; does not
-/// gate (the same recorded-not-gated posture `finetune-step` takes — the
-/// comparison this dump feeds, `ci/scripts/perf/compare_grad_oracle.py`, is
-/// the piece that asserts a bound, kept out-of-process so a Python-side
-/// numpy oracle is never coupled to this binary's own exit code). Exits
-/// non-zero only when the step could not be measured at all.
+/// step) and write the leg to `out`, as a report with a `finetune_step`
+/// tier. Records; does not gate — `jammi-bench ladder` judges it. Exits
+/// non-zero only when the forward could not be taken at all.
 fn run_grad_oracle(
     params: grad_oracle::GradOracleParams,
     out: &std::path::Path,
 ) -> std::process::ExitCode {
-    let report = match grad_oracle::run(&params) {
-        Ok(r) => r,
+    let leg = match grad_oracle::run(&params) {
+        Ok(leg) => leg,
         Err(e) => {
             eprintln!("grad-oracle failed: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    let report = Report::new(
+        "grad-oracle",
+        Tiers {
+            finetune_step: Some(leg),
+            ..Default::default()
+        },
+    );
     let json = match serde_json::to_string_pretty(&report) {
         Ok(j) => j,
         Err(e) => {
@@ -1617,12 +1893,11 @@ async fn run_cache_slo_scale() -> std::process::ExitCode {
             finetune_run: None,
             conformal: None,
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: Some(tier),
             recompute: None,
         },
@@ -1670,12 +1945,11 @@ async fn run_recompute_scale() -> std::process::ExitCode {
             finetune_run: None,
             conformal: None,
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: Some(tier),
         },
@@ -1774,12 +2048,11 @@ async fn run_train_scale() -> std::process::ExitCode {
             finetune_run: None,
             conformal: None,
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1837,12 +2110,11 @@ fn run_conformal_scale() -> std::process::ExitCode {
             finetune_run: None,
             conformal: Some(tier),
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1890,12 +2162,11 @@ fn run_eval_scale() -> std::process::ExitCode {
             finetune_run: None,
             conformal: None,
             eval: Some(tier),
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: None,
         },
@@ -1907,60 +2178,6 @@ fn run_eval_scale() -> std::process::ExitCode {
         eprintln!(
             "an eval metric DRIFTED off its committed golden (or the eval_compare bootstrap CI \
              diverged across orderings) — see tiers.eval for the metric that regressed"
-        );
-        std::process::ExitCode::FAILURE
-    }
-}
-
-/// Run the CPU-hermetic propagation tier: load the committed spec, re-fold the
-/// gated digest through the engine's real `propagate_embeddings`, measure the
-/// un-gated latency reference, emit the report with the `propagate` tier set, and
-/// map the digest verdict to the exit code. A digest drift prints and exits
-/// non-zero — the run never fakes a pass.
-async fn run_propagate_scale() -> std::process::ExitCode {
-    let spec = match propagate::PropagateSpec::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("propagate-scale could not load the committed spec: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let tier = match propagate::run(&spec).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("propagate-scale digest fold failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let passed = propagate::gate_passed(&tier);
-    let report = Report::new(
-        "propagate-scale",
-        Tiers {
-            arxiv: None,
-            binding: None,
-            recall_sweep: None,
-            training: None,
-            finetune_step: None,
-            finetune_run: None,
-            conformal: None,
-            eval: None,
-            propagate: Some(tier),
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
-            encode_step: None,
-            cache_slo: None,
-            recompute: None,
-        },
-    );
-    emit(&report);
-    if passed {
-        std::process::ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "the propagation digest DRIFTED off its committed value — the engine's \
-             propagate_embeddings output changed; see tiers.propagate.digest for the bits"
         );
         std::process::ExitCode::FAILURE
     }
@@ -2060,224 +2277,6 @@ fn run_rebuild_eval_spec() -> std::process::ExitCode {
     }
 }
 
-/// The embedding dimensionality the committed propagation fixture's `X⁽⁰⁾` and
-/// the propagated output live in.
-const PROPAGATE_DIM: usize = 16;
-/// The number of classes the committed propagation graph wires within — a clique
-/// per class, so two classes give a graph with structure to smooth over.
-const PROPAGATE_N_CLASSES: usize = 4;
-/// Nodes per class in the *gated* fixture (the tractable digest size the
-/// hermetic `cargo test` gate re-folds in seconds). The gated node count is
-/// `PROPAGATE_N_CLASSES · PROPAGATE_GATE_PER_CLASS`.
-const PROPAGATE_GATE_PER_CLASS: usize = 8;
-/// Bounded fan-out: each node wires to its next `PROPAGATE_FAN_OUT` class-mates
-/// (a circulant graph per class), so the edge set is `O(nodes · fan_out)` and
-/// stays under the engine's edge-set ceiling at the larger latency sizes.
-const PROPAGATE_FAN_OUT: usize = 4;
-/// The APPNP hop count the committed digest is folded at — the engine's
-/// over-smoothing sweet spot.
-const PROPAGATE_HOPS: usize = 2;
-/// The APPNP teleport probability the committed digest is folded with — the
-/// engine's default restart.
-const PROPAGATE_ALPHA: f64 = 0.1;
-/// The node counts the un-gated propagation latency reference is measured at — a
-/// machine-dependent wall-time curve, ascending. The named sizes the
-/// `propagate-scale` subcommand emits the reference at; they are NOT gated.
-const PROPAGATE_LATENCY_NODES: [usize; 2] = [1_000, 10_000];
-
-/// Rebuild and write the committed propagation spec from a fresh fold. The
-/// off-box one-shot; prints the spec it wrote so the operator sees the digest
-/// being committed.
-async fn run_rebuild_propagate_spec() -> std::process::ExitCode {
-    let spec = match propagate::rebuild_spec(
-        PROPAGATE_DIM,
-        PROPAGATE_N_CLASSES,
-        PROPAGATE_GATE_PER_CLASS,
-        PROPAGATE_FAN_OUT,
-        PROPAGATE_HOPS,
-        PROPAGATE_ALPHA,
-        &PROPAGATE_LATENCY_NODES,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("rebuild-propagate-spec failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    match serde_json::to_string_pretty(&spec) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(propagate::PropagateSpec::path(), format!("{json}\n")) {
-                eprintln!("rebuild-propagate-spec could not write the spec: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            println!("{json}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to serialize propagate spec: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// Run the CPU-hermetic graph fine-tune tier: load the committed spec, re-sample
-/// the graph through the engine's real `GraphSampler`, gate the sampled-pair
-/// digest and the throughput, emit the report with the `graph_train` tier set,
-/// and map the verdict to the exit code. A digest drift or a throughput
-/// regression prints and exits non-zero — the run never fakes a pass.
-fn run_graph_train_scale() -> std::process::ExitCode {
-    let spec = match graph_train::GraphTrainSpec::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("graph-train-scale could not load the committed spec: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let tier = match graph_train::run(&spec) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("graph-train-scale sample failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let passed = graph_train::gates_passed(&tier);
-    let report = Report::new(
-        "graph-train-scale",
-        Tiers {
-            arxiv: None,
-            binding: None,
-            recall_sweep: None,
-            training: None,
-            finetune_step: None,
-            finetune_run: None,
-            conformal: None,
-            eval: None,
-            propagate: None,
-            graph_train: Some(tier),
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
-            encode_step: None,
-            cache_slo: None,
-            recompute: None,
-        },
-    );
-    emit(&report);
-    if passed {
-        std::process::ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "graph fine-tune gate FAILED — the sampled-pair digest drifted off its committed \
-             value, or the sample throughput regressed below the same-box floor; see \
-             tiers.graph_train for the numbers"
-        );
-        std::process::ExitCode::FAILURE
-    }
-}
-
-/// The committed graph fine-tune generation parameters — the synthetic-graph shape
-/// and the sampler knobs the committed digest and same-box baseline are derived
-/// from. A multi-community circulant with sparse bridges, sampled by a
-/// higher-order biased walk with structure-aware negative mining.
-const GRAPH_TRAIN_PARAMS: graph_train::GraphTrainParams = graph_train::GraphTrainParams {
-    communities: 8,
-    nodes_per: 64,
-    intra_degree: 4,
-    bridge_stride: 8,
-    walk_length: 4,
-    walks_per_node: 4,
-    return_p: 1.0,
-    in_out_q: 0.5,
-    hard_negatives: 2,
-    exclude_hops: 1,
-    seed: 0x00C0_FFEE_0011,
-};
-
-/// Rebuild and write the committed graph fine-tune spec from a fresh sample. The
-/// off-box one-shot; prints the spec it wrote so the operator sees the digest and
-/// baseline being committed.
-fn run_rebuild_graph_train_spec() -> std::process::ExitCode {
-    let spec = match graph_train::rebuild_spec(GRAPH_TRAIN_PARAMS) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("rebuild-graph-train-spec failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    match serde_json::to_string_pretty(&spec) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(graph_train::GraphTrainSpec::path(), format!("{json}\n"))
-            {
-                eprintln!("rebuild-graph-train-spec could not write the spec: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            println!("{json}");
-            std::process::ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to serialize graph-train spec: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// Run the CPU-hermetic context-predictor tier: load the committed spec, measure
-/// `train_context_predictor` throughput, re-fold the predict digest over the
-/// committed weight bundle through `predict_with_context_predictor`, emit the
-/// report with the `context_predictor` tier set, and map the verdict to the exit
-/// code. A digest drift or a throughput regression prints and exits non-zero.
-async fn run_context_predictor_scale() -> std::process::ExitCode {
-    let spec = match context_predictor::ContextPredictorSpec::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("context-predictor-scale could not load the committed spec: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let tier = match context_predictor::run(&spec).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("context-predictor-scale run failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let passed = context_predictor::gates_passed(&tier);
-    let report = Report::new(
-        "context-predictor-scale",
-        Tiers {
-            arxiv: None,
-            binding: None,
-            recall_sweep: None,
-            training: None,
-            finetune_step: None,
-            finetune_run: None,
-            conformal: None,
-            eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: Some(tier),
-            model_inference: None,
-            gpu_inference: None,
-            encode_step: None,
-            cache_slo: None,
-            recompute: None,
-        },
-    );
-    emit(&report);
-    if passed {
-        std::process::ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "context-predictor gate FAILED — the predicted-distribution digest drifted off its \
-             committed value, or the training throughput regressed below the same-box floor; see \
-             tiers.context_predictor for the numbers"
-        );
-        std::process::ExitCode::FAILURE
-    }
-}
-
 /// The committed context-predictor generation parameters — the synthetic
 /// meta-dataset shape, the predictor spec, and how many targets the predict digest
 /// folds over. A CNP over a family of linear functions, the engine
@@ -2331,182 +2330,139 @@ async fn run_rebuild_context_predictor_spec() -> std::process::ExitCode {
     }
 }
 
-/// Run the CPU-hermetic model-inference tier: load the committed spec, serve both
-/// GPU-model verbs (`generate_text_embeddings` and `infer`) over the committed
-/// tiny bundles on `Device::Cpu`, re-fold both digests, emit the report with the
-/// `model_inference` tier set, and map the verdict to the exit code. A digest
-/// drift or a serving-throughput regression prints and exits non-zero.
-async fn run_model_inference_scale() -> std::process::ExitCode {
-    let spec = match model_inference::ModelInferenceSpec::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("model-inference-scale could not load the committed spec: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let tier = match model_inference::run(&spec).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("model-inference-scale run failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let passed = model_inference::gates_passed(&tier);
-    let report = Report::new(
-        "model-inference-scale",
-        Tiers {
-            arxiv: None,
-            binding: None,
-            recall_sweep: None,
-            training: None,
-            finetune_step: None,
-            finetune_run: None,
-            conformal: None,
-            eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: Some(tier),
-            gpu_inference: None,
-            encode_step: None,
-            cache_slo: None,
-            recompute: None,
-        },
-    );
-    emit(&report);
-    if passed {
-        std::process::ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "model-inference gate FAILED — a served-output digest drifted off its committed value, \
-             or a serving throughput regressed below the same-box floor; see tiers.model_inference \
-             for the numbers"
-        );
-        std::process::ExitCode::FAILURE
-    }
-}
-
-/// The committed model-inference generation parameters — the synthetic corpus
-/// shape and how many targets the infer digest folds over.
-const MODEL_INFERENCE_PARAMS: model_inference::ModelInferenceParams =
-    model_inference::ModelInferenceParams {
-        row_count: 16,
-        corpus_seed: 11,
-        target_count: 8,
-    };
-
-/// Rebuild and write the committed model-inference spec from a fresh serve over
-/// the committed bundles. The off-box one-shot; prints the spec it wrote so the
-/// operator sees the digests and baselines being committed.
-async fn run_rebuild_model_inference_spec() -> std::process::ExitCode {
-    let spec = match model_inference::rebuild_spec(MODEL_INFERENCE_PARAMS).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("rebuild-model-inference-spec failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    match serde_json::to_string_pretty(&spec) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(
-                model_inference::ModelInferenceSpec::path(),
-                format!("{json}\n"),
-            ) {
-                eprintln!("rebuild-model-inference-spec could not write the spec: {e}");
-                return std::process::ExitCode::FAILURE;
+/// Run the encode producer: every (unit, take) in a child under the sampler,
+/// the legs written, the sweep summarised on stdout. Exits non-zero only when
+/// a leg session failed — a checkpoint that does not load, a CUDA ordinal the
+/// box does not have, a rung that was not deterministic or lost a row.
+fn run_encode_step(params: encode_step::EncodeStepParams) -> std::process::ExitCode {
+    match encode_step::run(&params) {
+        Ok(sweep) => match serde_json::to_string_pretty(&sweep) {
+            Ok(json) => {
+                println!("{json}");
+                std::process::ExitCode::SUCCESS
             }
-            println!("{json}");
-            std::process::ExitCode::SUCCESS
-        }
+            Err(e) => {
+                eprintln!("failed to serialize the encode sweep: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        },
         Err(e) => {
-            eprintln!("failed to serialize model-inference spec: {e}");
+            eprintln!("encode-step run failed: {e}");
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-/// The GPU-inference corpus/measurement shape. A larger corpus than the CPU tier
-/// so the GPU serve is non-trivial, and enough iters for a meaningful p99 without
-/// making the prove-lane run long.
-const GPU_INFERENCE_PARAMS: gpu_inference::GpuInferenceParams = gpu_inference::GpuInferenceParams {
-    row_count: 256,
-    corpus_seed: 0,
-    // A caller-set, emitted identity field
-    // (`GpuInferenceTier::warmup`). 2 mirrors `ENCODE_STEP_PARAMS`'s own
-    // warmup count for the CPU-hermetic encode-step tier.
-    warmup: 2,
-    iters: 20,
-};
-
-/// Run the GPU-inference tier, emit the report, and exit non-zero only when the
-/// session did not resolve to a CUDA device, a serve itself failed, or the
-/// classification lane's row-conservation check failed — there is no perf
-/// pass/fail (see the `gpu_inference` module docs).
-async fn run_gpu_inference_scale() -> std::process::ExitCode {
-    let tier = match gpu_inference::run(GPU_INFERENCE_PARAMS).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("gpu-inference-scale run failed: {e}");
+/// Run `command` under the sampler for `cuda` and print what it read.
+fn run_sample_device(cuda: Option<usize>, command: &[String]) -> std::process::ExitCode {
+    let (program, args) = match command.split_first() {
+        Some(split) => split,
+        None => {
+            eprintln!("sample-device needs a command after --");
             return std::process::ExitCode::FAILURE;
         }
     };
-    let report = Report::new(
-        "gpu-inference-scale",
-        Tiers {
-            gpu_inference: Some(tier),
-            ..Default::default()
+    let mut child = std::process::Command::new(program);
+    child.args(args);
+    let sampled = match vram::run_sampled(&mut child, vram::device_memory_probe(cuda)) {
+        Ok((output, peak_vram_bytes)) => vram::SampledRun {
+            peak_vram_bytes,
+            child_stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            exit_code: output.status.code(),
         },
+        Err(e) => {
+            eprintln!("sample-device could not run {program}: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string(&sampled) {
+        Ok(json) => println!("{json}"),
+        Err(e) => {
+            eprintln!("failed to serialize the sampled run: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    match sampled.exit_code {
+        Some(0) => std::process::ExitCode::SUCCESS,
+        Some(code) => std::process::ExitCode::from(code.clamp(1, 255) as u8),
+        None => std::process::ExitCode::FAILURE,
+    }
+}
+
+/// The `encode-leg` child: one leg session in this process, one report per
+/// rung printed as a JSON array for `encode-step` to file.
+async fn run_encode_leg(
+    params: encode_step::EncodeStepParams,
+    rows: usize,
+    take: usize,
+) -> std::process::ExitCode {
+    let legs = match encode_step::measure_legs(&params, rows, take).await {
+        Ok(legs) => legs,
+        Err(e) => {
+            eprintln!("encode-leg session failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string(&encode_step::leg_reports(legs)) {
+        Ok(json) => {
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize the legs: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(feature = "plane")]
+fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
+    use jammi_test_utils::fleet::{Ports, ShapeDPlace, ShapeDRole};
+    let role = match args.role.as_str() {
+        "scheduler" => ShapeDRole::Scheduler,
+        "query" => ShapeDRole::Query,
+        "compute" => ShapeDRole::Compute,
+        other => {
+            eprintln!("fleet-env: unknown --role {other:?}; expected scheduler, query, or compute");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let backends = jammi_test_utils::DistributedBackends::from_env();
+    let env = role.env(&ShapeDPlace {
+        backends: &backends,
+        result_root: &args.result_root,
+        artifact_dir: &args.artifact_dir,
+        bind_host: &args.bind_host,
+        advertise_host: &args.advertise_host,
+        scheduler_address: &args.scheduler_address,
+        ports: Ports {
+            flight: args.flight_port,
+            health: args.health_port,
+            peer: args.peer_port,
+            scheduler: args.scheduler_port,
+            exec_bind: args.exec_bind_port,
+            exec_grpc: args.exec_grpc_port,
+        },
+        device: args.device.map_or(-1, |o| o as i32),
+    });
+    println!(
+        "# jammi-server --config deploy/kubernetes/overlays/shape-d/jammi-{}.toml",
+        role.as_str()
     );
-    emit(&report);
+    for (key, value) in env {
+        println!("{key}={value}");
+    }
     std::process::ExitCode::SUCCESS
 }
 
-/// The encode-step corpus/measurement shape: a small, deterministic corpus —
-/// enough rows for the real tokenizer to produce a genuinely varied
-/// `row_lengths` (see `encode_step`'s own teeth test) without making the
-/// CI-hermetic default slow. `gpu_device` here is the CI-hermetic default;
-/// `run_encode_step` overrides it from `--cuda` when the caller supplied one.
-const ENCODE_STEP_PARAMS: encode_step::EncodeStepParams = encode_step::EncodeStepParams {
-    row_count: 8,
-    seed: 0,
-    warmup: 2,
-    iters: 3,
-    gpu_device: encode_step::CPU_HERMETIC_DEVICE,
-};
-
-/// Run the encode-step tier, emit the report, and exit non-zero only when the
-/// real serve itself failed (real tokenization, real checksums, a real
-/// `generate_text_embeddings` call) — there is no perf pass/fail here; the
-/// identity-completeness self-check (`assert_identity_fields_present`) is
-/// enforced INSIDE `encode_step::run` on every invocation.
-///
-/// `cuda` is `--cuda`'s ordinal (the SAME `Option<usize>` convention
-/// `finetune-step`/`grad-oracle` already take) — `Some(ordinal)` flows into
-/// `EncodeStepParams::gpu_device` as `ordinal as i32`, `None` keeps
-/// [`encode_step::CPU_HERMETIC_DEVICE`], the CI-hermetic default.
-async fn run_encode_step(cuda: Option<usize>) -> std::process::ExitCode {
-    let params = encode_step::EncodeStepParams {
-        gpu_device: cuda
-            .map(|ordinal| ordinal as i32)
-            .unwrap_or(encode_step::CPU_HERMETIC_DEVICE),
-        ..ENCODE_STEP_PARAMS
-    };
-    let tier = match encode_step::run(params).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("encode-step run failed: {e}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let report = Report::new(
-        "encode-step",
-        Tiers {
-            encode_step: Some(tier),
-            ..Default::default()
-        },
+#[cfg(not(feature = "plane"))]
+fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
+    eprintln!(
+        "fleet-env: the {} role's environment is rendered by the compute plane's fleet facility: \
+         build jammi-bench with --features plane",
+        args.role
     );
-    emit(&report);
-    std::process::ExitCode::SUCCESS
+    std::process::ExitCode::FAILURE
 }
 
 /// The `measure-once` child: run one variant over the pre-materialized corpus,
@@ -2562,12 +2518,11 @@ async fn run_search_rss() -> std::process::ExitCode {
             finetune_run: None,
             conformal: None,
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: None,
         },
@@ -2617,12 +2572,11 @@ async fn run_arxiv() -> std::process::ExitCode {
             finetune_run: None,
             conformal: None,
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: None,
         },
@@ -2678,12 +2632,11 @@ async fn run_recall_sweep(
             finetune_run: None,
             conformal: None,
             eval: None,
-            propagate: None,
-            graph_train: None,
-            context_predictor: None,
-            model_inference: None,
-            gpu_inference: None,
             encode_step: None,
+            graph_sample: None,
+            propagate: None,
+            structure: None,
+            predictor_train_run: None,
             cache_slo: None,
             recompute: None,
         },

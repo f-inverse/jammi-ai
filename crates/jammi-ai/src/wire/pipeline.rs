@@ -38,6 +38,7 @@ use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef};
 use crate::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput, PropagationWeighting,
 };
+use crate::pipeline::graph_structure::StructureRequest;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::pipeline::recompute::{Cascade, RecomputeReport};
 use crate::wire::edge_gather_from_proto;
@@ -128,37 +129,21 @@ pub fn propagate_request_from_proto(
         return Err(Status::invalid_argument("source_id is required"));
     }
     let cache = crate::wire::cache_policy_from_proto(req.cache)?;
-    let edge_source = match req.graph {
-        Some(pb::propagate_embeddings_request::Graph::EdgeGraphTable(table_name)) => {
-            if table_name.is_empty() {
-                return Err(Status::invalid_argument("edge_graph_table is empty"));
-            }
-            EdgeSourceRef::NeighborGraph { table_name }
-        }
-        Some(pb::propagate_embeddings_request::Graph::EdgeSource(s)) => {
-            if s.edge_source.is_empty() {
-                return Err(Status::invalid_argument("edge_source is empty"));
-            }
-            EdgeSourceRef::Registered {
-                source_id: s.edge_source,
-                src_column: empty_or(s.src_column, "src"),
-                dst_column: empty_or(s.dst_column, "dst"),
-                type_column: None,
-                weight_column: s.weight_column,
-                as_of_column: None,
-            }
-        }
-        None => {
-            return Err(Status::invalid_argument(
-                "propagate requires a graph: edge_graph_table or edge_source",
-            ))
-        }
-    };
+    let edge_source = edge_source_from_arm(req.graph.map(|graph| match graph {
+        pb::propagate_embeddings_request::Graph::EdgeGraphTable(table) => GraphArm::Table(table),
+        pb::propagate_embeddings_request::Graph::EdgeSource(source) => GraphArm::Source(source),
+    }))?;
+    let output = propagation_output_from_proto(req.output, req.hop_weights)?;
 
     let mut request = PropagateRequest::new(req.source_id, edge_source)
-        .with_direction(propagation_direction_from_proto(req.direction)?)
-        .with_weighting(propagation_weighting_from_proto(req.weighting)?)
-        .with_output(propagation_output_from_proto(req.output)?);
+        .with_direction(
+            propagation_direction_from_proto(req.direction)?.unwrap_or(EdgeDirection::Out),
+        )
+        .with_weighting(
+            propagation_weighting_from_proto(req.weighting)?
+                .unwrap_or(PropagationWeighting::DegreeNormalized),
+        )
+        .with_output(output);
     if let Some(table) = req.embedding_table {
         request = request.with_embedding_table(table);
     }
@@ -180,42 +165,160 @@ fn empty_or(value: String, default: &str) -> String {
     }
 }
 
-/// Map the propagation edge direction (reusing the shared inference
-/// [`EdgeDirection`] enum); `UNSPECIFIED` keeps the engine default (`Out`).
-fn propagation_direction_from_proto(direction: i32) -> Result<EdgeDirection, Status> {
+/// The graph arm of a request, whichever message's `oneof` carried it.
+enum GraphArm {
+    Table(String),
+    Source(pb::PropagateEdgeSource),
+}
+
+/// The edge source a request's graph arm names — a neighbour-graph table or a
+/// registered edge source. Neither arm, or an empty name, is a client error.
+fn edge_source_from_arm(arm: Option<GraphArm>) -> Result<EdgeSourceRef, Status> {
+    match arm {
+        Some(GraphArm::Table(table_name)) if table_name.is_empty() => {
+            Err(Status::invalid_argument("edge_graph_table is empty"))
+        }
+        Some(GraphArm::Table(table_name)) => Ok(EdgeSourceRef::NeighborGraph { table_name }),
+        Some(GraphArm::Source(s)) if s.edge_source.is_empty() => {
+            Err(Status::invalid_argument("edge_source is empty"))
+        }
+        Some(GraphArm::Source(s)) => Ok(EdgeSourceRef::Registered {
+            source_id: s.edge_source,
+            src_column: empty_or(s.src_column, "src"),
+            dst_column: empty_or(s.dst_column, "dst"),
+            type_column: None,
+            weight_column: s.weight_column,
+            as_of_column: None,
+        }),
+        None => Err(Status::invalid_argument(
+            "a graph is required: edge_graph_table or edge_source",
+        )),
+    }
+}
+
+/// Map a graph verb's edge direction (the shared inference [`EdgeDirection`]
+/// enum); `UNSPECIFIED` is `None` — the verb's own default.
+fn propagation_direction_from_proto(direction: i32) -> Result<Option<EdgeDirection>, Status> {
     use jammi_wire::proto::inference::EdgeDirection as ProtoDir;
     match ProtoDir::try_from(direction) {
-        Ok(ProtoDir::Unspecified) | Ok(ProtoDir::Out) => Ok(EdgeDirection::Out),
-        Ok(ProtoDir::In) => Ok(EdgeDirection::In),
-        Ok(ProtoDir::Undirected) => Ok(EdgeDirection::Undirected),
+        Ok(ProtoDir::Unspecified) => Ok(None),
+        Ok(ProtoDir::Out) => Ok(Some(EdgeDirection::Out)),
+        Ok(ProtoDir::In) => Ok(Some(EdgeDirection::In)),
+        Ok(ProtoDir::Undirected) => Ok(Some(EdgeDirection::Undirected)),
         Err(_) => Err(Status::invalid_argument("unknown edge direction")),
     }
 }
 
-/// Map the wire [`pb::PropagationWeighting`]; `UNSPECIFIED` keeps the engine
-/// default (`DegreeNormalized`).
-fn propagation_weighting_from_proto(weighting: i32) -> Result<PropagationWeighting, Status> {
+/// Map the wire [`pb::PropagationWeighting`]; `UNSPECIFIED` is `None` — the
+/// verb's own default.
+fn propagation_weighting_from_proto(
+    weighting: i32,
+) -> Result<Option<PropagationWeighting>, Status> {
     match pb::PropagationWeighting::try_from(weighting) {
-        Ok(pb::PropagationWeighting::Unspecified)
-        | Ok(pb::PropagationWeighting::DegreeNormalized) => {
-            Ok(PropagationWeighting::DegreeNormalized)
+        Ok(pb::PropagationWeighting::Unspecified) => Ok(None),
+        Ok(pb::PropagationWeighting::DegreeNormalized) => {
+            Ok(Some(PropagationWeighting::DegreeNormalized))
         }
-        Ok(pb::PropagationWeighting::Uniform) => Ok(PropagationWeighting::Uniform),
-        Ok(pb::PropagationWeighting::EdgeSimilarity) => Ok(PropagationWeighting::EdgeSimilarity),
+        Ok(pb::PropagationWeighting::Uniform) => Ok(Some(PropagationWeighting::Uniform)),
+        Ok(pb::PropagationWeighting::EdgeSimilarity) => {
+            Ok(Some(PropagationWeighting::EdgeSimilarity))
+        }
         Err(_) => Err(Status::invalid_argument("unknown propagation weighting")),
     }
 }
 
-/// Map the wire [`pb::PropagationOutput`]; `UNSPECIFIED` keeps the engine
-/// default (`Final`).
-fn propagation_output_from_proto(output: i32) -> Result<PropagationOutput, Status> {
-    match pb::PropagationOutput::try_from(output) {
-        Ok(pb::PropagationOutput::Unspecified) | Ok(pb::PropagationOutput::Final) => {
-            Ok(PropagationOutput::Final)
+/// Map the wire [`pb::PropagationOutput`] and its `hop_weights`;
+/// `UNSPECIFIED` keeps the engine default (`Final`). The weights belong to
+/// the weighted sum alone: present under another output they are a client
+/// error, not silently dropped.
+fn propagation_output_from_proto(
+    output: i32,
+    hop_weights: Vec<f64>,
+) -> Result<PropagationOutput, Status> {
+    let output = match pb::PropagationOutput::try_from(output) {
+        Ok(pb::PropagationOutput::WeightedSum) => {
+            return Ok(PropagationOutput::WeightedSum {
+                weights: hop_weights,
+            })
         }
-        Ok(pb::PropagationOutput::JumpingKnowledge) => Ok(PropagationOutput::JumpingKnowledge),
-        Err(_) => Err(Status::invalid_argument("unknown propagation output")),
+        Ok(pb::PropagationOutput::Unspecified) | Ok(pb::PropagationOutput::Final) => {
+            PropagationOutput::Final
+        }
+        Ok(pb::PropagationOutput::JumpingKnowledge) => PropagationOutput::JumpingKnowledge,
+        Err(_) => return Err(Status::invalid_argument("unknown propagation output")),
+    };
+    if hop_weights.is_empty() {
+        Ok(output)
+    } else {
+        Err(Status::invalid_argument(
+            "hop_weights is only read under PROPAGATION_OUTPUT_WEIGHTED_SUM",
+        ))
     }
+}
+
+// ─── GenerateStructureEmbeddings ─────────────────────────────────────────────
+
+/// Decode a serialized [`pb::GenerateStructureEmbeddingsRequest`] body — the
+/// seam the embedded binding and the remote handler share, as
+/// [`propagate_request_from_bytes`] is for a propagation.
+pub fn structure_request_from_bytes(
+    body: &[u8],
+) -> Result<(StructureRequest, jammi_db::store::CachePolicy), Status> {
+    let req = pb::GenerateStructureEmbeddingsRequest::decode(body).map_err(|e| {
+        Status::invalid_argument(format!(
+            "malformed GenerateStructureEmbeddings request: {e}"
+        ))
+    })?;
+    structure_request_from_proto(req)
+}
+
+/// Decode a [`pb::GenerateStructureEmbeddingsRequest`] into the engine
+/// [`StructureRequest`]. Each optional scalar — and an empty `weights` —
+/// overrides only when present, so an unset field keeps the
+/// [`StructureRequest`] builder default, the engine's value. The values
+/// themselves are the engine's to refuse.
+pub fn structure_request_from_proto(
+    req: pb::GenerateStructureEmbeddingsRequest,
+) -> Result<(StructureRequest, jammi_db::store::CachePolicy), Status> {
+    if req.source_id.is_empty() {
+        return Err(Status::invalid_argument("source_id is required"));
+    }
+    let cache = crate::wire::cache_policy_from_proto(req.cache)?;
+    let edge_source = edge_source_from_arm(req.graph.map(|graph| match graph {
+        pb::generate_structure_embeddings_request::Graph::EdgeGraphTable(table) => {
+            GraphArm::Table(table)
+        }
+        pb::generate_structure_embeddings_request::Graph::EdgeSource(source) => {
+            GraphArm::Source(source)
+        }
+    }))?;
+
+    let mut request = StructureRequest::new(req.source_id, edge_source);
+    if let Some(direction) = propagation_direction_from_proto(req.direction)? {
+        request = request.with_direction(direction);
+    }
+    if let Some(weighting) = propagation_weighting_from_proto(req.weighting)? {
+        request = request.with_weighting(weighting);
+    }
+    if let Some(key_column) = req.key_column {
+        request = request.with_key_column(key_column);
+    }
+    if let Some(dimensions) = req.dimensions {
+        request = request.with_dimensions(dimensions as usize);
+    }
+    if !req.weights.is_empty() {
+        request = request.with_weights(req.weights);
+    }
+    if let Some(beta) = req.beta {
+        request = request.with_beta(beta);
+    }
+    if let Some(sparsity) = req.sparsity {
+        request = request.with_sparsity(sparsity);
+    }
+    if let Some(seed) = req.seed {
+        request = request.with_seed(seed);
+    }
+    Ok((request, cache))
 }
 
 // ─── AsofJoin ────────────────────────────────────────────────────────────────

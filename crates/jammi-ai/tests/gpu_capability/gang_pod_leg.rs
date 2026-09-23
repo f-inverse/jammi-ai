@@ -92,7 +92,7 @@
 //! already established and tested in this crate
 //! (`gather_exactness_w2_matches_w1_within_pre_registered_epsilon`'s
 //! `GATHER_EXACTNESS_EPSILON = 1e-4`, `crates/jammi-ai/src/fine_tune/
-//! trainer.rs` — itself `batch_bucket.rs`'s own bucket-padding-variance
+//! trainer.rs` — itself the ladder padding's own measured variance
 //! `TOLERANCE`), to admit exactly the ONE further fp32 reduction
 //! reassociation a real GPU pod run adds beyond what that CPU oracle
 //! already measures: cuBLAS's own forward/backward accumulation order, plus

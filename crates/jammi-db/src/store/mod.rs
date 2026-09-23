@@ -11,6 +11,7 @@ pub mod mutable;
 pub mod reconcile;
 pub mod result_schema;
 pub mod schema;
+pub mod segment_builder;
 pub mod segment_set_cache;
 pub mod sink;
 pub mod statement;
@@ -37,7 +38,7 @@ pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
 pub use sink::{
     ResultTableSinkExec, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind, SinkSummary,
-    SINK_WRITE_LOG,
+    SINK_PHASES_TARGET, SINK_WRITE_LOG,
 };
 pub use statement::CreateTableAs;
 pub use version::VersionManifest;
@@ -1927,6 +1928,26 @@ impl ResultStore {
     /// ever registers through the store need not call it; a session installs it
     /// eagerly so the provider is present even before the first table lands.
     pub fn install_result_schema(&self, ctx: &QueryContext) -> Result<()> {
+        // A session that resolves result tables must also be able to READ
+        // the bytes they point at. A query builds each table's provider and
+        // binds this root's driver on the way (`build_result_table_provider`),
+        // but a process that only EXECUTES — a compute-plane executor handed
+        // a placed stage that scans a result table — builds no provider of
+        // its own, and DataFusion would resolve the scan's cloud URL against
+        // a runtime that has never heard of it. Bound here, once, where the
+        // session takes the store on.
+        // A root the registry cannot drive yet — a cloud scheme with no
+        // credentials configured for it — is not an error at install time:
+        // a session that never reads a result table needs no driver, and
+        // the query path builds the provider and reports the failure where
+        // the read actually happens.
+        if let Ok(driver) = self.registry.driver_for(&self.root, None) {
+            crate::storage::read_view::register_read_view(
+                &ctx.inner().runtime_env(),
+                &self.root,
+                driver,
+            )?;
+        }
         // The store rides in the session's config as an extension, beside
         // the compute-plane slot: a statement planned under this session
         // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the
@@ -4093,6 +4114,31 @@ impl ResultStore {
                     .await
             }
         }
+    }
+
+    /// The provider over a `building` table's own Parquet, in the `schema`
+    /// its writer wrote (pinned, never re-inferred: inference reads a string
+    /// column back as a view type the writer never produced), declaring the
+    /// order it committed the rows in when it committed one (`sort_order`,
+    /// so a merge over it plans no sort) — what a writer that reads its own working relation
+    /// back before the row is ever promoted scans through. The object must
+    /// have been written ([`Self::write_result_table`]); nothing registers
+    /// the provider under a name.
+    pub async fn building_provider(
+        &self,
+        ctx: &QueryContext,
+        building: &BuildingTable,
+        schema: arrow::datatypes::SchemaRef,
+        sort_order: Option<Vec<SortExpr>>,
+    ) -> Result<Arc<dyn TableProvider>> {
+        build_result_table_provider(
+            ctx.inner(),
+            &self.registry,
+            building.parquet_url(),
+            Some(schema),
+            sort_order.map(|order| vec![order]),
+        )
+        .await
     }
 
     /// Read the `vector` column of the pinned embedding table into one

@@ -1,0 +1,42 @@
+# predictor-train-run ladder, torch -> shape-d
+
+## torch -> in-process  [INVALID]  — the engine against PyTorch
+judged at: reference_minimum
+unit      epoch  lower         upper         d             learned       premise
+seed1     4      0.299556      0.299556      0.000000      0.152925      clean
+seed2     3      0.482297      0.482297      0.000000      0.139402      clean
+seed3     7      0.516066      0.516066      0.000000      0.138061      clean
+sign_test: n=1 n_pos=1 n_neg=0 ties=2 p_value=1 critical_count=11
+decision: clean_units=3 mean_d=0.000000 direction=none
+assay: reference improved by 0.143463 [0.138508, 0.148417]; M1=0.138508 delta=0.069254 -> effect established
+margin: mean_d interval [0.000000, 0.000000] vs ±0.069254 -> non-inferior; equivalent
+repeat_floor: max_delta=0 spread=0.000000021073424255447017
+space (upper/lower): host Some(0.34459467972366353) device None host bytes per unit of work None
+  [pass] evidence no_directional_difference against alpha 0.0064 — 1 of 3 higher, 0 lower; Some(11) needed either way at alpha 0.0064
+  [pass] evidence outcome_non_inferior against 0.069254 (derived) — mean d in [0.000000, 0.000000] against an upper bound below +0.069254
+  [pass] evidence equivalent_within_delta against 0.069254 (derived) — mean d in [0.000000, 0.000000] against ±0.069254
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.3446 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: edge torch -> in-process: 3 premise-clean unit(s); the rule is stated for exactly 12
+  REFUSED: leg torch__seed3__r2: the time series is not stationary (trend p = 9.807e-4, drift +6.75% of the median over the series)
+  REFUSED: leg in-process__seed1__r2: the time series is not stationary (trend p = 7.064e-9, drift -4.24% of the median over the series)
+
+## in-process -> placed  [INVALID]  — the same training as a job, placed on an executor
+outcome digests equal on 3/3 unit(s)
+space (upper/lower): host Some(1.0030684902914226) device None host bytes per unit of work None
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 1.0031 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: leg in-process__seed1__r2: the time series is not stationary (trend p = 7.064e-9, drift -4.24% of the median over the series)
+  REFUSED: leg placed__seed2__r2: the time series is not stationary (trend p = 9.742e-8, drift +4.99% of the median over the series)
+  REFUSED: leg placed__seed3__r1: the time series is not stationary (trend p = 1.400e-10, drift +4.93% of the median over the series)
+
+## placed -> shape-d  [INVALID]  — the deployed topology: the job claimed by a compute process
+outcome digests equal on 3/3 unit(s)
+space (upper/lower): host Some(1.000577111504489) device None host bytes per unit of work None
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 1.0006 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — not measured on every leg
+  REFUSED: leg placed__seed2__r2: the time series is not stationary (trend p = 9.742e-8, drift +4.99% of the median over the series)
+  REFUSED: leg placed__seed3__r1: the time series is not stationary (trend p = 1.400e-10, drift +4.93% of the median over the series)
+
+causes: edge torch -> in-process is INVALID; edge in-process -> placed is INVALID; edge placed -> shape-d is INVALID
+status: INVALID

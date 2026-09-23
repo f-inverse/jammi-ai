@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: ssh-keygen, jq
 # Mocks-only, no-network regression suite for the RunPod REST v2 cluster
 # primitives in ci/scripts/runpod_lib.sh:
 # `_rp_rest`, `_rp_entrypoint_setup` (shared with the pod payload's

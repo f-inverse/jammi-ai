@@ -4605,6 +4605,7 @@ dependencies = [
  "futures",
  "jammi-ai",
  "jammi-db",
+ "jammi-numerics",
  "jammi-test-utils",
  "jammi-wire",
  "libc",
@@ -4632,23 +4633,33 @@ dependencies = [
  "arrow",
  "candle-core",
  "candle-nn",
+ "chrono",
  "clap",
  "datafusion",
  "futures",
  "hex",
+ "jammi-admin",
  "jammi-ai",
+ "jammi-ballista",
+ "jammi-client",
  "jammi-db",
  "jammi-encoders",
  "jammi-kernels",
  "jammi-lora",
  "jammi-numerics",
  "jammi-test-resources",
+ "jammi-test-utils",
+ "jammi-wire",
  "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -4904,7 +4915,9 @@ dependencies = [
  "jammi-test-resources",
  "libc",
  "parquet",
+ "tempfile",
  "tonic",
+ "uuid",
 ]
 
 [[package]]
@@ -6619,14 +6632,6 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "probed-ops-index"
-version = "0.1.0"
-dependencies = [
- "jammi-kernels",
- "serde_json",
 ]
 
 [[package]]

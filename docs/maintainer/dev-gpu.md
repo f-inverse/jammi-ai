@@ -86,10 +86,8 @@ records this particular number) — datacenter bandwidth makes it free.
 
 Disk sizing (`RP_DISK_GB`): `>= 25` (base) `+ S_src + S_seed + N*S_clone`
 (one clone per tree the pod hosts). Measured by this formula's producer,
-`ci/scripts/perf/pod_build_timings.sh` (committed JSON:
-`ci/artifacts/pod-build-timings/20260827T183928Z-bc27e75.json`, an
-A100-SXM4 secure-cloud pod at `bc27e75`; all values decimal GB from the
-artifact's exact byte fields): `S_src` ≈ 3.6 GB (the checkout, `.git`
+`ci/scripts/perf/pod_build_timings.sh`, on an A100-SXM4 secure-cloud pod
+(decimal GB): `S_src` ≈ 3.6 GB (the checkout, `.git`
 included), `S_seed` ≈ 7.8 GB, `S_clone` ≈ 8.1 GB. By the formula, the
 default `RP_DISK_GB=60` covers base + src + seed + **two** clones
 (≈ 52.7 GB); a third tree computes to ≈ 60.9 GB — over the default — so a
@@ -505,14 +503,9 @@ one.
 
 `ci/scripts/runpod_gpu_prove.sh` exports its own `RP_TIMEOUT` (default 6000s)
 rather than relying on `runpod_lib.sh`'s 3000s default — the prove lane's own
-budget, never shared with `run`/`shell`/`gpu-perf-ab.sh`, which still see the
-library default. `check_gpu_prove_timings.py`'s R3 re-derives the floor this
-value must clear from COMMITTED evidence
-(`ci/artifacts/gpu-prove-timings/*.json`) on every CI run: `RP_TIMEOUT >= 1.5 ×
-the largest HEALTHY leg's wall` AND `RP_TIMEOUT >= that wall + 3 × RP_INACTIVITY`
-— raising either the healthy walls or `RP_INACTIVITY` tightens this floor, and
-the gate goes vacuously RED (never a silent pass) if any shipped arch has zero
-healthy evidence at all.
+budget, never shared with `run`/`shell`, which still see the
+library default. The budget clears `1.5 × the slowest healthy leg's wall` and
+`that wall + 3 × RP_INACTIVITY`; a leg that grows past either moves it.
 
 ### `RP_INACTIVITY` — the hang detector `RP_TIMEOUT` cannot be
 
@@ -520,16 +513,10 @@ healthy evidence at all.
 and silent" — a genuinely hung leg pays the FULL budget before `timeout` ever
 fires. `rp_run_remote_watched` (`runpod_lib.sh`, used by
 `runpod_gpu_prove.sh` only) layers an inactivity watchdog on top: `RP_INACTIVITY`
-seconds (default 900 — derived from D5 run 33674156137's largest healthy
-in-window silence, 285.2s on sm_90 during the repository clone, × R2's own
-3x margin, rounded up to the next 300s step; see `runpod_lib.sh`'s own
-setter comment for the full derivation) of silent remote stdout+stderr kills
-the ssh session and returns 76, well before `RP_TIMEOUT` would ever have
-expired.
-`check_gpu_prove_timings.py`'s R2 re-demands `RP_INACTIVITY >= 3 ×` the largest
-silent gap any healthy (or `slow-host`-disposed) leg has shown, on every run —
-the same "re-checked, not one-time-derived" discipline R3 applies to
-`RP_TIMEOUT`.
+seconds (default 900: three times the longest silence a healthy leg has shown,
+the repository clone at under five minutes on sm_90, rounded up to the next
+300s step) of silent remote stdout+stderr kills the ssh session and returns
+76, well before `RP_TIMEOUT` would ever have expired.
 
 ## Verbs that deliberately do not exist
 

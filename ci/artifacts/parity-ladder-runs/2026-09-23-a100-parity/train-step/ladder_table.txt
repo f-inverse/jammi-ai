@@ -1,0 +1,10 @@
+# train-step ladder, torch -> fused
+
+## torch -> fused  [GREEN]  — the engine against PyTorch
+cost (upper/lower time): 0.9014 by minima, 0.8850 by medians [0.8798, 0.8874] — outside the x1.0167 noise band
+space (upper/lower): host Some(0.7010018948536493) device Some(0.7545443525389895) host bytes per unit of work None
+  [n/m ] evidence speed_non_inferiority against UNBUDGETED — lower/upper time at least 1.1269, bar UNBUDGETED
+  [n/m ] evidence host_memory_ratio against UNBUDGETED — 0.7010 against UNBUDGETED
+  [n/m ] evidence device_memory_ratio against UNBUDGETED — 0.7545 against UNBUDGETED
+
+status: GREEN

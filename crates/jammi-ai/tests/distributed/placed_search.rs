@@ -7,7 +7,7 @@
 //!
 //! Three `jammi-server` workers, all `[server] placement = "rendezvous"`
 //! (`Fleet::spawn_with_placement(.., PlacementKnob::Rendezvous)`), share the
-//! harness's Postgres catalog and MinIO `result_root`. The harness itself
+//! harness's Postgres catalog and S3 `result_root`. The harness itself
 //! builds a 24-segment f32-precision embedding table directly through its own
 //! `ResultStore` (`create_table` + `append_segment`, `key_column = None` so
 //! `Search`'s hydration join never runs — no `sources` registration needed);

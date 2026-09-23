@@ -1335,7 +1335,7 @@ async fn fine_tune_job_catalog_crud() {
         })
         .await
         .unwrap();
-    assert!(finalized, "the lease owner finalizes the job");
+    assert!(finalized.is_some(), "the lease owner finalizes the job");
     let output = catalog
         .get_model("jammi:fine-tuned:job-1")
         .await
@@ -2755,10 +2755,11 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
 // retires every key beyond the window once each write has landed:
 // epoch_0's retirement fails after epoch_1's write and again after
 // epoch_2's (warned each time, never an error of the epoch), while
-// epoch_1's succeeds as epoch_2 lands. `publish_and_finalize`'s winner arm then registers the
-// trailing window (epoch_2 only) and the finisher's `reclaim_checkpoints`
-// retries epoch_0 — which fails again (still chmod'd), and must emit the one
-// warning this test asserts on.
+// epoch_1's succeeds as epoch_2 lands. `publish_and_finalize`'s winner arm
+// then registers the trailing window (epoch_2 only), its terminal transaction
+// retires the rows of every unpublished epoch, and the finisher's
+// `delete_retired_checkpoints` deletes their bytes — epoch_0's fails again
+// (still chmod'd), and must emit the one warning this test asserts on.
 // Deliberately the DEFAULT (`current_thread`) flavor, not `multi_thread`:
 // the tracing capture below installs a THREAD-LOCAL default subscriber,
 // which does not propagate across OS threads. On a `multi_thread` runtime
@@ -2957,9 +2958,9 @@ async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
          silently succeeding)"
     );
     assert!(
-        logs.contains("the ended job's checkpoints were not fully reclaimed")
+        logs.contains("the ended job's retired checkpoints were not fully deleted")
             && logs.contains(&job_id),
-        "a failed finalize-time reclaim must emit exactly one warning naming the job; \
+        "a failed finalize-time deletion must emit exactly one warning naming the job; \
          captured logs:\n{logs}"
     );
 }

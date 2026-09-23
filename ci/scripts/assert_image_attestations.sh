@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# needs: jq
 # Asserts a pushed image digest carries both a provenance attestation and an
 # SBOM attestation, and -- when the index is multi-platform -- that BOTH
 # attestations actually cover every platform the index carries, not just

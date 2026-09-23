@@ -1102,7 +1102,7 @@ impl InferenceSession {
             key_column: key_column.to_string(),
             source_id: String::new(),
             backend: None,
-            batch_size: inference.forward_batch_size()?,
+            chunk: inference.chunk_budget()?,
             embedding_dim,
             regression_form,
             passthrough: Vec::new(),
@@ -1607,7 +1607,7 @@ impl InferenceSession {
             key_column: key_column.to_string(),
             source_id: source_id.to_string(),
             backend: None,
-            batch_size: inference.forward_batch_size()?,
+            chunk: inference.chunk_budget()?,
             embedding_dim,
             regression_form,
             passthrough: Vec::new(),
@@ -2191,7 +2191,7 @@ impl InferenceSession {
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
         config.validate()?;
-        sample_config.validate()?;
+        sample_config.validate_for_training()?;
 
         // The job record's `source` field records the node source — the model is
         // fine-tuned on that source's text, the edges only supervise the pairing.

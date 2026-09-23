@@ -859,8 +859,8 @@ mod tests {
         );
         for spelling in ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_ENDPOINT_URL_S3"] {
             assert_eq!(
-                of(&[(spelling, "https://minio.local:9000")]),
-                be("https://minio.local:9000/bucket"),
+                of(&[(spelling, "https://store.local:9000")]),
+                be("https://store.local:9000/bucket"),
                 "{spelling}"
             );
         }
@@ -869,10 +869,10 @@ mod tests {
         // identity — the fifth oracle round's executed refutation.
         assert_eq!(
             of(&[
-                ("AWS_ENDPOINT_URL", "https://minio.local:9000"),
+                ("AWS_ENDPOINT_URL", "https://store.local:9000"),
                 ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "1")
             ]),
-            be("https://minio.local:9000")
+            be("https://store.local:9000")
         );
         // `AWS_ENDPOINT_URL_S3` wins over the generic endpoint, as `build()` dials it.
         assert_eq!(
@@ -884,8 +884,8 @@ mod tests {
         );
         // Trailing slashes are trimmed as the driver trims them.
         assert_eq!(
-            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000/")]),
-            of(&[("AWS_ENDPOINT_URL", "https://minio.local:9000")])
+            of(&[("AWS_ENDPOINT_URL", "https://store.local:9000/")]),
+            of(&[("AWS_ENDPOINT_URL", "https://store.local:9000")])
         );
         // Config on top of the environment, as `build_s3` applies it …
         let cfg = CloudConfig::S3(super::super::config::S3Config {

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: cargo-registry
 """Assert no release lane's feature selection reaches jammi-db's postgres/
 mysql features.
 

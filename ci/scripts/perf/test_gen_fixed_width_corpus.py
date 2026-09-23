@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# needs: tokenizers
 """`gen_fixed_width_corpus.py`'s own suite: determinism (same
 `(rows, min_wordpieces, seed)` -> byte-identical output; different seed ->
 different output), the emitted JSONL schema (exactly the six
@@ -13,7 +14,7 @@ and its guarantee").
 
 No network. The generator itself is stdlib-only; its `--verify-tokenizer`
 mechanical check reads a real tokenizer through the `tokenizers` package,
-which is this suite's `tokenizers` need in `ci/guards.toml`: the guard runner
+which is this suite's `tokenizers` need (`ci/needs.toml`): the script-test runner
 provides it, and without it the check's own import fails naming it.
 
 Run: `python3 ci/scripts/perf/test_gen_fixed_width_corpus.py`

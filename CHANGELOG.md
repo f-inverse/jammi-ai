@@ -15,11 +15,11 @@ workspace ships every publishable crate at the same
   operators are: `jammi_datafusion::{ModelTask, ComputeDeviceKind, ModelSource}`, re-exported at
   their engine paths. **BREAKING** for the published Rust API: `jammi_ai::inference::{adapter,
   chunk, observer, runner, schema}` and `jammi_ai::operator::{inference_exec, numbered_input_exec,
-  row_cost_exec, key_check_exec}` are `jammi_datafusion::{adapter, chunk, observer, runner, schema,
-  exec, numbered, row_cost, key_check}`; `InferenceSpec` carries no backend hint; a keyed
+  row_cost_exec, key_check_exec}` are `jammi_datafusion::inference::{adapter, chunk, observer,
+  runner, schema, exec, numbered, row_cost, key_check}`; `InferenceSpec` carries no backend hint; a keyed
   `RowOrder` names its tie breakers (the engine names `_content_hash`); `ModelTask::as_db_str` /
   `try_from_db_str` are `as_str` / `parse`; and `jammi_ballista::codec`'s inference messages are
-  `jammi_datafusion::wire`'s, which `JammiCodec` frames rather than owns. The served regression σ's
+  `jammi_datafusion::inference::wire`'s, which `JammiCodec` frames rather than owns. The served regression σ's
   floor and de-standardise are `jammi_numerics::regression`, one transform for training and
   serving.
 - **A model is described from its files before, and without, its weights are materialized.**

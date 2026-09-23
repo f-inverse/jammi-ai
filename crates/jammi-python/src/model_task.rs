@@ -2,7 +2,7 @@
 //!
 //! Exposes the engine's `ModelTask` enum to Python as a pyclass enum, surfacing
 //! every task variant with its canonical catalog snake-case spelling
-//! (`as_db_str` / `from_str` mirror [`jammi_datafusion::ModelTask::as_str`] /
+//! (`as_str` / `from_str` mirror [`jammi_datafusion::ModelTask::as_str`] /
 //! [`jammi_datafusion::ModelTask::parse`]) so
 //! a caller can name a task as a typed value rather than a bare string.
 
@@ -28,7 +28,7 @@ pub enum PyModelTask {
 #[pymethods]
 impl PyModelTask {
     /// Canonical snake-case string stored in the catalog.
-    fn as_db_str(&self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         ModelTask::from(*self).as_str()
     }
 

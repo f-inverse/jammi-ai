@@ -4210,7 +4210,7 @@ with the rest of the workspace, no cargo feature — a process's role is
   `AnnSearchExec`/`AsofJoinExec`/`KeyCheckExec`/`PlacedAttemptExec` as prost
   messages of a package it compiles itself, `jammi.ballista.v1`, and frames
   `InferenceExec`/`NumberedInputExec` in the wire forms `jammi-datafusion`
-  owns (`jammi_datafusion::wire`, package `jammi.inference.v1`) under the same
+  owns (`jammi_datafusion::inference::wire`, package `jammi.inference.v1`) under the same
   magic and tag
   (`build.rs`) — **not** part of the frozen `jammi.v1.*` surface [§1.3]:
   this package crosses a scheduler/executor boundary INSIDE one cluster's

@@ -527,7 +527,7 @@ mod tests {
 
     /// A device that never refuses a forward.
     fn unbounded() -> impl Fn() -> BoxFuture<'static, Result<ForwardPermit>> {
-        || Box::pin(async { Ok(ForwardPermit::unbounded()) })
+        || Box::pin(async { Ok(ForwardPermit::new(())) })
     }
 
     /// A device that admits `slots` forwards at once.

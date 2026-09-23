@@ -654,7 +654,7 @@ impl From<datafusion::error::DataFusionError> for JammiError {
         let typed = source_chain(&e).find_map(|err| {
             if let Some(inner) = err.downcast_ref::<JammiError>() {
                 Some(inner.clone())
-            } else if let Some(inner) = err.downcast_ref::<jammi_datafusion::Error>() {
+            } else if let Some(inner) = jammi_datafusion::Error::found_in(err) {
                 Some(inference_error(inner))
             } else if let Some(DF::ResourcesExhausted(msg)) = err.downcast_ref::<DF>() {
                 Some(JammiError::ResourcesExhausted {

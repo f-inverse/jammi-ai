@@ -39,11 +39,6 @@ impl ForwardPermit {
             _held: Box::new(held),
         }
     }
-
-    /// An admission that holds nothing — a device that never refuses.
-    pub fn unbounded() -> Self {
-        Self::new(())
-    }
 }
 
 impl std::fmt::Debug for ForwardPermit {
@@ -129,16 +124,6 @@ pub struct InferenceRuntime {
     pub model: Arc<dyn ModelRuntime>,
     /// Observes every output batch.
     pub observer: Option<Arc<dyn InferenceObserver>>,
-}
-
-impl InferenceRuntime {
-    /// A runtime over `model` with no observer.
-    pub fn new(model: Arc<dyn ModelRuntime>) -> Self {
-        Self {
-            model,
-            observer: None,
-        }
-    }
 }
 
 /// A runtime with no model behind it, for the operators' own tests: a
@@ -290,7 +275,10 @@ pub(crate) mod stub {
             binds: AtomicUsize::new(0),
         });
         (
-            InferenceRuntime::new(Arc::clone(&stub) as Arc<dyn ModelRuntime>),
+            InferenceRuntime {
+                model: Arc::clone(&stub) as Arc<dyn ModelRuntime>,
+                observer: None,
+            },
             stub,
         )
     }

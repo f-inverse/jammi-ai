@@ -31,6 +31,8 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from . import determinism
 
@@ -78,6 +80,28 @@ LICENSES = {
 }
 
 
+# A pinned source lives on a third party's host: a dropped connection, a read
+# that stalls, or a 429/5xx is retried with exponential backoff rather than
+# failing the fetch. The connect bound is short so a dead connection is
+# retried within seconds; the read bound covers the largest pinned file.
+_FETCH_RETRY = Retry(
+    total=6,
+    backoff_factor=2.0,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset({"GET"}),
+)
+_FETCH_TIMEOUT = (30, 300)
+
+
+def _fetch(url: str) -> bytes:
+    with requests.Session() as session:
+        session.mount("https://", HTTPAdapter(max_retries=_FETCH_RETRY))
+        session.mount("http://", HTTPAdapter(max_retries=_FETCH_RETRY))
+        resp = session.get(url, timeout=_FETCH_TIMEOUT)
+        resp.raise_for_status()
+        return resp.content
+
+
 def _download(url: str, sha256: str, *, dest: Path) -> Path:
     """Fetch ``url`` to ``dest`` (cached) and verify its SHA-256 digest.
 
@@ -86,9 +110,7 @@ def _download(url: str, sha256: str, *, dest: Path) -> Path:
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
-        resp = requests.get(url, timeout=300)
-        resp.raise_for_status()
-        dest.write_bytes(resp.content)
+        dest.write_bytes(_fetch(url))
     digest = hashlib.sha256(dest.read_bytes()).hexdigest()
     if digest != sha256:
         dest.unlink(missing_ok=True)

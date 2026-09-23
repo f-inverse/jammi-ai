@@ -1,10 +1,11 @@
 name: CI
 
+# Every pull request, whatever its base: a stacked PR's base is another
+# branch, and its run here is the evidence the stack is green.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -948,6 +949,11 @@ jobs:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: python3 ci/scripts/check_no_consumer_names.py
 
+  # The multi-process lanes over Postgres and the S3-class store: the claim,
+  # chaos, compute-plane and ladder-rung legs `distributed.yml` defines.
+  distributed:
+    uses: ./.github/workflows/distributed.yml
+
   ci-summary:
     needs:
       - check
@@ -967,6 +973,7 @@ jobs:
       - test-python
       - test-pg
       - symbol-index-gates
+      - distributed
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

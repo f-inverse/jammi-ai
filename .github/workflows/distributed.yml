@@ -2,37 +2,34 @@ name: Distributed validation
 
 # The multi-process distributed-validation lane: N `jammi-server` worker
 # processes claiming from a shared Postgres catalog + a shared object store
-# (the lane's S3-class store), proving the durable-worker fleet-safety properties under real
+# (the lane's S3-class store), proving the durable-worker fleet-safety
+# properties, the compute plane and the ladder's fleet rungs under real
 # distribution.
 #
-# One job, three matrix legs split by failure character (each leg re-provisions
-# its own Postgres + S3 store so they stay independent):
+# One job, four matrix legs split by what decides their outcome (each leg
+# provisions its own Postgres + S3 store so they stay independent):
 #
 #   * `deterministic` — the claim-correctness tests (exactly-one claim,
-#     cross-tenant isolation). Their outcome is decided by Postgres locking,
-#     not by a timing window, so a red here is a real regression signal: this
-#     leg runs WITHOUT `continue-on-error` (`advisory: false`), and the
-#     nightly watcher treats its failure as actionable.
-#
+#     cross-tenant isolation), decided by Postgres locking.
 #   * `chaos` — the SIGKILL crash-window tests (kill-9 reclaim, the
-#     publish/finalize crash, the cross-host artifact round-trip). These race a
+#     publish/finalize crash, the cross-host artifact round-trip). They race a
 #     kill against an in-flight publish, but their outcome does not depend on
 #     where the kill lands: `crash_between_publish_and_finalize_commits_only_
 #     the_winner` derives its expected prefix through `ArtifactStore::
 #     prefix_url` (the same function `put_artifact` lays a bundle out
-#     through), never a hand-built layout string. This leg runs WITHOUT
-#     `continue-on-error` (`advisory: false`), like `deterministic`.
-#
+#     through), never a hand-built layout string.
 #   * `ballista` — the compute-plane tests (three `jammi-server` processes
-#     hosting a Ballista scheduler and executors over the shared catalog: the
-#     placed gang, device-kind refusal, drain/stop). Their outcome is decided
-#     by catalog CAS and Ballista's own task binding, so this leg runs WITHOUT
-#     `continue-on-error` (`advisory: false`) like `deterministic`.
+#     hosting a Ballista scheduler and executors over the shared catalog),
+#     decided by catalog CAS and Ballista's own task binding.
+#   * `rungs` — the ladder's fleet rungs (`placed`, `shape-d`) of every
+#     workload that has them.
 #
-# All three are the heaviest lanes (process spawn + a real object store), so none
-# is on the default hermetic PR path. There is no `pull_request` trigger: this
-# lane never gates a merge (it would be branch protection by another name).
+# Every leg is a verdict: a red is a regression. `ci.yml` calls this workflow
+# on every pull request and every push to `main`, inside the `ci-summary`
+# check a merge requires; the nightly run re-proves `main` against the
+# moving CI image.
 on:
+  workflow_call:
   workflow_dispatch:
   schedule:
     # Nightly at 04:17 UTC — off-peak, and offset from round hours to avoid the
@@ -40,8 +37,11 @@ on:
     - cron: "17 4 * * *"
 
 concurrency:
-  group: distributed-${{ github.ref }}
-  cancel-in-progress: true
+  # Called from `ci.yml`, `github.workflow` is the caller's, so a merge's run
+  # and the nightly one never share a group; as in `ci.yml`, a run on `main`
+  # is never cancelled — it is the only evidence that commit is green.
+  group: distributed-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: this lane only reads the checkout; nothing publishes.
 permissions:
@@ -56,30 +56,25 @@ jobs:
     name: ${{ matrix.display }} (Postgres + S3 store)
     runs-on: ubuntu-latest
     strategy:
-      # One leg's failure must not cancel the other — they carry independent
-      # signals (a deterministic red is actionable regardless of chaos flake).
+      # One leg's failure must not cancel another: each carries its own signal.
       fail-fast: false
       matrix:
         include:
-          # Decided by Postgres locking, not a timing window — a red is a real
-          # regression the nightly watcher acts on.
+          # Decided by Postgres locking, not a timing window.
           - name: deterministic
             display: Deterministic claim correctness
             crate: jammi-ai
-            advisory: false
             tests: >-
               one_job_n_workers_exactly_one_wins
               mixed_tenant_queue_completes_each_under_its_own_scope
               rendezvous_placed_search_over_real_worker_processes
-          # Not advisory (see this file's header comment). The two
-          # `gang_chaos` rows SIGKILL
+          # The two `gang_chaos` rows SIGKILL
           # one process of a two-rank gang (a peer, then the coordinator)
           # and need the server's rank body for the cross-process gang to
           # complete.
           - name: chaos
             display: SIGKILL crash-window chaos
             crate: jammi-ai
-            advisory: false
             tests: >-
               killed_worker_job_is_reclaimed_and_completed_once
               crash_between_publish_and_finalize_commits_only_the_winner
@@ -105,11 +100,10 @@ jobs:
           # and `list_workers`/`list_compute_executor_devices`
           # device reporting. Not a SIGKILL-race chaos leg (the killed-executor test
           # IS a SIGKILL test, but its completion is driven by jammi's lease
-          # timer, not a publish-window race) — `advisory: false`.
+          # timer, not a publish-window race).
           - name: ballista
             display: Ballista compute plane (three processes)
             crate: jammi-ballista
-            advisory: false
             tests: >-
               embedding_job_across_two_executors_matches_in_process
               embedding_job_fanned_out_four_ways_matches_in_process
@@ -139,13 +133,11 @@ jobs:
           - name: rungs
             display: Ladder rungs on a fleet (placed, shape-d)
             crate: jammi-bench
-            advisory: false
             tests: >-
               every_train_run_rung_publishes_the_same_adapter
               every_encode_rung_serves_the_same_vectors
               a_placed_propagation_matches_the_plan
               every_predictor_train_run_rung_publishes_the_same_predictor
-    continue-on-error: ${{ matrix.advisory }}
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     services:

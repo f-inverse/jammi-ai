@@ -21,7 +21,7 @@ differ by exactly one layer. A ladder has as many rungs as its workload has laye
 | workload | artifact | rungs, in order |
 |---|---|---|
 | `encode` | one vector per key | `torch` → `direct` (the loaded model called on the same texts, no plan) → `plan` (DataFusion, 1 partition) → `plan-partitioned` (N partitions) → `placed` (the same plan on a Ballista executor) → `shape-d` (the deployed topology: the serve through the query tier, on a compute process) |
-| `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes; on the `torch` edge, gradient agreement at shared weights | `torch` → `reference` (the engine with every fused-kernel family off) → `fused` |
+| `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes; on the `torch` edge, gradient agreement at shared weights | `torch` → `reference` (the engine on the training reference arm: the flash cascade and the fused AdamW step off) → `fused` |
 | `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident-reference` (the trainer over in-memory rows, reference kernels) → `resident` (the fused kernels) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) → `shape-d` (the deployed topology: the job through the query tier, on a compute process) |
 | `graph-sample` | a pair table, from random walks over a graph | `torch` (PyTorch Geometric's node2vec walk sampler) → `sampler` (the engine's graph sampler) |
 | `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` → `placed` |
@@ -69,13 +69,22 @@ consulted absorbing family off, until no new key appears; each step its own proc
 the disable list is read once per process). A BERT-family checkpoint has no GeGLU or RoPE seam
 to turn off and a ModernBERT one has no GELU-erf seam; the derived sets differ by exactly those
 families. An arm that turns off a family whose absorber it leaves on (RoPE without the attention
-block) is refused by name, since its key could never fire on the device. The how-well reference
-arm is `{flash attention, AdamW}` off; the step-level reference arm is every family off; both go
-through the one derivation, and each rung's premises then prove the arm from the leg's own
-dispatch counters. The census is device-independent — every call site consults its key before
-the device is looked at — and this was measured on an A100: the derived ModernBERT all-off set
-(nine keys) and the how-well arm's two keys each fired exactly under a strict step, with no
-CUDA-only key.
+block) is refused by name, since its key could never fire on the device. Both training ladders
+have one reference arm, `{flash attention, AdamW}` off: the two families that change the step's
+numerics and its optimizer, both live on the checkpoints the ladders run on. It goes through the
+one derivation, and each rung's premises then prove the arm from the leg's own dispatch
+counters. The composition with every family off is not a rung. Measured on an A100 80 GB in the
+campaign's setting (ModernBERT-large, bf16): at 8×128 it holds 45.1 GiB where the fused arm
+holds 3.7 GiB, and at 8×512 and 16×128 it exceeds the device, where the fused arm holds 14.5 and
+7.3 GiB. The cause is the eager composition itself: candle's autograd keeps every operator's
+output alive until the backward and materializes a gradient for every operand, frozen weights
+included, and each LoRA site's eager epilogue widens its base and low-rank outputs to `f32`
+before the add (`lora_linear_fused` off alone exceeds the device at 8×512; the eager layer norm
+alone holds 39 GiB). An arm the device cannot hold at the shapes swept controls nothing, so it
+is a diagnostic (`kernel-arm --all`) and not a rung. The census is device-independent — every
+call site consults its key before the device is looked at — and this was measured on an A100:
+the derived ModernBERT all-off set (nine keys) and the reference arm's two keys each fired
+exactly under a strict step, with no CUDA-only key.
 
 Because adjacent rungs differ by one layer, an edge's speed ratio *is* that layer's cost, and
 the ratios telescope: the product of the edge ratios is the end-to-end ratio against PyTorch.

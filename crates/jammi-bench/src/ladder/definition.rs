@@ -792,9 +792,14 @@ impl<'a> EdgeRules<'a> {
 const TORCH: &str = "torch";
 const PYTORCH: &str = "PyTorch";
 
-/// The reference arm of the how-well decision: the two families the fused
-/// kernels are judged against, both live on the checkpoints it runs on.
-fn how_well_reference_arm() -> KernelArm {
+/// The reference arm of both training ladders: the two families the fused
+/// kernels are judged against, both live on the checkpoints they run on.
+/// The composition with every family off is not a rung — the eager
+/// composition keeps every intermediate of every site alive for the
+/// backward and widens each LoRA epilogue to `f32`, so at the shapes the
+/// ladders sweep it exceeds a device the fused arm fits in twelve times
+/// over; an arm the device cannot hold controls nothing.
+fn training_reference_arm() -> KernelArm {
     KernelArm::off([KernelFamily::FlashAttention, KernelFamily::AdamW])
 }
 
@@ -816,7 +821,7 @@ fn train_run_ladder(budgets: &Budgets) -> Ladder {
             learns(),
         )
     };
-    let reference_arm = how_well_reference_arm();
+    let reference_arm = training_reference_arm();
     let mut streamed = fused("streamed");
     streamed.flat_host_memory = Some(EdgeRules::flat_host_memory(budgets, w, "streamed"));
     Ladder {
@@ -887,14 +892,19 @@ fn train_run_ladder(budgets: &Budgets) -> Ladder {
 /// weights, read off the edge's `grads` take.
 fn train_step_ladder(budgets: &Budgets) -> Ladder {
     let w = Workload::TrainStep;
-    let reference_arm = KernelArm::all_off();
+    let reference_arm = training_reference_arm();
     let torch_edge = EdgeRules::of(budgets, w, TORCH, "reference");
     Ladder {
         workload: w,
         reference: Rung::new(TORCH, vec![]),
         cross_stack: vec![
             (
-                Rung::on_arm("reference", reference_arm.clone(), &[], vec![]),
+                Rung::on_arm(
+                    "reference",
+                    reference_arm.clone(),
+                    &[KernelFamily::AttentionBlock],
+                    vec![],
+                ),
                 Difference::Framework { reference: PYTORCH },
                 torch_edge.cross_stack(
                     CrossStackOutcome::GradientAgreement {

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# The train-step ladder on a GPU: `torch` -> `reference` (every fused-kernel
-# family off) -> `fused`, one unit per shape, judged by `jammi-bench ladder
-# train-step`. Runs on a pod; not a CI job.
+# The train-step ladder on a GPU: `torch` -> `reference` (the flash cascade
+# and the fused AdamW step off, the training ladders' one reference arm) ->
+# `fused`, one unit per shape, judged by `jammi-bench ladder train-step`.
+# Runs on a pod; not a CI job.
 #
 # Every jammi leg runs off ONE binary built here. The reference rung is not a
 # second build: it is this binary with the families of its arm turned off
 # through `JAMMI_KERNELS_DISABLE`, whose value is derived per checkpoint by
-# `jammi-bench kernel-arm --all` from the keys one training step actually
-# consults — never a list typed here. Each leg's dispatch counters are what
-# the ladder's rung premises read to prove the arm it was filed under.
+# `jammi-bench kernel-arm --off flash-attention,adam-w` from the keys one
+# training step actually consults — never a list typed here. Each leg's
+# dispatch counters are what the ladder's rung premises read to prove the
+# arm it was filed under.
 #
 # Legs of one shape run in a balanced order — reference, fused, torch, torch,
 # fused, reference — so a drift over the session lands on both sides of every
@@ -92,8 +94,8 @@ if [ "$FINETUNE_STEP_AB_DRY_RUN" != "1" ]; then
     exit 1
   fi
   # The reference arm's disable list, derived from this checkpoint's census.
-  REFERENCE_DISABLE="$("$BIN" kernel-arm --model-dir "$JAMMI_MODEL_DIR" --all --target-modules "$TARGET_MODULES")" \
-    || { echo "::error::'$BIN kernel-arm --all' failed on $JAMMI_MODEL_DIR" >&2; exit 1; }
+  REFERENCE_DISABLE="$("$BIN" kernel-arm --model-dir "$JAMMI_MODEL_DIR" --off flash-attention,adam-w --target-modules "$TARGET_MODULES")" \
+    || { echo "::error::'$BIN kernel-arm --off flash-attention,adam-w' failed on $JAMMI_MODEL_DIR" >&2; exit 1; }
   echo "=== reference arm: JAMMI_KERNELS_DISABLE=$REFERENCE_DISABLE ==="
 else
   REFERENCE_DISABLE="[dry-run]"

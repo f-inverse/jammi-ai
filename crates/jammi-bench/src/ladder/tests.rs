@@ -1217,32 +1217,38 @@ fn a_law_the_legs_did_not_run_under_is_refused() {
 
 const STEP_UNIT: &str = "b8s128d0";
 
-/// The counted facts of a leg on the step ladder's `reference` rung: every
-/// family off, every dispatch a fallback.
-fn all_off_facts() -> Value {
+/// The counted facts of a leg on the step ladder's `reference` rung: the
+/// flash cascade declined and the attention block behind it, AdamW eager,
+/// every other family fused.
+fn reference_arm_facts() -> Value {
     let mut facts = fused_facts();
-    let pairs = facts.as_object().unwrap().clone();
-    for (field, value) in pairs {
-        if field.ends_with("_fused_dispatches") {
-            let fallback = if field == "attention_block_flash_fused_dispatches" {
-                "attention_block_flash_declined_dispatches".to_owned()
-            } else {
-                field.replace("_fused_dispatches", "_eager_dispatches")
-            };
-            facts[&fallback] = json!(value.as_u64().unwrap().max(1));
-            facts[&field] = json!(0);
-        }
+    for (field, value) in [
+        ("arm", json!("alloff")),
+        ("attention_arm", json!("eager")),
+        (
+            "kernels_disabled_requested",
+            json!(["adamw_step_fused", "attention_block_flash"]),
+        ),
+        (
+            "kernels_disabled_fired",
+            json!(["adamw_step_fused", "attention_block_flash"]),
+        ),
+        ("adamw_fused_dispatches", json!(0)),
+        ("adamw_eager_dispatches", json!(26208)),
+        ("attention_block_flash_fused_dispatches", json!(0)),
+        ("attention_block_flash_declined_dispatches", json!(3276)),
+        ("attention_block_fused_dispatches", json!(3276)),
+    ] {
+        facts[field] = value;
     }
-    facts["arm"] = json!("alloff");
-    facts["attention_arm"] = json!("eager");
     facts
 }
 
 /// A leg of the step ladder: a `torch` leg carries no counted facts, a
-/// `reference` leg proves the all-off arm.
+/// `reference` leg proves the reference arm.
 fn step_leg(rung: &str, take: &str, fields: Value) -> Leg {
     let facts = if rung == "reference" {
-        all_off_facts()
+        reference_arm_facts()
     } else {
         json!({"backbone_dtype": "bf16"})
     };
@@ -2251,11 +2257,13 @@ fn the_committed_aa_null_runs_reproduce_their_ratios_and_show_build_variance() {
 
 // ── oracle: the committed train-step sweep ─────────────────────────────────
 
-/// The committed step sweep — six shapes, `jammi-eager` once and the
-/// `jammi-fused`/`torch-sdpa` pair twice each in A,B,B,A order — as
-/// `train-step` legs: `torch`, `reference` and `fused` at each shape, each
-/// leg's series the one median the merged report kept, so the ladder's
-/// point ratio is reproducible and its interval is not.
+/// The committed step sweep — six shapes, the `jammi-fused`/`torch-sdpa`
+/// pair twice each in A,B,B,A order — as `train-step` legs: `torch` and
+/// `fused` at each shape, each leg's series the one median the merged
+/// report kept, so the ladder's point ratio is reproducible and its
+/// interval is not. The sweep's `jammi-eager` arm had every family off,
+/// which is no rung of this ladder (it ran out of memory at four of the six
+/// shapes), so it files no leg.
 fn committed_step_sweep() -> (Value, Vec<Leg>) {
     let path = artifacts()
         .join("finetune-ab-runs/2026-08-30-full-sweep-acce7b3d-a100-pcie/finetune_ab_report.json");
@@ -2287,17 +2295,6 @@ fn committed_step_sweep() -> (Value, Vec<Leg>) {
                 &format!("{rung}__{unit}__{take}"),
                 p50(m),
                 fields,
-            ));
-        }
-        if let Some(m) = metrics("jammi-eager") {
-            legs.push(constant_leg(
-                Workload::TrainStep,
-                &format!("reference__{unit}__r1"),
-                p50(m),
-                merged(
-                    merged(vram(m), json!({"backbone_dtype": "bf16"})),
-                    step_facts(m, "alloff"),
-                ),
             ));
         }
     }
@@ -2335,9 +2332,9 @@ fn step_facts(m: &Value, arm: &str) -> Value {
 /// reaches it: PASS is a cost outside the repeat noise band with the
 /// non-inferiority bound met; INDETERMINATE is a cost inside the band
 /// (the two repeats disagree by more than the ratio is from 1); INVALID is
-/// a refusal. The reference rung ran out of memory at four shapes, so
-/// those units are refused on both edges that touch it, and the end-to-end
-/// pair is read directly at every shape, as a session of its own.
+/// a refusal. The sweep has no leg of the reference rung, so the edge below
+/// it refuses every unit by name, and the end-to-end pair is read directly
+/// at every shape, as a session of its own.
 #[test]
 fn the_committed_step_sweep_reproduces_every_configs_reading() {
     let (report, legs) = committed_step_sweep();
@@ -2401,9 +2398,10 @@ fn the_committed_step_sweep_reproduces_every_configs_reading() {
         2
     );
 
-    // The ladder over every shape: the four units with no reference leg
-    // are refused by name, and nothing else is. The committed sweep carries
-    // no gradient legs, so the outcome axis is left out.
+    // The ladder over every shape: the sweep filed no leg of the reference
+    // rung, so the edge below it refuses every unit by name and nothing
+    // else. The committed sweep carries no gradient legs, so the outcome
+    // axis is left out.
     let cost_axes = axes(false, true, true, false);
     let torch_to_reference = edge_verdict(&ladder, "torch", "reference", &legs, &cost_axes);
     let missing: Vec<String> = torch_to_reference
@@ -2419,42 +2417,16 @@ fn the_committed_step_sweep_reproduces_every_configs_reading() {
         [
             "reference/b16s128d0",
             "reference/b16s128d0p05",
+            "reference/b8s128d0",
+            "reference/b8s128d0p05",
             "reference/b8s512d0",
             "reference/b8s512d0p05"
         ]
     );
     assert_eq!(
         torch_to_reference.refusals.len(),
-        4,
+        6,
         "{:#?}",
         torch_to_reference.refusals
     );
-
-    // Over the shapes every rung ran: the reference legs' own counters
-    // prove the all-off arm, the fused legs prove the fused arm and the
-    // flash cascade, and each edge's speed and space are read.
-    let complete: Vec<Leg> = {
-        let (_, all) = committed_step_sweep();
-        all.into_iter()
-            .filter(|l| l.name.unit.as_str().starts_with("b8s128"))
-            .collect()
-    };
-    let complete = set(complete);
-    for (lower, upper) in [("torch", "reference"), ("reference", "fused")] {
-        let verdict = edge_verdict(&ladder, lower, upper, &complete, &cost_axes);
-        assert!(
-            verdict.refusals.is_empty(),
-            "{lower} -> {upper}: {:#?}",
-            verdict.refusals
-        );
-        assert_eq!(verdict.units.len(), 2);
-        let speed = verdict.speed.as_ref().unwrap();
-        eprintln!(
-            "{lower} -> {upper}: cost {:.4}, host {:?}, device {:?}",
-            speed.cost.of_medians,
-            verdict.space.as_ref().unwrap().host_ratio,
-            verdict.space.as_ref().unwrap().device_ratio
-        );
-        assert_ne!(verdict.status, Status::Invalid);
-    }
 }

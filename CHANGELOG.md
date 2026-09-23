@@ -5,6 +5,14 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **One reference arm for both training ladders.** The `train-step` ladder's `reference` rung
+  runs the arm the `train-run` ladder already judges against — the flash cascade and the fused
+  AdamW step off — instead of every family off. Measured on an A100 80 GB in the campaign's
+  setting, the every-family-off composition holds 45 GiB at 8×128 against the fused arm's 3.7 and
+  exceeds the device at 8×512 and 16×128: candle's autograd keeps every operator's output alive
+  for the backward and materializes a gradient for every operand, and each LoRA site's eager
+  epilogue widens to `f32`. An arm the device cannot hold controls nothing; `kernel-arm --all`
+  still derives it as a diagnostic.
 - **A guard holds a property; a script's test is a script test.** `ci/guards.toml` keeps the
   properties of the tree — twenty-two of them — and `ci/scripts/run_script_tests.py` discovers and
   runs every `test_*` file and every script's own `--self-test`, selected when a change touches the

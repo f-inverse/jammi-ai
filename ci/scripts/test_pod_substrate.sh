@@ -1134,8 +1134,22 @@ BSHAPY
   # loudly-messaged — never a traceback, never a partial value.
   mkdir -p "$bsha/no_stamp"
   [ -z "$(bsha_resolve "$bsha/no_stamp")" ] \
-    && ok "(i/build-sha) a tree with no push stamp exports nothing (build.rs bakes \"unknown\" and the producer refuses, as it should)" \
+    && ok "(i/build-sha) a tree with no push stamp exports nothing" \
     || bad "(i/build-sha) a stampless tree produced a sha — got: '$(bsha_resolve "$bsha/no_stamp")'"
+  # What the job log says about a stampless tree depends on whether build.rs
+  # has a repository to read: a git checkout resolves its own sha (a note),
+  # a bare tree bakes "unknown" (the warning).
+  bsha_message() { bash -c "$(bash "$RUNPOD_DRIVER" rp_job_build_sha_lines "$1")" 2>&1 >/dev/null; }
+  bsha_message "$bsha/no_stamp" | grep -qF "::warning::JAMMI_BUILD_SHA left UNSET" \
+    && ok "(i/build-sha) a stampless tree with no git checkout warns that the build bakes \"unknown\"" \
+    || bad "(i/build-sha) a stampless non-checkout tree did not warn — got: '$(bsha_message "$bsha/no_stamp")'"
+  mkdir -p "$bsha/checkout"
+  git -C "$bsha/checkout" init -q && git -C "$bsha/checkout" -c user.name=t -c user.email=t@t commit -q --allow-empty -m fixture
+  bsha_checkout_msg="$(bsha_message "$bsha/checkout")"
+  [ -z "$(bsha_resolve "$bsha/checkout")" ] && ! grep -qF "::warning::" <<<"$bsha_checkout_msg" \
+    && grep -qF "$(git -C "$bsha/checkout" rev-parse HEAD)" <<<"$bsha_checkout_msg" \
+    && ok "(i/build-sha) a stampless git checkout exports nothing and names the HEAD build.rs will resolve — no false \"unknown\" warning" \
+    || bad "(i/build-sha) a stampless git checkout was misreported — got: '$bsha_checkout_msg'"
   mkdir -p "$bsha/corrupt"; printf 'not json' > "$bsha/corrupt/.jammi-push-stamp.json"
   [ -z "$(bsha_resolve "$bsha/corrupt")" ] \
     && ok "(i/build-sha) a corrupt push stamp exports nothing (and does not abort the job with a traceback)" \

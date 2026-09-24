@@ -1,0 +1,14 @@
+{
+  "definition_equal_all": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "p2_artifact_equal": {
+    "tol": 0.0,
+    "value": 1.0
+  },
+  "p4_artifact_equal": {
+    "tol": 0.0,
+    "value": 1.0
+  }
+}

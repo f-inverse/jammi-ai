@@ -8,10 +8,10 @@ import jammi_cookbook
 ```
 
 **Recipe:** `generate_embeddings` under `[inference] partitions = 1, 2, 4` ·
-the table's manifest sidecar (`artifact`, `definition_hash`) · **Theory:** a
-parallel plan is deterministic when the unit of work is fixed before the work
-is distributed [@kleppmann2017ddia] · **Rail:** measurement (every cell an
-equality verdict frozen to golden, tol 0).
+`describe_table` (`artifact`, `definition_hash`) · **Theory:** a parallel plan
+is deterministic when the unit of work is fixed before the work is
+distributed [@kleppmann2017ddia] · **Rail:** measurement (every verdict an
+equality, frozen to golden, tolerance 0).
 
 A model stage attached to a query engine as a user-defined function sees
 whatever batches the engine hands it. How rows are grouped then depends on the
@@ -32,37 +32,106 @@ rows are distributed:
    own distribution enforcement.
 
 So every partition count forwards identical chunks and writes identical bytes.
-This chapter measures that on CPU, hermetically: the same embedding plan over
-the same 24-row corpus, run at partitions 1, 2 and 4, each in a fresh catalog.
+This chapter measures that: the same embedding plan over the same 24-row
+corpus, run at partitions 1, 2 and 4, each in a fresh catalog.
+
+## The corpus and the three runs
+
+The rows are one to fourteen words long — the lengths are what the chunk cut
+orders on, so they are deliberately uneven. `batch_size = 4` makes every
+fan-out forward several chunks.
 
 ```{python}
-from jammi_cookbook import contracts
+import tempfile
+from pathlib import Path
 
-matrix = contracts.load_artifact("fanout.matrix")
-record = contracts.load_artifact("fanout.record")
-print(record["method"])
-print(f"\nrows={matrix['rows']}  batch_size={matrix['batch_size']}")
-for run in matrix["runs"]:
+import jammi
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from jammi_cookbook import contracts, fixtures
+
+MODEL = fixtures.model("tiny_bert")
+PARTITIONS = (1, 2, 4)
+BATCH_SIZE = 4
+
+docs = pa.table({
+    "_row_id": [f"d{i:02d}" for i in range(24)],
+    "text": [
+        "graph",
+        "signal processing on graphs",
+        "a spectral filter applied to node features over the normalized laplacian",
+        "message passing",
+        "random walks with restart as a personalized ranking",
+        "edge weights",
+        "attention over neighbours weights each message by a learned compatibility score",
+        "pooling",
+        "a laplacian eigenmap embeds nodes by the smallest nontrivial eigenvectors",
+        "k nearest neighbours",
+        "propagation smooths a signal along the edges of the graph",
+        "label spreading",
+        "a node embedding",
+        "the adjacency matrix and its powers count walks between node pairs",
+        "diffusion",
+        "graph convolution as a first order polynomial of the laplacian",
+        "readout",
+        "a heterogeneous graph carries typed nodes and typed edges",
+        "clustering coefficient",
+        "spectral clustering partitions the graph by the fiedler vector of its laplacian",
+        "homophily",
+        "over smoothing makes deep propagation collapse node representations together",
+        "subgraph sampling",
+        "the incidence matrix relates edges to their endpoints",
+    ],
+})
+
+
+def embed_at(partitions: int) -> dict:
+    """Embed the corpus in a fresh catalog fanned over `partitions`, and read
+    back what the table recorded about itself."""
+    with tempfile.TemporaryDirectory() as tmp:
+        corpus = Path(tmp) / "docs.parquet"
+        pq.write_table(docs, corpus)
+        config = Path(tmp) / "jammi.toml"
+        config.write_text(
+            f"[inference]\npartitions = {partitions}\nbatch_size = {BATCH_SIZE}\n"
+        )
+        with jammi.connect(f"file://{tmp}/catalog", config=str(config)) as db:
+            db.add_source("docs", url=str(corpus), format="parquet")
+            table = db.generate_embeddings(
+                source="docs", model=MODEL, columns=["text"], key="_row_id"
+            )
+            recorded = db.describe_table(table)
+    return {
+        "partitions": partitions,
+        "artifact": recorded["artifact"],
+        "definition_hash": recorded["definition_hash"],
+    }
+
+
+runs = [embed_at(n) for n in PARTITIONS]
+for run in runs:
     print(f"partitions={run['partitions']}  artifact={run['artifact']}")
 ```
 
 ## The verdicts
 
-The artifact digest covers the table's Parquet bytes, so equal digests mean
-equal bytes. The definition hash is the recorded identity of what produced the
-table; it is equal across runs because the partition count changes how the
+`describe_table` returns a table's recorded materialization: its artifact
+digest covers the table's Parquet bytes, so equal digests mean equal bytes; its
+definition hash is the recorded identity of what produced the table. The
+definition is the same across runs because the partition count changes how the
 work is spread, not what is computed.
 
 ```{python}
-reference = matrix["runs"][0]
-for run in matrix["runs"][1:]:
+reference = runs[0]
+for run in runs[1:]:
     same = 1.0 if run["artifact"] == reference["artifact"] else 0.0
     contracts.assert_close(f"fanout.p{run['partitions']}_artifact_equal", same)
-    print(f"partitions={run['partitions']}: same artifact as partitions=1 → {same}")
+    print(f"partitions={run['partitions']}: same bytes as partitions=1 → {same}")
 
-same_definition = 1.0 if len({r["definition_hash"] for r in matrix["runs"]}) == 1 else 0.0
-contracts.assert_close("fanout.definition_equal_all", same_definition)
-print(f"one definition across every fan-out → {same_definition}")
+one_definition = 1.0 if len({r["definition_hash"] for r in runs}) == 1 else 0.0
+contracts.assert_close("fanout.definition_equal_all", one_definition)
+print(f"one definition across every fan-out → {one_definition}")
 ```
 
 ## Why this matters beyond one table
@@ -76,8 +145,8 @@ print(f"one definition across every fan-out → {same_definition}")
 - **Scaling out is a configuration change.** The same holds when the plan's
   partitions run as tasks of a Ballista cluster. The chunk ids travel with
   the rows through the shuffle, so a cluster writes what one process writes.
-  The engine's distributed tests prove that leg; this chapter's CPU matrix
-  proves the in-process one.
+  The engine's distributed tests prove that leg; this chapter proves the
+  in-process one.
 
 The mechanism lives in `crates/jammi-datafusion/src/inference/` (`numbered.rs`
 numbers and cuts; `exec.rs` holds `InferenceExec` and `InferenceFanOut`). The

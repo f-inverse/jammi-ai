@@ -1,0 +1,74 @@
+{
+  "tier01.cite_homophily": {
+    "tol": 0.02,
+    "value": 0.5
+  },
+  "tier01.neighbor_homophily": {
+    "tol": 0.03,
+    "value": 0.559
+  },
+  "tier04.classifier_accuracy": {
+    "tol": 0.04,
+    "value": 0.496
+  },
+  "tier04.local_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.867
+  },
+  "tier04.marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.867
+  },
+  "tier04.marginal_set_size": {
+    "tol": 0.6,
+    "value": 6.17
+  },
+  "tier04.reg_cal_mean": {
+    "tol": 1.0,
+    "value": 2018.36
+  },
+  "tier04.reg_cal_resid_mag": {
+    "tol": 0.25,
+    "value": 0.488
+  },
+  "tier04.reg_interval_coverage": {
+    "tol": 0.04,
+    "value": 0.721
+  },
+  "tier04.reg_interval_width": {
+    "tol": 0.6,
+    "value": 1.94
+  },
+  "tier04.reg_pred_std": {
+    "tol": 0.5,
+    "value": 0.855
+  },
+  "tier04.reg_resid_corr": {
+    "tol": 0.2,
+    "value": 0.05
+  },
+  "tier04.reg_test_mean": {
+    "tol": 1.0,
+    "value": 2018.45
+  },
+  "tier04.reg_test_resid_mag": {
+    "tol": 0.25,
+    "value": 0.739
+  },
+  "tier04.reg_weighted_coverage": {
+    "tol": 0.04,
+    "value": 0.721
+  },
+  "tier04.reg_weighting_delta": {
+    "tol": 0.02,
+    "value": 0.0
+  },
+  "tier04.score_shift_corr": {
+    "tol": 0.12,
+    "value": -0.121
+  },
+  "tier04.weighting_max_abs_delta": {
+    "tol": 0.01,
+    "value": 0.0222
+  }
+}

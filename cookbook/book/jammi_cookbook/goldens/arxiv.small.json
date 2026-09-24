@@ -1,0 +1,98 @@
+{
+  "tier01.cite_homophily": {
+    "tol": 1e-09,
+    "value": 0.5370957514267597
+  },
+  "tier01.neighbor_homophily": {
+    "tol": 0.02,
+    "value": 0.43125
+  },
+  "tier01.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.40349999999999986
+  },
+  "tier02.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.4260000000000001
+  },
+  "tier02.precision_delta": {
+    "tol": 0.02,
+    "value": 0.02250000000000052
+  },
+  "tier03.base_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.40349999999999986
+  },
+  "tier03.declared_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.4049999999999999
+  },
+  "tier03.random_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.40099999999999986
+  },
+  "tier03.similarity_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.41050000000000003
+  },
+  "tier04.classifier_accuracy": {
+    "tol": 0.04,
+    "value": 0.6666666666666666
+  },
+  "tier04.local_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9479166666666666
+  },
+  "tier04.marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9479166666666666
+  },
+  "tier04.marginal_set_size": {
+    "tol": 0.6,
+    "value": 4.208333333333333
+  },
+  "tier04.reg_cal_mean": {
+    "tol": 1.0,
+    "value": 2017.459231517354
+  },
+  "tier04.reg_cal_resid_mag": {
+    "tol": 0.25,
+    "value": 0.7231735479636271
+  },
+  "tier04.reg_interval_coverage": {
+    "tol": 0.04,
+    "value": 0.9375
+  },
+  "tier04.reg_interval_width": {
+    "tol": 0.6,
+    "value": 3.878173828125
+  },
+  "tier04.reg_pred_std": {
+    "tol": 0.5,
+    "value": 0.996896394895851
+  },
+  "tier04.reg_resid_corr": {
+    "tol": 0.2,
+    "value": -0.759484401858868
+  },
+  "tier04.reg_test_mean": {
+    "tol": 1.0,
+    "value": 2018.0902849833171
+  },
+  "tier04.reg_test_resid_mag": {
+    "tol": 0.25,
+    "value": 1.0451316833496094
+  },
+  "tier04.reg_weighted_coverage": {
+    "tol": 0.04,
+    "value": 0.9375
+  },
+  "tier04.score_shift_corr": {
+    "tol": 0.12,
+    "value": -0.3121501451803838
+  },
+  "tier04.weighting_max_abs_delta": {
+    "tol": 0.01,
+    "value": 0.02083333333333326
+  }
+}

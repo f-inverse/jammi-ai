@@ -1,0 +1,26 @@
+{
+  "air_airports": {
+    "tol": 0.0,
+    "value": 3504.0
+  },
+  "air_contains": {
+    "tol": 0.0,
+    "value": 7008.0
+  },
+  "air_routes": {
+    "tol": 0.0,
+    "value": 50637.0
+  },
+  "arxiv_cites": {
+    "tol": 0.0,
+    "value": 1577.0
+  },
+  "arxiv_homophily": {
+    "tol": 1e-09,
+    "value": 0.5370957514267597
+  },
+  "arxiv_papers": {
+    "tol": 0.0,
+    "value": 400.0
+  }
+}

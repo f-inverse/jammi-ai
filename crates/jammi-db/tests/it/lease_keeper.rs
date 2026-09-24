@@ -337,13 +337,18 @@ async fn every_hold_reports_lost_when_the_keeper_thread_dies() {
         "holds start live"
     );
 
+    // The kill wakes the thread; wait for its death, bounded by the lease
+    // window — so a flip observed here is the death arm, never the "no
+    // renewal for a whole lease window" arm.
+    let killed = std::time::Instant::now();
     keeper.kill_thread_for_test();
-    // Kill lands at the next heartbeat tick (1 s); wait well inside the
-    // 3 s lease window so a flip observed here is the death arm, not the
-    // "no renewal for a whole lease window" arm.
-    tokio::time::sleep(Duration::from_millis(1_800)).await;
-
-    assert!(!keeper.is_alive(), "the keeper must report its thread dead");
+    while keeper.is_alive() {
+        assert!(
+            killed.elapsed() < intervals.lease(),
+            "the keeper must report its thread dead within the lease window"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(
         job_hold.lost(),
         "a job hold must read lost once the keeper thread is dead"

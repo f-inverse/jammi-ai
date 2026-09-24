@@ -3,6 +3,11 @@ pub mod environment;
 pub mod image_preprocess;
 pub mod runtime;
 
+/// Observes every output batch a session's inference plans produce —
+/// what [`crate::session::InferenceSession::with_observer`] takes, defined by
+/// `jammi-datafusion`, whose operators call it.
+pub use jammi_datafusion::inference::observer::InferenceObserver;
+
 use std::borrow::Cow;
 
 use arrow::array::{

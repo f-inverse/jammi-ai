@@ -572,13 +572,15 @@ impl LeaseKeeper {
         self.liveness.instant_of(&self.liveness.last_pass_ms)
     }
 
-    /// Test hook: make the keeper thread panic at its next heartbeat tick,
-    /// the way a defect inside the renewal loop would kill it — so a test
-    /// can prove every hold observes the death rather than reading "live"
-    /// forever.
+    /// Test hook: make the keeper thread panic the way a defect inside the
+    /// renewal loop would kill it — so a test can prove every hold observes
+    /// the death rather than reading "live" forever. The thread is woken, as
+    /// a shutdown wakes it, so the panic lands as soon as any renewal pass
+    /// in flight completes rather than a heartbeat later.
     #[cfg(feature = "test-hooks")]
     pub fn kill_thread_for_test(&self) {
         self.kill.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
     }
 
     /// Signal the keeper thread to stop, wait — bounded by `timeout` — for

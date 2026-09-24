@@ -534,6 +534,41 @@ retrieval surfaces:
 
 ---
 
+### 1.5 The foundation seams — where Jammi plugs into DataFusion, Ballista and candle
+
+Every capability Jammi adds to a foundation sits on an extension point that
+foundation ships for it: no fork, no vendored copy, no upstream patch. The
+user-facing map is `docs/guide/src/foundations.md`. This table is the
+maintainer's, with the invariant each seam implementation holds.
+
+| Foundation seam | Jammi type | File | Invariant it holds |
+|---|---|---|---|
+| DataFusion `ExecutionPlan` | `InferenceExec` | `crates/jammi-datafusion/src/inference/exec.rs` | Binds to a model only through `ModelRuntime`/`BoundModel`; a forward is admitted by its device before it runs |
+| DataFusion `ExecutionPlan` | `NumberedInputExec`, `RowCostExec`, `KeyCheckExec` | `crates/jammi-datafusion/src/inference/{numbered,row_cost,key_check}.rs` | Chunks are cut once, by row cost, and carried as `_chunk`; null keys are refused before any forward |
+| DataFusion `PhysicalOptimizerRule` | `InferenceFanOut` | `crates/jammi-datafusion/src/inference/exec.rs` | Restores the node's own declared fan-out after `EnforceDistribution`; the exchange hashes on `_chunk`, so bytes are identical at every width |
+| DataFusion `ExecutionPlan` | `TrainingExec` | `crates/jammi-datafusion/src/training/exec.rs` | A claimed training job as one task, run by the `TrainingRunner` it was bound to |
+| DataFusion `ExecutionPlan` + `ExtensionPlanner` + `UserDefinedLogicalNodeCore` | `ResultTableSinkExec`, `MaterializationPlanner`, `StoreStatementNode` | `crates/jammi-db/src/store/sink.rs`, `crates/jammi-db/src/compute_plane.rs` | Every result table, `CREATE TABLE … AS` included, roots in the one sink; `BuildingTable::finish` is the sole building→ready transition |
+| DataFusion `ExecutionPlan` | `AnnSearchExec`, `AsofJoinExec`, `InitialStateExec`/`HopFoldExec`/`ReadoutExec` | `crates/jammi-ai/src/operator/`, `crates/jammi-ai/src/pipeline/{asof,graph_propagation}/` | Out-of-core under the session pool; graph hops walk with an explicit work stack |
+| DataFusion `TableProvider` | `MaskedTableProvider`, `MutableTableProvider` | `crates/jammi-db/src/store/masked_provider.rs`, `crates/jammi-db/src/store/mutable/provider.rs` | A versioned read resolves one version; mutable tables expose CRUD through DML only |
+| DataFusion UDF/UDAF/UDTF | `annotate`, `jammi_content_hash`, `vector_{mean,sum,max}` | `crates/jammi-ai/src/query/` | Pure functions of their inputs |
+| DataFusion `MemoryPool` | `ActiveSpillPool` | `crates/jammi-db/src/memory_pool.rs` | A spilling consumer is held to an equal share among the consumers actually holding memory |
+| Ballista `PhysicalExtensionCodec` | `JammiCodec` | `crates/jammi-ballista/src/codec.rs` | Writes a magic prefix no prost message can start with; every other node crosses through Ballista's codec unchanged |
+| Ballista `TaskDistributionPolicy::Custom` | `DevicePlacement` | `crates/jammi-ballista/src/placement.rs` | A stage binds only to an executor that registered the device kind its plan requires (the one `required_device_kind` predicate) |
+| Ballista `ExecutionEngine` | `JammiExecutionEngine` | `crates/jammi-ballista/src/engine.rs` | Wraps the default engine; refuses a stage whose required device kind is not this executor's |
+| Ballista `ClusterState`/`JobState` | `CatalogClusterState`, `CatalogJobState` | `crates/jammi-ballista/src/cluster.rs` | Catalog rows are every scheduler's view of the fleet; execution graphs are never persisted, and a lost executor fails its jobs to Jammi's reclaim |
+| candle `CustomOp1/2/3` | the fused kernels | `crates/jammi-kernels/src/ops/` | Every kernel has a CPU reference arm; candle's eager composition is the fallback |
+
+Two rules hold across every row:
+
+- **Ownership stays on Jammi's side.** Attempts, retries, terminal writes and
+  who may write a row are Jammi's discipline. The foundation's own retry
+  loops are off (Ballista's `task_max_failures = stage_max_failures = 0`,
+  `crates/jammi-ballista/src/roles.rs`).
+- **A new capability starts from a seam.** When the foundation ships no
+  extension point for what a change needs, that is a design fork to resolve
+  (`docs/guide/src/engineering.md`, "Deciding at a fork"). Forking or
+  patching the foundation is never the resolution.
+
 ## 2. Core abstractions & contracts
 
 Every trait/enum/base surface a maintainer extends, with anchors and invariants.

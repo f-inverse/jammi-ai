@@ -250,7 +250,12 @@ plan rooted in the result-table sink, so the table's bytes are written on
 the executor under the row's lease and only a summary crosses back — the
 row counts, the index segments, and the environment that produced them;
 the query-tier replica finishes the catalog side, recording that
-environment. It runs in the query-tier replica otherwise, and its table
+environment. The replica plans against the model's description — its
+output width, its regression head's form and the identity the
+environment records, read from the model's files and configuration —
+and never holds the weights: the executor that runs the plan materializes
+them, from the same description, so what the replica planned against
+and what the executor recorded cannot disagree. It runs in the query-tier replica otherwise, and its table
 records the replica's CPU. An executor the scheduler expires mid-task (its
 heartbeat stopped — Ballista's `executor_timeout_seconds`, 180 s, swept
 every `expire_dead_executor_interval_seconds`, 15 s) fails every placed

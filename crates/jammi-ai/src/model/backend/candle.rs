@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -27,7 +28,8 @@ use crate::inference::{
 use crate::model::arch::EncoderFamily;
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use crate::model::{
-    LoadedModel, ModelDimensions, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
+    LoadedModel, ModelDescription, ModelDimensions, ModelTask, ResolvedModel, SavedAdapterFiles,
+    TokenizerSource, WeightsFormat,
 };
 
 /// Candle backend — loads safetensors models via candle.
@@ -556,10 +558,12 @@ impl CandleTextForward for BertClassificationForward {
     }
 }
 
-/// A candle-loaded model ready for inference.
+/// A candle-loaded model ready for inference: the weights of a described
+/// model, materialized on a device.
 pub struct CandleModel {
-    /// Architecture dimensions for memory estimation and output sizing.
-    pub dimensions: ModelDimensions,
+    /// The description this model was materialized from — its identity,
+    /// geometry and head form, reported unchanged.
+    description: Arc<ModelDescription>,
     /// Text architecture forward pass (BERT, ModernBERT, DistilBERT).
     text: Option<Box<dyn CandleTextForward>>,
     /// Vision architecture forward pass (OpenCLIP ViT).
@@ -591,47 +595,10 @@ pub struct CandleModel {
     /// affine the trainer did, so the served mean/quantiles carry the target
     /// offset. `None` for every non-regression head.
     regression_scaler: Option<crate::fine_tune::regression_loss::TargetScaler>,
-    /// Predictive distribution form of a reloaded regression head: `Gaussian`
-    /// (de-standardise the mean column only) or `Quantile` (de-standardise every
-    /// column). This is the authoritative gaussian-vs-quantile signal persisted
-    /// with the head; serving dispatches the de-standardisation on it rather than
-    /// on head width, so a 2-level quantile head (also width 2) is de-standardised
-    /// as a quantile head. `Some` exactly when `regression_scaler` is.
-    regression_form: Option<crate::inference::adapter::DistributionForm>,
     /// Label index → label string mapping for classification/NER models.
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
     ner_classifier: Option<candle_nn::Linear>,
-    /// The effective inference compute precision this model loaded at — the
-    /// resolved per-model override or the global default, unless a saved
-    /// fine-tune adapter's own persisted `backbone_dtype` won instead (see
-    /// `effective_precision` in `CandleBackend::load`). Output-affecting, so
-    /// the materialization contract folds it into `ModelIdentity`.
-    pub(crate) compute_precision: jammi_numerics::ComputePrecision,
-    /// The model's content digest: a SHA-256 fold of the
-    /// resolved model directory's `config.json` / `1_Pooling/config.json` /
-    /// tokenizer / weights bytes, computed once here by
-    /// [`compute_model_content_digest`] and carried through unchanged. See
-    /// that function for the exact input set and ordering. Output-affecting
-    /// (two directories that share one `model_id` but differ in any of those
-    /// bytes must never collide on one `DefinitionHash`), so the
-    /// materialization contract folds it into `ModelIdentity.content_digest`.
-    pub(crate) content_digest: ModelContentDigest,
-    /// The load-time `stat`-only staleness fingerprint over the
-    /// same input set `content_digest` was hashed from, computed once here
-    /// by [`compute_model_fingerprint`] and re-probed on every warm
-    /// `ModelCache::get_or_load` hit via [`ModelFingerprint::probe`]. See
-    /// that type's doc for the exact guarantee (a tripwire, not a
-    /// cryptographic one) and [`compute_model_fingerprint`] for the input
-    /// set.
-    pub(crate) fingerprint: ModelFingerprint,
-    /// The GGUF/k-quant weight-storage format this model's backbone loaded
-    /// from — `Some` (the MODAL quantized dtype among the backbone's
-    /// matmul-site tensors) for a `model.gguf` load, `None` for every
-    /// safetensors/ONNX load. See
-    /// [`super::super::LoadedModel::quantization`]'s doc for the
-    /// output-affecting rationale.
-    pub(crate) quantization: Option<jammi_numerics::WeightQuantization>,
     /// Every kernel admission decision this model's forwards have taken —
     /// see [`Self::kernel_admission`].
     kernel_admission: std::sync::Mutex<jammi_kernels::admission::AdmissionLedger>,
@@ -1737,13 +1704,9 @@ impl CandleModel {
         self.text.as_ref().map(|t| t.max_sequence_length())
     }
 
-    /// The persisted predictive-distribution form of a reloaded regression head,
-    /// or `None` for a non-regression model (or a regression head saved without a
-    /// form). Serving reads this to select the `Infer` output adapter
-    /// (`gaussian()` vs `quantile(levels)`) — the authoritative signal the head
-    /// was trained for, never a head-width guess.
-    pub(crate) fn regression_form(&self) -> Option<&crate::inference::adapter::DistributionForm> {
-        self.regression_form.as_ref()
+    /// The description this model was materialized from.
+    pub(crate) fn description(&self) -> &Arc<ModelDescription> {
+        &self.description
     }
 
     /// The persisted scaler's σ_y (target standard deviation), or `None` for a
@@ -2114,7 +2077,7 @@ impl CandleModel {
         // together, so a scaler without a form is an inconsistent saved head, not
         // a case to paper over with a width guess.
         let params = if let Some(scaler) = self.regression_scaler.as_ref() {
-            let form = self.regression_form.as_ref().ok_or_else(|| {
+            let form = self.description.regression_form().ok_or_else(|| {
                 JammiError::Inference(
                     "regression head carries a de-standardising scaler but no distribution form \
                      (the persisted head is inconsistent)"
@@ -2162,7 +2125,7 @@ impl CandleModel {
     ) -> Result<BackendOutput> {
         let num_rows = row_status.len();
         if num_rows == 0 {
-            // `(0, 0)`, not `(0, self.dimensions.hidden_size)`: the SHARED
+            // `(0, 0)`, not `(0, self.description.dimensions().hidden_size)`: the SHARED
             // empty-batch shape every `BackendOutput` producer reports for a
             // zero-row float-embedding head, embedded (`CandleModel`) and
             // remote (`HttpBackend`) alike — see `HttpBackend::
@@ -2179,7 +2142,7 @@ impl CandleModel {
                 shapes: vec![(0, 0)],
             });
         }
-        let hidden_size = self.dimensions.hidden_size;
+        let hidden_size = self.description.dimensions().hidden_size;
         let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
         if let Some(embedded) = embedded {
             let embedded = if embedded.dtype() == DType::F32 {
@@ -2680,41 +2643,204 @@ enum Payload {
     },
 }
 
-impl ModelBackend for CandleBackend {
-    fn load(&self, resolved: &ResolvedModel, device_config: &DeviceConfig) -> Result<LoadedModel> {
-        let device = select_device(device_config)?;
+/// The compute precision `resolved`'s configuration declares for a run on
+/// `device_config`: the per-model `compute_precision` in `config.json` wins
+/// over the deployment's default; both default to `F32`. Read the same
+/// best-effort way `id2label` is: a malformed/unknown value is honestly
+/// "not declared", never a hard error over an optional field.
+fn configured_compute_precision(
+    resolved: &ResolvedModel,
+    device_config: &DeviceConfig,
+) -> jammi_numerics::ComputePrecision {
+    resolved
+        .model_config
+        .get("compute_precision")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(device_config.compute_precision)
+}
 
-        // Computed ONCE per model load, before the (potentially expensive)
-        // weight loading below, so a hashing/stat IO failure (a typed
-        // refusal, never a silent `Unavailable`) surfaces fast rather than
-        // after mmapping several GB of safetensors. Routed through the ONE
-        // composed function — never the two independently — so the
-        // fingerprint-before-digest order is pinned
+/// The raw `model_type` SPELLING the text arm dispatches on and every
+/// refusal message names, read through the ONE shared reader
+/// (`crate::model::arch::config_model_type`): for a declared string the
+/// shared reader answers with that string unchanged; for an absent (or
+/// non-string) key it answers `UNDECLARED_MODEL_TYPE_FAMILY`'s id, the
+/// SAME rule `EncoderFamily::from_config` applies. A `config.json` without
+/// a `model_type` therefore resolves to the same family here as it does at
+/// the fine-tune worker — the two can never diverge.
+fn config_model_type(resolved: &ResolvedModel) -> &str {
+    crate::model::arch::config_model_type(&resolved.model_config)
+}
+
+/// The GGUF backbone `resolved` loads as — its architecture and layer
+/// count — or `None` for a safetensors checkpoint. The resolver already
+/// classified the weight-storage format at resolve time
+/// (`ResolvedModel.weights_format`); it is never re-derived by
+/// extension-sniffing here. `Ort` never resolves a GGUF path (the
+/// resolver's local/HF arms only ever look for `model.onnx`), so
+/// `(Ort, Gguf)` cannot reach this backend at all. GGUF loading is threaded
+/// only through the BERT-family/DistilBERT/ModernBERT text towers, so a
+/// quantized cross-modal checkpoint is a typed refusal. Shared by the
+/// description (the checkpoint's quantization format) and the load (its
+/// backbone), so both refuse the same checkpoint the same way.
+fn gguf_backbone_shape(
+    resolved: &ResolvedModel,
+    model_type: &str,
+) -> Result<Option<(GgufArchitecture, usize)>> {
+    if resolved.weights_format != WeightsFormat::Gguf {
+        return Ok(None);
+    }
+    // The ONE architecture predicate: the same `EncoderFamily` the
+    // fine-tune worker dispatches on, so a checkpoint can never be "CLAP"
+    // to one of them and "OpenCLIP" to the other.
+    let base_family = EncoderFamily::from_config(&resolved.model_config);
+    if matches!(
+        base_family,
+        Some(EncoderFamily::ClapAudio | EncoderFamily::OpenClip)
+    ) {
+        return Err(JammiError::Model {
+            model_id: resolved.model_id.0.clone(),
+            message: format!(
+                "quantized serving not supported for this architecture (model_type \
+                 '{model_type}') — GGUF loading is threaded only through the \
+                 BERT-family/DistilBERT/ModernBERT text towers"
+            ),
+        });
+    }
+    let arch = GgufArchitecture::from_model_type(model_type).ok_or_else(|| JammiError::Model {
+        model_id: resolved.model_id.0.clone(),
+        message: format!(
+            "quantized serving not supported for this architecture (model_type '{model_type}')"
+        ),
+    })?;
+    let num_layers =
+        gguf::gguf_num_layers(model_type, &resolved.model_config).ok_or_else(|| {
+            JammiError::Model {
+                model_id: resolved.model_id.0.clone(),
+                message: "GGUF load requires num_hidden_layers (or num_layers) in config.json"
+                    .into(),
+            }
+        })?;
+    Ok(Some((arch, num_layers)))
+}
+
+/// The saved fine-tune adapter `resolved` carries, if any. Both flavours of
+/// `SavedAdapter` share the same on-disk layout (`adapter.safetensors` plus
+/// `adapter_config.json` with the `adapter_type` discriminator); the
+/// variant is the type-level switch that decides whether to wire LoRA
+/// inside the encoder or leave it as an external projection head applied
+/// post-pool.
+///
+/// `resolved.adapter_path` is `Some` only via the fine-tuned-model
+/// catalog-lookup path (`ModelResolver::try_catalog_lookup`), which sets it
+/// exactly when a fine-tuned model record's artifact was fetched from the
+/// artifact store into a local directory — i.e. the resolver has already
+/// asserted "this model IS fine-tuned and its adapter bundle lives here". A
+/// missing `adapter_config.json` / `adapter.safetensors` under that
+/// directory therefore signals a genuinely broken artifact (a partial
+/// fetch, corruption, an artifact-store/catalog inconsistency) — not "no
+/// adapter". Both a missing file and a read/parse failure are typed
+/// refusals: falling back to the unadapted base model would drop the
+/// fine-tuning with no signal to the caller, and an output-affecting file
+/// that is expected to be present must fail loudly when it is not, never
+/// silently degrade to a different, unrequested model.
+fn read_saved_adapter(resolved: &ResolvedModel) -> Result<Option<SavedAdapterFiles>> {
+    let Some(dir) = resolved.adapter_path.as_ref() else {
+        return Ok(None);
+    };
+    let cfg_path = dir.join("adapter_config.json");
+    let weights = dir.join("adapter.safetensors");
+    if !cfg_path.exists() || !weights.exists() {
+        return Err(JammiError::Model {
+            model_id: resolved.model_id.0.clone(),
+            message: format!(
+                "resolved adapter_path {dir:?} is missing adapter_config.json and/or \
+                 adapter.safetensors — a fine-tuned model's adapter directory must carry \
+                 both files; refusing to silently fall back to serving the unadapted base \
+                 model, which would drop the fine-tuning with no signal"
+            ),
+        });
+    }
+    let cfg_str = std::fs::read_to_string(&cfg_path).map_err(|e| JammiError::Model {
+        model_id: resolved.model_id.0.clone(),
+        message: format!("failed to read {cfg_path:?}: {e}"),
+    })?;
+    let config: crate::fine_tune::target::SavedAdapter =
+        serde_json::from_str(&cfg_str).map_err(|e| JammiError::Model {
+            model_id: resolved.model_id.0.clone(),
+            message: format!("failed to parse {cfg_path:?}: {e}"),
+        })?;
+    Ok(Some(SavedAdapterFiles { config, weights }))
+}
+
+impl ModelBackend for CandleBackend {
+    fn describe(
+        &self,
+        resolved: &ResolvedModel,
+        device_config: &DeviceConfig,
+    ) -> Result<ModelDescription> {
+        // Routed through the ONE composed function — never the two
+        // independently — so the fingerprint-before-digest order is pinned
         // structurally. See `compute_model_identity_facets`'s doc for the
         // exact input set, ordering invariant, and why it matters.
         let (fingerprint, content_digest) = compute_model_identity_facets(resolved)?;
+        let model_type = config_model_type(resolved);
+        let configured_precision = configured_compute_precision(resolved, device_config);
+        let saved_adapter = read_saved_adapter(resolved)?;
+        // A fine-tune adapter's backbone runs at its own *persisted*
+        // `backbone_dtype` (a training-time choice); with no adapter, the
+        // backbone follows the configured inference precision. This is the
+        // precision the materialization contract folds into the identity.
+        let compute_precision = match saved_adapter.as_ref().map(|adapter| &adapter.config) {
+            Some(crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg)) => {
+                cfg.backbone_dtype
+            }
+            _ => configured_precision,
+        };
+        // Normalize DistilBERT config fields to standard BERT names — the
+        // SAME normalization authority `gguf::gguf_num_layers` routes
+        // through, so a DistilBERT config.json (whose only geometry fields
+        // are its own `dim`/`n_heads`/`n_layers`/`hidden_dim` names) can
+        // never diverge between the geometry read here and any GGUF consumer.
+        let model_config = gguf::normalize_model_config(model_type, &resolved.model_config);
+        let dimensions =
+            ModelDimensions::from_config(&model_config).ok_or_else(|| JammiError::Model {
+                model_id: resolved.model_id.0.clone(),
+                message: "Could not parse model dimensions from config".into(),
+            })?;
+        let quantization = match gguf_backbone_shape(resolved, model_type)? {
+            Some((arch, num_layers)) => gguf::gguf_modal_quantization(
+                &resolved.weights_paths[0],
+                arch,
+                num_layers,
+                &resolved.model_id.0,
+            )?,
+            None => None,
+        };
+        Ok(ModelDescription {
+            identity: jammi_db::store::manifest::ModelIdentity {
+                model_id: resolved.model_id.0.clone(),
+                backend: "candle".to_string(),
+                compute_precision,
+                content_digest,
+                quantization,
+            },
+            dimensions,
+            configured_precision,
+            saved_adapter,
+            fingerprint,
+        })
+    }
 
-        // The raw `model_type` SPELLING the text arm below dispatches on and
-        // every refusal message names, read through the ONE shared reader
-        // (`crate::model::arch::config_model_type`) rather than this site's own
-        // `unwrap_or("bert")`: for a declared string the shared reader answers
-        // with that string unchanged; for an absent (or non-string) key it
-        // answers `UNDECLARED_MODEL_TYPE_FAMILY`'s id, the SAME rule
-        // `EncoderFamily::from_config` applies. A `config.json` without a
-        // `model_type` therefore resolves to the same family here as it does
-        // at the fine-tune worker — the two can never diverge.
-        let model_type = crate::model::arch::config_model_type(&resolved.model_config);
+    fn materialize(
+        &self,
+        resolved: &ResolvedModel,
+        description: Arc<ModelDescription>,
+        device_config: &DeviceConfig,
+    ) -> Result<LoadedModel> {
+        let device = select_device(device_config)?;
+        let model_type = config_model_type(resolved);
 
-        // Per-model `compute_precision` in `config.json` wins over the global
-        // `DeviceConfig` default; both default to `F32`. Read the same
-        // best-effort way `id2label` is read below: a malformed/unknown value
-        // is honestly "not declared", never a hard error over an optional
-        // field.
-        let per_model_precision: Option<jammi_numerics::ComputePrecision> = resolved
-            .model_config
-            .get("compute_precision")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
-        let compute_precision = per_model_precision.unwrap_or(device_config.compute_precision);
+        let compute_precision = description.configured_precision;
         let compute_dtype = match compute_precision {
             jammi_numerics::ComputePrecision::F32 | jammi_numerics::ComputePrecision::F16 => {
                 jammi_encoders::compute_precision_to_dtype(compute_precision)
@@ -2771,78 +2897,27 @@ impl ModelBackend for CandleBackend {
         let is_clap = base_family == Some(EncoderFamily::ClapAudio);
         let is_open_clip = base_family == Some(EncoderFamily::OpenClip);
 
-        // Normalize DistilBERT config fields to standard BERT names — the
-        // SAME normalization authority `gguf::gguf_num_layers` (below, and
-        // through it `estimate_gguf_residency`/the fine-tune GGUF arm)
-        // routes through, so a DistilBERT config.json (whose only geometry
-        // fields are its own `dim`/`n_heads`/`n_layers`/`hidden_dim` names)
-        // can never diverge between this ordinary encoder-config build and
-        // any GGUF consumer.
+        // The SAME normalization the description's geometry read went
+        // through (`describe`), so this build and that read agree.
         let model_config = gguf::normalize_model_config(model_type, &resolved.model_config);
 
-        // GGUF weight-storage format: the resolver already
-        // classified this at resolve time (`ResolvedModel.weights_format`) —
-        // never re-derived by extension-sniffing here. `Ort` never resolves
-        // a GGUF path (`ModelResolver`'s local/HF arms only ever look for
-        // `model.onnx`), so `(Ort, Gguf)` cannot reach this Candle backend
-        // at all.
-        let is_gguf = resolved.weights_format == WeightsFormat::Gguf;
-        if is_gguf && (is_clap || is_open_clip) {
-            return Err(JammiError::Model {
-                model_id: resolved.model_id.0.clone(),
-                message: format!(
-                    "quantized serving not supported for this architecture (model_type \
-                     '{model_type}') — GGUF loading is threaded only through the \
-                     BERT-family/DistilBERT/ModernBERT text towers"
-                ),
-            });
-        }
-        let gguf_arch = if is_gguf {
-            Some(
-                GgufArchitecture::from_model_type(model_type).ok_or_else(|| JammiError::Model {
-                    model_id: resolved.model_id.0.clone(),
-                    message: format!(
-                        "quantized serving not supported for this architecture (model_type \
-                         '{model_type}')"
-                    ),
-                })?,
-            )
-        } else {
-            None
-        };
         // Everything the GGUF load path needs, built ONCE here: a
         // per-matmul-site `FrozenBase` map plus a synthesized in-memory
         // safetensors file carrying every OTHER tensor densified to
         // `compute_dtype` (embeddings, norms, classifier/NER heads — see
         // `gguf::load_gguf_backbone`'s own doc). `None` for a non-GGUF load
         // — every downstream site below then takes the plain safetensors path.
-        let gguf_backbone = match gguf_arch {
-            Some(arch) => {
-                let num_layers = gguf::gguf_num_layers(model_type, &resolved.model_config)
-                    .ok_or_else(|| JammiError::Model {
-                        model_id: resolved.model_id.0.clone(),
-                        message: "GGUF load requires num_hidden_layers (or num_layers) in \
-                                  config.json"
-                            .into(),
-                    })?;
-                Some(gguf::load_gguf_backbone(
-                    &resolved.weights_paths[0],
-                    arch,
-                    num_layers,
-                    compute_dtype,
-                    &device,
-                    &resolved.model_id.0,
-                )?)
-            }
+        let gguf_backbone = match gguf_backbone_shape(resolved, model_type)? {
+            Some((arch, num_layers)) => Some(gguf::load_gguf_backbone(
+                &resolved.weights_paths[0],
+                arch,
+                num_layers,
+                compute_dtype,
+                &device,
+                &resolved.model_id.0,
+            )?),
             None => None,
         };
-        // MODAL quantized dtype among the backbone's matmul-site tensors —
-        // the value `ModelIdentity.quantization` reports. A GGUF file whose matmul-site tensors are
-        // ALL stored densely (F32/F16/BF16, no genuine k-quant tensor at
-        // all — a pathological, self-defeating "GGUF" checkpoint) reports
-        // `None` here rather than fabricating a quantized format that was
-        // never actually used.
-        let gguf_quantization = gguf_backbone.as_ref().and_then(|b| b.modal_quantization);
         // The `FrozenWeightLookup`-shaped closure every text-tower builder
         // below consults via `.weight_source(..)` — `None` for a non-GGUF
         // load (every builder call site then skips `.weight_source(..)`
@@ -2894,65 +2969,16 @@ impl ModelBackend for CandleBackend {
         let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
         let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
 
-        // Read the saved adapter, if any. Both flavours of `SavedAdapter`
-        // share the same on-disk layout (`adapter.safetensors` plus
-        // `adapter_config.json` with the `adapter_type` discriminator); the
+        // The saved adapter, read once when the model was described: the
         // variant is the type-level switch that decides whether to wire
         // LoRA inside the encoder or leave it as an external projection
         // head applied post-pool.
-        //
-        // `resolved.adapter_path` is `Some` only via the fine-tuned-model
-        // catalog-lookup path (`ModelResolver::try_catalog_lookup`), which
-        // sets it exactly when a fine-tuned model record's artifact
-        // was fetched from the artifact store into a local directory — i.e.
-        // the resolver has already asserted "this model IS fine-tuned and
-        // its adapter bundle lives here". A missing `adapter_config.json` /
-        // `adapter.safetensors` under that directory therefore signals a
-        // genuinely broken artifact (a partial fetch, corruption, an
-        // artifact-store/catalog inconsistency) — not "no adapter". Both a
-        // missing file and a read/parse failure are typed refusals: falling
-        // back to the unadapted base model would drop the fine-tuning with
-        // no signal to the caller, and an output-affecting file that is
-        // expected to be present must fail loudly when it is not, never
-        // silently degrade to a different, unrequested model.
-        let saved_adapter: Option<(crate::fine_tune::target::SavedAdapter, std::path::PathBuf)> =
-            match resolved.adapter_path.as_ref() {
-                None => None,
-                Some(p) => {
-                    let cfg_path = p.join("adapter_config.json");
-                    let weights_path = p.join("adapter.safetensors");
-                    if !cfg_path.exists() || !weights_path.exists() {
-                        return Err(JammiError::Model {
-                            model_id: resolved.model_id.0.clone(),
-                            message: format!(
-                                "resolved adapter_path {p:?} is missing adapter_config.json \
-                                 and/or adapter.safetensors — a fine-tuned model's adapter \
-                                 directory must carry both files; refusing to silently fall \
-                                 back to serving the unadapted base model, which would drop \
-                                 the fine-tuning with no signal"
-                            ),
-                        });
-                    }
-                    let cfg_str =
-                        std::fs::read_to_string(&cfg_path).map_err(|e| JammiError::Model {
-                            model_id: resolved.model_id.0.clone(),
-                            message: format!("failed to read {cfg_path:?}: {e}"),
-                        })?;
-                    let saved: crate::fine_tune::target::SavedAdapter =
-                        serde_json::from_str(&cfg_str).map_err(|e| JammiError::Model {
-                            model_id: resolved.model_id.0.clone(),
-                            message: format!("failed to parse {cfg_path:?}: {e}"),
-                        })?;
-                    Some((saved, weights_path))
-                }
-            };
-
-        let encoder_adapter = saved_adapter.as_ref().and_then(|(saved, weights)| {
-            if let crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) = saved {
-                Some(((**cfg).clone(), weights.as_path()))
-            } else {
-                None
+        let saved_adapter = description.saved_adapter.as_ref();
+        let encoder_adapter = saved_adapter.and_then(|adapter| match &adapter.config {
+            crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => {
+                Some(((**cfg).clone(), adapter.weights.as_path()))
             }
+            crate::fine_tune::target::SavedAdapter::ProjectionHead(_) => None,
         });
         // Adapter IDENTITY validation, at the one seam where
         // the saved adapter is read.
@@ -3041,20 +3067,15 @@ impl ModelBackend for CandleBackend {
         };
         let encoder_adapter_file: Option<&std::path::Path> =
             encoder_adapter.as_ref().map(|(_, p)| *p);
-        // A fine-tune adapter's backbone loads at its own *persisted*
-        // `backbone_dtype` (a training-time choice); with no adapter, the
-        // backbone follows the resolved inference `compute_precision` the root
-        // `vb` above just loaded at — so an unadapted model's backbone and its
-        // heads always agree on dtype. This is also the precision the
-        // materialization contract folds into `ModelIdentity`, so it is
-        // computed once here (as `ComputePrecision`) and carried through to
-        // `CandleModel::compute_precision`, never re-derived.
-        let effective_precision: jammi_numerics::ComputePrecision = encoder_adapter
-            .as_ref()
-            .map(|(cfg, _)| cfg.backbone_dtype)
-            .unwrap_or(compute_precision);
+        // The backbone's precision is the description's — a fine-tune
+        // adapter's own *persisted* `backbone_dtype` (a training-time
+        // choice), else the configured inference precision the root `vb`
+        // above just loaded at, so an unadapted model's backbone and its
+        // heads always agree on dtype. It was resolved once, in `describe`,
+        // and is what the materialization contract folds into the identity;
+        // it is never re-derived here.
         let encoder_backbone_dtype =
-            jammi_encoders::compute_precision_to_dtype(effective_precision);
+            jammi_encoders::compute_precision_to_dtype(description.compute_precision());
         // For a GGUF load this points at the SAME synthesized densified
         // file `vb` above reads (`vb_weights_paths`'s own doc) — every
         // `*Builder::build` call below constructs its OWN `frozen_vb` from
@@ -3410,47 +3431,40 @@ impl ModelBackend for CandleBackend {
             })
             .transpose()?;
 
-        let dimensions =
-            ModelDimensions::from_config(&model_config).ok_or_else(|| JammiError::Model {
-                model_id: resolved.model_id.0.clone(),
-                message: "Could not parse model dimensions from config".into(),
-            })?;
+        let dimensions = description.dimensions();
 
         // Load the post-pool projection head, if the saved adapter is one.
         // Encoder-adapters are installed inside `text` above via the encoder
         // builder's `.lora(...)` + `.adapter(Some(...))` calls.
-        let (projection_head, distribution_head, regression_scaler, regression_form) =
-            match saved_adapter.as_ref() {
-                Some((
-                    crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg),
-                    weights_path,
-                )) => {
-                    (
-                        load_projection_head(
-                            weights_path,
-                            cfg.lora_alpha,
-                            cfg.use_rslora,
-                            &device,
-                            &dimensions,
-                            &resolved.model_id.0,
-                        )?,
-                        // The `distribution` layer is present only for a
-                        // regression head; `load_distribution_head` returns `None`
-                        // for embedding/classification/NER projection heads.
-                        load_distribution_head(
-                            weights_path,
-                            cfg.lora_alpha,
-                            cfg.use_rslora,
-                            &device,
-                            &dimensions,
-                            &resolved.model_id.0,
-                        )?,
-                        cfg.target_scaler,
-                        cfg.regression_form.clone(),
-                    )
-                }
-                _ => (None, None, None, None),
-            };
+        let (projection_head, distribution_head, regression_scaler) = match saved_adapter
+            .map(|adapter| (&adapter.config, adapter.weights.as_path()))
+        {
+            Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => {
+                (
+                    load_projection_head(
+                        weights_path,
+                        cfg.lora_alpha,
+                        cfg.use_rslora,
+                        &device,
+                        dimensions,
+                        &resolved.model_id.0,
+                    )?,
+                    // The `distribution` layer is present only for a
+                    // regression head; `load_distribution_head` returns `None`
+                    // for embedding/classification/NER projection heads.
+                    load_distribution_head(
+                        weights_path,
+                        cfg.lora_alpha,
+                        cfg.use_rslora,
+                        &device,
+                        dimensions,
+                        &resolved.model_id.0,
+                    )?,
+                    cfg.target_scaler,
+                )
+            }
+            _ => (None, None, None),
+        };
 
         // Load NER token classifier if this is a NER model
         let ner_classifier = if is_ner {
@@ -3505,8 +3519,8 @@ impl ModelBackend for CandleBackend {
             None
         };
 
-        Ok(LoadedModel::Candle(Box::new(CandleModel {
-            dimensions,
+        Ok(LoadedModel::candle(CandleModel {
+            description,
             text,
             vision,
             audio,
@@ -3516,15 +3530,10 @@ impl ModelBackend for CandleBackend {
             projection_head,
             distribution_head,
             regression_scaler,
-            regression_form,
             id2label,
             ner_classifier,
-            compute_precision: effective_precision,
-            content_digest,
-            fingerprint,
-            quantization: gguf_quantization,
             kernel_admission: std::sync::Mutex::default(),
-        })))
+        }))
     }
 
     fn estimate_memory(&self, resolved: &ResolvedModel) -> usize {
@@ -4673,13 +4682,32 @@ mod ner_nonfinite_logit_tests {
         let bias = Tensor::zeros((2,), DType::F32, &device).unwrap();
         let ner_classifier = Linear::new(weight, Some(bias));
 
-        CandleModel {
+        let description = Arc::new(ModelDescription {
+            identity: jammi_db::store::manifest::ModelIdentity {
+                model_id: "synthetic-ner".to_string(),
+                backend: "candle".to_string(),
+                compute_precision: jammi_numerics::ComputePrecision::F32,
+                // No real model directory backs this synthetic fixture, so
+                // there is nothing to hash — an arbitrary fixed placeholder
+                // is fine here (no test in this module asserts on the
+                // digest value).
+                content_digest: ModelContentDigest::Sha256("test-fixture-digest".into()),
+                quantization: None,
+            },
             dimensions: ModelDimensions {
                 hidden_size: HIDDEN,
                 num_layers: 1,
                 num_attention_heads: 1,
                 intermediate_size: HIDDEN,
             },
+            configured_precision: jammi_numerics::ComputePrecision::F32,
+            saved_adapter: None,
+            // No real model directory backs this fixture either, so there is
+            // nothing to fingerprint — `empty()` probes vacuously fresh.
+            fingerprint: ModelFingerprint::empty(),
+        });
+        CandleModel {
+            description,
             text: Some(Box::new(FixedHiddenForward {
                 max_seq_len: 128,
                 hidden_size: HIDDEN,
@@ -4693,18 +4721,8 @@ mod ner_nonfinite_logit_tests {
             projection_head: None,
             distribution_head: None,
             regression_scaler: None,
-            regression_form: None,
             id2label: Some(id2label),
             ner_classifier: Some(ner_classifier),
-            compute_precision: jammi_numerics::ComputePrecision::F32,
-            // No real model directory backs this synthetic fixture, so there
-            // is nothing to hash — an arbitrary fixed placeholder is fine
-            // here (no test in this module asserts on the digest value).
-            content_digest: ModelContentDigest::Sha256("test-fixture-digest".into()),
-            // No real model directory backs this fixture either, so there is
-            // nothing to fingerprint — `empty()` probes vacuously fresh.
-            fingerprint: ModelFingerprint::empty(),
-            quantization: None,
             kernel_admission: std::sync::Mutex::default(),
         }
     }

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use jammi_ai::fine_tune::{
     data::TrainingDataLoader, trainer::compute_lr, FineTuneConfig, FineTuneMethod, LrSchedule,
 };
-use jammi_ai::model::ModelTask;
+use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::LoraLinear;
@@ -440,10 +440,39 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
             .await
             .unwrap(),
     );
+    // Cold, the fine-tuned model is described from its published bundle —
+    // the identity the environment records, at the adapter's own persisted
+    // backbone precision — without materializing it; the cold serve below
+    // then materializes exactly that description.
+    let fine_tuned = ModelSource::parse(job.model_id());
+    let described = cold_session
+        .model_cache()
+        .describe(&fine_tuned, ModelTask::TextEmbedding, None)
+        .await
+        .expect("the published fine-tuned model describes cold");
+    assert!(
+        cold_session
+            .model_cache()
+            .resident_models_for_test()
+            .await
+            .is_empty(),
+        "describing the fine-tuned model materialized it"
+    );
     let cold_embedding = cold_session
         .encode_text_query(job.model_id(), "quantum computing")
         .await
         .expect("the fine-tuned BERT model resolves and serves cold");
+    let served = cold_session
+        .model_cache()
+        .get_or_load(&fine_tuned, ModelTask::TextEmbedding, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        served.model.description().identity(),
+        described.identity(),
+        "the cold serve materialized the description the cold session read"
+    );
+    drop(served);
 
     let cold_vs_base_diff: f32 = base_embedding
         .iter()

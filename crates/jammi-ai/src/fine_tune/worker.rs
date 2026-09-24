@@ -3875,11 +3875,7 @@ impl JobWorker {
             .await
             .map_err(WorkerJobError::from)?;
         let base_model_arc = Arc::clone(&guard.model);
-        let hidden_size = guard.model.embedding_dim().ok_or_else(|| {
-            WorkerJobError::Failed(JammiError::FineTune(
-                "Base model does not support embeddings".into(),
-            ))
-        })?;
+        let hidden_size = guard.model.description().embedding_dim();
         drop(guard);
 
         // Test hook: a no-op in production (the whole call
@@ -5362,7 +5358,7 @@ impl FineTuneMaterialization {
 /// The dtype folded is `common.config.backbone_dtype` — the SAME value
 /// `probe_acceleration`'s own `dtype_class_of(backbone_dtype)` call resolves
 /// the acceleration report's dtype class from — never
-/// `guard.model.compute_precision()` (the loaded model's own ON-DISK weight
+/// `guard.model.description().compute_precision()` (the loaded model's own ON-DISK weight
 /// dtype, a DIFFERENT axis: the trainer's `VarBuilder` and LoRA adapters are
 /// always `F32` regardless of `backbone_dtype`, and `guard.model` can be
 /// loaded at `F32` while `backbone_dtype` casts the forward activations to
@@ -5419,10 +5415,7 @@ async fn fine_tune_materialization(
     );
     let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),
-        vec![guard
-            .model
-            .identity(&model_source)
-            .map_err(WorkerJobError::from)?],
+        vec![guard.model.description().identity().clone()],
     )
     .with_kernel_admission_profile(kernel_admission_profile);
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {
@@ -6748,9 +6741,7 @@ async fn member_rank_body(
         Err(e) => return failed(e.to_string()),
     };
     let base_model_arc = Arc::clone(&guard.model);
-    let Some(hidden_size) = guard.model.embedding_dim() else {
-        return failed("Base model does not support embeddings".into());
-    };
+    let hidden_size = guard.model.description().embedding_dim();
     drop(guard);
 
     let device_config = session.device_config().clone();

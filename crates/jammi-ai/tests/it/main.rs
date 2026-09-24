@@ -15,6 +15,7 @@ mod context_predictor;
 mod context_set;
 mod cookbook;
 mod cpu_budget;
+mod describe;
 mod distributional;
 mod e2e_inference;
 mod encoder_adapters;

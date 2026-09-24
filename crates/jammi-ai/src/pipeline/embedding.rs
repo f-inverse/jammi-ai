@@ -12,37 +12,35 @@ use crate::operator::inference_exec::{plan_inference, InferenceSpec};
 use crate::operator::numbered_input_exec::RowOrder;
 use crate::session::InferenceSession;
 
-/// The loaded model's identity for one embedding definition: the model
+/// The described model's identity for one embedding definition: the model
 /// source, its embedding width, and the output-affecting environment the
 /// definition hash folds (backend, precision, content digest, quantization,
-/// device). Loaded once per producer call — the base embed and every refresh
-/// build their descriptor + environment from this one place.
+/// device). Described once per producer call, never loaded — the base embed
+/// and every refresh build their descriptor + environment from this one
+/// place, and a plan placed elsewhere leaves this process holding no
+/// weights.
 pub(crate) struct EmbeddingDefinition {
     pub(crate) model_source: ModelSource,
     pub(crate) embedding_dim: usize,
     pub(crate) env: jammi_db::store::manifest::MaterializationEnv,
 }
 
-/// Load `model_id` for `task` and build its [`EmbeddingDefinition`].
+/// Describe `model_id` for `task` and build its [`EmbeddingDefinition`].
 pub(crate) async fn embedding_definition(
     session: &InferenceSession,
     model_id: &str,
     task: ModelTask,
 ) -> Result<EmbeddingDefinition> {
     let model_source = ModelSource::parse(model_id);
-    let guard = session
+    let description = session
         .model_cache()
-        .get_or_load(&model_source, task, None)
+        .describe(&model_source, task, None)
         .await?;
-    let embedding_dim = guard
-        .model
-        .embedding_dim()
-        .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
+    let embedding_dim = description.embedding_dim();
     let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),
-        vec![guard.model.identity(&model_source)?],
+        vec![description.identity().clone()],
     );
-    drop(guard);
     Ok(EmbeddingDefinition {
         model_source,
         embedding_dim,
@@ -57,9 +55,9 @@ pub(crate) async fn embedding_definition(
 /// in-process and a cluster submitter ships it, so both write the same bytes
 /// by construction (one plan-building site).
 ///
-/// `embedding_dim` and `model_source` are the caller's own (already resolved
-/// via `embedding_definition`) rather than re-derived here, so this
-/// function never re-loads the model.
+/// `embedding_dim` and `model_source` are the caller's own (already
+/// described via `embedding_definition`) rather than re-derived here, so
+/// this function never touches the model.
 pub async fn build_embedding_plan(
     session: &InferenceSession,
     source_id: &str,
@@ -152,8 +150,9 @@ impl<'a> EmbeddingPipeline<'a> {
         cache: CachePolicy,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
-        // Pre-load the model: its embedding width and the output-affecting
-        // environment the definition hash folds.
+        // Describe the model: its embedding width and the output-affecting
+        // environment the definition hash folds. Nothing is loaded here —
+        // the plan's executing process materializes the weights.
         let EmbeddingDefinition {
             model_source,
             embedding_dim,
@@ -162,8 +161,8 @@ impl<'a> EmbeddingPipeline<'a> {
             .instrument(tracing::debug_span!("embed.definition"))
             .await?;
 
-        // The materialization contract is knowable here — the model is loaded
-        // (so `embedding_dim` is fixed) and the source is named — so the cache
+        // The materialization contract is knowable here — the model is
+        // described (so `embedding_dim` is fixed) and the source is named — so the cache
         // probe keys on the identical definition + anchors the funnel records at
         // finalize. The sole input is the raw source with no version surface →
         // `UnpinnedAtInstant`, so the probe is honestly always a miss.

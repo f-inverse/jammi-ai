@@ -324,6 +324,39 @@ async fn gaussian_regression_separates_groups_through_public_path() {
 
     let model_source = ModelSource::parse(job.model_id());
 
+    // The fine-tuned model is described from its published bundle — the
+    // regression head's persisted form, and the identity the environment
+    // records — as the load reports it, and describing materializes
+    // nothing.
+    let described = session
+        .model_cache()
+        .describe(&model_source, ModelTask::Regression, None)
+        .await
+        .expect("a published regression head describes");
+    assert_eq!(
+        described.regression_form(),
+        Some(&jammi_ai::inference::adapter::DistributionForm::Gaussian)
+    );
+    assert!(
+        !session
+            .model_cache()
+            .resident_models_for_test()
+            .await
+            .contains(&jammi_ai::model::ModelId::from(&model_source)),
+        "describing the fine-tuned model materialized it"
+    );
+    let loaded = session
+        .model_cache()
+        .get_or_load(&model_source, ModelTask::Regression, None)
+        .await
+        .unwrap();
+    assert_eq!(loaded.model.description().identity(), described.identity());
+    assert_eq!(
+        loaded.model.description().regression_form(),
+        described.regression_form()
+    );
+    drop(loaded);
+
     // The served Gaussian columns must be present (break #4: a Gaussian-form head
     // serves predicted_mean/predicted_std, not a mis-decode).
     let results_a = session

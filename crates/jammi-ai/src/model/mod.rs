@@ -21,8 +21,7 @@ use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use backend::candle::CandleModel;
-use backend::ort::OrtModel;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::inference::adapter::BackendOutput;
@@ -354,71 +353,184 @@ impl ModelDimensions {
     }
 }
 
-/// A model loaded into memory, ready for inference.
-pub enum LoadedModel {
-    /// Loaded via the Candle backend (safetensors weights).
-    Candle(Box<CandleModel>),
-    /// Loaded via the ORT backend (ONNX weights).
-    Ort(OrtModel),
+/// The saved fine-tune adapter a resolved model carries: its
+/// `adapter_config.json`, parsed, and the path of its `adapter.safetensors`.
+/// Read once, when the model is described; materializing installs it.
+pub(crate) struct SavedAdapterFiles {
+    pub(crate) config: crate::fine_tune::target::SavedAdapter,
+    pub(crate) weights: PathBuf,
+}
+
+/// What planning a model's run needs to know about it, read from its
+/// files and configuration without allocating a tensor: the identity a
+/// materialization's environment records, the width of its output, and
+/// the form of its regression head. A backend computes it
+/// ([`backend::ModelBackend::describe`]) before it materializes the
+/// weights, and a loaded model is materialized FROM a description and
+/// reports it unchanged — so a submitter that plans against a description
+/// and the executing process that records what ran can never disagree.
+pub struct ModelDescription {
+    /// The identity a materialization's environment records for this
+    /// model on the device it was described for.
+    pub(crate) identity: jammi_db::store::manifest::ModelIdentity,
+    /// The architecture's geometry, read from `config.json`.
+    pub(crate) dimensions: ModelDimensions,
+    /// The precision the configuration resolves for this model on the
+    /// described device — `config.json`'s own `compute_precision`, else the
+    /// device's default — which every head materializes at. The identity's
+    /// precision is the backbone's: the same, unless a saved encoder
+    /// adapter's persisted `backbone_dtype` won.
+    pub(crate) configured_precision: jammi_numerics::ComputePrecision,
+    /// The saved fine-tune adapter, when the resolved model carries one.
+    pub(crate) saved_adapter: Option<SavedAdapterFiles>,
+    /// The stat-only staleness fingerprint of the files the identity's
+    /// content digest was hashed from. See
+    /// [`backend::candle::ModelFingerprint`].
+    pub(crate) fingerprint: backend::candle::ModelFingerprint,
+}
+
+impl ModelDescription {
+    /// This model's identity as a materialization's environment records it
+    /// — the one construction a submitter's prediction and the executing
+    /// process's record both use.
+    pub fn identity(&self) -> &jammi_db::store::manifest::ModelIdentity {
+        &self.identity
+    }
+
+    /// The backend kind that runs this model, as the canonical lowercase
+    /// token the materialization contract records (`candle`).
+    pub fn backend_kind(&self) -> &str {
+        &self.identity.backend
+    }
+
+    /// The compute precision the model's backbone runs at — the resolved
+    /// per-model `config.json` override or the device's default, unless a
+    /// saved encoder adapter's persisted `backbone_dtype` won. Output-
+    /// affecting (an `F16` backbone emits different bytes than `F32`), so
+    /// the materialization contract folds it into the identity.
+    pub fn compute_precision(&self) -> jammi_numerics::ComputePrecision {
+        self.identity.compute_precision
+    }
+
+    /// The model's content digest: a SHA-256 fold of the resolved
+    /// directory's config / `1_Pooling/config.json` / tokenizer / weights
+    /// bytes (`backend::candle::compute_model_content_digest`). Output-
+    /// affecting — two directories that share one `model_id` but differ in
+    /// any of those bytes must never collide on one `DefinitionHash` — so
+    /// the materialization contract folds it into the identity.
+    pub fn content_digest(&self) -> &jammi_db::store::manifest::ModelContentDigest {
+        &self.identity.content_digest
+    }
+
+    /// The GGUF/k-quant weight-storage format of the model's backbone —
+    /// `Some` (the MODAL quantized dtype among the matmul-site tensors,
+    /// tie-broken by [`jammi_numerics::WeightQuantization`]'s own `Ord`)
+    /// for a `model.gguf` checkpoint, `None` for safetensors. Output-
+    /// affecting, so the materialization contract folds it into the
+    /// identity.
+    pub fn quantization(&self) -> Option<jammi_numerics::WeightQuantization> {
+        self.identity.quantization
+    }
+
+    /// The architecture's geometry, for memory estimation and output sizing.
+    pub fn dimensions(&self) -> &ModelDimensions {
+        &self.dimensions
+    }
+
+    /// Output dimensionality of the model's embedding head.
+    ///
+    /// For BERT-family encoders this is the transformer's `hidden_size`.
+    /// For OpenCLIP-family models (vision and text towers) this is the
+    /// projected shared-latent `embed_dim` — the dimension the emitted
+    /// vectors carry and cross-modal cosine similarity is computed in, not
+    /// the per-tower hidden `width`.
+    pub fn embedding_dim(&self) -> usize {
+        self.dimensions.hidden_size
+    }
+
+    /// The persisted predictive-distribution form of a regression head
+    /// (`Gaussian` or `Quantile { levels }`), or `None` for a model that is
+    /// not a regression head. Serving selects the `Infer` output adapter on
+    /// it, so a quantile-trained head is served as quantile points, never
+    /// silently mis-decoded as a Gaussian `(mean, std)`.
+    pub fn regression_form(&self) -> Option<&crate::inference::adapter::DistributionForm> {
+        match self.saved_adapter.as_ref().map(|adapter| &adapter.config) {
+            Some(crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg)) => {
+                cfg.regression_form.as_ref()
+            }
+            _ => None,
+        }
+    }
+
+    /// Stat-only staleness probe of the files the identity was computed
+    /// from, re-`stat`ing (never re-reading) the same file set the digest
+    /// was hashed from and comparing `(len, mtime)` against the snapshot
+    /// taken when the description was computed.
+    ///
+    /// - `Ok(true)` — unchanged: the description still describes the files.
+    /// - `Ok(false)` — at least one fingerprinted file diverged: the caller
+    ///   must discard this description and describe again.
+    /// - `Err` — a fingerprinted file vanished or became unreadable: a
+    ///   typed refusal, never a silent "treat as fresh".
+    ///
+    /// `(len, mtime)` is a staleness TRIPWIRE, not a cryptographic
+    /// guarantee — a same-length, same-mtime content swap is invisible to
+    /// it. The digest, recomputed fresh on every re-description, remains
+    /// the sole attestation of the bytes that were hashed; this probe only
+    /// decides WHEN a re-description is triggered. The guarantee is BOUNDED
+    /// STALENESS, never per-hit freshness: `Ok(true)` proves the file set
+    /// was unchanged at the instant the probe ran, not that it stays so
+    /// while the caller goes on to use the description. See
+    /// [`backend::candle::ModelFingerprint`] for the narrow scope this
+    /// bound sits within.
+    pub(crate) fn probe_freshness(&self) -> Result<bool> {
+        self.fingerprint.probe()
+    }
+}
+
+/// A model materialized in memory, ready for inference: the weights of a
+/// described model, resident on a device. Every fact a materialization
+/// records about it is its [`ModelDescription`], unchanged from the one it
+/// was materialized from.
+pub struct LoadedModel {
+    candle: Box<CandleModel>,
 }
 
 impl LoadedModel {
-    /// This model's identity as a materialization's environment records it,
-    /// loaded from `source` — the one construction a producer's prediction
-    /// and the executing process's record both use.
-    pub fn identity(
-        &self,
-        source: &ModelSource,
-    ) -> Result<jammi_db::store::manifest::ModelIdentity> {
-        Ok(jammi_db::store::manifest::ModelIdentity {
-            model_id: source.to_string(),
-            backend: self.backend_kind().to_string(),
-            compute_precision: self.compute_precision(),
-            content_digest: self.content_digest()?,
-            quantization: self.quantization(),
-        })
-    }
-
-    /// The backend kind that loaded this model, as the canonical lowercase token
-    /// the materialization contract records in `ModelIdentity.backend`. A loaded
-    /// model is always a native backend (`candle` / `ort`); the `http` backend
-    /// serves remotely and is never a `LoadedModel`.
-    pub fn backend_kind(&self) -> &'static str {
-        match self {
-            LoadedModel::Candle(_) => "candle",
-            LoadedModel::Ort(_) => "ort",
+    pub(crate) fn candle(model: CandleModel) -> Self {
+        Self {
+            candle: Box::new(model),
         }
     }
 
-    /// The effective inference compute precision this model was loaded at —
-    /// the resolved per-model `config.json` override, or the global
-    /// `GpuConfig::compute_precision` default. Output-affecting (an `F16`
-    /// backbone emits different embedding/logit bytes than `F32`), so the
-    /// materialization contract folds it into `ModelIdentity.compute_precision`
-    /// alongside `backend_kind`. The ORT backend does not yet select a compute
-    /// precision, so it always reports `F32`.
-    pub fn compute_precision(&self) -> jammi_numerics::ComputePrecision {
-        match self {
-            LoadedModel::Candle(m) => m.compute_precision,
-            LoadedModel::Ort(_) => jammi_numerics::ComputePrecision::F32,
-        }
+    /// The description this model was materialized from.
+    pub fn description(&self) -> &Arc<ModelDescription> {
+        self.candle.description()
+    }
+
+    /// The backend's own model, for a consumer inside this crate that
+    /// drives a tower directly (the fine-tune trainer).
+    pub(crate) fn backend_model(&self) -> &CandleModel {
+        &self.candle
+    }
+
+    /// The tokenizer the text forward turns content into token ids with,
+    /// or `None` for a model with no text tower.
+    pub fn tokenizer(&self) -> Option<&tokenizer::TokenizerWrapper> {
+        self.candle.tokenizer.as_ref()
     }
 
     /// The pooling strategy the loaded text-embedding forward path ACTUALLY
     /// resolved to and applies — the SAME strategy
     /// `backend::candle::CandleTextForward::forward_pooled` pools with, read
-    /// via `CandleModel::resolved_pooling` (unit-62 F-5': a bench/report
-    /// consumer must read this off the loaded model, never transcribe a
-    /// fixture-declared constant that could silently drift from what actually
-    /// served). `None` when this loaded model has no pooling concept at all
-    /// (a CLAP audio tower, an OpenCLIP text tower whose output is already
-    /// pooled-and-projected, a classification head) or for the ORT backend
-    /// (which does not yet resolve a text-embedding pooling wrapper).
+    /// via `CandleModel::resolved_pooling`: a bench/report consumer must
+    /// read this off the loaded model, never transcribe a fixture-declared
+    /// constant that could silently drift from what actually served. `None`
+    /// when this model has no pooling concept at all (a CLAP audio tower,
+    /// an OpenCLIP text tower whose output is already pooled-and-projected,
+    /// a classification head).
     pub fn resolved_pooling(&self) -> Option<jammi_encoders::Pooling> {
-        match self {
-            LoadedModel::Candle(m) => m.resolved_pooling(),
-            LoadedModel::Ort(_) => None,
-        }
+        self.candle.resolved_pooling()
     }
 
     /// The token-sequence bound the loaded text forward truncates its
@@ -426,216 +538,66 @@ impl LoadedModel {
     /// A consumer that counts the tokens a serve actually forwards must
     /// truncate at this bound, read off the loaded model, never at a value
     /// re-derived from `config.json`. `None` when the loaded model has no
-    /// text forward (a CLAP audio tower) or for the ORT backend.
+    /// text forward (a CLAP audio tower).
     pub fn max_sequence_length(&self) -> Option<usize> {
-        match self {
-            LoadedModel::Candle(m) => m.max_sequence_length(),
-            LoadedModel::Ort(_) => None,
-        }
+        self.candle.max_sequence_length()
     }
 
     /// Every kernel admission decision this model's forwards have taken
-    /// since it was loaded — `CandleModel::kernel_admission`. The ORT
-    /// backend dispatches no jammi kernel, so its ledger is empty.
+    /// since it was loaded — `CandleModel::kernel_admission`.
     pub fn kernel_admission(&self) -> jammi_kernels::admission::AdmissionLedger {
-        match self {
-            LoadedModel::Candle(m) => m.kernel_admission(),
-            LoadedModel::Ort(_) => jammi_kernels::admission::AdmissionLedger::default(),
-        }
-    }
-
-    /// The model's content digest: a SHA-256 fold of the
-    /// resolved model directory's config / `1_Pooling/config.json` /
-    /// tokenizer / weights bytes, computed once at load time by
-    /// `backend::candle::compute_model_content_digest`. Output-affecting
-    /// (two directories that share one `model_id` but differ in any of those
-    /// bytes must never collide on one `DefinitionHash`), so the
-    /// materialization contract folds it into `ModelIdentity.content_digest`
-    /// alongside `backend_kind` / `compute_precision`.
-    ///
-    /// The ORT backend never actually reaches a loaded state today
-    /// (`OrtBackend::load` unconditionally errors — see `forward`'s identical
-    /// stance below) — there is no local-directory digest to report for it,
-    /// and `ModelContentDigest::Unavailable` is reserved for the
-    /// external-producer import path (a categorically different "no local
-    /// files at all" case), so this returns a typed refusal rather than
-    /// misusing that reason.
-    pub fn content_digest(&self) -> Result<jammi_db::store::manifest::ModelContentDigest> {
-        match self {
-            LoadedModel::Candle(m) => Ok(m.content_digest.clone()),
-            LoadedModel::Ort(_) => Err(JammiError::Inference(
-                "ORT content digest not available in this build".into(),
-            )),
-        }
-    }
-
-    /// The GGUF/k-quant weight-storage format this model's backbone was
-    /// loaded from — `Some` (the MODAL quantized dtype among the backbone's
-    /// matmul-site tensors, tie-broken by [`jammi_numerics::WeightQuantization`]'s
-    /// own `Ord`) for a `model.gguf` load, `None` for every safetensors/ONNX
-    /// load. Output-affecting (a `Q4K` backbone emits different
-    /// bytes than an `F32` one), so the materialization contract folds it
-    /// into `ModelIdentity.quantization` alongside `backend_kind` /
-    /// `compute_precision` / `content_digest`. The ORT backend never loads a
-    /// GGUF file (see `WeightsFormat::Gguf`'s own doc), so it always
-    /// reports `None`.
-    pub fn quantization(&self) -> Option<jammi_numerics::WeightQuantization> {
-        match self {
-            LoadedModel::Candle(m) => m.quantization,
-            LoadedModel::Ort(_) => None,
-        }
-    }
-
-    /// Stat-only warm-cache staleness probe. `ModelCache::get_or_load`'s
-    /// fast path calls this before handing out the cached `Arc<LoadedModel>` —
-    /// re-`stat`ing (never re-reading) the same file set `content_digest` was
-    /// hashed from at load time and comparing `(len, mtime)` against the
-    /// load-time snapshot.
-    ///
-    /// - `Ok(true)` — unchanged (or nothing local to check — see below):
-    ///   serve from cache.
-    /// - `Ok(false)` — at least one fingerprinted file diverged: the caller
-    ///   must evict the entry and reload rather than serve.
-    /// - `Err` — a fingerprinted file vanished or became unreadable between
-    ///   load and this probe: a typed refusal, never a silent "treat as
-    ///   fresh".
-    ///
-    /// **Honest residual** (see `backend::candle::ModelFingerprint`'s own
-    /// doc): `(len, mtime)` is a staleness TRIPWIRE, not a cryptographic
-    /// guarantee — a same-length, same-mtime content swap is invisible to
-    /// it. `content_digest`, recomputed fresh on every actual reload, remains
-    /// the sole authoritative attestation of the bytes that were hashed;
-    /// this probe only decides WHEN a reload is triggered.
-    ///
-    /// **The guarantee this provides is BOUNDED STALENESS, never per-hit
-    /// freshness.** A call
-    /// that reports `Ok(true)` proves this file set was unchanged AT THE
-    /// INSTANT this probe ran — not that the `Arc<LoadedModel>` the caller
-    /// then goes on to use stays fresh for the duration of that use.
-    /// `ModelCache::get_or_load`'s returned [`ModelGuard`] is never
-    /// revalidated again after this call returns: a mutation landing between
-    /// this probe and the guard's actual forward pass (or landing during a
-    /// long-held guard) is a TOCTOU window this type does not — and
-    /// structurally cannot, being `stat`-only and synchronous with a single
-    /// call — close. Treat every guard as "fresh as of load or last warm-hit
-    /// probe", never "fresh for as long as I hold it." See
-    /// `backend::candle::ModelFingerprint`'s doc for the narrow-contract
-    /// scope this bound additionally sits within (catalog rewrites, HF
-    /// revision moves and remote listings are entirely outside it).
-    ///
-    /// The ORT backend never actually reaches a loaded state today (see
-    /// `content_digest`'s doc), and more generally a backend whose
-    /// `content_digest` is `ModelContentDigest::Unavailable` (an
-    /// external-producer model with no local directory at all) has nothing
-    /// on disk that could go stale — for either, this vacuously reports
-    /// fresh rather than refusing, since "no local files to check" is not a
-    /// staleness condition.
-    pub(crate) fn probe_freshness(&self) -> Result<bool> {
-        match self {
-            LoadedModel::Candle(m) => m.fingerprint.probe(),
-            LoadedModel::Ort(_) => Ok(true),
-        }
+        self.candle.kernel_admission()
     }
 
     /// Estimate GPU memory for one inference batch.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
-        match self {
-            LoadedModel::Candle(m) => m.dimensions.estimate_activation_memory(batch_size, seq_len),
-            LoadedModel::Ort(m) => m.dimensions.estimate_activation_memory(batch_size, seq_len),
-        }
-    }
-
-    /// Output dimensionality of the model's embedding head, if known.
-    ///
-    /// For BERT-family encoders this is the transformer's `hidden_size`.
-    /// For OpenCLIP-family models (vision and text towers) this is the
-    /// projected shared-latent `embed_dim` — the dimension that vectors
-    /// emitted by `generate_text_embeddings`, `generate_image_embeddings`,
-    /// `encode_text_query`, and `encode_image_query` carry, and the
-    /// dimension that cross-modal cosine similarity is computed in. It is
-    /// not the per-tower hidden `width`; the in-tower hidden size is
-    /// projected through `visual.proj` / `text_projection` before the
-    /// embedding is exposed.
-    pub fn embedding_dim(&self) -> Option<usize> {
-        match self {
-            LoadedModel::Candle(m) => Some(m.dimensions.hidden_size),
-            LoadedModel::Ort(m) => Some(m.dimensions.hidden_size),
-        }
-    }
-
-    /// The persisted predictive-distribution form of a reloaded regression head
-    /// (`Gaussian` or `Quantile { levels }`), or `None` for a non-regression
-    /// model. Serving reads this to select the `Infer` output adapter so a
-    /// quantile-trained head is served as quantile points, never silently
-    /// mis-decoded as a Gaussian `(mean, std)`. The ORT backend has no
-    /// regression head, so it always reports `None`.
-    pub fn regression_form(&self) -> Option<&crate::inference::adapter::DistributionForm> {
-        match self {
-            LoadedModel::Candle(m) => m.regression_form(),
-            LoadedModel::Ort(_) => None,
-        }
+        self.description()
+            .dimensions()
+            .estimate_activation_memory(batch_size, seq_len)
     }
 
     /// The persisted scaler's σ_y for a reloaded regression head, or `None` for a
-    /// non-regression / no-scaler / ORT model. Serving reads this to scale a
+    /// non-regression / no-scaler model. Serving reads this to scale a
     /// Gaussian head's served σ from the z-space the loss trained (σ_z ≈ 1) back
     /// to raw units (`σ_y·σ_z`) — the σ-axis half of the de-standardise contract
     /// (the mean/quantile axes carry σ_y in the backend's affine).
     pub fn regression_std_scale(&self) -> Option<f32> {
-        match self {
-            LoadedModel::Candle(m) => m.regression_std_scale(),
-            LoadedModel::Ort(_) => None,
-        }
+        self.candle.regression_std_scale()
     }
 
     /// TEST-ONLY non-vacuity seam: zero a loaded regression head's trained LoRA
     /// `B` factor so it regresses to its zero-initialised base and emits the
     /// scaler offset `μ_y` for every input (the untrained-head behaviour). No-op
-    /// for a non-regression / ORT model. Used by the regression-surface tests to
+    /// for a non-regression model. Used by the regression-surface tests to
     /// prove their group-separation assertion collapses to ≈0 when the head
     /// carries no learned signal. See
-    /// [`super::backend::candle::CandleModel::zero_distribution_head_for_test`].
+    /// [`backend::candle::CandleModel::zero_distribution_head_for_test`].
     #[doc(hidden)]
     pub fn zero_distribution_head_for_test(&mut self) {
-        match self {
-            LoadedModel::Candle(m) => m.zero_distribution_head_for_test(),
-            LoadedModel::Ort(_) => {}
-        }
+        self.candle.zero_distribution_head_for_test();
     }
 
     /// The cost of every row of `content` under `task`: its length along the
     /// axis a forward pads. See [`CandleModel::row_costs`].
     pub fn row_costs(&self, content: &[ArrayRef], task: ModelTask) -> Result<Vec<u32>> {
-        match self {
-            LoadedModel::Candle(m) => m.row_costs(content, task),
-            LoadedModel::Ort(_) => Err(ort_unavailable()),
-        }
+        self.candle.row_costs(content, task)
     }
 
     /// The ladder a forward under `task` pads its rows on. See
     /// [`CandleModel::shape_ladder`].
     pub fn shape_ladder(&self, task: ModelTask) -> Result<jammi_numerics::ShapeLadder> {
-        match self {
-            LoadedModel::Candle(m) => m.shape_ladder(task),
-            LoadedModel::Ort(_) => Err(ort_unavailable()),
-        }
+        self.candle.shape_ladder(task)
     }
 
     /// The host half of a forward: prepare `content` for the device. See
     /// [`CandleModel::prepare`].
     pub fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> Result<PreparedInput> {
-        match self {
-            LoadedModel::Candle(m) => m.prepare(content, task),
-            LoadedModel::Ort(_) => Err(ort_unavailable()),
-        }
+        self.candle.prepare(content, task)
     }
 
     /// The device half of a forward: run the model over a prepared input.
     pub fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
-        match self {
-            LoadedModel::Candle(m) => m.forward_prepared(input),
-            LoadedModel::Ort(_) => Err(ort_unavailable()),
-        }
+        self.candle.forward_prepared(input)
     }
 
     /// [`Self::prepare`] then [`Self::forward_prepared`], with no device
@@ -643,10 +605,6 @@ impl LoadedModel {
     pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
         self.forward_prepared(self.prepare(content, task)?)
     }
-}
-
-fn ort_unavailable() -> JammiError {
-    JammiError::Inference("ORT forward pass not available in this build".into())
 }
 
 /// RAII guard that decrements ref count on drop.

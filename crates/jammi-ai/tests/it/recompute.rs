@@ -814,7 +814,7 @@ async fn a_pre_contract_table_is_not_recomputable() {
 /// `pipeline/recompute.rs`) re-invokes `EmbeddingPipeline::run`, which
 /// re-loads the model and recomputes its content digest fresh from the
 /// model directory's CURRENT bytes (`session.rs`/`pipeline/embedding.rs`
-/// thread `LoadedModel::content_digest()` into every `ModelIdentity` they
+/// thread `ModelDescription::content_digest()` into every `ModelIdentity` they
 /// build — there is no separate digest-threading code path inside
 /// `recompute.rs` itself to break). So a recompute run **after** the model
 /// directory was mutated in place must record a DIFFERENT `definition_hash`

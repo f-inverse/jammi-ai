@@ -288,12 +288,9 @@ pub trait OutputAdapter: Send + Sync {
 /// Create an adapter for a given task with model-derived dimensions.
 pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn OutputAdapter>> {
     match task {
-        ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
-            let dim = model.embedding_dim().ok_or_else(|| {
-                JammiError::Inference("Model does not report embedding dim".into())
-            })?;
-            Ok(Box::new(EmbeddingAdapter::new(dim)))
-        }
+        ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => Ok(
+            Box::new(EmbeddingAdapter::new(model.description().embedding_dim())),
+        ),
         ModelTask::Classification => Ok(Box::new(ClassificationAdapter)),
         ModelTask::Ner => Ok(Box::new(ner::NerAdapter)),
         // A regression model serves the form its head was trained for, read
@@ -305,7 +302,7 @@ pub fn create_adapter(task: ModelTask, model: &LoadedModel) -> Result<Box<dyn Ou
         // Gaussian `(mean, std)` on the public `Infer` read path. A regression
         // head saved without a form (none today) falls back to Gaussian, the
         // density-bearing core form.
-        ModelTask::Regression => match model.regression_form() {
+        ModelTask::Regression => match model.description().regression_form() {
             Some(DistributionForm::Quantile { levels }) => {
                 Ok(Box::new(DistributionAdapter::quantile(levels.clone())?))
             }

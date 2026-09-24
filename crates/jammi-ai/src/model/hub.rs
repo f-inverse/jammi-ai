@@ -24,7 +24,7 @@
 //!
 //! If none of the four resolves (no config, no `HF_HUB_CACHE`, no `HF_HOME`,
 //! and no home directory — `HOME`/`USERPROFILE` unset) this is a typed
-//! [`JammiError::Config`], **never** the panic `hf_hub::Cache::default()`
+//! [`jammi_db::error::JammiError::Config`], **never** the panic `hf_hub::Cache::default()`
 //! raises in the same situation.
 //!
 //! **Endpoint:**

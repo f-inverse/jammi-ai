@@ -1091,7 +1091,7 @@ impl QueryContext {
     pub async fn sql(&self, sql: &str) -> DfResult<DataFrame> {
         let plan = self.0.state().create_logical_plan(sql).await?;
         self.0
-            .execute_logical_plan(StatementClass::of(plan).into_plan())
+            .execute_logical_plan(StatementClass::of(plan)?.into_plan())
             .await
     }
 

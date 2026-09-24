@@ -273,6 +273,74 @@ async fn scoped_session_sees_own_plus_global(backend: BackendKind) {
     assert_eq!(values, vec![100, 200]);
 }
 
+/// A tenant rewrites only its own rows: an unfiltered UPDATE and DELETE
+/// leave the global rows it reads, and another tenant's rows, untouched.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_tenant_rewrites_only_its_own_rows(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let widgets = format!("widgets_{}", unique_suffix());
+    let (tenant_a, tenant_b) = (fresh_tenant(), fresh_tenant());
+
+    let global = make_test_session(backend, dir.path()).await;
+    register_widgets(&global, &widgets).await;
+    let insert = |id: i64, name: &str| {
+        format!("INSERT INTO mutable.public.{widgets} (id, name) VALUES ({id}, '{name}')")
+    };
+    global.sql(&insert(1, "global")).await.unwrap();
+    let session_a = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_a);
+    session_a.sql(&insert(2, "a")).await.unwrap();
+    let session_b = make_test_session(backend, dir.path())
+        .await
+        .with_tenant(tenant_b);
+    session_b.sql(&insert(3, "b")).await.unwrap();
+
+    session_a
+        .sql(&format!(
+            "UPDATE mutable.public.{widgets} SET name = 'renamed'"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&session_a, &widgets).await,
+        vec!["global".to_string(), "renamed".to_string()]
+    );
+
+    session_a
+        .sql(&format!("DELETE FROM mutable.public.{widgets}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&session_a, &widgets).await,
+        vec!["global".to_string()]
+    );
+    assert_eq!(
+        names(&session_b, &widgets).await,
+        vec!["global".to_string(), "b".to_string()]
+    );
+}
+
+/// The `name` column a session reads from `widgets`, ordered by id.
+async fn names(session: &JammiSession, widgets: &str) -> Vec<String> {
+    let rows = session
+        .sql(&format!(
+            "SELECT name FROM mutable.public.{widgets} ORDER BY id"
+        ))
+        .await
+        .unwrap();
+    rows.iter()
+        .flat_map(|b| {
+            let names = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..names.len())
+                .map(|i| names.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Tenant binding persists across multiple queries on the same session.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]

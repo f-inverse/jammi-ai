@@ -1,0 +1,22 @@
+{
+  "populated_rows": {
+    "tol": 0.0,
+    "value": 177.0
+  },
+  "top_subject_total": {
+    "tol": 0.0,
+    "value": 798.0
+  },
+  "total_in_degree": {
+    "tol": 0.0,
+    "value": 1566.0
+  },
+  "upserted_rows": {
+    "tol": 0.0,
+    "value": 208.0
+  },
+  "withdrawn_citations": {
+    "tol": 0.0,
+    "value": 10.0
+  }
+}

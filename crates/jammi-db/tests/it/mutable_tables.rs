@@ -148,6 +148,140 @@ async fn datafusion_insert_then_scan_round_trip(backend: BackendKind) {
     assert_eq!(names[2], "gamma");
 }
 
+/// `(id, name, score)` rows of `table`, ordered by id.
+async fn widget_rows(
+    session: &jammi_db::session::JammiSession,
+    table: &str,
+) -> Vec<(i64, String, Option<f64>)> {
+    let batches = session
+        .sql(&format!(
+            "SELECT id, name, score FROM mutable.public.{table} ORDER BY id"
+        ))
+        .await
+        .unwrap();
+    let batch = arrow::compute::concat_batches(&widget_schema(), &batches).unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let scores = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .map(|i| {
+            let score = (!scores.is_null(i)).then(|| scores.value(i));
+            (ids.value(i), names.value(i).to_string(), score)
+        })
+        .collect()
+}
+
+/// The `count` a DML statement answers with.
+async fn affected(session: &jammi_db::session::JammiSession, statement: &str) -> u64 {
+    let batches = session.sql(statement).await.unwrap();
+    batches[0]
+        .column_by_name("count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap()
+        .value(0)
+}
+
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_delete_and_replace_rewrite_rows_in_place(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let id = unique_id("widgets");
+    let table = id.as_str();
+    let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{table} (id, name, score) VALUES \
+             (1, 'alpha', 0.5), (2, 'beta', 1.5), (3, 'gamma', 2.5), (4, 'delta', NULL)"
+        ))
+        .await
+        .unwrap();
+
+    // An UPDATE evaluates its assignment against each matched row's own values.
+    let updated = affected(
+        &session,
+        &format!("UPDATE mutable.public.{table} SET score = score * 10 WHERE score > 1"),
+    )
+    .await;
+    assert_eq!(updated, 2, "rows 2 and 3 match; the NULL score does not");
+
+    let deleted = affected(
+        &session,
+        &format!("DELETE FROM mutable.public.{table} WHERE name = 'gamma'"),
+    )
+    .await;
+    assert_eq!(deleted, 1);
+
+    // REPLACE INTO upserts by primary key: row 1 is replaced, row 5 is new.
+    let replaced = affected(
+        &session,
+        &format!(
+            "REPLACE INTO mutable.public.{table} (id, name, score) VALUES \
+             (1, 'alpha', 9.0), (5, 'epsilon', 5.0)"
+        ),
+    )
+    .await;
+    assert_eq!(replaced, 2);
+
+    // A plain INSERT of an existing key still fails, and fails whole.
+    assert!(session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{table} (id, name, score) VALUES (6, 'zeta', 0.0), (2, 'dup', 0.0)"
+        ))
+        .await
+        .is_err());
+
+    assert_eq!(
+        widget_rows(&session, table).await,
+        vec![
+            (1, "alpha".into(), Some(9.0)),
+            (2, "beta".into(), Some(15.0)),
+            (4, "delta".into(), None),
+            (5, "epsilon".into(), Some(5.0)),
+        ]
+    );
+
+    // A predicate beyond the table's own columns is refused before it can
+    // run, so it never rewrites rows it did not select.
+    assert!(session
+        .sql(&format!(
+            "DELETE FROM mutable.public.{table} WHERE id IN \
+             (SELECT id FROM mutable.public.{table} WHERE name = 'beta')"
+        ))
+        .await
+        .is_err());
+    assert_eq!(widget_rows(&session, table).await.len(), 4);
+
+    // An unfiltered DELETE empties the table.
+    assert_eq!(
+        affected(&session, &format!("DELETE FROM mutable.public.{table}")).await,
+        4
+    );
+    assert!(widget_rows(&session, table).await.is_empty());
+}
+
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",

@@ -260,6 +260,11 @@ pub fn map_engine_error(err: JammiError) -> Status {
         ),
         // No recorded materialization to describe — the absent-resource
         // convention `VersionUnavailable` follows.
+        // The caller asked to encode a query into a space no encoder produced.
+        JammiError::NoQueryEncoder { table, producer } => (
+            Code::InvalidArgument,
+            format!("table `{table}` has no query encoder: its vectors come from `{producer}`"),
+        ),
         JammiError::MissingManifest { table } => (
             Code::NotFound,
             format!("result table `{table}` has no recorded materialization manifest"),

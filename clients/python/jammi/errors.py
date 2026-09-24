@@ -45,6 +45,15 @@ class InvalidKey(InvalidArgument):
     """
 
 
+class NoQueryEncoder(InvalidArgument):
+    """A query could not be encoded into an embedding table's space: no engine
+    encoder produced its vectors (they come from a graph's structure, or were
+    imported). Query such a table by row key or with a vector you computed.
+    Refines :class:`InvalidArgument` (``INVALID_ARGUMENT`` on the remote
+    transport).
+    """
+
+
 class NonUniqueKey(InvalidArgument):
     """An incremental refresh found the same key more than once on a complete
     scan of the source (or of the parent version's current state).

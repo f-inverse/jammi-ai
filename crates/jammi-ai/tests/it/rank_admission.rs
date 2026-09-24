@@ -601,6 +601,7 @@ fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictor
         test_task_fraction: 0.3,
         min_task_count: 2,
         seed: 7,
+        embedding_table: None,
     }
 }
 

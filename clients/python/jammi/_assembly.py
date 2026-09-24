@@ -828,13 +828,16 @@ def build_context_predictor_request(
     seed: int = 0,
     model_id: Optional[str] = None,
     idempotency_key: str = "",
+    embedding_table: Optional[str] = None,
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for an amortized in-context predictor
     (S19, the `ContextPredictorSpec` arm) from the embed binding's flat kwargs.
 
     Validates the `architecture` vocabulary, builds the gaussian/quantile
     predictive head (with the `output='quantile' requires levels` check), and
-    defaults the model id to `{source}-context-predictor`.
+    defaults the model id to `{source}-context-predictor`. `embedding_table`
+    names the table the contexts are read from (the source's default when
+    unset); the resolved table is recorded with the trained predictor.
     """
     try:
         wire_architecture = _CONTEXT_ARCHITECTURE[architecture]
@@ -900,6 +903,8 @@ def build_context_predictor_request(
         min_task_count=min_task_count,
         seed=seed,
     )
+    if embedding_table is not None:
+        spec.embedding_table = embedding_table
     # The third and last `SubmitJobRequest` construction in this module, and the
     # one that carries NO `world_size`: that field is the wire form of the two
     # LoRA kinds' `TrainingCommon.world_size`, and `ContextPredictorSpec` folds

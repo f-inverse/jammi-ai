@@ -33,7 +33,7 @@
 //! ones — `Source`, `SourceNotFound`, `Model`, `ModelNotFound`, `ModelReferenced`, `Inference`,
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
-//! `NotRecomputable`, `MissingManifest`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
+//! `NotRecomputable`, `MissingManifest`, `NoQueryEncoder`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
 //! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`,
@@ -213,6 +213,12 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             JammiError::MissingManifest { table } => {
                 Variant::MissingManifest(pb::MissingManifestError {
                     table: table.clone(),
+                })
+            }
+            JammiError::NoQueryEncoder { table, producer } => {
+                Variant::NoQueryEncoder(pb::NoQueryEncoderError {
+                    table: table.clone(),
+                    producer: producer.clone(),
                 })
             }
             JammiError::InvalidKey { column, null_count } => {
@@ -416,6 +422,10 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
         Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
         Some(Variant::MissingManifest(e)) => JammiError::MissingManifest { table: e.table },
+        Some(Variant::NoQueryEncoder(e)) => JammiError::NoQueryEncoder {
+            table: e.table,
+            producer: e.producer,
+        },
         Some(Variant::InvalidKey(e)) => JammiError::InvalidKey {
             column: e.column,
             null_count: e.null_count,
@@ -1276,6 +1286,7 @@ mod tests {
             | JammiError::DependencyCycle { .. }
             | JammiError::NotRecomputable { .. }
             | JammiError::MissingManifest { .. }
+            | JammiError::NoQueryEncoder { .. }
             | JammiError::RowGone { .. }
             | JammiError::TenantMismatch { .. }
             | JammiError::LeaseLost { .. }
@@ -1381,6 +1392,10 @@ mod tests {
             },
             JammiError::MissingManifest {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::NoQueryEncoder {
+                table: "src1__text_embedding__graph_structure__20260101T000000_deadbeef".into(),
+                producer: "graph_structure".into(),
             },
             JammiError::InvalidKey {
                 column: "id".into(),

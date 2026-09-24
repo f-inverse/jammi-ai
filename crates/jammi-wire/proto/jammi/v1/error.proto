@@ -142,6 +142,10 @@ message JammiErrorDetail {
     // recorded materialization found no sidecar. The absent-resource
     // convention `VersionUnavailable` follows: maps to `NOT_FOUND`.
     MissingManifestError missing_manifest = 47;
+    // `JammiError::NoQueryEncoder { table, producer }` — a query could not be
+    // encoded into a table whose vectors no engine encoder produced. The
+    // caller's request names an impossible encode: `INVALID_ARGUMENT`.
+    NoQueryEncoderError no_query_encoder = 48;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -258,6 +262,12 @@ message NotRecomputableError {
 // describe.
 message MissingManifestError {
   string table = 1;
+}
+
+// `JammiError::NoQueryEncoder { table, producer }`.
+message NoQueryEncoderError {
+  string table = 1;
+  string producer = 2;
 }
 
 // `JammiError::Unavailable`: the resource that could not be served (`segment

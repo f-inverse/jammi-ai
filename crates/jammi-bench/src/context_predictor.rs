@@ -197,6 +197,7 @@ impl ContextPredictorSpec {
             test_task_fraction: self.test_task_fraction,
             min_task_count: self.min_task_count,
             seed: self.spec_seed,
+            embedding_table: None,
         })
     }
 }

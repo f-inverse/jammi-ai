@@ -112,6 +112,7 @@ impl InferenceService for InferenceServer {
         let options = ContextServeOptions {
             source: serve_source,
             split: req.split,
+            embedding_table: req.embedding_table,
         };
 
         let prediction: PredictionWithProvenance = scoped(&self.session, tenant, || async {

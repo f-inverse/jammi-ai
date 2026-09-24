@@ -1870,6 +1870,7 @@ class RemoteDatabase:
         seed: int = 0,
         model_id: Optional[str] = None,
         idempotency_key: str = "",
+        embedding_table: Optional[str] = None,
     ) -> RemoteJob:
         """Submit an amortized in-context predictor (S19) meta-training to the
         remote engine.
@@ -1902,6 +1903,7 @@ class RemoteDatabase:
             seed=seed,
             model_id=model_id,
             idempotency_key=idempotency_key,
+            embedding_table=embedding_table,
         )
         return self._submit_job(request)
 
@@ -1923,6 +1925,7 @@ class RemoteDatabase:
         edge_types: Optional[List[str]] = None,
         min_weight: Optional[float] = None,
         hybrid_ann_k: Optional[int] = None,
+        embedding_table: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Predict a target's distribution with a trained context predictor (S19).
 
@@ -1940,6 +1943,8 @@ class RemoteDatabase:
         )
         if split is not None:
             request.split = split
+        if embedding_table is not None:
+            request.embedding_table = embedding_table
         if edge_source is not None:
             gather = inference_pb2.EdgeGather(
                 edge_source=edge_source,

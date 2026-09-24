@@ -56,8 +56,8 @@ impl<'a> EvalRunner<'a> {
     /// walked iteratively down the (acyclic) lineage. A table whose vectors no
     /// engine encoder produced (structure embeddings, imported vectors) has no
     /// query encoder, so a text/image/audio golden cannot be run against it:
-    /// a typed [`JammiError::Eval`] naming the producer, never a model load
-    /// of the producer's tag.
+    /// the typed [`JammiError::NoQueryEncoder`] naming the producer, never a
+    /// model load of the producer's tag.
     ///
     /// Returns the encoder's canonical model id, as `result_tables.model_id`
     /// and the model catalog store it.
@@ -75,23 +75,14 @@ impl<'a> EvalRunner<'a> {
                     current = self
                         .session
                         .catalog()
-                        .get_result_table(&source_table)
-                        .await?
-                        .ok_or_else(|| {
-                            JammiError::Eval(format!(
-                                "table `{}` was propagated from `{source_table}`, which no \
-                                 longer resolves, so its query encoder is unknown",
-                                table.table_name
-                            ))
-                        })?;
+                        .resolve_embedding_table(&table.source_id, Some(&source_table))
+                        .await?;
                 }
                 other => {
-                    return Err(JammiError::Eval(format!(
-                        "table `{}` holds vectors no engine encoder produced (producer `{}`), so \
-                         a query golden cannot be encoded into its space",
-                        table.table_name,
-                        other.producer()
-                    )))
+                    return Err(JammiError::NoQueryEncoder {
+                        table: table.table_name.clone(),
+                        producer: other.producer().to_string(),
+                    })
                 }
             }
         }

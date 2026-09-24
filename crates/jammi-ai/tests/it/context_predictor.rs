@@ -144,6 +144,7 @@ pub(crate) fn spec(
         test_task_fraction: 0.25,
         min_task_count: 4,
         seed: 7,
+        embedding_table: None,
     }
 }
 
@@ -2094,4 +2095,84 @@ async fn context_predictor_reload_permission_fault_is_not_a_typed_model_error() 
          transport fault, StorageError::Io (never be folded into this surface's typed reload \
          refusal), got: {err:?}"
     );
+}
+
+/// A predictor reads its context from the table it trained on, not from
+/// whichever table is newest on the source. A newer table of the same width in
+/// a different vector space — here every feature negated — must not change a
+/// served prediction; naming that table explicitly does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_predictor_serves_from_the_table_it_trained_on() {
+    use jammi_ai::pipeline::context_predictor::PredictedDistribution;
+
+    let rows = linear_tasks(12, 16, 4242);
+    let (session, _dir) = session_with_meta_dataset(&rows).await;
+    let model_id = train(
+        &session,
+        &spec(
+            ContextArchitecture::AttnCnp,
+            PredictiveHead::Gaussian {
+                objective: GaussianObjective::Crps,
+            },
+        ),
+    )
+    .await;
+
+    let target = &rows[0].id;
+    let mean = |dist: PredictedDistribution| match dist {
+        PredictedDistribution::Gaussian { mean, .. } => mean,
+        other => panic!("a Gaussian head serves a Gaussian, got {other:?}"),
+    };
+    let serve = |options: ContextServeOptions| {
+        let session = Arc::clone(&session);
+        let model_id = model_id.clone();
+        async move {
+            let served = session
+                .load_context_predictor(&model_id, "fns", options)
+                .await
+                .unwrap();
+            session
+                .predict_with_context_predictor(&served, target)
+                .await
+                .unwrap()
+        }
+    };
+    let trained = mean(serve(ContextServeOptions::default()).await);
+
+    let flipped: Vec<Row> = rows
+        .iter()
+        .map(|r| Row {
+            id: r.id.clone(),
+            task: r.task.clone(),
+            x: r.x.iter().map(|v| -v).collect(),
+            y: r.y,
+        })
+        .collect();
+    meta_dataset::materialize_embeddings(
+        &session.result_store(),
+        session.context(),
+        "fns",
+        &flipped,
+    )
+    .await;
+    let newer = session
+        .catalog()
+        .resolve_embedding_table("fns", None)
+        .await
+        .unwrap()
+        .table_name;
+
+    assert_eq!(
+        mean(serve(ContextServeOptions::default()).await),
+        trained,
+        "a newer table on the training source must not move the served prediction"
+    );
+    let named = mean(
+        serve(ContextServeOptions {
+            embedding_table: Some(newer),
+            ..Default::default()
+        })
+        .await,
+    );
+    assert_ne!(named, trained, "a named table is the one served from");
 }

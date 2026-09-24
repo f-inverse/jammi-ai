@@ -2130,7 +2130,9 @@ impl InferenceSession {
                 source,
                 predictor_spec,
             } => Ok(TrainingJobLinks {
-                model_ref: self.context_predictor_base_model_pk(source).await?,
+                model_ref: self
+                    .context_predictor_base_model_pk(source, predictor_spec)
+                    .await?,
                 output_model_id: predictor_spec.model_id.clone(),
             }),
         }

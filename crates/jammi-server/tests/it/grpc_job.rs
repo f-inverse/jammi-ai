@@ -592,6 +592,7 @@ fn predictor_start_request() -> SubmitJobRequest {
                 test_task_fraction: 0.25,
                 min_task_count: 4,
                 seed: 7,
+                embedding_table: None,
             }),
         })),
         // The predictor carries its full budget in `predictor_spec`; no base

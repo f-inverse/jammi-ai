@@ -400,6 +400,7 @@ class EmbeddedBackend:
         edge_types: Optional[List[str]] = None,
         min_weight: Optional[float] = None,
         hybrid_ann_k: Optional[int] = None,
+        embedding_table: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Predict a target's distribution with a trained context predictor (S19)."""
         return self._native.predict_with_context_predictor(
@@ -418,6 +419,7 @@ class EmbeddedBackend:
             edge_types=edge_types,
             min_weight=min_weight,
             hybrid_ann_k=hybrid_ann_k,
+            embedding_table=embedding_table,
         )
 
     # --- Stateless conformal / RRF numerics (computed in-process) ---------------
@@ -739,6 +741,7 @@ class EmbeddedBackend:
         seed: int = 0,
         model_id: Optional[str] = None,
         idempotency_key: str = "",
+        embedding_table: Optional[str] = None,
     ):
         """Submit an amortized in-context predictor (S19) meta-training to the
         in-process engine.
@@ -773,6 +776,7 @@ class EmbeddedBackend:
             seed=seed,
             model_id=model_id,
             idempotency_key=idempotency_key,
+            embedding_table=embedding_table,
         )
         return self._native._start_training_proto(
             request.SerializeToString(), idempotency_key or None

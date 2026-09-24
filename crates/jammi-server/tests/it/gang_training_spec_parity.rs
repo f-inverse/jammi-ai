@@ -75,6 +75,7 @@ fn context_predictor_spec() -> TrainingSpec {
             test_task_fraction: 0.25,
             min_task_count: 2,
             seed: 7,
+            embedding_table: None,
         },
     }
 }

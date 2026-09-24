@@ -1290,12 +1290,16 @@ impl PyDatabase {
     /// The returned dict also carries `"source"` (`"ann"`/`"edges"`/`"hybrid"` —
     /// how the context was assembled) and `"context_ref"` (the context member
     /// keys), so a graph-conditioned prediction is never unattributed.
+    ///
+    /// `embedding_table` names the serving source's embedding table the context
+    /// is read from; unset on the training source it is the table the predictor
+    /// trained on, unset on another source that source's default table.
     #[pyo3(signature = (
         model_id, *, source, target_key, split = None,
         edge_source = None, edge_src_column = None, edge_dst_column = None,
         edge_type_column = None, edge_weight_column = None, edge_hops = None,
         edge_fanout = None, edge_direction = None, edge_types = None,
-        min_weight = None, hybrid_ann_k = None,
+        min_weight = None, hybrid_ann_k = None, embedding_table = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn predict_with_context_predictor(
@@ -1316,6 +1320,7 @@ impl PyDatabase {
         edge_types: Option<Vec<String>>,
         min_weight: Option<f64>,
         hybrid_ann_k: Option<usize>,
+        embedding_table: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         use jammi_ai::pipeline::context_predictor::PredictedDistribution;
@@ -1344,6 +1349,7 @@ impl PyDatabase {
         let options = ContextServeOptions {
             source: serve_source,
             split,
+            embedding_table,
         };
 
         let served = crate::released(

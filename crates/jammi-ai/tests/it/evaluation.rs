@@ -1033,10 +1033,10 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
         )
         .await
     {
-        Err(JammiError::Eval(message)) => assert!(
-            message.contains("graph_structure"),
-            "the refusal names the producer: {message}"
-        ),
+        Err(JammiError::NoQueryEncoder { table, producer }) => {
+            assert_eq!(table, structure.table_name);
+            assert_eq!(producer, "graph_structure");
+        }
         other => panic!("a structure table has no query encoder, got {other:?}"),
     }
 }

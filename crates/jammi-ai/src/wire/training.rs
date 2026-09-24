@@ -336,6 +336,7 @@ fn predictor_config_from_proto(
         test_task_fraction: c.test_task_fraction,
         min_task_count: c.min_task_count as usize,
         seed: c.seed,
+        embedding_table: c.embedding_table,
     })
 }
 
@@ -359,6 +360,7 @@ fn predictor_config_to_proto(
         test_task_fraction: c.test_task_fraction,
         min_task_count: c.min_task_count as u32,
         seed: c.seed,
+        embedding_table: c.embedding_table.clone(),
     }
 }
 
@@ -549,6 +551,7 @@ mod tests {
                 test_task_fraction: 0.3,
                 min_task_count: 7,
                 seed: 0xC0FF_EE42,
+                embedding_table: None,
             },
         };
 
@@ -620,6 +623,7 @@ mod tests {
                     test_task_fraction: 0.2,
                     min_task_count: 3,
                     seed: 42,
+                    embedding_table: None,
                 },
             };
 
@@ -871,6 +875,7 @@ mod tests {
                     test_task_fraction: 0.3,
                     min_task_count: 2,
                     seed: 7,
+                    embedding_table: None,
                 },
             })
         };

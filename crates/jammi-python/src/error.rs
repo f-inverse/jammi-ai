@@ -93,6 +93,7 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         JammiError::InvalidKey { .. } => "InvalidKey",
         JammiError::VersionUnavailable { .. } => "VersionUnavailable",
         JammiError::MissingManifest { .. } => "MissingManifest",
+        JammiError::NoQueryEncoder { .. } => "NoQueryEncoder",
         JammiError::NotRefreshable { .. } => "NotRefreshable",
         JammiError::DefinitionDrift { .. } => "DefinitionDrift",
         JammiError::NonUniqueKey { .. } => "NonUniqueKey",

@@ -377,6 +377,7 @@ pub async fn submit_context_predictor(
         test_task_fraction: 0.25,
         min_task_count: 4,
         seed: 7,
+        embedding_table: None,
     };
     session
         .train_context_predictor(source, &spec)

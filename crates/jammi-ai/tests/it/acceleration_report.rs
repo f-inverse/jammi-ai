@@ -1172,6 +1172,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
         test_task_fraction: 0.5,
         min_task_count: 2,
         seed: 1,
+        embedding_table: None,
     };
 
     let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");

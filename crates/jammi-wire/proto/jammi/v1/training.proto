@@ -331,6 +331,11 @@ message ContextPredictorTrainConfig {
   // Seed for the deterministic train/test task partition and the
   // predictor's initial weights.
   uint64 seed = 16;
+  // The embedding table the contexts are read from — the vector space the
+  // predictor learns in. Unset = the source's current default embedding table,
+  // resolved once when training starts; the resolved table is recorded with
+  // the trained predictor.
+  optional string embedding_table = 17;
 }
 
 // A column-source contrastive / classification / regression fine-tune. Mirrors

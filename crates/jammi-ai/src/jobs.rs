@@ -1674,6 +1674,7 @@ mod tests {
                     test_task_fraction: 0.2,
                     min_task_count: 2,
                     seed: 1,
+                    embedding_table: None,
                 },
             },
         ];

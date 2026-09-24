@@ -140,8 +140,9 @@ Where a capability is better bought than built, the engine extends the
 library at the seam it already exposes for exactly that — its own
 extension points, never a fork and never a vendored copy — and keeps the
 retry/actuator/ownership discipline (attempts, terminal writes, who is
-allowed to write a row) on jammi's own side of that seam. Two examples,
-one pattern:
+allowed to write a row) on jammi's own side of that seam. Three examples,
+one pattern (the full map, seam by seam, is
+[Built on DataFusion and Ballista](./foundations.md)):
 
 - **Fused CUDA kernels extend candle**, never replace it: a jammi kernel is
   a candle `CustomOp` with a CPU reference arm and an optional fused CUDA

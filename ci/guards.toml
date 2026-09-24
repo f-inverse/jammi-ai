@@ -69,6 +69,11 @@ run = "bash ci/scripts/check_no_runtime_skips.sh"
 why = "No test reads green when its resource is missing: none calls a run-time skip, and none reads a JAMMI_REQUIRE_* flag, because none has a skip for one to guard."
 
 [[guard]]
+name = "no piped grep -q"
+run = "bash ci/scripts/check_no_piped_grep_q.sh"
+why = "No bash test reads a match as no match: none pipes into grep -q, whose early exit SIGPIPEs the writer and, under pipefail, flips the pipeline's status."
+
+[[guard]]
 name = "GPU parity matrix"
 run = "python3 ci/scripts/check_gpu_parity_matrix.py"
 why = "Every shipped (architecture × verb) cell is covered by a GPU parity test, structurally excluded, or named as pending."

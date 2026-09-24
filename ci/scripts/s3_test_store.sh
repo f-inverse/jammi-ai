@@ -69,7 +69,7 @@ fetch() {
     chmod 0755 "$bin"
   fi
   # A binary that is not the pinned build is a corrupt cache, never a store.
-  "$bin" --version 2>/dev/null | grep -q "Version  : ${VERSION}" || die "$bin is not versitygw ${VERSION}"
+  grep -q "Version  : ${VERSION}" <<<"$("$bin" --version 2>/dev/null)" || die "$bin is not versitygw ${VERSION}"
   echo "$bin"
 }
 
@@ -87,7 +87,13 @@ parse_opts() {
   REST=("$@")
 }
 
-answers() { curl -s -o /dev/null -w '%{http_code}' "http://${ADDR}/" 2>/dev/null | grep -qE '^[0-9]{3}$'; }
+# curl prints `000` when nothing listens, so its own exit status is the
+# answer to "does anything listen", and the code only confirms it spoke HTTP.
+answers() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://${ADDR}/" 2>/dev/null)" \
+    && grep -qE '^[0-9]{3}$' <<<"$code"
+}
 
 start() {
   local bin

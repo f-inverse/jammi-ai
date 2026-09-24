@@ -891,15 +891,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
+          cfg="$(cargo rustc -p jammi-numerics --lib -- --print cfg)"
+          grep -q 'target_feature="fp16"' <<<"$cfg"
           echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (config.toml joined with CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS)"
 
       - name: Reader 1 -- config.toml alone, with this job's own env var explicitly unset
         shell: bash
         run: |
           set -euo pipefail
-          env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
-            cargo rustc -p jammi-numerics --lib -- --print cfg | grep -q 'target_feature="fp16"'
+          cfg="$(env -u CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS \
+            cargo rustc -p jammi-numerics --lib -- --print cfg)"
+          grep -q 'target_feature="fp16"' <<<"$cfg"
           echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (.cargo/config.toml alone, no CI-side env var at all)"
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────

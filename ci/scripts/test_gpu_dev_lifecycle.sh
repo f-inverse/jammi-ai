@@ -468,7 +468,7 @@ while ! log_has "podFindAndDeployOnDemand" && [ "$SECONDS" -lt "$deadline" ]; do
 # pod), so inspecting the watch dir post-exit would always find it already
 # deleted regardless of whether the isolation actually took effect, and the
 # assertion would fail even against correct code.
-if find "$TMPWATCH" -name 'id_ed25519' 2>/dev/null | grep -q .; then
+if grep -q . <<<"$(find "$TMPWATCH" -name 'id_ed25519' 2>/dev/null)"; then
   ok "shell-session-isolation: RP_WORK resolved to a fresh \$TMPDIR temp dir (a new keypair was generated there)"
 else
   bad "shell-session-isolation: expected a NEW keypair under \$TMPDIR (RP_WORK never resolved to a throwaway temp dir); watch dir contents: $(ls -A "$TMPWATCH" 2>/dev/null)"
@@ -1226,7 +1226,7 @@ JSON
   rp_gql() { cat "$SANDBOX/g4c-account.json"; }
 
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-unageable"; then
+  if [ "$rc" -eq 1 ] && grep -q "pod-unageable" <<<"$out"; then
     record PASS "group4c-unageable-pod-rc1-named"
   else
     record FAIL "group4c-unageable-pod-rc1-named (rc=$rc): $out"
@@ -1258,7 +1258,7 @@ JSON
   source "$DIR/runpod_lib.sh"
   rp_init
   g5_out="$(ssh -G "${RP_SSHO[@]}" placeholder-host 2>&1)"
-  if printf '%s\n' "$g5_out" | grep -qi '^identitiesonly yes$'; then
+  if grep -qi '^identitiesonly yes$' <<<"$g5_out"; then
     record PASS "group5-RP_SSHO-identitiesonly-yes"
   else
     record FAIL "group5-RP_SSHO-identitiesonly-yes (ssh -G output: $g5_out)"
@@ -1568,7 +1568,7 @@ if [ -z "$g8_missing" ]; then
     tmux kill-session -t "=${SESS}" 2>/dev/null
     script_both="$(rp_seed_wait_script "$PFX" "$SESS")"
     out_both="$(bash -c "$script_both" 2>&1)"; rc_both=$?
-    if [ "$rc_both" -eq 1 ] && printf '%s' "$out_both" | grep -qi "FAILED"; then
+    if [ "$rc_both" -eq 1 ] && grep -qi "FAILED" <<<"$out_both"; then
       record PASS "g8b-both-markers-present-reads-FAILED-not-COMPLETE"
     else
       record FAIL "g8b-both-markers-present-reads-FAILED-not-COMPLETE (rc=$rc_both out=$out_both)"
@@ -1586,7 +1586,7 @@ if [ -z "$g8_missing" ]; then
     script_live="$(rp_seed_wait_script "$PFX2" "$SESS2")"
     out_live="$(bash -c "$script_live" 2>&1)"; rc_live=$?
     tmux kill-session -t "=${SESS2}" 2>/dev/null
-    if [ "$rc_live" -eq 2 ] && printf '%s' "$out_live" | grep -qi "still building"; then
+    if [ "$rc_live" -eq 2 ] && grep -qi "still building" <<<"$out_live"; then
       record PASS "g8c-complete-marker-plus-live-session-reads-RUNNING-not-SUCCESS"
     else
       record FAIL "g8c-complete-marker-plus-live-session-reads-RUNNING-not-SUCCESS (rc=$rc_live out=$out_live)"
@@ -1607,7 +1607,7 @@ if [ -z "$g8_missing" ]; then
     SESSOK="jammi-g8-ok-$$"; tmux kill-session -t "=${SESSOK}" 2>/dev/null
     script_ok="$(rp_job_wait_script "$TREED" "$SESSOK" "ok-tree")"
     out_ok="$(bash -c "$script_ok" 2>&1)"; rc_ok=$?
-    if [ "$job_ok_rc" -eq 0 ] && [ "$rc_ok" -eq 0 ] && printf '%s' "$out_ok" | grep -qi "successfully"; then
+    if [ "$job_ok_rc" -eq 0 ] && [ "$rc_ok" -eq 0 ] && grep -qi "successfully" <<<"$out_ok"; then
       record PASS "g8d-wrapper-rc0-reads-SUCCESS"
     else
       record FAIL "g8d-wrapper-rc0-reads-SUCCESS (job_ok_rc=$job_ok_rc rc_ok=$rc_ok out=$out_ok)"
@@ -1628,7 +1628,7 @@ if [ -z "$g8_missing" ]; then
     SESSFAIL="jammi-g8-fail-$$"; tmux kill-session -t "=${SESSFAIL}" 2>/dev/null
     script_fail="$(rp_job_wait_script "$TREEF" "$SESSFAIL" "fail-tree")"
     out_fail="$(bash -c "$script_fail" 2>&1)"; rc_fail=$?
-    if [ "$job_fail_rc" -eq 3 ] && [ "$rc_fail" -eq 1 ] && printf '%s' "$out_fail" | grep -q "rc=3"; then
+    if [ "$job_fail_rc" -eq 3 ] && [ "$rc_fail" -eq 1 ] && grep -q "rc=3" <<<"$out_fail"; then
       record PASS "g8e-wrapper-rc3-reads-FAILED-naming-the-real-rc"
     else
       record FAIL "g8e-wrapper-rc3-reads-FAILED-naming-the-real-rc (job_fail_rc=$job_fail_rc rc_fail=$rc_fail out=$out_fail)"
@@ -1656,7 +1656,7 @@ if [ -z "$g8_missing" ]; then
     SESSLOCK="jammi-g8-lock-$$"; tmux kill-session -t "=${SESSLOCK}" 2>/dev/null
     script_lock="$(rp_job_wait_script "$TREEL" "$SESSLOCK" "lock-tree")"
     out_lock="$(bash -c "$script_lock" 2>&1)"; rc_lock=$?
-    if [ "$job_lock_rc" -eq 75 ] && [ "$rc_lock" -eq 1 ] && printf '%s' "$out_lock" | grep -qi "REFUSED"; then
+    if [ "$job_lock_rc" -eq 75 ] && [ "$rc_lock" -eq 1 ] && grep -qi "REFUSED" <<<"$out_lock"; then
       record PASS "g8f-wrapper-lock-refused-reads-REFUSED-distinctly-from-a-real-rc75-job"
     else
       record FAIL "g8f-wrapper-lock-refused-reads-REFUSED-distinctly-from-a-real-rc75-job (job_lock_rc=$job_lock_rc rc_lock=$rc_lock out=$out_lock)"
@@ -1670,7 +1670,7 @@ if [ -z "$g8_missing" ]; then
     SESSSTALE="jammi-g8-stale-$$"; tmux kill-session -t "=${SESSSTALE}" 2>/dev/null
     script_stale="$(rp_job_wait_script "$TREES" "$SESSSTALE" "stale-tree")"
     out_stale="$(bash -c "$script_stale" 2>&1)"; rc_stale=$?
-    if [ "$rc_stale" -eq 3 ] && printf '%s' "$out_stale" | grep -qi "no job evidence"; then
+    if [ "$rc_stale" -eq 3 ] && grep -qi "no job evidence" <<<"$out_stale"; then
       record PASS "g8g-stale-log-no-marker-reads-no-evidence-not-SUCCESS"
     else
       record FAIL "g8g-stale-log-no-marker-reads-no-evidence-not-SUCCESS (rc=$rc_stale out=$out_stale)"

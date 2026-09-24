@@ -347,12 +347,12 @@ print("OK" if (m.get("adopted") is True and m.get("seed_dir") is None
 
   # --verify: a log WITH a Fresh jammi-* line fails (the poisoned-clone case).
   # The Fresh line sits FIRST (cargo prints Fresh units before anything
-  # else) with 1,320,035 B of filler AFTER it — the portable trigger for
-  # the SIGPIPE'd `printf | grep -q` shape this guards against is ONE PIPE
-  # BUFFER (64 KiB), not any specific "cargo log" byte count, so this
-  # fixture clears it by >20x. A smaller (~70-byte) fixture fits in one
-  # pipe write and would pass even against the buggy shape, silently
-  # under-covering a regression.
+  # else) with 1,320,035 B of filler AFTER it — what makes the SIGPIPE'd
+  # `printf | grep -q` shape this guards against fail on EVERY run is a
+  # stream past ONE PIPE BUFFER (64 KiB), not any specific "cargo log" byte
+  # count, so this fixture clears it by >20x. A smaller (~70-byte) fixture
+  # fails the buggy shape only when its writer is descheduled between
+  # lines, so it would pass almost every run.
   DIRTY_LOG="$SANDBOX/b_dirty.log"
   {
     echo "       Fresh jammi-kernels v0.47.0"
@@ -817,7 +817,7 @@ PY
   # op) must target "=<session>:" — the ':' after the =-anchored session is
   # what makes it a WINDOW target rather than a session target.
   window_ops="$(grep -n 'tmux set-option -w' "$GPU_DEV")"
-  if [ -n "$window_ops" ] && ! printf '%s\n' "$window_ops" | grep -qvE '"=[^"]+:"'; then
+  if [ -n "$window_ops" ] && ! grep -qvE '"=[^"]+:"' <<<"$window_ops"; then
     ok "(g) every tmux window-level op targets \"=<session>:\""
   else
     bad "(g) a tmux window-level op does not target \"=<session>:\" — $window_ops"
@@ -888,15 +888,15 @@ DRV
 
   # rp_job_wrapper_lines carries the CARGO_TARGET_DIR export.
   wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_lines "/root/trees/mytree" "/root/target-mytree" "cargo test")"
-  if printf '%s\n' "$wrapper_text" | grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'"; then
+  if grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'" <<<"$wrapper_text"; then
     ok "(i) rp_job_wrapper_lines emits the CARGO_TARGET_DIR export pointing at the tree's own clone"
   else
     bad "(i) rp_job_wrapper_lines did not emit the expected CARGO_TARGET_DIR export — got: $wrapper_text"
   fi
-  printf '%s\n' "$wrapper_text" | grep -qF "cd '/root/trees/mytree'" \
+  grep -qF "cd '/root/trees/mytree'" <<<"$wrapper_text" \
     && ok "(i) rp_job_wrapper_lines still cd's into the tree (source), not the target dir" \
     || bad "(i) rp_job_wrapper_lines did not cd into the tree dir — got: $wrapper_text"
-  printf '%s\n' "$wrapper_text" | grep -qF "cargo test" \
+  grep -qF "cargo test" <<<"$wrapper_text" \
     && ok "(i) rp_job_wrapper_lines carries the caller's job command verbatim" \
     || bad "(i) rp_job_wrapper_lines dropped the job command — got: $wrapper_text"
 
@@ -943,24 +943,24 @@ DRV
   # marker wait-job actually reads, PLUS (one-pod-per-wave, WAVE-scoped) the
   # active-wave claim write/clear.
   marker_wrapper_text="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "0" "mywave" "mytree")"
-  if printf '%s\n' "$marker_wrapper_text" | grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'"; then
+  if grep -qF "export CARGO_TARGET_DIR='/root/target-mytree'" <<<"$marker_wrapper_text"; then
     ok "(i/job-marker) rp_job_wrapper_with_marker_lines still emits the CARGO_TARGET_DIR export"
   else
     bad "(i/job-marker) rp_job_wrapper_with_marker_lines did not emit the expected CARGO_TARGET_DIR export — got: $marker_wrapper_text"
   fi
-  printf '%s\n' "$marker_wrapper_text" | grep -qF "rm -f '/root/trees/mytree/.jammi.exit'" \
+  grep -qF "rm -f '/root/trees/mytree/.jammi.exit'" <<<"$marker_wrapper_text" \
     && ok "(i/job-marker) rp_job_wrapper_with_marker_lines removes any stale .jammi.exit at the VERY START" \
     || bad "(i/job-marker) rp_job_wrapper_with_marker_lines did not remove .jammi.exit up front — got: $marker_wrapper_text"
-  printf '%s\n' "$marker_wrapper_text" | grep -qF '"token":"tok123"' \
+  grep -qF '"token":"tok123"' <<<"$marker_wrapper_text" \
     && ok "(i/job-marker) rp_job_wrapper_with_marker_lines carries the caller's own token into the marker" \
     || bad "(i/job-marker) rp_job_wrapper_with_marker_lines dropped the caller's token — got: $marker_wrapper_text"
-  printf '%s\n' "$marker_wrapper_text" | grep -q 'flock -n 9' \
+  grep -q 'flock -n 9' <<<"$marker_wrapper_text" \
     && bad "(i/job-marker) timing=0 must NOT emit a flock acquisition — got: $marker_wrapper_text" \
     || ok "(i/job-marker) timing=0 emits no flock acquisition"
   # (one-pod-per-wave) the active-wave claim is written with
   # the caller's wave/tree at the very START (alongside .jammi.exit removal)
   # and removed again at the NORMAL-completion exit path.
-  printf '%s\n' "$marker_wrapper_text" | grep -qF "printf '%s\\n' 'WAVE=mywave' 'TREE=mytree' 'TS=" \
+  grep -qF "printf '%s\\n' 'WAVE=mywave' 'TREE=mytree' 'TS=" <<<"$marker_wrapper_text" \
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines writes the active-wave claim (wave+tree) up front" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines did not write the expected active-wave claim — got: $marker_wrapper_text"
   # Every claim write and every claim removal is inside a flock critical
@@ -1004,10 +1004,10 @@ DRV
     && ok "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines clears the active-wave claim on normal completion" \
     || bad "(i/one-pod-per-wave) rp_job_wrapper_with_marker_lines never clears the active-wave claim — got: $marker_wrapper_text"
   marker_wrapper_timing="$(bash "$RUNPOD_DRIVER" rp_job_wrapper_with_marker_lines "/root/trees/mytree" "/root/target-mytree" "cargo test" "tok123" "1" "mywave" "mytree")"
-  printf '%s\n' "$marker_wrapper_timing" | grep -q 'flock -n 9' \
+  grep -q 'flock -n 9' <<<"$marker_wrapper_timing" \
     && ok "(i/job-marker) timing=1 emits the fd-based flock acquisition INSIDE the wrapper" \
     || bad "(i/job-marker) timing=1 did not emit a flock acquisition — got: $marker_wrapper_timing"
-  printf '%s\n' "$marker_wrapper_timing" | grep -qF '"rc":75,"lock_refused":true' \
+  grep -qF '"rc":75,"lock_refused":true' <<<"$marker_wrapper_timing" \
     && ok "(i/job-marker) timing=1's refusal arm writes an rc=75/lock_refused=true marker before exiting" \
     || bad "(i/job-marker) timing=1 did not write the lock-refused marker — got: $marker_wrapper_timing"
   # (one-pod-per-wave) the lock-refused early-exit path must
@@ -1140,7 +1140,8 @@ BSHAPY
   # has a repository to read: a git checkout resolves its own sha (a note),
   # a bare tree bakes "unknown" (the warning).
   bsha_message() { bash -c "$(bash "$RUNPOD_DRIVER" rp_job_build_sha_lines "$1")" 2>&1 >/dev/null; }
-  bsha_message "$bsha/no_stamp" | grep -qF "::warning::JAMMI_BUILD_SHA left UNSET" \
+  bsha_out="$(bsha_message "$bsha/no_stamp")" \
+    && grep -qF "::warning::JAMMI_BUILD_SHA left UNSET" <<<"$bsha_out" \
     && ok "(i/build-sha) a stampless tree with no git checkout warns that the build bakes \"unknown\"" \
     || bad "(i/build-sha) a stampless non-checkout tree did not warn — got: '$(bsha_message "$bsha/no_stamp")'"
   mkdir -p "$bsha/checkout"
@@ -1164,7 +1165,7 @@ BSHAPY
   # Wired into the preamble EVERY job runs through, not merely defined —
   # the same single-source discipline the CARGO_TARGET_DIR assertions above
   # check for their own line.
-  printf '%s\n' "$marker_wrapper_text" | grep -qF "__jammi_push_stamp='/root/trees/mytree/.jammi-push-stamp.json'" \
+  grep -qF "__jammi_push_stamp='/root/trees/mytree/.jammi-push-stamp.json'" <<<"$marker_wrapper_text" \
     && ok "(i/build-sha) the real job wrapper carries the stamp-derived JAMMI_BUILD_SHA default (rp_job_env_lines, one definition)" \
     || bad "(i/build-sha) rp_job_wrapper_with_marker_lines does not carry the build-sha default — got: $marker_wrapper_text"
 
@@ -1298,7 +1299,7 @@ DRV
   else
     bad "(j) .jammi-seed-failed marker missing or malformed after the failure"
   fi
-  printf '%s' "$out1" | grep -q "seed build FAILED" \
+  grep -q "seed build FAILED" <<<"$out1" \
     && ok "(j) the failure's log tail is printed to stdout" \
     || bad "(j) the failure's log tail was not printed to stdout — got: $out1"
 
@@ -1311,7 +1312,7 @@ DRV
   else
     bad "(j) second invocation should have refused without retrying cargo (rc=$rc2, cargo calls ${calls_after_first}->${calls_after_second})"
   fi
-  printf '%s' "$out2" | grep -qi "previously FAILED" \
+  grep -qi "previously FAILED" <<<"$out2" \
     && ok "(j) the refusal names the prior failure, not a generic error" \
     || bad "(j) the refusal did not name the prior failure — got: $out2"
 
@@ -1361,7 +1362,7 @@ DRV
     rm -f "$SANDBOX/k.lock"
     out="$(bash "$KDRIVER" 2>&1)"
     rc=$?
-    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "dry-run: args parsed OK"; then
+    if [ "$rc" -eq 0 ] && grep -q "dry-run: args parsed OK" <<<"$out"; then
       ok "(k) the documented default invocation (no args) re-execs through pod_timing_lock.sh and reaches the inner script with no argument-parsing error"
     else
       bad "(k) the default (no-args) re-exec path failed (rc=$rc): $out"
@@ -1383,7 +1384,7 @@ DRV
     chmod +x "$NEG_DRIVER"
     neg_out="$(bash "$NEG_DRIVER" 2>&1)"
     neg_rc=$?
-    if [ "$neg_rc" -eq 2 ] && printf '%s' "$neg_out" | grep -q "unknown argument ''"; then
+    if [ "$neg_rc" -eq 2 ] && grep -q "unknown argument ''" <<<"$neg_out"; then
       ok "(k) negative control: passing a literal empty-string argument (what a quoted conditional shape produces) is genuinely rejected by the arg loop — the array form avoids a real failure mode"
     else
       bad "(k) negative control did not reproduce the empty-string rejection (rc=$neg_rc): $neg_out"
@@ -1415,7 +1416,7 @@ DRV
   mkdir -p "$SUBSET_UNLISTED"
   printf 'cargo:rerun-if-env-changed=NVCC\ncargo:rerun-if-env-changed=JAMMI_N4_UNLISTED_VAR\n' > "$SUBSET_UNLISTED/release__jammi-kernels-abc.output"
   out="$(bash "$SUBSET_DRIVER" "$SUBSET_UNLISTED" 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'JAMMI_N4_UNLISTED_VAR'; then
+  if [ "$rc" -ne 0 ] && grep -q 'JAMMI_N4_UNLISTED_VAR' <<<"$out"; then
     ok "(l/stdout-subset) an unlisted announced var reddens the cross-check"
   else
     bad "(l/stdout-subset) expected RED naming JAMMI_N4_UNLISTED_VAR (rc=$rc): $out"
@@ -1427,7 +1428,7 @@ DRV
   SUBSET_EMPTY="$SANDBOX/subset_empty"
   rm -rf "$SUBSET_EMPTY"; mkdir -p "$SUBSET_EMPTY"
   out="$(bash "$SUBSET_DRIVER" "$SUBSET_EMPTY" 2>&1)"; rc=$?
-  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'capture_count=0'; then
+  if [ "$rc" -ne 0 ] && grep -q 'capture_count=0' <<<"$out"; then
     ok "(l/stdout-subset) an EMPTY capture dir reddens the cross-check (capture_count=0), never a silent pass"
   else
     bad "(l/stdout-subset) expected RED naming capture_count=0 for an empty capture dir (rc=$rc): $out"
@@ -1478,7 +1479,7 @@ exit "$bad"
 DRV
   chmod +x "$SUBSET_OLD_CHECK_SCRIPT"
   old_out="$(bash "$SUBSET_OLD_CHECK_SCRIPT" "$SUBSET_EMPTYFILE" 2>&1)"; old_rc=$?
-  if [ "$old_rc" -ne 0 ] && printf '%s' "$old_out" | grep -q 'chrono-tz'; then
+  if [ "$old_rc" -ne 0 ] && grep -q 'chrono-tz' <<<"$old_out"; then
     ok "(l/stdout-subset revert-RED) a per-file empty-is-an-error rule genuinely DOES fire on the SAME zero-byte fixture — the GREEN above is not a vacuous no-op"
   else
     bad "(l/stdout-subset revert-RED) the old-rule reproduction did not fire as expected (rc=$old_rc): $old_out"
@@ -1513,7 +1514,7 @@ DRV
   # cutlass-check: mismatched sha -> 1, refusal, both shas printed.
   m_out="$(bash "$PUSH_STAMP_SH" cutlass-check "$M_STAMP" "0000000000000000000000000000000000000000" 2>&1)"
   m_rc=$?
-  if [ "$m_rc" -eq 1 ] && printf '%s' "$m_out" | grep -q "$m_gitlink" && printf '%s' "$m_out" | grep -q '0000000000000000000000000000000000000000'; then
+  if [ "$m_rc" -eq 1 ] && grep -q "$m_gitlink" <<<"$m_out" && grep -q '0000000000000000000000000000000000000000' <<<"$m_out"; then
     ok "(m/cutlass-stamp) cutlass-check REFUSES a mismatched sha and names BOTH shas"
   else
     bad "(m/cutlass-stamp) expected a refusal naming both shas (rc=$m_rc): $m_out"
@@ -1652,7 +1653,7 @@ DRV
   prov_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$PROV_TREE_MATCH" "$PROV_SUPER_MATCH" 2>&1)"; prov_rc=$?
   if [ "$prov_rc" -eq 0 ] && [ -f "$PROV_TREE_MATCH/crates/jammi-kernels/third_party/cutlass/header.h" ] \
      && [ ! -e "$PROV_TREE_MATCH/crates/jammi-kernels/third_party/cutlass/.git" ] \
-     && ! printf '%s' "$prov_out" | grep -q 'attempting to fetch'; then
+     && ! grep -q 'attempting to fetch' <<<"$prov_out"; then
     ok "(m/provision match) matching stamp/submodule -> copies straight through, no remediation attempted"
   else
     bad "(m/provision match) expected a clean copy with no remediation (rc=$prov_rc): $prov_out"
@@ -1664,7 +1665,7 @@ DRV
   PROV_TREE_DRIFT="$PROV_ROOT/tree_drift"
   prov_make_tree "$PROV_TREE_DRIFT" "$PROV_SHA2"
   prov_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$PROV_TREE_DRIFT" "$PROV_SUPER_DRIFT" 2>&1)"; prov_rc=$?
-  if [ "$prov_rc" -eq 0 ] && printf '%s' "$prov_out" | grep -q 'attempting to fetch' \
+  if [ "$prov_rc" -eq 0 ] && grep -q 'attempting to fetch' <<<"$prov_out" \
      && [ -f "$PROV_TREE_DRIFT/crates/jammi-kernels/third_party/cutlass/header.h" ] \
      && [ "$(cat "$PROV_TREE_DRIFT/crates/jammi-kernels/third_party/cutlass/header.h")" = v2 ]; then
     ok "(m/provision drift) a genuine mismatch reaches the remediation arm, fetches+checks out the STAMPED commit, re-verifies OK, and copies the CORRECT (v2) content"
@@ -1687,8 +1688,8 @@ DRV
   # only when `submodule update --init` itself SUCCEEDS but leaves no
   # .git, not exercised by this leg) is ever printed. Either message is a
   # genuine, loud, non-silent refusal — the fixture accepts both.
-  if [ "$prov_rc" -ne 0 ] && { printf '%s' "$prov_out" | grep -q 'no .git after submodule update' \
-     || printf '%s' "$prov_out" | grep -q 'pathspec.*did not match'; } \
+  if [ "$prov_rc" -ne 0 ] && { grep -q 'no .git after submodule update' <<<"$prov_out" \
+     || grep -q 'pathspec.*did not match' <<<"$prov_out"; } \
      && [ ! -e "$PROV_TREE_DEINIT/crates/jammi-kernels/third_party/cutlass" ]; then
     ok "(m/provision deinit) no submodule registered at all -> refuses loudly, nothing copied"
   else
@@ -1701,7 +1702,7 @@ DRV
   PROV_TREE_FETCHFAIL="$PROV_ROOT/tree_fetchfail"
   prov_make_tree "$PROV_TREE_FETCHFAIL" "0000000000000000000000000000000000000000"
   prov_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$PROV_TREE_FETCHFAIL" "$PROV_SUPER_FETCHFAIL" 2>&1)"; prov_rc=$?
-  if [ "$prov_rc" -ne 0 ] && printf '%s' "$prov_out" | grep -q 'could not fetch/checkout' \
+  if [ "$prov_rc" -ne 0 ] && grep -q 'could not fetch/checkout' <<<"$prov_out" \
      && [ ! -e "$PROV_TREE_FETCHFAIL/crates/jammi-kernels/third_party/cutlass" ]; then
     ok "(m/provision fetch-failure) an unreachable stamped sha -> loud refusal, nothing copied"
   else
@@ -1719,7 +1720,7 @@ DRV
   PROV_TREE_EMPTYCONTENT="$PROV_ROOT/tree_emptycontent"
   prov_make_tree "$PROV_TREE_EMPTYCONTENT" "$PROV_SHA1"
   prov_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$PROV_TREE_EMPTYCONTENT" "$PROV_SUPER_EMPTYCONTENT" 2>&1)"; prov_rc=$?
-  if [ "$prov_rc" -ne 0 ] && printf '%s' "$prov_out" | grep -q 'missing include/cutlass/cutlass.h' \
+  if [ "$prov_rc" -ne 0 ] && grep -q 'missing include/cutlass/cutlass.h' <<<"$prov_out" \
      && [ ! -e "$PROV_TREE_EMPTYCONTENT/crates/jammi-kernels/third_party/cutlass" ]; then
     ok "(m/provision empty-content) SUPER_DIR's own submodule has a valid .git/HEAD but its checked-out content was deleted -> refused loudly, nothing copied"
   else
@@ -1792,7 +1793,7 @@ DRV
   prov_make_tree "$PROV_TREE_UNREACHABLE" "$PROV_SHA1"
   prov_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROVISION_SH" "$PROV_TREE_UNREACHABLE" "$PROV_SUPER_UNREACHABLE" 2>&1)"; prov_rc=$?
   mv "$PROV_UPSTREAM_MOVED" "$PROV_UPSTREAM"
-  if [ "$prov_rc" -ne 0 ] && printf '%s' "$prov_out" | grep -q 'pod_provision_cutlass: submodule update failed (network/remote unreachable?)'; then
+  if [ "$prov_rc" -ne 0 ] && grep -q 'pod_provision_cutlass: submodule update failed (network/remote unreachable?)' <<<"$prov_out"; then
     ok "(m/provision unreachable-remote) SUPER_DIR's own submodule update, with its remote made unreachable, FAILS with the NAMED error (never git's bare stderr alone)"
   else
     bad "(m/provision unreachable-remote) expected the named submodule-update-failed error (rc=$prov_rc): $prov_out"
@@ -1833,8 +1834,8 @@ PY
     PROV_TREE_REVERT="$PROV_ROOT/tree_revert"
     prov_make_tree "$PROV_TREE_REVERT" "$PROV_SHA2"
     provr_out="$(env GIT_ALLOW_PROTOCOL=file bash "$PROV_REVERTED" "$PROV_TREE_REVERT" "$PROV_SUPER_REVERT" 2>&1)"; provr_rc=$?
-    if [ "$provr_rc" -ne 0 ] && printf '%s' "$provr_out" | grep -q 'MISMATCH' \
-       && ! printf '%s' "$provr_out" | grep -q 'attempting to fetch' \
+    if [ "$provr_rc" -ne 0 ] && grep -q 'MISMATCH' <<<"$provr_out" \
+       && ! grep -q 'attempting to fetch' <<<"$provr_out" \
        && [ ! -e "$PROV_TREE_REVERT/crates/jammi-kernels/third_party/cutlass/header.h" ]; then
       ok "(m/provision revert-RED) the bare-command form on the SAME drift fixture stops at MISMATCH under set -e — the remediation arm is dead code without the if/else, so the if/else is load-bearing"
     else
@@ -1931,7 +1932,7 @@ DRV
   SEEDH_T1B_ELSE="$(awk -v s="$SEEDH_T1B_START" 'NR>s && /^    else$/{print NR; exit}' "$SEEDH_SEEDSH")"
   SEEDH_T1B_FI="$(awk -v s="$SEEDH_T1B_START" 'NR>s && /^    fi$/{print NR; exit}' "$SEEDH_SEEDSH")"
   if [ -n "$SEEDH_T1B_ELSE" ] && [ -n "$SEEDH_T1B_FI" ] \
-     && sed -n "${SEEDH_T1B_ELSE},${SEEDH_T1B_FI}p" "$SEEDH_SEEDSH" | grep -q 'exit 1'; then
+     && grep -q 'exit 1' <<<"$(sed -n "${SEEDH_T1B_ELSE},${SEEDH_T1B_FI}p" "$SEEDH_SEEDSH")"; then
     ok "(n/seed-helpers) T1b's rc=2 else-branch genuinely contains 'exit 1' (aborts the seed subshell), not merely a warning"
   else
     bad "(n/seed-helpers) could not confirm T1b's rc=2 else-branch aborts (start=${SEEDH_T1B_START:-?} else=${SEEDH_T1B_ELSE:-?} fi=${SEEDH_T1B_FI:-?})"
@@ -2000,7 +2001,7 @@ DRV
     fa2_driver_a="$(fa2_build_driver main)"
     if bash -n "$fa2_driver_a"; then
       fa2_out_a="$(bash "$fa2_driver_a" 2>&1)"; fa2_rc_a=$?
-      if [ "$fa2_rc_a" -ne 0 ] && printf '%s' "$fa2_out_a" | grep -q 'could not determine whether jammi-kernels declares flash-attn'; then
+      if [ "$fa2_rc_a" -ne 0 ] && grep -q 'could not determine whether jammi-kernels declares flash-attn' <<<"$fa2_out_a"; then
         ok "(n/fa2-leg a) on branch 'main': the real FA2-leg bytes reach pod_seed_pkg_has_feature (stubbed rc=2) and ABORT naming the real cause"
       else
         bad "(n/fa2-leg a) expected the real FA2-leg bytes to abort on rc=2 when on main (rc=$fa2_rc_a): $fa2_out_a"
@@ -2019,7 +2020,7 @@ DRV
     # alone.
     fa2_driver_b="$(fa2_build_driver "$FA2_OTHER_SHA")"
     fa2_out_b="$(bash "$fa2_driver_b" 2>&1)"; fa2_rc_b=$?
-    if [ "$fa2_rc_b" -ne 0 ] && printf '%s' "$fa2_out_b" | grep -q 'could not determine whether jammi-kernels declares flash-attn'; then
+    if [ "$fa2_rc_b" -ne 0 ] && grep -q 'could not determine whether jammi-kernels declares flash-attn' <<<"$fa2_out_b"; then
       ok "(n/fa2-leg b) DETACHED HEAD at the SAME sha as origin/main: the gate STILL matches (sha-based, not abbrev-ref) — reaches pod_seed_pkg_has_feature and ABORTS naming the cause, exactly like leg (a)"
     else
       bad "(n/fa2-leg b) expected a detached HEAD at origin/main's own sha to still match the gate (rc=$fa2_rc_b): $fa2_out_b"
@@ -2030,8 +2031,8 @@ DRV
     # reason recorded — never a silent null.
     fa2_driver_c="$(fa2_build_driver "$FA2_MAIN_SHA")"
     fa2_out_c="$(bash "$fa2_driver_c" 2>&1)"; fa2_rc_c=$?
-    if [ "$fa2_rc_c" -eq 0 ] && printf '%s' "$fa2_out_c" | grep -q 'FA2_RAN=false' \
-       && printf '%s' "$fa2_out_c" | grep -q 'FA2_REASON=resolved sha'; then
+    if [ "$fa2_rc_c" -eq 0 ] && grep -q 'FA2_RAN=false' <<<"$fa2_out_c" \
+       && grep -q 'FA2_REASON=resolved sha' <<<"$fa2_out_c"; then
       ok "(n/fa2-leg c) DETACHED HEAD at a sha that is NOT origin/main: fa2_ran=false with a real, non-empty reason recorded — never silently vanishing with no explanation"
     else
       bad "(n/fa2-leg c) expected fa2_ran=false with a real reason for a non-main detached sha (rc=$fa2_rc_c): $fa2_out_c"
@@ -2071,8 +2072,8 @@ json.dump({
     chmod +x "$FA2_MARKER_DRIVER"
     if bash -n "$FA2_MARKER_DRIVER"; then
       fa2_marker_out="$(bash "$FA2_MARKER_DRIVER" 2>&1)"
-      if printf '%s' "$fa2_marker_out" | grep -q 'TUPLES=\["T1", "T2", "T3"\] RAN=false REASON=ref != main' \
-         || printf '%s' "$fa2_marker_out" | grep -qE 'TUPLES=\[.T1., .T2., .T3.\] RAN=false REASON=ref != main'; then
+      if grep -q 'TUPLES=\["T1", "T2", "T3"\] RAN=false REASON=ref != main' <<<"$fa2_marker_out" \
+         || grep -qE 'TUPLES=\[.T1., .T2., .T3.\] RAN=false REASON=ref != main' <<<"$fa2_marker_out"; then
         ok "(n/fa2-leg) the real marker-reading python snippets correctly copy seed_tuples (no T1b) / seed_t1b_flash_attn_ran=false / the real reason out of a real seed-complete marker"
       else
         bad "(n/fa2-leg) expected the marker fields to be copied verbatim: $fa2_marker_out"
@@ -2169,7 +2170,7 @@ json.dump({
   # cargo deliberately left OFF PATH here.
   SEEDH_TOOLS_OUT="$(PATH="$SEEDH_TOOLBIN_MISSING" "$SEEDH_REAL_BASH" -c '. "'"$SEEDH_SEEDSH"'"; pod_seed_assert_required_tools' 2>&1)"
   SEEDH_TOOLS_RC=$?
-  if [ "$SEEDH_TOOLS_RC" -ne 0 ] && printf '%s' "$SEEDH_TOOLS_OUT" | grep -q 'cargo'; then
+  if [ "$SEEDH_TOOLS_RC" -ne 0 ] && grep -q 'cargo' <<<"$SEEDH_TOOLS_OUT"; then
     ok "(n/seed-helpers) pod_seed_assert_required_tools fails and NAMES 'cargo' when it is missing from PATH"
   else
     bad "(n/seed-helpers) expected a failure naming 'cargo' (rc=$SEEDH_TOOLS_RC): $SEEDH_TOOLS_OUT"
@@ -2384,7 +2385,7 @@ DRV
   chmod +x "$P1_DRIVER"
 
   p1_out="$(bash "$P1_DRIVER" 2>&1)"; p1_rc=$?
-  if [ "$p1_rc" -ne 0 ] && printf '%s' "$p1_out" | grep -q 'libjammi_kernels-cafef00d.rlib' \
+  if [ "$p1_rc" -ne 0 ] && grep -q 'libjammi_kernels-cafef00d.rlib' <<<"$p1_out" \
      && [ ! -f "${P1_SEED}.jammi-seed-complete" ]; then
     ok "(p1/member-freedom) pod_seed_target_main's own completion-stamp gate refuses a lib-prefixed poisoned target dir (real T1-T4 pipeline, real cargo metadata) and writes no completion marker"
   else
@@ -2413,7 +2414,7 @@ pod_seed_target_main --no-lock
 DRV
   chmod +x "$P1_CLEAN_DRIVER"
   p1c_out="$(bash "$P1_CLEAN_DRIVER" 2>&1)"
-  if ! printf '%s' "$p1c_out" | grep -q 'NOT member-free'; then
+  if ! grep -q 'NOT member-free' <<<"$p1c_out"; then
     ok "(p1/member-freedom) an unpoisoned target dir passes the member-free gate cleanly (no 'NOT member-free' from THIS check)"
   else
     bad "(p1/member-freedom) the member-free gate false-positived on a clean target dir: $p1c_out"
@@ -2450,7 +2451,7 @@ pod_seed_target_main --no-lock
 DRV
       chmod +x "$P1_REVERT_DRIVER"
       p1r_out="$(bash "$P1_REVERT_DRIVER" 2>&1)"
-      if ! printf '%s' "$p1r_out" | grep -q 'NOT member-free'; then
+      if ! grep -q 'NOT member-free' <<<"$p1r_out"; then
         ok "(p1/member-freedom revert-RED) neutering pod_seed_target.sh's own completion-stamp gate call (line ${REVERT_LINE}) on the SAME-shaped poisoned dir makes the 'NOT member-free' catch disappear — the call site is genuinely load-bearing, not a proxy"
       else
         bad "(p1/member-freedom revert-RED) expected the poison catch to disappear after neutering line ${REVERT_LINE}, but it is still present: $p1r_out"
@@ -2501,8 +2502,8 @@ DRV
       JAMMI_FA2_TIP_REF=irrelevant JAMMI_BOX_LABEL=probe JAMMI_BUILD_TIMINGS_OUT=/dev/null \
       bash "$P2_ROOT/perf/driver.sh" --no-lock 2>&1)"
     p2_poison_rc=$?
-    if [ "$p2_poison_rc" -ne 0 ] && printf '%s' "$p2_poison_out" | grep -q 'NOT member-free' \
-       && ! printf '%s' "$p2_poison_out" | grep -q 'P2_REACHED_PAST_MEMBER_CHECK'; then
+    if [ "$p2_poison_rc" -ne 0 ] && grep -q 'NOT member-free' <<<"$p2_poison_out" \
+       && ! grep -q 'P2_REACHED_PAST_MEMBER_CHECK' <<<"$p2_poison_out"; then
       ok "(p2/member-freedom) pod_build_timings.sh's own second, independent member-free witness refuses a poisoned seed and never reaches past it (real script bytes through the (i) block)"
     else
       bad "(p2/member-freedom) expected pod_build_timings.sh's own witness to refuse the poisoned seed and not reach past it (rc=$p2_poison_rc): $p2_poison_out"
@@ -2517,7 +2518,7 @@ DRV
       JAMMI_FA2_TIP_REF=irrelevant JAMMI_BOX_LABEL=probe JAMMI_BUILD_TIMINGS_OUT=/dev/null \
       bash "$P2_ROOT/perf/driver.sh" --no-lock 2>&1)"
     p2_clean_rc=$?
-    if [ "$p2_clean_rc" -eq 0 ] && printf '%s' "$p2_clean_out" | grep -q 'P2_REACHED_PAST_MEMBER_CHECK'; then
+    if [ "$p2_clean_rc" -eq 0 ] && grep -q 'P2_REACHED_PAST_MEMBER_CHECK' <<<"$p2_clean_out"; then
       ok "(p2/member-freedom) a clean seed reaches past pod_build_timings.sh's own witness (negative control — the gate does not block legitimate runs)"
     else
       bad "(p2/member-freedom) expected a clean seed to reach past the witness (rc=$p2_clean_rc): $p2_clean_out"
@@ -2534,7 +2535,7 @@ DRV
           JAMMI_FA2_TIP_REF=irrelevant JAMMI_BOX_LABEL=probe JAMMI_BUILD_TIMINGS_OUT=/dev/null \
           bash "$P2_ROOT/perf/driver_reverted.sh" --no-lock 2>&1)"
         p2_revert_rc=$?
-        if [ "$p2_revert_rc" -eq 0 ] && printf '%s' "$p2_revert_out" | grep -q 'P2_REACHED_PAST_MEMBER_CHECK'; then
+        if [ "$p2_revert_rc" -eq 0 ] && grep -q 'P2_REACHED_PAST_MEMBER_CHECK' <<<"$p2_revert_out"; then
           ok "(p2/member-freedom revert-RED) neutering pod_build_timings.sh's own witness call (line ${CALL_LINE}) on the SAME poisoned seed lets it reach past the check — the call site is genuinely load-bearing, not a proxy"
         else
           bad "(p2/member-freedom revert-RED) expected the poisoned seed to reach past the check after neutering line ${CALL_LINE} (rc=$p2_revert_rc): $p2_revert_out"
@@ -2714,28 +2715,28 @@ DRV
 
   if [ -n "$R_TRISTATE_START" ] && [ -n "$R_TRISTATE_END" ]; then
     r_out="$(r_run_tristate "" "")"
-    if printf '%s' "$r_out" | grep -q 'byte_equal=invalid diff_nonempty=yes'; then
+    if grep -q 'byte_equal=invalid diff_nonempty=yes' <<<"$r_out"; then
       ok "(r/byte-equal) an empty snapshot on BOTH sides -> byte_equal=invalid, with a non-empty explanatory diff"
     else
       bad "(r/byte-equal) expected byte_equal=invalid for a doubly-empty snapshot: $r_out"
     fi
 
     r_out="$(r_run_tristate "" $'path\tsha')"
-    if printf '%s' "$r_out" | grep -q 'byte_equal=invalid'; then
+    if grep -q 'byte_equal=invalid' <<<"$r_out"; then
       ok "(r/byte-equal) an empty snapshot on ONE side (clone) -> byte_equal=invalid"
     else
       bad "(r/byte-equal) expected byte_equal=invalid for a one-sided-empty snapshot: $r_out"
     fi
 
     r_out="$(r_run_tristate $'a\tsha1' $'a\tsha1')"
-    if printf '%s' "$r_out" | grep -q 'byte_equal=true diff_nonempty=no'; then
+    if grep -q 'byte_equal=true diff_nonempty=no' <<<"$r_out"; then
       ok "(r/byte-equal) equal, non-empty hash sets -> byte_equal=true"
     else
       bad "(r/byte-equal) expected byte_equal=true for identical non-empty snapshots: $r_out"
     fi
 
     r_out="$(r_run_tristate $'a\tsha1' $'a\tsha2')"
-    if printf '%s' "$r_out" | grep -q 'byte_equal=false diff_nonempty=yes'; then
+    if grep -q 'byte_equal=false diff_nonempty=yes' <<<"$r_out"; then
       ok "(r/byte-equal) differing, non-empty hash sets -> byte_equal=false, with a real diff"
     else
       bad "(r/byte-equal) expected byte_equal=false for differing non-empty snapshots: $r_out"
@@ -2748,7 +2749,7 @@ DRV
     # into a bare "false" that reads exactly like a genuine
     # byte-reproducibility regression.
     r_out="$(r_run_tristate "$(printf 'a\tsha1\nb\tsha2')" $'a\tsha1')"
-    if printf '%s' "$r_out" | grep -q 'byte_equal=set_mismatch diff_nonempty=yes'; then
+    if grep -q 'byte_equal=set_mismatch diff_nonempty=yes' <<<"$r_out"; then
       ok "(r/byte-equal) a clone snapshot with an EXTRA path the cold side lacks -> byte_equal=set_mismatch (never a bare false), with the symmetric difference"
     else
       bad "(r/byte-equal) expected byte_equal=set_mismatch for a path-set mismatch: $r_out"
@@ -2767,7 +2768,7 @@ DRV
       } > "$driver"
       bash "$driver"
     )"
-    if printf '%s' "$r_reverted_out" | grep -q 'byte_equal=true'; then
+    if grep -q 'byte_equal=true' <<<"$r_reverted_out"; then
       ok "(r/byte-equal revert-RED) a bare-comparison form (no empty-set guard), on the SAME doubly-empty fixture, reads a silent WRONG 'true' — the invalid-state guard is load-bearing, not vacuous"
     else
       bad "(r/byte-equal revert-RED) expected the reverted form to read a false 'true' on the doubly-empty fixture: $r_reverted_out"
@@ -2908,7 +2909,7 @@ assert needle in t, "revert fixture: could not locate the CC_* wildcard entry to
 open(dst, "w").write(t.replace(needle, replacement, 1))
 PY
   s_revert_out="$(bash "$S_DRIVER" "$S_CAPTURE" "$S_MANIFEST_REVERTED" 2>&1)"; s_revert_rc=$?
-  if [ "$s_revert_rc" -ne 0 ] && printf '%s' "$s_revert_out" | grep -q 'CC_x86_64'; then
+  if [ "$s_revert_rc" -ne 0 ] && grep -q 'CC_x86_64' <<<"$s_revert_out"; then
     ok "(s/manifest revert-RED) removing the CC_* wildcard from the SAME manifest makes the SAME real capture set fail, naming the real unlisted CC_x86_64* names — the wildcard is genuinely load-bearing"
   else
     bad "(s/manifest revert-RED) expected removing CC_* to reintroduce a real RED (rc=$s_revert_rc): $s_revert_out"
@@ -2996,7 +2997,7 @@ if not mutated:
 open(p, "w").writelines(lines)
 PY
   t_mutant_out="$(python3 "$T_SCANNER" "$T_MUTANT" 2>&1)"; t_mutant_rc=$?
-  if [ "$t_mutant_rc" -ne 0 ] && printf '%s' "$t_mutant_out" | grep -q 'UNANNOTATED'; then
+  if [ "$t_mutant_rc" -ne 0 ] && grep -q 'UNANNOTATED' <<<"$t_mutant_out"; then
     ok "(t revert-RED) stripping ONE real tripwire-ok annotation from a scratch copy makes the scanner catch it — the scanner is genuinely load-bearing, not vacuous"
   else
     bad "(t revert-RED) expected the scanner to catch the stripped annotation (rc=$t_mutant_rc): $t_mutant_out"
@@ -3064,7 +3065,7 @@ PYEOF
   U_MUTANT="$U_MUTANT_DIR/fake_source.sh"
   printf '#!/usr/bin/env bash\n# verified against a real fixture -- see test_pod_substrate.sh'"'"'s `(z/DOES_NOT_EXIST)` leg\n' > "$U_MUTANT"
   u_mutant_out="$(python3 "$U_SCANNER" "$U_TEST_SUITE" "$U_MUTANT" 2>&1)"; u_mutant_rc=$?
-  if [ "$u_mutant_rc" -ne 0 ] && printf '%s' "$u_mutant_out" | grep -q 'z/DOES_NOT_EXIST'; then
+  if [ "$u_mutant_rc" -ne 0 ] && grep -q 'z/DOES_NOT_EXIST' <<<"$u_mutant_out"; then
     ok "(u revert-RED) a citation to a label that genuinely does not exist is caught by the SAME scanner — not vacuous"
   else
     bad "(u revert-RED) expected the scanner to catch a nonexistent label citation (rc=$u_mutant_rc): $u_mutant_out"
@@ -3334,7 +3335,7 @@ DRV
   # repo at all"); a failure lands in the else-arm's INVALID abort below.
   if git -C "$W_CLONE1" rev-parse --git-dir >/dev/null 2>&1 \
      && [ -n "$w_head" ] && [ "$w_head" = "$w_omain" ] \
-     && printf '%s' "$w_gitlink_entry" | grep -q "^160000 commit $W_PIN_SHA" \
+     && grep -q "^160000 commit $W_PIN_SHA" <<<"$w_gitlink_entry" \
      && [ ! -d "$W_CLONE1/$W_INC_REL" ] \
      && [ -n "$W_DRIVER1" ] && bash -n "$W_DRIVER1"; then
     W_FIXTURE_VALID=1
@@ -3350,8 +3351,8 @@ DRV
     # the empty result already fails the sha assertion loudly just below.
     w_sub_head="$(w_git -C "$W_CLONE1/$W_SUB_REL" rev-parse HEAD 2>/dev/null)"
     if [ "$w_rc" -eq 0 ] \
-       && printf '%s' "$w_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' \
-       && printf '%s' "$w_out" | grep -q 'W_HUNK_COMPLETED' \
+       && grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$w_out" \
+       && grep -q 'W_HUNK_COMPLETED' <<<"$w_out" \
        && [ -f "$W_CLONE1/$W_INC_REL/cutlass/cutlass.h" ] \
        && [ "$w_sub_head" = "$W_PIN_SHA" ]; then
       ok "(w/cutlass green) the REAL provisioning hunk, driven against the triggering provenance, runs 'git submodule update --init --force --checkout --depth 1' and include/ exists at the pinned commit afterwards"
@@ -3441,7 +3442,7 @@ PY
     fi
     w4_out="$(bash "$W_DRIVER4" 2>&1)"; w4_rc=$?
     if [ "$w4_rc" -eq 0 ] && [ -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] \
-       && printf '%s' "$w4_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+       && grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$w4_out"; then
       ok "(w/cutlass predicate green) the file-level guard fires on the include-present/header-absent state and RE-provisions — cutlass.h restored"
     else
       bad "(w/cutlass predicate green) expected the hunk to re-provision cutlass.h (rc=$w4_rc): $w4_out"
@@ -3465,7 +3466,7 @@ PY
     if [ -n "$W_DRIVER4R" ] && bash -n "$W_DRIVER4R"; then
       w4r_out="$(bash "$W_DRIVER4R" 2>&1)"; w4r_rc=$?
       if [ "$w4r_rc" -eq 0 ] && [ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] \
-         && ! printf '%s' "$w4r_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+         && ! grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$w4r_out"; then
         ok "(w/cutlass predicate revert-RED) a dir-exists guard, in a scratch copy, SKIPS the same include-present/header-absent state (no provisioning banner, cutlass.h stays absent) — the file-level predicate is load-bearing"
       else
         bad "(w/cutlass predicate revert-RED) expected the coarsened guard to skip (rc=$w4r_rc, header_absent=$([ ! -f "$W_CLONE4/$W_INC_REL/cutlass/cutlass.h" ] && echo yes || echo no)): $w4r_out"
@@ -3484,7 +3485,7 @@ PY
     w5_sub_head="$(w_git -C "$W_CLONE1/$W_SUB_REL" rev-parse HEAD 2>/dev/null)"
     if [ "$w5_rc" -eq 0 ] && [ -f "$W_CLONE1/$W_INC_REL/cutlass/cutlass.h" ] \
        && [ "$w5_sub_head" = "$W_PIN_SHA" ] \
-       && ! printf '%s' "$w5_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+       && ! grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$w5_out"; then
       ok "(w/cutlass idempotence) a second run on the fully-provisioned clone SKIPS (no provisioning banner), rc=0, cutlass.h present, submodule still at the pinned sha"
     else
       bad "(w/cutlass idempotence) expected a clean skip on an already-provisioned clone (rc=$w5_rc, sub_head=${w5_sub_head:-none}): $w5_out"
@@ -3500,7 +3501,7 @@ PY
     if [ -n "$W_DRIVER6" ] && bash -n "$W_DRIVER6"; then
       w6_out="$(bash "$W_DRIVER6" 2>&1)"; w6_rc=$?
       if [ "$w6_rc" -eq 0 ] && [ ! -d "$W_PLAIN/$W_INC_REL" ] \
-         && ! printf '%s' "$w6_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+         && ! grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$w6_out"; then
         ok "(w/cutlass non-git skip) a plain non-git tree with include/ absent is SKIPPED (rc=0, no banner, include/ still absent) — build.rs, not the hunk, owns the loud failure on that arm"
       else
         bad "(w/cutlass non-git skip) expected the hunk to skip a non-git tree (rc=$w6_rc, include_absent=$([ ! -d "$W_PLAIN/$W_INC_REL" ] && echo yes || echo no)): $w6_out"
@@ -3573,7 +3574,7 @@ PY
   W_AB_FIXTURE_VALID=0
   if git -C "$W_CLONE_BRANCH" rev-parse --git-dir >/dev/null 2>&1 \
      && [ -n "$W_AB_HEAD" ] && [ -n "$W_AB_OMAIN" ] && [ "$W_AB_HEAD" != "$W_AB_OMAIN" ] \
-     && printf '%s' "$W_AB_GITLINK" | grep -q "^160000 commit $W_PIN_SHA" \
+     && grep -q "^160000 commit $W_PIN_SHA" <<<"$W_AB_GITLINK" \
      && [ ! -d "$W_CLONE_BRANCH/$W_INC_REL" ]; then
     W_AB_FIXTURE_VALID=1
     ok "(w/cutlass any-branch fixture) non-vacuity: real git repo, HEAD (${W_AB_HEAD}) != origin/main (${W_AB_OMAIN}), gitlink pinned at ${W_PIN_SHA}, include/ absent — a measurement pod's own provenance"
@@ -3588,12 +3589,12 @@ PY
       wab_out="$(bash "$W_AB_DRIVER" 2>&1)"; wab_rc=$?
       wab_sub_head="$(w_git -C "$W_CLONE_BRANCH/$W_SUB_REL" rev-parse HEAD 2>/dev/null)" # tripwire-ok: a failed provisioning leaves no submodule repo to query — the empty result already fails the sha assertion loudly just below
       if [ "$wab_rc" -eq 0 ] \
-         && printf '%s' "$wab_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' \
+         && grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$wab_out" \
          && [ -f "$W_CLONE_BRANCH/$W_INC_REL/cutlass/cutlass.h" ] \
          && [ "$wab_sub_head" = "$W_PIN_SHA" ] \
-         && ! printf '%s' "$wab_out" | grep -q 'T1b (main only)' \
-         && printf '%s' "$wab_out" | grep -q 'T1B_RAN=false' \
-         && printf '%s' "$wab_out" | grep -q 'main-only by design'; then
+         && ! grep -q 'T1b (main only)' <<<"$wab_out" \
+         && grep -q 'T1B_RAN=false' <<<"$wab_out" \
+         && grep -q 'main-only by design' <<<"$wab_out"; then
         ok "(w/cutlass any-branch green) on a feature-branch fixture (HEAD != origin/main) the header exists and the submodule is at the pinned sha AFTER the seed's provisioning step, while T1b's own build did NOT run and is still reported skipped as main-only"
       else
         bad "(w/cutlass any-branch green) expected provisioning to fire and T1b to stay skipped (rc=$wab_rc, sub_head=${wab_sub_head:-none}): $wab_out"
@@ -3632,7 +3633,7 @@ PY
     if [ -n "$W_AB_OLD_DRIVER" ] && bash -n "$W_AB_OLD_DRIVER" && [ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ]; then
       wabold_out="$(bash "$W_AB_OLD_DRIVER" 2>&1)"; wabold_rc=$?
       if [ "$wabold_rc" -eq 0 ] && [ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ] \
-         && ! printf '%s' "$wabold_out" | grep -q 'T1b prerequisite: provisioning the CUTLASS submodule'; then
+         && ! grep -q 'T1b prerequisite: provisioning the CUTLASS submodule' <<<"$wabold_out"; then
         ok "(w/cutlass any-branch revert-RED) a main-only placement, in a scratch copy, SKIPS provisioning on the SAME non-main fixture (include/ stays absent) — provisioning outside the main-only block is load-bearing"
       else
         bad "(w/cutlass any-branch revert-RED) expected a main-only placement to skip provisioning (rc=$wabold_rc, include_absent=$([ ! -d "$W_CLONE_BRANCH2/$W_INC_REL" ] && echo yes || echo no)): $wabold_out"
@@ -3784,7 +3785,7 @@ del lines[target]
 open(p, "w").writelines(lines)
 PY
   x_mut_out="$(python3 "$X_SCANNER" "$X_MUTANT" 2>&1)"; x_mut_rc=$?
-  if [ "$x_mut_rc" -ne 0 ] && printf '%s' "$x_mut_out" | grep -q 'max_abs_diff_finite_first'; then
+  if [ "$x_mut_rc" -ne 0 ] && grep -q 'max_abs_diff_finite_first' <<<"$x_mut_out"; then
     ok "(x/cfg-gates revert-RED) stripping ONE gate (max_abs_diff_finite_first's) in a scratch copy is caught by the SAME scanner, naming the item — the scanner is load-bearing, not vacuous"
   else
     bad "(x/cfg-gates revert-RED) expected the scanner to catch the stripped gate (rc=$x_mut_rc): $x_mut_out"
@@ -3819,7 +3820,7 @@ PY
   X_NOCLIPPY="$SANDBOX/x_noclippy_fixture.sh"
   printf '#!/usr/bin/env bash\necho "no clippy invocation anywhere in this file"\n' > "$X_NOCLIPPY"
   x_empty_out="$(x_check_t3_lockstep "$X_NOCLIPPY")"; x_empty_rc=$?
-  if [ "$x_empty_rc" -ne 0 ] && printf '%s' "$x_empty_out" | grep -q 'empty match set'; then
+  if [ "$x_empty_rc" -ne 0 ] && grep -q 'empty match set' <<<"$x_empty_out"; then
     ok "(x/t3-lockstep empty-RED) a source with ZERO extractable clippy tuples fails the check (an empty match set must fail) — never a vacuous pass"
   else
     bad "(x/t3-lockstep empty-RED) expected the empty-match-set to fail (rc=$x_empty_rc): $x_empty_out"
@@ -3837,7 +3838,7 @@ assert old in t, "drift fixture: could not locate the T3 line to mutate"
 open(p, "w").write(t.replace(old, new, 1))
 PY
   x_drift_out="$(x_check_t3_lockstep "$X_T3_MUTANT")"; x_drift_rc=$?
-  if [ "$x_drift_rc" -ne 0 ] && printf '%s' "$x_drift_out" | grep -q 'cuda,flash-attn'; then
+  if [ "$x_drift_rc" -ne 0 ] && grep -q 'cuda,flash-attn' <<<"$x_drift_out"; then
     ok "(x/t3-lockstep drift-RED) mutating the T3 line to '--features cuda,flash-attn' in a scratch copy is caught — exact-tuple match, never substring: cuda,flash-attn does NOT satisfy cuda"
   else
     bad "(x/t3-lockstep drift-RED) expected the mutated tuple to fail the exact-match check (rc=$x_drift_rc): $x_drift_out"
@@ -3880,7 +3881,7 @@ PY
   echo hi > "$Y_SRC/file.txt"
   Y_DEST="$Y_PODROOT/trees/freshtree"   # neither "trees" nor "freshtree" exists yet
   y_before_out="$(rsync -a "$Y_SRC/" "$Y_DEST/" 2>&1)"; y_before_rc=$?
-  if [ "$y_before_rc" -ne 0 ] && printf '%s' "$y_before_out" | grep -qi 'no such file or directory'; then
+  if [ "$y_before_rc" -ne 0 ] && grep -qi 'no such file or directory' <<<"$y_before_out"; then
     ok "(y/push-parent repro) a bare rsync into a destination whose PARENT ('trees') does not exist fails (rc=$y_before_rc): $(printf '%s' "$y_before_out" | head -1)"
   else
     bad "(y/push-parent repro) expected the bare rsync to fail naming a missing parent directory (rc=$y_before_rc): $y_before_out"
@@ -3964,7 +3965,7 @@ PY
     Y_DRV_SESSIONS="$SANDBOX/y_sessions_mutant" Y_DRV_SSH_CONFIG="$SANDBOX/y_ssh_config_mutant" \
     bash "$Y_ENSURE_DRIVER" > "$SANDBOX/y_mutant_ensure.out" 2>&1
   y_mutant_rsync_out="$(rsync -a "$Y_SRC/" "$Y_MUTANT_DEST/" 2>&1)"; y_mutant_rsync_rc=$?
-  if [ "$y_mutant_rsync_rc" -ne 0 ] && printf '%s' "$y_mutant_rsync_out" | grep -qi 'no such file or directory'; then
+  if [ "$y_mutant_rsync_rc" -ne 0 ] && grep -qi 'no such file or directory' <<<"$y_mutant_rsync_out"; then
     ok "(y/push-parent revert-RED) neutering rp_push_ensure_parent's mkdir on a scratch copy brings the missing-parent failure back (rc=$y_mutant_rsync_rc) — the mkdir is genuinely load-bearing"
   else
     bad "(y/push-parent revert-RED) expected the neutered copy to fail on the missing parent (rc=$y_mutant_rsync_rc): $y_mutant_rsync_out"
@@ -3986,9 +3987,9 @@ PY
   Z_PLAIN_CWD="$SANDBOX/z_plain_cwd"
   rm -rf "$Z_PLAIN_CWD"; mkdir -p "$Z_PLAIN_CWD"
   z_plain_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" push somesession --tree x 2>&1)"; z_plain_rc=$?
-  if [ "$z_plain_rc" -eq 2 ] && printf '%s' "$z_plain_out" | grep -qF "REPO_ROOT=${REPO_ROOT}" \
-     && printf '%s' "$z_plain_out" | grep -qF "$Z_PLAIN_CWD" \
-     && printf '%s' "$z_plain_out" | grep -q 'RP_ALLOW_ROOT_MISMATCH'; then
+  if [ "$z_plain_rc" -eq 2 ] && grep -qF "REPO_ROOT=${REPO_ROOT}" <<<"$z_plain_out" \
+     && grep -qF "$Z_PLAIN_CWD" <<<"$z_plain_out" \
+     && grep -q 'RP_ALLOW_ROOT_MISMATCH' <<<"$z_plain_out"; then
     ok "(z/cwd-guard) 'push' from a plain (non-git) mismatched cwd REFUSES (exit 2), naming REPO_ROOT, the cwd, and the override"
   else
     bad "(z/cwd-guard) expected a named refusal (rc=$z_plain_rc): $z_plain_out"
@@ -4002,8 +4003,8 @@ PY
       && echo hi > f.txt && git add f.txt && git commit -q -m init )
   Z_OTHER_TOPLEVEL="$(cd "$Z_OTHER_REPO" && git rev-parse --show-toplevel)"
   z_other_out="$(cd "$Z_OTHER_REPO" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" run somesession echo hi 2>&1)"; z_other_rc=$?
-  if [ "$z_other_rc" -eq 2 ] && printf '%s' "$z_other_out" | grep -qF "REPO_ROOT=${REPO_ROOT}" \
-     && printf '%s' "$z_other_out" | grep -qF "$Z_OTHER_TOPLEVEL"; then
+  if [ "$z_other_rc" -eq 2 ] && grep -qF "REPO_ROOT=${REPO_ROOT}" <<<"$z_other_out" \
+     && grep -qF "$Z_OTHER_TOPLEVEL" <<<"$z_other_out"; then
     ok "(z/cwd-guard) 'run' from a DIFFERENT real git checkout REFUSES, naming the OTHER checkout's own git toplevel (not just \$PWD verbatim)"
   else
     bad "(z/cwd-guard) expected a named refusal citing the other repo's git toplevel (rc=$z_other_rc): $z_other_out"
@@ -4011,13 +4012,13 @@ PY
 
   # ---- 'target' is gated too -----------------------------------------------
   z_target_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" target somesession sometree 2>&1)"; z_target_rc=$?
-  [ "$z_target_rc" -eq 2 ] && printf '%s' "$z_target_out" | grep -qF "REPO_ROOT=${REPO_ROOT}" \
+  [ "$z_target_rc" -eq 2 ] && grep -qF "REPO_ROOT=${REPO_ROOT}" <<<"$z_target_out" \
     && ok "(z/cwd-guard) 'target' is gated by the same cwd-mismatch check as push/run" \
     || bad "(z/cwd-guard) expected 'target' to refuse too (rc=$z_target_rc): $z_target_out"
 
   # ---- the override opts in deliberately -----------------------------------
   z_override_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key RP_ALLOW_ROOT_MISMATCH=1 bash "$Z_GPU_DEV" push somesession --tree x 2>&1)"; z_override_rc=$?
-  if ! printf '%s' "$z_override_out" | grep -q 'RP_ALLOW_ROOT_MISMATCH=1 to override' && [ "$z_override_rc" -ne 2 ]; then
+  if ! grep -q 'RP_ALLOW_ROOT_MISMATCH=1 to override' <<<"$z_override_out" && [ "$z_override_rc" -ne 2 ]; then
     ok "(z/cwd-guard) RP_ALLOW_ROOT_MISMATCH=1 opts past the refusal (proceeds to the next real check — no live session — rather than the mismatch error; rc=$z_override_rc)"
   else
     bad "(z/cwd-guard) RP_ALLOW_ROOT_MISMATCH=1 did not bypass the mismatch refusal (rc=$z_override_rc): $z_override_out"
@@ -4025,7 +4026,7 @@ PY
 
   # ---- the ordinary (matching) invocation is never false-positived --------
   z_ok_out="$(cd "$REPO_ROOT" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" push somesession --tree x 2>&1)"; z_ok_rc=$?
-  if ! printf '%s' "$z_ok_out" | grep -q "this script's own location resolves to REPO_ROOT"; then
+  if ! grep -q "this script's own location resolves to REPO_ROOT" <<<"$z_ok_out"; then
     ok "(z/cwd-guard) invoking from REPO_ROOT itself never trips the mismatch refusal (rc=$z_ok_rc, a real 'no live session' failure downstream is expected and fine)"
   else
     bad "(z/cwd-guard) a matching cwd must never trip the mismatch refusal: $z_ok_out"
@@ -4033,7 +4034,7 @@ PY
 
   # ---- verbs OUTSIDE {push,run,target} are never gated ---------------------
   z_attach_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_GPU_DEV" attach somesession 2>&1)"; z_attach_rc=$?
-  if ! printf '%s' "$z_attach_out" | grep -q "this script's own location resolves to REPO_ROOT"; then
+  if ! grep -q "this script's own location resolves to REPO_ROOT" <<<"$z_attach_out"; then
     ok "(z/cwd-guard) 'attach' (outside the gated verb set) is unaffected by a mismatched cwd (rc=$z_attach_rc, a real 'no live session' failure downstream is expected and fine)"
   else
     bad "(z/cwd-guard) 'attach' must never be gated by the cwd-mismatch check: $z_attach_out"
@@ -4062,7 +4063,7 @@ open(p, "w").write(t2)
 PY
   bash -n "$Z_MUTANT_GPU_DEV" || bad "(z/cwd-guard revert-RED) the neutered gpu-dev.sh copy has a syntax error"
   z_mut_out="$(cd "$Z_PLAIN_CWD" && RUNPOD_API_KEY=test-dummy-key bash "$Z_MUTANT_GPU_DEV" push somesession --tree x 2>&1)"; z_mut_rc=$?
-  if [ "$z_mut_rc" -ne 2 ] && ! printf '%s' "$z_mut_out" | grep -q "this script's own location resolves to REPO_ROOT"; then
+  if [ "$z_mut_rc" -ne 2 ] && ! grep -q "this script's own location resolves to REPO_ROOT" <<<"$z_mut_out"; then
     ok "(z/cwd-guard revert-RED) neutering the cwd-mismatch guard on a scratch copy silently proceeds past a mismatched cwd (rc=$z_mut_rc) — the guard is genuinely load-bearing"
   else
     bad "(z/cwd-guard revert-RED) expected the neutered copy to NOT refuse (rc=$z_mut_rc): $z_mut_out"
@@ -4321,7 +4322,7 @@ COMMUNITY|NVIDIA A100 80GB PCIe"
     | grep -vx 'ci/scripts/runpod_gpu_gang.sh' \
     | grep -vx 'ci/scripts/test_gpu_gang_lane.sh' \
     | grep -vx 'ci/scripts/test_pod_substrate.sh' || true)" # tripwire-ok: grep -v with no surviving line legitimately exits 1; the emptiness IS the pass condition, asserted on the next line.
-  if printf '%s\n' "$ab_mentions" | grep -qx 'ci/scripts/runpod_lib.sh' && [ -z "$ab_unexpected" ]; then
+  if grep -qx 'ci/scripts/runpod_lib.sh' <<<"$ab_mentions" && [ -z "$ab_unexpected" ]; then
     ok "(ab/gpuCount D5) RP_GPU_COUNT is mentioned only by runpod_lib.sh, the gang driver, the gang-lane suite that asserts its value and this suite across every tracked ci/scripts + .github/workflows file — gpu-prove, gpu-perf-ab, gpu-dev and howwell all inherit the default"
   else
     bad "(ab/gpuCount D5) unexpected RP_GPU_COUNT site(s) — a lane other than the gang driver is changing its own gpuCount: ${ab_unexpected:-<runpod_lib.sh itself never mentions it>}"

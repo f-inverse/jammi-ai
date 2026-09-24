@@ -14,7 +14,7 @@ Attach an observer to inspect every output batch during inference. Use this for 
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::config::JammiConfig;
 # async fn ex(config: JammiConfig) -> jammi_db::error::Result<()> {
-use jammi_ai::inference::observer::InferenceObserver;
+use jammi_ai::inference::InferenceObserver;
 use std::sync::Arc;
 
 struct MetricsCollector;
@@ -52,7 +52,7 @@ The observer is called once per output batch. When no observer is attached, the 
 # use std::sync::atomic::{AtomicUsize, Ordering};
 # use std::time::Duration;
 # use arrow::record_batch::RecordBatch;
-# use jammi_ai::inference::observer::InferenceObserver;
+# use jammi_ai::inference::InferenceObserver;
 struct ProgressLogger { total: AtomicUsize }
 
 impl InferenceObserver for ProgressLogger {
@@ -71,7 +71,7 @@ impl InferenceObserver for ProgressLogger {
 # use std::time::Duration;
 # use arrow::array::StringArray;
 # use arrow::record_batch::RecordBatch;
-# use jammi_ai::inference::observer::InferenceObserver;
+# use jammi_ai::inference::InferenceObserver;
 struct QualityChecker;
 
 impl InferenceObserver for QualityChecker {
@@ -95,7 +95,7 @@ impl InferenceObserver for QualityChecker {
 # extern crate arrow;
 # use std::time::Duration;
 # use arrow::record_batch::RecordBatch;
-# use jammi_ai::inference::observer::InferenceObserver;
+# use jammi_ai::inference::InferenceObserver;
 struct LatencyTracker { slow_threshold: Duration }
 
 impl InferenceObserver for LatencyTracker {

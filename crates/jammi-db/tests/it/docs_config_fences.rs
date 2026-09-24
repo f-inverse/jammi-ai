@@ -277,16 +277,16 @@ fn docs_toml_fences_parse_under_the_real_loader() {
     // `> 0` alone would stay green through it. Bump this number in the same
     // commit that adds (or removes) a `JammiConfig`-shaped ```toml fence
     // under `docs/guide/src` -- including one that arrives only as a
-    // resolved `{{#include}}`. 27 direct fences + 4 includes
+    // resolved `{{#include}}`. 29 direct fences + 4 includes
     // (`deploy/kubernetes/base/jammi.toml`, `deploy/kubernetes/overlays/shape-d/jammi-query.toml`,
     // `deploy/kubernetes/overlays/shape-d/jammi-compute.toml`,
     // `deploy/kubernetes/overlays/shape-d/jammi-scheduler.toml`)
-    // = 31; `deploy/kubernetes/overlays/ci/jammi.toml` is not included by
+    // = 33; `deploy/kubernetes/overlays/ci/jammi.toml` is not included by
     // the guide, so it is not counted here.
     assert_eq!(
         selected,
-        31,
-        "selected {selected} config fence(s) under {} -- expected exactly 31; if you \
+        33,
+        "selected {selected} config fence(s) under {} -- expected exactly 33; if you \
          added or removed a JammiConfig-shaped ```toml fence (directly or via {{{{#include}}}}), \
          update this pinned count",
         guide_root().display()

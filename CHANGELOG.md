@@ -5,6 +5,17 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **Postgres is the production trigger broker; the NATS JetStream driver is gone.** The Postgres
+  broker's `LISTEN`/`NOTIFY` wake-ups over the topic's backing table (the authoritative log) give
+  replayable cross-replica delivery on the database a shared deployment already runs, so the second
+  production driver is cut. **BREAKING:** `[broker.jet_stream]` is refused at load (`BrokerConfig`
+  names `in_memory` and `postgres`); the `jetstream-broker` and `live-broker-tests` cargo features,
+  `JetStreamBroker` and `BrokerKind::JetStream` are removed, and `ServerInfo.broker` reports
+  `"in_memory"` or `"postgres"`. A topic carries no per-topic broker configuration any more: the
+  `broker_metadata` field leaves `TopicDefinition`, `RegisterTopicRequest` and `Topic` (fields 3 and
+  5 reserved), the catalog drops `topics.broker_metadata` (migration 044), and `register_topic`
+  (Python, both transports) and `jammi trigger register` no longer take it. The Compose and
+  Kubernetes shapes run one Postgres as catalog and broker (`JAMMI_BROKER__POSTGRES__URL`).
 - **The model operators are a crate on DataFusion's seams: `jammi-datafusion`.** Running a model
   over a relation as a physical stage — numbered and chunked by a token budget once, below every
   exchange; prepared on the host, admitted against its device and forwarded; its output behind a

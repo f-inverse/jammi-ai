@@ -13,7 +13,6 @@
 //! Control: an `Int64`/`Utf8`-only topic round-trips in every other test in
 //! `trigger.rs`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -82,7 +81,6 @@ async fn every_accepted_type_round_trips_through_replay() {
         name: "trigger.every_type".to_string(),
         schema: topic_schema(),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     broker.register_topic(&topic).await.unwrap();
     topic_repo.register_topic(&topic).await.unwrap();
@@ -209,7 +207,6 @@ async fn uint64_above_i64_max_is_refused_at_publish() {
         name: "trigger.uint64_overflow".to_string(),
         schema: Arc::clone(&schema),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     broker.register_topic(&topic).await.unwrap();
     topic_repo.register_topic(&topic).await.unwrap();

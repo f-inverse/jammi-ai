@@ -471,7 +471,6 @@ impl CatalogClient {
             .register_topic(RegisterTopicRequest {
                 name: topic.name.clone(),
                 schema,
-                broker_metadata: topic.broker_metadata.clone().into_iter().collect(),
                 // The id is engine-assigned, not caller input: the server mints
                 // it and ignores this field. Sent empty to make that explicit.
                 topic_id: String::new(),

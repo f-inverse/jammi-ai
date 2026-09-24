@@ -5,7 +5,6 @@
 //! corresponding `ListTopics` filter; an unbound client sees only globally
 //! scoped topics; an invalid UUID is rejected with `InvalidArgument`.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -32,7 +31,6 @@ async fn seed_topic(session: &InferenceSession, name: &str) {
         name: name.to_string(),
         schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
         tenant: session.tenant(),
-        broker_metadata: BTreeMap::new(),
     };
     session
         .trigger_broker()

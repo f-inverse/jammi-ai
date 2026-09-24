@@ -333,7 +333,6 @@ async fn register_events_topic(session: &InferenceSession) {
         name: "events".into(),
         schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
         tenant: None,
-        broker_metadata: Default::default(),
     };
     session
         .trigger_broker()

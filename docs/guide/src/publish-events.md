@@ -61,7 +61,6 @@ the gRPC `CatalogService.RegisterTopic` verb it rides) does this in one call.
 ```rust,no_run
 # extern crate jammi_db;
 # extern crate arrow_schema;
-# use std::collections::BTreeMap;
 # use std::sync::Arc;
 # use arrow_schema::SchemaRef;
 use jammi_db::trigger::{TopicDefinition, TopicId};
@@ -71,8 +70,7 @@ let topic = TopicDefinition {
     id: TopicId::new(),
     name: "cdc.orders".into(),
     schema,
-    tenant: None,                          // None = global; Some(t) scopes to t
-    broker_metadata: BTreeMap::new(),      // driver-specific opts (e.g. retention)
+    tenant: None, // None = global; Some(t) scopes to t
 };
 # topic
 # }
@@ -93,7 +91,6 @@ db.register_topic(
         ("key", pa.string()),
         ("after", pa.string()),
     ]),
-    broker_metadata={"retention_seconds": "604800"},
 )
 ```
 

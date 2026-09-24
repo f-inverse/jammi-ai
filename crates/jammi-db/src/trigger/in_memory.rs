@@ -261,7 +261,6 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
-    use std::collections::BTreeMap;
 
     fn topic(name: &str) -> TopicDefinition {
         TopicDefinition {
@@ -269,7 +268,6 @@ mod tests {
             name: name.into(),
             schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
             tenant: None,
-            broker_metadata: BTreeMap::new(),
         }
     }
 

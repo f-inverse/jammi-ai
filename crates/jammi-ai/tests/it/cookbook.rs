@@ -31,7 +31,6 @@ async fn register_cdc_orders_topic(session: &jammi_db::session::JammiSession) {
             Field::new("key", DataType::Utf8, false),
         ])),
         tenant: session.tenant(),
-        broker_metadata: std::collections::BTreeMap::new(),
     };
     session
         .trigger_broker()

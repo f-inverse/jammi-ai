@@ -12,7 +12,6 @@
 //! Parameterised over both backends: SQLite always runs; Postgres runs under
 //! `live-postgres-tests`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
@@ -76,7 +75,6 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
         name: format!("trigger.row_order.{}", jammi_test_utils::unique_suffix()),
         schema: topic_schema(),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     broker.register_topic(&topic).await.unwrap();
     topic_repo.register_topic(&topic).await.unwrap();
@@ -174,7 +172,6 @@ async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() 
         name: format!("trigger.update_churn.{}", jammi_test_utils::unique_suffix()),
         schema: topic_schema(),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     broker.register_topic(&topic).await.unwrap();
     topic_repo.register_topic(&topic).await.unwrap();

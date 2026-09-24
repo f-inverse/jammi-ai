@@ -147,7 +147,7 @@ REQUIRED: dict[str, list[str]] = {
     "drop_mutable_table": ["if_exists"],
     "list_mutable_tables": [],
     # trigger stream / topics
-    "register_topic": ["schema", "broker_metadata"],
+    "register_topic": ["schema"],
     "drop_topic": ["if_exists"],
     "list_topics": [],
     "publish_topic": ["batch"],

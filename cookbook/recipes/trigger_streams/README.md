@@ -26,7 +26,7 @@ time.
 
 ## API surface exercised
 
-- `Database.register_topic(name, *, schema, broker_metadata=None)`
+- `Database.register_topic(name, *, schema)`
 - `Database.list_topics()`
 - `Database.publish_topic(name, *, batch)` — returns the assigned offset
 - `Database.subscribe_collect(name, *, from_offset, max_batches)`

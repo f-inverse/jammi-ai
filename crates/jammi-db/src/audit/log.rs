@@ -193,7 +193,6 @@ async fn publish_to_topic(
                 name: AUDIT_TOPIC.to_string(),
                 schema: topic_payload_schema(),
                 tenant: Some(tenant),
-                broker_metadata: std::collections::BTreeMap::new(),
             };
             repo.register_topic(&definition)
                 .await

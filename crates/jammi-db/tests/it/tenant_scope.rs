@@ -1041,7 +1041,6 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns(
     use jammi_db::trigger::{
         InMemoryBroker, Offset, Predicate, Subscriber, TopicDefinition, TopicId, TriggerBroker,
     };
-    use std::collections::BTreeMap;
 
     let dir = tempdir().unwrap();
     let session = Arc::new(make_test_session(backend, dir.path()).await);
@@ -1062,7 +1061,6 @@ async fn subscribe_scoped_stream_remains_tenant_filtered_after_closure_returns(
         name: topic_name,
         schema: Arc::clone(&topic_schema),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     let broker: Arc<dyn TriggerBroker> = Arc::new(InMemoryBroker::new());
     broker.register_topic(&topic).await.unwrap();

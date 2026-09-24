@@ -1,6 +1,5 @@
 //! `TopicDefinition` — the catalog-registered shape of one trigger-stream topic.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -40,10 +39,6 @@ pub struct TopicDefinition {
     /// `docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from`).
     /// `None` is the engine-default global topic.
     pub tenant: Option<TenantId>,
-    /// Broker-driver-specific configuration (retention, replication, etc.).
-    /// Opaque to the engine; surfaced to the driver via
-    /// [`crate::trigger::broker::TriggerBroker::register_topic`].
-    pub broker_metadata: BTreeMap<String, String>,
 }
 
 impl TopicDefinition {

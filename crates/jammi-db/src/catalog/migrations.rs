@@ -232,6 +232,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
             postgres: schema::MIGRATION_043_MODELS_BACKEND_REQUIRED_POSTGRES,
         },
     ),
+    (
+        "044_topics_drop_broker_metadata",
+        MigrationSql::Same(schema::MIGRATION_044_TOPICS_DROP_BROKER_METADATA),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

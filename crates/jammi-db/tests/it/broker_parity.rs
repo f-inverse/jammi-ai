@@ -16,7 +16,6 @@
 //! `broker_for` returns: `postgres_listener_killed_recovers_via_replay`
 //! and `postgres_suppressed_notify_recovers_via_idle_tick`.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,7 +139,6 @@ fn topic_def(name: &str) -> TopicDefinition {
         name: name.to_string(),
         schema: topic_schema(),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     }
 }
 
@@ -650,7 +648,6 @@ async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
         name: "parity.every_type".to_string(),
         schema: Arc::clone(&schema),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -897,7 +894,6 @@ async fn every_accepted_type_round_trips_through_postgres_backing_table() {
         ),
         schema: Arc::clone(&schema),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     broker.register_topic(&topic).await.unwrap();
     topic_repo.register_topic(&topic).await.unwrap();

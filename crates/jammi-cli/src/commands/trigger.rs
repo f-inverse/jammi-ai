@@ -7,7 +7,6 @@
 //! only builds the topic schema from its inline spec and hands the work to the
 //! session.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema};
@@ -31,10 +30,6 @@ pub enum TriggerAction {
         /// Schema definition, e.g. `op:string,ts_ms:int,key:string,after:string:nullable`.
         #[arg(long)]
         schema: String,
-        /// Optional broker-driver metadata, parsed as JSON object (e.g.
-        /// `'{"retention_seconds":86400}'`).
-        #[arg(long, default_value = "{}")]
-        broker_metadata: String,
     },
 
     /// Drop a topic by name. `--if-exists` makes a missing topic a no-op.
@@ -54,11 +49,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         TriggerAction::List => list_topics(session).await,
-        TriggerAction::Register {
-            name,
-            schema,
-            broker_metadata,
-        } => register_topic(session, &name, &schema, &broker_metadata).await,
+        TriggerAction::Register { name, schema } => register_topic(session, &name, &schema).await,
         TriggerAction::Drop { name, if_exists } => drop_topic(session, &name, if_exists).await,
     }
 }
@@ -94,11 +85,8 @@ async fn register_topic(
     session: &CatalogClient,
     name: &str,
     schema_spec: &str,
-    broker_metadata: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = parse_schema_spec(schema_spec)?;
-    let broker_metadata: BTreeMap<String, String> = serde_json::from_str(broker_metadata)
-        .map_err(|e| format!("broker_metadata must be a JSON object: {e}"))?;
     let topic = TopicDefinition {
         // The id is engine-assigned: the server mints it and returns the
         // authoritative value below. This placeholder is never sent.
@@ -108,7 +96,6 @@ async fn register_topic(
         // The wire body stays tenant-free: the server stamps the session's
         // tenant onto the topic under its tenant scope.
         tenant: None,
-        broker_metadata,
     };
     let id = session.register_topic(&topic).await?;
     println!("Topic '{name}' registered (id={id}).");

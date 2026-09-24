@@ -5,7 +5,6 @@
 //! correctness, broadcast fan-out, tenant-scope isolation, schema
 //! validation, and a backpressure smoke test.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,7 +140,6 @@ fn topic_def(name: &str, tenant: Option<TenantId>) -> TopicDefinition {
         name: name.to_string(),
         schema: topic_schema(),
         tenant,
-        broker_metadata: BTreeMap::new(),
     }
 }
 
@@ -495,8 +493,6 @@ async fn session_topic_register_drop_round_trip(backend: BackendKind) {
     // resolves it) and the catalog (the system of record a lookup reads). The
     // session always carries a broker (defaulting to the in-memory broker), so
     // both registrations succeed.
-    let mut broker_metadata = BTreeMap::new();
-    broker_metadata.insert("retention_seconds".to_string(), "3600".to_string());
     let topic = TopicDefinition {
         id: TopicId::new(),
         name: unique_topic("orders.changes"),
@@ -506,7 +502,6 @@ async fn session_topic_register_drop_round_trip(backend: BackendKind) {
             Field::new("payload", DataType::Utf8, true),
         ])),
         tenant: None,
-        broker_metadata,
     };
     session
         .trigger_broker()
@@ -524,10 +519,6 @@ async fn session_topic_register_drop_round_trip(backend: BackendKind) {
     assert_eq!(mine.len(), 1);
     assert_eq!(mine[0].name, topic.name);
     assert_eq!(mine[0].schema.fields().len(), 3);
-    assert_eq!(
-        mine[0].broker_metadata.get("retention_seconds"),
-        Some(&"3600".to_string())
-    );
 
     // Dropping removes the catalog row; the broker drop is best-effort.
     session

@@ -1592,14 +1592,12 @@ def build_register_topic_request(
     name: str,
     *,
     schema: pa.Schema,
-    broker_metadata: Optional[Dict[str, str]] = None,
 ) -> catalog_pb2.RegisterTopicRequest:
     """Assemble the `RegisterTopicRequest` for a trigger-stream topic from the
     binding's flat kwargs.
 
     `schema` is the contract every published batch must satisfy (rides as a
-    schema-only Arrow IPC stream). `broker_metadata` is opaque driver-side
-    configuration (retention, replication, …). The `topic_id` is left unset — the
+    schema-only Arrow IPC stream). The `topic_id` is left unset — the
     engine mints a fresh id at the decode seam (the server and the embedded
     binding share that mint), keeping a single source of the minted id. The wire
     body is tenant-free; the server stamps the session tenant. The same request
@@ -1608,7 +1606,6 @@ def build_register_topic_request(
     return catalog_pb2.RegisterTopicRequest(
         name=name,
         schema=_encode_ipc_schema(schema),
-        broker_metadata=broker_metadata or {},
     )
 
 

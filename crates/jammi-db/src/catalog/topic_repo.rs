@@ -2,13 +2,12 @@
 //!
 //! `topic_repo` persists the [`TopicDefinition`] tuple — id, name, Arrow
 //! schema (serialised as JSON in a `TEXT` column to keep the DDL identical
-//! on SQLite and Postgres), tenant scope, broker metadata, backing
-//! mutable-table name — and the matching Phase-2 backing table inside one
+//! on SQLite and Postgres), tenant scope, backing mutable-table name — and
+//! the matching Phase-2 backing table inside one
 //! `CatalogBackend::transaction`. The encoding mirrors what `mutable_repo`
 //! does for `mutable_tables.schema_json` so the two catalog tables decode
 //! through the same lens.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -72,8 +71,6 @@ impl TopicRepo {
         let name = topic.name.clone();
         let schema_json = encode_schema_json(topic.schema.as_ref())?;
         let tenant_str = topic.tenant.map(|t| t.to_string());
-        let broker_metadata = serde_json::to_string(&topic.broker_metadata)
-            .map_err(|e| TriggerError::Catalog(format!("broker_metadata serialisation: {e}")))?;
         let backing_table = backing_id.as_str().to_string();
 
         let mutable_backend = self.mutable.backend_arc();
@@ -88,14 +85,13 @@ impl TopicRepo {
                         .map_err(|e| BackendError::Execution(e.to_string()))?;
                     tx.execute(
                         "INSERT INTO topics \
-                         (topic_id, name, schema_json, tenant_id, broker_metadata, backing_table) \
-                         VALUES ($1, $2, $3, $4, $5, $6)",
+                         (topic_id, name, schema_json, tenant_id, backing_table) \
+                         VALUES ($1, $2, $3, $4, $5)",
                         &[
                             SqlValue::TextOwned(topic_id),
                             SqlValue::TextOwned(name),
                             SqlValue::TextOwned(schema_json),
                             SqlValue::from(tenant_str),
-                            SqlValue::TextOwned(broker_metadata),
                             SqlValue::TextOwned(backing_table),
                         ],
                     )
@@ -135,7 +131,7 @@ impl TopicRepo {
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT topic_id, name, schema_json, tenant_id, \
-                                    broker_metadata, backing_table \
+                                    backing_table \
                              FROM topics \
                              WHERE name = $1 AND (tenant_id = $2 OR tenant_id IS NULL) \
                              LIMIT 1",
@@ -172,7 +168,7 @@ impl TopicRepo {
                     Box::pin(async move {
                         tx.query(
                             "SELECT topic_id, name, schema_json, tenant_id, \
-                                    broker_metadata, backing_table \
+                                    backing_table \
                              FROM topics \
                              WHERE (tenant_id = $1 OR tenant_id IS NULL) \
                              ORDER BY created_at, topic_id",
@@ -222,7 +218,7 @@ impl TopicRepo {
                     Box::pin(async move {
                         tx.query_opt(
                             "SELECT topic_id, name, schema_json, tenant_id, \
-                                    broker_metadata, backing_table \
+                                    backing_table \
                              FROM topics \
                              WHERE topic_id = $1 \
                                AND (tenant_id = $2 OR (tenant_id IS NULL AND $2 IS NULL))",
@@ -303,7 +299,6 @@ struct RawTopicRow {
     name: String,
     schema_json: String,
     tenant_id: Option<String>,
-    broker_metadata: String,
     backing_table: String,
 }
 
@@ -313,7 +308,6 @@ fn parse_topic_row(row: &Row<'_>) -> Result<RawTopicRow, BackendError> {
         name: row.get("name")?,
         schema_json: row.get("schema_json")?,
         tenant_id: row.try_get("tenant_id")?,
-        broker_metadata: row.get("broker_metadata")?,
         backing_table: row.get("backing_table")?,
     })
 }
@@ -328,14 +322,11 @@ fn materialize_topic(raw: RawTopicRow) -> Result<TopicDefinition, TriggerError> 
         ),
         None => None,
     };
-    let broker_metadata: BTreeMap<String, String> = serde_json::from_str(&raw.broker_metadata)
-        .map_err(|e| TriggerError::Catalog(format!("broker_metadata parse: {e}")))?;
     Ok(TopicDefinition {
         id,
         name: raw.name,
         schema,
         tenant,
-        broker_metadata,
     })
 }
 

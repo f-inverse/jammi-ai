@@ -75,7 +75,6 @@ async fn exercise_all_primitives(session: &JammiSession) {
         name: "shape_events".to_string(),
         schema: Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)])),
         tenant: session.tenant(),
-        broker_metadata: std::collections::BTreeMap::new(),
     };
     session
         .trigger_broker()

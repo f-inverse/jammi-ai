@@ -1330,22 +1330,15 @@ class EmbeddedBackend:
         name: str,
         *,
         schema: pa.Schema,
-        broker_metadata: Optional[Dict[str, str]] = None,
     ) -> str:
         """Register a trigger-stream topic and return its engine-minted topic id.
 
-        `schema` is the contract every published batch must satisfy.
-        `broker_metadata` is opaque driver-side configuration (retention,
-        replication, …). Tenant scope is the session's bound tenant. Same handle
+        `schema` is the contract every published batch must satisfy. Tenant scope is the session's bound tenant. Same handle
         shape and verb signature as the remote `RemoteDatabase.register_topic`; the
         request is assembled with the shared `RegisterTopicRequest` builder and
         submitted through the engine's wire seam.
         """
-        request = build_register_topic_request(
-            name,
-            schema=schema,
-            broker_metadata=broker_metadata,
-        )
+        request = build_register_topic_request(name, schema=schema)
         return self._native._register_topic_proto(request.SerializeToString())
 
     def eval_embeddings(

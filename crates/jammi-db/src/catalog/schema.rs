@@ -2101,3 +2101,12 @@ END;
 pub(super) const MIGRATION_043_MODELS_BACKEND_REQUIRED_POSTGRES: &str = r#"
 ALTER TABLE models ALTER COLUMN backend SET NOT NULL;
 "#;
+
+/// Migration 044: `topics` carries no per-topic broker configuration.
+///
+/// Every broker driver takes its configuration from `[broker]` alone — the
+/// in-memory driver has none, and the Postgres driver's wake-ups ride the
+/// backing table — so no reader of `topics.broker_metadata` exists.
+pub(super) const MIGRATION_044_TOPICS_DROP_BROKER_METADATA: &str = r#"
+ALTER TABLE topics DROP COLUMN broker_metadata;
+"#;

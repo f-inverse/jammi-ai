@@ -1401,21 +1401,15 @@ class RemoteDatabase:
         name: str,
         *,
         schema: pa.Schema,
-        broker_metadata: Optional[Dict[str, str]] = None,
     ) -> str:
         """Register a trigger-stream topic on the remote engine and return its
         engine-minted topic id.
 
         `schema` is the contract every published batch must satisfy (rides as a
-        schema-only Arrow IPC stream). `broker_metadata` is opaque driver-side
-        configuration (retention, replication, …). Tenant scope is the session's
+        schema-only Arrow IPC stream). Tenant scope is the session's
         bound tenant. Maps to `CatalogService.RegisterTopic`.
         """
-        request = build_register_topic_request(
-            name,
-            schema=schema,
-            broker_metadata=broker_metadata,
-        )
+        request = build_register_topic_request(name, schema=schema)
         resp = self._call(self._catalog.RegisterTopic, request)
         return resp.topic_id
 

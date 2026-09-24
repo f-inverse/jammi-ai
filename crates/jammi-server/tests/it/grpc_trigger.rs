@@ -24,7 +24,6 @@ use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
-use std::collections::BTreeMap;
 
 use jammi_db::session::JammiSession;
 use jammi_db::trigger::{TopicDefinition, TopicId};
@@ -186,7 +185,6 @@ async fn start_grpc_test_server(seeds: &[TopicSeed]) -> ServerFixture {
             name: seed.name.clone(),
             schema: events_schema(),
             tenant: session.tenant(),
-            broker_metadata: BTreeMap::new(),
         };
         session
             .trigger_broker()

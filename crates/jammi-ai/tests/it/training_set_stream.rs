@@ -772,7 +772,7 @@ async fn p3_streamed_read_completes_under_a_small_pool_while_eager_fails() {
     session_a.close().await;
 
     let mut config_b = common::test_config(dir.path());
-    config_b.engine.memory_limit = "64MB".to_string();
+    config_b.engine.memory_limit = "64MB".parse().unwrap();
     let session_b = Arc::new(InferenceSession::new(config_b).await.unwrap());
 
     let window = stream::RowWindow::new(0, rows);
@@ -1027,7 +1027,7 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
     std::fs::write(&csv, lines).unwrap();
 
     let mut config = common::test_config(dir.path());
-    config.engine.memory_limit = "64MB".to_string();
+    config.engine.memory_limit = "64MB".parse().unwrap();
     config.engine.batch_size = 32;
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
     session

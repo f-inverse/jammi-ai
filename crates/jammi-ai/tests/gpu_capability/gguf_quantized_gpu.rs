@@ -776,7 +776,6 @@ fn gpu_device_config() -> DeviceConfig {
     DeviceConfig {
         gpu_device: 0,
         devices: vec![0],
-        memory_fraction: 1.0,
         require_gpu: true,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     }

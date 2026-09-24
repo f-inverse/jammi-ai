@@ -13,8 +13,7 @@ use tokio::time::timeout;
 
 #[tokio::test]
 async fn permit_lifecycle_and_raii() {
-    let scheduler = Arc::new(GpuScheduler::new(1_000_000_000, 0.2));
-    // 1 GB total, 20% headroom -> 800 MB usable
+    let scheduler = Arc::new(GpuScheduler::new(800_000_000));
 
     // Two small permits acquired concurrently
     let permit_a = scheduler
@@ -50,20 +49,20 @@ async fn permit_lifecycle_and_raii() {
     assert_eq!(scheduler.available(), initial, "Scope drop restores memory");
 
     // Nested permit scopes release in order
-    let sched_no_headroom = Arc::new(GpuScheduler::new(1_000_000_000, 0.0));
-    let full = sched_no_headroom.available();
+    let nested = Arc::new(GpuScheduler::new(1_000_000_000));
+    let full = nested.available();
     {
-        let _p1 = sched_no_headroom.try_acquire(100_000_000).unwrap();
+        let _p1 = nested.try_acquire(100_000_000).unwrap();
         {
-            let _p2 = sched_no_headroom.try_acquire(200_000_000).unwrap();
+            let _p2 = nested.try_acquire(200_000_000).unwrap();
             {
-                let _p3 = sched_no_headroom.try_acquire(300_000_000).unwrap();
+                let _p3 = nested.try_acquire(300_000_000).unwrap();
             }
-            assert_eq!(sched_no_headroom.available(), full - 300_000_000);
+            assert_eq!(nested.available(), full - 300_000_000);
         }
-        assert_eq!(sched_no_headroom.available(), full - 100_000_000);
+        assert_eq!(nested.available(), full - 100_000_000);
     }
-    assert_eq!(sched_no_headroom.available(), full);
+    assert_eq!(nested.available(), full);
 }
 
 // ─── Blocking acquire and panic safety ───────────────────────────────────────
@@ -74,7 +73,7 @@ async fn permit_lifecycle_and_raii() {
 
 #[tokio::test]
 async fn blocking_acquire_and_panic_safety() {
-    let scheduler = Arc::new(GpuScheduler::new(1_000_000_000, 0.2));
+    let scheduler = Arc::new(GpuScheduler::new(800_000_000));
 
     // Large request blocks until memory freed
     let blocker = scheduler
@@ -129,7 +128,7 @@ async fn blocking_acquire_and_panic_safety() {
 
 #[tokio::test]
 async fn try_acquire_nonblocking_semantics() {
-    let scheduler = Arc::new(GpuScheduler::new(1_000_000_000, 0.2));
+    let scheduler = Arc::new(GpuScheduler::new(800_000_000));
 
     // Succeeds when sufficient
     let permit = scheduler.try_acquire(200_000_000);
@@ -149,15 +148,14 @@ async fn try_acquire_nonblocking_semantics() {
     );
 }
 
-// ─── Headroom enforcement ────────────────────────────────────────────────────
+// ─── Budget enforcement ──────────────────────────────────────────────────────
 //
-// Validates headroom limits usable capacity, different fractions work,
-// and exact-boundary behavior. Covers acceptance criteria 7, 8.
+// The budget bounds admission exactly at its boundary. Covers acceptance
+// criteria 7, 8.
 
 #[tokio::test]
-async fn headroom_fraction_enforced() {
-    // 20% headroom: 800 MB usable from 1 GB
-    let scheduler = Arc::new(GpuScheduler::new(1_000_000_000, 0.2));
+async fn budget_enforced_at_its_boundary() {
+    let scheduler = Arc::new(GpuScheduler::new(800_000_000));
     assert_eq!(scheduler.available(), 800_000_000);
 
     // Exact limit succeeds
@@ -172,12 +170,6 @@ async fn headroom_fraction_enforced() {
         "Exceeding usable limit must fail"
     );
     assert_eq!(scheduler.available(), 800_000_000);
-
-    // 50% headroom: 500 MB usable
-    let half = Arc::new(GpuScheduler::new(1_000_000_000, 0.5));
-    assert_eq!(half.available(), 500_000_000);
-    assert!(half.try_acquire(600_000_000).is_none());
-    assert!(half.try_acquire(500_000_000).is_some());
 }
 
 // ─── GPU memory detection ────────────────────────────────────────────────────
@@ -208,11 +200,9 @@ fn detect_gpu_memory_returns_result_not_panic() {
 #[tokio::test]
 async fn concurrent_acquire_stress_and_liveness() {
     // --- 20 tasks, 100 MB each, 800 MB usable (at most 8 concurrent) ---
-    let total = 1_000_000_000_usize;
-    let headroom = 0.2;
-    let usable = (total as f64 * (1.0 - headroom)) as usize;
+    let usable = 800_000_000_usize;
     let permit_size = 100_000_000_usize;
-    let scheduler = Arc::new(GpuScheduler::new(total, headroom));
+    let scheduler = Arc::new(GpuScheduler::new(usable));
 
     let mut handles = Vec::new();
     for _ in 0..20 {
@@ -244,7 +234,7 @@ async fn concurrent_acquire_stress_and_liveness() {
     );
 
     // --- 10 waiters, 200 MB each, 500 MB pool (only 2 at a time) ---
-    let scheduler = Arc::new(GpuScheduler::new(500_000_000, 0.0));
+    let scheduler = Arc::new(GpuScheduler::new(500_000_000));
     let mut handles = Vec::new();
     for i in 0..10 {
         let sched = Arc::clone(&scheduler);
@@ -271,7 +261,7 @@ async fn concurrent_acquire_stress_and_liveness() {
     assert_eq!(completed, (0..10).collect::<Vec<_>>());
 
     // --- Rapid acquire/release: sum conservation ---
-    let scheduler = Arc::new(GpuScheduler::new(1_000_000_000, 0.2));
+    let scheduler = Arc::new(GpuScheduler::new(800_000_000));
     let usable = 800_000_000_usize;
     let mut permits: Vec<GpuPermit> = Vec::new();
     let sizes = [

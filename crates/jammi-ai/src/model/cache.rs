@@ -899,7 +899,6 @@ mod cache_key_tests {
         let device_config = DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
@@ -994,7 +993,6 @@ mod cache_key_tests {
         let config = DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
@@ -1028,7 +1026,6 @@ mod f3_prime_tests {
         DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }
@@ -1111,7 +1108,7 @@ mod f3_prime_tests {
         // Budget fits EXACTLY one model — B's admission loop MUST evict A
         // to succeed; there is no slack that could mask the bug by simply
         // admitting B without ever calling `evict_one`.
-        let scheduler = Arc::new(GpuScheduler::new(weights_len, 0.0));
+        let scheduler = Arc::new(GpuScheduler::new(weights_len));
         let cache = Arc::new(ModelCache::new(resolver, device_config(), scheduler));
 
         // (1) Load A, then drop the guard: A is warm, resident, and IDLE
@@ -1222,7 +1219,7 @@ mod f3_prime_tests {
         // load's own weight (`weights_len`) plus X's and Y's one-byte
         // synthetic permits below, so every `available()` assertion is
         // exact, not merely directionally suggestive.
-        let scheduler = Arc::new(GpuScheduler::new(weights_len + 2, 0.0));
+        let scheduler = Arc::new(GpuScheduler::new(weights_len + 2));
         let cache = ModelCache::new(resolver, device_config(), Arc::clone(&scheduler));
         let guard = cache
             .get_or_load(&source, ModelTask::TextEmbedding)
@@ -1428,8 +1425,8 @@ mod f3_prime_tests {
 
         // One budget per device, each with exactly one byte of slack beyond
         // what its resident copies hold.
-        let budget_0 = Arc::new(GpuScheduler::new(1, 0.0));
-        let budget_1 = Arc::new(GpuScheduler::new(2, 0.0));
+        let budget_0 = Arc::new(GpuScheduler::new(1));
+        let budget_1 = Arc::new(GpuScheduler::new(2));
 
         let on_device_0 = CacheKey::for_test("model_a", 0);
         let older_on_device_1 = CacheKey::for_test("model_b", 1);
@@ -1512,7 +1509,6 @@ mod single_flight_tests {
         DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }
@@ -1652,7 +1648,6 @@ mod r5_f1_tokenizer_tests {
         DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }
@@ -1897,7 +1892,6 @@ mod admission_wake_tests {
         DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }
@@ -1988,7 +1982,7 @@ mod admission_wake_tests {
         // Budget fits EXACTLY one model — B cannot be admitted until A's
         // guard drops and M1 is evicted; there is no slack that would let
         // B's `try_acquire` succeed on its own.
-        let scheduler = Arc::new(GpuScheduler::new(weights_len, 0.0));
+        let scheduler = Arc::new(GpuScheduler::new(weights_len));
         let cache = Arc::new(ModelCache::new(resolver, device_config(), scheduler));
 
         // (1) A loads M1 and KEEPS THE GUARD — the entire budget is
@@ -2098,7 +2092,6 @@ mod load_bookkeeping_tests {
         DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }

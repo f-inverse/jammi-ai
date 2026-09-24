@@ -278,7 +278,6 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -320,7 +319,6 @@ async fn cache_ref_count_decrements_on_guard_drop() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -403,7 +401,6 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -445,7 +442,6 @@ async fn single_flight_concurrent_loads_coalesce() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -495,7 +491,6 @@ async fn eviction_skips_model_with_active_guard() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -588,7 +583,6 @@ async fn cache_load_failure_clears_in_flight_state() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };

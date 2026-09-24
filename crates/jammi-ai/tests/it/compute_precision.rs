@@ -63,7 +63,6 @@ async fn resolve_and_load(
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: precision,
     };
@@ -415,7 +414,6 @@ async fn bf16_inference_request_is_rejected_loudly() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: ComputePrecision::BF16,
     };

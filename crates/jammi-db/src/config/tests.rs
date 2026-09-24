@@ -1720,16 +1720,16 @@ fn env_unknown_key_under_a_known_section_refuses_naming_it() {
 fn env_value_outside_domain_refuses_naming_key_and_var() {
     let err = JammiConfig::parse_from(
         "",
-        vec![("JAMMI_GPU__MEMORY_FRACTION".to_string(), "90%".to_string())],
+        vec![(
+            "JAMMI_GPU__MEMORY_LIMIT".to_string(),
+            "90 percent".to_string(),
+        )],
     )
     .unwrap_err();
     match err {
         JammiError::Config(msg) => {
-            assert!(msg.contains("JAMMI_GPU__MEMORY_FRACTION"), "msg = {msg}");
-            assert!(
-                msg.contains("gpu.memory_fraction") || msg.contains("memory_fraction"),
-                "msg = {msg}"
-            );
+            assert!(msg.contains("JAMMI_GPU__MEMORY_LIMIT"), "msg = {msg}");
+            assert!(msg.contains("gpu.memory_limit"), "msg = {msg}");
         }
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
@@ -2064,11 +2064,12 @@ fn file_header_map_plus_nested_env_header_merges() {
     );
 }
 
-/// `[engine] memory_limit` is parsed by [`EngineConfig::memory_limit_bytes`];
-/// `[gpu] memory_limit` is an unread String field, so it is the string field
-/// this oracle pairs with the integer coercion.
+/// A memory limit from the environment is a string in the limit grammar, so
+/// `"007"` is seven bytes there, while an integer field reads the same text
+/// as the number 7 — leading zeros are tolerated by both, and neither keeps
+/// the raw text.
 #[test]
-fn env_integer_field_parses_leading_zeros_string_field_keeps_them_verbatim() {
+fn env_integer_field_and_memory_limit_field_both_read_leading_zeros() {
     let cfg = JammiConfig::parse_from(
         "",
         vec![
@@ -2078,21 +2079,16 @@ fn env_integer_field_parses_leading_zeros_string_field_keeps_them_verbatim() {
     )
     .unwrap();
     assert_eq!(cfg.engine.batch_size, 7);
-    assert_eq!(cfg.gpu.memory_limit, "007");
+    assert_eq!(cfg.gpu.memory_limit, "7".parse().unwrap());
 }
 
-/// `"007"` parses as the integer `7` (leading zeros tolerated, matching
-/// [`env_integer_field_parses_leading_zeros_string_field_keeps_them_verbatim`]'s
-/// batch-size half) — 7 bytes, refused by the 64 MiB floor, naming both the
-/// key and the floor. `parse_from` alone does not run this check (it is
-/// `load_from`'s post-load validation), so this drives it directly.
+/// `"007"` is 7 bytes — refused by the 64 MiB floor, naming the key, the
+/// resolved byte count and the floor. `parse_from` alone does not run this
+/// check (it is `load_from`'s post-load validation), so this drives it
+/// directly.
 #[test]
 fn memory_limit_007_parses_to_seven_bytes_and_is_refused_by_the_floor() {
-    let cfg = EngineConfig {
-        memory_limit: "007".to_string(),
-        ..EngineConfig::default()
-    };
-    let err = cfg.memory_limit_bytes().unwrap_err();
+    let err = engine_with("007").memory_limit_bytes().unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("memory_limit"), "{msg}");
     assert!(msg.contains('7'), "names the resolved byte count: {msg}");
@@ -2101,34 +2097,20 @@ fn memory_limit_007_parses_to_seven_bytes_and_is_refused_by_the_floor() {
 
 fn engine_with(memory_limit: &str) -> EngineConfig {
     EngineConfig {
-        memory_limit: memory_limit.to_string(),
+        memory_limit: memory_limit.parse().unwrap(),
         ..EngineConfig::default()
     }
 }
 
-/// `[engine] memory_limit`'s grammar: every arm, both accepted and
-/// refused, driven straight through [`EngineConfig::memory_limit_bytes`].
-mod memory_limit_grammar {
+/// `[engine] memory_limit`'s resolution: a share against the host, and the
+/// floor. The grammar itself is `MemoryLimit`'s, tested beside it.
+mod engine_memory_limit {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * MIB;
 
     #[test]
-    fn bytes_form_resolves_verbatim() {
-        assert_eq!(
-            engine_with("134217728").memory_limit_bytes().unwrap(),
-            128 * MIB
-        );
-    }
-
-    #[test]
-    fn gb_form_scales_by_the_binary_unit() {
-        assert_eq!(engine_with("2GB").memory_limit_bytes().unwrap(), 2 * GIB);
-    }
-
-    #[test]
-    fn mb_form_scales_by_the_binary_unit() {
+    fn an_absolute_limit_resolves_verbatim() {
         assert_eq!(
             engine_with("128MB").memory_limit_bytes().unwrap(),
             128 * MIB
@@ -2136,15 +2118,7 @@ mod memory_limit_grammar {
     }
 
     #[test]
-    fn kb_form_scales_by_the_binary_unit() {
-        assert_eq!(
-            engine_with("131072KB").memory_limit_bytes().unwrap(),
-            128 * MIB
-        );
-    }
-
-    #[test]
-    fn percent_form_resolves_against_a_readable_host() {
+    fn a_share_resolves_against_a_readable_host() {
         // Not pinned to an exact value (the host total varies by machine),
         // only that it resolves to something plausible: strictly positive,
         // and at most the (readable) host total.
@@ -2152,24 +2126,6 @@ mod memory_limit_grammar {
         let bytes = engine_with("50%").memory_limit_bytes().unwrap();
         assert!(bytes > 0);
         assert!(bytes <= total);
-    }
-
-    #[test]
-    fn percent_zero_is_refused_by_range_not_the_floor() {
-        let err = engine_with("0%").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("between 1 and 100"), "{err}");
-    }
-
-    #[test]
-    fn percent_over_a_hundred_is_refused() {
-        let err = engine_with("101%").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("between 1 and 100"), "{err}");
-    }
-
-    #[test]
-    fn zero_bytes_is_refused_by_the_floor() {
-        let err = engine_with("0").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("memory_limit"), "{err}");
     }
 
     #[test]
@@ -2185,56 +2141,50 @@ mod memory_limit_grammar {
         let err = engine_with("67108863").memory_limit_bytes().unwrap_err();
         assert!(err.to_string().contains("64"), "{err}");
     }
+}
 
-    #[test]
-    fn empty_string_is_refused() {
-        let err = engine_with("").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("not a valid form"), "{err}");
-    }
-
-    #[test]
-    fn a_decimal_is_refused() {
-        let err = engine_with("4.5GB").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("not a valid form"), "{err}");
-    }
-
-    #[test]
-    fn a_negative_value_is_refused() {
-        let err = engine_with("-1").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("not a valid form"), "{err}");
-    }
-
-    #[test]
-    fn a_bare_unit_with_no_digits_is_refused() {
-        let err = engine_with("GB").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("not a valid form"), "{err}");
-    }
-
-    #[test]
-    fn a_lowercase_unit_is_an_unrecognised_form() {
-        // The grammar is exact-case; a lowercase suffix does not fall back to
-        // a looser match, it is simply unrecognised (falls through to the
-        // bytes arm, where "4gb" fails to parse as an integer).
-        let err = engine_with("4gb").memory_limit_bytes().unwrap_err();
-        assert!(err.to_string().contains("not a valid form"), "{err}");
-    }
-
-    /// Load-time wiring: an out-of-grammar `[engine] memory_limit` in a real
-    /// TOML file is refused by `JammiConfig::load_from` (via `parse_from` +
-    /// the post-load check), never merely by a unit test calling
-    /// `memory_limit_bytes` directly.
-    #[test]
-    fn an_out_of_grammar_memory_limit_is_refused_at_load() {
-        let err = load_src(
-            r#"
-                artifact_dir = "/tmp/jammi"
-
-                [engine]
-                memory_limit = "not-a-value"
-            "#,
-        )
+/// Load-time wiring: an out-of-grammar memory limit in a real TOML file is
+/// refused while the file is parsed, naming the key it was written under —
+/// at both scales, since both are one grammar.
+#[test]
+fn an_out_of_grammar_memory_limit_is_refused_at_load_naming_its_key() {
+    for (section, key) in [
+        ("engine", "engine.memory_limit"),
+        ("gpu", "gpu.memory_limit"),
+    ] {
+        let err = load_src(&format!(
+            "artifact_dir = \"/tmp/jammi\"\n\n[{section}]\nmemory_limit = \"auto\"\n"
+        ))
         .unwrap_err();
-        assert!(err.to_string().contains("memory_limit"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains(key), "{msg}");
+        assert!(msg.contains("is not a memory limit"), "{msg}");
+    }
+}
+
+/// The defaults, stated in the grammar an operator writes.
+#[test]
+fn memory_limit_defaults_are_shares_of_the_bounded_memory() {
+    let cfg = JammiConfig::default();
+    assert_eq!(cfg.engine.memory_limit.to_string(), "75%");
+    assert_eq!(cfg.gpu.memory_limit.to_string(), "90%");
+}
+
+/// A key the engine does not read is not a key: a configuration that still
+/// sets one fails to load, naming it, instead of being accepted with no
+/// effect.
+#[test]
+fn keys_that_bound_nothing_are_refused_at_load() {
+    for (section, key) in [
+        ("gpu", "memory_fraction = 0.9"),
+        ("inference", "batch_timeout_secs = 300"),
+    ] {
+        let err = load_src(&format!(
+            "artifact_dir = \"/tmp/jammi\"\n\n[{section}]\n{key}\n"
+        ))
+        .unwrap_err();
+        let field = key.split(' ').next().unwrap();
+        assert!(err.to_string().contains(field), "{err}");
     }
 }
 

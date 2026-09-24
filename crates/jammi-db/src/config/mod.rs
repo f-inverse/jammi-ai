@@ -16,11 +16,13 @@ use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 mod env_map;
 pub mod host_memory;
 mod layers;
+pub mod memory_limit;
 pub mod remote_model;
 pub mod secret;
 #[cfg(test)]
 mod tests;
 
+pub use memory_limit::{MemoryLimit, Percent};
 pub use remote_model::{RemoteModelConfig, RemoteProtocol};
 pub use secret::{Secret, SecretSource};
 
@@ -691,80 +693,48 @@ pub struct EngineConfig {
     /// the OS reports — set it where a container is allotted fewer cores than
     /// it can see.
     pub execution_threads: std::num::NonZeroUsize,
-    /// Maximum memory for the query engine: `"<n>%"` (1-100) of host
-    /// physical memory, `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or
-    /// `"<n>"` (bytes). Default: `"75%"`. Parsed by
-    /// [`Self::memory_limit_bytes`] — see its doc for the full grammar and
-    /// refusals.
-    pub memory_limit: String,
+    /// Maximum memory for the query engine, in [`MemoryLimit`]'s grammar; a
+    /// share resolves against host physical memory. Default: `"75%"`. Read
+    /// through [`Self::memory_limit_bytes`].
+    pub memory_limit: MemoryLimit,
     /// Maximum rows per DataFusion batch. Default: 8192.
     pub batch_size: usize,
 }
 
 impl EngineConfig {
+    const DEFAULT_MEMORY_SHARE: Percent = match Percent::new(75) {
+        Some(share) => share,
+        None => panic!("75 is a percentage"),
+    };
+
     /// Below this, a resolved `memory_limit` is refused at load: 64 MiB is small enough that
     /// DataFusion's own long-lived pool consumers (a `SortPreservingMergeExec`'s per-partition
     /// reservation, an external sorter's spill buffer) would be refused on the very first
     /// non-trivial query, before the setting ever bounds the workload it exists to bound.
     pub const MEMORY_LIMIT_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 
-    /// Parse `[engine] memory_limit` into bytes — the ONE reader of the
-    /// field; every consumer of the byte value (the session's
-    /// [`crate::memory_pool::ActiveSpillPool`]) calls this,
-    /// never the raw string.
+    /// `[engine] memory_limit` in bytes — the ONE resolution of the field;
+    /// every consumer of the byte value (the session's
+    /// [`crate::memory_pool::ActiveSpillPool`]) calls this.
     ///
-    /// # Grammar
+    /// A share resolves against
+    /// [`host_memory::total_physical_memory_bytes`] (a Linux cgroup ceiling
+    /// honoured when it is lower than the host total and readable), read
+    /// once per call — not cached, so a caller that wants ONE resolved value
+    /// for a whole session's lifetime calls this once and keeps the `u64`,
+    /// the same discipline `crate::session::JammiSession::build` follows.
     ///
-    /// - `"<n>%"`, `1 <= n <= 100`: that percentage of
-    ///   [`host_memory::total_physical_memory_bytes`] (a Linux cgroup
-    ///   ceiling honoured when it is lower than the host total and
-    ///   readable), read once per call — not cached, so a caller that wants
-    ///   ONE resolved value for a whole session's lifetime calls this once
-    ///   and keeps the `u64`, the same discipline
-    ///   `crate::session::JammiSession::build` follows.
-    /// - `"<n>GB"` / `"<n>MB"` / `"<n>KB"`: `n` binary (1024-based) units.
-    /// - `"<n>"`: `n` bytes, unadorned.
-    ///
-    /// # Refusals
-    ///
-    /// Every arm is a typed [`JammiError::Config`] naming the key and the
-    /// configured value:
-    ///
-    /// - a percentage outside `1..=100`;
-    /// - a form matching none of the three shapes above (an empty string, a
-    ///   decimal, a stray unit with no digits, an unrecognised suffix, a
-    ///   negative number);
-    /// - a resolved value below [`Self::MEMORY_LIMIT_FLOOR_BYTES`] — the
-    ///   floor also named in the message, so `"007"` (7 bytes, a
-    ///   `[engine]` config typo for `"7%"` or similar) is refused rather than
-    ///   silently building a 7-byte pool no query could ever run under.
+    /// A resolved value below [`Self::MEMORY_LIMIT_FLOOR_BYTES`] is a typed
+    /// [`JammiError::Config`] naming the key, the value and the floor, so
+    /// `"007"` (7 bytes, a typo for `"7%"` or similar) is refused rather
+    /// than silently building a 7-byte pool no query could ever run under.
     pub fn memory_limit_bytes(&self) -> Result<u64> {
-        let raw = self.memory_limit.trim();
-        let bytes = if let Some(pct) = raw.strip_suffix('%') {
-            let pct: u64 = pct
-                .parse()
-                .map_err(|_| Self::memory_limit_grammar_error(&self.memory_limit))?;
-            if !(1..=100).contains(&pct) {
-                return Err(JammiError::Config(format!(
-                    "[engine] memory_limit = {:?}: a percentage must be between 1 and 100",
-                    self.memory_limit
-                )));
-            }
-            let total = host_memory::total_physical_memory_bytes()?;
-            total.saturating_mul(pct) / 100
-        } else if let Some(n) = raw.strip_suffix("GB") {
-            Self::parse_binary_unit(n, &self.memory_limit, 1024 * 1024 * 1024)?
-        } else if let Some(n) = raw.strip_suffix("MB") {
-            Self::parse_binary_unit(n, &self.memory_limit, 1024 * 1024)?
-        } else if let Some(n) = raw.strip_suffix("KB") {
-            Self::parse_binary_unit(n, &self.memory_limit, 1024)?
-        } else {
-            raw.parse::<u64>()
-                .map_err(|_| Self::memory_limit_grammar_error(&self.memory_limit))?
-        };
+        let bytes = self
+            .memory_limit
+            .resolve(host_memory::total_physical_memory_bytes)?;
         if bytes < Self::MEMORY_LIMIT_FLOOR_BYTES {
             return Err(JammiError::Config(format!(
-                "[engine] memory_limit = {:?} resolves to {bytes} byte(s), below the {} MiB \
+                "[engine] memory_limit = \"{}\" resolves to {bytes} byte(s), below the {} MiB \
                  floor (a smaller pool would refuse DataFusion's own long-lived reservations \
                  before it ever bounds a query)",
                 self.memory_limit,
@@ -772,20 +742,6 @@ impl EngineConfig {
             )));
         }
         Ok(bytes)
-    }
-
-    fn parse_binary_unit(digits: &str, raw: &str, unit: u64) -> Result<u64> {
-        let n: u64 = digits
-            .parse()
-            .map_err(|_| Self::memory_limit_grammar_error(raw))?;
-        Ok(n.saturating_mul(unit))
-    }
-
-    fn memory_limit_grammar_error(raw: &str) -> JammiError {
-        JammiError::Config(format!(
-            "[engine] memory_limit = {raw:?} is not a valid form: use \"<n>%\" (1-100), \
-             \"<n>GB\"/\"<n>MB\"/\"<n>KB\", or \"<n>\" (bytes)"
-        ))
     }
 }
 
@@ -828,10 +784,13 @@ pub struct GpuConfig {
     /// `device` its author set; the resolution lives in
     /// [`Self::device_list`], the one place both arities are reconciled.
     pub devices: Option<Vec<i32>>,
-    /// GPU memory limit (e.g., `"auto"` or `"8GB"`). Default: `"auto"`.
-    pub memory_limit: String,
-    /// Fraction of GPU memory to allocate (0.0 - 1.0). Default: 0.9.
-    pub memory_fraction: f64,
+    /// Each device's model-residency budget, in [`MemoryLimit`]'s grammar;
+    /// a share resolves against the device's total memory. What the budget
+    /// leaves of the card is headroom for the activations and workspace a
+    /// model's residency estimate does not count. An absolute budget larger
+    /// than a device is refused when that device's budget is built.
+    /// Default: `"90%"`.
+    pub memory_limit: MemoryLimit,
     /// Require a usable GPU: when `true`, refuse to fall back to CPU and fail
     /// fast if the requested device is unavailable. Default: `false` (degrade
     /// to CPU with a warning).
@@ -846,6 +805,11 @@ pub struct GpuConfig {
 }
 
 impl GpuConfig {
+    const DEFAULT_MEMORY_SHARE: Percent = match Percent::new(90) {
+        Some(share) => share,
+        None => panic!("90 is a percentage"),
+    };
+
     /// The CPU device ordinal: `-1`, the value every backend already reads as
     /// "no CUDA device, run on the host".
     pub const CPU_DEVICE: i32 = -1;
@@ -961,8 +925,6 @@ pub struct InferenceConfig {
     /// than the budget still forwards alone. Default: 16384 (32 rows of a
     /// 512-token encoder).
     pub batch_tokens: usize,
-    /// Seconds to wait before flushing an incomplete batch. Default: 300.
-    pub batch_timeout_secs: u64,
     /// The most idle models a process keeps loaded, per process across its
     /// devices. Past it the least recently used idle model is evicted; a
     /// model in use is never evicted, so the count can exceed this while
@@ -2822,7 +2784,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             execution_threads: num_cpus(),
-            memory_limit: "75%".into(),
+            memory_limit: MemoryLimit::Share(Self::DEFAULT_MEMORY_SHARE),
             batch_size: 8192,
         }
     }
@@ -2836,8 +2798,7 @@ impl Default for GpuConfig {
             // must resolve to the CPU, which it does only while the plural
             // stays absent and `device_list()` derives it from `device`.
             devices: None,
-            memory_limit: "auto".into(),
-            memory_fraction: 0.9,
+            memory_limit: MemoryLimit::Share(Self::DEFAULT_MEMORY_SHARE),
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         }
@@ -2849,7 +2810,6 @@ impl Default for InferenceConfig {
         Self {
             batch_size: 32,
             batch_tokens: 16384,
-            batch_timeout_secs: 300,
             max_loaded_models: 0,
             max_described_models: 1024,
             partitions: 1,
@@ -3191,9 +3151,8 @@ impl JammiConfig {
         // `otlp_endpoint`) at load time, naming the offending key, rather
         // than at the first `jammi_ai::telemetry::otlp_layer` call.
         config.observability.validate()?;
-        // Reject an out-of-grammar `[engine] memory_limit` (an unparseable
-        // form, an out-of-range percentage, or a resolved value below the
-        // floor) at load time, naming the key — rather than at the first
+        // Reject an `[engine] memory_limit` that resolves below the floor
+        // at load time, naming the key — rather than at the first
         // session build, deep inside `JammiSession::build`'s memory-pool
         // construction. The resolved value itself is discarded here; every
         // real consumer re-resolves through this same reader.

@@ -1851,7 +1851,6 @@ impl RunContext {
             gpu_device,
             // One device: a bench leg runs on the ordinal it was given.
             devices: vec![gpu_device],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: params.backbone_dtype,
         };

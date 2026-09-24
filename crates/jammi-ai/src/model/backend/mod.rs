@@ -67,8 +67,6 @@ pub struct DeviceConfig {
     /// hand-constructed value that violates either states a deployment no
     /// loaded configuration can produce.
     pub devices: Vec<i32>,
-    /// Fraction of GPU memory available for model loading.
-    pub memory_fraction: f64,
     /// When `true`, refuse to fall back to CPU if the requested GPU is
     /// unavailable: device selection returns an error so the server fails
     /// fast instead of silently serving on CPU. When `false` (the default),
@@ -121,7 +119,6 @@ impl DeviceConfig {
             // same deployment, and this reads the resolved answer rather
             // than re-deriving it.
             devices: config.gpu.device_list(),
-            memory_fraction: config.gpu.memory_fraction,
             require_gpu: config.gpu.require_gpu,
             compute_precision: config.gpu.compute_precision,
         }
@@ -147,7 +144,6 @@ mod device_config_tests {
         let config = DeviceConfig {
             gpu_device: 0,
             devices: vec![0, 1, 2],
-            memory_fraction: 0.9,
             require_gpu: true,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
@@ -166,7 +162,6 @@ mod device_config_tests {
                 "`devices[0] == gpu_device` is the invariant this type documents"
             );
             // The knobs that are not about WHICH device travel unchanged.
-            assert_eq!(restricted.memory_fraction, config.memory_fraction);
             assert_eq!(restricted.require_gpu, config.require_gpu);
             assert_eq!(restricted.compute_precision, config.compute_precision);
         }
@@ -191,7 +186,6 @@ mod device_config_tests {
         let config = DeviceConfig {
             gpu_device: 0,
             devices: vec![0, 1],
-            memory_fraction: 0.9,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };

@@ -3259,20 +3259,18 @@ the copies disagreed.
   this resolver-computed figure verbatim for a GGUF-resolved model rather
   than re-deriving anything from `weights_paths` (a single `model.gguf`
   file's raw byte size is wildly unrepresentative of resident memory).
-- **`ModelIdentity.quantization`** —
-  `crates/jammi-db/src/store/manifest.rs` (`ModelIdentity::quantization:
-  Option<jammi_numerics::WeightQuantization>`): the MODAL `WeightQuantization`
-  among a GGUF backbone's matmul-site tensors (ties broken by that type's
-  own `Ord`, i.e. GGUF wire-ID order), `None` for every safetensors
-  load. Folds in alongside `compute_precision`/`content_digest` (`#[serde
-  (default, skip_serializing_if = "Option::is_none")]`, preserving every
-  pre-existing `DefinitionHash` byte-for-byte — a `None` serialises to no
-  key at all, never a present `null`) because a quantized run is
-  output-affecting relative to a full-precision run of the same model over
-  the same inputs: two such runs must never collide on one materialization
-  identity. `LoadedModel::quantization()` (`crates/jammi-ai/src/model/
-  mod.rs`) is the read path both `session.rs` and `pipeline/embedding.rs`
-  consult.
+- **`LocalRun::quantization`** —
+  `crates/jammi-db/src/store/manifest.rs` (a field of `LocalRun`, the run a
+  `ModelIdentity` records for a model this engine ran over local weights):
+  the MODAL `WeightQuantization` among a GGUF backbone's matmul-site tensors
+  (ties broken by that type's own `Ord`, i.e. GGUF wire-ID order), `None`
+  for dense weights, and then absent from the serialized run. It is a
+  determinant beside `compute_precision` and `content_digest` because a
+  quantized run is output-affecting relative to a full-precision run of the
+  same model over the same inputs: two such runs must never collide on one
+  materialization identity. A candle `ModelDescription` holds the run and
+  builds the identity `session.rs` and `pipeline/embedding.rs` record from
+  it.
 
 **Catalog identity — the durable model row (`jammi-db/catalog/model_repo.rs`)**
 

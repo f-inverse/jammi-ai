@@ -2707,6 +2707,28 @@ impl JobWorker {
                 );
                 AttemptEnd::LeftForReclaim
             }
+            Err(WorkerJobError::Failed(error))
+                if hold.lost() && !cancel_requested_seen.load(Ordering::SeqCst) =>
+            {
+                // The job's own lease was lost while the attempt ran, and the
+                // step that noticed it first surfaced it as its own error — a
+                // training-set materialization's result-table lease reads the
+                // same keeper, and reports "lease lost to another writer"
+                // before the training loop's epoch check ever runs. The error
+                // is a consequence of the lease loss, so the attempt ends as
+                // one: nothing terminal is written, the row is `running` for
+                // reclaim, and another worker owns, or will own, the job.
+                tracing::warn!(job_id = %job_id, worker = %self.worker_id, error = %error, "attempt failed after its lease was lost; left for reclaim");
+                reclaim_unpublished_artifacts(
+                    &session.artifact_store(),
+                    &catalog,
+                    &job_id,
+                    &self.worker_id,
+                    attempt,
+                )
+                .await;
+                AttemptEnd::LeftForReclaim
+            }
             Err(WorkerJobError::Failed(error)) => {
                 tracing::error!(job_id = %job_id, error = %error, "training job failed");
                 record_failed(

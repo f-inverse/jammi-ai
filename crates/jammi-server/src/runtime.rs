@@ -2308,7 +2308,7 @@ async fn preload_models(
         tracing::info!(model = %entry.id, ?task, "preloading model");
         session
             .model_cache()
-            .preload(&source, task, None)
+            .preload(&source, task)
             .await
             .map_err(|e| ServerError::Preload {
                 id: entry.id.clone(),

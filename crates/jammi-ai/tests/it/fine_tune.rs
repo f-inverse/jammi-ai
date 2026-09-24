@@ -448,7 +448,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
     let fine_tuned = ModelSource::parse(job.model_id());
     let described = cold_session
         .model_cache()
-        .describe(&fine_tuned, ModelTask::TextEmbedding, None)
+        .describe(&fine_tuned, ModelTask::TextEmbedding)
         .await
         .expect("the published fine-tuned model describes cold");
     assert!(
@@ -465,7 +465,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
         .expect("the fine-tuned BERT model resolves and serves cold");
     let served = cold_session
         .model_cache()
-        .get_or_load(&fine_tuned, ModelTask::TextEmbedding, None)
+        .get_or_load(&fine_tuned, ModelTask::TextEmbedding)
         .await
         .unwrap();
     assert_eq!(
@@ -1265,7 +1265,7 @@ async fn fine_tune_job_catalog_crud() {
             model_id: "base-model",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
@@ -1353,7 +1353,7 @@ async fn fine_tune_job_catalog_crud() {
                     model_id: "jammi:fine-tuned:job-1",
                     version: 1,
                     model_type: "fine-tuned",
-                    backend: "candle",
+                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                     task: ModelTask::TextEmbedding,
                     base_model_id: Some("base-model"),
                     config_json: None,
@@ -1508,7 +1508,7 @@ async fn training_divergence_detection() {
             model_id: "div-test-model",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
@@ -1642,7 +1642,7 @@ async fn training_early_stopping_triggers() {
             model_id: "es-test-model",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
@@ -3173,7 +3173,7 @@ async fn training_bails_when_lease_lost_mid_run() {
             model_id: "lease-model",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,

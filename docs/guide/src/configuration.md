@@ -92,8 +92,6 @@ require_gpu = false
 compute_precision = "f32"
 
 [inference]
-# Default backend selection strategy. Default: "auto".
-default_backend = "auto"
 # The chunk budget: what bounds one model forward. A forward chunk is cut
 # from the input ordered by row cost — a text row's token count, then the
 # key — under both caps, whatever the fan-out below, so rows that share a
@@ -121,13 +119,6 @@ max_loaded_models = 0
 # device admits queues rather than oversubscribes. 1 is the default and the
 # minimum: 0 is refused at load, never silently treated as 1. Default: 1.
 partitions = 1
-
-[inference.http]
-# HTTP request timeout (seconds). Default: 60.
-timeout_secs = 60
-# Custom headers for HTTP model endpoints.
-[inference.http.headers]
-# Authorization = "Bearer sk-..."
 
 [embedding]
 # Distance metric for vector indices. Default: "cosine".
@@ -738,8 +729,7 @@ rejected as an unknown tier name) selects all-in-one; a comma-separated list
 exactly those tiers. See [Service tiers](./deploy-server.md#service-tiers).
 
 **Secrets.** A `Secret`-typed field (`catalog.postgres.url`,
-`broker.jet_stream.credentials`, `broker.postgres.url`,
-`inference.http.headers` values, the cloud
+`broker.jet_stream.credentials`, `broker.postgres.url`, the cloud
 credential fields, `models.hub_token`) takes the value inline
 (`JAMMI_CATALOG__POSTGRES__URL=…`)
 or as a file reference via the `__FILE` suffix

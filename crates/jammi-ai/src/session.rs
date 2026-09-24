@@ -1108,7 +1108,7 @@ impl InferenceSession {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // The output schema is the described model's — its width and its
         // regression head's form — so planning holds no weights.
-        let description = self.model_cache.describe(model, task, None).await?;
+        let description = self.model_cache.describe(model, task).await?;
 
         // `input` is caller-supplied — the fluent chain's plan, or the
         // `annotate` table function's scan — with no key order to impose, so
@@ -1138,7 +1138,7 @@ impl InferenceSession {
 
         let guard = self
             .model_cache
-            .get_or_load(&model_source, ModelTask::TextEmbedding, None)
+            .get_or_load(&model_source, ModelTask::TextEmbedding)
             .await?;
 
         // Build a single-row input with the text
@@ -1322,7 +1322,7 @@ impl InferenceSession {
 
         let guard = self
             .model_cache
-            .get_or_load(&model_source, ModelTask::ImageEmbedding, None)
+            .get_or_load(&model_source, ModelTask::ImageEmbedding)
             .await?;
 
         let binary_array =
@@ -1378,7 +1378,7 @@ impl InferenceSession {
 
         let guard = self
             .model_cache
-            .get_or_load(&model_source, ModelTask::AudioEmbedding, None)
+            .get_or_load(&model_source, ModelTask::AudioEmbedding)
             .await?;
 
         let binary_array =
@@ -1552,7 +1552,7 @@ impl InferenceSession {
         // its regression head's form, and the identity the environment
         // records. Nothing is loaded here — the executing process
         // materializes the weights when the plan runs.
-        let description = self.model_cache.describe(source, task, None).await?;
+        let description = self.model_cache.describe(source, task).await?;
         let identity = description.identity().clone();
 
         // The materialization contract is knowable here (model described,
@@ -2151,7 +2151,7 @@ impl InferenceSession {
                     model_id: &canonical_name,
                     version: 1,
                     model_type: "embedding",
-                    backend: "candle",
+                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                     task,
                     base_model_id: None,
                     external_location: None,

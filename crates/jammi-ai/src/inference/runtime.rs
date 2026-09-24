@@ -27,7 +27,7 @@ impl ModelRuntime for ModelCache {
         task: ModelTask,
     ) -> jammi_datafusion::Result<Arc<dyn BoundModel>> {
         let guard = self
-            .get_or_load(source, task, None)
+            .get_or_load(source, task)
             .await
             .map_err(jammi_datafusion::Error::runtime)?;
         Ok(Arc::new(guard))

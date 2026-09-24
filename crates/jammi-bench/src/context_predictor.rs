@@ -1248,7 +1248,7 @@ mod tests {
                 model_id,
                 version: 1,
                 model_type: "context-predictor",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::Regression,
                 base_model_id: None,
                 external_location: Some(&artifact),

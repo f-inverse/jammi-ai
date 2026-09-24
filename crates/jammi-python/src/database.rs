@@ -1547,11 +1547,11 @@ impl PyDatabase {
         self.check_open()?;
         let source = ModelSource::parse(model_id);
         self.runtime
-            .block_on(self.session.model_cache().get_or_load(
-                &source,
-                ModelTask::TextEmbedding,
-                None,
-            ))
+            .block_on(
+                self.session
+                    .model_cache()
+                    .get_or_load(&source, ModelTask::TextEmbedding),
+            )
             .map_err(to_pyerr)?;
         Ok(())
     }

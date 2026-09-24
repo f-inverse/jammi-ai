@@ -1,4 +1,4 @@
-use jammi_ai::model::{resolver::ModelResolver, BackendType};
+use jammi_ai::model::{resolver::ModelResolver, WeightsFormat};
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
@@ -40,7 +40,7 @@ async fn resolve_hf_hub_sentence_transformer() {
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
@@ -66,7 +66,7 @@ async fn resolve_hf_hub_sentence_transformer() {
 
 #[cfg(feature = "live-hub-tests")]
 #[tokio::test]
-async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
+async fn resolve_hf_hub_selects_safetensors_weights() {
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(
@@ -78,11 +78,11 @@ async fn resolve_hf_hub_selects_candle_for_safetensors_model() {
 
     let source = ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2");
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
-    assert_eq!(resolved.backend, BackendType::Candle);
+    assert_eq!(resolved.weights_format, WeightsFormat::Safetensors);
 }
 
 // --- Local path resolution ---
@@ -123,25 +123,27 @@ async fn resolve_local_path_with_safetensors() {
 
     let source = ModelSource::local(&model_dir);
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
-    assert_eq!(resolved.backend, BackendType::Candle);
+    assert_eq!(resolved.weights_format, WeightsFormat::Safetensors);
     assert!(resolved
         .weights_paths
         .iter()
         .any(|p| p.ends_with("model.safetensors")));
 }
 
+/// An ONNX export is not a weights file the engine loads: a directory that
+/// carries only `model.onnx` is refused, naming the files it would load.
 #[tokio::test]
-async fn resolve_local_path_with_onnx() {
+async fn resolve_local_refuses_a_directory_with_only_onnx_weights() {
     let dir = tempdir().unwrap();
     let model_dir = dir.path().join("onnx_model");
     std::fs::create_dir_all(&model_dir).unwrap();
 
     std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
-    std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
+    std::fs::write(model_dir.join("model.onnx"), b"onnx-export").unwrap();
 
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let resolver = ModelResolver::new(
@@ -152,27 +154,25 @@ async fn resolve_local_path_with_onnx() {
     .unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await
-        .unwrap();
-
-    assert_eq!(resolved.backend, BackendType::Ort);
-    assert!(resolved
-        .weights_paths
-        .iter()
-        .any(|p| p.ends_with("model.onnx")));
+    let Err(error) = resolver.resolve(&source, ModelTask::TextEmbedding).await else {
+        panic!("a directory with only ONNX weights must not resolve");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("model.safetensors") && message.contains("model.gguf"),
+        "the refusal names the weights the engine loads: {message}"
+    );
+    assert!(
+        !message.contains("model.onnx"),
+        "the refusal never offers ONNX as a loadable format: {message}"
+    );
 }
 
-/// The weights slot's cold-side backend flip: `model.onnx` appearing beside an already-existing
-/// `model.safetensors` must flip a FRESH resolve's backend selection to ORT
-/// — the same `has_onnx` preference `resolve_local` always applies,
-/// independent of load order. This is the cold-side half of
-/// `model::backend::candle::digest_fingerprint_tests::weights_slot_alternate_arm_appearing_trips_the_probe`,
-/// which proves the WARM staleness probe detects the appearance; this test
-/// proves what a subsequent cold reload actually does once it fires.
+/// An ONNX export appearing beside `model.safetensors` changes nothing a
+/// resolve loads: the directory resolves to the same safetensors file
+/// before and after.
 #[tokio::test]
-async fn resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors() {
+async fn an_onnx_export_beside_safetensors_changes_nothing_a_resolve_loads() {
     let dir = tempdir().unwrap();
     let model_dir = dir.path().join("onnx_appears_model");
     std::fs::create_dir_all(&model_dir).unwrap();
@@ -189,68 +189,19 @@ async fn resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetenso
     .unwrap();
     let source = ModelSource::local(&model_dir);
 
-    // Before model.onnx exists: Candle, via model.safetensors.
-    let resolved_before = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+    let before = resolver
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    assert_eq!(resolved_before.backend, BackendType::Candle);
-
-    // model.onnx APPEARS beside the existing model.safetensors.
-    std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
-
-    // A FRESH resolve of the SAME directory now prefers ORT — proving the
-    // staleness the warm probe detects (candle.rs's peer test) corresponds
-    // to a REAL change in what a cold reload would do, not merely an inert
-    // file the resolver ignores.
-    let resolved_after = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        resolved_after.backend,
-        BackendType::Ort,
-        "a fresh resolve of a directory where model.onnx now exists alongside \
-         model.safetensors must prefer ORT (resolve_local's has_onnx branch), \
-         even though an earlier resolve of the SAME directory picked Candle"
-    );
-    assert!(resolved_after
-        .weights_paths
-        .iter()
-        .any(|p| p.ends_with("model.onnx")));
-}
-
-// --- Backend selection heuristic ---
-
-#[tokio::test]
-async fn backend_hint_overrides_heuristic() {
-    let dir = tempdir().unwrap();
-    let model_dir = dir.path().join("hint_model");
-    std::fs::create_dir_all(&model_dir).unwrap();
-
-    std::fs::write(model_dir.join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
-    write_minimal_safetensors(&model_dir.join("model.safetensors"));
-    std::fs::write(model_dir.join("model.onnx"), b"fake-onnx").unwrap();
-
-    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let resolver = ModelResolver::new(
-        catalog,
-        crate::common::test_artifact_store(),
-        crate::common::test_hub_source(),
-    )
-    .unwrap();
-
-    let source = ModelSource::local(&model_dir);
-    let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, Some(BackendType::Candle))
+    std::fs::write(model_dir.join("model.onnx"), b"onnx-export").unwrap();
+    let after = resolver
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
-    assert_eq!(
-        resolved.backend,
-        BackendType::Candle,
-        "Hint should override heuristic"
-    );
+    assert_eq!(before.weights_paths, after.weights_paths);
+    assert_eq!(after.weights_format, WeightsFormat::Safetensors);
+    assert!(after.weights_paths[0].ends_with("model.safetensors"));
 }
 
 // --- Tokenizer encoding (live only) ---
@@ -338,7 +289,6 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -349,7 +299,6 @@ async fn cache_get_or_load_returns_guard_with_ref_count() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -382,7 +331,6 @@ async fn cache_ref_count_decrements_on_guard_drop() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -391,7 +339,6 @@ async fn cache_ref_count_decrements_on_guard_drop() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -402,7 +349,6 @@ async fn cache_ref_count_decrements_on_guard_drop() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -468,7 +414,6 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
         .preload(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -477,7 +422,6 @@ async fn preload_loads_model_into_cache_without_returning_guard() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -517,7 +461,6 @@ async fn single_flight_concurrent_loads_coalesce() {
                 .get_or_load(
                     &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                     ModelTask::TextEmbedding,
-                    None,
                 )
                 .await
         }),
@@ -526,7 +469,6 @@ async fn single_flight_concurrent_loads_coalesce() {
                 .get_or_load(
                     &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                     ModelTask::TextEmbedding,
-                    None,
                 )
                 .await
         }),
@@ -564,7 +506,6 @@ async fn eviction_skips_model_with_active_guard() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -591,9 +532,7 @@ async fn resolve_local_missing_config_returns_error() {
     .unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     assert!(
         result.is_err(),
         "Missing config.json should fail resolution"
@@ -615,9 +554,7 @@ async fn resolve_local_empty_directory_returns_error() {
     .unwrap();
 
     let source = ModelSource::local(&model_dir);
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     assert!(result.is_err(), "Empty directory should fail resolution");
 }
 
@@ -633,9 +570,7 @@ async fn resolve_nonexistent_local_path_returns_error() {
     .unwrap();
 
     let source = ModelSource::local("/nonexistent/path/to/model");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     assert!(result.is_err(), "Nonexistent path should fail resolution");
 }
 
@@ -664,7 +599,6 @@ async fn cache_load_failure_clears_in_flight_state() {
         .get_or_load(
             &ModelSource::hf("nonexistent-org/nonexistent-model-xyz"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await;
     assert!(result.is_err());
@@ -673,7 +607,6 @@ async fn cache_load_failure_clears_in_flight_state() {
         .get_or_load(
             &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();
@@ -697,7 +630,7 @@ async fn ner_model_round_trips_through_catalog() {
             model_id: "tenant/ner-model",
             version: 1,
             model_type: "huggingface",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::Ner,
             base_model_id: None,
             external_location: None,
@@ -712,7 +645,10 @@ async fn ner_model_round_trips_through_catalog() {
         .unwrap()
         .expect("model just registered should be present");
     assert_eq!(fetched.task, ModelTask::Ner);
-    assert_eq!(fetched.backend, "candle");
+    assert_eq!(
+        fetched.backend,
+        jammi_db::catalog::model_repo::ModelBackendKind::Candle
+    );
 }
 
 // =============================================================================
@@ -743,7 +679,7 @@ async fn fine_tuned_record_without_a_location_refuses_to_resolve() {
             model_id: "jammi:fine-tuned:broken-artifact-path",
             version: 1,
             model_type: "fine-tuned",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
             external_location: None,
@@ -759,9 +695,7 @@ async fn fine_tuned_record_without_a_location_refuses_to_resolve() {
     )
     .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:broken-artifact-path");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     let err = match result {
         Ok(_) => panic!(
             "a fine-tuned record with no location must refuse to resolve, never \
@@ -797,7 +731,7 @@ async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
             model_id: "jammi:fine-tuned:broken-base-id",
             version: 1,
             model_type: "fine-tuned",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: Some("/nonexistent/adapter/prefix"),
@@ -813,9 +747,7 @@ async fn fine_tuned_record_without_base_model_id_refuses_to_resolve() {
     )
     .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:broken-base-id");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     let err = match result {
         Ok(_) => panic!(
             "a fine-tuned record with no base_model_id must refuse to resolve, never \
@@ -891,9 +823,7 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
 
     let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:missing-adapter-file");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     let err = match result {
         Ok(_) => panic!(
             "a fine-tuned record whose adapter.safetensors was deleted must refuse to \
@@ -955,7 +885,7 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
             model_id: "jammi:fine-tuned:unpublished-bundle",
             version: 1,
             model_type: "fine-tuned",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
             external_location: Some(&prefix),
@@ -966,9 +896,7 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
 
     let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:unpublished-bundle");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     let err = match result {
         Ok(_) => panic!(
             "a fine-tuned record whose location names a prefix nothing was ever \
@@ -1017,7 +945,7 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
             model_id: "jammi:fine-tuned:corrupted-by-old-build",
             version: 1,
             model_type: "huggingface",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
             external_location: Some(base_dir.to_str().unwrap()),
@@ -1033,9 +961,7 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
     )
     .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:corrupted-by-old-build");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     let err = match result {
         Ok(_) => panic!(
             "a jammi:fine-tuned: id whose row is typed 'huggingface' must refuse to \
@@ -1075,7 +1001,7 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
             model_id: "jammi:fine-tuned:corrupted-pointer",
             version: 1,
             model_type: "fine-tuned",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: Some(&base_id),
             external_location: Some("not-a-real-scheme://nonsense"),
@@ -1091,9 +1017,7 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
     )
     .unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:corrupted-pointer");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
     let err = match result {
         Ok(_) => panic!(
             "a fine-tuned record whose location does not parse as a storage URL must \
@@ -1164,9 +1088,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
 
     let resolver = ModelResolver::new(catalog, store, crate::common::test_hub_source()).unwrap();
     let source = ModelSource::hf("jammi:fine-tuned:permission-fault-bundle");
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
 
     // Restore permissions unconditionally so the tempdir's own Drop cleanup
     // never has to fight the chmod.

@@ -31,7 +31,7 @@ impl jammi_db::store::sink::ProducingEnvironment for InferenceEnvironment {
         for spec in inference_specs(plan) {
             let guard = self
                 .model_cache
-                .get_or_load(&spec.source, spec.task, None)
+                .get_or_load(&spec.source, spec.task)
                 .await?;
             let identity = guard.model.description().identity();
             if !models.contains(identity) {

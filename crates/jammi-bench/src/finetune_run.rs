@@ -98,7 +98,7 @@ use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::tokenizer::{BatchEncoding, TokenizerWrapper};
-use jammi_ai::model::{BackendType, LoadedModel, ModelId, ResolvedModel, TokenizerSource};
+use jammi_ai::model::{LoadedModel, ModelId, ResolvedModel, TokenizerSource};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
@@ -888,7 +888,7 @@ pub(crate) struct Checkpoint {
     /// Its parsed contents.
     pub(crate) config_json: serde_json::Value,
     /// The weights file that was actually found (one of
-    /// `jammi_ai::model::arch::CANDLE_WEIGHTS_CANDIDATE_NAMES`).
+    /// `jammi_ai::model::arch::WEIGHTS_CANDIDATE_NAMES`).
     pub(crate) weights_path: PathBuf,
 }
 
@@ -919,7 +919,7 @@ impl Checkpoint {
                 "finetune-run: {} holds none of {:?} — this tier builds LoRA-injected encoders \
                  from a Candle-loadable weights file",
                 model_dir.display(),
-                arch::CANDLE_WEIGHTS_CANDIDATE_NAMES
+                arch::WEIGHTS_CANDIDATE_NAMES
             )
         })?;
         // The shared Candle chain's last candidate is `model.gguf`. A GGUF
@@ -1025,7 +1025,6 @@ fn load_base_model(
     };
     let resolved = ResolvedModel {
         model_id: ModelId(model_dir.display().to_string()),
-        backend: BackendType::Candle,
         weights_format: jammi_ai::model::WeightsFormat::Safetensors,
         task: task.model_task(),
         config_path,
@@ -1904,7 +1903,7 @@ impl RunContext {
                 model_id: &model_row_id,
                 version: 1,
                 model_type: checkpoint.family.adapter_model_type(),
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: params.task.model_task(),
                 base_model_id: None,
                 external_location: None,

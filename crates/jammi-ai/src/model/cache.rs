@@ -7,10 +7,9 @@ use jammi_db::error::{JammiError, Result};
 use tokio::sync::RwLock;
 
 use super::backend::candle::CandleBackend;
-use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
-use super::{BackendType, LoadedModel, ModelDescription, ModelGuard, ModelId, ResolvedModel};
+use super::{LoadedModel, ModelDescription, ModelGuard, ModelId, ResolvedModel};
 use crate::concurrency::{DeviceSchedulers, GpuPermit, GpuScheduler};
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
@@ -45,14 +44,13 @@ struct CacheEntry {
 ///
 /// A model id alone is not an identity: the same weights loaded on two
 /// devices are two resident copies with two budgets, and the same
-/// checkpoint loaded for two tasks or through two backends is two different
-/// loaded objects. Keying on the id alone made the second load a warm HIT on
-/// the first — a model served from the wrong device, or with the wrong head.
+/// checkpoint loaded for two tasks is two different loaded objects. Keying
+/// on the id alone made the second load a warm HIT on the first — a model
+/// served from the wrong device, or with the wrong head.
 ///
-/// `None` is a DISTINCT KEY VALUE, never a wildcard: a load that named no
-/// backend hint is its own entry, and it neither matches nor is matched by a
-/// load that named one. A wildcard would reintroduce exactly the collision
-/// this key exists to remove.
+/// A `None` task is a DISTINCT KEY VALUE, never a wildcard: it neither
+/// matches nor is matched by a key that names a task. A wildcard would
+/// reintroduce exactly the collision this key exists to remove.
 ///
 /// The same shape both maps are keyed by — the entries and the single-flight
 /// `in_flight` — because a single-flight that keyed more coarsely than the
@@ -65,24 +63,17 @@ pub struct CacheKey {
     pub device: i32,
     /// The task the model was loaded for, when the caller named one.
     pub task: Option<ModelTask>,
-    /// The backend the caller asked for, when it named one — not the backend
-    /// that was ultimately selected, which is a consequence of the load
-    /// rather than an input to it.
-    pub backend: Option<BackendType>,
 }
 
 #[cfg(test)]
 impl CacheKey {
     /// A key for an inner-state test: one model id on one device, with no
-    /// task or backend named. `None` here is the DISTINCT "named none" value
-    /// the production keys also carry when a caller named none, never a
-    /// wildcard.
+    /// task named. `None` here is a DISTINCT key value, never a wildcard.
     pub(crate) fn for_test(model_id: &str, device: i32) -> Self {
         Self {
             model_id: ModelId(model_id.to_string()),
             device,
             task: None,
-            backend: None,
         }
     }
 }
@@ -91,11 +82,6 @@ struct CacheInner {
     entries: HashMap<CacheKey, CacheEntry>,
     lru_order: VecDeque<CacheKey>,
     in_flight: HashMap<CacheKey, Arc<tokio::sync::Notify>>,
-}
-
-struct Backends {
-    candle: CandleBackend,
-    ort: OrtBackend,
 }
 
 /// Test-only deterministic interleaving seam for `get_or_load`'s fast path.
@@ -148,7 +134,7 @@ pub struct ModelCache {
     inner: Arc<RwLock<CacheInner>>,
     descriptions: RwLock<DescriptionMemo>,
     resolver: ModelResolver,
-    backends: Backends,
+    backend: CandleBackend,
     device_config: DeviceConfig,
     /// One admission budget per configured device — see [`DeviceSchedulers`].
     gpu_schedulers: DeviceSchedulers,
@@ -210,10 +196,7 @@ impl ModelCache {
             })),
             descriptions: RwLock::new(DescriptionMemo::default()),
             resolver,
-            backends: Backends {
-                candle: CandleBackend,
-                ort: OrtBackend,
-            },
+            backend: CandleBackend,
             device_config,
             gpu_schedulers,
             admission_notify: Arc::new(tokio::sync::Notify::new()),
@@ -304,7 +287,7 @@ impl ModelCache {
     /// for the full accounting): this cache's warm-hit staleness detection
     /// is NARROW.** It re-`stat`s the FILES the resolver selected at load
     /// time and reloads on in-place mutation, deletion, or appearance among
-    /// them; it does NOT re-verify catalog location/`backend`
+    /// them; it does NOT re-verify catalog location
     /// rewrites (a fine-tuned retrain's new adapter goes unnoticed by a warm
     /// entry until process restart), catalog-vs-local precedence, HF
     /// revision moves, or remote sibling listings. The guarantee this DOES
@@ -313,13 +296,8 @@ impl ModelCache {
     /// [`ModelGuard`] was fresh at some instant before this call began, but
     /// is never revalidated again — a TOCTOU window between that instant and
     /// the guard's actual use is inherent, not a defect.
-    pub async fn get_or_load(
-        &self,
-        source: &ModelSource,
-        task: ModelTask,
-        backend_hint: Option<BackendType>,
-    ) -> Result<ModelGuard> {
-        self.get_or_load_on(self.gpu_schedulers.primary(), source, task, backend_hint)
+    pub async fn get_or_load(&self, source: &ModelSource, task: ModelTask) -> Result<ModelGuard> {
+        self.get_or_load_on(self.gpu_schedulers.primary(), source, task)
             .await
     }
 
@@ -338,7 +316,6 @@ impl ModelCache {
         device: i32,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
         // The device is validated here — a warm hit must not be able to
         // return a copy from a device this deployment never declared — but
@@ -356,7 +333,6 @@ impl ModelCache {
             model_id: ModelId::from(source),
             device,
             task: Some(task),
-            backend: backend_hint,
         };
 
         loop {
@@ -541,9 +517,7 @@ impl ModelCache {
             cache.in_flight.insert(id.clone(), Arc::clone(&notify));
             drop(cache);
 
-            let result = self
-                .do_load(&id, &scheduler, source, task, backend_hint)
-                .await;
+            let result = self.do_load(&id, &scheduler, source, task).await;
 
             let mut cache = self.inner.write().await;
             cache.in_flight.remove(&id);
@@ -578,9 +552,8 @@ impl ModelCache {
         &self,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<Arc<ModelDescription>> {
-        self.describe_on(self.gpu_schedulers.primary(), source, task, backend_hint)
+        self.describe_on(self.gpu_schedulers.primary(), source, task)
             .await
     }
 
@@ -592,23 +565,19 @@ impl ModelCache {
         device: i32,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<Arc<ModelDescription>> {
         let device_config = self.device_config.for_device(device)?;
         let id = CacheKey {
             model_id: ModelId::from(source),
             device,
             task: Some(task),
-            backend: backend_hint,
         };
-        let resolved = self.resolver.resolve(source, task, backend_hint).await?;
-        let backend = self.backend_for(&resolved, source)?;
-        self.describe_resolved(&id, &resolved, backend, &device_config)
-            .await
+        let resolved = self.resolver.resolve(source, task).await?;
+        self.describe_resolved(&id, &resolved, &device_config).await
     }
 
-    /// The memoized description of `id`: `resolved` described by `backend`
-    /// for `device_config`, computed once for every concurrent caller of
+    /// The memoized description of `id`: `resolved` described for
+    /// `device_config`, computed once for every concurrent caller of
     /// the same key and reused by [`Self::do_load`], so the content digest
     /// is hashed once per resolved directory.
     ///
@@ -623,7 +592,6 @@ impl ModelCache {
         &self,
         id: &CacheKey,
         resolved: &ResolvedModel,
-        backend: &dyn ModelBackend,
         device_config: &DeviceConfig,
     ) -> Result<Arc<ModelDescription>> {
         loop {
@@ -665,7 +633,7 @@ impl ModelCache {
             memo.in_flight.insert(id.clone(), Arc::clone(&notify));
             drop(memo);
 
-            let described = backend.describe(resolved, device_config).map(Arc::new);
+            let described = self.backend.describe(resolved, device_config).map(Arc::new);
 
             let mut memo = self.descriptions.write().await;
             memo.in_flight.remove(id);
@@ -675,23 +643,6 @@ impl ModelCache {
             drop(memo);
             notify.notify_waiters();
             return described;
-        }
-    }
-
-    /// The backend a resolved model loads through. `Http` serves remotely
-    /// and never resolves to a loadable backend.
-    fn backend_for(
-        &self,
-        resolved: &ResolvedModel,
-        source: &ModelSource,
-    ) -> Result<&dyn ModelBackend> {
-        match resolved.backend {
-            BackendType::Candle => Ok(&self.backends.candle),
-            BackendType::Ort => Ok(&self.backends.ort),
-            other => Err(JammiError::Model {
-                model_id: source.to_string(),
-                message: format!("Backend {other:?} not available"),
-            }),
         }
     }
 
@@ -722,9 +673,8 @@ impl ModelCache {
         source: &ModelSource,
         task: ModelTask,
     ) -> Result<LoadedModel> {
-        let resolved = self.resolver.resolve(source, task, None).await?;
-        self.backend_for(&resolved, source)?
-            .load(&resolved, &self.device_config)
+        let resolved = self.resolver.resolve(source, task).await?;
+        self.backend.load(&resolved, &self.device_config)
     }
 
     /// Complete a generic (plain local/HuggingFace, or `"embedding"`
@@ -811,7 +761,6 @@ impl ModelCache {
                          catalog-managed record of a different kind"
                     );
                 } else {
-                    let backend_str = format!("{:?}", resolved.backend).to_lowercase();
                     let model_type = match source {
                         ModelSource::HuggingFace(_) => "huggingface",
                         ModelSource::Local(_) => "local",
@@ -829,7 +778,7 @@ impl ModelCache {
                             model_id: source_str,
                             version: 1,
                             model_type,
-                            backend: &backend_str,
+                            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                             task,
                             base_model_id: None,
                             external_location: artifact_dir_str.as_deref(),
@@ -853,22 +802,20 @@ impl ModelCache {
         gpu_scheduler: &Arc<GpuScheduler>,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<ModelGuard> {
         // This load's device, as the backend sees it. Built here rather than
         // at the (warm-hit) entry point: it owns a `Vec`, and the cold path
         // is the only one that needs it.
         let device_config = self.device_config.for_device(id.device)?;
-        let resolved = self.resolver.resolve(source, task, backend_hint).await?;
+        let resolved = self.resolver.resolve(source, task).await?;
         let source_str = source.to_string();
-        let backend = self.backend_for(&resolved, source)?;
         // Describe before admitting: the description is what the load
         // materializes from, and a submitter that already described this
         // model has it memoized — the digest is never hashed twice.
         let description = self
-            .describe_resolved(id, &resolved, backend, &device_config)
+            .describe_resolved(id, &resolved, &device_config)
             .await?;
-        let memory_bytes = backend.estimate_memory(&resolved);
+        let memory_bytes = self.backend.estimate_memory(&resolved);
 
         // A stale-fingerprint reload can transiently need this model's
         // budget TWICE — the caller in `get_or_load`'s `Ok(false)` arm
@@ -973,7 +920,9 @@ impl ModelCache {
             }
         };
 
-        let loaded = backend.materialize(&resolved, description, &device_config)?;
+        let loaded = self
+            .backend
+            .materialize(&resolved, description, &device_config)?;
 
         // Register model in catalog (idempotent — ignores if already registered).
         // See `Self::complete_generic_registration`'s own doc for which rows
@@ -1011,19 +960,14 @@ impl ModelCache {
     /// Preload a model without running inference — the server's
     /// warm-before-ready step (`[server] preload_models`) and the Python
     /// `preload_model` verb.
-    pub async fn preload(
-        &self,
-        source: &ModelSource,
-        task: ModelTask,
-        backend_hint: Option<BackendType>,
-    ) -> Result<()> {
+    pub async fn preload(&self, source: &ModelSource, task: ModelTask) -> Result<()> {
         #[cfg(feature = "test-hooks")]
         preload_test_hooks::maybe_park(
             &source.to_string(),
             preload_test_hooks::ParkPoint::BeforeLoad,
         )
         .await;
-        let guard = self.get_or_load(source, task, backend_hint).await?;
+        let guard = self.get_or_load(source, task).await?;
         drop(guard);
         Ok(())
     }
@@ -1246,7 +1190,7 @@ mod cache_key_tests {
         let scheduler = Arc::new(GpuScheduler::new_unlimited());
         let loader = ModelCache::new(resolver, device_config, Arc::clone(&scheduler));
         let guard = loader
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .unwrap();
         let model = Arc::clone(&guard.model);
@@ -1294,21 +1238,15 @@ mod cache_key_tests {
         );
     }
 
-    /// `None` is a distinct key VALUE, never a wildcard: a load that named
-    /// no task or backend hint neither matches nor is matched by one that
-    /// did. Each of the two optional components is mutated on its own, so
-    /// one of them silently collapsing to a wildcard cannot hide behind the
-    /// other.
+    /// `None` is a distinct key VALUE, never a wildcard: a key that names no
+    /// task neither matches nor is matched by one that does, and two named
+    /// tasks are two keys.
     #[test]
-    fn an_unnamed_task_or_backend_is_its_own_key_never_a_wildcard() {
+    fn an_unnamed_task_is_its_own_key_never_a_wildcard() {
         let unnamed = CacheKey::for_test("tiny-bert", 0);
 
         let with_task = CacheKey {
             task: Some(ModelTask::TextEmbedding),
-            ..unnamed.clone()
-        };
-        let with_backend = CacheKey {
-            backend: Some(BackendType::Candle),
             ..unnamed.clone()
         };
         let other_task = CacheKey {
@@ -1318,17 +1256,15 @@ mod cache_key_tests {
 
         let mut map: HashMap<CacheKey, &str> = HashMap::new();
         for (key, label) in [
-            (unnamed.clone(), "named neither"),
+            (unnamed.clone(), "named none"),
             (with_task.clone(), "named a task"),
-            (with_backend.clone(), "named a backend"),
             (other_task.clone(), "named another task"),
         ] {
             map.insert(key, label);
         }
-        assert_eq!(map.len(), 4, "four distinct keys, four entries");
-        assert_eq!(map.get(&unnamed), Some(&"named neither"));
+        assert_eq!(map.len(), 3, "three distinct keys, three entries");
+        assert_eq!(map.get(&unnamed), Some(&"named none"));
         assert_eq!(map.get(&with_task), Some(&"named a task"));
-        assert_eq!(map.get(&with_backend), Some(&"named a backend"));
         assert_eq!(map.get(&other_task), Some(&"named another task"));
     }
 
@@ -1463,7 +1399,7 @@ mod f3_prime_tests {
         // `CacheEntry`'s own, i.e. `Arc::strong_count(&gpu_permit) == 1`) —
         // `evict_one`'s eligibility condition.
         let guard_a = cache
-            .get_or_load(&source_a, ModelTask::TextEmbedding, None)
+            .get_or_load(&source_a, ModelTask::TextEmbedding)
             .await
             .unwrap();
         drop(guard_a);
@@ -1477,7 +1413,7 @@ mod f3_prime_tests {
         let source_a_for_task = source_a.clone();
         let task_a = tokio::spawn(async move {
             cache_for_a
-                .get_or_load(&source_a_for_task, ModelTask::TextEmbedding, None)
+                .get_or_load(&source_a_for_task, ModelTask::TextEmbedding)
                 .await
         });
 
@@ -1488,9 +1424,7 @@ mod f3_prime_tests {
         // (3) With A's fast-path task paused in the pre-ref_count-increment
         // window, drive B's load — under this budget it MUST evict
         // something, and A is the only idle entry.
-        let guard_b = cache
-            .get_or_load(&source_b, ModelTask::TextEmbedding, None)
-            .await;
+        let guard_b = cache.get_or_load(&source_b, ModelTask::TextEmbedding).await;
         let guard_b = match guard_b {
             Ok(g) => g,
             Err(e) => panic!(
@@ -1571,7 +1505,7 @@ mod f3_prime_tests {
         let scheduler = Arc::new(GpuScheduler::new(weights_len + 2, 0.0));
         let cache = ModelCache::new(resolver, device_config(), Arc::clone(&scheduler));
         let guard = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .unwrap();
         let model = Arc::clone(&guard.model);
@@ -1725,7 +1659,7 @@ mod f3_prime_tests {
             Arc::new(GpuScheduler::new_unlimited()),
         );
         let guard = loader
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .unwrap();
         let model = Arc::clone(&guard.model);
@@ -1899,7 +1833,6 @@ mod single_flight_tests {
             model_id: ModelId::from(&source),
             device: cache.device_config.gpu_device,
             task: Some(ModelTask::TextEmbedding),
-            backend: None,
         };
 
         // Simulate "another task is already loading this id" directly,
@@ -1918,7 +1851,7 @@ mod single_flight_tests {
         let source_for_waiter = source.clone();
         let waiter = tokio::spawn(async move {
             cache_for_waiter
-                .get_or_load(&source_for_waiter, ModelTask::TextEmbedding, None)
+                .get_or_load(&source_for_waiter, ModelTask::TextEmbedding)
                 .await
         });
 
@@ -2039,7 +1972,7 @@ mod r5_f1_tokenizer_tests {
 
         // (1) Cold load: tokenizer.json present, resolves to `Some(..)`.
         let guard = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .expect("initial load with tokenizer.json present must succeed");
         drop(guard);
@@ -2055,9 +1988,7 @@ mod r5_f1_tokenizer_tests {
         // now-invalid fingerprint entry and reload with `tokenizer: None`),
         // never return the typed refusal that would come from mis-classifying
         // the tokenizer as REQUIRED.
-        let first = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
-            .await;
+        let first = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
         match &first {
             Ok(_) => {}
             Err(e) => panic!(
@@ -2071,9 +2002,7 @@ mod r5_f1_tokenizer_tests {
         // (3) Second, CONSECUTIVE post-deletion call: the wedge check. This
         // is an ordinary warm hit against the freshly-reloaded entry from
         // step (2); a still-cached stale entry would `Err` here again.
-        let second = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
-            .await;
+        let second = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
         if let Err(e) = second {
             panic!(
                 "the second, consecutive get_or_load call after \
@@ -2125,7 +2054,7 @@ mod r5_f1_tokenizer_tests {
 
         // (1) Cold load: `tokenizer.json` present, resolves to `Some(..)`.
         let guard = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .expect("initial load with tokenizer.json present must succeed");
         guard
@@ -2142,7 +2071,7 @@ mod r5_f1_tokenizer_tests {
         // cannot serve embeddings — with the typed "no tokenizer" error,
         // never a panic or a silently-wrong output.
         let tokenizer_less = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .expect("stale-reload after tokenizer.json's deletion must succeed");
         match tokenizer_less
@@ -2180,7 +2109,7 @@ mod r5_f1_tokenizer_tests {
         // (5) The NEXT get_or_load must detect the restoration as staleness
         // (not report fresh) and reload WITH the tokenizer.
         let restored = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .expect("get_or_load after tokenizer.json's restoration must succeed");
 
@@ -2312,7 +2241,7 @@ mod admission_wake_tests {
         // (1) A loads M1 and KEEPS THE GUARD — the entire budget is
         // reserved, and M1 is NOT idle (`ref_count == 1`).
         let guard_a = cache
-            .get_or_load(&source_a, ModelTask::TextEmbedding, None)
+            .get_or_load(&source_a, ModelTask::TextEmbedding)
             .await
             .unwrap();
 
@@ -2325,7 +2254,7 @@ mod admission_wake_tests {
         let source_b_for_task = source_b.clone();
         let mut task_b = tokio::spawn(async move {
             cache_for_b
-                .get_or_load(&source_b_for_task, ModelTask::TextEmbedding, None)
+                .get_or_load(&source_b_for_task, ModelTask::TextEmbedding)
                 .await
         });
 
@@ -2452,7 +2381,6 @@ mod load_bookkeeping_tests {
     fn fake_resolved(model_id: &str, weights_dir: &std::path::Path) -> ResolvedModel {
         ResolvedModel {
             model_id: ModelId(model_id.to_string()),
-            backend: BackendType::Candle,
             weights_format: super::super::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path: weights_dir.join("config.json"),
@@ -2495,7 +2423,7 @@ mod load_bookkeeping_tests {
                 model_id,
                 version: 1,
                 model_type: "open_clip",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::ImageEmbedding,
                 base_model_id: Some("producer-owned-base"),
                 external_location: Some("/producer/owned/weights"),
@@ -2557,7 +2485,7 @@ mod load_bookkeeping_tests {
                 model_id,
                 version: 1,
                 model_type: "some-future-architecture-nobody-enumerated-yet",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: Some("some-base"),
                 external_location: Some("/some/owned/weights"),
@@ -2599,7 +2527,7 @@ mod load_bookkeeping_tests {
                 model_id,
                 version: 1,
                 model_type: "local",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -2646,7 +2574,7 @@ mod load_bookkeeping_tests {
                 model_id,
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -2746,7 +2674,7 @@ mod load_bookkeeping_tests {
                     model_id,
                     version: 1,
                     model_type: "local",
-                    backend: "candle",
+                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                     task: ModelTask::TextEmbedding,
                     base_model_id: None,
                     external_location: None,

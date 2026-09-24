@@ -752,7 +752,9 @@ async fn ready_table_with_poisoned_row(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "test-model".into(),
-            backend: "candle".into(),
+            backend: jammi_db::store::manifest::ModelRunner::Backend(
+                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+            ),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
             quantization: None,

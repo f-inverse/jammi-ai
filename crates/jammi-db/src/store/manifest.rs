@@ -54,6 +54,8 @@ use sha2::{Digest, Sha256};
 
 use jammi_datafusion::ModelTask;
 
+use crate::catalog::model_repo::ModelBackendKind;
+
 // Re-exported (not merely imported) so a consumer that constructs or matches a
 // `ModelIdentity` — every model-producing descriptor's environment carries a
 // `Vec<ModelIdentity>` — reaches `ComputePrecision`'s type from this module,
@@ -367,12 +369,58 @@ impl MaterializationEnv {
 /// uniform across every model-producing variant, exactly like
 /// `compute_precision` above — `Inference` would otherwise collide on it
 /// identically.
+/// What produced a model's outputs: a backend of this engine running the
+/// model, or an external producer whose outputs were imported.
+///
+/// Serialized as one canonical spelling (`candle`, `external_import`), the
+/// same string a definition hash folds in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ModelRunner {
+    /// The model ran on this engine's backend.
+    Backend(ModelBackendKind),
+    /// The outputs were computed elsewhere and imported; no model ran here.
+    ExternalImport,
+}
+
+impl ModelRunner {
+    /// The canonical spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Backend(kind) => kind.as_str(),
+            Self::ExternalImport => "external_import",
+        }
+    }
+}
+
+impl std::fmt::Display for ModelRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<ModelRunner> for String {
+    fn from(runner: ModelRunner) -> Self {
+        runner.as_str().to_string()
+    }
+}
+
+impl TryFrom<String> for ModelRunner {
+    type Error = crate::error::JammiError;
+    fn try_from(s: String) -> crate::error::Result<Self> {
+        match s.as_str() {
+            "external_import" => Ok(Self::ExternalImport),
+            other => ModelBackendKind::parse(other).map(Self::Backend),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentity {
     /// Canonical model id as stored in `result_tables.model_id`.
     pub model_id: String,
-    /// The backend kind that ran the model (`candle` / `ort` / `http`).
-    pub backend: String,
+    /// What produced the model's outputs.
+    pub backend: ModelRunner,
     /// The compute precision the model ran at (the resolved per-model
     /// `config.json` override, or the global `GpuConfig::compute_precision`
     /// default).
@@ -1932,7 +1980,7 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-                backend: "candle".into(),
+                backend: ModelRunner::Backend(ModelBackendKind::Candle),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 quantization: None,
@@ -1960,7 +2008,7 @@ mod tests {
     fn quantization_none_serialises_to_no_key() {
         let identity = ModelIdentity {
             model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-            backend: "candle".into(),
+            backend: ModelRunner::Backend(ModelBackendKind::Candle),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
             quantization: None,
@@ -2154,7 +2202,7 @@ mod tests {
                 ComputeDevice::Cuda { ordinal: 0 },
                 vec![ModelIdentity {
                     model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-                    backend: "candle".into(),
+                    backend: ModelRunner::Backend(ModelBackendKind::Candle),
                     compute_precision: ComputePrecision::F32,
                     content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                     quantization: None,
@@ -2185,7 +2233,7 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L12-v2".into(),
-                backend: "candle".into(),
+                backend: ModelRunner::Backend(ModelBackendKind::Candle),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 quantization: None,
@@ -2215,7 +2263,7 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
-                backend: "candle".into(),
+                backend: ModelRunner::Backend(ModelBackendKind::Candle),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 quantization: None,
@@ -2225,7 +2273,7 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
-                backend: "candle".into(),
+                backend: ModelRunner::Backend(ModelBackendKind::Candle),
                 compute_precision: ComputePrecision::F16,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 quantization: None,
@@ -2312,7 +2360,7 @@ mod tests {
     #[derive(Clone)]
     struct ModelIdentityFields {
         model_id: String,
-        backend: String,
+        backend: ModelRunner,
         compute_precision: ComputePrecision,
         content_digest: ModelContentDigest,
         quantization: Option<jammi_numerics::WeightQuantization>,
@@ -2343,7 +2391,7 @@ mod tests {
     fn model_identity_each_field_moves_the_hash() {
         let base = ModelIdentityFields {
             model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-            backend: "candle".into(),
+            backend: ModelRunner::Backend(ModelBackendKind::Candle),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("base-digest".into()),
             quantization: None,
@@ -2356,7 +2404,7 @@ mod tests {
             ("model_id", |p| {
                 p.model_id = "sentence-transformers/all-MiniLM-L12-v2".into()
             }),
-            ("backend", |p| p.backend = "ort".into()),
+            ("backend", |p| p.backend = ModelRunner::ExternalImport),
             ("compute_precision", |p| {
                 p.compute_precision = ComputePrecision::F16
             }),
@@ -3279,7 +3327,7 @@ mod tests {
     fn base_model_identity() -> ModelIdentity {
         ModelIdentity {
             model_id: "bert-base-uncased".into(),
-            backend: "candle".into(),
+            backend: ModelRunner::Backend(ModelBackendKind::Candle),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("fine-tune-fixture-digest".into()),
             quantization: None,

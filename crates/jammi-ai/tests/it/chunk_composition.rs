@@ -255,7 +255,6 @@ async fn measure(label: &str, sizes: &[usize]) {
         .get_or_load(
             &ModelSource::parse(&tiny_bert_model()),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();

@@ -91,11 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // LEDGER-BEGIN
     let guard = session
         .model_cache()
-        .get_or_load(
-            &ModelSource::parse(&model_id),
-            ModelTask::TextEmbedding,
-            None,
-        )
+        .get_or_load(&ModelSource::parse(&model_id), ModelTask::TextEmbedding)
         .await?;
     let ledger = guard.model.kernel_admission();
     for (op, d) in &ledger.two_arm {

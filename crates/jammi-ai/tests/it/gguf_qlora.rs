@@ -20,7 +20,7 @@ use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::{BackendType, LoadedModel, WeightsFormat};
+use jammi_ai::model::{LoadedModel, WeightsFormat};
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
@@ -242,10 +242,7 @@ fn device_config() -> DeviceConfig {
     }
 }
 
-async fn try_resolve(
-    dir: &Path,
-    backend_hint: Option<BackendType>,
-) -> jammi_db::error::Result<jammi_ai::model::ResolvedModel> {
+async fn try_resolve(dir: &Path) -> jammi_db::error::Result<jammi_ai::model::ResolvedModel> {
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
     let resolver = ModelResolver::new(
@@ -255,22 +252,17 @@ async fn try_resolve(
     )
     .unwrap();
     let source = ModelSource::local(dir);
-    resolver
-        .resolve(&source, ModelTask::TextEmbedding, backend_hint)
-        .await
+    resolver.resolve(&source, ModelTask::TextEmbedding).await
 }
 
 async fn resolve_and_load(dir: &Path) -> LoadedModel {
-    let resolved = try_resolve(dir, None).await.unwrap();
+    let resolved = try_resolve(dir).await.unwrap();
     let backend = CandleBackend;
     backend.load(&resolved, &device_config()).unwrap()
 }
 
-async fn try_resolve_and_load(
-    dir: &Path,
-    backend_hint: Option<BackendType>,
-) -> jammi_db::error::Result<LoadedModel> {
-    let resolved = try_resolve(dir, backend_hint).await?;
+async fn try_resolve_and_load(dir: &Path) -> jammi_db::error::Result<LoadedModel> {
+    let resolved = try_resolve(dir).await?;
     let backend = CandleBackend;
     backend.load(&resolved, &device_config())
 }
@@ -410,7 +402,7 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
 fn definition_hash_for(model_id: &str, model: &LoadedModel) -> DefinitionHash {
     let identity = ModelIdentity {
         model_id: model_id.to_string(),
-        backend: model.description().backend_kind().to_string(),
+        backend: model.description().runner(),
         compute_precision: model.description().compute_precision(),
         content_digest: model.description().content_digest().clone(),
         quantization: model.description().quantization(),
@@ -522,7 +514,7 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
     let source = ModelSource::local(&dir);
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let digest1 = guard1.model.description().content_digest().clone();
@@ -536,7 +528,7 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
     std::fs::write(&weights_path, &bytes).unwrap();
 
     let guard_warm = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let digest_warm = guard_warm.model.description().content_digest().clone();
@@ -835,7 +827,7 @@ async fn other_gguf_filename_without_the_canonical_name_is_a_typed_refusal() {
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
     std::fs::rename(dir.join("model.gguf"), dir.join("weights.gguf")).unwrap();
 
-    let err = expect_err(try_resolve(&dir, None).await);
+    let err = expect_err(try_resolve(&dir).await);
     let msg = model_err_message(&err);
     assert!(
         msg.contains("weights.gguf") && msg.contains("model.gguf"),
@@ -925,7 +917,7 @@ async fn assert_dual_format_resolve_phase(
     reference_embedding: &[f32],
     phase: &str,
 ) {
-    let resolved = try_resolve(dir, None).await.unwrap();
+    let resolved = try_resolve(dir).await.unwrap();
     assert_eq!(
         resolved.weights_format,
         WeightsFormat::Safetensors,
@@ -965,7 +957,7 @@ async fn gguf_without_config_json_is_the_existing_missing_config_refusal() {
     std::fs::create_dir_all(&dir).unwrap();
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
 
-    let err = expect_err(try_resolve(&dir, None).await);
+    let err = expect_err(try_resolve(&dir).await);
     let msg = model_err_message(&err);
     assert!(
         msg.contains("config.json"),
@@ -1007,7 +999,7 @@ async fn unsupported_ggml_dtype_is_a_typed_refusal_naming_tensor_and_dtype() {
     let refs: Vec<(&str, &QTensor)> = qtensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
     gguf_file::write(&mut writer, &[], &refs).unwrap();
 
-    let err = expect_err(try_resolve_and_load(&dir, None).await);
+    let err = expect_err(try_resolve_and_load(&dir).await);
     let msg = model_err_message(&err);
     assert!(
         msg.contains(&target) && msg.to_lowercase().contains("dtype"),
@@ -1030,7 +1022,7 @@ async fn missing_matmul_site_tensor_is_a_typed_refusal_listing_the_key() {
     tensors.remove(&missing_key);
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
 
-    let err = expect_err(try_resolve_and_load(&dir, None).await);
+    let err = expect_err(try_resolve_and_load(&dir).await);
     let msg = model_err_message(&err);
     assert!(
         msg.contains(&missing_key),
@@ -1059,32 +1051,11 @@ async fn unsupported_architecture_gguf_is_a_typed_refusal() {
     // map (a structurally-valid, empty GGUF file) is sufficient.
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
 
-    let err = expect_err(try_resolve_and_load(&dir, None).await);
+    let err = expect_err(try_resolve_and_load(&dir).await);
     let msg = model_err_message(&err);
     assert!(
         msg.contains("not supported for this architecture"),
         "expected the architecture refusal, got: {msg}"
-    );
-}
-
-/// `backend_hint = Some(Ort)` against a directory that carries only
-/// `model.gguf`: GGUF is Candle-only, so this is the SAME typed refusal an
-/// ONNX-missing directory produces today.
-#[tokio::test]
-async fn ort_backend_with_only_gguf_present_is_a_typed_refusal() {
-    let device = Device::Cpu;
-    let (tensors, config, sites) = small_fixture(&device);
-    let tmp = tempdir().unwrap();
-    let dir = tmp.path().join("model");
-    write_json(&dir, "config.json", &config);
-    write_tokenizer(&dir);
-    write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
-
-    let err = expect_err(try_resolve(&dir, Some(BackendType::Ort)).await);
-    let msg = model_err_message(&err);
-    assert!(
-        msg.contains("ONNX"),
-        "expected the existing 'No ONNX weights found for ORT backend' refusal, got: {msg}"
     );
 }
 
@@ -1105,7 +1076,7 @@ async fn corrupt_gguf_header_is_a_typed_resolver_refusal() {
     )
     .unwrap();
 
-    let err = expect_err(try_resolve(&dir, None).await);
+    let err = expect_err(try_resolve(&dir).await);
     let msg = model_err_message(&err);
     assert!(
         msg.contains("GGUF") || msg.to_lowercase().contains("magic"),

@@ -677,8 +677,8 @@ pub struct ModelRow<'a> {
     pub version: i32,
     /// Catalog `model_type` (`"fine-tuned"`, `"context-predictor"`).
     pub model_type: &'a str,
-    /// Inference backend identifier.
-    pub backend: &'a str,
+    /// The backend that runs the model.
+    pub backend: super::model_repo::ModelBackendKind,
     /// The task the model performs.
     pub task: jammi_datafusion::ModelTask,
     /// The base model it was derived from, if any.
@@ -902,7 +902,7 @@ struct ModelRowWrite {
     version: i64,
     model_type: String,
     task: &'static str,
-    backend: String,
+    backend: &'static str,
     status: &'static str,
     metadata: String,
 }
@@ -915,7 +915,7 @@ impl ModelRowWrite {
             version: i64::from(row.version),
             model_type: row.model_type.to_string(),
             task: row.task.as_str(),
-            backend: row.backend.to_string(),
+            backend: row.backend.as_str(),
             status,
             metadata: super::model_repo::model_metadata(row.base_model_id, row.config_json),
         }
@@ -954,7 +954,7 @@ impl ModelRowWrite {
                     SqlValue::TextOwned(self.name.clone()),
                     SqlValue::TextOwned(self.model_type.clone()),
                     SqlValue::Text(self.task),
-                    SqlValue::TextOwned(self.backend.clone()),
+                    SqlValue::Text(self.backend),
                     SqlValue::Int(self.version),
                     SqlValue::Text(self.status),
                     SqlValue::TextOwned(self.metadata.clone()),

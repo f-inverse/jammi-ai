@@ -263,7 +263,9 @@ async fn a_sink_reports_the_environment_of_the_store_that_runs_it() {
         ComputeDevice::Cuda { ordinal: 1 },
         vec![ModelIdentity {
             model_id: "test-model".into(),
-            backend: "candle".into(),
+            backend: jammi_db::store::manifest::ModelRunner::Backend(
+                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+            ),
             compute_precision: ComputePrecision::BF16,
             content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
             quantization: None,

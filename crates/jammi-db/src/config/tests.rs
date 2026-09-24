@@ -192,7 +192,7 @@ fn jammi_config_debug_never_prints_a_secret() {
         url = "nats://nats-user:nats-url-token-secret@nats.svc:4222"
         credentials = "nats-jwt-secret-abc"
 
-        [inference.http.headers]
+        [observability.otlp_headers]
         Authorization = "Bearer tok-4f9a-secret"
 
         [models]
@@ -284,7 +284,7 @@ fn env_whole_value_type_mismatch_at_a_map_position_never_echoes_the_value() {
     let err = JammiConfig::parse_from(
         "",
         vec![(
-            "JAMMI_INFERENCE__HTTP__HEADERS".to_string(),
+            "JAMMI_OBSERVABILITY__OTLP_HEADERS".to_string(),
             "\"Bearer hunter2-env-secret\"".to_string(),
         )],
     )
@@ -306,7 +306,7 @@ fn env_leaf_invalid_toml_syntax_never_echoes_the_value_and_names_the_variable() 
     let err = JammiConfig::parse_from(
         "",
         vec![(
-            "JAMMI_INFERENCE__HTTP__HEADERS".to_string(),
+            "JAMMI_OBSERVABILITY__OTLP_HEADERS".to_string(),
             // An unterminated string literal: not valid TOML at all, so this
             // hits `Node::parse_as_toml`'s own parse-failure branch rather
             // than a downstream `invalid_type` check.
@@ -318,7 +318,7 @@ fn env_leaf_invalid_toml_syntax_never_echoes_the_value_and_names_the_variable() 
         JammiError::Config(msg) => {
             assert!(!msg.contains("hunter2-env-secret"), "msg = {msg}");
             assert!(
-                msg.contains("JAMMI_INFERENCE__HTTP__HEADERS"),
+                msg.contains("JAMMI_OBSERVABILITY__OTLP_HEADERS"),
                 "msg = {msg}"
             );
         }
@@ -328,7 +328,7 @@ fn env_leaf_invalid_toml_syntax_never_echoes_the_value_and_names_the_variable() 
 
 /// The FILE-arm half of the same rule: a file value can itself be a
 /// `${VAR}` expansion, so the same `invalid_type` leak is reachable with NO
-/// env override at all — `[inference.http] headers = "${TOKEN}"` expands to
+/// env override at all — `[observability] otlp_headers = "${TOKEN}"` expands to
 /// a bare string at a map position.
 #[test]
 fn file_value_type_mismatch_at_a_map_position_never_echoes_an_expanded_secret() {
@@ -336,7 +336,7 @@ fn file_value_type_mismatch_at_a_map_position_never_echoes_an_expanded_secret() 
         "TOKEN".to_string(),
         "Bearer hunter2-file-value-secret".to_string(),
     )];
-    let toml_src = "[inference.http]\nheaders = \"${TOKEN}\"\n";
+    let toml_src = "[observability]\notlp_headers = \"${TOKEN}\"\n";
     let err = JammiConfig::parse_from(toml_src, env).unwrap_err();
     match err {
         JammiError::Config(msg) => {
@@ -455,23 +455,29 @@ fn signing_key_config_round_trip_file() {
 }
 
 #[test]
-fn http_headers_deserialise_inline_and_file_forms() {
+fn otlp_headers_deserialise_inline_and_file_forms() {
     let dir = tempfile::tempdir().unwrap();
     let token_path = dir.path().join("hf-token");
     std::fs::write(&token_path, "hf_filetoken\n").unwrap();
     let toml_src = format!(
         r#"
-        [inference.http.headers]
+        [observability.otlp_headers]
         Authorization = "Bearer x"
         X-Api-Key = {{ file = {:?} }}
     "#,
         token_path.to_str().unwrap()
     );
     let cfg: JammiConfig = toml::from_str(&toml_src).unwrap();
-    let headers = &cfg.inference.http.headers;
+    let headers = &cfg.observability.otlp_headers;
     assert_eq!(headers.len(), 2);
-    assert_eq!(headers["Authorization"].expose(), "Bearer x");
-    assert_eq!(headers["X-Api-Key"].expose(), "hf_filetoken");
+    assert_eq!(
+        headers["Authorization"].resolve().unwrap().expose(),
+        "Bearer x"
+    );
+    assert_eq!(
+        headers["X-Api-Key"].resolve().unwrap().expose(),
+        "hf_filetoken"
+    );
     let rendered = format!("{cfg:?}");
     assert!(!rendered.contains("Bearer x") && !rendered.contains("hf_filetoken"));
     // Keys are still visible: the header NAME is not a secret.
@@ -2011,16 +2017,21 @@ fn env_whole_value_struct_position_is_refused_even_with_no_file_layer() {
 #[test]
 fn env_whole_value_override_of_a_map_position_replaces_not_merges() {
     let cfg = JammiConfig::parse_from(
-        "[inference.http.headers]\na = \"1\"\n",
+        "[observability.otlp_headers]\na = \"1\"\n",
         vec![(
-            "JAMMI_INFERENCE__HTTP__HEADERS".to_string(),
+            "JAMMI_OBSERVABILITY__OTLP_HEADERS".to_string(),
             "{ b = \"2\" }".to_string(),
         )],
     )
     .unwrap();
-    let headers = &cfg.inference.http.headers;
+    let headers = &cfg.observability.otlp_headers;
     assert_eq!(headers.len(), 1, "headers = {headers:?}");
-    assert_eq!(headers.get("b").map(Secret::expose), Some("2"));
+    assert_eq!(
+        headers
+            .get("b")
+            .map(|h| h.resolve().unwrap().expose().to_string()),
+        Some("2".into())
+    );
     assert!(!headers.contains_key("a"));
 }
 
@@ -2031,16 +2042,26 @@ fn env_whole_value_override_of_a_map_position_replaces_not_merges() {
 #[test]
 fn file_header_map_plus_nested_env_header_merges() {
     let cfg = JammiConfig::parse_from(
-        "[inference.http.headers]\na = \"1\"\n",
+        "[observability.otlp_headers]\na = \"1\"\n",
         vec![(
-            "JAMMI_INFERENCE__HTTP__HEADERS__B".to_string(),
+            "JAMMI_OBSERVABILITY__OTLP_HEADERS__B".to_string(),
             "2".to_string(),
         )],
     )
     .unwrap();
-    let headers = &cfg.inference.http.headers;
-    assert_eq!(headers.get("a").map(Secret::expose), Some("1"));
-    assert_eq!(headers.get("b").map(Secret::expose), Some("2"));
+    let headers = &cfg.observability.otlp_headers;
+    assert_eq!(
+        headers
+            .get("a")
+            .map(|h| h.resolve().unwrap().expose().to_string()),
+        Some("1".into())
+    );
+    assert_eq!(
+        headers
+            .get("b")
+            .map(|h| h.resolve().unwrap().expose().to_string()),
+        Some("2".into())
+    );
 }
 
 /// `[engine] memory_limit` is parsed by [`EngineConfig::memory_limit_bytes`];

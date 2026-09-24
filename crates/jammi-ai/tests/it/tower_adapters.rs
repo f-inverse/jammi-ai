@@ -1353,7 +1353,6 @@ async fn cross_family_adapter_refuses_at_load() {
         .resolve(
             &ModelSource::local(common::cookbook_fixture("tiny_bert")),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
         .unwrap();

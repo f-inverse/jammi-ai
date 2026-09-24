@@ -290,7 +290,6 @@ mod live {
             .get_or_load(
                 &ModelSource::hf("sentence-transformers/all-MiniLM-L6-v2"),
                 ModelTask::TextEmbedding,
-                None,
             )
             .await
             .unwrap();
@@ -403,7 +402,7 @@ mod live {
         // Load PatentCLIP
         let source = ModelSource::hf("patentclip/PatentCLIP_Vit_B");
         let guard = cache
-            .get_or_load(&source, ModelTask::ImageEmbedding, None)
+            .get_or_load(&source, ModelTask::ImageEmbedding)
             .await
             .unwrap();
 

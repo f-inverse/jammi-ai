@@ -159,7 +159,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
 
     // (1) Warm the cache.
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d1_raw = guard1.model.description().content_digest().clone();
@@ -192,7 +192,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
 
     // (3) Warm replay in the SAME session, SAME cache, SAME ModelId.
     let guard_warm = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d_warm_raw = guard_warm.model.description().content_digest().clone();
@@ -261,7 +261,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
     let untouched_source = ModelSource::local(&untouched_dir);
 
     let guard_u1 = cache
-        .get_or_load(&untouched_source, ModelTask::TextEmbedding, None)
+        .get_or_load(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let du1 = assert_hashed(
@@ -272,7 +272,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
     drop(guard_u1);
 
     let guard_u_warm = cache
-        .get_or_load(&untouched_source, ModelTask::TextEmbedding, None)
+        .get_or_load(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let du_warm = assert_hashed(
@@ -334,7 +334,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
     let source = ModelSource::local(&dir);
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d1 = assert_hashed(
@@ -354,7 +354,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
     std::fs::write(&pooling_config_path, &mutated).unwrap();
 
     let guard_warm = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d_warm = assert_hashed(
@@ -392,7 +392,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
     let source = ModelSource::local(&dir);
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d1 = assert_hashed(
@@ -412,7 +412,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
     .unwrap();
 
     let guard_warm = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d_warm = assert_hashed(
@@ -452,7 +452,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
     let source = ModelSource::local(&dir);
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d1 = assert_hashed(
@@ -465,7 +465,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
     write_preprocessor_config(&dir, &sample_preprocessor_config());
 
     let guard_warm = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d_warm = assert_hashed(
@@ -563,7 +563,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
 
     // (1) Warm the cache and KEEP THE GUARD (the shape under test).
     let warm_guard = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     assert_eq!(
@@ -581,7 +581,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     // (3) Second `get_or_load`, SAME session/cache/id, `warm_guard` STILL
     // HELD: the stale probe fires, evicts the `CacheEntry`, and reloads.
     let reload_guard = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
@@ -711,7 +711,7 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
     // (1) Warm the cache and KEEP THE GUARD — the budget is now fully
     // reserved by `warm_guard` alone.
     let warm_guard = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     assert_eq!(
@@ -732,7 +732,7 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
     let source_for_reload = source.clone();
     let mut reload_task = tokio::spawn(async move {
         cache_for_reload
-            .get_or_load(&source_for_reload, ModelTask::TextEmbedding, None)
+            .get_or_load(&source_for_reload, ModelTask::TextEmbedding)
             .await
     });
 
@@ -822,7 +822,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
     let source = ModelSource::local(&dir);
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let d1 = assert_hashed(
@@ -836,9 +836,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
 
     // First warm call after deletion: must reload FRESH (not error, not
     // silently keep serving the pre-deletion CLS-pooled vectors).
-    let guard_warm_1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let guard_warm_1 = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
     let guard_warm_1 = match guard_warm_1 {
         Ok(g) => g,
         Err(e) => panic!(
@@ -909,9 +907,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
     // Never a permanent wedge: a SECOND warm call after the reload must
     // also succeed, with STABLE output (not merely 'succeeds once, then
     // starts failing' or vice versa).
-    let guard_warm_2 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let guard_warm_2 = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
     let guard_warm_2 = match guard_warm_2 {
         Ok(g) => g,
         Err(e) => panic!(
@@ -957,7 +953,7 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
     let source = ModelSource::local(&dir);
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     drop(guard1);
@@ -965,9 +961,7 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
     // DELETE the required candidate.
     std::fs::remove_file(dir.join("model.safetensors")).unwrap();
 
-    let result_1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result_1 = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
     let msg_1 = match result_1 {
         Err(e) => e.to_string(),
         Ok(_) => panic!(
@@ -986,9 +980,7 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
     // arm evicted the entry, so this call is cold-equivalent — it must
     // still refuse (the weights file is still gone), but via the LOADER's
     // own typed error, never the probe's.
-    let result_2 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result_2 = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
     let msg_2 = match result_2 {
         Err(e) => e.to_string(),
         Ok(_) => panic!(
@@ -1018,88 +1010,60 @@ async fn warm_hit_after_required_weights_deleted_evicts_and_second_call_hits_the
 // ── The weights slot's alternate-arm appearance/deletion, at the full \
 //    ModelCache level ──
 
-/// (a) appearance, end-to-end: `model.onnx` appears beside an already-loaded
-/// `model.safetensors`. The warm path must NOT silently keep serving the
-/// pre-appearance `Arc<LoadedModel>` forever: it must detect the staleness
-/// and evict + genuinely reload.
+/// (a) appearance, end-to-end: an UNSELECTED arm of the weights chain
+/// (`model.gguf`) appears beside an already-loaded `model.safetensors`. The
+/// warm path must NOT silently keep serving the pre-appearance
+/// `Arc<LoadedModel>`: it must detect the staleness and evict + genuinely
+/// reload — proven by `Arc::ptr_eq` inequality between the two guards'
+/// `model` handles, the direct signal that a real evict+reload cycle ran.
+/// The reload succeeds: safetensors still wins the chain's precedence.
 ///
-/// **What this test can honestly assert at the `ModelCache` level**: by the
-/// time this model's SECOND `get_or_load` runs, `do_load`'s first call has
-/// already registered it in the catalog (`register_model`, with the
-/// persisted `backend` it loaded at — Candle). `ModelResolver::resolve`
-/// checks the catalog FIRST (`try_catalog_lookup`), so THIS reload reuses
-/// the persisted Candle/`model.safetensors` record rather than re-deriving
-/// `resolve_local`'s `has_onnx` heuristic from scratch — the backend-flip
-/// itself only happens for an resolve with no catalog record to short-circuit
-/// it, proven independently, unregistered, in `models.rs`'s
-/// `resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors`.
-/// What THIS test proves is the piece that mechanism actually gates: the
-/// stale-fingerprint eviction genuinely fires and a NEW `Arc<LoadedModel>` is
-/// constructed (never the SAME cached instance silently handed back) —
-/// proven by `Arc::ptr_eq` inequality between the two guards' `model`
-/// handles, the direct, non-vacuous signal that a real evict+reload cycle
-/// ran rather than the fast path short-circuiting on a stale-but-undetected
-/// probe.
-///
-/// **Caveat.** The "persisted record" language above must not be read as the catalog row
-/// being some fixed, identity-pinned fact once written. `Catalog::register_model`
-/// is an UPSERT on every load of a directly-registered model:
-/// `backend`, `task`, and `model_type` are overwritten with
-/// `excluded.<col>` on every `ON CONFLICT`, last-writer-wins — only
-/// `external_location` gets the `COALESCE(excluded, existing)` set-but-never-
-/// clear treatment. So this test's observed pinning (the reload keeps
-/// resolving Candle/`model.safetensors` rather than flipping to ORT/
-/// `model.onnx`) is NOT a guarantee that the catalog row is immutable or
-/// that re-registration is a no-op; it is a consequence of
-/// `try_catalog_lookup`'s catalog-FIRST precedence over `resolve_local`'s
-/// on-disk heuristic, for THIS specific model's second load — a different
-/// sequence (e.g. a load with a different `backend_hint`, which
-/// `try_catalog_lookup` honors over the persisted `backend`) can and does
-/// re-derive a different backend on the very next call; this test neither
-/// relies on nor settles that.
-///
-/// The weights slot's fingerprint tracks the UNSELECTED arms too: tracking
-/// only `model.safetensors` would leave `model.onnx` appearing invisible to
-/// `probe`, and the second call would return the IDENTICAL `Arc`.
+/// A file outside the chain — an ONNX export shipped beside the weights —
+/// changes nothing a resolve loads, so its appearance is a warm hit on the
+/// SAME instance.
 #[tokio::test]
-async fn warm_hit_after_model_onnx_appearing_beside_safetensors_evicts_and_genuinely_reloads() {
+async fn warm_hit_reloads_when_a_weights_arm_appears_but_not_for_an_onnx_export() {
     let tmp = tempdir().unwrap();
     let catalog_dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
     let cache = new_cache(Arc::clone(&catalog));
 
-    let dir = tiny_bert_dir(tmp.path(), "onnx_appears_model", &mean_pooling_config());
+    let dir = tiny_bert_dir(tmp.path(), "arm_appears_model", &mean_pooling_config());
     let source = ModelSource::local(&dir);
 
-    // (1) Cold load: only model.safetensors exists — Candle backend.
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let model1 = Arc::clone(&guard1.model);
     drop(guard1);
 
-    // (2) model.onnx APPEARS beside the existing model.safetensors — the
-    // UNSELECTED arm of the weights slot.
-    std::fs::write(dir.join("model.onnx"), b"fake-onnx-bytes").unwrap();
-
-    // (3) The warm path must evict and genuinely reload rather than silently
-    // keep serving the pre-appearance `Arc`.
+    std::fs::write(dir.join("model.onnx"), b"onnx-export-bytes").unwrap();
     let guard2 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
+        .await
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&model1, &guard2.model),
+        "an ONNX export beside the weights is not part of what a resolve loads, \
+         so it must be a warm hit on the SAME instance"
+    );
+    drop(guard2);
+
+    // `model.gguf` — an UNSELECTED arm of the weights chain — APPEARS.
+    std::fs::write(dir.join("model.gguf"), b"gguf-bytes").unwrap();
+    let guard3 = cache
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .expect(
-            "model.onnx appearing must trip a stale-reload — which succeeds here \
-             because try_catalog_lookup's persisted record keeps resolving Candle/ \
-             model.safetensors (both still present and unchanged) — never a refusal",
+            "a weights arm appearing trips a stale-reload, which succeeds: \
+             model.safetensors still wins the chain",
         );
     assert!(
-        !Arc::ptr_eq(&model1, &guard2.model),
-        "model.onnx appearing beside model.safetensors must trip the staleness probe \
-         and produce a GENUINELY NEW Arc<LoadedModel> on the next get_or_load — the \
-         SAME Arc being handed back (Arc::ptr_eq == true) would mean the appearance \
-         was never detected and the fast path silently kept \
-         serving the pre-appearance instance forever"
+        !Arc::ptr_eq(&model1, &guard3.model),
+        "model.gguf appearing beside model.safetensors must trip the staleness probe \
+         and produce a GENUINELY NEW Arc<LoadedModel>; the SAME Arc would mean the \
+         appearance was never detected"
     );
 }
 
@@ -1137,7 +1101,7 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
     .unwrap();
 
     let guard1 = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let model1 = Arc::clone(&guard1.model);
@@ -1158,9 +1122,7 @@ async fn warm_hit_after_selected_weights_arm_deleted_with_alternate_present_relo
     // `Arc::ptr_eq` inequality, proving a real reload occurred rather than
     // the assertion being vacuously satisfied by an untouched warm hit.
     for attempt in 0..2 {
-        let result = cache
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
-            .await;
+        let result = cache.get_or_load(&source, ModelTask::TextEmbedding).await;
         match result {
             Ok(guard) => {
                 if attempt == 0 {

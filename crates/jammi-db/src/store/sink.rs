@@ -1036,7 +1036,9 @@ mod tests {
                 ComputeDevice::Cuda { ordinal: 0 },
                 vec![ModelIdentity {
                     model_id: "local:/models/encoder".into(),
-                    backend: "candle".into(),
+                    backend: crate::store::manifest::ModelRunner::Backend(
+                        crate::catalog::model_repo::ModelBackendKind::Candle,
+                    ),
                     compute_precision: jammi_numerics::ComputePrecision::BF16,
                     content_digest: ModelContentDigest::Sha256("digest".into()),
                     quantization: None,

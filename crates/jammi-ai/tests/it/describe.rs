@@ -67,7 +67,7 @@ async fn a_local_model_is_described_as_it_is_loaded() {
     let cache = session.model_cache();
 
     let described = cache
-        .describe(&source, ModelTask::TextEmbedding, None)
+        .describe(&source, ModelTask::TextEmbedding)
         .await
         .expect("a local model describes");
     assert!(
@@ -75,13 +75,13 @@ async fn a_local_model_is_described_as_it_is_loaded() {
         "describing a model materializes nothing"
     );
     assert_eq!(described.identity().model_id, source.to_string());
-    assert_eq!(described.backend_kind(), "candle");
+    assert_eq!(described.runner().as_str(), "candle");
     assert_eq!(described.embedding_dim(), 32, "tiny_bert's hidden size");
     assert_eq!(described.regression_form(), None);
     assert_eq!(described.quantization(), None);
 
     let guard = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .expect("the described model loads");
     let loaded = guard.model.description();
@@ -114,14 +114,14 @@ async fn a_gguf_model_is_described_as_it_is_loaded() {
     let cache = session.model_cache();
 
     let described = cache
-        .describe(&source, ModelTask::TextEmbedding, None)
+        .describe(&source, ModelTask::TextEmbedding)
         .await
         .expect("a GGUF model describes");
     assert_eq!(described.quantization(), Some(WeightQuantization::Q8_0));
     assert!(cache.resident_models_for_test().await.is_empty());
 
     let guard = cache
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .expect("the described GGUF model loads");
     assert_eq!(guard.model.description().identity(), described.identity());
@@ -185,11 +185,11 @@ async fn a_description_follows_its_files() {
     let cache = session.model_cache();
 
     let before = cache
-        .describe(&source, ModelTask::TextEmbedding, None)
+        .describe(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let again = cache
-        .describe(&source, ModelTask::TextEmbedding, None)
+        .describe(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     assert!(
@@ -203,7 +203,7 @@ async fn a_description_follows_its_files() {
     )
     .unwrap();
     let after = cache
-        .describe(&source, ModelTask::TextEmbedding, None)
+        .describe(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     assert!(

@@ -144,7 +144,7 @@ impl TableFunctionImpl for AnnotateTableFunction {
             tokio::runtime::Handle::current().block_on(async {
                 session
                     .model_cache()
-                    .describe(&model_source_to_describe, task, None)
+                    .describe(&model_source_to_describe, task)
                     .await
                     .map_err(|e| {
                         DataFusionError::Plan(format!("annotate: describe model '{model}': {e}"))

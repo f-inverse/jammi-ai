@@ -58,7 +58,7 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
 
     let identity = ModelIdentity {
         model_id: model_id.clone(),
-        backend: model.description().backend_kind().to_string(),
+        backend: model.description().runner(),
         compute_precision: model.description().compute_precision(),
         content_digest: model.description().content_digest().clone(),
         quantization: None,
@@ -344,7 +344,7 @@ async fn resolve_and_load_with_adapter(dir: &Path, adapter_dir: &Path) -> Loaded
     .unwrap();
     let source = ModelSource::local(dir);
     let mut resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     resolved.adapter_path = Some(adapter_dir.to_path_buf());
@@ -414,7 +414,7 @@ async fn missing_adapter_files_under_some_adapter_path_refuses_to_load() {
     .unwrap();
     let source = ModelSource::local(&dir);
     let mut resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     resolved.adapter_path = Some(adapter_dir);
@@ -485,7 +485,7 @@ async fn resolve_and_load_for_task(dir: &Path, task: ModelTask) -> LoadedModel {
     )
     .unwrap();
     let resolved = resolver
-        .resolve(&ModelSource::local(dir), task, None)
+        .resolve(&ModelSource::local(dir), task)
         .await
         .unwrap();
     let backend = CandleBackend;

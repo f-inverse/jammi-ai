@@ -1823,7 +1823,9 @@ mod tests {
             crate::store::manifest::ComputeDevice::Cpu,
             vec![crate::store::manifest::ModelIdentity {
                 model_id: "bert-base-uncased".into(),
-                backend: "candle".into(),
+                backend: crate::store::manifest::ModelRunner::Backend(
+                    crate::catalog::model_repo::ModelBackendKind::Candle,
+                ),
                 compute_precision: crate::store::manifest::ComputePrecision::F32,
                 content_digest: crate::store::manifest::ModelContentDigest::Sha256(
                     "fixture-digest".into(),

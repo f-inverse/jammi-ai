@@ -6,6 +6,19 @@ mod error;
 mod job;
 pub mod model_task;
 
+/// Drive `future` to completion on `runtime` with the GIL released — the one
+/// way a Python verb waits on the engine. The engine's work (a query, an
+/// embedding plan, a request to a remote model) runs while every other Python
+/// thread in the process keeps running, including one the engine itself is
+/// waiting on, such as an in-process HTTP endpoint.
+pub(crate) fn released<F>(runtime: &tokio::runtime::Runtime, future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    pyo3::Python::attach(|py| py.detach(|| runtime.block_on(future)))
+}
+
 use pyo3::prelude::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

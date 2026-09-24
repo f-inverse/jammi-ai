@@ -78,7 +78,10 @@ async fn a_local_model_is_described_as_it_is_loaded() {
     assert_eq!(described.backend().as_str(), "candle");
     assert_eq!(described.embedding_dim(), 32, "tiny_bert's hidden size");
     assert_eq!(described.regression_form(), None);
-    assert_eq!(described.quantization(), None);
+    assert_eq!(
+        described.local_run().expect("a local model").quantization,
+        None
+    );
 
     let guard = cache
         .get_or_load(&source, ModelTask::TextEmbedding)
@@ -117,7 +120,10 @@ async fn a_gguf_model_is_described_as_it_is_loaded() {
         .describe(&source, ModelTask::TextEmbedding)
         .await
         .expect("a GGUF model describes");
-    assert_eq!(described.quantization(), Some(WeightQuantization::Q8_0));
+    assert_eq!(
+        described.local_run().expect("a local model").quantization,
+        Some(WeightQuantization::Q8_0)
+    );
     assert!(cache.resident_models_for_test().await.is_empty());
 
     let guard = cache
@@ -211,8 +217,8 @@ async fn a_description_follows_its_files() {
         "changed files are described again"
     );
     assert_ne!(
-        before.content_digest(),
-        after.content_digest(),
+        before.local_run().expect("a local model").content_digest,
+        after.local_run().expect("a local model").content_digest,
         "the pooling declaration is output-affecting"
     );
 }

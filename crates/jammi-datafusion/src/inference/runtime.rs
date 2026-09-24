@@ -103,7 +103,10 @@ pub trait BoundModel: Send + Sync {
     async fn admit_forward(&self) -> Result<ForwardPermit>;
 
     /// The device half of a forward: run the model over a prepared chunk.
-    fn forward(&self, prepared: Prepared) -> std::result::Result<BackendOutput, ForwardError>;
+    /// Asynchronous because the device may be a remote endpoint, whose half
+    /// of a forward is a request.
+    async fn forward(&self, prepared: Prepared)
+        -> std::result::Result<BackendOutput, ForwardError>;
 }
 
 /// What binds a model to a process: the model cache a consumer runs, asked
@@ -235,7 +238,10 @@ pub(crate) mod stub {
             Ok(ForwardPermit::new(permit))
         }
 
-        fn forward(&self, prepared: Prepared) -> std::result::Result<BackendOutput, ForwardError> {
+        async fn forward(
+            &self,
+            prepared: Prepared,
+        ) -> std::result::Result<BackendOutput, ForwardError> {
             let len = *prepared
                 .downcast::<usize>()
                 .expect("the stub prepared this chunk");

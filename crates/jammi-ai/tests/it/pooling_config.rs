@@ -12,7 +12,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
 use candle_core::{DType, Device};
 use candle_nn::VarMap;
 use jammi_ai::model::backend::candle::CandleBackend;
@@ -157,14 +156,6 @@ pub(crate) async fn resolve_and_load(dir: &Path) -> LoadedModel {
     backend.load(&resolved, &device_config).unwrap()
 }
 
-/// Embed `text` through the live embedding path (`LoadedModel::forward` →
-/// `forward_embedding` → `CandleTextForward::forward_pooled`).
-fn embed(model: &LoadedModel, text: &str) -> Vec<f32> {
-    let content: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text])) as ArrayRef];
-    let output = model.forward(&content, ModelTask::TextEmbedding).unwrap();
-    output.float_outputs[0].clone()
-}
-
 /// Independent oracle: load the SAME `tiny_bert` weights directly through
 /// `jammi_encoders::Bert` with an explicit `.pooling(strategy)`, bypassing
 /// the resolver/`candle.rs` config-dispatch path under test entirely.
@@ -220,9 +211,9 @@ async fn cls_declared_pooling_differs_from_mean_declared_pooling() {
     let model_b = resolve_and_load(&dir_b).await;
     let model_c = resolve_and_load(&dir_c).await;
 
-    let vec_a = embed(&model_a, TEXT);
-    let vec_b = embed(&model_b, TEXT);
-    let vec_c = embed(&model_c, TEXT);
+    let vec_a = crate::common::embed(&model_a, TEXT).await;
+    let vec_b = crate::common::embed(&model_b, TEXT).await;
+    let vec_c = crate::common::embed(&model_c, TEXT).await;
 
     let reference_cls = reference_pooled(&dir_a, TEXT, Pooling::Cls);
     let reference_mean = reference_pooled(&dir_b, TEXT, Pooling::Mean);

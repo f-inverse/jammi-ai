@@ -1824,7 +1824,7 @@ mod tests {
             vec![crate::store::manifest::ModelIdentity {
                 model_id: "bert-base-uncased".into(),
                 run: crate::store::manifest::ModelRun::Local(crate::store::manifest::LocalRun {
-                    backend: crate::catalog::model_repo::ModelBackendKind::Candle,
+                    backend: crate::store::manifest::LocalBackend::Candle,
                     compute_precision: crate::store::manifest::ComputePrecision::F32,
                     content_digest: crate::store::manifest::ContentDigest("fixture-digest".into()),
                     quantization: None,

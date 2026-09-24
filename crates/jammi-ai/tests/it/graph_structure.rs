@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -182,35 +182,6 @@ async fn encode(session: &Arc<InferenceSession>, request: &StructureRequest) -> 
         .0
 }
 
-async fn read_table_vectors(
-    session: &Arc<InferenceSession>,
-    table: &ResultTableRecord,
-) -> HashMap<String, Vec<f32>> {
-    let batches = session
-        .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{}\"",
-            table.table_name
-        ))
-        .await
-        .unwrap();
-    let mut out = HashMap::new();
-    for batch in &batches {
-        let ids = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
-        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
-        let list = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            let cell = list.value(i);
-            let floats = cell.as_any().downcast_ref::<Float32Array>().unwrap();
-            out.insert(ids.value(i).to_string(), floats.values().to_vec());
-        }
-    }
-    out
-}
-
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|f| f.to_bits()).collect()
 }
@@ -262,8 +233,8 @@ async fn planted_communities_are_recovered_well_above_the_seed_and_the_base_rate
     let k = 5;
     let base_rate = 59.0 / 239.0;
 
-    let structure = read_table_vectors(&session, &encode(&session, &request()).await).await;
-    let seed_only = read_table_vectors(
+    let structure = common::read_table_vectors(&session, &encode(&session, &request()).await).await;
+    let seed_only = common::read_table_vectors(
         &session,
         &encode(&session, &request().with_weights([1.0])).await,
     )
@@ -292,7 +263,8 @@ async fn planted_communities_are_recovered_well_above_the_seed_and_the_base_rate
 async fn output_is_byte_identical_across_partitions_and_edge_row_orders() {
     let (edges, community) = planted_partition(3, 40, 0.2, 0.02, 5);
     let (session_one, _d1) = graph_session(&edges, &community, 1).await;
-    let reference = read_table_vectors(&session_one, &encode(&session_one, &request()).await).await;
+    let reference =
+        common::read_table_vectors(&session_one, &encode(&session_one, &request()).await).await;
 
     let mut reversed = edges.clone();
     reversed.reverse();
@@ -305,7 +277,8 @@ async fn output_is_byte_identical_across_partitions_and_edge_row_orders() {
         ("flipped endpoints", &flipped, 4),
     ] {
         let (session, _dir) = graph_session(edges, &community, partitions).await;
-        let vectors = read_table_vectors(&session, &encode(&session, &request()).await).await;
+        let vectors =
+            common::read_table_vectors(&session, &encode(&session, &request()).await).await;
         assert_eq!(vectors.len(), reference.len(), "{label}");
         for (key, vector) in &reference {
             assert_eq!(
@@ -331,8 +304,10 @@ async fn adding_a_node_leaves_seed_rows_and_far_nodes_bit_identical() {
 
     // The seed rows: every existing node's is unchanged — a row is a function
     // of its key, and at β = 0 of nothing else.
-    let seeds_before = read_table_vectors(&s_before, &encode(&s_before, &seed_only).await).await;
-    let seeds_after = read_table_vectors(&s_after, &encode(&s_after, &seed_only).await).await;
+    let seeds_before =
+        common::read_table_vectors(&s_before, &encode(&s_before, &seed_only).await).await;
+    let seeds_after =
+        common::read_table_vectors(&s_after, &encode(&s_after, &seed_only).await).await;
     for (key, row) in &seeds_before {
         assert_eq!(
             bits(row),
@@ -346,8 +321,9 @@ async fn adding_a_node_leaves_seed_rows_and_far_nodes_bit_identical() {
     // move, and the attachment point does. At β = 0 the change reaches a
     // node only through the degree of the one it touched, so the measured
     // radius is K − 1: three rows, the farthest at distance 1.
-    let out_before = read_table_vectors(&s_before, &encode(&s_before, &two_hops).await).await;
-    let out_after = read_table_vectors(&s_after, &encode(&s_after, &two_hops).await).await;
+    let out_before =
+        common::read_table_vectors(&s_before, &encode(&s_before, &two_hops).await).await;
+    let out_after = common::read_table_vectors(&s_after, &encode(&s_after, &two_hops).await).await;
     let distance = |key: &str| -> usize {
         let i: usize = key["acct-".len()..].parse().unwrap();
         i.min(n - i)
@@ -383,8 +359,8 @@ async fn an_isolated_node_keeps_its_seed_direction() {
     let mut edges = ring(12);
     edges.push(("acct-iso".into(), "acct-iso".into()));
     let (session, _dir) = graph_session(&edges, &HashMap::new(), 2).await;
-    let full = read_table_vectors(&session, &encode(&session, &request()).await).await;
-    let seed_only = read_table_vectors(
+    let full = common::read_table_vectors(&session, &encode(&session, &request()).await).await;
+    let seed_only = common::read_table_vectors(
         &session,
         &encode(&session, &request().with_weights([1.0])).await,
     )
@@ -416,7 +392,7 @@ async fn a_bipartite_graph_clusters_by_side_under_odd_and_even_blocks_alike() {
         ("odd block", [0.0, 1.0, 0.0]),
         ("even block", [0.0, 0.0, 1.0]),
     ] {
-        let vectors = read_table_vectors(
+        let vectors = common::read_table_vectors(
             &session,
             &encode(&session, &request().with_weights(weights)).await,
         )
@@ -431,14 +407,14 @@ async fn a_bipartite_graph_clusters_by_side_under_odd_and_even_blocks_alike() {
 async fn the_seed_the_exponent_and_the_weights_each_change_the_table() {
     let (edges, community) = planted_partition(2, 30, 0.2, 0.02, 3);
     let (session, _dir) = graph_session(&edges, &community, 2).await;
-    let reference = read_table_vectors(&session, &encode(&session, &request()).await).await;
+    let reference = common::read_table_vectors(&session, &encode(&session, &request()).await).await;
     for (label, request) in [
         ("seed", request().with_seed(1)),
         ("beta", request().with_beta(-0.5)),
         ("weights", request().with_weights([0.0, 0.0, 1.0, 1.0, 2.0])),
         ("sparsity", request().with_sparsity(8.0)),
     ] {
-        let vectors = read_table_vectors(&session, &encode(&session, &request).await).await;
+        let vectors = common::read_table_vectors(&session, &encode(&session, &request).await).await;
         assert!(
             reference
                 .iter()
@@ -667,7 +643,7 @@ async fn an_edge_source_that_moves_mid_run_changes_nothing() {
 
     let (reference_session, reference_dir) = graph_session(&original, &community, 2).await;
     let request = own_edge_source(&reference_session, &reference_dir, "ledger_reference").await;
-    let reference = read_table_vectors(
+    let reference = common::read_table_vectors(
         &reference_session,
         &encode(&reference_session, &request).await,
     )
@@ -690,7 +666,7 @@ async fn an_edge_source_that_moves_mid_run_changes_nothing() {
     overwrite_edges(&dir, &moved);
     parked.release();
     let (table, _) = run.await.unwrap().unwrap();
-    let vectors = read_table_vectors(&session, &table).await;
+    let vectors = common::read_table_vectors(&session, &table).await;
     assert_eq!(vectors.len(), reference.len());
     for (key, row) in &reference {
         assert_eq!(
@@ -706,7 +682,7 @@ async fn an_edge_source_that_moves_mid_run_changes_nothing() {
     let (moved_session, moved_dir) = graph_session(&moved, &community, 2).await;
     let request = own_edge_source(&moved_session, &moved_dir, "ledger_moved").await;
     let moved_vectors =
-        read_table_vectors(&moved_session, &encode(&moved_session, &request).await).await;
+        common::read_table_vectors(&moved_session, &encode(&moved_session, &request).await).await;
     assert!(
         reference
             .iter()

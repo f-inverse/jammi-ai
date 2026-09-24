@@ -3096,15 +3096,24 @@ note below.
 - **`ModelBackend`** — `crates/jammi-ai/src/model/backend/mod.rs` (the `ModelBackend`
   trait): `load` (synchronous, blocking, no cache lock held) + `estimate_memory` (cheap,
   side-effect-free; the **admission currency** — under-estimating risks OOM).
-  `CandleBackend` is its one implementor; the `models.backend` column records it as
-  `ModelBackendKind::Candle` (`crates/jammi-db/src/catalog/model_repo.rs`), and a row
-  naming anything else is refused where it is read.
+  `CandleBackend` is its implementor for local weights. A model a remote endpoint
+  serves (`crates/jammi-ai/src/model/backend/remote.rs`, `RemoteModel`) has no files
+  to resolve: its `[models.remote.<name>]` declaration is its description, and the
+  cache routes a `ModelSource::Remote` to it before the resolver is asked. The
+  `models.backend` column records `ModelBackendKind::{Candle, Remote}`
+  (`crates/jammi-db/src/catalog/model_repo.rs`), and a row naming anything else is
+  refused where it is read. `LoadedModel` dispatches every forward over its runner
+  (candle or remote), and `ModelDescription` holds the backing each describes
+  (`DescribedBacking::{Local, Remote}`), so a candle load reads its local parts through
+  `local_parts()` and a remote description reaching it is a typed refusal.
 - **`GpuScheduler` / `GpuPermit`** — `crates/jammi-ai/src/concurrency/gpu_scheduler.rs`
   (the `GpuScheduler` and `GpuPermit` types). `GpuScheduler::try_acquire(bytes) ->
   Option<GpuPermit>` is non-blocking CAS on `reserved_memory`; `Drop for GpuPermit`
-  releases budget + notifies (RAII). **Production wires
-  `GpuScheduler::new_unlimited()`** (called in `InferenceSession::new`,
-  `crates/jammi-ai/src/session.rs`), so admission is inert in deployment [§7]. The async
+  releases budget + notifies (RAII). A session builds one scheduler per configured
+  device (`DeviceSchedulers::for_devices`, `crates/jammi-ai/src/session.rs`): budgeted
+  on a probed accelerator, unbudgeted on the CPU. A declared remote model gets its own
+  `GpuScheduler::endpoint(max_in_flight)` — the endpoint is the device its forwards run
+  on, with no memory budget and `max_in_flight` forward slots. The async
   `GpuScheduler::acquire` and `GpuPriority` are tests-only.
 - **`ModelGuard`** — `crates/jammi-ai/src/model/mod.rs` (the `ModelGuard` struct): the
   handle execution holds. Drop decrements `ref_count`; **eviction only removes idle
@@ -5189,16 +5198,19 @@ auto-available to every encoder.)
 
 ### 4.7 Add a new model backend / source / tokenizer (lifecycle)
 
-- **Backend:** a second backend arrives as a capability with a loader: a
+- **Backend:** a backend arrives as a capability with a loader: a
   `ModelBackendKind` variant (`crates/jammi-db/src/catalog/model_repo.rs`) the catalog
-  records, a `crates/jammi-ai/src/model/backend/<name>.rs` impl of `ModelBackend`, the
-  cache's dispatch from the resolved model to it, and the resolver recognizing its
-  weights. `LoadedModel` gains a variant, and *every* match over it is extended
-  (`estimate_batch_memory`, `embedding_dim`, `regression_form`, `regression_std_scale`,
-  `forward`, …) — no catch-all arm by design.
-- **Model source:** `ModelSource` variant (`crates/jammi-ai/src/model/mod.rs`) + update
-  `Display`/`parse`/`from_canonical` + the `model_type` match in `do_load`; a
-  `resolve_<source>` method dispatched in `resolve`.
+  records, a `crates/jammi-ai/src/model/backend/<name>.rs` module, the cache's dispatch
+  to it, and the run a materialization records for it — a `LocalBackend` variant for a
+  backend over local weights, or its own `ModelRun` variant for one that is not
+  (`crates/jammi-db/src/store/manifest.rs`). The `Runner` (`LoadedModel`) and
+  `DescribedBacking` (`ModelDescription`) enums gain a variant, and every match over
+  them is extended — no catch-all arm by design. Rows reach a backend through
+  `model::backend::rows` (`TextRows`, `embedding_output`), never a copy of it.
+- **Model source:** `ModelSource` variant (`crates/jammi-datafusion/src/source.rs`) +
+  `Display`/`parse`/`from_canonical` + its wire form (`crates/jammi-datafusion/proto/
+  jammi/inference/v1/plan.proto`, `inference/wire.rs`) + the `model_type` match in
+  `complete_generic_registration`; the cache or resolver arm that serves it.
 - **Tokenizer shape:** `TokenizerSource` variant (`crates/jammi-ai/src/model/mod.rs`) +
   `path()` + resolver discovery + `TokenizerWrapper` constructor + backend dispatch.
 

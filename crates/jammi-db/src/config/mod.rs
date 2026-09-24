@@ -16,10 +16,12 @@ use crate::storage::{AzureConfig, CloudConfig, GcsConfig, R2Config, S3Config};
 mod env_map;
 pub mod host_memory;
 mod layers;
+pub mod remote_model;
 pub mod secret;
 #[cfg(test)]
 mod tests;
 
+pub use remote_model::{RemoteModelConfig, RemoteProtocol};
 pub use secret::{Secret, SecretSource};
 
 use layers::Node;
@@ -2670,26 +2672,30 @@ impl ObservabilityConfig {
             )));
         }
         if let Some(endpoint) = &self.otlp_endpoint {
-            let parsed = url::Url::parse(endpoint).map_err(|e| {
-                JammiError::Config(format!(
-                    "observability.otlp_endpoint '{endpoint}' is not a valid URL: {e}"
-                ))
-            })?;
-            if !matches!(parsed.scheme(), "http" | "https") {
-                return Err(JammiError::Config(format!(
-                    "observability.otlp_endpoint '{endpoint}' must use the http or https \
-                     scheme, got '{}'",
-                    parsed.scheme()
-                )));
-            }
-            if parsed.host_str().is_none() {
-                return Err(JammiError::Config(format!(
-                    "observability.otlp_endpoint '{endpoint}' must name a host"
-                )));
-            }
+            http_url("observability.otlp_endpoint", endpoint)?;
         }
         Ok(())
     }
+}
+
+/// `value` as an `http`/`https` URL naming a host, or a typed refusal naming
+/// `key` and the value — the one rule every endpoint the configuration names
+/// is held to.
+fn http_url(key: &str, value: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(value)
+        .map_err(|e| JammiError::Config(format!("{key} '{value}' is not a valid URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(JammiError::Config(format!(
+            "{key} '{value}' must use the http or https scheme, got '{}'",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(JammiError::Config(format!(
+            "{key} '{value}' must name a host"
+        )));
+    }
+    Ok(parsed)
 }
 
 /// Model source: where the Hugging Face Hub cache lives, which endpoint and
@@ -2763,6 +2769,18 @@ pub struct ModelsConfig {
     /// (`huggingface_hub`'s own `ENV_VARS_TRUE_VALUES`: `"1"`, `"on"`,
     /// `"yes"`, `"true"`, case-insensitively).
     pub offline: Option<bool>,
+    /// Models served at remote endpoints, by the name a plan references them
+    /// under (`remote:<name>`). See [`RemoteModelConfig`].
+    pub remote: BTreeMap<String, RemoteModelConfig>,
+}
+
+impl ModelsConfig {
+    /// Refuse a remote model declaration no request could be built from.
+    pub fn validate(&self) -> Result<()> {
+        self.remote
+            .iter()
+            .try_for_each(|(name, model)| model.validate(name))
+    }
 }
 
 // --- Defaults ---
@@ -3198,6 +3216,11 @@ impl JammiConfig {
         // struct-literal `JammiConfig` that skips this function entirely) is
         // named on `InferenceConfig::validate`'s own doc.
         config.inference.validate()?;
+        // Refuse a `[models.remote.<name>]` declaration no request could be
+        // built from (an endpoint that is not an http(s) URL, an empty
+        // model name or revision, a header that is not a header name) at
+        // load time, by key.
+        config.models.validate()?;
         Ok(config)
     }
 

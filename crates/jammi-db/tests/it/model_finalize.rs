@@ -137,7 +137,7 @@ async fn attest(store: &ResultStore, staged: &StagedArtifact) -> Materialization
         vec![ModelIdentity {
             model_id: "q-base".into(),
             run: ModelRun::Local(LocalRun {
-                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                backend: jammi_db::store::manifest::LocalBackend::Candle,
                 compute_precision: ComputePrecision::F32,
                 content_digest: ContentDigest("fixture-digest".into()),
                 quantization: None,

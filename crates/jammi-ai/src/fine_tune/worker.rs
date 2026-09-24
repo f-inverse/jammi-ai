@@ -5320,7 +5320,7 @@ impl FineTuneMaterialization {
 /// The dtype folded is `common.config.backbone_dtype` — the SAME value
 /// `probe_acceleration`'s own `dtype_class_of(backbone_dtype)` call resolves
 /// the acceleration report's dtype class from — never
-/// `guard.model.description().compute_precision()` (the loaded model's own ON-DISK weight
+/// the loaded model's `LocalRun::compute_precision` (the loaded model's own ON-DISK weight
 /// dtype, a DIFFERENT axis: the trainer's `VarBuilder` and LoRA adapters are
 /// always `F32` regardless of `backbone_dtype`, and `guard.model` can be
 /// loaded at `F32` while `backbone_dtype` casts the forward activations to

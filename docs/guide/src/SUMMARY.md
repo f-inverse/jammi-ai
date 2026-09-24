@@ -17,6 +17,7 @@
 - [Query Your Data with SQL](./query-data.md)
 - [Generate Embeddings](./generate-embeddings.md)
 - [Use a Local Model Checkpoint](./local-models.md)
+- [Use a Remote Model](./remote-models.md)
 - [Generate Image Embeddings](./generate-image-embeddings.md)
 - [Search Text Against Images (Cross-Modal)](./cross-modal-search.md)
 - [Classify Text](./classify-text.md)

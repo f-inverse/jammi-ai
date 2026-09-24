@@ -3,6 +3,10 @@ pub mod candle;
 /// [`super::resolver`] and [`candle`] — see the module's own doc.
 pub(crate) mod gguf;
 pub mod open_clip_text;
+pub mod remote;
+/// The rows of one forward, shared by every backend — see the module's own
+/// doc.
+pub(crate) mod rows;
 /// Safetensors header-parsed residency-estimation helper shared by
 /// [`super::resolver`] and [`candle`] — see the module's own doc.
 pub(crate) mod safetensors_residency;

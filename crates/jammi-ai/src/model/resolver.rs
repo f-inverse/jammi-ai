@@ -82,6 +82,12 @@ impl ModelResolver {
         }
 
         match source {
+            ModelSource::Remote(_) => Err(JammiError::Model {
+                model_id: source.to_string(),
+                message: "a remote model is served by its endpoint; it has no local files to \
+                          resolve"
+                    .into(),
+            }),
             ModelSource::Local(path) => self.resolve_local(path, source, task),
             ModelSource::HuggingFace(repo_id) => {
                 // `[models] offline`: the catalog lookup above is offline's

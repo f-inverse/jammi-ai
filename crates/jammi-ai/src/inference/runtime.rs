@@ -94,11 +94,11 @@ impl BoundModel for ModelGuard {
     /// place the engine's OOM spelling table (`model::oom`) meets the
     /// operators' typed recovery: a genuine out-of-memory failure takes
     /// the runner's batch-halving retry, every other failure propagates.
-    fn forward(&self, prepared: Prepared) -> Result<BackendOutput, ForwardError> {
+    async fn forward(&self, prepared: Prepared) -> Result<BackendOutput, ForwardError> {
         let prepared = prepared
             .downcast::<PreparedInput>()
             .map_err(|_| foreign_prepared())?;
-        self.model.forward_prepared(*prepared).map_err(|e| {
+        self.model.forward_prepared(*prepared).await.map_err(|e| {
             if is_oom_message(&e.to_string().to_lowercase()) {
                 ForwardError::OutOfMemory(e.to_string())
             } else {

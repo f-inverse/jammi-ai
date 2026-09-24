@@ -19,16 +19,15 @@ use jammi_encoders::{
 
 use super::gguf::{self, GgufArchitecture};
 use super::open_clip_text::OpenClipTextForward;
+use super::rows::{content_row_count, TextRows};
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
-use crate::inference::{
-    arrow_to_audio, arrow_to_images, arrow_to_texts, audio_preprocess, image_preprocess,
-};
+use crate::inference::{arrow_to_audio, arrow_to_images, audio_preprocess, image_preprocess};
 use crate::model::arch::EncoderFamily;
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use crate::model::{
-    LoadedModel, ModelDescription, ModelDimensions, ResolvedModel, SavedAdapterFiles,
-    TokenizerSource, WeightsFormat,
+    DescribedBacking, LoadedModel, LocalDescription, ModelDescription, ModelDimensions,
+    ResolvedModel, SavedAdapterFiles, TokenizerSource, WeightsFormat,
 };
 use jammi_datafusion::BackendOutput;
 use jammi_datafusion::ModelTask;
@@ -2057,50 +2056,21 @@ impl CandleModel {
         row_errors: Vec<String>,
         embedded: Option<Tensor>,
     ) -> Result<BackendOutput> {
-        let num_rows = row_status.len();
-        if num_rows == 0 {
-            // `(0, 0)`, not `(0, self.description.dimensions().hidden_size)`: the SHARED
-            // empty-batch shape every `BackendOutput` producer reports for a
-            // zero-row float-embedding head, embedded (`CandleModel`) and
-            // remote (`HttpBackend`) alike — see `HttpBackend::
-            // forward_embeddings`'s own `inputs.is_empty()` arm for why
-            // `(0, 0)` (`BackendOutput`'s documented "no real embedding"
-            // shape) is the one both surfaces can report honestly, and
-            // `EmbeddingAdapter::adapt`'s `row_count == 0` branch for why
-            // this value is descriptive only, never load-bearing.
-            return Ok(BackendOutput {
-                float_outputs: vec![vec![]],
-                string_outputs: vec![],
-                row_status: vec![],
-                row_errors: vec![],
-                shapes: vec![(0, 0)],
-            });
-        }
-        let hidden_size = self.description.dimensions().hidden_size;
-        let mut all_embeddings = vec![0.0_f32; num_rows * hidden_size];
-        if let Some(embedded) = embedded {
-            let embedded = if embedded.dtype() == DType::F32 {
-                embedded
-            } else {
-                embedded
-                    .to_dtype(DType::F32)
-                    .map_err(|e| JammiError::Inference(format!("Embedding dtype cast: {e}")))?
-            };
-            let embeddings = embedded
-                .to_vec2::<f32>()
-                .map_err(|e| JammiError::Inference(format!("Tensor to vec failed: {e}")))?;
-            for (emb_idx, &orig_idx) in valid.iter().enumerate() {
-                let start = orig_idx * hidden_size;
-                all_embeddings[start..start + hidden_size].copy_from_slice(&embeddings[emb_idx]);
-            }
-        }
-        Ok(BackendOutput {
-            float_outputs: vec![all_embeddings],
-            string_outputs: vec![],
+        let rows = match embedded {
+            Some(embedded) => embedded
+                .to_dtype(DType::F32)
+                .and_then(|e| e.to_vec2::<f32>())
+                .map_err(|e| JammiError::Inference(format!("Embedding to host: {e}")))?,
+            None => Vec::new(),
+        };
+        let rows: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        super::rows::embedding_output(
+            valid,
             row_status,
             row_errors,
-            shapes: vec![(num_rows, hidden_size)],
-        })
+            self.description.embedding_dim(),
+            &rows,
+        )
     }
 
     /// Apply the trained projection head, if one was loaded.
@@ -2432,56 +2402,6 @@ impl CandleModel {
     }
 }
 
-/// The row count of a content column set, refusing an empty set the way
-/// every content reader does.
-fn content_row_count(content: &[ArrayRef]) -> Result<usize> {
-    content
-        .first()
-        .map(|c| c.len())
-        .ok_or_else(|| JammiError::Inference("No content columns provided".into()))
-}
-
-/// The rows of one text forward: every row's rendered text, and which rows
-/// carry any. An empty or null text is marked at its row and never reaches
-/// the tokenizer.
-struct TextRows {
-    texts: Vec<String>,
-    valid: Vec<usize>,
-    row_status: Vec<bool>,
-    row_errors: Vec<String>,
-}
-
-impl TextRows {
-    fn of(content: &[ArrayRef]) -> Result<Self> {
-        let texts = arrow_to_texts(content)?;
-        let mut row_status = vec![true; texts.len()];
-        let mut row_errors = vec![String::new(); texts.len()];
-        let mut valid = Vec::with_capacity(texts.len());
-        for (i, text) in texts.iter().enumerate() {
-            if text.is_empty() {
-                row_status[i] = false;
-                row_errors[i] = "Empty or null text input".into();
-            } else {
-                valid.push(i);
-            }
-        }
-        Ok(Self {
-            texts,
-            valid,
-            row_status,
-            row_errors,
-        })
-    }
-
-    fn len(&self) -> usize {
-        self.texts.len()
-    }
-
-    fn valid_texts(&self) -> Vec<&str> {
-        self.valid.iter().map(|&i| self.texts[i].as_str()).collect()
-    }
-}
-
 /// The rows of one media forward: every row that decoded, Arrow-row-numbered
 /// in `valid`, and the status of every row. A null row and a row whose bytes
 /// failed to decode are each marked at their row (the latter with its decode
@@ -2750,16 +2670,18 @@ impl ModelBackend for CandleBackend {
         };
         Ok(ModelDescription {
             model_id: resolved.model_id.0.clone(),
-            run: LocalRun {
-                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                compute_precision,
-                content_digest,
-                quantization,
-            },
-            dimensions,
-            configured_precision,
-            saved_adapter,
-            fingerprint,
+            backing: DescribedBacking::Local(LocalDescription {
+                run: LocalRun {
+                    backend: jammi_db::store::manifest::LocalBackend::Candle,
+                    compute_precision,
+                    content_digest,
+                    quantization,
+                },
+                dimensions,
+                configured_precision,
+                saved_adapter,
+                fingerprint,
+            }),
         })
     }
 
@@ -2771,8 +2693,9 @@ impl ModelBackend for CandleBackend {
     ) -> Result<LoadedModel> {
         let device = select_device(device_config)?;
         let model_type = config_model_type(resolved);
+        let local = description.local_parts()?;
 
-        let compute_precision = description.configured_precision;
+        let compute_precision = local.configured_precision;
         let compute_dtype = match compute_precision {
             jammi_numerics::ComputePrecision::F32 | jammi_numerics::ComputePrecision::F16 => {
                 jammi_encoders::compute_precision_to_dtype(compute_precision)
@@ -2905,7 +2828,7 @@ impl ModelBackend for CandleBackend {
         // variant is the type-level switch that decides whether to wire
         // LoRA inside the encoder or leave it as an external projection
         // head applied post-pool.
-        let saved_adapter = description.saved_adapter.as_ref();
+        let saved_adapter = local.saved_adapter.as_ref();
         let encoder_adapter = saved_adapter.and_then(|adapter| match &adapter.config {
             crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => {
                 Some(((**cfg).clone(), adapter.weights.as_path()))
@@ -3007,7 +2930,7 @@ impl ModelBackend for CandleBackend {
         // and is what the materialization contract folds into the identity;
         // it is never re-derived here.
         let encoder_backbone_dtype =
-            jammi_encoders::compute_precision_to_dtype(description.compute_precision());
+            jammi_encoders::compute_precision_to_dtype(local.run.compute_precision);
         // For a GGUF load this points at the SAME synthesized densified
         // file `vb` above reads (`vb_weights_paths`'s own doc) — every
         // `*Builder::build` call below constructs its OWN `frozen_vb` from
@@ -3363,7 +3286,7 @@ impl ModelBackend for CandleBackend {
             })
             .transpose()?;
 
-        let dimensions = description.dimensions();
+        let dimensions = &local.dimensions;
 
         // Load the post-pool projection head, if the saved adapter is one.
         // Encoder-adapters are installed inside `text` above via the encoder
@@ -4606,25 +4529,28 @@ mod ner_nonfinite_logit_tests {
 
         let description = Arc::new(ModelDescription {
             model_id: "synthetic-ner".to_string(),
-            run: LocalRun {
-                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                compute_precision: jammi_numerics::ComputePrecision::F32,
-                // No model directory backs this synthetic fixture; no test
-                // in this module reads the digest.
-                content_digest: ContentDigest("test-fixture-digest".into()),
-                quantization: None,
-            },
-            dimensions: ModelDimensions {
-                hidden_size: HIDDEN,
-                num_layers: 1,
-                num_attention_heads: 1,
-                intermediate_size: HIDDEN,
-            },
-            configured_precision: jammi_numerics::ComputePrecision::F32,
-            saved_adapter: None,
-            // No real model directory backs this fixture either, so there is
-            // nothing to fingerprint — `empty()` probes vacuously fresh.
-            fingerprint: ModelFingerprint::empty(),
+            backing: DescribedBacking::Local(LocalDescription {
+                run: LocalRun {
+                    backend: jammi_db::store::manifest::LocalBackend::Candle,
+                    compute_precision: jammi_numerics::ComputePrecision::F32,
+                    // No model directory backs this synthetic fixture; no
+                    // test in this module reads the digest.
+                    content_digest: ContentDigest("test-fixture-digest".into()),
+                    quantization: None,
+                },
+                dimensions: ModelDimensions {
+                    hidden_size: HIDDEN,
+                    num_layers: 1,
+                    num_attention_heads: 1,
+                    intermediate_size: HIDDEN,
+                },
+                configured_precision: jammi_numerics::ComputePrecision::F32,
+                saved_adapter: None,
+                // No real model directory backs this fixture either, so
+                // there is nothing to fingerprint — `empty()` probes
+                // vacuously fresh.
+                fingerprint: ModelFingerprint::empty(),
+            }),
         });
         CandleModel {
             description,
@@ -5977,7 +5903,10 @@ mod r5_f2_classification_pooling_tests {
             .expect("a genuinely classification-shaped checkpoint must load successfully");
 
         let content = two_row_content();
-        let result = loaded.forward(&content, ModelTask::TextEmbedding);
+        let result = loaded
+            .backend_model()
+            .expect("a candle model")
+            .forward(&content, ModelTask::TextEmbedding);
 
         match result {
             Ok(_) => panic!(
@@ -6013,7 +5942,10 @@ mod r5_f2_classification_pooling_tests {
             .expect("a genuinely classification-shaped checkpoint must load successfully");
 
         let content = two_row_content();
-        let result = loaded.forward(&content, ModelTask::Classification);
+        let result = loaded
+            .backend_model()
+            .expect("a candle model")
+            .forward(&content, ModelTask::Classification);
         match result {
             Ok(out) => {
                 // The float head is one
@@ -6083,7 +6015,10 @@ mod r5_f2_classification_pooling_tests {
             .expect("an id2label-bearing checkpoint loaded for TextEmbedding must still succeed");
 
         let content = two_row_content();
-        let result = loaded.forward(&content, ModelTask::Classification);
+        let result = loaded
+            .backend_model()
+            .expect("a candle model")
+            .forward(&content, ModelTask::Classification);
 
         match result {
             Ok(_) => panic!(
@@ -6119,7 +6054,10 @@ mod r5_f2_classification_pooling_tests {
             .expect("an id2label-bearing checkpoint loaded for TextEmbedding must still succeed");
 
         let content = two_row_content();
-        let result = loaded.forward(&content, ModelTask::TextEmbedding);
+        let result = loaded
+            .backend_model()
+            .expect("a candle model")
+            .forward(&content, ModelTask::TextEmbedding);
         match result {
             Ok(_) => {}
             Err(e) => panic!(

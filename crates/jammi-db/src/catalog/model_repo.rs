@@ -81,6 +81,8 @@ impl std::fmt::Display for ModelLocation {
 pub enum ModelBackendKind {
     /// Candle: safetensors or GGUF weights, run natively.
     Candle,
+    /// A remote endpoint the deployment declares (`[models.remote.<name>]`).
+    Remote,
 }
 
 impl ModelBackendKind {
@@ -89,6 +91,7 @@ impl ModelBackendKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Candle => "candle",
+            Self::Remote => "remote",
         }
     }
 
@@ -97,8 +100,9 @@ impl ModelBackendKind {
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "candle" => Ok(Self::Candle),
+            "remote" => Ok(Self::Remote),
             other => Err(JammiError::Config(format!(
-                "unknown model backend '{other}': the engine runs 'candle'"
+                "unknown model backend '{other}': the engine runs 'candle' and 'remote'"
             ))),
         }
     }

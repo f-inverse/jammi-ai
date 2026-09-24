@@ -21,12 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, StringArray};
 use jammi_ai::concurrency::GpuScheduler;
 use jammi_ai::model::backend::DeviceConfig;
 use jammi_ai::model::cache::ModelCache;
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::LoadedModel;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
@@ -62,12 +60,6 @@ fn new_cache(catalog: Arc<Catalog>) -> ModelCache {
     };
     let scheduler = Arc::new(GpuScheduler::new_unlimited());
     ModelCache::new(resolver, device_config, scheduler)
-}
-
-fn embed(model: &LoadedModel, text: &str) -> Vec<f32> {
-    let content: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text])) as ArrayRef];
-    let output = model.forward(&content, ModelTask::TextEmbedding).unwrap();
-    output.float_outputs[0].clone()
 }
 
 /// (c)'s non-finite-safe divergence check: every element of BOTH vectors
@@ -148,9 +140,15 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1_raw = guard1.model.description().content_digest().clone();
+    let d1_raw = guard1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
     let d1 = d1_raw.0.clone();
-    let v1 = embed(&guard1.model, TEXT);
+    let v1 = crate::common::embed(&guard1.model, TEXT).await;
     drop(guard1); // mirrors EmbeddingPipeline::run: guard dropped once digest/dims are read.
 
     // (2) In-place mutation — dir (and therefore ModelId) never changes.
@@ -181,9 +179,15 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm_raw = guard_warm.model.description().content_digest().clone();
+    let d_warm_raw = guard_warm
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
     let d_warm = d_warm_raw.0.clone();
-    let v_warm = embed(&guard_warm.model, TEXT);
+    let v_warm = crate::common::embed(&guard_warm.model, TEXT).await;
     drop(guard_warm);
 
     // (4) Control: the post-mutation COLD reading, bypassing the LRU
@@ -192,9 +196,14 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .load_owned_for_test(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d2_raw = cold_model.description().content_digest().clone();
+    let d2_raw = cold_model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
     let d2 = d2_raw.0.clone();
-    let v2 = embed(&cold_model, TEXT);
+    let v2 = crate::common::embed(&cold_model, TEXT).await;
 
     // (a) both D1 and D2 are HASHED — a local run's digest is always one.
 
@@ -249,24 +258,44 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let du1 = guard_u1.model.description().content_digest().0.clone();
-    let vu1 = embed(&guard_u1.model, TEXT);
+    let du1 = guard_u1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let vu1 = crate::common::embed(&guard_u1.model, TEXT).await;
     drop(guard_u1);
 
     let guard_u_warm = cache
         .get_or_load(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let du_warm = guard_u_warm.model.description().content_digest().0.clone();
-    let vu_warm = embed(&guard_u_warm.model, TEXT);
+    let du_warm = guard_u_warm
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let vu_warm = crate::common::embed(&guard_u_warm.model, TEXT).await;
     drop(guard_u_warm);
 
     let cold_u_model = cache
         .load_owned_for_test(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let du_cold = cold_u_model.description().content_digest().0.clone();
-    let vu_cold = embed(&cold_u_model, TEXT);
+    let du_cold = cold_u_model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let vu_cold = crate::common::embed(&cold_u_model, TEXT).await;
 
     assert_eq!(
         du1, du_warm,
@@ -313,7 +342,14 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = guard1.model.description().content_digest().0.clone();
+    let d1 = guard1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
     drop(guard1);
 
     let pooling_config_path = dir.join("1_Pooling/config.json");
@@ -330,7 +366,14 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm = guard_warm.model.description().content_digest().0.clone();
+    let d_warm = guard_warm
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
 
     assert_ne!(
         d_warm, d1,
@@ -365,8 +408,15 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = guard1.model.description().content_digest().0.clone();
-    let v1 = embed(&guard1.model, TEXT);
+    let d1 = guard1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let v1 = crate::common::embed(&guard1.model, TEXT).await;
     drop(guard1);
 
     // 1_Pooling/config.json APPEARS — did not exist at load time.
@@ -382,8 +432,15 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm = guard_warm.model.description().content_digest().0.clone();
-    let v_warm = embed(&guard_warm.model, TEXT);
+    let d_warm = guard_warm
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let v_warm = crate::common::embed(&guard_warm.model, TEXT).await;
 
     assert_ne!(
         d_warm, d1,
@@ -419,7 +476,14 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = guard1.model.description().content_digest().0.clone();
+    let d1 = guard1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
     drop(guard1);
 
     // preprocessor_config.json APPEARS — did not exist at load time.
@@ -429,7 +493,14 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm = guard_warm.model.description().content_digest().0.clone();
+    let d_warm = guard_warm
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
 
     assert_ne!(
         d_warm, d1,
@@ -444,7 +515,13 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .load_owned_for_test(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_cold = cold_model.description().content_digest().0.clone();
+    let d_cold = cold_model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
     assert_eq!(
         d_warm, d_cold,
         "the warm replay's digest must match a fresh cold reading of the \
@@ -780,7 +857,14 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = guard1.model.description().content_digest().0.clone();
+    let d1 = guard1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
     drop(guard1);
 
     // DELETE the optional candidate — present at load time, gone now.
@@ -797,8 +881,15 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
              typed refusal — got Err({e})"
         ),
     };
-    let d_warm_1 = guard_warm_1.model.description().content_digest().0.clone();
-    let v_warm_1 = embed(&guard_warm_1.model, TEXT);
+    let d_warm_1 = guard_warm_1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let v_warm_1 = crate::common::embed(&guard_warm_1.model, TEXT).await;
     drop(guard_warm_1);
 
     assert_ne!(
@@ -821,7 +912,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         )
         .await
         .unwrap();
-    let v_reference = embed(&reference_model, TEXT);
+    let v_reference = crate::common::embed(&reference_model, TEXT).await;
     assert_eq!(
         v_warm_1, v_reference,
         "post-deletion vectors must be bitwise-identical to an independent \
@@ -839,8 +930,14 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         .load_owned_for_test(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_cold = cold_model.description().content_digest().0.clone();
-    let v_cold = embed(&cold_model, TEXT);
+    let d_cold = cold_model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
+    let v_cold = crate::common::embed(&cold_model, TEXT).await;
     assert_eq!(
         d_cold, d_warm_1,
         "a cold reading taken after the deletion must match the warm reload's digest"
@@ -861,7 +958,14 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
              also succeed — never a permanent wedge — got Err({e})"
         ),
     };
-    let d_warm_2 = guard_warm_2.model.description().content_digest().0.clone();
+    let d_warm_2 = guard_warm_2
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .0
+        .clone();
     assert_eq!(
         d_warm_2, d_warm_1,
         "the second warm call after the reload must report the SAME (now \

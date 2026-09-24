@@ -230,13 +230,18 @@ async fn run_plan(
 
 /// `chunks` forwarded bare — prepare then forward, no plan above: the
 /// floor the plan's overhead is measured against.
-fn run_direct(model: &LoadedModel, chunks: &[RecordBatch]) -> Run {
+async fn run_direct(model: &LoadedModel, chunks: &[RecordBatch]) -> Run {
     let start = Instant::now();
     let mut rows = 0;
     for chunk in chunks {
         let text: ArrayRef = Arc::clone(chunk.column(1));
         let prepared = model.prepare(&[text], ModelTask::TextEmbedding).unwrap();
-        rows += model.forward_prepared(prepared).unwrap().row_status.len();
+        rows += model
+            .forward_prepared(prepared)
+            .await
+            .unwrap()
+            .row_status
+            .len();
     }
     let elapsed = start.elapsed();
     assert_eq!(rows, chunks.iter().map(|c| c.num_rows()).sum::<usize>());
@@ -261,7 +266,7 @@ async fn measure(label: &str, sizes: &[usize]) {
     let model = &guard.model;
     // Warm: the first forward is paid once, outside every timing.
     let source_id = format!("chunk-measure-{label}");
-    run_direct(model, &chunks_of(&session, &source_id, &corpus(16)).await);
+    run_direct(model, &chunks_of(&session, &source_id, &corpus(16)).await).await;
 
     println!(
         "== chunk composition [{label}] batch_size={BATCH_SIZE} batch_tokens={BATCH_TOKENS} =="
@@ -287,7 +292,7 @@ async fn measure(label: &str, sizes: &[usize]) {
             .sum();
         let chunks = chunks_of(&session, &source_id, &batch).await;
         let (padded, widths) = padded_over(model, &chunks);
-        let direct = run_direct(model, &chunks);
+        let direct = run_direct(model, &chunks).await;
         let plan1 = run_plan(&session, &source_id, &batch, 1).await;
         let plan4 = run_plan(&session, &source_id, &batch, 4).await;
         assert_eq!(

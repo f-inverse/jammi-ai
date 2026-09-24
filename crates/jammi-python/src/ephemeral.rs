@@ -98,7 +98,9 @@ impl PyEphemeralSession {
     ) -> PyResult<()> {
         let schema_ref = schema.into_inner();
         let rt = Arc::clone(&self.runtime);
-        self.with_session(|s| rt.block_on(s.create_ephemeral_table(name, schema_ref, primary_key)))
+        self.with_session(|s| {
+            crate::released(&rt, s.create_ephemeral_table(name, schema_ref, primary_key))
+        })
     }
 
     /// Append a `pyarrow.Table` to a named ephemeral table. The schema must
@@ -118,7 +120,7 @@ impl PyEphemeralSession {
                 .map_err(|e| PyRuntimeError::new_err(format!("concat insert batches: {e}")))?
         };
         let rt = Arc::clone(&self.runtime);
-        self.with_session(|s| rt.block_on(s.insert(name, concatenated)))
+        self.with_session(|s| crate::released(&rt, s.insert(name, concatenated)))
     }
 
     /// Run a read query against a named ephemeral table. `{table}` in `query`
@@ -126,14 +128,14 @@ impl PyEphemeralSession {
     /// `pyarrow.Table`.
     fn sql(&self, py: Python<'_>, name: &str, query: &str) -> PyResult<Py<PyAny>> {
         let rt = Arc::clone(&self.runtime);
-        let batches = self.with_session(|s| rt.block_on(s.sql(name, query)))?;
+        let batches = self.with_session(|s| crate::released(&rt, s.sql(name, query)))?;
         batches_to_pyarrow(py, &batches)
     }
 
     /// Count rows currently stored in a named ephemeral table.
     fn count_rows(&self, name: &str) -> PyResult<u64> {
         let rt = Arc::clone(&self.runtime);
-        self.with_session(|s| rt.block_on(s.count_rows(name)))
+        self.with_session(|s| crate::released(&rt, s.count_rows(name)))
     }
 
     /// The fully qualified SQL reference (`mutable.public."<physical id>"`) for a
@@ -156,10 +158,7 @@ impl PyEphemeralSession {
             guard.take()
         };
         match taken {
-            Some(session) => self
-                .runtime
-                .block_on(session.close())
-                .map_err(ephemeral_err),
+            Some(session) => crate::released(&self.runtime, session.close()).map_err(ephemeral_err),
             None => Ok(()),
         }
     }

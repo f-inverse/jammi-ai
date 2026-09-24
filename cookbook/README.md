@@ -18,6 +18,7 @@ blocks the merge.
 | Measure NER precision/recall/F1 against gold spans | [`recipes/eval_inference_ner/`](./recipes/eval_inference_ner/) |
 | Fine-tune an encoder with LoRA | [`recipes/fine_tune/`](./recipes/fine_tune/) |
 | Connect to a remote `jammi-server` via Flight SQL | [`recipes/flight_sql/`](./recipes/flight_sql/) |
+| Embed and search with a model served at a remote endpoint | [`recipes/remote_model/`](./recipes/remote_model/) |
 
 ## Fixtures
 

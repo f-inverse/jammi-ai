@@ -103,6 +103,12 @@ impl GpuScheduler {
         Self::unbudgeted(threads.get())
     }
 
+    /// A remote endpoint as a device: it holds no memory this process
+    /// budgets, and takes `max_in_flight` forwards at once.
+    pub fn endpoint(max_in_flight: NonZeroUsize) -> Self {
+        Self::unbudgeted(max_in_flight.get())
+    }
+
     /// No memory budget, `forward_slots` forwards at once.
     fn unbudgeted(forward_slots: usize) -> Self {
         Self {

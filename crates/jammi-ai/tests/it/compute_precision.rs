@@ -11,7 +11,7 @@ use crate::common;
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Float32Array, StringArray};
+use arrow::array::{Array, Float32Array, StringArray};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::resolver::ModelResolver;
@@ -70,14 +70,6 @@ async fn resolve_and_load(
     backend.load(&resolved, &device_config).unwrap()
 }
 
-/// Embed `text` through the live embedding path (`LoadedModel::forward` →
-/// `forward_embedding` → `CandleTextForward::forward_pooled` → L2-normalize).
-fn embed(model: &LoadedModel, text: &str) -> Vec<f32> {
-    let content: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text])) as ArrayRef];
-    let output = model.forward(&content, ModelTask::TextEmbedding).unwrap();
-    output.float_outputs[0].clone()
-}
-
 /// (a) F16 inference produces a valid embedding: finite, correct dimension,
 /// unit-norm.
 /// (b) It differs from the F32 embedding of the same input (precision is
@@ -98,8 +90,8 @@ async fn f16_embedding_is_valid_and_active_but_close_to_f32() {
     )
     .await;
 
-    let vec_f32 = embed(&model_f32, TEXT);
-    let vec_f16 = embed(&model_f16, TEXT);
+    let vec_f32 = crate::common::embed(&model_f32, TEXT).await;
+    let vec_f16 = crate::common::embed(&model_f16, TEXT).await;
 
     // (a) A valid embedding: correct dimension (tiny_bert hidden_size = 32),
     // every component finite, unit L2 norm (the embedding path L2-normalizes).

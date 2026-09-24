@@ -196,6 +196,50 @@ pub fn audio_serve(model_id: impl Into<String>, bytes: Arc<Vec<u8>>) -> ServeFn 
 /// L2 norm is `> 1e-6` — rules out a degenerate (NaN-laced, all-zero, or
 /// near-zero) embedding making the downstream difference/bit-equality
 /// checks pass vacuously.
+/// A materialized embedding table's `(_row_id, vector)` rows, by row id.
+pub async fn read_table_vectors(
+    session: &InferenceSession,
+    table: &ResultTableRecord,
+) -> std::collections::HashMap<String, Vec<f32>> {
+    use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
+    let batches = session
+        .sql(&format!(
+            "SELECT _row_id, vector FROM \"jammi.{}\"",
+            table.table_name
+        ))
+        .await
+        .unwrap();
+    let mut out = std::collections::HashMap::new();
+    for batch in &batches {
+        let ids = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8).unwrap();
+        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
+        let list = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            let cell = list.value(i);
+            let floats = cell.as_any().downcast_ref::<Float32Array>().unwrap();
+            out.insert(ids.value(i).to_string(), floats.values().to_vec());
+        }
+    }
+    out
+}
+
+/// One text's vector off a loaded model's own forward — no plan, no device
+/// admission: what a test compares a plan's output, or another load's,
+/// against.
+pub async fn embed(model: &jammi_ai::model::LoadedModel, text: &str) -> Vec<f32> {
+    let content: Vec<arrow::array::ArrayRef> =
+        vec![Arc::new(arrow::array::StringArray::from(vec![text])) as arrow::array::ArrayRef];
+    let output = model
+        .forward(&content, jammi_datafusion::ModelTask::TextEmbedding)
+        .await
+        .unwrap();
+    output.float_outputs[0].clone()
+}
+
 pub fn assert_finite_and_nondegenerate(v: &[f32], label: &str) {
     for (i, x) in v.iter().enumerate() {
         assert!(

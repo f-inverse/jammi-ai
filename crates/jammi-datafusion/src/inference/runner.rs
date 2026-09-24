@@ -318,7 +318,7 @@ impl InferenceRunner {
     where
         A: Fn() -> BoxFuture<'a, Result<ForwardPermit>>,
         P: Fn(&[ArrayRef]) -> Result<T>,
-        F: FnMut(T) -> std::result::Result<BackendOutput, ForwardError>,
+        F: FnMut(T) -> BoxFuture<'a, std::result::Result<BackendOutput, ForwardError>>,
     {
         for chunk in chunks {
             let flow = Self::run_chunk(
@@ -363,7 +363,7 @@ impl InferenceRunner {
     where
         A: Fn() -> BoxFuture<'a, Result<ForwardPermit>>,
         P: Fn(&[ArrayRef]) -> Result<T>,
-        F: FnMut(T) -> std::result::Result<BackendOutput, ForwardError>,
+        F: FnMut(T) -> BoxFuture<'a, std::result::Result<BackendOutput, ForwardError>>,
     {
         let row_count = chunk.len();
         let mut chunk_start = 0;
@@ -386,8 +386,9 @@ impl InferenceRunner {
                 test_hooks::record_forward(ctx.source_id);
                 test_hooks::enter_forward(ctx.source_id);
             }
-            let forward_result = tracing::debug_span!("forward.device", rows = chunk_len)
-                .in_scope(|| (forwarder.forward)(prepared));
+            let forward_result = (forwarder.forward)(prepared)
+                .instrument(tracing::debug_span!("forward.device", rows = chunk_len))
+                .await;
             #[cfg(feature = "test-hooks")]
             test_hooks::exit_forward(ctx.source_id);
             drop(admitted);
@@ -525,6 +526,15 @@ mod tests {
         .expect("schema builds")
     }
 
+    /// A synchronous forward as the runner's asynchronous one: the result is
+    /// computed when the forward is called, and the returned future is
+    /// already complete.
+    fn settled<T>(
+        mut forward: impl FnMut(T) -> std::result::Result<BackendOutput, ForwardError>,
+    ) -> impl FnMut(T) -> BoxFuture<'static, std::result::Result<BackendOutput, ForwardError>> {
+        move |prepared| Box::pin(std::future::ready(forward(prepared)))
+    }
+
     /// A device that never refuses a forward.
     fn unbounded() -> impl Fn() -> BoxFuture<'static, Result<ForwardPermit>> {
         || Box::pin(async { Ok(ForwardPermit::new(())) })
@@ -623,13 +633,13 @@ mod tests {
             &mut Forwarder {
                 admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                forward: |len| {
+                forward: settled(|len| {
                     if len > oom_threshold {
                         Err(out_of_memory())
                     } else {
                         Ok(ones(len))
                     }
-                },
+                }),
             },
         )
         .await
@@ -677,13 +687,13 @@ mod tests {
             &mut Forwarder {
                 admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                forward: |len| {
+                forward: settled(|len| {
                     if len > oom_threshold {
                         Err(out_of_memory())
                     } else {
                         Ok(ones(len))
                     }
-                },
+                }),
             },
         )
         .await
@@ -730,7 +740,7 @@ mod tests {
             &mut Forwarder {
                 admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                forward: |_len| Err(out_of_memory()),
+                forward: settled(|_len| Err(out_of_memory())),
             },
         )
         .await;
@@ -774,11 +784,11 @@ mod tests {
             &mut Forwarder {
                 admit: unbounded(),
                 prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                forward: |_len| {
+                forward: settled(|_len| {
                     Err(ForwardError::Other(Error::Inference(
                         "the kernel ran out of memory to name its shape mismatch".into(),
                     )))
-                },
+                }),
             },
         )
         .await;
@@ -884,10 +894,10 @@ mod tests {
                             }
                             Ok(chunk[0].len())
                         },
-                        forward: |len| {
+                        forward: settled(|len| {
                             std::thread::sleep(std::time::Duration::from_millis(20));
                             Ok(ones(len))
-                        },
+                        }),
                     },
                 )
                 .await
@@ -941,10 +951,10 @@ mod tests {
                     &mut Forwarder {
                         admit,
                         prepare: |chunk: &[ArrayRef]| Ok(chunk[0].len()),
-                        forward: |len| {
+                        forward: settled(|len| {
                             std::thread::sleep(std::time::Duration::from_millis(40));
                             Ok(ones(len))
-                        },
+                        }),
                     },
                 )
                 .await

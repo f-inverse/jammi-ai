@@ -162,9 +162,7 @@ impl PyAuditHandle {
     /// tenant; publishes them to the `jammi.audit.search.v1` trigger topic.
     fn log(&self, records: Vec<PyPerQueryAudit>) -> PyResult<()> {
         let recs: Vec<PerQueryAudit> = records.into_iter().map(|r| r.inner).collect();
-        self.runtime
-            .block_on(self.session.audit().log(recs))
-            .map_err(audit_err)
+        crate::released(&self.runtime, self.session.audit().log(recs)).map_err(audit_err)
     }
 
     /// Fetch one record by query id (tenant-scoped). Returns `None` if absent.
@@ -172,9 +170,7 @@ impl PyAuditHandle {
         let qid = Uuid::parse_str(query_id).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid query_id '{query_id}': {e}"))
         })?;
-        let rec = self
-            .runtime
-            .block_on(self.session.audit().fetch_by_query_id(qid))
+        let rec = crate::released(&self.runtime, self.session.audit().fetch_by_query_id(qid))
             .map_err(audit_err)?;
         Ok(rec.map(|inner| PyPerQueryAudit { inner }))
     }
@@ -182,9 +178,7 @@ impl PyAuditHandle {
     /// Fetch the most recent records (tenant-scoped), newest first.
     #[pyo3(signature = (*, limit=20))]
     fn fetch_recent(&self, limit: usize) -> PyResult<Vec<PyPerQueryAudit>> {
-        let recs = self
-            .runtime
-            .block_on(self.session.audit().fetch_recent(limit))
+        let recs = crate::released(&self.runtime, self.session.audit().fetch_recent(limit))
             .map_err(audit_err)?;
         Ok(recs
             .into_iter()

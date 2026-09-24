@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use arrow::array::{ArrayRef, StringArray};
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, VarBuilder, VarMap};
@@ -226,12 +225,6 @@ pub(crate) fn write_gguf_checkpoint(
     gguf_file::write(&mut writer, &[], &refs).unwrap();
 }
 
-fn embed(model: &LoadedModel, text: &str) -> Vec<f32> {
-    let content: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text])) as ArrayRef];
-    let output = model.forward(&content, ModelTask::TextEmbedding).unwrap();
-    output.float_outputs[0].clone()
-}
-
 fn device_config() -> DeviceConfig {
     DeviceConfig {
         gpu_device: -1,
@@ -341,8 +334,8 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
     let mut finite_values = 0usize;
     let mut cosines = Vec::with_capacity(texts.len());
     for text in texts {
-        let a = embed(&f32_model, text);
-        let b = embed(&gguf_model, text);
+        let a = crate::common::embed(&f32_model, text).await;
+        let b = crate::common::embed(&gguf_model, text).await;
         assert_eq!(a.len(), b.len());
         for &v in a.iter().chain(b.iter()) {
             total_values += 1;
@@ -435,12 +428,20 @@ async fn gguf_model_identity_reports_quantization_and_a_distinct_definition_hash
     let gguf_model = resolve_and_load(&gguf_dir).await;
 
     assert_eq!(
-        f32_model.description().quantization(),
+        f32_model
+            .description()
+            .local_run()
+            .expect("a local model")
+            .quantization,
         None,
         "a safetensors load must report no weight-quantization format"
     );
     assert_eq!(
-        gguf_model.description().quantization(),
+        gguf_model
+            .description()
+            .local_run()
+            .expect("a local model")
+            .quantization,
         Some(WeightQuantization::Q8_0),
         "every matmul-site tensor in this fixture was quantized at q8_0, so the \
          modal quantized dtype must be exactly q8_0"
@@ -466,7 +467,12 @@ async fn gguf_byte_mutation_changes_content_digest() {
     write_gguf_checkpoint(&dir, &tensors, &sites, GgmlDType::Q4_0);
 
     let model_before = resolve_and_load(&dir).await;
-    let digest_before = model_before.description().content_digest().clone();
+    let digest_before = model_before
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
     drop(model_before);
 
     let weights_path = dir.join("model.gguf");
@@ -476,7 +482,12 @@ async fn gguf_byte_mutation_changes_content_digest() {
     std::fs::write(&weights_path, &bytes).unwrap();
 
     let model_after = resolve_and_load(&dir).await;
-    let digest_after = model_after.description().content_digest().clone();
+    let digest_after = model_after
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
 
     assert_ne!(
         digest_before, digest_after,
@@ -514,7 +525,13 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let digest1 = guard1.model.description().content_digest().clone();
+    let digest1 = guard1
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
     drop(guard1);
 
     // In-place mutation, length-changing (never rests on sub-second mtime
@@ -528,7 +545,13 @@ async fn warm_cache_reload_after_gguf_in_place_mutation_reports_a_fresh_digest()
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let digest_warm = guard_warm.model.description().content_digest().clone();
+    let digest_warm = guard_warm
+        .model
+        .description()
+        .local_run()
+        .expect("a local model")
+        .content_digest
+        .clone();
 
     assert_ne!(
         digest1, digest_warm,
@@ -878,7 +901,7 @@ async fn local_dir_with_both_safetensors_and_gguf_resolves_to_safetensors_and_ig
     write_tokenizer(&ref_dir);
     write_f32_checkpoint(&ref_dir, &tensors);
     let reference = resolve_and_load(&ref_dir).await;
-    let reference_embedding = embed(&reference, "dual-format precedence");
+    let reference_embedding = crate::common::embed(&reference, "dual-format precedence").await;
 
     // The dual-format directory under test — BOTH files valid to start.
     let dir = tmp.path().join("model");
@@ -928,7 +951,7 @@ async fn assert_dual_format_resolve_phase(
          not model.gguf"
     );
     let loaded = backend.load(&resolved, &device_config()).unwrap();
-    let embedding = embed(&loaded, "dual-format precedence");
+    let embedding = crate::common::embed(&loaded, "dual-format precedence").await;
     assert!(
         !embedding.is_empty(),
         "phase {phase}: the embedding must be non-empty — an empty-vs-empty \
@@ -1117,10 +1140,14 @@ async fn q4k_over_a_256_dim_tower_resolves_and_loads_successfully() {
 
     let model = resolve_and_load(&dir).await;
     assert_eq!(
-        model.description().quantization(),
+        model
+            .description()
+            .local_run()
+            .expect("a local model")
+            .quantization,
         Some(WeightQuantization::Q4K)
     );
-    let v = embed(&model, "the quick brown fox");
+    let v = crate::common::embed(&model, "the quick brown fox").await;
     assert!(
         v.iter().all(|x| x.is_finite()),
         "embedding must be finite: {v:?}"

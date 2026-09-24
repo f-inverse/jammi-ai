@@ -1037,7 +1037,7 @@ mod tests {
                 vec![ModelIdentity {
                     model_id: "local:/models/encoder".into(),
                     run: ModelRun::Local(LocalRun {
-                        backend: crate::catalog::model_repo::ModelBackendKind::Candle,
+                        backend: crate::store::manifest::LocalBackend::Candle,
                         compute_precision: jammi_numerics::ComputePrecision::BF16,
                         content_digest: ContentDigest("digest".into()),
                         quantization: None,

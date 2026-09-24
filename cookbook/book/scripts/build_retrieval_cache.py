@@ -48,7 +48,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import re
@@ -61,7 +60,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import contracts
+from jammi_cookbook import cache, contracts
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "retrieval"
 RECALL_K = 10
@@ -326,21 +325,11 @@ def emit(db) -> None:
     metrics["hybrid_vs_dense"] = {"value": hybrid_vs_dense, "tol": 0.02}
     (ARTIFACTS / "golden_metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\nemitted cache:", flush=True)
     for f in sorted(ARTIFACTS.glob("*")):
         if f.is_file():
             print(f"  {f.name}  ({f.stat().st_size} bytes)", flush=True)
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

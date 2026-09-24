@@ -33,7 +33,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import tempfile
 from collections import Counter
@@ -44,7 +43,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import contracts
+from jammi_cookbook import cache, contracts
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "feature_store"
 
@@ -180,7 +179,7 @@ def emit(db, work: Path) -> None:
     (ARTIFACTS / "golden_metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\n=== mutable companion table, measured ===", flush=True)
     print(f"  populated_rows={populated}  total_in_degree={join_total}  "
           f"top_subject={top_subject!r}({top_subject_total})", flush=True)
@@ -215,16 +214,6 @@ def _probe_append_only(db, sample_paper_id: str) -> dict[str, bool]:
             "INSERT INTO mutable.public.paper_features (paper_id, in_degree) "
             f"VALUES ('{sample_paper_id}', 0)"),
     }
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

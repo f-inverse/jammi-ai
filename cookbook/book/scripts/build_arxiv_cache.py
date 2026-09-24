@@ -30,7 +30,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import tempfile
 from pathlib import Path
@@ -41,7 +40,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import datasets, determinism
+from jammi_cookbook import cache, datasets, determinism
 
 EMBED_MODEL = "answerdotai/ModernBERT-base"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "arxiv"
@@ -103,10 +102,6 @@ def _dump_emb(db, table: str, dest: Path) -> None:
 
 def _dump_table(db, table: str, dest: Path, *, columns: str = "*") -> None:
     pq.write_table(db.sql(f"SELECT {columns} FROM {_emb_ref(table)}"), dest)
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- #
@@ -348,7 +343,7 @@ def emit(db) -> None:
 
     (ARTIFACTS / "golden_metrics.json").write_text(
         json.dumps(_merge_golden_metrics(metrics), indent=2, sort_keys=True))
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\nemitted cache:", flush=True)
     for f in sorted(ARTIFACTS.glob("*")):
         if f.is_file():
@@ -921,12 +916,6 @@ def _merge_golden_metrics(
     existing: dict[str, dict[str, float]] = json.loads(path.read_text()) if path.exists() else {}
     existing.update(freshly_measured)
     return existing
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

@@ -58,10 +58,7 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
 
     let identity = ModelIdentity {
         model_id: model_id.clone(),
-        backend: model.description().runner(),
-        compute_precision: model.description().compute_precision(),
-        content_digest: model.description().content_digest().clone(),
-        quantization: None,
+        ..model.description().identity()
     };
     let descriptor = ProducingDescriptor::Embedding {
         model_id,
@@ -499,15 +496,12 @@ async fn resolve_and_load_for_task(dir: &Path, task: ModelTask) -> LoadedModel {
     backend.load(&resolved, &device_config).unwrap()
 }
 
-/// Assert a fixture's live `content_digest()` equals `expected_hex`. The
-/// digest's own `Debug` form is `Sha256("<hex>")`, so the comparison is made
-/// on that rendering rather than on a re-parse.
+/// Assert a fixture's live `content_digest()` equals `expected_hex`.
 async fn assert_content_digest(dir: &Path, task: ModelTask, expected_hex: &str, label: &str) {
     let model = resolve_and_load_for_task(dir, task).await;
     let digest = model.description().content_digest().clone();
     assert_eq!(
-        format!("{digest:?}"),
-        format!("Sha256(\"{expected_hex}\")"),
+        digest.0, expected_hex,
         "{label}: the model::arch candidate lists must not change any identity \
          byte — this constant is a literal pin and is not this test's to update"
     );

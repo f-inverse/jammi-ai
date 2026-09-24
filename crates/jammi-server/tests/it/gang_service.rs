@@ -263,8 +263,8 @@ async fn materialize_ready_table_for_tenant(
     use jammi_datafusion::ModelTask;
     use jammi_db::session::QueryContext;
     use jammi_db::store::manifest::{
-        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelContentDigest, ModelIdentity, ProducingDescriptor,
+        ComputeDevice, ComputePrecision, ContentDigest, InputAnchor, LocalRun, Materialization,
+        MaterializationEnv, ModelIdentity, ModelRun, ProducingDescriptor,
     };
     use jammi_db::store::EmbeddingTableSpec;
 
@@ -280,12 +280,12 @@ async fn materialize_ready_table_for_tenant(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "rt-base".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("gang-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("gang-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     );
     let ctx = QueryContext::from(SessionContext::new());

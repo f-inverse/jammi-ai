@@ -5377,7 +5377,7 @@ async fn fine_tune_materialization(
     );
     let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),
-        vec![guard.model.description().identity().clone()],
+        vec![guard.model.description().identity()],
     )
     .with_kernel_admission_profile(kernel_admission_profile);
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::FineTune {

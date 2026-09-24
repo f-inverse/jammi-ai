@@ -1876,7 +1876,7 @@ subject, the root of the version-identity chain, and what a verifier holding the
 recomputes; bytes outside every row group (footer, page index, bloom filters) belong to
 no leaf and are the whole-object digest's to catch.
 
-`MANIFEST_VERSION = 3` (`crates/jammi-db/src/store/manifest.rs`); a version mismatch or a
+`MANIFEST_VERSION = 4` (`crates/jammi-db/src/store/manifest.rs`); a version mismatch or a
 serde-shape mismatch is a typed `ManifestError`, never a silently-trusted stale hash
 (`Manifest::from_json_bytes`). One shape rejection is named on its own: an object at the
 current version with no `leaves` — a sidecar written before the inventory existed —

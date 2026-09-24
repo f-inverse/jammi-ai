@@ -277,9 +277,11 @@ pub(crate) struct SavedAdapterFiles {
 /// reports it unchanged — so a submitter that plans against a description
 /// and the executing process that records what ran can never disagree.
 pub struct ModelDescription {
-    /// The identity a materialization's environment records for this
-    /// model on the device it was described for.
-    pub(crate) identity: jammi_db::store::manifest::ModelIdentity,
+    /// The id a materialization's environment records the model under.
+    pub(crate) model_id: String,
+    /// The run of the model on the device it was described for — every
+    /// output-affecting fact a materialization's environment records.
+    pub(crate) run: jammi_db::store::manifest::LocalRun,
     /// The architecture's geometry, read from `config.json`.
     pub(crate) dimensions: ModelDimensions,
     /// The precision the configuration resolves for this model on the
@@ -300,13 +302,16 @@ impl ModelDescription {
     /// This model's identity as a materialization's environment records it
     /// — the one construction a submitter's prediction and the executing
     /// process's record both use.
-    pub fn identity(&self) -> &jammi_db::store::manifest::ModelIdentity {
-        &self.identity
+    pub fn identity(&self) -> jammi_db::store::manifest::ModelIdentity {
+        jammi_db::store::manifest::ModelIdentity {
+            model_id: self.model_id.clone(),
+            run: jammi_db::store::manifest::ModelRun::Local(self.run.clone()),
+        }
     }
 
-    /// What runs this model, as the materialization contract records it.
-    pub fn runner(&self) -> jammi_db::store::manifest::ModelRunner {
-        self.identity.backend
+    /// The backend that runs this model.
+    pub fn backend(&self) -> jammi_db::catalog::model_repo::ModelBackendKind {
+        self.run.backend
     }
 
     /// The compute precision the model's backbone runs at — the resolved
@@ -315,7 +320,7 @@ impl ModelDescription {
     /// affecting (an `F16` backbone emits different bytes than `F32`), so
     /// the materialization contract folds it into the identity.
     pub fn compute_precision(&self) -> jammi_numerics::ComputePrecision {
-        self.identity.compute_precision
+        self.run.compute_precision
     }
 
     /// The model's content digest: a SHA-256 fold of the resolved
@@ -324,8 +329,8 @@ impl ModelDescription {
     /// affecting — two directories that share one `model_id` but differ in
     /// any of those bytes must never collide on one `DefinitionHash` — so
     /// the materialization contract folds it into the identity.
-    pub fn content_digest(&self) -> &jammi_db::store::manifest::ModelContentDigest {
-        &self.identity.content_digest
+    pub fn content_digest(&self) -> &jammi_db::store::manifest::ContentDigest {
+        &self.run.content_digest
     }
 
     /// The GGUF/k-quant weight-storage format of the model's backbone —
@@ -335,7 +340,7 @@ impl ModelDescription {
     /// affecting, so the materialization contract folds it into the
     /// identity.
     pub fn quantization(&self) -> Option<jammi_numerics::WeightQuantization> {
-        self.identity.quantization
+        self.run.quantization
     }
 
     /// The architecture's geometry, for memory estimation and output sizing.

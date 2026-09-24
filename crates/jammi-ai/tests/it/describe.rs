@@ -75,7 +75,7 @@ async fn a_local_model_is_described_as_it_is_loaded() {
         "describing a model materializes nothing"
     );
     assert_eq!(described.identity().model_id, source.to_string());
-    assert_eq!(described.runner().as_str(), "candle");
+    assert_eq!(described.backend().as_str(), "candle");
     assert_eq!(described.embedding_dim(), 32, "tiny_bert's hidden size");
     assert_eq!(described.regression_form(), None);
     assert_eq!(described.quantization(), None);

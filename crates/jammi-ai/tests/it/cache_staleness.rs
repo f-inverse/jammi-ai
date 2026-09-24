@@ -30,7 +30,6 @@ use jammi_ai::model::LoadedModel;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
-use jammi_db::store::manifest::ModelContentDigest;
 use tempfile::tempdir;
 
 use crate::pooling_config::{
@@ -114,19 +113,6 @@ fn assert_finite_and_identical(label: &str, a: &[f32], b: &[f32]) {
     );
 }
 
-/// (a) `digest` must be the HASHED `Sha256` variant, never `Unavailable` —
-/// otherwise `D1 == D2` could hold vacuously (a silently degraded digest
-/// looks "unchanged" no matter what).
-fn assert_hashed(label: &str, digest: &ModelContentDigest) -> String {
-    match digest {
-        ModelContentDigest::Sha256(hex) => hex.clone(),
-        ModelContentDigest::Unavailable(reason) => panic!(
-            "{label}: expected a hashed Sha256 content digest, got \
-             Unavailable({reason:?}) — a degraded digest would make this control vacuous"
-        ),
-    }
-}
-
 fn tiny_bert_dir(root: &Path, name: &str, pooling: &serde_json::Value) -> std::path::PathBuf {
     let dir = root.join(name);
     build_local_model_dir(&dir, Some(pooling));
@@ -163,7 +149,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .await
         .unwrap();
     let d1_raw = guard1.model.description().content_digest().clone();
-    let d1 = assert_hashed("D1 (pre-mutation, warm)", &d1_raw);
+    let d1 = d1_raw.0.clone();
     let v1 = embed(&guard1.model, TEXT);
     drop(guard1); // mirrors EmbeddingPipeline::run: guard dropped once digest/dims are read.
 
@@ -196,7 +182,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .await
         .unwrap();
     let d_warm_raw = guard_warm.model.description().content_digest().clone();
-    let d_warm = assert_hashed("D (warm, post-mutation)", &d_warm_raw);
+    let d_warm = d_warm_raw.0.clone();
     let v_warm = embed(&guard_warm.model, TEXT);
     drop(guard_warm);
 
@@ -207,11 +193,10 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .await
         .unwrap();
     let d2_raw = cold_model.description().content_digest().clone();
-    let d2 = assert_hashed("D2 (post-mutation, cold)", &d2_raw);
+    let d2 = d2_raw.0.clone();
     let v2 = embed(&cold_model, TEXT);
 
-    // (a) both D1 and D2 are HASHED — already enforced by `assert_hashed`
-    // above (not `Unavailable`, not `Err`).
+    // (a) both D1 and D2 are HASHED — a local run's digest is always one.
 
     // (b) D2 != D1 as exact hex strings — independently established, so the
     // fixture genuinely produces different bytes post-mutation.
@@ -264,10 +249,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let du1 = assert_hashed(
-        "D (untouched, first load)",
-        guard_u1.model.description().content_digest(),
-    );
+    let du1 = guard_u1.model.description().content_digest().0.clone();
     let vu1 = embed(&guard_u1.model, TEXT);
     drop(guard_u1);
 
@@ -275,10 +257,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .get_or_load(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let du_warm = assert_hashed(
-        "D (untouched, warm replay)",
-        guard_u_warm.model.description().content_digest(),
-    );
+    let du_warm = guard_u_warm.model.description().content_digest().0.clone();
     let vu_warm = embed(&guard_u_warm.model, TEXT);
     drop(guard_u_warm);
 
@@ -286,10 +265,7 @@ async fn warm_hit_after_in_place_mutation_reloads_fresh_digest_and_vectors() {
         .load_owned_for_test(&untouched_source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let du_cold = assert_hashed(
-        "D (untouched, cold reading)",
-        cold_u_model.description().content_digest(),
-    );
+    let du_cold = cold_u_model.description().content_digest().0.clone();
     let vu_cold = embed(&cold_u_model, TEXT);
 
     assert_eq!(
@@ -337,10 +313,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = assert_hashed(
-        "D1 (pre-mutation, warm)",
-        guard1.model.description().content_digest(),
-    );
+    let d1 = guard1.model.description().content_digest().0.clone();
     drop(guard1);
 
     let pooling_config_path = dir.join("1_Pooling/config.json");
@@ -357,10 +330,7 @@ async fn warm_hit_after_same_length_mutation_is_mtime_dependent_diagnostic() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm = assert_hashed(
-        "D (warm, post-mutation)",
-        guard_warm.model.description().content_digest(),
-    );
+    let d_warm = guard_warm.model.description().content_digest().0.clone();
 
     assert_ne!(
         d_warm, d1,
@@ -395,10 +365,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = assert_hashed(
-        "D1 (pre-appearance, warm, mean fallback)",
-        guard1.model.description().content_digest(),
-    );
+    let d1 = guard1.model.description().content_digest().0.clone();
     let v1 = embed(&guard1.model, TEXT);
     drop(guard1);
 
@@ -415,10 +382,7 @@ async fn warm_hit_after_1_pooling_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm = assert_hashed(
-        "D (warm, post-appearance)",
-        guard_warm.model.description().content_digest(),
-    );
+    let d_warm = guard_warm.model.description().content_digest().0.clone();
     let v_warm = embed(&guard_warm.model, TEXT);
 
     assert_ne!(
@@ -455,10 +419,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = assert_hashed(
-        "D1 (pre-appearance, warm)",
-        guard1.model.description().content_digest(),
-    );
+    let d1 = guard1.model.description().content_digest().0.clone();
     drop(guard1);
 
     // preprocessor_config.json APPEARS — did not exist at load time.
@@ -468,10 +429,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_warm = assert_hashed(
-        "D (warm, post-appearance)",
-        guard_warm.model.description().content_digest(),
-    );
+    let d_warm = guard_warm.model.description().content_digest().0.clone();
 
     assert_ne!(
         d_warm, d1,
@@ -486,10 +444,7 @@ async fn warm_hit_after_preprocessor_config_appearing_reloads_fresh() {
         .load_owned_for_test(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_cold = assert_hashed(
-        "D (cold, post-appearance)",
-        cold_model.description().content_digest(),
-    );
+    let d_cold = cold_model.description().content_digest().0.clone();
     assert_eq!(
         d_warm, d_cold,
         "the warm replay's digest must match a fresh cold reading of the \
@@ -825,10 +780,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d1 = assert_hashed(
-        "D1 (pre-deletion, CLS, warm)",
-        guard1.model.description().content_digest(),
-    );
+    let d1 = guard1.model.description().content_digest().0.clone();
     drop(guard1);
 
     // DELETE the optional candidate — present at load time, gone now.
@@ -845,10 +797,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
              typed refusal — got Err({e})"
         ),
     };
-    let d_warm_1 = assert_hashed(
-        "D (warm, post-deletion, 1st call)",
-        guard_warm_1.model.description().content_digest(),
-    );
+    let d_warm_1 = guard_warm_1.model.description().content_digest().0.clone();
     let v_warm_1 = embed(&guard_warm_1.model, TEXT);
     drop(guard_warm_1);
 
@@ -890,10 +839,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
         .load_owned_for_test(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
-    let d_cold = assert_hashed(
-        "D (cold, post-deletion)",
-        cold_model.description().content_digest(),
-    );
+    let d_cold = cold_model.description().content_digest().0.clone();
     let v_cold = embed(&cold_model, TEXT);
     assert_eq!(
         d_cold, d_warm_1,
@@ -915,10 +861,7 @@ async fn warm_hit_after_optional_pooling_config_deleted_reloads_fresh_never_wedg
              also succeed — never a permanent wedge — got Err({e})"
         ),
     };
-    let d_warm_2 = assert_hashed(
-        "D (warm, post-deletion, 2nd call)",
-        guard_warm_2.model.description().content_digest(),
-    );
+    let d_warm_2 = guard_warm_2.model.description().content_digest().0.clone();
     assert_eq!(
         d_warm_2, d_warm_1,
         "the second warm call after the reload must report the SAME (now \

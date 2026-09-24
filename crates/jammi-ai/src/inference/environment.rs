@@ -34,8 +34,8 @@ impl jammi_db::store::sink::ProducingEnvironment for InferenceEnvironment {
                 .get_or_load(&spec.source, spec.task)
                 .await?;
             let identity = guard.model.description().identity();
-            if !models.contains(identity) {
-                models.push(identity.clone());
+            if !models.contains(&identity) {
+                models.push(identity);
             }
         }
         Ok(MaterializationEnv::of_models(self.device.clone(), models))

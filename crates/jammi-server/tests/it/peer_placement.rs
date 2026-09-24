@@ -53,8 +53,8 @@ use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, Ve
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{
-    ComputeDevice, ComputePrecision, Materialization, MaterializationEnv, ModelContentDigest,
-    ModelIdentity, ProducingDescriptor,
+    ComputeDevice, ComputePrecision, ContentDigest, LocalRun, Materialization, MaterializationEnv,
+    ModelIdentity, ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore};
@@ -752,12 +752,12 @@ async fn ready_table_with_poisoned_row(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "test-model".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("it-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     );
     building

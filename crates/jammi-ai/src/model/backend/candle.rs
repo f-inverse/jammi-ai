@@ -5,7 +5,7 @@ use arrow::array::ArrayRef;
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::store::manifest::{ComputeDevice, ModelContentDigest};
+use jammi_db::store::manifest::{ComputeDevice, ContentDigest, LocalRun};
 use jammi_encoders::{
     Bert, BertConfig, DistilBert, DistilBertConfig, ModernBert, ModernBertConfig, Pooling,
 };
@@ -842,11 +842,9 @@ fn sha256_and_len(path: &std::path::Path) -> Result<(String, u64)> {
 ///
 /// **Errors are typed refusals** — an IO failure while hashing (a file
 /// vanishing between resolve and load, a permission error, a truncated read)
-/// propagates as a `JammiError`, never silently collapsing into
-/// [`ModelContentDigest::Unavailable`]. `Unavailable` is reserved for the
-/// external-producer import path (`pipeline::import`), which has no local
-/// model directory to hash at all — a categorically different case from "the
-/// loader tried to hash local files and failed."
+/// propagates as a `JammiError`: a local run always records the digest of
+/// its files, and a run with no local files to hash is a different kind of
+/// run ([`ModelRun`]), never a local run with its digest missing.
 fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::path::PathBuf)>> {
     let mut gated: Vec<(String, std::path::PathBuf)> = all_candidate_paths(resolved)?
         .into_iter()
@@ -1215,7 +1213,7 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     Ok(result)
 }
 
-fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContentDigest> {
+fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ContentDigest> {
     let entries = content_digest_entries(resolved)?;
 
     let mut combined = sha2::Sha256::new();
@@ -1229,7 +1227,7 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
         combined.update([b'\n']);
     }
 
-    Ok(ModelContentDigest::Sha256(hex::encode(combined.finalize())))
+    Ok(ContentDigest(hex::encode(combined.finalize())))
 }
 
 /// A `stat`-only on-disk staleness fingerprint of the SAME input
@@ -1247,7 +1245,7 @@ fn compute_model_content_digest(resolved: &ResolvedModel) -> Result<ModelContent
 /// length at the exact same modification time (a crafted rewrite, or a
 /// same-second overwrite on a filesystem with coarse mtime resolution) is
 /// invisible to this probe and will keep serving the stale in-memory model.
-/// The [`ModelContentDigest`] recomputed on every actual reload remains the
+/// The [`ContentDigest`] recomputed on every actual reload remains the
 /// sole authoritative attestation of what bytes were hashed; this type only
 /// decides WHEN a reload is triggered, and does not strengthen the digest's
 /// own guarantee.
@@ -1557,7 +1555,7 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
 }
 
 /// Compute BOTH per-load staleness facets — [`ModelFingerprint`] (stat) and
-/// [`ModelContentDigest`] (hash) — in the ONLY safe order: fingerprint
+/// [`ContentDigest`] (hash) — in the ONLY safe order: fingerprint
 /// FIRST, digest SECOND. This is the sole caller of either function; every
 /// other call site (the `digest_fingerprint_tests` / `content_digest`
 /// unit tests below) calls the two directly and independently, which is
@@ -1587,7 +1585,7 @@ fn compute_model_fingerprint(resolved: &ResolvedModel) -> Result<ModelFingerprin
 /// unit test that is deliberately probing one facet in isolation.
 fn compute_model_identity_facets(
     resolved: &ResolvedModel,
-) -> Result<(ModelFingerprint, ModelContentDigest)> {
+) -> Result<(ModelFingerprint, ContentDigest)> {
     let fingerprint = compute_model_fingerprint(resolved)?;
     let content_digest = compute_model_content_digest(resolved)?;
     Ok((fingerprint, content_digest))
@@ -2751,11 +2749,9 @@ impl ModelBackend for CandleBackend {
             None => None,
         };
         Ok(ModelDescription {
-            identity: jammi_db::store::manifest::ModelIdentity {
-                model_id: resolved.model_id.0.clone(),
-                backend: jammi_db::store::manifest::ModelRunner::Backend(
-                    jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                ),
+            model_id: resolved.model_id.0.clone(),
+            run: LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 compute_precision,
                 content_digest,
                 quantization,
@@ -4609,17 +4605,13 @@ mod ner_nonfinite_logit_tests {
         let ner_classifier = Linear::new(weight, Some(bias));
 
         let description = Arc::new(ModelDescription {
-            identity: jammi_db::store::manifest::ModelIdentity {
-                model_id: "synthetic-ner".to_string(),
-                backend: jammi_db::store::manifest::ModelRunner::Backend(
-                    jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                ),
+            model_id: "synthetic-ner".to_string(),
+            run: LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 compute_precision: jammi_numerics::ComputePrecision::F32,
-                // No real model directory backs this synthetic fixture, so
-                // there is nothing to hash — an arbitrary fixed placeholder
-                // is fine here (no test in this module asserts on the
-                // digest value).
-                content_digest: ModelContentDigest::Sha256("test-fixture-digest".into()),
+                // No model directory backs this synthetic fixture; no test
+                // in this module reads the digest.
+                content_digest: ContentDigest("test-fixture-digest".into()),
                 quantization: None,
             },
             dimensions: ModelDimensions {
@@ -5462,7 +5454,7 @@ mod digest_fingerprint_tests {
     /// Pins the composed function's OUTPUT correctness — its digest matches
     /// an independent manual `compute_model_content_digest` call, and its
     /// fingerprint reports fresh — and its return shape,
-    /// `(ModelFingerprint, ModelContentDigest)`.
+    /// `(ModelFingerprint, ContentDigest)`.
     ///
     /// **What this test does NOT prove**: over an UNMUTATED directory (the only case exercised
     /// here), fingerprint-then-digest and digest-then-fingerprint produce

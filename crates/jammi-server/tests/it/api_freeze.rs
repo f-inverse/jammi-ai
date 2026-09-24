@@ -106,8 +106,8 @@ fn manifest_format_version_is_frozen() {
     // deliberate, reviewed format change (see docs/guide/src/format-stability.md
     // and api-stability.md); pinning it here means an accidental bump reds CI.
     assert_eq!(
-        MANIFEST_VERSION, 3,
-        "MANIFEST_VERSION changed from the frozen value 3 — a persisted-format \
+        MANIFEST_VERSION, 4,
+        "MANIFEST_VERSION changed from the frozen value 4 — a persisted-format \
          version bump must be a deliberate, reviewed format change, not an \
          accidental edit"
     );

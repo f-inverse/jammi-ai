@@ -62,8 +62,9 @@ use crate::catalog::model_repo::ModelBackendKind;
 // without its own direct `jammi-numerics` import.
 pub use jammi_numerics::ComputePrecision;
 
-/// Manifest format version. A change to the [`ProducingDescriptor`] shape — the
-/// determinant set a producer folds into its [`DefinitionHash`] *and* records
+/// Manifest format version. A change to the [`ProducingDescriptor`] or
+/// [`MaterializationEnv`] shape — the determinant set a producer folds into its
+/// [`DefinitionHash`] *and* records
 /// verbatim for replay — bumps this so a reader detects an incompatible older
 /// manifest as a typed [`ManifestError::UnsupportedManifestVersion`] rather than
 /// comparing a stale hash computed over a different determinant set, or replaying
@@ -88,7 +89,7 @@ pub use jammi_numerics::ComputePrecision;
 /// already knows) — that shape still deserializes under the old
 /// definition, so nothing else would catch the older reader comparing a
 /// stale hash computed over a different determinant set.
-pub const MANIFEST_VERSION: u32 = 3;
+pub const MANIFEST_VERSION: u32 = 4;
 
 /// The row-order rule version 1 of the training-set producer commits and
 /// records in [`ProducingDescriptor::TrainingSet::order_rule`]: the rows are
@@ -292,9 +293,15 @@ impl ModelIdentity {
     /// device resolved it to.
     pub fn same_model(&self, other: &Self) -> bool {
         self.model_id == other.model_id
-            && self.backend == other.backend
-            && self.content_digest == other.content_digest
-            && self.quantization == other.quantization
+            && match (&self.run, &other.run) {
+                (ModelRun::Local(a), ModelRun::Local(b)) => {
+                    a.backend == b.backend
+                        && a.content_digest == b.content_digest
+                        && a.quantization == b.quantization
+                }
+                (ModelRun::ExternalImport, ModelRun::ExternalImport) => true,
+                _ => false,
+            }
     }
 }
 
@@ -345,159 +352,72 @@ impl MaterializationEnv {
     }
 }
 
-/// The identity + backend kind + compute precision + content digest of a
-/// model an environment invoked. The canonical model id (HF repo or local
-/// path string) plus the backend kind that ran it, the dtype it ran at, and a
-/// digest of the model's on-disk content.
+/// A model an environment invoked: its canonical id (HF repo or local path
+/// string) and the run that produced its outputs.
 ///
-/// `compute_precision` folds in here — the same place `backend` does — rather
-/// than into a single per-descriptor field, so it enters the definition hash
-/// **uniformly for every model-producing descriptor** (`Inference` and
-/// `Embedding` alike) the moment either records a `ModelIdentity`, instead of
-/// requiring each new model-invoking `ProducingDescriptor` variant to
-/// remember its own precision field. An `F16` run of a model is output-
-/// affecting relative to an `F32` run of the same model over the same input —
-/// two such runs must never collide on one materialization identity.
-///
-/// `content_digest` folds in the SAME way, for the SAME reason:
-/// pooling strategy (`1_Pooling/config.json`), tokenizer files, and model
-/// weights are all output-affecting relative to the bare `model_id` string —
-/// two directories that share one HF repo id but differ in any of those bytes
-/// must never collide on one `DefinitionHash`. Folding one combined
-/// [`ModelContentDigest`] here (rather than a bespoke pooling/tokenizer/
-/// weights field on `ProducingDescriptor::Embedding`) keeps the determinant
-/// uniform across every model-producing variant, exactly like
-/// `compute_precision` above — `Inference` would otherwise collide on it
-/// identically.
-/// What produced a model's outputs: a backend of this engine running the
-/// model, or an external producer whose outputs were imported.
-///
-/// Serialized as one canonical spelling (`candle`, `external_import`), the
-/// same string a definition hash folds in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub enum ModelRunner {
-    /// The model ran on this engine's backend.
-    Backend(ModelBackendKind),
-    /// The outputs were computed elsewhere and imported; no model ran here.
-    ExternalImport,
-}
-
-impl ModelRunner {
-    /// The canonical spelling.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Backend(kind) => kind.as_str(),
-            Self::ExternalImport => "external_import",
-        }
-    }
-}
-
-impl std::fmt::Display for ModelRunner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl From<ModelRunner> for String {
-    fn from(runner: ModelRunner) -> Self {
-        runner.as_str().to_string()
-    }
-}
-
-impl TryFrom<String> for ModelRunner {
-    type Error = crate::error::JammiError;
-    fn try_from(s: String) -> crate::error::Result<Self> {
-        match s.as_str() {
-            "external_import" => Ok(Self::ExternalImport),
-            other => ModelBackendKind::parse(other).map(Self::Backend),
-        }
-    }
-}
-
+/// Every output-affecting fact of the run folds into the definition hash
+/// here, **uniformly for every model-producing descriptor** (`Inference`
+/// and `Embedding` alike) the moment either records a `ModelIdentity`,
+/// instead of each model-invoking `ProducingDescriptor` variant carrying
+/// its own fields — two runs that could emit different bytes must never
+/// collide on one materialization identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentity {
     /// Canonical model id as stored in `result_tables.model_id`.
     pub model_id: String,
     /// What produced the model's outputs.
-    pub backend: ModelRunner,
+    pub run: ModelRun,
+}
+
+/// What produced a model's outputs. Each kind of run carries exactly the
+/// facts that shape its outputs, so a fact that does not apply to a run
+/// (the precision an imported vector was computed at) cannot be recorded
+/// for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "runner", rename_all = "snake_case")]
+pub enum ModelRun {
+    /// A backend of this engine ran the model over local weights.
+    Local(LocalRun),
+    /// The outputs were computed elsewhere and imported; no model ran here.
+    ExternalImport,
+}
+
+/// A run of a model over local weights on one of this engine's backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalRun {
+    /// The backend that ran the model.
+    pub backend: ModelBackendKind,
     /// The compute precision the model ran at (the resolved per-model
     /// `config.json` override, or the global `GpuConfig::compute_precision`
-    /// default).
+    /// default). An `F16` run is output-affecting relative to an `F32` run
+    /// of the same model over the same input.
     pub compute_precision: ComputePrecision,
-    /// A digest of the model's on-disk content (config + pooling config +
-    /// tokenizer files + weights), or the typed reason none could be
-    /// computed. See [`ModelContentDigest`] for why this is not a bare
-    /// `Option<String>`.
-    pub content_digest: ModelContentDigest,
-    /// The GGUF/k-quant weight-storage format the model's weights were
-    /// loaded in, or `None` when the model ran unquantized (a dense
-    /// `f32`/`f16`/`bf16` weight tensor — the `compute_precision` field above
-    /// already names that case).
-    ///
-    /// `quantization` folds in here — the same place `compute_precision` and
-    /// `content_digest` do, for the same reason (see their doc comments
-    /// above): a `WeightQuantization` is a determinant of the weight BYTES a
-    /// model loaded, so it must enter the definition hash **uniformly for
-    /// every model-producing descriptor** the moment either records a
-    /// `ModelIdentity`, rather than requiring each new model-invoking
-    /// `ProducingDescriptor` variant to remember its own quantization field.
-    /// A `Q4K`-quantized run of a model is output-affecting relative to a
-    /// full-precision run of the same model over the same inputs — two such
-    /// runs must never collide on one materialization identity.
-    ///
-    /// `#[serde(skip_serializing_if = "Option::is_none")]` means an absent
-    /// key (a pre-feature row, or any row for a model that ran unquantized)
-    /// serialises to identical canonical bytes as before this field existed
-    /// — so every `DefinitionHash` recorded before this field was added is
-    /// preserved exactly; only a `Some` quantization changes the hash.
+    /// The digest of the model's files. See [`ContentDigest`].
+    pub content_digest: ContentDigest,
+    /// The GGUF/k-quant weight-storage format the weights were loaded in,
+    /// or `None` for dense weights (the `compute_precision` above names
+    /// that case). A `Q4K` run is output-affecting relative to a
+    /// full-precision run of the same model. Absent from the serialized
+    /// form when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization: Option<jammi_numerics::WeightQuantization>,
 }
 
-/// A model's content digest — the [`ModelIdentity`] determinant for the
-/// model's bytes: a `model_id` string alone does not change when the referenced
-/// directory's `1_Pooling/config.json`, tokenizer files, or weights bytes
-/// change, so two genuinely different models could otherwise collide on one
-/// [`DefinitionHash`]. A loader computes this once per model load — SHA-256
-/// over the model's config, `1_Pooling/config.json`, tokenizer files, and
-/// weights bytes — and threads it into every `ModelIdentity` it builds.
+/// SHA-256 (hex) over a model's config, `1_Pooling/config.json`, tokenizer
+/// files and weights bytes — computed once per model load.
 ///
-/// Deliberately **not** a bare `Option<String>`: an external-producer import
-/// (`ProducingDescriptor::External`-adjacent rows built by
-/// `pipeline::import`) has no local model directory to hash, and that
-/// "no digest" state must say WHY, typed, so a reader can tell "genuinely no
-/// content to hash" from "the loader forgot to compute one" — the same
-/// question a bare `Option::None` can never answer once constructed. This is
-/// the digest's complete presence lattice, expressed as one closed sum type
-/// rather than an `Option<T>` field paired with a second, independently
-/// omittable reason field (a "None carries a typed reason, never a silent
-/// default" contract that a companion field could silently violate by being
-/// left `None` itself).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", content = "value", rename_all = "snake_case")]
-pub enum ModelContentDigest {
-    /// SHA-256 hex digest of the model's on-disk content, computed once per
-    /// model load.
-    Sha256(String),
-    /// No digest could be computed for this model invocation, with the
-    /// typed reason why.
-    Unavailable(ModelContentDigestUnavailableReason),
-}
+/// A `model_id` string alone does not change when the referenced
+/// directory's pooling config, tokenizer or weights change, so two
+/// genuinely different models could otherwise collide on one
+/// [`DefinitionHash`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ContentDigest(pub String);
 
-/// Why a [`ModelContentDigest`] is [`ModelContentDigest::Unavailable`] for a
-/// given model invocation. A closed enum (not a free-form string) so a new
-/// reason is a reviewed, compiler-visible addition, and so downstream
-/// matching (e.g. an audit that should only ever see `ExternalImport`) breaks
-/// loudly at compile time if a second reason is ever added without being
-/// handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelContentDigestUnavailableReason {
-    /// The model reached this environment through the external-producer
-    /// import path (`pipeline::import`), which has no local model directory
-    /// — no config, pooling config, tokenizer, or weights files — to hash.
-    ExternalImport,
+impl std::fmt::Display for ContentDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// [`ProducingDescriptor::GraphTrainingSet::sample`]'s fields — a db-local
@@ -1980,10 +1900,12 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-                backend: ModelRunner::Backend(ModelBackendKind::Candle),
-                compute_precision: ComputePrecision::F32,
-                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                quantization: None,
+                run: ModelRun::Local(LocalRun {
+                    backend: ModelBackendKind::Candle,
+                    compute_precision: ComputePrecision::F32,
+                    content_digest: ContentDigest("cpu-fixture-digest".into()),
+                    quantization: None,
+                }),
             }],
         )
     }
@@ -2008,10 +1930,12 @@ mod tests {
     fn quantization_none_serialises_to_no_key() {
         let identity = ModelIdentity {
             model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-            backend: ModelRunner::Backend(ModelBackendKind::Candle),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("cpu-fixture-digest".into()),
+                quantization: None,
+            }),
         };
         let value = serde_json::to_value(&identity).unwrap();
         let object = value.as_object().unwrap();
@@ -2021,36 +1945,33 @@ mod tests {
         );
     }
 
-    /// HASH-PRESERVATION GOLDEN: the end-to-end `definition_hash` for the
-    /// representative `embedding_descriptor()` / `cpu_env()` fixture (the
-    /// same fixture `definition_hash_is_deterministic` above uses) equals the
-    /// value this fixture hashes to without any `ModelIdentity::quantization`
-    /// key — so adding that `None` field changes no existing hash. Never
-    /// update the literal to match a new computed value; that would silently
-    /// rubber-stamp a migration. A migration is a new `MANIFEST_VERSION` and a
-    /// fresh golden.
+    /// GOLDEN: the end-to-end `definition_hash` of the representative
+    /// `embedding_descriptor()` / `cpu_env()` fixture at this
+    /// [`MANIFEST_VERSION`]. A change to the hashed shape is a new
+    /// `MANIFEST_VERSION` and a fresh golden — never an edit of the literal to
+    /// match a new computed value, which would rubber-stamp a migration.
     ///
-    /// `engine_version` is a hash input BY DESIGN
+    /// `engine_version` is a hash input by design
     /// (`different_engine_version_changes_the_hash` below pins that
-    /// sensitivity), and `cpu_env()` stamps it from `CARGO_PKG_VERSION`. The
-    /// golden was computed at engine version `0.48.0`, so this test — and ONLY
-    /// this test, never `cpu_env()` itself, which other tests rely on for the
-    /// CURRENT engine version — pins `engine_version` to `0.48.0` before
-    /// hashing; otherwise every lockstep version bump would move it, which is
-    /// not the migration this golden exists to catch.
+    /// sensitivity), so this test — and only this test, never `cpu_env()`,
+    /// which other tests rely on for the current engine version — pins it to
+    /// `0.48.0`; otherwise every lockstep version bump would move the golden.
     #[test]
-    fn definition_hash_golden_is_preserved_across_the_quantization_fold() {
+    fn definition_hash_golden_at_this_manifest_version() {
+        assert_eq!(
+            MANIFEST_VERSION, 4,
+            "a new manifest version takes a fresh golden"
+        );
         let d = embedding_descriptor();
         let mut env = cpu_env();
         env.engine_version = "0.48.0".into();
         let hash = definition_hash(&d, &env).unwrap();
         assert_eq!(
             hash.as_str(),
-            "bb0bb2f37aa2dcde1a2244d6e37f6ca9e8e73c04961c5009164eef72b426ecaa",
+            "8f8df95c9dfac18f28dc6a3094cccb73508d6364b10511698fbf1a09ed5fc57f",
             "definition_hash for the embedding_descriptor()/cpu_env() fixture (pinned to \
-             engine_version 0.48.0) drifted from the golden value — the \
-             `quantization: None` fold must be byte-identical to the shape without the key, \
-             not a silent migration"
+             engine_version 0.48.0) drifted from this manifest version's golden — a \
+             change to the hashed shape is a new MANIFEST_VERSION, not a silent migration"
         );
     }
 
@@ -2064,7 +1985,8 @@ mod tests {
         let none_hash = definition_hash(&d, &cpu_env()).unwrap();
 
         let mut quantized_env = cpu_env();
-        quantized_env.models[0].quantization = Some(jammi_numerics::WeightQuantization::Q4K);
+        local_run(&mut quantized_env.models[0]).quantization =
+            Some(jammi_numerics::WeightQuantization::Q4K);
         let some_hash = definition_hash(&d, &quantized_env).unwrap();
 
         assert_ne!(
@@ -2074,33 +1996,31 @@ mod tests {
         );
     }
 
-    /// Serde round-trip: a pre-feature JSON row — one
-    /// with no `quantization` key at all, modelling what is actually on disk
-    /// from before this field existed — deserialises to `None` via
-    /// `#[serde(default)]`; a `Some` quantization round-trips through the
-    /// lowercase wire vocabulary `WeightQuantization` already defines
-    /// (`#[serde(rename_all = "lowercase")]`), so `Q4K` reads back as the
-    /// string `"q4k"`.
+    /// Serde round-trip: a local run with no `quantization` key reads as
+    /// dense weights (`#[serde(default)]`), and a `Some` quantization
+    /// round-trips through the lowercase wire vocabulary `WeightQuantization`
+    /// defines, so `Q4K` reads back as the string `"q4k"`.
     #[test]
-    fn quantization_serde_round_trips_and_pre_feature_rows_default_to_none() {
-        // A pre-feature row: no "quantization" key in the JSON at all.
-        let pre_feature_json = serde_json::json!({
+    fn quantization_serde_round_trips_and_an_absent_key_reads_as_dense() {
+        let dense_json = serde_json::json!({
             "model_id": "sentence-transformers/all-MiniLM-L6-v2",
-            "backend": "candle",
-            "compute_precision": "f32",
-            "content_digest": {"state": "sha256", "value": "cpu-fixture-digest"},
+            "run": {
+                "runner": "local",
+                "backend": "candle",
+                "compute_precision": "f32",
+                "content_digest": "cpu-fixture-digest",
+            },
         });
-        let identity: ModelIdentity = serde_json::from_value(pre_feature_json).unwrap();
-        assert_eq!(identity.quantization, None);
+        let mut identity: ModelIdentity = serde_json::from_value(dense_json).unwrap();
+        assert_eq!(local_run(&mut identity).quantization, None);
 
-        // Some(Q4K) round-trips, and serialises as the lowercase wire tag.
         let mut with_quant = identity.clone();
-        with_quant.quantization = Some(jammi_numerics::WeightQuantization::Q4K);
+        local_run(&mut with_quant).quantization = Some(jammi_numerics::WeightQuantization::Q4K);
         let value = serde_json::to_value(&with_quant).unwrap();
-        assert_eq!(value["quantization"], "q4k");
-        let back: ModelIdentity = serde_json::from_value(value).unwrap();
+        assert_eq!(value["run"]["quantization"], "q4k");
+        let mut back: ModelIdentity = serde_json::from_value(value).unwrap();
         assert_eq!(
-            back.quantization,
+            local_run(&mut back).quantization,
             Some(jammi_numerics::WeightQuantization::Q4K)
         );
     }
@@ -2202,10 +2122,12 @@ mod tests {
                 ComputeDevice::Cuda { ordinal: 0 },
                 vec![ModelIdentity {
                     model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-                    backend: ModelRunner::Backend(ModelBackendKind::Candle),
-                    compute_precision: ComputePrecision::F32,
-                    content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                    quantization: None,
+                    run: ModelRun::Local(LocalRun {
+                        backend: ModelBackendKind::Candle,
+                        compute_precision: ComputePrecision::F32,
+                        content_digest: ContentDigest("cpu-fixture-digest".into()),
+                        quantization: None,
+                    }),
                 }],
             ),
         )
@@ -2233,10 +2155,12 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L12-v2".into(),
-                backend: ModelRunner::Backend(ModelBackendKind::Candle),
-                compute_precision: ComputePrecision::F32,
-                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                quantization: None,
+                run: ModelRun::Local(LocalRun {
+                    backend: ModelBackendKind::Candle,
+                    compute_precision: ComputePrecision::F32,
+                    content_digest: ContentDigest("cpu-fixture-digest".into()),
+                    quantization: None,
+                }),
             }],
         );
         assert_ne!(base, definition_hash(&d, &other_model).unwrap());
@@ -2263,20 +2187,24 @@ mod tests {
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
-                backend: ModelRunner::Backend(ModelBackendKind::Candle),
-                compute_precision: ComputePrecision::F32,
-                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                quantization: None,
+                run: ModelRun::Local(LocalRun {
+                    backend: ModelBackendKind::Candle,
+                    compute_precision: ComputePrecision::F32,
+                    content_digest: ContentDigest("cpu-fixture-digest".into()),
+                    quantization: None,
+                }),
             }],
         );
         let f16_env = MaterializationEnv::of_models(
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
-                backend: ModelRunner::Backend(ModelBackendKind::Candle),
-                compute_precision: ComputePrecision::F16,
-                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                quantization: None,
+                run: ModelRun::Local(LocalRun {
+                    backend: ModelBackendKind::Candle,
+                    compute_precision: ComputePrecision::F16,
+                    content_digest: ContentDigest("cpu-fixture-digest".into()),
+                    quantization: None,
+                }),
             }],
         );
         assert_ne!(
@@ -2299,8 +2227,8 @@ mod tests {
         let base = definition_hash(&d, &cpu_env()).unwrap();
 
         let mut other_digest = cpu_env();
-        other_digest.models[0].content_digest =
-            ModelContentDigest::Sha256("a-different-digest".into());
+        local_run(&mut other_digest.models[0]).content_digest =
+            ContentDigest("a-different-digest".into());
         assert_ne!(
             base,
             definition_hash(&d, &other_digest).unwrap(),
@@ -2309,38 +2237,29 @@ mod tests {
         );
     }
 
-    /// None-vs-Some: an `Unavailable` content digest (the external-producer
-    /// import path, which has no local model directory to hash) must hash
-    /// differently from a `Sha256` digest recorded for the identical
-    /// `model_id`/`backend`/`compute_precision` — the typed "no digest"
-    /// reason is itself part of the identity, never a value that silently
-    /// collides with a real digest.
+    /// An imported run of a model is a different run from a local run of a
+    /// model under the same id: the two must never share a definition.
     #[test]
-    fn unavailable_content_digest_differs_from_present_digest() {
+    fn an_imported_run_differs_from_a_local_run() {
         let d = embedding_descriptor();
-        let present = definition_hash(&d, &cpu_env()).unwrap();
+        let local = definition_hash(&d, &cpu_env()).unwrap();
 
-        let mut unavailable_env = cpu_env();
-        unavailable_env.models[0].content_digest =
-            ModelContentDigest::Unavailable(ModelContentDigestUnavailableReason::ExternalImport);
-        let unavailable = definition_hash(&d, &unavailable_env).unwrap();
+        let mut imported_env = cpu_env();
+        imported_env.models[0].run = ModelRun::ExternalImport;
+        let imported = definition_hash(&d, &imported_env).unwrap();
 
         assert_ne!(
-            present, unavailable,
-            "a present content_digest and an Unavailable one must hash differently"
+            local, imported,
+            "a local run and an imported run under one model id must hash differently"
         );
     }
 
-    /// Determinism family, extended to the `Unavailable` arm: two runs over
-    /// an environment whose model content digest is `Unavailable` (not just
-    /// the `Sha256`-carrying arm `definition_hash_is_deterministic` already
-    /// covers) must hash identically.
+    /// Determinism holds for an imported run as it does for a local one.
     #[test]
-    fn definition_hash_is_deterministic_with_unavailable_content_digest() {
+    fn definition_hash_is_deterministic_for_an_imported_run() {
         let d = embedding_descriptor();
         let mut env = cpu_env();
-        env.models[0].content_digest =
-            ModelContentDigest::Unavailable(ModelContentDigestUnavailableReason::ExternalImport);
+        env.models[0].run = ModelRun::ExternalImport;
         assert_eq!(
             definition_hash(&d, &env).unwrap(),
             definition_hash(&d, &env).unwrap()
@@ -2348,22 +2267,22 @@ mod tests {
     }
 
     /// The `ModelIdentity` fold is exhaustive-by-type: `model_identity_from_fields`
-    /// destructures `ModelIdentityFields` and reconstructs `ModelIdentity` by
-    /// named field, with no `..` elision on either side — a field added to
-    /// either struct without a matching update on the other breaks this
-    /// function's compilation, so the fixture can never silently go stale
-    /// relative to the real type. Every field then gets its own non-default
-    /// mutation asserted to move the hash (the non-vacuity guard the
-    /// NeighborGraph/GraphPropagation/ContextSet families above already use),
-    /// covering `content_digest`'s two states (`Sha256` and `Unavailable`)
-    /// alongside `model_id`/`backend`/`compute_precision`.
+    /// destructures `ModelIdentityFields` and reconstructs `ModelIdentity` and
+    /// its `LocalRun` by named field, with no `..` elision on either side — a
+    /// field added to either struct without a matching update on the other
+    /// breaks this function's compilation, so the fixture can never silently
+    /// go stale relative to the real type. Every field then gets its own
+    /// non-default mutation asserted to move the hash (the non-vacuity guard
+    /// the NeighborGraph/GraphPropagation/ContextSet families above already
+    /// use), and the run itself is swapped for an imported one.
     #[derive(Clone)]
     struct ModelIdentityFields {
         model_id: String,
-        backend: ModelRunner,
+        backend: ModelBackendKind,
         compute_precision: ComputePrecision,
-        content_digest: ModelContentDigest,
+        content_digest: ContentDigest,
         quantization: Option<jammi_numerics::WeightQuantization>,
+        imported: bool,
     }
 
     fn model_identity_from_fields(p: &ModelIdentityFields) -> ModelIdentity {
@@ -2373,13 +2292,29 @@ mod tests {
             compute_precision,
             content_digest,
             quantization,
+            imported,
         } = p.clone();
-        ModelIdentity {
-            model_id,
+        let local = LocalRun {
             backend,
             compute_precision,
             content_digest,
             quantization,
+        };
+        ModelIdentity {
+            model_id,
+            run: if imported {
+                ModelRun::ExternalImport
+            } else {
+                ModelRun::Local(local)
+            },
+        }
+    }
+
+    /// The local run of a fixture identity.
+    fn local_run(identity: &mut ModelIdentity) -> &mut LocalRun {
+        match &mut identity.run {
+            ModelRun::Local(run) => run,
+            ModelRun::ExternalImport => panic!("the fixture identity is a local run"),
         }
     }
 
@@ -2391,10 +2326,11 @@ mod tests {
     fn model_identity_each_field_moves_the_hash() {
         let base = ModelIdentityFields {
             model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-            backend: ModelRunner::Backend(ModelBackendKind::Candle),
+            backend: ModelBackendKind::Candle,
             compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("base-digest".into()),
+            content_digest: ContentDigest("base-digest".into()),
             quantization: None,
+            imported: false,
         };
         let d = embedding_descriptor();
         let base_hash =
@@ -2404,17 +2340,12 @@ mod tests {
             ("model_id", |p| {
                 p.model_id = "sentence-transformers/all-MiniLM-L12-v2".into()
             }),
-            ("backend", |p| p.backend = ModelRunner::ExternalImport),
+            ("run (local -> imported)", |p| p.imported = true),
             ("compute_precision", |p| {
                 p.compute_precision = ComputePrecision::F16
             }),
-            ("content_digest (different Sha256)", |p| {
-                p.content_digest = ModelContentDigest::Sha256("other-digest".into())
-            }),
-            ("content_digest (Unavailable)", |p| {
-                p.content_digest = ModelContentDigest::Unavailable(
-                    ModelContentDigestUnavailableReason::ExternalImport,
-                )
+            ("content_digest", |p| {
+                p.content_digest = ContentDigest("other-digest".into())
             }),
             ("quantization (None -> Some(Q4K))", |p| {
                 p.quantization = Some(jammi_numerics::WeightQuantization::Q4K)
@@ -3327,10 +3258,12 @@ mod tests {
     fn base_model_identity() -> ModelIdentity {
         ModelIdentity {
             model_id: "bert-base-uncased".into(),
-            backend: ModelRunner::Backend(ModelBackendKind::Candle),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("fine-tune-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("fine-tune-fixture-digest".into()),
+                quantization: None,
+            }),
         }
     }
 
@@ -3403,7 +3336,7 @@ mod tests {
         let d = fine_tune_descriptor(&fine_tune_fields());
         let base = definition_hash(&d, &env_with_model(base_model_identity())).unwrap();
         let mut other = base_model_identity();
-        other.content_digest = ModelContentDigest::Sha256("a-different-base-digest".into());
+        local_run(&mut other).content_digest = ContentDigest("a-different-base-digest".into());
         assert_ne!(base, definition_hash(&d, &env_with_model(other)).unwrap());
     }
 

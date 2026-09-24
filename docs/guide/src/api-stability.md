@@ -87,7 +87,7 @@ version with reject-newer (or strict) semantics — the full contract is on the
 
 | Format | Stamp | Current version |
 |---|---|---|
-| Materialization manifest (`.materialization.json`) | `MANIFEST_VERSION` | `3` |
+| Materialization manifest (`.materialization.json`) | `MANIFEST_VERSION` | `4` |
 | ANN row map (`.rowmap`) | `ROWMAP_VERSION` | `1` |
 | ANN sidecar manifest (`.manifest.json`) | `ANN_MANIFEST_VERSION` | `3` |
 | Catalog schema | append-only migration ledger | see `crates/jammi-db/src/catalog/migrations.rs` |

@@ -29,9 +29,9 @@ use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
-    ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, Materialization,
-    MaterializationEnv, MaterializationManifest, ModelContentDigest, ModelIdentity,
-    ProducingDescriptor,
+    ArtifactDigest, ComputeDevice, ComputePrecision, ContentDigest, DefinitionHash, InputAnchor,
+    LocalRun, Materialization, MaterializationEnv, MaterializationManifest, ModelIdentity,
+    ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore, StaleReason, Staleness};
@@ -134,12 +134,12 @@ fn env() -> MaterializationEnv {
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "test-model".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("it-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     )
 }

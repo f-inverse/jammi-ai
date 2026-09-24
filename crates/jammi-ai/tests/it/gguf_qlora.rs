@@ -402,10 +402,7 @@ async fn gguf_embedding_matches_f32_reference_within_a_measured_cosine_floor() {
 fn definition_hash_for(model_id: &str, model: &LoadedModel) -> DefinitionHash {
     let identity = ModelIdentity {
         model_id: model_id.to_string(),
-        backend: model.description().runner(),
-        compute_precision: model.description().compute_precision(),
-        content_digest: model.description().content_digest().clone(),
-        quantization: model.description().quantization(),
+        ..model.description().identity()
     };
     let descriptor = ProducingDescriptor::Embedding {
         model_id: model_id.to_string(),

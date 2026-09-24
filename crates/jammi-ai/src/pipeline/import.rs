@@ -25,10 +25,7 @@ use std::collections::BTreeMap;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::storage::StorageUrl;
-use jammi_db::store::manifest::{
-    InputAnchor, MaterializationEnv, ModelContentDigest, ModelContentDigestUnavailableReason,
-    ModelIdentity,
-};
+use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ModelIdentity, ModelRun};
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
 
 use crate::session::InferenceSession;
@@ -128,31 +125,9 @@ impl<'a> ImportPipeline<'a> {
             self.session.compute_device(),
             vec![ModelIdentity {
                 model_id: canonical_model_id.clone(),
-                backend: jammi_db::store::manifest::ModelRunner::ExternalImport,
-                // No inference ran (the vectors were produced outside the
-                // engine), so there is no resolved compute precision to
-                // report; the descriptor is `External` and therefore
-                // recompute-inert (`NotRecomputable`) regardless, and the
-                // content digest the verb auto-folds into `params` is what
-                // actually distinguishes two imports, not this field. The
-                // default is recorded rather than a fabricated non-default
-                // value, as the runner records the import mechanism rather
-                // than a backend that never ran.
-                compute_precision: jammi_numerics::ComputePrecision::default(),
-                // The external-producer import path has no local model
-                // directory — no config, pooling config, tokenizer, or
-                // weights files — to hash. This is the ONLY
-                // site in the crate that constructs
-                // `ModelContentDigest::Unavailable`; every local-load path
-                // (`session.rs`, `pipeline/embedding.rs`) always threads a
-                // real `Sha256` digest computed at load time, never this
-                // variant.
-                content_digest: ModelContentDigest::Unavailable(
-                    ModelContentDigestUnavailableReason::ExternalImport,
-                ),
-                // No inference ran through this engine, so there is no
-                // weight-quantization format to report either.
-                quantization: None,
+                // No model ran here: what distinguishes two imports is the
+                // content digest the verb folds into `params`.
+                run: ModelRun::ExternalImport,
             }],
         );
         // The sole input is the external vector object, which exposes no version

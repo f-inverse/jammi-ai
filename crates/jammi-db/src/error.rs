@@ -491,7 +491,7 @@ pub enum JammiError {
         wire_kinds(held)
     )]
     DeviceKindUnheld {
-        /// The kind the plan's own `InferenceExec`/`PlacedAttemptExec` stamps.
+        /// The kind the plan's own `InferenceExec`/`TrainingExec` stamps.
         required: jammi_datafusion::ComputeDeviceKind,
         /// The kinds the holder lists, distinct and in wire order.
         held: Vec<jammi_datafusion::ComputeDeviceKind>,
@@ -655,7 +655,7 @@ impl From<datafusion::error::DataFusionError> for JammiError {
             if let Some(inner) = err.downcast_ref::<JammiError>() {
                 Some(inner.clone())
             } else if let Some(inner) = jammi_datafusion::Error::found_in(err) {
-                Some(inference_error(inner))
+                Some(operator_error(inner))
             } else if let Some(DF::ResourcesExhausted(msg)) = err.downcast_ref::<DF>() {
                 Some(JammiError::ResourcesExhausted {
                     limit_bytes: parse_pool_size_bytes(msg).unwrap_or(0),
@@ -675,30 +675,32 @@ impl From<datafusion::error::DataFusionError> for JammiError {
     }
 }
 
-/// An inference operator's error as this crate's: the null-key refusal
-/// keeps its typed shape, a runtime failure that was one of ours is
-/// restored from its source chain, and the rest is an inference error
+/// A `jammi-datafusion` operator's error as this crate's: the null-key
+/// refusal keeps its typed shape, a runtime failure that was one of ours is
+/// restored from its source chain, a training job reaching a process that
+/// runs none is a fine-tune refusal, and the rest is an inference error
 /// naming the cause.
-fn inference_error(e: &jammi_datafusion::Error) -> JammiError {
-    use jammi_datafusion::Error as Inference;
+fn operator_error(e: &jammi_datafusion::Error) -> JammiError {
+    use jammi_datafusion::Error as Operator;
     match e {
-        Inference::InvalidKey { column, null_count } => JammiError::InvalidKey {
+        Operator::InvalidKey { column, null_count } => JammiError::InvalidKey {
             column: column.clone(),
             null_count: *null_count,
         },
-        Inference::Runtime(source) => source_chain(source.as_ref())
+        Operator::Runtime(source) => source_chain(source.as_ref())
             .find_map(|err| err.downcast_ref::<JammiError>().cloned())
             .unwrap_or_else(|| JammiError::Inference(e.to_string())),
-        Inference::Inference(_)
-        | Inference::UnknownTask(_)
-        | Inference::UnknownDeviceKind(_)
-        | Inference::Decode(_) => JammiError::Inference(e.to_string()),
+        Operator::NoTrainingRunner => JammiError::FineTune(e.to_string()),
+        Operator::Inference(_)
+        | Operator::UnknownTask(_)
+        | Operator::UnknownDeviceKind(_)
+        | Operator::Decode(_) => JammiError::Inference(e.to_string()),
     }
 }
 
 impl From<jammi_datafusion::Error> for JammiError {
     fn from(e: jammi_datafusion::Error) -> Self {
-        inference_error(&e)
+        operator_error(&e)
     }
 }
 

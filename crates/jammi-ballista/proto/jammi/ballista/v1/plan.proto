@@ -46,24 +46,6 @@ message KeyCheckExecNode {
   string key_column = 1;
 }
 
-// `PlacedAttemptExec`'s construction inputs: a claimed training attempt's
-// coordinates, of any training kind. The executor re-derives the run —
-// its kind, spec and rank count — from the job's catalog row.
-message PlacedAttemptExecNode {
-  string job_id = 1;
-  uint32 attempt = 2;
-  string submitter = 3;
-  // The device KIND this attempt must run on ("cpu"|"cuda"|"metal") — the
-  // submitter's own `compute_device().kind()`, stamped where the claimant
-  // builds the task (KIND MATCH, the same rule
-  // `InferenceSpec::device_kind` carries).
-  string device_kind = 4;
-  // When the submitter claimed the attempt, RFC 3339 UTC on its own clock:
-  // the first station of the timeline the executing process folds into the
-  // job's metrics.
-  string claimed_at = 5;
-}
-
 // `ResultTableSinkExec`'s construction inputs (`jammi_db::store::sink`):
 // the sink's spec as JSON (`ResultTableSinkSpec`, `serde`), its one child
 // carried the generic way. The store the decoding process writes through is

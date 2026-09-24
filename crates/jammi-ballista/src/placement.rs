@@ -5,14 +5,14 @@
 //! Round-robin over executor slots, with three refinements over plain
 //! round-robin:
 //!
-//! 1. A stage whose plan contains a `PlacedAttemptExec` is never bound to the
-//!    executor whose id equals the descriptor's own `submitter` instance id
+//! 1. A stage whose plan contains a `TrainingExec` is never bound to the
+//!    executor whose id equals the job's own `submitter` instance id
 //!    — the submitter's own host holds a rank/job admission for the whole
 //!    await, so binding the attempt's task back to it would
 //!    deadlock the placed run against itself.
 //! 2. KIND MATCH: a stage
-//!    whose plan carries a required device kind — a `PlacedAttemptExec` (its
-//!    descriptor's own stamped `device_kind`, CPU included) or an
+//!    whose plan carries a required device kind — a `TrainingExec` (its
+//!    job's own stamped `device_kind`, CPU included) or an
 //!    `InferenceExec` (its `spec().device_kind`) —
 //!    [`crate::engine::required_device_kind`], the ONE predicate this policy
 //!    and `client::submit_physical_plan`'s pre-submission refusal both use
@@ -25,7 +25,7 @@
 //!    GPU-bound": a placed attempt's kind is a property of its DESCRIPTOR, not of the
 //!    node type — a CPU-stamped attempt must bind to a CPU executor, exactly
 //!    as a CPU-stamped `InferenceExec` does.
-//! 3. A `PlacedAttemptExec` stage whose job row is already `claimed_by` an executor
+//! 3. A `TrainingExec` stage whose job row is already `claimed_by` an executor
 //!    OTHER than this stage's own submitter is never bound to ANY slot —
 //!    the bind-time half of the re-launch guard (`transfer_claim` is the
 //!    other half): Ballista's own reset-on-
@@ -143,8 +143,8 @@ impl DistributionPolicy for DevicePlacement {
             .collect();
 
         // Refinement 3's row-read cache, keyed by the TRAINING job's catalog
-        // job_id (`PlacedAttempt::job_id`, read lazily below — never
-        // Ballista's own `JobId`, see `placed_attempt_of`'s doc) so a
+        // job_id (`TrainingJob::job_id`, read lazily below — never
+        // Ballista's own `JobId`, see `training_job_of`'s doc) so a
         // job with multiple runnable placed-attempt stages across rounds reads its
         // row at most once per `bind_tasks` call. `None` (unclaimed,
         // should not occur for a `running` row but is not itself a fault)
@@ -165,34 +165,34 @@ impl DistributionPolicy for DevicePlacement {
             let session_id = graph.session_id().to_string();
             let mut black_list: Vec<usize> = Vec::new();
             while let Some((stage, task_id_gen)) = graph.fetch_running_stage(&black_list) {
-                // Refinement 3's re-launch guard reads the descriptor's OWN
-                // training job id (`crate::engine::placed_attempt_of`'s
+                // Refinement 3's re-launch guard reads the stage's OWN
+                // training job id (`crate::engine::training_job_of`'s
                 // doc), never the outer loop's Ballista `JobId`.
-                let placed_attempt = crate::engine::placed_attempt_of(&stage.plan).cloned();
-                if let Some(descriptor) = &placed_attempt {
-                    let claim = match claim_of.get(&descriptor.job_id) {
+                let training_job = crate::engine::training_job_of(&stage.plan).cloned();
+                if let Some(job) = &training_job {
+                    let claim = match claim_of.get(&job.job_id) {
                         Some(cached) => cached.clone(),
                         None => {
                             let row = jammi_db::tenant_scope::TenantBinding::admin_scope(async {
-                                self.catalog.get_job(&descriptor.job_id).await
+                                self.catalog.get_job(&job.job_id).await
                             })
                             .await;
                             let claim = row
                                 .map(|r| r.claimed_by)
                                 .unwrap_or_else(|_| Some(String::new()));
-                            claim_of.insert(descriptor.job_id.clone(), claim.clone());
+                            claim_of.insert(job.job_id.clone(), claim.clone());
                             claim
                         }
                     };
                     if let Some(claimant) = &claim {
-                        if claimant != &descriptor.submitter {
+                        if claimant != &job.submitter {
                             tracing::warn!(
-                                job_id = %descriptor.job_id,
+                                job_id = %job.job_id,
                                 ballista_job_id = %job_id,
                                 stage_id = stage.stage_id,
-                                submitter = %descriptor.submitter,
+                                submitter = %job.submitter,
                                 claimed_by = %claimant,
-                                "jammi-ballista DevicePlacement: refusing to bind a PlacedAttemptExec \
+                                "jammi-ballista DevicePlacement: refusing to bind a TrainingExec \
                                  whose job row is already claimed by another instance — the \
                                  re-launch guard"
                             );
@@ -201,7 +201,7 @@ impl DistributionPolicy for DevicePlacement {
                         }
                     }
                 }
-                let attempt_submitter = placed_attempt.as_ref().map(|d| d.submitter.clone());
+                let attempt_submitter = training_job.as_ref().map(|job| job.submitter.clone());
                 let required_kind = crate::engine::required_device_kind(&stage.plan);
                 let runnable_partitions: Vec<usize> = stage
                     .task_infos

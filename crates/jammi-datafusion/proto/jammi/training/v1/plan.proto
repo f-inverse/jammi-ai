@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+// The wire form of `jammi-datafusion`'s training stage: what a
+// `PhysicalExtensionCodec` writes for a `TrainingExec` and rebuilds the node
+// from in another process. Only the job's coordinates cross; the runner a
+// node runs against is the decoding process's own.
+package jammi.training.v1;
+
+// `TrainingExec`'s construction inputs: a claimed training job's
+// coordinates, of any training kind. The runner re-derives the run — its
+// kind, spec and rank count — from wherever the job is recorded.
+message TrainingExecNode {
+  string job_id = 1;
+  uint32 attempt = 2;
+  // Who claimed the attempt and submitted this stage.
+  string submitter = 3;
+  // The device KIND this job must run on ("cpu"|"cuda"|"metal"): exactly the
+  // value the node was constructed with. The codec never invents or rewrites
+  // it.
+  string device_kind = 4;
+  // When the submitter claimed the attempt, RFC 3339 UTC on its own clock.
+  string claimed_at = 5;
+}

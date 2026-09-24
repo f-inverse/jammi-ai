@@ -1,13 +1,13 @@
 [package]
 name = "jammi-datafusion"
-description = "Jammi's DataFusion extension: ExecutionPlan nodes, a PhysicalOptimizerRule and a wire form that run a model over a relation as a physical stage — numbered, chunked by a token budget, device-admitted, streamed, placeable on a Ballista executor — over one model-runtime trait pair, plus the model vocabulary every stage shares."
+description = "Jammi's DataFusion extension: ExecutionPlan nodes, a PhysicalOptimizerRule and a wire form that run a model over a relation as a physical stage — numbered, chunked by a token budget, device-admitted, streamed, placeable on a Ballista executor — over one model-runtime trait pair; a training stage that runs a claimed training job where its device is, over a runner seam; and the model vocabulary every stage shares."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-keywords = ["datafusion", "inference", "execution-plan", "embeddings", "arrow"]
+keywords = ["datafusion", "inference", "training", "execution-plan", "arrow"]
 categories = ["science"]
 build = "build.rs"
 
@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 prost.workspace = true
 
 [build-dependencies]

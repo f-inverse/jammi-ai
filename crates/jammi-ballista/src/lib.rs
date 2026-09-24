@@ -17,11 +17,12 @@
 //!
 //! Dependency direction: this crate depends on `jammi-ai`/`jammi-db`/
 //! `jammi-wire`; neither `jammi-ai` nor `jammi-db` depends on it. The
-//! `ComputePlane` seam `jammi-db` exposes and the `PlacedAttemptRunner` seam
-//! `jammi-ai` exposes are INSTALLED by this crate's roles
-//! (`roles::host_client`/`roles::host_executor`), never called from their
-//! own dependency graphs — the same shape `MemberDialer` already uses
-//! (`crates/jammi-ai/src/fine_tune/worker.rs`).
+//! `ComputePlane` seam `jammi-db` exposes is INSTALLED by this crate's client
+//! role (`roles::host_client`), and the `TrainingRunner` seam
+//! `jammi-datafusion` exposes is implemented by its executor role
+//! (`roles::host_executor`) and bound by that role's codec to every training
+//! stage it decodes — neither is called from its own crate's dependency
+//! graph.
 
 pub mod client;
 pub mod cluster;

@@ -4710,6 +4710,7 @@ version = "0.49.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "chrono",
  "datafusion",
  "futures",
  "jammi-datafusion",

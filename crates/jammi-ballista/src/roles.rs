@@ -9,9 +9,10 @@
 //! serve, the client names what it dials, and a process that hosts a
 //! scheduler names itself as a client when its own submissions are to be
 //! placed — one way to name a submitter's target, never an implied one.
-//! Each role installs the seam it implements on the session: the executor
-//! its `PlacedAttemptRunner`, the client its `ComputePlane` — the one submit
-//! client every submission the process makes goes through.
+//! Each role supplies the seam it implements: the executor its
+//! `TrainingRunner`, bound by its codec to every training stage it decodes,
+//! and the client its `ComputePlane` on the session — the one submit client
+//! every submission the process makes goes through.
 //!
 //! `ballista-scheduler` in this crate's `Cargo.toml` is
 //! `default-features = false`: no `rest-api` surface. This is load-bearing,
@@ -22,7 +23,7 @@
 //! regress that property the moment it queried a restarted scheduler.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -59,7 +60,7 @@ use ballista_scheduler::scheduler_process::create_scheduler;
 use ballista_scheduler::scheduler_server::SessionBuilder;
 
 use datafusion::execution::SendableRecordBatchStream;
-use jammi_ai::operator::placed_attempt_exec::PlacedAttempt;
+use jammi_datafusion::{TrainingJob, TrainingOutcome, TrainingRunner};
 use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 
@@ -332,28 +333,25 @@ impl ComputePlane for ClientComputePlane {
     }
 }
 
-/// The executor role's [`jammi_ai::fine_tune::worker::PlacedAttemptRunner`]:
-/// runs a placed training attempt's body on THIS process via
-/// `JobWorker::run_placed_attempt` — `PlacedAttemptExec::
-/// execute` reaches this through the process-global seam `install_
-/// placed_attempt_runner` registers, since a Ballista executor's `TaskContext`
-/// carries no jammi session.
-struct ExecutorPlacedAttemptRunner {
-    session: Arc<InferenceSession>,
+/// The executor role's [`TrainingRunner`]: runs a placed training attempt's
+/// body on THIS process via `JobWorker::run_placed_attempt`. The executor's
+/// codec binds every `TrainingExec` it decodes to it
+/// ([`JammiCodec::running_training`]); a failed attempt's typed error is
+/// carried as the runner's own, and restored on the submitter.
+struct ExecutorTrainingRunner {
+    session: Weak<InferenceSession>,
 }
 
-impl jammi_ai::fine_tune::worker::PlacedAttemptRunner for ExecutorPlacedAttemptRunner {
-    fn run(
-        &self,
-        descriptor: PlacedAttempt,
-    ) -> futures::future::BoxFuture<
-        'static,
-        jammi_db::error::Result<jammi_ai::operator::placed_attempt_exec::PlacedOutcome>,
-    > {
-        let session = Arc::clone(&self.session);
-        Box::pin(async move {
-            jammi_ai::fine_tune::worker::JobWorker::run_placed_attempt(&session, descriptor).await
-        })
+#[async_trait::async_trait]
+impl TrainingRunner for ExecutorTrainingRunner {
+    async fn run(&self, job: TrainingJob) -> jammi_datafusion::Result<TrainingOutcome> {
+        let session = self
+            .session
+            .upgrade()
+            .ok_or_else(|| jammi_datafusion::Error::runtime(crate::error::Error::SessionGone))?;
+        jammi_ai::fine_tune::worker::JobWorker::run_placed_attempt(&session, job)
+            .await
+            .map_err(jammi_datafusion::Error::runtime)
     }
 }
 
@@ -496,7 +494,11 @@ pub async fn host_executor(
         }
     };
 
-    let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(JammiCodec::new(session));
+    let codec: Arc<dyn PhysicalExtensionCodec> = Arc::new(
+        JammiCodec::new(session).running_training(Arc::new(ExecutorTrainingRunner {
+            session: Arc::downgrade(session),
+        })),
+    );
 
     let session_for_runtime = Arc::clone(session);
     let runtime_producer: ballista_core::RuntimeProducer =
@@ -671,16 +673,6 @@ pub async fn host_executor(
             );
         }
     }
-
-    // Install the `PlacedAttemptRunner` seam: `PlacedAttemptExec::
-    // execute` reaches this process's coordinator body through it, since a
-    // Ballista executor's `TaskContext` carries no jammi session.
-    // Write-once, same shape as `install_member_dialer`.
-    session
-        .host_admission()
-        .install_placed_attempt_runner(Arc::new(ExecutorPlacedAttemptRunner {
-            session: Arc::clone(session),
-        }));
 
     Ok(ExecutorRole {
         flight_addr: flight_local_addr,

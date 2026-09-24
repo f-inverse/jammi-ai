@@ -250,6 +250,17 @@ impl GpuScheduler {
         self.budget
     }
 
+    /// A reservation of no memory — what a model that holds no memory on this
+    /// device (a remote model, whose device is its endpoint) is admitted
+    /// with. Always granted: it takes nothing from the budget and releases
+    /// nothing when it drops.
+    pub(crate) fn reserve_nothing(self: &Arc<Self>) -> GpuPermit {
+        GpuPermit {
+            reserved_bytes: 0,
+            scheduler: Arc::clone(self),
+        }
+    }
+
     /// Non-blocking acquisition attempt. Returns `None` if insufficient memory.
     ///
     /// CAS loop with `spin_loop()` hint on contention — the retry window is
@@ -544,6 +555,20 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("memory_limit"), "{msg}");
         assert!(msg.contains("device 3"), "{msg}");
+    }
+
+    /// A reservation of nothing is granted even on a spent budget, and gives
+    /// nothing back when it drops.
+    #[test]
+    fn a_reservation_of_nothing_is_granted_on_a_spent_budget() {
+        let sched = Arc::new(GpuScheduler::new(1_000));
+        let full = sched.try_acquire(1_000).expect("the whole budget");
+        let nothing = sched.reserve_nothing();
+        assert_eq!(sched.available(), 0);
+        drop(nothing);
+        assert_eq!(sched.available(), 0, "dropping it released nothing");
+        drop(full);
+        assert_eq!(sched.available(), 1_000);
     }
 
     fn share(percent: u8) -> MemoryLimit {

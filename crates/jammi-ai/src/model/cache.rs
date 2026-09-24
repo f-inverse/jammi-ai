@@ -766,11 +766,7 @@ impl ModelCache {
     ) -> Result<CacheEntry> {
         let endpoint = self.remote_endpoint(name)?;
         let description = self.describe_remote(source, endpoint, task)?;
-        let gpu_permit = endpoint.admission.try_acquire(0).ok_or_else(|| {
-            JammiError::Gpu(format!(
-                "{source}: a remote endpoint's admission holds no memory budget to refuse"
-            ))
-        })?;
+        let gpu_permit = endpoint.admission.reserve_nothing();
         self.complete_generic_registration(
             source,
             &source.to_string(),

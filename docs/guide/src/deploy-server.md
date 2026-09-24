@@ -159,8 +159,7 @@ For GPU-accelerated inference in production:
 ```toml
 [gpu]
 device = 0            # CUDA device index
-memory_limit = "auto"
-memory_fraction = 0.9
+memory_limit = "90%"  # per-device model budget: a share of the card, or e.g. "20GB"
 require_gpu = false   # fail fast if the GPU is unavailable instead of CPU fallback
 
 [inference]

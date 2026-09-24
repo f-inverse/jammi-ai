@@ -1,4 +1,4 @@
-//! Host physical-memory reader for `[engine] memory_limit`'s `"<n>%"` form.
+//! Host physical-memory reader for `[engine] memory_limit`'s share form.
 //!
 //! [`EngineConfig::memory_limit_bytes`](super::EngineConfig::memory_limit_bytes)
 //! is the ONE reader of `[engine] memory_limit`; when the configured value is

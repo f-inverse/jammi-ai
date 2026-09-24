@@ -71,10 +71,11 @@ if [ "$VERIFY" = "1" ]; then
   # the front and `grep -q` exits immediately, SIGPIPE-ing `printf` while it
   # is still writing the rest — under `pipefail` (line 16) that promotes
   # printf's SIGPIPE status over grep's own successful exit, flipping this
-  # `if` to the "no Fresh unit" branch on a POISONED clone — the portable
-  # trigger is ONE PIPE BUFFER, 64 KiB, not any particular byte count of
-  # "cargo output"; once the stream exceeds that, `printf` can still be
-  # blocked mid-write when `grep -q` exits. A file has no writer to kill.
+  # `if` to the "no Fresh unit" branch on a POISONED clone. Any stream with
+  # lines after the match can lose this race (bash's `printf` writes line
+  # by line); one past ONE PIPE BUFFER, 64 KiB, loses it every time, since
+  # `printf` is still blocked mid-write when `grep -q` exits. A file has no
+  # writer to kill.
   #
   # This script has no `set -e` (line 43: `-uo pipefail` only, never `-e` —
   # `--verify`/`--adopt` legitimately want SOME failures to fall through to
@@ -182,7 +183,7 @@ mkdir -p "$(dirname "$DEST_DIR")"
 # the RunPod image's rootfs may or may not. `--reflink=auto` falls back to a
 # real copy silently when the filesystem cannot CoW, so this is always safe
 # to pass when the flag itself is recognised — never assumed.
-if cp --help 2>&1 | grep -q -- '--reflink'; then
+if grep -q -- '--reflink' <<<"$(cp --help 2>&1)"; then
   echo "cp: using --reflink=auto (CoW where the filesystem supports it, else a real copy)"
   cp -a --reflink=auto "$SEED_DIR" "$DEST_DIR"
 else

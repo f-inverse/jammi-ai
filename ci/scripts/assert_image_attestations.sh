@@ -300,7 +300,7 @@ _self_test() {
   partial_map='{"linux/arm64":{"b":2}}'
   rc=0
   out="$(platform_keys_match "$partial_map" "$index_two" "provenance" 2>&1)" || rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/amd64'; then
+  if [ "$rc" -eq 1 ] && grep -q 'linux/amd64' <<<"$out"; then
     echo "self-test[platform-keys-match-partial-names-missing]: OK"
   else
     echo "self-test[platform-keys-match-partial-names-missing]: FAIL (rc=$rc, out=$out)" >&2
@@ -313,7 +313,7 @@ _self_test() {
   extra_map='{"linux/amd64":{"a":1},"linux/arm64":{"b":2},"linux/riscv64":{"c":3}}'
   rc=0
   out="$(platform_keys_match "$extra_map" "$index_two" "SBOM" 2>&1)" || rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/riscv64'; then
+  if [ "$rc" -eq 1 ] && grep -q 'linux/riscv64' <<<"$out"; then
     echo "self-test[platform-keys-match-extra-names-unexpected]: OK"
   else
     echo "self-test[platform-keys-match-extra-names-unexpected]: FAIL (rc=$rc, out=$out)" >&2
@@ -356,7 +356,7 @@ _self_test() {
   # must fail, naming every platform it doesn't cover.
   rc=0
   out="$(assert_attestation_shape "$real_flat_provenance" "$index_two" "provenance" 2>&1)" || rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/amd64' && printf '%s' "$out" | grep -q 'linux/arm64'; then
+  if [ "$rc" -eq 1 ] && grep -q 'linux/amd64' <<<"$out" && grep -q 'linux/arm64' <<<"$out"; then
     echo "self-test[assert-shape-multi-platform-flat-fail]: OK"
   else
     echo "self-test[assert-shape-multi-platform-flat-fail]: FAIL (rc=$rc, out=$out)" >&2
@@ -374,7 +374,7 @@ _self_test() {
   # multi-platform map missing one -> fail, naming it.
   rc=0
   out="$(assert_attestation_shape "$partial_map" "$index_two" "provenance" 2>&1)" || rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/amd64'; then
+  if [ "$rc" -eq 1 ] && grep -q 'linux/amd64' <<<"$out"; then
     echo "self-test[assert-shape-multi-platform-map-missing-fail]: OK"
   else
     echo "self-test[assert-shape-multi-platform-map-missing-fail]: FAIL (rc=$rc, out=$out)" >&2
@@ -384,7 +384,7 @@ _self_test() {
   # multi-platform map with an extra platform -> fail, naming it.
   rc=0
   out="$(assert_attestation_shape "$extra_map" "$index_two" "SBOM" 2>&1)" || rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'linux/riscv64'; then
+  if [ "$rc" -eq 1 ] && grep -q 'linux/riscv64' <<<"$out"; then
     echo "self-test[assert-shape-multi-platform-map-extra-fail]: OK"
   else
     echo "self-test[assert-shape-multi-platform-map-extra-fail]: FAIL (rc=$rc, out=$out)" >&2

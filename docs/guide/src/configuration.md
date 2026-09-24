@@ -107,8 +107,16 @@ batch_size = 32
 batch_tokens = 16384
 # Timeout for batch accumulation in server mode (seconds). Default: 300.
 batch_timeout_secs = 300
-# Maximum models kept loaded simultaneously. 0 = unlimited. Default: 0.
+# The most IDLE models kept loaded, across the process's devices. Past it
+# the least recently used idle model is evicted; a model in use is never
+# evicted, so the count can exceed this while models are held. 0 = unbounded
+# (device memory still bounds what is admitted). Default: 0.
 max_loaded_models = 0
+# The most model descriptions kept memoized — what a plan is built against
+# without loading a model, a few kilobytes each. Past it the least recently
+# used is dropped and recomputed (its files re-hashed) if described again.
+# 0 = unbounded. Default: 1024.
+max_described_models = 1024
 # The inference fan-out: how many partitions of one plan forward chunks
 # concurrently — threads of one process, or tasks of a cluster when the plan
 # is submitted to one. The rows a model forwards together are decided by

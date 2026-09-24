@@ -352,11 +352,10 @@ impl InferenceSession {
             device_config.memory_fraction,
             inner.config().engine.execution_threads,
         )?;
-        let model_cache = Arc::new(ModelCache::with_device_schedulers(
-            resolver,
-            device_config.clone(),
-            schedulers,
-        ));
+        let model_cache = Arc::new(
+            ModelCache::with_device_schedulers(resolver, device_config.clone(), schedulers)
+                .bounded(inner.config().inference.cache_bounds()),
+        );
         // What a sink this process runs records as having produced its
         // bytes — its device and the models the plan ran — wherever the
         // plan was submitted from.

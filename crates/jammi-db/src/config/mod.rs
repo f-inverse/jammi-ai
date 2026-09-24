@@ -934,6 +934,16 @@ impl GpuConfig {
     }
 }
 
+/// How many idle entries the model cache keeps; `None` is unbounded. Read
+/// from `[inference]` by [`InferenceConfig::cache_bounds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheBounds {
+    /// Idle loaded models kept.
+    pub loaded_models: Option<NonZeroUsize>,
+    /// Model descriptions kept.
+    pub described_models: Option<NonZeroUsize>,
+}
+
 /// Model inference defaults.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -951,8 +961,19 @@ pub struct InferenceConfig {
     pub batch_tokens: usize,
     /// Seconds to wait before flushing an incomplete batch. Default: 300.
     pub batch_timeout_secs: u64,
-    /// Maximum number of models held in memory simultaneously. 0 means unlimited. Default: 0.
+    /// The most idle models a process keeps loaded, per process across its
+    /// devices. Past it the least recently used idle model is evicted; a
+    /// model in use is never evicted, so the count can exceed this while
+    /// models are held. 0 means unbounded (device memory still bounds what
+    /// is admitted). Default: 0.
     pub max_loaded_models: usize,
+    /// The most model descriptions a process keeps memoized — what a plan
+    /// is built against without loading a model. Past it the least recently
+    /// used description is dropped and recomputed (its files re-hashed) if
+    /// described again. Each is a few kilobytes: identity, geometry, saved
+    /// adapter configuration and the file fingerprint. 0 means unbounded.
+    /// Default: 1024.
+    pub max_described_models: usize,
     /// The inference fan-out: how many partitions of one plan forward chunks
     /// concurrently — threads of one process, or tasks of a cluster when the
     /// plan is submitted to one. Written bytes are identical at every value:
@@ -2812,6 +2833,7 @@ impl Default for InferenceConfig {
             batch_tokens: 16384,
             batch_timeout_secs: 300,
             max_loaded_models: 0,
+            max_described_models: 1024,
             partitions: 1,
         }
     }
@@ -2842,6 +2864,15 @@ impl InferenceConfig {
             rows: non_zero("batch_size", self.batch_size)?,
             tokens: non_zero("batch_tokens", self.batch_tokens)?,
         })
+    }
+
+    /// How many idle entries the model cache keeps: `max_loaded_models` and
+    /// `max_described_models`, with 0 read as unbounded.
+    pub fn cache_bounds(&self) -> CacheBounds {
+        CacheBounds {
+            loaded_models: NonZeroUsize::new(self.max_loaded_models),
+            described_models: NonZeroUsize::new(self.max_described_models),
+        }
     }
 
     /// `partitions` as the non-zero fan-out a plan is built with. `0` is

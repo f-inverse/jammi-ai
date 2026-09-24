@@ -116,7 +116,7 @@ impl PyDatabase {
         // This process is the engine's host: size the process-wide CPU pool
         // from the same budget the session is about to take.
         jammi_ai::concurrency::init_cpu_pool(config.engine.execution_threads)?;
-        let session = runtime.block_on(InferenceSession::open(config))?;
+        let session = crate::released(&runtime, InferenceSession::open(config))?;
         // Spawn the embedded training worker on the shared runtime, if this
         // process is configured to run one. The spawn must happen inside the
         // runtime context; the worker holds a `Weak` to the session so it never
@@ -155,11 +155,11 @@ impl PyDatabase {
 
     /// Spawn the ephemeral timeout scanner on first use. The scanner runs on
     /// the shared runtime for the lifetime of the connection; the spawn must
-    /// happen inside the runtime context, so it is driven through `block_on`.
+    /// happen inside the runtime context, so it is driven on the runtime.
     fn ensure_ephemeral_scanner(&self) {
         self.ephemeral_scanner.call_once(|| {
             let session = Arc::clone(&self.session);
-            self.runtime.block_on(async {
+            crate::released(&self.runtime, async {
                 session.spawn_ephemeral_timeout_scanner(jammi_db::ephemeral::DEFAULT_SCAN_INTERVAL);
             });
         });
@@ -189,7 +189,7 @@ impl PyDatabase {
     /// Gracefully close this connection and RELEASE the catalog file.
     ///
     /// Two awaited steps, in this order, with the GIL released across both
-    /// (`py.detach`, so other Python threads keep running):
+    /// (as for every verb, [`crate::released`]):
     ///
     /// 1. **Stop the embedded training worker**, when this connection has one.
     ///    Signals it to stop and blocks until it actually has
@@ -316,35 +316,33 @@ impl PyDatabase {
     /// attempt-guarded CAS may still land `completed` — the one named
     /// divergence from the server, which exits the process.
     #[pyo3(signature = (release = false))]
-    fn close(&self, py: Python<'_>, release: bool) -> PyResult<()> {
+    fn close(&self, release: bool) -> PyResult<()> {
         if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        py.detach(|| {
-            self.runtime.block_on(async {
-                let stopped: Result<(), JammiError> = match (&self._worker, release) {
-                    (Some(worker), false) => worker.stop_and_join().await.map(|_| ()),
-                    (Some(worker), true) => worker.release_and_stop().await.map(|_| ()),
-                    // `worker.enabled = false`: there is no claim loop to
-                    // stop. A release still runs the session's own (no-op by
-                    // construction) sweep so the surface is uniform. The
-                    // session close below runs either way — the catalog
-                    // release is what a caller closes for, and it must not
-                    // depend on this connection having happened to own a
-                    // worker.
-                    (None, true) => self.session.release_job_leases().await.map(|_| ()),
-                    (None, false) => Ok(()),
-                };
-                // `InferenceSession::close` shuts the session's lease
-                // keeper down and joins its dedicated thread — closing
-                // its OWN catalog connection — before closing the shared
-                // pool. Closing only the shared pool without this step
-                // would leave the keeper's connection open, and for the
-                // SQLite backend that connection alone is enough to keep
-                // the `unix-excl` VFS's process-exclusive lock held.
-                self.session.close().await;
-                stopped
-            })
+        crate::released(&self.runtime, async {
+            let stopped: Result<(), JammiError> = match (&self._worker, release) {
+                (Some(worker), false) => worker.stop_and_join().await.map(|_| ()),
+                (Some(worker), true) => worker.release_and_stop().await.map(|_| ()),
+                // `worker.enabled = false`: there is no claim loop to
+                // stop. A release still runs the session's own (no-op by
+                // construction) sweep so the surface is uniform. The
+                // session close below runs either way — the catalog
+                // release is what a caller closes for, and it must not
+                // depend on this connection having happened to own a
+                // worker.
+                (None, true) => self.session.release_job_leases().await.map(|_| ()),
+                (None, false) => Ok(()),
+            };
+            // `InferenceSession::close` shuts the session's lease
+            // keeper down and joins its dedicated thread — closing
+            // its OWN catalog connection — before closing the shared
+            // pool. Closing only the shared pool without this step
+            // would leave the keeper's connection open, and for the
+            // SQLite backend that connection alone is enough to keep
+            // the `unix-excl` VFS's process-exclusive lock held.
+            self.session.close().await;
+            stopped
         })
         .map_err(to_pyerr)
     }
@@ -391,10 +389,8 @@ impl PyDatabase {
     /// two arms cannot drift on which rows are visible.
     fn list_jobs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let records = self
-            .runtime
-            .block_on(self.session.catalog().list_jobs())
-            .map_err(to_pyerr)?;
+        let records =
+            crate::released(&self.runtime, self.session.catalog().list_jobs()).map_err(to_pyerr)?;
         let list = PyList::empty(py);
         for record in &records {
             let entry = PyDict::new(py);
@@ -418,8 +414,7 @@ impl PyDatabase {
     /// job was already terminal or absent. Mirrors `JobService.CancelJob`.
     fn cancel_job(&self, job_id: &str) -> PyResult<bool> {
         self.check_open()?;
-        self.runtime
-            .block_on(self.session.catalog().cancel_request(job_id))
+        crate::released(&self.runtime, self.session.catalog().cancel_request(job_id))
             .map_err(to_pyerr)
     }
 
@@ -430,9 +425,7 @@ impl PyDatabase {
     /// Fleet/liveness metadata, not tenant-scoped (mirrors the wire rpc).
     fn list_workers(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let records = self
-            .runtime
-            .block_on(self.session.catalog().list_workers())
+        let records = crate::released(&self.runtime, self.session.catalog().list_workers())
             .map_err(to_pyerr)?;
         let list = PyList::empty(py);
         for w in &records {
@@ -457,8 +450,7 @@ impl PyDatabase {
     fn prune_jobs(&self) -> PyResult<usize> {
         self.check_open()?;
         let retention = self.session.inner_config().jobs.retention();
-        self.runtime
-            .block_on(self.session.catalog().prune_jobs(retention))
+        crate::released(&self.runtime, self.session.catalog().prune_jobs(retention))
             .map_err(to_pyerr)
     }
 
@@ -549,9 +541,7 @@ impl PyDatabase {
         self.check_open()?;
         self.ensure_ephemeral_scanner();
         let timeout = std::time::Duration::from_secs(timeout_seconds);
-        let session = self
-            .runtime
-            .block_on(self.session.ephemeral_session(timeout))
+        let session = crate::released(&self.runtime, self.session.ephemeral_session(timeout))
             .map_err(crate::ephemeral::ephemeral_err)?;
         Ok(crate::ephemeral::PyEphemeralSession::new(
             session,
@@ -568,9 +558,11 @@ impl PyDatabase {
         self.check_open()?;
         let file_format = parse_file_format(format)?;
         let connection = SourceConnection::parse(url, file_format).map_err(to_pyerr)?;
-        self.runtime
-            .block_on(self.session.add_source(name, SourceType::File, connection))
-            .map_err(to_pyerr)
+        crate::released(
+            &self.runtime,
+            self.session.add_source(name, SourceType::File, connection),
+        )
+        .map_err(to_pyerr)
     }
 
     /// List a descriptor for every source registered to the current tenant.
@@ -580,10 +572,11 @@ impl PyDatabase {
     /// introspection, not a SQL query.
     fn list_sources(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let descriptors = self
-            .runtime
-            .block_on(self.session.catalog().list_source_descriptors())
-            .map_err(to_pyerr)?;
+        let descriptors = crate::released(
+            &self.runtime,
+            self.session.catalog().list_source_descriptors(),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &descriptors)
     }
 
@@ -592,10 +585,11 @@ impl PyDatabase {
     /// `list_sources` yields per entry.
     fn describe_source(&self, py: Python<'_>, source_id: &str) -> PyResult<Option<Py<PyAny>>> {
         self.check_open()?;
-        let descriptor = self
-            .runtime
-            .block_on(self.session.catalog().describe_source(source_id))
-            .map_err(to_pyerr)?;
+        let descriptor = crate::released(
+            &self.runtime,
+            self.session.catalog().describe_source(source_id),
+        )
+        .map_err(to_pyerr)?;
         descriptor
             .map(|d| serializable_to_pydict(py, &d))
             .transpose()
@@ -625,10 +619,11 @@ impl PyDatabase {
     /// silently.
     fn list_index_segments(&self, py: Python<'_>, table_name: &str) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let segments = self
-            .runtime
-            .block_on(self.local_session().list_index_segments(table_name))
-            .map_err(to_pyerr)?;
+        let segments = crate::released(
+            &self.runtime,
+            self.local_session().list_index_segments(table_name),
+        )
+        .map_err(to_pyerr)?;
         let list = PyList::empty(py);
         for segment in &segments {
             let entry = PyDict::new(py);
@@ -650,10 +645,8 @@ impl PyDatabase {
     /// peer of `list_sources`. Registry introspection, not a SQL query.
     fn list_models(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let records = self
-            .runtime
-            .block_on(self.local_session().list_models())
-            .map_err(to_pyerr)?;
+        let records =
+            crate::released(&self.runtime, self.local_session().list_models()).map_err(to_pyerr)?;
         serializable_to_pydict(py, &records)
     }
 
@@ -662,9 +655,7 @@ impl PyDatabase {
     /// `list_models` yields per entry.
     fn describe_model(&self, py: Python<'_>, model_id: &str) -> PyResult<Option<Py<PyAny>>> {
         self.check_open()?;
-        let record = self
-            .runtime
-            .block_on(self.local_session().describe_model(model_id))
+        let record = crate::released(&self.runtime, self.local_session().describe_model(model_id))
             .map_err(to_pyerr)?;
         record.map(|r| serializable_to_pydict(py, &r)).transpose()
     }
@@ -676,12 +667,12 @@ impl PyDatabase {
     #[pyo3(signature = (model_id, *, version=None, if_exists=false))]
     fn delete_model(&self, model_id: &str, version: Option<i32>, if_exists: bool) -> PyResult<()> {
         self.check_open()?;
-        self.runtime
-            .block_on(
-                self.local_session()
-                    .delete_model(model_id, version, if_exists),
-            )
-            .map_err(to_pyerr)
+        crate::released(
+            &self.runtime,
+            self.local_session()
+                .delete_model(model_id, version, if_exists),
+        )
+        .map_err(to_pyerr)
     }
 
     /// The engine's capabilities handshake: a dict with `version`, `features`
@@ -707,10 +698,7 @@ impl PyDatabase {
     /// Execute a SQL query. Returns a `pyarrow.Table`.
     fn sql(&self, py: Python<'_>, query: &str) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let batches = self
-            .runtime
-            .block_on(self.session.sql(query))
-            .map_err(to_pyerr)?;
+        let batches = crate::released(&self.runtime, self.session.sql(query)).map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
     }
 
@@ -726,17 +714,18 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::generate_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let (record, _outcome) = self
-            .runtime
-            .block_on(self.local_session().generate_embeddings(
+        let (record, _outcome) = crate::released(
+            &self.runtime,
+            self.local_session().generate_embeddings(
                 &args.source_id,
                 &args.model_id,
                 &args.columns,
                 &args.key_column,
                 args.modality,
                 args.cache,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
@@ -753,17 +742,18 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::import_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let record = self
-            .runtime
-            .block_on(self.local_session().import_embeddings(
+        let record = crate::released(
+            &self.runtime,
+            self.local_session().import_embeddings(
                 &args.source_id,
                 &args.model_id,
                 &args.vectors_url,
                 &args.key_column,
                 &args.text_columns,
                 args.dimensions,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
@@ -778,17 +768,18 @@ impl PyDatabase {
         self.check_open()?;
         let args = jammi_ai::wire::infer_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let model_source = ModelSource::parse(&args.model);
-        let (batches, _outcome) = self
-            .runtime
-            .block_on(self.session.infer(
+        let (batches, _outcome) = crate::released(
+            &self.runtime,
+            self.session.infer(
                 &args.source_id,
                 &model_source,
                 args.task,
                 &args.columns,
                 &args.key_column,
                 args.cache,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
     }
 
@@ -797,10 +788,8 @@ impl PyDatabase {
         self.check_open()?;
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
-        let topics = self
-            .runtime
-            .block_on(topic_repo.list_topics(tenant))
-            .map_err(to_pyerr)?;
+        let topics =
+            crate::released(&self.runtime, topic_repo.list_topics(tenant)).map_err(to_pyerr)?;
         Ok(topics.into_iter().map(|t| t.name).collect())
     }
 
@@ -817,9 +806,7 @@ impl PyDatabase {
         self.check_open()?;
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
-        let topic_def = self
-            .runtime
-            .block_on(topic_repo.lookup_by_name(topic, tenant))
+        let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
             .map_err(to_pyerr)?
             .ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
@@ -839,10 +826,11 @@ impl PyDatabase {
                 .map_err(|e| to_pyerr(datafusion::error::DataFusionError::from(e)))?
         };
         let publisher = self.session.publisher();
-        let offset = self
-            .runtime
-            .block_on(publisher.publish_scoped(&topic_def, tenant, concatenated))
-            .map_err(to_pyerr)?;
+        let offset = crate::released(
+            &self.runtime,
+            publisher.publish_scoped(&topic_def, tenant, concatenated),
+        )
+        .map_err(to_pyerr)?;
         Ok(offset.value())
     }
 
@@ -866,9 +854,7 @@ impl PyDatabase {
         self.check_open()?;
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
-        let topic_def = self
-            .runtime
-            .block_on(topic_repo.lookup_by_name(topic, tenant))
+        let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
             .map_err(to_pyerr)?
             .ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!("topic '{topic}' not found"))
@@ -881,21 +867,19 @@ impl PyDatabase {
         .map_err(to_pyerr)?;
         let from = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
         let subscriber = self.session.subscriber();
-        let collected: Vec<RecordBatch> = self
-            .runtime
-            .block_on(async move {
-                let mut stream = subscriber.subscribe(&topic_def, predicate, from).await?;
-                let mut out: Vec<RecordBatch> = Vec::new();
-                while out.len() < max_batches {
-                    match StreamExt::next(&mut stream).await {
-                        Some(Ok(d)) => out.push(d.batch),
-                        Some(Err(e)) => return Err(e),
-                        None => break,
-                    }
+        let collected: Vec<RecordBatch> = crate::released(&self.runtime, async move {
+            let mut stream = subscriber.subscribe(&topic_def, predicate, from).await?;
+            let mut out: Vec<RecordBatch> = Vec::new();
+            while out.len() < max_batches {
+                match StreamExt::next(&mut stream).await {
+                    Some(Ok(d)) => out.push(d.batch),
+                    Some(Err(e)) => return Err(e),
+                    None => break,
                 }
-                Ok::<_, jammi_db::trigger::TriggerError>(out)
-            })
-            .map_err(to_pyerr)?;
+            }
+            Ok::<_, jammi_db::trigger::TriggerError>(out)
+        })
+        .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &collected)
     }
 
@@ -913,9 +897,11 @@ impl PyDatabase {
         self.check_open()?;
         let spec =
             jammi_ai::wire::register_channel_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        self.runtime
-            .block_on(self.session.catalog().channels().register(&spec))
-            .map_err(to_pyerr)
+        crate::released(
+            &self.runtime,
+            self.session.catalog().channels().register(&spec),
+        )
+        .map_err(to_pyerr)
     }
 
     /// Append columns to an already-registered channel from a serialized
@@ -932,14 +918,14 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::add_channel_columns_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        self.runtime
-            .block_on(
-                self.session
-                    .catalog()
-                    .channels()
-                    .add_columns(&args.id, &args.columns),
-            )
-            .map_err(to_pyerr)
+        crate::released(
+            &self.runtime,
+            self.session
+                .catalog()
+                .channels()
+                .add_columns(&args.id, &args.columns),
+        )
+        .map_err(to_pyerr)
     }
 
     /// List every evidence channel registered to the session's currently bound
@@ -951,9 +937,7 @@ impl PyDatabase {
     /// global (NULL-tenant) channels.
     fn list_channels(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let specs = self
-            .runtime
-            .block_on(self.session.catalog().channels().list())
+        let specs = crate::released(&self.runtime, self.session.catalog().channels().list())
             .map_err(to_pyerr)?;
         let out = PyList::empty(py);
         for spec in &specs {
@@ -989,10 +973,11 @@ impl PyDatabase {
     ) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let expected = expected_definition.map(jammi_db::store::manifest::DefinitionHash);
-        let verdict = self
-            .runtime
-            .block_on(self.local_session().verify_materialization(table, expected))
-            .map_err(to_pyerr)?;
+        let verdict = crate::released(
+            &self.runtime,
+            self.local_session().verify_materialization(table, expected),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &verdict)
     }
 
@@ -1011,10 +996,11 @@ impl PyDatabase {
     ) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let current = jammi_db::store::manifest::DefinitionHash(current_definition);
-        let verdict = self
-            .runtime
-            .block_on(self.local_session().staleness(table, current))
-            .map_err(to_pyerr)?;
+        let verdict = crate::released(
+            &self.runtime,
+            self.local_session().staleness(table, current),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &verdict)
     }
 
@@ -1024,9 +1010,7 @@ impl PyDatabase {
     /// transitively.
     fn derives_from(&self, py: Python<'_>, table: &str) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let edges = self
-            .runtime
-            .block_on(self.local_session().derives_from(table))
+        let edges = crate::released(&self.runtime, self.local_session().derives_from(table))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &edges)
     }
@@ -1077,9 +1061,9 @@ impl PyDatabase {
         };
         let store = self.session.result_store();
         let report = if all {
-            self.runtime.block_on(store.reconcile_all(opts))
+            crate::released(&self.runtime, store.reconcile_all(opts))
         } else {
-            self.runtime.block_on(store.reconcile(opts))
+            crate::released(&self.runtime, store.reconcile(opts))
         }
         .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
@@ -1099,9 +1083,7 @@ impl PyDatabase {
         let def =
             jammi_ai::wire::create_mutable_table_from_bytes(proto_bytes, self.session.tenant())
                 .map_err(status_to_pyerr)?;
-        let id = self
-            .runtime
-            .block_on(self.session.create_mutable_table(def))
+        let id = crate::released(&self.runtime, self.session.create_mutable_table(def))
             .map_err(to_pyerr)?;
         Ok(id.to_string())
     }
@@ -1113,7 +1095,7 @@ impl PyDatabase {
     fn drop_mutable_table(&self, name: String, if_exists: bool) -> PyResult<()> {
         self.check_open()?;
         let id = MutableTableId::new(&name).map_err(to_pyerr)?;
-        match self.runtime.block_on(self.session.drop_mutable_table(&id)) {
+        match crate::released(&self.runtime, self.session.drop_mutable_table(&id)) {
             Ok(()) => Ok(()),
             Err(JammiError::MutableTable(MutableTableError::NotFound(_))) if if_exists => Ok(()),
             Err(e) => Err(to_pyerr(e)),
@@ -1128,10 +1110,8 @@ impl PyDatabase {
     /// the table declares none), and `chunk_size` (int).
     fn list_mutable_tables(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let defs = self
-            .runtime
-            .block_on(self.session.list_mutable_tables())
-            .map_err(to_pyerr)?;
+        let defs =
+            crate::released(&self.runtime, self.session.list_mutable_tables()).map_err(to_pyerr)?;
         let out = PyList::empty(py);
         for def in &defs {
             let entry = PyDict::new(py);
@@ -1175,12 +1155,16 @@ impl PyDatabase {
         // Dual-register the broker driver and the catalog (so a later `publish`
         // resolves the topic) — the same invariant the control-plane handler's
         // `Session::register_topic` holds.
-        self.runtime
-            .block_on(self.session.trigger_broker().register_topic(&topic))
-            .map_err(to_pyerr)?;
-        self.runtime
-            .block_on(self.session.topic_repo().register_topic(&topic))
-            .map_err(to_pyerr)?;
+        crate::released(
+            &self.runtime,
+            self.session.trigger_broker().register_topic(&topic),
+        )
+        .map_err(to_pyerr)?;
+        crate::released(
+            &self.runtime,
+            self.session.topic_repo().register_topic(&topic),
+        )
+        .map_err(to_pyerr)?;
         Ok(topic.id.to_string())
     }
 
@@ -1194,19 +1178,16 @@ impl PyDatabase {
         self.check_open()?;
         let tenant = self.session.tenant();
         let topic_repo = self.session.topic_repo();
-        let topic_opt = self
-            .runtime
-            .block_on(topic_repo.lookup_by_name(&name, tenant))
+        let topic_opt = crate::released(&self.runtime, topic_repo.lookup_by_name(&name, tenant))
             .map_err(to_pyerr)?;
         match topic_opt {
             Some(t) => {
-                self.runtime
-                    .block_on(topic_repo.drop_topic(t.id, tenant))
+                crate::released(&self.runtime, topic_repo.drop_topic(t.id, tenant))
                     .map_err(to_pyerr)?;
-                if let Err(e) = self
-                    .runtime
-                    .block_on(self.session.trigger_broker().drop_topic(t.id))
-                {
+                if let Err(e) = crate::released(
+                    &self.runtime,
+                    self.session.trigger_broker().drop_topic(t.id),
+                ) {
                     tracing::warn!(
                         topic_id = %t.id,
                         error = %e,
@@ -1232,9 +1213,7 @@ impl PyDatabase {
     fn _search_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let request = jammi_ai::wire::search_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let batches = self
-            .runtime
-            .block_on(self.local_session().search(request))
+        let batches = crate::released(&self.runtime, self.local_session().search(request))
             .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &batches)
     }
@@ -1269,10 +1248,11 @@ impl PyDatabase {
             jammi_ai::wire::training_spec_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let kind = spec.kind().to_string();
         let key = idempotency_key.filter(|k| !k.is_empty());
-        let job = self
-            .runtime
-            .block_on(self.session.run_training_spec_deduped(spec, key))
-            .map_err(to_pyerr)?;
+        let job = crate::released(
+            &self.runtime,
+            self.session.run_training_spec_deduped(spec, key),
+        )
+        .map_err(to_pyerr)?;
         Ok(PyJob::new(
             job,
             kind,
@@ -1352,20 +1332,18 @@ impl PyDatabase {
             split,
         };
 
-        let served = self
-            .runtime
-            .block_on(
-                self.session
-                    .load_context_predictor(model_id, source, options),
-            )
-            .map_err(to_pyerr)?;
-        let prediction = self
-            .runtime
-            .block_on(
-                self.session
-                    .predict_with_context_predictor_provenanced(&served, target_key),
-            )
-            .map_err(to_pyerr)?;
+        let served = crate::released(
+            &self.runtime,
+            self.session
+                .load_context_predictor(model_id, source, options),
+        )
+        .map_err(to_pyerr)?;
+        let prediction = crate::released(
+            &self.runtime,
+            self.session
+                .predict_with_context_predictor_provenanced(&served, target_key),
+        )
+        .map_err(to_pyerr)?;
 
         let out = PyDict::new(py);
         match prediction.distribution {
@@ -1398,16 +1376,17 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::eval_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(self.session.eval_embeddings(
+        let report = crate::released(
+            &self.runtime,
+            self.session.eval_embeddings(
                 &args.source_id,
                 args.embedding_table.as_deref(),
                 &args.golden_source,
                 args.k,
                 &args.cohorts,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
@@ -1425,9 +1404,7 @@ impl PyDatabase {
         self.check_open()?;
         let eval_run_id =
             jammi_ai::wire::eval_per_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let records = self
-            .runtime
-            .block_on(self.session.eval_per_query(&eval_run_id))
+        let records = crate::released(&self.runtime, self.session.eval_per_query(&eval_run_id))
             .map_err(to_pyerr)?;
 
         let out = pyo3::types::PyList::empty(py);
@@ -1460,17 +1437,18 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::eval_inference_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(self.session.eval_inference(
+        let report = crate::released(
+            &self.runtime,
+            self.session.eval_inference(
                 &args.model_id,
                 &args.source_id,
                 &args.columns,
                 args.task,
                 &args.golden_source,
                 &args.label_column,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
@@ -1486,15 +1464,16 @@ impl PyDatabase {
     fn _eval_compare_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let args = jammi_ai::wire::eval_compare_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(self.session.eval_compare(
+        let report = crate::released(
+            &self.runtime,
+            self.session.eval_compare(
                 &args.embedding_tables,
                 &args.source_id,
                 &args.golden_source,
                 args.k,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
@@ -1512,15 +1491,16 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::eval_calibration_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(self.session.eval_calibration(
+        let report = crate::released(
+            &self.runtime,
+            self.session.eval_calibration(
                 &args.source_id,
                 &args.golden_source,
                 args.shape,
                 &args.cohorts,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
@@ -1534,25 +1514,25 @@ impl PyDatabase {
     fn _encode_query_proto(&self, proto_bytes: &[u8]) -> PyResult<Vec<f32>> {
         self.check_open()?;
         let args = jammi_ai::wire::encode_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        self.runtime
-            .block_on(
-                self.local_session()
-                    .encode_query(&args.model_id, args.input, args.modality),
-            )
-            .map_err(to_pyerr)
+        crate::released(
+            &self.runtime,
+            self.local_session()
+                .encode_query(&args.model_id, args.input, args.modality),
+        )
+        .map_err(to_pyerr)
     }
 
     /// Preload a model into the cache without running inference.
     fn preload_model(&self, model_id: &str) -> PyResult<()> {
         self.check_open()?;
         let source = ModelSource::parse(model_id);
-        self.runtime
-            .block_on(
-                self.session
-                    .model_cache()
-                    .get_or_load(&source, ModelTask::TextEmbedding),
-            )
-            .map_err(to_pyerr)?;
+        crate::released(
+            &self.runtime,
+            self.session
+                .model_cache()
+                .get_or_load(&source, ModelTask::TextEmbedding),
+        )
+        .map_err(to_pyerr)?;
         Ok(())
     }
 
@@ -1568,15 +1548,16 @@ impl PyDatabase {
         self.check_open()?;
         let args = jammi_ai::wire::build_neighbor_graph_from_bytes(proto_bytes)
             .map_err(status_to_pyerr)?;
-        let (record, _outcome) = self
-            .runtime
-            .block_on(self.session.build_neighbor_graph(
+        let (record, _outcome) = crate::released(
+            &self.runtime,
+            self.session.build_neighbor_graph(
                 &args.source_id,
                 args.embedding_table.as_deref(),
                 &args.params,
                 args.cache,
-            ))
-            .map_err(to_pyerr)?;
+            ),
+        )
+        .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
@@ -1593,10 +1574,11 @@ impl PyDatabase {
         self.check_open()?;
         let (request, cache) =
             jammi_ai::wire::propagate_request_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let (record, _outcome) = self
-            .runtime
-            .block_on(self.session.propagate_embeddings(&request, cache))
-            .map_err(to_pyerr)?;
+        let (record, _outcome) = crate::released(
+            &self.runtime,
+            self.session.propagate_embeddings(&request, cache),
+        )
+        .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
@@ -1610,10 +1592,11 @@ impl PyDatabase {
         self.check_open()?;
         let (request, cache) =
             jammi_ai::wire::structure_request_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let (record, _outcome) = self
-            .runtime
-            .block_on(self.session.generate_structure_embeddings(&request, cache))
-            .map_err(to_pyerr)?;
+        let (record, _outcome) = crate::released(
+            &self.runtime,
+            self.session.generate_structure_embeddings(&request, cache),
+        )
+        .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
@@ -1628,10 +1611,11 @@ impl PyDatabase {
     fn _asof_join_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
         self.check_open()?;
         let args = jammi_ai::wire::asof_join_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let record = self
-            .runtime
-            .block_on(self.session.asof_join(&args.spine, &args.facts, &args.spec))
-            .map_err(to_pyerr)?;
+        let record = crate::released(
+            &self.runtime,
+            self.session.asof_join(&args.spine, &args.facts, &args.spec),
+        )
+        .map_err(to_pyerr)?;
         Ok(record.table_name)
     }
 
@@ -1650,10 +1634,11 @@ impl PyDatabase {
     fn _recompute_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         let args = jammi_ai::wire::recompute_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(self.local_session().recompute(&args.table, args.cascade))
-            .map_err(to_pyerr)?;
+        let report = crate::released(
+            &self.runtime,
+            self.local_session().recompute(&args.table, args.cascade),
+        )
+        .map_err(to_pyerr)?;
         let bytes = jammi_ai::wire::recompute_report_to_bytes(report);
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
@@ -1667,13 +1652,12 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::refresh_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(
-                self.local_session()
-                    .refresh_embeddings(&args.table, args.options),
-            )
-            .map_err(to_pyerr)?;
+        let report = crate::released(
+            &self.runtime,
+            self.local_session()
+                .refresh_embeddings(&args.table, args.options),
+        )
+        .map_err(to_pyerr)?;
         let bytes = jammi_ai::wire::refresh_report_to_bytes(&report);
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
@@ -1684,10 +1668,11 @@ impl PyDatabase {
         self.check_open()?;
         let table =
             jammi_ai::wire::compact_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(self.local_session().compact_embeddings(&table))
-            .map_err(to_pyerr)?;
+        let report = crate::released(
+            &self.runtime,
+            self.local_session().compact_embeddings(&table),
+        )
+        .map_err(to_pyerr)?;
         let bytes = jammi_ai::wire::refresh_report_to_bytes(&report);
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
@@ -1698,13 +1683,12 @@ impl PyDatabase {
         self.check_open()?;
         let args =
             jammi_ai::wire::expire_versions_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = self
-            .runtime
-            .block_on(
-                self.local_session()
-                    .expire_versions(&args.table, args.before),
-            )
-            .map_err(to_pyerr)?;
+        let report = crate::released(
+            &self.runtime,
+            self.local_session()
+                .expire_versions(&args.table, args.before),
+        )
+        .map_err(to_pyerr)?;
         let bytes = jammi_ai::wire::expiry_report_to_bytes(&report);
         Ok(pyo3::types::PyBytes::new(py, &bytes).into())
     }
@@ -1868,9 +1852,7 @@ impl PyDatabase {
         self.check_open()?;
         let request = jammi_ai::wire::assemble_context_request_from_bytes(proto_bytes)
             .map_err(status_to_pyerr)?;
-        let context = self
-            .runtime
-            .block_on(self.session.assemble_context(&request))
+        let context = crate::released(&self.runtime, self.session.assemble_context(&request))
             .map_err(to_pyerr)?;
 
         let out = PyDict::new(py);

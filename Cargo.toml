@@ -166,7 +166,6 @@ half = "2.5"
 # tests quote specific measured tolerances/residuals) without any commit
 # in this repository visibly changing them.
 libm = "0.2"
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["download-binaries"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 usearch = "2.25"
 # Pure-Rust Lucene-class full-text / BM25 engine backing the lexical-retrieval

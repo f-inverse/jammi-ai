@@ -57,6 +57,7 @@ mod recompute;
 mod refresh;
 mod regression_surface;
 mod release_manifest;
+mod remote_model;
 mod scheduling;
 mod search;
 mod search_attribution;

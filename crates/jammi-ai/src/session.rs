@@ -354,7 +354,8 @@ impl InferenceSession {
         )?;
         let model_cache = Arc::new(
             ModelCache::with_device_schedulers(resolver, device_config.clone(), schedulers)
-                .bounded(inner.config().inference.cache_bounds()),
+                .bounded(inner.config().inference.cache_bounds())
+                .with_remote_models(&inner.config().models.remote)?,
         );
         // What a sink this process runs records as having produced its
         // bytes — its device and the models the plan ran — wherever the
@@ -1146,6 +1147,7 @@ impl InferenceSession {
         let output = guard
             .model
             .forward(&[text_array], ModelTask::TextEmbedding)
+            .await
             .map_err(|e| JammiError::Inference(format!("encode_query forward: {e}")))?;
 
         // A single-row query has no other row to fall back on, so an empty or
@@ -1329,6 +1331,7 @@ impl InferenceSession {
         let output = guard
             .model
             .forward(&[binary_array], ModelTask::ImageEmbedding)
+            .await
             .map_err(|e| JammiError::Inference(format!("encode_image_query forward: {e}")))?;
 
         // A single-row query has no other row to fall back on, so a corrupt
@@ -1385,6 +1388,7 @@ impl InferenceSession {
         let output = guard
             .model
             .forward(&[binary_array], ModelTask::AudioEmbedding)
+            .await
             .map_err(|e| JammiError::Inference(format!("encode_audio_query forward: {e}")))?;
 
         // A single-row query has no other row to fall back on, so a corrupt
@@ -1446,7 +1450,7 @@ impl InferenceSession {
             loaded.zero_distribution_head_for_test();
         }
         let col: arrow::array::ArrayRef = Arc::new(StringArray::from(texts.to_vec()));
-        let output = loaded.forward(&[col], ModelTask::Regression)?;
+        let output = loaded.forward(&[col], ModelTask::Regression).await?;
         extract_test_column(&output, col_idx)
     }
 

@@ -111,9 +111,8 @@ impl PyJob {
         runtime: Arc<tokio::runtime::Runtime>,
         session: Arc<InferenceSession>,
     ) -> PyResult<Self> {
-        let record = runtime
-            .block_on(session.catalog().get_job(&job_id))
-            .map_err(to_pyerr)?;
+        let record =
+            crate::released(&runtime, session.catalog().get_job(&job_id)).map_err(to_pyerr)?;
         let kind = record.kind.clone();
         let output_model_id = if is_training_kind(&kind) {
             resolve_attach_model_id(&job_id, &record)?
@@ -175,12 +174,10 @@ impl PyJob {
     fn status(&self) -> PyResult<String> {
         match &self.inner {
             JobState::Submitted { job, .. } => {
-                self.runtime.block_on(job.status()).map_err(to_pyerr)
+                crate::released(&self.runtime, job.status()).map_err(to_pyerr)
             }
             JobState::Attached { job_id, .. } => {
-                let record = self
-                    .runtime
-                    .block_on(self.session.catalog().get_job(job_id))
+                let record = crate::released(&self.runtime, self.session.catalog().get_job(job_id))
                     .map_err(to_pyerr)?;
                 Ok(record.status)
             }
@@ -194,10 +191,11 @@ impl PyJob {
     /// string until the producer names one. Mirrors the wire's `JobProgress`
     /// field-for-field, so a caller reads the same shape on both transports.
     fn progress(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let record = self
-            .runtime
-            .block_on(self.session.catalog().get_job(self.job_id_str()))
-            .map_err(to_pyerr)?;
+        let record = crate::released(
+            &self.runtime,
+            self.session.catalog().get_job(self.job_id_str()),
+        )
+        .map_err(to_pyerr)?;
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("rows_done", record.progress_rows_done)?;
         dict.set_item("rows_total", record.progress_rows_total)?;
@@ -211,9 +209,11 @@ impl PyJob {
     /// `jammi.errors.TrainingError` message, and [`Self::wait`] surfaces it.
     /// `False` when the job is already terminal or absent.
     fn cancel(&self) -> PyResult<bool> {
-        self.runtime
-            .block_on(self.session.catalog().cancel_request(self.job_id_str()))
-            .map_err(to_pyerr)
+        crate::released(
+            &self.runtime,
+            self.session.catalog().cancel_request(self.job_id_str()),
+        )
+        .map_err(to_pyerr)
     }
 
     /// Block until the job reaches a terminal state, returning the tagged
@@ -242,9 +242,7 @@ impl PyJob {
     /// and terminal classification exactly.
     fn wait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let job_id = self.job_id_str().to_string();
-        let result = self
-            .runtime
-            .block_on(wait_for_result(&self.session, &job_id))
+        let result = crate::released(&self.runtime, wait_for_result(&self.session, &job_id))
             .map_err(to_pyerr)?;
         serializable_to_pydict(py, &result)
     }
@@ -270,10 +268,11 @@ impl PyJob {
     /// arrays, so this dict carries them exactly like every other recorded
     /// metric.
     fn metrics(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let record = self
-            .runtime
-            .block_on(self.session.catalog().get_job(self.job_id_str()))
-            .map_err(to_pyerr)?;
+        let record = crate::released(
+            &self.runtime,
+            self.session.catalog().get_job(self.job_id_str()),
+        )
+        .map_err(to_pyerr)?;
         // The generalised `jobs` schema (migration 029) has no dedicated
         // `metrics` column — the raw metrics JSON is nested inside the tagged
         // `result` payload (`jammi_ai::jobs::JobResult::Model.metrics`).
@@ -332,10 +331,11 @@ impl PyJob {
     /// to parse as JSON — a catalog data-integrity fault, matching
     /// `metrics()`'s same-shaped guard.
     fn acceleration_report(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let record = self
-            .runtime
-            .block_on(self.session.catalog().get_job(self.job_id_str()))
-            .map_err(to_pyerr)?;
+        let record = crate::released(
+            &self.runtime,
+            self.session.catalog().get_job(self.job_id_str()),
+        )
+        .map_err(to_pyerr)?;
         match record.acceleration_report.as_deref() {
             // NULL — honest absence, never coerced into a state claim.
             None => Ok(py.None()),

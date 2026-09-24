@@ -297,6 +297,7 @@ impl ModelIdentity {
                         && a.content_digest == b.content_digest
                         && a.quantization == b.quantization
                 }
+                (ModelRun::Remote(a), ModelRun::Remote(b)) => a == b,
                 (ModelRun::ExternalImport, ModelRun::ExternalImport) => true,
                 _ => false,
             }
@@ -376,6 +377,8 @@ pub struct ModelIdentity {
 pub enum ModelRun {
     /// A backend of this engine ran the model over local weights.
     Local(LocalRun),
+    /// A remote endpoint the deployment declares ran the model.
+    Remote(RemoteRun),
     /// The outputs were computed elsewhere and imported; no model ran here.
     ExternalImport,
 }
@@ -384,7 +387,7 @@ pub enum ModelRun {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalRun {
     /// The backend that ran the model.
-    pub backend: ModelBackendKind,
+    pub backend: LocalBackend,
     /// The compute precision the model ran at (the resolved per-model
     /// `config.json` override, or the global `GpuConfig::compute_precision`
     /// default). An `F16` run is output-affecting relative to an `F32` run
@@ -399,6 +402,41 @@ pub struct LocalRun {
     /// form when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quantization: Option<jammi_numerics::WeightQuantization>,
+}
+
+/// A backend of this engine that runs a model over local weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalBackend {
+    /// Candle: safetensors or GGUF weights, run natively.
+    Candle,
+}
+
+impl From<LocalBackend> for ModelBackendKind {
+    fn from(backend: LocalBackend) -> Self {
+        match backend {
+            LocalBackend::Candle => Self::Candle,
+        }
+    }
+}
+
+/// A run of a model at a remote endpoint: its declaration, less the
+/// credentials. The endpoint exposes no digest of its weights, so the
+/// operator's `revision` pin is what separates two models served under one
+/// name; a model changed behind an unchanged declaration is not detected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteRun {
+    /// The protocol the endpoint speaks.
+    pub protocol: crate::config::RemoteProtocol,
+    /// The URL requests were sent to.
+    pub url: String,
+    /// The model name the endpoint was asked for.
+    pub model: String,
+    /// The width of every returned vector, widened to `u64` so the recorded
+    /// value does not depend on the compiling target.
+    pub dimensions: u64,
+    /// The operator's pin of what the name serves.
+    pub revision: String,
 }
 
 /// SHA-256 (hex) over a model's config, `1_Pooling/config.json`, tokenizer
@@ -1899,7 +1937,7 @@ mod tests {
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
                 run: ModelRun::Local(LocalRun {
-                    backend: ModelBackendKind::Candle,
+                    backend: LocalBackend::Candle,
                     compute_precision: ComputePrecision::F32,
                     content_digest: ContentDigest("cpu-fixture-digest".into()),
                     quantization: None,
@@ -1929,7 +1967,7 @@ mod tests {
         let identity = ModelIdentity {
             model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
             run: ModelRun::Local(LocalRun {
-                backend: ModelBackendKind::Candle,
+                backend: LocalBackend::Candle,
                 compute_precision: ComputePrecision::F32,
                 content_digest: ContentDigest("cpu-fixture-digest".into()),
                 quantization: None,
@@ -2121,7 +2159,7 @@ mod tests {
                 vec![ModelIdentity {
                     model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
                     run: ModelRun::Local(LocalRun {
-                        backend: ModelBackendKind::Candle,
+                        backend: LocalBackend::Candle,
                         compute_precision: ComputePrecision::F32,
                         content_digest: ContentDigest("cpu-fixture-digest".into()),
                         quantization: None,
@@ -2154,7 +2192,7 @@ mod tests {
             vec![ModelIdentity {
                 model_id: "sentence-transformers/all-MiniLM-L12-v2".into(),
                 run: ModelRun::Local(LocalRun {
-                    backend: ModelBackendKind::Candle,
+                    backend: LocalBackend::Candle,
                     compute_precision: ComputePrecision::F32,
                     content_digest: ContentDigest("cpu-fixture-digest".into()),
                     quantization: None,
@@ -2186,7 +2224,7 @@ mod tests {
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
                 run: ModelRun::Local(LocalRun {
-                    backend: ModelBackendKind::Candle,
+                    backend: LocalBackend::Candle,
                     compute_precision: ComputePrecision::F32,
                     content_digest: ContentDigest("cpu-fixture-digest".into()),
                     quantization: None,
@@ -2198,7 +2236,7 @@ mod tests {
             vec![ModelIdentity {
                 model_id: "distilbert-base-uncased-finetuned-sst-2-english".into(),
                 run: ModelRun::Local(LocalRun {
-                    backend: ModelBackendKind::Candle,
+                    backend: LocalBackend::Candle,
                     compute_precision: ComputePrecision::F16,
                     content_digest: ContentDigest("cpu-fixture-digest".into()),
                     quantization: None,
@@ -2276,7 +2314,7 @@ mod tests {
     #[derive(Clone)]
     struct ModelIdentityFields {
         model_id: String,
-        backend: ModelBackendKind,
+        backend: LocalBackend,
         compute_precision: ComputePrecision,
         content_digest: ContentDigest,
         quantization: Option<jammi_numerics::WeightQuantization>,
@@ -2312,7 +2350,9 @@ mod tests {
     fn local_run(identity: &mut ModelIdentity) -> &mut LocalRun {
         match &mut identity.run {
             ModelRun::Local(run) => run,
-            ModelRun::ExternalImport => panic!("the fixture identity is a local run"),
+            ModelRun::Remote(_) | ModelRun::ExternalImport => {
+                panic!("the fixture identity is a local run")
+            }
         }
     }
 
@@ -2324,7 +2364,7 @@ mod tests {
     fn model_identity_each_field_moves_the_hash() {
         let base = ModelIdentityFields {
             model_id: "sentence-transformers/all-MiniLM-L6-v2".into(),
-            backend: ModelBackendKind::Candle,
+            backend: LocalBackend::Candle,
             compute_precision: ComputePrecision::F32,
             content_digest: ContentDigest("base-digest".into()),
             quantization: None,
@@ -2357,6 +2397,68 @@ mod tests {
             assert_ne!(
                 base_hash, changed_hash,
                 "changing ModelIdentity `{label}` must change the definition hash"
+            );
+        }
+    }
+
+    /// Every field of a remote run's declaration is a determinant: the same
+    /// exhaustive-by-type construction as [`ModelIdentityFields`], a mutation
+    /// per field, and the remote run differs from a local run under one id.
+    #[test]
+    fn remote_run_each_field_moves_the_hash() {
+        fn identity_of(run: &RemoteRun) -> ModelIdentity {
+            let RemoteRun {
+                protocol,
+                url,
+                model,
+                dimensions,
+                revision,
+            } = run.clone();
+            ModelIdentity {
+                model_id: "remote:hosted-encoder".into(),
+                run: ModelRun::Remote(RemoteRun {
+                    protocol,
+                    url,
+                    model,
+                    dimensions,
+                    revision,
+                }),
+            }
+        }
+        let base = RemoteRun {
+            protocol: crate::config::RemoteProtocol::OpenaiEmbeddings,
+            url: "https://embeddings.example/v1/embeddings".into(),
+            model: "encoder-small".into(),
+            dimensions: 384,
+            revision: "2026-01".into(),
+        };
+        let d = embedding_descriptor();
+        let base_hash = definition_hash(&d, &env_with_model(identity_of(&base))).unwrap();
+        let local_hash = definition_hash(
+            &d,
+            &env_with_model(ModelIdentity {
+                model_id: "remote:hosted-encoder".into(),
+                ..cpu_env().models[0].clone()
+            }),
+        )
+        .unwrap();
+        assert_ne!(base_hash, local_hash, "a remote run is not a local run");
+
+        let cases: &[LabelledMutation<RemoteRun>] = &[
+            ("url", |r| {
+                r.url = "https://other.example/v1/embeddings".into()
+            }),
+            ("model", |r| r.model = "encoder-large".into()),
+            ("dimensions", |r| r.dimensions = 768),
+            ("revision", |r| r.revision = "2026-02".into()),
+        ];
+        for (label, mutate) in cases {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                base_hash,
+                definition_hash(&d, &env_with_model(identity_of(&changed))).unwrap(),
+                "changing RemoteRun `{label}` must change the definition hash"
             );
         }
     }
@@ -3257,7 +3359,7 @@ mod tests {
         ModelIdentity {
             model_id: "bert-base-uncased".into(),
             run: ModelRun::Local(LocalRun {
-                backend: ModelBackendKind::Candle,
+                backend: LocalBackend::Candle,
                 compute_precision: ComputePrecision::F32,
                 content_digest: ContentDigest("fine-tune-fixture-digest".into()),
                 quantization: None,

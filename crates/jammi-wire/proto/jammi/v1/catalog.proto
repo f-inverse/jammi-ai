@@ -374,7 +374,8 @@ message DeleteModelRequest {
 message Model {
   // Unique model name (e.g. an HF repo id or a fine-tuned id).
   string model_id = 1;
-  // Inference backend (e.g. "candle", "vllm", "http").
+  // The backend that runs the model: "candle", or "remote" for a model a
+  // declared endpoint serves.
   string backend = 2;
   // The task this model performs.
   jammi.v1.inference.ModelTask task = 3;

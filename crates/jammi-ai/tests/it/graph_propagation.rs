@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Float64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -279,39 +279,6 @@ async fn registered_request(session: &Arc<InferenceSession>) -> PropagateRequest
     .with_direction(EdgeDirection::Undirected)
 }
 
-/// Read a materialised embedding table's `(_row_id, vector)` rows back into a map.
-async fn read_table_vectors(
-    session: &Arc<InferenceSession>,
-    table: &ResultTableRecord,
-) -> HashMap<String, Vec<f32>> {
-    let batches = session
-        .sql(&format!(
-            "SELECT _row_id, vector FROM \"jammi.{}\"",
-            table.table_name
-        ))
-        .await
-        .unwrap();
-    let mut out = HashMap::new();
-    for batch in &batches {
-        let ids = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
-        let ids = ids.as_any().downcast_ref::<StringArray>().unwrap();
-        let list = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            let cell = list.value(i);
-            let floats = cell.as_any().downcast_ref::<Float32Array>().unwrap();
-            out.insert(
-                ids.value(i).to_string(),
-                (0..floats.len()).map(|j| floats.value(j)).collect(),
-            );
-        }
-    }
-    out
-}
-
 /// Two equal-size classes, fully wired within class (homophilous) — a clean
 /// signal-sharing graph the propagated mean should denoise.
 fn two_class_homophilous(per_class: usize) -> (Vec<Node>, Vec<Edge>) {
@@ -510,7 +477,7 @@ async fn declared_self_edge_does_not_inflate_augmented_degree() {
         .await
         .unwrap()
         .0;
-    let plain_out = read_table_vectors(&plain_session, &plain_table).await;
+    let plain_out = common::read_table_vectors(&plain_session, &plain_table).await;
 
     let (self_session, _d2) = graph_session(
         &nodes,
@@ -527,7 +494,7 @@ async fn declared_self_edge_does_not_inflate_augmented_degree() {
         .await
         .unwrap()
         .0;
-    let self_out = read_table_vectors(&self_session, &self_table).await;
+    let self_out = common::read_table_vectors(&self_session, &self_table).await;
 
     let plain_a = &plain_out["a"];
     let self_a = &self_out["a"];
@@ -570,7 +537,7 @@ async fn isolated_node_propagates_to_its_own_x0() {
         .await
         .unwrap()
         .0;
-    let out = read_table_vectors(&session, &table).await;
+    let out = common::read_table_vectors(&session, &table).await;
 
     let got = out
         .get("lonely")
@@ -604,7 +571,7 @@ async fn homophily_propagation_beats_raw() {
         .await
         .unwrap()
         .0;
-    let propagated = read_table_vectors(&session, &table).await;
+    let propagated = common::read_table_vectors(&session, &table).await;
 
     // Structure respect both ways: the nearest-neighbour class-agreement rate
     // does not drop, and the class separation strictly improves (denoising).
@@ -663,7 +630,7 @@ async fn heterophily_propagation_is_worse_than_raw() {
         .await
         .unwrap()
         .0;
-    let propagated = read_table_vectors(&session, &table).await;
+    let propagated = common::read_table_vectors(&session, &table).await;
 
     // Cross-class averaging collapses the class separation: propagated
     // separation must be SIGNIFICANTLY below raw (a seeded directional margin) —
@@ -733,8 +700,8 @@ async fn alpha_restart_controls_oversmoothing() {
         .unwrap()
         .0;
 
-    let uniform_vecs = read_table_vectors(&session, &uniform_deep).await;
-    let appnp_vecs = read_table_vectors(&session, &appnp_deep).await;
+    let uniform_vecs = common::read_table_vectors(&session, &uniform_deep).await;
+    let appnp_vecs = common::read_table_vectors(&session, &appnp_deep).await;
 
     let uniform_erank = effective_rank(&uniform_vecs);
     let appnp_erank = effective_rank(&appnp_vecs);
@@ -747,7 +714,7 @@ async fn alpha_restart_controls_oversmoothing() {
     );
 
     // Geometric convergence: ‖X⁽ᵏ⁾ − X⁽ᵏ⁻¹⁾‖ shrinks as uniform mean deepens.
-    let one_hop = read_table_vectors(
+    let one_hop = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -763,7 +730,7 @@ async fn alpha_restart_controls_oversmoothing() {
             .0,
     )
     .await;
-    let two_hop = read_table_vectors(
+    let two_hop = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -819,7 +786,7 @@ async fn deterministic_across_target_partitions() {
         .await
         .unwrap()
         .0;
-    let out1 = read_table_vectors(&session1, &table1).await;
+    let out1 = common::read_table_vectors(&session1, &table1).await;
 
     let (session4, _d4) = graph_session_with_partitions(&nodes, &edges, None, 4).await;
     let req4 = registered_request(&session4).await;
@@ -828,7 +795,7 @@ async fn deterministic_across_target_partitions() {
         .await
         .unwrap()
         .0;
-    let out4 = read_table_vectors(&session4, &table4).await;
+    let out4 = common::read_table_vectors(&session4, &table4).await;
 
     assert_eq!(out1.len(), out4.len());
     for (key, v1) in &out1 {
@@ -879,7 +846,7 @@ async fn edge_similarity_clamps_negative_and_falls_back_on_zero_weight() {
         .await
         .unwrap()
         .0;
-    let out = read_table_vectors(&session, &table).await;
+    let out = common::read_table_vectors(&session, &table).await;
 
     // Expected: a = (1·X_a + 2·X_b) / 3 — c excluded by the clamp.
     let xa = node_vector("a", 0);
@@ -922,7 +889,7 @@ async fn edge_similarity_isolated_node_falls_back_to_x0() {
         .await
         .unwrap()
         .0;
-    let out = read_table_vectors(&session, &table).await;
+    let out = common::read_table_vectors(&session, &table).await;
     let raw = node_vector("lonely", 1);
     for (g, r) in out["lonely"].iter().zip(&raw) {
         assert!((g - r).abs() < 1e-5, "edge-similarity isolated node → X⁽⁰⁾");
@@ -939,7 +906,7 @@ async fn hop_cap_clamps_request() {
     let (nodes, edges) = one_community_path(12);
     let (session, _dir) = graph_session(&nodes, &edges, None).await;
 
-    let capped = read_table_vectors(
+    let capped = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -954,7 +921,7 @@ async fn hop_cap_clamps_request() {
             .0,
     )
     .await;
-    let three = read_table_vectors(
+    let three = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -969,7 +936,7 @@ async fn hop_cap_clamps_request() {
             .0,
     )
     .await;
-    let one = read_table_vectors(
+    let one = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -1026,7 +993,7 @@ async fn jumping_knowledge_concats_every_hop_normalizes_blocks_and_is_searchable
         Some((DIM * blocks) as i32),
         "JK output dim = (K+1)·d — one block per hop plus X⁰"
     );
-    let out = read_table_vectors(&session, &table).await;
+    let out = common::read_table_vectors(&session, &table).await;
     for (key, v) in &out {
         assert_eq!(
             v.len(),
@@ -1140,7 +1107,7 @@ async fn evaluable_through_eval_embeddings() {
     // The eval runner's per-query loop runs `search_vectors` over the resolved
     // table — exercise exactly that read path without a live
     // encoder: a query vector against the propagated table returns ranked hits.
-    let probe = read_table_vectors(&session, &table).await["c0_0"].clone();
+    let probe = common::read_table_vectors(&session, &table).await["c0_0"].clone();
     let hits = session
         .result_store()
         .search_vectors(session.context(), &resolved, &vq(&probe), 3)
@@ -1441,7 +1408,7 @@ async fn two_hop_symmetric_appnp_hand_checked() {
     let xc = node_vector("c", 0);
     let alpha = 0.2;
 
-    let out = read_table_vectors(
+    let out = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -1495,7 +1462,7 @@ async fn undirected_redundant_reverse_edge_does_not_double_count() {
     ];
 
     let (once_session, _d1) = graph_session(&nodes, &[Edge::plain("a", "b")], None).await;
-    let once = read_table_vectors(
+    let once = common::read_table_vectors(
         &once_session,
         &once_session
             .propagate_embeddings(
@@ -1519,7 +1486,7 @@ async fn undirected_redundant_reverse_edge_does_not_double_count() {
         None,
     )
     .await;
-    let both = read_table_vectors(
+    let both = common::read_table_vectors(
         &both_session,
         &both_session
             .propagate_embeddings(
@@ -1575,7 +1542,7 @@ async fn weighting_variants_hand_checked() {
     let xc = node_vector("c", 0);
 
     // Uniform = D̃⁻¹Ã = mean over self-loop neighbourhood.
-    let uniform = read_table_vectors(
+    let uniform = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -1602,7 +1569,7 @@ async fn weighting_variants_hand_checked() {
 
     // DegreeNormalized = Σ_{v∈Ñ(u)} X(v)/(√d̃_u·√d̃_v). For b: neighbours a,b,c
     // with d̃_a=2, d̃_b=3, d̃_c=2 → b = (X_a/√2 + X_b/√3 + X_c/√2)/√3.
-    let degnorm = read_table_vectors(
+    let degnorm = common::read_table_vectors(
         &session,
         &session
             .propagate_embeddings(
@@ -1680,7 +1647,7 @@ async fn cross_tenant_edge_endpoint_is_never_propagated() {
         .await
         .unwrap()
         .0;
-    let out = read_table_vectors(&session, &table).await;
+    let out = common::read_table_vectors(&session, &table).await;
 
     assert!(
         !out.contains_key("secret"),

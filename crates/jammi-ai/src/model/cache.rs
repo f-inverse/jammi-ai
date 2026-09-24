@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::catalog::model_repo::{ModelBackendKind, RegisterModelParams};
 use jammi_db::config::CacheBounds;
 use jammi_db::error::{JammiError, Result};
 
 use super::backend::candle::CandleBackend;
+use super::backend::remote::RemoteModel;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::memo::{Memo, MemoEntry};
 use super::resolver::ModelResolver;
@@ -14,24 +16,12 @@ use crate::concurrency::{DeviceSchedulers, GpuPermit, GpuScheduler};
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 
-/// Where a cached model currently resides.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ModelResidency {
-    /// Weights are loaded on GPU memory.
-    Gpu,
-    /// Weights are loaded in CPU memory.
-    Cpu,
-    /// Model has been evicted and is no longer in memory.
-    Unloaded,
-}
-
 /// A loaded model the cache holds: the model, the count of guards handed
 /// out for it, and its device reservation.
 pub(crate) struct CacheEntry {
     model: Arc<LoadedModel>,
     ref_count: Arc<AtomicUsize>,
     memory_bytes: usize,
-    _residency: ModelResidency,
     /// Shared with every outstanding `ModelGuard` handed
     /// out for this entry (see `ModelGuard::gpu_permit`'s doc). Removing this
     /// `CacheEntry` from the cache (stale-fingerprint eviction, `evict_one`)
@@ -140,7 +130,6 @@ impl CacheEntry {
             model: Arc::clone(model),
             ref_count: Arc::new(AtomicUsize::new(0)),
             memory_bytes,
-            _residency: ModelResidency::Gpu,
             gpu_permit,
             admission_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -200,6 +189,15 @@ pub struct ModelCache {
     /// notify is not sufficient on its own, and `do_load`'s admission loop
     /// for the full wake-set enumeration this notify is one half of.
     admission_notify: Arc<tokio::sync::Notify>,
+    /// The remote models this deployment declares, by name.
+    remote: BTreeMap<String, RemoteEndpoint>,
+}
+
+/// A remote model this deployment declares, and the admission its forwards
+/// share: the endpoint is the device they run on.
+struct RemoteEndpoint {
+    model: Arc<RemoteModel>,
+    admission: Arc<GpuScheduler>,
 }
 
 impl ModelCache {
@@ -246,7 +244,57 @@ impl ModelCache {
             device_config,
             gpu_schedulers,
             admission_notify: Arc::new(tokio::sync::Notify::new()),
+            remote: BTreeMap::new(),
         }
+    }
+
+    /// This cache, serving the remote models `declared` — each with its own
+    /// admission of `max_in_flight` forwards. A declaration whose
+    /// credentials cannot be read is refused here, when the session opens.
+    pub fn with_remote_models(
+        self,
+        declared: &BTreeMap<String, jammi_db::config::RemoteModelConfig>,
+    ) -> Result<Self> {
+        let remote = declared
+            .iter()
+            .map(|(name, config)| {
+                Ok((
+                    name.clone(),
+                    RemoteEndpoint {
+                        model: Arc::new(RemoteModel::from_config(name, config)?),
+                        admission: Arc::new(GpuScheduler::endpoint(config.max_in_flight)),
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { remote, ..self })
+    }
+
+    /// The declared remote model `name`, or a refusal naming the missing
+    /// declaration.
+    fn remote_endpoint(&self, name: &str) -> Result<&RemoteEndpoint> {
+        self.remote.get(name).ok_or_else(|| JammiError::Model {
+            model_id: ModelSource::remote(name).to_string(),
+            message: format!(
+                "no remote model '{name}' is declared: add [models.remote.{name}] to this \
+                 deployment's configuration"
+            ),
+        })
+    }
+
+    /// A remote model's description: its declaration, for a task its
+    /// protocol carries.
+    fn describe_remote(
+        &self,
+        source: &ModelSource,
+        endpoint: &RemoteEndpoint,
+        task: ModelTask,
+    ) -> Result<Arc<ModelDescription>> {
+        endpoint.model.check_task(task)?;
+        Ok(Arc::new(ModelDescription {
+            model_id: source.to_string(),
+            backing: super::DescribedBacking::Remote(endpoint.model.run().clone()),
+        }))
     }
 
     /// This cache, keeping at most `bounds` idle entries.
@@ -333,7 +381,14 @@ impl ModelCache {
         };
 
         self.models
-            .get_or_compute(&id, || self.do_load(&id, &scheduler, source, task))
+            .get_or_compute(&id, || async {
+                match source {
+                    ModelSource::Remote(name) => self.load_remote(source, name, task).await,
+                    ModelSource::HuggingFace(_) | ModelSource::Local(_) => {
+                        self.do_load(&id, &scheduler, source, task).await
+                    }
+                }
+            })
             .await
     }
 
@@ -367,6 +422,9 @@ impl ModelCache {
         task: ModelTask,
     ) -> Result<Arc<ModelDescription>> {
         let device_config = self.device_config.for_device(device)?;
+        if let ModelSource::Remote(name) = source {
+            return self.describe_remote(source, self.remote_endpoint(name)?, task);
+        }
         let id = CacheKey {
             model_id: ModelId::from(source),
             device,
@@ -473,10 +531,11 @@ impl ModelCache {
         &self,
         source: &ModelSource,
         source_str: &str,
-        resolved: &ResolvedModel,
+        backend: ModelBackendKind,
+        location: Option<&str>,
         task: ModelTask,
     ) {
-        const GENERIC_COMPLETABLE_TYPES: &[&str] = &["local", "huggingface", "embedding"];
+        const GENERIC_COMPLETABLE_TYPES: &[&str] = &["local", "huggingface", "remote", "embedding"];
         // A catalog READ error is not "no row" — collapsing it to `None`
         // would fall through to the write below and could clobber a row this
         // call never actually inspected. This bookkeeping is best-effort (a `register_model`
@@ -511,13 +570,8 @@ impl ModelCache {
                     let model_type = match source {
                         ModelSource::HuggingFace(_) => "huggingface",
                         ModelSource::Local(_) => "local",
+                        ModelSource::Remote(_) => "remote",
                     };
-                    let artifact_dir_str: Option<String> = resolved
-                        .weights_paths
-                        .first()
-                        .and_then(|p| p.parent())
-                        .and_then(|p| p.to_str())
-                        .map(|s| s.to_owned());
                     if let Err(e) = self
                         .resolver
                         .catalog()
@@ -525,10 +579,10 @@ impl ModelCache {
                             model_id: source_str,
                             version: 1,
                             model_type,
-                            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                            backend,
                             task,
                             base_model_id: None,
-                            external_location: artifact_dir_str.as_deref(),
+                            external_location: location,
                             config_json: None,
                         })
                         .await
@@ -681,8 +735,14 @@ impl ModelCache {
         // Register model in catalog (idempotent — ignores if already registered).
         // See `Self::complete_generic_registration`'s own doc for which rows
         // this call may write.
-        self.complete_generic_registration(source, &source_str, &resolved, task)
-            .await;
+        self.complete_generic_registration(
+            source,
+            &source_str,
+            ModelBackendKind::Candle,
+            resolved.weights_dir(),
+            task,
+        )
+        .await;
 
         // The permit is `Arc`-shared between this `CacheEntry` and every
         // guard handed out of it — see `ModelGuard::gpu_permit`'s doc for why.
@@ -690,7 +750,38 @@ impl ModelCache {
             model: Arc::new(loaded),
             ref_count: Arc::new(AtomicUsize::new(0)),
             memory_bytes,
-            _residency: ModelResidency::Gpu,
+            gpu_permit: Arc::new(gpu_permit),
+            admission_notify: Arc::clone(&self.admission_notify),
+        })
+    }
+
+    /// Describe and admit a declared remote model: the entry holds no
+    /// device memory, and its guard's forwards share the endpoint's
+    /// admission.
+    async fn load_remote(
+        &self,
+        source: &ModelSource,
+        name: &str,
+        task: ModelTask,
+    ) -> Result<CacheEntry> {
+        let endpoint = self.remote_endpoint(name)?;
+        let description = self.describe_remote(source, endpoint, task)?;
+        let gpu_permit = endpoint.admission.reserve_nothing();
+        self.complete_generic_registration(
+            source,
+            &source.to_string(),
+            ModelBackendKind::Remote,
+            None,
+            task,
+        )
+        .await;
+        Ok(CacheEntry {
+            model: Arc::new(LoadedModel::remote(
+                Arc::clone(&endpoint.model),
+                description,
+            )),
+            ref_count: Arc::new(AtomicUsize::new(0)),
+            memory_bytes: 0,
             gpu_permit: Arc::new(gpu_permit),
             admission_notify: Arc::clone(&self.admission_notify),
         })
@@ -1710,6 +1801,7 @@ mod r5_f1_tokenizer_tests {
         guard
             .model
             .forward(&text_content, ModelTask::TextEmbedding)
+            .await
             .expect("the cold-loaded, tokenizer-bearing entry must serve embeddings");
         drop(guard);
 
@@ -1727,6 +1819,7 @@ mod r5_f1_tokenizer_tests {
         match tokenizer_less
             .model
             .forward(&text_content, ModelTask::TextEmbedding)
+            .await
         {
             Err(e) => {
                 // Pin the refusal to the SPECIFIC typed message
@@ -1769,6 +1862,7 @@ mod r5_f1_tokenizer_tests {
         restored
             .model
             .forward(&text_content, ModelTask::TextEmbedding)
+            .await
             .expect(
                 "the entry reloaded after tokenizer.json's restoration must serve embeddings \
                  again — a cold process loading this same, now-restored directory would \
@@ -2087,7 +2181,8 @@ mod load_bookkeeping_tests {
             .complete_generic_registration(
                 &ModelSource::hf(model_id),
                 model_id,
-                &resolved,
+                ModelBackendKind::Candle,
+                resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
             .await;
@@ -2149,7 +2244,8 @@ mod load_bookkeeping_tests {
             .complete_generic_registration(
                 &ModelSource::hf(model_id),
                 model_id,
-                &resolved,
+                ModelBackendKind::Candle,
+                resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
             .await;
@@ -2190,7 +2286,8 @@ mod load_bookkeeping_tests {
             .complete_generic_registration(
                 &ModelSource::local(tmp.path()),
                 model_id,
-                &resolved,
+                ModelBackendKind::Candle,
+                resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
             .await;
@@ -2237,7 +2334,8 @@ mod load_bookkeeping_tests {
             .complete_generic_registration(
                 &ModelSource::local(tmp.path()),
                 model_id,
-                &resolved,
+                ModelBackendKind::Candle,
+                resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
             .await;
@@ -2350,7 +2448,8 @@ mod load_bookkeeping_tests {
                 .complete_generic_registration(
                     &ModelSource::local(tmp.path()),
                     model_id,
-                    &resolved,
+                    ModelBackendKind::Candle,
+                    resolved.weights_dir(),
                     ModelTask::TextEmbedding,
                 )
                 .await;

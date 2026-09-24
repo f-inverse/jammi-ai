@@ -99,6 +99,12 @@ impl GpuScheduler {
         Self::unbudgeted(threads.get())
     }
 
+    /// A remote endpoint as a device: it holds no memory this process
+    /// budgets, and takes `max_in_flight` forwards at once.
+    pub fn endpoint(max_in_flight: NonZeroUsize) -> Self {
+        Self::unbudgeted(max_in_flight.get())
+    }
+
     /// No memory budget, `forward_slots` forwards at once.
     fn unbudgeted(forward_slots: usize) -> Self {
         Self {
@@ -242,6 +248,17 @@ impl GpuScheduler {
     /// single-notify wait is not enough on its own.
     pub fn usable_capacity(&self) -> usize {
         self.budget
+    }
+
+    /// A reservation of no memory — what a model that holds no memory on this
+    /// device (a remote model, whose device is its endpoint) is admitted
+    /// with. Always granted: it takes nothing from the budget and releases
+    /// nothing when it drops.
+    pub(crate) fn reserve_nothing(self: &Arc<Self>) -> GpuPermit {
+        GpuPermit {
+            reserved_bytes: 0,
+            scheduler: Arc::clone(self),
+        }
     }
 
     /// Non-blocking acquisition attempt. Returns `None` if insufficient memory.
@@ -538,6 +555,20 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("memory_limit"), "{msg}");
         assert!(msg.contains("device 3"), "{msg}");
+    }
+
+    /// A reservation of nothing is granted even on a spent budget, and gives
+    /// nothing back when it drops.
+    #[test]
+    fn a_reservation_of_nothing_is_granted_on_a_spent_budget() {
+        let sched = Arc::new(GpuScheduler::new(1_000));
+        let full = sched.try_acquire(1_000).expect("the whole budget");
+        let nothing = sched.reserve_nothing();
+        assert_eq!(sched.available(), 0);
+        drop(nothing);
+        assert_eq!(sched.available(), 0, "dropping it released nothing");
+        drop(full);
+        assert_eq!(sched.available(), 1_000);
     }
 
     fn share(percent: u8) -> MemoryLimit {

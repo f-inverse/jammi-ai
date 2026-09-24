@@ -4299,3 +4299,75 @@ fn inference_partitions_in_range_is_accepted() {
         assert!(cfg.validate().is_ok(), "partitions = {p} must be accepted");
     }
 }
+
+/// A remote model declared in TOML loads with every field it states and the
+/// defaults it omits, credentials held as unresolved sources.
+#[test]
+fn a_remote_model_declaration_loads_with_its_defaults() {
+    let cfg = load_src(
+        r#"
+            artifact_dir = "/tmp/jammi"
+
+            [models.remote.hosted-encoder]
+            protocol = "openai_embeddings"
+            url = "https://embeddings.example/v1/embeddings"
+            model = "encoder-small"
+            dimensions = 384
+            revision = "2026-01"
+            headers = { Authorization = { file = "/run/secrets/key" } }
+        "#,
+    )
+    .unwrap();
+    let model = &cfg.models.remote["hosted-encoder"];
+    assert_eq!(model.protocol, RemoteProtocol::OpenaiEmbeddings);
+    assert_eq!(model.dimensions.get(), 384);
+    assert_eq!(model.timeout_secs.get(), 60);
+    assert_eq!(model.max_in_flight.get(), 4);
+    assert_eq!(model.max_retries, 2);
+    assert_eq!(
+        model.headers["Authorization"],
+        SecretSource::File("/run/secrets/key".into())
+    );
+}
+
+/// A declaration no request could be built from is refused at load, naming
+/// the key under `[models.remote.<name>]`.
+#[test]
+fn a_remote_model_no_request_could_be_built_from_is_refused_at_load() {
+    let declaration = |fields: &str| {
+        format!(
+            "artifact_dir = \"/tmp/jammi\"\n\n[models.remote.enc]\nprotocol = \"openai_embeddings\"\n\
+             dimensions = 8\n{fields}\n"
+        )
+    };
+    let valid = "url = \"https://h.example/v1/embeddings\"\nmodel = \"m\"\nrevision = \"r\"";
+    load_src(&declaration(valid)).expect("the control declaration loads");
+    for (fields, key) in [
+        (
+            "url = \"ftp://h.example/e\"\nmodel = \"m\"\nrevision = \"r\"",
+            "models.remote.enc.url",
+        ),
+        (
+            "url = \"https://h.example/e\"\nmodel = \" \"\nrevision = \"r\"",
+            "models.remote.enc.model",
+        ),
+        (
+            "url = \"https://h.example/e\"\nmodel = \"m\"\nrevision = \"\"",
+            "models.remote.enc.revision",
+        ),
+        (
+            "url = \"https://h.example/e\"\nmodel = \"m\"\nrevision = \"r\"\nheaders = { \"bad header\" = \"v\" }",
+            "models.remote.enc.headers",
+        ),
+    ] {
+        let err = load_src(&declaration(fields)).unwrap_err().to_string();
+        assert!(err.contains(key), "expected {key} in {err}");
+    }
+    let err = load_src(&declaration(&format!("{valid}\nprotocol_version = 2")))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("protocol_version"),
+        "an unknown key is refused: {err}"
+    );
+}

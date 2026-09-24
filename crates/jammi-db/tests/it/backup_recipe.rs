@@ -40,7 +40,7 @@ fn env() -> MaterializationEnv {
         vec![ModelIdentity {
             model_id: "backup-model".into(),
             run: ModelRun::Local(LocalRun {
-                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                backend: jammi_db::store::manifest::LocalBackend::Candle,
                 compute_precision: ComputePrecision::F32,
                 content_digest: ContentDigest("backup-fixture-digest".into()),
                 quantization: None,

@@ -36,6 +36,7 @@ pub fn spec_to_proto(spec: &InferenceSpec) -> Result<pb::InferenceExecNode> {
         ModelSource::Local(path) => {
             pb::model_source::Source::Local(path.to_string_lossy().into_owned())
         }
+        ModelSource::Remote(name) => pb::model_source::Source::Remote(name.clone()),
     };
     Ok(pb::InferenceExecNode {
         source: Some(pb::ModelSource {
@@ -78,6 +79,7 @@ pub fn spec_from_proto(msg: pb::InferenceExecNode) -> Result<InferenceSpec> {
     let source = match msg.source.and_then(|s| s.source) {
         Some(pb::model_source::Source::HuggingFace(id)) => ModelSource::hf(id),
         Some(pb::model_source::Source::Local(p)) => ModelSource::local(p),
+        Some(pb::model_source::Source::Remote(name)) => ModelSource::remote(name),
         None => return Err(Error::Decode("InferenceExecNode: missing source".into())),
     };
     Ok(InferenceSpec {
@@ -175,4 +177,40 @@ pub fn decode_numbered_input(
     let exec = NumberedInputExec::try_new(input, order, spec_from_proto(spec)?, runtime)
         .map_err(|e| Error::Decode(e.to_string()))?;
     Ok(Arc::new(exec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every model source crosses the wire as itself: a remote model's name
+    /// is decoded as a remote source, for the decoding process to resolve
+    /// against its own declaration — never as a Hub id it would fetch.
+    #[test]
+    fn every_model_source_round_trips_through_the_descriptor() {
+        for source in [
+            ModelSource::hf("owner/encoder"),
+            ModelSource::local("/models/encoder"),
+            ModelSource::remote("hosted-encoder"),
+        ] {
+            let spec = InferenceSpec {
+                source: source.clone(),
+                task: ModelTask::TextEmbedding,
+                content_columns: vec!["text".into()],
+                key_column: "id".into(),
+                source_id: "src".into(),
+                chunk: ChunkBudget {
+                    rows: NonZeroUsize::new(32).unwrap(),
+                    tokens: NonZeroUsize::new(16384).unwrap(),
+                },
+                embedding_dim: Some(384),
+                regression_form: None,
+                passthrough: vec![],
+                device_kind: ComputeDeviceKind::Cpu,
+                partitions: NonZeroUsize::new(1).unwrap(),
+            };
+            let decoded = spec_from_proto(spec_to_proto(&spec).unwrap()).unwrap();
+            assert_eq!(decoded.source, source);
+        }
+    }
 }

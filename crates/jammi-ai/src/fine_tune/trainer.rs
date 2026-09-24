@@ -2864,7 +2864,7 @@ impl TrainingLoop {
     ) -> Result<jammi_encoders::OwnedEncoderInput> {
         use crate::inference::audio_preprocess;
 
-        let frontend = base.backend_model().audio_frontend().ok_or_else(|| {
+        let frontend = base.backend_model()?.audio_frontend().ok_or_else(|| {
             JammiError::FineTune(
                 "Encoder-adapters audio training requires the base model's CLAP \
                  feature-extractor geometry (preprocessor_config.json); the loaded base \
@@ -3004,6 +3004,7 @@ impl TrainingLoop {
             }
         };
         let output = base
+            .backend_model()?
             .forward(&[content], task)
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
         // A corrupt training item is a refusal, not a row to skip: reject the
@@ -14336,6 +14337,7 @@ mod media_front_end_wall_tests {
         let probe_arr = Arc::new(BinaryArray::from(vec![clip.as_slice()])) as ArrayRef;
         let probe = base_model
             .forward(&[probe_arr], ModelTask::AudioEmbedding)
+            .await
             .expect("htsat_clap_tiny fixture must forward a real audio clip");
         let hidden = probe.shapes[0].1;
 

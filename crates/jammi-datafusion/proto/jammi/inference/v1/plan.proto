@@ -14,6 +14,9 @@ message ModelSource {
     string hugging_face = 1;
     // A local directory.
     string local = 2;
+    // A model served at a remote endpoint, by its declared name. The
+    // decoding process resolves the name against its own configuration.
+    string remote = 3;
   }
 }
 

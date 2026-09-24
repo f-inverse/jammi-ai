@@ -429,6 +429,7 @@ mod live {
         let output = guard
             .model
             .forward(&[binary_array], ModelTask::ImageEmbedding)
+            .await
             .unwrap();
 
         // Verify output shape

@@ -87,7 +87,7 @@ pub enum JammiError {
     #[error("GPU error: {0}")]
     Gpu(String),
 
-    /// Remote backend error (vLLM, HTTP).
+    /// A remote model endpoint's refusal or failure.
     #[error("Backend error: {0}")]
     Backend(String),
 

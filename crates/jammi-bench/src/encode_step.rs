@@ -1004,7 +1004,7 @@ impl RungSession {
                     let content: ArrayRef = Arc::new(StringArray::from_iter_values(
                         chunk.iter().map(|&row| unit.texts.value(row)),
                     ));
-                    let mut out = self.model.forward(&[content], task.model_task())?;
+                    let mut out = self.model.forward(&[content], task.model_task()).await?;
                     if let Some(at) = out.row_status.iter().position(|ok| !ok) {
                         return Err(format!(
                             "the direct forward failed row {}: {}",
@@ -1314,7 +1314,12 @@ pub async fn measure_legs(
         }
     }
 
-    let compute_precision = loaded.description().compute_precision().to_string();
+    let compute_precision = loaded
+        .description()
+        .local_run()
+        .expect("a local model")
+        .compute_precision
+        .to_string();
     let pooling = loaded
         .resolved_pooling()
         .map_or_else(|| "none".to_string(), |p| p.to_string());

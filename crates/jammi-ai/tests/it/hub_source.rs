@@ -75,6 +75,7 @@ async fn config_token_reaches_the_mock_and_file_lands_under_root_hub() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: Some(SecretSource::Inline("tok".into())),
         offline: Some(false),
+        remote: Default::default(),
     };
     let hub = HubSource::from_config(&config, &|_: &str| None).unwrap();
 
@@ -123,6 +124,7 @@ async fn hf_home_env_drives_the_cache_root_end_to_end() {
         hub_cache_dir: None,
         hub_token: None,
         offline: None,
+        remote: Default::default(),
     };
     let env = move |k: &str| (k == "HF_HOME").then(|| hf_home_path.to_str().unwrap().to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
@@ -158,6 +160,7 @@ async fn warm_cache_across_a_second_hub_source_issues_no_requests() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: None,
+        remote: Default::default(),
     };
 
     // Cold cache: the first HubSource genuinely downloads.
@@ -434,6 +437,7 @@ async fn hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended(
         hub_cache_dir: None,
         hub_token: None,
         offline: None,
+        remote: Default::default(),
     };
     let env = move |k: &str| {
         (k == "HF_HUB_CACHE").then(|| hf_hub_cache_path.to_str().unwrap().to_string())
@@ -496,6 +500,7 @@ async fn config_offline_false_wins_over_hf_hub_offline_env() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "1".to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
@@ -539,6 +544,7 @@ async fn env_token_used_when_config_token_absent() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let env = |k: &str| (k == "HF_TOKEN").then(|| "env-tok".to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
@@ -575,6 +581,7 @@ async fn no_token_no_authorization_header() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let hub = HubSource::from_config(&config, &|_: &str| None).unwrap();
 
@@ -617,6 +624,7 @@ async fn hf_home_token_file_used_with_hf_hub_cache_set_file_lands_under_hf_hub_c
         hub_cache_dir: None,
         hub_token: None,
         offline: None,
+        remote: Default::default(),
     };
     let hf_home_path = hf_home.path().to_str().unwrap().to_string();
     let hf_hub_cache_path = hf_hub_cache.path().to_str().unwrap().to_string();
@@ -669,6 +677,7 @@ async fn empty_hf_token_falls_through_to_home_token_file() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let hf_home_path = hf_home.path().to_str().unwrap().to_string();
     let env = move |k: &str| match k {
@@ -719,6 +728,7 @@ async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let hf_home_path = hf_home.path().to_str().unwrap().to_string();
     let token_path = token_file.path().to_str().unwrap().to_string();
@@ -764,6 +774,7 @@ async fn legacy_hugging_face_hub_token_env_used_when_hf_token_absent() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let env = |k: &str| (k == "HUGGING_FACE_HUB_TOKEN").then(|| "legacy-tok".to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
@@ -904,6 +915,7 @@ async fn offline_warm_cache_without_catalog_row_still_refuses() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        remote: Default::default(),
     };
     let online_hub = HubSource::from_config(&online_config, &|_: &str| None).unwrap();
     tokio::task::spawn_blocking({

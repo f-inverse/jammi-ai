@@ -1914,7 +1914,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 vec![ModelIdentity {
                     model_id: model_id.into(),
                     run: ModelRun::Local(LocalRun {
-                        backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                        backend: jammi_db::store::manifest::LocalBackend::Candle,
                         compute_precision: ComputePrecision::F32,
                         content_digest: ContentDigest("cpu-fixture-digest".into()),
                         quantization: None,
@@ -2045,7 +2045,7 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
             vec![ModelIdentity {
                 model_id: model_id.into(),
                 run: ModelRun::Local(LocalRun {
-                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                    backend: jammi_db::store::manifest::LocalBackend::Candle,
                     compute_precision: ComputePrecision::F32,
                     content_digest: ContentDigest("cpu-fixture-digest".into()),
                     quantization: None,
@@ -3012,7 +3012,7 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
         vec![ModelIdentity {
             model_id: model_id.into(),
             run: ModelRun::Local(LocalRun {
-                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                backend: jammi_db::store::manifest::LocalBackend::Candle,
                 compute_precision: ComputePrecision::F32,
                 content_digest: ContentDigest("cpu-fixture-digest".into()),
                 quantization: None,

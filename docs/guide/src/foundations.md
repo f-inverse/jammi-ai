@@ -71,10 +71,15 @@ No Python runs in the serving or training path.
 - **The planner sees the model.** Device placement is a property of the
   plan (`DevicePlacement` reads the kind an `InferenceExec` or
   `TrainingExec` declares). A model's residency is admitted against its
-  device's memory budget (`[gpu]`), and a forward against the device's
+  device's `[gpu] memory_limit` budget, and a forward against the device's
   forward slots; host-side operators share the session's memory pool. A
   forward the device refuses for memory is retried at half the rows, and
   fails the query only when a single row does not fit.
+- **A remote model is one more device.** A model served at a declared
+  endpoint runs through the same `InferenceExec`: its forwards are requests,
+  admitted by the endpoint's `max_in_flight` the way a local model's are
+  admitted by its device, and its declaration is the run a table records
+  ([Use a Remote Model](./remote-models.md)).
 - **Identical bytes at any fan-out.** The rows a model forwards together
   are decided once, by row cost, and carried as a chunk id the exchange
   hashes on. A plan fanned over one partition or sixteen, in one process or

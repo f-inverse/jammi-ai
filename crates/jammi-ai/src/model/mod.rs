@@ -57,7 +57,6 @@ pub enum WeightsFormat {
     Gguf,
 }
 
-pub use backend::candle::PreparedInput;
 /// The model vocabulary this crate's public API takes — where a model is
 /// loaded from and what it computes — defined by `jammi-datafusion`, whose
 /// operators run them, and re-exported so a caller of this crate names them
@@ -121,6 +120,14 @@ pub struct ResolvedModel {
     pub adapter_path: Option<std::path::PathBuf>,
     /// Estimated GPU memory in bytes (sum of weight file sizes).
     pub estimated_memory: usize,
+}
+
+impl ResolvedModel {
+    /// The directory the weights live in — what a catalog row records as
+    /// the model's location — or `None` when it is not a UTF-8 path.
+    pub(crate) fn weights_dir(&self) -> Option<&str> {
+        self.weights_paths.first()?.parent()?.to_str()
+    }
 }
 
 /// Model architecture dimensions used for memory estimation and output sizing.
@@ -268,17 +275,31 @@ pub(crate) struct SavedAdapterFiles {
     pub(crate) weights: PathBuf,
 }
 
-/// What planning a model's run needs to know about it, read from its
-/// files and configuration without allocating a tensor: the identity a
-/// materialization's environment records, the width of its output, and
-/// the form of its regression head. A backend computes it
-/// ([`backend::ModelBackend::describe`]) before it materializes the
-/// weights, and a loaded model is materialized FROM a description and
-/// reports it unchanged — so a submitter that plans against a description
-/// and the executing process that records what ran can never disagree.
+/// What planning a model's run needs to know about it, read without
+/// allocating a tensor or sending a request: the identity a
+/// materialization's environment records, the width of its output, and the
+/// form of its regression head. A backend computes it before it
+/// materializes the model, and a loaded model is materialized FROM a
+/// description and reports it unchanged — so a submitter that plans against
+/// a description and the executing process that records what ran can never
+/// disagree.
 pub struct ModelDescription {
     /// The id a materialization's environment records the model under.
     pub(crate) model_id: String,
+    /// What the backend that runs the model described.
+    pub(crate) backing: DescribedBacking,
+}
+
+/// What a description holds for the backend that runs the model.
+pub(crate) enum DescribedBacking {
+    /// A model this engine runs over local weights.
+    Local(LocalDescription),
+    /// A model a remote endpoint runs: its declaration is its description.
+    Remote(jammi_db::store::manifest::RemoteRun),
+}
+
+/// A model described from its local files and configuration.
+pub(crate) struct LocalDescription {
     /// The run of the model on the device it was described for — every
     /// output-affecting fact a materialization's environment records.
     pub(crate) run: jammi_db::store::manifest::LocalRun,
@@ -286,15 +307,14 @@ pub struct ModelDescription {
     pub(crate) dimensions: ModelDimensions,
     /// The precision the configuration resolves for this model on the
     /// described device — `config.json`'s own `compute_precision`, else the
-    /// device's default — which every head materializes at. The identity's
+    /// device's default — which every head materializes at. The run's
     /// precision is the backbone's: the same, unless a saved encoder
     /// adapter's persisted `backbone_dtype` won.
     pub(crate) configured_precision: jammi_numerics::ComputePrecision,
     /// The saved fine-tune adapter, when the resolved model carries one.
     pub(crate) saved_adapter: Option<SavedAdapterFiles>,
-    /// The stat-only staleness fingerprint of the files the identity's
-    /// content digest was hashed from. See
-    /// [`backend::candle::ModelFingerprint`].
+    /// The stat-only staleness fingerprint of the files the run's content
+    /// digest was hashed from. See [`backend::candle::ModelFingerprint`].
     pub(crate) fingerprint: backend::candle::ModelFingerprint,
 }
 
@@ -303,49 +323,41 @@ impl ModelDescription {
     /// — the one construction a submitter's prediction and the executing
     /// process's record both use.
     pub fn identity(&self) -> jammi_db::store::manifest::ModelIdentity {
+        use jammi_db::store::manifest::ModelRun;
         jammi_db::store::manifest::ModelIdentity {
             model_id: self.model_id.clone(),
-            run: jammi_db::store::manifest::ModelRun::Local(self.run.clone()),
+            run: match &self.backing {
+                DescribedBacking::Local(local) => ModelRun::Local(local.run.clone()),
+                DescribedBacking::Remote(remote) => ModelRun::Remote(remote.clone()),
+            },
         }
     }
 
     /// The backend that runs this model.
     pub fn backend(&self) -> jammi_db::catalog::model_repo::ModelBackendKind {
-        self.run.backend
+        match &self.backing {
+            DescribedBacking::Local(local) => local.run.backend.into(),
+            DescribedBacking::Remote(_) => jammi_db::catalog::model_repo::ModelBackendKind::Remote,
+        }
     }
 
-    /// The compute precision the model's backbone runs at — the resolved
-    /// per-model `config.json` override or the device's default, unless a
-    /// saved encoder adapter's persisted `backbone_dtype` won. Output-
-    /// affecting (an `F16` backbone emits different bytes than `F32`), so
-    /// the materialization contract folds it into the identity.
-    pub fn compute_precision(&self) -> jammi_numerics::ComputePrecision {
-        self.run.compute_precision
+    /// The run of a model this engine runs over local weights — its
+    /// precision, content digest and weight format — or `None` for a model
+    /// a remote endpoint runs.
+    pub fn local_run(&self) -> Option<&jammi_db::store::manifest::LocalRun> {
+        match &self.backing {
+            DescribedBacking::Local(local) => Some(&local.run),
+            DescribedBacking::Remote(_) => None,
+        }
     }
 
-    /// The model's content digest: a SHA-256 fold of the resolved
-    /// directory's config / `1_Pooling/config.json` / tokenizer / weights
-    /// bytes (`backend::candle::compute_model_content_digest`). Output-
-    /// affecting — two directories that share one `model_id` but differ in
-    /// any of those bytes must never collide on one `DefinitionHash` — so
-    /// the materialization contract folds it into the identity.
-    pub fn content_digest(&self) -> &jammi_db::store::manifest::ContentDigest {
-        &self.run.content_digest
-    }
-
-    /// The GGUF/k-quant weight-storage format of the model's backbone —
-    /// `Some` (the MODAL quantized dtype among the matmul-site tensors,
-    /// tie-broken by [`jammi_numerics::WeightQuantization`]'s own `Ord`)
-    /// for a `model.gguf` checkpoint, `None` for safetensors. Output-
-    /// affecting, so the materialization contract folds it into the
-    /// identity.
-    pub fn quantization(&self) -> Option<jammi_numerics::WeightQuantization> {
-        self.run.quantization
-    }
-
-    /// The architecture's geometry, for memory estimation and output sizing.
-    pub fn dimensions(&self) -> &ModelDimensions {
-        &self.dimensions
+    /// The architecture's geometry, for memory estimation, or `None` for a
+    /// model a remote endpoint runs.
+    pub fn dimensions(&self) -> Option<&ModelDimensions> {
+        match &self.backing {
+            DescribedBacking::Local(local) => Some(&local.dimensions),
+            DescribedBacking::Remote(_) => None,
+        }
     }
 
     /// Output dimensionality of the model's embedding head.
@@ -354,9 +366,13 @@ impl ModelDescription {
     /// For OpenCLIP-family models (vision and text towers) this is the
     /// projected shared-latent `embed_dim` — the dimension the emitted
     /// vectors carry and cross-modal cosine similarity is computed in, not
-    /// the per-tower hidden `width`.
+    /// the per-tower hidden `width`. For a remote model it is the width its
+    /// declaration states and every response is held to.
     pub fn embedding_dim(&self) -> usize {
-        self.dimensions.hidden_size
+        match &self.backing {
+            DescribedBacking::Local(local) => local.dimensions.hidden_size,
+            DescribedBacking::Remote(remote) => remote.dimensions as usize,
+        }
     }
 
     /// The persisted predictive-distribution form of a regression head
@@ -367,7 +383,10 @@ impl ModelDescription {
     pub fn regression_form(
         &self,
     ) -> Option<&jammi_datafusion::inference::adapter::DistributionForm> {
-        match self.saved_adapter.as_ref().map(|adapter| &adapter.config) {
+        let DescribedBacking::Local(local) = &self.backing else {
+            return None;
+        };
+        match local.saved_adapter.as_ref().map(|adapter| &adapter.config) {
             Some(crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg)) => {
                 cfg.regression_form.as_ref()
             }
@@ -375,12 +394,14 @@ impl ModelDescription {
         }
     }
 
-    /// Stat-only staleness probe of the files the identity was computed
-    /// from, re-`stat`ing (never re-reading) the same file set the digest
-    /// was hashed from and comparing `(len, mtime)` against the snapshot
-    /// taken when the description was computed.
+    /// Stat-only staleness probe of the files a local model's identity was
+    /// computed from, re-`stat`ing (never re-reading) the same file set the
+    /// digest was hashed from and comparing `(len, mtime)` against the
+    /// snapshot taken when the description was computed.
     ///
     /// - `Ok(true)` — unchanged: the description still describes the files.
+    ///   A remote model is always this: its declaration is read once, when
+    ///   the session opens, and has no files to go stale.
     /// - `Ok(false)` — at least one fingerprinted file diverged: the caller
     ///   must discard this description and describe again.
     /// - `Err` — a fingerprinted file vanished or became unreadable: a
@@ -397,40 +418,101 @@ impl ModelDescription {
     /// [`backend::candle::ModelFingerprint`] for the narrow scope this
     /// bound sits within.
     pub(crate) fn probe_freshness(&self) -> Result<bool> {
-        self.fingerprint.probe()
+        match &self.backing {
+            DescribedBacking::Local(local) => local.fingerprint.probe(),
+            DescribedBacking::Remote(_) => Ok(true),
+        }
+    }
+
+    /// The local parts a local backend materializes from, refused for a
+    /// description of a model a remote endpoint runs — the two backends'
+    /// halves never mix.
+    pub(crate) fn local_parts(&self) -> Result<&LocalDescription> {
+        match &self.backing {
+            DescribedBacking::Local(local) => Ok(local),
+            DescribedBacking::Remote(_) => Err(jammi_db::error::JammiError::Model {
+                model_id: self.model_id.clone(),
+                message: "a remote model's description reached a local backend".into(),
+            }),
+        }
     }
 }
 
-/// A model materialized in memory, ready for inference: the weights of a
-/// described model, resident on a device. Every fact a materialization
-/// records about it is its [`ModelDescription`], unchanged from the one it
-/// was materialized from.
+/// A model materialized, ready for inference: the weights of a described
+/// model resident on a device, or a remote model's endpoint ready to take
+/// requests. Every fact a materialization records about it is its
+/// [`ModelDescription`], unchanged from the one it was materialized from.
 pub struct LoadedModel {
-    candle: Box<CandleModel>,
+    runner: Runner,
+}
+
+/// What runs a loaded model's forwards.
+enum Runner {
+    Candle(Box<CandleModel>),
+    Remote {
+        model: Arc<backend::remote::RemoteModel>,
+        description: Arc<ModelDescription>,
+    },
+}
+
+/// One forward's input, prepared for the runner that will take it.
+pub enum PreparedInput {
+    /// Tensors uploaded for a local model.
+    Candle(backend::candle::PreparedInput),
+    /// The rows of one request to a remote model.
+    Remote(backend::remote::PreparedRequest),
 }
 
 impl LoadedModel {
     pub(crate) fn candle(model: CandleModel) -> Self {
         Self {
-            candle: Box::new(model),
+            runner: Runner::Candle(Box::new(model)),
+        }
+    }
+
+    pub(crate) fn remote(
+        model: Arc<backend::remote::RemoteModel>,
+        description: Arc<ModelDescription>,
+    ) -> Self {
+        Self {
+            runner: Runner::Remote { model, description },
         }
     }
 
     /// The description this model was materialized from.
     pub fn description(&self) -> &Arc<ModelDescription> {
-        self.candle.description()
+        match &self.runner {
+            Runner::Candle(candle) => candle.description(),
+            Runner::Remote { description, .. } => description,
+        }
     }
 
-    /// The backend's own model, for a consumer inside this crate that
-    /// drives a tower directly (the fine-tune trainer).
-    pub(crate) fn backend_model(&self) -> &CandleModel {
-        &self.candle
+    /// The local backend's own model, for a consumer inside this crate that
+    /// drives a tower directly (the fine-tune trainer). A remote model has
+    /// no tower here to drive.
+    pub(crate) fn backend_model(&self) -> Result<&CandleModel> {
+        match &self.runner {
+            Runner::Candle(candle) => Ok(candle),
+            Runner::Remote { description, .. } => Err(jammi_db::error::JammiError::Model {
+                model_id: description.model_id.clone(),
+                message: "a remote model is served by its endpoint; this engine holds no \
+                          tower of it to train or drive"
+                    .into(),
+            }),
+        }
+    }
+
+    fn candle_model(&self) -> Option<&CandleModel> {
+        match &self.runner {
+            Runner::Candle(candle) => Some(candle),
+            Runner::Remote { .. } => None,
+        }
     }
 
     /// The tokenizer the text forward turns content into token ids with,
-    /// or `None` for a model with no text tower.
+    /// or `None` for a model with no local text tower.
     pub fn tokenizer(&self) -> Option<&tokenizer::TokenizerWrapper> {
-        self.candle.tokenizer.as_ref()
+        self.candle_model()?.tokenizer.as_ref()
     }
 
     /// The pooling strategy the loaded text-embedding forward path ACTUALLY
@@ -439,11 +521,11 @@ impl LoadedModel {
     /// via `CandleModel::resolved_pooling`: a bench/report consumer must
     /// read this off the loaded model, never transcribe a fixture-declared
     /// constant that could silently drift from what actually served. `None`
-    /// when this model has no pooling concept at all (a CLAP audio tower,
-    /// an OpenCLIP text tower whose output is already pooled-and-projected,
-    /// a classification head).
+    /// when this model has no local pooling (a CLAP audio tower, an OpenCLIP
+    /// text tower whose output is already pooled-and-projected, a
+    /// classification head, a remote model).
     pub fn resolved_pooling(&self) -> Option<jammi_encoders::Pooling> {
-        self.candle.resolved_pooling()
+        self.candle_model()?.resolved_pooling()
     }
 
     /// The token-sequence bound the loaded text forward truncates its
@@ -451,22 +533,27 @@ impl LoadedModel {
     /// A consumer that counts the tokens a serve actually forwards must
     /// truncate at this bound, read off the loaded model, never at a value
     /// re-derived from `config.json`. `None` when the loaded model has no
-    /// text forward (a CLAP audio tower).
+    /// local text forward (a CLAP audio tower, a remote model).
     pub fn max_sequence_length(&self) -> Option<usize> {
-        self.candle.max_sequence_length()
+        self.candle_model()?.max_sequence_length()
     }
 
     /// Every kernel admission decision this model's forwards have taken
-    /// since it was loaded — `CandleModel::kernel_admission`.
+    /// since it was loaded — `CandleModel::kernel_admission`. A remote
+    /// model runs no kernel here, so its ledger is empty.
     pub fn kernel_admission(&self) -> jammi_kernels::admission::AdmissionLedger {
-        self.candle.kernel_admission()
+        match self.candle_model() {
+            Some(candle) => candle.kernel_admission(),
+            None => jammi_kernels::admission::AdmissionLedger::default(),
+        }
     }
 
-    /// Estimate GPU memory for one inference batch.
+    /// Estimate device memory for one inference batch. A remote model's
+    /// batch occupies no memory here.
     pub fn estimate_batch_memory(&self, batch_size: usize, seq_len: usize) -> usize {
         self.description()
             .dimensions()
-            .estimate_activation_memory(batch_size, seq_len)
+            .map_or(0, |d| d.estimate_activation_memory(batch_size, seq_len))
     }
 
     /// The persisted scaler's σ_y for a reloaded regression head, or `None` for a
@@ -475,7 +562,7 @@ impl LoadedModel {
     /// to raw units (`σ_y·σ_z`) — the σ-axis half of the de-standardise contract
     /// (the mean/quantile axes carry σ_y in the backend's affine).
     pub fn regression_std_scale(&self) -> Option<f32> {
-        self.candle.regression_std_scale()
+        self.candle_model()?.regression_std_scale()
     }
 
     /// TEST-ONLY non-vacuity seam: zero a loaded regression head's trained LoRA
@@ -487,36 +574,57 @@ impl LoadedModel {
     /// [`backend::candle::CandleModel::zero_distribution_head_for_test`].
     #[doc(hidden)]
     pub fn zero_distribution_head_for_test(&mut self) {
-        self.candle.zero_distribution_head_for_test();
+        if let Runner::Candle(candle) = &mut self.runner {
+            candle.zero_distribution_head_for_test();
+        }
     }
 
     /// The cost of every row of `content` under `task`: its length along the
-    /// axis a forward pads. See [`CandleModel::row_costs`].
+    /// axis a forward pads.
     pub fn row_costs(&self, content: &[ArrayRef], task: ModelTask) -> Result<Vec<u32>> {
-        self.candle.row_costs(content, task)
+        match &self.runner {
+            Runner::Candle(candle) => candle.row_costs(content, task),
+            Runner::Remote { model, .. } => model.row_costs(content, task),
+        }
     }
 
-    /// The ladder a forward under `task` pads its rows on. See
-    /// [`CandleModel::shape_ladder`].
+    /// The ladder a forward under `task` pads its rows on.
     pub fn shape_ladder(&self, task: ModelTask) -> Result<jammi_numerics::ShapeLadder> {
-        self.candle.shape_ladder(task)
+        match &self.runner {
+            Runner::Candle(candle) => candle.shape_ladder(task),
+            Runner::Remote { model, .. } => model.shape_ladder(task),
+        }
     }
 
-    /// The host half of a forward: prepare `content` for the device. See
-    /// [`CandleModel::prepare`].
+    /// The host half of a forward: prepare `content` for the runner.
     pub fn prepare(&self, content: &[ArrayRef], task: ModelTask) -> Result<PreparedInput> {
-        self.candle.prepare(content, task)
+        match &self.runner {
+            Runner::Candle(candle) => candle.prepare(content, task).map(PreparedInput::Candle),
+            Runner::Remote { model, .. } => model.prepare(content, task).map(PreparedInput::Remote),
+        }
     }
 
-    /// The device half of a forward: run the model over a prepared input.
-    pub fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
-        self.candle.forward_prepared(input)
+    /// The device half of a forward: run the model over a prepared input —
+    /// a local model's device operation, or a remote model's request. An
+    /// input prepared by the other runner is refused.
+    pub async fn forward_prepared(&self, input: PreparedInput) -> Result<BackendOutput> {
+        match (&self.runner, input) {
+            (Runner::Candle(candle), PreparedInput::Candle(input)) => {
+                candle.forward_prepared(input)
+            }
+            (Runner::Remote { model, .. }, PreparedInput::Remote(request)) => {
+                model.forward(request).await
+            }
+            _ => Err(jammi_db::error::JammiError::Inference(
+                "an input prepared for another model's runner reached this one".into(),
+            )),
+        }
     }
 
     /// [`Self::prepare`] then [`Self::forward_prepared`], with no device
     /// admission between: the single-row query encoders' call.
-    pub fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
-        self.forward_prepared(self.prepare(content, task)?)
+    pub async fn forward(&self, content: &[ArrayRef], task: ModelTask) -> Result<BackendOutput> {
+        self.forward_prepared(self.prepare(content, task)?).await
     }
 }
 

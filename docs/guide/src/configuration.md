@@ -678,6 +678,27 @@ not. `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` are truthy for any of
 `"true"`, case-insensitively, surrounding whitespace trimmed. See
 [Use a Local Model Checkpoint](./local-models.md).
 
+A model served at a remote endpoint is declared under
+`[models.remote.<name>]` and referenced as `remote:<name>`:
+
+```toml
+[models.remote.hosted-encoder]
+protocol = "openai_embeddings"            # the only protocol: text embedding
+url = "https://api.example.com/v1/embeddings"
+model = "text-embedding-small"            # the name the endpoint is asked for
+dimensions = 1536                         # every response is held to this width
+revision = "2026-01"                      # your pin of what the name serves
+headers = { Authorization = { file = "/run/secrets/embeddings-key" } }
+timeout_secs = 60                         # per request; default 60
+max_in_flight = 4                         # requests at once; default 4
+max_retries = 2                           # 429 / 5xx / timeout; default 2
+```
+
+A declaration that no request could be built from is refused at load, naming
+the key: a `url` that is not an http(s) URL naming a host, an empty `model` or
+`revision`, or a header that is not a header name. A credential that cannot be
+read is refused when the session opens. See [Remote Models](./remote-models.md).
+
 ## Environment variable overrides
 
 Every field in the config tree is overridable — not a hand-enumerated subset

@@ -51,6 +51,8 @@ half = { workspace = true, optional = true }
 # tonic client / server stream is built over (`fine_tune::collective::peer`).
 tokio-stream = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
+# A remote model's requests (`model::backend::remote`).
+reqwest = { workspace = true, optional = true }
 # `HubSource`'s cache-root fallback (`model/hub.rs`): when neither
 # `[models] hub_cache_dir` nor `HF_HOME` is set, the platform home directory
 # stands in for hf-hub's own `Cache::default()` — but resolved through
@@ -232,6 +234,7 @@ local = [
     "dep:hex",
     "dep:half",
     "dep:tokio-stream",
+    "dep:reqwest",
     "jammi-lora/candle",
 ]
 live-hub-tests = []

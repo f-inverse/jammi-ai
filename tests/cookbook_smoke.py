@@ -67,6 +67,7 @@ RECIPES: tuple[Recipe, ...] = (
     example("eval_inference_ner"),
     example("search_audit"),
     example("session_lifecycle"),
+    example("remote_model"),
     example("fine_tune", slow=True),
     example("flight_sql", slow=True),
 )

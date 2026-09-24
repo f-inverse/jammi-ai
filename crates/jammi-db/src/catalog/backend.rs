@@ -142,6 +142,10 @@ impl BackendImpl {
     ///
     /// Bounded: a transaction that still conflicts after
     /// [`SERIALIZABLE_TRIES`] tries surfaces the `Retry` to the caller.
+    ///
+    /// The wait before each re-run is [`serializable_backoff`]'s: randomized,
+    /// so two transactions that lost the same conflict do not re-run in
+    /// lockstep and lose it again.
     pub(crate) async fn serializable<F, R>(&self, f: F) -> Result<R, BackendError>
     where
         F: for<'tx> Fn(
@@ -160,7 +164,8 @@ impl BackendImpl {
         loop {
             match self.transaction(opts, &f).await {
                 Err(BackendError::Retry(_)) if tries < SERIALIZABLE_TRIES => {
-                    tokio::time::sleep(std::time::Duration::from_millis(5 * tries as u64)).await;
+                    let wait = serializable_backoff(tries, &mut rand::thread_rng());
+                    tokio::time::sleep(wait).await;
                     tries += 1;
                 }
                 settled => return settled,
@@ -351,6 +356,21 @@ pub enum BackendKind {
 /// How many times [`BackendImpl::serializable`] runs a transaction that keeps
 /// losing serialization conflicts before surfacing the failure.
 const SERIALIZABLE_TRIES: usize = 8;
+
+/// The wait before [`BackendImpl::serializable`]'s re-run after `tries`
+/// lost conflicts: uniformly random in `[0, 5 ms × 2^tries]`, the doubling
+/// capped at 2^6 (exponential backoff with full jitter).
+///
+/// Both sides of a serialization conflict usually run this loop — an attach
+/// and a reclaim over one artifact, two finalizes over one row — and they
+/// lose at the same moment. A fixed schedule sends them back at the same
+/// moment too, to conflict again, until every try is spent; drawing each
+/// wait at random spreads them apart, so one commits while the other waits.
+fn serializable_backoff(tries: usize, rng: &mut impl rand::Rng) -> std::time::Duration {
+    const BASE_MS: u64 = 5;
+    let ceiling = BASE_MS << tries.min(6);
+    std::time::Duration::from_millis(rng.gen_range(0..=ceiling))
+}
 
 /// Lifetime-scoped transactional handle handed to a [`CatalogBackend::transaction`]
 /// closure. Holds a borrowed reference to the backend's connection (the
@@ -1300,6 +1320,46 @@ mod close_barrier_tests {
         assert!(
             elapsed < BOUND,
             "the close took {elapsed:?}: it waited out the ceiling on a connection it never swept"
+        );
+    }
+}
+
+#[cfg(test)]
+mod serializable_backoff_tests {
+    use super::serializable_backoff;
+    use rand::SeedableRng;
+
+    /// Every wait lies in `[0, 5 ms × 2^tries]`, the doubling capped at
+    /// 2^6, and the ceiling is reached: the draw spans the whole window.
+    #[test]
+    fn each_wait_lies_in_its_window_and_the_window_doubles_to_its_cap() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for tries in 1..=10usize {
+            let ceiling = 5u64 << tries.min(6);
+            let waits: Vec<u64> = (0..2_000)
+                .map(|_| serializable_backoff(tries, &mut rng).as_millis() as u64)
+                .collect();
+            assert!(waits.iter().all(|&w| w <= ceiling), "tries {tries}");
+            assert_eq!(waits.iter().max(), Some(&ceiling), "tries {tries}");
+            assert_eq!(waits.iter().min(), Some(&0), "tries {tries}");
+        }
+    }
+
+    /// Two transactions that lost the same conflict draw independent waits:
+    /// across a whole retry schedule they do not wake in lockstep, which is
+    /// what a fixed schedule guarantees and what re-runs the conflict.
+    #[test]
+    fn two_losers_do_not_retry_in_lockstep() {
+        let mut first = rand::rngs::StdRng::seed_from_u64(1);
+        let mut second = rand::rngs::StdRng::seed_from_u64(2);
+        let lockstep = (1..super::SERIALIZABLE_TRIES)
+            .filter(|&tries| {
+                serializable_backoff(tries, &mut first) == serializable_backoff(tries, &mut second)
+            })
+            .count();
+        assert!(
+            lockstep < super::SERIALIZABLE_TRIES - 1,
+            "every retry of two independent losers landed on the same instant"
         );
     }
 }

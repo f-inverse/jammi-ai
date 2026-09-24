@@ -7,6 +7,8 @@ pub mod clip_bpe;
 /// resolver/worker call site. See [`hub`]'s module docs for the precedence
 /// chain and the `offline` promise.
 pub mod hub;
+/// The keyed single-flight memo both halves of [`cache::ModelCache`] are.
+pub(crate) mod memo;
 /// The shared "is this error message OOM-shaped" home. Neutral ground
 /// between `inference` (the batch-halving retry) and `fine_tune` (the
 /// training OOM guidance classifier) — neither reaches into the other's

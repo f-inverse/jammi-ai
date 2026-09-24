@@ -1,13 +1,13 @@
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use jammi_db::catalog::model_repo::RegisterModelParams;
+use jammi_db::config::CacheBounds;
 use jammi_db::error::{JammiError, Result};
-use tokio::sync::RwLock;
 
 use super::backend::candle::CandleBackend;
 use super::backend::{DeviceConfig, ModelBackend};
+use super::memo::{Memo, MemoEntry};
 use super::resolver::ModelResolver;
 use super::{LoadedModel, ModelDescription, ModelGuard, ModelId, ResolvedModel};
 use crate::concurrency::{DeviceSchedulers, GpuPermit, GpuScheduler};
@@ -25,7 +25,9 @@ pub enum ModelResidency {
     Unloaded,
 }
 
-struct CacheEntry {
+/// A loaded model the cache holds: the model, the count of guards handed
+/// out for it, and its device reservation.
+pub(crate) struct CacheEntry {
     model: Arc<LoadedModel>,
     ref_count: Arc<AtomicUsize>,
     memory_bytes: usize,
@@ -38,6 +40,111 @@ struct CacheEntry {
     /// so `reserved_memory` is never decremented while a guard still holds
     /// this model's device tensors resident across a forward pass.
     gpu_permit: Arc<GpuPermit>,
+    /// Signalled by every guard's drop — see [`ModelGuard`]'s
+    /// `admission_notify` field doc.
+    admission_notify: Arc<tokio::sync::Notify>,
+}
+
+/// A loaded model is probed through its description's fingerprint, and
+/// handed out as a [`ModelGuard`].
+///
+/// The probe handle is the `Arc<LoadedModel>` alone — never a `gpu_permit`
+/// clone. A permit clone made before `ref_count` is incremented would be an
+/// outstanding `Arc<GpuPermit>` invisible to eviction: the entry would be
+/// removed and reported as progress while the reservation stays held, and
+/// `do_load`'s admission loop, which trusts that report, would evict a
+/// second model or fail a load that fits. The permit clone is taken in
+/// [`MemoEntry::hand_out`], under the memo's write lock and in the same
+/// critical section as the `ref_count` increment.
+///
+/// `ModelGuard::drop` likewise releases its permit clone before
+/// decrementing `ref_count`. Neither ordering is what eviction relies on:
+/// [`MemoEntry::is_idle`] checks `Arc::strong_count(&gpu_permit) == 1`, the
+/// quantity that actually decides whether dropping the entry releases the
+/// reservation. `ref_count == 0` alone is not enough — an entry whose permit
+/// still has a clone outstanding is skipped, never removed as progress.
+///
+/// A stale entry is evicted whether or not it is in use (serving stale
+/// bytes is a correctness bug, not a capacity one). Removing it drops only
+/// ITS permit clone, so the reservation is not released while a guard
+/// still forwarding through the pre-mutation model holds another — the
+/// accounting never double-books that model's still-resident memory.
+impl MemoEntry for CacheEntry {
+    type Probe = Arc<LoadedModel>;
+    type Handle = ModelGuard;
+
+    fn probe_handle(&self) -> Arc<LoadedModel> {
+        Arc::clone(&self.model)
+    }
+
+    fn is(&self, probe: &Arc<LoadedModel>) -> bool {
+        Arc::ptr_eq(&self.model, probe)
+    }
+
+    fn probe_freshness(probe: &Arc<LoadedModel>) -> Result<bool> {
+        probe.description().probe_freshness()
+    }
+
+    fn hand_out(&self) -> ModelGuard {
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+        ModelGuard::new(
+            Arc::clone(&self.model),
+            Arc::clone(&self.ref_count),
+            Arc::clone(&self.gpu_permit),
+            Arc::clone(&self.admission_notify),
+        )
+    }
+
+    fn is_idle(&self) -> bool {
+        self.ref_count.load(Ordering::Relaxed) == 0 && Arc::strong_count(&self.gpu_permit) == 1
+    }
+}
+
+/// A description is probed through its own fingerprint and handed out as
+/// the shared `Arc`. It holds no reservation, so it is always idle.
+impl MemoEntry for Arc<ModelDescription> {
+    type Probe = Arc<ModelDescription>;
+    type Handle = Arc<ModelDescription>;
+
+    fn probe_handle(&self) -> Arc<ModelDescription> {
+        Arc::clone(self)
+    }
+
+    fn is(&self, probe: &Arc<ModelDescription>) -> bool {
+        Arc::ptr_eq(self, probe)
+    }
+
+    fn probe_freshness(probe: &Arc<ModelDescription>) -> Result<bool> {
+        probe.probe_freshness()
+    }
+
+    fn hand_out(&self) -> Arc<ModelDescription> {
+        Arc::clone(self)
+    }
+
+    fn is_idle(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+impl CacheEntry {
+    /// An idle entry for an inner-state test: `model` holding `gpu_permit`,
+    /// no guard handed out.
+    pub(crate) fn for_test(
+        model: &Arc<LoadedModel>,
+        gpu_permit: Arc<GpuPermit>,
+        memory_bytes: usize,
+    ) -> Self {
+        Self {
+            model: Arc::clone(model),
+            ref_count: Arc::new(AtomicUsize::new(0)),
+            memory_bytes,
+            _residency: ModelResidency::Gpu,
+            gpu_permit,
+            admission_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 /// What identifies one cached model.
@@ -52,9 +159,9 @@ struct CacheEntry {
 /// matches nor is matched by a key that names a task. A wildcard would
 /// reintroduce exactly the collision this key exists to remove.
 ///
-/// The same shape both maps are keyed by — the entries and the single-flight
-/// `in_flight` — because a single-flight that keyed more coarsely than the
-/// entries would make one loader stand in for a load of a different thing.
+/// Both memos key by it, entries and single-flight alike: a single-flight
+/// that keyed more coarsely than the entries would make one loader stand in
+/// for a load of a different thing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     /// The resolved model id.
@@ -78,61 +185,11 @@ impl CacheKey {
     }
 }
 
-struct CacheInner {
-    entries: HashMap<CacheKey, CacheEntry>,
-    lru_order: VecDeque<CacheKey>,
-    in_flight: HashMap<CacheKey, Arc<tokio::sync::Notify>>,
-}
-
-/// Test-only deterministic interleaving seam for `get_or_load`'s fast path.
-/// A unit test installs one of these (via [`ModelCache::install_probe_pause`])
-/// to pause a warm-hit task between releasing the snapshot's READ lock and
-/// calling `probe_freshness` — before `ref_count` is incremented and before
-/// the `gpu_permit` clone (taken only in the re-validate branch) — so a
-/// concurrent, budget-pressure-triggered `evict_one` can be driven into that
-/// window without a `sleep`-based race. `None` (production, and every test
-/// that never installs it) is a complete no-op.
-#[cfg(test)]
-pub(crate) struct ProbePauseHandle {
-    /// Signalled once the paused task has reached the pause point, so the
-    /// test knows it is now safe to drive a concurrent `evict_one`.
-    pub(crate) arrived: Arc<tokio::sync::Notify>,
-    /// The test calls `.notify_one()` on this to resume the paused task.
-    pub(crate) release: Arc<tokio::sync::Notify>,
-}
-
-/// The descriptions a [`ModelCache`] has computed, one per [`CacheKey`]:
-/// what a submitter plans against without materializing the model, and
-/// what a load materializes from, so the content digest is hashed once per
-/// resolved directory. An entry is re-probed for staleness on every read
-/// and recomputed when its files changed; one computation serves every
-/// concurrent reader of the same key.
-#[derive(Default)]
-struct DescriptionMemo {
-    entries: HashMap<CacheKey, Arc<ModelDescription>>,
-    in_flight: HashMap<CacheKey, Arc<tokio::sync::Notify>>,
-}
-
-impl DescriptionMemo {
-    /// Remove `id`'s entry if — and only if — it is still the SAME
-    /// description this call's snapshot probed (`Arc::ptr_eq`); a concurrent
-    /// task may have already replaced it, in which case whatever is there
-    /// now is left alone.
-    fn evict_if_current(&mut self, id: &CacheKey, description: &Arc<ModelDescription>) {
-        if self
-            .entries
-            .get(id)
-            .is_some_and(|current| Arc::ptr_eq(current, description))
-        {
-            self.entries.remove(id);
-        }
-    }
-}
-
-/// LRU cache of loaded models with GPU memory tracking and single-flight loading.
+/// LRU cache of loaded models with GPU memory tracking and single-flight
+/// loading, and the memo of the descriptions they are materialized from.
 pub struct ModelCache {
-    inner: Arc<RwLock<CacheInner>>,
-    descriptions: RwLock<DescriptionMemo>,
+    models: Memo<CacheKey, CacheEntry>,
+    descriptions: Memo<CacheKey, Arc<ModelDescription>>,
     resolver: ModelResolver,
     backend: CandleBackend,
     device_config: DeviceConfig,
@@ -143,17 +200,6 @@ pub struct ModelCache {
     /// notify is not sufficient on its own, and `do_load`'s admission loop
     /// for the full wake-set enumeration this notify is one half of.
     admission_notify: Arc<tokio::sync::Notify>,
-    /// See [`ProbePauseHandle`]. Consumed (taken) the first time
-    /// `get_or_load`'s fast path reaches the pause point, so it only ever
-    /// pauses once per installation.
-    #[cfg(test)]
-    probe_pause: std::sync::Mutex<Option<ProbePauseHandle>>,
-    /// The single-flight-wait peer of `probe_pause` — same
-    /// [`ProbePauseHandle`] shape, a different pause point
-    /// (`get_or_load`'s single-flight wait branch, after `enable()`/`drop`,
-    /// before `.await`).
-    #[cfg(test)]
-    single_flight_pause: std::sync::Mutex<Option<ProbePauseHandle>>,
 }
 
 impl ModelCache {
@@ -183,27 +229,32 @@ impl ModelCache {
     /// device: a model resident on two devices is two entries of one LRU, so
     /// eviction still reasons over the whole process's residency, while
     /// admission is charged to the device the copy actually occupies.
+    ///
+    /// Bounded by the `[inference]` defaults; a deployment's own bounds are
+    /// set with [`Self::bounded`].
     pub fn with_device_schedulers(
         resolver: ModelResolver,
         device_config: DeviceConfig,
         gpu_schedulers: DeviceSchedulers,
     ) -> Self {
+        let bounds = jammi_db::config::InferenceConfig::default().cache_bounds();
         Self {
-            inner: Arc::new(RwLock::new(CacheInner {
-                entries: HashMap::new(),
-                lru_order: VecDeque::new(),
-                in_flight: HashMap::new(),
-            })),
-            descriptions: RwLock::new(DescriptionMemo::default()),
+            models: Memo::new(bounds.loaded_models),
+            descriptions: Memo::new(bounds.described_models),
             resolver,
             backend: CandleBackend,
             device_config,
             gpu_schedulers,
             admission_notify: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(test)]
-            probe_pause: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            single_flight_pause: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// This cache, keeping at most `bounds` idle entries.
+    pub fn bounded(self, bounds: CacheBounds) -> Self {
+        Self {
+            models: Memo::new(bounds.loaded_models),
+            descriptions: Memo::new(bounds.described_models),
+            ..self
         }
     }
 
@@ -212,73 +263,19 @@ impl ModelCache {
         &self.gpu_schedulers
     }
 
-    /// Test seam: install a fresh [`ProbePauseHandle`]
-    /// pair on this cache and return the caller's half. See
-    /// [`ProbePauseHandle`]'s doc for exactly what it pauses.
+    /// Test seam: pause the next warm lookup of a loaded model between its
+    /// snapshot and its freshness probe — the window a concurrent eviction
+    /// must interleave into.
     #[cfg(test)]
-    pub(crate) fn install_probe_pause(&self) -> ProbePauseHandle {
-        let arrived = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.probe_pause.lock().unwrap() = Some(ProbePauseHandle {
-            arrived: Arc::clone(&arrived),
-            release: Arc::clone(&release),
-        });
-        ProbePauseHandle { arrived, release }
+    pub(crate) fn install_probe_pause(&self) -> super::memo::PauseHandle {
+        self.models.install_probe_pause()
     }
 
-    /// Take (consume) the installed pause, if any, signal the test that this
-    /// task has arrived, and block until the test releases it. A no-op
-    /// (including in every production build, where this method does not
-    /// even exist) once already consumed or never installed.
+    /// Test seam: pause the next caller that waits on another's load, after
+    /// it registered as a waiter and before it awaits.
     #[cfg(test)]
-    async fn pause_before_probe_for_test(&self) {
-        let handle = self.probe_pause.lock().unwrap().take();
-        if let Some(handle) = handle {
-            handle.arrived.notify_one();
-            handle.release.notified().await;
-        }
-    }
-
-    /// Test seam: the single-flight-wait peer of
-    /// [`ModelCache::install_probe_pause`].
-    #[cfg(test)]
-    pub(crate) fn install_single_flight_pause(&self) -> ProbePauseHandle {
-        let arrived = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *self.single_flight_pause.lock().unwrap() = Some(ProbePauseHandle {
-            arrived: Arc::clone(&arrived),
-            release: Arc::clone(&release),
-        });
-        ProbePauseHandle { arrived, release }
-    }
-
-    #[cfg(test)]
-    async fn pause_before_single_flight_wait_for_test(&self) {
-        let handle = self.single_flight_pause.lock().unwrap().take();
-        if let Some(handle) = handle {
-            handle.arrived.notify_one();
-            handle.release.notified().await;
-        }
-    }
-
-    /// Remove `id`'s `CacheEntry` if — and only if — it still holds the SAME
-    /// `Arc<LoadedModel>` this call's snapshot probed (`Arc::ptr_eq`); a
-    /// concurrent task may have already evicted/reloaded it, in which case
-    /// this is a no-op and whatever is there now is left alone. Shared by
-    /// `get_or_load`'s `Ok(false)` (stale) and `Err` (unprobeable) arms — the
-    /// same removal discipline applies to both: serving stale bytes, or
-    /// re-probing a permanently dead entry forever, are both correctness bugs
-    /// the idle-only `evict_one` (memory-pressure eviction) does not address.
-    async fn evict_if_current(&self, id: &CacheKey, model: &Arc<LoadedModel>) {
-        let mut cache = self.inner.write().await;
-        if cache
-            .entries
-            .get(id)
-            .is_some_and(|e| Arc::ptr_eq(&e.model, model))
-        {
-            cache.entries.remove(id);
-            cache.lru_order.retain(|x| x != id);
-        }
+    pub(crate) fn install_single_flight_pause(&self) -> super::memo::PauseHandle {
+        self.models.install_wait_pause()
     }
 
     /// Get or load a model. Returns a guard that keeps the model alive.
@@ -335,206 +332,9 @@ impl ModelCache {
             task: Some(task),
         };
 
-        loop {
-            // Fast-path snapshot: clone the currently cached entry's shared
-            // handles under a short-held READ lock (tokio's `RwLock` admits
-            // concurrent readers), then drop the lock BEFORE the staleness
-            // probe below. `probe_freshness` runs one blocking `stat` per
-            // fingerprinted candidate (config, weights, tokenizer, pooling,
-            // preprocessor, adapter pair); running that under the cache's
-            // single write lock would block every OTHER model's concurrent
-            // `get_or_load` for the duration. The snapshot + `Arc::ptr_eq`
-            // re-validate pattern below accepts a narrow race instead: if
-            // another task evicts/reloads this id while we probe, we retry
-            // from the top against whatever is there now — single-flight
-            // below still ensures at most one loader per id.
-            //
-            // The probe snapshot carries ONLY the `Arc<LoadedModel>` +
-            // `ref_count` handle — never a `gpu_permit` clone. A permit
-            // clone made here, before `ref_count` is incremented, would be an
-            // outstanding `Arc<GpuPermit>` invisible to `evict_one`: it would
-            // remove the `CacheEntry` and report progress while the
-            // reservation stays held, and `do_load`'s admission loop, which
-            // trusts that report, would evict a second model or fail a load
-            // that fits. The permit clone is taken in the re-validate branch
-            // below, under the WRITE lock and in the same critical section
-            // as the `ref_count` increment, so `evict_one` (also
-            // write-lock-gated) never observes `ref_count == 0` alongside a
-            // clone made on this path.
-            //
-            // `ModelGuard::drop` likewise releases its permit clone before
-            // decrementing `ref_count`. Neither ordering is what `evict_one`
-            // relies on: it checks `Arc::strong_count(&entry.gpu_permit) ==
-            // 1` at removal time, the quantity that actually decides whether
-            // dropping the entry releases the reservation.
-            let snapshot = {
-                let cache = self.inner.read().await;
-                cache
-                    .entries
-                    .get(&id)
-                    .map(|entry| (Arc::clone(&entry.model), Arc::clone(&entry.ref_count)))
-            };
-
-            if let Some((model, ref_count)) = snapshot {
-                // Test seam: a no-op unless a test installed a pause
-                // (`ProbePauseHandle`'s doc) — pauses exactly HERE, after
-                // the snapshot but before the probe, the window a
-                // concurrent `evict_one` must interleave into.
-                #[cfg(test)]
-                self.pause_before_probe_for_test().await;
-
-                match model.description().probe_freshness() {
-                    Ok(true) => {
-                        let mut cache = self.inner.write().await;
-                        let still_current = cache
-                            .entries
-                            .get(&id)
-                            .is_some_and(|e| Arc::ptr_eq(&e.model, &model));
-                        if still_current {
-                            // Atomic with the clone below: `evict_one`
-                            // cannot interleave between these two lines
-                            // (both require this same write lock), so it
-                            // never sees `ref_count == 0` while this clone
-                            // is outstanding.
-                            ref_count.fetch_add(1, Ordering::Acquire);
-                            let gpu_permit = Arc::clone(
-                                &cache
-                                    .entries
-                                    .get(&id)
-                                    .expect("just matched still_current above")
-                                    .gpu_permit,
-                            );
-                            cache.touch_lru(&id);
-                            return Ok(ModelGuard::new(
-                                model,
-                                ref_count,
-                                gpu_permit,
-                                Arc::clone(&self.admission_notify),
-                            ));
-                        }
-                        // The entry changed under us (a concurrent
-                        // evict/reload won the race) — retry against the
-                        // current state.
-                        continue;
-                    }
-                    Ok(false) => {
-                        // Stale: at least one fingerprinted candidate's
-                        // (len, mtime) diverged from load time, or a
-                        // candidate absent at load time now exists.
-                        // Evict — but only the SAME entry we probed; if it
-                        // already changed (another task raced us), leave
-                        // whatever is there now alone and retry.
-                        //
-                        // Deliberately unconditional on `ref_count`
-                        // (unlike `evict_one`, which only evicts an idle
-                        // `ref_count == 0` entry for memory-pressure
-                        // reasons): serving stale bytes is a correctness
-                        // bug, not a capacity one, so it overrides the
-                        // idle-only discipline. Removing the `CacheEntry`
-                        // drops only ITS `Arc<GpuPermit>` clone — the
-                        // reservation is not released while any live
-                        // `ModelGuard`'s clone (e.g. one still forwarding
-                        // through the pre-mutation model) is outstanding,
-                        // so the accounting never double-books the
-                        // pre-mutation model's still-resident memory. This
-                        // snapshot itself never held a permit clone (see
-                        // above), so there is nothing of ITS OWN to release.
-                        self.evict_if_current(&id, &model).await;
-                        // Fall through to single-flight/load below, which
-                        // re-resolves and re-hashes the CURRENT bytes.
-                    }
-                    Err(e) => {
-                        // A fingerprinted candidate vanished or became
-                        // unreadable between load and this probe — a typed
-                        // refusal, never a silent "treat as fresh". The
-                        // entry is evicted too, exactly like the `Ok(false)`
-                        // arm above: left cached, every LATER call would
-                        // re-probe the identical dead entry and fail forever
-                        // — a permanent wedge, even for a transient cause or
-                        // one a cold resolve routes around via an alternate
-                        // the probe's own slot did not see. Evicted, the
-                        // NEXT call takes the full cold path. Under the narrow
-                        // staleness contract (see `ModelFingerprint`'s doc)
-                        // this is cold-equivalence, not a silent recovery —
-                        // if the cause is still present, the next call hits
-                        // the loader's own typed error (a different message
-                        // than this probe's, but the identical OBSERVABLE
-                        // outcome: refusal), never a wedge; if the cause was
-                        // transient, the system self-heals instead.
-                        self.evict_if_current(&id, &model).await;
-                        return Err(e);
-                    }
-                }
-            }
-
-            let mut cache = self.inner.write().await;
-            // Re-check under the write lock: another task may have
-            // inserted this id (via `do_load` below) between our snapshot
-            // (which saw no entry, or a now-evicted one) and here.
-            if cache.entries.contains_key(&id) {
-                drop(cache);
-                continue;
-            }
-
-            // Single-flight: wait if another task is loading this model.
-            //
-            // `Notify::notify_waiters` only wakes futures that are ALREADY
-            // registered as waiting at the moment it is called — it does not
-            // persist a wakeup for a `Notified` future created afterward. A
-            // `Notified` created after dropping this write lock could miss a
-            // loader that finishes, removes itself from `in_flight`, and
-            // calls `notify_waiters()` in that gap — and with no timeout the
-            // waiter would hang. So, following the idiom
-            // `GpuScheduler::acquire` uses (see `concurrency/gpu_scheduler.rs`),
-            // the `Notified` future is built and `enable()`d — which
-            // registers the waiter synchronously — WHILE STILL HOLDING this
-            // write lock.
-            // The loader task cannot acquire this same write lock (needed
-            // to remove itself from `in_flight` before it may call
-            // `notify_waiters`) until this task has dropped it below, so
-            // registration always happens-before any `notify_waiters` call
-            // that could apply to this wait — the lost-wakeup window is
-            // closed structurally, not by a timeout.
-            if let Some(notify) = cache.in_flight.get(&id) {
-                let notify = Arc::clone(notify);
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                drop(cache);
-                // Test seam: a no-op unless a test installed a pause.
-                // Placed AFTER `enable()` (the registration point, reached
-                // before `drop(cache)` above) so it exercises whether an
-                // already-REGISTERED waiter still wakes when the loader
-                // completes and calls `notify_waiters` during the pause.
-                #[cfg(test)]
-                self.pause_before_single_flight_wait_for_test().await;
-                notified.await;
-                continue;
-            }
-
-            // We are the loader
-            let notify = Arc::new(tokio::sync::Notify::new());
-            cache.in_flight.insert(id.clone(), Arc::clone(&notify));
-            drop(cache);
-
-            let result = self.do_load(&id, &scheduler, source, task).await;
-
-            let mut cache = self.inner.write().await;
-            cache.in_flight.remove(&id);
-
-            match result {
-                Ok(guard) => {
-                    drop(cache);
-                    notify.notify_waiters();
-                    return Ok(guard);
-                }
-                Err(e) => {
-                    drop(cache);
-                    notify.notify_waiters();
-                    return Err(e);
-                }
-            }
-        }
+        self.models
+            .get_or_compute(&id, || self.do_load(&id, &scheduler, source, task))
+            .await
     }
 
     /// Describe a model without materializing it: everything planning its
@@ -577,73 +377,20 @@ impl ModelCache {
     }
 
     /// The memoized description of `id`: `resolved` described for
-    /// `device_config`, computed once for every concurrent caller of
-    /// the same key and reused by [`Self::do_load`], so the content digest
-    /// is hashed once per resolved directory.
-    ///
-    /// The same snapshot → probe → re-validate → single-flight shape as
-    /// [`Self::get_or_load`], without that loop's admission and permits:
-    /// a stale or unprobeable entry is evicted (only if it is still the
-    /// entry that was probed) and the key is described again; a caller
-    /// that finds another description of the same key in flight waits for
-    /// it, registered as a waiter before the write lock is released so the
-    /// completing computation's `notify_waiters` cannot be missed.
+    /// `device_config`, computed once for every concurrent caller of the
+    /// same key and reused by [`Self::do_load`], so the content digest is
+    /// hashed once per resolved directory.
     async fn describe_resolved(
         &self,
         id: &CacheKey,
         resolved: &ResolvedModel,
         device_config: &DeviceConfig,
     ) -> Result<Arc<ModelDescription>> {
-        loop {
-            let snapshot = self.descriptions.read().await.entries.get(id).cloned();
-            if let Some(description) = snapshot {
-                match description.probe_freshness() {
-                    Ok(true) => return Ok(description),
-                    Ok(false) => {
-                        self.descriptions
-                            .write()
-                            .await
-                            .evict_if_current(id, &description);
-                    }
-                    Err(e) => {
-                        self.descriptions
-                            .write()
-                            .await
-                            .evict_if_current(id, &description);
-                        return Err(e);
-                    }
-                }
-            }
-
-            let mut memo = self.descriptions.write().await;
-            if memo.entries.contains_key(id) {
-                drop(memo);
-                continue;
-            }
-            if let Some(notify) = memo.in_flight.get(id) {
-                let notify = Arc::clone(notify);
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                drop(memo);
-                notified.await;
-                continue;
-            }
-            let notify = Arc::new(tokio::sync::Notify::new());
-            memo.in_flight.insert(id.clone(), Arc::clone(&notify));
-            drop(memo);
-
-            let described = self.backend.describe(resolved, device_config).map(Arc::new);
-
-            let mut memo = self.descriptions.write().await;
-            memo.in_flight.remove(id);
-            if let Ok(description) = &described {
-                memo.entries.insert(id.clone(), Arc::clone(description));
-            }
-            drop(memo);
-            notify.notify_waiters();
-            return described;
-        }
+        self.descriptions
+            .get_or_compute(id, || async {
+                self.backend.describe(resolved, device_config).map(Arc::new)
+            })
+            .await
     }
 
     /// TEST-ONLY: the models resident in this process right now, one id per
@@ -651,8 +398,8 @@ impl ModelCache {
     /// planning materialized nothing reads. Not used by any production path.
     #[doc(hidden)]
     pub async fn resident_models_for_test(&self) -> Vec<ModelId> {
-        let cache = self.inner.read().await;
-        let mut ids: Vec<ModelId> = cache.entries.keys().map(|k| k.model_id.clone()).collect();
+        let models = self.models.read().await;
+        let mut ids: Vec<ModelId> = models.keys().map(|k| k.model_id.clone()).collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));
         ids.dedup();
         ids
@@ -796,13 +543,15 @@ impl ModelCache {
         }
     }
 
+    /// Resolve, describe, admit and materialize `id`: the entry the model
+    /// memo inserts and hands the first guard out of.
     async fn do_load(
         &self,
         id: &CacheKey,
         gpu_scheduler: &Arc<GpuScheduler>,
         source: &ModelSource,
         task: ModelTask,
-    ) -> Result<ModelGuard> {
+    ) -> Result<CacheEntry> {
         // This load's device, as the backend sees it. Built here rather than
         // at the (warm-hit) entry point: it owns a `Vec`, and the cold path
         // is the only one that needs it.
@@ -818,9 +567,8 @@ impl ModelCache {
         let memory_bytes = self.backend.estimate_memory(&resolved);
 
         // A stale-fingerprint reload can transiently need this model's
-        // budget TWICE — the caller in `get_or_load`'s `Ok(false)` arm
-        // already removed the stale `CacheEntry` from `cache.entries` (so
-        // `evict_one` here can never find it again), but its
+        // budget TWICE — the memo already removed the stale `CacheEntry`
+        // (so `evict_one` here can never find it again), but its
         // `Arc<GpuPermit>` clone stays outstanding for as long as ANY live
         // `ModelGuard` from before the mutation is still held — the
         // reservation is not released until that guard drops. Under a budget realistically sized to
@@ -894,13 +642,19 @@ impl ModelCache {
             if let Some(permit) = gpu_scheduler.try_acquire(memory_bytes) {
                 break permit;
             }
-            let evicted = {
-                let mut cache = self.inner.write().await;
-                // The budget this loop is waiting on is `id.device`'s, so
-                // only a copy resident on `id.device` can release it.
-                cache.evict_one(id.device)
-            };
-            if evicted {
+            // The budget this loop is waiting on is `id.device`'s, so only a
+            // copy resident on `id.device` can release it.
+            if let Some((evicted, entry)) = self
+                .models
+                .evict_one(|resident| resident.device == id.device)
+                .await
+            {
+                tracing::info!(
+                    model_id = %evicted.model_id.0,
+                    device = evicted.device,
+                    bytes = entry.memory_bytes,
+                    "Evicted model from cache"
+                );
                 continue;
             }
             if memory_bytes > gpu_scheduler.usable_capacity() {
@@ -930,31 +684,16 @@ impl ModelCache {
         self.complete_generic_registration(source, &source_str, &resolved, task)
             .await;
 
-        let mut cache = self.inner.write().await;
-        let ref_count = Arc::new(AtomicUsize::new(1));
-        let model = Arc::new(loaded);
-        // The permit is `Arc`-shared between this `CacheEntry` and the
-        // `ModelGuard` returned below (and every subsequent warm-hit guard) —
-        // see `ModelGuard::gpu_permit`'s doc for why.
-        let gpu_permit = Arc::new(gpu_permit);
-        cache.entries.insert(
-            id.clone(),
-            CacheEntry {
-                model: Arc::clone(&model),
-                ref_count: Arc::clone(&ref_count),
-                memory_bytes,
-                _residency: ModelResidency::Gpu,
-                gpu_permit: Arc::clone(&gpu_permit),
-            },
-        );
-        cache.lru_order.push_back(id.clone());
-
-        Ok(ModelGuard::new(
-            model,
-            ref_count,
-            gpu_permit,
-            Arc::clone(&self.admission_notify),
-        ))
+        // The permit is `Arc`-shared between this `CacheEntry` and every
+        // guard handed out of it — see `ModelGuard::gpu_permit`'s doc for why.
+        Ok(CacheEntry {
+            model: Arc::new(loaded),
+            ref_count: Arc::new(AtomicUsize::new(0)),
+            memory_bytes,
+            _residency: ModelResidency::Gpu,
+            gpu_permit: Arc::new(gpu_permit),
+            admission_notify: Arc::clone(&self.admission_notify),
+        })
     }
 
     /// Preload a model without running inference — the server's
@@ -973,167 +712,49 @@ impl ModelCache {
     }
 }
 
-impl CacheInner {
-    fn touch_lru(&mut self, id: &CacheKey) {
-        if let Some(pos) = self.lru_order.iter().position(|x| x == id) {
-            self.lru_order.remove(pos);
-        }
-        self.lru_order.push_back(id.clone());
-    }
-
-    /// Evict the oldest idle entry RESIDENT ON `device` and report whether
-    /// real progress was made (i.e. a `GpuPermit` reservation on that
-    /// device was actually released).
-    ///
-    /// The device is a parameter and not a convenience: admission is per
-    /// device (`DeviceSchedulers` holds one `GpuScheduler` per card, and a
-    /// reservation on one is invisible to the other), so the only eviction
-    /// that can answer a shortage on `device` is an eviction FROM `device`.
-    /// A device-blind scan would hand `do_load`'s admission loop a `true`
-    /// for a copy removed from some other card — real progress against a
-    /// budget nobody was waiting on — and the loop, still unable to
-    /// `try_acquire`, would come round and do it again until the other
-    /// card's cache was empty. `false` here means "nothing resident on
-    /// `device` can be released", which is the answer that makes the
-    /// admission loop wait rather than spin.
-    ///
-    /// `ref_count == 0` alone is NOT sufficient to
-    /// promise a caller (`do_load`'s admission loop) that removing this
-    /// entry frees GPU budget. A `ModelGuard`'s `Drop` releases its permit
-    /// clone before decrementing `ref_count` (see `ModelGuard::drop`'s
-    /// doc), so by the time `ref_count` reaches 0 the LAST outstanding
-    /// clone has, in the common case, already gone — but a snapshot taken
-    /// by a concurrent fast-path `get_or_load` between the write-lock
-    /// section that increments `ref_count` and clones the permit (see
-    /// `get_or_load`'s "atomic with the clone below" comment) can, in
-    /// principle, still hold a permit clone this scan cannot see reflected
-    /// in `ref_count` alone. We therefore gate progress on the actual,
-    /// checkable invariant: at removal time, THIS `CacheEntry`'s
-    /// `gpu_permit` clone must be the only clone left
-    /// (`Arc::strong_count == 1`) — only then does dropping it truly
-    /// decrement `GpuScheduler::reserved_memory`. An entry that is
-    /// `ref_count == 0` but whose permit still has outstanding clones is
-    /// not idle in the accounting sense: we skip it (leave it in the cache)
-    /// and keep scanning for another candidate, rather than removing it and
-    /// lying about progress.
-    fn evict_one(&mut self, device: i32) -> bool {
-        let evict_id = self
-            .lru_order
-            .iter()
-            .find(|id| {
-                id.device == device
-                    && self.entries.get(*id).is_some_and(|e| {
-                        e.ref_count.load(Ordering::Relaxed) == 0
-                            && Arc::strong_count(&e.gpu_permit) == 1
-                    })
-            })
-            .cloned();
-
-        if let Some(id) = evict_id {
-            if let Some(entry) = self.entries.remove(&id) {
-                self.lru_order.retain(|x| x != &id);
-                debug_assert_eq!(
-                    Arc::strong_count(&entry.gpu_permit),
-                    1,
-                    "evict_one only removes entries whose permit clone is the last one \
-                     outstanding — dropping `entry` here must be what actually releases \
-                     the GpuScheduler reservation"
-                );
-                tracing::info!(
-                    model_id = %id.model_id.0,
-                    device = id.device,
-                    bytes = entry.memory_bytes,
-                    "Evicted model from cache"
-                );
-            }
-            true
-        } else {
-            false
-        }
-    }
-}
-
 // ── The cache key: two devices are two resident copies, not one ────────────
 
 #[cfg(test)]
 mod cache_key_tests {
+    use std::collections::HashMap;
+
+    use super::super::memo::MemoState;
     use super::*;
 
-    /// Two devices hold TWO entries for one model id — in both maps.
+    /// A load in flight for device 0 is not a load in flight for device 1:
+    /// keyed by the id alone, the second caller would wait on the first's
+    /// load and then be handed a copy resident on the wrong card.
     ///
     /// Hermetic mechanism: two CPU "devices" are indistinguishable at
     /// execution, so the oracle drives the `device` COMPONENT of the key
     /// with two distinct values, which is exactly the quantity a two-card
-    /// deployment varies. Keyed by the id alone, the second insert would
-    /// overwrite the first and both maps would hold one entry — a rank
-    /// served a copy resident on another rank's card.
-    ///
-    /// The two maps are two determinants and are asserted separately: an
-    /// `in_flight` keyed more coarsely than `entries` would make one loader
-    /// stand in for a load of a different thing, which is a distinct defect
-    /// from a colliding entry.
+    /// deployment varies. Asserted on the PRODUCTION single-flight map, the
+    /// one `get_or_load` reads and writes.
     #[test]
-    fn two_devices_hold_two_entries_and_two_single_flight_slots_for_one_model_id() {
+    fn two_devices_hold_two_single_flight_slots_for_one_model_id() {
         let first = CacheKey::for_test("tiny-bert", 0);
         let second = CacheKey::for_test("tiny-bert", 1);
         assert_eq!(
             first.model_id, second.model_id,
-            "the control: it is ONE model id, so an id-keyed map would hold one entry"
+            "the control: it is ONE model id, so an id-keyed map would hold one slot"
         );
         assert_ne!(first, second);
 
-        // The PRODUCTION maps, not mirrors of them: `CacheInner` is what
-        // `get_or_load` reads and writes.
-        let mut inner = CacheInner {
-            entries: HashMap::new(),
-            lru_order: VecDeque::new(),
-            in_flight: HashMap::new(),
-        };
-
-        // Determinant 1 — the single-flight map. A load in flight for device
-        // 0 is not a load in flight for device 1: keyed by the id alone, the
-        // second caller would wait on the first's load and then be handed a
-        // copy resident on the wrong card.
-        inner
-            .in_flight
-            .insert(first.clone(), Arc::new(tokio::sync::Notify::new()));
-        inner
-            .in_flight
-            .insert(second.clone(), Arc::new(tokio::sync::Notify::new()));
+        let mut state = MemoState::<CacheKey, CacheEntry>::default();
+        let in_flight = state.in_flight_for_test();
+        in_flight.insert(first.clone(), Arc::new(tokio::sync::Notify::new()));
+        in_flight.insert(second.clone(), Arc::new(tokio::sync::Notify::new()));
         assert_eq!(
-            inner.in_flight.len(),
+            in_flight.len(),
             2,
             "the single-flight map holds one slot per device, not one per model id"
         );
-        assert!(inner.in_flight.contains_key(&first));
-        assert!(inner.in_flight.contains_key(&second));
-
-        // Determinant 2 — the LRU order. The two devices occupy two distinct
-        // slots of it rather than one, and touching one copy does not move
-        // the other. (The entries map itself is determinant 3, in
-        // `the_entries_map_holds_one_entry_per_device_for_one_model_id`
-        // below: it takes a really-loaded model, so it cannot be asserted
-        // here.)
-        assert!(inner.entries.is_empty());
-        inner.lru_order.push_back(first.clone());
-        inner.lru_order.push_back(second.clone());
-        inner.touch_lru(&first);
-        assert_eq!(
-            inner.lru_order.len(),
-            2,
-            "two devices are two resident copies of one model id, and the LRU tracks both"
-        );
-        assert_eq!(
-            inner.lru_order.back(),
-            Some(&first),
-            "touching device 0's copy must not move device 1's"
-        );
     }
 
-    /// Determinant 3 — the PRODUCTION entries map holds one entry per
+    /// The PRODUCTION entries map, and its recency order, hold one entry per
     /// device for one model id.
     ///
-    /// Asserted on `CacheInner::entries`, the map `get_or_load` reads and
+    /// Asserted on the model memo's own state, the map `get_or_load` reads and
     /// writes, and not on a throwaway `HashMap` built beside it: a mirror
     /// keyed by [`CacheKey`] would report two entries however the real map
     /// were keyed, so it measures this test's own construction rather than
@@ -1203,38 +824,41 @@ mod cache_key_tests {
             "the control: it is ONE model id, so an id-keyed map would hold one entry"
         );
 
-        let mut inner = CacheInner {
-            entries: HashMap::new(),
-            lru_order: VecDeque::new(),
-            in_flight: HashMap::new(),
-        };
+        let mut state = MemoState::<CacheKey, CacheEntry>::default();
         for (id, memory_bytes) in [(&first, 11usize), (&second, 22)] {
-            inner.entries.insert(
+            state.insert_for_test(
                 id.clone(),
-                CacheEntry {
-                    model: Arc::clone(&model),
-                    ref_count: Arc::new(AtomicUsize::new(0)),
+                CacheEntry::for_test(
+                    &model,
+                    Arc::new(scheduler.try_acquire(memory_bytes).unwrap()),
                     memory_bytes,
-                    _residency: ModelResidency::Gpu,
-                    gpu_permit: Arc::new(scheduler.try_acquire(memory_bytes).unwrap()),
-                },
+                ),
             );
         }
 
         assert_eq!(
-            inner.entries.len(),
+            state.len(),
             2,
             "two devices are two resident copies of one model id, in the cache's own map"
         );
         assert_eq!(
-            inner.entries.get(&first).map(|e| e.memory_bytes),
+            state.get(&first).map(|e| e.memory_bytes),
             Some(11),
             "device 0's entry must still be device 0's"
         );
         assert_eq!(
-            inner.entries.get(&second).map(|e| e.memory_bytes),
+            state.get(&second).map(|e| e.memory_bytes),
             Some(22),
             "device 1's entry must not have overwritten device 0's"
+        );
+
+        // The recency order tracks both copies, and touching one does not
+        // move the other.
+        state.touch_for_test(&first);
+        assert_eq!(
+            state.keys().cloned().collect::<Vec<_>>(),
+            vec![second.clone(), first.clone()],
+            "touching device 0's copy must not move device 1's"
         );
     }
 
@@ -1295,6 +919,7 @@ mod cache_key_tests {
 
 #[cfg(test)]
 mod f3_prime_tests {
+    use super::super::memo::MemoState;
     use super::*;
     use std::sync::Arc;
 
@@ -1465,7 +1090,7 @@ mod f3_prime_tests {
     /// `evict_one` must not claim progress for a `ref_count == 0` entry
     /// whose `gpu_permit` still has an outstanding clone. Rather than
     /// reproducing an ordering race through the async cache API, this test
-    /// drives `CacheInner::evict_one` DIRECTLY against a hand-built
+    /// drives `MemoState::evict_one` DIRECTLY against a hand-built
     /// `CacheEntry` whose permit has a second, test-held clone —
     /// deterministically constructing the state such a race would leave
     /// behind, with no timing dependency.
@@ -1524,35 +1149,11 @@ mod f3_prime_tests {
         let permit_y = Arc::new(scheduler.try_acquire(1).unwrap());
         let id_y = CacheKey::for_test("model_y", -1);
 
-        let mut inner = CacheInner {
-            entries: HashMap::new(),
-            lru_order: VecDeque::new(),
-            in_flight: HashMap::new(),
-        };
-        inner.entries.insert(
-            id_x.clone(),
-            CacheEntry {
-                model: Arc::clone(&model),
-                ref_count: Arc::new(AtomicUsize::new(0)),
-                memory_bytes: 1,
-                _residency: ModelResidency::Gpu,
-                gpu_permit: permit_x,
-            },
-        );
-        inner.entries.insert(
-            id_y.clone(),
-            CacheEntry {
-                model,
-                ref_count: Arc::new(AtomicUsize::new(0)),
-                memory_bytes: 1,
-                _residency: ModelResidency::Gpu,
-                gpu_permit: permit_y,
-            },
-        );
         // X is scanned before Y — the scan must SKIP X and land on Y rather
         // than stopping at the first misleading candidate.
-        inner.lru_order.push_back(id_x.clone());
-        inner.lru_order.push_back(id_y.clone());
+        let mut inner = MemoState::<CacheKey, CacheEntry>::default();
+        inner.insert_for_test(id_x.clone(), CacheEntry::for_test(&model, permit_x, 1));
+        inner.insert_for_test(id_y.clone(), CacheEntry::for_test(&model, permit_y, 1));
 
         // The budget has NO slack: the real load (`weights_len`) plus X's
         // and Y's one-byte permits exactly exhaust it.
@@ -1563,18 +1164,18 @@ mod f3_prime_tests {
         );
 
         assert!(
-            inner.evict_one(-1),
+            inner.evict_one(|k| k.device == -1).is_some(),
             "Y is genuinely idle (no outstanding permit clone) — evict_one \
              must find and remove it, skipping past the misleading X"
         );
         assert!(
-            inner.entries.contains_key(&id_x),
+            inner.get(&id_x).is_some(),
             "X must NOT have been removed: its permit still has an \
              outstanding clone, so evicting it would not have released \
              real memory"
         );
         assert!(
-            !inner.entries.contains_key(&id_y),
+            inner.get(&id_y).is_none(),
             "Y — the genuinely idle entry — must be the one actually evicted"
         );
         assert_eq!(
@@ -1588,13 +1189,13 @@ mod f3_prime_tests {
         // Now only the misleading X remains. evict_one must report NO
         // progress rather than removing X and lying about it.
         assert!(
-            !inner.evict_one(-1),
+            inner.evict_one(|k| k.device == -1).is_none(),
             "evict_one claimed progress for the sole remaining entry even \
              though its permit clone is still outstanding — removing X here would not decrement \
              GpuScheduler::reserved_memory because `outstanding_clone` is \
              still alive"
         );
-        assert!(inner.entries.contains_key(&id_x));
+        assert!(inner.get(&id_x).is_some());
         assert_eq!(
             scheduler.available(),
             1,
@@ -1611,16 +1212,81 @@ mod f3_prime_tests {
              has one live clone (the entry's own)"
         );
         assert!(
-            inner.evict_one(-1),
+            inner.evict_one(|k| k.device == -1).is_some(),
             "once the outstanding clone is gone, X is genuinely idle and \
              evict_one must now claim (and deliver) real progress"
         );
-        assert!(!inner.entries.contains_key(&id_x));
+        assert!(inner.get(&id_x).is_none());
         assert_eq!(
             scheduler.available(),
             2,
             "the final evict_one — now genuinely idle — must ACTUALLY \
              release X's reserved byte too, matching its claimed progress"
+        );
+    }
+
+    /// `[inference] max_loaded_models` bounds the models a cache keeps: past
+    /// it the least recently used idle model is evicted, and a model in use
+    /// is kept however far past the bound that takes the count.
+    #[tokio::test]
+    async fn max_loaded_models_evicts_the_oldest_idle_model_and_never_one_in_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
+        let resolver = ModelResolver::new(
+            Arc::clone(&catalog),
+            test_artifact_store(),
+            test_hub_source(),
+        )
+        .unwrap();
+        let (source_a, _) = tiny_bert_source(tmp.path(), "model_a");
+        let (source_b, _) = tiny_bert_source(tmp.path(), "model_b");
+        let (source_c, _) = tiny_bert_source(tmp.path(), "model_c");
+
+        let cache = ModelCache::new(
+            resolver,
+            device_config(),
+            Arc::new(GpuScheduler::new_unlimited()),
+        )
+        .bounded(CacheBounds {
+            loaded_models: std::num::NonZeroUsize::new(1),
+            described_models: None,
+        });
+        let resident = || async {
+            cache
+                .resident_models_for_test()
+                .await
+                .into_iter()
+                .map(|id| id.0)
+                .collect::<Vec<_>>()
+        };
+
+        let guard_a = cache
+            .get_or_load(&source_a, ModelTask::TextEmbedding)
+            .await
+            .unwrap();
+        let guard_b = cache
+            .get_or_load(&source_b, ModelTask::TextEmbedding)
+            .await
+            .unwrap();
+        assert_eq!(
+            resident().await.len(),
+            2,
+            "both models are in use, so neither is evicted past the bound"
+        );
+
+        drop(guard_a);
+        drop(guard_b);
+        drop(
+            cache
+                .get_or_load(&source_c, ModelTask::TextEmbedding)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            resident().await,
+            vec![source_c.to_string()],
+            "once idle, the older models are evicted down to the bound"
         );
     }
 
@@ -1674,44 +1340,32 @@ mod f3_prime_tests {
         let older_on_device_1 = CacheKey::for_test("model_b", 1);
         let newer_on_device_1 = CacheKey::for_test("model_c", 1);
 
-        let mut inner = CacheInner {
-            entries: HashMap::new(),
-            lru_order: VecDeque::new(),
-            in_flight: HashMap::new(),
-        };
+        let mut inner = MemoState::<CacheKey, CacheEntry>::default();
         for (id, scheduler) in [
             (&older_on_device_1, &budget_1),
             (&newer_on_device_1, &budget_1),
             (&on_device_0, &budget_0),
         ] {
-            inner.entries.insert(
-                id.clone(),
-                CacheEntry {
-                    model: Arc::clone(&model),
-                    ref_count: Arc::new(AtomicUsize::new(0)),
-                    memory_bytes: 1,
-                    _residency: ModelResidency::Gpu,
-                    gpu_permit: Arc::new(scheduler.try_acquire(1).unwrap()),
-                },
-            );
             // Device 1's two copies are the OLDEST entries in the LRU.
-            inner.lru_order.push_back(id.clone());
+            inner.insert_for_test(
+                id.clone(),
+                CacheEntry::for_test(&model, Arc::new(scheduler.try_acquire(1).unwrap()), 1),
+            );
         }
         assert_eq!(budget_0.available(), 0, "sanity: device 0 is full");
         assert_eq!(budget_1.available(), 0, "sanity: device 1 is full");
 
         // Device 0 is the one under pressure.
         assert!(
-            inner.evict_one(0),
+            inner.evict_one(|k| k.device == 0).is_some(),
             "device 0 holds an idle entry, so there is real progress to make"
         );
         assert!(
-            !inner.entries.contains_key(&on_device_0),
+            inner.get(&on_device_0).is_none(),
             "the entry evicted for device 0's pressure must be device 0's own"
         );
         assert!(
-            inner.entries.contains_key(&older_on_device_1)
-                && inner.entries.contains_key(&newer_on_device_1),
+            inner.get(&older_on_device_1).is_some() && inner.get(&newer_on_device_1).is_some(),
             "device 1's resident copies are not device 0's to spend"
         );
         assert_eq!(
@@ -1729,20 +1383,19 @@ mod f3_prime_tests {
         // — NOT device 1's oldest entry, which would free nothing for
         // device 0 while emptying another card's cache.
         assert!(
-            !inner.evict_one(0),
+            inner.evict_one(|k| k.device == 0).is_none(),
             "nothing device 0 holds can be evicted, and nothing another device holds would help"
         );
-        assert_eq!(inner.entries.len(), 2, "device 1's entries are untouched");
+        assert_eq!(inner.len(), 2, "device 1's entries are untouched");
         assert!(
-            inner.lru_order.iter().all(|id| id.device == 1),
+            inner.keys().all(|id| id.device == 1),
             "the LRU still tracks exactly device 1's two copies"
         );
 
         // Device 1's own pressure evicts device 1's oldest, and only it.
-        assert!(inner.evict_one(1));
+        assert!(inner.evict_one(|k| k.device == 1).is_some());
         assert!(
-            !inner.entries.contains_key(&older_on_device_1)
-                && inner.entries.contains_key(&newer_on_device_1),
+            inner.get(&older_on_device_1).is_none() && inner.get(&newer_on_device_1).is_some(),
             "within a device the scan is still oldest-first"
         );
         assert_eq!(budget_1.available(), 1);
@@ -1839,12 +1492,12 @@ mod single_flight_tests {
         // bypassing `do_load` entirely — the ONLY state `get_or_load`'s
         // single-flight branch actually observes.
         let loader_notify = Arc::new(tokio::sync::Notify::new());
-        {
-            let mut inner = cache.inner.write().await;
-            inner
-                .in_flight
-                .insert(id.clone(), Arc::clone(&loader_notify));
-        }
+        cache
+            .models
+            .write_for_test()
+            .await
+            .in_flight_for_test()
+            .insert(id.clone(), Arc::clone(&loader_notify));
 
         let pause = cache.install_single_flight_pause();
         let cache_for_waiter = Arc::clone(&cache);
@@ -1861,10 +1514,12 @@ mod single_flight_tests {
 
         // Simulate the loader completing WHILE the waiter is paused —
         // exactly the lost-wakeup window.
-        {
-            let mut inner = cache.inner.write().await;
-            inner.in_flight.remove(&id);
-        }
+        cache
+            .models
+            .write_for_test()
+            .await
+            .in_flight_for_test()
+            .remove(&id);
         loader_notify.notify_waiters();
 
         // Release the waiter: it must wake immediately (already

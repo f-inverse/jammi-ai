@@ -3106,16 +3106,18 @@ note below.
   `crates/jammi-ai/src/session.rs`), so admission is inert in deployment [§7]. The async
   `GpuScheduler::acquire` and `GpuPriority` are tests-only.
 - **`ModelGuard`** — `crates/jammi-ai/src/model/mod.rs` (the `ModelGuard` struct): the
-  handle execution holds. Drop decrements `ref_count`; **eviction only removes
-  `ref_count==0` entries** (`ModelCache::evict_one`,
-  `crates/jammi-ai/src/model/cache.rs`), so a model an executor holds is never evicted out
-  from under it.
-- **`ModelCache`** — `crates/jammi-ai/src/model/cache.rs` (the `ModelCache` struct): LRU
-  + single-flight + ref-counted entries + GPU-permit-gated admission. The `GpuPermit` is
+  handle execution holds. Drop decrements `ref_count`; **eviction only removes idle
+  entries** (`MemoEntry::is_idle` for `CacheEntry`, `crates/jammi-ai/src/model/cache.rs`),
+  so a model an executor holds is never evicted out from under it.
+- **`ModelCache`** — `crates/jammi-ai/src/model/cache.rs` (the `ModelCache` struct): two
+  instances of one keyed single-flight memo (`Memo`, `crates/jammi-ai/src/model/memo.rs`) —
+  the loaded models and the descriptions they are materialized from — plus
+  GPU-permit-gated admission. Each memo keeps at most its bound of idle entries
+  (`[inference] max_loaded_models`, `max_described_models`; `InferenceConfig::cache_bounds`). The `GpuPermit` is
   `Arc`-shared, not moved: `CacheEntry` holds its own clone (`gpu_permit`) and every live
   `ModelGuard` holds another (`_gpu_permit`), so permit lifetime is **not** entry lifetime
   — the reservation is released only when the *last* `Arc<GpuPermit>` clone drops.
-  `evict_one` therefore gates real progress on `ref_count == 0` **and**
+  Eviction therefore gates real progress on `ref_count == 0` **and**
   `Arc::strong_count(&entry.gpu_permit) == 1` (the entry's own clone is the only one
   left); an entry that is idle by ref-count but still has an outstanding guard-held clone
   is skipped, not removed.
@@ -4557,21 +4559,26 @@ the worker's sole authority.**
 
 ### 3.6 get_or_load (model lifecycle, end to end)
 
-`ModelCache::get_or_load(source, task)` (`crates/jammi-ai/src/model/cache.rs`),
-retry loop re-taking the write lock:
-- **Fast path**: entry hit → `ref_count.fetch_add(1)` → build `ModelGuard` → `touch_lru` →
-  return. No resolver/backend/permit churn.
-- **Single-flight wait**: another task is loading this id → clone the `Notify`, drop the
-  lock, `notified().await`, `continue`.
-- **New-load path**: insert into `in_flight`, drop the lock, call `do_load`, re-acquire,
-  `in_flight.remove`, **`notify_waiters()` on BOTH Ok and Err arms** (failure must not
-  strand waiters).
-- `ModelCache::do_load`: `resolver.resolve` → pick backend by `resolved.backend` →
-  `estimate_memory` → **admission loop** (`try_acquire`; on `None` take the lock and
-  `evict_one`; if nothing evictable, error) → `backend.load` → post-load catalog bookkeeping
-  (`complete_generic_registration`,
-  `crates/jammi-ai/src/model/cache.rs`) → insert `CacheEntry` (permit moved in) → return
-  guard with refcount 1. The bookkeeping write is gated by an ALLOWLIST of the generic,
+`ModelCache::get_or_load(source, task)` (`crates/jammi-ai/src/model/cache.rs`) is
+`Memo::get_or_compute` (`crates/jammi-ai/src/model/memo.rs`) over the model memo, with
+`do_load` as the computation:
+- **Fast path**: snapshot the entry under the read lock, probe its freshness outside it,
+  re-validate by identity under the write lock → `hand_out` (`ref_count` increment and
+  permit clone in one critical section) → touch the LRU → return. A stale or unprobeable
+  entry is evicted if it is still the one probed.
+- **Single-flight wait**: another task is loading this key → register the `Notified`
+  (`enable()`) while still holding the write lock, drop it, await, `continue` — the loader
+  may have *failed*.
+- **New-load path**: insert into `in_flight`, drop the lock, run `do_load`, re-acquire,
+  `in_flight.remove`, insert the entry and hand out the first guard, shed idle entries past
+  the bound, **`notify_waiters()` on BOTH Ok and Err arms** (failure must not strand
+  waiters).
+- `ModelCache::do_load`: `resolver.resolve` → the memoized description → `estimate_memory`
+  → **admission loop** (`try_acquire`; on `None` evict the device's least recently used
+  idle entry; if nothing is evictable and the request fits the device at all, wait on a
+  permit release or a guard drop) → `materialize` → post-load catalog bookkeeping
+  (`complete_generic_registration`, `crates/jammi-ai/src/model/cache.rs`) → the
+  `CacheEntry` the memo inserts. The bookkeeping write is gated by an ALLOWLIST of the generic,
   non-terminal row kinds it exists to complete, `GENERIC_COMPLETABLE_TYPES`
   (`crates/jammi-ai/src/model/cache.rs`, `&["local", "huggingface", "embedding"]`) — never a
   denylist of the terminal types to protect, which would fail open on every unenumerated
@@ -5384,11 +5391,14 @@ auto-available to every encoder.)
 - **Cache key = model id + device + task** (`CacheKey`) — the same weights on two devices, or
   loaded for two tasks, are two entries.
 - **Single-flight: a waiter must `continue` and re-check the fast path on wake** — the loader may
-  have *failed*. Keep `in_flight.remove` + `notify` paired on every exit, both Ok and Err arms.
-- **Admission uses `try_acquire` + evict, not `acquire`** (the async `acquire` and `GpuPriority`
-  are dead in production). **Eviction only frees `ref_count==0` entries** — fail-fast, no queuing.
-- **`GpuPermit` lifetime == `CacheEntry` lifetime** (moved into the entry, field `_gpu_permit`) —
-  dropping it early releases budget while the model still occupies memory. **`estimate_memory`
+  have *failed*. `Memo::get_or_compute` keeps `in_flight.remove` + `notify` paired on every exit.
+- **Admission uses `try_acquire` + evict + a wait on the complete wake set, not `acquire`**
+  (the async `acquire` and `GpuPriority` are dead in production). **Eviction only frees idle
+  entries** (`ref_count == 0` and the entry's permit clone the last one); a request larger than
+  the device could ever admit is refused.
+- **`GpuPermit` lifetime == the last `Arc<GpuPermit>` clone's** (the entry's and every live
+  guard's) — releasing it while any holder remains releases budget while the model still
+  occupies memory. **`estimate_memory`
   precision matters** (admission budgets weights only, not activations).
 - **Retired-model refusal lives in the resolver, not the catalog read** — `get_model` still returns
   retired rows for reference resolution.

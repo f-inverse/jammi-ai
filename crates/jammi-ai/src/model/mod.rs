@@ -24,7 +24,7 @@ use backend::candle::CandleModel;
 use jammi_db::error::Result;
 use serde::{Deserialize, Serialize};
 
-use jammi_datafusion::{BackendOutput, ModelSource};
+use jammi_datafusion::BackendOutput;
 
 /// Unique identifier for a loaded model, used as cache key.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -79,13 +79,12 @@ pub enum WeightsFormat {
     Gguf,
 }
 
-/// What task this model performs.
-///
-/// Re-exported from `jammi_db` so the engine — which owns the catalog
-/// tables that persist this — and `jammi_ai` agree on the variant set and
-/// on-disk spelling without `jammi_db` depending on `jammi_ai`.
 pub use backend::candle::PreparedInput;
-pub use jammi_datafusion::ModelTask;
+/// The model vocabulary this crate's public API takes — where a model is
+/// loaded from and what it computes — defined by `jammi-datafusion`, whose
+/// operators run them, and re-exported so a caller of this crate names them
+/// from one place.
+pub use jammi_datafusion::{ModelSource, ModelTask};
 
 /// Where the tokenizer for a resolved model lives, and what shape it is.
 ///

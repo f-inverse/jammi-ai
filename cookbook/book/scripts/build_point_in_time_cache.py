@@ -74,7 +74,7 @@ import pyarrow.parquet as pq
 from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import contracts
+from jammi_cookbook import cache, contracts
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "point_in_time"
 
@@ -377,15 +377,6 @@ def verdict_matrix(work: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _checksums() -> None:
-    sums = {
-        p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in sorted(ARTIFACTS.glob("*"))
-        if p.is_file() and p.name != "checksums.json"
-    }
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
-
-
 def emit(target: str, server_bin: str | None) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
@@ -540,7 +531,7 @@ def emit(target: str, server_bin: str | None) -> None:
 
     (ARTIFACTS / "point_in_time.json").write_text(json.dumps(record, indent=2, sort_keys=True))
     (ARTIFACTS / "golden_metrics.json").write_text(json.dumps(golden, indent=2, sort_keys=True))
-    _checksums()
+    cache.write_checksums(ARTIFACTS)
 
     print("\n=== point-in-time cache, measured ===", flush=True)
     print(f"  leakage_delta = naive {leak['naive_auc']:.4f} - asof {leak['asof_auc']:.4f} "

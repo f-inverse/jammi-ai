@@ -135,7 +135,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  — applies the determinism env on import
-from jammi_cookbook import contracts, determinism
+from jammi_cookbook import cache, contracts, determinism
 
 ENGINE_VERSION = "0.49.1"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "media_tower"
@@ -198,10 +198,6 @@ CLAP_TARGET_MODULES = ["query", "value", "linear1"]
 ROW_ORDER = contracts.MEDIA_TOWER_ROW_ORDER
 CORRUPT_ARROW_POSITION = contracts.MEDIA_TOWER_CORRUPT_ARROW_POSITION
 _ROW_INDEX_RE = re.compile(r"row (\d+)")
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 def _run_generator(args: list[str]) -> None:
@@ -835,7 +831,7 @@ def emit(server: GpuLiveServer, vision_checkpoint: str, audio_checkpoint: str, d
         tmp.unlink(missing_ok=True)
     shutil.rmtree(work, ignore_errors=True)
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\n=== media-tower LoRA cache (REAL checkpoints) ===", flush=True)
     for name, rec in towers.items():
         print(f"  {name:<6} change={rec['change_vs_base_max_abs_diff']:.6f}  "
@@ -845,12 +841,6 @@ def emit(server: GpuLiveServer, vision_checkpoint: str, audio_checkpoint: str, d
     for f in sorted(ARTIFACTS.glob("*")):
         if f.is_file():
             print(f"  {f.name}  ({f.stat().st_size} bytes)", flush=True)
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

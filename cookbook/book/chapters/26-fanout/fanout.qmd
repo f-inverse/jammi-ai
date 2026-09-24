@@ -1,0 +1,85 @@
+---
+title: "One plan, every fan-out — the model stage writes the same bytes at any width"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `generate_embeddings` under `[inference] partitions = 1, 2, 4` ·
+the table's manifest sidecar (`artifact`, `definition_hash`) · **Theory:** a
+parallel plan is deterministic when the unit of work is fixed before the work
+is distributed [@kleppmann2017ddia] · **Rail:** measurement (every cell an
+equality verdict frozen to golden, tol 0).
+
+A model stage attached to a query engine as a user-defined function sees
+whatever batches the engine hands it. How rows are grouped then depends on the
+partition count and on how the exchanges above it re-batch, so a padded forward
+over a different grouping produces different bytes. In jammi, the model stage
+is a plan operator (`InferenceExec`), so it can fix the grouping before any
+rows are distributed:
+
+1. **Rows are costed once.** Each row's cost is its length along the axis a
+   forward pads (its token count for text). The numbered input orders rows by
+   cost, then key.
+2. **Chunks are cut once.** The ordered rows are cut into forward chunks under
+   the chunk budget (`batch_size` rows, `batch_tokens` padded tokens), and each
+   row carries its chunk id.
+3. **The exchange hashes on the chunk id.** A fan-out of *N* partitions
+   distributes whole chunks, never dividing one. The `InferenceFanOut` rule
+   keeps that exchange at the node's own declared width through DataFusion's
+   own distribution enforcement.
+
+So every partition count forwards identical chunks and writes identical bytes.
+This chapter measures that on CPU, hermetically: the same embedding plan over
+the same 24-row corpus, run at partitions 1, 2 and 4, each in a fresh catalog.
+
+```{python}
+from jammi_cookbook import contracts
+
+matrix = contracts.load_artifact("fanout.matrix")
+record = contracts.load_artifact("fanout.record")
+print(record["method"])
+print(f"\nrows={matrix['rows']}  batch_size={matrix['batch_size']}")
+for run in matrix["runs"]:
+    print(f"partitions={run['partitions']}  artifact={run['artifact']}")
+```
+
+## The verdicts
+
+The artifact digest covers the table's Parquet bytes, so equal digests mean
+equal bytes. The definition hash is the recorded identity of what produced the
+table; it is equal across runs because the partition count changes how the
+work is spread, not what is computed.
+
+```{python}
+reference = matrix["runs"][0]
+for run in matrix["runs"][1:]:
+    same = 1.0 if run["artifact"] == reference["artifact"] else 0.0
+    contracts.assert_close(f"fanout.p{run['partitions']}_artifact_equal", same)
+    print(f"partitions={run['partitions']}: same artifact as partitions=1 → {same}")
+
+same_definition = 1.0 if len({r["definition_hash"] for r in matrix["runs"]}) == 1 else 0.0
+contracts.assert_close("fanout.definition_equal_all", same_definition)
+print(f"one definition across every fan-out → {same_definition}")
+```
+
+## Why this matters beyond one table
+
+- **Reuse is safe at any width.** A table materialized at one fan-out is the
+  cached answer for the same definition at another. The definition hash
+  doesn't carry the partition count, and the bytes it names don't depend on it.
+- **Verification is width-independent.** `verify_materialization` recomputes
+  an artifact digest; a verifier running a different fan-out than the
+  producer still gets a `match`.
+- **Scaling out is a configuration change.** The same holds when the plan's
+  partitions run as tasks of a Ballista cluster. The chunk ids travel with
+  the rows through the shuffle, so a cluster writes what one process writes.
+  The engine's distributed tests prove that leg; this chapter's CPU matrix
+  proves the in-process one.
+
+The mechanism lives in `crates/jammi-datafusion/src/inference/` (`numbered.rs`
+numbers and cuts; `exec.rs` holds `InferenceExec` and `InferenceFanOut`). The
+guide's *Built on DataFusion and Ballista* page maps it among the engine's
+other extensions of DataFusion.

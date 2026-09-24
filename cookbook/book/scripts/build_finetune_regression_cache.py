@@ -48,7 +48,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -58,7 +57,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import datasets, determinism
+from jammi_cookbook import cache, datasets, determinism
 
 ENGINE_VERSION = "0.46.0"
 EMBED_MODEL = "answerdotai/ModernBERT-base"
@@ -80,10 +79,6 @@ GAUSSIAN_LOSSES = ["beta_nll", "gaussian_nll", "crps"]
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 def _text(row: dict) -> str:
@@ -318,7 +313,7 @@ def emit(db) -> None:
     for tmp in ("_train.parquet", "_test.parquet"):
         (ARTIFACTS / tmp).unlink(missing_ok=True)
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\n=== per-loss held-out regression (REAL) ===", flush=True)
     print(f"  target year [{years.min()},{years.max()}] std {target_std} "
           f"over {len(test_rows)} test rows", flush=True)
@@ -334,12 +329,6 @@ def emit(db) -> None:
     for f in sorted(ARTIFACTS.glob("*")):
         if f.is_file():
             print(f"  {f.name}  ({f.stat().st_size} bytes)", flush=True)
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

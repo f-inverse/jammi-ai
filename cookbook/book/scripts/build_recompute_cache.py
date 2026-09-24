@@ -120,9 +120,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
-import os
 import tempfile
 from pathlib import Path
 
@@ -131,6 +129,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
+from jammi_cookbook import cache
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "recompute"
 
@@ -372,19 +371,6 @@ def run_recompute(catalog_root: Path, model: str, src_path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_checksums() -> None:
-    sums = {
-        p.name: _checksum(p)
-        for p in sorted(ARTIFACTS.glob("*"))
-        if p.is_file() and p.name != "checksums.json"
-    }
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
-
-
 def emit(fixtures_root: Path) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     model = f"local:{fixtures_root / 'tests' / 'fixtures' / 'tiny_modernbert'}"
@@ -495,7 +481,7 @@ def emit(fixtures_root: Path) -> None:
     }
     (ARTIFACTS / "recompute.json").write_text(json.dumps(record, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
 
     # --- the loud verdict --------------------------------------------------- #
     print("\n=== incremental-recompute + caching, measured (embedded, CPU-hermetic) ===",
@@ -533,26 +519,17 @@ def emit(fixtures_root: Path) -> None:
             print(f"  {f.name}  ({f.stat().st_size} bytes)", flush=True)
 
 
-def _fixtures_root(arg: str | None) -> Path:
-    root = arg or os.environ.get("JAMMI_FIXTURES_ROOT")
-    if not root:
-        raise SystemExit(
-            "pass --fixtures-root (or set JAMMI_FIXTURES_ROOT) to the engine checkout "
-            "carrying tests/fixtures/tiny_modernbert (the base model the embedding step runs)"
-        )
-    p = Path(root).resolve()
-    if not (p / "tests" / "fixtures" / "tiny_modernbert" / "config.json").exists():
-        raise SystemExit(f"--fixtures-root {p} has no tests/fixtures/tiny_modernbert")
-    return p
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixtures-root", default=None,
                     help="engine checkout with tests/fixtures/tiny_modernbert "
                          "(or set JAMMI_FIXTURES_ROOT)")
     args = ap.parse_args()
-    emit(_fixtures_root(args.fixtures_root))
+    fixtures = cache.engine_fixtures_root(
+        args.fixtures_root,
+        "tests/fixtures/tiny_modernbert/config.json",
+    )
+    emit(fixtures)
 
 
 if __name__ == "__main__":

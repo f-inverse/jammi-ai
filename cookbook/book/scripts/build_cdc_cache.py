@@ -44,7 +44,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import tempfile
 from pathlib import Path
@@ -53,7 +52,7 @@ import jammi
 import pyarrow as pa
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import contracts
+from jammi_cookbook import cache, contracts
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "cdc"
 
@@ -237,7 +236,7 @@ def emit(db, _work: Path) -> None:
     (ARTIFACTS / "golden_metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\n=== change-data-capture, measured ===", flush=True)
     print(f"  num_published={num_published}  replay_count={replay_count}  "
           f"add_count={add_count}  tail_count={tail_count}  "
@@ -246,16 +245,6 @@ def emit(db, _work: Path) -> None:
     for f in sorted(ARTIFACTS.glob("*")):
         if f.is_file():
             print(f"  {f.name}  ({f.stat().st_size} bytes)", flush=True)
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

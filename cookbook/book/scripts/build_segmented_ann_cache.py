@@ -112,9 +112,7 @@ the engine wheel + client and shells out to `cargo test`; PR CI never runs it.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 import re
 import subprocess
 import tempfile
@@ -126,6 +124,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
+from jammi_cookbook import cache
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "segmented_ann"
 
@@ -292,34 +291,6 @@ def _run_append_suite(fixtures_root: Path) -> dict:
     }
 
 
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-
-def _write_checksums() -> None:
-    sums = {
-        p.name: _checksum(p)
-        for p in sorted(ARTIFACTS.glob("*"))
-        if p.is_file() and p.name != "checksums.json"
-    }
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
-
-
-def _fixtures_root(arg: str | None) -> Path:
-    root = arg or os.environ.get("JAMMI_FIXTURES_ROOT")
-    if not root:
-        raise SystemExit(
-            "pass --fixtures-root (or set JAMMI_FIXTURES_ROOT) to the engine "
-            "checkout carrying tests/fixtures/patents.parquet + tests/fixtures/tiny_modernbert"
-        )
-    p = Path(root).resolve()
-    if not (p / "tests" / "fixtures" / "patents.parquet").exists():
-        raise SystemExit(f"--fixtures-root {p} has no tests/fixtures/patents.parquet")
-    if not (p / "tests" / "fixtures" / "tiny_modernbert" / "config.json").exists():
-        raise SystemExit(f"--fixtures-root {p} has no tests/fixtures/tiny_modernbert")
-    return p
-
-
 def emit(fixtures_root: Path) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
@@ -459,7 +430,7 @@ def emit(fixtures_root: Path) -> None:
     }
     (ARTIFACTS / "record.json").write_text(json.dumps(record, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
 
     print("\n=== segmented ANN index, measured ===", flush=True)
     print(f"  N=1: segment_count={catalog['segment_count']} segment_id={seg0['segment_id']} "
@@ -480,7 +451,12 @@ def main() -> None:
                     help="engine checkout with tests/fixtures/patents.parquet + "
                          "tests/fixtures/tiny_modernbert (or set JAMMI_FIXTURES_ROOT)")
     args = ap.parse_args()
-    emit(_fixtures_root(args.fixtures_root))
+    fixtures = cache.engine_fixtures_root(
+        args.fixtures_root,
+        "tests/fixtures/patents.parquet",
+        "tests/fixtures/tiny_modernbert/config.json",
+    )
+    emit(fixtures)
 
 
 if __name__ == "__main__":

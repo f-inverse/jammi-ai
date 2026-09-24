@@ -59,7 +59,6 @@ a live CPU `jammi-server`; PR CI never runs it (it reads the committed cache).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import tempfile
@@ -69,6 +68,7 @@ import jammi
 from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
+from jammi_cookbook import cache
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "channels"
 
@@ -243,19 +243,6 @@ def _parity(name: str, embedded: dict, remote: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_checksums() -> None:
-    sums = {
-        p.name: _checksum(p)
-        for p in sorted(ARTIFACTS.glob("*"))
-        if p.is_file() and p.name != "checksums.json"
-    }
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
-
-
 _MODES = ("duplicate", "unknown", "column_conflict", "bad_argument")
 
 
@@ -416,7 +403,7 @@ def emit(server_bin: str) -> None:
     }
     (ARTIFACTS / "channels_taxonomy.json").write_text(json.dumps(record, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
 
     print("\n=== channel error taxonomy, measured (mode → wire code) ===", flush=True)
     for mode in _MODES:

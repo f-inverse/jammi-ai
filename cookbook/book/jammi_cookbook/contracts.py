@@ -844,6 +844,27 @@ ARTIFACTS: dict[str, Artifact] = {
         "recompute per request, one bounded sweep; the scheduled/monitored recompute LOOP "
         "is the consumer's, names no consumer).",
     ),
+    # --- one plan at every fan-out writes the same bytes ----------------------
+    "fanout.matrix": Artifact(
+        name="fanout.matrix",
+        kind="model_id",
+        filename="matrix.json",
+        produced_by="fanout",
+        note="One generate_embeddings plan over a committed 24-row corpus of uneven "
+        "lengths, run at [inference] partitions = 1, 2 and 4 (batch_size 4, so every "
+        "fan-out forwards several chunks), each in a fresh file:// catalog: per run, the "
+        "artifact digest and definition hash off the table's manifest sidecar. The rows "
+        "a model forwards together are decided by row cost and carried as a chunk id the "
+        "exchange hashes on, so every fan-out writes the same artifact.",
+    ),
+    "fanout.record": Artifact(
+        name="fanout.record",
+        kind="model_id",
+        filename="fanout.json",
+        produced_by="fanout",
+        note="How the fan-out matrix was produced: the method, the partition counts, the "
+        "engine version and the base model.",
+    ),
     # --- tenant isolation as a measured property -----------------------------
     "tenancy_b.record": Artifact(
         name="tenancy_b.record",

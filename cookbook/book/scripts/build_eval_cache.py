@@ -55,7 +55,6 @@ of the engine wheel + client; PR CI never runs it.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import tempfile
@@ -65,6 +64,7 @@ import jammi
 from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
+from jammi_cookbook import cache
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "eval"
 
@@ -215,19 +215,6 @@ def _parity(name: str, embedded: dict | list, remote: dict | list) -> dict:
 # --------------------------------------------------------------------------- #
 # Fixture registration (fresh, source-bound — never the bare arxiv matrix)
 # --------------------------------------------------------------------------- #
-
-
-def _fixtures_root(arg: str | None) -> Path:
-    root = arg or os.environ.get("JAMMI_FIXTURES_ROOT")
-    if not root:
-        raise SystemExit(
-            "pass --fixtures-root (or set JAMMI_FIXTURES_ROOT) to the engine "
-            "checkout carrying tests/fixtures + cookbook/fixtures"
-        )
-    p = Path(root).resolve()
-    if not (p / "tests" / "fixtures" / "patents.parquet").exists():
-        raise SystemExit(f"--fixtures-root {p} has no tests/fixtures/patents.parquet")
-    return p
 
 
 class Fixtures:
@@ -389,19 +376,6 @@ def run_channel_sequence(db, tenant_a: str, tenant_b: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_checksums() -> None:
-    sums = {
-        p.name: _checksum(p)
-        for p in sorted(ARTIFACTS.glob("*"))
-        if p.is_file() and p.name != "checksums.json"
-    }
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
-
-
 def emit(fx: Fixtures, server_bin: str) -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
 
@@ -559,7 +533,7 @@ def emit(fx: Fixtures, server_bin: str) -> None:
     }
     (ARTIFACTS / "eval.json").write_text(json.dumps(eval_record, indent=2, sort_keys=True))
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
 
     print("\n=== eval + channels, measured (embedded canonical) ===", flush=True)
     print(f"  embeddings: recall@k={emb_agg['recall_at_k']:.6f} mrr={emb_agg['mrr']:.6f} "
@@ -592,7 +566,7 @@ def main() -> None:
     args = ap.parse_args()
     if not args.server_bin or not os.path.exists(args.server_bin):
         raise SystemExit("pass --server-bin (or set JAMMI_SERVER_BIN) to a built jammi-server")
-    fx = Fixtures(_fixtures_root(args.fixtures_root))
+    fx = Fixtures(cache.engine_fixtures_root(args.fixtures_root, "tests/fixtures/patents.parquet"))
     emit(fx, args.server_bin)
 
 

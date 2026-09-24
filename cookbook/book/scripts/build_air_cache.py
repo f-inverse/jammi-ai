@@ -32,7 +32,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -42,7 +41,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
-from jammi_cookbook import datasets
+from jammi_cookbook import cache, datasets
 
 EMBED_MODEL = "answerdotai/ModernBERT-base"
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "air"
@@ -75,10 +74,6 @@ def _dump_emb(db, table: str, dest: Path) -> None:
 
 def _dump_table(db, table: str, dest: Path) -> None:
     pq.write_table(db.sql(f"SELECT * FROM {_emb_ref(table)}"), dest)
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 # --------------------------------------------------------------------------- #
@@ -278,7 +273,7 @@ def emit(db, target: str) -> None:
         "value": float(record["global_source_visible"]), "tol": 0.0}
 
     (ARTIFACTS / "golden_metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
     print("\nemitted cache:", flush=True)
     for f in sorted(ARTIFACTS.glob("*")):
         if f.is_file():
@@ -376,12 +371,6 @@ def tenancy_showcase(target: str, airport_rows: list[dict]) -> dict:
     }
     (ARTIFACTS / "tenancy.json").write_text(json.dumps(record, indent=2))
     return record
-
-
-def _write_checksums() -> None:
-    sums = {p.name: _checksum(p) for p in sorted(ARTIFACTS.glob("*"))
-            if p.is_file() and p.name != "checksums.json"}
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
 
 
 def main() -> None:

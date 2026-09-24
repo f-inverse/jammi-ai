@@ -58,7 +58,6 @@ imports a build of the engine wheel + client; PR CI never runs it.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import tempfile
@@ -70,6 +69,7 @@ import pyarrow.parquet as pq
 from jammi.testing import LiveServer
 
 import jammi_cookbook  # noqa: F401  # applies the determinism env on import
+from jammi_cookbook import cache
 
 ARTIFACTS = Path(__file__).resolve().parent.parent / "artifacts" / "lifecycle"
 
@@ -248,32 +248,6 @@ def _parity(name: str, embedded, remote) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _fixtures_root(arg: str | None) -> Path:
-    root = arg or os.environ.get("JAMMI_FIXTURES_ROOT")
-    if not root:
-        raise SystemExit(
-            "pass --fixtures-root (or set JAMMI_FIXTURES_ROOT) to the engine "
-            "checkout carrying tests/fixtures/tiny_modernbert"
-        )
-    p = Path(root).resolve()
-    if not (p / "tests" / "fixtures" / "tiny_modernbert" / "config.json").exists():
-        raise SystemExit(f"--fixtures-root {p} has no tests/fixtures/tiny_modernbert")
-    return p
-
-
-def _checksum(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _write_checksums() -> None:
-    sums = {
-        p.name: _checksum(p)
-        for p in sorted(ARTIFACTS.glob("*"))
-        if p.is_file() and p.name != "checksums.json"
-    }
-    (ARTIFACTS / "checksums.json").write_text(json.dumps(sums, indent=2, sort_keys=True))
-
-
 # The observables compared across transports (the model_id UUID is excluded inside
 # the projections, so these are byte-stable and instance-agnostic).
 _OBSERVABLES = (
@@ -407,7 +381,7 @@ def emit(fixtures_root: Path, server_bin: str) -> None:
         json.dumps(catalog_record, indent=2, sort_keys=True)
     )
 
-    _write_checksums()
+    cache.write_checksums(ARTIFACTS)
 
     print("\n=== model catalog, measured (embedded canonical) ===", flush=True)
     print(f"  register: status={m['registered']['status']} "
@@ -435,7 +409,11 @@ def main() -> None:
     args = ap.parse_args()
     if not args.server_bin or not os.path.exists(args.server_bin):
         raise SystemExit("pass --server-bin (or set JAMMI_SERVER_BIN) to a built jammi-server")
-    emit(_fixtures_root(args.fixtures_root), args.server_bin)
+    fixtures = cache.engine_fixtures_root(
+        args.fixtures_root,
+        "tests/fixtures/tiny_modernbert/config.json",
+    )
+    emit(fixtures, args.server_bin)
 
 
 if __name__ == "__main__":

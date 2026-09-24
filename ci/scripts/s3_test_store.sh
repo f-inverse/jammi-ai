@@ -87,7 +87,13 @@ parse_opts() {
   REST=("$@")
 }
 
-answers() { grep -qE '^[0-9]{3}$' <<<"$(curl -s -o /dev/null -w '%{http_code}' "http://${ADDR}/" 2>/dev/null)"; }
+# curl prints `000` when nothing listens, so its own exit status is the
+# answer to "does anything listen", and the code only confirms it spoke HTTP.
+answers() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://${ADDR}/" 2>/dev/null)" \
+    && grep -qE '^[0-9]{3}$' <<<"$code"
+}
 
 start() {
   local bin

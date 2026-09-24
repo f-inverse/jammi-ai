@@ -7,9 +7,12 @@
 # races the lines after it, and a stream past one pipe buffer loses every
 # time.
 #
-# The form that cannot lose: `grep -q PATTERN <<<"$text"`, or
-# `<<<"$(command)"` for a command's output — the shell reads the command to
-# its end before grep starts, and grep has no writer to kill.
+# The form that cannot lose: `grep -q PATTERN <<<"$text"` — grep has no
+# writer to kill. For a command's output, capture it first,
+# `out="$(command)" && grep -q PATTERN <<<"$out"`: the shell reads the
+# command to its end, and its exit status still counts, as `pipefail` made it
+# count in the pipeline. `<<<"$(command)"` alone drops that status, which is
+# only the same test when a failing command prints nothing that matches.
 #
 # Scope: bash sources — `*.sh` and workflow `run:` blocks. A Dockerfile
 # `RUN` is POSIX sh without `pipefail`, where a pipeline's status is grep's
@@ -35,7 +38,7 @@ pipelines="$(grep -v -E "$COMMENT_LINE" <<<"$hits")" || rc=$?
 case "$rc" in
   0)
     printf '%s\n' "$pipelines"
-    echo "a pipeline into grep -q reads a match as no match when its writer takes SIGPIPE: use grep -q PATTERN <<<\"\$text\" (or <<<\"\$(command)\")" >&2
+    echo "a pipeline into grep -q reads a match as no match when its writer takes SIGPIPE: use grep -q PATTERN <<<\"\$text\", capturing a command's output first (out=\"\$(command)\" && grep -q PATTERN <<<\"\$out\")" >&2
     exit 1
     ;;
   1) exit 0 ;;

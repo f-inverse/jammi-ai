@@ -1140,7 +1140,8 @@ BSHAPY
   # has a repository to read: a git checkout resolves its own sha (a note),
   # a bare tree bakes "unknown" (the warning).
   bsha_message() { bash -c "$(bash "$RUNPOD_DRIVER" rp_job_build_sha_lines "$1")" 2>&1 >/dev/null; }
-  grep -qF "::warning::JAMMI_BUILD_SHA left UNSET" <<<"$(bsha_message "$bsha/no_stamp")" \
+  bsha_out="$(bsha_message "$bsha/no_stamp")" \
+    && grep -qF "::warning::JAMMI_BUILD_SHA left UNSET" <<<"$bsha_out" \
     && ok "(i/build-sha) a stampless tree with no git checkout warns that the build bakes \"unknown\"" \
     || bad "(i/build-sha) a stampless non-checkout tree did not warn — got: '$(bsha_message "$bsha/no_stamp")'"
   mkdir -p "$bsha/checkout"

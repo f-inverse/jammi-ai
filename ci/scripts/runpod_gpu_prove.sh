@@ -321,7 +321,7 @@ echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tes
 cap_out="\$(JAMMI_KERNELS_STRICT=1 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture 2>&1)"
 cap_rc=\$?
 echo "\${cap_out}"
-if echo "\${cap_out}" | grep -q "running 0 tests"; then
+if grep -q "running 0 tests" <<<"\${cap_out}"; then
   echo "::error::jammi-ai gpu_capability's capability_surface test matched ZERO tests on this ref — the capability-surface test is absent here; refusing to read a 0-test run as a pass" >&2
   grc=1
 elif [ "\${cap_rc}" -ne 0 ]; then

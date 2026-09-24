@@ -1220,7 +1220,7 @@ bundle_assert_jail_file_set() {
   local rel extra="" missing=""
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
-    if ! printf '%s\n' "$expected_nl" | grep -Fxq -- "$rel"; then
+    if ! grep -Fxq -- "$rel" <<<"$expected_nl"; then
       extra="${extra} ${rel}"
     fi
   done <<EOF

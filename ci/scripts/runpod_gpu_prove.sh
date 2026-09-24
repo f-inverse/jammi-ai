@@ -295,16 +295,16 @@ if [ -z "\${ai_features}" ]; then
 fi
 echo "cu12-tarball cargo_features=\${cu12_features}"
 echo "jammi-ai-applicable subset=\${ai_features}"
-if [ "\${cu12_features}" != "cuda,flash-attn,jetstream-broker,storage-cloud" ]; then
-  echo "::error::PROVE_SURFACE_DRIFT: manifest-derived cu12-tarball cargo_features (\${cu12_features}) no longer matches the literal jammi-server RELEASE tuple this leg builds (cuda,flash-attn,jetstream-broker,storage-cloud) -- update the literal (and its PROVE_TUPLE echo) in the SAME unit as the manifest edit" >&2
+if [ "\${cu12_features}" != "cuda,flash-attn,storage-cloud" ]; then
+  echo "::error::PROVE_SURFACE_DRIFT: manifest-derived cu12-tarball cargo_features (\${cu12_features}) no longer matches the literal jammi-server RELEASE tuple this leg builds (cuda,flash-attn,storage-cloud) -- update the literal (and its PROVE_TUPLE echo) in the SAME unit as the manifest edit" >&2
   grc=1
 fi
 if [ "\${ai_features}" != "cuda,flash-attn" ]; then
   echo "::error::PROVE_SURFACE_DRIFT: manifest-derived jammi-ai-applicable subset (\${ai_features}) no longer matches the literal jammi-ai TEST tuple's non-prove_only half (cuda,flash-attn)" >&2
   grc=1
 fi
-echo "PROVE_TUPLE crate=jammi-server kind=release features=cuda,flash-attn,jetstream-broker,storage-cloud"
-cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud || grc=\$?
+echo "PROVE_TUPLE crate=jammi-server kind=release features=cuda,flash-attn,storage-cloud"
+cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-cloud || grc=\$?
 echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
@@ -349,8 +349,8 @@ ran_tests() {
 # remote-session read-back on the device.
 echo "::group::served-client-server-proof"
 grc=0
-echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud"
-cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it -- gpu:: --nocapture --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
+echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,live-gpu-tests,storage-cloud"
+cargo test -p jammi-server --features cuda,flash-attn,live-gpu-tests,storage-cloud --test it -- gpu:: --nocapture --test-threads=1 2>&1 | tee /tmp/gpu_tests.log
 ran_tests \${PIPESTATUS[0]} || grc=\$?
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=served-client-server-proof rc=\${grc}"

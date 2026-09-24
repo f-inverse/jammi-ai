@@ -64,8 +64,8 @@ pub struct JammiSession {
     sources: Arc<SourceRegistry>,
     mutable: Arc<MutableTableRegistry>,
     mutable_schema: Arc<JammiSchemaProvider>,
-    /// Broker for the trigger-stream surface. Defaults to [`InMemoryBroker`];
-    /// callers that wire a clustered broker (e.g. JetStream) pass it through
+    /// Broker for the trigger-stream surface, resolved from `config.broker`;
+    /// callers that build their own broker pass it through
     /// [`JammiSession::with_broker`] or [`JammiSession::with_backend_and_broker`].
     trigger_broker: Arc<dyn TriggerBroker>,
     topic_repo: Arc<TopicRepo>,
@@ -90,13 +90,8 @@ pub struct JammiSession {
 impl JammiSession {
     /// Create a new session. The catalog backend and trigger broker are
     /// constructed from `config.catalog` and `config.broker` respectively —
-    /// SQLite + in-process is the dev-laptop default, Postgres + JetStream
-    /// is the SaaS-deployment pairing.
-    ///
-    /// Selecting `BrokerConfig::JetStream` without the `jetstream-broker`
-    /// cargo feature on `jammi-db` returns [`JammiError::Config`] rather
-    /// than panicking — the broker variant is gone from the build, not
-    /// merely unreachable.
+    /// SQLite + in-process is the dev-laptop default, Postgres catalog +
+    /// Postgres broker is the shared-deployment pairing.
     pub async fn new(config: JammiConfig) -> Result<Self> {
         let backend = build_backend_from_config(&config).await?;
         let broker = build_broker_from_config(&config).await?;
@@ -139,8 +134,8 @@ impl JammiSession {
     /// Build a session around a caller-supplied catalog backend AND a
     /// caller-supplied trigger broker. The signing-key store is derived from
     /// `config.signing_key` (defaulting to [`EnvSigningKeyStore`]). Server
-    /// deployments combining a shared Postgres pool with a JetStream broker
-    /// reach for this one.
+    /// deployments combining a shared Postgres pool with a caller-built
+    /// broker reach for this one.
     pub async fn with_backend_and_broker(
         config: JammiConfig,
         backend: BackendImpl,
@@ -1339,27 +1334,12 @@ async fn build_backend_from_config(config: &JammiConfig) -> Result<BackendImpl> 
     }
 }
 
-/// Build a trigger broker from `config.broker`. JetStream requires the
-/// `jetstream-broker` cargo feature; selecting it without the feature
-/// returns a typed [`JammiError::Config`] rather than panicking. Postgres has
-/// no cargo feature (sqlx's `postgres` feature is unconditional in the
-/// workspace) and defaults its `url` from `config.catalog` when the catalog
+/// Build a trigger broker from `config.broker`. Postgres has no cargo feature
+/// (sqlx's `postgres` feature is unconditional in the workspace) and defaults its `url` from `config.catalog` when the catalog
 /// itself is Postgres.
 async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn TriggerBroker>> {
     match &config.broker {
         BrokerConfig::InMemory => Ok(Arc::new(InMemoryBroker::new())),
-        BrokerConfig::JetStream {
-            url,
-            retention_seconds,
-            credentials,
-        } => {
-            // `credentials` is the `.creds` CONTENTS (a resolved `Secret`),
-            // handed to the broker as the text async-nats parses. `url` is
-            // a `Secret` too: a NATS URL can carry userinfo/token auth
-            // inline (`nats://user:pass@host`).
-            let creds = credentials.as_ref().map(crate::config::Secret::expose);
-            build_jetstream_broker(url.expose(), *retention_seconds, creds).await
-        }
         BrokerConfig::Postgres {
             url,
             idle_poll_secs,
@@ -1409,37 +1389,6 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
             Ok(Arc::new(broker))
         }
     }
-}
-
-#[cfg(feature = "jetstream-broker")]
-async fn build_jetstream_broker(
-    url: &str,
-    retention_seconds: u64,
-    credentials: Option<&str>,
-) -> Result<Arc<dyn TriggerBroker>> {
-    let js = match credentials {
-        Some(creds) => {
-            crate::trigger::jetstream::JetStreamBroker::connect_with_credentials(
-                url,
-                retention_seconds,
-                creds,
-            )
-            .await?
-        }
-        None => crate::trigger::jetstream::JetStreamBroker::connect(url, retention_seconds).await?,
-    };
-    Ok(Arc::new(js))
-}
-
-#[cfg(not(feature = "jetstream-broker"))]
-async fn build_jetstream_broker(
-    _url: &str,
-    _retention_seconds: u64,
-    _credentials: Option<&str>,
-) -> Result<Arc<dyn TriggerBroker>> {
-    Err(JammiError::Config(
-        "[broker.jet_stream] requires the `jetstream-broker` cargo feature on jammi-db".into(),
-    ))
 }
 
 /// Handle passed to the closure inside [`JammiSession::with_tenant_scoped`].

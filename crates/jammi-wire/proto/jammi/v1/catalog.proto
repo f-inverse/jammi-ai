@@ -228,7 +228,7 @@ message ServerInfo {
   // The engine version (the `jammi` workspace version, e.g. "0.17.0").
   string version = 1;
   // Engine capability feature flags compiled into this build (e.g. "postgres",
-  // "mysql", "jetstream-broker"), sorted.
+  // "mysql"), sorted.
   repeated string features = 2;
   // Storage URL schemes this build can address (always "file" and "memory";
   // cloud schemes appear when their driver feature is compiled in), sorted.
@@ -244,7 +244,7 @@ message ServerInfo {
   // reports an empty list.
   repeated string services = 4;
   // The RUNTIME trigger-broker driver this deployment is actually running:
-  // "in_memory" | "jet_stream" | "postgres". Unlike the fields above, an
+  // "in_memory" | "postgres". Unlike the fields above, an
   // embedded (in-process) client and a remote server built from the same
   // config report the IDENTICAL value here -- every engine session holds a
   // real broker whether or not it also serves gRPC.
@@ -660,9 +660,9 @@ message RegisterTopicRequest {
   // Arrow schema for batch payloads, encoded as an Arrow IPC schema message
   // (the same self-describing IPC framing the batch payloads use).
   bytes schema = 2;
-  // Broker-driver-specific configuration (retention, replication, etc.),
-  // opaque to the engine. Empty == no driver metadata.
-  map<string, string> broker_metadata = 3;
+  // 3 was `broker_metadata` — removed (no broker driver reads per-topic config).
+  reserved 3;
+  reserved "broker_metadata";
   // Reserved on the wire; the server ignores it. The topic id is engine-assigned
   // identity, not caller input: the server always mints a fresh UUIDv7 and
   // returns it in `RegisterTopicResponse.topic_id`. Honouring a caller id would
@@ -707,8 +707,9 @@ message Topic {
   bytes schema = 3;
   // Tenant scope (the tenant's canonical string form); empty == global topic.
   string tenant_id = 4;
-  // Broker-driver-specific configuration, opaque to the engine.
-  map<string, string> broker_metadata = 5;
+  // 5 was `broker_metadata` — removed (no broker driver reads per-topic config).
+  reserved 5;
+  reserved "broker_metadata";
 }
 
 message ListTopicsResponse {

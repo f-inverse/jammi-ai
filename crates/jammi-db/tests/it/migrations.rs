@@ -63,6 +63,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "041_models_artifact_reference",
     "042_result_table_replacement",
     "043_models_backend_required",
+    "044_topics_drop_broker_metadata",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -3540,4 +3541,49 @@ async fn migration_043_refuses_a_model_row_without_a_backend(
         })
         .await
         .expect_err("clearing a model's backend must be refused");
+}
+
+/// Migration 044 drops `topics.broker_metadata` on both backends: selecting
+/// the column from a migrated catalog is an error, while the columns a topic
+/// row still carries read back.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_044_drops_topics_broker_metadata(kind: jammi_db::catalog::backend::BackendKind) {
+    let dir = tempdir().unwrap();
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
+    backend.migrate().await.unwrap();
+
+    let select = |sql: &'static str| {
+        let backend = &backend;
+        async move {
+            backend
+                .transaction(
+                    TxOptions {
+                        read_only: true,
+                        ..Default::default()
+                    },
+                    move |tx| {
+                        Box::pin(async move {
+                            tx.query::<_, String>(sql, &[], |row| row.get("topic_id"))
+                                .await
+                        })
+                    },
+                )
+                .await
+        }
+    };
+
+    select("SELECT topic_id FROM topics WHERE broker_metadata IS NOT NULL")
+        .await
+        .expect_err("topics.broker_metadata must be gone after migration 044");
+    select(
+        "SELECT topic_id FROM topics \
+         WHERE name IS NOT NULL AND schema_json IS NOT NULL AND backing_table IS NOT NULL",
+    )
+    .await
+    .expect("the columns a topic row carries still read back");
 }

@@ -106,7 +106,7 @@ bound tenant. Each dict carries `{model_id, backend, task, status}`.
 
 ## Trigger stream / topics
 
-- `db.register_topic(name, *, schema, broker_metadata=None) -> str` — register a trigger-stream topic with a row `schema`; `broker_metadata` carries backend-specific configuration.
+- `db.register_topic(name, *, schema) -> str` — register a trigger-stream topic with a row `schema`.
 - `db.drop_topic(name, *, if_exists=False) -> None` — drop a topic; `if_exists=True` makes a missing topic a no-op.
 - `db.list_topics() -> list[str]` — control-plane catalog read of the registered topic names.
 - `db.publish_topic(topic, *, batch) -> int` — publish an Arrow `batch` of rows onto a topic; returns the 0-based offset the batch landed at.

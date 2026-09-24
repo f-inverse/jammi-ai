@@ -21,7 +21,6 @@
 //! a gap-free, collision-free offset sequence (covered by `trigger.rs`'s
 //! single-publisher tests).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch};
@@ -110,7 +109,6 @@ async fn two_replica_publishers_assign_gap_free_offsets() {
         name: "trigger.multi_replica".to_string(),
         schema: topic_schema(),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     };
     broker.register_topic(&topic).await.unwrap();
     topic_repo.register_topic(&topic).await.unwrap();

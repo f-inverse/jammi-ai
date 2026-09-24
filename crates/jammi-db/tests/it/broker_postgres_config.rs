@@ -126,7 +126,7 @@ async fn non_postgres_url_is_a_typed_config_error() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = jammi_test_utils::test_config(dir.path());
     cfg.broker = BrokerConfig::Postgres {
-        url: Some(Secret::from("nats://nats.svc:4222")),
+        url: Some(Secret::from("mysql://db.svc:3306/jammi")),
         idle_poll_secs: 5,
     };
     let err = match JammiSession::new(cfg).await {
@@ -156,18 +156,6 @@ fn broker_kind_as_str_matches_every_config_tag() {
     assert_eq!(BrokerKind::InMemory.as_str(), "in_memory");
     let cfg = parse(&format!("broker = \"{}\"\n", BrokerKind::InMemory.as_str()));
     assert_eq!(cfg.broker, BrokerConfig::InMemory);
-
-    // `jet_stream`: requires `url`.
-    assert_eq!(BrokerKind::JetStream.as_str(), "jet_stream");
-    let cfg = parse(&format!(
-        "[broker.{}]\nurl = \"nats://n:4222\"\n",
-        BrokerKind::JetStream.as_str()
-    ));
-    assert!(
-        matches!(cfg.broker, BrokerConfig::JetStream { .. }),
-        "the `[broker.{}]` tag must resolve to `BrokerConfig::JetStream`",
-        BrokerKind::JetStream.as_str()
-    );
 
     // `postgres`: every field defaults.
     assert_eq!(BrokerKind::Postgres.as_str(), "postgres");

@@ -440,7 +440,7 @@ def _self_test() -> int:
     # block alone.
     m = _fixture_manifest()
     m["lanes"]["c"] = {
-        "cargo_features": ["jetstream-broker", "storage-cloud"],
+        "cargo_features": ["storage-cloud"],
         "capabilities": json.loads(json.dumps(m["lanes"]["a"]["capabilities"])),
     }
     probs = check_manifest(m, REPO_ROOT)
@@ -464,7 +464,7 @@ def _self_test() -> int:
     # 1d. A CPU family with NO `capabilities` block (the real,
     # correct shape) is accepted.
     m = _fixture_manifest()
-    m["lanes"]["c"] = {"cargo_features": ["jetstream-broker", "storage-cloud"]}
+    m["lanes"]["c"] = {"cargo_features": ["storage-cloud"]}
     probs = check_manifest(m, REPO_ROOT)
     check("cpu-family-without-capabilities-accepted", probs == [], f"{probs}")
 

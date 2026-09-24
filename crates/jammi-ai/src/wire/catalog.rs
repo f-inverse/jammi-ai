@@ -163,7 +163,6 @@ pub fn register_topic_from_proto(
         name: req.name,
         schema,
         tenant,
-        broker_metadata: req.broker_metadata.into_iter().collect(),
     })
 }
 
@@ -193,7 +192,6 @@ mod tests {
         let req = pb::RegisterTopicRequest {
             name: "events".into(),
             schema: topic_schema_bytes(),
-            broker_metadata: Default::default(),
             topic_id: attacker_id.to_string(),
         };
 
@@ -217,7 +215,6 @@ mod tests {
         let make = || pb::RegisterTopicRequest {
             name: "events".into(),
             schema: topic_schema_bytes(),
-            broker_metadata: Default::default(),
             topic_id: replayed.clone(),
         };
 

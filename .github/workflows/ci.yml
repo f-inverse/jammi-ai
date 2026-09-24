@@ -47,7 +47,7 @@ jobs:
       - name: Clippy (feature-gated test surfaces)
         run: |
           cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings
-          cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-broker-tests,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
+          cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
           cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
           cargo clippy -p jammi-ballista --tests --features live-distributed-tests,live-postgres-tests -- -D warnings
           cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
@@ -449,16 +449,16 @@ jobs:
       # step above builds the DEFAULT one — which excludes every crate reachable
       # only through an optional feature: the whole
       # `datafusion-table-providers{,-common,-mysql,-postgres}` subtree behind
-      # jammi-db's `postgres`/`mysql`, `async-nats` behind `jetstream-broker`,
-      # and `object_store`'s aws/gcp/azure backends behind `storage-*`. Those
+      # jammi-db's `postgres`/`mysql`, and `object_store`'s aws/gcp/azure
+      # backends behind `storage-*`. Those
       # are precisely where a second DataFusion line or an unseen advisory can
       # hide: with `datafusion-substrait = "55"` added behind jammi-db's
       # `postgres` feature, the lockfile carries DataFusion 54 AND 55 and the
       # step above still prints `bans ok`, while this one reports 8 errors.
       # The `--all-features` graph is the SHIPPED one for every family except
       # the bare crates.io crate: the CPU PyPI wheel, the CPU tarball, the CPU
-      # container image and the CUDA lanes all build `jetstream-broker` +
-      # `storage-cloud` (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`
+      # container image and the CUDA lanes all build `storage-cloud`
+      # (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`
       # derives and gates the exact per-family list), so all four lanes run
       # over it — licenses and sources included: an LGPL
       # crate or a git-sourced crate behind jammi-db's `postgres` feature
@@ -534,54 +534,6 @@ jobs:
       - name: Guard — base client stays native-free at import
         run: |
           python -c "import sys, jammi; bad=[m for m in sys.modules if m=='jammi_native' or m.startswith('jammi_native.')]; assert not bad, f'import jammi eagerly pulled jammi_native: {bad}'; print('client import-direction OK')"
-
-  test-broker:
-    name: Test (NATS JetStream)
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
-
-      # Same trap as the hermetic `test` job above and `dep-dag.yml`'s
-      # freshness step: a container `run:` step's `git` is a different UID
-      # than the checkout. This job's own it-suite shells out to `git
-      # ls-files` (`crates/jammi-db/tests/it/terminality_source_gate.rs`'s
-      # `tracked_files`), which hits "fatal: detected dubious ownership"
-      # (exit 128) without the safe.directory mark
-      # `./.github/actions/setup-rust-ci` sets once for every job (above).
-
-      - name: Install and start nats-server (with JetStream)
-        # GHA `services:` cannot override the upstream image's CMD to pass
-        # `-js`, so the broker driver's JetStream API isn't available with
-        # the default `nats:2.10` entrypoint. Running the official tarball
-        # release directly lets the job pass `-js -m 8222` and own the
-        # process lifetime explicitly.
-        run: |
-          NATS_VERSION=v2.10.21
-          NATS_TGZ="nats-server-${NATS_VERSION}-linux-amd64.tar.gz"
-          curl -fsSL "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/${NATS_TGZ}" -o /tmp/nats.tar.gz
-          tar -xzf /tmp/nats.tar.gz -C /tmp
-          /tmp/nats-server-${NATS_VERSION}-linux-amd64/nats-server -js -m 8222 -p 4222 >/tmp/nats.log 2>&1 &
-          for i in $(seq 1 30); do
-            if curl -fsS http://localhost:8222/healthz >/dev/null 2>&1; then
-              echo "nats-server ready after ${i}s"
-              break
-            fi
-            sleep 1
-          done
-          curl -fsS http://localhost:8222/healthz
-
-      - name: Run JetStream broker tests
-        env:
-          JAMMI_TEST_NATS_URL: nats://127.0.0.1:4222
-        # JetStream streams are global; serialise so concurrent tests do not
-        # collide on freshly minted topic ids while one of them is still
-        # tearing down.
-        run: |
-          cargo test -p jammi-db --features live-broker-tests --test it -- --test-threads=1
 
   test-python:
     name: Test (Python)
@@ -971,7 +923,6 @@ jobs:
       - dep-audit
       - ts-client
       - py-client
-      - test-broker
       - test-python
       - test-pg
       - symbol-index-gates

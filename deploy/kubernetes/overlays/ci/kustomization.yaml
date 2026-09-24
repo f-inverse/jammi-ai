@@ -9,7 +9,6 @@ namespace: jammi-ci
 resources:
   - ../../base
   - postgres.yaml
-  - nats.yaml
 
 # The kind smoke never pulls from a registry -- it loads the image the
 # workflow already built into the kind cluster and pins the tag kustomize

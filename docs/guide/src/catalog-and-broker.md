@@ -4,7 +4,7 @@ Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through
 two fields on `JammiConfig`: `catalog` and `broker`. The dev-laptop default
 is SQLite + an in-process broker; production deployments swap one or both
-for Postgres (catalog and/or broker) or NATS JetStream (broker only).
+for Postgres.
 
 ## TOML schema
 
@@ -81,17 +81,6 @@ broker = "in_memory"
 ```
 
 ```toml
-[broker.jet_stream]
-url = "nats://nats.svc:4222"
-retention_seconds = 604800
-credentials = { file = "/var/run/secrets/nats.creds" }
-```
-
-`[broker.jet_stream]` requires the `jetstream-broker` cargo feature
-on `jammi-db`; selecting it without the feature returns
-`JammiError::Config` rather than panicking at session construction time.
-
-```toml
 [broker.postgres]
 # url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 #                                                 # optional; defaults to
@@ -141,10 +130,8 @@ url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certifi
 pool_size = 16
 max_lifetime_secs = 1800
 
-[broker.jet_stream]
-url = "nats://${NATS_HOST}:4222"
-retention_seconds = 604800
-credentials = { file = "/var/run/secrets/nats.creds" }
+[broker.postgres]
+idle_poll_secs = 5
 ```
 
 A working copy of this file ships at
@@ -253,26 +240,24 @@ live object-store listing in both directions — see
 maintainer guide (`docs/maintainer/MAINTAINER-GUIDE.md`) for the allowlist
 and deletion-arm detail.
 
-## In-memory vs Postgres vs JetStream broker
+## In-memory vs Postgres broker
 
-| Concern | InMemory | Postgres | JetStream |
-| --- | --- | --- | --- |
-| Persistence | In-process only; lost on restart. | None of its own — the topic's mutable backing table (already durable) is the log; the driver carries no bytes. | NATS server retains streams per `retention_seconds`. |
-| Cross-process delivery | None — a publish in process A is invisible to a subscriber in process B. | All subscribers (any process, any host) see a wake within `idle_poll_secs` of a publish; the actual rows come from a replay of the shared backing table. | All subscribers (any process, any host) see every published batch within the retention window. |
-| Auth | None. | Whatever `[broker.postgres] url` (or the catalog's) already authenticates with. | Anonymous or NATS `.creds` file contents via `credentials`. |
-| Operational footprint | None. | **None beyond the catalog** — up to three extra connections to the SAME Postgres instance the catalog already uses (or points at); no extra service. | One NATS server (or cluster). |
+| Concern | InMemory | Postgres |
+| --- | --- | --- |
+| Persistence | In-process only; lost on restart. | None of its own — the topic's mutable backing table (already durable) is the log; the driver carries no bytes. |
+| Cross-process delivery | None — a publish in process A is invisible to a subscriber in process B. | All subscribers (any process, any host) see a wake within `idle_poll_secs` of a publish; the actual rows come from a replay of the shared backing table. |
+| Auth | None. | Whatever `[broker.postgres] url` (or the catalog's) already authenticates with. |
+| Operational footprint | None. | **None beyond the catalog** — up to three extra connections to the SAME Postgres instance the catalog already uses (or points at); no extra service. |
 
 In-memory is fine for tests, local development, and single-process server
 deployments where every consumer lives in the same `jammi-server` process.
 For any deployment that wants replay across restarts or fan-out across
-multiple `jammi-server` replicas (Shapes B and C), **Postgres is the
-recommended broker** whenever the catalog is already Postgres: it adds no
-extra service, only a handful of connections to the database already in the
-topology. Reach for JetStream when the deployment wants a dedicated,
-broker-scoped retention window independent of the catalog's own lifecycle,
-or when the catalog itself stays SQLite (single-process) while the broker
-still needs to fan out beyond one process — a shape Postgres-as-broker
-cannot serve without a Postgres catalog to default its `url` from.
+multiple `jammi-server` replicas (Shapes B and C), the broker is Postgres: it
+adds no extra service, only a handful of connections to the database already
+in the topology. Fan-out across processes needs the backing tables to be
+shared too, so a multi-process deployment runs a Postgres catalog; a SQLite
+catalog is single-process by construction and pairs with the in-memory
+broker.
 
 ## Health probe
 

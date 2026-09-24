@@ -24,10 +24,6 @@ postgres = ["datafusion-table-providers/postgres", "dep:tokio-postgres", "dep:se
 mysql = ["datafusion-table-providers/mysql", "dep:mysql_async", "dep:secrecy"]
 # Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL).
 live-postgres-tests = []
-# Compiles the JetStream broker driver and the live broker tests; both
-# require a NATS JetStream server reachable via JAMMI_TEST_NATS_URL.
-jetstream-broker = ["dep:async-nats", "dep:arrow-ipc"]
-live-broker-tests = ["jetstream-broker"]
 # Compiles the mutable-sink crash-recovery checkpoint hook. Pure test
 # infrastructure: the hook is a single `await` on a notifier that only
 # arms when env vars are set. Off by default; the
@@ -63,7 +59,6 @@ datafusion-federation.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 arrow-array.workspace = true
-arrow-ipc = { workspace = true, optional = true }
 
 # External sources (feature-gated — not a workspace dep to avoid sqlite3 links conflict)
 datafusion-table-providers = { version = "0.13.1", default-features = false, optional = true }
@@ -101,7 +96,6 @@ backon.workspace = true
 futures.workspace = true
 async-stream.workspace = true
 parking_lot.workspace = true
-async-nats = { workspace = true, optional = true }
 
 # Utilities
 uuid.workspace = true

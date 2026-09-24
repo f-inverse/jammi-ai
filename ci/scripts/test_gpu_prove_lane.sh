@@ -501,7 +501,7 @@ fi
 # --- negative control: the SAME shim, but the served-proof invocation
 # (jammi-server's `it` target) fails instead -- this must NOT be swallowed. ---
 heredoc_exec_neg_log="$SANDBOX/heredoc-exec-served-fail.log"
-heredoc_exec_run "-p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it" "$heredoc_exec_neg_log"
+heredoc_exec_run "-p jammi-server --features cuda,flash-attn,live-gpu-tests,storage-cloud --test it" "$heredoc_exec_neg_log"
 heredoc_exec_neg_raw_rc=$?
 rp_prove_verdict "$heredoc_exec_neg_raw_rc" "$heredoc_exec_neg_log"
 heredoc_exec_neg_verdict_rc=$?

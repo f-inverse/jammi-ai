@@ -25,14 +25,8 @@ def events_schema() -> pa.Schema:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
 
-        # 1. Register a topic with a typed schema. `broker_metadata`
-        #    flows through to the broker driver — the in-process broker
-        #    accepts arbitrary string-keyed metadata.
-        topic_id = db.register_topic(
-            "events.demo",
-            schema=events_schema(),
-            broker_metadata={"retention_seconds": "3600"},
-        )
+        # 1. Register a topic with a typed schema.
+        topic_id = db.register_topic("events.demo", schema=events_schema())
         assert topic_id, "register_topic returned empty id"
 
         # 2. The catalog now lists the topic for the current tenant.

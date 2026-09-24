@@ -48,7 +48,7 @@ Python](./quickstart-python.md).
 ## Shape B — single-tenant server
 
 **Artifact:** [`deploy/docker-compose.yml`](https://github.com/f-inverse/jammi-ai/blob/main/deploy/docker-compose.yml)
-— one `jammi-server` process, a Postgres catalog, and a JetStream broker,
+— one `jammi-server` process and one Postgres serving as catalog and broker,
 tested end to end by the `compose-smoke` workflow on every push to `main`
 and nightly.
 
@@ -60,7 +60,9 @@ The `jammi-server` service's configuration is entirely environment-driven,
 through the same `JAMMI_<PATH>` layer every deployment shape uses:
 
 - `JAMMI_CATALOG__POSTGRES__URL` — the Postgres catalog connection.
-- `JAMMI_BROKER__JET_STREAM__URL` — the JetStream broker connection.
+- `JAMMI_BROKER__POSTGRES__URL` — the Postgres broker's connection, the
+  same database as the catalog (its `LISTEN`/`NOTIFY` wake-ups ride the
+  database whose backing tables are the log).
 - `JAMMI_SERVER__SERVICES` — `all` here (every compiled-in service tier); see
   [Service tiers](./deploy-server.md#service-tiers) for narrower selections.
 - `JAMMI_AUDIT_MASTER_KEY` — read from `deploy/.env` (copy
@@ -87,9 +89,9 @@ smoke oracle; `shape_b_remote.py` (this Compose shape) and
 differing only in how they restart the server and in what they assert
 afterwards — durability on the Compose volume here, the shared catalog on
 the emptyDir pods there. The oracle asserts
-`get_server_info().broker == "jet_stream"` — the RUNTIME driver kind, which
-fails if `JAMMI_BROKER__JET_STREAM__URL` were ever dropped from the compose
-file, unlike the compile-time `features` list alone — registers the bundled
+`get_server_info().broker == "postgres"` — the RUNTIME driver kind, which
+fails if `JAMMI_BROKER__POSTGRES__URL` were ever dropped from the compose
+file (the server falls back to `in_memory`) — registers the bundled
 `patents.parquet` fixture, generates embeddings with the bundled `tiny_bert`
 fixture, searches for the stored vector's own nearest neighbor (an exact
 self-hit), then restarts the `jammi-server` container and repeats the same
@@ -104,8 +106,7 @@ side, failing if `JAMMI_CATALOG__POSTGRES__URL` were ever dropped.
 ## Shape C — multi-tenant server
 
 **Artifact:** N `jammi-server` replicas behind a load balancer, a shared
-Postgres catalog, a shared object store, and a shared JetStream (or
-Postgres-as-)broker. Every replica runs the identical config; only the
+Postgres catalog and broker, and a shared object store. Every replica runs the identical config; only the
 process count differs from Shape B.
 
 ```toml
@@ -116,10 +117,8 @@ url = "${POSTGRES_URL}?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certifi
 pool_size = 16
 max_lifetime_secs = 1800
 
-[broker.jet_stream]
-url = "nats://${NATS_HOST}:4222"
-retention_seconds = 604800
-credentials = { file = "/var/run/secrets/nats.creds" }
+[broker.postgres]
+idle_poll_secs = 5
 
 [lease]
 duration_secs = 30
@@ -141,8 +140,7 @@ file-backed audit signing key):
 ```bash
 export JAMMI_CATALOG__POSTGRES__URL="postgres://jammi:${POSTGRES_PASSWORD}@postgres.internal:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 export JAMMI_CATALOG__POSTGRES__POOL_SIZE=16
-export JAMMI_BROKER__JET_STREAM__URL="nats://nats.internal:4222"
-export JAMMI_BROKER__JET_STREAM__CREDENTIALS__FILE=/run/secrets/nats.creds
+export JAMMI_BROKER__POSTGRES__IDLE_POLL_SECS=5   # selects [broker.postgres]; its url defaults to the catalog's
 export JAMMI_LEASE__DURATION_SECS=30
 export JAMMI_LEASE__HEARTBEAT_SECS=10
 export JAMMI_SERVER__SERVICES=all
@@ -207,7 +205,7 @@ manual dispatch, and on any pull request that touches
 
 `jammi-server-secrets` is a `Secret` carrying the same env keys the Compose
 and bare-env forms above use — `JAMMI_CATALOG__POSTGRES__URL`,
-`JAMMI_BROKER__JET_STREAM__CREDENTIALS__FILE` (or `__URL`),
+`JAMMI_BROKER__POSTGRES__URL` (or its `__FILE` form),
 `JAMMI_AUDIT_MASTER_KEY` — mounted as env vars, never baked into the
 ConfigMap. No `Secret` manifest ships in git; create it out-of-band, once per
 cluster namespace:
@@ -216,20 +214,20 @@ cluster namespace:
 kubectl -n <namespace> create secret generic jammi-server-secrets \
   --from-literal=JAMMI_AUDIT_MASTER_KEY=<...> \
   --from-literal=JAMMI_CATALOG__POSTGRES__URL=<...> \
-  --from-literal=JAMMI_BROKER__JET_STREAM__URL=<...>
+  --from-literal=JAMMI_BROKER__POSTGRES__URL=<...>
 ```
 
 never in git.
 
 **What `kube-smoke` proves.** Against the `ci` overlay on a real `kind`
 cluster: readiness (`kubectl rollout status`), `get_server_info().broker ==
-"jet_stream"`, the Postgres `sources` table's row count via `psql` against
+"postgres"`, the Postgres `sources` table's row count via `psql` against
 the `postgres` StatefulSet, one-hop image identity — every pod's
 `containerStatuses[].imageID` traces back to the image `kind load`ed, never
 a registry pull — and a `rollout restart` after which the new pod still
 sees the source the pod it replaced registered. What it does NOT prove:
 durability across that restart — the scratch volume is an `emptyDir`, so the
-Postgres catalog and the JetStream broker, not the pod's local disk, carry
+shared Postgres catalog and broker, not the pod's local disk, carry
 the state a fresh pod recovers.
 
 ## Shape D — disaggregated
@@ -506,9 +504,9 @@ its `readinessProbe.httpGet` already speaks HTTP directly against `/readyz`.
 ## What the published images can and cannot do
 
 The published CPU image (`ghcr.io/f-inverse/jammi-ai-server`) is built with
-`cargo build --features jammi-server/jetstream-broker,jammi-server/storage-cloud`
-— nothing else. `GetServerInfo.features` on that image therefore reports
-`["jetstream-broker"]`, and `storage_backends` reports the schemes
+`cargo build --features jammi-server/storage-cloud` — nothing else.
+`GetServerInfo.features` on that image therefore reports `[]`, and
+`storage_backends` reports the schemes
 `storage-cloud` pulls in (`s3`, `r2`, `gs`, `azure`, alongside the always-on
 `file`/`memory`).
 

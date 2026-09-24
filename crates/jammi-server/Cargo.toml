@@ -102,11 +102,6 @@ flash-attn = ["jammi-ai/flash-attn"]
 live-gpu-tests = ["cuda", "jammi-ai/live-gpu-tests"]
 # Compiles the tests that need a live Postgres at JAMMI_TEST_PG_URL.
 live-postgres-tests = []
-# Compiles the JetStream broker driver into the binary so production
-# deploys can run Postgres + NATS via config without rebuilding from
-# source. CI publishes the OSS image with this feature enabled.
-jetstream-broker = ["jammi-db/jetstream-broker"]
-
 # Cloud object-store backends for source reads / result-table storage, forwarded
 # to jammi-db (which gates each behind object_store's cloud SDKs). The published
 # server image enables `storage-cloud` so it is deployment-agnostic — it reads

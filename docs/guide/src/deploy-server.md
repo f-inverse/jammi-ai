@@ -187,15 +187,14 @@ jammi-server
 
 ### A production shape, entirely from the environment
 
-A Postgres catalog, a JetStream broker, an S3 result root, and a file-backed
+A Postgres catalog and broker, an S3 result root, and a file-backed
 audit signing key — Shape C's stack — need no TOML file at all: every field
 resolves from `JAMMI_*` variables through the same layered loader.
 
 ```bash
 export JAMMI_CATALOG__POSTGRES__URL="postgres://jammi:${POSTGRES_PASSWORD}@postgres.internal:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 export JAMMI_CATALOG__POSTGRES__POOL_SIZE=16
-export JAMMI_BROKER__JET_STREAM__URL="nats://nats.internal:4222"
-export JAMMI_BROKER__JET_STREAM__CREDENTIALS__FILE=/run/secrets/nats.creds
+export JAMMI_BROKER__POSTGRES__IDLE_POLL_SECS=5   # selects [broker.postgres]; its url defaults to the catalog's
 export JAMMI_STORAGE__RESULT_ROOT="s3://jammi-results/prod"
 export JAMMI_STORAGE__CLOUD__S3__REGION=us-east-1
 export JAMMI_SIGNING_KEY__FILE__PATH=/run/secrets/jammi-audit-master-key
@@ -212,9 +211,8 @@ overrides the other's fields when both are present:
 url = "postgres://jammi:${POSTGRES_PASSWORD}@postgres.internal:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 pool_size = 16
 
-[broker.jet_stream]
-url = "nats://nats.internal:4222"
-credentials = { file = "/run/secrets/nats.creds" }
+[broker.postgres]
+idle_poll_secs = 5
 
 [storage]
 result_root = "s3://jammi-results/prod"
@@ -568,7 +566,7 @@ docker run --rm \
   ghcr.io/f-inverse/jammi-ai-server:latest --config /etc/jammi/jammi.toml
 ```
 
-A tested Compose stack (server + Postgres catalog + JetStream broker) lives
+A tested Compose stack (server + one Postgres serving as catalog and broker) lives
 at `deploy/docker-compose.yml`, exercised end to end by the `compose-smoke`
 workflow — see [Reference Topologies: Shape
 B](./reference-topologies.md#shape-b--single-tenant-server) for the full
@@ -597,7 +595,7 @@ above all apply. Under Compose, the same two options carry over unchanged
 --config ...` does; `environment:` sets the same `JAMMI_*` vars) — see
 [Reference Topologies: Shape B](./reference-topologies.md#shape-b--single-tenant-server)
 for a complete, tested Compose file doing exactly this against a Postgres
-catalog and JetStream broker.
+catalog and broker.
 
 ### GPU serving
 

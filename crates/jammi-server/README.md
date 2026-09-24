@@ -66,7 +66,7 @@ public network until a terminator or reverse proxy is put in front of it.
 ## Quickstart (from source)
 
 ```bash
-cargo run --release --bin jammi-server --features jetstream-broker -- \
+cargo run --release --bin jammi-server -- \
   --config crates/jammi-server/examples/jammi.toml
 ```
 

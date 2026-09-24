@@ -558,17 +558,6 @@ broker = "in_memory"
 ```
 
 ```toml
-[broker.jet_stream]
-url = "nats://${NATS_HOST}:4222"
-retention_seconds = 604800
-credentials = { file = "/var/run/secrets/nats.creds" }
-```
-
-`[broker.jet_stream]` requires the `jetstream-broker` cargo feature on
-`jammi-db`; selecting it without the feature is a load-time
-`JammiError::Config`, never a panic at session construction.
-
-```toml
 [broker.postgres]
 # url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt"
 #                                                 # optional; defaults to
@@ -758,7 +747,7 @@ rejected as an unknown tier name) selects all-in-one; a comma-separated list
 exactly those tiers. See [Service tiers](./deploy-server.md#service-tiers).
 
 **Secrets.** A `Secret`-typed field (`catalog.postgres.url`,
-`broker.jet_stream.credentials`, `broker.postgres.url`, the cloud
+`broker.postgres.url`, the cloud
 credential fields, `models.hub_token`) takes the value inline
 (`JAMMI_CATALOG__POSTGRES__URL=…`)
 or as a file reference via the `__FILE` suffix

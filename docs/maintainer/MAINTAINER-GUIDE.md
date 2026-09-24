@@ -1245,26 +1245,19 @@ here: the trigger broker is the pluggable one; the catalog/mutable backend rides
   no payload — for a driver that carries no bytes at all. There is no error
   variant for "history not retained" or "receiver lagged": every driver
   routes both into `Wake`, and the engine's subscribe seam self-heals by
-  replaying the backing table. Three impls behind `Arc<dyn TriggerBroker>`:
+  replaying the backing table. Two impls behind `Arc<dyn TriggerBroker>`:
   `InMemoryBroker` (`crates/jammi-db/src/trigger/in_memory.rs`,
-  `BrokerKind::InMemory`, the **default**, yields `Batch`), `PostgresBroker`
-  (`crates/jammi-db/src/trigger/postgres.rs`, `BrokerKind::Postgres`, yields
-  only `Wake` over `LISTEN`/`NOTIFY` — **no cargo feature**, `sqlx`'s
-  `postgres` feature is unconditional in the workspace), and `JetStreamBroker`
-  (`crates/jammi-db/src/trigger/jetstream.rs`, `BrokerKind::JetStream`, yields
-  `Batch`) — the latter is gated behind the **`jetstream-broker` cargo
-  feature** (`crates/jammi-db/Cargo.toml`; re-exported only under that cfg,
-  `crates/jammi-db/src/trigger/mod.rs`; `jammi-server` re-exposes it as
-  `jetstream-broker`, `crates/jammi-server/Cargo.toml`). Selection is
+  `BrokerKind::InMemory`, the **default**, yields `Batch`) and
+  `PostgresBroker` (`crates/jammi-db/src/trigger/postgres.rs`,
+  `BrokerKind::Postgres`, yields only `Wake` over `LISTEN`/`NOTIFY` — **no
+  cargo feature**, `sqlx`'s `postgres` feature is unconditional in the
+  workspace). Selection is
   **config-driven**, `build_broker_from_config`
   (`crates/jammi-db/src/session.rs`): `BrokerConfig::InMemory` →
   `InMemoryBroker::new()`; `BrokerConfig::Postgres{…}` → connect (`url`
   defaults from `catalog.postgres.url` when the catalog is Postgres, else a
-  typed `JammiError::Config` naming both keys); `BrokerConfig::JetStream{…}` →
-  connect; choosing JetStream **without** the feature returns a typed
-  `JammiError::Config`, not a panic (the
-  `#[cfg(not(feature = "jetstream-broker"))]` `build_jetstream_broker`,
-  `crates/jammi-db/src/session.rs`).
+  typed `JammiError::Config` naming both keys). A `[broker.<name>]` section
+  naming no shipped driver is refused at load.
 - **The engine-facing type never changes with the driver.** `Subscriber`
   (`crates/jammi-db/src/trigger/subscriber.rs`) resolves every driver's
   `LiveStream` into the transport-neutral `Subscription`
@@ -1415,8 +1408,8 @@ here: the trigger broker is the pluggable one; the catalog/mutable backend rides
   `Subscriber`/`Publisher`/the wire encoders. Add a `BrokerKind` variant
   (`crates/jammi-db/src/trigger/broker.rs`) and a `BrokerConfig` arm, wire it
   in `build_broker_from_config` (`crates/jammi-db/src/session.rs`); gate a
-  new dependency behind a cargo feature like `jetstream-broker` and return
-  `JammiError::Config` when selected without it — **only when the dependency
+  new dependency behind a cargo feature and return `JammiError::Config` when
+  selected without it — **only when the dependency
   is genuinely optional**: `PostgresBroker` needs no feature at all, because
   `sqlx`'s `postgres` feature is already unconditional in the workspace (the
   catalog backend depends on it), so gating it would be a feature flag
@@ -5280,7 +5273,7 @@ auto-available to every encoder.)
 - **New gated (live) test lane:** empty-list `[features]` entry; gate test code behind `#[cfg(feature
   = "…")]` (never `#[ignore]`); `[[test]]` target with `required-features` if it needs its own
   binary; **skip cleanly** (`tracing::warn`) without the feature; a CI job modeled on
-  `test-pg`/`test-broker` + a `--no-run` compile-check in `compile-check-gated`.
+  `test-pg` + a `--no-run` compile-check in `compile-check-gated`.
 - **Cut a release:** PR bumping the version across the lockstep version files
   (`docs/plans/50-open-core-hardening-roadmap/ROADMAP.md`, the version-bump file list) + `cargo
   update --workspace` + `CHANGELOG.md`; run the full gate; on merge tag both `vX.Y.Z` and
@@ -5532,7 +5525,7 @@ once prove-gated (`build-and-push` → `merge-cpu-tag`, `v*` tags only, semver/`
 `compile-check-gated` (`--no-run` for live-hub / live-gpu, a *separate job* so accumulated test-binary
 graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle-free boundary guards**)
 → `dep-direction` (`check_dep_direction.py`) → `oss-only-build` (`--locked` hermeticity) → `ts-client`
-/ `py-client` / `test-python` / `test-broker` (serialised `--test-threads=1`) / `test-pg` (serialised)
+/ `py-client` / `test-python` / `test-pg` (serialised)
 → `test-live` (main-only, advisory).
 
 **The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for the `check`, `test`,

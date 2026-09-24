@@ -21,7 +21,6 @@
 //! `GenerateEmbeddings` returns — so there is one source-of-truth for the
 //! embedding numbers, not a parallel one.
 
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -242,7 +241,6 @@ pub fn topic_to_proto(topic: &TopicDefinition) -> Result<pb::Topic, Status> {
         name: topic.name.clone(),
         schema,
         tenant_id: topic.tenant.map(|t| t.to_string()).unwrap_or_default(),
-        broker_metadata: topic.broker_metadata.clone().into_iter().collect(),
     })
 }
 
@@ -263,13 +261,11 @@ pub fn topic_from_proto(wire: pb::Topic) -> Result<TopicDefinition, Status> {
                 .map_err(|e| Status::invalid_argument(format!("invalid tenant id: {e}")))?,
         )
     };
-    let broker_metadata: BTreeMap<String, String> = wire.broker_metadata.into_iter().collect();
     Ok(TopicDefinition {
         id,
         name: wire.name,
         schema,
         tenant,
-        broker_metadata,
     })
 }
 

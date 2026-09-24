@@ -1204,7 +1204,6 @@ mod grpc_timeout_header_tests {
             name: "does-not-matter".into(),
             schema: Arc::new(Schema::empty()),
             tenant: None,
-            broker_metadata: Default::default(),
         };
 
         let _ = client

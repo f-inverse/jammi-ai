@@ -268,7 +268,6 @@ async fn uat_workflow_c_cdc_pipeline_isolates_tenants_and_predicates() {
             Field::new("key", DataType::Utf8, false),
         ])),
         tenant: session.tenant(),
-        broker_metadata: std::collections::BTreeMap::new(),
     };
     session
         .trigger_broker()

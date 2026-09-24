@@ -7,7 +7,7 @@ name: Kubernetes smoke (kind)
 # restart` — proving the ci overlay's manifests, the image's file-then-env
 # config resolution (ConfigMap baked file, env layer on top), and that a
 # rollout restart's new pod still shares the OLD pod's Postgres catalog and
-# JetStream broker, together, not any one of them in isolation. It does NOT
+# broker, together, not any one of them in isolation. It does NOT
 # assert result durability across the restart -- the overlay's Deployment
 # mounts `emptyDir`, so a new pod starts with an empty local index; see
 # `tests/compose/shape_c_kube_remote.py`'s own module doc for the exact
@@ -38,8 +38,8 @@ name: Kubernetes smoke (kind)
 # already proven by `compose-smoke.yml`'s arm64 leg.
 #
 # Kubernetes has no `depends_on` analogue (unlike `deploy/docker-compose.yml`,
-# whose `jammi-server` waits on Postgres/NATS healthchecks): the ci overlay's
-# Deployment starts jammi-server alongside the Postgres/NATS StatefulSets and
+# whose `jammi-server` waits on the Postgres healthcheck): the ci overlay's
+# Deployment starts jammi-server alongside the Postgres StatefulSet and
 # converges by CrashLoopBackOff-and-retry until its catalog/broker
 # dependencies answer, inside the 300s `rollout status` timeout below --
 # there is no ordering gate in the manifests themselves.
@@ -180,8 +180,7 @@ jobs:
         run: |
           set -euo pipefail
           docker pull postgres:16
-          docker pull nats:2.10-alpine
-          kind load docker-image jammi-ai-server:pr postgres:16 nats:2.10-alpine --name kind
+          kind load docker-image jammi-ai-server:pr postgres:16 --name kind
 
       - name: Create the namespace and the Secret
         run: |
@@ -190,7 +189,7 @@ jobs:
           kubectl -n jammi-ci create secret generic jammi-server-secrets \
             --from-literal=JAMMI_AUDIT_MASTER_KEY="$JAMMI_AUDIT_MASTER_KEY" \
             --from-literal=JAMMI_CATALOG__POSTGRES__URL=postgres://jammi:jammi@postgres:5432/jammi \
-            --from-literal=JAMMI_BROKER__JET_STREAM__URL=nats://nats:4222
+            --from-literal=JAMMI_BROKER__POSTGRES__URL=postgres://jammi:jammi@postgres:5432/jammi
 
       - name: Validate the ci overlay against the pinned schema (kubeconform --strict, before apply)
         run: |
@@ -207,11 +206,10 @@ jobs:
       - name: Apply the ci overlay
         run: kustomize build deploy/kubernetes/overlays/ci | kubectl apply -f -
 
-      - name: Wait for postgres, nats, and jammi-server to roll out
+      - name: Wait for postgres and jammi-server to roll out
         run: |
           set -euo pipefail
           kubectl -n jammi-ci rollout status statefulset/postgres --timeout=300s
-          kubectl -n jammi-ci rollout status statefulset/nats --timeout=300s
           kubectl -n jammi-ci rollout status deploy/jammi-server --timeout=300s
 
       - name: Assert one-hop image identity (kind-loaded image vs kubelet-reported imageID)

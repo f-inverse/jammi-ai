@@ -80,7 +80,6 @@ fn events_topic() -> TopicDefinition {
         name: "cdc.events".to_string(),
         schema: events_schema(),
         tenant: None,
-        broker_metadata: std::collections::BTreeMap::new(),
     }
 }
 

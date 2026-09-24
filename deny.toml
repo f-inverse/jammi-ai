@@ -20,8 +20,8 @@
 # the bare `jammi-server` crate as published to crates.io, built with no
 # `--features` at all) and over `--all-features` (which covers every OTHER
 # shipped family — the CPU PyPI wheel, the CPU tarball, the CPU container
-# image and all three CUDA lanes, every one of which builds `jetstream-broker`
-# + `storage-cloud`; see `.github/workflows/pypi-server.yml`,
+# image and all three CUDA lanes, every one of which builds `storage-cloud`;
+# see `.github/workflows/pypi-server.yml`,
 # `release-binaries.yml`, `Dockerfile` and `ci/release-feature-manifest.json`
 # — plus jammi-db's `postgres`/`mysql` backends). A copyleft license, a git
 # source, a second engine line or an advisory hiding behind an optional
@@ -71,11 +71,10 @@ ignore = [
     # with no `--features` at all — is advisory-clean without them. That is
     # NOT the shipped posture of every OTHER family: the CPU PyPI wheel and
     # CPU tarball (`.github/workflows/pypi-server.yml`,
-    # `release-binaries.yml`: `jetstream-broker,storage-cloud`), the CPU
-    # container image (`Dockerfile`: `--features
-    # jammi-server/jetstream-broker,jammi-server/storage-cloud`), and all
-    # three CUDA lanes (`ci/release-feature-manifest.json`: `cargo_features`
-    # include `jetstream-broker` and `storage-cloud`) all build these features
+    # `release-binaries.yml`: `storage-cloud`), the CPU container image
+    # (`Dockerfile`: `--features jammi-server/storage-cloud`), and all three
+    # CUDA lanes (`ci/release-feature-manifest.json`: `cargo_features` include
+    # `storage-cloud`) all build these features
     # and ARE exposed to every entry below that they carry. That is exactly
     # why the `--all-features` advisories lane is a merge gate: a new advisory
     # on one of these paths reds the PR instead of shipping in a build unseen.
@@ -161,7 +160,7 @@ multiple-versions = "allow"
 # features (only the bare crates.io `jammi-server` crate) and once with
 # `--all-features` (the CPU PyPI wheel, the CPU tarball, the CPU container
 # image and all three CUDA lanes, every one of which builds
-# `jetstream-broker` + `storage-cloud`). The second run is the load-bearing one for the optional
+# `storage-cloud`). The second run is the load-bearing one for the optional
 # backends: every crate reachable only through jammi-db's `postgres`/`mysql`
 # features — the whole `datafusion-table-providers{,-common,-mysql,-postgres}`
 # subtree, the likeliest carrier of a second DataFusion — is ABSENT from the

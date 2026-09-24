@@ -23,7 +23,6 @@
 //! Postgres also provides; the `mutable_tables` and `trigger` suites drive the
 //! same operations on Postgres under `live-postgres-tests`.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -171,7 +170,6 @@ fn lifecycle_topic_def() -> TopicDefinition {
         name: LIFECYCLE_TOPIC.to_string(),
         schema: lifecycle_schema(),
         tenant: None,
-        broker_metadata: BTreeMap::new(),
     }
 }
 

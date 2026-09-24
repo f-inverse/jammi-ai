@@ -1,4 +1,4 @@
-# Sample Jammi config selecting Postgres + JetStream.
+# Sample Jammi config selecting a Postgres catalog + Postgres broker.
 #
 # Environment substitution: a `$` followed by `{VAR}` is replaced from the
 # process environment before the TOML parser runs; a missing variable is an
@@ -24,12 +24,10 @@ pool_size = 16
 # pool rotates onto fresh upstream connections instead of pinning one.
 max_lifetime_secs = 1800
 
-[broker.jet_stream]
-url = "nats://${NATS_HOST}:4222"
-# Default retention if a topic does not set `broker_metadata.retention_seconds`.
-retention_seconds = 604800
-# The `.creds` file CONTENTS, read at load (or inline the text). Never printed.
-credentials = { file = "/var/run/secrets/nats.creds" }
+[broker.postgres]
+# `url` defaults to `catalog.postgres.url`: the broker's LISTEN/NOTIFY wake-ups
+# ride the same database whose backing tables are the authoritative log.
+idle_poll_secs = 5
 
 [engine]
 execution_threads = 8

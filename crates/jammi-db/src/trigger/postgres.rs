@@ -111,9 +111,9 @@ struct ConsumerTracker {
     topic_id: TopicId,
     /// Best-effort, INFORMATIONAL only: the highest offset this consumer has
     /// observed in a NOTIFY payload. This driver never delivers a batch
-    /// itself (only `Wake`), so — unlike `InMemoryBroker`/`JetStreamBroker`,
-    /// whose `last_delivered`/`last_acked` are authoritative because they
-    /// carry the batch — this value can lag or skip (a coalesced or dropped
+    /// itself (only `Wake`), so — unlike `InMemoryBroker`, whose
+    /// `last_delivered`/`last_acked` are authoritative because it carries the
+    /// batch — this value can lag or skip (a coalesced or dropped
     /// NOTIFY, an idle-tick wake) and must never be read as "the last engine
     /// offset this consumer has replayed". `0` is a legitimate engine
     /// offset (the very first published row), so it can never double as
@@ -547,7 +547,7 @@ mod tests {
     /// before any network call, so this needs no live Postgres.
     #[tokio::test]
     async fn connect_rejects_non_postgres_url() {
-        let err = PostgresBroker::connect("nats://nats.svc:4222", Duration::from_secs(5))
+        let err = PostgresBroker::connect("mysql://db.svc:3306/jammi", Duration::from_secs(5))
             .await
             .unwrap_err();
         match err {

@@ -37,7 +37,7 @@ preload_models = []
 # SQLite under `artifact_dir`. Single-instance, ephemeral, no external DB.
 catalog = "sqlite"
 
-# In-process broker — no NATS/JetStream sidecar to reach.
+# In-process broker — no external broker to reach.
 broker = "in_memory"
 
 [logging]

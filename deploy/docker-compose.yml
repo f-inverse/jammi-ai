@@ -1,9 +1,9 @@
-# Shape B: `jammi-server` against Postgres (catalog) + JetStream (broker) —
+# Shape B: `jammi-server` against one Postgres serving as catalog AND broker —
 # a worked example of a *configuration* change, not orchestration policy
 # (orchestration is the deployer's runtime; see `docs/guide/src/philosophy.md`).
 # Every knob below is one this compose file only sets, never invents: the
 # image's env-only configuration layer (`crates/jammi-db/src/config/`)
-# resolves `JAMMI_CATALOG__POSTGRES__URL`, `JAMMI_BROKER__JET_STREAM__URL`,
+# resolves `JAMMI_CATALOG__POSTGRES__URL`, `JAMMI_BROKER__POSTGRES__URL`,
 # and `JAMMI_SERVER__SERVICES` exactly as documented in
 # `docs/guide/src/reference-topologies.md`.
 #
@@ -34,7 +34,7 @@ services:
       dockerfile: Dockerfile
     environment:
       JAMMI_CATALOG__POSTGRES__URL: postgres://jammi:jammi@postgres:5432/jammi
-      JAMMI_BROKER__JET_STREAM__URL: nats://nats:4222
+      JAMMI_BROKER__POSTGRES__URL: postgres://jammi:jammi@postgres:5432/jammi
       JAMMI_SERVER__SERVICES: all
       JAMMI_AUDIT_MASTER_KEY: ${JAMMI_AUDIT_MASTER_KEY:?set it in .env}
     ports:
@@ -53,8 +53,6 @@ services:
       - jammi-data:/var/lib/jammi
     depends_on:
       postgres:
-        condition: service_healthy
-      nats:
         condition: service_healthy
     restart: unless-stopped
     # `docker stop` / `docker compose down` send SIGTERM (DRAIN: the in-flight
@@ -85,19 +83,6 @@ services:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "jammi"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-
-  nats:
-    image: nats:2.10-alpine
-    command: ["-js", "-m", "8222"]
-    healthcheck:
-      # The image ships no shell — `wget` is the one HTTP-capable binary
-      # nats:2.10-alpine's base carries; `nats-server --help` (no shell
-      # dependency either) would prove only that the binary exists, not
-      # that JetStream came up.
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8222/healthz"]
       interval: 5s
       timeout: 5s
       retries: 12

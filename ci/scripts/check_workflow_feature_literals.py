@@ -164,7 +164,7 @@ def check() -> list[str]:
 
 
 def self_test() -> int:
-    features = {"cuda", "flash-attn", "storage-cloud", "jetstream-broker"}
+    features = {"cuda", "flash-attn", "storage-cloud"}
     failures: list[str] = []
 
     def expect(label: str, text: str, want: set[str]) -> None:
@@ -203,9 +203,9 @@ def self_test() -> int:
         jobs:
           b:
             steps:
-              - run: cargo build -F 'storage-cloud jetstream-broker'
+              - run: cargo build -F 'storage-cloud cuda'
         """,
-        {"storage-cloud", "jetstream-broker"},
+        {"storage-cloud", "cuda"},
     )
     expect(
         "an input default that is nothing but features is refused",

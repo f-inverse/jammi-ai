@@ -8,7 +8,6 @@
 //! both durable and subscribable via the standard `subscribe` surface. The
 //! topic is tenant-pinned, so each tenant owns its own lifecycle stream.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
@@ -56,7 +55,6 @@ pub(super) async fn publish_lifecycle(
                 name: SESSION_LIFECYCLE_TOPIC.to_string(),
                 schema: payload_schema(),
                 tenant: Some(tenant),
-                broker_metadata: BTreeMap::new(),
             };
             repo.register_topic(&definition)
                 .await

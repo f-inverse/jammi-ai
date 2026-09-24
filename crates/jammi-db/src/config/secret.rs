@@ -18,7 +18,7 @@
 //! [`Secret`] directly. `Secret`'s `Deserialize` accepts the same shapes as
 //! `SecretSource` and resolves the file form eagerly, so a missing or
 //! unreadable secret file fails `JammiConfig::load` — the one place a
-//! deployment error should surface — instead of the first Postgres pool, NATS
+//! deployment error should surface — instead of the first Postgres pool, broker
 //! connect, or audit signature deep in a server startup. The alternative
 //! (fields hold `SecretSource`, a parallel resolved view is built by the
 //! loader) would let a config parse cleanly with a secret nobody can read; a

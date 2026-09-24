@@ -1,6 +1,6 @@
 """UAT shape-B: drive the topic-registration primitive from a Python client.
 
-Registers a trigger-stream topic with broker metadata, confirms the
+Registers a trigger-stream topic with a typed schema, confirms the
 topic catalog returns it via `list_topics`, then drops it. The publish
 and subscribe side of the trigger primitive is exercised in
 `shape_b_trigger.py`.
@@ -36,7 +36,6 @@ def main() -> int:
         topic_id = db.register_topic(
             "events.demo",
             schema=_events_schema(),
-            broker_metadata={"retention_seconds": "3600"},
         )
         assert len(topic_id) > 0, "register_topic returned empty id"
 

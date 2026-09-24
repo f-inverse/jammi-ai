@@ -94,7 +94,6 @@ retention_days = 30
 #
 # broker = "in_memory"           # default; the in-process broker
 #
-# [broker.jet_stream]            # needs jammi-db's `jetstream-broker` feature
-# url = "nats://nats:4222"
-# retention_seconds = 604800     # per-stream default; default 7 days
-# credentials = { file = "/var/run/secrets/nats.creds" }   # optional; the `.creds` contents (read at load); omitted connects anonymously
+# [broker.postgres]              # LISTEN/NOTIFY wake-ups over the topic's backing table
+# url = "postgres://jammi:secret@postgres:5432/jammi"   # optional; defaults to catalog.postgres.url
+# idle_poll_secs = 5             # idle-tick wake interval; default 5, must be >= 1

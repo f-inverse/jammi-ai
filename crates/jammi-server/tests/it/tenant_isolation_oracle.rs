@@ -861,7 +861,6 @@ fn cases() -> Vec<IsolationCase> {
                     name: "a.events".into(),
                     schema: topic_schema(),
                     tenant: Some(tenant_a()),
-                    broker_metadata: Default::default(),
                 };
                 sess_a.topic_repo().register_topic(&owned_a).await.unwrap();
                 let b_ids = list_topic_ids(&sess_b, Some(tenant_b())).await;
@@ -880,7 +879,6 @@ fn cases() -> Vec<IsolationCase> {
                 name: "global.events".into(),
                 schema: topic_schema(),
                 tenant: None,
-                broker_metadata: Default::default(),
             };
             sess_g.topic_repo().register_topic(&global).await.unwrap();
             let owned_a = TopicDefinition {
@@ -888,7 +886,6 @@ fn cases() -> Vec<IsolationCase> {
                 name: "a.events".into(),
                 schema: topic_schema(),
                 tenant: Some(tenant_a()),
-                broker_metadata: Default::default(),
             };
             sess_a.topic_repo().register_topic(&owned_a).await.unwrap();
             match sess_b
@@ -925,7 +922,6 @@ fn cases() -> Vec<IsolationCase> {
                 name: "a.events".into(),
                 schema: topic_schema(),
                 tenant: Some(tenant_a()),
-                broker_metadata: Default::default(),
             };
             sess_a.topic_repo().register_topic(&owned_a).await.unwrap();
             assert!(
@@ -946,7 +942,6 @@ fn cases() -> Vec<IsolationCase> {
                 name: "a.events".into(),
                 schema: topic_schema(),
                 tenant: Some(tenant_a()),
-                broker_metadata: Default::default(),
             };
             sess_a.topic_repo().register_topic(&owned_a).await.unwrap();
             assert!(
@@ -1366,7 +1361,6 @@ async fn assert_live_subscribe_tenant_isolated() {
         name: "global.live_events".into(),
         schema: topic_schema(),
         tenant: None,
-        broker_metadata: Default::default(),
     };
     session
         .trigger_broker()

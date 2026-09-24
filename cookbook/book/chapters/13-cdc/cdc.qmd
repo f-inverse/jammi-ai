@@ -25,7 +25,7 @@ record-change events that a downstream selectively subscribes to and resumes fro
 checkpoint.
 
 This chapter builds a CDC stream honestly, on CPU, hermetically (the embedded
-`Database` uses the in-memory broker by default — no server, no NATS). The events are
+`Database` uses the in-memory broker by default — no server, no external broker). The events are
 real and deterministic — `N` record-change events, each an `op` (`add` / `update` /
 `remove`) on a key, keyed by a committed `arxiv` `paper_id` for realism — committed by
 the build script. The chapter re-publishes them onto a live topic, drains them with

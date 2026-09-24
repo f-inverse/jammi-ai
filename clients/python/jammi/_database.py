@@ -1182,8 +1182,7 @@ class RemoteDatabase:
         ``"eval"`` appear only when this server enabled them). A
         client reads ``services`` to know which verbs are reachable here before
         calling them. ``broker`` is the RUNTIME trigger-broker driver this
-        deployment is running (``"in_memory"`` / ``"jet_stream"`` /
-        ``"postgres"``) — unlike ``services``, the embedded and the remote
+        deployment is running (``"in_memory"`` / ``"postgres"``) — unlike ``services``, the embedded and the remote
         surfaces report the IDENTICAL value here when built from the same
         config.
 
@@ -1402,21 +1401,15 @@ class RemoteDatabase:
         name: str,
         *,
         schema: pa.Schema,
-        broker_metadata: Optional[Dict[str, str]] = None,
     ) -> str:
         """Register a trigger-stream topic on the remote engine and return its
         engine-minted topic id.
 
         `schema` is the contract every published batch must satisfy (rides as a
-        schema-only Arrow IPC stream). `broker_metadata` is opaque driver-side
-        configuration (retention, replication, …). Tenant scope is the session's
+        schema-only Arrow IPC stream). Tenant scope is the session's
         bound tenant. Maps to `CatalogService.RegisterTopic`.
         """
-        request = build_register_topic_request(
-            name,
-            schema=schema,
-            broker_metadata=broker_metadata,
-        )
+        request = build_register_topic_request(name, schema=schema)
         resp = self._call(self._catalog.RegisterTopic, request)
         return resp.topic_id
 

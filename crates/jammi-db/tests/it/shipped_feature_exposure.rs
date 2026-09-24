@@ -233,7 +233,7 @@ fn families_carrying_excludes_a_family_missing_the_feature() {
         .iter()
         .map(|fam| (*fam, vec!["storage-cloud".to_string()]))
         .collect();
-    features_by_family.insert("cpu-wheel", vec!["jetstream-broker".to_string()]);
+    features_by_family.insert("cpu-wheel", vec!["storage-s3".to_string()]);
     let families = families_carrying("storage-cloud", &features_by_family);
     assert!(
         !families.contains(&"cpu-wheel"),

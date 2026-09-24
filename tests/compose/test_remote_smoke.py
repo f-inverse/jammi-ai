@@ -31,7 +31,7 @@ What each case proves:
     `describe_source` returns `None` (the source did not survive the
     restart onto the new pod).
   - `test_shared_catalog_after_restart_raises_on_wrong_broker`: NEGATIVE
-    control -- raises when the re-asserted broker is not `jet_stream`.
+    control -- raises when the re-asserted broker is not `postgres`.
   - `test_shared_catalog_after_restart_raises_on_wrong_sources_count`:
     NEGATIVE control -- raises when `list_sources()`'s count changed after
     restart (the emptyDir shape asserts the catalog, never the result
@@ -121,7 +121,7 @@ class _FakeDb:
 class DurableAfterRestartTests(unittest.TestCase):
     def test_key_mismatch_raises_with_both_key_lists(self):
         ctx = remote_smoke.Ctx(
-            db=_FakeDb(describe_source_result=None, broker="jet_stream"),
+            db=_FakeDb(describe_source_result=None, broker="postgres"),
             table="t1",
             do_search=lambda: _FakeHits(["1", "2", "999"], [1.0, 0.9, 0.8]),
             hit_keys=["1", "2", "3"],
@@ -137,7 +137,7 @@ class DurableAfterRestartTests(unittest.TestCase):
         self.assertIn("['1', '2', '999']", msg)
 
     def test_matching_keys_and_segments_pass(self):
-        db = _FakeDb(describe_source_result=None, broker="jet_stream")
+        db = _FakeDb(describe_source_result=None, broker="postgres")
 
         def list_index_segments(_table):
             return [{"segment_id": 1}]
@@ -184,7 +184,7 @@ class SharedCatalogAfterRestartTests(unittest.TestCase):
         )
 
     def test_raises_when_source_missing(self):
-        ctx = self._ctx(describe_source_result=None, broker="jet_stream")
+        ctx = self._ctx(describe_source_result=None, broker="postgres")
         with self.assertRaises(AssertionError) as cm:
             remote_smoke.shared_catalog_after_restart(ctx)
         self.assertIn("describe_source", str(cm.exception))
@@ -192,7 +192,7 @@ class SharedCatalogAfterRestartTests(unittest.TestCase):
     def test_raises_on_wrong_sources_count(self):
         ctx = self._ctx(
             describe_source_result={"id": "patents"},
-            broker="jet_stream",
+            broker="postgres",
             sources_before=({"source_id": "patents"},),
             list_sources_result=(),  # the new pod's catalog lost the source
         )
@@ -204,10 +204,10 @@ class SharedCatalogAfterRestartTests(unittest.TestCase):
         ctx = self._ctx(describe_source_result={"id": "patents"}, broker="in_memory")
         with self.assertRaises(AssertionError) as cm:
             remote_smoke.shared_catalog_after_restart(ctx)
-        self.assertIn("jet_stream", str(cm.exception))
+        self.assertIn("postgres", str(cm.exception))
 
     def test_passes_when_everything_matches(self):
-        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="jet_stream")
+        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="postgres")
         remote_smoke.shared_catalog_after_restart(ctx)  # must not raise
 
     def test_never_queries_sql(self):
@@ -220,7 +220,7 @@ class SharedCatalogAfterRestartTests(unittest.TestCase):
         'AssertionError: the result table must never be queried by an
         after-restart callback on the emptyDir shape, got sql('SELECT
         count(*) FROM "jammi.t1"')'."""
-        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="jet_stream")
+        ctx = self._ctx(describe_source_result={"id": "patents"}, broker="postgres")
         remote_smoke.shared_catalog_after_restart(ctx)  # must not raise
 
 

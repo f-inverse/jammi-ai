@@ -28,15 +28,6 @@ def _events_schema() -> pa.Schema:
     )
 
 
-def _orders_schema() -> pa.Schema:
-    return pa.schema(
-        [
-            pa.field("order_id", pa.int64(), nullable=False),
-            pa.field("amount", pa.float64(), nullable=False),
-        ]
-    )
-
-
 def test_register_publish_subscribe_round_trips(tmp_path):
     """Register `events.demo`, publish one batch, read it back via
     `subscribe_collect`."""
@@ -65,20 +56,6 @@ def test_register_publish_subscribe_round_trips(tmp_path):
     payloads = collected.column("payload").to_pylist()
     assert event_ids == [1, 2, 3]
     assert payloads == ["a", "b", "c"]
-
-
-def test_register_with_broker_metadata(tmp_path):
-    """`broker_metadata` is opaque driver config; the topic catalog round-
-    trips it as-is and `list_topics` includes the registered topic."""
-    db = jammi.connect(f"file://{tmp_path}")
-    db.register_topic(
-        "cdc.orders",
-        schema=_orders_schema(),
-        broker_metadata={"retention_seconds": "3600"},
-    )
-
-    topics = db.list_topics()
-    assert "cdc.orders" in topics
 
 
 def test_register_inherits_session_tenant(tmp_path):

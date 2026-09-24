@@ -11,7 +11,6 @@
 //! is the in-memory default; every fixture is hermetic and uses realistic
 //! schemas. No network.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -251,7 +250,6 @@ async fn register_topic_then_list_then_drop() {
         .register_topic(RegisterTopicRequest {
             name: "events".into(),
             schema: encode_schema_ipc(&schema),
-            broker_metadata: HashMap::new(),
             // Empty id: this DDL-style caller has no client-minted id, so the
             // server mints a fresh UUIDv7.
             topic_id: String::new(),
@@ -328,7 +326,6 @@ async fn register_topic_mints_id_server_side_and_ignores_caller_id() {
         .register_topic(RegisterTopicRequest {
             name: "events_a".into(),
             schema: encode_schema_ipc(&schema),
-            broker_metadata: HashMap::new(),
             topic_id: attacker_id.clone(),
         })
         .await
@@ -355,7 +352,6 @@ async fn register_topic_mints_id_server_side_and_ignores_caller_id() {
         .register_topic(RegisterTopicRequest {
             name: "events_b".into(),
             schema: encode_schema_ipc(&schema),
-            broker_metadata: HashMap::new(),
             topic_id: attacker_id.clone(),
         })
         .await

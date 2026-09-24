@@ -349,7 +349,7 @@ impl InferenceSession {
         // what it was before the list existed.
         let schedulers = crate::concurrency::DeviceSchedulers::for_devices(
             &device_config.devices,
-            device_config.memory_fraction,
+            inner.config().gpu.memory_limit,
             inner.config().engine.execution_threads,
         )?;
         let model_cache = Arc::new(

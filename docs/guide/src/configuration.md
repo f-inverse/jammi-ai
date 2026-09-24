@@ -78,10 +78,12 @@ batch_size = 8192
 [gpu]
 # GPU device index. -1 for CPU only. Default: 0.
 device = -1
-# GPU memory limit. Default: "auto".
-memory_limit = "auto"
-# Fraction of GPU memory Jammi may use. Default: 0.9.
-memory_fraction = 0.9
+# Each device's model-residency budget, in the same grammar as
+# [engine] memory_limit: "<n>%" of the device's total memory, or an absolute
+# "<n>GB"/"<n>MB"/"<n>KB"/"<n>". What the budget leaves of the card is
+# headroom for activations and workspace. An absolute budget larger than a
+# device is refused when the session opens on it. Default: "90%".
+memory_limit = "90%"
 # Fail fast if the requested GPU is unavailable instead of falling back to CPU.
 # Default: false (degrade to CPU with a warning).
 require_gpu = false
@@ -105,8 +107,6 @@ compute_precision = "f32"
 # Defaults: 32 rows, 16384 tokens (32 rows of a 512-token encoder).
 batch_size = 32
 batch_tokens = 16384
-# Timeout for batch accumulation in server mode (seconds). Default: 300.
-batch_timeout_secs = 300
 # The most IDLE models kept loaded, across the process's devices. Past it
 # the least recently used idle model is evicted; a model in use is never
 # evicted, so the count can exceed this while models are held. 0 = unbounded

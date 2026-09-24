@@ -484,7 +484,6 @@ async fn load_tiny_bert_on(device_ordinal: i32) -> std::sync::Arc<jammi_ai::mode
     let device_config = DeviceConfig {
         gpu_device: device_ordinal,
         devices: vec![device_ordinal],
-        memory_fraction: 1.0,
         require_gpu: true,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };

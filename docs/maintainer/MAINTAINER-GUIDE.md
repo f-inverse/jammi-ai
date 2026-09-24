@@ -2929,11 +2929,16 @@ in `ready` status.
 (`crates/jammi-db/src/config/mod.rs`) — is the ONE knob every consumer of a session's
 memory is bounded by: an ordinary `SortExec`/`SortPreservingMergeExec`, a training-set
 stream's chunk reservation, an eager materialization's collected-batch reservation.
-`memory_limit_bytes` (`crates/jammi-db/src/config/mod.rs`) is the ONE reader of the
-field, parsing `"<n>%"` (1–100, of `total_physical_memory_bytes`,
-`crates/jammi-db/src/config/host_memory.rs` — the lower of the host's physical total and
-a readable Linux cgroup ceiling), `"<n>GB"`/`"<n>MB"`/`"<n>KB"` (binary units), or `"<n>"`
-(bytes); every unparseable form is a typed `JammiError::Config` naming the key. A resolved
+The field is a `MemoryLimit` (`crates/jammi-db/src/config/memory_limit.rs`), the one
+grammar every memory bound is written in — `"<n>%"` (1–100), `"<n>GB"`/`"<n>MB"`/`"<n>KB"`
+(binary units), or `"<n>"` (bytes) — parsed when the configuration loads, so an
+unparseable form is refused naming its key. `[gpu] memory_limit` is the same type at the
+device scale: `GpuScheduler::budget_for` resolves a share against the card's total and
+refuses an absolute size larger than the card. `memory_limit_bytes`
+(`crates/jammi-db/src/config/mod.rs`) is the ONE resolution of `[engine] memory_limit`,
+resolving a share against `total_physical_memory_bytes`
+(`crates/jammi-db/src/config/host_memory.rs` — the lower of the host's physical total and
+a readable Linux cgroup ceiling). A resolved
 value below the 64 MiB `MEMORY_LIMIT_FLOOR_BYTES`
 (`crates/jammi-db/src/config/mod.rs`) is refused too — small enough that DataFusion's
 own long-lived pool consumers would be refused on the very first non-trivial query, before

@@ -1,5 +1,5 @@
 ---
-title: "Eval on the wire + provenance channels — the remote ML surface, validated"
+title: "Evaluation and provenance channels — one program, either transport"
 ---
 
 ```{python}
@@ -7,292 +7,263 @@ title: "Eval on the wire + provenance channels — the remote ML surface, valida
 import jammi_cookbook
 ```
 
-**Recipe:** `eval_embeddings` · `eval_per_query` · `eval_inference`
-(classification + NER) · `eval_compare` · `register_channel` ·
-`add_channel_columns` · `list_channels` · **Theory:** retrieval and inference
-*evaluation as a first-class engine verb* — recall\@k / nDCG, accuracy / F1,
-entity-span precision/recall — and the *evidence-provenance channel* as a typed,
-append-only, tenant-scoped registry [@kleppmann2017ddia] · **Rail:** measurement
-(every aggregate asserted against the frozen golden) + tenancy (the
-per-tenant channel-isolation property, measured live).
+**Recipe:** `eval_embeddings` (with cohorts) · `eval_per_query` ·
+`eval_compare` · `eval_inference` (classification and NER) ·
+`register_channel` · `add_channel_columns` · `list_channels` · `jammi.testing.LiveServer`
+· **Theory:** retrieval and inference *evaluation as an engine verb* —
+precision\@k / recall\@k / MRR / nDCG, accuracy / F1, entity-span
+precision/recall — and the evidence-provenance channel as a typed, append-only,
+tenant-scoped registry [@kleppmann2017ddia] · **Rail:** measurement (every
+aggregate against its golden) + parity (the remote report equals the embedded
+one, value for value) + tenancy (channel isolation, measured).
 
-The eval verbs — `eval_embeddings`, `eval_compare`, `eval_inference` — and the
-evidence-channel registry are on the `grpc://` `RemoteDatabase` as well as the
-embedded `Database`, and this chapter is the engine↔cookbook validator that proves
-it. (The keystone still measures recall by an exact-kNN numpy fold, for the reason
-the rails chapter gives: its committed vectors are a bare matrix.)
-
-## What this chapter validates — and what it does not
-
-Read this plainly, because the framing is the honesty contract:
-
-- **It validates the wire SURFACE** of the eval + channel verbs on the engine's
-  own **public deterministic fixtures** — the same 20-row `patents` corpus,
-  `tiny_modernbert` / `tiny_bert` encoders, classifier, and NER fixtures the
-  engine's own live tests drive. It is a **golden-stability gate**: the committed
-  reports' aggregates must reproduce to a frozen golden, or CI fails.
-- **It does NOT extend the cookbook's corpus coverage**, and it does **not**
-  reproduce the keystone's `0.538` / `0.556` recall — those stay the ch05 numpy
-  fold, forced by the keystone's committed arxiv vectors being a **bare matrix**,
-  not a source-bound engine embedding table. This chapter registers **fresh,
-  source-bound** tables (the exact thing the keystone could not), which is why it
-  can call `eval_embeddings` at all — but on the public patents fixture, not arxiv.
-- **Cross-transport parity is a one-time emit-side LIVE check.** The build script
-  ran every eval verb and the channel sequence on BOTH the embedded engine and a
-  live remote `grpc://` `jammi-server`, and asserted **remote == embedded** live
-  (shape + value-close, tol `1e-9`). That verdict is recorded in `eval.json`. It
-  is **not** a per-PR re-validation (re-diffing two static committed artifacts
-  would re-validate nothing) — it is continuously re-guarded by the engine's gated
-  `test_remote_eval_live.py` / `test_remote_channel_live.py`. This chapter reads
-  the **embedded-canonical** reports on CPU and asserts aggregates-to-golden.
-
-```{python}
-from jammi_cookbook import contracts, rails
-
-record = contracts.load_artifact("eval.eval")  # the provenance + parity record
-print(f"transports:     {record['transports']}")
-print(f"parity verdict: {record['parity_verdict']} (tol {record['parity_tol']})")
-print(f"fixtures:       engine public deterministic fixtures (patents / tiny_* models)")
-```
-
-## eval_embeddings — retrieval quality as an engine verb
-
-The build script registered the `patents` corpus fresh, embedded its `abstract`
-column with the deterministic `tiny_modernbert` encoder into a **source-bound**
-result table, and scored it against the `golden_relevance` set with
-`eval_embeddings(source, golden_source, k=10, cohorts=…)`. The report carries an
-`aggregate` block (mean `recall_at_k` / `precision_at_k` / `mrr` / `ndcg` over the
-golden queries) and a `per_query` record per query — the same nested shape on both
-transports. We read the committed embedded report and assert each aggregate to its
-golden.
-
-```{python}
-embeddings = contracts.load_artifact("eval.embeddings")
-agg = embeddings["aggregate"]
-print(f"queries scored:  {len(embeddings['per_query'])}")
-for metric in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
-    observed = float(agg[metric])
-    rails.measure(f"eval.embeddings.{metric}", observed)
-    print(f"  {metric:<16} {observed:.4f}  (asserted to golden)")
-```
-
-`eval_per_query` reads back the persisted per-query rows for the run — one row per
-golden query, each carrying its `cohorts` tag and `metrics` dict. The cohort tag
-(`{"split": "val"}` on `q1`) rode the wire verbatim into the persisted record.
-
-```{python}
-per_query = contracts.load_artifact("eval.per_query")
-print(f"persisted per-query rows: {len(per_query)}")
-q1 = next(r for r in per_query if r["query_id"] == "q1")
-print(f"q1 cohorts (persisted):   {q1['cohorts']}")
-assert q1["cohorts"] == {"split": "val"}, "the cohort tag must persist with the per-query metrics"
-```
-
-## eval_inference — classification and NER, scored on the wire
-
-`eval_inference` runs a model forward pass over a source's columns and scores the
-predictions against a golden label set. It is **task-tagged**: a
-`{"task": "classification"}` aggregate carries `accuracy` / `f1` / `per_class`; a
-`{"task": "ner"}` aggregate carries entity-span `precision` / `recall` / `f1` /
-`per_type`. Both run identically on the wire.
-
-### Classification
-
-```{python}
-cls = contracts.load_artifact("eval.inference_cls")
-cls_agg = cls["aggregate"]
-assert cls_agg["task"] == "classification"
-rails.measure("eval.inference_cls.accuracy", float(cls_agg["accuracy"]))
-rails.measure("eval.inference_cls.f1", float(cls_agg["f1"]))
-print(f"classification: accuracy={cls_agg['accuracy']:.4f}  f1={cls_agg['f1']:.4f}  "
-      f"({len(cls['per_record'])} records)")
-```
-
-### NER — the entity-span eval the wire's own Python tests do not carry
-
-The NER eval is scored over a **separate** corpus (`tiny_ner_corpus`) against a
-char-offset **span** golden (`tiny_ner_gold`: `id, label, start, end`) — the
-runner joins on `id`, groups the spans into per-row entity sets, and computes
-entity-level precision/recall/F1. The fixture model is random-initialised, so it
-produces well-defined rates (not necessarily positive) — the point is the **wire
-surface runs end-to-end and is deterministic**, the Python + remote NER coverage
-the engine's own Python live tests (classification-only) do not carry.
-
-```{python}
-ner = contracts.load_artifact("eval.inference_ner")
-ner_agg = ner["aggregate"]
-assert ner_agg["task"] == "ner"
-for metric in ("precision", "recall", "f1"):
-    value = float(ner_agg[metric])
-    assert 0.0 <= value <= 1.0, f"NER {metric} must be a well-defined rate in [0, 1]"
-    rails.measure(f"eval.inference_ner.{metric}", value)
-print(f"ner: precision={ner_agg['precision']:.4f}  recall={ner_agg['recall']:.4f}  "
-      f"f1={ner_agg['f1']:.4f}  ({len(ner['per_record'])} records)")
-print(f"per-type support: { {t: m['support'] for t, m in ner_agg['per_type'].items()} }")
-```
-
-## eval_compare — the determinism anchor and the genuine comparison
-
-`eval_compare` scores several embedding tables side-by-side against one golden set
-and reports each table's metrics plus a `delta` against the baseline (the first
-table carries `delta: None`), with a paired `significance` block. We run it two
-ways — the contrast is the teaching point.
-
-### Self-comparison — the determinism anchor (delta exactly 0.0)
-
-The same table compared against itself: every metric delta is **exactly 0.0**, and
-because the two runs share every query, the paired significance is present with a
-CI collapsed onto zero. This is the determinism anchor — a non-zero delta here
-would mean the engine is not deterministic over a fixed table.
-
-```{python}
-compare_self = contracts.load_artifact("eval.compare_self")
-baseline, treatment = compare_self["per_table"]
-assert baseline["delta"] is None, "the baseline table carries an explicit None delta"
-deltas = {m: treatment["delta"][m]["absolute"]
-          for m in ("recall_at_k", "precision_at_k", "mrr", "ndcg")}
-max_abs = max(abs(v) for v in deltas.values())
-print(f"self-comparison max |delta|: {max_abs:.2e}  (significance present: "
-      f"{treatment['delta']['significance'] is not None})")
-rails.measure("eval.compare.self_max_abs_delta", float(max_abs))
-rails.measure("eval.compare.self_significance_present",
-              float(treatment["delta"]["significance"] is not None))
-```
-
-### Two-table comparison — a genuine, non-zero delta
-
-The same `patents` corpus embedded with a **second** model (`tiny_bert`) gives a
-genuinely different ranking, so comparing `tiny_modernbert` vs `tiny_bert` yields a
-**non-zero** recall delta with a real significance block — the non-degenerate case
-the chapter must demonstrate, not just the self-anchor.
-
-```{python}
-compare_two = contracts.load_artifact("eval.compare_two")
-base2, treat2 = compare_two["per_table"]
-assert base2["delta"] is None
-recall_delta = float(treat2["delta"]["recall_at_k"]["absolute"])
-sig = treat2["delta"]["significance"]
-assert sig is not None, "the two-table comparison must carry a significance block"
-print(f"two-table recall Δ (tiny_modernbert vs tiny_bert): {recall_delta:+.4f}")
-print(f"  paired significance present: True  "
-      f"(recall p-value {sig['recall_at_k']['p_value']:.4f})")
-rails.measure("eval.compare.two_recall_delta_abs", recall_delta)
-assert recall_delta != 0.0, "the two-table delta is a genuine non-zero comparison"
-rails.measure("eval.compare.two_significance_present", float(sig is not None))
-```
-
-## Provenance channels — typed, append-only, tenant-scoped
-
-The second half is the **evidence-provenance channel** registry: a generic
-primitive for attaching typed, append-only columns of provenance to records,
-scoped **per tenant**. It names no consumer — a channel is just an id, a priority,
-and a list of `(name, dtype)` columns. This half runs **live on the embedded
-engine each render** (a fresh `file://` catalog, no server, no GPU — the catalog
-ops are pure, deterministic, and transport-independent; their remote parity is the
-emit-side check recorded in `eval.json`).
+Every evaluation in the keystone ran on the embedded engine. The same verbs are
+on a `jammi-server`, and a program written against a `Session` runs unchanged on
+either. This chapter makes that a measured property rather than a claim: it
+writes the evaluation once, as one function, runs it against an in-process
+engine and against a live server, and asserts the two reports are the same.
 
 ```{python}
 import tempfile
 import uuid
 
 import jammi
+from jammi.testing import LiveServer
+from jammi_cookbook import contracts, datasets, fixtures, keystone, scale
 
-db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_ch14_chan_')}")
-tenant_a = str(uuid.uuid4())
-tenant_b = str(uuid.uuid4())
+SCALE = scale.current()
+TENANTS = (str(uuid.uuid4()), str(uuid.uuid4()))
 ```
 
-### register → list, and append-order
+## The evaluation, written once
 
-We register two generic channels — `scored_by` (priority 50, a score + a model
-name) and `annotated_by` (priority 10, a label) — then **append** two columns to
-`annotated_by`. `list_channels` returns them ordered by `(priority, channel_id)`,
-each with its columns in declaration order (the appended columns AFTER the
-originals), alongside the global `vector` / `inference` seed channels.
+Four evaluations and one provenance sequence, over a `Session` of either kind:
+
+- **`eval_embeddings`** scores the keystone's raw embeddings on same-subject
+  retrieval, with each query tagged by its **cohort** — the time-split era its
+  paper belongs to — so the report can be sliced; **`eval_per_query`** reads the
+  run's persisted per-query rows back;
+- **`eval_compare`** scores the raw and graph-propagated tables side by side,
+  with a paired significance test on the difference;
+- **`eval_inference`** runs a model's forward pass and scores it:
+  classification (accuracy / F1 against a label set) and NER (entity-span
+  precision / recall against character-offset gold spans), on the cookbook's
+  small fixture models;
+- the **channel sequence** registers two provenance channels under one tenant,
+  appends columns, and reads the registry from both tenants and from no tenant.
 
 ```{python}
-with db.tenant_scope(tenant_a):
-    db.register_channel("scored_by", priority=50,
-                        columns=[("score", "Float64"), ("model", "Utf8")])
-    db.register_channel("annotated_by", priority=10, columns=[("label", "Utf8")])
-    db.add_channel_columns("annotated_by",
-                           columns=[("confidence", "Float32"), ("rank", "Int32")])
-    list_a = db.list_channels()
+def evaluate(db) -> dict:
+    arxiv = datasets.arxiv(db, SCALE)
+    raw = keystone.embed(db, arxiv, SCALE)
+    propagated = keystone.propagate(db, arxiv, raw)
+    golden = keystone.subject_golden(db, arxiv)
+    era = {pid: name for name, ids in arxiv.split.items() for pid in ids}
+    queries = db.sql(f"SELECT DISTINCT query_id FROM {golden}").column(0).to_pylist()
 
-names = {c["channel_id"] for c in list_a}
-assert {"vector", "inference"} <= names, "the global seed channels are present"
+    retrieval = db.eval_embeddings(
+        source=arxiv.papers, golden_source=golden, embedding_table=raw, k=10,
+        cohorts={q: {"era": era[q]} for q in queries},
+    )
+    per_query = db.eval_per_query(retrieval["eval_run_id"])
+    compared = db.eval_compare(
+        embedding_tables=[raw, propagated], source=arxiv.papers, golden_source=golden, k=10,
+    )
 
-annotated = next(c for c in list_a if c["channel_id"] == "annotated_by")
-assert annotated["columns"] == [
-    {"name": "label", "data_type": "Utf8"},
-    {"name": "confidence", "data_type": "Float32"},
-    {"name": "rank", "data_type": "Int32"},
-], "appended columns follow the originals in declaration order"
+    db.add_source("corpus", url=fixtures.url("tiny_corpus.parquet"), format="parquet")
+    db.add_source("labels", url=fixtures.url("tiny_labels.csv"), format="csv")
+    classification = db.eval_inference(
+        model=fixtures.model("tiny_modernbert_classifier"), source="corpus",
+        columns=["content"], task="classification",
+        golden_source="labels.public.tiny_labels", label_column="label",
+    )
+    db.add_source("ner_corpus", url=fixtures.url("tiny_ner_corpus.parquet"), format="parquet")
+    db.add_source("ner_gold", url=fixtures.url("tiny_ner_gold.csv"), format="csv")
+    ner = db.eval_inference(
+        model=fixtures.model("tiny_modernbert_ner"), source="ner_corpus",
+        columns=["text"], task="ner",
+        golden_source="ner_gold.public.tiny_ner_gold", label_column="label",
+    )
 
-print(f"tenant A channels: {sorted(names)}")
-print(f"annotated_by columns: {[c['name'] for c in annotated['columns']]}")
-rails.measure("eval.channel.a_channel_count", float(len(names)))
-rails.measure("eval.channel.annotated_column_count", float(len(annotated["columns"])))
+    a, b = TENANTS
+    with db.tenant_scope(a):
+        db.register_channel("scored_by", priority=50,
+                            columns=[("score", "Float64"), ("model", "Utf8")])
+        db.register_channel("annotated_by", priority=10, columns=[("label", "Utf8")])
+        db.add_channel_columns("annotated_by",
+                               columns=[("confidence", "Float32"), ("rank", "Int32")])
+    with db.tenant_scope(b):
+        seen_by_b = db.list_channels()
+        db.register_channel("scored_by", priority=3, columns=[("note", "Utf8")])
+        b_channels = db.list_channels()
+    with db.tenant_scope(a):
+        a_channels = db.list_channels()
+
+    return {
+        "retrieval": retrieval, "per_query": per_query, "compared": compared,
+        "classification": classification, "ner": ner,
+        "channels": {"a": a_channels, "b_before": seen_by_b, "b": b_channels,
+                     "unbound": db.list_channels()},
+    }
 ```
 
-### Tenant isolation and non-collision — measured live
+## Run it in process, then against a server
 
-A channel registered under tenant A is **invisible** to tenant B; B may register
-the **same id** with **different columns** without collision; A's channel is
-unchanged by B's; an unbound connection sees only the global seeds. These are hard
-properties — a leak or a collision is a measured non-zero that fails the gate.
+`jammi.connect("file://…")` runs the engine in this process;
+`jammi.testing.LiveServer` starts a real `jammi-server` (the `jammi-server`
+wheel puts one on `PATH`) on ports the kernel assigns, and
+`jammi.connect(server.endpoint)` is a `grpc://` session to it. The same
+function runs on each.
 
 ```{python}
-# B sees none of A's named channels.
-with db.tenant_scope(tenant_b):
-    b_before = {c["channel_id"] for c in db.list_channels()}
-leak = len({"scored_by", "annotated_by"} & b_before)
-print(f"tenant B leak of A's channels: {leak}")
-rails.measure("eval.channel.tenant_leak", float(leak))
+with jammi.connect(f"file://{tempfile.mkdtemp()}") as embedded:
+    local = evaluate(embedded)
 
-# B registers its OWN scored_by (different columns) — no collision with A's.
-with db.tenant_scope(tenant_b):
-    db.register_channel("scored_by", priority=3, columns=[("note", "Utf8")])
-    b_scored = next(c for c in db.list_channels() if c["channel_id"] == "scored_by")
-with db.tenant_scope(tenant_a):
-    a_scored = next(c for c in db.list_channels() if c["channel_id"] == "scored_by")
-
-collision = 1.0 if a_scored["columns"] == b_scored["columns"] else 0.0
-print(f"A's scored_by columns: {[c['name'] for c in a_scored['columns']]}")
-print(f"B's scored_by columns: {[c['name'] for c in b_scored['columns']]}  "
-      f"(collision: {bool(collision)})")
-rails.measure("eval.channel.collision", collision)
-
-# An unbound connection sees only the global seeds — never a tenant's channel.
-unbound = {c["channel_id"] for c in db.list_channels()}
-assert "scored_by" not in unbound and "annotated_by" not in unbound
-assert {"vector", "inference"} <= unbound
-print(f"unbound listing: only the global seeds ({sorted(unbound)})")
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as remote:
+    served = evaluate(remote)
+print(f"evaluated in process and at {server.endpoint}")
 ```
 
-The session's work is done, so it is closed. An embedded engine holds its catalog until
-`close()` returns, which is why `close()` comes before anything removes the directory the
-catalog lives in.
+## The reports
+
+Retrieval quality of the raw embeddings, overall and by cohort. The engine
+never interprets a cohort tag; it carries each query's tags on its per-query
+record, so a slice is a group-by over those records:
 
 ```{python}
-db.close()
+from collections import defaultdict
+
+agg = local["retrieval"]["aggregate"]
+print("  ".join(f"{m} {agg[m]:.3f}" for m in ("precision_at_k", "recall_at_k", "mrr", "ndcg")))
+by_era = defaultdict(list)
+for record in local["retrieval"]["per_query"]:
+    by_era[record["cohorts"]["era"]].append(record["metrics"]["precision"])
+for era in ("train", "valid", "test"):
+    scores = by_era[era]
+    print(f"  era={era:<5}  queries {len(scores):>3}  precision@10 {sum(scores) / len(scores):.3f}")
+print(f"persisted per-query rows: {len(local['per_query'])}")
 ```
+
+The comparison: the propagated table's precision\@10 against the raw baseline,
+with the paired test's confidence interval on the difference.
+
+```{python}
+treated = local["compared"]["per_table"][1]
+delta = treated["delta"]["precision_at_k"]
+significance = treated["delta"]["significance"]["precision_at_k"]
+print(f"propagated − raw precision@10: {delta['absolute']:+.3f}  "
+      f"(95% CI {significance['ci_lower']:+.3f} … {significance['ci_upper']:+.3f}, "
+      f"p = {significance['p_value']:.4f})")
+```
+
+And the inference evaluations. The fixture models are small and randomly
+initialised, so their scores are low — what is under test here is the verb, not
+the model: a forward pass scored against labels, and against gold entity spans.
+
+```{python}
+cls, ner = local["classification"]["aggregate"], local["ner"]["aggregate"]
+print(f"classification: accuracy {cls['accuracy']:.3f}  f1 {cls['f1']:.3f}")
+print(f"ner:            precision {ner['precision']:.3f}  recall {ner['recall']:.3f}  "
+      f"f1 {ner['f1']:.3f}")
+```
+
+```{python}
+# | echo: false
+for metric in ("precision_at_k", "recall_at_k", "mrr", "ndcg"):
+    contracts.assert_close(f"eval.retrieval.{metric}", agg[metric], tol=0.01)
+contracts.assert_close("eval.compare.precision_delta", delta["absolute"], tol=0.01)
+contracts.assert_close("eval.classification.accuracy", cls["accuracy"])
+contracts.assert_close("eval.ner.f1", ner["f1"])
+assert len(local["per_query"]) == len(local["retrieval"]["per_query"])
+```
+
+## The same report from either transport
+
+The server's report must equal the in-process one: the same keys at every
+level and the same values. Two things legitimately differ and are set aside —
+identifiers each engine mints for itself (the run id, the embedding table's
+name), and the order of per-query and per-record rows, which the report does not
+promise.
+
+```{python}
+MINTED = {"eval_run_id", "table_name", "embedding_table"}
+
+
+def canonical(value):
+    """A report with minted identifiers dropped and row lists in key order."""
+    if isinstance(value, dict):
+        return {k: canonical(v) for k, v in value.items() if k not in MINTED}
+    if isinstance(value, list):
+        rows = [canonical(v) for v in value]
+        key = next((k for k in ("query_id", "record_id", "channel_id") if rows and
+                    isinstance(rows[0], dict) and k in rows[0]), None)
+        return sorted(rows, key=lambda r: r[key]) if key else rows
+    return value
+
+
+def differences(a, b, path=""):
+    """Every path at which two canonical reports disagree."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return [d for k in a.keys() | b.keys()
+                for d in differences(a.get(k), b.get(k), f"{path}.{k}")]
+    if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+        return [d for i, (x, y) in enumerate(zip(a, b)) for d in differences(x, y, f"{path}[{i}]")]
+    if isinstance(a, float) and isinstance(b, float):
+        return [] if abs(a - b) <= 1e-6 * max(1.0, abs(a), abs(b)) else [path]
+    return [] if a == b else [path]
+
+
+for verb in local:
+    print(f"{verb:<15} remote == embedded: {not differences(canonical(local[verb]), canonical(served[verb]))}")
+```
+
+```{python}
+# | echo: false
+for verb in local:
+    assert not differences(canonical(local[verb]), canonical(served[verb])), verb
+```
+
+## Provenance channels — typed, append-only, tenant-scoped
+
+An **evidence-provenance channel** attaches typed columns of provenance to
+records: a channel is an id, a priority, and `(name, dtype)` columns, and its
+columns can be appended to but never changed. The registry is scoped per
+tenant, and the sequence above read it from each side:
+
+```{python}
+channels = local["channels"]
+annotated = next(c for c in channels["a"] if c["channel_id"] == "annotated_by")
+a_scored = next(c for c in channels["a"] if c["channel_id"] == "scored_by")
+b_scored = next(c for c in channels["b"] if c["channel_id"] == "scored_by")
+leak = {"scored_by", "annotated_by"} & {c["channel_id"] for c in channels["b_before"]}
+print(f"annotated_by columns (appended after the original): "
+      f"{[c['name'] for c in annotated['columns']]}")
+print(f"tenant B saw A's channels: {sorted(leak) or 'none'}")
+print(f"scored_by — A: {[c['name'] for c in a_scored['columns']]}  "
+      f"B: {[c['name'] for c in b_scored['columns']]}")
+print(f"unbound listing: {sorted(c['channel_id'] for c in channels['unbound'])}")
+```
+
+```{python}
+# | echo: false
+assert [c["name"] for c in annotated["columns"]] == ["label", "confidence", "rank"]
+assert not leak and a_scored["columns"] != b_scored["columns"]
+assert {c["channel_id"] for c in channels["unbound"]} == {"vector", "inference", "bm25"}
+```
+
+Tenant B cannot see tenant A's channels, and registers its own `scored_by` —
+different columns, no collision with A's. A session bound to no tenant sees only
+the global channels every engine seeds, one per way the engine itself produces
+evidence: `vector` (similarity search), `inference` (a model's output), and
+`bm25` (lexical scoring).
 
 ## Bridge note
 
-> **Evaluation is an engine verb, and it is on the wire.** Retrieval quality
-> (`eval_embeddings`: recall\@k / nDCG over a golden relevance set), inference
-> quality (`eval_inference`: classification accuracy/F1, NER entity-span
-> precision/recall), and side-by-side comparison (`eval_compare`: a baseline + a
-> significance-tested delta) are first-class verbs that return the **same nested
-> report on the embedded `Database` and the remote `RemoteDatabase`** — proven by
-> the emit-side live `remote == embedded` parity check (tol `1e-9`), recorded in
-> `eval.json` and continuously re-guarded by the engine's gated live tests. The
-> evidence-provenance **channel** registry is the typed, append-only, per-tenant
-> complement — a generic primitive that attaches provenance columns to records and
-> isolates them by tenant, the engine's two isolation layers applied to the
-> channel catalog. The eval family is not embedded-only. This chapter validates the wire surface on the engine's public
-> deterministic fixtures as a golden-stability gate — it does not re-measure the
-> arxiv keystone (that stays the ch05 numpy fold), and the cross-transport parity
-> is the one-time emit-side live check, not a per-PR static re-diff.
-```
+> **Evaluation is an engine verb, on every transport.** Retrieval quality
+> (`eval_embeddings`, sliced by cohort and read back per query), comparison
+> (`eval_compare`, with a paired significance test), and inference quality
+> (`eval_inference` for classification and NER) return the same nested report
+> from an in-process engine and from a server — measured here on every run, not
+> asserted once. The provenance channel registry is the typed, append-only,
+> per-tenant complement: the engine's isolation applied to the catalog of
+> provenance columns.

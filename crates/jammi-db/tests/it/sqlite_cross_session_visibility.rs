@@ -45,13 +45,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::session::JammiSession;
-use jammi_db::ModelTask;
 use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 

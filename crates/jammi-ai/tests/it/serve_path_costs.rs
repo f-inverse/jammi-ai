@@ -294,8 +294,8 @@ async fn table_bytes() {
         session
             .infer(
                 "corpus",
-                &jammi_ai::model::ModelSource::parse(&model()),
-                jammi_ai::model::ModelTask::TextEmbedding,
+                &jammi_datafusion::ModelSource::parse(&model()),
+                jammi_datafusion::ModelTask::TextEmbedding,
                 &["text".to_string()],
                 "id",
                 jammi_db::store::CachePolicy::Bypass,

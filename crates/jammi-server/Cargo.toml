@@ -16,6 +16,7 @@ path = "src/main.rs"
 # The candle-free wire substrate: the generated `jammi.v1` stubs (the server
 # stubs back this crate's service impls) and the candle-free proto↔domain
 # conversions the receive side consumes.
+jammi-datafusion.workspace = true
 jammi-wire.workspace = true
 # `jammi-server release`: `libc::kill(pid, SIGINT)` — the RELEASE actuator.
 libc.workspace = true

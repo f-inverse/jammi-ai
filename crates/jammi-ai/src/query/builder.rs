@@ -279,10 +279,10 @@ impl QueryBuilder {
     pub async fn annotate(
         mut self,
         model: &str,
-        task: crate::model::ModelTask,
+        task: jammi_datafusion::ModelTask,
         columns: &[String],
     ) -> Result<Self> {
-        let model_source = crate::model::ModelSource::parse(model);
+        let model_source = jammi_datafusion::ModelSource::parse(model);
         self.plan = self
             .session
             .annotate_plan(self.plan, &model_source, task, columns, "_row_id")

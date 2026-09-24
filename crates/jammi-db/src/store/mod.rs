@@ -81,7 +81,6 @@ use crate::index::segment::{SegmentId, SegmentedIndex};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
-use crate::model_task::ModelTask;
 use crate::session::QueryContext;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
@@ -93,6 +92,7 @@ use crate::store::result_schema::BoundArtifact;
 use crate::store::segment_set_cache::{LoadedSegmentSet, SegmentSetCache};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
+use jammi_datafusion::ModelTask;
 
 /// The catalog-row provenance of an embedding result table
 /// [`ResultStore::materialize_embedding_table`] writes — *what* the table is in
@@ -2080,7 +2080,7 @@ impl ResultStore {
         // when two tokio tasks call create_table within the same nanosecond
         // (concurrent embedding generation on the same source).
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let task_str = task.as_db_str();
+        let task_str = task.as_str();
         let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
         self.create_named_table(
             table_name,

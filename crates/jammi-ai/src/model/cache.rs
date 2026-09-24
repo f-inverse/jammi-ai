@@ -10,11 +10,10 @@ use super::backend::candle::CandleBackend;
 use super::backend::ort::OrtBackend;
 use super::backend::{DeviceConfig, ModelBackend};
 use super::resolver::ModelResolver;
-use super::{
-    BackendType, LoadedModel, ModelDescription, ModelGuard, ModelId, ModelSource, ModelTask,
-    ResolvedModel,
-};
+use super::{BackendType, LoadedModel, ModelDescription, ModelGuard, ModelId, ResolvedModel};
 use crate::concurrency::{DeviceSchedulers, GpuPermit, GpuScheduler};
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 
 /// Where a cached model currently resides.
 #[derive(Debug, Clone, Copy, PartialEq)]

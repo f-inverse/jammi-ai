@@ -100,12 +100,12 @@ use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::tokenizer::{BatchEncoding, TokenizerWrapper};
 use jammi_ai::model::{BackendType, LoadedModel, ModelId, ResolvedModel, TokenizerSource};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::JammiConfig;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
 use jammi_db::store::{ArtifactStore, CachePolicy, LocalArtifact};
-use jammi_db::ModelTask;
 use jammi_encoders::AnyEncoder;
 use jammi_lora::{AdapterConfig, LoraInitMode};
 

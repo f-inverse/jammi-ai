@@ -60,8 +60,8 @@ use jammi_ai::fine_tune::target::SavedAdapter;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::inference::{audio_preprocess, image_preprocess};
 use jammi_ai::model::tokenizer::TokenizerWrapper;
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::{AdapterConfig, LoraBuildConfig, LoraInitMode, Tower};
 
@@ -602,7 +602,7 @@ fn write_image_triplets_with_one_corrupt_cell(dir: &Path) -> PathBuf {
 }
 
 /// `project_frozen_embedding` is the ONLY caller of
-/// [`jammi_ai::inference::adapter::BackendOutput::all_rows_or_err`] in
+/// [`jammi_datafusion::BackendOutput::all_rows_or_err`] in
 /// production. A corrupt item in a projection-head training group must fail
 /// the job, never silently train the head on the all-zero placeholder
 /// `forward_image_embedding` substitutes for that row's decode failure. The
@@ -1311,7 +1311,7 @@ async fn cross_family_adapter_refuses_at_load() {
     use jammi_ai::model::backend::candle::CandleBackend;
     use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
     use jammi_ai::model::resolver::ModelResolver;
-    use jammi_ai::model::ModelSource;
+    use jammi_datafusion::ModelSource;
 
     let scratch = TempDir::new().unwrap();
     let adapter_dir = scratch.path().join("adapter");

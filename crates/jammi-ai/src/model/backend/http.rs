@@ -8,8 +8,8 @@ use jammi_db::error::{JammiError, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::inference::adapter::BackendOutput;
-use crate::model::ModelTask;
+use jammi_datafusion::BackendOutput;
+use jammi_datafusion::ModelTask;
 
 /// HTTP backend that forwards inference to an OpenAI-compatible endpoint.
 pub struct HttpBackend {
@@ -147,7 +147,13 @@ impl HttpBackend {
         // a test has to police.
         let validated = row_widths::validate(&response.data, dim)?;
         let flat = row_widths::flatten(validated, n)?;
-        BackendOutput::single_head(flat, n, dim, vec![true; n], vec![String::new(); n])
+        Ok(BackendOutput::single_head(
+            flat,
+            n,
+            dim,
+            vec![true; n],
+            vec![String::new(); n],
+        )?)
     }
 }
 

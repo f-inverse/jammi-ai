@@ -95,12 +95,12 @@ pub use trigger::{
 };
 
 /// Map the wire [`proto::inference::ModelTask`] onto the substrate's
-/// [`jammi_db::ModelTask`]. An unspecified task is rejected — a request that
+/// [`jammi_datafusion::ModelTask`]. An unspecified task is rejected — a request that
 /// names no task is a client error, not a silent default. Shared by the
 /// inference and fine-tune surfaces, which both carry `jammi.v1.inference
 /// .ModelTask`.
-pub fn model_task_from_proto(task: i32) -> Result<jammi_db::ModelTask, Status> {
-    use jammi_db::ModelTask;
+pub fn model_task_from_proto(task: i32) -> Result<jammi_datafusion::ModelTask, Status> {
+    use jammi_datafusion::ModelTask;
     use proto::inference::ModelTask as ProtoModelTask;
     match ProtoModelTask::try_from(task) {
         Ok(ProtoModelTask::TextEmbedding) => Ok(ModelTask::TextEmbedding),
@@ -115,13 +115,13 @@ pub fn model_task_from_proto(task: i32) -> Result<jammi_db::ModelTask, Status> {
     }
 }
 
-/// Encode the substrate's [`jammi_db::ModelTask`] onto the wire enum — the
+/// Encode the substrate's [`jammi_datafusion::ModelTask`] onto the wire enum — the
 /// inverse of [`model_task_from_proto`], for the client send side. Total: every
 /// task maps to a concrete wire variant (the type has no unspecified state).
 /// Shared by the inference and fine-tune send surfaces, which both carry
 /// `jammi.v1.inference.ModelTask`.
-pub fn model_task_to_proto(task: jammi_db::ModelTask) -> proto::inference::ModelTask {
-    use jammi_db::ModelTask;
+pub fn model_task_to_proto(task: jammi_datafusion::ModelTask) -> proto::inference::ModelTask {
+    use jammi_datafusion::ModelTask;
     use proto::inference::ModelTask as ProtoModelTask;
     match task {
         ModelTask::TextEmbedding => ProtoModelTask::TextEmbedding,

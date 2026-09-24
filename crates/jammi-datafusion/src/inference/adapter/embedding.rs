@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use crate::error::{Error, Result};
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field};
-use jammi_db::error::{JammiError, Result};
 
-use super::{BackendOutput, OutputAdapter};
+use super::OutputAdapter;
+use crate::inference::output::BackendOutput;
 
 /// Adapt raw float embeddings into a `FixedSizeList<Float32>` Arrow column.
 pub struct EmbeddingAdapter {
@@ -47,7 +48,7 @@ impl OutputAdapter for EmbeddingAdapter {
             ..
         } = output;
         if float_outputs.is_empty() {
-            return Err(JammiError::Inference(
+            return Err(Error::Inference(
                 "embedding adapter: backend emitted no float head".into(),
             ));
         }
@@ -57,14 +58,14 @@ impl OutputAdapter for EmbeddingAdapter {
         // checked multiply refuses by name instead (mirrors
         // `BackendOutput::checked_rows`'s `rows.checked_mul(dim)`).
         let expected = row_count.checked_mul(self.dimensions).ok_or_else(|| {
-            JammiError::Inference(format!(
+            Error::Inference(format!(
                 "embedding adapter: row_count*dim overflows (row_count={row_count}, \
                  dim={})",
                 self.dimensions
             ))
         })?;
         if flat_values.len() != expected {
-            return Err(JammiError::Inference(format!(
+            return Err(Error::Inference(format!(
                 "embedding adapter: head has {} floats, expected rows({row_count}) * \
                  dim({})",
                 flat_values.len(),
@@ -76,7 +77,7 @@ impl OutputAdapter for EmbeddingAdapter {
         // row count. Refuse by name here, before construction, rather than
         // let a malformed `row_status` abort the process below.
         if row_status.len() != row_count {
-            return Err(JammiError::Inference(format!(
+            return Err(Error::Inference(format!(
                 "embedding adapter: row_status has {} entries, expected one per row \
                  ({row_count})",
                 row_status.len()

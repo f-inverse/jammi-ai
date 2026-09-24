@@ -18,8 +18,8 @@ use jammi_ai::fine_tune::worker::{
     WorkerPhase,
 };
 use jammi_ai::jobs::{compute_test_hooks, ComputeSpec};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::instance::InstanceRegistration;
 use jammi_db::catalog::status::JobStatus;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};

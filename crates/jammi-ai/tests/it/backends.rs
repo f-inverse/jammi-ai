@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use jammi_ai::model::backend::http::HttpBackend;
-use jammi_ai::model::ModelTask;
+use jammi_datafusion::ModelTask;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

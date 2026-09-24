@@ -35,7 +35,8 @@ use super::resume::{
 use super::role::RunnerRole;
 use super::target::TrainingTarget;
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
-use crate::model::{LoadedModel, ModelTask};
+use crate::model::LoadedModel;
+use jammi_datafusion::ModelTask;
 
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -1416,7 +1417,7 @@ impl TrainingLoop {
         let regression_targets: Option<Vec<f32>> = match &source {
             Source::Resident { train_loader, .. } => train_loader.regression_targets(),
             Source::Streamed(streamed) => {
-                if streamed.task == crate::model::ModelTask::Regression {
+                if streamed.task == jammi_datafusion::ModelTask::Regression {
                     Some(self.collect_streamed_regression_targets(streamed)?)
                 } else {
                     None
@@ -3185,9 +3186,9 @@ impl TrainingLoop {
     /// This is the single gaussian-vs-quantile dispatch — the de-standardisation
     /// (here and at serving) and the persisted head metadata all derive from it,
     /// so the served form can never disagree with the trained one.
-    fn regression_form(&self) -> crate::inference::adapter::DistributionForm {
+    fn regression_form(&self) -> jammi_datafusion::inference::adapter::DistributionForm {
         use super::target::StandardizableHead;
-        use crate::inference::adapter::DistributionForm;
+        use jammi_datafusion::inference::adapter::DistributionForm;
         // Route the gaussian-vs-quantile decision through the offset-bearing-head
         // classifier — the same closed enum the standardisation-contract guards
         // and oracle pin — so the trained form, the persisted form, and the
@@ -5841,11 +5842,10 @@ mod clone_text_loader_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::super::regression_loss::{
-        gaussian_params, softplus_std_for_test, TargetScaler, STD_FLOOR,
-    };
+    use super::super::regression_loss::{gaussian_params, softplus_std_for_test, TargetScaler};
     use super::*;
     use candle_core::Var;
+    use jammi_numerics::regression::STD_FLOOR;
 
     /// L2 norm of a gradient tensor as an f64 scalar.
     fn grad_norm(g: &Tensor) -> f64 {
@@ -7357,7 +7357,8 @@ mod ner_loss_ignore_index {
 mod test_fixtures {
     use std::sync::Arc;
 
-    use crate::model::{ModelSource, ModelTask};
+    use jammi_datafusion::ModelSource;
+    use jammi_datafusion::ModelTask;
 
     /// Load the hermetic `tiny_bert` cookbook fixture through a real
     /// `InferenceSession`'s model cache — the same resolve+backend-load path
@@ -7602,7 +7603,7 @@ mod streamed_whole_set_arm_refusal_oracle {
     use super::super::{EmbeddingLoss, FineTuneConfig, HardNegativeConfig};
     use super::test_fixtures::tiny_bert;
     use super::TrainingLoopBuilder;
-    use crate::model::ModelTask;
+    use jammi_datafusion::ModelTask;
 
     const HIDDEN: usize = 32; // tiny_bert's hidden width.
 
@@ -8245,7 +8246,7 @@ mod gang_lockstep_oracle {
             &session,
             tag,
             &columns,
-            crate::model::ModelTask::TextEmbedding,
+            jammi_datafusion::ModelTask::TextEmbedding,
             tag,
         )
         .await
@@ -8303,7 +8304,7 @@ mod gang_lockstep_oracle {
                 session,
                 table,
                 columns: vec!["anchor".to_string(), "positive".to_string()],
-                task: crate::model::ModelTask::TextEmbedding,
+                task: jammi_datafusion::ModelTask::TextEmbedding,
                 total_rows: train_count,
                 train_count,
                 batch,
@@ -10128,7 +10129,7 @@ mod standardization_contract {
                 version: 1,
                 model_type: "embedding",
                 backend: "candle",
-                task: crate::model::ModelTask::Regression,
+                task: jammi_datafusion::ModelTask::Regression,
                 base_model_id: None,
                 external_location: None,
                 config_json: None,
@@ -10196,9 +10197,10 @@ mod standardization_contract {
     /// for quantile, the first vec is unused and the second is the sorted served
     /// quantiles for row 0.
     fn serve_through_production(loop_: &TrainingLoop, z_head: &Tensor) -> Vec<Vec<f32>> {
-        use crate::inference::adapter::{
-            BackendOutput, DistributionAdapter, DistributionForm, OutputAdapter,
+        use jammi_datafusion::inference::adapter::{
+            DistributionAdapter, DistributionForm, OutputAdapter,
         };
+        use jammi_datafusion::BackendOutput;
         let scaler = loop_.target_scaler.as_ref().unwrap();
         let form = loop_.regression_form();
         // Backend de-standardise: mean/quantile affine; raw σ passthrough.
@@ -10243,8 +10245,9 @@ mod standardization_contract {
     /// factor) would cancel out of a ratio of two helper outputs, so the reference
     /// must bypass the helper to expose it.
     fn serve_unscaled_and_scaled(loop_: &TrainingLoop, z_head: &Tensor) -> Vec<(f32, f32)> {
-        use crate::inference::adapter::{BackendOutput, DistributionAdapter, OutputAdapter};
         use arrow::array::{Array, Float32Array};
+        use jammi_datafusion::inference::adapter::{DistributionAdapter, OutputAdapter};
+        use jammi_datafusion::BackendOutput;
         let scaler = loop_.target_scaler.as_ref().unwrap();
         let raw = scaler
             .destandardize(z_head, &loop_.regression_form())
@@ -11511,8 +11514,9 @@ mod standardization_contract {
     /// forced constant.
     #[tokio::test(flavor = "multi_thread")]
     async fn mutant_served_sigma_gaussian_scaled_one_rejected_by_aggregate_checker() {
-        use crate::inference::adapter::{BackendOutput, DistributionAdapter, OutputAdapter};
         use arrow::array::{Array, Float32Array};
+        use jammi_datafusion::inference::adapter::{DistributionAdapter, OutputAdapter};
+        use jammi_datafusion::BackendOutput;
 
         let device = Device::Cpu;
         let n = WIDE.len();
@@ -11973,7 +11977,7 @@ mod determinism_through_forward {
                 version: 1,
                 model_type: "embedding",
                 backend: "candle",
-                task: crate::model::ModelTask::Regression,
+                task: jammi_datafusion::ModelTask::Regression,
                 base_model_id: None,
                 external_location: None,
                 config_json: None,
@@ -12300,7 +12304,7 @@ mod resume_invariant {
                 version: 1,
                 model_type: "embedding",
                 backend: "candle",
-                task: crate::model::ModelTask::Regression,
+                task: jammi_datafusion::ModelTask::Regression,
                 base_model_id: None,
                 external_location: None,
                 config_json: None,
@@ -12986,7 +12990,7 @@ mod resume_invariant {
                 version: 1,
                 model_type: "embedding",
                 backend: "candle",
-                task: crate::model::ModelTask::TextEmbedding,
+                task: jammi_datafusion::ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
                 config_json: None,
@@ -13988,7 +13992,9 @@ mod media_front_end_wall_tests {
     use crate::model::backend::{DeviceConfig, ModelBackend};
     use crate::model::hub::HubSource;
     use crate::model::resolver::ModelResolver;
-    use crate::model::{LoadedModel, ModelSource, ModelTask};
+    use crate::model::LoadedModel;
+    use jammi_datafusion::ModelSource;
+    use jammi_datafusion::ModelTask;
 
     use super::super::data::TrainingDataLoader;
     use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
@@ -14414,7 +14420,9 @@ mod encode_texts_bucketing_oracle {
     use super::encoder_adapters_training_state_tests::build_encoder_adapters_target;
     use super::{RankContext, TrainingLoop, TrainingLoopBuilder};
     use crate::fine_tune::optimizer;
-    use crate::model::{LoadedModel, ModelSource, ModelTask};
+    use crate::model::LoadedModel;
+    use jammi_datafusion::ModelSource;
+    use jammi_datafusion::ModelTask;
 
     // The tests below all call into `tokenize_and_bucket` (directly, or
     // indirectly via `TrainingLoop::encode_texts`'s `EncoderAdapters`

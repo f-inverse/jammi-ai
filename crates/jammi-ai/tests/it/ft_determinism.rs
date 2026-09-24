@@ -38,7 +38,7 @@ use jammi_ai::fine_tune::{
     trainer::TrainingLoopBuilder,
     EarlyStoppingMetric, FineTuneConfig,
 };
-use jammi_ai::model::ModelTask;
+use jammi_datafusion::ModelTask;
 
 /// Catalog + claimed-job boilerplate so a `TrainingLoop` can run (it stamps
 /// lease-guarded run-start metrics). Mirrors `ft_correctness_sweep`'s setup.

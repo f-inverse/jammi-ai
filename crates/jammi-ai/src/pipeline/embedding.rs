@@ -7,10 +7,11 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact, SinkKind};
 use tracing::Instrument;
 
-use crate::model::{ModelSource, ModelTask};
-use crate::operator::inference_exec::{plan_inference, InferenceSpec};
-use crate::operator::numbered_input_exec::RowOrder;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::RowOrder;
+use jammi_datafusion::{plan_inference, InferenceSpec};
 
 /// The described model's identity for one embedding definition: the model
 /// source, its embedding width, and the output-affecting environment the
@@ -88,7 +89,6 @@ pub async fn build_embedding_plan(
         content_columns: columns.to_vec(),
         key_column: key_column.to_string(),
         source_id: source_id.to_string(),
-        backend: None,
         chunk: inference.chunk_budget()?,
         embedding_dim: Some(embedding_dim),
         regression_form: None,
@@ -100,6 +100,7 @@ pub async fn build_embedding_plan(
         input_plan,
         RowOrder::Keyed {
             key_column: key_column.to_string(),
+            tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
         },
         spec,
         session.inference_runtime(),

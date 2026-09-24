@@ -9,11 +9,11 @@
 use arrow::array::StringArray;
 use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::{StorageError, StorageUrl};
 use jammi_db::store::manifest::{

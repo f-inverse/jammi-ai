@@ -54,8 +54,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, StringArray};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule, RegressionLoss};
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
@@ -335,7 +336,7 @@ async fn gaussian_regression_separates_groups_through_public_path() {
         .expect("a published regression head describes");
     assert_eq!(
         described.regression_form(),
-        Some(&jammi_ai::inference::adapter::DistributionForm::Gaussian)
+        Some(&jammi_datafusion::inference::adapter::DistributionForm::Gaussian)
     );
     assert!(
         !session

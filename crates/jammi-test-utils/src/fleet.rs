@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_datafusion::ComputeDeviceKind;
 
 use crate::DistributedBackends;
 

@@ -84,8 +84,8 @@ use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::manifest::{InputAnchor, ProducingDescriptor};
 use jammi_db::store::{TrainingSetInput, TrainingSetSpec, TrainingSetTable};
 
-use crate::model::ModelTask;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 
 /// The single constructor every SQL-sourced production call site in this
 /// crate builds a [`TrainingSetSpec`] through: a future field added to the

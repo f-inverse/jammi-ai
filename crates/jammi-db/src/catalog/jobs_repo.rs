@@ -680,7 +680,7 @@ pub struct ModelRow<'a> {
     /// Inference backend identifier.
     pub backend: &'a str,
     /// The task the model performs.
-    pub task: crate::model_task::ModelTask,
+    pub task: jammi_datafusion::ModelTask,
     /// The base model it was derived from, if any.
     pub base_model_id: Option<&'a str>,
     /// Backend-specific configuration the reload path reads, if any.
@@ -914,7 +914,7 @@ impl ModelRowWrite {
             name: row.model_id.to_string(),
             version: i64::from(row.version),
             model_type: row.model_type.to_string(),
-            task: row.task.as_db_str(),
+            task: row.task.as_str(),
             backend: row.backend.to_string(),
             status,
             metadata: super::model_repo::model_metadata(row.base_model_id, row.config_json),

@@ -1,4 +1,6 @@
-use jammi_ai::model::{resolver::ModelResolver, BackendType, ModelSource, ModelTask};
+use jammi_ai::model::{resolver::ModelResolver, BackendType};
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
 use std::sync::Arc;
 use tempfile::tempdir;

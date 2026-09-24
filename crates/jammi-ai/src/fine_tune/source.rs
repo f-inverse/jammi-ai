@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use jammi_db::store::TrainingSetTable;
 
-use crate::model::ModelTask;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 
 use super::data::TrainingDataLoader;
 use super::decode::LabelVocabulary;

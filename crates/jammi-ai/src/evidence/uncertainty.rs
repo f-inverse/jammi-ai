@@ -1,7 +1,7 @@
 //! The `uncertainty` evidence channel (S18): a predictive distribution carried
 //! alongside a point output.
 //!
-//! A distributional regression head ([`crate::inference::adapter::DistributionAdapter`])
+//! A distributional regression head ([`jammi_datafusion::inference::adapter::DistributionAdapter`])
 //! emits, per row, either a parametric Gaussian `(predicted_mean, predicted_std)`
 //! or a set of quantiles. Those serving outputs ride the evidence substrate
 //! exactly as `vector`, `inference`, and `conformal` do — one channel, declared

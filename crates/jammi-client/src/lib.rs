@@ -33,12 +33,13 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::{Stream, StreamExt, TryStreamExt};
 use tonic::transport::Endpoint;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
-use jammi_db::{AuditError, ModelTask, PerQueryAudit, TenantId};
+use jammi_db::{AuditError, PerQueryAudit, TenantId};
 
 use jammi_admin::CatalogClient;
 use jammi_wire::embedding_refresh::{
@@ -1263,8 +1264,8 @@ mod world_size_tests {
     use tonic::transport::{Endpoint, Server};
     use tonic::{Request, Response, Status};
 
+    use jammi_datafusion::ModelTask;
     use jammi_db::store::CachePolicy;
-    use jammi_db::ModelTask;
     use jammi_wire::fine_tune::FineTuneMethod;
     use jammi_wire::proto::job::job_service_server::{JobService, JobServiceServer};
     use jammi_wire::proto::job::{

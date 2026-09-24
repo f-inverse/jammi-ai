@@ -27,10 +27,11 @@
 //! server's own background `JobWorker` — which claims exclusively
 //! `WHERE status = 'queued'` — never mutates a fixture out from under a test.
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{SqlNullType, SqlValue};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
-use jammi_db::{ModelTask, TxOptions};
+use jammi_db::TxOptions;
 use tempfile::TempDir;
 
 use crate::server_harness::TestServer;

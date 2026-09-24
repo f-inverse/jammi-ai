@@ -23,14 +23,15 @@ set -euo pipefail
 # `candle` feature grew an optional `jammi-kernels` dependency,
 # and nothing re-verified the publish order against that change):
 #   - jammi-numerics -> (none)
-#   - jammi-db -> jammi-numerics
+#   - jammi-datafusion -> jammi-numerics
+#   - jammi-db -> jammi-datafusion, jammi-numerics
 #   - jammi-kernels -> (none)
 #   - jammi-lora -> jammi-kernels, jammi-numerics
 #   - jammi-encoders -> jammi-kernels, jammi-lora, jammi-numerics
 #   - jammi-wire -> jammi-db, jammi-lora, jammi-numerics
 #   - jammi-admin -> jammi-db, jammi-wire
 #   - jammi-client -> jammi-admin, jammi-db, jammi-wire
-#   - jammi-ai -> jammi-db, jammi-encoders, jammi-lora, jammi-numerics, jammi-wire
+#   - jammi-ai -> jammi-db, jammi-encoders, jammi-datafusion, jammi-lora, jammi-numerics, jammi-wire
 #   - jammi-server -> jammi-ai, jammi-db, jammi-numerics, jammi-wire
 #   - jammi-cli -> jammi-admin, jammi-db
 # The presence guard skips crates that don't exist at this tag's
@@ -38,6 +39,7 @@ set -euo pipefail
 # tags don't have jammi-kernels.
 PUBLISH_ORDER=(
   jammi-numerics
+  jammi-datafusion
   jammi-db
   jammi-kernels
   jammi-lora

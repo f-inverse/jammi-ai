@@ -493,7 +493,7 @@ pub async fn multi_row_group_pairs(
     dir: &std::path::Path,
     split: bool,
 ) -> MultiRowGroupFixture {
-    use jammi_ai::model::ModelTask;
+    use jammi_datafusion::ModelTask;
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     const ROWS: usize = 70_000;
@@ -573,7 +573,7 @@ pub async fn padded_regression_fixture(
     rows: usize,
     pad_bytes: usize,
 ) -> (jammi_db::store::TrainingSetTable, Vec<String>) {
-    use jammi_ai::model::ModelTask;
+    use jammi_datafusion::ModelTask;
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     let pad: String = "x".repeat(pad_bytes);
@@ -647,7 +647,7 @@ pub async fn finalize_fine_tuned_model(
                 version: 1,
                 model_type: "embedding",
                 backend: "candle",
-                task: jammi_ai::model::ModelTask::TextEmbedding,
+                task: jammi_datafusion::ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
                 config_json: None,
@@ -698,7 +698,7 @@ pub async fn finalize_fine_tuned_model(
                     version: 1,
                     model_type: "fine-tuned",
                     backend: "candle",
-                    task: jammi_ai::model::ModelTask::TextEmbedding,
+                    task: jammi_datafusion::ModelTask::TextEmbedding,
                     base_model_id: Some(base_id),
                     config_json: None,
                 },

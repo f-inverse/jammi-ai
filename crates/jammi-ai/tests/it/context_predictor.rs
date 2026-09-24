@@ -30,7 +30,7 @@ use jammi_ai::pipeline::context_predictor::{
 use jammi_ai::pipeline::context_set::ContextSourceKind;
 use jammi_ai::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
 use jammi_ai::session::InferenceSession;
-use jammi_db::model_task::ModelTask;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_encoders::{AnyContextPredictor, ContextArchitecture, ContextPredictorConfig};
 use parquet::arrow::ArrowWriter;

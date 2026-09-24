@@ -16,14 +16,16 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 use tempfile::TempDir;
 
-use jammi_ai::inference::chunk::ChunkAssembler;
-use jammi_ai::inference::runner::test_hooks;
 use jammi_ai::model::tokenizer::TokenizerWrapper;
-use jammi_ai::model::{LoadedModel, ModelSource, ModelTask};
-use jammi_ai::operator::inference_exec::{plan_inference, InferenceSpec};
-use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
+use jammi_ai::model::LoadedModel;
 use jammi_ai::session::InferenceSession;
-use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_datafusion::inference::chunk::ChunkAssembler;
+use jammi_datafusion::inference::runner::test_hooks;
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::{plan_inference, InferenceSpec};
+use jammi_datafusion::{NumberedInputExec, RowOrder};
 use jammi_numerics::ChunkBudget;
 
 use crate::common;
@@ -95,7 +97,6 @@ fn spec(source_id: &str, partitions: usize) -> InferenceSpec {
         content_columns: vec!["text".to_string()],
         key_column: "id".to_string(),
         source_id: source_id.to_string(),
-        backend: None,
         chunk: ChunkBudget {
             rows: NonZeroUsize::new(BATCH_SIZE).unwrap(),
             tokens: NonZeroUsize::new(BATCH_TOKENS).unwrap(),
@@ -152,6 +153,7 @@ async fn chunks_of(
         source,
         RowOrder::Keyed {
             key_column: "id".into(),
+            tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
         },
         spec(source_id, 1),
         session.inference_runtime(),
@@ -210,6 +212,7 @@ async fn run_plan(
         source,
         RowOrder::Keyed {
             key_column: "id".into(),
+            tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
         },
         spec(source_id, partitions),
         session.inference_runtime(),

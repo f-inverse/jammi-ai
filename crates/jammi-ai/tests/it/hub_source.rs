@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use jammi_ai::model::hub::HubSource;
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::{BackendType, ModelSource, ModelTask};
+use jammi_ai::model::BackendType;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{ModelsConfig, SecretSource};

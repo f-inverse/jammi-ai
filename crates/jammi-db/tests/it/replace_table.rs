@@ -12,6 +12,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::{
     CreateResultTableParams, ResultTableCas, ResultTableKind, ResultTableRecord,
@@ -19,7 +20,6 @@ use jammi_db::catalog::result_repo::{
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::{result_table_relation, CreateTableAs, ResultStore};

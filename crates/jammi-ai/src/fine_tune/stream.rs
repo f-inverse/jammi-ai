@@ -99,8 +99,8 @@ use futures::StreamExt;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{verbatim_column, TrainingSetTable};
 
-use crate::model::ModelTask;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 
 use super::data::TextChunk;
 use super::decode::{self, ChunkAccumulator, DetectedFormat, LabelVocabulary};

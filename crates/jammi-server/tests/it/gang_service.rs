@@ -260,7 +260,7 @@ async fn materialize_ready_table_for_tenant(
     source_id: &str,
 ) -> ReadyTable {
     use datafusion::prelude::SessionContext;
-    use jammi_db::model_task::ModelTask;
+    use jammi_datafusion::ModelTask;
     use jammi_db::session::QueryContext;
     use jammi_db::store::manifest::{
         ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
@@ -358,7 +358,7 @@ fn tiny_bert_model() -> String {
 fn world_two_spec_json() -> String {
     use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
     use jammi_ai::fine_tune::{EarlyStoppingMetric, FineTuneConfig, FineTuneMethod};
-    use jammi_ai::model::ModelTask;
+    use jammi_datafusion::ModelTask;
     use jammi_db::store::CachePolicy;
 
     serde_json::to_string(&TrainingSpec::FineTune {
@@ -400,7 +400,7 @@ async fn materialize_training_set_for_tenant(
     tenant: TenantId,
 ) -> ReadyTable {
     use jammi_ai::fine_tune::data::TrainingFormat;
-    use jammi_ai::model::ModelTask;
+    use jammi_datafusion::ModelTask;
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 
     // Registered once per engine (an idempotent upsert of the same URL).
@@ -466,9 +466,9 @@ async fn materialize_training_set_for_tenant(
 /// strict resolver must never hand it to a real tenant, so nothing past the
 /// resolution is ever reached for it.
 fn null_tenant_row(table: &str) -> jammi_db::catalog::result_repo::CreateResultTableParams<'_> {
+    use jammi_datafusion::ModelTask;
     use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
     use jammi_db::config::StoragePrecision;
-    use jammi_db::model_task::ModelTask;
     CreateResultTableParams {
         table_name: table,
         source_id: "src",

@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use jammi_ai::inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use jammi_ai::pipeline::embedding_refresh::{RefreshOptions, RefreshOutcome, RefreshReport};
 use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::pipeline::recompute::Cascade;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
+use jammi_datafusion::inference::runner::test_hooks::{forward_calls_for, reset_forward_calls_for};
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
 use jammi_db::index::sidecar::SidecarIndex;

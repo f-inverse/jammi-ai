@@ -9,8 +9,8 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::sql::quote_relation;
 
 use crate::eval::{EvalCalibrationShape, EvalTask};
-use crate::model::ModelSource;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelSource;
 use jammi_wire::eval::report::{
     compute_calibration, delta_significance, AggregateDelta, CalibrationEvalReport,
     CalibrationPrediction, CompareEvalReport, EmbeddingEvalReport, InferenceAggregate,
@@ -294,7 +294,7 @@ impl<'a> EvalRunner<'a> {
                     .infer_materialize(
                         source_id,
                         &model_source,
-                        crate::model::ModelTask::Classification,
+                        jammi_datafusion::ModelTask::Classification,
                         columns,
                         "id",
                         jammi_db::store::CachePolicy::Bypass,
@@ -351,7 +351,7 @@ impl<'a> EvalRunner<'a> {
                     .infer_materialize(
                         source_id,
                         &model_source,
-                        crate::model::ModelTask::Ner,
+                        jammi_datafusion::ModelTask::Ner,
                         columns,
                         "id",
                         jammi_db::store::CachePolicy::Bypass,

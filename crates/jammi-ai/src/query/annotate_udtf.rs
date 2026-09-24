@@ -53,12 +53,12 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::scalar::ScalarValue;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::sql::{quote_ident, quote_relation};
-use jammi_db::ModelTask;
 
-use crate::inference::schema::build_output_schema;
-use crate::model::ModelSource;
 use crate::session::InferenceSession;
+use jammi_datafusion::inference::schema::build_output_schema;
+use jammi_datafusion::ModelSource;
 
 /// The `annotate` table function. Holds a **weak** handle to the engine
 /// session so its [`TableProvider`]s can load models and build inference plans.
@@ -124,7 +124,7 @@ impl TableFunctionImpl for AnnotateTableFunction {
             .map(|i| string_arg(args, i, "content_column"))
             .collect::<datafusion::error::Result<Vec<_>>>()?;
 
-        let task = ModelTask::try_from_db_str(&task_str)
+        let task = ModelTask::parse(&task_str)
             .map_err(|e| DataFusionError::Plan(format!("annotate: invalid task: {e}")))?;
         let model_source = ModelSource::parse(&model);
 

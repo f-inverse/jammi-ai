@@ -14,16 +14,16 @@
 use prost::Message;
 use tonic::Status;
 
-use crate::model::ModelTask;
 use crate::pipeline::context_predictor::PredictedDistribution;
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
+use jammi_datafusion::ModelTask;
 use jammi_wire::model_task_from_proto;
 use jammi_wire::proto::inference as pb;
 
 /// The decoded identity + task an `Infer` request carries. The engine method
 /// (`Session::infer`) takes these separately, so the decode returns them as a
 /// struct the binding destructures; `model` is the model-id string the engine
-/// parses into a [`ModelSource`](crate::model::ModelSource) at the call site,
+/// parses into a [`ModelSource`](jammi_datafusion::ModelSource) at the call site,
 /// matching the in-process binding.
 pub struct InferArgs {
     pub source_id: String,

@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::artifact_repo::{ArtifactRef, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::jobs_repo::{
@@ -19,7 +20,6 @@ use jammi_db::catalog::jobs_repo::{
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::status::{ArtifactState, JobStatus};
 use jammi_db::catalog::Catalog;
-use jammi_db::model_task::ModelTask;
 use jammi_db::store::manifest::{
     ArtifactDigest, ComputeDevice, ComputePrecision, DefinitionHash, InputAnchor, Materialization,
     MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,

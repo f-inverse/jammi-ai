@@ -233,7 +233,7 @@ impl TrainingTarget {
         &self,
         config: &super::FineTuneConfig,
         target_scaler: Option<TargetScaler>,
-        regression_form: Option<crate::inference::adapter::DistributionForm>,
+        regression_form: Option<jammi_datafusion::inference::adapter::DistributionForm>,
     ) -> SavedAdapter {
         match self {
             Self::ProjectionHead { head } => SavedAdapter::ProjectionHead(ProjectionHeadConfig {
@@ -310,7 +310,7 @@ pub struct ProjectionHeadConfig {
     /// `None`/absent for every non-regression head; existing non-regression
     /// adapter configs round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) regression_form: Option<crate::inference::adapter::DistributionForm>,
+    pub(crate) regression_form: Option<jammi_datafusion::inference::adapter::DistributionForm>,
 }
 
 /// The closed set of **offset-bearing** distribution heads — the heads whose
@@ -365,7 +365,7 @@ impl StandardizableHead {
     /// truth for "which heads carry the standardisation contract" — the
     /// completeness test fans over this and over the two source enums, and the
     /// exhaustive `for_*` maps below keep it from drifting from the enum body.
-    /// Mirrors the [`jammi_db::ModelTask::ALL`] idiom.
+    /// Mirrors the [`jammi_datafusion::ModelTask::ALL`] idiom.
     pub(crate) const ALL: &'static [StandardizableHead] = &[
         StandardizableHead::RegressionGaussian,
         StandardizableHead::RegressionQuantile,
@@ -429,8 +429,8 @@ mod tests {
 
     use super::super::regression_loss::TargetScaler;
     use super::{ProjectionHeadConfig, SavedAdapter, StandardizableHead};
-    use crate::inference::adapter::DistributionForm;
     use crate::pipeline::context_predictor::{GaussianObjective, PredictiveHead};
+    use jammi_datafusion::inference::adapter::DistributionForm;
 
     /// COMPLETENESS GUARD (b): every arm of the two offset-bearing source enums
     /// — [`jammi_wire::fine_tune::RegressionLoss`] and

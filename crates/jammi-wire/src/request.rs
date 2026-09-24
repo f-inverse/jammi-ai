@@ -8,8 +8,8 @@
 
 use std::num::NonZeroU32;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::store::CachePolicy;
-use jammi_db::ModelTask;
 
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
 

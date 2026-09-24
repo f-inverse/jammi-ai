@@ -32,14 +32,15 @@
 //! model cache, result store, and DataFusion context are the decoding
 //! session's, never serialized.
 //!
-//! A partitioned inference plan (`jammi_ai::operator::inference_exec::
-//! plan_inference`) crosses whole: `InferenceExec` and `NumberedInputExec`
-//! are this codec's, and the exchange, merge and coalesce between them are
-//! stock operators `datafusion-proto` already carries. Ballista cuts a stage
+//! A partitioned inference plan (`jammi_datafusion::plan_inference`)
+//! crosses whole: `InferenceExec` and `NumberedInputExec` are
+//! `jammi-datafusion`'s, their wire forms that crate's own
+//! (`jammi_datafusion::inference::wire`) under this codec's framing, and the exchange,
+//! merge and coalesce between them are stock operators `datafusion-proto`
+//! already carries. Ballista cuts a stage
 //! at each of those three, so the numbered input runs as one task, the
 //! `N`-partition `InferenceExec` as `N` tasks, and the merge as one.
 
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 
 use datafusion::error::DataFusionError;
@@ -52,12 +53,7 @@ use prost::Message;
 
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 
-use jammi_ai::inference::adapter::DistributionForm;
-use jammi_ai::model::{BackendType, ModelSource, ModelTask};
 use jammi_ai::operator::ann_search_exec::AnnSearchExec;
-use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
-use jammi_ai::operator::key_check_exec::KeyCheckExec;
-use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
@@ -65,12 +61,14 @@ use jammi_ai::pipeline::graph_propagation::hop::{HopFoldExec, HopSpec};
 use jammi_ai::pipeline::graph_propagation::readout::{ReadoutExec, ReadoutSpec};
 use jammi_ai::pipeline::graph_propagation::state::{InitialStateExec, InitialStateSpec};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::inference::key_check::KeyCheckExec;
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::InferenceExec;
+use jammi_datafusion::NumberedInputExec;
 use jammi_db::error::JammiError;
 use jammi_db::index::{FiniteQuery, QuerySource};
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
-use jammi_numerics::ChunkBudget;
 
 use crate::error::Error;
 
@@ -308,60 +306,14 @@ fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
     }
 }
 
+/// The inference operators' wire forms are `jammi-datafusion`'s own
+/// ([`jammi_datafusion::inference::wire`]); this codec frames them under its magic and
+/// tag and binds a decoded node to the decoding session's runtime.
 fn encode_inference(exec: &InferenceExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let msg = spec_to_proto(exec.spec())?;
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::Inference as u8);
-    msg.encode(buf)
+    jammi_datafusion::inference::wire::encode_inference(exec, buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
-}
-
-/// `spec` as the wire descriptor both `InferenceExecNode` and
-/// `NumberedInputExecNode` carry.
-fn spec_to_proto(spec: &InferenceSpec) -> DfResult<pb::InferenceExecNode> {
-    let source = match &spec.source {
-        ModelSource::HuggingFace(id) => pb::model_source::Source::HuggingFace(id.clone()),
-        ModelSource::Local(path) => {
-            pb::model_source::Source::Local(path.to_string_lossy().into_owned())
-        }
-    };
-    let msg = pb::InferenceExecNode {
-        source: Some(pb::ModelSource {
-            source: Some(source),
-        }),
-        task: spec.task.as_db_str().to_string(),
-        content_columns: spec.content_columns.clone(),
-        key_column: spec.key_column.clone(),
-        source_id: spec.source_id.clone(),
-        backend_json: spec.backend.as_ref().map(to_json_string).transpose()?,
-        batch_size: spec.chunk.rows.get() as u64,
-        batch_tokens: spec.chunk.tokens.get() as u64,
-        embedding_dim: spec.embedding_dim.map(|d| d as u64),
-        regression_form_json: spec
-            .regression_form
-            .as_ref()
-            .map(to_json_string)
-            .transpose()?,
-        passthrough: spec.passthrough.clone(),
-        // The wire carries exactly the constructed value — the codec never
-        // invents or rewrites a device kind.
-        device_kind: device_kind_str(spec.device_kind).to_string(),
-        partitions: spec.partitions.get() as u64,
-    };
-    Ok(msg)
-}
-
-/// A wire count that must be at least one.
-fn non_zero(field: &str, value: u64) -> DfResult<NonZeroUsize> {
-    usize::try_from(value)
-        .ok()
-        .and_then(NonZeroUsize::new)
-        .ok_or_else(|| {
-            Error::Decode(format!(
-                "InferenceExecNode: {field} = {value} is not a count >= 1"
-            ))
-            .into_df_error()
-        })
 }
 
 fn decode_inference(
@@ -369,69 +321,14 @@ fn decode_inference(
     inputs: &[Arc<dyn ExecutionPlan>],
     session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let msg = pb::InferenceExecNode::decode(body)
-        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
-    let input = inputs
-        .first()
-        .cloned()
-        .ok_or_else(|| Error::Decode("InferenceExecNode: no input".into()).into_df_error())?;
-    // The same constructor `with_new_children` uses, bound to the DECODING
-    // session's model cache and observer.
-    Ok(Arc::new(InferenceExec::bind(
-        input,
-        spec_from_proto(msg)?,
-        session.inference_runtime(),
-    )?))
-}
-
-fn spec_from_proto(msg: pb::InferenceExecNode) -> DfResult<InferenceSpec> {
-    let source = match msg.source.and_then(|s| s.source) {
-        Some(pb::model_source::Source::HuggingFace(id)) => ModelSource::hf(id),
-        Some(pb::model_source::Source::Local(p)) => ModelSource::local(p),
-        None => {
-            return Err(Error::Decode("InferenceExecNode: missing source".into()).into_df_error())
-        }
-    };
-    let spec = InferenceSpec {
-        source,
-        task: ModelTask::try_from_db_str(&msg.task)
-            .map_err(|e| Error::Catalog(e).into_df_error())?,
-        content_columns: msg.content_columns,
-        key_column: msg.key_column,
-        source_id: msg.source_id,
-        backend: msg
-            .backend_json
-            .as_deref()
-            .map(from_json_str::<BackendType>)
-            .transpose()?,
-        chunk: ChunkBudget {
-            rows: non_zero("batch_size", msg.batch_size)?,
-            tokens: non_zero("batch_tokens", msg.batch_tokens)?,
-        },
-        embedding_dim: msg.embedding_dim.map(|d| d as usize),
-        regression_form: msg
-            .regression_form_json
-            .as_deref()
-            .map(from_json_str::<DistributionForm>)
-            .transpose()?,
-        passthrough: msg.passthrough,
-        device_kind: device_kind_from_str(&msg.device_kind)?,
-        partitions: non_zero("partitions", msg.partitions)?,
-    };
-    Ok(spec)
+    jammi_datafusion::inference::wire::decode_inference(body, inputs, session.inference_runtime())
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
 fn encode_numbered_input(exec: &NumberedInputExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let msg = pb::NumberedInputExecNode {
-        key_column: match exec.order() {
-            RowOrder::Keyed { key_column } => Some(key_column.clone()),
-            RowOrder::Arrival => None,
-        },
-        spec: Some(spec_to_proto(exec.spec())?),
-    };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::NumberedInput as u8);
-    msg.encode(buf)
+    jammi_datafusion::inference::wire::encode_numbered_input(exec, buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
@@ -440,26 +337,12 @@ fn decode_numbered_input(
     inputs: &[Arc<dyn ExecutionPlan>],
     session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let msg = pb::NumberedInputExecNode::decode(body)
-        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
-    let input = inputs
-        .first()
-        .cloned()
-        .ok_or_else(|| Error::Decode("NumberedInputExecNode: no input".into()).into_df_error())?;
-    let order = msg
-        .key_column
-        .map_or(RowOrder::Arrival, |key_column| RowOrder::Keyed {
-            key_column,
-        });
-    let spec = msg.spec.ok_or_else(|| {
-        Error::Decode("NumberedInputExecNode: missing spec".into()).into_df_error()
-    })?;
-    Ok(Arc::new(NumberedInputExec::try_new(
-        input,
-        order,
-        spec_from_proto(spec)?,
+    jammi_datafusion::inference::wire::decode_numbered_input(
+        body,
+        inputs,
         session.inference_runtime(),
-    )?))
+    )
+    .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
 fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {

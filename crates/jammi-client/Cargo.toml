@@ -9,6 +9,7 @@ repository.workspace = true
 readme = "README.md"
 
 [dependencies]
+jammi-datafusion.workspace = true
 jammi-wire.workspace = true
 jammi-admin.workspace = true
 jammi-db.workspace = true

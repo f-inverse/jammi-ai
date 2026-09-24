@@ -14,19 +14,18 @@ use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::training_job::{fine_tuned_model_id, resolve_model_id, TrainingJob};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
-use crate::inference::adapter::BackendOutput;
-use crate::inference::observer::InferenceObserver;
 use crate::model::backend::DeviceConfig;
 use crate::model::cache::ModelCache;
 use crate::model::hub::HubSource;
 use crate::model::resolver::ModelResolver;
-use crate::model::{ModelSource, ModelTask};
-use crate::operator::inference_exec::{
-    plan_inference, InferenceFanOut, InferenceRuntime, InferenceSpec,
-};
-use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::EmbeddingPipeline;
 use crate::query::QueryBuilder;
+use jammi_datafusion::inference::observer::InferenceObserver;
+use jammi_datafusion::BackendOutput;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::RowOrder;
+use jammi_datafusion::{plan_inference, InferenceFanOut, InferenceRuntime, InferenceSpec};
 use jammi_db::cache::ann_cache::AnnCache;
 
 /// An inference-capable session that wraps `JammiSession` with model loading
@@ -362,7 +361,7 @@ impl InferenceSession {
         // bytes — its device and the models the plan ran — wherever the
         // plan was submitted from.
         result_store.install_producing_environment(Arc::new(
-            crate::operator::inference_exec::InferenceEnvironment {
+            crate::inference::environment::InferenceEnvironment {
                 device: crate::model::backend::candle::effective_compute_device(&device_config),
                 model_cache: Arc::clone(&model_cache),
             },
@@ -923,7 +922,7 @@ impl InferenceSession {
     /// this session's model cache and observer.
     pub fn inference_runtime(&self) -> InferenceRuntime {
         InferenceRuntime {
-            model_cache: Arc::clone(&self.model_cache),
+            model: Arc::clone(&self.model_cache) as Arc<dyn jammi_datafusion::ModelRuntime>,
             observer: self.observer.clone(),
         }
     }
@@ -981,7 +980,7 @@ impl InferenceSession {
     /// deployment names one, this session's own otherwise. A plan's
     /// admission is the only reader — where the plan actually runs, and so
     /// what its table records, is the holder's own device.
-    pub fn required_device_kind(&self) -> jammi_db::store::manifest::ComputeDeviceKind {
+    pub fn required_device_kind(&self) -> jammi_datafusion::ComputeDeviceKind {
         self.compute_plane()
             .plane()
             .and_then(|plane| plane.device_kind())
@@ -1121,7 +1120,6 @@ impl InferenceSession {
             content_columns: columns.to_vec(),
             key_column: key_column.to_string(),
             source_id: String::new(),
-            backend: None,
             chunk: inference.chunk_budget()?,
             embedding_dim: Some(description.embedding_dim()),
             regression_form: description.regression_form().cloned(),
@@ -1616,7 +1614,6 @@ impl InferenceSession {
             content_columns: content_columns.to_vec(),
             key_column: key_column.to_string(),
             source_id: source_id.to_string(),
-            backend: None,
             chunk: inference.chunk_budget()?,
             embedding_dim: Some(description.embedding_dim()),
             regression_form: description.regression_form().cloned(),
@@ -1628,6 +1625,7 @@ impl InferenceSession {
             input_plan,
             RowOrder::Keyed {
                 key_column: key_column.to_string(),
+                tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
             },
             spec,
             self.inference_runtime(),
@@ -2367,7 +2365,7 @@ impl InferenceSession {
 /// independently-typed strings that happen to agree today. Orders by
 /// `(_row_id, _ordinal)`: `_row_id` alone is not enough (a source can key
 /// multiple rows under one id), so `_ordinal` — the stream-scoped monotonic
-/// counter [`crate::inference::schema::common_prefix_fields`] documents —
+/// counter [`jammi_datafusion::inference::schema::common_prefix_fields`] documents —
 /// breaks every tie in the order the model actually emitted the rows,
 /// regardless of how the underlying Parquet scan or model batches arrive on
 /// a later read.

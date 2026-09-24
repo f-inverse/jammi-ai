@@ -149,6 +149,14 @@ one pattern:
   arm, parity-tested on CUDA) whether or not the fused kernel compiles in.
   Candle's own eager composition is always the fallback, never a second
   implementation to keep in sync.
+- **The model stage extends DataFusion**, never forks it: `jammi-datafusion`
+  is a crate of DataFusion `ExecutionPlan` nodes and a
+  `PhysicalOptimizerRule` — a relation's rows numbered and chunked by a
+  token budget once, each chunk prepared, admitted and forwarded, the
+  output behind a common prefix — that binds to a model through one trait
+  pair and depends on no engine, so a DataFusion user who wants a model
+  stage takes the crate and brings their own model cache; jammi's engine
+  is one such consumer.
 - **The Ballista compute plane extends Ballista**, never forks it: a codec
   (`PhysicalExtensionCodec`), an execution engine wrapper, and a custom task
   distribution policy are all extension points Ballista ships for exactly

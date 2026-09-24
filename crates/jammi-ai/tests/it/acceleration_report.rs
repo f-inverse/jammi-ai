@@ -32,8 +32,8 @@ use tempfile::TempDir;
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use jammi_ai::fine_tune::worker::EmbeddedWorker;
 use jammi_ai::fine_tune::{ComputePrecision, FineTuneConfig, FineTuneMethod, LrSchedule};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::jobs_repo::{
     FinishJobWithModelParams, ModelRow, ProducedModel, SubmitJobParams,
 };

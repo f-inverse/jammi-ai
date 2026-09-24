@@ -16,7 +16,6 @@ pub mod error;
 pub mod evidence_channel;
 pub mod index;
 pub mod memory_pool;
-pub mod model_task;
 pub mod server_info;
 pub mod session;
 pub mod source;
@@ -38,7 +37,6 @@ pub use ephemeral::{
     SessionLifecycleRecord, SESSION_LIFECYCLE_TOPIC,
 };
 pub use evidence_channel::ChannelId;
-pub use model_task::ModelTask;
 pub use server_info::ServerInfo;
 pub use session::{AdminScope, TenantScope};
 pub use tenant::TenantId;

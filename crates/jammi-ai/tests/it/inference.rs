@@ -1,8 +1,9 @@
 use crate::common;
 
-use jammi_ai::inference::adapter::{
-    BackendOutput, ClassificationAdapter, EmbeddingAdapter, OutputAdapter,
+use jammi_datafusion::inference::adapter::{
+    ClassificationAdapter, EmbeddingAdapter, OutputAdapter,
 };
+use jammi_datafusion::BackendOutput;
 
 use arrow::array::Array;
 #[cfg(feature = "live-hub-tests")]
@@ -176,8 +177,9 @@ mod live {
     use super::*;
     use arrow::array::{Float32Array, StringArray};
     use candle_core::Device;
-    use jammi_ai::model::{ModelSource, ModelTask};
     use jammi_ai::session::InferenceSession;
+    use jammi_datafusion::ModelSource;
+    use jammi_datafusion::ModelTask;
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use serial_test::serial;
     use std::sync::Arc;

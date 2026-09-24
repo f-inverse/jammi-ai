@@ -62,13 +62,13 @@ use ballista_executor::execution_engine::{
     DefaultExecutionEngine, ExecutionEngine, QueryStageExecutor,
 };
 
-use jammi_ai::operator::inference_exec::InferenceExec;
-use jammi_ai::operator::numbered_input_exec::NumberedInputExec;
 use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::InferenceExec;
+use jammi_datafusion::NumberedInputExec;
 use jammi_db::compute_plane::PlanRequirements;
 use jammi_db::error::JammiError;
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_wire::TaskErrorEnvelope;
 
 /// Wraps [`DefaultExecutionEngine`], holding the executor process's own

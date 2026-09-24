@@ -4,10 +4,10 @@ use crate::catalog::backend::{
 };
 use crate::catalog::lease::{canonical_stamp_now, stale_before_clause, CanonicalStampColumn};
 use crate::error::{JammiError, Result};
-use crate::model_task::ModelTask;
 use crate::storage::{StorageError, StorageUrl};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
+use jammi_datafusion::ModelTask;
 
 use super::status::JobStatus;
 use super::Catalog;
@@ -186,7 +186,7 @@ impl Catalog {
         let metadata = model_metadata(params.base_model_id, params.config_json);
         let model_id = params.model_id.to_string();
         let model_type = params.model_type.to_string();
-        let task = params.task.as_db_str();
+        let task = params.task.as_str();
         let backend = params.backend.to_string();
         let version = params.version as i64;
         let external_location = params.external_location.map(str::to_string);
@@ -620,7 +620,7 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
     let name: String = row.get("name")?;
     let model_type: String = row.get("model_type")?;
     let task_raw: String = row.get("task")?;
-    let task = ModelTask::try_from_db_str(&task_raw).map_err(|e| BackendError::TypeConversion {
+    let task = ModelTask::parse(&task_raw).map_err(|e| BackendError::TypeConversion {
         column: "task".into(),
         detail: e.to_string(),
     })?;

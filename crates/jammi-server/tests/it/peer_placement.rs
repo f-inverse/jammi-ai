@@ -40,6 +40,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use arrow::datatypes::{DataType, Field, Schema};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::config::{AnnIndexConfig, ServerConfig, StoragePrecision};
 use jammi_db::error::JammiError;
@@ -49,7 +50,6 @@ use jammi_db::index::peer::{
 };
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, VectorIndex};
-use jammi_db::model_task::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{

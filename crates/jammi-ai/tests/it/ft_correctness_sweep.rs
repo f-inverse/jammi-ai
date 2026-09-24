@@ -16,7 +16,7 @@ use jammi_ai::fine_tune::{
     trainer::{compute_lr, TrainingLoopBuilder},
     FineTuneConfig, LrSchedule,
 };
-use jammi_ai::model::ModelTask;
+use jammi_datafusion::ModelTask;
 
 // ── Shared catalog/job boilerplate so a precomputed TrainingLoop can run. ────
 //

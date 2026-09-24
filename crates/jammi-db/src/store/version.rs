@@ -148,7 +148,7 @@ impl VersionManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_task::ModelTask;
+    use jammi_datafusion::ModelTask;
 
     fn descriptor() -> ProducingDescriptor {
         ProducingDescriptor::Embedding {

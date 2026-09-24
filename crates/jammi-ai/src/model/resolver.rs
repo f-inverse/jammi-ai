@@ -11,9 +11,9 @@ use super::arch;
 use super::backend::gguf::estimate_gguf_residency;
 use super::backend::safetensors_residency::estimate_safetensors_residency;
 use super::hub::HubSource;
-use super::{
-    BackendType, ModelId, ModelSource, ModelTask, ResolvedModel, TokenizerSource, WeightsFormat,
-};
+use super::{BackendType, ModelId, ResolvedModel, TokenizerSource, WeightsFormat};
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 
 /// The canonical GGUF weight filename: mirrors
 /// `model.safetensors`/`model.onnx`'s own literal-filename convention — the

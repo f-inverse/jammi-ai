@@ -1,10 +1,12 @@
-pub mod adapter;
 pub mod audio_preprocess;
-pub mod chunk;
+pub mod environment;
 pub mod image_preprocess;
-pub mod observer;
-pub mod runner;
-pub mod schema;
+pub mod runtime;
+
+/// Observes every output batch a session's inference plans produce —
+/// what [`crate::session::InferenceSession::with_observer`] takes, defined by
+/// `jammi-datafusion`, whose operators call it.
+pub use jammi_datafusion::inference::observer::InferenceObserver;
 
 use std::borrow::Cow;
 
@@ -159,37 +161,6 @@ fn get_string_value(col: &ArrayRef, i: usize) -> Option<&str> {
             .map(|a| a.value(i)),
         _ => None,
     }
-}
-
-/// Extract named columns from a RecordBatch as ArrayRefs.
-pub fn extract_columns(
-    batch: &arrow::record_batch::RecordBatch,
-    column_names: &[String],
-) -> Result<Vec<ArrayRef>> {
-    column_names
-        .iter()
-        .map(|name| {
-            batch
-                .column_by_name(name)
-                .map(std::sync::Arc::clone)
-                .ok_or_else(|| {
-                    JammiError::Inference(format!("Column '{name}' not found in input batch"))
-                })
-        })
-        .collect()
-}
-
-/// Extract a single named column from a RecordBatch.
-pub fn extract_column(
-    batch: &arrow::record_batch::RecordBatch,
-    column_name: &str,
-) -> Result<ArrayRef> {
-    batch
-        .column_by_name(column_name)
-        .map(std::sync::Arc::clone)
-        .ok_or_else(|| {
-            JammiError::Inference(format!("Column '{column_name}' not found in input batch"))
-        })
 }
 
 /// Extract images from an Arrow column.
@@ -580,12 +551,4 @@ pub fn arrow_to_audio(
     }
 
     Ok(clips)
-}
-
-/// Slice a set of columns to a sub-range.
-pub fn slice_columns(columns: &[ArrayRef], offset: usize, length: usize) -> Vec<ArrayRef> {
-    columns
-        .iter()
-        .map(|col| col.slice(offset, length))
-        .collect()
 }

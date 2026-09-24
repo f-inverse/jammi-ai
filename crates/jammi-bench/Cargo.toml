@@ -18,6 +18,7 @@ name = "jammi-bench"
 path = "src/main.rs"
 
 [dependencies]
+jammi-datafusion.workspace = true
 jammi-db.workspace = true
 jammi-numerics.workspace = true
 # The training-throughput tier drives the engine's hermetic CPU fine-tune

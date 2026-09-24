@@ -25,11 +25,11 @@ use tracing::warn;
 
 use crate::catalog::result_repo::{ResultTableCas, ResultTableKind, ResultTableRecord};
 use crate::error::{JammiError, Result};
-use crate::model_task::ModelTask;
 use crate::session::QueryContext;
 use crate::store::building::BuildingTable;
 use crate::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
 use crate::store::{ResultStore, ResultTableOrigin, SinkKind};
+use jammi_datafusion::ModelTask;
 
 #[cfg(doc)]
 use crate::catalog::result_repo::CreateResultTableParams;

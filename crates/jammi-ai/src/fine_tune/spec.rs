@@ -18,8 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use jammi_datafusion::ModelTask;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::model_task::ModelTask;
 use jammi_db::store::CachePolicy;
 
 use crate::fine_tune::graph_sampler::{GraphFineTuneSources, GraphSampleConfig};

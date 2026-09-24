@@ -80,7 +80,7 @@ type TableShape = (
     String,
     usize,
     Option<i32>,
-    jammi_db::ModelTask,
+    jammi_datafusion::ModelTask,
     ResultTableKind,
     Option<String>,
     Option<String>,
@@ -201,7 +201,7 @@ async fn remote_list_and_describe_sources_like_local() {
     assert_eq!(rt.status, "ready");
     assert_eq!(rt.row_count, table.row_count);
     assert_eq!(rt.dimensions_raw(), table.dimensions_raw());
-    assert_eq!(rt.task, jammi_db::ModelTask::TextEmbedding);
+    assert_eq!(rt.task, jammi_datafusion::ModelTask::TextEmbedding);
     assert_eq!(rt.kind, ResultTableKind::Model);
     assert_eq!(rt.derived_from, None);
 
@@ -287,7 +287,7 @@ async fn remote_describe_source_carries_a_training_set_kind_like_local() {
             table_name: "patents_training_set",
             source_id: "patents",
             model_id: "trainer",
-            task: jammi_db::ModelTask::TextEmbedding,
+            task: jammi_datafusion::ModelTask::TextEmbedding,
             kind: ResultTableKind::TrainingSet,
             derived_from: None,
             parquet_path: "file:///tmp/patents_training_set.parquet",

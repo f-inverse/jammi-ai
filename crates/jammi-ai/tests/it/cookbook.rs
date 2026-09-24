@@ -8,8 +8,9 @@ use std::sync::Arc;
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use jammi_ai::eval::{EvalTask, InferenceAggregate, PerRecordPrediction};
 use jammi_ai::fine_tune::FineTuneMethod;
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 

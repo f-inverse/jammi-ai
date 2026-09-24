@@ -8,18 +8,18 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
-use jammi_ai::model::ModelTask;
-use jammi_ai::operator::inference_exec::{InferenceExec, InferenceSpec};
-use jammi_ai::operator::key_check_exec::KeyCheckExec;
-use jammi_ai::operator::numbered_input_exec::{NumberedInputExec, RowOrder};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::{AsofJoinSpecBuilder, AsofKey};
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::codec::JammiCodec;
+use jammi_datafusion::inference::key_check::KeyCheckExec;
+use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::ModelTask;
+use jammi_datafusion::{InferenceExec, InferenceSpec};
+use jammi_datafusion::{NumberedInputExec, RowOrder};
 use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::StoragePrecision;
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_db::store::{ResultStore, ResultTableSinkExec, SinkKind, SinkLeaseKind};
 
 async fn session() -> Arc<InferenceSession> {
@@ -198,6 +198,7 @@ async fn numbered_input_exec_round_trips() {
         RowOrder::Arrival,
         RowOrder::Keyed {
             key_column: "id".into(),
+            tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
         },
     ] {
         let spec = InferenceSpec {

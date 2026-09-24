@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Int64Array, ListArray, StringArray};
-use jammi_ai::model::ModelTask;
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 

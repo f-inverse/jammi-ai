@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use crate::error::Result;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field};
-use jammi_db::error::Result;
 
-use super::{nullify_floats, nullify_strings, BackendOutput, OutputAdapter};
+use super::{nullify_floats, nullify_strings, OutputAdapter};
+use crate::inference::output::BackendOutput;
 
 /// Adapt classification output into `label`, `confidence`, and `all_scores_json` columns.
 pub struct ClassificationAdapter;

@@ -3,7 +3,7 @@
 //!
 //! It appends two non-null `UInt64` columns: `_ordinal`, the row's position
 //! in the input's order, contiguous from 0, and `_chunk`, the forward chunk
-//! the row belongs to (`inference::chunk`). The two answer different
+//! the row belongs to ([`crate::inference::chunk`]). The two answer different
 //! questions and are decided here, once, below everything that fans a plan
 //! out: `_ordinal` is where a row belongs in the OUTPUT — a result table is
 //! keyed, its readers look rows up, join and merge by key, and Parquet
@@ -13,19 +13,20 @@
 //! forward pads to little more than their real length instead of to the
 //! longest row of an arbitrary run (`jammi_numerics::batch_shape`). The rows
 //! leave this node in chunk order; the plan above restores `_ordinal` order
-//! (`super::inference_exec`).
+//! ([`crate::inference::exec`]).
 //!
 //! [`RowOrder`] names the input's order:
 //!
 //! * [`RowOrder::Keyed`] — the deterministic total order of a source scan,
-//!   `(key ASC NULLS LAST, _content_hash ASC NULLS LAST)`, the key on its own
-//!   type. Rows tied on both are equal in `_row_id` and in content, so they
+//!   `(key ASC NULLS LAST, tie_breakers... ASC NULLS LAST)`, the key on its
+//!   own type and the tie breakers the caller names (a content hash: rows
+//!   tied on key and content are equal in `_row_id` and in content, so they
 //!   are mutually substitutable and the written bytes are invariant under
 //!   permuting them — which a partial key could not promise, since the arrow
-//!   sort is unstable and a coalesce interleaves nondeterministically. A key
+//!   sort is unstable and a coalesce interleaves nondeterministically). A key
 //!   of a type that cannot render as `_row_id` (a struct) is refused at plan
 //!   build. Null keys are counted over the whole input: a null key is one
-//!   `JammiError::InvalidKey { column, null_count }` carrying the exact
+//!   `Error::InvalidKey { column, null_count }` carrying the exact
 //!   total, raised BEFORE any row is emitted — the sort is blocking, so it
 //!   holds every row back until the count is complete, and no forward ever
 //!   runs over the input. The rows are numbered in that order, costed, and
@@ -38,7 +39,7 @@
 //!
 //! Every row's COST — its length along the axis the forward pads, the
 //! model's own tokenisation for text, one for a fixed-shape input — is
-//! appended as the rows stream (`super::row_cost_exec`), and the chunks are
+//! appended as the rows stream ([`crate::inference::row_cost`]), and the chunks are
 //! one pass of a [`ChunkCutter`] over the cost sequence under the spec's
 //! [`ChunkBudget`](jammi_numerics::ChunkBudget), so the chunk of a row is a
 //! function of the ordered rows alone: identical at every partition count,
@@ -80,30 +81,17 @@ use datafusion::physical_plan::{
     Partitioning, PlanProperties,
 };
 use futures::{StreamExt, TryStreamExt};
-use jammi_db::store::schema::CONTENT_HASH_COLUMN;
 use jammi_numerics::ChunkCutter;
 use tracing::Instrument;
 
-use super::inference_exec::{InferenceRuntime, InferenceSpec};
-use super::key_check_exec::KeyCheckExec;
-use super::row_cost_exec::{RowCostExec, COST_COLUMN};
 use crate::inference::chunk::{chunk_ordering, CHUNK_COLUMN};
+use crate::inference::key_check::KeyCheckExec;
+use crate::inference::row_cost::{RowCostExec, COST_COLUMN};
+use crate::inference::runtime::InferenceRuntime;
 use crate::inference::schema::ORDINAL_COLUMN;
+use crate::inference::spec::{InferenceSpec, RowOrder};
 
-/// The order [`NumberedInputExec`] numbers its rows in. See the module doc.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RowOrder {
-    /// The total order `(key, _content_hash)`, null keys refused. The input
-    /// must carry `key_column` and `_content_hash`.
-    Keyed {
-        /// The row-identity column.
-        key_column: String,
-    },
-    /// The order rows arrive in.
-    Arrival,
-}
-
-/// `ASC NULLS LAST` — the direction of every ordering this engine declares
+/// `ASC NULLS LAST` — the direction of every ordering this crate declares
 /// over `_ordinal`, `_chunk` and the keyed sort.
 pub const ASCENDING: SortOptions = SortOptions {
     descending: false,
@@ -156,9 +144,8 @@ impl fmt::Debug for NumberedInputExec {
 impl NumberedInputExec {
     /// Number `input` in `order`, chunked under `spec.chunk` by the costs of
     /// `spec`'s model and task. Refuses an input that already carries
-    /// `_ordinal` or `_chunk`, and a keyed order whose key or
-    /// `_content_hash` column the input lacks or whose key cannot render as
-    /// `_row_id`.
+    /// `_ordinal` or `_chunk`, and a keyed order whose key or tie-breaker
+    /// column the input lacks or whose key cannot render as `_row_id`.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         order: RowOrder,
@@ -215,7 +202,11 @@ impl NumberedInputExec {
         spec: &InferenceSpec,
         runtime: &InferenceRuntime,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let RowOrder::Keyed { key_column } = order else {
+        let RowOrder::Keyed {
+            key_column,
+            tie_breakers,
+        } = order
+        else {
             let numbered: Arc<dyn ExecutionPlan> = Arc::new(OrdinalExec::new(input));
             return Ok(Arc::new(RowCostExec::try_new(
                 numbered,
@@ -235,7 +226,10 @@ impl NumberedInputExec {
             )));
         }
         let checked: Arc<dyn ExecutionPlan> = Arc::new(KeyCheckExec::try_new(input, key_column)?);
-        let keyed = Self::sorted(checked, &[key_column.as_str(), CONTENT_HASH_COLUMN])?;
+        let order_columns: Vec<&str> = std::iter::once(key_column.as_str())
+            .chain(tie_breakers.iter().map(String::as_str))
+            .collect();
+        let keyed = Self::sorted(checked, &order_columns)?;
         let numbered: Arc<dyn ExecutionPlan> = Arc::new(OrdinalExec::new(keyed));
         let costed: Arc<dyn ExecutionPlan> = Arc::new(RowCostExec::try_new(
             numbered,
@@ -262,8 +256,15 @@ impl NumberedInputExec {
 impl DisplayAs for NumberedInputExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match &self.order {
-            RowOrder::Keyed { key_column } => {
-                write!(f, "NumberedInputExec: order=key({key_column})")?;
+            RowOrder::Keyed {
+                key_column,
+                tie_breakers,
+            } => {
+                write!(f, "NumberedInputExec: order=key({key_column}")?;
+                for column in tie_breakers {
+                    write!(f, ", {column}")?;
+                }
+                write!(f, ")")?;
             }
             RowOrder::Arrival => write!(f, "NumberedInputExec: order=arrival")?,
         }
@@ -324,16 +325,16 @@ impl ExecutionPlan for NumberedInputExec {
         let cost_index = self.ordered.schema().index_of(COST_COLUMN)?;
         let schema = Arc::clone(&self.schema);
         let spec = self.spec.clone();
-        let cache = Arc::clone(&self.runtime.model_cache);
+        let runtime = Arc::clone(&self.runtime.model);
         // The ladder the chunks are budgeted on is the model's own, so the
-        // cutter is built once the model is loaded — a cache hit, the cost
-        // node below having loaded it already.
+        // cutter is built once the model is bound — already resident, the
+        // cost node below having bound it first.
         let chunked = async move {
-            let ladder = cache
-                .get_or_load(&spec.source, spec.task, spec.backend)
+            let ladder = runtime
+                .bind(&spec.source, spec.task)
                 .await
-                .and_then(|guard| guard.model.shape_ladder(spec.task))
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                .and_then(|model| model.shape_ladder(spec.task))
+                .map_err(DataFusionError::from)?;
             let mut chunking = Chunking {
                 schema,
                 cost_index,
@@ -512,24 +513,29 @@ mod tests {
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::common::collect;
     use datafusion::physical_plan::displayable;
+    use datafusion::prelude::SessionContext;
     use futures::StreamExt;
-    use jammi_db::error::JammiError;
-    use jammi_db::store::manifest::ComputeDeviceKind;
     use jammi_numerics::ChunkBudget;
 
-    use crate::model::{ModelSource, ModelTask};
-    use crate::session::InferenceSession;
+    use crate::device::ComputeDeviceKind;
+    use crate::error::Error;
+    use crate::inference::runtime::stub::{self, StubModel};
+    use crate::source::ModelSource;
+    use crate::task::ModelTask;
+
+    /// The tie breaker the keyed order names beside the key.
+    const HASH: &str = "hash";
 
     fn source_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, true),
             Field::new("text", DataType::Utf8, true),
-            Field::new(CONTENT_HASH_COLUMN, DataType::Utf8, true),
+            Field::new(HASH, DataType::Utf8, true),
         ]))
     }
 
-    /// Rows keyed `ids`, hashed `hashes`, each with `words` in-vocabulary
-    /// words of text — its cost, plus the two special tokens.
+    /// Rows keyed `ids`, hashed `hashes`, each with `words` words of text —
+    /// its cost, plus the two special tokens the stub adds.
     fn batch(ids: Vec<Option<i64>>, hashes: Vec<&str>, words: Vec<usize>) -> RecordBatch {
         RecordBatch::try_new(
             source_schema(),
@@ -550,27 +556,22 @@ mod tests {
         MemorySourceConfig::try_new_exec(&partitions, source_schema(), None).unwrap()
     }
 
-    async fn session() -> (InferenceSession, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let session = InferenceSession::new(jammi_test_utils::test_config(dir.path()))
-            .await
-            .unwrap();
-        (session, dir)
+    fn runtime() -> InferenceRuntime {
+        stub::runtime(StubModel::embedding()).0
     }
 
     fn spec(rows: usize, tokens: usize) -> InferenceSpec {
         InferenceSpec {
-            source: ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert")),
+            source: ModelSource::hf("a/model"),
             task: ModelTask::TextEmbedding,
             content_columns: vec!["text".into()],
             key_column: "id".into(),
             source_id: "numbered-input".into(),
-            backend: None,
             chunk: ChunkBudget {
                 rows: NonZeroUsize::new(rows).unwrap(),
                 tokens: NonZeroUsize::new(tokens).unwrap(),
             },
-            embedding_dim: Some(32),
+            embedding_dim: Some(1),
             regression_form: None,
             passthrough: Vec::new(),
             device_kind: ComputeDeviceKind::Cpu,
@@ -578,23 +579,27 @@ mod tests {
         }
     }
 
-    fn keyed(
-        session: &InferenceSession,
-        input: Arc<dyn ExecutionPlan>,
-        rows: usize,
-        tokens: usize,
-    ) -> Arc<dyn ExecutionPlan> {
+    fn keyed_order() -> RowOrder {
+        RowOrder::Keyed {
+            key_column: "id".into(),
+            tie_breakers: vec![HASH.into()],
+        }
+    }
+
+    fn keyed(input: Arc<dyn ExecutionPlan>, rows: usize, tokens: usize) -> Arc<dyn ExecutionPlan> {
         Arc::new(
             NumberedInputExec::try_new(
                 Arc::new(CoalescePartitionsExec::new(input)),
-                RowOrder::Keyed {
-                    key_column: "id".into(),
-                },
+                keyed_order(),
                 spec(rows, tokens),
-                session.inference_runtime(),
+                runtime(),
             )
             .unwrap(),
         )
+    }
+
+    fn task_ctx() -> Arc<TaskContext> {
+        SessionContext::new().task_ctx()
     }
 
     fn column<'a, A: 'static>(batch: &'a RecordBatch, name: &str) -> &'a A {
@@ -613,15 +618,13 @@ mod tests {
     }
 
     /// Keyed: every input partition's rows leave partition 0 in chunk order
-    /// — `(cost, key, _content_hash)`: the two-word rows first, then by key
-    /// on its own type (`2` before `10`) — each carrying as `_ordinal` its
-    /// position in KEY order `(key, _content_hash)`, chunked under the
-    /// budget, with the private cost column gone.
+    /// — `(cost, key, hash)`: the two-word rows first, then by key on its
+    /// own type (`2` before `10`) — each carrying as `_ordinal` its position
+    /// in KEY order `(key, hash)`, chunked under the budget, with the private
+    /// cost column gone.
     #[tokio::test]
     async fn keyed_rows_leave_in_cost_order_numbered_in_key_order_and_chunked() {
-        let (session, _dir) = session().await;
         let plan = keyed(
-            &session,
             source(vec![
                 batch(vec![Some(2)], vec!["b"], vec![9]),
                 batch(vec![Some(10)], vec!["a"], vec![2]),
@@ -633,9 +636,7 @@ mod tests {
         );
         assert_eq!(plan.output_partitioning().partition_count(), 1);
         assert!(plan.schema().field_with_name(COST_COLUMN).is_err());
-        let out = collect(plan.execute(0, session.context().task_ctx()).unwrap())
-            .await
-            .unwrap();
+        let out = collect(plan.execute(0, task_ctx()).unwrap()).await.unwrap();
         let ids: Vec<i64> = out
             .iter()
             .flat_map(|b| column::<Int64Array>(b, "id").values().to_vec())
@@ -643,7 +644,7 @@ mod tests {
         let hashes: Vec<String> = out
             .iter()
             .flat_map(|b| {
-                column::<StringArray>(b, CONTENT_HASH_COLUMN)
+                column::<StringArray>(b, HASH)
                     .iter()
                     .map(|h| h.unwrap().to_string())
                     .collect::<Vec<_>>()
@@ -660,7 +661,6 @@ mod tests {
     /// of 4096 under a row cap of 3 holds three.
     #[tokio::test]
     async fn the_chunk_budget_cuts_by_padded_tokens_and_by_rows() {
-        let (session, _dir) = session().await;
         let rows = || {
             source(vec![batch(
                 (1..=6).map(Some).collect(),
@@ -668,13 +668,13 @@ mod tests {
                 vec![9; 6],
             )])
         };
-        let by_tokens = keyed(&session, rows(), 100, 40);
-        let out = collect(by_tokens.execute(0, session.context().task_ctx()).unwrap())
+        let by_tokens = keyed(rows(), 100, 40);
+        let out = collect(by_tokens.execute(0, task_ctx()).unwrap())
             .await
             .unwrap();
         assert_eq!(u64s(&out, CHUNK_COLUMN), vec![0, 0, 1, 1, 2, 2]);
-        let by_rows = keyed(&session, rows(), 3, 4096);
-        let out = collect(by_rows.execute(0, session.context().task_ctx()).unwrap())
+        let by_rows = keyed(rows(), 3, 4096);
+        let out = collect(by_rows.execute(0, task_ctx()).unwrap())
             .await
             .unwrap();
         assert_eq!(u64s(&out, CHUNK_COLUMN), vec![0, 0, 0, 1, 1, 1]);
@@ -685,7 +685,6 @@ mod tests {
     /// order.
     #[tokio::test]
     async fn arrival_rows_are_numbered_across_batches_in_arrival_order() {
-        let (session, _dir) = session().await;
         let batches = vec![
             batch(vec![Some(7), Some(3)], vec!["x", "y"], vec![1, 1]),
             batch(vec![Some(5)], vec!["z"], vec![1]),
@@ -696,16 +695,9 @@ mod tests {
             ),
         ];
         let input = MemorySourceConfig::try_new_exec(&[batches], source_schema(), None).unwrap();
-        let plan = NumberedInputExec::try_new(
-            input,
-            RowOrder::Arrival,
-            spec(4, 4096),
-            session.inference_runtime(),
-        )
-        .unwrap();
-        let out = collect(plan.execute(0, session.context().task_ctx()).unwrap())
-            .await
-            .unwrap();
+        let plan =
+            NumberedInputExec::try_new(input, RowOrder::Arrival, spec(4, 4096), runtime()).unwrap();
+        let out = collect(plan.execute(0, task_ctx()).unwrap()).await.unwrap();
         let ids: Vec<i64> = out
             .iter()
             .flat_map(|b| column::<Int64Array>(b, "id").values().to_vec())
@@ -723,29 +715,18 @@ mod tests {
     /// name, in either order, never silently overwritten or duplicated.
     #[tokio::test]
     async fn an_input_already_numbered_is_refused() {
-        let (session, _dir) = session().await;
         for name in [ORDINAL_COLUMN, CHUNK_COLUMN] {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, true),
                 Field::new("text", DataType::Utf8, true),
-                Field::new(CONTENT_HASH_COLUMN, DataType::Utf8, true),
+                Field::new(HASH, DataType::Utf8, true),
                 Field::new(name, DataType::UInt64, false),
             ]));
-            for order in [
-                RowOrder::Arrival,
-                RowOrder::Keyed {
-                    key_column: "id".into(),
-                },
-            ] {
+            for order in [RowOrder::Arrival, keyed_order()] {
                 let input =
                     MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None).unwrap();
-                let err = NumberedInputExec::try_new(
-                    input,
-                    order,
-                    spec(4, 4096),
-                    session.inference_runtime(),
-                )
-                .expect_err("a colliding numbered column must refuse");
+                let err = NumberedInputExec::try_new(input, order, spec(4, 4096), runtime())
+                    .expect_err("a colliding numbered column must refuse");
                 assert!(err.to_string().contains(name), "{err}");
             }
         }
@@ -755,7 +736,6 @@ mod tests {
     /// plan build, naming the column and its type.
     #[tokio::test]
     async fn a_key_that_cannot_render_as_row_id_is_refused_at_plan_build() {
-        let (session, _dir) = session().await;
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "id",
@@ -763,40 +743,45 @@ mod tests {
                 true,
             ),
             Field::new("text", DataType::Utf8, true),
-            Field::new(CONTENT_HASH_COLUMN, DataType::Utf8, true),
+            Field::new(HASH, DataType::Utf8, true),
         ]));
         let input = MemorySourceConfig::try_new_exec(&[vec![]], schema, None).unwrap();
+        let err = NumberedInputExec::try_new(input, keyed_order(), spec(4, 4096), runtime())
+            .expect_err("a struct key must refuse");
+        assert!(err.to_string().contains("'id'"), "{err}");
+        assert!(err.to_string().contains("Struct"), "{err}");
+    }
+
+    /// A keyed order names a tie breaker the input lacks: refused at plan
+    /// build, by name.
+    #[tokio::test]
+    async fn a_missing_tie_breaker_is_refused_at_plan_build() {
+        let input = MemorySourceConfig::try_new_exec(&[vec![]], source_schema(), None).unwrap();
         let err = NumberedInputExec::try_new(
             input,
             RowOrder::Keyed {
                 key_column: "id".into(),
+                tie_breakers: vec!["version".into()],
             },
             spec(4, 4096),
-            session.inference_runtime(),
+            runtime(),
         )
-        .expect_err("a struct key must refuse");
-        assert!(err.to_string().contains("'id'"), "{err}");
-        assert!(err.to_string().contains("Struct"), "{err}");
+        .expect_err("a tie breaker the input lacks must refuse");
+        assert!(err.to_string().contains("version"), "{err}");
     }
 
     /// The numbering is a total only over one stream, so the node refuses to
     /// execute over an input of several partitions rather than number one.
     #[tokio::test]
     async fn an_input_of_several_partitions_refuses_to_execute() {
-        let (session, _dir) = session().await;
         let src = source(vec![
             batch(vec![Some(1)], vec!["a"], vec![1]),
             batch(vec![Some(2)], vec!["b"], vec![1]),
         ]);
-        let plan = NumberedInputExec::try_new(
-            src,
-            RowOrder::Arrival,
-            spec(4, 4096),
-            session.inference_runtime(),
-        )
-        .unwrap();
+        let plan =
+            NumberedInputExec::try_new(src, RowOrder::Arrival, spec(4, 4096), runtime()).unwrap();
         let err = plan
-            .execute(0, session.context().task_ctx())
+            .execute(0, task_ctx())
             .err()
             .expect("a multi-partition input must refuse");
         assert!(err.to_string().contains("one partition"), "{err}");
@@ -807,9 +792,7 @@ mod tests {
     /// emitted before it.
     #[tokio::test]
     async fn keyed_null_keys_refuse_with_the_exact_total_before_any_row() {
-        let (session, _dir) = session().await;
         let plan = keyed(
-            &session,
             source(vec![
                 batch(vec![Some(1), None], vec!["a", "b"], vec![1, 1]),
                 batch(
@@ -821,20 +804,32 @@ mod tests {
             4,
             4096,
         );
-        let mut stream = plan.execute(0, session.context().task_ctx()).unwrap();
+        let mut stream = plan.execute(0, task_ctx()).unwrap();
         let first = stream
             .next()
             .await
             .expect("the stream yields the refusal")
             .expect_err("the first item is the refusal, never a batch");
-        match JammiError::from(first) {
-            JammiError::InvalidKey { column, null_count } => {
+        match Error::found_in(&first) {
+            Some(Error::InvalidKey { column, null_count }) => {
                 assert_eq!(column, "id");
-                assert_eq!(null_count, 3);
+                assert_eq!(*null_count, 3);
             }
             other => panic!("expected InvalidKey, got {other:?}"),
         }
     }
+
+    /// An error of the source's own, below this node.
+    #[derive(Debug)]
+    struct Upstream;
+
+    impl std::fmt::Display for Upstream {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("the source lost its lease")
+        }
+    }
+
+    impl std::error::Error for Upstream {}
 
     /// A leaf that yields `ok` batches and then one error.
     #[derive(Debug)]
@@ -886,9 +881,7 @@ mod tests {
             _context: Arc<TaskContext>,
         ) -> DfResult<SendableRecordBatchStream> {
             let items = self.ok.iter().cloned().map(Ok).chain(std::iter::once(Err(
-                DataFusionError::External(Box::new(JammiError::LeaseLost {
-                    table: "numbered_input_source".into(),
-                })),
+                DataFusionError::External(Box::new(Upstream)),
             )));
             Ok(Box::pin(RecordBatchStreamAdapter::new(
                 source_schema(),
@@ -897,39 +890,27 @@ mod tests {
         }
     }
 
-    /// An upstream error crosses the node as the typed variant it was raised
+    /// An upstream error crosses the node as the typed error it was raised
     /// as, in both orders.
     #[tokio::test]
     async fn an_upstream_error_passes_through_typed() {
-        let (session, _dir) = session().await;
-        for order in [
-            RowOrder::Arrival,
-            RowOrder::Keyed {
-                key_column: "id".into(),
-            },
-        ] {
+        for order in [RowOrder::Arrival, keyed_order()] {
             let src = Arc::new(FailingSource::new(vec![batch(
                 vec![Some(1)],
                 vec!["a"],
                 vec![1],
             )]));
-            let plan = NumberedInputExec::try_new(
-                src,
-                order.clone(),
-                spec(4, 4096),
-                session.inference_runtime(),
-            )
-            .unwrap();
-            let err = collect(plan.execute(0, session.context().task_ctx()).unwrap())
+            let plan =
+                NumberedInputExec::try_new(src, order.clone(), spec(4, 4096), runtime()).unwrap();
+            let err = collect(plan.execute(0, task_ctx()).unwrap())
                 .await
                 .expect_err("the upstream error must surface");
-            assert!(
-                matches!(
-                    JammiError::from(err),
-                    JammiError::LeaseLost { ref table } if table == "numbered_input_source"
-                ),
-                "{order:?}: the error must keep its variant"
-            );
+            let upstream =
+                std::iter::successors(Some(&err as &(dyn std::error::Error + 'static)), |e| {
+                    e.source()
+                })
+                .any(|e| e.downcast_ref::<Upstream>().is_some());
+            assert!(upstream, "{order:?}: the error must keep its type: {err}");
         }
     }
 
@@ -956,9 +937,7 @@ mod tests {
     /// precedes any output.
     #[tokio::test]
     async fn the_distribution_and_sorting_rules_leave_the_node_intact() {
-        let (session, _dir) = session().await;
         let numbered = keyed(
-            &session,
             source(vec![
                 batch(vec![Some(1), None], vec!["a", "b"], vec![1, 1]),
                 batch(vec![None], vec!["c"], vec![1]),
@@ -1001,15 +980,15 @@ mod tests {
             );
         }
 
-        let mut stream = optimized.execute(0, session.context().task_ctx()).unwrap();
+        let mut stream = optimized.execute(0, task_ctx()).unwrap();
         let first = stream
             .next()
             .await
             .expect("the stream yields the refusal")
             .expect_err("the refusal precedes any output");
         assert!(matches!(
-            JammiError::from(first),
-            JammiError::InvalidKey { ref column, null_count: 2 } if column == "id"
+            Error::found_in(&first),
+            Some(Error::InvalidKey { column, null_count: 2 }) if column == "id"
         ));
     }
 }

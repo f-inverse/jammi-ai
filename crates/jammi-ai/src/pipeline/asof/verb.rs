@@ -15,13 +15,13 @@ use arrow::compute::SortOptions;
 use datafusion::physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::ExecutionPlan;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, InputAnchor, Materialization, ProducingDescriptor,
 };
 use jammi_db::store::SinkKind;
-use jammi_db::ModelTask;
 
 use super::exec::AsofJoinExec;
 use super::spec::{AsofJoinSpec, Boundary, MatchDirection, TieBreak, Tolerance};

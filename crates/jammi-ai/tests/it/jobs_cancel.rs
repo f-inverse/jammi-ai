@@ -14,8 +14,9 @@ use jammi_ai::fine_tune::worker::{training_test_hooks, EmbeddedWorker, JobWorker
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::jobs::compute_test_hooks::{arm, ParkPoint};
 use jammi_ai::jobs::{ComputeSpec, JobSpec};
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::JobRecord;
 use jammi_db::catalog::status::JobStatus;

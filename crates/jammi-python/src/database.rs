@@ -9,11 +9,12 @@ use pyo3::types::{PyDict, PyList};
 use pyo3_arrow::{PySchema, PyTable};
 
 use jammi_ai::local_session::Session;
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::pipeline::context_predictor::{ContextServeOptions, ContextServeSource};
 use jammi_ai::pipeline::context_set::{ContextSourceKind, HybridMerge};
 use jammi_ai::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};

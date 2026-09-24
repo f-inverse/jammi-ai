@@ -23,6 +23,7 @@ use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use jammi_ai::Session;
 use jammi_client::DataClient;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{
@@ -31,7 +32,6 @@ use jammi_db::catalog::result_repo::{
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::MutableTableDefinitionBuilder;
-use jammi_db::ModelTask;
 use jammi_wire::index_segment_to_proto;
 use jammi_wire::proto::catalog::ListIndexSegmentsResponse;
 use parquet::arrow::ArrowWriter;

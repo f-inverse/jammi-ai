@@ -144,6 +144,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::future::BoxFuture;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::instance::{
     DeviceFact, GangListing, GangMember, InstanceRegistration, PeerAddr, WorkerFacts,
@@ -155,7 +156,6 @@ use jammi_db::catalog::Catalog;
 use jammi_db::compute_plane::ComputePlane;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::model_task::ModelTask;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::manifest::{
     ComputeDevice, GraphSampleFields, InputAnchor, ProducingDescriptor,
@@ -182,9 +182,9 @@ use crate::fine_tune::FineTuneConfig;
 use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
-use crate::model::ModelSource;
 use crate::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec, PlacedOutcome};
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelSource;
 use jammi_wire::proto::gang::{AbortReason, Assign};
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
@@ -11849,7 +11849,7 @@ mod tests {
         let config = jammi_test_utils::test_config(dir.path());
         let session = crate::session::InferenceSession::new(config).await.unwrap();
         let source =
-            crate::model::ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+            jammi_datafusion::ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
         session
             .model_cache()
             .get_or_load(&source, ModelTask::TextEmbedding, None)

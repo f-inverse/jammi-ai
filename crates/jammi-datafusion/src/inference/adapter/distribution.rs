@@ -20,11 +20,12 @@
 
 use std::sync::Arc;
 
+use crate::error::{Error, Result};
 use arrow::array::{ArrayRef, Float32Array};
 use arrow::datatypes::{DataType, Field};
-use jammi_db::error::{JammiError, Result};
 
-use super::{BackendOutput, OutputAdapter};
+use super::OutputAdapter;
+use crate::inference::output::BackendOutput;
 
 /// The minimum standard deviation served by the Gaussian head, the inference
 /// peer of the trainer's learnable variance floor. A served `σ` is never below
@@ -35,7 +36,7 @@ use super::{BackendOutput, OutputAdapter};
 /// kept equal by prose: it references the trainer's crate-internal `STD_FLOOR`
 /// (the single source of truth) so the trained `σ` and the served `σ` are one
 /// transform.
-pub const SERVED_STD_FLOOR: f32 = crate::fine_tune::regression_loss::STD_FLOOR as f32;
+pub const SERVED_STD_FLOOR: f32 = jammi_numerics::regression::STD_FLOOR as f32;
 
 /// Map a raw real-valued head output to a positive standard deviation:
 /// `floor + softplus(raw)`. `softplus(x) = ln(1 + e^x)` is smooth and positive
@@ -144,17 +145,17 @@ impl DistributionAdapter {
     /// the adapter, so there is no post-softplus σ for the adapter to scale.
     pub fn quantile(levels: Vec<f64>) -> Result<Self> {
         if levels.is_empty() {
-            return Err(JammiError::Inference(
+            return Err(Error::Inference(
                 "quantile distribution head requires at least one level".into(),
             ));
         }
         if levels.iter().any(|&q| !(0.0..1.0).contains(&q) || q <= 0.0) {
-            return Err(JammiError::Inference(
+            return Err(Error::Inference(
                 "quantile levels must lie strictly in (0, 1)".into(),
             ));
         }
         if levels.windows(2).any(|w| w[1] <= w[0]) {
-            return Err(JammiError::Inference(
+            return Err(Error::Inference(
                 "quantile levels must be strictly ascending".into(),
             ));
         }
@@ -210,19 +211,19 @@ impl OutputAdapter for DistributionAdapter {
         }
 
         let flat = output.float_outputs.first().ok_or_else(|| {
-            JammiError::Inference("distribution adapter: backend emitted no float head".into())
+            Error::Inference("distribution adapter: backend emitted no float head".into())
         })?;
         // Checked multiply (mirrors `BackendOutput::checked_rows`'s
         // `rows.checked_mul(dim)`): a raw `row_count * width` could silently
         // overflow on an adversarial `row_count`.
         let expected = row_count.checked_mul(width).ok_or_else(|| {
-            JammiError::Inference(format!(
+            Error::Inference(format!(
                 "distribution adapter: row_count*width overflows (row_count={row_count}, \
                  width={width})"
             ))
         })?;
         if flat.len() != expected {
-            return Err(JammiError::Inference(format!(
+            return Err(Error::Inference(format!(
                 "distribution adapter: head has {} floats, expected rows({row_count}) * width({width})",
                 flat.len()
             )));
@@ -234,7 +235,7 @@ impl OutputAdapter for DistributionAdapter {
         // treat an out-of-bounds row as errored instead of surfacing the
         // producer bug that shorted `row_status`).
         if output.row_status.len() != row_count {
-            return Err(JammiError::Inference(format!(
+            return Err(Error::Inference(format!(
                 "distribution adapter: row_status has {} entries, expected one per row \
                  ({row_count})",
                 output.row_status.len()
@@ -260,7 +261,7 @@ impl OutputAdapter for DistributionAdapter {
                         // `destandardize_distribution` also calls — one copy of the
                         // σ math across both serve paths.
                         let sigma_z = softplus_std(raw_std, SERVED_STD_FLOOR);
-                        let sigma = crate::fine_tune::regression_loss::destandardize_sigma(
+                        let sigma = jammi_numerics::regression::destandardize_sigma(
                             self.std_scale,
                             sigma_z,
                         );
@@ -289,7 +290,7 @@ impl OutputAdapter for DistributionAdapter {
                         // would break the order; a non-finite head output is a
                         // backend bug, surfaced as a typed error.
                         if row_vals.iter().any(|v| !v.is_finite()) {
-                            return Err(JammiError::Inference(format!(
+                            return Err(Error::Inference(format!(
                                 "distribution adapter: row {row} quantile output is non-finite"
                             )));
                         }
@@ -341,53 +342,8 @@ mod tests {
         // the autodiff objective, f32 at serve time).
         assert_eq!(
             SERVED_STD_FLOOR,
-            crate::fine_tune::regression_loss::STD_FLOOR as f32
+            jammi_numerics::regression::STD_FLOOR as f32
         );
-    }
-
-    #[test]
-    fn served_sigma_matches_trained_sigma_across_raw_sweep() {
-        // The σ map must agree between training and serving for every raw scale,
-        // or a model would be scored under a different σ than it was trained on.
-        // Drive the adapter's full serve path (which applies the adapter-side
-        // `softplus_std`) and the trainer's `gaussian_params` (the autodiff σ
-        // map) on the same raw values and require the served σ to equal the
-        // trained σ. The two share the floor constant exactly (the single
-        // source of truth) and the same `floor + softplus(raw)` formula; they
-        // differ only by the last-bit rounding of two softplus spellings — the
-        // candle-native numerically-stable form vs the scalar `ln(1+e^x)` — so
-        // the agreement is to f32 round-off (≤ a few ULP), not a wider drift
-        // that would mean two different transforms.
-        use candle_core::{Device, Tensor};
-        let dev = Device::Cpu;
-        let mut raw = -5.0_f32;
-        while raw <= 5.0 {
-            // Adapter side: serve a one-row Gaussian head `(mean, raw)`.
-            let out = backend(vec![0.0, raw], 1, 2, vec![true]);
-            let cols = DistributionAdapter::gaussian()
-                .adapt(out.clone(), 1)
-                .unwrap();
-            let served = cols[1]
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(0);
-
-            // Trainer side: the same raw through the autodiff σ map, read as f32.
-            let input = Tensor::from_vec(vec![0.0_f32, raw], (1, 2), &dev).unwrap();
-            let (_, sigma) = crate::fine_tune::regression_loss::gaussian_params(&input).unwrap();
-            let trained: f32 = sigma.squeeze(0).unwrap().to_scalar().unwrap();
-
-            // Tight relative tolerance: only f32 last-bit rounding may separate
-            // them. A real divergence (a changed floor or a different formula)
-            // is orders of magnitude larger and trips this guard.
-            let tol = 4.0 * f32::EPSILON * served.abs().max(1.0);
-            assert!(
-                (served - trained).abs() <= tol,
-                "served σ {served} and trained σ {trained} disagree for raw={raw} (tol {tol})"
-            );
-            raw += 0.5;
-        }
     }
 
     #[test]

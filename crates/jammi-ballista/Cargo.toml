@@ -11,6 +11,7 @@ publish = true
 [dependencies]
 jammi-ai.workspace = true
 jammi-db.workspace = true
+jammi-datafusion.workspace = true
 jammi-numerics.workspace = true
 jammi-wire.workspace = true
 

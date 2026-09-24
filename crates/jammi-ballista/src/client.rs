@@ -33,10 +33,10 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::PhysicalPlanNode;
 
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ComputeDeviceKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::compute_plane::{PlanRequirements, Unheld};
 use jammi_db::error::JammiError;
-use jammi_db::store::manifest::ComputeDeviceKind;
 use jammi_wire::TaskErrorEnvelope;
 
 use crate::codec::JammiCodec;

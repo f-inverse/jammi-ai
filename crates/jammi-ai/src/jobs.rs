@@ -71,12 +71,12 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::store::{CacheOutcome, CachePolicy};
 use tracing::Instrument;
 
-use crate::model::ModelTask;
 use crate::pipeline::asof::AsofJoinSpec;
 use crate::pipeline::graph_propagation::PropagateRequest;
 use crate::pipeline::graph_structure::StructureRequest;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelTask;
 
 /// A durable, self-contained description of a compute job: the verb that
 /// produced it (the variant) and the inputs [`execute_compute`] reconstructs
@@ -154,7 +154,7 @@ impl ComputeSpec {
     pub fn model_source(&self) -> Option<String> {
         match self {
             ComputeSpec::Embedding { model_id, .. } | ComputeSpec::Infer { model_id, .. } => {
-                Some(crate::model::ModelSource::parse(model_id).to_string())
+                Some(jammi_datafusion::ModelSource::parse(model_id).to_string())
             }
             ComputeSpec::NeighborGraph { .. }
             | ComputeSpec::Propagate { .. }
@@ -466,7 +466,7 @@ impl JobSpec {
     fn model_source(&self) -> Option<String> {
         match self {
             JobSpec::Embedding { model_id, .. } | JobSpec::Infer { model_id, .. } => {
-                Some(crate::model::ModelSource::parse(model_id).to_string())
+                Some(jammi_datafusion::ModelSource::parse(model_id).to_string())
             }
             _ => None,
         }
@@ -867,7 +867,7 @@ pub async fn execute_compute(
             key_column,
             cache,
         } => {
-            let source = crate::model::ModelSource::parse(model_id);
+            let source = jammi_datafusion::ModelSource::parse(model_id);
             let (table, _batches, outcome) = session
                 .infer_materialize(
                     source_id,
@@ -1462,7 +1462,7 @@ mod tests {
             source: "src".into(),
             columns: vec!["text".into()],
             method: crate::fine_tune::FineTuneMethod::Lora,
-            task: jammi_db::ModelTask::TextEmbedding,
+            task: jammi_datafusion::ModelTask::TextEmbedding,
             common: crate::fine_tune::spec::TrainingCommon {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
@@ -1584,7 +1584,7 @@ mod tests {
             source: "src".into(),
             columns: vec!["text".into()],
             method: crate::fine_tune::FineTuneMethod::Lora,
-            task: jammi_db::ModelTask::TextEmbedding,
+            task: jammi_datafusion::ModelTask::TextEmbedding,
             common: crate::fine_tune::spec::TrainingCommon {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),
@@ -1637,7 +1637,7 @@ mod tests {
                 source: "src".into(),
                 columns: vec!["text".into()],
                 method: crate::fine_tune::FineTuneMethod::Lora,
-                task: jammi_db::ModelTask::TextEmbedding,
+                task: jammi_datafusion::ModelTask::TextEmbedding,
                 common: common(1),
             },
             TrainingSpec::GraphFineTune {
@@ -1730,7 +1730,7 @@ mod tests {
             ComputeSpec::Infer {
                 source_id: "s".into(),
                 model_id: "m".into(),
-                task: jammi_db::ModelTask::TextEmbedding,
+                task: jammi_datafusion::ModelTask::TextEmbedding,
                 content_columns: vec!["text".into()],
                 key_column: "id".into(),
                 cache: CachePolicy::Bypass,
@@ -1759,7 +1759,7 @@ mod tests {
             source: "src".into(),
             columns: vec!["text".into()],
             method: crate::fine_tune::FineTuneMethod::Lora,
-            task: jammi_db::ModelTask::TextEmbedding,
+            task: jammi_datafusion::ModelTask::TextEmbedding,
             common: crate::fine_tune::spec::TrainingCommon {
                 base_model: "base".into(),
                 config: crate::fine_tune::FineTuneConfig::default(),

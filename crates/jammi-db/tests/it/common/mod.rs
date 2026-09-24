@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::artifact_repo::{ArtifactRef, StagedArtifact};
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{ModelRow, ProducedModel, SubmitJobParams};
@@ -13,7 +14,6 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::model_task::ModelTask;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{DefinitionHash, InputAnchor, ProducingDescriptor};
 use jammi_db::store::version::{VersionDelta, VersionManifest, VERSION_FORMAT};

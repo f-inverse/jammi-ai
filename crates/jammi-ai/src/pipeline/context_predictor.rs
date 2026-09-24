@@ -45,10 +45,10 @@ use arrow::record_batch::RecordBatch;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::model_task::ModelTask;
 
 use serde::{Deserialize, Serialize};
 
@@ -63,8 +63,6 @@ use crate::fine_tune::regression_loss;
 use crate::fine_tune::regression_loss::TargetScaler;
 use crate::fine_tune::spec::TrainingSpec;
 use crate::fine_tune::target::StandardizableHead;
-use crate::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
-use crate::inference::adapter::{BackendOutput, OutputAdapter};
 use crate::pipeline::context_set::{
     ContextRequest, ContextSource, ContextSourceKind, HybridMerge, SetAggregator,
 };
@@ -72,6 +70,9 @@ use crate::pipeline::graph_neighbourhood::EdgeGather;
 use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig, ParallelTrainReport};
 use crate::predict::conformal::{ConformalModel, IntervalScore};
 use crate::session::InferenceSession;
+use jammi_datafusion::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
+use jammi_datafusion::inference::adapter::OutputAdapter;
+use jammi_datafusion::BackendOutput;
 
 /// Shape of the predictive-distribution head the predictor emits and the
 /// objective scores — the distributional output families, selected by config
@@ -1685,7 +1686,7 @@ fn destandardize_distribution(
             // σ_y·σ_z + re-floor via the SHARED `destandardize_sigma` helper the
             // fine-tune adapter also calls — one copy of the σ-axis math across
             // both serve paths, so the σ rule cannot drift between them.
-            std: regression_loss::destandardize_sigma(std, z_std),
+            std: jammi_numerics::regression::destandardize_sigma(std, z_std),
         },
         PredictedDistribution::Quantile { levels } => PredictedDistribution::Quantile {
             levels: levels

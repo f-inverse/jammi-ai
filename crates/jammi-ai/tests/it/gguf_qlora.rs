@@ -20,7 +20,9 @@ use candle_nn::{Linear, VarBuilder, VarMap};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::{BackendType, LoadedModel, ModelSource, ModelTask, WeightsFormat};
+use jammi_ai::model::{BackendType, LoadedModel, WeightsFormat};
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
 use jammi_db::store::manifest::{

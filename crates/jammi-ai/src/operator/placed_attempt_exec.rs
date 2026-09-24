@@ -42,7 +42,7 @@ use datafusion::physical_plan::{
     stream::RecordBatchReceiverStreamBuilder, DisplayAs, DisplayFormatType, ExecutionPlan,
     Partitioning, PlanProperties,
 };
-use jammi_db::store::manifest::ComputeDeviceKind;
+use jammi_datafusion::ComputeDeviceKind;
 use serde::{Deserialize, Serialize};
 
 /// The coordinates of a placed training attempt's one Ballista task —

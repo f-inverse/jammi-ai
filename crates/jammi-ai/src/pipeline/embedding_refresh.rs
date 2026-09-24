@@ -27,10 +27,10 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason, Result};
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::content_hash::ContentHash;
@@ -46,11 +46,11 @@ use jammi_db::store::version::{
 use jammi_db::store::{BuildingVersion, PinnedSource, PublishedVersion, ResultStore, SinkKind};
 use jammi_db::tenant_scope::TenantBinding;
 
-use crate::operator::inference_exec::{plan_inference, InferenceSpec};
-use crate::operator::key_check_exec::key_checked;
-use crate::operator::numbered_input_exec::RowOrder;
 use crate::pipeline::embedding::{embedding_definition, EmbeddingDefinition};
 use crate::session::InferenceSession;
+use jammi_datafusion::inference::key_check::key_checked;
+use jammi_datafusion::RowOrder;
+use jammi_datafusion::{plan_inference, InferenceSpec};
 
 // The report vocabulary lives on the wire substrate so the remote client and
 // a local session hand a caller the identical value.
@@ -988,7 +988,6 @@ impl InferenceSession {
             content_columns: params.columns.clone(),
             key_column: params.key_column.clone(),
             source_id: params.source_id.clone(),
-            backend: None,
             chunk: inference.chunk_budget()?,
             embedding_dim: Some(definition.embedding_dim),
             regression_form: None,
@@ -1000,6 +999,7 @@ impl InferenceSession {
             join,
             RowOrder::Keyed {
                 key_column: params.key_column.clone(),
+                tie_breakers: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
             },
             spec,
             self.inference_runtime(),

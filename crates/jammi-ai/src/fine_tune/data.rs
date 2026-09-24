@@ -89,7 +89,7 @@ pub enum TrainingFormat {
     /// (WAV/FLAC/MP3/Ogg bytes) or images (PNG/JPEG/… bytes).
     ///
     /// The MODALITY is not carried by this variant and is not sniffed from
-    /// the bytes: it is the job's own [`crate::model::ModelTask`]
+    /// the bytes: it is the job's own [`jammi_datafusion::ModelTask`]
     /// (`audio_embedding` / `image_embedding`), which the loader's caller
     /// already supplies and which the trainer dispatches its front end on.
     /// An encoded WAV and an encoded PNG are both `Vec<u8>`; the column

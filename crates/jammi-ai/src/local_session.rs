@@ -47,13 +47,14 @@ use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::store::{DerivesFromEdge, PinnedSource, Staleness};
 
 use crate::pipeline::recompute::{Cascade, RecomputeReport};
+use jammi_datafusion::ModelTask;
 use jammi_db::trigger::{DeliveredBatch, Offset, Predicate, TopicDefinition, TriggerError};
-use jammi_db::{ModelTask, PerQueryAudit, ServerInfo, TenantId, TopicId};
+use jammi_db::{PerQueryAudit, ServerInfo, TenantId, TopicId};
 
 use crate::eval::{CompareEvalReport, EmbeddingEvalReport, EvalTask, InferenceEvalReport};
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
-use crate::model::ModelSource;
 use crate::session::InferenceSession;
+use jammi_datafusion::ModelSource;
 
 /// The request / result vocabulary lives on the wire substrate so the gRPC
 /// converters can satisfy the orphan rule; re-exported here so an embedded

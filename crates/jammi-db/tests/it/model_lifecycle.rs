@@ -22,6 +22,7 @@
 
 use std::str::FromStr;
 
+use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
@@ -30,7 +31,6 @@ use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::JammiError;
-use jammi_db::model_task::ModelTask;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;

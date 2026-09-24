@@ -7,8 +7,9 @@ use tempfile::TempDir;
 use jammi_ai::fine_tune::{
     data::TrainingDataLoader, trainer::compute_lr, FineTuneConfig, FineTuneMethod, LrSchedule,
 };
-use jammi_ai::model::{ModelSource, ModelTask};
 use jammi_ai::session::InferenceSession;
+use jammi_datafusion::ModelSource;
+use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_lora::LoraLinear;
 

@@ -203,8 +203,8 @@ mod gauges {
     use jammi_ai::fine_tune::worker::WorkerShared;
     use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
     use jammi_ai::jobs::{compute_test_hooks, ComputeSpec};
-    use jammi_ai::model::ModelTask;
     use jammi_ai::session::InferenceSession;
+    use jammi_datafusion::ModelTask;
     use jammi_db::config::{JammiConfig, WorkerKinds};
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use jammi_db::store::CachePolicy;

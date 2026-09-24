@@ -69,7 +69,7 @@ fetch() {
     rm -f "$dir/$jar" "$dir/$archive"
   fi
   # A server that is not the pinned build is a corrupt cache, never a catalog.
-  "$dir/bin/postgres" --version | grep -q "PostgreSQL) ${VERSION%.0}" || die "$dir/bin/postgres is not PostgreSQL ${VERSION%.0}"
+  grep -q "PostgreSQL) ${VERSION%.0}" <<<"$("$dir/bin/postgres" --version)" || die "$dir/bin/postgres is not PostgreSQL ${VERSION%.0}"
   echo "$dir/bin"
 }
 

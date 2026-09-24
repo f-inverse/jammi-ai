@@ -473,7 +473,7 @@ gang_on_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$GANG_YML" 2>&1)"
 gang_on_rc=$?
 if [ "$gang_on_rc" -ne 0 ]; then
   bad "G7: cannot examine gpu-gang.yml's on: block -- $gang_on_keys"
-elif printf '%s\n' "$gang_on_keys" | grep -qx schedule; then
+elif grep -qx schedule <<<"$gang_on_keys"; then
   bad "G7: gpu-gang.yml carries a schedule: key -- NO cron of any kind may fire this paid two-GPU lane"
 else
   ok "G7: gpu-gang.yml carries no schedule: key (read through the shared on: block reader)"
@@ -485,7 +485,7 @@ g7_quoted="$SANDBOX/g7-quoted-schedule.yml"
 printf 'on:\n  "schedule":\n    - cron: "30 8 * * *"\n  workflow_dispatch:\n' > "$g7_quoted"
 g7q_keys="$(python3 "$PROVE_ONCE_PY" --read-on-block "$g7_quoted")"
 g7q_rc=$?
-if [ "$g7q_rc" -eq 0 ] && printf '%s\n' "$g7q_keys" | grep -qx schedule; then
+if [ "$g7q_rc" -eq 0 ] && grep -qx schedule <<<"$g7q_keys"; then
   ok "G7: a quoted \"schedule\": key is read as schedule (quote-normalized, never silently dropped)"
 else
   bad "G7: expected a quoted \"schedule\": key to be read as schedule; got rc=${g7q_rc} keys=${g7q_keys}"

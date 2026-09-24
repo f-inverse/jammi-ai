@@ -148,9 +148,9 @@ RP_SSHO=(); RP_PORT=22; RP_HOST=localhost
 out="$(rp_run_remote_watched 3 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 76 ] \
-  && echo "$out" | grep -q 'NO PROGRESS' \
-  && echo "$out" | grep -q 'group "served-client-server-proof"' \
-  && echo "$out" | grep -q 'groups: \[capability-surface-build:0\]'; then
+  && grep -q 'NO PROGRESS' <<<"$out" \
+  && grep -q 'group "served-client-server-proof"' <<<"$out" \
+  && grep -q 'groups: \[capability-surface-build:0\]' <<<"$out"; then
   ok "inactivity kill: inactivity kill -> 76, names the open group, lists [name:rc...]"
 else
   bad "inactivity kill: expected 76 + named group + list; got rc=$rc out=$out"
@@ -168,7 +168,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'BUDGET' && echo "$out" | grep -q 'groups: \[kernels-default:0\]'; then
+if [ "$rc" -eq 124 ] && grep -q 'BUDGET' <<<"$out" && grep -q 'groups: \[kernels-default:0\]' <<<"$out"; then
   ok "budget cut: budget cut -> 124, lists [name:rc...]"
 else
   bad "budget cut: expected 124 + list; got rc=$rc out=$out"
@@ -182,7 +182,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'groups: \[\]'; then
+if [ "$rc" -eq 124 ] && grep -q 'groups: \[\]' <<<"$out"; then
   ok "budget cut: N=0 groups renders as []"
 else
   bad "budget cut: expected groups: []; got rc=$rc out=$out"
@@ -205,7 +205,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 124 ] && ! echo "$out" | grep -q 'BUDGET'; then
+if [ "$rc" -eq 124 ] && ! grep -q 'BUDGET' <<<"$out"; then
   ok "pass-through: in-suite 124 (PROVE_EXIT=124 present) -> 124 verbatim, no BUDGET line"
 else
   bad "pass-through: expected 124 with no BUDGET line; got rc=$rc out=$out"
@@ -219,7 +219,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 76 ] && ! echo "$out" | grep -q 'NO PROGRESS'; then
+if [ "$rc" -eq 76 ] && ! grep -q 'NO PROGRESS' <<<"$out"; then
   ok "pass-through: in-suite 76 (PROVE_EXIT=76 present) passes through unchanged, no watchdog diagnostic"
 else
   bad "pass-through: expected in-suite 76 unchanged; got rc=$rc out=$out"
@@ -229,7 +229,7 @@ ssh() { cat >/dev/null; return 97; }
 export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 97 ] && ! echo "$out" | grep -qE 'NO PROGRESS|BUDGET'; then
+if [ "$rc" -eq 97 ] && ! grep -qE 'NO PROGRESS|BUDGET' <<<"$out"; then
   ok "pass-through: an early exit 97 with no markers passes through verbatim"
 else
   bad "pass-through: expected 97 verbatim with no diagnostic; got rc=$rc out=$out"
@@ -298,7 +298,7 @@ all_groups_pass_log "$log"
 rp_prove_verdict 76 "$log"
 rc=$?
 out="$(rp_prove_verdict 76 "$log" 2>&1 >/dev/null)"
-if [ "$rc" -eq 0 ] && echo "$out" | grep -q '::warning::'; then
+if [ "$rc" -eq 0 ] && grep -q '::warning::' <<<"$out"; then
   ok "bench non-gating: a cut INSIDE bench with every proof group already rc=0 -> 0 + ::warning::"
 else
   bad "bench non-gating: expected 0 + warning, got rc=$rc out=$out"
@@ -607,7 +607,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched 1 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 76 ] && echo "$out" | grep -q 'groups: \[engine-core-sweep:0\]'; then
+if [ "$rc" -eq 76 ] && grep -q 'groups: \[engine-core-sweep:0\]' <<<"$out"; then
   ok "partial-line-at-poll-boundary: a marker split across two polls is reassembled correctly"
 else
   bad "partial-line-at-poll-boundary: expected engine-core-sweep:0 in the group list; got rc=$rc out=$out"
@@ -633,9 +633,9 @@ export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 124 ] \
-  && echo "$out" | grep -q 'group "kernels-cuda"' \
-  && ! echo "$out" | grep -q 'kernels-cuda::group::kernels-cuda' \
-  && echo "$out" | grep -q 'groups: \[kernels-default:0\]'; then
+  && grep -q 'group "kernels-cuda"' <<<"$out" \
+  && ! grep -q 'kernels-cuda::group::kernels-cuda' <<<"$out" \
+  && grep -q 'groups: \[kernels-default:0\]' <<<"$out"; then
   ok "final-drain carry: an unterminated last ::group:: line names the group once, never doubled"
 else
   bad "final-drain carry: unterminated ::group:: line mishandled; rc=$rc out=$out"
@@ -650,7 +650,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'groups: \[kernels-cuda:0\]'; then
+if [ "$rc" -eq 124 ] && grep -q 'groups: \[kernels-cuda:0\]' <<<"$out"; then
   ok "final-drain carry: an unterminated last PROVE_GROUP_RC marker is still parsed (not dropped, not doubled)"
 else
   bad "final-drain carry: unterminated PROVE_GROUP_RC marker mishandled; rc=$rc out=$out"
@@ -675,9 +675,9 @@ export -f ssh
 out="$(rp_run_remote_watched 1 0.2 <<< "noop" 2>&1)"
 rc=$?
 if [ "$rc" -eq 76 ] \
-  && echo "$out" | grep -q 'group "kernels-cuda"' \
-  && ! echo "$out" | grep -q 'kernels-default"; groups: \[\]' \
-  && echo "$out" | grep -q 'groups: \[kernels-default:0\]'; then
+  && grep -q 'group "kernels-cuda"' <<<"$out" \
+  && ! grep -q 'kernels-default"; groups: \[\]' <<<"$out" \
+  && grep -q 'groups: \[kernels-default:0\]' <<<"$out"; then
   ok "kill-arm final-drain carry: an unterminated last ::group:: line names the CORRECT (newly-opened) group, never the stale previous one"
 else
   bad "kill-arm final-drain carry: unterminated ::group:: line mishandled under the 76 path; rc=$rc out=$out"
@@ -692,7 +692,7 @@ ssh() {
 export -f ssh
 out="$(rp_run_remote_watched 1 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 76 ] && echo "$out" | grep -q 'groups: \[kernels-cuda:0\]'; then
+if [ "$rc" -eq 76 ] && grep -q 'groups: \[kernels-cuda:0\]' <<<"$out"; then
   ok "kill-arm final-drain carry: an unterminated last PROVE_GROUP_RC marker is still parsed under the 76 path (not dropped)"
 else
   bad "kill-arm final-drain carry: unterminated PROVE_GROUP_RC marker mishandled under the 76 path; rc=$rc out=$out"
@@ -719,7 +719,7 @@ export -f ssh
 PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched 3 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}"; then
+if [ "$rc" -eq 77 ] && grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}" <<<"$out"; then
   ok "wrong-tree: a disagreeing PROVE_SHA on a growth tick -> 77 within one poll tick"
 else
   bad "wrong-tree: expected 77 + WRONG TREE diagnostic on a growth tick; got rc=$rc out=$out"
@@ -740,7 +740,7 @@ export -f ssh
 PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}"; then
+if [ "$rc" -eq 77 ] && grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}" <<<"$out"; then
   ok "wrong-tree: a mismatching PROVE_SHA landing only in the final flush -> 77"
 else
   bad "wrong-tree: expected 77 + WRONG TREE diagnostic from the final flush; got rc=$rc out=$out"
@@ -760,7 +760,7 @@ export -f ssh
 PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=none"; then
+if [ "$rc" -eq 77 ] && grep -q "WRONG TREE expected=${GOOD_SHA} got=none" <<<"$out"; then
   ok "wrong-tree: PROVE_EXPECT_SHA set but no PROVE_SHA= line ever observed -> 77 (absence is a failure)"
 else
   bad "wrong-tree: expected 77 + got=none; got rc=$rc out=$out"
@@ -800,7 +800,7 @@ export -f ssh
 unset PROVE_EXPECT_SHA
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 0 ] && ! echo "$out" | grep -q "WRONG TREE"; then
+if [ "$rc" -eq 0 ] && ! grep -q "WRONG TREE" <<<"$out"; then
   ok "wrong-tree: PROVE_EXPECT_SHA unset -> no check even on a mismatching PROVE_SHA (hand runs have no record to protect)"
 else
   bad "wrong-tree: PROVE_EXPECT_SHA unset should never check identity; got rc=$rc out=$out"
@@ -826,7 +826,7 @@ export -f ssh
 PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 255 ] && ! echo "$out" | grep -q "WRONG TREE"; then
+if [ "$rc" -eq 255 ] && ! grep -q "WRONG TREE" <<<"$out"; then
   ok "wrong-tree: absence + remote rc 255 -> 255 verbatim, never relabeled 77"
 else
   bad "wrong-tree: expected 255 with no WRONG TREE diagnostic; got rc=$rc out=$out"
@@ -845,7 +845,7 @@ export -f ssh
 PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 124 ] && echo "$out" | grep -q 'BUDGET' && ! echo "$out" | grep -q "WRONG TREE"; then
+if [ "$rc" -eq 124 ] && grep -q 'BUDGET' <<<"$out" && ! grep -q "WRONG TREE" <<<"$out"; then
   ok "wrong-tree: absence + rc 124 with no PROVE_EXIT -> 124 AND the BUDGET diagnostic still fires"
 else
   bad "wrong-tree: expected 124 + BUDGET, no WRONG TREE; got rc=$rc out=$out"
@@ -863,7 +863,7 @@ export -f ssh
 PROVE_EXPECT_SHA="$GOOD_SHA"
 out="$(rp_run_remote_watched "" 0.2 <<< "noop" 2>&1)"
 rc=$?
-if [ "$rc" -eq 77 ] && echo "$out" | grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}"; then
+if [ "$rc" -eq 77 ] && grep -q "WRONG TREE expected=${GOOD_SHA} got=${BAD_SHA}" <<<"$out"; then
   ok "wrong-tree: mismatch + rc 255 -> still 77 (mismatch wins regardless of rc)"
 else
   bad "wrong-tree: expected 77 despite rc 255; got rc=$rc out=$out"

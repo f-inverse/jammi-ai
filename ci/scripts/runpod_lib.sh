@@ -1031,7 +1031,7 @@ else
     [ -n "\$claim_wave" ] && [ -n "\$claim_tree" ] || continue
     claim_session="jammi-\$claim_tree"
     [ "\$claim_session" = '${own_session}' ] && continue
-    printf '%s\\n' "\$live" | grep -Fxq -e "\$claim_session" || continue
+    grep -Fxq -e "\$claim_session" <<<"\$live" || continue
     holders=\$((holders + 1))
     if [ "\$claim_wave" != '${own_wave}' ]; then
       busy_wave="\$claim_wave"
@@ -1347,7 +1347,7 @@ if [ -f '${tree_dir}/.jammi.exit' ]; then
     echo "job completion marker at ${tree_dir}/.jammi.exit is malformed: \$marker"
     exit 1
   fi
-  if printf '%s' "\$marker" | grep -q '"lock_refused":true'; then
+  if grep -q '"lock_refused":true' <<<"\$marker"; then
     echo "job REFUSED: the shared pod-wide timing lock was already held (rc=75) -- \$marker"
     exit 1
   fi
@@ -3013,7 +3013,7 @@ except Exception as e:
       unjudged+=("pod ${age} (${why}): $([ "$id" = "UNAGEABLE" ] && echo 'no usable createdAt' || echo 'no parseable -ttl<H> in its name') — retire it by id with rp_terminate ${age} if it is an orphan")
       continue
     fi
-    if [ -n "$member_ids" ] && printf '%s\n' "$member_ids" | grep -qxF -- "$id"; then
+    if [ -n "$member_ids" ] && grep -qxF -- "$id" <<<"$member_ids"; then
       echo "cluster member, skipped: ${id}"
       continue
     fi

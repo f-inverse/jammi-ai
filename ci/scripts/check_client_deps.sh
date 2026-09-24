@@ -28,8 +28,8 @@
 #   check_client_deps.sh substrate|cli
 #   check_client_deps.sh --self-test
 #     (drives the assertion logic below against synthetic compiler-artifact
-#     fixtures, incl. >1 MB streams sized well past one pipe buffer to
-#     genuinely reproduce the SIGPIPE class below; no cargo, no network)
+#     fixtures, incl. >1 MB streams sized well past one pipe buffer so the
+#     SIGPIPE class below fires on every run; no cargo, no network)
 #   check_client_deps.sh --assert-boundary <mode> <artifacts-file>
 #     (internal only — see `_run_assert_boundary`'s own comment for why
 #     `--self-test` invokes this as a genuinely separate process)
@@ -92,9 +92,9 @@ extract_artifacts() {
 # package, 2 on an unknown mode.
 #
 # Every grep below reads `$2` — a FILE — directly, never a variable piped
-# through `printf | grep -q`: on a stream bigger than one pipe buffer,
-# `grep -q` exits at its first match and SIGPIPEs the upstream writer,
-# which `pipefail` turns into a spurious 141 that flips the verdict — a
+# through `printf | grep -q`: `grep -q` exits at its first match, and a
+# writer with anything left to write takes SIGPIPE — which `pipefail`
+# turns into a spurious 141 that flips the verdict — a
 # false "package never appeared" (this function's package-presence loop, on
 # ANY mode) or a false-GREEN swallowed real violation (the cli-only
 # jammi-ai check below, the dangerous direction: an early match reads as no
@@ -161,12 +161,13 @@ assert_boundary() {
 }
 
 # Prints `$1` harmless compiler-artifact lines — padding to a size that
-# genuinely reproduces the SIGPIPE class this file's grep-a-file-not-a-pipe
-# discipline defends against (a stream too big for a pipe buffer to hold
-# whole, so a `grep -q` that matches near the front of the stream genuinely
-# outruns and kills a writer still filling the pipe). A fixture that fits
-# in one pipe write would pass even on the buggy `printf | grep -q` shape,
-# silently under-covering a reintroduced regression.
+# reproduces the SIGPIPE class this file's grep-a-file-not-a-pipe
+# discipline defends against on EVERY run (a stream too big for a pipe
+# buffer to hold whole, so a `grep -q` that matches near the front of the
+# stream always outruns and kills a writer still filling the pipe). A small
+# fixture races too — bash's `printf` writes line by line — but loses the
+# race only when the writer is descheduled between two lines, so it would
+# pass the buggy `printf | grep -q` shape almost every time.
 _gen_filler() {
   awk -v n="$1" 'BEGIN{for(i=0;i<n;i++) print "{\"reason\":\"compiler-artifact\",\"manifest_path\":\"/build/filler/Cargo.toml\"}"}'
 }
@@ -220,13 +221,13 @@ _self_test() {
   trap 'rm -rf "$work"' EXIT
 
   # The four SIGPIPE-class fixtures below carry ~14,000 filler lines
-  # (1,036,000 B measured) after/around the line that matters. The
-  # portable trigger for the SIGPIPE'd `printf | grep -q` shape this file
-  # replaced is ONE PIPE BUFFER — 64 KiB — not any specific "cargo output"
-  # byte count; >1 MB clears that by more than 15x while staying fast. A
-  # much smaller fixture (a two-line, ~70-byte stream) fits inside one pipe
-  # write and would pass even on the unfixed script, silently regressing
-  # this self-test's own coverage.
+  # (1,036,000 B measured) after/around the line that matters. What makes
+  # the SIGPIPE'd `printf | grep -q` shape this file replaced fail on EVERY
+  # run is a stream larger than ONE PIPE BUFFER — 64 KiB — not any specific
+  # "cargo output" byte count; >1 MB clears that by more than 15x while
+  # staying fast. A much smaller fixture (a two-line, ~70-byte stream)
+  # fails the unfixed script only when its writer is descheduled between
+  # lines, so it would pass almost every run.
   local filler=14000
 
   # Fixture 1: substrate, clean, LARGE — jammi-wire's line sits FIRST
@@ -275,7 +276,7 @@ _self_test() {
     out="$(_run_assert_boundary cli "$work/cli-violation.artifacts")" || rc=$?
   fi
   total=$((total + 1))
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF 'the jammi CLI compiled jammi-ai'; then
+  if [ "$rc" -eq 1 ] && grep -qF 'the jammi CLI compiled jammi-ai' <<<"$out"; then
     echo "self-test[cli-jammi-ai-violation-large-stream]: OK (exit 1, jammi-ai error present)"
   else
     echo "self-test[cli-jammi-ai-violation-large-stream]: FAIL (exit $rc, expected 1 with the jammi-ai error)" >&2
@@ -321,7 +322,7 @@ _self_test() {
     out="$(_run_assert_boundary substrate "$work/substrate-missing.artifacts")" || rc=$?
   fi
   total=$((total + 1))
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF 'jammi-client never appeared'; then
+  if [ "$rc" -eq 1 ] && grep -qF 'jammi-client never appeared' <<<"$out"; then
     echo "self-test[substrate-missing-package]: OK (exit 1, missing-package error present)"
   else
     echo "self-test[substrate-missing-package]: FAIL (exit $rc, expected 1 with the missing-package error)" >&2
@@ -348,7 +349,7 @@ _self_test() {
     out="$(_run_assert_boundary substrate "$work/substrate-ml-violation.artifacts")" || rc=$?
   fi
   total=$((total + 1))
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF 'the candle-free boundary regressed'; then
+  if [ "$rc" -eq 1 ] && grep -qF 'the candle-free boundary regressed' <<<"$out"; then
     echo "self-test[substrate-ml-dep-violation]: OK (exit 1, ml_error present)"
   else
     echo "self-test[substrate-ml-dep-violation]: FAIL (exit $rc, expected 1 with ml_error)" >&2
@@ -373,7 +374,7 @@ _self_test() {
     out="$(_run_assert_boundary cli "$work/cli-ml-violation.artifacts")" || rc=$?
   fi
   total=$((total + 1))
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF 'the strict-client boundary regressed'; then
+  if [ "$rc" -eq 1 ] && grep -qF 'the strict-client boundary regressed' <<<"$out"; then
     echo "self-test[cli-ml-dep-violation]: OK (exit 1, ml_error present)"
   else
     echo "self-test[cli-ml-dep-violation]: FAIL (exit $rc, expected 1 with ml_error)" >&2

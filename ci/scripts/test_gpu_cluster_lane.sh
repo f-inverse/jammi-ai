@@ -192,7 +192,7 @@ rm -f "$SANDBOX/rp-cleanup-called"
 out="$(MOCK_SELF_REMOVE_STATUS="200" MOCK_DELETE_OK="0" \
   run_cleanup_in_subshell "cl-test-3" 0 2>&1)"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "LEAKED cluster cl-test-3"; then
+if [ "$rc" -ne 0 ] && grep -q "LEAKED cluster cl-test-3" <<<"$out"; then
   ok "a failed rp_cluster_delete on exit is LEAKED, naming the cluster id, and joins the exit status non-zero"
 else
   bad "expected a non-zero exit naming 'LEAKED cluster cl-test-3' (rc=$rc): $out"
@@ -304,7 +304,7 @@ carrier_intact() { # $1=carrier dir -> 0 iff run.log AND both rank logs survive 
 # it was.
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 0 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 1 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir"; then
+if [ "$trap_rc" -eq 1 ] && grep -q "gang-id-secrecy-scan: clean" <<<"$scan_out" && carrier_intact "$carrier_dir"; then
   ok "'assembly refused' arm (never claimed, clean carrier) -> the scan ran (clean), rc=1 preserved, run.log + rank logs REMAIN at the upload path"
 else
   bad "'assembly refused' arm: expected rc=1 + a clean scan + intact carrier; got rc=$trap_rc carrier_intact=$(carrier_intact "$carrier_dir" && echo yes || echo no) out=$scan_out"
@@ -319,7 +319,7 @@ rm -rf "$(dirname "$carrier_dir")"
 # path -- the only evidence a reviewer has on exactly this arm.
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 0 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 1 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir"; then
+if [ "$trap_rc" -eq 1 ] && grep -q "gang-id-secrecy-scan: clean" <<<"$scan_out" && carrier_intact "$carrier_dir"; then
   ok "'pull failed' arm (never claimed, clean carrier) -> the scan ran (clean), the exit code is the arm's own (not 2), run.log + rank logs REMAIN at the upload path"
 else
   bad "'pull failed' arm: expected rc=1 (not 2) + a clean scan + intact carrier; got rc=$trap_rc carrier_intact=$(carrier_intact "$carrier_dir" && echo yes || echo no) out=$scan_out"
@@ -333,7 +333,7 @@ rm -rf "$(dirname "$carrier_dir")"
 # assembly must not weaken the scan's own strictness about an actual leak.
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 1 1 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -ne 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: HIT" && carrier_is_clean "$carrier_dir"; then
+if [ "$trap_rc" -ne 0 ] && grep -q "gang-id-secrecy-scan: HIT" <<<"$scan_out" && carrier_is_clean "$carrier_dir"; then
   ok "planted-id refusal arm (pull failed, dirty carrier, never claimed assembly) -> the scan ran (HIT), the carrier is DESTROYED, nothing reaches the upload path"
 else
   bad "planted-id refusal arm: expected a HIT scan + a destroyed carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
@@ -345,7 +345,7 @@ rm -rf "$(dirname "$carrier_dir")"
 # code (124) survives verbatim, and the carrier stays intact.
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 124 0 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 124 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir"; then
+if [ "$trap_rc" -eq 124 ] && grep -q "gang-id-secrecy-scan: clean" <<<"$scan_out" && carrier_intact "$carrier_dir"; then
   ok "'budget cut' arm (never claimed, clean carrier) -> the scan ran (clean), the named exit code 124 survives verbatim, carrier intact"
 else
   bad "'budget cut' arm: expected rc=124 + a clean scan + intact carrier; got rc=$trap_rc out=$scan_out"
@@ -359,7 +359,7 @@ rm -rf "$(dirname "$carrier_dir")"
 # rp_cluster_verdict's own priority doctrine).
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 77 1 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 77 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: HIT" && carrier_is_clean "$carrier_dir"; then
+if [ "$trap_rc" -eq 77 ] && grep -q "gang-id-secrecy-scan: HIT" <<<"$scan_out" && carrier_is_clean "$carrier_dir"; then
   ok "'wrong tree' arm (rc=77, dirty carrier) -> the scan ran (HIT), DESTROYED the carrier, AND the named exit code 77 survives verbatim"
 else
   bad "'wrong tree' arm: expected rc=77 + a HIT scan + a destroyed carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
@@ -372,7 +372,7 @@ rm -rf "$(dirname "$carrier_dir")"
 # proving assembly_ok=1 does not itself break the ordinary pass arm.
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 0 0 1 1)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -eq 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: clean" && carrier_intact "$carrier_dir" && [ -f "$carrier_dir/assembled.json" ]; then
+if [ "$trap_rc" -eq 0 ] && grep -q "gang-id-secrecy-scan: clean" <<<"$scan_out" && carrier_intact "$carrier_dir" && [ -f "$carrier_dir/assembled.json" ]; then
   ok "happy-path arm (assembly claimed, file present, clean) -> the scan still requires and finds the assembled artifact, passes clean, rc=0 preserved"
 else
   bad "happy-path arm: expected rc=0 + a clean scan + the assembled artifact present; got rc=$trap_rc out=$scan_out"
@@ -388,7 +388,7 @@ rm -rf "$(dirname "$carrier_dir")"
 # wiring, not just the scanner in isolation.
 IFS=$'\t' read -r trap_rc carrier_dir out_b64 <<< "$(run_trap_scan_arm 0 0 1 0)"
 scan_out="$(printf '%s' "$out_b64" | base64 -d)"
-if [ "$trap_rc" -ne 0 ] && printf '%s' "$scan_out" | grep -q "gang-id-secrecy-scan: UNEXAMINABLE" && carrier_is_clean "$carrier_dir"; then
+if [ "$trap_rc" -ne 0 ] && grep -q "gang-id-secrecy-scan: UNEXAMINABLE" <<<"$scan_out" && carrier_is_clean "$carrier_dir"; then
   ok "'claimed but missing' arm (assembly_ok=1, file absent) -> UNEXAMINABLE, never clean, carrier DESTROYED -- happy-path strictness holds"
 else
   bad "'claimed but missing' arm: expected a non-zero rc + UNEXAMINABLE + a destroyed carrier; got rc=$trap_rc carrier_clean=$(carrier_is_clean "$carrier_dir" && echo yes || echo no) out=$scan_out"
@@ -410,7 +410,7 @@ rc75_out="$(bash -c '
   _rpc_cleanup_cluster
 ' 2>&1)"
 rc75=$?
-if [ "$rc75" -eq 75 ] && ! printf '%s' "$rc75_out" | grep -q "gang-id-secrecy-scan"; then
+if [ "$rc75" -eq 75 ] && ! grep -q "gang-id-secrecy-scan" <<<"$rc75_out"; then
   ok "id_landed=0 (the id never reached this runner) -> the trap never invokes the scanner at all"
 else
   bad "expected no scanner invocation when id_landed is unset; rc=$rc75 out=$rc75_out"
@@ -881,8 +881,8 @@ print(json.dumps(body))
 body="$(readback_body "bash -c '${SETUP_TEXT}'" '{"direct":{"host":"1.2.3.4","port":22}}' "10.0.0.2" \
   "bash -c '${SETUP_TEXT}'" '{"direct":{"host":"5.6.7.8","port":22}}' "10.0.0.3")"
 out="$(_rpc_check_readback "$body" "$SETUP_TEXT")"
-if printf '%s' "$out" | grep -q "^primary 0 READBACK_OK 10.0.0.2 1.2.3.4 22$" \
-  && printf '%s' "$out" | grep -q "^member 1 READBACK_OK 10.0.0.3 5.6.7.8 22$"; then
+if grep -q "^primary 0 READBACK_OK 10.0.0.2 1.2.3.4 22$" <<<"$out" \
+  && grep -q "^member 1 READBACK_OK 10.0.0.3 5.6.7.8 22$" <<<"$out"; then
   ok "both members with matching args + direct ssh -> READBACK_OK, host/port carried"
 else
   bad "expected both READBACK_OK with host/port; got: $out"
@@ -891,7 +891,7 @@ fi
 body="$(readback_body "bash -c 'not the setup'" '{"direct":{"host":"1.2.3.4","port":22}}' "10.0.0.2" \
   "bash -c '${SETUP_TEXT}'" '{"direct":{"host":"5.6.7.8","port":22}}' "10.0.0.3")"
 out="$(_rpc_check_readback "$body" "$SETUP_TEXT")"
-if printf '%s' "$out" | grep -q "READBACK_ARGS_MISMATCH"; then
+if grep -q "READBACK_ARGS_MISMATCH" <<<"$out"; then
   ok "a member whose args do not echo the setup text -> READBACK_ARGS_MISMATCH"
 else
   bad "expected READBACK_ARGS_MISMATCH; got: $out"
@@ -900,7 +900,7 @@ fi
 body="$(readback_body "bash -c '${SETUP_TEXT}'" '{"direct":{"host":"1.2.3.4","port":22}}' "10.0.0.2" \
   "bash -c '${SETUP_TEXT}'" '{}' "")"
 out="$(_rpc_check_readback "$body" "$SETUP_TEXT")"
-if printf '%s' "$out" | grep -q "READBACK_NO_SSH_PATH"; then
+if grep -q "READBACK_NO_SSH_PATH" <<<"$out"; then
   ok "a member with NO ssh.direct and NO overlay ip -> READBACK_NO_SSH_PATH"
 else
   bad "expected READBACK_NO_SSH_PATH; got: $out"
@@ -909,14 +909,14 @@ fi
 body="$(readback_body "bash -c '${SETUP_TEXT}'" '{"direct":{"host":"1.2.3.4","port":22}}' "10.0.0.2" \
   "bash -c '${SETUP_TEXT}'" '{}' "10.0.0.3")"
 out="$(_rpc_check_readback "$body" "$SETUP_TEXT")"
-if printf '%s' "$out" | grep -q "^member 1 READBACK_OK 10.0.0.3 - -$"; then
+if grep -q "^member 1 READBACK_OK 10.0.0.3 - -$" <<<"$out"; then
   ok "a member with NO ssh.direct but a usable overlay ip -> still READBACK_OK (the no-public-port fallback)"
 else
   bad "expected member READBACK_OK with dash host/port (proxy fallback); got: $out"
 fi
 
 out="$(_rpc_check_readback "not json at all" "$SETUP_TEXT" 2>/dev/null)"; rc=$?
-if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "PARSE_ERROR"; then
+if [ "$rc" -eq 2 ] && grep -q "PARSE_ERROR" <<<"$out"; then
   ok "an unparseable pods response -> rc=2, named PARSE_ERROR"
 else
   bad "expected rc=2 + PARSE_ERROR on unparseable body; got rc=$rc out=$out"
@@ -949,7 +949,7 @@ pod = lambda pid, rank: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"r
 print(json.dumps({"pods": [pod("a", 0), pod("b", 0)]}))
 ')"
 IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$dup_rank0_body" 1)"
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "rank 0 seen: 1, rank 1 seen: 0"; then
+if [ "$rc" -eq 97 ] && grep -q "rank 0 seen: 1, rank 1 seen: 0" <<<"$out"; then
   ok "two rows BOTH claiming rank 0 (rank 1 never seen) -> refused (97), never read as ready by a raw count"
 else
   bad "expected rc=97 naming 'rank 0 seen: 1, rank 1 seen: 0'; got rc=$rc out=$out"
@@ -962,7 +962,7 @@ pod = lambda pid, rank: {"id": pid, "args": "bash -c %r" % setup, "cluster": {"r
 print(json.dumps({"pods": [pod("a", 0), pod("b", 1)]}))
 ')"
 IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$ok_ranks_body" 10)"
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 1.2.3.4 22 "; then
+if [ "$rc" -eq 0 ] && grep -q "^1.2.3.4 22 1.2.3.4 22 " <<<"$out"; then
   ok "rank 0 and rank 1 each seen exactly once -> ready (0), both endpoints carried"
 else
   bad "expected rc=0 with both endpoints; got rc=$rc out=$out"
@@ -1041,8 +1041,8 @@ PY
 # IDENTICAL fixture, proving the loop's own readiness gate broke out wrongly
 # (and early) under the mutated shape.
 IFS=$'\t' read -r rc out <<< "$(run_wait_for_members_ready "$dup_rank0_body" 10 "$RAWCOUNT_SCRATCH")"
-if printf '%s' "$out" | grep -q "neither a direct ssh endpoint nor an overlay ip" \
-  && ! printf '%s' "$out" | grep -q "not every member reached a usable ssh path"; then
+if grep -q "neither a direct ssh endpoint nor an overlay ip" <<<"$out" \
+  && ! grep -q "not every member reached a usable ssh path" <<<"$out"; then
   ok "mutation check: a raw-count shape (ok_count -ge 2) breaks the wait loop 'ready' on the duplicate-rank-0/no-rank-1 fixture (proceeds past it into the member-resolution phase with rank 1 unset) — the distinct-rank tracking above is load-bearing, not vacuous"
 else
   bad "mutation check: expected the raw-count shape to break out of the wait loop early (a different, generic downstream failure, never the accurate 'not every member reached' refusal); got rc=$rc out=$out — the mutation fixture itself may be stale"
@@ -1089,7 +1089,7 @@ pod = lambda pid, rank, ip, host: {"id": pid, "args": "bash -c %r" % setup, "clu
 print(json.dumps({"pods": [pod("a", 0, "10.0.0.2", "1.2.3.4"), pod("b", 1, "10.0.0.3", "5.6.7.8")]}))
 ')"
 IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20)"
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 5.6.7.8 22 10.0.0.3 0$"; then
+if [ "$rc" -eq 0 ] && grep -q "^1.2.3.4 22 5.6.7.8 22 10.0.0.3 0$" <<<"$out"; then
   ok "overlay-only first read (ssh.direct null on both ranks) -> the loop keeps polling and returns the direct endpoints the second read carries (rc=0, proxy_flag 0)"
 else
   bad "expected rc=0 with both direct endpoints from the second read; got rc=$rc out=$out"
@@ -1099,7 +1099,7 @@ fi
 # endpoint within RP_SSH_WAIT_SECS is refused by name (97), not carried
 # forward as a jump host it cannot be.
 IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$provisioning_body" 1)"
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
+if [ "$rc" -eq 97 ] && grep -q "carries no direct ssh endpoint" <<<"$out"; then
   ok "rank 0 overlay-only through the deadline -> refused by name (97: no direct ssh endpoint / no jump host)"
 else
   bad "expected rc=97 naming the missing direct endpoint at the deadline; got rc=$rc out=$out"
@@ -1137,7 +1137,7 @@ assert old in text, "ready-on-readback mutation fixture: break condition not fou
 open(dst, "w").write(text.replace(old, new, 1))
 PY
 IFS=$'\t' read -r rc out <<< "$(run_wait_two_reads "$provisioning_body" "$ready_body" 20 "$PROVISIONING_SCRATCH")"
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint"; then
+if [ "$rc" -eq 97 ] && grep -q "carries no direct ssh endpoint" <<<"$out"; then
   ok "mutation check: a ready-on-readback break condition refuses the provisioning read at once (97, no direct ssh endpoint) on the fixture the real loop waits through -- the wait is load-bearing"
 else
   bad "mutation check: expected the ready-on-readback shape to refuse at once with 'carries no direct ssh endpoint'; got rc=$rc out=$out -- the mutation fixture itself may be stale"
@@ -1162,7 +1162,7 @@ grace_elapsed=$(( SECONDS - grace_t0 ))
 # The property is the TIME: a loop without the grace reaches the same line
 # by running to the deadline (40 s here); the grace settles it within two
 # polls.
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$" && [ "$grace_elapsed" -lt 20 ]; then
+if [ "$rc" -eq 0 ] && grep -q "^1.2.3.4 22 10.0.0.3 22 10.0.0.3 1$" <<<"$out" && [ "$grace_elapsed" -lt 20 ]; then
   ok "rank 0 direct + rank 1 overlay-only past the grace -> ready with the proxy fallback (rc=0, member=overlay ip, proxy_flag 1) in ${grace_elapsed}s, not the 40 s window"
 else
   bad "expected rc=0 with the proxy-fallback line within 20 s (grace 1 s); got rc=$rc elapsed=${grace_elapsed}s out=$out"
@@ -1181,7 +1181,7 @@ print(json.dumps({"pods": [p0, p1]}))
 grace_t0=$SECONDS
 IFS=$'\t' read -r rc out <<< "$(RP_SSH_MIXED_GRACE_SECS=1 run_wait_two_reads "$mixed_r1_body" "$mixed_r1_body" 40)"
 grace_elapsed=$(( SECONDS - grace_t0 ))
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "carries no direct ssh endpoint" && [ "$grace_elapsed" -lt 20 ]; then
+if [ "$rc" -eq 97 ] && grep -q "carries no direct ssh endpoint" <<<"$out" && [ "$grace_elapsed" -lt 20 ]; then
   ok "rank 1 direct + rank 0 overlay-only past the grace -> refused by name (97) in ${grace_elapsed}s, not the 40 s window"
 else
   bad "expected rc=97 naming the missing rank-0 endpoint within 20 s; got rc=$rc elapsed=${grace_elapsed}s out=$out"
@@ -1243,7 +1243,7 @@ else
   bad "expected an empty NATIVE_COMPUTE_CAP for an out-of-domain id; got '$got'"
 fi
 if grep -q 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" \
-  && awk '/-z "\$NATIVE_COMPUTE_CAP"/{f=1} f && /exit 2/{print "refuses"; exit}' "$CLUSTER_SH" | grep -q refuses \
+  && grep -q refuses <<<"$(awk '/-z "\$NATIVE_COMPUTE_CAP"/{f=1} f && /exit 2/{print "refuses"; exit}' "$CLUSTER_SH")" \
   && [ "$(grep -n 'if \[ -z "\$NATIVE_COMPUTE_CAP" \]; then' "$CLUSTER_SH" | cut -d: -f1)" -lt "$(grep -n '_rpc_phase "availability read' "$CLUSTER_SH" | head -1 | cut -d: -f1)" ]; then
   ok "the empty-cap refusal (exit 2) sits BEFORE phase 0's availability read -- nothing is rented on an out-of-domain id (either transport)"
 else
@@ -1411,8 +1411,8 @@ else
 fi
 if err="$(_rpc_choose_data_center "US-GA-2 CA-MTL-1" "EU-NL-1" 2>&1 >/dev/null)"; then
   bad "_rpc_choose_data_center: a name outside the candidates was accepted"
-elif printf '%s' "$err" | grep -qF 'RP_CLUSTER_DC=EU-NL-1 is not a co-located candidate' \
-  && printf '%s' "$err" | grep -qF 'candidates: US-GA-2 CA-MTL-1'; then
+elif grep -qF 'RP_CLUSTER_DC=EU-NL-1 is not a co-located candidate' <<<"$err" \
+  && grep -qF 'candidates: US-GA-2 CA-MTL-1' <<<"$err"; then
   ok "_rpc_choose_data_center: a name outside the candidates is refused naming it and the candidates"
 else
   bad "_rpc_choose_data_center: the refusal does not name the choice and the candidates: $err"
@@ -1669,7 +1669,7 @@ done
 # ============================================================================
 g7_out="$(python3 "$PROVE_ONCE_PY" --read-on-block "$CLUSTER_YML" 2>&1)"
 g7_rc=$?
-if [ "$g7_rc" -eq 0 ] && ! printf '%s\n' "$g7_out" | grep -qx "schedule"; then
+if [ "$g7_rc" -eq 0 ] && ! grep -qx "schedule" <<<"$g7_out"; then
   ok "gpu-cluster.yml carries no schedule: key (read through the shared on: block reader)"
 else
   bad "expected gpu-cluster.yml to carry no schedule: key; got rc=${g7_rc} out=${g7_out}"
@@ -1736,7 +1736,7 @@ run_wait_two_host_pods() { # $1=body0 $2=body1 $3=wait_secs $4=driver path (defa
 ok_body0="$(pod_json pod-0 RUNNING dc-a true 10.0.0.2 1.2.3.4 22)"
 ok_body1="$(pod_json pod-1 RUNNING dc-a true 10.0.0.3 5.6.7.8 22)"
 IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$ok_body1" 10)"
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "^1.2.3.4 22 5.6.7.8 22 dc-a 10.0.0.2 10.0.0.3$"; then
+if [ "$rc" -eq 0 ] && grep -q "^1.2.3.4 22 5.6.7.8 22 dc-a 10.0.0.2 10.0.0.3$" <<<"$out"; then
   ok "both pods RUNNING, GN-enabled, co-located in dc-a -> ready (0), both endpoints + GN ips carried"
 else
   bad "expected rc=0 with both endpoints and GN ips; got rc=$rc out=$out"
@@ -1744,7 +1744,7 @@ fi
 
 diff_dc_body1="$(pod_json pod-1 RUNNING dc-b true 10.0.0.3 5.6.7.8 22)"
 IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$diff_dc_body1" 6)"
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "DIFFERENT data centers"; then
+if [ "$rc" -eq 97 ] && grep -q "DIFFERENT data centers" <<<"$out"; then
   ok "the two pods landing in DIFFERENT data centers -> refused (97), named, before any build"
 else
   bad "expected rc=97 naming DIFFERENT data centers; got rc=$rc out=$out"
@@ -1752,7 +1752,7 @@ fi
 
 no_gn_body1="$(pod_json pod-1 RUNNING dc-a false null 5.6.7.8 22)"
 IFS=$'\t' read -r rc out <<< "$(run_wait_two_host_pods "$ok_body0" "$no_gn_body1" 1)"
-if [ "$rc" -eq 97 ] && printf '%s' "$out" | grep -q "rank 1 ready: 0"; then
+if [ "$rc" -eq 97 ] && grep -q "rank 1 ready: 0" <<<"$out"; then
   ok "rank 1 never reporting Global Networking enabled -> refused (97) at the deadline, never a silent pass"
 else
   bad "expected rc=97 naming rank 1 unready; got rc=$rc out=$out"
@@ -1869,11 +1869,11 @@ else
 fi
 
 pods_iface_text="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.9 bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
-if printf '%s' "$pods_iface_text" | grep -q 'gn_ip="10.0.0.9"' \
-  && printf '%s' "$pods_iface_text" | grep -qF '/proc/net/route' \
-  && ! printf '%s' "$pods_iface_text" | grep -qF 'ip -o -4 addr show' \
-  && printf '%s' "$pods_iface_text" | grep -qF 'DERIVED_NCCL_IFACE=' \
-  && ! printf '%s' "$pods_iface_text" | grep -qF 'NCCL_SOCKET_IFNAME=ens1'; then
+if grep -q 'gn_ip="10.0.0.9"' <<<"$pods_iface_text" \
+  && grep -qF '/proc/net/route' <<<"$pods_iface_text" \
+  && ! grep -qF 'ip -o -4 addr show' <<<"$pods_iface_text" \
+  && grep -qF 'DERIVED_NCCL_IFACE=' <<<"$pods_iface_text" \
+  && ! grep -qF 'NCCL_SOCKET_IFNAME=ens1' <<<"$pods_iface_text"; then
   ok "under RP_TWO_HOST_TRANSPORT=pods, _rpc_two_host_iface_lines derives the interface from the rank's own GN ip -- never the ens1 literal"
 else
   bad "expected the pods transport's iface text to derive from RP_TWO_HOST_GN_IP_0 with no ens1 literal; got: ${pods_iface_text}"
@@ -1892,7 +1892,7 @@ printf 'eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n' >> "$IFA
 printf 'eth0\t0000000A\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n' >> "$IFACE_ROUTES"
 printf 'ens7\t0000000A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n' >> "$IFACE_ROUTES"
 match_out="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$pods_iface_text"; echo "RC=$?")"
-if printf '%s' "$match_out" | grep -q 'DERIVED_NCCL_IFACE=ens7' && printf '%s' "$match_out" | grep -q 'RC=0'; then
+if grep -q 'DERIVED_NCCL_IFACE=ens7' <<<"$match_out" && grep -q 'RC=0' <<<"$match_out"; then
   ok "executed end to end, the derivation picks 'ens7' (the interface actually carrying the GN ip) and exits 0"
 else
   bad "expected the executed derivation to pick ens7 and exit 0; got: ${match_out}"
@@ -1900,7 +1900,7 @@ fi
 
 nomatch_iface_text="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$CLUSTER_SH"'"; _rpc_two_host_iface_lines 0')"
 nomatch_out="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text" 2>&1; echo "RC=$?")"
-if printf '%s' "$nomatch_out" | grep -q 'covers the Global-Networking ip 10.9.9.9' && printf '%s' "$nomatch_out" | grep -q 'RC=97'; then
+if grep -q 'covers the Global-Networking ip 10.9.9.9' <<<"$nomatch_out" && grep -q 'RC=97' <<<"$nomatch_out"; then
   ok "executed end to end, an ip with NO matching interface is a NAMED refusal (97), never a silent pass"
 else
   bad "expected the executed derivation to refuse (97) naming the ip; got: ${nomatch_out}"
@@ -1932,7 +1932,7 @@ then
 fi
 nomatch_iface_text_red="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.9.9.9 bash -c 'source "'"$IFACE_SCRATCH"'"; _rpc_two_host_iface_lines 0')"
 nomatch_out_red="$(RP_ROUTE_TABLE="$IFACE_ROUTES" bash -c "$nomatch_iface_text_red"; echo "RC=$?")"
-if printf '%s' "$nomatch_out_red" | grep -q 'RC=0'; then
+if grep -q 'RC=0' <<<"$nomatch_out_red"; then
   ok "mutation check: a hardcoded-interface shape reads the no-match fixture as a SUCCESS (RC=0) -- the real derivation above is load-bearing"
 else
   bad "mutation check: expected the hardcoded-interface shape to succeed on the no-match fixture; got: ${nomatch_out_red} -- the mutation fixture itself may be stale"
@@ -2002,7 +2002,7 @@ fi
 rm -f "$SANDBOX/two-host-cleanup-called"
 out="$(run_two_host_cleanup "pod-0" "pod-1" 0 0 2>&1)"
 rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "LEAKED two-host pod pod-0" && printf '%s' "$out" | grep -q "LEAKED two-host pod pod-1"; then
+if [ "$rc" -ne 0 ] && grep -q "LEAKED two-host pod pod-0" <<<"$out" && grep -q "LEAKED two-host pod pod-1" <<<"$out"; then
   ok "BOTH termination calls failing names BOTH pod ids LEAKED and joins the exit status non-zero"
 else
   bad "expected both pod ids named LEAKED with a non-zero exit; got rc=$rc out=$out"
@@ -2032,7 +2032,7 @@ out="$(bash -c '
   ( exit 0 )
   _rpc_cleanup_cluster
 ' 2>&1)"
-if ! printf '%s' "$out" | grep -q "SHOULD_NOT_BE_CALLED"; then
+if ! grep -q "SHOULD_NOT_BE_CALLED" <<<"$out"; then
   ok "a pods-transport cleanup (cluster_id unset) never invokes the cluster branch's self-remove/delete calls"
 else
   bad "the pods-transport cleanup unexpectedly touched the cluster branch: $out"
@@ -2118,14 +2118,14 @@ run_ssh_ready() { # $1=refusals before success (-1 = never) $2=bound(s)
 rm -f "$SANDBOX/sshready-ssh-calls"
 out="$(run_ssh_ready 2 300 2>&1)"; rc=$?
 calls="$(grep -c '^ssh ' "$SANDBOX/sshready-ssh-calls" 2>/dev/null || echo 0)"
-if [ "$rc" -eq 0 ] && [ "$calls" -eq 3 ] && printf '%s' "$out" | grep -q "sshd up on rank 0 (10.0.0.1:2222)" && grep -q -- "-o Fixture=yes -o ProxyJump=root@jump:1 -p 2222 root@10.0.0.1 true" "$SANDBOX/sshready-ssh-calls"; then
+if [ "$rc" -eq 0 ] && [ "$calls" -eq 3 ] && grep -q "sshd up on rank 0 (10.0.0.1:2222)" <<<"$out" && grep -q -- "-o Fixture=yes -o ProxyJump=root@jump:1 -p 2222 root@10.0.0.1 true" "$SANDBOX/sshready-ssh-calls"; then
   ok "two refused connects then success -> rc 0 after exactly 3 probes, RP_SSHO + the member's extra options + the port on every probe"
 else
   bad "expected rc 0 after 3 probes with the options threaded; got rc=$rc calls=$calls out=$out"
 fi
 rm -f "$SANDBOX/sshready-ssh-calls"
 out="$(run_ssh_ready -1 1 2>&1)"; rc=$?
-if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "::error::sshd on rank 0 (10.0.0.1:2222) answered no connect within 1s"; then
+if [ "$rc" -eq 1 ] && grep -q "::error::sshd on rank 0 (10.0.0.1:2222) answered no connect within 1s" <<<"$out"; then
   ok "a member whose sshd never answers -> rc 1 within the bound, named ::error:: (never a remote command)"
 else
   bad "expected rc 1 with the named ::error:: on the bound; got rc=$rc out=$out"
@@ -2196,12 +2196,12 @@ run_two_ranks_fixture() { # $1=rank0 script body $2=rank1 script body $3=RP_INAC
 r0_happy='echo start0; command sleep 0.4; echo 128 > "'"$TWORANKS_DIR"'/idsize"; command sleep 0.4; echo done0'
 r1_happy='echo start1; command sleep 0.6; echo done1'
 out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 600)"
-if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
-   && printf '%s' "$out" | grep -q "the id crossed to the member" \
+if grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" <<<"$out" \
+   && grep -q "the id crossed to the member" <<<"$out" \
    && [ "$(grep -c '^ssh ' "$TWORANKS_DIR/calls")" -eq 2 ] \
    && [ "$(grep -n '^scp ' "$TWORANKS_DIR/calls" | wc -l | tr -d ' ')" -eq 2 ] \
-   && grep -m1 '^scp ' "$TWORANKS_DIR/calls" | grep -q "root@10.0.0.1:/remote/nccl.id" \
-   && grep '^scp ' "$TWORANKS_DIR/calls" | tail -1 | grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" \
+   && grep -q "root@10.0.0.1:/remote/nccl.id" <<<"$(grep -m1 '^scp ' "$TWORANKS_DIR/calls")" \
+   && grep -q -- "-o ProxyJump=root@jump:1 -P 2202 .* root@10.0.0.2:/remote/nccl.id" <<<"$(grep '^scp ' "$TWORANKS_DIR/calls" | tail -1)" \
    && [ "$(grep '^ssh ' "$TWORANKS_DIR/calls" | grep -c -- "-o ProxyJump=root@jump:1 -p 2202 root@10.0.0.2")" -eq 1 ] \
    && [ "$(grep '^ssh ' "$TWORANKS_DIR/calls" | grep -v -- "ProxyJump" | grep -c -- "-p 2201 root@10.0.0.1")" -eq 1 ]; then
   ok "happy path -- both ranks launched up front (2 ssh, rank 1 with its own options), the id scp'd down from the primary then up to the member exactly once each, both ranks rc 0, id_landed=1"
@@ -2223,9 +2223,9 @@ fi
 # this is what a short proof looks like, at random.
 r0_mints_and_ends='echo start0; echo 128 > "'"$TWORANKS_DIR"'/idsize"; echo done0'
 out="$(run_two_ranks_fixture "$r0_mints_and_ends" "$r1_happy" 30 600 1)"
-if printf '%s' "$out" | grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" \
-   && printf '%s' "$out" | grep -q "the id crossed to the member" \
-   && ! printf '%s' "$out" | grep -q "before minting" \
+if grep -q "RC=0 id_landed=1 rank0_rc=0 rank1_rc=0" <<<"$out" \
+   && grep -q "the id crossed to the member" <<<"$out" \
+   && ! grep -q "before minting" <<<"$out" \
    && [ "$(grep -c '^scp ' "$TWORANKS_DIR/calls")" -eq 2 ]; then
   ok "a mint landing between the watcher's id read and its liveness test still crosses: a GONE rank 0's id is read once more, and only its absence then is 'never minted'"
 else
@@ -2233,7 +2233,7 @@ else
 fi
 r0_dies='echo start0; command sleep 0.2; exit 3'
 out="$(run_two_ranks_fixture "$r0_dies" "$r1_happy" 30 600)"
-if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file" \
+if grep -q "RC=76" <<<"$out" && grep -q "::error::rank 0 ended (rc=3) before minting the 128-byte id file" <<<"$out" \
    && grep -q "start0" "$TWORANKS_DIR/artifact/rank0.log" && grep -q "start1" "$TWORANKS_DIR/artifact/rank1.log"; then
   ok "rank 0 exiting before the id is minted -> 76 with rank 0's own rc named; no scp ever attempted; BOTH rank logs shipped into the artifact dir on this refusal arm"
 else
@@ -2242,13 +2242,13 @@ fi
 r0_silent='command sleep 5'
 r1_silent='command sleep 5'
 out="$(run_two_ranks_fixture "$r0_silent" "$r1_silent" 1 600)"
-if printf '%s' "$out" | grep -q "RC=76" && printf '%s' "$out" | grep -q "::error::inactivity: no new output on either rank's log for 1s"; then
+if grep -q "RC=76" <<<"$out" && grep -q "::error::inactivity: no new output on either rank's log for 1s" <<<"$out"; then
   ok "no log growth on either rank within RP_INACTIVITY -> 76, named inactivity (the crossing wait has no clock of its own)"
 else
   bad "expected the inactivity arm; out=$out"
 fi
 out="$(run_two_ranks_fixture "$r0_happy" "$r1_happy" 30 0)"
-if printf '%s' "$out" | grep -q "RC=124" && printf '%s' "$out" | grep -q "budget cut at T-10m"; then
+if grep -q "RC=124" <<<"$out" && grep -q "budget cut at T-10m" <<<"$out"; then
   ok "the T-10m budget cuts the leg at 124 during the crossing wait"
 else
   bad "expected the budget arm (124); out=$out"
@@ -2265,7 +2265,7 @@ tworanks_scripts="$(RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 ba
   echo "r1=$(_rpc_remote_script 1 | grep -c "=== id-wait: rank 1 built") r0=$(_rpc_remote_script 0 | grep -c "id-wait")"
   _rpc_remote_script 1 | awk "/::group::cluster-build/{b=NR} /=== id-wait: rank 1 built/{w=NR} /::group::cluster-proof/{p=NR} END{print (b<w && w<p) ? \"order-ok\" : \"order-bad\"}" | head -1
 ' 2>&1 | tr '\n' ' ')"
-if printf '%s' "$tworanks_scripts" | grep -q "r1=1 r0=0" && printf '%s' "$tworanks_scripts" | grep -q "order-ok"; then
+if grep -q "r1=1 r0=0" <<<"$tworanks_scripts" && grep -q "order-ok" <<<"$tworanks_scripts"; then
   ok "rank 1's remote script waits for the 128-byte id BETWEEN its build and its proof; rank 0's never waits"
 else
   bad "expected the id wait only in rank 1's script, between build and proof; got: $tworanks_scripts"
@@ -2280,17 +2280,17 @@ fi
 # ----------------------------------------------------------------------------
 checkout_sha_text="$(PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
 checkout_ref_text="$(bash -c 'unset PROVE_EXPECT_SHA; source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "some-branch" "https://example.invalid/r.git"')"
-if printf '%s' "$checkout_sha_text" | grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' \
-   && printf '%s' "$checkout_sha_text" | grep -qF 'git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out' \
-   && ! printf '%s' "$checkout_sha_text" | grep -qF 'some-branch' \
-   && printf '%s' "$checkout_sha_text" | grep -qF 'could not fetch the exact commit'; then
+if grep -qF 'git fetch -q --depth 1 origin "0123456789abcdef0123456789abcdef01234567"' <<<"$checkout_sha_text" \
+   && grep -qF 'git checkout -q --detach FETCH_HEAD || { echo "::error::could not check out' <<<"$checkout_sha_text" \
+   && ! grep -qF 'some-branch' <<<"$checkout_sha_text" \
+   && grep -qF 'could not fetch the exact commit' <<<"$checkout_sha_text"; then
   ok "with PROVE_EXPECT_SHA the remote checkout fetches that exact sha and never names the ref; a failed fetch is a named error"
 else
   bad "expected a by-sha fetch with no ref; got: ${checkout_sha_text}"
 fi
-if printf '%s' "$checkout_ref_text" | grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai || { echo "::error::could not clone' \
-   && ! printf '%s' "$checkout_ref_text" | grep -qF '| tail -1' \
-   && ! printf '%s' "$checkout_ref_text" | grep -qF 'FETCH_HEAD'; then
+if grep -qF 'git clone --depth 1 -b "some-branch" "https://example.invalid/r.git" jammi-ai || { echo "::error::could not clone' <<<"$checkout_ref_text" \
+   && ! grep -qF '| tail -1' <<<"$checkout_ref_text" \
+   && ! grep -qF 'FETCH_HEAD' <<<"$checkout_ref_text"; then
   ok "without PROVE_EXPECT_SHA (a hand run) the ref is cloned"
 else
   bad "expected the ref clone without PROVE_EXPECT_SHA; got: ${checkout_ref_text}"
@@ -2315,27 +2315,27 @@ fi
 # ----------------------------------------------------------------------------
 remoteroot_text="$(RP_TWO_HOST_TRANSPORT=pods RP_REMOTE_ROOT=/sandbox/x RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 PROVE_EXPECT_SHA=0123456789abcdef0123456789abcdef01234567 bash -c 'source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 1' 2>&1)"
 if [ "$(printf '%s' "$remoteroot_text" | grep -c '/root')" -eq 0 ] \
-   && printf '%s' "$remoteroot_text" | grep -qF 'cd "/sandbox/x" || { echo "::error::remote root /sandbox/x is not enterable" >&2; exit 1; }' \
-   && printf '%s' "$remoteroot_text" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/sandbox/x/nccl.id' \
-   && printf '%s' "$remoteroot_text" | grep -qF 'export JAMMI_GANG_ARTIFACT_DIR=/sandbox/x/jammi-ai/.gang-artifact'; then
+   && grep -qF 'cd "/sandbox/x" || { echo "::error::remote root /sandbox/x is not enterable" >&2; exit 1; }' <<<"$remoteroot_text" \
+   && grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/sandbox/x/nccl.id' <<<"$remoteroot_text" \
+   && grep -qF 'export JAMMI_GANG_ARTIFACT_DIR=/sandbox/x/jammi-ai/.gang-artifact' <<<"$remoteroot_text"; then
   ok "under RP_REMOTE_ROOT=/sandbox/x the whole remote text (checkout, id file, artifact dir) is rooted there and carries no /root literal"
 else
   bad "expected a fully re-rooted remote text with no /root literal; got: $(printf '%s' "$remoteroot_text" | grep -n '/root\|sandbox' | head -5)"
 fi
 remoteroot_default="$(RP_TWO_HOST_TRANSPORT=pods RP_TWO_HOST_GN_IP_0=10.0.0.1 RP_TWO_HOST_GN_IP_1=10.0.0.2 bash -c 'unset RP_REMOTE_ROOT; source "'"$CLUSTER_SH"'" >/dev/null 2>&1; export RP_TWO_HOST_GN_IP_0 RP_TWO_HOST_GN_IP_1; _rpc_remote_script 0' 2>&1)"
-if printf '%s' "$remoteroot_default" | grep -qF 'cd "/root" || {' && printf '%s' "$remoteroot_default" | grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/root/nccl.id'; then
+if grep -qF 'cd "/root" || {' <<<"$remoteroot_default" && grep -qF 'export JAMMI_GANG_TWO_HOSTS_ID_FILE=/root/nccl.id' <<<"$remoteroot_default"; then
   ok "with RP_REMOTE_ROOT unset the root is /root (a real pod)"
 else
   bad "expected the /root default; got: $(printf '%s' "$remoteroot_default" | grep -n 'cd \"' | head -2)"
 fi
 remoteroot_fc="$(mktemp -d "$SANDBOX/remoteroot-XXXXXX")"
 remoteroot_out="$(RP_REMOTE_ROOT="$remoteroot_fc/does-not-exist" bash -c 'source "'"$DIR"'/runpod_lib.sh" >/dev/null 2>&1; rp_remote_checkout_lines "b" "https://example.invalid/r.git"' | bash 2>&1; echo "RC=$?")"
-if printf '%s' "$remoteroot_out" | grep -q "RC=1" && printf '%s' "$remoteroot_out" | grep -q "::error::remote root .*/does-not-exist is not enterable" && ! printf '%s' "$remoteroot_out" | grep -qi "clon"; then
+if grep -q "RC=1" <<<"$remoteroot_out" && grep -q "::error::remote root .*/does-not-exist is not enterable" <<<"$remoteroot_out" && ! grep -qi "clon" <<<"$remoteroot_out"; then
   ok "executed — an un-enterable root stops the checkout by name before any git command (rc 1, never a clone into the caller's cwd)"
 else
   bad "expected the fail-closed root arm; got: ${remoteroot_out}"
 fi
-if ! grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | grep -q .; then
+if ! grep -q . <<<"$(grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#')"; then
   ok "no GPU leg carries a /root literal outside a comment (the root is RP_REMOTE_ROOT everywhere)"
 else
   bad "a /root literal survives in a leg: $(grep -nE '"/root/|=/root' "$DIR/runpod_gpu_cluster.sh" "$DIR/runpod_gpu_gang.sh" "$DIR/runpod_gpu_prove.sh" | grep -v '^\S*:[0-9]*:\s*#' | head -3)"

@@ -62,6 +62,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "040_model_artifacts",
     "041_models_artifact_reference",
     "042_result_table_replacement",
+    "043_models_backend_required",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -245,8 +246,8 @@ async fn migration_019_normalizes_available_status_to_registered() {
             Box::pin(async move {
                 for (id, status) in [("legacy::1", "available"), ("modern::1", "registered")] {
                     tx.execute(
-                        "INSERT INTO models (model_id, name, model_type, task, version, status, created_at, updated_at) \
-                         VALUES ($1, $2, 'embedding', 'text-embedding', 1, $3, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
+                        "INSERT INTO models (model_id, name, model_type, task, backend, version, status, created_at, updated_at) \
+                         VALUES ($1, $2, 'embedding', 'text-embedding', 'candle', 1, $3, '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                         &[
                             SqlValue::TextOwned(id.into()),
                             SqlValue::TextOwned(id.into()),
@@ -887,8 +888,8 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // requires — the copy's `base_model_id -> model_ref` value
                 // must resolve.
                 tx.execute(
-                    "INSERT INTO models (model_id, name, model_type, task, created_at, updated_at) \
-                     VALUES ('base::1', 'base', 'embedding', 'text-embedding', \
+                    "INSERT INTO models (model_id, name, model_type, task, backend, created_at, updated_at) \
+                     VALUES ('base::1', 'base', 'embedding', 'text-embedding', 'candle', \
                              '2026-01-01T00:00:00.000000Z', '2026-01-01T00:00:00.000000Z')",
                     &[],
                 )
@@ -1946,10 +1947,10 @@ async fn migration_041_backfills_artifacts_from_engine_produced_rows(
                 for params in &seeded {
                     tx.execute(
                         "INSERT INTO models \
-                             (model_id, name, tenant_id, model_type, task, version, status, \
-                              artifact_path, definition_hash, input_anchors_json, \
+                             (model_id, name, tenant_id, model_type, task, backend, version, \
+                              status, artifact_path, definition_hash, input_anchors_json, \
                               created_at, updated_at) \
-                         VALUES ($1, $2, $3, $4, 'text_embedding', 1, 'registered', \
+                         VALUES ($1, $2, $3, $4, 'text_embedding', 'candle', 1, 'registered', \
                                  $5, $6, $7, $8, $8)",
                         params,
                     )
@@ -3473,4 +3474,70 @@ mod jobs_table_rebuild_hits_self_tests {
         ));
         assert!(contains_word_pair("DROP TABLE jobs;", "DROP TABLE", "jobs"));
     }
+}
+
+/// Migration 043: a `models` row without a backend is refused by the schema
+/// itself, on INSERT and on an UPDATE that clears it, while a row naming its
+/// backend is written as before.
+#[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test]
+async fn migration_043_refuses_a_model_row_without_a_backend(
+    kind: jammi_db::catalog::backend::BackendKind,
+) {
+    use jammi_db::catalog::backend::SqlValue;
+
+    let dir = tempdir().unwrap();
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
+    backend.migrate().await.unwrap();
+    let pk = format!("m-{}::1", jammi_test_utils::unique_suffix());
+
+    let insert = |backend_value: Option<&'static str>| {
+        let pk = pk.clone();
+        let backend = &backend;
+        async move {
+            backend
+                .transaction(TxOptions::default(), |tx| {
+                    Box::pin(async move {
+                        tx.execute(
+                            "INSERT INTO models (model_id, name, model_type, task, backend, \
+                                                 created_at, updated_at) \
+                             VALUES ($1, $1, 'embedding', 'text_embedding', $2, \
+                                     '2026-01-01T00:00:00.000000Z', \
+                                     '2026-01-01T00:00:00.000000Z')",
+                            &[
+                                SqlValue::TextOwned(pk),
+                                SqlValue::from(backend_value.map(str::to_string)),
+                            ],
+                        )
+                        .await
+                    })
+                })
+                .await
+        }
+    };
+
+    insert(None)
+        .await
+        .expect_err("a model row without a backend must be refused");
+    insert(Some("candle"))
+        .await
+        .expect("a model row naming its backend is written");
+
+    backend
+        .transaction(TxOptions::default(), |tx| {
+            let pk = pk.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE models SET backend = NULL WHERE model_id = $1",
+                    &[SqlValue::TextOwned(pk)],
+                )
+                .await
+            })
+        })
+        .await
+        .expect_err("clearing a model's backend must be refused");
 }

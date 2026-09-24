@@ -2071,3 +2071,33 @@ ALTER TABLE result_table_versions DROP CONSTRAINT result_table_versions_table_na
 ALTER TABLE result_table_versions ADD CONSTRAINT result_table_versions_table_name_fkey
     FOREIGN KEY (table_name) REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE;
 "#;
+
+/// Migration 043: every `models` row names the backend that runs it.
+///
+/// Every engine writer (registration, a job's finalize) records one, and the
+/// catalog's typed read refuses a row without one, so the schema says so
+/// too. The VALUE set stays the typed read's (`ModelBackendKind`), as
+/// `models.task`'s does — the schema holds presence only. Postgres alters
+/// the column in place; SQLite cannot add a constraint to a column, so it
+/// refuses a missing backend with the trigger pair migration 039 uses for
+/// canonical stamps.
+pub(super) const MIGRATION_043_MODELS_BACKEND_REQUIRED_SQLITE: &str = r#"
+CREATE TRIGGER trg_models_backend_required_ins
+BEFORE INSERT ON models
+WHEN NEW.backend IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'models.backend: every model names the backend that runs it');
+END;
+CREATE TRIGGER trg_models_backend_required_upd
+BEFORE UPDATE OF backend ON models
+WHEN NEW.backend IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'models.backend: every model names the backend that runs it');
+END;
+"#;
+
+/// The Postgres arm of migration 043 — see
+/// [`MIGRATION_043_MODELS_BACKEND_REQUIRED_SQLITE`].
+pub(super) const MIGRATION_043_MODELS_BACKEND_REQUIRED_POSTGRES: &str = r#"
+ALTER TABLE models ALTER COLUMN backend SET NOT NULL;
+"#;

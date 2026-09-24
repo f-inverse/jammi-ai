@@ -261,11 +261,9 @@ pub struct MaterializationEnv {
     ///
     /// `None` for every producer that records no kernel-admission decision
     /// (every variant before [`ProducingDescriptor::FineTune`]).
-    /// `#[serde(skip_serializing_if = "Option::is_none")]` means a `None`
-    /// value serialises to no JSON key at all — the same hash-preservation
-    /// contract [`ModelIdentity::quantization`] keeps — so this field's
-    /// addition changes not one byte of any [`DefinitionHash`] computed
-    /// before it existed.
+    /// `None` serialises to no JSON key at all (as [`LocalRun::quantization`]
+    /// does), so a producer that records no admission decision folds nothing
+    /// for it into its [`DefinitionHash`].
     ///
     /// **Populated by the `FineTune` producer.** `jammi-db`
     /// cannot itself compute this value (it depends on no `jammi-kernels`

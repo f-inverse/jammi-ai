@@ -658,9 +658,12 @@ against the digest of the empty string. `push` sends uncommitted work too,
 so on a dirty push `laptop_head` names the commit the tree was *based on*,
 not the commit it *is*; exporting it there would be a fabricated
 provenance, which is worse than `unknown` because a reader cannot detect
-it. On a dirty (or absent, or unreadable) stamp the variable is left unset
-and the job log carries `JAMMI_BUILD_SHA left UNSET`
-(`ci/scripts/runpod_lib.sh`) as a `::warning::`.
+it. On a dirty (or absent, or unreadable) stamp the variable is left unset.
+A tree that is a git checkout with no stamp — the bootstrap checkout moved to
+a commit with `git checkout` — needs none: build.rs resolves the sha from its
+HEAD (`-dirty` when its tracked files differ), and the job log says so. Any
+other case carries `JAMMI_BUILD_SHA left UNSET` (`ci/scripts/runpod_lib.sh`)
+as a `::warning::`.
 
 Two consequences worth knowing:
 

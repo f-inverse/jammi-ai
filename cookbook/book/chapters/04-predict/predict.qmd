@@ -49,10 +49,10 @@ arxiv = datasets.arxiv(db, SCALE)
 embeddings = keystone.embed(db, arxiv, SCALE)
 propagated = keystone.propagate(db, arxiv, embeddings)
 
-papers = db.sql(
-    f"SELECT paper_id, subject, year FROM {arxiv.papers}.public.{arxiv.papers}"
-).to_pylist()
-year = {p["paper_id"]: p["year"] for p in papers}
+year = {
+    r["paper_id"]: r["year"]
+    for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
+}
 cal_ids, test_ids = arxiv.split["valid"], arxiv.split["test"]
 print(f"calibration era (2018): {len(cal_ids)} papers   test era (2019–): {len(test_ids)} papers")
 ```
@@ -71,20 +71,17 @@ source gains afterwards.
 keystone.show(keystone.train_year_predictor)
 ```
 
+Each prediction is one `predict_with_context_predictor` call:
+
+```{python}
+# | echo: false
+keystone.show(keystone.predict_years)
+```
+
 ```{python}
 predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
-
-
-def predict(keys: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    served = [
-        db.predict_with_context_predictor(predictor, source=arxiv.papers, target_key=k)
-        for k in keys
-    ]
-    return np.array([s["mean"] for s in served]), np.array([s["std"] for s in served])
-
-
-cal_mean, cal_std = predict(cal_ids)
-test_mean, test_std = predict(test_ids)
+cal_mean, cal_std = keystone.predict_years(db, arxiv, predictor, cal_ids)
+test_mean, test_std = keystone.predict_years(db, arxiv, predictor, test_ids)
 cal_year = np.array([year[k] for k in cal_ids], dtype=float)
 test_year = np.array([year[k] for k in test_ids], dtype=float)
 pred_std = float(np.concatenate([cal_std, test_std]).mean())
@@ -138,11 +135,8 @@ uncorrelated with test-era likeness, so no reweighting of the calibration
 residuals can favour the larger ones.
 
 ```{python}
-ids, vectors = keystone.vectors(db, propagated)
-row = {k: i for i, k in enumerate(ids)}
-unit = shift.unit_rows(vectors)
-cal_emb = unit[[row[k] for k in cal_ids]]
-test_emb = unit[[row[k] for k in test_ids]]
+scores = keystone.subject_scores(db, arxiv, propagated)  # carries each era's embeddings
+cal_emb, test_emb = scores.cal_embeddings, scores.test_embeddings
 
 cal_resid = np.abs(cal_mean - cal_year)
 test_resid = np.abs(test_mean - test_year)
@@ -203,17 +197,13 @@ the **propagated** (citation-graph-conditioned, tier 02) embeddings, fitted on
 the training era, calibrated on 2018, tested on 2019 onward.
 
 ```{python}
-classes = sorted({p["subject"] for p in papers})
-label = np.array([classes.index(next(p["subject"] for p in papers if p["paper_id"] == k))
-                  for k in ids])
-train = np.array([row[k] for k in arxiv.split["train"]])
-cal = np.array([row[k] for k in cal_ids])
-test = np.array([row[k] for k in test_ids])
+# | echo: false
+keystone.show(keystone.subject_scores)
+```
 
-cal_scores = shift.nearest_centroid_scores(vectors, label, train, cal, len(classes))
-test_scores = shift.nearest_centroid_scores(vectors, label, train, test, len(classes))
-accuracy = float(np.mean(test_scores.argmax(1) == label[test]))
-print(f"{len(classes)} classes; test-era accuracy: {accuracy:.3f}")
+```{python}
+accuracy = float(np.mean(scores.test_scores.argmax(1) == scores.test_labels))
+print(f"{len(scores.classes)} classes; test-era accuracy: {accuracy:.3f}")
 ```
 
 ```{python}
@@ -229,9 +219,10 @@ per test paper. It is exactly valid **under exchangeability**.
 
 ```{python}
 sets = db.conformalize(
-    cal_scores.tolist(), label[cal].tolist(), test_scores.tolist(), alpha=ALPHA, score="aps"
+    scores.cal_scores.tolist(), scores.cal_labels.tolist(), scores.test_scores.tolist(),
+    alpha=ALPHA, score="aps",
 )
-marg_cov = float(np.mean([label[t] in s for t, s in zip(test, sets)]))
+marg_cov = float(np.mean([y in s for y, s in zip(scores.test_labels, sets)]))
 marg_size = float(np.mean([len(s) for s in sets]))
 print(f"engine APS marginal coverage: {marg_cov:.3f}   (mean set size {marg_size:.2f})")
 ```
@@ -260,13 +251,15 @@ comparison that matters is between its own two passes.
 
 ```{python}
 local_cov, _ = shift.aps_coverage(
-    cal_scores, label[cal], test_scores, label[test], weights=None, alpha=ALPHA
+    scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
+    weights=None, alpha=ALPHA,
 )
 schemes = shift.weight_schemes(cal_emb, test_emb)
 deltas = {}
 for name, weights in schemes.items():
     cov, size = shift.aps_coverage(
-        cal_scores, label[cal], test_scores, label[test], weights=weights, alpha=ALPHA
+        scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
+        weights=weights, alpha=ALPHA,
     )
     deltas[name] = cov - local_cov
     print(f"weighted ({name:<9}) coverage {cov:.3f}   Δ {cov - local_cov:+.4f}   set size {size:.2f}")
@@ -294,7 +287,7 @@ Weighted conformal can move the quantile only if test-era-like calibration
 papers have systematically different nonconformity scores.
 
 ```{python}
-nonconformity = shift.aps_nonconformity(cal_scores, label[cal])
+nonconformity = shift.aps_nonconformity(scores.cal_scores, scores.cal_labels)
 corr = float(np.corrcoef(nonconformity, likeness)[0, 1])
 print(f"corr(nonconformity, test-likeness): {corr:+.3f}")
 ```

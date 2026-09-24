@@ -14,45 +14,48 @@ calibration error [@guo2017], and PIT uniformity as the prequential calibration 
 [@dawid1984] · **Rails:** measurement (the honesty of the uncertainty channel).
 
 A prediction with a number is half a prediction; the other half is *how sure*. This
-chapter audits the uncertainty channel of the committed tier-04 gaussian year
-predictor — does its stated spread match reality? It runs on CPU against the cache (no
-GPU, no recompute): the engine's `eval_calibration` produces the proper-score and ECE
-headline, and an independent numpy PIT/reliability fold cross-checks every number and
-draws the diagnostic the aggregate summarizes.
+chapter audits the uncertainty channel of tier 04's Gaussian year predictor —
+does its stated spread match reality? The engine's `eval_calibration` produces
+the proper-score and ECE headline, and an independent numpy PIT/reliability fold
+cross-checks every number and draws the diagnostic the aggregate summarizes.
 
 ## The predictive distributions
 
-The cache holds the gaussian context predictor's per-row `pred_mean` and `pred_std`
-on the test era, paired with the realised `true_year`. `eval_calibration` wants a
-*golden source* pairing each predictive distribution with its outcome, so we
-materialize the committed rows into a registered source with the gaussian schema
-(`record_id, mean, sd, outcome`).
+The predictor serves a mean and a standard deviation per paper; we take its
+distributions over the test era and pair each with the realised year.
+`eval_calibration` reads a *golden source* pairing each predictive distribution
+with its outcome, in the Gaussian schema `(record_id, mean, sd, outcome)`.
 
 ```{python}
 import tempfile
 
+import jammi
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
+from jammi_cookbook import contracts, datasets, keystone, scale
 
-import jammi
-from jammi_cookbook import contracts, datasets, rails
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+embeddings = keystone.embed(db, arxiv, SCALE)
+propagated = keystone.propagate(db, arxiv, embeddings)
+predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
 
-reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
-test = [r for r in reg if r["split"] == "test"]
-print(f"test-era predictive distributions: {len(test)}")
+test_ids = arxiv.split["test"]
+mu, sd = keystone.predict_years(db, arxiv, predictor, test_ids)
+year = {
+    r["paper_id"]: r["year"]
+    for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
+}
+y = np.array([float(year[k]) for k in test_ids])
+print(f"test-era predictive distributions: {len(test_ids)}")
 
-golden = pa.table({
-    "record_id": [r["paper_id"] for r in test],
-    "mean": [float(r["pred_mean"]) for r in test],
-    "sd": [float(r["pred_std"]) for r in test],
-    "outcome": [float(r["true_year"]) for r in test],
-})
-golden_url = datasets._write_parquet(golden, "arxiv_calibration_golden")
-
-# A fresh artifact dir each run, so re-execution never collides with a
-# previously-registered source (the catalog persists registrations per artifact dir).
-db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_calibration_')}")  # CPU embed arm
-db.add_source("arxiv_calibration_golden", url=golden_url, format="parquet")
+golden_path = f"{tempfile.mkdtemp()}/arxiv_calibration_golden.parquet"
+pq.write_table(
+    pa.table({"record_id": test_ids, "mean": mu, "sd": sd, "outcome": y}), golden_path
+)
+db.add_source("arxiv_calibration_golden", url=golden_path, format="parquet")
 ```
 
 ## The engine's calibration report
@@ -82,32 +85,28 @@ print(f"central coverage:        {central_cov:.3f}")
 
 ```{python}
 # | echo: false
-rails.measure("arxiv.calibration.crps", crps)
-rails.measure("arxiv.calibration.nll", nll)
-rails.measure("arxiv.calibration.adaptive_ece", ece)
-rails.measure("arxiv.calibration.sharpness", sharpness)
-rails.measure("arxiv.calibration.central_coverage", central_cov)
+contracts.assert_close("arxiv.calibration.crps", crps, tol=0.05)
+contracts.assert_close("arxiv.calibration.nll", nll, tol=0.1)
+contracts.assert_close("arxiv.calibration.adaptive_ece", ece, tol=0.05)
+contracts.assert_close("arxiv.calibration.sharpness", sharpness, tol=0.2)
+contracts.assert_close("arxiv.calibration.central_coverage", central_cov, tol=0.05)
 ```
 
 The **proper scores** are the headline. CRPS [@matheson1976] and NLL [@gneiting2007]
 are *strictly proper*: they are optimized in expectation only by the true predictive
 distribution, so they reward a forecast that is both accurate **and** honestly spread
-— you cannot game them by being over-confident. CRPS ≈ 0.39 (in years; lower is
-better) and NLL ≈ 1.08 summarize the predictor's distributional quality in one number
+— you cannot game them by being over-confident. CRPS (in years; lower is
+better) and NLL summarize the predictor's distributional quality in one number
 each.
 
 ## Proper scoring, cross-checked
 
 A proper score is only trustworthy if we know what it computes. We recompute CRPS and
-NLL independently with the gaussian closed forms over the same committed predictions,
-and confirm they match the engine to the digit.
+NLL independently with the Gaussian closed forms over the same predictions, and
+confirm they match the engine to the digit.
 
 ```{python}
 from math import erf, pi
-
-mu = np.array([r["pred_mean"] for r in test])
-sd = np.array([r["pred_std"] for r in test])
-y = np.array([float(r["true_year"]) for r in test])
 
 
 def std_normal_cdf(z):
@@ -161,14 +160,12 @@ for q, obs in zip(quantile_levels, observed_below):
 
 ```{python}
 # | echo: false
-rails.measure("arxiv.calibration.pit_ks", pit_ks)
-# The honest verdict: the PIT is FAR from uniform (KS ≈ 0.42). The predictor is sharp
-# but miscalibrated under the time-split — the same non-exchangeability the conformal
-# tier reports. A well-calibrated predictor would have a small KS; this one does not.
-assert pit_ks > 0.2, "the PIT must register the miscalibration (it is not uniform)"
+contracts.assert_close("arxiv.calibration.pit_ks", pit_ks, tol=0.05)
+if SCALE is scale.Scale.FULL:
+    assert pit_ks > 0.2  # the PIT registers the miscalibration under the time split
 ```
 
-The verdict is honest and negative: the PIT is **far from uniform** (KS ≈ 0.42), and
+At `full` scale the verdict is honest and negative: the PIT is **far from uniform** (KS ≈ 0.42), and
 the reliability curve shows the outcomes are not spread across the predictive
 quantiles as a calibrated forecast would place them. The predictor is **sharp but
 miscalibrated** under the time-split — exactly the non-exchangeability the conformal
@@ -186,21 +183,20 @@ honest-but-vague one, and a strictly proper score is precisely the instrument th
 refuses to reward the former.
 
 ```{python}
-report_record = contracts.load_artifact("arxiv.calibration_report")
 print(f"sharpness (mean predictive σ): {sharpness:.3f} years")
 print(f"central coverage:              {central_cov:.3f}")
-print(report_record["note"])
+print(f"adaptive ECE:                  {ece:.3f}")
 ```
 
 ```{python}
 # | echo: false
-# This predictor sits on the wrong side of the tradeoff: it IS sharp (a narrow ~2.9y
-# spread) but NOT calibrated (high ECE, non-uniform PIT) — sharpness bought at the cost
-# of honesty. The committed record matches the live recomputation.
-assert abs(report_record["crps"] - crps) < 1e-2
-assert abs(report_record["pit_ks"] - pit_ks) < 1e-2
-assert ece > 0.05, "the adaptive ECE registers the miscalibration"
+if SCALE is scale.Scale.FULL:
+    assert ece > 0.05  # sharp but not calibrated: sharpness bought at the cost of honesty
 ```
+
+At `full` scale this predictor sits on the wrong side of the tradeoff: it *is*
+sharp but *not* calibrated (a high ECE, a non-uniform PIT) — sharpness bought at
+the cost of honesty.
 
 The session's work is done, so it is closed. An embedded engine holds its catalog until
 `close()` returns, which is why `close()` comes before anything removes the directory the

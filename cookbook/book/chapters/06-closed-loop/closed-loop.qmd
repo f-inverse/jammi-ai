@@ -21,7 +21,7 @@ import tempfile
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, datasets, keystone, scale, shift
+from jammi_cookbook import contracts, datasets, keystone, scale
 
 SCALE = scale.current()
 ALPHA = 0.10
@@ -79,41 +79,21 @@ year = {
     for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
 }
 cal_ids, test_ids = arxiv.split["valid"], arxiv.split["test"]
-
-
-def means(keys):
-    return [
-        db.predict_with_context_predictor(predictor, source=arxiv.papers, target_key=k)["mean"]
-        for k in keys
-    ]
-
-
-cal_mean, test_mean = means(cal_ids), means(test_ids)
+cal_mean, _ = keystone.predict_years(db, arxiv, predictor, cal_ids)
+test_mean, _ = keystone.predict_years(db, arxiv, predictor, test_ids)
 intervals = db.conformalize_interval(
-    cal_mean, [float(year[k]) for k in cal_ids], test_mean, alpha=ALPHA
+    cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=ALPHA
 )
 reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
 contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
 print(f"year interval coverage:       {reg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
 
-ids, vectors = keystone.vectors(db, propagated)
-row = {k: i for i, k in enumerate(ids)}
-subject = {
-    r["paper_id"]: r["subject"]
-    for r in db.sql(f"SELECT paper_id, subject FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
-}
-classes = sorted(set(subject.values()))
-label = np.array([classes.index(subject[k]) for k in ids])
-train = np.array([row[k] for k in arxiv.split["train"]])
-cal = np.array([row[k] for k in cal_ids])
-test = np.array([row[k] for k in test_ids])
+scores = keystone.subject_scores(db, arxiv, propagated)
 sets = db.conformalize(
-    shift.nearest_centroid_scores(vectors, label, train, cal, len(classes)).tolist(),
-    label[cal].tolist(),
-    shift.nearest_centroid_scores(vectors, label, train, test, len(classes)).tolist(),
+    scores.cal_scores.tolist(), scores.cal_labels.tolist(), scores.test_scores.tolist(),
     alpha=ALPHA, score="aps",
 )
-marg_cov = float(np.mean([label[t] in s for t, s in zip(test, sets)]))
+marg_cov = float(np.mean([y in s for y, s in zip(scores.test_labels, sets)]))
 contracts.assert_close("arxiv.tier04.marginal_coverage", marg_cov)
 print(f"subject APS set coverage:     {marg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
 ```

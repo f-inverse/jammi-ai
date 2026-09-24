@@ -14,11 +14,22 @@ each take one operation and show it is the *same object at three altitudes*, the
 run it on the committed cache; the Neptune-contrast framing; and the **verified
 citation map** that pins every recipe to its sources.
 
-Every measured claim below reads the committed cache and asserts via the
-measurement rail — no recomputation, no fabricated numbers.
+Every signature below runs its call live and checks what it measured against
+the golden its tier's chapter froze — at `small` scale in seconds on a CPU, at
+`full` scale over the data the findings are about.
 
 ```{python}
-from jammi_cookbook import contracts, rails
+import tempfile
+
+import jammi
+import numpy as np
+from jammi_cookbook import contracts, datasets, keystone, scale
+
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+golden = keystone.subject_golden(db, arxiv)
+embeddings = keystone.embed(db, arxiv, SCALE)
 ```
 
 ## Signature 1 — Propagation = low-pass graph filter = SGC/APPNP = vector-agg
@@ -43,25 +54,18 @@ The headline equivalence. **One equation, three names, one call.**
   seeding, identical across threads. The reproducible point on the
   construct→learn spectrum.
 
-We *demonstrate* the equivalence, not assert it: the keystone ran the APPNP
-filter (`degree_normalized` + `alpha`) over the citation graph and froze the
-result. The honest test of a low-pass filter is a downstream measurement —
-same-subject retrieval recall must rise.
+We *demonstrate* the equivalence, not assert it: the APPNP filter
+(`degree_normalized` + `alpha`) over the citation graph, measured downstream —
+same-subject retrieval precision.
 
 ```{python}
-raw = contracts.golden("arxiv.tier01.recall_at_10").value
-prop = contracts.golden("arxiv.tier02.recall_at_10").value
-delta = contracts.golden("arxiv.tier02.recall_delta").value
-print(f"recall@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {delta:+.3f})")
-rails.measure("arxiv.tier02.recall_at_10", prop)
-rails.measure("arxiv.tier02.recall_delta", delta)
-```
-
-```{python}
-# | echo: false
-# The low-pass filter denoises: APPNP propagation lifts same-subject recall. One
-# equation (the GFT low-pass), three names (SGC/APPNP/jumping-knowledge), one call.
-assert delta > 0
+propagated = keystone.propagate(db, arxiv, embeddings)
+compared = db.eval_compare(
+    embedding_tables=[embeddings, propagated], source=arxiv.papers, golden_source=golden, k=10
+)
+raw, prop = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
+contracts.assert_close("arxiv.tier02.precision_at_10", prop)
+print(f"precision@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {prop - raw:+.3f})")
 ```
 
 ## Signature 2 — An edge is a self-`search`; a context set is a `search`/walk
@@ -78,16 +82,23 @@ Retrieval is the substrate of *both* graphs and prediction.
   `assemble_context` (the retrieval-conditioned context set) are the same retrieval
   primitive at two altitudes.
 
-The derived neighbor graph from tier 01 is exactly this self-search; its edges
-each carry their `similarity` and `rank` — the provenance rail showing an edge's
-origin is a queryable fact.
+The derived neighbor graph is exactly this self-search: each edge records the
+retrieval that produced it — its `similarity` and its `rank` among the source
+row's neighbours — and a paper's edges are its top `search` hits.
 
 ```{python}
-ng = contracts.load_artifact("arxiv.neighbor_graph")
-print(f"self-kNN edges: {ng.num_rows}   columns: {ng.column_names}")
-# every derived edge records the retrieval that produced it (similarity + rank)
-assert {"src", "dst", "rank", "similarity"} <= set(ng.column_names)
-print("each edge is an auditable self-search result (similarity + rank recorded)")
+graph = db.build_neighbor_graph(arxiv.papers, table=embeddings, k=10, exact=True)
+edges = db.sql(f'SELECT src, dst, rank, similarity FROM "jammi.{graph}" ORDER BY src, rank')
+first = edges.slice(0, 3).to_pylist()
+print(f"self-kNN edges: {edges.num_rows}")
+for edge in first:
+    print(f"  {edge['src']} → {edge['dst']}  rank {edge['rank']}  similarity {edge['similarity']:.3f}")
+```
+
+```{python}
+# | echo: false
+assert {"src", "dst", "rank", "similarity"} <= set(edges.column_names)
+assert [e["rank"] for e in first] == sorted(e["rank"] for e in first)
 ```
 
 ## Signature 3 — Graph-supervised metric learning = contrastive fine-tune over walks
@@ -108,32 +119,21 @@ print("each edge is an auditable self-search result (similarity + rank recorded)
   drawn *by* the metric). The two are not equally informative, but neither is the
   similarity graph a no-op — see the measurement below.
 
-We measure this empirically from the cached tier-03 results, over three graphs run
-with the identical recipe: the **declared** citation graph (trained to
-convergence), the **similarity** self-k-NN graph, and a **random** null.
+The declared-graph fine-tune, measured against the base encoder (tier 03 runs
+the similarity and random controls beside it; at `full` scale the ordering is
+random < base < similarity < declared):
 
 ```{python}
-base = contracts.golden("arxiv.tier01.recall_at_10").value
-ft = contracts.golden("arxiv.tier03.recall_at_10").value
-gain = contracts.golden("arxiv.tier03.recall_gain_vs_base").value
-sim_gain = contracts.golden("arxiv.tier03.control_similarity_recall_gain_vs_base").value
-rand_gain = contracts.golden("arxiv.tier03.control_random_recall_gain_vs_base").value
-print(f"recall@10 base → declared-edge fine-tune: {base:.3f} → {ft:.3f}   (Δ {gain:+.3f})")
-print(f"control gains — similarity: {sim_gain:+.3f}   random: {rand_gain:+.3f}")
-rails.measure("arxiv.tier03.recall_at_10", ft)
-rails.measure("arxiv.tier03.recall_gain_vs_base", gain)
-rails.measure("arxiv.tier03.control_similarity_recall_gain_vs_base", sim_gain)
-rails.measure("arxiv.tier03.control_random_recall_gain_vs_base", rand_gain)
-```
-
-```{python}
-# | echo: false
-# The honest three-way ordering: random (harmful) < base < similarity (real,
-# partial, via homophily — NNCLR/SciNCL) < declared (largest — SPECTER). A
-# similarity graph is a weak bootstrap, not "nothing"; only a random graph is a
-# true no-signal control, and it actively hurts.
-assert gain > 0
-assert rand_gain < 0 < sim_gain < gain
+tuned = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edges=arxiv.cites, provenance="declared",
+    epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
+)
+ft_compared = db.eval_compare(
+    embedding_tables=[embeddings, tuned], source=arxiv.papers, golden_source=golden, k=10
+)
+ft = ft_compared["per_table"][1]["embedding_eval"]["aggregate"]["precision_at_k"]
+contracts.assert_close("arxiv.tier03.declared_precision_at_10", ft)
+print(f"precision@10 base → declared-edge fine-tune: {raw:.3f} → {ft:.3f}")
 ```
 
 ## Signature 4 — A prediction is a context-conditioned posterior (the moat)
@@ -160,24 +160,28 @@ under-cover under the time-split — the honest finding weighted conformal canno
 repair (it moves the quantile only when the shift is score-aligned).
 
 ```{python}
-cal_mean = contracts.golden("arxiv.tier04.reg_cal_mean").value
-reg_cov = contracts.golden("arxiv.tier04.reg_interval_coverage").value
-marg_cov = contracts.golden("arxiv.tier04.marginal_coverage").value
-nominal = contracts.golden("arxiv.tier04.nominal_coverage").value
-print(f"context-predictor posterior mean (cal era): {cal_mean:.2f}   (real fit, no collapse)")
-print(f"regression interval coverage:  {reg_cov:.3f}   (nominal {nominal:.2f} — under-covers)")
-print(f"classification APS coverage:   {marg_cov:.3f}   (nominal {nominal:.2f} — under-covers)")
-rails.measure("arxiv.tier04.reg_cal_mean", cal_mean)
-rails.measure("arxiv.tier04.reg_interval_coverage", reg_cov)
-rails.measure("arxiv.tier04.marginal_coverage", marg_cov)
+predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
+year = {
+    r["paper_id"]: r["year"]
+    for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
+}
+cal_ids, test_ids = arxiv.split["valid"], arxiv.split["test"]
+cal_mean, _ = keystone.predict_years(db, arxiv, predictor, cal_ids)
+test_mean, _ = keystone.predict_years(db, arxiv, predictor, test_ids)
+intervals = db.conformalize_interval(
+    cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=0.10
+)
+reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
+contracts.assert_close("arxiv.tier04.reg_cal_mean", float(np.mean(cal_mean)))
+contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
+print(f"posterior mean (cal era):      {np.mean(cal_mean):.2f}   (a real fit, no collapse)")
+print(f"regression interval coverage:  {reg_cov:.3f}   (nominal 0.90)")
 ```
 
 ```{python}
 # | echo: false
-# The moat, measured: a real context-conditioned posterior, and BOTH cruxes
-# under-cover under the time-split (the graph-dependence break) — the tier with no
-# monograph and no Neptune analogue.
-assert cal_mean > 2010 and reg_cov < nominal and marg_cov < nominal
+if SCALE is scale.Scale.FULL:
+    assert reg_cov < 0.90  # the graph-dependence break, at the scale it is about
 ```
 
 ## The Neptune-contrast framing
@@ -248,6 +252,10 @@ for _row in CITATION_MAP:
         f"citation map cites a non-existent verb: {_row.jammi_call}"
 print(f"citation map: {len(CITATION_MAP)} rows, every reference resolved, "
       f"every Jammi call exists on the pinned engine ✓")
+```
+
+```{python}
+db.close()
 ```
 
 ### Verification notes — three citations that are easy to get wrong

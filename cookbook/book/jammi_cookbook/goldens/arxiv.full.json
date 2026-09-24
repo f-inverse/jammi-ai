@@ -1,4 +1,80 @@
 {
+  "calibration.adaptive_ece": {
+    "tol": 0.03,
+    "value": 0.223
+  },
+  "calibration.central_coverage": {
+    "tol": 0.03,
+    "value": 0.878
+  },
+  "calibration.crps": {
+    "tol": 0.03,
+    "value": 0.489
+  },
+  "calibration.nll": {
+    "tol": 0.05,
+    "value": 1.216
+  },
+  "calibration.pit_ks": {
+    "tol": 0.03,
+    "value": 0.471
+  },
+  "calibration.sharpness": {
+    "tol": 0.15,
+    "value": 2.76
+  },
+  "conformal.aps_coverage": {
+    "tol": 0.03,
+    "value": 0.8667
+  },
+  "conformal.aps_set_size": {
+    "tol": 0.6,
+    "value": 6.17
+  },
+  "conformal.cqr_coverage": {
+    "tol": 0.04,
+    "value": 0.849
+  },
+  "conformal.cqr_width": {
+    "tol": 0.6,
+    "value": 2.36
+  },
+  "conformal.interval_coverage": {
+    "tol": 0.04,
+    "value": 0.721
+  },
+  "conformal.interval_width": {
+    "tol": 0.6,
+    "value": 1.94
+  },
+  "conformal.lac_coverage": {
+    "tol": 0.03,
+    "value": 0.8894
+  },
+  "conformal.lac_set_size": {
+    "tol": 0.6,
+    "value": 7.97
+  },
+  "conformal.raps_coverage": {
+    "tol": 0.03,
+    "value": 0.8667
+  },
+  "conformal.raps_set_size": {
+    "tol": 0.6,
+    "value": 6.17
+  },
+  "conformal.synthetic_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.8333
+  },
+  "conformal.synthetic_shift_corr": {
+    "tol": 0.08,
+    "value": 0.73
+  },
+  "conformal.synthetic_weighted_coverage": {
+    "tol": 0.03,
+    "value": 0.9389
+  },
   "tier01.cite_homophily": {
     "tol": 0.02,
     "value": 0.5

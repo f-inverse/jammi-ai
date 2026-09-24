@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import inspect
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
 
-from . import datasets, encoders
+from . import datasets, encoders, shift
 from .datasets import Arxiv
 from .scale import Scale
 
@@ -100,7 +101,7 @@ def register_edges(db, table: str, name: str) -> str:
     return name
 
 
-def vectors(db, table: str) -> tuple[list[str], np.ndarray]:
+def vectors_of(db, table: str) -> tuple[list[str], np.ndarray]:
     """An embedding table's row keys and its vectors as a matrix, in key order."""
     rows = db.sql(f'SELECT _row_id, vector FROM "jammi.{table}" ORDER BY _row_id')
     ids = [str(k) for k in rows.column("_row_id").to_pylist()]
@@ -142,4 +143,57 @@ def subject_golden(db, arxiv: Arxiv) -> str:
     return datasets.same_label_golden(
         db, papers, key="paper_id", label="subject", text="title", queries=200,
         name="arxiv_subject_golden",
+    )
+
+
+def predict_years(db, arxiv: Arxiv, predictor: str, keys: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Tier 04: the predictor's served year distribution — mean and standard
+    deviation — for each paper in ``keys``."""
+    served = [
+        db.predict_with_context_predictor(predictor, source=arxiv.papers, target_key=k)
+        for k in keys
+    ]
+    return np.array([s["mean"] for s in served]), np.array([s["std"] for s in served])
+
+
+@dataclass(frozen=True)
+class SubjectScores:
+    """Tier 04's subject classifier over one embedding table: softmax class
+    scores and true labels for the calibration (2018) and test (2019–) eras,
+    and each era's unit embeddings."""
+
+    classes: list[str]
+    cal_scores: np.ndarray
+    cal_labels: np.ndarray
+    test_scores: np.ndarray
+    test_labels: np.ndarray
+    cal_embeddings: np.ndarray
+    test_embeddings: np.ndarray
+
+
+def subject_scores(db, arxiv: Arxiv, embeddings: str) -> SubjectScores:
+    """Tier 04: a nearest-centroid softmax head over ``embeddings``, fitted on
+    the training era and scored on the calibration and test eras."""
+    ids, vectors = vectors_of(db, embeddings)
+    row = {k: i for i, k in enumerate(ids)}
+    subject = {
+        r["paper_id"]: r["subject"]
+        for r in db.sql(
+            f"SELECT paper_id, subject FROM {arxiv.papers}.public.{arxiv.papers}"
+        ).to_pylist()
+    }
+    classes = sorted(set(subject.values()))
+    labels = np.array([classes.index(subject[k]) for k in ids])
+    train, cal, test = (
+        np.array([row[k] for k in arxiv.split[era]]) for era in ("train", "valid", "test")
+    )
+    unit = shift.unit_rows(vectors)
+    return SubjectScores(
+        classes=classes,
+        cal_scores=shift.nearest_centroid_scores(vectors, labels, train, cal, len(classes)),
+        cal_labels=labels[cal],
+        test_scores=shift.nearest_centroid_scores(vectors, labels, train, test, len(classes)),
+        test_labels=labels[test],
+        cal_embeddings=unit[cal],
+        test_embeddings=unit[test],
     )

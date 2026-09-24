@@ -15,7 +15,7 @@ use tempfile::tempdir;
 /// refused at every larger, more realistic deployment value too.
 async fn floor_pool_session(dir: &std::path::Path) -> jammi_db::session::JammiSession {
     let mut config = test_config(dir);
-    config.engine.memory_limit = "64MB".to_string();
+    config.engine.memory_limit = "64MB".parse().unwrap();
     jammi_db::session::JammiSession::new(config)
         .await
         .expect("sqlite-backed session at the memory_limit floor")

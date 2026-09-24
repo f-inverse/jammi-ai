@@ -937,7 +937,6 @@ async fn one_device_admits_forwards_across_two_inference_execs() {
         let device_config = DeviceConfig {
             gpu_device: -1,
             devices: vec![-1],
-            memory_fraction: 1.0,
             require_gpu: false,
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
@@ -975,7 +974,7 @@ async fn one_device_admits_forwards_across_two_inference_execs() {
     }
 
     assert_eq!(
-        peak_over_two_plans(GpuScheduler::new(1 << 40, 0.0), "one-forward-device").await,
+        peak_over_two_plans(GpuScheduler::new(1 << 40), "one-forward-device").await,
         1,
         "a device that admits one forward never runs two, whichever plan they belong to"
     );

@@ -56,7 +56,6 @@ fn new_cache(catalog: Arc<Catalog>) -> ModelCache {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -499,7 +498,7 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
         .unwrap()
         .len() as usize;
 
-    let scheduler = Arc::new(GpuScheduler::new(2 * weights_len, 0.0));
+    let scheduler = Arc::new(GpuScheduler::new(2 * weights_len));
     let resolver = ModelResolver::new(
         Arc::clone(&catalog),
         crate::common::test_artifact_store(),
@@ -509,7 +508,6 @@ async fn stale_eviction_never_double_books_gpu_memory_while_guard_held() {
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };
@@ -642,7 +640,7 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
 
     // Realistic budget: exactly ONE resident copy, no slack for a second,
     // transient one.
-    let scheduler = Arc::new(GpuScheduler::new(weights_len, 0.0));
+    let scheduler = Arc::new(GpuScheduler::new(weights_len));
     let resolver = ModelResolver::new(
         Arc::clone(&catalog),
         crate::common::test_artifact_store(),
@@ -652,7 +650,6 @@ async fn stale_reload_while_guard_live_waits_for_release_under_a_realistic_budge
     let device_config = DeviceConfig {
         gpu_device: -1,
         devices: vec![-1],
-        memory_fraction: 1.0,
         require_gpu: false,
         compute_precision: jammi_numerics::ComputePrecision::F32,
     };

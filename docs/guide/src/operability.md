@@ -185,8 +185,9 @@ reclaim path fails the job for good rather than re-queueing it indefinitely.
 ### GPU admission — a memory budget
 
 GPU admission is a **memory budget**, not a max-concurrent-job count. The
-scheduler admits work against a budget of
-`total_gpu_memory × (1 − headroom_fraction)`: a reservation is admitted by a
+scheduler admits work against each device's `[gpu] memory_limit` budget
+(a share of the card, `"90%"` by default, or an absolute size that fits
+it): a reservation is admitted by a
 compare-and-swap against the reserved total, and released via RAII when the
 permit drops. Many small jobs can run concurrently while one large job is
 admitted only when its memory fits the remaining budget.

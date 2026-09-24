@@ -47,7 +47,7 @@ jobs:
       - name: Clippy (feature-gated test surfaces)
         run: |
           cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings
-          cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-broker-tests,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
+          cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
           cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
           cargo clippy -p jammi-ballista --tests --features live-distributed-tests,live-postgres-tests -- -D warnings
           cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings

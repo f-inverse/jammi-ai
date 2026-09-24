@@ -1,17 +1,15 @@
 """Cookbook smoke runner — every recipe is a CI gate.
 
-Default: runs the quickstart and the fast recipes. Fails the build if any
-recipe exits non-zero, if quickstart wall-clock exceeds 60 seconds, or if
-the smoke runner itself errors.
+Runs the quickstart and every recipe. Fails the build if any recipe exits
+non-zero, if quickstart wall-clock exceeds 60 seconds, or if the smoke runner
+itself errors. The recipes that talk to a server (`remote_session`,
+`flight_sql`) start one with `jammi.testing.LiveServer`, which runs the
+`jammi-server` on PATH; the lane that runs this puts one there.
 
 Every step runs under `python -m jammi.session_journal`, so a recipe that
 leaves a session open — in any process it starts — fails by the session's
 label, and a recipe's exit status is never the only evidence it closed what it
 opened.
-
-Set `JAMMI_COOKBOOK_SLOW=1` to additionally run `fine_tune` (slow on CPU)
-and `flight_sql` (requires `cargo build --release -p jammi-server` to have
-produced `target/release/jammi-server`). The nightly CI cron sets this flag.
 
 Run with `python tests/cookbook_smoke.py`.
 """
@@ -30,7 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 COOKBOOK = REPO_ROOT / "cookbook"
 
 QUICKSTART_BUDGET_S = 60.0
-SLOW_FLAG = "JAMMI_COOKBOOK_SLOW"
 
 
 @dataclass(frozen=True)
@@ -40,12 +37,11 @@ class Recipe:
 
     name: str
     steps: tuple[Path, ...]
-    slow: bool = False
     workdir_env: str | None = None
 
 
-def example(name: str, *, slow: bool = False) -> Recipe:
-    return Recipe(name, (COOKBOOK / "recipes" / name / "example.py",), slow=slow)
+def example(name: str) -> Recipe:
+    return Recipe(name, (COOKBOOK / "recipes" / name / "example.py",))
 
 
 def stepwise(name: str, workdir_env: str) -> Recipe:
@@ -68,8 +64,13 @@ RECIPES: tuple[Recipe, ...] = (
     example("search_audit"),
     example("session_lifecycle"),
     example("remote_model"),
-    example("fine_tune", slow=True),
-    example("flight_sql", slow=True),
+    example("fine_tune"),
+    example("graph_and_lineage"),
+    example("model_catalog"),
+    example("jobs"),
+    example("context_predictor"),
+    example("remote_session"),
+    example("flight_sql"),
 )
 
 
@@ -109,20 +110,12 @@ def run_recipe(recipe: Recipe) -> Result:
 
 
 def main() -> int:
-    include_slow = os.environ.get(SLOW_FLAG) == "1"
-    selected = [r for r in RECIPES if include_slow or not r.slow]
-    skipped = [r for r in RECIPES if not include_slow and r.slow]
-
-    print(f"Cookbook smoke — {len(selected)} recipes" + (
-        f"  (skipping {len(skipped)} slow: {', '.join(r.name for r in skipped)})"
-        if skipped
-        else ""
-    ))
+    print(f"Cookbook smoke — {len(RECIPES)} recipes")
     print("-" * 60)
 
     failures: list[Result] = []
     budget_breach: Result | None = None
-    for recipe in selected:
+    for recipe in RECIPES:
         result = run_recipe(recipe)
         marker = "PASS" if result.returncode == 0 else "FAIL"
         print(f"  {marker}  {result.name:<26}  {result.elapsed_s:>6.2f}s")

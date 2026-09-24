@@ -12,12 +12,11 @@ import tempfile
 from pathlib import Path
 
 import jammi
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-CORPUS_PATH = FIXTURES / "tiny_corpus.parquet"
-GOLDEN_PATH = FIXTURES / "tiny_golden.json"
-MODEL = f"local:{FIXTURES / 'tiny_bert'}"
+CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
+GOLDEN_PATH = fixtures.path("tiny_golden.json")
+MODEL = fixtures.model("tiny_bert")
 
 
 def expand_golden_to_csv(json_path: Path, out_path: Path) -> None:
@@ -39,7 +38,7 @@ def main() -> int:
 
         # 1. Register the corpus and build the embedding index.
         db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
-        db.generate_embeddings(
+        base = db.generate_embeddings(
             source="corpus",
             model=MODEL,
             columns=["content"],
@@ -101,6 +100,26 @@ def main() -> int:
         if "q1" in by_query:
             assert by_query["q1"]["cohorts"].get("split") == "val", "cohort stored verbatim"
             print("cohort tag round-trip: OK (q1 -> {'split': 'val'})")
+
+        # 8. Compare two embedding tables on the same golden set: the base
+        #    embeddings, and the same embeddings smoothed over the corpus's own
+        #    k-NN graph. The first table is the baseline; every other entry
+        #    carries its per-metric delta against it.
+        graph = db.build_neighbor_graph("corpus", k=3, exact=True)
+        smoothed = db.propagate_embeddings(
+            "corpus", embedding_table=base, edge_graph_table=graph, hops=1, alpha=0.5
+        )
+        compared = db.eval_compare(
+            embedding_tables=[base, smoothed],
+            source="corpus",
+            golden_source="golden.public.golden",
+            k=5,
+        )
+        baseline, candidate = compared["per_table"]
+        assert baseline["delta"] is None
+        base_recall = baseline["embedding_eval"]["aggregate"]["recall_at_k"]
+        recall_delta = candidate["delta"]["recall_at_k"]["absolute"]
+        print(f"compare: base recall@5 {base_recall:.4f}; smoothed Δ {recall_delta:+.4f}")
 
     print("eval_embeddings: OK")
     return 0

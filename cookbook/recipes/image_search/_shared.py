@@ -14,16 +14,15 @@ import tempfile
 from pathlib import Path
 
 import pyarrow as pa
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-IMAGE_CORPUS_DIR = FIXTURES / "tiny_image_corpus"
-GOLDEN_PATH = FIXTURES / "tiny_image_golden.json"
+IMAGE_CORPUS_DIR = fixtures.path("tiny_image_corpus")
+GOLDEN_PATH = fixtures.path("tiny_image_golden.json")
 
 # Default to the hermetic local fixture (offline CI). Override with
 # JAMMI_IMAGE_MODEL=<a domain-specialized checkpoint, e.g.
 # patentclip/PatentCLIP_Vit_B> when the corpus is technical drawings.
-DEFAULT_MODEL = f"local:{FIXTURES / 'tiny_open_clip'}"
+DEFAULT_MODEL = fixtures.model("tiny_open_clip")
 MODEL = os.environ.get("JAMMI_IMAGE_MODEL", DEFAULT_MODEL)
 
 # Persistent scratch dir shared across the numbered steps in one sequence.

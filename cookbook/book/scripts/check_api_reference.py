@@ -105,6 +105,7 @@ REQUIRED: dict[str, list[str]] = {
         "tie_break_column",
         "project",
     ],
+    "describe_table": ["table"],
     "verify_materialization": ["expected_definition"],
     "staleness": ["current_definition"],
     "derives_from": [],

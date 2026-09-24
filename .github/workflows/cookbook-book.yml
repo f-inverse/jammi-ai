@@ -35,9 +35,9 @@ name: Cookbook book
 # nightly renders the PRE-merge base, so it proves the chapter as it was,
 # never as the diff leaves it.
 #
-# The return half — chapter-coverage accounting (which chapters a merged PR's
-# diff SHOULD have moved, closing the loop the other direction) — is the
-# "Chapter-coverage gate" step below; together the two mechanize the
+# The return half — every public verb is run by a recipe or an executed
+# chapter cell — is the repo guard `ci/scripts/check_cookbook_coverage.py`
+# (ci/guards.toml), which runs on every change; together the two mechanize the
 # co-evolution doctrine end to end.
 
 on:
@@ -164,18 +164,6 @@ jobs:
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           python -m jammi.session_journal -- python scripts/check_api_reference.py
-
-      # The RETURN half of the engine<->cookbook co-evolution loop:
-      # check_api_reference.py above guards that a shipped
-      # surface's signature hasn't drifted out from under a chapter; this
-      # guards that every shipped surface HAS a chapter (or a reviewed,
-      # dated deferral) exercising it in the first place, so a new public
-      # capability cannot ship with silently-unaccounted cookbook coverage.
-      - name: Chapter-coverage gate
-        working-directory: cookbook/book
-        run: |
-          . "$GITHUB_WORKSPACE/.venv/bin/activate"
-          python -m jammi.session_journal -- python scripts/check_chapter_coverage.py
 
       - name: Lint
         working-directory: cookbook/book

@@ -10,12 +10,11 @@ import tempfile
 from pathlib import Path
 
 import jammi
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-CORPUS_PATH = FIXTURES / "tiny_corpus.parquet"
-LABELS_PATH = FIXTURES / "tiny_labels.csv"
-MODEL = f"local:{FIXTURES / 'tiny_modernbert_classifier'}"
+CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
+LABELS_PATH = fixtures.path("tiny_labels.csv")
+MODEL = fixtures.model("tiny_modernbert_classifier")
 
 
 def main() -> int:
@@ -62,6 +61,19 @@ def main() -> int:
                 f"  recall={stats['recall']:.4f}  f1={stats['f1']:.4f}"
             )
         print(f"per_record: {len(per_record)} predictions")
+
+        # 6. The predictions themselves, without the gold labels: `infer` runs
+        #    the model over the source and returns one row per source row,
+        #    keyed by `id`, with the model's outputs as columns.
+        predictions = db.infer(
+            source="corpus",
+            model=MODEL,
+            columns=["content"],
+            task="classification",
+            key="id",
+        )
+        assert predictions.num_rows == 20, predictions.num_rows
+        print(f"infer: {predictions.num_rows} rows, columns {predictions.column_names}")
 
     print("eval_inference: OK")
     return 0

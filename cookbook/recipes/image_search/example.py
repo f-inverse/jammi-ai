@@ -48,18 +48,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
+from jammi_cookbook import fixtures
 from jammi.errors import TrainingError
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-IMAGE_CORPUS_DIR = FIXTURES / "tiny_image_corpus"
-GOLDEN_PATH = FIXTURES / "tiny_image_golden.json"
+IMAGE_CORPUS_DIR = fixtures.path("tiny_image_corpus")
+GOLDEN_PATH = fixtures.path("tiny_image_golden.json")
 
 # Default to the hermetic local fixture so CI runs offline. Override with
 # JAMMI_IMAGE_MODEL=<a domain-specialized checkpoint, e.g.
 # patentclip/PatentCLIP_Vit_B> or any other OpenCLIP-format model ID /
 # `local:<path>`.
-DEFAULT_MODEL = f"local:{FIXTURES / 'tiny_open_clip'}"
+DEFAULT_MODEL = fixtures.model("tiny_open_clip")
 MODEL = os.environ.get("JAMMI_IMAGE_MODEL", DEFAULT_MODEL)
 
 

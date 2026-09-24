@@ -34,9 +34,9 @@ from pathlib import Path
 os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
 
 import jammi
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-CORPUS_PATH = REPO_ROOT / "cookbook" / "fixtures" / "tiny_corpus.parquet"
+CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
 DIMS = 32
 TOKEN = "local-demo-token"
 

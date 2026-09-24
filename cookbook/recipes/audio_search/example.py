@@ -55,16 +55,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
+from jammi_cookbook import fixtures
 from jammi.errors import TrainingError
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-AUDIO_CORPUS_DIR = FIXTURES / "tiny_audio_corpus"
-GOLDEN_PATH = FIXTURES / "tiny_audio_golden.json"
+AUDIO_CORPUS_DIR = fixtures.path("tiny_audio_corpus")
+GOLDEN_PATH = fixtures.path("tiny_audio_golden.json")
 
 # Default to the hermetic local fixture so CI runs offline. Override with
 # JAMMI_AUDIO_MODEL=<hf-repo-id> or `local:<path>` for any CLAP-format model.
-DEFAULT_MODEL = f"local:{FIXTURES / 'htsat_clap_tiny'}"
+DEFAULT_MODEL = fixtures.model("htsat_clap_tiny")
 MODEL = os.environ.get("JAMMI_AUDIO_MODEL", DEFAULT_MODEL)
 
 

@@ -10,12 +10,11 @@ import tempfile
 from pathlib import Path
 
 import jammi
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-CORPUS_PATH = FIXTURES / "tiny_ner_corpus.parquet"
-GOLD_PATH = FIXTURES / "tiny_ner_gold.csv"
-MODEL = f"local:{FIXTURES / 'tiny_modernbert_ner'}"
+CORPUS_PATH = fixtures.path("tiny_ner_corpus.parquet")
+GOLD_PATH = fixtures.path("tiny_ner_gold.csv")
+MODEL = fixtures.model("tiny_modernbert_ner")
 
 
 def main() -> int:

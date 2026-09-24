@@ -91,12 +91,12 @@ retry_transient() {
       return 0
     fi
 
-    if printf '%s' "$output" | grep -qiE 'already uploaded|already exists'; then
+    if grep -qiE 'already uploaded|already exists' <<<"$output"; then
       echo "::error::${desc}: version conflict — not transient, failing fast" >&2
       return "$rc"
     fi
 
-    if ! printf '%s' "$output" | grep -qiE '(^|[^0-9])(500|502|503|504)([^0-9]|$)|service unavailable|spurious network error|failed to get successful http response|could not resolve host|connection reset|connection refused|operation timed out|network is unreachable'; then
+    if ! grep -qiE '(^|[^0-9])(500|502|503|504)([^0-9]|$)|service unavailable|spurious network error|failed to get successful http response|could not resolve host|connection reset|connection refused|operation timed out|network is unreachable' <<<"$output"; then
       echo "::error::${desc}: non-transient failure — failing fast" >&2
       return "$rc"
     fi
@@ -155,8 +155,8 @@ wait_for_index() {
   local deadline=$(( SECONDS + 300 ))  # bound: 5 minutes, then fail loudly
   echo "Waiting for ${crate} ${version} to appear in the crates.io sparse index (${url})..."
   while (( SECONDS < deadline )); do
-    if curl -sf -A "jammi-ai release CI (github.com/f-inverse/jammi-ai)" "${url}" \
-      | grep -q "\"vers\":\"${version}\""; then
+    if grep -q "\"vers\":\"${version}\"" \
+      <<<"$(curl -sf -A "jammi-ai release CI (github.com/f-inverse/jammi-ai)" "${url}")"; then
       echo "${crate} ${version} is visible in the sparse index"
       return 0
     fi

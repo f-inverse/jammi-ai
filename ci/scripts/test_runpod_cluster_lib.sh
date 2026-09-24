@@ -340,7 +340,7 @@ for status in 401 429 500; do
 (
   export MOCK_CLUSTER_LIST_STATUS="$status"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT enumerate clusters"; then
+  if [ "$rc" -eq 1 ] && grep -q "could NOT enumerate clusters" <<<"$out"; then
     ok "cluster sweep: a ${status} on the cluster GET is rc=1, named 'could NOT enumerate clusters'"
   else
     bad "cluster sweep: expected rc=1 naming the enumeration failure for status ${status} (got rc=$rc): $out"
@@ -352,7 +352,7 @@ done
   echo 'not json at all' > "$SANDBOX/g3-badjson.json"
   export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g3-badjson.json"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT enumerate clusters"; then
+  if [ "$rc" -eq 1 ] && grep -q "could NOT enumerate clusters" <<<"$out"; then
     ok "cluster sweep: an unparseable cluster-list body is rc=1, named 'could NOT enumerate clusters'"
   else
     bad "cluster sweep: expected rc=1 on an unparseable body (got rc=$rc): $out"
@@ -366,7 +366,7 @@ done
   rm -f "$MOCK_LIST_CALL_COUNTER"
   export MOCK_CLUSTER_DELETE_STATUS="204"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "still present after delete"; then
+  if [ "$rc" -eq 1 ] && grep -q "still present after delete" <<<"$out"; then
     ok "cluster sweep: the post-delete re-enumeration is fail-closed — a cluster still listed after a 204 delete is reported by name, never trusted"
   else
     bad "cluster sweep: expected the post-delete confirmation to catch a still-listed cluster (rc=$rc): $out"
@@ -377,7 +377,7 @@ done
   export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g3-list.json"
   export MOCK_CLUSTER_DELETE_STATUS="409"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "cl-stale"; then
+  if [ "$rc" -eq 1 ] && grep -q "cl-stale" <<<"$out"; then
     ok "cluster sweep: a non-204 DELETE is rc=1, naming the cluster id (cl-stale)"
   else
     bad "cluster sweep: expected rc=1 naming cl-stale on a non-204 delete (rc=$rc): $out"
@@ -391,7 +391,7 @@ done
   rm -f "$MOCK_LIST_CALL_COUNTER"
   export MOCK_CLUSTER_DELETE_STATUS="204"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "terminated 1 orphaned cluster"; then
+  if [ "$rc" -eq 0 ] && grep -q "terminated 1 orphaned cluster" <<<"$out"; then
     ok "cluster sweep: a 204 DELETE followed by a clean re-enumeration is a genuine success (rc=0)"
   else
     bad "cluster sweep: expected rc=0 on a clean delete+reconfirm (rc=$rc): $out"
@@ -413,7 +413,7 @@ JSON
   export MOCK_DELETE_CALL_LOG="$SANDBOX/g3-unageable-delete.log"
   rm -f "$MOCK_DELETE_CALL_LOG"; : > "$MOCK_DELETE_CALL_LOG"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "cl-unageable"; then
+  if [ "$rc" -eq 1 ] && grep -q "cl-unageable" <<<"$out"; then
     ok "cluster sweep: a cluster with no usable createdAt is rc=1, naming the cluster id (cl-unageable)"
   else
     bad "cluster sweep: expected rc=1 naming cl-unageable (got rc=$rc): $out"
@@ -436,14 +436,14 @@ JSON
   export MOCK_CLUSTER_DELETE_STATUS="204"
   for bad_val in 0 00; do
     out="$(rp_cluster_sweep "$bad_val" 2>&1)"; rc=$?
-    if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "hours must be > 0"; then
+    if [ "$rc" -eq 2 ] && grep -q "hours must be > 0" <<<"$out"; then
       ok "force-hours validation: rp_cluster_sweep ${bad_val} refuses (rc=2, 'hours must be > 0')"
     else
       bad "force-hours validation: rp_cluster_sweep ${bad_val} expected rc=2 'hours must be > 0' (got rc=$rc): $out"
     fi
   done
   out="$(rp_cluster_sweep abc 2>&1)"; rc=$?
-  if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q "positive integer"; then
+  if [ "$rc" -eq 2 ] && grep -q "positive integer" <<<"$out"; then
     ok "force-hours validation: rp_cluster_sweep abc refuses (rc=2, non-digit named)"
   else
     bad "force-hours validation: rp_cluster_sweep abc expected rc=2 naming a non-digit input (got rc=$rc): $out"
@@ -496,20 +496,20 @@ JSON
   export MOCK_TERM_COUNTER="$SANDBOX/g5-term-counter"
   rm -f "$MOCK_TERM_COUNTER"
   out="$(rp_sweep 2>&1)"; rc=$?
-  if printf '%s' "$out" | grep -q "cluster member, skipped: pod-member"; then
+  if grep -q "cluster member, skipped: pod-member" <<<"$out"; then
     ok "pod sweep exclusion: rp_sweep skips a cluster member by name ('cluster member, skipped: pod-member') without ever calling terminate on it"
   else
     bad "pod sweep exclusion: expected 'cluster member, skipped: pod-member' in rp_sweep's output: $out"
   fi
-  if printf '%s' "$out" | grep -q 'podTerminate.*pod-member' 2>/dev/null; then
+  if grep -q 'podTerminate.*pod-member' 2>/dev/null <<<"$out"; then
     bad "pod sweep exclusion: rp_sweep must never issue podTerminate for a known cluster member (regression!)"
   fi
-  if printf '%s' "$out" | grep -q "terminate refused: pod is a cluster member (pod pod-refused)"; then
+  if grep -q "terminate refused: pod is a cluster member (pod pod-refused)" <<<"$out"; then
     ok "pod sweep exclusion: a refused podTerminate is reported by name ('terminate refused: pod is a cluster member (pod pod-refused)')"
   else
     bad "pod sweep exclusion: expected the named terminate-refused line for pod-refused: $out"
   fi
-  if printf '%s' "$out" | grep -q "swept pod pod-stale"; then
+  if grep -q "swept pod pod-stale" <<<"$out"; then
     ok "pod sweep exclusion: an ordinary orphan (pod-stale) is still swept normally alongside the exclusion/refusal handling"
   else
     bad "pod sweep exclusion: expected pod-stale to be swept: $out"
@@ -524,7 +524,7 @@ JSON
   else
     bad "pod sweep exclusion: expected rc=1 (a refusal is fatal to the run's own exit) (got rc=$rc)"
   fi
-  if printf '%s' "$out" | grep -q "1 terminate(s) refused: pod-refused: pod is a cluster member"; then
+  if grep -q "1 terminate(s) refused: pod-refused: pod is a cluster member" <<<"$out"; then
     ok "pod sweep exclusion: the refusal summary names the pod id and the refused reason ('1 terminate(s) refused: pod-refused: pod is a cluster member')"
   else
     bad "pod sweep exclusion: expected the refusal summary naming pod-refused and its reason: $out"
@@ -551,7 +551,7 @@ JSON
   else
     bad "pod sweep fail-closed: expected rc=1 on a failed cluster-member enumeration (got rc=$rc): $out"
   fi
-  if printf '%s' "$out" | grep -q "sweep could NOT enumerate cluster members; pod sweep skipped"; then
+  if grep -q "sweep could NOT enumerate cluster members; pod sweep skipped" <<<"$out"; then
     ok "pod sweep fail-closed: the refusal is named ('sweep could NOT enumerate cluster members; pod sweep skipped: <reason>')"
   else
     bad "pod sweep fail-closed: expected the named 'sweep could NOT enumerate cluster members; pod sweep skipped' line: $out"
@@ -561,7 +561,7 @@ JSON
   else
     ok "pod sweep fail-closed: zero podTerminate calls were recorded — nothing was terminated, not even the ordinary orphan pod-stale"
   fi
-  if printf '%s' "$out" | grep -q "swept pod\|terminate refused\|cluster member, skipped"; then
+  if grep -q "swept pod\|terminate refused\|cluster member, skipped" <<<"$out"; then
     bad "pod sweep fail-closed: no pod outcome line (swept/refused/skipped) may appear — the whole pod sweep is skipped, not just the terminations: $out"
   else
     ok "pod sweep fail-closed: no per-pod outcome line appears — the entire pod sweep was skipped, not merely the terminations within it"
@@ -590,7 +590,7 @@ JSON
   export MOCK_CLUSTER_CREATE_STATUS="201"
   export MOCK_CLUSTER_CREATE_RESPONSE="$SANDBOX/g7-create-noid.json"
   out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "carried no id"; then
+  if [ "$rc" -eq 1 ] && grep -q "carried no id" <<<"$out"; then
     ok "cluster create: rp_cluster_create names a 201 with no id key ('carried no id')"
   else
     bad "cluster create: expected rc=1 'carried no id' (got rc=$rc): $out"
@@ -601,7 +601,7 @@ JSON
   export MOCK_CLUSTER_CREATE_STATUS="201"
   export MOCK_CLUSTER_CREATE_RESPONSE="$SANDBOX/g7-create-badjson.json"
   out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "unparseable"; then
+  if [ "$rc" -eq 1 ] && grep -q "unparseable" <<<"$out"; then
     ok "cluster create: rp_cluster_create names a 201 unparseable body distinctly from 'no id'"
   else
     bad "cluster create: expected rc=1 naming 'unparseable' (got rc=$rc): $out"
@@ -610,7 +610,7 @@ JSON
 (
   export MOCK_CLUSTER_CREATE_STATUS="422"
   out="$(rp_cluster_create "NVIDIA A100 80GB PCIe" 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused"; then
+  if [ "$rc" -eq 1 ] && grep -q "refused" <<<"$out"; then
     ok "cluster create: rp_cluster_create refuses a non-201 status by name"
   else
     bad "cluster create: expected rc=1 'refused' on a non-201 (got rc=$rc): $out"
@@ -626,7 +626,7 @@ JSON
   export MOCK_CLUSTER_GET_STATUS="200"
   export MOCK_CLUSTER_GET_RESPONSE="$SANDBOX/g8-get-ok.json"
   out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
-  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '"id":"cl_x"'; then
+  if [ "$rc" -eq 0 ] && grep -q '"id":"cl_x"' <<<"$out"; then
     ok "cluster get: rp_cluster_get prints the body on a 200 with an id"
   else
     bad "cluster get: expected rc=0 with the body (got rc=$rc): $out"
@@ -637,7 +637,7 @@ JSON
   export MOCK_CLUSTER_GET_STATUS="200"
   export MOCK_CLUSTER_GET_RESPONSE="$SANDBOX/g8-get-missing.json"
   out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "missing the required 'id' key"; then
+  if [ "$rc" -eq 1 ] && grep -q "missing the required 'id' key" <<<"$out"; then
     ok "cluster get: rp_cluster_get names a 200 missing the id key"
   else
     bad "cluster get: expected rc=1 'missing...id' (got rc=$rc): $out"
@@ -648,7 +648,7 @@ JSON
   export MOCK_CLUSTER_GET_STATUS="200"
   export MOCK_CLUSTER_GET_RESPONSE="$SANDBOX/g8-get-badjson.json"
   out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "unparseable"; then
+  if [ "$rc" -eq 1 ] && grep -q "unparseable" <<<"$out"; then
     ok "cluster get: rp_cluster_get names a 200 unparseable body distinctly from 'missing key'"
   else
     bad "cluster get: expected rc=1 'unparseable' (got rc=$rc): $out"
@@ -657,7 +657,7 @@ JSON
 (
   export MOCK_CLUSTER_GET_STATUS="404"
   out="$(rp_cluster_get cl_missing 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused"; then
+  if [ "$rc" -eq 1 ] && grep -q "refused" <<<"$out"; then
     ok "cluster get: rp_cluster_get refuses a 404 by name"
   else
     bad "cluster get: expected rc=1 'refused' on 404 (got rc=$rc): $out"
@@ -666,7 +666,7 @@ JSON
 (
   export MOCK_CLUSTER_GET_STATUS="500"
   out="$(rp_cluster_get cl_x 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused"; then
+  if [ "$rc" -eq 1 ] && grep -q "refused" <<<"$out"; then
     ok "cluster get: rp_cluster_get refuses a 500 by name"
   else
     bad "cluster get: expected rc=1 'refused' on 500 (got rc=$rc): $out"
@@ -695,7 +695,7 @@ for label_body in "unparseable:not json at all" "empty:" "array:[]"; do
   rm -f "$MOCK_LIST_CALL_COUNTER" "$MOCK_DELETE_CALL_LOG"; : > "$MOCK_DELETE_CALL_LOG"
   export MOCK_CLUSTER_DELETE_STATUS="204"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT confirm cluster cl-stale is gone"; then
+  if [ "$rc" -eq 1 ] && grep -q "could NOT confirm cluster cl-stale is gone" <<<"$out"; then
     ok "post-delete confirmation: a ${label} post-delete re-enumeration body is rc=1, named 'could NOT confirm ... is gone'"
   else
     bad "post-delete confirmation: expected rc=1 naming the unconfirmable delete for a ${label} body (got rc=$rc): $out"
@@ -721,7 +721,7 @@ done
   rm -f "$MOCK_LIST_CALL_COUNTER" "$MOCK_DELETE_CALL_LOG"; : > "$MOCK_DELETE_CALL_LOG"
   export MOCK_CLUSTER_DELETE_STATUS="204"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT re-enumerate clusters after deleting"; then
+  if [ "$rc" -eq 1 ] && grep -q "could NOT re-enumerate clusters after deleting" <<<"$out"; then
     ok "post-delete confirmation: a 429 on the post-delete re-enumeration is rc=1, named 'could NOT re-enumerate ... after deleting'"
   else
     bad "post-delete confirmation: expected rc=1 naming the failed re-enumeration on a 429 (got rc=$rc): $out"
@@ -750,12 +750,12 @@ JSON
   else
     bad "terminate response: expected rc=1 on an unparseable podTerminate body (got rc=$rc): $out"
   fi
-  if printf '%s' "$out" | grep -q "swept pod pod-html"; then
+  if grep -q "swept pod pod-html" <<<"$out"; then
     bad "terminate response: an unparseable podTerminate body must NEVER read as 'swept pod pod-html' (regression!)"
   else
     ok "terminate response: pod-html was never reported swept"
   fi
-  if printf '%s' "$out" | grep -q "terminate refused:.*pod-html"; then
+  if grep -q "terminate refused:.*pod-html" <<<"$out"; then
     ok "terminate response: the unparseable body is reported as a refused terminate, naming pod-html"
   else
     bad "terminate response: expected 'terminate refused' naming pod-html: $out"
@@ -778,7 +778,7 @@ JSON
   export MOCK_TERM_COUNTER="$SANDBOX/g11-term-counter"
   rm -f "$MOCK_TERM_COUNTER"
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-unageable"; then
+  if [ "$rc" -eq 1 ] && grep -q "pod-unageable" <<<"$out"; then
     ok "unageable pod: an unageable pod (no usable createdAt) is rc=1, naming the pod id (pod-unageable)"
   else
     bad "unageable pod: expected rc=1 naming pod-unageable (got rc=$rc): $out"
@@ -810,7 +810,7 @@ JSON
   export MOCK_TERM_COUNTER="$SANDBOX/g12-term-counter"
   rm -f "$MOCK_TERM_COUNTER"; reset_log
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-unageable" && printf '%s' "$out" | grep -q "rp_terminate pod-unageable"; then
+  if [ "$rc" -eq 1 ] && grep -q "pod-unageable" <<<"$out" && grep -q "rp_terminate pod-unageable" <<<"$out"; then
     ok "unjudgeable resource: the unageable pod is named with its by-id remedy (rp_terminate <id>) and the sweep exits 1"
   else
     bad "unjudgeable resource: expected rc=1 naming pod-unageable with the rp_terminate remedy (got rc=$rc): $out"
@@ -853,7 +853,7 @@ JSON
   export MOCK_LIST_CALL_COUNTER="$SANDBOX/g12-list-counter"; rm -f "$MOCK_LIST_CALL_COUNTER"
   export MOCK_DELETE_CALL_LOG="$SANDBOX/g12-deletes"; : > "$MOCK_DELETE_CALL_LOG"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "rp_cluster_delete cl-unageable" && grep -q "cl-real-orphan" "$MOCK_DELETE_CALL_LOG" && ! grep -q "cl-unageable" "$MOCK_DELETE_CALL_LOG"; then
+  if [ "$rc" -eq 1 ] && grep -q "rp_cluster_delete cl-unageable" <<<"$out" && grep -q "cl-real-orphan" "$MOCK_DELETE_CALL_LOG" && ! grep -q "cl-unageable" "$MOCK_DELETE_CALL_LOG"; then
     ok "unjudgeable resource: cluster arm — the unageable cluster is named with rp_cluster_delete <id>, the orphan behind it is deleted, rc=1"
   else
     bad "unjudgeable resource: cluster arm — expected rc=1, cl-real-orphan deleted, cl-unageable named-not-deleted (got rc=$rc): $out / deletes: $(cat "$MOCK_DELETE_CALL_LOG")"
@@ -874,7 +874,7 @@ JSON
   export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g13-clusters.json"
   export MOCK_DELETE_CALL_LOG="$SANDBOX/g13-deletes"; : > "$MOCK_DELETE_CALL_LOG"
   out="$(rp_cluster_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "cl-manual" && printf '%s' "$out" | grep -q "no parseable -ttl" && ! grep -q "cl-manual" "$MOCK_DELETE_CALL_LOG"; then
+  if [ "$rc" -eq 1 ] && grep -q "cl-manual" <<<"$out" && grep -q "no parseable -ttl" <<<"$out" && ! grep -q "cl-manual" "$MOCK_DELETE_CALL_LOG"; then
     ok "unparseable ttl: a prefixed cluster with no parseable -ttl<H> is named (by-id remedy) and NOT deleted; rc=1"
   else
     bad "unparseable ttl: expected rc=1, named, zero deletes for cl-manual (got rc=$rc): $out / deletes: $(cat "$MOCK_DELETE_CALL_LOG")"
@@ -888,7 +888,7 @@ JSON
   export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g13-account.json"
   export MOCK_TERM_COUNTER="$SANDBOX/g13-term-counter"; rm -f "$MOCK_TERM_COUNTER"; reset_log
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "pod-manual" && ! log_has "podTerminate"; then
+  if [ "$rc" -eq 1 ] && grep -q "pod-manual" <<<"$out" && ! log_has "podTerminate"; then
     ok "unparseable ttl: pod mirror — a prefixed pod with no parseable -ttl<H> is named and NOT terminated; rc=1"
   else
     bad "unparseable ttl: pod mirror — expected rc=1, named, zero terminates (got rc=$rc): $out"
@@ -905,7 +905,7 @@ JSON
   echo '{"clusters":["oops"]}' > "$SANDBOX/g14-list.json"
   export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g14-list.json"
   out="$(rp_cluster_list 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could not be read" && ! printf '%s' "$out" | grep -q "missing the required"; then
+  if [ "$rc" -eq 1 ] && grep -q "could not be read" <<<"$out" && ! grep -q "missing the required" <<<"$out"; then
     ok "total parse: rp_cluster_list — a non-object row is 'could not be read', never 'missing the required key'"
   else
     bad "total parse: rp_cluster_list on a non-object row (got rc=$rc): $out"
@@ -915,7 +915,7 @@ JSON
   echo '{"pods":[{"id":"p1","ssh":{"direct":{"port":22}}}]}' > "$SANDBOX/g14-pods.json"
   export MOCK_CLUSTER_PODS_RESPONSE="$SANDBOX/g14-pods.json"
   out="$(rp_cluster_pods cl-x 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could not be read" && ! printf '%s' "$out" | grep -q "missing the required"; then
+  if [ "$rc" -eq 1 ] && grep -q "could not be read" <<<"$out" && ! grep -q "missing the required" <<<"$out"; then
     ok "total parse: rp_cluster_pods — an ssh.direct block without host is 'could not be read', never 'missing the required pods key'"
   else
     bad "total parse: rp_cluster_pods on a malformed member row (got rc=$rc): $out"
@@ -924,7 +924,7 @@ JSON
 (
   export MOCK_CLUSTER_PODS_STATUS="503"
   out="$(rp_cluster_pods cl-x 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "refused (status 503)"; then
+  if [ "$rc" -eq 1 ] && grep -q "refused (status 503)" <<<"$out"; then
     ok "total parse: rp_cluster_pods — a non-200 is a named refusal (MOCK_CLUSTER_PODS_STATUS drives the arm)"
   else
     bad "total parse: rp_cluster_pods non-200 arm (got rc=$rc): $out"
@@ -936,7 +936,7 @@ JSON
     export MOCK_CLUSTER_LIST_RESPONSE="$SANDBOX/g14-sweep.json"
     export MOCK_DELETE_CALL_LOG="$SANDBOX/g14-deletes"; : > "$MOCK_DELETE_CALL_LOG"
     out="$(rp_cluster_sweep 2>&1)"; rc=$?
-    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT enumerate clusters" && printf '%s' "$out" | grep -q "response contained no cluster list\|could not read" && ! [ -s "$MOCK_DELETE_CALL_LOG" ]; then
+    if [ "$rc" -eq 1 ] && grep -q "could NOT enumerate clusters" <<<"$out" && grep -q "response contained no cluster list\|could not read" <<<"$out" && ! [ -s "$MOCK_DELETE_CALL_LOG" ]; then
       ok "total parse: rp_cluster_sweep on body ${body} — named 'could NOT enumerate' with a reason, zero deletes"
     else
       bad "total parse: rp_cluster_sweep on body ${body} (got rc=$rc): $out"
@@ -948,7 +948,7 @@ JSON
   export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g14-account.json"
   export MOCK_TERM_COUNTER="$SANDBOX/g14-term-counter"; rm -f "$MOCK_TERM_COUNTER"; reset_log
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could NOT enumerate pods" && ! log_has "podTerminate"; then
+  if [ "$rc" -eq 1 ] && grep -q "could NOT enumerate pods" <<<"$out" && ! log_has "podTerminate"; then
     ok "total parse: rp_sweep on an array body — named 'could NOT enumerate pods', zero terminates"
   else
     bad "total parse: rp_sweep on an array body (got rc=$rc): $out"
@@ -960,7 +960,7 @@ JSON
   export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g14-account2.json"
   export MOCK_TERM_COUNTER="$SANDBOX/g14-term-counter2"; rm -f "$MOCK_TERM_COUNTER"; reset_log
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "could not read the pod list" && ! log_has "podTerminate"; then
+  if [ "$rc" -eq 1 ] && grep -q "could not read the pod list" <<<"$out" && ! log_has "podTerminate"; then
     ok "total parse: rp_sweep on a null pod row — 'could not read the pod list: ...', zero terminates"
   else
     bad "total parse: rp_sweep on a null pod row (got rc=$rc): $out"
@@ -993,7 +993,7 @@ JSON
   export MOCK_ACCOUNT_RESPONSE="$SANDBOX/g15-account.json"
   export MOCK_TERM_COUNTER="$SANDBOX/g15-term-counter"; rm -f "$MOCK_TERM_COUNTER"; reset_log
   out="$(rp_sweep 2>&1)"; rc=$?
-  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "sweep could NOT enumerate cluster members; pod sweep skipped" && ! log_has "podTerminate"; then
+  if [ "$rc" -eq 1 ] && grep -q "sweep could NOT enumerate cluster members; pod sweep skipped" <<<"$out" && ! log_has "podTerminate"; then
     ok "idless member: a member row with no readable id suspends the pod sweep (exclusion set incomplete → nothing terminated)"
   else
     bad "idless member: expected rc=1, pod sweep skipped, zero terminates (got rc=$rc): $out"
@@ -1024,7 +1024,7 @@ f = json.load(open(sys.argv[1]))
 print(" ".join(sorted(k for k in f["top_level_keys"])))
 print(" ".join(sorted(f["compute_keys"])))
 ' "$REPO_ROOT/ci/scripts/fixtures/runpod_cluster_create_request_keys.json" 2>/dev/null || echo "fixture-unreadable")"
-  if [ "$rc" -eq 0 ] && [ -s "$MOCK_REQUEST_BODY_LOG" ] && printf '%s' "$sent_keys" | tail -n1 | grep -qx "2 1"; then
+  if [ "$rc" -eq 0 ] && [ -s "$MOCK_REQUEST_BODY_LOG" ] && grep -qx "2 1" <<<"$(tail -n1 <<<"$sent_keys")"; then
     ok "sent create body: the SENT create body was captured and carries the fixed 2×1 shape (podCount 2, gpuCountPerPod 1)"
   else
     bad "sent create body: expected a captured request body with podCount 2 / gpuCountPerPod 1 (got rc=$rc): sent=[$sent_keys] out=$out"

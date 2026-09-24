@@ -139,13 +139,12 @@ shape specifically — a version skew here is the other half of the toolchain lo
 silently mis-parse a different nightly's format). Install the pinned version: \
 cargo install build-graph --version ${BUILD_GRAPH_VERSION} --locked"
 
-rustup toolchain list 2>/dev/null | grep -q "^${NIGHTLY}" \
+grep -q "^${NIGHTLY}" <<<"$(rustup toolchain list 2>/dev/null)" \
   || fail "pinned nightly toolchain ${NIGHTLY} is not installed (this graph is pinned to it, in \
 lockstep with build-graph ${BUILD_GRAPH_VERSION} — see the pin comment at the top of this \
 script): rustup toolchain install ${NIGHTLY}"
 
-rustup component list --toolchain "${NIGHTLY}" 2>/dev/null \
-  | grep -q '^rust-analyzer.*(installed)' \
+grep -q '^rust-analyzer.*(installed)' <<<"$(rustup component list --toolchain "${NIGHTLY}" 2>/dev/null)" \
   || fail "rust-analyzer is not installed on the pinned ${NIGHTLY} toolchain (needed for \
 --references reference edges): rustup component add rust-analyzer --toolchain ${NIGHTLY}"
 

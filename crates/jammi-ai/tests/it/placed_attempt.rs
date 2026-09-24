@@ -28,12 +28,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::future::BoxFuture;
 use futures::stream;
 use jammi_ai::fine_tune::worker::{loop_test_hooks, training_test_hooks, JobWorker};
-use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec, PlacedOutcome};
 use jammi_ai::pipeline::context_predictor::{
     ContextArchitecture, GaussianObjective, PredictiveHead,
 };
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::{TrainingExec, TrainingJob, TrainingOutcome};
 use jammi_db::catalog::Catalog;
 use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::JammiConfig;
@@ -69,11 +69,11 @@ fn err_stream(e: JammiError) -> SendableRecordBatchStream {
     ))
 }
 
-/// The attempt the worker submitted: the plan is its one `PlacedAttemptExec`.
-fn descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> PlacedAttempt {
-    plan.downcast_ref::<PlacedAttemptExec>()
-        .expect("the worker submits its attempt as one PlacedAttemptExec")
-        .descriptor()
+/// The attempt the worker submitted: the plan is its one `TrainingExec`.
+fn descriptor_of(plan: &Arc<dyn ExecutionPlan>) -> TrainingJob {
+    plan.downcast_ref::<TrainingExec>()
+        .expect("the worker submits its attempt as one TrainingExec")
+        .job()
         .clone()
 }
 
@@ -629,7 +629,7 @@ async fn p6_run_placed_attempt_refuses_a_stale_attempt_and_a_second_launch() {
     let submitter_id = submitter.instance_id().to_string();
 
     // A stale `attempt` (the row's real attempts is 1).
-    let stale = PlacedAttempt {
+    let stale = TrainingJob {
         job_id: job_id.clone(),
         attempt: 99,
         submitter: submitter_id.clone(),
@@ -645,7 +645,7 @@ async fn p6_run_placed_attempt_refuses_a_stale_attempt_and_a_second_launch() {
     assert_eq!(unchanged.claimed_by.as_deref(), Some(submitter_id.as_str()));
 
     // The real descriptor: the first launch succeeds and completes.
-    let real = PlacedAttempt {
+    let real = TrainingJob {
         job_id: job_id.clone(),
         attempt: 1,
         submitter: submitter_id.clone(),
@@ -656,7 +656,7 @@ async fn p6_run_placed_attempt_refuses_a_stale_attempt_and_a_second_launch() {
         .await
         .expect("the first launch succeeds");
     assert!(
-        matches!(outcome, PlacedOutcome::Trained { .. }),
+        matches!(outcome, TrainingOutcome::Trained { .. }),
         "{outcome:?}"
     );
     let completed = row(submitter.catalog(), &job_id).await;
@@ -692,7 +692,7 @@ async fn p7_run_placed_attempt_refuses_a_host_already_holding_a_rank_before_any_
         .try_hold_rank("some-other-job", 1)
         .expect("Free admits a rank");
 
-    let descriptor = PlacedAttempt {
+    let descriptor = TrainingJob {
         job_id: job_id.clone(),
         attempt: 1,
         submitter: submitter_id.clone(),
@@ -733,7 +733,7 @@ async fn p9_run_placed_attempt_refuses_a_draining_host_before_any_transfer() {
         "Running -> Draining"
     );
 
-    let descriptor = PlacedAttempt {
+    let descriptor = TrainingJob {
         job_id: job_id.clone(),
         attempt: 1,
         submitter: submitter_id.clone(),
@@ -849,7 +849,7 @@ async fn the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_
 /// `admission.release_epoch()` live after both catalog round trips would
 /// fold the RELEASE into the very value compared against itself:
 /// `released_since_birth` would read `false` and the claim would dispatch
-/// straight through the RELEASE (`Ok(PlacedOutcome::Trained { .. })`).
+/// straight through the RELEASE (`Ok(TrainingOutcome::Trained { .. })`).
 #[tokio::test(flavor = "multi_thread")]
 async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed_attempt() {
     let (submitter, executor, _dir) = fleet().await;
@@ -859,7 +859,7 @@ async fn release_landing_between_probe_claim_and_transfer_self_releases_a_placed
     let submitter_id = submitter.instance_id().to_string();
     let executor_id = executor.instance_id().to_string();
 
-    let descriptor = PlacedAttempt {
+    let descriptor = TrainingJob {
         job_id: job_id.clone(),
         attempt: 1,
         submitter: submitter_id.clone(),
@@ -939,7 +939,7 @@ async fn release_landing_between_the_epoch_read_and_probe_claim_is_still_refused
     let job_id = record.job_id.clone();
     let submitter_id = submitter.instance_id().to_string();
 
-    let descriptor = PlacedAttempt {
+    let descriptor = TrainingJob {
         job_id: job_id.clone(),
         attempt: 1,
         submitter: submitter_id.clone(),

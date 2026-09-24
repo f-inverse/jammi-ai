@@ -12,10 +12,10 @@ use datafusion::prelude::SessionConfig;
 
 use ballista_executor::execution_engine::ExecutionEngine;
 
-use jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::engine::JammiExecutionEngine;
 use jammi_datafusion::ComputeDeviceKind;
+use jammi_datafusion::TrainingExec;
 use jammi_db::error::JammiError;
 
 async fn session() -> Arc<InferenceSession> {
@@ -105,7 +105,7 @@ async fn does_not_refuse_a_matching_device_kind() {
     );
 }
 
-/// The device-kind check also covers `PlacedAttemptExec` — its
+/// The device-kind check also covers `TrainingExec` — its
 /// descriptor's own stamped `device_kind` is compared against this
 /// executor's kind the same way `InferenceExec`'s is. The test session's
 /// default device is CPU, so a descriptor explicitly stamped `Cuda`
@@ -118,14 +118,17 @@ async fn refuses_a_placed_attempt_stage_whose_descriptor_names_a_different_devic
         ComputeDeviceKind::Cpu,
         "test precondition: the fixture session runs on CPU"
     );
-    let descriptor = jammi_ai::operator::placed_attempt_exec::PlacedAttempt {
+    let descriptor = jammi_datafusion::TrainingJob {
         job_id: "job-1".to_string(),
         attempt: 0,
         submitter: "submitter-1".to_string(),
         device_kind: ComputeDeviceKind::Cuda,
         claimed_at: chrono::Utc::now(),
     };
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+        descriptor,
+        Arc::new(jammi_datafusion::NoTrainingRunner),
+    ));
 
     let engine = JammiExecutionEngine::new(Arc::clone(&session));
     let err = engine
@@ -137,32 +140,36 @@ async fn refuses_a_placed_attempt_stage_whose_descriptor_names_a_different_devic
             "/tmp",
             &SessionConfig::default(),
         )
-        .expect_err(
-            "a device-kind mismatch on a PlacedAttemptExec must be refused, never silently run",
-        );
+        .expect_err("a device-kind mismatch on a TrainingExec must be refused, never silently run");
     assert_device_kind_unheld(err);
 }
 
-/// A stage plan wrapping a `PlacedAttemptExec` under a
+/// A stage plan wrapping a `TrainingExec` under a
 /// MULTI-partition node is refused typed — one attempt is one task, never a
-/// multi-partition fan-out of its body. Two `PlacedAttemptExec` leaves
-/// under a `UnionExec` (partition count 2, `PlacedAttemptExec` itself is always
+/// multi-partition fan-out of its body. Two `TrainingExec` leaves
+/// under a `UnionExec` (partition count 2, `TrainingExec` itself is always
 /// single-partition) exercises the "under" wording literally: the refusal
 /// looks at the STAGE's own output partitioning, not each leaf's.
 #[tokio::test]
 async fn refuses_a_placed_attempt_stage_with_more_than_one_partition() {
     let session = session().await;
-    let descriptor = jammi_ai::operator::placed_attempt_exec::PlacedAttempt {
+    let descriptor = jammi_datafusion::TrainingJob {
         job_id: "job-1".to_string(),
         attempt: 0,
         submitter: "submitter-1".to_string(),
         device_kind: ComputeDeviceKind::Cpu,
         claimed_at: chrono::Utc::now(),
     };
-    let left: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor.clone()));
-    let right: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
+    let left: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+        descriptor.clone(),
+        Arc::new(jammi_datafusion::NoTrainingRunner),
+    ));
+    let right: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+        descriptor,
+        Arc::new(jammi_datafusion::NoTrainingRunner),
+    ));
     let plan = datafusion::physical_plan::union::UnionExec::try_new(vec![left, right])
-        .expect("two same-schema PlacedAttemptExec leaves union");
+        .expect("two same-schema TrainingExec leaves union");
     assert_eq!(
         plan.properties().output_partitioning().partition_count(),
         2,
@@ -179,9 +186,7 @@ async fn refuses_a_placed_attempt_stage_with_more_than_one_partition() {
             "/tmp",
             &SessionConfig::default(),
         )
-        .expect_err(
-            "a multi-partition stage containing a PlacedAttemptExec must be refused, never run",
-        );
+        .expect_err("a multi-partition stage containing a TrainingExec must be refused, never run");
     match JammiError::from(err) {
         JammiError::PlacedAttemptFanOut { job_id, partitions } => {
             assert_eq!(

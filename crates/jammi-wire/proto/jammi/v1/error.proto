@@ -397,7 +397,7 @@ message SourceNotFoundError {
 }
 
 // `JammiError::DeviceKindUnheld { required, held }`. `required` is the kind
-// the plan's own `InferenceExec`/`PlacedAttemptExec` stamps and `held` every
+// the plan's own `InferenceExec`/`TrainingExec` stamps and `held` every
 // kind the holder lists, each as its `ComputeDeviceKind::wire_str` token (`cpu`,
 // `cuda`, `metal`). Maps to `FailedPrecondition`.
 message DeviceKindUnheldError {

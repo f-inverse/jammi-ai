@@ -247,7 +247,7 @@ async fn key_check_exec_round_trips() {
 #[tokio::test]
 async fn placed_attempt_round_trips() {
     let session = session().await;
-    let descriptor = jammi_ai::operator::placed_attempt_exec::PlacedAttempt {
+    let descriptor = jammi_datafusion::TrainingJob {
         job_id: "job-1".to_string(),
         attempt: 3,
         submitter: "instance-a".to_string(),
@@ -258,7 +258,10 @@ async fn placed_attempt_round_trips() {
         device_kind: ComputeDeviceKind::Cuda,
         claimed_at: chrono::Utc::now(),
     };
-    let node = jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec::new(descriptor.clone());
+    let node = jammi_datafusion::TrainingExec::new(
+        descriptor.clone(),
+        Arc::new(jammi_datafusion::NoTrainingRunner),
+    );
     let node: Arc<dyn ExecutionPlan> = Arc::new(node);
 
     let codec = JammiCodec::new(&session);
@@ -269,14 +272,14 @@ async fn placed_attempt_round_trips() {
     let ctx = session.context().task_ctx();
     let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
     let decoded = decoded
-        .downcast_ref::<jammi_ai::operator::placed_attempt_exec::PlacedAttemptExec>()
+        .downcast_ref::<jammi_datafusion::TrainingExec>()
         .unwrap();
-    assert_eq!(decoded.descriptor().job_id, descriptor.job_id);
-    assert_eq!(decoded.descriptor().attempt, descriptor.attempt);
-    assert_eq!(decoded.descriptor().submitter, descriptor.submitter);
-    assert_eq!(decoded.descriptor().claimed_at, descriptor.claimed_at);
+    assert_eq!(decoded.job().job_id, descriptor.job_id);
+    assert_eq!(decoded.job().attempt, descriptor.attempt);
+    assert_eq!(decoded.job().submitter, descriptor.submitter);
+    assert_eq!(decoded.job().claimed_at, descriptor.claimed_at);
     assert_eq!(
-        decoded.descriptor().device_kind,
+        decoded.job().device_kind,
         descriptor.device_kind,
         "the wire must carry the constructed device_kind verbatim, never the decoding \
          session's own kind"

@@ -54,7 +54,6 @@ use prost::Message;
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 
 use jammi_ai::operator::ann_search_exec::AnnSearchExec;
-use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::pipeline::graph_propagation::hop::{HopFoldExec, HopSpec};
@@ -62,9 +61,9 @@ use jammi_ai::pipeline::graph_propagation::readout::{ReadoutExec, ReadoutSpec};
 use jammi_ai::pipeline::graph_propagation::state::{InitialStateExec, InitialStateSpec};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::inference::key_check::KeyCheckExec;
-use jammi_datafusion::ComputeDeviceKind;
 use jammi_datafusion::InferenceExec;
 use jammi_datafusion::NumberedInputExec;
+use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingRunner};
 use jammi_db::error::JammiError;
 use jammi_db::index::{FiniteQuery, QuerySource};
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
@@ -94,7 +93,7 @@ pub enum NodeTag {
     AnnSearch = 1,
     AsofJoin = 2,
     KeyCheck = 3,
-    PlacedAttempt = 4,
+    Training = 4,
     NumberedInput = 5,
     ResultTableSink = 6,
     InitialState = 7,
@@ -105,6 +104,9 @@ pub enum NodeTag {
 /// The codec `jammi-ballista`'s scheduler and executor roles both install.
 pub struct JammiCodec {
     session: Weak<InferenceSession>,
+    /// What a decoded [`TrainingExec`] runs its job through: the executor
+    /// role's runner on an executor, [`NoTrainingRunner`] everywhere else.
+    training: Arc<dyn TrainingRunner>,
     inner: BallistaPhysicalExtensionCodec,
 }
 
@@ -118,10 +120,24 @@ impl JammiCodec {
     /// Build a codec over a (weakly held) session. The session outlives
     /// every plan this codec decodes through it; a codec surviving its
     /// session is the typed-refusal case `try_decode` covers.
+    ///
+    /// A training stage this codec decodes runs no job: the codec binds
+    /// [`NoTrainingRunner`] until [`Self::running_training`] names the
+    /// process's runner.
     pub fn new(session: &Arc<InferenceSession>) -> Self {
         Self {
             session: Arc::downgrade(session),
+            training: Arc::new(NoTrainingRunner),
             inner: BallistaPhysicalExtensionCodec::default(),
+        }
+    }
+
+    /// This codec, binding every training stage it decodes to `runner` —
+    /// the executor role's, the one process kind that runs training jobs.
+    pub fn running_training(self, runner: Arc<dyn TrainingRunner>) -> Self {
+        Self {
+            training: runner,
+            ..self
         }
     }
 
@@ -175,7 +191,7 @@ impl PhysicalExtensionCodec for JammiCodec {
             t if t == NodeTag::AnnSearch as u8 => decode_ann_search(body, &session),
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
-            t if t == NodeTag::PlacedAttempt as u8 => decode_placed_attempt(body),
+            t if t == NodeTag::Training as u8 => decode_training(body, &self.training),
             t if t == NodeTag::NumberedInput as u8 => decode_numbered_input(body, inputs, &session),
             t if t == NodeTag::ResultTableSink as u8 => {
                 decode_result_table_sink(body, inputs, &session)
@@ -221,8 +237,8 @@ impl PhysicalExtensionCodec for JammiCodec {
         if let Some(exec) = node.downcast_ref::<KeyCheckExec>() {
             return encode_key_check(exec, buf);
         }
-        if let Some(exec) = node.downcast_ref::<PlacedAttemptExec>() {
-            return encode_placed_attempt(exec, buf);
+        if let Some(exec) = node.downcast_ref::<TrainingExec>() {
+            return encode_training(exec, buf);
         }
         if let Some(exec) = node.downcast_ref::<NumberedInputExec>() {
             return encode_numbered_input(exec, buf);
@@ -284,26 +300,6 @@ fn to_json_string<T: serde::Serialize>(v: &T) -> DfResult<String> {
 
 fn from_json_str<T: serde::de::DeserializeOwned>(s: &str) -> DfResult<T> {
     serde_json::from_str(s).map_err(|e| Error::Decode(e.to_string()).into_df_error())
-}
-
-/// `ComputeDeviceKind` <-> its canonical wire spelling. A plain match, not
-/// `serde_json`: this field is compared byte-for-byte by `JammiExecutionEngine`
-/// on every task, so it stays a bare string, never a quoted JSON scalar.
-fn device_kind_str(kind: ComputeDeviceKind) -> &'static str {
-    match kind {
-        ComputeDeviceKind::Cpu => "cpu",
-        ComputeDeviceKind::Cuda => "cuda",
-        ComputeDeviceKind::Metal => "metal",
-    }
-}
-
-fn device_kind_from_str(s: &str) -> DfResult<ComputeDeviceKind> {
-    match s {
-        "cpu" => Ok(ComputeDeviceKind::Cpu),
-        "cuda" => Ok(ComputeDeviceKind::Cuda),
-        "metal" => Ok(ComputeDeviceKind::Metal),
-        other => Err(Error::Decode(format!("unknown device_kind '{other}'")).into_df_error()),
-    }
 }
 
 /// The inference operators' wire forms are `jammi-datafusion`'s own
@@ -565,36 +561,19 @@ fn decode_key_check(
     Ok(Arc::new(node))
 }
 
-fn encode_placed_attempt(exec: &PlacedAttemptExec, buf: &mut Vec<u8>) -> DfResult<()> {
-    let d = exec.descriptor();
-    let msg = pb::PlacedAttemptExecNode {
-        job_id: d.job_id.clone(),
-        attempt: d.attempt,
-        submitter: d.submitter.clone(),
-        device_kind: device_kind_str(d.device_kind).to_string(),
-        claimed_at: d.claimed_at.to_rfc3339(),
-    };
+fn encode_training(exec: &TrainingExec, buf: &mut Vec<u8>) -> DfResult<()> {
     buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::PlacedAttempt as u8);
-    msg.encode(buf)
+    buf.push(NodeTag::Training as u8);
+    jammi_datafusion::training::wire::encode_training(exec, buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
-fn decode_placed_attempt(body: &[u8]) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let msg = pb::PlacedAttemptExecNode::decode(body)
-        .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
-    let descriptor = PlacedAttempt {
-        job_id: msg.job_id,
-        attempt: msg.attempt,
-        submitter: msg.submitter,
-        device_kind: device_kind_from_str(&msg.device_kind)?,
-        claimed_at: chrono::DateTime::parse_from_rfc3339(&msg.claimed_at)
-            .map_err(|e| {
-                Error::Decode(format!("PlacedAttemptExecNode: claimed_at: {e}")).into_df_error()
-            })?
-            .with_timezone(&chrono::Utc),
-    };
-    Ok(Arc::new(PlacedAttemptExec::new(descriptor)))
+fn decode_training(
+    body: &[u8],
+    runner: &Arc<dyn TrainingRunner>,
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    jammi_datafusion::training::wire::decode_training(body, Arc::clone(runner))
+        .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
 /// The sink crosses as its spec; the node that arrives is PLACED — it

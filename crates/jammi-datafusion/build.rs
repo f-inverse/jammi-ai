@@ -1,7 +1,8 @@
-//! Codegen for the `jammi.inference.v1` operator-descriptor messages a
-//! `PhysicalExtensionCodec` carries across a process boundary. Messages
-//! only — no service is defined, and [`crate::wire`] speaks these bytes
-//! directly (`Message::encode`/`decode`) rather than over a gRPC call.
+//! Codegen for the `jammi.inference.v1` and `jammi.training.v1`
+//! operator-descriptor messages a `PhysicalExtensionCodec` carries across a
+//! process boundary. Messages only — no service is defined, and each stage's
+//! `wire` module speaks these bytes directly (`Message::encode`/`decode`)
+//! rather than over a gRPC call.
 
 fn main() {
     use std::path::PathBuf;
@@ -15,7 +16,10 @@ fn main() {
     }
 
     let proto_root = PathBuf::from("proto");
-    let proto_files = vec![proto_root.join("jammi/inference/v1/plan.proto")];
+    let proto_files = vec![
+        proto_root.join("jammi/inference/v1/plan.proto"),
+        proto_root.join("jammi/training/v1/plan.proto"),
+    ];
 
     for f in &proto_files {
         println!("cargo:rerun-if-changed={}", f.display());

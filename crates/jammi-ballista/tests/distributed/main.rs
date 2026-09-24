@@ -37,7 +37,6 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::pipeline::embedding::build_embedding_plan;
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
@@ -45,6 +44,7 @@ use jammi_ballista::placement::BOUND_TASK_LOG;
 use jammi_datafusion::InferenceExec;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
+use jammi_datafusion::{TrainingExec, TrainingJob};
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::SINK_WRITE_LOG;
@@ -1226,20 +1226,23 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
     await_fleet_registered(&session, &fleet).await;
     let scheduler_url = format!("http://127.0.0.1:{scheduler_port}");
 
-    // KIND MATCH: a PlacedAttemptExec's required
+    // KIND MATCH: a TrainingExec's required
     // kind is its OWN descriptor's stamp, never "is this node type
     // GPU-shaped" — a dummy descriptor (never actually run) stamped `Cuda`
     // is refused on this all-CPU cluster (no registered executor lists a
     // `cuda` device); a `Cpu`-stamped one would be accepted (exercised
     // below by the real embedding plan, whose `InferenceExec` is stamped
     // from the harness session's own CPU device).
-    let attempt_plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(PlacedAttempt {
-        job_id: "dummy-job".to_string(),
-        attempt: 0,
-        submitter: "dummy-submitter".to_string(),
-        device_kind: jammi_datafusion::ComputeDeviceKind::Cuda,
-        claimed_at: chrono::Utc::now(),
-    }));
+    let attempt_plan: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+        TrainingJob {
+            job_id: "dummy-job".to_string(),
+            attempt: 0,
+            submitter: "dummy-submitter".to_string(),
+            device_kind: jammi_datafusion::ComputeDeviceKind::Cuda,
+            claimed_at: chrono::Utc::now(),
+        },
+        Arc::new(jammi_datafusion::NoTrainingRunner),
+    ));
     // The device check is a fast, purely client-side catalog read before
     // any RPC: a 20s timeout is generous headroom, never load-bearing for a
     // passing run, but turns an unexpected fall-through to a real submission
@@ -1256,13 +1259,15 @@ async fn device_less_cluster_refuses_gpu_bound_plan_and_accepts_cpu_plan() {
              network at all",
         );
         panic!(
-            "a PlacedAttemptExec plan's device-less refusal must return fast (client-side, before any \
+            "a TrainingExec plan's device-less refusal must return fast (client-side, before any \
              RPC); it did not return within 20s"
         );
     });
     let refusal = match result {
         Ok(_) => {
-            panic!("a PlacedAttemptExec plan must be refused on a device-less cluster, but it was accepted")
+            panic!(
+                "a TrainingExec plan must be refused on a device-less cluster, but it was accepted"
+            )
         }
         Err(e) => JammiError::from(e),
     };

@@ -27,12 +27,12 @@ use ballista_scheduler::planner::DefaultDistributedPlanner;
 use ballista_scheduler::state::execution_graph::{ExecutionGraphBox, StaticExecutionGraph};
 use ballista_scheduler::state::task_manager::JobInfoCache;
 
-use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ballista::client::submit_physical_plan;
 use jammi_ballista::cluster::{
     executor_is_live, executor_liveness_window, removal_is_a_loss, CatalogClusterState,
 };
 use jammi_ballista::placement::DevicePlacement;
+use jammi_datafusion::{TrainingExec, TrainingJob};
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::catalog::instance::DeviceFact;
@@ -678,7 +678,7 @@ async fn cpu_stamped_stage_binds_to_a_cpu_only_executor_postgres() {
     cpu_stamped_stage_binds_to_a_cpu_only_executor(BackendKind::Postgres).await;
 }
 
-/// (b6, first half) A `PlacedAttemptExec` stage whose job row is already
+/// (b6, first half) A `TrainingExec` stage whose job row is already
 /// `claimed_by` an instance OTHER than the stage's own submitter is never
 /// bound to ANY slot — the re-launch guard. Mutation: drop the `claim_of`
 /// skip in `DevicePlacement::bind_tasks` and this reds (the task binds to
@@ -736,14 +736,17 @@ async fn already_transferred_attempt_is_never_bound(kind: BackendKind) {
             .expect("row claimed");
 
         let submitter = format!("submitter-{}", jammi_test_utils::unique_suffix());
-        let descriptor = PlacedAttempt {
+        let descriptor = TrainingJob {
             job_id: job_id_s.clone(),
             attempt: 0,
             submitter: submitter.clone(),
             device_kind: jammi_datafusion::ComputeDeviceKind::Cuda,
             claimed_at: chrono::Utc::now(),
         };
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(descriptor));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+            descriptor,
+            Arc::new(jammi_datafusion::NoTrainingRunner),
+        ));
         let job_id: JobId = job_id_s.clone().into();
         let cache = job_info_cache(&job_id, plan);
         let jobs = active_jobs(job_id, cache);

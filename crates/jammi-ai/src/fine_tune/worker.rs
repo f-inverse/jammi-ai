@@ -143,7 +143,6 @@ use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::ExecutionPlan;
-use futures::future::BoxFuture;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::instance::{
@@ -182,9 +181,9 @@ use crate::fine_tune::FineTuneConfig;
 use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
-use crate::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec, PlacedOutcome};
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
+use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingJob, TrainingOutcome};
 use jammi_wire::proto::gang::{AbortReason, Assign};
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
@@ -360,11 +359,6 @@ pub struct HostAdmission {
     /// ([`CoordinatorEnd::HostCannotCoordinate`]). Write-once: a second
     /// install is refused, never a silent swap under a running body.
     dialer: OnceLock<Arc<dyn MemberDialer>>,
-    /// Installed ONCE by the EXECUTOR role: how `PlacedAttemptExec::execute` — which
-    /// runs with only a Ballista `TaskContext` in hand, never a session —
-    /// reaches this process's training body (see [`placed_attempt_runner`]'s
-    /// doc for the process-global seam this backs).
-    placed_attempt_runner: OnceLock<Arc<dyn PlacedAttemptRunner>>,
     /// The single claim-loop slot: `0` (free) or
     /// a nonzero GENERATION id — the id [`HostAdmission::try_claim_loop`]
     /// handed out to whichever [`EmbeddedWorker`] currently owns the slot.
@@ -405,39 +399,6 @@ pub struct HostAdmission {
     release_epoch: AtomicU64,
 }
 
-/// The process-global weak link to whichever session's [`HostAdmission`]
-/// installed a [`PlacedAttemptRunner`] — set the one time
-/// [`HostAdmission::install_placed_attempt_runner`] succeeds anywhere in this
-/// process, never a second, independent global (see
-/// `crate::operator::placed_attempt_exec`'s module doc for the refutation of a
-/// `TaskContext`-extension alternative).
-static PLACED_ATTEMPT_HOST: OnceLock<Weak<HostAdmission>> = OnceLock::new();
-
-/// The process's installed [`PlacedAttemptRunner`], if this process's session
-/// hosts a Ballista executor — the ONLY way
-/// `PlacedAttemptExec::execute` reaches it, since its
-/// `execute` runs with no session in hand. `None` both when no session on
-/// this process ever installed one, and when the installing session has
-/// since dropped (the weak upgrade fails).
-pub fn placed_attempt_runner() -> Option<Arc<dyn PlacedAttemptRunner>> {
-    PLACED_ATTEMPT_HOST
-        .get()
-        .and_then(Weak::upgrade)
-        .and_then(|admission| admission.placed_attempt_runner())
-}
-
-/// Run a placed training attempt's body on THIS process — installed by the
-/// EXECUTOR role through [`HostAdmission::install_placed_attempt_runner`];
-/// `PlacedAttemptExec::execute` dispatches through it
-/// via the process-global [`placed_attempt_runner`] (that function's doc states
-/// why: a Ballista executor's `TaskContext` carries no jammi session).
-pub trait PlacedAttemptRunner: Send + Sync {
-    fn run(
-        &self,
-        descriptor: PlacedAttempt,
-    ) -> BoxFuture<'static, Result<crate::operator::placed_attempt_exec::PlacedOutcome>>;
-}
-
 /// The coordinator's one transport seam: open `RunRank` on a member's
 /// `peer_bind` listener with the coordinator's `Assign`, require `Admitted`,
 /// and hand back the [`CoordinatorLink`] its `Peer` is built from, the
@@ -455,8 +416,7 @@ pub trait MemberDialer: Send + Sync {
 }
 
 impl HostAdmission {
-    /// Fresh admission state: phase `Running`, holder `Free`, no dialer, no
-    /// placed-attempt seam.
+    /// Fresh admission state: phase `Running`, holder `Free`, no dialer.
     pub fn new(registry: Arc<InstanceRegistration>) -> Arc<Self> {
         let (phase, _) = watch::channel(WorkerPhase::Running);
         let (holder, _) = watch::channel(Holder::Free);
@@ -465,7 +425,6 @@ impl HostAdmission {
             holder,
             registry,
             dialer: OnceLock::new(),
-            placed_attempt_runner: OnceLock::new(),
             loop_owner: AtomicU64::new(0),
             next_generation: AtomicU64::new(1),
             release_epoch: AtomicU64::new(0),
@@ -520,31 +479,8 @@ impl HostAdmission {
         self.dialer.get().cloned()
     }
 
-    /// Install the process's [`PlacedAttemptRunner`] — once — and, on that
-    /// first install only, register this admission as the process-global
-    /// `PLACED_ATTEMPT_HOST` a body-less `PlacedAttemptExec::execute` reaches it
-    /// through (`false` on a second install, the same [`MemberDialer`]
-    /// shape; the global is set only alongside a WINNING install, never on
-    /// a losing one).
-    pub fn install_placed_attempt_runner(
-        self: &Arc<Self>,
-        runner: Arc<dyn PlacedAttemptRunner>,
-    ) -> bool {
-        let installed = self.placed_attempt_runner.set(runner).is_ok();
-        if installed {
-            let _ = PLACED_ATTEMPT_HOST.set(Arc::downgrade(self));
-        }
-        installed
-    }
-
-    /// The installed [`PlacedAttemptRunner`], if this process mounted a
-    /// Ballista executor.
-    pub fn placed_attempt_runner(&self) -> Option<Arc<dyn PlacedAttemptRunner>> {
-        self.placed_attempt_runner.get().cloned()
-    }
-
     /// `JobRun → Awaiting{job_id, attempt}` — the claim loop's own attempt
-    /// is about to submit a `PlacedAttempt` (the move precedes the submit)
+    /// is about to submit its training stage (the move precedes the submit)
     /// and then awaits its stream: this host runs no compute for the
     /// attempt meanwhile, so it can still serve a `RunRank` session
     /// ([`Self::try_hold_rank`]'s `Awaiting` arm admits exactly as `Free`
@@ -2322,7 +2258,7 @@ impl JobWorker {
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
         if is_compute_kind(&record.kind) {
-            // Unreachable for `placed`: a `PlacedAttempt` only ever names a
+            // Unreachable for `placed`: a training stage only ever names a
             // training attempt (the placement check below is the only
             // producer of one) — a compute kind never reaches
             // `run_placed_attempt`.
@@ -2501,17 +2437,21 @@ impl JobWorker {
         // exists somewhere": `DevicePlacement` and the plane's admission
         // bind/refuse on this exact kind, and the executor's engine refuses
         // a stage of any other. An attempt that is itself placed never
-        // consults the plane: it is already where it runs.
+        // consults the plane: it is already where it runs. The stage binds
+        // no runner here — this process submits it and runs none of it; the
+        // executor that decodes it binds its own.
         let placement = match session.compute_plane().plane() {
             Some(plane) if origin == AttemptOrigin::Claimed => {
-                let plan: Arc<dyn ExecutionPlan> =
-                    Arc::new(PlacedAttemptExec::new(PlacedAttempt {
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+                    TrainingJob {
                         job_id: job_id.clone(),
                         attempt,
                         submitter: session.instance_id().to_string(),
                         device_kind: session.required_device_kind(),
                         claimed_at: timeline.claimed_at,
-                    }));
+                    },
+                    Arc::new(NoTrainingRunner),
+                ));
                 placement_of(&plane, plan).await
             }
             _ => None,
@@ -2596,7 +2536,7 @@ impl JobWorker {
                 // Computed BEFORE the artifact's directory is handed to
                 // `publish_and_finalize` (which consumes it) — the SAME
                 // bytes a member/an in-process `Peer` rank digests, so
-                // a placed run's `PlacedOutcome::Trained` carries an
+                // a placed run's `TrainingOutcome::Trained` carries an
                 // identical digest without a second row read.
                 let digest = artifact_files_digest(artifact.dir.path());
                 match self
@@ -2736,7 +2676,7 @@ impl JobWorker {
         end
     }
 
-    /// Submit this attempt — `plan`, its one `PlacedAttemptExec` task, already
+    /// Submit this attempt — `plan`, its one `TrainingExec` task, already
     /// admitted by `plane` — through the session's compute plane and await
     /// its stream, instead of running it in-process. The submitter's exit
     /// arms are total (this function's only return values):
@@ -2891,9 +2831,9 @@ impl JobWorker {
         end
     }
 
-    /// Run a placed training attempt's body on THIS process — the seam
-    /// `PlacedAttemptExec::execute` dispatches through
-    /// as the process's installed [`PlacedAttemptRunner`]. Reuses
+    /// Run a placed training attempt's body on THIS process — the body of
+    /// the executor role's [`jammi_datafusion::TrainingRunner`], which a
+    /// `TrainingExec` decoded on that executor is bound to. Reuses
     /// `Self::run_claimed_job_under`
     /// VERBATIM (`placed = true`, the recursion guard) — the SAME body the
     /// attempt's claimant would run for the row's kind (a context
@@ -2933,7 +2873,7 @@ impl JobWorker {
     /// the claim loop uses after `claim_next`) and flips the claim guard's
     /// `ClaimProbe → JobRun` (`HostAdmission::job_running`) itself, so
     /// nothing here duplicates that registration; (iv) maps the body's
-    /// `AttemptEnd` to [`PlacedOutcome`] (`Published` → `Trained`;
+    /// `AttemptEnd` to [`TrainingOutcome`] (`Published` → `Trained`;
     /// `Reused` → `Reused`; `Failed` → `Err` carrying the attempt's own
     /// typed error, which the row already records and which reaches the
     /// submitter as the task's error; `LeftForReclaim` → a typed `Err` too,
@@ -2945,8 +2885,8 @@ impl JobWorker {
     /// every exit arm (the claim guard's own `Drop`).
     pub async fn run_placed_attempt(
         session: &Arc<InferenceSession>,
-        descriptor: PlacedAttempt,
-    ) -> Result<PlacedOutcome> {
+        descriptor: TrainingJob,
+    ) -> Result<TrainingOutcome> {
         let admission = session.host_admission();
         // The birth snapshot for this run's `WorkerShared`, read BEFORE
         // `probe_claim()` itself — see this function's own doc, point (i),
@@ -3037,9 +2977,9 @@ impl JobWorker {
         drop(claim);
         match end {
             AttemptEnd::Published { artifact_digest } => {
-                Ok(PlacedOutcome::Trained { artifact_digest })
+                Ok(TrainingOutcome::Trained { artifact_digest })
             }
-            AttemptEnd::Reused => Ok(PlacedOutcome::Reused),
+            AttemptEnd::Reused => Ok(TrainingOutcome::Reused),
             AttemptEnd::Failed { error } => Err(error),
             AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
                 "run_placed_attempt: job '{}' attempt {} left running for reclaim (no terminal \
@@ -7029,7 +6969,7 @@ enum PublishOutcome {
 
 /// What one attempt of [`JobWorker::run_claimed_job_under`] ended as — the
 /// fact [`JobWorker::run_placed_attempt`] maps onto
-/// [`crate::operator::placed_attempt_exec::PlacedOutcome`] without a second row read.
+/// [`TrainingOutcome`] without a second row read.
 /// `run_claimed_job`/the claim loop discard it; both already observe every
 /// row write this type merely reports.
 enum AttemptEnd {

@@ -154,12 +154,13 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
 - **`jammi-server` depends on `jammi-ai` (engine) AND `jammi-wire`**: it mounts
   service impls over the shared engine.
 - **`jammi-ballista` depends on `jammi-ai`/`jammi-db`/`jammi-wire`, never the
-  reverse.** The seams the engine exposes — `jammi-db`'s `ComputePlane`
-  (`crates/jammi-db/src/compute_plane.rs`, the one submit client) and
-  `jammi-ai`'s `PlacedAttemptRunner` (`HostAdmission`, `crates/jammi-ai/src/
-  fine_tune/worker.rs`) — are INSTALLED by `jammi-ballista`'s roles, never
-  called from their own dependency graphs — the same shape `MemberDialer`
-  already uses [§2.8a]. `jammi-server` depends on `jammi-ballista` unconditionally
+  reverse.** The seams it plugs into — `jammi-db`'s `ComputePlane`
+  (`crates/jammi-db/src/compute_plane.rs`, the one submit client, installed
+  by the client role) and `jammi-datafusion`'s `TrainingRunner`
+  (`crates/jammi-datafusion/src/training/exec.rs`, implemented by the
+  executor role over `JobWorker::run_placed_attempt` and bound by that
+  role's codec to every `TrainingExec` it decodes) — are never called from
+  their own crates' dependency graphs. `jammi-server` depends on `jammi-ballista` unconditionally
   (no cargo feature): roles are `[ballista]` config, decided at runtime
   [§2.8f].
 - **`jammi-bench` depends on `jammi-ballista`, `jammi-test-utils`, `jammi-client`
@@ -4206,10 +4207,12 @@ with the rest of the workspace, no cargo feature — a process's role is
 `[ballista]` config (§2.1 above), decided at runtime by `jammi-server`.
 
 - **`JammiCodec`** (`codec.rs`, `PhysicalExtensionCodec`) — encodes
-  `AnnSearchExec`/`AsofJoinExec`/`KeyCheckExec`/`PlacedAttemptExec` as prost
+  `AnnSearchExec`/`AsofJoinExec`/`KeyCheckExec` as prost
   messages of a package it compiles itself, `jammi.ballista.v1`, and frames
-  `InferenceExec`/`NumberedInputExec` in the wire forms `jammi-datafusion`
-  owns (`jammi_datafusion::inference::wire`, package `jammi.inference.v1`) under the same
+  `InferenceExec`/`NumberedInputExec` and `TrainingExec` in the wire forms
+  `jammi-datafusion` owns (`jammi_datafusion::inference::wire`, package
+  `jammi.inference.v1`; `jammi_datafusion::training::wire`, package
+  `jammi.training.v1`) under the same
   magic and tag
   (`build.rs`) — **not** part of the frozen `jammi.v1.*` surface [§1.3]:
   this package crosses a scheduler/executor boundary INSIDE one cluster's
@@ -4225,9 +4228,9 @@ with the rest of the workspace, no cargo feature — a process's role is
   `Weak` reference).
 - **`JammiExecutionEngine`** (`engine.rs`) wraps Ballista's
   `DefaultExecutionEngine` and adds two duties before delegating: a stage
-  containing a `PlacedAttemptExec` must be single-partition (one attempt is one
+  containing a `TrainingExec` must be single-partition (one attempt is one
   task, never a multi-partition fan-out); a stage whose required device kind (an
-  `InferenceExec`'s or a `PlacedAttemptExec`'s stamped `device_kind`) differs from this executor's own
+  `InferenceExec`'s or a `TrainingExec`'s stamped `device_kind`) differs from this executor's own
   `InferenceSession::compute_device()` is refused typed (device
   pinning), never silently run on the wrong device.
 - **Roles** (`roles.rs`): `host_scheduler`/`host_executor` build a
@@ -4242,13 +4245,14 @@ with the rest of the workspace, no cargo feature — a process's role is
   there is no knob, the catalog-backed pair is the shipped scheduler,
   never the in-memory one. The client role installs the session's
   `jammi_db::compute_plane::ComputePlane` over `client.rs`; the executor
-  role installs `PlacedAttemptRunner` and writes this process's own device
+  role's codec runs training (`JammiCodec::running_training`) and the role
+  writes this process's own device
   claim to its `compute_executors` row right after registering.
 - **Client** (`client.rs`) — the one submit client, the two verbs the
   client role's `ComputePlane` makes: `unheld`, the admission — a pure
   predicate (`unheld_by`) over the plan's own requirements
   (`engine::plan_requirements`: the device KIND a node is stamped with,
-  `InferenceExec::device_kind` or `PlacedAttempt::device_kind`, "cpu" is a
+  `InferenceExec::device_kind` or `TrainingJob::device_kind`, "cpu" is a
   kind too; and a gang's own submitter as the executor it must not land
   on) and the LIVE inventory, refusing typed BEFORE submitting when no
   live registered executor can hold the plan, reading the same catalog
@@ -4275,11 +4279,11 @@ with the rest of the workspace, no cargo feature — a process's role is
   reclaim, never revived by Ballista.
 - **`DevicePlacement`** (`placement.rs`, `TaskDistributionPolicy::Custom`)
   — round-robin over executor slots with three refinements: never binds a
-  `PlacedAttemptExec` stage to the executor equal to its own `submitter` (deadlock
+  `TrainingExec` stage to the executor equal to its own `submitter` (deadlock
   avoidance); a stage binds only to an executor whose OWN registered
   devices list its `PlacedAttempt.device_kind`/`InferenceExec::
   device_kind()` (a CPU-stamped stage binds a CPU executor, never only a
-  GPU refinement); a `PlacedAttemptExec` stage whose job row is already
+  GPU refinement); a `TrainingExec` stage whose job row is already
   `claimed_by` a DIFFERENT executor is never bound at all (the bind-time
   half of the re-launch guard, §2.8g below).
 
@@ -4287,19 +4291,20 @@ with the rest of the workspace, no cargo feature — a process's role is
 
 Under Ballista placement a claimed training attempt of ANY kind — a
 `fine_tune` of any world size, a `graph_fine_tune`, a `context_predictor` —
-runs as ONE task, `PlacedAttemptExec { job_id, attempt, submitter,
-device_kind }` (`crates/jammi-ai/src/operator/placed_attempt_exec.rs`), placed
+runs as ONE task, `TrainingExec` over a `TrainingJob { job_id, attempt,
+submitter, device_kind, claimed_at }` (`crates/jammi-datafusion/src/training/`), placed
 by the scheduler on an executor of the claimant's device kind other than the
 submitter. Where an attempt runs is a property of the attempt; how many ranks
-share it is the spec's `world_size`, which the descriptor does not carry —
+share it is the spec's `world_size`, which the job does not carry —
 the executor re-derives the run, its kind and its topology from the job's
 row. The claimant submits the task
 through the session's `ComputePlane` (installed by the client role) — the
 same seam a materialization's plan goes through, the attempt's admission
-being the plan's own requirements — and the executor runs it through one
-more `HostAdmission` seam beside `MemberDialer` [§2.8a],
-`crates/jammi-ai/src/fine_tune/worker.rs`: `PlacedAttemptRunner` (installed
-by the executor role) — `jammi-ai` never depends on `jammi-ballista`.
+being the plan's own requirements — and the executor runs it through the
+`TrainingRunner` its codec bound the decoded node to (the executor role's,
+over `JobWorker::run_placed_attempt`); every other process's codec binds
+`NoTrainingRunner`, a typed refusal — `jammi-ai` never depends on
+`jammi-ballista`.
 
 **The submitting host's holder.** `Holder` (`worker.rs`) gains
 `Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
@@ -4333,7 +4338,7 @@ must FAIL a transfer, the opposite of how a reclaim sweep reads that same
 net attempts, never a re-claim.
 
 `run_placed_attempt` (`crates/jammi-ai/src/fine_tune/worker.rs`, called from the
-executor role's `PlacedAttemptRunner`) — (i) takes this host's job slot
+executor role's `TrainingRunner`) — (i) takes this host's job slot
 through `HostAdmission::probe_claim` (a host already holding a rank, a
 loop-claimed job, or another placement refuses typed BEFORE any row write,
 ); (ii) `transfer_claim`s the row from the descriptor's submitter to

@@ -25,10 +25,10 @@ use datafusion::prelude::SessionContext;
 
 use jammi_db::config::BallistaSchedulerConfig;
 
-use jammi_ai::operator::placed_attempt_exec::{PlacedAttempt, PlacedAttemptExec};
 use jammi_ai::session::InferenceSession;
 use jammi_ballista::client::submit_physical_plan;
 use jammi_ballista::roles::{host_client, host_executor, host_scheduler};
+use jammi_datafusion::{TrainingExec, TrainingJob};
 use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
 use jammi_db::compute_plane::Unheld;
 use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig};
@@ -358,13 +358,16 @@ async fn the_plane_admits_a_placed_attempt_on_a_live_peer_of_its_kind_only() {
         .compute_plane()
         .plane()
         .expect("host_client installs the compute plane");
-    let attempt: Arc<dyn ExecutionPlan> = Arc::new(PlacedAttemptExec::new(PlacedAttempt {
-        job_id: "job-admission".to_string(),
-        attempt: 1,
-        submitter: session.instance_id().to_string(),
-        device_kind: session.compute_device().kind(),
-        claimed_at: chrono::Utc::now(),
-    }));
+    let attempt: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
+        TrainingJob {
+            job_id: "job-admission".to_string(),
+            attempt: 1,
+            submitter: session.instance_id().to_string(),
+            device_kind: session.compute_device().kind(),
+            claimed_at: chrono::Utc::now(),
+        },
+        Arc::new(jammi_datafusion::NoTrainingRunner),
+    ));
     let kind = session.compute_device().kind();
     let none_of_kind = Some(Unheld::NoExecutorOfKind {
         required: kind,

@@ -3,13 +3,14 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use jammi_db::config::MemoryLimit;
 use jammi_db::error::{JammiError, Result};
 
 /// One device's admission: a memory budget for the models resident on it,
 /// and a bound on the model forwards running on it at once.
 ///
 /// `new_unlimited()` passes every memory permit — useful for tests and
-/// CPU-only deployments. `new()` enforces memory-budget admission via CAS.
+/// CPU-only deployments. `new()` enforces a byte budget via CAS.
 ///
 /// Forward admission belongs to the DEVICE, never to a plan node: every
 /// `InferenceExec` whose model is resident here — every partition of one, two
@@ -20,9 +21,8 @@ use jammi_db::error::{JammiError, Result};
 /// admits the engine's CPU parallelism budget.
 #[derive(Debug)]
 pub struct GpuScheduler {
-    total_gpu_memory: usize,
+    budget: usize,
     reserved_memory: AtomicUsize,
-    headroom_fraction: f64,
     unlimited: bool,
     pub(crate) notify: tokio::sync::Notify,
     forward_slots: Arc<tokio::sync::Semaphore>,
@@ -74,16 +74,12 @@ impl Drop for GpuPermit {
 }
 
 impl GpuScheduler {
-    /// Memory-budget constructor. Validates headroom_fraction is in [0.0, 1.0].
-    pub fn new(total_gpu_memory: usize, headroom_fraction: f64) -> Self {
-        assert!(
-            (0.0..=1.0).contains(&headroom_fraction),
-            "headroom_fraction must be between 0.0 and 1.0, got {headroom_fraction}"
-        );
+    /// A device that admits models while their reservations fit `budget`
+    /// bytes.
+    pub fn new(budget: usize) -> Self {
         Self {
-            total_gpu_memory,
+            budget,
             reserved_memory: AtomicUsize::new(0),
-            headroom_fraction,
             unlimited: false,
             notify: tokio::sync::Notify::new(),
             forward_slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -106,9 +102,8 @@ impl GpuScheduler {
     /// No memory budget, `forward_slots` forwards at once.
     fn unbudgeted(forward_slots: usize) -> Self {
         Self {
-            total_gpu_memory: usize::MAX,
+            budget: usize::MAX,
             reserved_memory: AtomicUsize::new(0),
-            headroom_fraction: 0.0,
             unlimited: true,
             notify: tokio::sync::Notify::new(),
             forward_slots: Arc::new(tokio::sync::Semaphore::new(forward_slots)),
@@ -154,9 +149,8 @@ impl GpuScheduler {
     /// The scheduler appropriate for the configured device.
     ///
     /// On a CUDA device whose memory can be probed, this is a real memory-budget
-    /// scheduler sized to the card: `memory_fraction` of total VRAM is usable and
-    /// the remainder is headroom for activations / workspace the coarse
-    /// per-model estimate does not count. Otherwise — a negative ordinal (CPU),
+    /// scheduler sized to the card by `memory_limit` ([`Self::budget_for`]).
+    /// Otherwise — a negative ordinal (CPU),
     /// a CPU-only build, or a device that could not be probed — it is an
     /// unlimited pass-through, since admission control without a real budget
     /// would gate nothing meaningfully.
@@ -164,20 +158,25 @@ impl GpuScheduler {
     /// Forwards: a probed card admits one at a time. An ordinal that cannot be
     /// probed is a Metal device on a Metal build (one at a time), and otherwise
     /// a request the loader serves on the CPU (`cpu_threads` at a time).
-    pub fn for_device(gpu_device: i32, memory_fraction: f64, cpu_threads: NonZeroUsize) -> Self {
+    pub fn for_device(
+        gpu_device: i32,
+        memory_limit: MemoryLimit,
+        cpu_threads: NonZeroUsize,
+    ) -> Result<Self> {
         if gpu_device < 0 {
-            return Self::cpu(cpu_threads);
+            return Ok(Self::cpu(cpu_threads));
         }
         match Self::detect_gpu_memory(gpu_device as usize) {
             Ok((_free, total)) => {
-                let headroom_fraction = (1.0 - memory_fraction).clamp(0.0, 1.0);
+                let budget = Self::budget_for(gpu_device, total, memory_limit)?;
                 tracing::info!(
                     gpu_device,
                     total_bytes = total,
-                    memory_fraction,
+                    budget_bytes = budget,
+                    %memory_limit,
                     "GPU memory admission enabled"
                 );
-                Self::new(total, headroom_fraction)
+                Ok(Self::new(budget))
             }
             Err(e) => {
                 // On a CUDA build a probe failure is a real anomaly worth a warn.
@@ -192,18 +191,31 @@ impl GpuScheduler {
                 );
                 #[cfg(not(feature = "cuda"))]
                 let _ = &e;
-                if cfg!(feature = "metal") {
+                Ok(if cfg!(feature = "metal") {
                     Self::unbudgeted(1)
                 } else {
                     Self::cpu(cpu_threads)
-                }
+                })
             }
         }
     }
 
-    /// Usable GPU memory after headroom reservation.
-    fn usable(&self) -> usize {
-        (self.total_gpu_memory as f64 * (1.0 - self.headroom_fraction)) as usize
+    /// The residency budget `[gpu] memory_limit` allows on a device of
+    /// `total` bytes: a share of the card, or an absolute size that fits it.
+    /// An absolute size larger than the card is refused, naming the device —
+    /// a budget the card cannot hold would admit models that then fail to
+    /// allocate, which is the failure admission exists to prevent.
+    pub fn budget_for(gpu_device: i32, total: usize, memory_limit: MemoryLimit) -> Result<usize> {
+        let total_bytes = total as u64;
+        let budget = memory_limit.resolve(|| Ok::<_, JammiError>(total_bytes))?;
+        if budget > total_bytes {
+            return Err(JammiError::Config(format!(
+                "[gpu] memory_limit = \"{memory_limit}\" is more than device {gpu_device}'s \
+                 {total_bytes} bytes: give an absolute limit that fits the card, or a share"
+            )));
+        }
+        // `budget <= total`, and `total` came from a `usize`.
+        Ok(budget as usize)
     }
 
     /// Unreserved GPU bytes currently available.
@@ -211,12 +223,12 @@ impl GpuScheduler {
         if self.unlimited {
             return usize::MAX;
         }
-        self.usable()
+        self.budget
             .saturating_sub(self.reserved_memory.load(Ordering::Acquire))
     }
 
-    /// The total usable GPU budget in bytes — `Self::usable` made public,
-    /// or `usize::MAX` for an unlimited scheduler. Lets a caller distinguish
+    /// The device's budget in bytes, or `usize::MAX` for an unlimited
+    /// scheduler. Lets a caller distinguish
     /// "this request can never be admitted, no matter how much frees up"
     /// (`bytes > usable_capacity()`) from "temporarily contended, and
     /// waiting for an outstanding release will eventually satisfy it"
@@ -229,10 +241,7 @@ impl GpuScheduler {
     /// for the full wake-set enumeration and why `Self::acquire`'s
     /// single-notify wait is not enough on its own.
     pub fn usable_capacity(&self) -> usize {
-        if self.unlimited {
-            return usize::MAX;
-        }
-        self.usable()
+        self.budget
     }
 
     /// Non-blocking acquisition attempt. Returns `None` if insufficient memory.
@@ -246,7 +255,7 @@ impl GpuScheduler {
                 scheduler: Arc::clone(self),
             });
         }
-        let usable = self.usable();
+        let usable = self.budget;
         loop {
             let current = self.reserved_memory.load(Ordering::Acquire);
             if current + bytes > usable {
@@ -324,7 +333,7 @@ impl DeviceSchedulers {
     /// every later lookup with no statement of why.
     pub fn for_devices(
         devices: &[i32],
-        memory_fraction: f64,
+        memory_limit: MemoryLimit,
         cpu_threads: NonZeroUsize,
     ) -> Result<Self> {
         let Some(&primary) = devices.first() else {
@@ -344,11 +353,7 @@ impl DeviceSchedulers {
             }
             by_device.push((
                 device,
-                Arc::new(GpuScheduler::for_device(
-                    device,
-                    memory_fraction,
-                    cpu_threads,
-                )),
+                Arc::new(GpuScheduler::for_device(device, memory_limit, cpu_threads)?),
             ));
         }
         Ok(Self { primary, by_device })
@@ -391,7 +396,7 @@ mod tests {
     /// as the permit drops; the CPU admits exactly its configured budget.
     #[tokio::test]
     async fn forward_admission_is_sized_by_the_device() {
-        let accelerator = GpuScheduler::new(1 << 30, 0.1);
+        let accelerator = GpuScheduler::new(1 << 30);
         let first = accelerator.admit_forward().await.expect("admitted");
         assert!(
             tokio::time::timeout(
@@ -427,8 +432,8 @@ mod tests {
     /// absence rather than handing back the primary's budget.
     #[test]
     fn device_schedulers_cover_exactly_the_declared_devices() {
-        let schedulers =
-            DeviceSchedulers::for_devices(&[0, 1, 2], 0.9, NonZeroUsize::MIN).expect("schedulers");
+        let schedulers = DeviceSchedulers::for_devices(&[0, 1, 2], share(90), NonZeroUsize::MIN)
+            .expect("schedulers");
         assert_eq!(schedulers.primary(), 0);
         assert_eq!(schedulers.devices().collect::<Vec<_>>(), vec![0, 1, 2]);
         for device in [0, 1, 2] {
@@ -449,9 +454,9 @@ mod tests {
     /// construction, not conditions a later admission discovers.
     #[test]
     fn device_schedulers_refuse_an_empty_or_repeating_list() {
-        DeviceSchedulers::for_devices(&[], 0.9, NonZeroUsize::MIN)
+        DeviceSchedulers::for_devices(&[], share(90), NonZeroUsize::MIN)
             .expect_err("a session needs a device");
-        DeviceSchedulers::for_devices(&[0, 0], 0.9, NonZeroUsize::MIN)
+        DeviceSchedulers::for_devices(&[0, 0], share(90), NonZeroUsize::MIN)
             .expect_err("two budgets over one card each admit as if they owned all of it");
     }
 
@@ -462,8 +467,8 @@ mod tests {
         let schedulers = DeviceSchedulers {
             primary: 0,
             by_device: vec![
-                (0, Arc::new(GpuScheduler::new(1_000, 0.0))),
-                (1, Arc::new(GpuScheduler::new(1_000, 0.0))),
+                (0, Arc::new(GpuScheduler::new(1_000))),
+                (1, Arc::new(GpuScheduler::new(1_000))),
             ],
         };
         let first = Arc::clone(schedulers.get(0).expect("device 0"));
@@ -481,7 +486,7 @@ mod tests {
     /// A negative ordinal is CPU: no budget, admit everything.
     #[test]
     fn for_device_cpu_is_unlimited() {
-        let sched = GpuScheduler::for_device(-1, 0.9, NonZeroUsize::MIN);
+        let sched = GpuScheduler::for_device(-1, share(90), NonZeroUsize::MIN).expect("the CPU");
         assert!(sched.unlimited);
         assert_eq!(sched.available(), usize::MAX);
     }
@@ -492,32 +497,50 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn for_device_falls_back_to_unlimited_when_probe_fails() {
-        let sched = GpuScheduler::for_device(0, 0.9, NonZeroUsize::MIN);
+        let sched = GpuScheduler::for_device(0, share(90), NonZeroUsize::MIN).expect("unprobed");
         assert!(sched.unlimited);
     }
 
-    /// `memory_fraction` maps to usable budget: with a 1 GiB card and 0.9,
-    /// 900 MiB is admittable and the rest is headroom.
+    /// `[gpu] memory_limit` sizes the budget on a probed card: a share of
+    /// it, or an absolute size that fits it, and admission holds to that
+    /// budget exactly.
     #[test]
-    fn budget_reflects_memory_fraction() {
-        let total = 1024 * 1024 * 1024;
-        let sched = Arc::new(GpuScheduler::new(total, 1.0 - 0.9));
-        let usable = sched.available();
-        // 90% of the card, within rounding.
-        assert!(
-            (usable as f64 - total as f64 * 0.9).abs() < 2.0,
-            "usable {usable} should be ~90% of {total}"
+    fn memory_limit_sizes_the_device_budget() {
+        let card = 1 << 30;
+        assert_eq!(
+            GpuScheduler::budget_for(0, card, share(90)).expect("a share fits"),
+            966_367_641,
+            "90% of 1 GiB, rounded down"
         );
-        // A request under budget is admitted and reserves; over-budget is refused.
-        let permit = sched.try_acquire(usable / 2).expect("half-budget admits");
+        let absolute = "512MB".parse().expect("a limit");
+        let budget = GpuScheduler::budget_for(0, card, absolute).expect("512 MiB fits 1 GiB");
+        assert_eq!(budget, 512 << 20);
+
+        let sched = Arc::new(GpuScheduler::new(budget));
+        let permit = sched.try_acquire(budget / 2).expect("half-budget admits");
         assert!(
-            sched.try_acquire(usable).is_none(),
+            sched.try_acquire(budget).is_none(),
             "over remaining refused"
         );
         drop(permit);
         assert!(
-            sched.try_acquire(usable).is_some(),
+            sched.try_acquire(budget).is_some(),
             "release frees the budget"
         );
+    }
+
+    /// An absolute limit larger than the card is refused by device, never
+    /// silently clipped to the card or admitted past it.
+    #[test]
+    fn an_absolute_limit_larger_than_the_card_is_refused() {
+        let err = GpuScheduler::budget_for(3, 1 << 30, "2GB".parse().expect("a limit"))
+            .expect_err("2 GiB does not fit a 1 GiB card");
+        let msg = err.to_string();
+        assert!(msg.contains("memory_limit"), "{msg}");
+        assert!(msg.contains("device 3"), "{msg}");
+    }
+
+    fn share(percent: u8) -> MemoryLimit {
+        MemoryLimit::Share(jammi_db::config::Percent::new(percent).expect("a percentage"))
     }
 }

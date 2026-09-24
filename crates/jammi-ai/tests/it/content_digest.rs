@@ -71,7 +71,7 @@ async fn definition_hash_for(dir: &Path) -> DefinitionHash {
         key_column: "id".to_string(),
         dimensions: DIMENSIONS,
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, vec![identity]);
+    let env = MaterializationEnv::of_models(ComputeDevice::Cpu, vec![identity]);
 
     MaterializationManifest::definition_of(&descriptor, &env)
         .expect("definition_of must succeed for a well-formed descriptor/env pair")

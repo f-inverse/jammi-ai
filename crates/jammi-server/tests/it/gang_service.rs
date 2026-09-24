@@ -276,7 +276,7 @@ async fn materialize_ready_table_for_tenant(
         key_column: "_row_id".into(),
         dimensions: 4,
     };
-    let env = MaterializationEnv::new(
+    let env = MaterializationEnv::of_models(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "rt-base".into(),
@@ -490,36 +490,19 @@ fn null_tenant_row(table: &str) -> jammi_db::catalog::result_repo::CreateResultT
     }
 }
 
-/// Rewrites a ready table's sidecar WITHOUT its `leaves` inventory, so
-/// `ResultStore::read_materialization_manifest` reads it as ABSENT
-/// (`Ok(None)`), never as a manifest whose whole artifact is one leaf.
-async fn strip_leaves_from_sidecar(
-    server: &crate::common::grpc::PeerEngineServer,
-    parquet_path: &str,
-) {
-    let store = server.engine.result_store();
+/// Removes a ready table's `.materialization.json` sidecar, so
+/// `ResultStore::read_materialization_manifest` reads it as absent. The test
+/// stores are `file://`, where the sidecar is the Parquet path with its
+/// extension swapped.
+async fn remove_sidecar(parquet_path: &str) {
     let url = jammi_db::storage::StorageUrl::parse(parquet_path).unwrap();
-    let handle = store.open_parquet(&url).unwrap();
-    let sidecar = handle.sibling_path("materialization.json").unwrap();
-    let bytes = handle.get_bytes(&sidecar).await.unwrap();
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    value
-        .as_object_mut()
-        .expect("a manifest is a JSON object")
-        .remove("leaves")
-        .expect("a freshly written sidecar carries a leaf inventory");
-    handle
-        .put_bytes(&sidecar, serde_json::to_vec(&value).unwrap().into())
-        .await
-        .unwrap();
-    assert!(
-        store
-            .read_materialization_manifest(&url)
-            .await
-            .unwrap()
-            .is_none(),
-        "the pre-leaves sidecar must read as absent"
+    assert_eq!(
+        url.scheme(),
+        jammi_db::storage::Scheme::File,
+        "a local test store"
     );
+    std::fs::remove_file(std::path::Path::new(url.path()).with_extension("materialization.json"))
+        .unwrap();
 }
 
 /// Raw SQL against `server`'s engine catalog: the ONE conjunct under test is
@@ -1743,8 +1726,8 @@ async fn refusal_scenario(
                 &ready.table,
             )
             .await;
-            // The pre-leaves sidecar: reads as absent, never as a verify.
-            strip_leaves_from_sidecar(&server, &ready.parquet_path).await;
+            // No sidecar: reads as absent, never as a verify.
+            remove_sidecar(&ready.parquet_path).await;
             assign_frame_full("nd-job-sidecar-absent", attempt, 0, 2, coord)
         }
         GangRefusalReason::TrainingSetDigestMismatch => {
@@ -2875,8 +2858,8 @@ async fn run_rank_held_session_ends_store_unavailable_when_this_hosts_store_faul
 }
 
 /// Re-verification at the artifact: a `world_size == 2` session whose training set's
-/// sidecar is stripped of its leaf inventory AFTER admission (reads as
-/// absent) ends `Aborted{Refuted}` — the artifact's fact, assembly-scoped,
+/// sidecar is removed AFTER admission (reads as absent) ends
+/// `Aborted{Refuted}` — the artifact's fact, assembly-scoped,
 /// never this host's `StoreUnavailable`. Pins the split between "the
 /// sidecar does not verify" and "this host could not read it".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2889,7 +2872,7 @@ async fn run_rank_held_session_ends_refuted_when_the_sidecar_stops_verifying() {
         "coord-sidecar-refuted",
     )
     .await;
-    strip_leaves_from_sidecar(&server, &ready.parquet_path).await;
+    remove_sidecar(&ready.parquet_path).await;
     expect_aborted(&mut rank, AbortReason::Refuted, HEARTBEAT * 3).await;
     assert_eq!(row_facts(&server, "job-sidecar-refuted").await, before);
 }

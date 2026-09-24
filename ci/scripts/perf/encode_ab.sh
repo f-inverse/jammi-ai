@@ -3,7 +3,7 @@
 # corpus, in one run — then the comparator. This script RUNS legs and decides
 # nothing; every ratio, budget and verdict is `jammi-bench ladder encode`'s.
 #
-# THE LEGS. Two producers, four arms, each arm run TAKES times, in a
+# THE LEGS. Two producers, four arms, each arm run once per take, in a
 # palindrome over the arms so a box that drifts over the run (a thermal or
 # clock trend) moves every arm's mean alike and cancels out of any two arms'
 # ratio:
@@ -13,9 +13,10 @@
 #   jammi          `jammi-bench encode-step --rung direct --rung plan --rung
 #                  plan-partitioned`: the three engine rungs INTERLEAVED in one
 #                  process per unit (the legs an edge's speed is read from),
-#                  then each rung again ALONE (`--rung <one>`, the legs its
-#                  space is read from: a shared process's high-water marks
-#                  belong to no one rung).
+#                  then each rung again ALONE (`--rung <one>`, filed as
+#                  `a<take>` beside the interleaved `r<take>` legs: the legs
+#                  its space is read from, a shared process's high-water marks
+#                  belonging to no one rung).
 #   torch-plan     `torch_encode.py --order plan --attn eager`: the reference
 #                  forwarding the chunks the engine's plan cuts — the
 #                  semantic twin, the `torch` rung.
@@ -46,7 +47,9 @@
 #                           the exchange directory, and the torch legs load it
 #                           from there — the same bytes either way.
 #   ENCODE_AB_ROWS          the sweep (default "16,1024,16384").
-#   ENCODE_AB_TAKES         measured repeats of each unit (default 2).
+#   ENCODE_AB_TAKE          the takes each unit is measured as, comma-separated;
+#                           unset, the producers' own default — the fewest
+#                           the ladder measures a rung against itself with.
 #   ENCODE_AB_PARTITIONS    N for the plan-partitioned rung (default 4).
 #   ENCODE_AB_BATCH_SIZE / ENCODE_AB_BATCH_TOKENS
 #                           the chunk budget every rung's forwards are cut
@@ -61,11 +64,17 @@
 #                           close on the same work (needs `usearch` in the torch
 #                           venv). 0: they stop at the Parquet file, and their
 #                           legs say so.
-#   ENCODE_AB_WARMUP / ENCODE_AB_ITERS
-#                           warm and measured serves per rung (defaults 2, 16;
-#                           ITERS must be even — the rungs are interleaved —
-#                           and at least the ladder's minimum series, which
-#                           `encode-step` refuses below).
+#   ENCODE_AB_RUNGS         the engine rungs, comma-separated (default
+#                           `direct,plan,plan-partitioned`); the plane's
+#                           `placed` and `shape-d` join them when named —
+#                           built with the plane, over the pinned Postgres
+#                           catalog and S3-class store (`pg_test_catalog.sh`,
+#                           `s3_test_store.sh`) this run starts, with a
+#                           `jammi-server` fleet built beside the bench.
+#   ENCODE_AB_ITERS         serves per rung, every one timed and filed (default
+#                           64; even — the rungs are interleaved — and at least
+#                           the ladder's minimum run, 32: the ladder cuts each
+#                           run's initial transient itself).
 #   ENCODE_AB_CUDA_ORDINAL  optional CUDA device ordinal (unset = CPU; when set,
 #                           every leg runs on it and the build is the fused GPU
 #                           stack, `cuda,jammi-encoders/flash-attn` — the same
@@ -82,14 +91,23 @@ REPO_ROOT="$(cd "$DIR/../../.." && pwd)"
 ENCODE_AB_DRY_RUN="${ENCODE_AB_DRY_RUN:-0}"
 ENCODE_AB_MODEL_DIR="${ENCODE_AB_MODEL_DIR:-}"
 ENCODE_AB_ROWS="${ENCODE_AB_ROWS:-16,1024,16384}"
-ENCODE_AB_TAKES="${ENCODE_AB_TAKES:-2}"
+ENCODE_AB_TAKE="${ENCODE_AB_TAKE:-}"
 ENCODE_AB_PARTITIONS="${ENCODE_AB_PARTITIONS:-4}"
 ENCODE_AB_BATCH_SIZE="${ENCODE_AB_BATCH_SIZE:-32}"
 ENCODE_AB_BATCH_TOKENS="${ENCODE_AB_BATCH_TOKENS:-16384}"
 ENCODE_AB_DTYPE="${ENCODE_AB_DTYPE:-f32}"
 ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
-ENCODE_AB_WARMUP="${ENCODE_AB_WARMUP:-2}"
-ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-16}"
+ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-64}"
+ENCODE_AB_RUNGS="${ENCODE_AB_RUNGS:-direct,plan,plan-partitioned}"
+IFS=',' read -r -a RUNGS <<< "$ENCODE_AB_RUNGS"
+FLEET=0
+for rung in "${RUNGS[@]}"; do
+  case "$rung" in
+    direct|plan|plan-partitioned) ;;
+    placed|shape-d) FLEET=1 ;;
+    *) echo "::error::ENCODE_AB_RUNGS names '$rung'; the engine rungs are direct, plan, plan-partitioned, placed, shape-d." >&2; exit 2 ;;
+  esac
+done
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="${ENCODE_AB_OUT_DIR:-$REPO_ROOT/.encode-ab-report/$TS}"
@@ -120,16 +138,38 @@ run_cmd() {
   "$@"
 }
 
+# A CUDA ordinal pulls in the engine's CUDA backend — without it `--cuda`
+# has no device to select; a plane rung pulls in the plane, and the fleet
+# its jobs run on is built with the same kernels and the S3 driver. Each
+# shape is its own literal invocation: the feature-closure and reachability
+# guards read these lines as written.
+SERVER_BIN="$TARGET_DIR/release/jammi-server"
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
-  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
-    # A CUDA ordinal was requested: pull in the engine's CUDA backend —
-    # without it `--cuda` has no device to select.
-    run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-bench --features cuda,jammi-encoders/flash-attn failed" >&2; exit 1; }
-  else
-    run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
-  fi
+  case "${ENCODE_AB_CUDA_ORDINAL:+cuda}:$FLEET" in
+    cuda:1)
+      run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn,plane --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+      run_cmd cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; } ;;
+    cuda:0)
+      run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; } ;;
+    :1)
+      run_cmd cargo build --release -p jammi-bench --features plane --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+      run_cmd cargo build --release -p jammi-server --bin jammi-server --features storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; } ;;
+    :0)
+      run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
+        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; } ;;
+  esac
+fi
+
+# A plane rung's catalog and store: the pinned Postgres and S3-class store,
+# started for this run and stopped with it.
+if [ "$FLEET" = 1 ] && [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
+  source "$DIR/plane_backends.sh"
+  plane_backends_up "$OUT_DIR/plane"
 fi
 
 # --- provenance cross-check, same shape as
@@ -184,14 +224,16 @@ run_legs() {
 run_jammi_legs() {
   local label="$1" legs_dir="$2"; shift 2
   local -a cmd=("$BIN" encode-step --task embed
-    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --rows "$ENCODE_AB_ROWS"
     --partitions "$ENCODE_AB_PARTITIONS"
     --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
     --compute-precision "$ENCODE_AB_DTYPE"
-    --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --iters "$ENCODE_AB_ITERS"
     --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
+  [ -n "$ENCODE_AB_TAKE" ] && cmd+=(--take "$ENCODE_AB_TAKE")
   local rung
   for rung in "$@"; do cmd+=(--rung "$rung"); done
+  [ "$FLEET" = 1 ] && cmd+=(--server-bin "$SERVER_BIN")
   # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
   # default (the compiled-in fixture on `Device::Cpu`) is the flagless run.
   [ -n "$ENCODE_AB_MODEL_DIR" ] && cmd+=(--model-dir "$ENCODE_AB_MODEL_DIR")
@@ -205,11 +247,12 @@ run_torch_legs() {
   local -a cmd=("$TORCH_PY" "$REF_SCRIPT"
     --model-dir "${ENCODE_AB_MODEL_DIR:-$EXCHANGE_DIR/model}" --exchange-dir "$EXCHANGE_DIR"
     --out-dir "$OUT_DIR/${label}.out" --legs-dir "$legs_dir" --sampler-bin "$BIN"
-    --rows "$ENCODE_AB_ROWS" --takes "$ENCODE_AB_TAKES"
+    --rows "$ENCODE_AB_ROWS"
     --batch-size "$ENCODE_AB_BATCH_SIZE" --batch-tokens "$ENCODE_AB_BATCH_TOKENS"
-    --dtype "$ENCODE_AB_DTYPE" --warmup "$ENCODE_AB_WARMUP" --iters "$ENCODE_AB_ITERS"
+    --dtype "$ENCODE_AB_DTYPE" --iters "$ENCODE_AB_ITERS"
     --order "$order" --attn "$attn")
   [ "$ENCODE_AB_TORCH_ANN_INDEX" = "1" ] && cmd+=(--ann-index)
+  [ -n "$ENCODE_AB_TAKE" ] && cmd+=(--take "$ENCODE_AB_TAKE")
   [ -n "$ENCODE_AB_CUDA_ORDINAL" ] && cmd+=(--cuda "$ENCODE_AB_CUDA_ORDINAL")
   mkdir -p "$OUT_DIR/${label}.out"
   run_legs "$label" "${cmd[@]}"
@@ -217,12 +260,12 @@ run_torch_legs() {
 
 # The palindrome over the arms. The interleaved jammi run is first so its
 # exchange directory exists for every torch leg; the solo runs close it.
-run_jammi_legs jammi-interleaved "$LEGS_PLAN" direct plan plan-partitioned
+run_jammi_legs jammi-interleaved "$LEGS_PLAN" "${RUNGS[@]}"
 run_torch_legs torch-plan "$LEGS_PLAN" plan eager
 run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
-run_jammi_legs jammi-direct "$LEGS_PLAN/space" direct
-run_jammi_legs jammi-plan "$LEGS_PLAN/space" plan
-run_jammi_legs jammi-plan-partitioned "$LEGS_PLAN/space" plan-partitioned
+for rung in "${RUNGS[@]}"; do
+  run_jammi_legs "jammi-$rung" "$LEGS_PLAN" "$rung"
+done
 
 # The sorted comparison sees the same engine legs beside the other torch order.
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then

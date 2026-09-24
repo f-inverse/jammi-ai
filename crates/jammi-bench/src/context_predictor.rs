@@ -61,7 +61,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -80,8 +80,9 @@ use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
 use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point,
-    vector_rows_digest, write_vector_rows, Artifact, IterationSeries,
+    vector_rows_digest, write_vector_rows, Artifact, Takes,
 };
+use crate::ladder::leg::Take;
 use crate::leg::{
     Facts, Leg, Measured, Measurement, Payload, Provenance, RanOn, Stations, TrajectoryPoint,
 };
@@ -341,8 +342,7 @@ async fn register_dataset(
         split: None,
         dimensions: FEATURE_DIM,
     };
-    let env =
-        jammi_db::store::manifest::MaterializationEnv::new(session.compute_device(), Vec::new());
+    let env = jammi_db::store::manifest::MaterializationEnv::without_models();
     let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
         source_id,
         "1970-01-01T00:00:00Z",
@@ -412,12 +412,10 @@ pub struct PredictorTrainParams {
     /// spec's when `None`. Every other knob — dataset, episodes, widths, heads,
     /// layers, optimiser — is the committed spec's for every architecture.
     pub architecture: Option<String>,
-    /// The run seed — the unit; the committed spec's when `None`.
-    pub seed: Option<u64>,
+    /// The run seed — the unit.
+    pub seed: u64,
     /// Passes over the train episodes; the committed spec's when `None`.
     pub epochs: Option<usize>,
-    /// Leading optimizer steps kept out of the timing series (they still train).
-    pub warmup_steps: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
 }
@@ -476,9 +474,8 @@ pub struct PredictorTrainRunPayload {
     pub train_episodes: usize,
     /// Held-out test episode batches scored.
     pub heldout_episodes: usize,
-    /// Leading steps excluded from the timing series.
-    pub warmup_steps: usize,
-    /// Optimizer steps timed.
+    /// Optimizer steps timed and filed: the whole run, its transient for the
+    /// ladder to cut.
     pub iters_measured: usize,
     /// The trained parameters.
     pub final_weights: Artifact,
@@ -577,7 +574,7 @@ pub async fn run_leg(
             .architecture
             .clone()
             .unwrap_or_else(|| committed.architecture.clone()),
-        spec_seed: params.seed.unwrap_or(committed.spec_seed),
+        spec_seed: params.seed,
         ..committed
     };
     let mut config = ContextPredictorTrainConfig {
@@ -586,7 +583,11 @@ pub async fn run_leg(
     };
     let rows = build_dataset(&spec);
     let unit = format!("seed{}", config.seed);
-    let stem = leg_stem(params.rung.as_str(), &unit, params.take);
+    let stem = leg_stem(
+        params.rung.as_str(),
+        &unit,
+        Take::Repeat(params.take as u32),
+    );
     let input_dir = params
         .legs_dir
         .join(INPUT_DIR)
@@ -621,13 +622,7 @@ pub async fn run_leg(
     let batch = batch_targets(&sampled.train)?;
 
     let trained = host
-        .train(
-            &config,
-            &mut varmap,
-            &predictor,
-            &sampled,
-            params.warmup_steps,
-        )
+        .train(&config, &mut varmap, &predictor, &sampled)
         .await?;
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
@@ -682,13 +677,12 @@ pub async fn run_leg(
         objective: "gaussian-crps",
         train_episodes: sampled.train.len(),
         heldout_episodes: sampled.test.len(),
-        warmup_steps: params.warmup_steps,
-        iters_measured: trained.total_steps.saturating_sub(params.warmup_steps),
+        iters_measured: trained.total_steps,
         final_weights: artifact_of(&final_path)?,
         trainer: "jammi_ai::pipeline::context_predictor::fit_context_predictor",
     };
     let measured = Measured {
-        iter_wall_s: Some(trained.steps.into_seconds()),
+        iter_wall_s: Some(trained.step_seconds),
         work: None,
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
@@ -721,8 +715,8 @@ pub async fn run_leg(
 /// What a rung's training left: the predictor's `varmap` holds the trained
 /// weights, and these are the run's observations.
 struct Trained {
-    /// Every optimizer step's wall, less the warmup.
-    steps: IterationSeries,
+    /// Every optimizer step's wall, in run order.
+    step_seconds: Vec<f64>,
     total_steps: usize,
     held_out_at_init: f64,
     /// The objective over the train episodes at init and after every epoch.
@@ -766,9 +760,7 @@ impl Host {
                 let leg = format!(
                     "predictor-{}-seed{}-r{}",
                     params.rung.as_str(),
-                    params
-                        .seed
-                        .map_or_else(|| "spec".to_string(), |s| s.to_string()),
+                    params.seed,
                     params.take
                 );
                 let fleet = match (params.rung, &params.plane.query_addr) {
@@ -840,7 +832,6 @@ impl Host {
         varmap: &mut candle_nn::VarMap,
         predictor: &jammi_encoders::AnyContextPredictor,
         sampled: &jammi_ai::pipeline::context_predictor::SampledEpisodes,
-        warmup_steps: usize,
     ) -> Result<Trained, Box<dyn std::error::Error>> {
         match self {
             Host::InProcess { .. } => {
@@ -869,7 +860,7 @@ impl Host {
                     },
                 )?;
                 Ok(Trained {
-                    steps: step_series(&report.step_seconds, warmup_steps),
+                    step_seconds: report.step_seconds,
                     total_steps: report.total_steps,
                     held_out_at_init,
                     train_probe_series,
@@ -948,7 +939,7 @@ impl Host {
                     })
                     .collect();
                 Ok(Trained {
-                    steps: step_series(&curve.step_seconds, warmup_steps),
+                    step_seconds: curve.step_seconds,
                     total_steps: curve.total_steps,
                     held_out_at_init: *held_out_at_init,
                     train_probe_series: curve.train_scores,
@@ -977,18 +968,6 @@ struct WithTimeline {
     timeline: Option<crate::leg::Timeline>,
 }
 
-/// Every step's wall as the leg's iteration series, less the warmup.
-fn step_series(step_seconds: &[f64], warmup_steps: usize) -> IterationSeries {
-    let mut series = IterationSeries::new(
-        warmup_steps,
-        step_seconds.len().saturating_sub(warmup_steps),
-    );
-    step_seconds
-        .iter()
-        .for_each(|s| series.record(Duration::from_secs_f64(*s)));
-    series
-}
-
 /// `predictor-train-run`'s flags.
 #[derive(Debug, Clone, clap::Args)]
 pub struct PredictorTrainArgs {
@@ -1004,28 +983,25 @@ pub struct PredictorTrainArgs {
     /// `Cnp`, `AttnCnp` or `Tnp`; defaults to the committed spec's.
     #[arg(long)]
     arch: Option<String>,
-    /// The seeds to run, comma-separated — one unit each; the committed spec's
-    /// seed when omitted.
-    #[arg(long, value_delimiter = ',')]
+    /// The seeds to run, comma-separated — one unit each; the default is the
+    /// seeds the ladder's learning rule is stated for.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = 1..=crate::ladder::definition::SEEDED_LOSS_SEEDS as u64
+    )]
     seeds: Vec<u64>,
     /// Passes over the train episodes; defaults to the committed spec's.
     #[arg(long)]
     epochs: Option<usize>,
-    /// Leading optimizer steps kept out of the timing series.
-    #[arg(long, default_value_t = 2)]
-    warmup_steps: usize,
-    /// Measured repeats of each seed, each in a process of its own.
-    #[arg(long, default_value_t = 1)]
-    takes: usize,
-    /// The take a single seed's run is filed as.
-    #[arg(long, default_value_t = 1)]
-    take: usize,
+    #[command(flatten)]
+    takes: Takes,
     #[command(flatten)]
     plane: PlaneArgs,
 }
 
 impl PredictorTrainArgs {
-    fn params(&self, seed: Option<u64>, rung: Rung, take: usize) -> PredictorTrainParams {
+    fn params(&self, seed: u64, rung: Rung, take: usize) -> PredictorTrainParams {
         PredictorTrainParams {
             rung,
             plane: self.plane.clone().into(),
@@ -1033,31 +1009,27 @@ impl PredictorTrainArgs {
             architecture: self.arch.clone(),
             seed,
             epochs: self.epochs,
-            warmup_steps: self.warmup_steps,
             take,
         }
     }
 
     /// Run the subcommand: one leg per (seed, take), and print the file names.
     pub async fn execute(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let seeds: Vec<Option<u64>> = if self.seeds.is_empty() {
-            vec![None]
-        } else {
-            self.seeds.iter().map(|s| Some(*s)).collect()
-        };
-        let points: Vec<(Option<u64>, Rung, usize)> = seeds
+        let points: Vec<(u64, Rung, usize)> = self
+            .seeds
             .iter()
             .flat_map(|&s| {
                 self.rungs
                     .iter()
-                    .flat_map(move |&r| (1..=self.takes).map(move |t| (s, r, t)))
+                    .flat_map(move |&r| self.takes.iter().map(move |t| (s, r, t)))
             })
             .collect();
-        let (seed, rung, _) = points[0];
-        let first = self.params(seed, rung, if points.len() == 1 { self.take } else { 1 });
         let files = legs_per_point(
             &points,
-            async move { run_leg(&first).await.map(|(_, file)| vec![file]) },
+            |&(seed, rung, take)| {
+                let params = self.params(seed, rung, take);
+                async move { run_leg(&params).await.map(|(_, file)| vec![file]) }
+            },
             |&(seed, rung, take)| {
                 let mut args: Vec<std::ffi::OsString> = vec![
                     "predictor-train-run".into(),
@@ -1065,16 +1037,13 @@ impl PredictorTrainArgs {
                     (&self.legs_dir).into(),
                     "--rung".into(),
                     rung.as_str().into(),
-                    "--warmup-steps".into(),
-                    self.warmup_steps.to_string().into(),
                     "--take".into(),
                     take.to_string().into(),
+                    "--seeds".into(),
+                    seed.to_string().into(),
                 ];
                 if let Some(arch) = &self.arch {
                     args.extend(["--arch".into(), arch.into()]);
-                }
-                if let Some(seed) = seed {
-                    args.extend(["--seeds".into(), seed.to_string().into()]);
                 }
                 if let Some(epochs) = self.epochs {
                     args.extend(["--epochs".into(), epochs.to_string().into()]);
@@ -1462,9 +1431,8 @@ mod tests {
                 plane: PlaneParams::default(),
                 legs_dir: dir.to_path_buf(),
                 architecture: Some(architecture.to_string()),
-                seed: Some(7),
+                seed: 7,
                 epochs: Some(3),
-                warmup_steps: 1,
                 take: 1,
             };
             async move { run_leg(&params).await.expect("predictor leg runs") }
@@ -1486,10 +1454,7 @@ mod tests {
                 .is_file());
             assert_eq!(first.payload.architecture, architecture);
             let steps = first.payload.train_episodes * first.payload.epochs;
-            assert_eq!(
-                first.measured.iter_wall_s.as_ref().unwrap().len(),
-                steps - 1
-            );
+            assert_eq!(first.measured.iter_wall_s.as_ref().unwrap().len(), steps);
             assert_eq!(first.measured.trajectory.len(), 3);
             assert_eq!(first.facts.train_probe_series.as_ref().unwrap().len(), 4);
             assert!(first.measured.held_out_at_init.is_some());
@@ -1547,9 +1512,8 @@ mod tests {
                 plane: PlaneParams::default(),
                 legs_dir: legs.clone(),
                 architecture: None,
-                seed: Some(seed),
+                seed,
                 epochs: Some(2),
-                warmup_steps: 0,
                 take: 1,
             })
             .await

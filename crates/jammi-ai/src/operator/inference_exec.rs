@@ -119,6 +119,54 @@ pub struct InferenceRuntime {
     pub observer: Option<Arc<dyn InferenceObserver>>,
 }
 
+/// The environment a process running [`InferenceExec`] nodes produces a
+/// materialization in: its compute device, and the identity of every model
+/// the plan's inference nodes ran, read from this process's own model cache —
+/// so a table records the models and the device that produced it wherever
+/// its plan was placed.
+pub struct InferenceEnvironment {
+    pub device: jammi_db::store::manifest::ComputeDevice,
+    pub model_cache: Arc<ModelCache>,
+}
+
+#[async_trait::async_trait]
+impl jammi_db::store::sink::ProducingEnvironment for InferenceEnvironment {
+    async fn of(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> jammi_db::error::Result<jammi_db::store::manifest::MaterializationEnv> {
+        let mut models = Vec::new();
+        for spec in inference_specs(plan) {
+            let guard = self
+                .model_cache
+                .get_or_load(&spec.source, spec.task, spec.backend)
+                .await?;
+            let identity = guard.model.identity(&spec.source)?;
+            if !models.contains(&identity) {
+                models.push(identity);
+            }
+        }
+        Ok(jammi_db::store::manifest::MaterializationEnv::of_models(
+            self.device.clone(),
+            models,
+        ))
+    }
+}
+
+/// Every [`InferenceExec`]'s spec in `plan`, in pre-order — walked with an
+/// explicit stack, so a deep plan cannot exhaust the thread's.
+fn inference_specs(plan: &Arc<dyn ExecutionPlan>) -> Vec<InferenceSpec> {
+    let mut stack = vec![Arc::clone(plan)];
+    let mut specs = Vec::new();
+    while let Some(node) = stack.pop() {
+        if let Some(inference) = node.downcast_ref::<InferenceExec>() {
+            specs.push(inference.spec().clone());
+        }
+        stack.extend(node.children().into_iter().rev().cloned());
+    }
+    specs
+}
+
 /// Runs a model over a numbered input, one forward per chunk, emitting the
 /// common prefix columns followed by the task's own.
 ///

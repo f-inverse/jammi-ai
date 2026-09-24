@@ -369,7 +369,6 @@ pub(crate) struct PropagationTable<'a> {
     pub derived_from: Option<&'a str>,
     pub key_column: Option<&'a str>,
     pub descriptor: &'a ProducingDescriptor,
-    pub env: &'a MaterializationEnv,
     pub inputs: Vec<InputAnchor>,
 }
 
@@ -476,7 +475,7 @@ impl InferenceSession {
             output: propagation_output(&request.output),
             dimensions: readout.out_dim(dimensions),
         };
-        let env = MaterializationEnv::new(self.compute_device(), Vec::new());
+        let env = MaterializationEnv::without_models();
         let inputs = vec![
             pin.input_anchor(),
             self.edge_source_anchor(&request.edge_source).await?,
@@ -516,7 +515,6 @@ impl InferenceSession {
                     // provenance is inherited, never re-asserted.
                     key_column: table.key_column.as_deref(),
                     descriptor: &descriptor,
-                    env: &env,
                     inputs,
                 },
                 job_attempt,
@@ -767,7 +765,7 @@ impl InferenceSession {
                 summary.rows as usize,
                 jammi_db::store::manifest::Materialization::new(
                     table.descriptor,
-                    table.env,
+                    &summary.env,
                     table.inputs,
                 ),
             )

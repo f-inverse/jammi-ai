@@ -161,10 +161,10 @@ async fn with_owned_rows<F: std::future::Future<Output = ()>>(
 }
 
 /// Register / heartbeat / remove round-trips through the `ClusterState`
-/// trait — every verb `CatalogClusterState` maps onto `compute_repo`.
-/// Mutation: drop `cache_heartbeat`'s write inside `register_executor` and
-/// `executor_heartbeats()` reds (empty where a fresh registration should
-/// already be visible).
+/// trait — every verb `CatalogClusterState` maps onto `compute_repo`, and
+/// the heartbeat view Ballista reads is the rows. Mutation: drop the row
+/// write inside `register_executor` and `executor_heartbeats()` reds (empty
+/// where a fresh registration should already be visible).
 async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
     let catalog = catalog(kind).await;
     let owned = RefCell::new(Vec::<String>::new());
@@ -178,10 +178,19 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
             .register_executor(meta.clone(), spec)
             .await
             .expect("register_executor");
-        assert_eq!(state.get_executor_heartbeat(&id).map(|_| ()), Some(()));
+        let cached = state
+            .get_executor_heartbeat(&id)
+            .expect("a fresh registration is already a heartbeat Ballista reads");
         assert!(state.executor_heartbeats().contains_key(&id));
         let listed = state.registered_executor_metadata().await;
         assert!(listed.iter().any(|m| m.id == id));
+        // The heartbeat Ballista reads IS the row: one instant, the whole
+        // second the scheduler's expiry sweep compares.
+        assert_eq!(
+            row_heartbeat_at(&catalog, &id).await,
+            stamp_of_seconds(cached.timestamp),
+            "the heartbeat read back is the registration row's own instant"
+        );
 
         state
             .save_executor_heartbeat(heartbeat(
@@ -195,8 +204,13 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
             state.get_executor_heartbeat(&id).map(|h| h.timestamp),
             Some(123)
         );
+        assert_eq!(
+            row_heartbeat_at(&catalog, &id).await,
+            "1970-01-01T00:02:03.000000Z",
+            "the row carries the heartbeat's own instant, never a second reading of the clock"
+        );
         // A heartbeat that claims no status is a foreign sender, refused
-        // typed and recorded nowhere: the cache still reads the last one.
+        // typed and recorded nowhere: the row still reads the last one.
         let refused = state
             .save_executor_heartbeat(ballista_core::serde::protobuf::ExecutorHeartbeat {
                 executor_id: id.clone(),
@@ -225,13 +239,13 @@ async fn register_heartbeat_remove_round_trip(kind: BackendKind) {
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn register_heartbeat_remove_round_trip_sqlite() {
     register_heartbeat_remove_round_trip(BackendKind::Sqlite).await;
 }
 
 #[cfg(feature = "live-postgres-tests")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn register_heartbeat_remove_round_trip_postgres() {
     register_heartbeat_remove_round_trip(BackendKind::Postgres).await;
 }
@@ -825,6 +839,23 @@ async fn a_slot_less_executor_never_gets_a_task_stamped_postgres() {
     a_slot_less_executor_never_gets_a_task_stamped(BackendKind::Postgres).await;
 }
 
+/// A canonical stamp of a whole-second Unix instant — the shape every
+/// `heartbeat_at` the cluster state writes has.
+fn stamp_of_seconds(secs: u64) -> String {
+    jammi_db::catalog::lease::canonical_stamp(
+        chrono::DateTime::from_timestamp(i64::try_from(secs).unwrap(), 0).unwrap(),
+    )
+}
+
+async fn row_heartbeat_at(catalog: &Catalog, id: &str) -> String {
+    catalog
+        .get_compute_executor(id)
+        .await
+        .unwrap()
+        .expect("the executor's row")
+        .heartbeat_at
+}
+
 fn record(id: &str, status: ComputeExecutorStatus, heartbeat_at: String) -> ComputeExecutorRecord {
     ComputeExecutorRecord {
         executor_id: id.to_string(),
@@ -841,17 +872,65 @@ fn record(id: &str, status: ComputeExecutorStatus, heartbeat_at: String) -> Comp
     }
 }
 
+/// Ballista's own expiry test (`ExecutorManager::get_expired_executors`):
+/// expired once `heartbeat <= now - executor_timeout_seconds`, every term
+/// in whole Unix seconds and the threshold clamped at the epoch. The
+/// tables below judge `executor_is_live` against THIS, never against a
+/// second window arithmetic of the test's own.
+fn ballista_expired(heartbeat_secs: u64, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let window = u64::try_from(executor_liveness_window().num_seconds()).unwrap();
+    let threshold = u64::try_from(now.timestamp())
+        .unwrap()
+        .saturating_sub(window);
+    heartbeat_secs <= threshold
+}
+
 /// `executor_is_live` — the ONE predicate the binder and the submit-edge
-/// refusal share — is `Active` AND a heartbeat within
-/// `executor_liveness_window()`; every other row (a `Terminating` one, a
-/// `Dead` one, a stale timestamp, an unparseable one) is not live.
-/// Mutation: drop the status arm and the `Terminating` row reads live;
-/// drop the window and the stale row reads live.
+/// refusal share — is `Active` AND a heartbeat Ballista's expiry sweep
+/// would not have expired; every other row (a `Terminating` one, a `Dead`
+/// one, a stale timestamp, an unparseable one) is not live. Mutation: drop
+/// the status arm and the `Terminating` row reads live; drop the window
+/// and the stale row reads live; compare the stamp at sub-second
+/// precision, or with `<` in place of Ballista's `<=`, and the edge rows
+/// below read live while the sweep has already expired them.
 #[test]
 fn executor_is_live_table() {
     let now = chrono::Utc::now();
     let stamp = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
     let fresh = stamp(now);
+
+    // The window's edge, as a sweep meets it: the executor's last
+    // heartbeat was cached at whole second `S`, and the sweep runs a
+    // fraction of a second past `S + window`. Ballista expires it — the
+    // row's verdict must be the same, whether the row's stamp is `S` itself
+    // or a finer reading of the same clock taken a fraction later (`S +
+    // 0.62 s`: within the window by sub-second arithmetic, expired by
+    // Ballista's).
+    let s = chrono::DateTime::from_timestamp(now.timestamp(), 0).unwrap();
+    let sweep = s + executor_liveness_window() + chrono::Duration::milliseconds(590);
+    for edge in [s, s + chrono::Duration::milliseconds(620)] {
+        assert!(ballista_expired(
+            u64::try_from(s.timestamp()).unwrap(),
+            sweep
+        ));
+        assert!(
+            !executor_is_live(
+                &record("e", ComputeExecutorStatus::Active, stamp(edge)),
+                sweep
+            ),
+            "a heartbeat the sweep expired is not live: stamp {edge}, sweep {sweep}"
+        );
+    }
+    // One second later the sweep keeps it, and so does the row.
+    let kept = s + chrono::Duration::seconds(1);
+    assert!(!ballista_expired(
+        u64::try_from(kept.timestamp()).unwrap(),
+        sweep
+    ));
+    assert!(executor_is_live(
+        &record("e", ComputeExecutorStatus::Active, stamp(kept)),
+        sweep
+    ));
     assert!(executor_is_live(
         &record("e", ComputeExecutorStatus::Active, fresh.clone()),
         now
@@ -922,7 +1001,65 @@ fn removal_is_a_loss_table() {
         Some(&record("e", ComputeExecutorStatus::Active, expired)),
         now
     ));
+    // The sweep's own case: it expired the executor at the window's edge,
+    // and its removal is a loss — never the launch-failure reading, which
+    // would leave the placed job waiting on an executor that is gone.
+    let s = chrono::DateTime::from_timestamp(now.timestamp(), 0).unwrap();
+    let sweep = s + executor_liveness_window() + chrono::Duration::milliseconds(590);
+    assert!(ballista_expired(
+        u64::try_from(s.timestamp()).unwrap(),
+        sweep
+    ));
+    assert!(removal_is_a_loss(
+        Some(&record("e", ComputeExecutorStatus::Active, stamp(s))),
+        sweep
+    ));
     assert!(removal_is_a_loss(None, now));
+}
+
+/// A second scheduler over the same catalog reads the heartbeat another
+/// scheduler's executor last wrote — the row's own instant — so its binder
+/// admits, and its expiry sweep judges, an executor it never served by
+/// when that executor was last heard from. Mutation: keep a per-process
+/// heartbeat cache and the second state reads nothing, or its own start.
+async fn a_second_state_over_one_catalog_reads_the_rows_heartbeat(kind: BackendKind) {
+    let catalog = catalog(kind).await;
+    let owned = RefCell::new(Vec::<String>::new());
+    with_owned_rows(&catalog, &owned, async {
+        let first = CatalogClusterState::new(Arc::clone(&catalog));
+        let id = format!("exec-{}", jammi_test_utils::unique_suffix());
+        owned.borrow_mut().push(id.clone());
+        let (meta, spec) = executor_metadata(&id, 1);
+        first.register_executor(meta, spec).await.unwrap();
+        first
+            .save_executor_heartbeat(heartbeat(
+                &id,
+                123,
+                ballista_core::serde::protobuf::executor_status::Status::Active(String::new()),
+            ))
+            .await
+            .unwrap();
+
+        let second = CatalogClusterState::new(Arc::clone(&catalog));
+        assert_eq!(
+            second.get_executor_heartbeat(&id).map(|h| h.timestamp),
+            Some(123),
+            "the second scheduler reads the row's own instant"
+        );
+        assert!(second.executor_heartbeats().contains_key(&id));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_state_over_one_catalog_reads_the_rows_heartbeat_sqlite() {
+    a_second_state_over_one_catalog_reads_the_rows_heartbeat(BackendKind::Sqlite).await;
+}
+
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_state_over_one_catalog_reads_the_rows_heartbeat_postgres() {
+    a_second_state_over_one_catalog_reads_the_rows_heartbeat(BackendKind::Postgres).await;
 }
 
 /// The binder never binds to an executor that is not live: a `Terminating`

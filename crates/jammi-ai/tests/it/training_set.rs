@@ -1185,7 +1185,6 @@ async fn recompute_re_anchors_every_recorded_relation() {
             InputAnchor::unpinned_at_instant("training", now.clone()),
             InputAnchor::unpinned_at_instant("training_secondary", now),
         ],
-        device: session.compute_device(),
     };
     let table = session
         .result_store()

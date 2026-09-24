@@ -34,7 +34,7 @@
 //! again and its tasks relaunch — never a loss.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc::error::TrySendError;
@@ -171,7 +171,7 @@ fn catalog_status(heartbeat: &ExecutorHeartbeat) -> BallistaResult<ComputeExecut
 }
 
 /// Ballista's own status for a catalog state — the inverse of
-/// [`catalog_status`], for seeding the heartbeat cache from the rows.
+/// [`catalog_status`], for reading a row as Ballista's heartbeat.
 fn ballista_status(status: ComputeExecutorStatus) -> executor_status::Status {
     match status {
         ComputeExecutorStatus::Active => executor_status::Status::Active(String::default()),
@@ -210,12 +210,20 @@ pub fn executor_liveness_window() -> chrono::Duration {
 
 /// The ONE liveness predicate every read that decides on executors shares
 /// (`bind_schedulable_tasks`, `client::submit_physical_plan`'s device-kind
-/// refusal): the row's `status` is `Active` (a `Terminating` row —
-/// `roles::ExecutorRole::begin_drain` — or a `Dead` one is not) AND its
-/// `heartbeat_at` lies within [`executor_liveness_window`] of `now`. A row
-/// left behind by a process that never ran its graceful `remove_executor`
-/// (SIGKILL, a crashed pod) therefore stops counting after the window, and
-/// a test row written with a stale timestamp never counts at all. A
+/// refusal, [`removal_is_a_loss`]): the row's `status` is `Active` (a
+/// `Terminating` row — `roles::ExecutorRole::begin_drain` — or a `Dead`
+/// one is not) AND its heartbeat has not expired by Ballista's own
+/// arithmetic. `ballista-scheduler`'s expiry sweep
+/// (`ExecutorManager::get_expired_executors`) expires an executor once
+/// `heartbeat <= now - executor_timeout_seconds`, every term in whole Unix
+/// seconds and the threshold clamped at the epoch; this predicate is that
+/// test's complement, computed the same way over the row's stamp — which
+/// records the whole-second instant the scheduler's sweep compares
+/// (`heartbeat_stamp`) — so the row and the sweep never disagree about
+/// one executor at the window's edge. A row left behind by a process that
+/// never ran its graceful `remove_executor` (SIGKILL, a crashed pod)
+/// therefore stops counting exactly when the sweep would expire it, and a
+/// test row written with a stale timestamp never counts at all. A
 /// `heartbeat_at` this predicate cannot parse is not live (the row-fact
 /// rule: the row is wrong, not the read).
 pub fn executor_is_live(
@@ -225,12 +233,35 @@ pub fn executor_is_live(
     if rec.status != ComputeExecutorStatus::Active {
         return false;
     }
-    match chrono::DateTime::parse_from_rfc3339(&rec.heartbeat_at) {
-        Ok(hb) => {
-            now.signed_duration_since(hb.with_timezone(&chrono::Utc)) <= executor_liveness_window()
-        }
-        Err(_) => false,
-    }
+    let threshold = now
+        .timestamp()
+        .saturating_sub(executor_liveness_window().num_seconds())
+        .max(0);
+    heartbeat_seconds(&rec.heartbeat_at).is_some_and(|heartbeat| heartbeat > threshold)
+}
+
+/// The whole-second instant a canonical `heartbeat_at` stamp records, as
+/// the Unix seconds Ballista's heartbeat carries
+/// (`ExecutorHeartbeat::timestamp`) — the inversion of
+/// [`heartbeat_stamp`]. `None` for a stamp that is not a canonical
+/// timestamp.
+fn heartbeat_seconds(stamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|at| at.timestamp())
+}
+
+/// The canonical stamp of a heartbeat's whole-second instant: what every
+/// `compute_executors.heartbeat_at` this state writes carries, so the row
+/// records the SAME instant the scheduler's expiry sweep compares
+/// (`ExecutorHeartbeat::timestamp`, Unix seconds), never a finer reading of
+/// the same clock taken alongside it.
+fn heartbeat_stamp(secs: u64) -> String {
+    let at = i64::try_from(secs)
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .expect("a heartbeat's Unix-seconds instant is a datetime");
+    jammi_db::catalog::lease::canonical_stamp(at)
 }
 
 /// Whether removing an executor's registration is the loss of the process
@@ -246,11 +277,11 @@ pub fn executor_is_live(
 /// a row `executor_is_live` admits — `Active`, its heartbeat inside the
 /// window — is a launch failure and not a loss. Everything else is: a
 /// `Dead` row, a `Terminating` one (a drain removed after its grace while
-/// still holding a task), a heartbeat past the window (the expiry sweep's
-/// case — the last heartbeat is `executor_timeout_seconds` old and the
-/// sweep runs within `expire_dead_executor_interval_seconds` after; only
-/// the process's own heartbeat RPC and its registration ever write the
-/// timestamp), and no row at all.
+/// still holding a task), an expired heartbeat (the expiry sweep's case:
+/// the row's stamp is the whole-second instant the sweep itself expired,
+/// so the sweep's verdict and this one are the same arithmetic over the
+/// same value; only the process's own heartbeat RPC and its registration
+/// ever write the timestamp), and no row at all.
 pub fn removal_is_a_loss(
     row: Option<&jammi_db::catalog::compute_repo::ComputeExecutorRecord>,
     now: chrono::DateTime<chrono::Utc>,
@@ -273,27 +304,22 @@ pub async fn live_executors(
         .collect())
 }
 
-/// The catalog-backed [`ClusterState`]. Registrations, slots, and heartbeats
-/// live in `compute_executors`; the ONE thing kept only in this
-/// process's memory is the executor-heartbeat CACHE the trait's own
-/// `executor_heartbeats`/`get_executor_heartbeat` require to be synchronous.
-///
-/// **Heartbeat cache staleness.** The cache is seeded from the catalog's
-/// committed `heartbeat_at`/`status` at [`Self::init`] and refreshed
-/// write-through by every [`Self::save_executor_heartbeat`] THIS process
-/// handles. A second scheduler process sharing the same catalog never
-/// receives the first scheduler's executors'
-/// heartbeats directly — its cache reflects only what its OWN `init` read
-/// plus whatever heartbeats land on IT — so `executor_heartbeats()` on a
-/// standby scheduler can read stale relative to the catalog's own row. The
-/// consequence for `expire_dead_executors` (which reads this cache, never
-/// the catalog): a standby scheduler's liveness view of an executor it does
-/// not itself serve is only as fresh as its last `init`, an inherent
-/// property of the active/standby split, not a bug this cache should paper
-/// over with an unbounded background poll.
+/// The catalog-backed [`ClusterState`]. Registrations, slots and heartbeats
+/// live in `compute_executors`, and the rows are every scheduler's ONE
+/// view of who is alive: the trait's synchronous heartbeat reads
+/// (`executor_heartbeats`, `get_executor_heartbeat`) read the rows at the
+/// moment Ballista decides — which executors a task may bind to, which
+/// have expired — so a scheduler sees an executor that registered with
+/// another scheduler over the same catalog the moment its row exists, and
+/// stops seeing one the moment its row goes stale. Nothing about an
+/// executor is kept only in this process's memory: a plan a scheduler
+/// places binds to any live executor, wherever it registered, and the
+/// executor reports the task to the scheduler that launched it. The
+/// synchronous reads block the calling worker thread on the catalog
+/// (`tokio::task::block_in_place`), which requires the multi-threaded
+/// tokio runtime every `jammi-server` process runs.
 pub struct CatalogClusterState {
     catalog: Arc<Catalog>,
-    heartbeats: StdRwLock<HashMap<String, ExecutorHeartbeat>>,
     cluster_event_sender: ClusterEventSender<ClusterStateEvent>,
     placed_jobs: OnceLock<PlacedJobs>,
 }
@@ -302,7 +328,6 @@ impl CatalogClusterState {
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Self {
             catalog,
-            heartbeats: StdRwLock::new(HashMap::new()),
             cluster_event_sender: ClusterEventSender::new(256),
             placed_jobs: OnceLock::new(),
         }
@@ -318,11 +343,42 @@ impl CatalogClusterState {
         }
     }
 
-    fn cache_heartbeat(&self, hb: ExecutorHeartbeat) {
-        self.heartbeats
-            .write()
-            .expect("heartbeat cache lock poisoned")
-            .insert(hb.executor_id.clone(), hb);
+    /// The `compute_executors` rows, read from a synchronous trait method:
+    /// the calling worker thread blocks on the catalog. A catalog that
+    /// cannot be read answers no rows — the scheduler then knows no live
+    /// executor until the next read, and the failure is logged, never a
+    /// stale view served in its place.
+    fn rows_now(&self) -> Vec<ComputeExecutorRecord> {
+        let read = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.catalog.list_compute_executors())
+        });
+        match read {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = %e, "the compute executors could not be read");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// A row as the heartbeat Ballista reads: the whole-second instant the
+/// executor was last heard from ([`heartbeat_stamp`]) and its status. A
+/// stamp that is not a canonical timestamp reads as the epoch — not live,
+/// as [`executor_is_live`] reads it — so the sweep removes the row rather
+/// than a scheduler serving it.
+fn row_heartbeat(rec: &ComputeExecutorRecord) -> ExecutorHeartbeat {
+    ExecutorHeartbeat {
+        executor_id: rec.executor_id.clone(),
+        timestamp: heartbeat_seconds(&rec.heartbeat_at)
+            .and_then(|secs| u64::try_from(secs).ok())
+            .unwrap_or(0),
+        metrics: vec![],
+        status: Some(ExecutorStatus {
+            status: Some(ballista_status(rec.status)),
+        }),
+        peak_proc_physical_memory: 0,
+        peak_proc_virtual_memory: 0,
     }
 }
 
@@ -341,38 +397,8 @@ fn record_to_executor_metadata(rec: &ComputeExecutorRecord) -> ExecutorMetadata 
 
 #[async_trait]
 impl ClusterState for CatalogClusterState {
+    /// Nothing to seed: the rows are the view, read whenever Ballista asks.
     async fn init(&self) -> BallistaResult<()> {
-        let rows = self
-            .catalog
-            .list_compute_executors()
-            .await
-            .map_err(ballista_err)?;
-        let mut cache = self
-            .heartbeats
-            .write()
-            .expect("heartbeat cache lock poisoned");
-        for rec in rows {
-            let status = ballista_status(rec.status);
-            cache.insert(
-                rec.executor_id.clone(),
-                ExecutorHeartbeat {
-                    executor_id: rec.executor_id,
-                    // Best-effort: the catalog's `heartbeat_at` is an opaque
-                    // sortable TEXT, not a Unix-seconds integer — `init`
-                    // seeds the cache with "now" rather than mis-decoding a
-                    // shape it cannot invert, which only matters for
-                    // `expire_dead_executors`' very first sweep after a
-                    // restart (see this type's own doc on staleness).
-                    timestamp: unix_seconds_now(),
-                    metrics: vec![],
-                    status: Some(ExecutorStatus {
-                        status: Some(status),
-                    }),
-                    peak_proc_physical_memory: 0,
-                    peak_proc_virtual_memory: 0,
-                },
-            );
-        }
         Ok(())
     }
 
@@ -485,7 +511,8 @@ impl ClusterState for CatalogClusterState {
             .map_err(ballista_err)?
             .map(|r| r.devices)
             .unwrap_or_default();
-        let now = jammi_db::catalog::lease::canonical_stamp_now();
+        // The registration is the executor's first heartbeat.
+        let registered_at = unix_seconds_now();
         let rec = ComputeExecutorRecord {
             executor_id: metadata.id.clone(),
             instance_id: metadata.id.clone(),
@@ -495,7 +522,7 @@ impl ClusterState for CatalogClusterState {
             task_slots: spec.total_task_slots,
             available_slots: spec.available_task_slots,
             status: ComputeExecutorStatus::Active,
-            heartbeat_at: now,
+            heartbeat_at: heartbeat_stamp(registered_at),
             metadata: String::new(),
             devices: existing_devices,
         };
@@ -503,16 +530,6 @@ impl ClusterState for CatalogClusterState {
             .upsert_compute_executor(&rec)
             .await
             .map_err(ballista_err)?;
-        self.cache_heartbeat(ExecutorHeartbeat {
-            executor_id: metadata.id.clone(),
-            timestamp: unix_seconds_now(),
-            metrics: vec![],
-            status: Some(ExecutorStatus {
-                status: Some(ballista_status(ComputeExecutorStatus::Active)),
-            }),
-            peak_proc_physical_memory: 0,
-            peak_proc_virtual_memory: 0,
-        });
         self.cluster_event_sender
             .send(&ClusterStateEvent::RegisteredExecutor {
                 executor_id: metadata.id,
@@ -535,7 +552,7 @@ impl ClusterState for CatalogClusterState {
                 metadata.specification.task_slots,
                 Vec::new(),
                 ComputeExecutorStatus::Active,
-                jammi_db::catalog::lease::canonical_stamp_now(),
+                heartbeat_stamp(unix_seconds_now()),
             ),
         };
         let rec = ComputeExecutorRecord {
@@ -594,7 +611,7 @@ impl ClusterState for CatalogClusterState {
             .record_compute_heartbeat(
                 &heartbeat.executor_id,
                 status,
-                &jammi_db::catalog::lease::canonical_stamp_now(),
+                &heartbeat_stamp(heartbeat.timestamp),
             )
             .await
             .map_err(ballista_err)?;
@@ -609,7 +626,6 @@ impl ClusterState for CatalogClusterState {
                 "heartbeat for an unregistered compute executor"
             );
         }
-        self.cache_heartbeat(heartbeat);
         Ok(())
     }
 
@@ -619,8 +635,7 @@ impl ClusterState for CatalogClusterState {
     /// (`PlacedJobs::fail_bound_to`, whose ordering against Ballista's own
     /// `ExecutorLost` this method's caller guarantees), while a live
     /// executor's removal leaves its graphs alone for the relaunch its
-    /// re-registration revives; then the heartbeat cache and the event
-    /// follow.
+    /// re-registration revives; then the event follows.
     async fn remove_executor(&self, executor_id: &str) -> BallistaResult<()> {
         let row = self
             .catalog
@@ -642,10 +657,6 @@ impl ClusterState for CatalogClusterState {
                  registers again and its tasks relaunch"
             );
         }
-        self.heartbeats
-            .write()
-            .expect("heartbeat cache lock poisoned")
-            .remove(executor_id);
         self.cluster_event_sender
             .send(&ClusterStateEvent::RemovedExecutor {
                 executor_id: executor_id.to_string(),
@@ -653,19 +664,20 @@ impl ClusterState for CatalogClusterState {
         Ok(())
     }
 
+    /// Every row, as Ballista's heartbeat view: what its binder admits and
+    /// its expiry sweep judges, read now.
     fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat> {
-        self.heartbeats
-            .read()
-            .expect("heartbeat cache lock poisoned")
-            .clone()
+        self.rows_now()
+            .iter()
+            .map(|rec| (rec.executor_id.clone(), row_heartbeat(rec)))
+            .collect()
     }
 
     fn get_executor_heartbeat(&self, executor_id: &str) -> Option<ExecutorHeartbeat> {
-        self.heartbeats
-            .read()
-            .expect("heartbeat cache lock poisoned")
-            .get(executor_id)
-            .cloned()
+        self.rows_now()
+            .iter()
+            .find(|rec| rec.executor_id == executor_id)
+            .map(row_heartbeat)
     }
 
     async fn cluster_state_events(&self) -> BallistaResult<ClusterStateEventStream> {

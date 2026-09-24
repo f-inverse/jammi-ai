@@ -363,6 +363,22 @@ pub enum LoadedModel {
 }
 
 impl LoadedModel {
+    /// This model's identity as a materialization's environment records it,
+    /// loaded from `source` — the one construction a producer's prediction
+    /// and the executing process's record both use.
+    pub fn identity(
+        &self,
+        source: &ModelSource,
+    ) -> Result<jammi_db::store::manifest::ModelIdentity> {
+        Ok(jammi_db::store::manifest::ModelIdentity {
+            model_id: source.to_string(),
+            backend: self.backend_kind().to_string(),
+            compute_precision: self.compute_precision(),
+            content_digest: self.content_digest()?,
+            quantization: self.quantization(),
+        })
+    }
+
     /// The backend kind that loaded this model, as the canonical lowercase token
     /// the materialization contract records in `ModelIdentity.backend`. A loaded
     /// model is always a native backend (`candle` / `ort`); the `http` backend

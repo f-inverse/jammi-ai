@@ -503,12 +503,12 @@ for the fine-tune reference is exactly why it is never the compared quantity.
 
 ```
 jammi-bench encode-step --rung direct --rung plan --rung plan-partitioned \
-    --model-dir /path/to/checkpoint --rows 16,1024,16384 --takes 2 \
+    --model-dir /path/to/checkpoint --rows 16,1024,16384 --take 1,2 \
     --batch-size 32 --batch-tokens 16384 --compute-precision bf16 --cuda 0 \
     --exchange-dir /tmp/x --legs-dir /tmp/legs
 python3 torch_encode.py --model-dir /path/to/checkpoint --exchange-dir /tmp/x \
     --legs-dir /tmp/legs --sampler-bin target/release/jammi-bench \
-    --rows 16,1024,16384 --takes 2 --batch-size 32 --batch-tokens 16384 \
+    --rows 16,1024,16384 --take 1,2 --batch-size 32 --batch-tokens 16384 \
     --dtype bf16 --cuda 0 --order plan --attn eager --ann-index
 jammi-bench ladder encode /tmp/legs
 ```
@@ -788,7 +788,8 @@ engine's legs and carries its block at the top level under the workload's key
 Rust — `TrainRunPayload::IDENTITY_FIELDS`, `EncodePayload::IDENTITY_FIELDS`,
 or the list in `crates/jammi-bench/src/ladder/definition.rs`; the ladder
 refuses a leg that omits one or spells a value differently), `iter_wall_s`
-(post-warmup seconds per timed iteration, in order), `peak_rss_bytes` and
+(seconds of every iteration of the run, in order — where it settled is the
+ladder's to find), `peak_rss_bytes` and
 `peak_vram_bytes` from the same instruments the engine's legs use, and the
 outcome (`held_out_example_mean` with a `trajectory` of `held_out_mean` and
 cumulative `train_wall_s`; or `vectors_file` + `vector_dim`, little-endian
@@ -871,8 +872,10 @@ fitted against `edge_count`, the unit (`edges<N>`). The engine rung files
 unit's law file `edges<N>.json` under `--law-dir` (`<legs-dir>/law` by
 default): node2vec's law `π(x | t, v) ∝ α_pq(t, x) · w(v, x)` for that graph
 (`graph_sample::node2vec_transition_law`), one cell per walk state in ascending
-order with the first-step states first, the state's next nodes ascending. Every
-leg counts its walks' steps in that order as `law_observed` and names the file
+order with the first-step states first, the state's next nodes ascending, and
+the `observation_passes` the law's fit needs (`graph_sample::observation_passes`).
+Every leg counts that many untimed passes' steps in that order as
+`law_observed`, files the count as `observation_passes`, and names the file
 by its sha256 as `law_sha256` — the ground truth both rungs' counts are judged
 against is the committed file, never a producer's claim; the torch rung
 recomputes the law to know the order and refuses if the file is not it.

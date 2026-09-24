@@ -17,7 +17,7 @@ use super::outcome::{CrossStackOptions, Pair};
 use super::premise::tests::fused_facts;
 use super::refusal::Refusal;
 use super::speed;
-use super::verdict::{Direction, EdgeVerdict, Judgement, OutcomeVerdict, Status};
+use super::verdict::{Direction, EdgeVerdict, Held, Judgement, OutcomeVerdict, Status};
 use super::{run_ladder, telescoping, Axis, LadderArgs};
 
 // ── building legs ──────────────────────────────────────────────────────────
@@ -224,7 +224,7 @@ fn small_paired_differences_are_green_non_inferior_and_equivalent() {
         "equivalent_within_delta",
         "no_directional_difference",
     ] {
-        assert_eq!(judgement(&verdict, rule).passed, Some(true), "{rule}");
+        assert_eq!(judgement(&verdict, rule).held, Held::Passed, "{rule}");
     }
 }
 
@@ -235,11 +235,11 @@ fn a_centred_but_wide_scatter_detects_nothing_and_establishes_nothing() {
     // claim is not made.
     let verdict = torch_verdict(seeded_legs(&alternating(0.3)));
     assert_eq!(
-        judgement(&verdict, "no_directional_difference").passed,
-        Some(true)
+        judgement(&verdict, "no_directional_difference").held,
+        Held::Passed
     );
     let claim = judgement(&verdict, "outcome_non_inferior");
-    assert_eq!((claim.passed, claim.force), (Some(false), RuleForce::Hard));
+    assert_eq!((claim.held, claim.force), (Held::Failed, RuleForce::Hard));
     assert_eq!(verdict.status, Status::Red);
 }
 
@@ -254,20 +254,20 @@ fn an_upper_rung_better_by_more_than_the_margin_is_non_inferior_and_not_equivale
     let verdict = torch_verdict(seeded_legs(&d));
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
     assert_eq!(
-        judgement(&verdict, "outcome_non_inferior").passed,
-        Some(true)
+        judgement(&verdict, "outcome_non_inferior").held,
+        Held::Passed
     );
     let equivalent = judgement(&verdict, "equivalent_within_delta");
     assert_eq!(
-        (equivalent.passed, equivalent.force),
-        (Some(false), RuleForce::Evidence)
+        (equivalent.held, equivalent.force),
+        (Held::Failed, RuleForce::Evidence)
     );
     // The mirror image — worse by the same amount — fails the claim.
     let worse: Vec<f64> = d.iter().map(|d| -d).collect();
     let verdict = torch_verdict(seeded_legs(&worse));
     assert_eq!(
-        judgement(&verdict, "outcome_non_inferior").passed,
-        Some(false)
+        judgement(&verdict, "outcome_non_inferior").held,
+        Held::Failed
     );
     assert_eq!(verdict.status, Status::Red);
 }
@@ -288,8 +288,8 @@ fn a_concordant_degradation_is_red_and_an_improvement_is_investigated() {
     // an anomaly to investigate.
     let better = torch_verdict(seeded_legs(&[-0.1; 12]));
     assert_eq!(
-        judgement(&better, "outcome_non_inferior").passed,
-        Some(true)
+        judgement(&better, "outcome_non_inferior").held,
+        Held::Passed
     );
     assert_eq!(better.status, Status::RedForInvestigation);
 }
@@ -665,7 +665,7 @@ fn a_rule_with_no_measured_budget_is_reported_unbudgeted_and_never_judged() {
         &one_size(),
     );
     let overhead = judgement(&verdict, "overhead_budget");
-    assert_eq!(overhead.passed, None);
+    assert_eq!(overhead.held, Held::Unjudged);
     assert_eq!(overhead.bound, super::verdict::Bound::Unbudgeted);
     assert!(verdict.speed.as_ref().unwrap().cost.of_medians > 2.9);
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
@@ -751,13 +751,13 @@ fn an_overhead_a_hair_under_budget_passes_and_a_hair_over_fails() {
         )
     };
     let (under, over) = (at(1.0999), at(1.1001));
-    assert_eq!(judgement(&under, "overhead_budget").passed, Some(true));
+    assert_eq!(judgement(&under, "overhead_budget").held, Held::Passed);
     assert_eq!(under.status, Status::Green);
     // A budget is evidence, reported beside a verdict it does not decide.
     let budget = judgement(&over, "overhead_budget");
     assert_eq!(
-        (budget.passed, budget.force),
-        (Some(false), RuleForce::Evidence)
+        (budget.held, budget.force),
+        (Held::Failed, RuleForce::Evidence)
     );
     assert_eq!(over.status, Status::Green);
 }
@@ -781,7 +781,7 @@ fn the_interval_is_judged_not_the_point() {
         "{:?}",
         speed.cost
     );
-    assert_eq!(judgement(&verdict, "overhead_budget").passed, Some(false));
+    assert_eq!(judgement(&verdict, "overhead_budget").held, Held::Failed);
 }
 
 #[test]
@@ -807,6 +807,56 @@ fn a_trending_series_and_a_short_one_are_refused() {
     )));
 }
 
+/// A run that starts slow and settles is cut where it settles: the cost is
+/// read from the steady iterations, the transient named per leg.
+#[test]
+fn a_warming_start_is_cut_and_the_cost_read_from_what_settled() {
+    let warming: Vec<f64> = (0..48)
+        .map(|i| {
+            if i < 12 {
+                1.3
+            } else {
+                1.0 + 0.001 * (i % 3) as f64
+            }
+        })
+        .collect();
+    let verdict = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", warming, json!({})),
+    );
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    let speed = verdict.speed.as_ref().unwrap();
+    assert!(
+        (speed.cost.of_medians - 1.001).abs() < 1e-9,
+        "{}",
+        speed.cost.of_medians
+    );
+    let cut = speed
+        .settled
+        .iter()
+        .find(|l| l.leg.starts_with(PARTITIONED))
+        .unwrap();
+    assert_eq!(
+        (cut.transient, cut.iterations, cut.at_limit),
+        (12, 48, false)
+    );
+}
+
+/// A run that drifts throughout is cut at the half-way limit and still
+/// refused: what is left drifts too, and the trend test says so.
+#[test]
+fn a_run_that_never_settles_is_refused_on_what_is_left() {
+    let drifting: Vec<f64> = (0..64).map(|i| 1.0 + 0.01 * i as f64).collect();
+    let verdict = exact_verdict(
+        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", drifting, json!({})),
+    );
+    assert!(refused(
+        &verdict,
+        |r| matches!(r, Refusal::NonStationary { leg, .. } if leg.starts_with(PARTITIONED))
+    ));
+}
+
 #[test]
 fn a_hard_speed_rule_with_nothing_to_measure_is_refused() {
     // The revision edge's band rule is hard; an evidence rule with nothing
@@ -817,7 +867,7 @@ fn a_hard_speed_rule_with_nothing_to_measure_is_refused() {
         encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
         without_series(PARTITIONED),
     );
-    assert_eq!(judgement(&evidence, "overhead_budget").passed, None);
+    assert_eq!(judgement(&evidence, "overhead_budget").held, Held::Unjudged);
     assert_eq!(evidence.status, Status::Green, "{:?}", evidence.refusals);
     let hard = revision_verdict(vec![
         encode_leg("direct@base", 16, "r1", steady(1.0), json!({})),
@@ -891,8 +941,8 @@ fn a_fixed_cost_regression_is_attributed_to_fixed_and_not_to_per_work() {
         "{shape:?}"
     );
     assert!((shape.per_work_ratio - 1.0).abs() < 1e-9);
-    assert_eq!(judgement(&verdict, "fixed_cost").passed, Some(false));
-    assert_eq!(judgement(&verdict, "per_work_cost").passed, Some(true));
+    assert_eq!(judgement(&verdict, "fixed_cost").held, Held::Failed);
+    assert_eq!(judgement(&verdict, "per_work_cost").held, Held::Passed);
 
     // The mirror image: the same fixed cost, 30% more per unit of work.
     let mut legs = sweep(PLAN, 0.001, 1e-5, |_| json!({}));
@@ -904,8 +954,8 @@ fn a_fixed_cost_regression_is_attributed_to_fixed_and_not_to_per_work() {
         &set(legs),
         &all_axes(),
     );
-    assert_eq!(judgement(&verdict, "fixed_cost").passed, Some(true));
-    assert_eq!(judgement(&verdict, "per_work_cost").passed, Some(false));
+    assert_eq!(judgement(&verdict, "fixed_cost").held, Held::Passed);
+    assert_eq!(judgement(&verdict, "per_work_cost").held, Held::Failed);
 }
 
 #[test]
@@ -933,6 +983,41 @@ fn time_that_is_not_a_line_in_work_is_refused_rather_than_fitted() {
     ));
 }
 
+/// Interleaved repeats share one process, so they carry no memory; each
+/// rung's memory comes from its run alone, whose time pairs with nothing.
+#[test]
+fn memory_is_read_from_the_runs_alone_and_speed_from_the_repeats() {
+    let shared = json!({
+        "peak_rss_bytes": {"value": null, "unit": "bytes"},
+        "peak_vram_bytes": {"value": null, "unit": "bytes"}
+    });
+    let alone = |rss: f64, seconds: f64| {
+        json!({
+            "peak_rss_bytes": {"value": rss, "unit": "bytes"},
+            "peak_vram_bytes": {"value": 2.0e9, "unit": "bytes"},
+            "iter_wall_s": steady(seconds)
+        })
+    };
+    let verdict = edge_verdict(
+        &encode_test_ladder(),
+        PLAN,
+        PARTITIONED,
+        &set([
+            encode_leg(PLAN, 16, "r1", steady(1.0), shared.clone()),
+            encode_leg(PARTITIONED, 16, "r1", steady(1.0), shared),
+            // Alone, the partitioned rung holds 5 % more memory — and its
+            // lone session ran twice as slow, which no speed rule may read.
+            encode_leg(PLAN, 16, "a1", steady(1.0), alone(1.0e9, 1.0)),
+            encode_leg(PARTITIONED, 16, "a1", steady(1.0), alone(1.05e9, 2.0)),
+        ]),
+        &one_size(),
+    );
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    let space = verdict.space.as_ref().unwrap();
+    assert!((space.host_ratio.unwrap() - 1.05).abs() < 1e-9);
+    assert!((verdict.speed.as_ref().unwrap().cost.of_medians - 1.0).abs() < 1e-9);
+}
+
 #[test]
 fn memory_over_budget_and_unmeasured_memory_are_reported_as_evidence() {
     let lower = || encode_leg(PLAN, 16, "r1", steady(1.0), json!({}));
@@ -942,11 +1027,8 @@ fn memory_over_budget_and_unmeasured_memory_are_reported_as_evidence() {
         encode_leg(PARTITIONED, 16, "r1", steady(1.0), heavy),
     );
     let host = judgement(&over, "host_memory_ratio");
-    assert_eq!(
-        (host.passed, host.force),
-        (Some(false), RuleForce::Evidence)
-    );
-    assert_eq!(judgement(&over, "device_memory_ratio").passed, Some(true));
+    assert_eq!((host.held, host.force), (Held::Failed, RuleForce::Evidence));
+    assert_eq!(judgement(&over, "device_memory_ratio").held, Held::Passed);
     assert_eq!(over.status, Status::Green);
 
     let unmeasured = json!({"peak_vram_bytes": {"value": null, "unit": "bytes"}});
@@ -954,7 +1036,10 @@ fn memory_over_budget_and_unmeasured_memory_are_reported_as_evidence() {
         lower(),
         encode_leg(PARTITIONED, 16, "r1", steady(1.0), unmeasured),
     );
-    assert_eq!(judgement(&verdict, "device_memory_ratio").passed, None);
+    assert_eq!(
+        judgement(&verdict, "device_memory_ratio").held,
+        Held::Unjudged
+    );
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
 }
 
@@ -981,14 +1066,14 @@ fn host_memory_that_grows_with_the_training_set_breaks_the_streaming_rung() {
     let space_only = axes(true, false, true, true);
     let flat = edge_verdict(&ladder, FUSED, "streamed", &legs(1.0), &space_only);
     assert_eq!(
-        judgement(&flat, "host_memory_flat_in_work").passed,
-        Some(true)
+        judgement(&flat, "host_memory_flat_in_work").held,
+        Held::Passed
     );
     assert_eq!(flat.status, Status::Green, "{:?}", flat.refusals);
     let growing = edge_verdict(&ladder, FUSED, "streamed", &legs(800.0), &space_only);
     assert_eq!(
-        judgement(&growing, "host_memory_flat_in_work").passed,
-        Some(false)
+        judgement(&growing, "host_memory_flat_in_work").held,
+        Held::Failed
     );
 }
 
@@ -1104,14 +1189,14 @@ fn rows_within_the_precision_allowance_agree_and_rows_beyond_it_do_not() {
     ] {
         let close = row_verdict(workload, upper, 1e-6);
         assert_eq!(
-            judgement(&close, "row_agreement").passed,
-            Some(true),
+            judgement(&close, "row_agreement").held,
+            Held::Passed,
             "{workload:?}"
         );
         let far = row_verdict(workload, upper, 1e-2);
         assert_eq!(
-            judgement(&far, "row_agreement").passed,
-            Some(false),
+            judgement(&far, "row_agreement").held,
+            Held::Failed,
             "{workload:?}"
         );
         assert!(matches!(
@@ -1193,11 +1278,42 @@ fn a_sampler_that_follows_the_law_passes_and_a_biased_one_fails_hard() {
     let faithful = law_verdict(json!([[1990, 3020, 4990], [5030, 4970]]), None);
     assert_eq!(faithful.status, Status::Green, "{:?}", faithful.refusals);
     let biased = law_verdict(json!([[2600, 3000, 4400], [5000, 5000]]), None);
-    assert_eq!(
-        judgement(&biased, "law_goodness_of_fit").passed,
-        Some(false)
-    );
+    assert_eq!(judgement(&biased, "law_goodness_of_fit").held, Held::Failed);
     assert_eq!(biased.status, Status::Red);
+}
+
+/// A state the sampler under-visited is pooled, not refused: the fit runs
+/// over what can be tested and the edge is judged.
+#[test]
+fn a_sparse_state_is_pooled_and_the_law_still_judged() {
+    // 20 visits of the first state expect (4, 6, 10): the 0.2 category is
+    // merged with the 0.3 one: two categories pooled into one.
+    let verdict = law_verdict(json!([[4, 6, 10], [5030, 4970]]), None);
+    assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
+    assert!(judgement(&verdict, "law_goodness_of_fit")
+        .detail
+        .contains("2 categories pooled"));
+}
+
+/// A fit the statistics refuse is that refusal, once: the rule is not also
+/// filed as unmeasured.
+#[test]
+fn a_refused_law_fit_is_filed_once_as_what_refused_it() {
+    // No state of the sampler's counts can be tested.
+    let verdict = law_verdict(json!([[1, 1, 1], [2, 2]]), None);
+    assert_eq!(verdict.status, Status::Invalid);
+    assert_eq!(
+        judgement(&verdict, "law_goodness_of_fit").held,
+        Held::Refused
+    );
+    assert!(refused(&verdict, |r| matches!(
+        r,
+        Refusal::Statistics { .. }
+    )));
+    assert!(!refused(&verdict, |r| matches!(
+        r,
+        Refusal::MeasurementMissing { .. }
+    )));
 }
 
 #[test]
@@ -1286,13 +1402,13 @@ fn gradients_that_agree_at_shared_weights_pass_the_structure_and_a_zero_pair_is_
     assert_eq!(verdict.status, Status::Green, "{:?}", verdict.refusals);
     let structure = judgement(&verdict, "gradient_structure");
     assert_eq!(
-        (structure.passed, structure.force),
-        (Some(true), RuleForce::Hard)
+        (structure.held, structure.force),
+        (Held::Passed, RuleForce::Hard)
     );
     // No artifact has measured a cosine floor: the rule is reported
     // unbudgeted and decides nothing.
     let floor = judgement(&verdict, "gradient_cosine_floor");
-    assert_eq!(floor.passed, None);
+    assert_eq!(floor.held, Held::Unjudged);
     assert_eq!(floor.bound, super::verdict::Bound::Unbudgeted);
     let Some(OutcomeVerdict::GradientAgreement {
         tensors,
@@ -1324,8 +1440,8 @@ fn a_measured_cosine_floor_judges_the_worst_tensor_as_evidence() {
         grads_leg("fused", &[("layer.0.Wqkv.lora_b", W, G)]),
     );
     assert_eq!(
-        judgement(&agreeing, "gradient_cosine_floor").passed,
-        Some(true)
+        judgement(&agreeing, "gradient_cosine_floor").held,
+        Held::Passed
     );
     let turned = gradient_verdict(
         &ladder,
@@ -1334,8 +1450,8 @@ fn a_measured_cosine_floor_judges_the_worst_tensor_as_evidence() {
     );
     let floor = judgement(&turned, "gradient_cosine_floor");
     assert_eq!(
-        (floor.passed, floor.force),
-        (Some(false), RuleForce::Evidence)
+        (floor.held, floor.force),
+        (Held::Failed, RuleForce::Evidence)
     );
     assert_eq!(turned.status, Status::Green);
 }
@@ -1349,8 +1465,8 @@ fn a_one_sided_zero_or_differing_weights_break_the_structure_and_fail_the_edge()
         grads_leg("fused", &[("layer.0.Wqkv.lora_b", W, ZERO)]),
     );
     assert_eq!(
-        judgement(&one_sided, "gradient_structure").passed,
-        Some(false)
+        judgement(&one_sided, "gradient_structure").held,
+        Held::Failed
     );
     assert_eq!(one_sided.status, Status::Red);
     let other_weights = gradient_verdict(
@@ -1359,7 +1475,7 @@ fn a_one_sided_zero_or_differing_weights_break_the_structure_and_fail_the_edge()
         grads_leg("fused", &[("layer.0.Wqkv.lora_b", &[1.0, 2.0, 3.0001], G)]),
     );
     let structure = judgement(&other_weights, "gradient_structure");
-    assert_eq!(structure.passed, Some(false));
+    assert_eq!(structure.held, Held::Failed);
     assert!(structure.detail.contains("same weights"));
     let missing_tensor = gradient_verdict(
         &ladder,
@@ -1777,8 +1893,8 @@ fn a_revision_inside_its_own_noise_band_is_green_and_indistinguishable_from_one(
     // Digests are compared on a revision edge and reported, never refused.
     let digests = judgement(&verdict, "outcome_digests_equal");
     assert_eq!(
-        (digests.passed, digests.force),
-        (Some(true), RuleForce::Evidence)
+        (digests.held, digests.force),
+        (Held::Passed, RuleForce::Evidence)
     );
 }
 
@@ -1788,8 +1904,8 @@ fn a_revision_outside_the_band_fails_slower_and_is_investigated_faster() {
     assert_eq!(slower.status, Status::Red, "{:#?}", slower.refusals);
     let rule = judgement(&slower, "speed_within_noise_band");
     assert_eq!(
-        (rule.passed, rule.direction),
-        (Some(false), Direction::Degradation)
+        (rule.held, rule.direction),
+        (Held::Failed, Direction::Degradation)
     );
     let faster = revision_verdict(revision_legs(1.0, 0.8, None));
     assert_eq!(faster.status, Status::RedForInvestigation);
@@ -2028,8 +2144,8 @@ fn the_committed_step_sweep_reproduces_every_configs_reading() {
             units: &one,
             ..pair
         };
-        let (cost, band) = speed::measure_cost(&single).unwrap().unwrap();
-        let band = band.unwrap();
+        let measured = speed::measure_cost(&single).unwrap().unwrap();
+        let (cost, band) = (measured.ratio, measured.band.unwrap());
         let inside = cost.of_medians.ln().abs() <= band.ln();
         let non_inferior = 1.0 / cost.of_medians > 0.9;
         let ladder_reading = if inside {

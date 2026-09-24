@@ -358,6 +358,15 @@ impl InferenceSession {
             device_config.clone(),
             schedulers,
         ));
+        // What a sink this process runs records as having produced its
+        // bytes — its device and the models the plan ran — wherever the
+        // plan was submitted from.
+        result_store.install_producing_environment(Arc::new(
+            crate::operator::inference_exec::InferenceEnvironment {
+                device: crate::model::backend::candle::effective_compute_device(&device_config),
+                model_cache: Arc::clone(&model_cache),
+            },
+        ));
         // Install the tenant-gating result-table schema as the context's
         // default schema before any table is loaded, so bare `jammi.{name}`
         // resolutions honour the catalog owner on every read lane and source
@@ -967,6 +976,18 @@ impl InferenceSession {
         self.inner.compute_plane()
     }
 
+    /// The device kind a plan this session builds requires of whoever holds
+    /// it: the kind the installed compute plane places onto when the
+    /// deployment names one, this session's own otherwise. A plan's
+    /// admission is the only reader — where the plan actually runs, and so
+    /// what its table records, is the holder's own device.
+    pub fn required_device_kind(&self) -> jammi_db::store::manifest::ComputeDeviceKind {
+        self.compute_plane()
+            .plane()
+            .and_then(|plane| plane.device_kind())
+            .unwrap_or_else(|| self.compute_device().kind())
+    }
+
     /// Access the engine configuration.
     pub fn inner_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()
@@ -1106,7 +1127,7 @@ impl InferenceSession {
             embedding_dim,
             regression_form,
             passthrough: Vec::new(),
-            device_kind: self.compute_device().kind(),
+            device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
         };
         let plan = plan_inference(input, RowOrder::Arrival, spec, self.inference_runtime())?;
@@ -1535,10 +1556,7 @@ impl InferenceSession {
         let guard = self.model_cache.get_or_load(source, task, None).await?;
         let embedding_dim = guard.model.embedding_dim();
         let regression_form = guard.model.regression_form().cloned();
-        let backend_kind = guard.model.backend_kind();
-        let compute_precision = guard.model.compute_precision();
-        let content_digest = guard.model.content_digest()?;
-        let quantization = guard.model.quantization();
+        let identity = guard.model.identity(source)?;
         drop(guard);
 
         // The materialization contract is knowable here (model loaded, source
@@ -1553,15 +1571,9 @@ impl InferenceSession {
             content_columns: content_columns.to_vec(),
             key_column: key_column.to_string(),
         };
-        let env = jammi_db::store::manifest::MaterializationEnv::new(
+        let env = jammi_db::store::manifest::MaterializationEnv::of_models(
             self.compute_device(),
-            vec![jammi_db::store::manifest::ModelIdentity {
-                model_id: source.to_string(),
-                backend: backend_kind.to_string(),
-                compute_precision,
-                content_digest,
-                quantization,
-            }],
+            vec![identity],
         );
         let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
             source_id,
@@ -1611,7 +1623,7 @@ impl InferenceSession {
             embedding_dim,
             regression_form,
             passthrough: Vec::new(),
-            device_kind: self.compute_device().kind(),
+            device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
         };
         let inference_exec = plan_inference(
@@ -1654,16 +1666,17 @@ impl InferenceSession {
             .await?;
         let row_count = summary.rows as usize;
 
-        // Finish with the contract built at the top (the same definition +
-        // anchors the cache probe keyed on). Every `?` above unwinds
-        // through the handle's Drop (a best-effort `building -> failed`
-        // CAS, no byte deletion); `finish` is the single `building ->
-        // ready` funnel, renewing the writer's lease before it attests.
+        // Finish with the descriptor and anchors built at the top and the
+        // environment the process that ran the plan reports — the cache
+        // probe keyed on this process's prediction of it. Every `?` above
+        // unwinds through the handle's Drop (a best-effort `building ->
+        // failed` CAS, no byte deletion); `finish` is the single `building
+        // -> ready` funnel, renewing the writer's lease before it attests.
         let record = building
             .finish(
                 self.inner.context(),
                 row_count,
-                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+                jammi_db::store::manifest::Materialization::new(&descriptor, &summary.env, inputs),
             )
             .await?;
 

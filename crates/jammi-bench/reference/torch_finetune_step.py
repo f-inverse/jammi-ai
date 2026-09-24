@@ -1134,6 +1134,9 @@ def run(args):
             vram_baseline_bytes = torch.cuda.memory_allocated(device)
             torch.cuda.reset_peak_memory_stats(device)
 
+        # Every step's wall in run order is the ladder's series, warmup steps
+        # included; `--warmup` is where the loss record starts.
+        iter_wall_s = []
         times = []
         losses = []
         for step in range(args.warmup + args.steps):
@@ -1142,11 +1145,11 @@ def run(args):
                 model, optimizer, scaler, blocks, mask, args, use_amp, device, trainable, clip_counter
             )
             elapsed = time.perf_counter() - t0
+            iter_wall_s.append(elapsed)
             if step >= args.warmup:
                 times.append(elapsed)
                 losses.append(loss_val)
 
-        iter_wall_s = list(times)
         times.sort()
         p50 = times[len(times) // 2]
         mean = sum(times) / len(times)

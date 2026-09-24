@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -243,12 +244,32 @@ class ArmFilterDryRun(unittest.TestCase):
             self.assertIn("'eager'", result.stderr)
             self.assertEqual(leg_commands(result.stdout), {})
 
-    def test_the_default_is_every_arm_of_the_run(self):
+    def test_the_default_is_the_in_process_arms(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = run_dry(tmp)
             self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
             arms = {arm for _seed, arm, _repeat in leg_commands(result.stdout)}
         self.assertEqual(arms, {"fused", "torch", "torch-natural"})
+
+    def test_the_planes_arms_run_their_rungs_and_the_verdict_spans_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_dry(tmp, FINETUNE_RUN_AB_ARMS="fused,streamed,placed,shape-d,torch")
+            self.assertEqual(result.returncode, 0, f"{result.stdout}\n{result.stderr}")
+            legs = leg_commands(result.stdout)
+            order = [arm for seed, arm, _repeat in legs if seed == "1"]
+        self.assertEqual(
+            order,
+            ["fused", "streamed", "placed", "shape-d", "torch", "torch", "shape-d", "placed", "streamed", "fused"],
+        )
+        self.assertEqual(flag_value(legs[("1", "streamed", "r1")], "--rung"), "streamed")
+        self.assertIsNone(flag_value(legs[("1", "streamed", "r1")], "--server-bin"))
+        for arm in ("placed", "shape-d"):
+            argv = legs[("1", arm, "r1")]
+            self.assertEqual(flag_value(argv, "--rung"), arm)
+            self.assertTrue(flag_value(argv, "--server-bin").endswith("/release/jammi-server"))
+        self.assertIn("ladder train-run", result.stdout)
+        self.assertIn("--from torch --to shape-d", result.stdout)
+        self.assertNotIn("--axes", result.stdout)
 
 
 class ControlLegsDryRun(unittest.TestCase):
@@ -359,6 +380,23 @@ class TorchArmPremises(unittest.TestCase):
 
     def test_an_objective_the_twin_does_not_train_is_refused(self):
         self.assert_refused("FINETUNE_RUN_AB_OBJECTIVE=mnrl", FINETUNE_RUN_AB_OBJECTIVE="triplet")
+
+
+
+class DefaultSeedsTest(unittest.TestCase):
+    """The run's default seeds are the ones its ladder's learning rule is
+    stated for, read off the Rust declaration so the two cannot drift."""
+
+    def test_the_default_seeds_are_the_count_the_rule_is_stated_for(self):
+        definition = os.path.join(PERF_DIR, "..", "..", "..", "crates", "jammi-bench", "src", "ladder", "definition.rs")
+        with open(definition) as fh:
+            declared = re.search(r"pub const SEEDED_LOSS_SEEDS: usize = (\d+);", fh.read())
+        self.assertIsNotNone(declared, f"{definition} no longer declares SEEDED_LOSS_SEEDS")
+        with open(SCRIPT) as fh:
+            default = re.search(r'FINETUNE_RUN_AB_SEEDS="\$\{FINETUNE_RUN_AB_SEEDS:-([0-9,]+)\}"', fh.read())
+        self.assertIsNotNone(default, "the script no longer defaults its seeds")
+        seeds = [int(s) for s in default.group(1).split(",")]
+        self.assertEqual(seeds, list(range(1, int(declared.group(1)) + 1)))
 
 
 if __name__ == "__main__":

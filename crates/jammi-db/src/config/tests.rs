@@ -3798,7 +3798,8 @@ fn ballista_unset_means_no_roles() {
 /// `[ballista.client]`: `hosts_client()` is true iff the table is present;
 /// `scheduler_address` is a `host:port` dial target (a DNS name is the
 /// Kubernetes case), refused when empty or malformed naming the key; the
-/// `__`-segmented env form reaches it; and it collides with nothing — a
+/// `__`-segmented env form reaches it; `device_kind` names the kind its
+/// plans are placed onto, unset by default; and it collides with nothing — a
 /// dial target binds no listener, so it joins no address-collision check
 /// even against a scheduler bound on the same process at the same port.
 #[test]
@@ -3818,6 +3819,36 @@ fn ballista_client_parses_validates_and_collides_with_nothing() {
             .map(|c| c.scheduler_address.as_str()),
         Some("jammi-server-scheduler:50050")
     );
+    assert_eq!(cfg.ballista.client.as_ref().unwrap().device_kind, None);
+
+    // A CPU query tier naming the GPU compute tier it places onto, in the
+    // file and in the environment; a kind no device has is refused.
+    let cfg = JammiConfig::parse_from(
+        "[ballista.client]\nscheduler_address = \"jammi-server-scheduler:50050\"\ndevice_kind = \"cuda\"\n",
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.ballista.client.as_ref().unwrap().device_kind,
+        Some(crate::store::manifest::ComputeDeviceKind::Cuda)
+    );
+    let cfg = JammiConfig::parse_from(
+        "[ballista.client]\nscheduler_address = \"10.0.4.7:50050\"\n",
+        vec![(
+            "JAMMI_BALLISTA__CLIENT__DEVICE_KIND".to_string(),
+            "metal".to_string(),
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.ballista.client.as_ref().unwrap().device_kind,
+        Some(crate::store::manifest::ComputeDeviceKind::Metal)
+    );
+    assert!(JammiConfig::parse_from(
+        "[ballista.client]\nscheduler_address = \"10.0.4.7:50050\"\ndevice_kind = \"tpu\"\n",
+        vec![],
+    )
+    .is_err());
 
     let cfg = JammiConfig::parse_from(
         "",
@@ -4059,6 +4090,7 @@ fn ballista_ports_fixture(overrides: &[(&str, &str)]) -> JammiConfig {
         // so the fixture proves the client joins no collision check.
         client: Some(BallistaClientConfig {
             scheduler_address: "127.0.0.1:41000".to_string(),
+            device_kind: None,
         }),
     };
     let mut server = ServerConfig {

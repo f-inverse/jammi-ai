@@ -76,6 +76,12 @@ pub trait ComputePlane: Send + Sync {
         &self,
         plan: Arc<dyn ExecutionPlan>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>>;
+
+    /// The device kind this plane places models' plans onto, when the
+    /// deployment names one; `None` places them onto the submitter's own.
+    fn device_kind(&self) -> Option<ComputeDeviceKind> {
+        None
+    }
 }
 
 /// What a plan asks of the executor that holds it — read off the plan's

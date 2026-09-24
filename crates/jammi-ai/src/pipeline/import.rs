@@ -130,7 +130,7 @@ impl<'a> ImportPipeline<'a> {
         params.insert("key_column".to_string(), key_column.to_string());
         params.insert("text_columns".to_string(), joined_text.clone());
 
-        let env = MaterializationEnv::new(
+        let env = MaterializationEnv::of_models(
             self.session.compute_device(),
             vec![ModelIdentity {
                 model_id: canonical_model_id.clone(),

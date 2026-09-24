@@ -1,5 +1,5 @@
 //! What every leg producer captures the same way, whichever workload it
-//! serves: the per-iteration series, the files a leg hands to the next stack
+//! serves: the files a leg hands to the next stack
 //! or to the comparator, the vector rows the ladder pairs by row, the file a
 //! leg is filed as, and one process per leg.
 //!
@@ -9,54 +9,13 @@
 use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::ladder::leg::{LegName, Take};
 use crate::leg::{Leg, MutantStamp, Payload, Provenance};
 use crate::report::{Report, Tiers};
-
-/// The per-iteration wall-clock series of a leg: the first `warmup` recorded
-/// iterations are dropped, the rest are kept in order, in seconds — the
-/// ladder's `iter_wall_s`.
-#[derive(Debug)]
-pub struct IterationSeries {
-    warmup: usize,
-    iterations: usize,
-    recorded: usize,
-    seconds: Vec<f64>,
-}
-
-impl IterationSeries {
-    /// A series that drops `warmup` iterations and keeps the `iterations` after.
-    pub fn new(warmup: usize, iterations: usize) -> Self {
-        Self {
-            warmup,
-            iterations,
-            recorded: 0,
-            seconds: Vec::with_capacity(iterations),
-        }
-    }
-
-    /// How many iterations the producer must run: warm-up plus measured.
-    pub fn total(&self) -> usize {
-        self.warmup + self.iterations
-    }
-
-    /// Record one iteration's wall-clock, in run order.
-    pub fn record(&mut self, elapsed: Duration) {
-        if self.recorded >= self.warmup {
-            self.seconds.push(elapsed.as_secs_f64());
-        }
-        self.recorded += 1;
-    }
-
-    /// The measured series, seconds per iteration, warm-up excluded.
-    pub fn into_seconds(self) -> Vec<f64> {
-        self.seconds
-    }
-}
 
 /// One file of a leg. The sha256 is of the file's own bytes, so two legs that
 /// name the same artifact are provably reading the same input.
@@ -227,9 +186,10 @@ pub fn unique_suffix() -> String {
     )
 }
 
-/// A leg's file stem by the ladder's contract: `<rung>__<unit>__r<take>`.
-pub fn leg_stem(rung: &str, unit: &str, take: usize) -> String {
-    format!("{rung}__{unit}__r{take}")
+/// A leg's file stem by the ladder's contract: `<rung>__<unit>__<take>`,
+/// spelled by the ladder's own [`LegName`] so producer and judge cannot differ.
+pub fn leg_stem(rung: &str, unit: &str, take: Take) -> String {
+    LegName::new(rung, unit, take).to_string()
 }
 
 /// Write `report` as `<stem>.json` under `legs_dir` and return the file name.
@@ -295,18 +255,46 @@ async fn legs_from_fresh_process(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+/// The takes a producer measures of each point, `--take 1,2`: every take a
+/// process of its own. A run naming one take of one point — the invocation a
+/// sweep hands each of its points — is that single point, filed as that take.
+#[derive(Debug, Clone, clap::Args)]
+pub struct Takes {
+    /// The takes to measure, comma-separated, each in a process of its own;
+    /// the default is the fewest the ladder measures a rung against itself
+    /// with.
+    #[arg(
+        long = "take",
+        value_delimiter = ',',
+        default_values_t = 1..=crate::ladder::definition::SpeedInstrument::MIN_REPEATS
+    )]
+    takes: Vec<usize>,
+}
+
+impl Takes {
+    pub fn iter(&self) -> impl Iterator<Item = usize> + Clone + '_ {
+        self.takes.iter().copied()
+    }
+}
+
 /// One leg per point, each owning its process's peak resident set: a single
 /// point is filed here by `in_process`; several are a sweep and each runs in
 /// a fresh process — `args_for` names the invocation of this binary that
 /// files exactly that one point — so no point inherits an earlier point's
-/// high-water mark. Returns every leg's file name.
-pub async fn legs_per_point<P>(
+/// high-water mark. Returns every leg's file name; a sweep of no points is
+/// refused, never an empty filing.
+pub async fn legs_per_point<P, F>(
     points: &[P],
-    in_process: impl std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>>,
+    in_process: impl FnOnce(&P) -> F,
     args_for: impl Fn(&P) -> Vec<OsString>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if let [_] = points {
-        return in_process.await;
+) -> Result<Vec<String>, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<Vec<String>, Box<dyn std::error::Error>>>,
+{
+    match points {
+        [] => return Err("the sweep has no points: every swept flag needs a value".into()),
+        [point] => return in_process(point).await,
+        _ => {}
     }
     let mut files = Vec::with_capacity(points.len());
     for point in points {
@@ -318,16 +306,6 @@ pub async fn legs_per_point<P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn series_drops_exactly_the_warmup_and_keeps_order() {
-        let mut series = IterationSeries::new(2, 3);
-        assert_eq!(series.total(), 5);
-        for ms in [900, 800, 3, 1, 2] {
-            series.record(Duration::from_millis(ms));
-        }
-        assert_eq!(series.into_seconds(), vec![0.003, 0.001, 0.002]);
-    }
 
     #[test]
     fn artifact_is_addressed_by_its_own_bytes() {
@@ -381,6 +359,13 @@ mod tests {
 
     #[test]
     fn a_leg_stem_is_the_ladders_name() {
-        assert_eq!(leg_stem("sampler", "edges64", 2), "sampler__edges64__r2");
+        assert_eq!(
+            leg_stem("sampler", "edges64", Take::Repeat(2)),
+            "sampler__edges64__r2"
+        );
+        assert_eq!(
+            leg_stem("plan", "rows16", Take::Alone(1)),
+            "plan__rows16__a1"
+        );
     }
 }

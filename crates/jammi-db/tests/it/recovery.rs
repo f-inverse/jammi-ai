@@ -71,8 +71,8 @@ use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{
-    ComputeDevice, ContextAggregator, ContextCandidateSource, InputAnchor, Materialization,
-    MaterializationEnv, ProducingDescriptor,
+    ContextAggregator, ContextCandidateSource, InputAnchor, Materialization, MaterializationEnv,
+    ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{BuildingTable, ResultStore};
@@ -221,7 +221,7 @@ fn descriptor() -> ProducingDescriptor {
 }
 
 fn env() -> MaterializationEnv {
-    MaterializationEnv::new(ComputeDevice::Cpu, Vec::new())
+    MaterializationEnv::without_models()
 }
 
 fn inputs() -> Vec<InputAnchor> {

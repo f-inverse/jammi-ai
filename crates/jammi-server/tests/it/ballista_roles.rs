@@ -124,6 +124,7 @@ async fn client_role_installs_the_compute_plane_and_binds_no_ballista_listener()
     cfg.server.flight_listen = "127.0.0.1:0".into();
     cfg.ballista.client = Some(BallistaClientConfig {
         scheduler_address: format!("127.0.0.1:{}", free_port()),
+        device_kind: None,
     });
     let server = OssServer::new(cfg).await.expect("oss server");
     let session = server.session();

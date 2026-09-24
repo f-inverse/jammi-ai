@@ -21,13 +21,14 @@ use jammi_db::catalog::result_repo::ResultTableRecord;
 
 use crate::capture::{
     cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, vector_rows_digest,
-    write_jsonl, write_vector_rows, IterationSeries,
+    write_jsonl, write_vector_rows, Takes,
 };
 use crate::graph_legs::{
     add_graph_sources, augmented_degrees, build_edges, build_nodes, read_sorted_vectors,
     EngineRung, GraphHost, GraphShape, GraphSources, KeyedRows, DEFAULT_SHAPE, EDGES_FILE,
     INPUT_DIR, X0_STEM,
 };
+use crate::ladder::leg::Take;
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload, Provenance};
 use crate::plane::{PlaneArgs, PlaneParams};
 use crate::report::{Nullable, Tiers};
@@ -56,9 +57,7 @@ pub struct StructureLegParams {
     pub seed: u64,
     /// Where the leg, its vectors and the unit's inputs are filed.
     pub legs_dir: PathBuf,
-    /// Untimed iterations before the series.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed, every one filed in run order.
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
@@ -103,9 +102,8 @@ pub struct StructurePayload {
     pub target_partitions: usize,
     /// The wiring rule's fan-out cap.
     pub fan_out: usize,
-    /// Untimed iterations before the series.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed and filed: the whole run, its transient for the
+    /// ladder to cut.
     pub iters_measured: usize,
     /// The implementation that encoded.
     pub operator: &'static str,
@@ -212,7 +210,7 @@ pub async fn run_leg(
     let edges = build_edges(&nodes, shape.fan_out);
     let unit = format!("edges{}", edges.len());
     let rung = params.rung.as_str();
-    let stem = leg_stem(rung, &unit, params.take);
+    let stem = leg_stem(rung, &unit, Take::Repeat(params.take as u32));
 
     let input_dir = params.legs_dir.join(INPUT_DIR).join(&unit);
     let x0 = write_vector_rows(&input_dir, X0_STEM, &seed_rows(params, &nodes, &edges)?)?;
@@ -240,12 +238,13 @@ pub async fn run_leg(
     let request = build_request(params, &sources);
     let hops = request.hops()?;
 
-    let mut series = IterationSeries::new(params.warmup, params.iterations);
+    // Each iteration's wall in run order, and the last one's table.
+    let mut iter_wall_s = Vec::with_capacity(params.iterations);
     let mut last = None;
-    for _ in 0..series.total() {
+    for _ in 0..params.iterations {
         let start = Instant::now();
         let table = encode(&mut host, &request).await?;
-        series.record(start.elapsed());
+        iter_wall_s.push(start.elapsed().as_secs_f64());
         last = Some(table);
     }
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
@@ -273,12 +272,11 @@ pub async fn run_leg(
         take: params.take,
         target_partitions: params.rung.target_partitions(params.partitions),
         fan_out: shape.fan_out,
-        warmup: params.warmup,
         iters_measured: params.iterations,
         operator: "jammi_ai::session::InferenceSession::generate_structure_embeddings",
     };
     let measured = Measured {
-        iter_wall_s: Some(series.into_seconds()),
+        iter_wall_s: Some(iter_wall_s),
         work: Some((edges.len() * hops) as f64),
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
@@ -332,18 +330,12 @@ pub struct StructureArgs {
     /// vectors beside, and the inputs under `input/edges<N>/`.
     #[arg(long)]
     legs_dir: PathBuf,
-    #[arg(long, default_value_t = 1)]
-    warmup: usize,
-    /// Timed iterations; the default is the comparator's minimum series, and a
-    /// shorter run files legs the speed axis refuses by name.
-    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_SAMPLES)]
+    /// Iterations timed, every one filed; the default is the fewest the
+    /// ladder settles, and a shorter run files legs it refuses by name.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
-    /// Measured repeats of each point, each in a process of its own.
-    #[arg(long, default_value_t = 1)]
-    takes: usize,
-    /// The take a single point's run is filed as.
-    #[arg(long, default_value_t = 1)]
-    take: usize,
+    #[command(flatten)]
+    takes: Takes,
     #[command(flatten)]
     plane: PlaneArgs,
 }
@@ -361,7 +353,6 @@ impl StructureArgs {
             sparsity: self.sparsity,
             seed: self.seed,
             legs_dir: self.legs_dir.clone(),
-            warmup: self.warmup,
             iterations: self.iterations,
             take,
             plane: self.plane.clone().into(),
@@ -376,13 +367,9 @@ impl StructureArgs {
             .flat_map(|&n| {
                 self.rungs
                     .iter()
-                    .flat_map(move |&r| (1..=self.takes).map(move |t| (n, r, t)))
+                    .flat_map(move |&r| self.takes.iter().map(move |t| (n, r, t)))
             })
             .collect();
-        let (n, rung, _) = *points
-            .first()
-            .ok_or("structure needs at least one --nodes value")?;
-        let first = self.params(n, rung, if points.len() == 1 { self.take } else { 1 });
         let weights = self
             .weights
             .iter()
@@ -391,7 +378,10 @@ impl StructureArgs {
             .join(",");
         let files = legs_per_point(
             &points,
-            async move { run_leg(&first).await.map(|(_, file)| vec![file]) },
+            |&(nodes, rung, take)| {
+                let params = self.params(nodes, rung, take);
+                async move { run_leg(&params).await.map(|(_, file)| vec![file]) }
+            },
             |&(nodes, rung, take)| {
                 let flags = [
                     ("--nodes", nodes.to_string()),
@@ -402,7 +392,6 @@ impl StructureArgs {
                     ("--beta", self.beta.to_string()),
                     ("--sparsity", self.sparsity.to_string()),
                     ("--seed", self.seed.to_string()),
-                    ("--warmup", self.warmup.to_string()),
                     ("--iterations", self.iterations.to_string()),
                     ("--take", take.to_string()),
                 ];
@@ -462,7 +451,6 @@ mod tests {
             sparsity: DEFAULT_STRUCTURE_SPARSITY,
             seed,
             legs_dir: legs_dir.to_path_buf(),
-            warmup: 0,
             iterations: 1,
             take: 1,
             plane: PlaneParams::default(),

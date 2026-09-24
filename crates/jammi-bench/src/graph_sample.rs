@@ -24,10 +24,14 @@
 //! * `law_observed`: the walks' raw second-order transition counts — for every
 //!   walk state `(previous, current)`, how often the walk stepped to each
 //!   `next` — in the order of the law file, `<unit>.json`
-//!   (`{"cells": [[probability, …], …]}`), which this rung writes from
-//!   [`node2vec_transition_law`] and every rung's leg names by its sha256 as
-//!   the identity field `law_sha256`. The counts are the evidence, the law is
-//!   the ground truth; judging one against the other is the ladder's.
+//!   (`{"cells": [[probability, …], …], "observation_passes": N}`), which this
+//!   rung writes from [`node2vec_transition_law`] and every rung's leg names
+//!   by its sha256 as the identity field `law_sha256`. The counts are over the
+//!   file's `observation_passes` untimed passes, sized from the law itself
+//!   ([`observation_passes`]) so that the fit has the evidence Cochran's floor
+//!   asks of every state, whatever the timed series' length. The counts are
+//!   the evidence, the law is the ground truth; judging one against the other
+//!   is the ladder's.
 //!
 //! ## The graph directory
 //!
@@ -43,14 +47,17 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
+use jammi_numerics::stats::MIN_EXPECTED_COUNT;
+
 use jammi_ai::fine_tune::graph_sampler::{
     sort_into_graph_read_order, GraphEdge, GraphSampleConfig, GraphSampler, SampledPair, TextNode,
 };
 
 use crate::capture::{
     artifact_of, cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, write_artifact,
-    write_jsonl, Artifact, IterationSeries,
+    write_jsonl, Artifact, Takes,
 };
+use crate::ladder::leg::Take;
 use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
 use crate::report::{Nullable, Tiers};
 
@@ -162,7 +169,11 @@ impl GraphFiles {
 
 /// A walk state: the node the walk arrived from (`None` on a walk's first
 /// step) and the node it stands on.
-pub type WalkState = (Option<String>, String);
+type WalkState = (Option<String>, String);
+
+/// node2vec's law over a graph: for every walk state, its next nodes and their
+/// probabilities, next nodes ascending.
+type TransitionLaw = BTreeMap<WalkState, Vec<(String, f64)>>;
 
 /// node2vec's exact transition law over a directed edge list: for every walk
 /// state `(t, v)` the probability of each next node `x`,
@@ -183,11 +194,7 @@ pub type WalkState = (Option<String>, String);
 /// Every state a walk can reach is present: `(None, v)` for each `v` with an
 /// out-edge, and `(t, v)` for each edge `t → v` whose `v` has an out-edge. Each
 /// state's probabilities are in ascending `x` order and sum to one.
-pub fn node2vec_transition_law(
-    edges: &[EdgeRow],
-    return_p: f64,
-    in_out_q: f64,
-) -> BTreeMap<WalkState, Vec<(String, f64)>> {
+fn node2vec_transition_law(edges: &[EdgeRow], return_p: f64, in_out_q: f64) -> TransitionLaw {
     let mut out: BTreeMap<&str, BTreeMap<&str, f64>> = BTreeMap::new();
     let mut adjacent: BTreeSet<(&str, &str)> = BTreeSet::new();
     for e in edges {
@@ -232,15 +239,95 @@ pub fn node2vec_transition_law(
     first_steps.chain(later_steps).collect()
 }
 
-/// The law as the ladder reads it: one cell per walk state, the probabilities
-/// of that state's next nodes in ascending order — [`node2vec_transition_law`]'s
-/// own order, which is also the order of every leg's `law_observed`.
-pub fn law_file(law: &BTreeMap<WalkState, Vec<(String, f64)>>) -> Vec<u8> {
-    let cells: Vec<Vec<f64>> = law
-        .values()
-        .map(|nexts| nexts.iter().map(|(_, p)| *p).collect())
+/// How often one pass — `walks_per_node` walks of `walk_length` steps from
+/// every node — is expected to step out of each state: the walk's state
+/// distribution pushed through `law` one step at a time, summed over the
+/// steps. A walk ends at a node with no out-edge, which the law gives no
+/// state, so its mass leaves there. Exact, and known before any walk is drawn.
+fn expected_state_visits(
+    law: &TransitionLaw,
+    walks_per_node: usize,
+    walk_length: usize,
+) -> BTreeMap<WalkState, f64> {
+    let starts: BTreeMap<WalkState, f64> = law
+        .keys()
+        .filter(|(previous, _)| previous.is_none())
+        .map(|state| (state.clone(), walks_per_node as f64))
         .collect();
-    serde_json::to_vec(&serde_json::json!({ "cells": cells })).expect("serialize the law")
+    std::iter::successors(Some(starts), |mass| {
+        let next = step_mass(law, mass);
+        (!next.is_empty()).then_some(next)
+    })
+    .take(walk_length)
+    .flatten()
+    .fold(BTreeMap::new(), accumulate)
+}
+
+/// One step of the walk's state distribution under `law`.
+fn step_mass(law: &TransitionLaw, mass: &BTreeMap<WalkState, f64>) -> BTreeMap<WalkState, f64> {
+    mass.iter()
+        .flat_map(|(state, m)| {
+            let (_, current) = state;
+            law[state]
+                .iter()
+                .map(move |(next, p)| ((Some(current.clone()), next.clone()), m * p))
+        })
+        .filter(|(state, _)| law.contains_key(state))
+        .fold(BTreeMap::new(), accumulate)
+}
+
+fn accumulate(
+    mut total: BTreeMap<WalkState, f64>,
+    (state, mass): (WalkState, f64),
+) -> BTreeMap<WalkState, f64> {
+    *total.entry(state).or_insert(0.0) += mass;
+    total
+}
+
+/// The passes a law's observation takes: the fewest whole passes at which
+/// every state a walk can reach is expected to step to its least likely next
+/// node at least [`MIN_EXPECTED_COUNT`] times — Cochran's floor for the
+/// state's cell of the law fit, met by the expected visits so that only the
+/// states a pass happens to under-visit are left for the fit to pool.
+fn observation_passes(law: &TransitionLaw, visits: &BTreeMap<WalkState, f64>) -> usize {
+    law.iter()
+        .filter_map(|(state, nexts)| {
+            let visited = visits.get(state).copied().filter(|v| *v > 0.0)?;
+            let least = nexts.iter().map(|(_, p)| *p).fold(f64::INFINITY, f64::min);
+            Some(MIN_EXPECTED_COUNT / (visited * least))
+        })
+        .fold(1.0, f64::max)
+        .ceil() as usize
+}
+
+/// The law file both rungs observe and the ladder judges against: one cell
+/// per walk state, the probabilities of that state's next nodes in ascending
+/// order — [`node2vec_transition_law`]'s own order, which is also the order of
+/// every leg's `law_observed` — and the passes every rung observes it over.
+#[derive(Debug, Serialize)]
+pub struct LawFile {
+    pub cells: Vec<Vec<f64>>,
+    pub observation_passes: usize,
+}
+
+impl LawFile {
+    /// The file for `law` at a pass of `walks_per_node` walks of
+    /// `walk_length` steps from every node.
+    fn new(law: &TransitionLaw, walks_per_node: usize, walk_length: usize) -> Self {
+        let visits = expected_state_visits(law, walks_per_node, walk_length);
+        Self {
+            cells: law
+                .values()
+                .map(|nexts| nexts.iter().map(|(_, p)| *p).collect())
+                .collect(),
+            observation_passes: observation_passes(law, &visits),
+        }
+    }
+
+    /// The file's bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("serialize the law")
+    }
 }
 
 /// The steps of a set of walks, counted by where each was taken: how often a
@@ -266,7 +353,7 @@ impl WalkStepCounts {
     /// A step the law gives no cell is an error — a walk that left the law.
     pub fn observed_by(
         &self,
-        law: &BTreeMap<WalkState, Vec<(String, f64)>>,
+        law: &TransitionLaw,
     ) -> Result<Vec<Vec<u64>>, Box<dyn std::error::Error>> {
         if let Some(((state, next), _)) = self.0.iter().find(|((state, next), _)| {
             !law.get(state)
@@ -376,9 +463,7 @@ pub struct GraphSampleParams {
     /// The sampler configuration; `seed` is the pair table's seed and the first
     /// timed iteration's.
     pub config: GraphSampleConfig,
-    /// Untimed iterations before the series starts.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed, every one filed in run order.
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
@@ -420,12 +505,13 @@ pub struct GraphSamplePayload {
     pub hard_negatives: usize,
     /// The negative pool's excluded radius; `null` when no negative is mined.
     pub exclude_hops: Option<usize>,
-    /// Untimed iterations before the series.
-    pub warmup: usize,
-    /// Timed iterations.
+    /// Iterations timed and filed: the whole run, its transient for the
+    /// ladder to cut.
     pub iters_measured: usize,
     /// Walks per sample: `node_count · walks_per_node`.
     pub walks: usize,
+    /// Passes `law_observed` counts over, the law file's own.
+    pub observation_passes: usize,
     /// Rows in the pair table.
     pub sampled_pairs: usize,
     /// The pair table at `seed`, one [`PairRow`] per line.
@@ -488,34 +574,40 @@ pub fn run_leg(
         ..config
     };
     let unit = format!("edges{}", graph.edges.len());
-    let stem = leg_stem(RUNG, &unit, params.take);
+    let stem = leg_stem(RUNG, &unit, Take::Repeat(params.take as u32));
 
-    let mut series = IterationSeries::new(params.warmup, params.iterations);
-    for i in 0..series.total() {
-        let sampler = graph.sampler(at_seed(i))?;
-        let start = Instant::now();
-        sampler.sample_into(|_| Ok(()))?;
-        series.record(start.elapsed());
-    }
+    let iter_wall_s = (0..params.iterations)
+        .map(|i| -> Result<f64, Box<dyn std::error::Error>> {
+            let sampler = graph.sampler(at_seed(i))?;
+            let start = Instant::now();
+            sampler.sample_into(|_| Ok(()))?;
+            Ok(start.elapsed().as_secs_f64())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
-    // The same walks the timed iterations drew, observed: one pass per seed.
-    let mut counts = WalkStepCounts::default();
-    for i in 0..series.total() {
-        graph.sampler(at_seed(i))?.sample_observing_walks(
-            |walk| {
-                counts.observe(walk);
-                Ok(())
-            },
-            |_| Ok(()),
-        )?;
-    }
     let law = node2vec_transition_law(&graph.edges, config.return_p, config.in_out_q);
+    let law_file = LawFile::new(&law, config.walks_per_node, config.walk_length);
     let law_dir = params
         .law_dir
         .clone()
         .unwrap_or_else(|| params.legs_dir.join(LAW_DIR));
-    let law_written = write_artifact(&law_dir, &format!("{unit}.json"), &law_file(&law))?;
+    let law_written = write_artifact(&law_dir, &format!("{unit}.json"), &law_file.to_bytes())?;
+    // Untimed, after the peak is read: the passes the law asks for, one seed
+    // each.
+    let counts = (0..law_file.observation_passes).try_fold(
+        WalkStepCounts::default(),
+        |mut counts, i| -> Result<_, Box<dyn std::error::Error>> {
+            graph.sampler(at_seed(i))?.sample_observing_walks(
+                |walk| {
+                    counts.observe(walk);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )?;
+            Ok(counts)
+        },
+    )?;
     let law_observed = counts.observed_by(&law)?;
 
     let (pairs_file, pairs_digest, sampled_pairs) = write_pair_table(
@@ -542,15 +634,15 @@ pub fn run_leg(
         edge_set_symmetric: graph.is_symmetric(),
         hard_negatives: config.hard_negatives,
         exclude_hops: (config.hard_negatives > 0).then_some(config.exclude_hops),
-        warmup: params.warmup,
         iters_measured: params.iterations,
         walks: graph.nodes.len() * config.walks_per_node,
+        observation_passes: law_file.observation_passes,
         sampled_pairs,
         pairs_file,
         walker: "jammi_ai::fine_tune::graph_sampler::GraphSampler",
     };
     let measured = Measured {
-        iter_wall_s: Some(series.into_seconds()),
+        iter_wall_s: Some(iter_wall_s),
         work: Some(graph.edges.len() as f64),
         peak_rss_bytes,
         peak_vram_bytes: Measurement::not_yet_measured("bytes"),
@@ -599,16 +691,12 @@ pub struct GraphSampleArgs {
     exclude_hops: usize,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    #[arg(long, default_value_t = 2)]
-    warmup: usize,
-    #[arg(long, default_value_t = 10)]
+    /// Iterations timed, every one filed; the default is the fewest the
+    /// ladder settles, and a shorter run files legs it refuses by name.
+    #[arg(long, default_value_t = crate::ladder::definition::SpeedInstrument::MIN_RUN)]
     iterations: usize,
-    /// Measured repeats of each graph, each in a process of its own.
-    #[arg(long, default_value_t = 1)]
-    takes: usize,
-    /// The take a single graph's run is filed as.
-    #[arg(long, default_value_t = 1)]
-    take: usize,
+    #[command(flatten)]
+    takes: Takes,
 }
 
 impl GraphSampleArgs {
@@ -627,7 +715,6 @@ impl GraphSampleArgs {
                 min_negatives: 1,
                 seed: self.seed,
             },
-            warmup: self.warmup,
             iterations: self.iterations,
             take,
         }
@@ -653,7 +740,6 @@ impl GraphSampleArgs {
             ("--hard-negatives", self.hard_negatives.to_string()),
             ("--exclude-hops", self.exclude_hops.to_string()),
             ("--seed", self.seed.to_string()),
-            ("--warmup", self.warmup.to_string()),
             ("--iterations", self.iterations.to_string()),
             ("--take", take.to_string()),
         ];
@@ -670,12 +756,14 @@ impl GraphSampleArgs {
         let points: Vec<(&Path, usize)> = self
             .graphs
             .iter()
-            .flat_map(|g| (1..=self.takes).map(move |t| (g.as_path(), t)))
+            .flat_map(|g| self.takes.iter().map(move |t| (g.as_path(), t)))
             .collect();
-        let first = self.params(points[0].0, if self.takes == 1 { self.take } else { 1 });
         let files = legs_per_point(
             &points,
-            async move { run_leg(&first).map(|(_, file)| vec![file]) },
+            |&(graph, take)| {
+                let params = self.params(graph, take);
+                async move { run_leg(&params).map(|(_, file)| vec![file]) }
+            },
             |&(graph, take)| self.child_args(graph, take),
         )
         .await?;
@@ -945,11 +1033,7 @@ mod tests {
             .collect()
     }
 
-    fn probability(
-        law: &BTreeMap<WalkState, Vec<(String, f64)>>,
-        state: WalkState,
-        x: &str,
-    ) -> f64 {
+    fn probability(law: &TransitionLaw, state: WalkState, x: &str) -> f64 {
         law[&state]
             .iter()
             .find(|(next, _)| next == x)
@@ -985,7 +1069,8 @@ mod tests {
         }
 
         // The law file is the cells in this order, and the counts follow it.
-        let file: serde_json::Value = serde_json::from_slice(&law_file(&law)).unwrap();
+        let file: serde_json::Value =
+            serde_json::from_slice(&LawFile::new(&law, 2, 3).to_bytes()).unwrap();
         let cells = file["cells"].as_array().unwrap();
         assert_eq!(cells.len(), law.len());
         assert_eq!(
@@ -1096,13 +1181,133 @@ mod tests {
         }
     }
 
+    /// The graph the visit tests walk: a triangle with a tail and a branch,
+    /// every `α` branch exercised, no dead end.
+    fn branching_graph() -> Vec<EdgeRow> {
+        undirected(&[
+            ("a", "b"),
+            ("b", "c"),
+            ("a", "c"),
+            ("c", "d"),
+            ("d", "e"),
+            ("e", "c"),
+            ("e", "f"),
+        ])
+    }
+
+    /// With no dead end every walk takes every step, so the expected visits
+    /// add up to the pass's steps; and the first step's states are visited
+    /// exactly `walks_per_node` times.
+    #[test]
+    fn expected_visits_add_up_to_every_step_of_a_pass() {
+        let law = node2vec_transition_law(&branching_graph(), 0.25, 4.0);
+        let visits = expected_state_visits(&law, 8, 6);
+        assert!((visits.values().sum::<f64>() - (6 * 8 * 6) as f64).abs() < 1e-9);
+        for (state, v) in &visits {
+            if state.0.is_none() {
+                assert!((v - 8.0).abs() < 1e-12, "{state:?}: {v}");
+            }
+        }
+    }
+
+    /// A walk ends where the law has no state: `a → b` leaves the pass at `b`.
+    #[test]
+    fn expected_visits_stop_at_a_dead_end() {
+        let law =
+            node2vec_transition_law(&[edge("a", "b"), edge("a", "c"), edge("c", "a")], 1.0, 1.0);
+        let visits = expected_state_visits(&law, 2, 3);
+        // Step 0: (∅, a) ×2, (∅, c) ×2. Step 1: (∅, a) sends half to b, where
+        // the walk ends, and half to (a, c) ×1; (∅, c) sends (c, a) ×2.
+        // Step 2: (a, c) sends (c, a) ×1; (c, a) sends half to b and half to
+        // (a, c) ×1.
+        let at =
+            |prev: Option<&str>, cur: &str| visits[&(prev.map(str::to_string), cur.to_string())];
+        assert!((at(None, "a") - 2.0).abs() < 1e-12);
+        assert!((at(Some("a"), "c") - 2.0).abs() < 1e-12);
+        assert!((at(Some("c"), "a") - 3.0).abs() < 1e-12);
+    }
+
+    /// The expected visits are what the engine's walks do: averaged over many
+    /// seeded passes, every state's visit count sits within a few standard
+    /// errors of its expectation.
+    #[test]
+    fn expected_visits_match_the_engine_walks() {
+        let edges = branching_graph();
+        let nodes: Vec<NodeRow> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|id| NodeRow {
+                id: id.to_string(),
+                text: format!("text {id}"),
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let graph = GraphFiles::write(dir.path(), &nodes, &edges).unwrap();
+        let (p, q, passes) = (0.25, 4.0, 400_u64);
+        let config = |seed| GraphSampleConfig {
+            walk_length: 6,
+            walks_per_node: 8,
+            return_p: p,
+            in_out_q: q,
+            hard_negatives: 0,
+            seed,
+            ..GraphSampleConfig::default()
+        };
+        let counts = (0..passes).fold(WalkStepCounts::default(), |mut counts, seed| {
+            graph
+                .sampler(config(seed))
+                .unwrap()
+                .sample_observing_walks(
+                    |walk| {
+                        counts.observe(walk);
+                        Ok(())
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+            counts
+        });
+        let visited = counts.rows().fold(HashMap::new(), |mut total, row| {
+            *total.entry((row.prev, row.cur)).or_insert(0_u64) += row.value;
+            total
+        });
+        let law = node2vec_transition_law(&graph.edges, p, q);
+        for (state, expected) in expected_state_visits(&law, 8, 6) {
+            let mean = visited[&state] as f64 / passes as f64;
+            // A state's visits in one pass are a sum of at most 48 walks'
+            // bounded contributions; its variance is below `expected · 6`.
+            let standard_error = (expected * 6.0 / passes as f64).sqrt();
+            assert!(
+                (mean - expected).abs() <= 5.0 * standard_error,
+                "{state:?}: mean {mean}, expected {expected}"
+            );
+        }
+    }
+
+    /// The passes are the fewest at which every reachable state expects
+    /// Cochran's floor in its least likely next node.
+    #[test]
+    fn observation_passes_are_the_fewest_that_reach_the_floor() {
+        let law = node2vec_transition_law(&branching_graph(), 0.25, 4.0);
+        let visits = expected_state_visits(&law, 2, 4);
+        let passes = observation_passes(&law, &visits);
+        let least_expected = |passes: usize| {
+            law.iter()
+                .map(|(state, nexts)| {
+                    let least = nexts.iter().map(|(_, p)| *p).fold(f64::INFINITY, f64::min);
+                    passes as f64 * visits[state] * least
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        assert!(least_expected(passes) >= MIN_EXPECTED_COUNT);
+        assert!(least_expected(passes - 1) < MIN_EXPECTED_COUNT);
+    }
+
     fn params(graph: &Path, legs_dir: &Path, config: GraphSampleConfig) -> GraphSampleParams {
         GraphSampleParams {
             graph: graph.to_path_buf(),
             legs_dir: legs_dir.to_path_buf(),
             law_dir: None,
             config,
-            warmup: 1,
             iterations: 3,
             take: 1,
         }
@@ -1143,8 +1348,17 @@ mod tests {
         assert_eq!(observed.len(), law.len());
         assert_eq!(
             observed.iter().flatten().sum::<u64>() as usize,
-            4 * graph.nodes.len() * config.walks_per_node * config.walk_length,
-            "every step of every iteration's walks is counted"
+            leg.payload.observation_passes
+                * graph.nodes.len()
+                * config.walks_per_node
+                * config.walk_length,
+            "every step of every observed pass's walks is counted"
+        );
+        let law_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&law_file.path).unwrap()).unwrap();
+        assert_eq!(
+            law_json["observation_passes"],
+            leg.payload.observation_passes as u64
         );
 
         let expected = graph.sampler(config).unwrap().sample().unwrap();
@@ -1198,7 +1412,7 @@ mod tests {
                 ..GraphSampleConfig::default()
             };
             let mut p = params(&graph_dir, &legs, config);
-            (p.warmup, p.iterations) = (0, 40);
+            p.iterations = 40;
             let (_, file) = run_leg(&p).unwrap();
             std::fs::copy(
                 legs.join(&file),
@@ -1246,7 +1460,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         committed.graph.write(&dir.path().join("graph")).unwrap();
         let mut p = params(&dir.path().join("graph"), &dir.path().join("legs"), config);
-        (p.warmup, p.iterations) = (0, 1);
+        p.iterations = 1;
         let (leg, _) = run_leg(&p).unwrap();
         (leg, dir)
     }

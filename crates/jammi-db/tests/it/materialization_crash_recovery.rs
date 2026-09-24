@@ -27,9 +27,7 @@ use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::model_task::ModelTask;
 use jammi_db::session::JammiSession;
-use jammi_db::store::manifest::{
-    ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
-};
+use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ProducingDescriptor};
 use jammi_db::store::mutable::test_hook::MATERIALIZATION_CHECKPOINT_ENV;
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::ResultStore;
@@ -118,7 +116,7 @@ async fn child_workload() {
         key_column: "_row_id".into(),
         dimensions: DIMS,
     };
-    let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
+    let env = MaterializationEnv::without_models();
     let inputs = vec![InputAnchor::unpinned_at_instant(
         TABLE_SOURCE,
         "1970-01-01T00:00:00Z",

@@ -14,9 +14,11 @@ use super::outcome::{AxisResult, Pair};
 use super::refusal::Refusal;
 use super::verdict::{Bound, Judgement, SpaceVerdict};
 
-/// A rung's peak for one unit: the largest any repeat reached.
+/// A rung's peak for one unit: the largest any measured run reached — a
+/// repeat whose process was its own, or a run alone beside repeats that
+/// shared theirs.
 fn peak(rung: &RungLegs, unit: &Unit, quantity: fn(&Leg) -> Option<f64>) -> Option<f64> {
-    rung.repeats(unit).filter_map(quantity).reduce(f64::max)
+    rung.measured(unit).filter_map(quantity).reduce(f64::max)
 }
 
 /// Geometric mean over units of `upper ÷ lower`; `None` unless every unit

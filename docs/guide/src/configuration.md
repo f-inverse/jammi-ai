@@ -462,9 +462,11 @@ max_job_waits = 1024
 # after) and streams one summary back; this process then finishes the
 # catalog side. A claimed training attempt of any kind -- a fine-tune, a
 # graph fine-tune, a context predictor -- is placed there as one task, on an
-# executor other than this process that lists this process's own device
-# kind. A plan no live executor can hold -- or that the wire cannot carry --
-# runs in this process, logged as such, never parked. A statement that serves rows
+# executor other than this process that lists the plan's device kind. A plan
+# no live executor can hold -- or that the wire cannot carry -- runs in this
+# process, logged as such, never parked. Wherever it runs, the table's
+# manifest records the environment of the process that ran it: that
+# process's device and the models it loaded. A statement that serves rows
 # inline (a `SELECT`, a search) never leaves this process. Unset (the
 # default) means every statement and claim runs in this process.
 # The scheduler this client submits to, `host:port` -- a `SocketAddr`
@@ -472,6 +474,11 @@ max_job_waits = 1024
 # binds nothing and joins no collision check. Required whenever
 # `[ballista.client]` is present.
 # scheduler_address = "10.0.4.7:50050"
+# The device kind (`cpu`, `cuda`, `metal`) this process's model plans are
+# placed onto -- a deployment fact, not this process's hardware: a CPU query
+# tier placing onto a GPU compute tier names `cuda`. Unset (the default)
+# means the kind of this process's own compute device.
+# device_kind = "cuda"
 #
 # `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
 # `[server] health_listen`/`flight_listen`/`peer_bind` (configuration.md's

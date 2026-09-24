@@ -205,6 +205,8 @@ def score_episodes(model, batches) -> float:
 
 
 KEY = "predictor_train_run"
+# The seeds the ladder's seeded-loss rule is stated for, `1..=SEEDED_LOSS_SEEDS`.
+DEFAULT_SEEDS = list(range(1, 13))
 RUNG = "torch"
 
 
@@ -230,8 +232,7 @@ def run(args, seed: int, take: int) -> list[str]:
     held_out_at_init = score_episodes(model, heldout)
     train_probe_series = [score_episodes(model, train)]
     trajectory = []
-    total_steps = args.epochs * len(train)
-    series = ll.IterationSeries(args.warmup_steps, total_steps - args.warmup_steps)
+    iter_wall_s: list[float] = []
     step_losses: list[float] = []
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
@@ -244,7 +245,7 @@ def run(args, seed: int, take: int) -> list[str]:
             if args.grad_clip > 0.0:
                 torch.nn.utils.clip_grad_norm_(parameters, args.grad_clip)
             optimizer.step()
-            series.record(time.perf_counter() - t0)
+            iter_wall_s.append(time.perf_counter() - t0)
         trajectory.append({"epoch": epoch, "held_out_mean": score_episodes(model, heldout), "run_wall_s_cumulative": time.perf_counter() - started})
         train_probe_series.append(score_episodes(model, train))
     peak = ll.peak_rss_bytes()
@@ -285,14 +286,13 @@ def run(args, seed: int, take: int) -> list[str]:
         "objective": "gaussian-crps",
         "train_episodes": len(train),
         "heldout_episodes": len(heldout),
-        "warmup_steps": args.warmup_steps,
-        "iters_measured": len(series.seconds),
+        "iters_measured": len(iter_wall_s),
         "final_weights": ll.artifact_of(final_path),
         "trainer": f"torch.optim.AdamW over a {model.architecture} twin",
         "step_losses": step_losses,
         **ll.provenance(),
         # Measured.
-        "iter_wall_s": series.seconds,
+        "iter_wall_s": iter_wall_s,
         "peak_rss_bytes": peak,
         "peak_vram_bytes": ll.NOT_MEASURED_BYTES,
         "outcome_digest": ll.vector_rows_digest(keys, predictions),
@@ -311,27 +311,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--legs-dir", type=Path, required=True, help="the engine legs' directory: inputs under input/<arch>/seed<N>/, legs filed beside them")
     parser.add_argument("--arch", choices=["Cnp", "AttnCnp", "Tnp"], required=True)
-    parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], required=True, help="the seed units to train, comma-separated (one process each)")
+    parser.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], default=DEFAULT_SEEDS, help="the seed units to train, comma-separated (one process each); the twelve the ladder's learning rule is stated for by default")
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--learning-rate", type=float, required=True)
     parser.add_argument("--grad-clip", type=float, required=True)
     parser.add_argument("--num-heads", type=int, required=True, help="the configuration's heads: the engine leg's identity.num_heads (a Cnp builds no attention)")
     parser.add_argument("--num-layers", type=int, required=True, help="the configuration's layers: the engine leg's identity.num_layers (only a Tnp builds them)")
-    parser.add_argument("--warmup-steps", type=int, default=2)
-    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each seed, each in its own process")
-    parser.add_argument("--take", type=int, default=1, help="the take a single seed's run is filed as")
+    ll.add_take_argument(parser)
     args = parser.parse_args()
 
-    points = [(seed, take) for seed in args.seeds for take in range(1, args.takes + 1)]
+    points = [(seed, take) for seed in args.seeds for take in args.take]
 
     def argv_for(point) -> list[str]:
         seed, take = point
         argv = ["--legs-dir", str(args.legs_dir), "--arch", args.arch, "--seeds", str(seed), "--take", str(take)]
-        for flag in ("epochs", "learning_rate", "grad_clip", "num_heads", "num_layers", "warmup_steps"):
+        for flag in ("epochs", "learning_rate", "grad_clip", "num_heads", "num_layers"):
             argv += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
         return argv
 
-    files = ll.legs_per_point(points, lambda point: run(args, point[0], args.take if len(points) == 1 else point[1]), argv_for)
+    files = ll.legs_per_point(points, lambda point: run(args, *point), argv_for)
     print(json.dumps(files))
 
 

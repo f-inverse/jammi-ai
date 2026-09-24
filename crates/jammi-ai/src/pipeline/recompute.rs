@@ -200,7 +200,10 @@ impl InferenceSession {
             Err(JammiError::VersionUnavailable { .. }) => store.base_descriptor(table).await?,
             Err(e) => return Err(e),
         };
-        let (recomputed, outcome) = self.replay_descriptor(table, descriptor).await?;
+        // A future holds its callees' state inline, so the dispatch — as
+        // large as its largest producer — lives on the heap: every caller's
+        // stack stays bounded, whichever producer a descriptor names.
+        let (recomputed, outcome) = Box::pin(self.replay_descriptor(table, descriptor)).await?;
         Ok(RecomputedTable {
             original: table.table_name.clone(),
             recomputed,
@@ -698,7 +701,6 @@ impl InferenceSession {
                     task,
                     &format,
                     inputs,
-                    self.compute_device(),
                 ),
             )
             .await?;

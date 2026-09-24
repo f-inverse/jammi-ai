@@ -1114,22 +1114,16 @@ async fn two_schedulers_over_one_catalog_serve_jobs_sequentially() {
     harness::add_training_source(&session, &source).await;
 
     // Scheduler 4 hosts its OWN local executor too (`SchedulerAndExecutor`).
-    // A scheduler 4 hosting no executor of its own fails every submission
-    // with Ballista's OWN "There are no
-    // alive executors to bind tasks" (`ballista-scheduler-54.1.0/src/state/
-    // executor_manager.rs:117-121`'s `get_alive_executors`, gated on THIS
-    // scheduler's own executor-HEARTBEAT cache — never the raw
-    // `compute_executors` row set `list_compute_executors` reads) —
-    // executors 2/3 heartbeat ONLY to the scheduler they registered with
-    // (scheduler 1), so scheduler 4 never learns they are alive, no
-    // matter how long a plan submitted to it waits (this is the concrete
-    // shape of `CatalogClusterState`'s own documented heartbeat-cache-
-    // staleness caveat: a standby scheduler's liveness view of an executor
-    // it does not itself serve is only as fresh as its last init).
-    // Scheduler 4 therefore serves its OWN job on its OWN local executor —
-    // two schedulers over one shared catalog, each independently able to
-    // serve a job, never a claim that Ballista binds a task ACROSS two live
-    // schedulers.
+    // The catalog rows are every scheduler's view of who is alive
+    // (`CatalogClusterState::executor_heartbeats` reads them at the moment
+    // Ballista binds and sweeps), so a plan either scheduler places may
+    // bind to any live executor — its own, or one that registered with the
+    // other scheduler and heartbeats there — and the executor reports the
+    // task to the scheduler that launched it. That is what lets a training
+    // attempt scheduler 1 places onto scheduler 4's executor submit its
+    // own materialization through scheduler 4 and have it land on one of
+    // scheduler 1's executors, rather than wait forever for the one slot
+    // the attempt itself is holding.
     let (mut specs, scheduler1_port) = standard_fleet_specs();
     let scheduler4_port = jammi_test_utils::free_port();
     specs.push(ProcSpec::fresh(

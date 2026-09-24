@@ -748,7 +748,7 @@ async fn ready_table_with_poisoned_row(
         key_column: "_row_id".into(),
         dimensions: 4,
     };
-    let env = MaterializationEnv::new(
+    let env = MaterializationEnv::of_models(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "test-model".into(),

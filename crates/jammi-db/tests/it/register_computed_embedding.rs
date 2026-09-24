@@ -22,9 +22,7 @@ use jammi_db::config::AnnIndexConfig;
 use jammi_db::error::JammiError;
 use jammi_db::model_task::ModelTask;
 use jammi_db::session::QueryContext;
-use jammi_db::store::manifest::{
-    AnchorKind, ComputeDevice, InputAnchor, MaterializationEnv, ProducingDescriptor,
-};
+use jammi_db::store::manifest::{AnchorKind, InputAnchor, MaterializationEnv, ProducingDescriptor};
 use jammi_db::store::{ComputedEmbeddingProvenance, EmbeddingTableSpec, ResultStore};
 use jammi_test_utils::unique_suffix;
 use tempfile::tempdir;
@@ -39,7 +37,7 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
 }
 
 fn env() -> MaterializationEnv {
-    MaterializationEnv::new(ComputeDevice::Cpu, vec![])
+    MaterializationEnv::without_models()
 }
 
 fn provenance(

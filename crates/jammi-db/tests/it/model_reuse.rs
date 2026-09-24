@@ -72,7 +72,7 @@ impl Definition {
                 collective: "noop".into(),
                 local_ranks: 1,
             },
-            env: MaterializationEnv::new(
+            env: MaterializationEnv::of_models(
                 ComputeDevice::Cpu,
                 vec![ModelIdentity {
                     model_id: "q-base".into(),

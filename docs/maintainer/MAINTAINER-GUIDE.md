@@ -4105,7 +4105,7 @@ over a two-host loopback fleet (two engines over one catalog and result
 root, the member's real `GangServer::run_rank` on its own runtime) in
 `crates/jammi-server/tests/it/gang_chaos.rs`; the process-level SIGKILL rows
 (a peer, the coordinator) are `crates/jammi-ai/tests/distributed/gang_chaos.rs`,
-advisory in the distributed lane. The oracles:
+in the distributed lane's `chaos` leg. The oracles:
 `crates/jammi-ai/tests/it/gang_coordinator.rs` (a two-rank job within the
 serveable world on a one-device host reaches assembly and lands
 `ShortListed`, cooled, released; the `Moved` CAS arm writes nothing; a

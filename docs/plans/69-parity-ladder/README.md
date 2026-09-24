@@ -166,12 +166,23 @@ randomness between the two stacks can be removed rather than averaged over:
 4. **Law** (`graph-sample`). Two samplers with different random streams cannot be paired or
    digest-compared at all. Each rung's output is instead tested against the workload's
    *analytic ground truth*: the empirical second-order walk transition counts against node2vec's
-   exact `p`/`q` transition probabilities on the fixture graph, by a likelihood-ratio
+   exact `p`/`q` transition probabilities on the fixture graph, by Pearson's chi-square
    goodness-of-fit test with its exact degrees of freedom (`Σ (categories − 1)`: the law is
-   given, no parameter is fitted) at a pre-fixed `α = 0.001`. Both rungs must fit. The law is a
-   committed artifact beside the fixture — `<unit>.json`, `{"cells": [[probability, …], …]}` —
-   whose sha256 is an identity field of every leg, so the ground truth is never a producer's
-   claim.
+   given, no parameter is fitted) at a pre-fixed `α = 0.001`. Both rungs must fit. Each walk
+   state is its own multinomial given how often it was visited (Anderson & Goodman, *Ann. Math.
+   Stat.* 28, 1957), so the cells are independent and their statistics add. Every category must
+   expect five observations (Cochran, *Ann. Math. Stat.* 23, 1952): the observation is sized
+   from the law — the walk's expected state visits are exact, so the law file names the fewest
+   passes at which every reachable state expects five in its least likely next node — and a
+   state a pass happens to under-visit has its sparsest categories pooled, sparsest first, until
+   every category reaches five, decided from the law and the state's visit count alone, never
+   from the counts. A state that cannot reach five in two categories is untested, and the
+   verdict names how many states and steps that left out. Pearson's statistic, not the
+   likelihood ratio's: at moderate expected counts Pearson's holds its nominal level where the
+   likelihood ratio's exceeds it (Larntz, *JASA* 73, 1978). The law is a committed artifact
+   beside the fixture — `<unit>.json`, `{"cells": [[probability, …], …], "observation_passes":
+   N}` — whose sha256 is an identity field of every leg, so the ground truth is never a
+   producer's claim.
 
 **Premises.** A leg's file name claims a rung; the rung's premises check the counted fact behind
 the claim before any number is read. For `train-run`: the schedule is constant; variable-length
@@ -201,13 +212,25 @@ alone: it has no controls of its own and no margin to keep.
 **Speed.** Every leg carries its per-iteration time series, never only a summary. The
 comparator:
 
-- (a) refuses a leg whose series is not stationary after warmup: a Mann-Kendall trend test
+- (a) settles every leg's run itself. A producer files every iteration in run order and
+  decides nothing; the comparator cuts the run's initial transient at the point the marginal
+  standard error rule (MSER; White 1997) chooses over the first half of the run — the prefix
+  whose removal minimises the squared standard error of the mean of what is left — and files
+  the cut in the verdict. MSER chooses a point and tests nothing, so choosing it inflates no
+  error rate. It runs on the iterations themselves, not on batch means of five: over the tens
+  to hundreds of iterations a leg files, a steady run of one-sided timing noise reaches
+  MSER-5's half-way limit several times as often as MSER-1's. A run is at least 32 iterations,
+  so that what is left after a cut of up to half reaches the 16 the rest of the axis needs;
+- (b) refuses a leg whose settled series is not stationary: a Mann-Kendall trend test
   rejecting at 0.01 *and* a Theil-Sen drift over the series above 2% of its median.
   Significance alone would refuse any long series for a drift too small to matter; drift alone
-  would refuse a short noisy one for a slope it cannot resolve;
-- (b) estimates each leg's location by the **minimum** — timing noise is one-sided, so the
+  would refuse a short noisy one for a slope it cannot resolve. It is the one decision on a
+  leg's timing: a run that drifts throughout is cut at MSER's limit and refused here on the
+  half that is left, and a run that settles and then slows is refused on the iterations after
+  the cut, which the cut was never chosen from;
+- (c) estimates each leg's location by the **minimum** — timing noise is one-sided, so the
   minimum is the robust estimator of the undisturbed run — and reports the median beside it;
-- (c) puts the interval on the ratio of **medians**. A minimum cannot carry a bootstrap
+- (d) puts the interval on the ratio of **medians**. A minimum cannot carry a bootstrap
   interval: a resample's minimum is the sample's minimum with probability `→ 1 − 1/e` and is
   never below it, so its bootstrap distribution is a spike whose percentile interval's lower
   bound is the observed value whatever the true floor is. The median is a smooth functional the
@@ -336,14 +359,17 @@ producer's JSON (`<key>` one of `encode_step`, `finetune_step`, `finetune_run`, 
 |---|---|
 | the **payload** `P` | the workload's own fields; its identity is declared once, in `Payload::IDENTITY_FIELDS` (the `Payload` impl of `TrainStepPayload`, `TrainRunPayload`, `EncodePayload`; the list in `ladder/definition.rs` for the workloads without a `jammi-bench` producer). Another framework's leg is held to the same declaration. Numbers agree as numbers; everything else agrees as written |
 | **provenance** | recorded, never compared: `device_name`, `build_features`, `flash_compiled`, `kernels_disabled_requested`, `kernels_disabled_fired`, `arm`, `attention_arm`, `mutant_id`/`mutant_base_sha`/`mutant_patch_sha256`. Absent on a leg another framework produced |
-| **measured** | what every axis reads: `iter_wall_s` (post-warmup wall seconds per timed iteration, in run order; a training run's iteration is its optimizer step, every epoch's `step_walls` in order), `work` (the size the cost scales with), `peak_rss_bytes` and `peak_vram_bytes` (a number, or `{value, unit}` with `value: null` for not measured; every rung uses the same two instruments — the kernel's high-water mark and one whole-device sampler), `outcome_digest`, `held_out_example_mean`, `trajectory[].{epoch, held_out_mean, train_wall_s}`, `vectors_file` + `vector_dim`, `law_observed` |
+| **measured** | what every axis reads: `iter_wall_s` (wall seconds of every iteration of the run, in run order — its initial transient included, for the comparator to cut; a training run's iteration is its optimizer step, every epoch's `step_walls` in order), `work` (the size the cost scales with), `peak_rss_bytes` and `peak_vram_bytes` (a number, or `{value, unit}` with `value: null` for not measured; every rung uses the same two instruments — the kernel's high-water mark and one whole-device sampler), `outcome_digest`, `held_out_example_mean`, `trajectory[].{epoch, held_out_mean, train_wall_s}`, `vectors_file` + `vector_dim`, `law_observed` |
 | **facts** | what the rung premises read: `train_probe_series`, `admission_is_dense`, `tie_fraction`, and the dispatch counters, `<base>_fused_dispatches` with `<base>_eager_dispatches` (`_declined_dispatches` for the flash cascade) for every counted family, read as a whole or not at all |
 
 A leg file is named `<rung>__<unit>__<take>.json`; the legs of the directly measured
 end-to-end pair live in the legs directory's `direct/` subdirectory; a revision edge's legs are
 filed under `<rung>@base`, `<rung>@revised` and `<rung>@rebuilt`. `unit` is one point of the
 sweep (`seed3`, `rows4096`, `b8s128d0`); `take` is `r1`, `r2`, … for measured repeats (`r1`
-carries the outcome, every repeat carries time and memory) or a control's tag (`lr0`).
+carries the outcome, every repeat carries time, and memory when its process was its own), `a1`,
+`a2`, … for a rung's runs alone beside repeats that shared one process (an interleaved encode
+session): they carry the rung's memory and nothing the speed axis pairs; or a control's tag
+(`lr0`). The space axis reads a unit's peak from every measured run that carries it.
 
 ## Sources of the method
 
@@ -364,7 +390,21 @@ carries the outcome, every repeat carries time and memory) or a control's tag (`
   averaged over.
 - D. Lakens, *Equivalence Tests* (2017): a margin claim — non-inferiority or equivalence — has a
   pre-specified smallest effect of interest, and is never the failure of a difference test.
+- K. P. White Jr., *An Effective Truncation Heuristic for Bias Reduction in Simulation Output*
+  (Simulation 69, 1997); K. P. White, M. J. Cobb, S. C. Spratt, *A Comparison of Five
+  Steady-State Truncation Heuristics* (WSC 2000); K. Hoad, S. Robinson, R. Davies, *Automating
+  Warm-up Length Estimation* (JORS 61, 2010); R. J. Wang, P. W. Glynn, *On the Marginal
+  Standard Error Rule and the Testing of Initial Transient Deletion Methods* (ACM TOMACS 27,
+  2016): MSER, the first-half limit, and its batch-means variants.
+- C. Laaber, S. Würsten, H. C. Gall, P. Leitner, *Dynamically Reconfiguring Software
+  Microbenchmarks* (ESEC/FSE '20): steady state judged on a window, then measured on fresh
+  iterations; E. Barrett et al., *Virtual Machine Warmup Blows Hot and Cold* (OOPSLA '17): runs
+  that never reach a steady state, and runs that slow after warming, are common.
 - A. Grover, J. Leskovec, *node2vec* (KDD '16): the second-order walk's transition
   probabilities, the law the samplers are tested against.
+- W. G. Cochran, *The χ² Test of Goodness of Fit* (Ann. Math. Stat. 23, 1952); T. W. Anderson,
+  L. A. Goodman, *Statistical Inference about Markov Chains* (Ann. Math. Stat. 28, 1957);
+  K. Larntz, *Small-Sample Comparisons of Exact Levels for Chi-Squared Goodness-of-Fit
+  Statistics* (JASA 73, 1978): the law fit's floor, its per-state cells, and its statistic.
 - MLCommons, *MLPerf Training Rules*: time-to-train to a quality target, and reference
   convergence points — speed never stands apart from convergence.

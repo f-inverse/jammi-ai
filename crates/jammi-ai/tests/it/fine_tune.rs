@@ -3232,3 +3232,236 @@ async fn training_bails_when_lease_lost_mid_run() {
         "a reclaimed job is re-queued for another worker"
     );
 }
+
+// ─── An attempt holds its lease through its publish; a resume with no epoch
+//     left publishes the run it resumed ────────────────────────────────────
+//
+// The finalize is lease-guarded, and the publish before it stages a bundle
+// whose size and store set how long it takes — so the lease an attempt holds
+// must outlive the publish, not the training. And an attempt whose
+// predecessor trained the whole run but lost its lease before its finalize
+// resumes after the last epoch: it trains nothing, and must still finalize
+// the run its predecessor trained — its history, its best weights, and the
+// job's retained epoch checkpoints, whichever attempt wrote them.
+
+/// A session on the shortest legal lease (3 s, heartbeat 1 s) with a queued
+/// three-epoch fine-tune that retains every epoch checkpoint as a model.
+async fn short_lease_job(dir: &TempDir) -> (Arc<InferenceSession>, String) {
+    let mut config = common::test_config(dir.path());
+    config.lease = jammi_db::config::LeaseConfig {
+        duration_secs: 3,
+        heartbeat_secs: 1,
+    };
+    config.worker = jammi_db::config::WorkerConfig {
+        idle_poll_secs: 1,
+        ..Default::default()
+    };
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    session
+        .add_source(
+            "training",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("training_pairs.csv")),
+                format: Some(FileFormat::Csv),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let job = session
+        .fine_tune(
+            "training",
+            &tiny_bert_model(),
+            &[
+                "text_a".to_string(),
+                "text_b".to_string(),
+                "score".to_string(),
+            ],
+            FineTuneMethod::Lora,
+            ModelTask::TextEmbedding,
+            Some(FineTuneConfig {
+                epochs: 3,
+                batch_size: 8,
+                lora_rank: 4,
+                warmup_steps: 0,
+                keep_last_n_checkpoints: Some(3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    (session, job.job_id)
+}
+
+/// Claim `job_id` as a fresh worker and run the attempt on its own task,
+/// parked before its publish; returns once it is parked.
+async fn attempt_parked_before_publish(
+    session: &Arc<InferenceSession>,
+    job_id: &str,
+) -> (
+    jammi_ai::fine_tune::worker::loop_test_hooks::ParkHandle,
+    tokio::task::JoinHandle<()>,
+) {
+    use jammi_ai::fine_tune::worker::{loop_test_hooks, JobWorker};
+    use std::time::Duration;
+    let park = loop_test_hooks::arm(job_id, loop_test_hooks::ParkPoint::BeforePublish);
+    let worker = JobWorker::new(session).expect("short timing clears the margin");
+    let lease = session.inner_config().lease.intervals().unwrap().lease();
+    let claimed = session
+        .catalog()
+        .claim_next(worker.worker_id(), &["fine_tune"], lease)
+        .await
+        .unwrap()
+        .expect("the queued job is claimable");
+    let session = Arc::clone(session);
+    let run = tokio::spawn(async move { worker.run_claimed_job(&session, claimed).await });
+    tokio::time::timeout(Duration::from_secs(60), park.wait_parked())
+        .await
+        .expect(
+            "a generous backstop against a wedged or starved machine: the attempt never reached \
+             its publish",
+        );
+    (park, run)
+}
+
+/// The run's metrics as the job's terminal result records them.
+async fn run_metrics(session: &InferenceSession, job_id: &str) -> serde_json::Value {
+    let record = session.catalog().get_job(job_id).await.unwrap();
+    let result: jammi_ai::jobs::JobResult = serde_json::from_str(
+        record
+            .result
+            .as_deref()
+            .expect("a completed job has a result"),
+    )
+    .unwrap();
+    let jammi_ai::jobs::JobResult::Model {
+        metrics: Some(metrics),
+        ..
+    } = result
+    else {
+        panic!("a fine-tune's result is a model with metrics");
+    };
+    serde_json::from_str(&metrics).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attempt_holds_its_lease_through_its_publish() {
+    use std::time::Duration;
+    let dir = TempDir::new().unwrap();
+    let (session, job_id) = short_lease_job(&dir).await;
+    let (park, run) = attempt_parked_before_publish(&session, &job_id).await;
+
+    // Parked past the whole lease: only the attempt's own keeper, renewing
+    // while the publish is pending, keeps the row from the sweep.
+    let lease = session.inner_config().lease.intervals().unwrap().lease();
+    tokio::time::sleep(lease * 2).await;
+    let reclaimed = session
+        .catalog()
+        .reclaim_expired_jobs(Duration::from_secs(60), 5)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed, 0, "a publishing attempt's lease is still held");
+
+    park.release();
+    tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect(
+            "a generous backstop against a wedged or starved machine: the attempt never finished",
+        )
+        .unwrap();
+    let record = session.catalog().get_job(&job_id).await.unwrap();
+    assert_eq!((record.status.as_str(), record.attempts), ("completed", 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_with_no_epoch_left_finalizes_the_run_it_resumed() {
+    use jammi_ai::fine_tune::worker::JobWorker;
+    use jammi_db::catalog::backend::{SqlValue, TxOptions};
+    use std::time::Duration;
+    let dir = TempDir::new().unwrap();
+    let (session, job_id) = short_lease_job(&dir).await;
+
+    // Attempt 1 trains all three epochs, then loses its lease before its
+    // finalize: forced stale and swept while it is parked.
+    let (park, run) = attempt_parked_before_publish(&session, &job_id).await;
+    let stale = job_id.clone();
+    session
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE jobs SET lease_expires_at = '2000-01-01T00:00:00.000000Z' \
+                     WHERE job_id = $1",
+                    &[SqlValue::TextOwned(stale)],
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .catalog()
+            .reclaim_expired_jobs(Duration::from_secs(60), 5)
+            .await
+            .unwrap(),
+        1
+    );
+    park.release();
+    tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("a generous backstop against a wedged or starved machine: attempt 1 never finished")
+        .unwrap();
+    assert_ne!(
+        session.catalog().get_job(&job_id).await.unwrap().status,
+        "completed",
+        "attempt 1 lost its lease, so its finalize does not land"
+    );
+
+    // Attempt 2 resumes after the last epoch: it trains nothing.
+    let worker = JobWorker::new(&session).expect("short timing clears the margin");
+    let lease = session.inner_config().lease.intervals().unwrap().lease();
+    let claimed = session
+        .catalog()
+        .claim_next(worker.worker_id(), &["fine_tune"], lease)
+        .await
+        .unwrap()
+        .expect("the reclaimed job is claimable");
+    worker.run_claimed_job(&session, claimed).await;
+
+    let record = session.catalog().get_job(&job_id).await.unwrap();
+    assert_eq!((record.status.as_str(), record.attempts), ("completed", 2));
+    let metrics = run_metrics(&session, &job_id).await;
+    let walls: Vec<u64> = metrics["epoch_walls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["epoch"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        walls,
+        vec![0, 1, 2],
+        "the run's walls, not the resumed attempt's none"
+    );
+    assert_eq!(metrics["train_loss_curve"].as_array().unwrap().len(), 3);
+    let final_loss = metrics["final_loss"].as_f64().unwrap();
+    assert!(
+        final_loss.is_finite() && final_loss < 1e6,
+        "the run's best loss, not a sentinel: {final_loss}"
+    );
+    let output = record
+        .output_model_id
+        .expect("the job names its output model");
+    for epoch in 0..3 {
+        session
+            .catalog()
+            .get_model(&format!("{output}:epoch_{epoch}"))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!("epoch {epoch}'s checkpoint, written by attempt 1, is published")
+            });
+    }
+}

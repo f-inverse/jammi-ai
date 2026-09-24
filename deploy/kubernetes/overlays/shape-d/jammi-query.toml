@@ -31,6 +31,9 @@ enabled = false
 # compute tier's executors when a live one holds every device kind it
 # requires, and in this replica otherwise; a `SELECT` never leaves the
 # replica that received it. This role binds nothing: it dials the
-# scheduler's Service.
+# scheduler's Service. This tier is CPU and the compute tier GPU, so a
+# model's plan names the compute tier's kind, not this replica's; the
+# table records the device the plan actually ran on.
 [ballista.client]
 scheduler_address = "jammi-server-scheduler:50050"
+device_kind = "cuda"

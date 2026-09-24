@@ -138,7 +138,13 @@ impl InProcessRoles {
         )
         .await?;
         let executor_id = executor.executor_id().to_string();
-        host_client(session, &BallistaClientConfig { scheduler_address })?;
+        host_client(
+            session,
+            &BallistaClientConfig {
+                scheduler_address,
+                device_kind: None,
+            },
+        )?;
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let registered = session

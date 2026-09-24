@@ -62,17 +62,37 @@ class DryRunTests(unittest.TestCase):
         self.assertIn(f"ladder encode {self.out.name}/legs-plan --out {self.out.name}/verdict-plan", ladder[0])
         self.assertIn(f"ladder encode {self.out.name}/legs-sorted --out {self.out.name}/verdict-sorted", ladder[1])
 
-    def test_the_engine_rungs_run_interleaved_then_each_alone(self):
-        _, legs, _ = self.run_and_parse(ENCODE_AB_PARTITIONS="6", ENCODE_AB_ROWS="16,64", ENCODE_AB_DTYPE="bf16", ENCODE_AB_TAKES="3")
+    def test_the_planes_rungs_join_the_session_and_run_alone_on_their_fleet(self):
+        _, legs, _ = self.run_and_parse(ENCODE_AB_RUNGS="plan,plan-partitioned,placed,shape-d")
         interleaved = legs["jammi-interleaved"]
-        self.assertIn("encode-step --task embed --rows 16\\,64 --takes 3 --partitions 6 ", interleaved)
+        self.assertIn("--rung plan --rung plan-partitioned --rung placed --rung shape-d", interleaved)
+        for label in ("jammi-interleaved", "jammi-plan", "jammi-placed", "jammi-shape-d"):
+            self.assertRegex(legs[label], r"--server-bin \S+/release/jammi-server ")
+        self.assertNotIn("jammi-direct", legs)
+
+    def test_a_rung_the_engine_does_not_have_is_refused(self):
+        result = subprocess.run(
+            ["bash", SCRIPT],
+            env={**os.environ, "ENCODE_AB_DRY_RUN": "1", "ENCODE_AB_RUNGS": "plan,warp"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'warp'", result.stderr)
+
+    def test_the_engine_rungs_run_interleaved_then_each_alone(self):
+        _, legs, _ = self.run_and_parse(ENCODE_AB_PARTITIONS="6", ENCODE_AB_ROWS="16,64", ENCODE_AB_DTYPE="bf16", ENCODE_AB_TAKE="1,2,3")
+        interleaved = legs["jammi-interleaved"]
+        self.assertIn("encode-step --task embed --rows 16\\,64 --partitions 6 ", interleaved)
+        self.assertIn(" --take 1\\,2\\,3 ", interleaved)
         self.assertIn("--rung direct --rung plan --rung plan-partitioned", interleaved)
         self.assertIn("--compute-precision bf16", interleaved)
         self.assertIn(f"--legs-dir {self.out.name}/legs-plan ", interleaved)
         self.assertIn(f"--exchange-dir {self.out.name}/exchange ", interleaved)
         for label, rung in (("jammi-direct", "direct"), ("jammi-plan", "plan"), ("jammi-plan-partitioned", "plan-partitioned")):
             self.assertTrue(legs[label].endswith(f"--rung {rung} "), legs[label])
-            self.assertIn(f"--legs-dir {self.out.name}/legs-plan/space ", legs[label])
+            # Alone, in the same legs directory: filed as `a<take>`, read for space.
+            self.assertIn(f"--legs-dir {self.out.name}/legs-plan ", legs[label])
         for command in legs.values():
             if "encode-step" in command:
                 self.assertNotIn("--cuda", command)

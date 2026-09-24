@@ -762,6 +762,10 @@ fn run_with(
     // process invocation did.
     let dispatch_before = DispatchCounters::snapshot();
 
+    // Every step's wall in run order is the ladder's series, warmup steps
+    // included — where the run settled is the ladder's to find. `--warmup`
+    // is where the reported loss record starts, which the twin mirrors.
+    let mut iter_wall_s = Vec::with_capacity(params.warmup + params.steps);
     let mut times = Vec::with_capacity(params.steps);
     let mut losses = Vec::with_capacity(params.steps);
     for step in 0..(params.warmup + params.steps) {
@@ -779,8 +783,10 @@ fn run_with(
             &trainable,
             params.max_grad_norm,
         )?;
+        let wall = t0.elapsed().as_secs_f64();
+        iter_wall_s.push(wall);
         if step >= params.warmup {
-            times.push(t0.elapsed().as_secs_f64());
+            times.push(wall);
             losses.push(loss_val);
         }
     }
@@ -820,9 +826,8 @@ fn run_with(
     // then both read `[]` here too, distinguishing it from a genuine
     // forced-eager run (both non-empty and equal) that a caller intended to
     // compare against.
-    // The series in run order is what the ladder's speed axis reads; the
-    // summaries beside it are read off the sorted copy.
-    let iter_wall_s = times.clone();
+    // The summaries beside the series are over the steps the loss record
+    // covers, read off a sorted copy.
     times.sort_by(f64::total_cmp);
     let p50 = times[times.len() / 2];
     let mean = times.iter().sum::<f64>() / times.len() as f64;

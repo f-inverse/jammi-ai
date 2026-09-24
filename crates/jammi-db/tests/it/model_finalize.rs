@@ -132,7 +132,7 @@ async fn attest(store: &ResultStore, staged: &StagedArtifact) -> Materialization
         collective: "noop".into(),
         local_ranks: 1,
     };
-    let env = MaterializationEnv::new(
+    let env = MaterializationEnv::of_models(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "q-base".into(),

@@ -84,7 +84,7 @@ for t in sorted(nbrs):
         z = sum(w.values())
         cells.append([w[x] / z for x in sorted(nbrs[v])])
 law = root / "gs" / "law"; law.mkdir(parents=True)
-(law / f"edges{len(edges)}.json").write_text(json.dumps({"cells": cells}))
+(law / f"edges{len(edges)}.json").write_text(json.dumps({"cells": cells, "observation_passes": 7}))
 
 # --- propagate: 7 nodes, one edge listed twice, one in both directions, a
 # self-edge; the dense reference beside.
@@ -288,7 +288,7 @@ class TorchGraphRungs(unittest.TestCase):
             "torch_graph_sample.py", "graph_sample", legs_dir,
             "--graph", str(self.root / "graph"), "--legs-dir", str(legs_dir),
             "--walk-length", "5", "--walks-per-node", "3", "--return-p", "0.25", "--in-out-q", "4",
-            "--warmup", "1", "--iterations", "4",
+            "--iterations", "4",
         )
         unit = f"edges{len(self.edges)}"
         self.assert_leg_shape(leg, legs_dir, f"torch__{unit}__r1.json", 4)
@@ -302,8 +302,10 @@ class TorchGraphRungs(unittest.TestCase):
         cells = json.loads(law_file.read_text())["cells"]
         observed = leg["law_observed"]
         self.assertEqual([len(c) for c in observed], [len(c) for c in cells])
-        # 6 nodes x 3 walks x 5 steps, over warm-up + measured iterations.
-        self.assertEqual(sum(map(sum, observed)), 6 * 3 * 5 * 5)
+        # 6 nodes x 3 walks x 5 steps, over the law file's passes — not the
+        # timed series' length.
+        self.assertEqual(leg["observation_passes"], 7)
+        self.assertEqual(sum(map(sum, observed)), 6 * 3 * 5 * 7)
         pairs = [json.loads(line) for line in Path(leg["pairs_file"]["path"]).read_text().splitlines()]
         self.assertEqual([p["_ordinal"] for p in pairs], list(range(len(pairs))))
         self.assertTrue(all(p["anchor_id"] != p["positive_id"] for p in pairs))
@@ -316,7 +318,7 @@ class TorchGraphRungs(unittest.TestCase):
 
     def test_propagate_torch_rung_is_the_stated_operator_and_pyg_agrees(self):
         legs_dir = self.root / "prop"
-        common = ["--legs-dir", str(legs_dir), "--unit", "edges6", "--hops", "2", "--alpha", "0.1", "--warmup", "1", "--iterations", "2"]
+        common = ["--legs-dir", str(legs_dir), "--unit", "edges6", "--hops", "2", "--alpha", "0.1", "--iterations", "2"]
         (exact,) = legs("torch_propagate.py", "propagate", legs_dir, *common, "--impl", "exact")
         (pyg,) = legs("torch_propagate.py", "propagate", legs_dir, *common, "--impl", "pyg")
         self.assert_leg_shape(exact, legs_dir, "torch__edges6__r1.json", 2)
@@ -338,7 +340,7 @@ class TorchGraphRungs(unittest.TestCase):
         legs_dir = self.root / "struct"
         (leg,) = legs(
             "torch_structure.py", "structure", legs_dir,
-            "--legs-dir", str(legs_dir), "--unit", "edges6", "--weights", "0,0,1,1,1", "--warmup", "1", "--iterations", "2",
+            "--legs-dir", str(legs_dir), "--unit", "edges6", "--weights", "0,0,1,1,1", "--iterations", "2",
         )
         self.assert_leg_shape(leg, legs_dir, "torch__edges6__r1.json", 2)
         self.assertEqual(leg["edge_count"], 6, "a repeated pair is one edge and a self-edge is none")
@@ -358,9 +360,9 @@ class TorchGraphRungs(unittest.TestCase):
                 (leg,) = legs(
                     "torch_context_predictor.py", "predictor_train_run", legs_dir,
                     "--legs-dir", str(legs_dir), "--arch", arch, "--seeds", "7", "--epochs", "4", "--learning-rate", "0.01",
-                    "--grad-clip", "1.0", "--num-heads", "2", "--num-layers", "2", "--warmup-steps", "2",
+                    "--grad-clip", "1.0", "--num-heads", "2", "--num-layers", "2",
                 )
-                self.assert_leg_shape(leg, legs_dir, "torch__seed7__r1.json", 4 * 3 - 2)
+                self.assert_leg_shape(leg, legs_dir, "torch__seed7__r1.json", 4 * 3)
                 self.assertEqual(leg["architecture"], arch)
                 self.assertEqual((leg["context_k"], leg["feature_dim"], leg["value_dim"], leg["head_width"], leg["batch"]), (3, 3, 1, 2, 4))
                 self.assertEqual(leg["schedule"], "constant")

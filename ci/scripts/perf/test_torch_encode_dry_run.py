@@ -55,7 +55,7 @@ class TorchEncodeDryRun(unittest.TestCase):
             self.assertFalse(missing or null, f"absent: {missing}; null but declared non-null: {null}")
 
     def test_the_legs_follow_the_ladders_contract(self):
-        expected = [(rows, take) for rows in torch_encode.DRY_RUN_ROWS for take in range(1, torch_encode.DRY_RUN_TAKES + 1)]
+        expected = [(rows, take) for rows in torch_encode.DRY_RUN_ROWS for take in range(1, torch_encode.ll.MIN_REPEATS + 1)]
         self.assertEqual([(leg["rows"], leg["take"]) for leg in self.legs], expected)
         for leg in self.legs:
             stem = f"torch__rows{leg['rows']}__r{leg['take']}"

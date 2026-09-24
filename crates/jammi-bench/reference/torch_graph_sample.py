@@ -17,11 +17,13 @@ CSR; that walker samples uniformly only and refuses `p != 1` or `q != 1`
 and nothing else. Which one ran is provenance.
 
 The law is the engine rung's: `<law-dir>/<unit>.json`,
-`{"cells": [[probability, …], …]}`, one cell per walk state `(previous,
-current)` in ascending order with the first-step states (`previous` absent)
-first, the probabilities of the state's next nodes in ascending order. This
-script recomputes the law from the graph to know that order, refuses if its
-probabilities are not the file's, counts its walks in it, and names the file
+`{"cells": [[probability, …], …], "observation_passes": N}`, one cell per walk
+state `(previous, current)` in ascending order with the first-step states
+(`previous` absent) first, the probabilities of the state's next nodes in
+ascending order, and the untimed passes both rungs count their steps over.
+This script recomputes the law from the graph to know that order, refuses if
+its probabilities are not the file's, counts N passes' walks in it, and names
+the file
 by its sha256 as `law_sha256` — the ground truth is the committed file, never
 a producer's claim.
 
@@ -143,7 +145,8 @@ def run(args, graph: Path, take: int) -> list[str]:
     start = torch.arange(len(ids)).repeat_interleave(args.walks_per_node)
 
     law_path = (args.law_dir or args.legs_dir / "law") / f"{unit}.json"
-    law_cells = json.loads(law_path.read_text(encoding="utf-8"))["cells"]
+    law_file = json.loads(law_path.read_text(encoding="utf-8"))
+    law_cells, observation_passes = law_file["cells"], law_file["observation_passes"]
     law = transition_law(edges, args.return_p, args.in_out_q)
     if len(law_cells) != len(law) or any(
         len(cell) != len(nexts) or any(abs(a - b) > 1e-12 for a, b in zip(cell, (p for _, p in nexts)))
@@ -153,17 +156,18 @@ def run(args, graph: Path, take: int) -> list[str]:
     cell_index = {state: i for i, (state, _) in enumerate(law)}
     next_index = {state: {x: j for j, (x, _) in enumerate(nexts)} for state, nexts in law}
 
-    series = ll.IterationSeries(args.warmup, args.iterations)
-    for i in range(series.total):
+    iter_wall_s: list[float] = []
+    for i in range(args.iterations):
         torch.manual_seed(args.seed + i)
         t0 = time.perf_counter()
         walker(start)
-        series.record(time.perf_counter() - t0)
+        iter_wall_s.append(time.perf_counter() - t0)
     peak = ll.peak_rss_bytes()
 
-    # Untimed, after the peak is read: one observed pass per timed seed.
+    # Untimed, after the peak is read: the passes the law file asks for, one
+    # seed each.
     observed = [[0] * len(nexts) for _, nexts in law]
-    for i in range(series.total):
+    for i in range(observation_passes):
         torch.manual_seed(args.seed + i)
         for nodes in walker(start).tolist():
             for j in range(len(nodes) - 1):
@@ -209,15 +213,15 @@ def run(args, graph: Path, take: int) -> list[str]:
         "edge_set_symmetric": symmetric,
         "hard_negatives": 0,
         "exclude_hops": None,
-        "warmup": args.warmup,
-        "iters_measured": len(series.seconds),
+        "iters_measured": len(iter_wall_s),
         "walks": int(start.numel()),
+        "observation_passes": observation_passes,
         "sampled_pairs": len(pair_rows),
         "pairs_file": pairs_file,
         "walker": walker_name,
         **ll.provenance(),
         # Measured.
-        "iter_wall_s": series.seconds,
+        "iter_wall_s": iter_wall_s,
         "work": len(edges),
         "peak_rss_bytes": peak,
         "peak_vram_bytes": ll.NOT_MEASURED_BYTES,
@@ -238,24 +242,22 @@ def main() -> None:
     parser.add_argument("--return-p", type=float, default=1.0)
     parser.add_argument("--in-out-q", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup", type=int, default=2)
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--takes", type=int, default=1, help="measured repeats of each graph, each in its own process")
-    parser.add_argument("--take", type=int, default=1, help="the take a single graph's run is filed as")
+    parser.add_argument("--iterations", type=int, default=32, help="passes timed and filed; the ladder settles no fewer than 32")
+    ll.add_take_argument(parser)
     args = parser.parse_args()
 
-    points = [(graph, take) for graph in args.graph for take in range(1, args.takes + 1)]
+    points = [(graph, take) for graph in args.graph for take in args.take]
 
     def argv_for(point) -> list[str]:
         graph, take = point
         argv = ["--graph", str(graph), "--legs-dir", str(args.legs_dir), "--walker", args.walker, "--take", str(take)]
         if args.law_dir:
             argv += ["--law-dir", str(args.law_dir)]
-        for flag in ("walk_length", "walks_per_node", "return_p", "in_out_q", "seed", "warmup", "iterations"):
+        for flag in ("walk_length", "walks_per_node", "return_p", "in_out_q", "seed", "iterations"):
             argv += [f"--{flag.replace('_', '-')}", str(getattr(args, flag))]
         return argv
 
-    files = ll.legs_per_point(points, lambda point: run(args, point[0], args.take if len(points) == 1 else point[1]), argv_for)
+    files = ll.legs_per_point(points, lambda point: run(args, *point), argv_for)
     print(json.dumps(files))
 
 

@@ -28,9 +28,7 @@ use crate::error::{JammiError, Result};
 use crate::model_task::ModelTask;
 use crate::session::QueryContext;
 use crate::store::building::BuildingTable;
-use crate::store::manifest::{
-    ComputeDevice, InputAnchor, Materialization, MaterializationEnv, ProducingDescriptor,
-};
+use crate::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
 use crate::store::{ResultStore, ResultTableOrigin, SinkKind};
 
 #[cfg(doc)]
@@ -154,8 +152,6 @@ impl ResultStore {
         let descriptor = ProducingDescriptor::Statement {
             query: statement.query.clone(),
         };
-        // A statement runs no model; its rows do not depend on a device.
-        let env = MaterializationEnv::new(ComputeDevice::Cpu, Vec::new());
         let now = chrono::Utc::now().to_rfc3339();
         let inputs = statement
             .sources
@@ -166,7 +162,7 @@ impl ResultStore {
             .finish(
                 ctx,
                 summary.rows as usize,
-                Materialization::new(&descriptor, &env, inputs),
+                Materialization::new(&descriptor, &summary.env, inputs),
             )
             .await
     }

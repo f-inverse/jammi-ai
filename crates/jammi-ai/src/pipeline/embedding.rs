@@ -38,22 +38,11 @@ pub(crate) async fn embedding_definition(
         .model
         .embedding_dim()
         .ok_or_else(|| JammiError::Inference("Model does not support embeddings".into()))?;
-    let backend_kind = guard.model.backend_kind();
-    let compute_precision = guard.model.compute_precision();
-    let content_digest = guard.model.content_digest()?;
-    let quantization = guard.model.quantization();
-    drop(guard);
-    let canonical_model_id = model_source.to_string();
-    let env = jammi_db::store::manifest::MaterializationEnv::new(
+    let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),
-        vec![jammi_db::store::manifest::ModelIdentity {
-            model_id: canonical_model_id,
-            backend: backend_kind.to_string(),
-            compute_precision,
-            content_digest,
-            quantization,
-        }],
+        vec![guard.model.identity(&model_source)?],
     );
+    drop(guard);
     Ok(EmbeddingDefinition {
         model_source,
         embedding_dim,
@@ -106,7 +95,7 @@ pub async fn build_embedding_plan(
         embedding_dim: Some(embedding_dim),
         regression_form: None,
         passthrough: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
-        device_kind: session.compute_device().kind(),
+        device_kind: session.required_device_kind(),
         partitions: inference.fan_out()?,
     };
     let plan = plan_inference(
@@ -284,15 +273,16 @@ impl<'a> EmbeddingPipeline<'a> {
             ));
         }
 
-        // Finish with the contract built at the top (the same definition +
-        // anchors the cache probe keyed on): renew the lease, write the
-        // manifest sidecar, flip the catalog row `building -> ready` by CAS,
-        // and register in DataFusion.
+        // Finish with the descriptor and anchors built at the top and the
+        // environment the process that ran the plan reports (the cache probe
+        // keyed on this process's prediction of it): renew the lease, write
+        // the manifest sidecar, flip the catalog row `building -> ready` by
+        // CAS, and register in DataFusion.
         let record = building
             .finish(
                 self.session.context(),
                 summary.rows as usize,
-                jammi_db::store::manifest::Materialization::new(&descriptor, &env, inputs),
+                jammi_db::store::manifest::Materialization::new(&descriptor, &summary.env, inputs),
             )
             .instrument(tracing::debug_span!("embed.finish"))
             .await?;

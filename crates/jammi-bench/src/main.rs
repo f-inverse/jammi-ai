@@ -331,7 +331,9 @@ struct FleetEnvArgs {
     /// `host:port` of the fleet's scheduler.
     #[arg(long)]
     scheduler_address: String,
-    /// The CUDA ordinal a compute process trains on; CPU when omitted.
+    /// The CUDA ordinal the fleet's compute tier trains on; the CPU when
+    /// omitted. The same value places every role of one fleet: the compute
+    /// role trains on it, the query role names its kind.
     #[arg(long)]
     device: Option<usize>,
     #[arg(long, default_value_t = 8815)]
@@ -568,9 +570,8 @@ enum Command {
         /// The corpus row count of each sweep unit, comma-separated.
         #[arg(long, value_delimiter = ',', default_values_t = [16, 256])]
         rows: Vec<usize>,
-        /// Measured repeats of each unit, each in a process of its own.
-        #[arg(long, default_value_t = 1)]
-        takes: usize,
+        #[command(flatten)]
+        takes: capture::Takes,
         /// The corpus generation seed.
         #[arg(long, default_value_t = 0)]
         seed: u64,
@@ -589,13 +590,11 @@ enum Command {
         /// loads at unless its own `config.json` declares one.
         #[arg(long, default_value = "f32")]
         compute_precision: jammi_numerics::ComputePrecision,
-        /// Warm serves discarded before the measured ones, per rung.
-        #[arg(long, default_value_t = 2)]
-        warmup: usize,
-        /// Measured serves per rung (even, when rungs are interleaved). The
-        /// default is the comparator's minimum series; a shorter run files
-        /// legs the speed axis refuses by name and the outcome axis reads.
-        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_SAMPLES)]
+        /// Serves per rung, every one timed and filed (even, when rungs are
+        /// interleaved). The default is the fewest the ladder settles; a
+        /// shorter run files legs the speed axis refuses by name and the
+        /// outcome axis reads.
+        #[arg(long, default_value_t = ladder::definition::SpeedInstrument::MIN_RUN)]
         iters: usize,
         /// Leave each unit's corpus (`corpus_<rows>.parquet`) and — without
         /// `--model-dir` — the fixture checkpoint (`model/`) here, for
@@ -650,8 +649,6 @@ enum Command {
         partitions: usize,
         #[arg(long)]
         compute_precision: jammi_numerics::ComputePrecision,
-        #[arg(long)]
-        warmup: usize,
         #[arg(long)]
         iters: usize,
         #[arg(long)]
@@ -968,7 +965,6 @@ async fn main() -> std::process::ExitCode {
             batch_tokens,
             partitions,
             compute_precision,
-            warmup,
             iters,
             exchange_dir,
             legs_dir,
@@ -978,13 +974,12 @@ async fn main() -> std::process::ExitCode {
             rungs,
             model_dir,
             rows,
-            takes,
+            takes: takes.iter().collect(),
             seed,
             batch_size,
             batch_tokens,
             partitions,
             compute_precision,
-            warmup,
             iters,
             gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
             exchange_dir,
@@ -1004,7 +999,6 @@ async fn main() -> std::process::ExitCode {
             batch_tokens,
             partitions,
             compute_precision,
-            warmup,
             iters,
             exchange_dir,
             legs_dir,
@@ -1016,13 +1010,12 @@ async fn main() -> std::process::ExitCode {
                     rungs,
                     model_dir,
                     rows: vec![rows],
-                    takes: take,
+                    takes: vec![take],
                     seed,
                     batch_size,
                     batch_tokens,
                     partitions,
                     compute_precision,
-                    warmup,
                     iters,
                     gpu_device: cuda
                         .map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
@@ -2443,7 +2436,7 @@ fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
             exec_bind: args.exec_bind_port,
             exec_grpc: args.exec_grpc_port,
         },
-        device: args.device.map_or(-1, |o| o as i32),
+        compute_device: args.device.map_or(-1, |o| o as i32),
     });
     println!(
         "# jammi-server --config deploy/kubernetes/overlays/shape-d/jammi-{}.toml",

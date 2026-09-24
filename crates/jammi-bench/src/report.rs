@@ -1237,9 +1237,7 @@ pub struct EncodePayload {
     /// Whether the artifact is L2-normalized: every embedding is, a score
     /// distribution is not.
     pub normalize: bool,
-    /// Warm serves discarded before the measured ones.
-    pub warmup: usize,
-    /// The measured serves: the length of the leg's `iter_wall_s`.
+    /// The serves timed and filed: the length of the leg's `iter_wall_s`.
     pub iters_measured: usize,
     /// sha256 of the model dir's `1_Pooling/config.json` bytes; `None` when
     /// the checkpoint carries no pooling config of its own.
@@ -1308,7 +1306,6 @@ impl Payload for EncodePayload {
         ("checkpoint_tokenizer_sha256", Nullable::NonNull),
         ("pooling", Nullable::NonNull),
         ("normalize", Nullable::NonNull),
-        ("warmup", Nullable::NonNull),
         ("iters_measured", Nullable::NonNull),
         (
             "checkpoint_pooling_sha256",

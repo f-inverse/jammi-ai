@@ -284,6 +284,7 @@ pub fn host_client(
         .install(Arc::new(ClientComputePlane {
             session: Arc::clone(session),
             scheduler_url: scheduler_url.clone(),
+            device_kind: cfg.device_kind,
         }));
     Ok(ClientRole { scheduler_url })
 }
@@ -295,9 +296,14 @@ pub fn host_client(
 struct ClientComputePlane {
     session: Arc<InferenceSession>,
     scheduler_url: String,
+    device_kind: Option<jammi_db::store::manifest::ComputeDeviceKind>,
 }
 
 impl ComputePlane for ClientComputePlane {
+    fn device_kind(&self) -> Option<jammi_db::store::manifest::ComputeDeviceKind> {
+        self.device_kind
+    }
+
     fn unheld(
         &self,
         plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,

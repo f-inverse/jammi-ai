@@ -58,6 +58,7 @@ use crate::error::{JammiError, Result};
 use crate::index::segment::SegmentId;
 use crate::index::sidecar::SidecarIndex;
 use crate::storage::{ObjectParquetWriter, StorageError, StorageUrl};
+use crate::store::manifest::MaterializationEnv;
 use crate::store::segment_builder::SegmentBuilder;
 use crate::store::{layout, BuildingTable, BuildingVersion, ResultStore};
 use crate::tenant::TenantId;
@@ -204,8 +205,32 @@ impl ResultTableSinkSpec {
     }
 }
 
+/// The environment a process produces a materialization's bytes in: its
+/// compute device, and the identity of every model the plan runs. Asked of
+/// the process that runs the sink — the submitter when the plan runs where
+/// it was issued, the executor when it is placed — so a table records what
+/// produced it, never what its submitter would have. Asked once the plan has
+/// run, when every model it names is loaded.
+#[async_trait::async_trait]
+pub trait ProducingEnvironment: Send + Sync {
+    async fn of(&self, plan: &Arc<dyn ExecutionPlan>) -> Result<MaterializationEnv>;
+}
+
+/// A process that runs no model: whatever plan it produces, its environment
+/// is the model-free one.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelFreeEnvironment;
+
+#[async_trait::async_trait]
+impl ProducingEnvironment for ModelFreeEnvironment {
+    async fn of(&self, _plan: &Arc<dyn ExecutionPlan>) -> Result<MaterializationEnv> {
+        Ok(MaterializationEnv::without_models())
+    }
+}
+
 /// What one sink reports back to its submitter: the rows its child
-/// produced, the rows it wrote, and the segments it appended.
+/// produced, the rows it wrote, the segments it appended, and the
+/// environment that produced them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkSummary {
     /// Rows the child produced, before any filter.
@@ -215,10 +240,14 @@ pub struct SinkSummary {
     /// The ANN segments appended under the lease, in the order of the rows
     /// they hold: empty unless a row realized under an embedding kind.
     pub segments: Vec<SegmentId>,
+    /// The environment of the process that ran the sink — what the table's
+    /// manifest records.
+    pub env: MaterializationEnv,
 }
 
 impl SinkSummary {
-    /// The summary batch's schema: `input_rows`, `rows`, `segment_ids`.
+    /// The summary batch's schema: `input_rows`, `rows`, `segment_ids`,
+    /// and `env` as JSON.
     pub fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("input_rows", DataType::UInt64, false),
@@ -228,6 +257,7 @@ impl SinkSummary {
                 DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
                 false,
             ),
+            Field::new("env", DataType::Utf8, false),
         ]))
     }
 
@@ -240,12 +270,15 @@ impl SinkSummary {
             )),
             None,
         );
+        let env = serde_json::to_string(&self.env)
+            .map_err(|e| JammiError::Other(format!("sink summary env: {e}")))?;
         RecordBatch::try_new(
             Self::schema(),
             vec![
                 Arc::new(UInt64Array::from(vec![self.input_rows])),
                 Arc::new(UInt64Array::from(vec![self.rows])),
                 Arc::new(ids),
+                Arc::new(StringArray::from(vec![env])),
             ],
         )
         .map_err(|e| JammiError::Other(format!("sink summary batch: {e}")))
@@ -285,10 +318,19 @@ impl SinkSummary {
         let ids = ids.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
             JammiError::Other("result table sink summary: segment_ids are not Int64".into())
         })?;
+        let env = column("env")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.value(0))
+            .ok_or_else(|| {
+                JammiError::Other("result table sink summary: env is not Utf8".into())
+            })?;
         Ok(Self {
             input_rows: u64_at("input_rows")?,
             rows: u64_at("rows")?,
             segments: ids.values().iter().map(|&id| SegmentId(id)).collect(),
+            env: serde_json::from_str(env)
+                .map_err(|e| JammiError::Other(format!("result table sink summary env: {e}")))?,
         })
     }
 }
@@ -725,7 +767,7 @@ async fn write_under(
         input_rows: 0,
         phases: SinkPhases::default(),
     };
-    let mut rows = execute_stream(input, context)?;
+    let mut rows = execute_stream(Arc::clone(&input), context)?;
     if let SinkKind::TrainingSet { columns, .. } = &spec.kind {
         rows = crate::store::assert_batches_are_ordinal_sorted(rows, columns);
     }
@@ -783,6 +825,7 @@ async fn write_under(
         input_rows,
         rows,
         segments,
+        env: store.producing_environment().of(&input).await?,
     })
 }
 
@@ -972,5 +1015,35 @@ impl ResultStore {
             .await
             .map_err(JammiError::from)?;
         SinkSummary::from_batches(&batches)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::manifest::{ComputeDevice, ModelContentDigest, ModelIdentity};
+
+    /// What a placed sink hands back crosses the wire as its one summary
+    /// row: the counts, the segments, and the environment that produced
+    /// them come back as they left.
+    #[test]
+    fn a_summary_round_trips_through_its_batch() {
+        let summary = SinkSummary {
+            input_rows: 7,
+            rows: 5,
+            segments: vec![SegmentId(3), SegmentId(4)],
+            env: MaterializationEnv::of_models(
+                ComputeDevice::Cuda { ordinal: 0 },
+                vec![ModelIdentity {
+                    model_id: "local:/models/encoder".into(),
+                    backend: "candle".into(),
+                    compute_precision: jammi_numerics::ComputePrecision::BF16,
+                    content_digest: ModelContentDigest::Sha256("digest".into()),
+                    quantization: None,
+                }],
+            ),
+        };
+        let batch = summary.clone().into_batch().unwrap();
+        assert_eq!(SinkSummary::from_batches(&[batch]).unwrap(), summary);
     }
 }

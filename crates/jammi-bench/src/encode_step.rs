@@ -184,8 +184,8 @@ pub struct EncodeStepParams {
     pub model_dir: Option<PathBuf>,
     /// The sweep: the corpus row count of each unit.
     pub rows: Vec<usize>,
-    /// How many times each unit is measured, each in a process of its own.
-    pub takes: usize,
+    /// The takes each unit is measured as, each in a process of its own.
+    pub takes: Vec<usize>,
     /// The corpus generation seed.
     pub seed: u64,
     /// `[inference] batch_size` — the row cap of a forward chunk, on every
@@ -200,9 +200,7 @@ pub struct EncodeStepParams {
     /// own `config.json` declares one. What it RESOLVED to is what a leg
     /// records, read off the loaded model.
     pub compute_precision: jammi_numerics::ComputePrecision,
-    /// Warm serves before the measured ones, per rung, discarded.
-    pub warmup: usize,
-    /// Measured serves per rung.
+    /// Serves per rung, every one timed and filed in run order.
     pub iters: usize,
     /// The device ordinal the sessions resolve on: [`CPU_HERMETIC_DEVICE`]
     /// (`-1`), or a CUDA ordinal the box must actually have.
@@ -232,13 +230,13 @@ impl EncodeStepParams {
             self.batch_size,
             self.batch_tokens,
             self.iters,
-            self.takes,
             self.rungs.len(),
         ];
-        if self.rows.is_empty() || self.rows.contains(&0) || counts.contains(&0) {
+        let unmeasured = |sweep: &[usize]| sweep.is_empty() || sweep.contains(&0);
+        if unmeasured(&self.rows) || unmeasured(&self.takes) || counts.contains(&0) {
             return Err(format!(
                 "encode-step needs at least one rung, one row count and one take, and every row \
-                 count, the chunk budget and the measured iterations at least 1: {self:?}"
+                 count, take, the chunk budget and the measured iterations at least 1: {self:?}"
             )
             .into());
         }
@@ -1217,7 +1215,10 @@ pub async fn measure_legs(
                     &corpus_path,
                     corpus_connection(&corpus_path)?,
                     params.gpu_device,
-                    &format!("encode-{}", leg_stem(rung, row_count, take)),
+                    &format!(
+                        "encode-{}",
+                        leg_stem(rung.as_str(), row_count, take, params.rungs.len() == 1)
+                    ),
                 )
                 .await
                 .map_err(plane_err)?;
@@ -1299,16 +1300,13 @@ pub async fn measure_legs(
     for (slot, session) in sessions.iter_mut().enumerate() {
         served[slot].first_serve_ms = session.serve(&unit).await?.0 * 1_000.0;
     }
-    for round in 0..params.warmup + params.iters {
+    for round in 0..params.iters {
         let mut order: Vec<usize> = (0..sessions.len()).collect();
         if round % 2 == 1 {
             order.reverse();
         }
         for slot in order {
             let (wall_s, phases, artifact, ran_on) = sessions[slot].serve(&unit).await?;
-            if round < params.warmup {
-                continue;
-            }
             let into = &mut served[slot];
             into.iter_wall_s.push(wall_s);
             into.phases.extend(phases);
@@ -1343,9 +1341,14 @@ pub async fn measure_legs(
             )
             .into());
         }
+        // The outcome is read off the first repeat's vectors; a run alone
+        // carries its rung's memory and nothing the outcome pairs.
         let vectors = match (&artifact, &params.legs_dir, take) {
-            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) => {
-                let name = format!("{}.vectors.f32", leg_stem(session.rung, row_count, take));
+            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) if !solo => {
+                let name = format!(
+                    "{}.vectors.f32",
+                    leg_stem(session.rung.as_str(), row_count, take, solo)
+                );
                 std::fs::create_dir_all(legs_dir)?;
                 let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write(legs_dir.join(&name), bytes)?;
@@ -1371,7 +1374,6 @@ pub async fn measure_legs(
             checkpoint_tokenizer_sha256: checkpoint_tokenizer_sha256.clone(),
             pooling: pooling.clone(),
             normalize: params.task == Task::Embed,
-            warmup: params.warmup,
             iters_measured: served.iter_wall_s.len(),
             checkpoint_pooling_sha256: checkpoint_pooling_sha256.clone(),
             device_requested: requested_device_label(params.gpu_device),
@@ -1444,9 +1446,20 @@ pub async fn measure_legs(
     Ok(legs)
 }
 
-/// A leg's file stem: `<rung>__rows<N>__r<take>`, the ladder's leg contract.
-fn leg_stem(rung: Rung, row_count: usize, take: usize) -> String {
-    format!("{}__rows{row_count}__r{take}", rung.as_str())
+/// A leg's file stem by the ladder's contract: a repeat when its session
+/// interleaves several rungs — the legs an edge's speed pairs — and a run
+/// alone when it serves one, the leg its rung's memory is read from.
+fn leg_stem(rung: &str, row_count: usize, take: usize, alone: bool) -> String {
+    let take = u32::try_from(take).expect("a take count fits u32");
+    crate::capture::leg_stem(
+        rung,
+        &format!("rows{row_count}"),
+        if alone {
+            crate::ladder::leg::Take::Alone(take)
+        } else {
+            crate::ladder::leg::Take::Repeat(take)
+        },
+    )
 }
 
 /// The reports one leg session prints: one per rung, the leg under
@@ -1554,20 +1567,21 @@ fn summarize(leg: &serde_json::Value, file: Option<String>) -> Option<LegSummary
 }
 
 /// File one leg's report under `legs_dir` by the ladder's leg contract
-/// (`<rung>__rows<N>__r<take>.json`), when a directory was given, and
-/// summarise it.
+/// ([`leg_stem`]), when a directory was given, and summarise it.
 fn file_leg(
     legs_dir: Option<&Path>,
     report: &serde_json::Value,
+    alone: bool,
 ) -> Result<LegSummary, Box<dyn std::error::Error>> {
     let leg = &report["tiers"]["encode_step"];
     let file = match legs_dir {
         Some(legs_dir) => {
+            let rung = leg["rung"].as_str().ok_or("a leg names its rung")?;
+            let rows = leg["rows"].as_u64().ok_or("a leg names its rows")?;
+            let take = leg["take"].as_u64().ok_or("a leg names its take")?;
             let name = format!(
-                "{}__rows{}__r{}.json",
-                leg["rung"].as_str().ok_or("a leg names its rung")?,
-                leg["rows"].as_u64().ok_or("a leg names its rows")?,
-                leg["take"].as_u64().ok_or("a leg names its take")?
+                "{}.json",
+                leg_stem(rung, usize::try_from(rows)?, usize::try_from(take)?, alone)
             );
             std::fs::create_dir_all(legs_dir)?;
             std::fs::write(legs_dir.join(&name), serde_json::to_string_pretty(report)?)?;
@@ -1610,7 +1624,7 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
     let solo = params.rungs.len() == 1;
     let mut legs = Vec::new();
     for &row_count in &params.rows {
-        for take in 1..=params.takes {
+        for &take in &params.takes {
             let mut child = std::process::Command::new(std::env::current_exe()?);
             child
                 .arg("encode-leg")
@@ -1622,7 +1636,6 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                 .args(["--batch-tokens", &params.batch_tokens.to_string()])
                 .args(["--partitions", &params.partitions.to_string()])
                 .args(["--compute-precision", &params.compute_precision.to_string()])
-                .args(["--warmup", &params.warmup.to_string()])
                 .args(["--iters", &params.iters.to_string()]);
             for rung in &params.rungs {
                 child.args(["--rung", rung.as_str()]);
@@ -1657,7 +1670,7 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                     report["tiers"]["encode_step"]["peak_vram_bytes"] =
                         serde_json::to_value(&peak_vram)?;
                 }
-                legs.push(file_leg(params.legs_dir.as_deref(), report)?);
+                legs.push(file_leg(params.legs_dir.as_deref(), report, solo)?);
             }
         }
     }
@@ -1675,13 +1688,12 @@ mod tests {
             rungs: vec![Rung::Plan],
             model_dir: None,
             rows: vec![48],
-            takes: 1,
+            takes: vec![1],
             seed: 0,
             batch_size: 8,
             batch_tokens: InferenceConfig::default().batch_tokens,
             partitions: 4,
             compute_precision: jammi_numerics::ComputePrecision::F32,
-            warmup: 1,
             iters: 2,
             gpu_device: CPU_HERMETIC_DEVICE,
             exchange_dir: None,
@@ -1736,7 +1748,6 @@ mod tests {
                 "checkpoint_tokenizer_sha256",
                 "pooling",
                 "normalize",
-                "warmup",
                 "iters_measured",
                 "checkpoint_pooling_sha256",
                 "device_requested",
@@ -2015,26 +2026,27 @@ mod tests {
         let legs_dir = tempfile::tempdir().expect("tempdir");
         let exchange = tempfile::tempdir().expect("tempdir");
         let params = EncodeStepParams {
-            rungs: vec![Rung::Direct],
+            rungs: vec![Rung::Direct, Rung::Plan],
             rows: vec![16, 32],
-            takes: 2,
+            takes: vec![1, 2],
             legs_dir: Some(legs_dir.path().to_path_buf()),
             exchange_dir: Some(exchange.path().to_path_buf()),
             ..test_params()
         };
         let mut summaries = Vec::new();
         for &rows in &params.rows {
-            for take in 1..=params.takes {
+            for &take in &params.takes {
                 let legs = measure_legs(&params, rows, take)
                     .await
                     .expect("leg session");
                 for report in leg_reports(legs) {
                     let report = serde_json::to_value(&report).expect("serialize");
-                    summaries.push(file_leg(params.legs_dir.as_deref(), &report).expect("file"));
+                    summaries
+                        .push(file_leg(params.legs_dir.as_deref(), &report, false).expect("file"));
                 }
             }
         }
-        assert_eq!(summaries.len(), 4);
+        assert_eq!(summaries.len(), 8);
         let fit = fit_rungs(&params.rungs, &params.rows, &summaries)[0]
             .fit_min
             .expect("two units fit two terms");
@@ -2063,6 +2075,25 @@ mod tests {
             .path()
             .join("model")
             .join("model.safetensors")
+            .exists());
+
+        // A session serving one rung alone is filed as that run alone: the
+        // leg its memory is read from, carrying no outcome vectors.
+        let alone = EncodeStepParams {
+            rungs: vec![Rung::Direct],
+            rows: vec![16],
+            takes: vec![1],
+            ..params
+        };
+        for report in leg_reports(measure_legs(&alone, 16, 1).await.expect("leg session")) {
+            let report = serde_json::to_value(&report).expect("serialize");
+            file_leg(alone.legs_dir.as_deref(), &report, true).expect("file");
+        }
+        let solo = read("direct__rows16__a1.json");
+        assert!(solo["tiers"]["encode_step"]["vectors_file"].is_null());
+        assert!(!legs_dir
+            .path()
+            .join("direct__rows16__a1.vectors.f32")
             .exists());
     }
 

@@ -12,6 +12,9 @@ is the one place the venv is resolved, probed and provisioned:
                                producers' packages (`torch-graph-venv`)
     torch_venv.py --path       print the venv's path
     torch_venv.py --provision  make the venv usable, or exit 1 naming why not
+    torch_venv.py --provision-graph
+                               the same, then the graph-learning producers'
+                               packages on top
     torch_venv.py --preflight  one real forward and backward of a tiny model
                                on CUDA device 0 through the reference
                                producer, or exit 1 naming why it cannot run
@@ -49,6 +52,11 @@ PACKAGES = ("torch", "transformers", "peft", "safetensors", "pyarrow", "usearch"
 TORCH_REQUIREMENT = "torch"
 REQUIREMENTS = ("transformers>=4.48", "peft", "safetensors", "pyarrow", "usearch")
 GRAPH_PACKAGES = ("torch", "torch_geometric", "torch_cluster", "safetensors", "numpy")
+GRAPH_REQUIREMENTS = ("torch_geometric", "numpy", "setuptools", "wheel")
+# `torch_cluster` publishes no wheel on PyPI: it compiles against the torch
+# already in the venv (so without build isolation), its CPU kernels alone —
+# the graph-learning legs run on the CPU.
+GRAPH_SOURCE_BUILDS = ("torch_cluster",)
 REFERENCE_STEP = REPO_ROOT / "crates" / "jammi-bench" / "reference" / "torch_finetune_step.py"
 
 # PyTorch's CUDA wheel indexes, newest first: `(CUDA version, index name)`.
@@ -154,6 +162,27 @@ def _pip_install(python: Path, requirements: tuple[str, ...], index: str | None 
     )
 
 
+def _pip_build(python: Path, requirements: tuple[str, ...]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [str(python), "-m", "pip", "install", "--no-build-isolation", *requirements],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "FORCE_ONLY_CPU": "1", "FORCE_CUDA": "0"},
+    )
+
+
+def _refused_install(done: subprocess.CompletedProcess, requirements: tuple[str, ...]) -> str | None:
+    """Why installing `requirements` failed, by name; `None` when it did not."""
+    if done.returncode == 0:
+        return None
+    tail = "\n".join((done.stderr or done.stdout).strip().splitlines()[-5:])
+    return (
+        f"cannot install {', '.join(requirements)} for {interpreter()}:\n{tail}\n"
+        "run this under an interpreter those packages publish wheels for"
+    )
+
+
 def preflight(run_step=None) -> str | None:
     """One real forward and backward of a tiny model on CUDA device 0, through
     the reference producer itself. `None` when it ran; otherwise why it could
@@ -197,16 +226,24 @@ def provision(install=_pip_install, driver=driver_cuda_version, check=preflight)
                 )
         venv.EnvBuilder(with_pip=True, symlinks=True).create(TORCH_VENV)
         for requirements, source in (((TORCH_REQUIREMENT,), index), (REQUIREMENTS, None)):
-            done = install(TORCH_PY, requirements, source)
-            if done.returncode != 0:
-                tail = "\n".join((done.stderr or done.stdout).strip().splitlines()[-5:])
-                return (
-                    f"cannot install {', '.join(requirements)} for {interpreter()}:\n{tail}\n"
-                    "run this under an interpreter those packages publish wheels for"
-                )
+            if why := _refused_install(install(TORCH_PY, requirements, source), requirements):
+                return why
         if why := missing(driver):
             return why
     return check() if version is not None else None
+
+
+def provision_graph(install=_pip_install, build=_pip_build, driver=driver_cuda_version, check=preflight) -> str | None:
+    """[`provision`], then the graph-learning producers' packages on top when
+    the venv lacks them. `None` on success; otherwise the refusal, by name."""
+    if why := provision(install, driver, check):
+        return why
+    if missing_for_graphs(driver) is None:
+        return None
+    for requirements, step in ((GRAPH_REQUIREMENTS, install), (GRAPH_SOURCE_BUILDS, build)):
+        if why := _refused_install(step(TORCH_PY, requirements), requirements):
+            return why
+    return missing_for_graphs(driver)
 
 
 def run(script: Path, *args: str, timeout: int) -> str:
@@ -241,6 +278,12 @@ if __name__ == "__main__":
             print(why, file=sys.stderr)
             sys.exit(1)
         print(f"torch venv at {TORCH_VENV}, built from {interpreter()}")
+        sys.exit(0)
+    if sys.argv[1:] == ["--provision-graph"]:
+        if why := provision_graph():
+            print(why, file=sys.stderr)
+            sys.exit(1)
+        print(f"torch venv with the graph packages at {TORCH_VENV}, built from {interpreter()}")
         sys.exit(0)
     if sys.argv[1:] == ["--graph"]:
         if why := missing_for_graphs():

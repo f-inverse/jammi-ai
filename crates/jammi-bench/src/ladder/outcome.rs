@@ -56,6 +56,27 @@ impl<V> AxisResult<V> {
             refusals,
         }
     }
+
+    /// No verdict on `rule`: refused when `refusals` say why the quantity
+    /// could not be measured, unjudged when there was nothing to measure.
+    pub fn unjudged(
+        rule: &'static str,
+        force: RuleForce,
+        bound: Bound,
+        detail: impl Into<String>,
+        refusals: Vec<Refusal>,
+    ) -> Self {
+        let judgement = if refusals.is_empty() {
+            Judgement::new(rule, force, bound, None, detail)
+        } else {
+            Judgement::refused(rule, force, bound, detail)
+        };
+        Self {
+            verdict: None,
+            judgements: vec![judgement],
+            refusals,
+        }
+    }
 }
 
 /// The two rungs of an edge and the units both were measured at.
@@ -717,17 +738,13 @@ fn row_agreement(
         }
     }
     let (Some(bound), false) = (bound, measured.is_empty()) else {
-        return AxisResult {
-            verdict: None,
-            judgements: vec![Judgement::new(
-                ROW_AGREEMENT_RULE,
-                force,
-                Bound::None,
-                None,
-                "no vectors to compare",
-            )],
+        return AxisResult::unjudged(
+            ROW_AGREEMENT_RULE,
+            force,
+            Bound::None,
+            "no vectors to compare",
             refusals,
-        };
+        );
     };
     if measured.iter().any(|m| !m.is_finite()) {
         refusals.push(Refusal::VectorsMalformed {
@@ -981,6 +998,19 @@ fn read_law(dir: &std::path::Path, unit: &Unit, legs: [&Leg; 2]) -> Result<LawFi
 
 const LAW_RULE: &str = "law_goodness_of_fit";
 
+/// What a law fit tested of what it was given.
+fn coverage(fit: &GoodnessOfFit) -> String {
+    format!(
+        "{} states tested at {} dof, {} categories pooled, {} states untested holding {} of {} steps",
+        fit.cells_tested,
+        fit.degrees_of_freedom,
+        fit.categories_pooled,
+        fit.cells_untested,
+        fit.observations_untested,
+        fit.observations + fit.observations_untested
+    )
+}
+
 fn law(
     pair: &Pair<'_>,
     statistic: FitStatistic,
@@ -989,13 +1019,10 @@ fn law(
     law_dir: Option<&std::path::Path>,
 ) -> AxisResult<OutcomeVerdict> {
     let level = || Bound::Level { alpha };
-    let unmeasured = |detail: &str, refusals| AxisResult {
-        verdict: None,
-        judgements: vec![Judgement::new(LAW_RULE, force, level(), None, detail)],
-        refusals,
-    };
+    let unjudged =
+        |detail: &str, refusals| AxisResult::unjudged(LAW_RULE, force, level(), detail, refusals);
     let Some(dir) = law_dir else {
-        return unmeasured("no law directory was given", vec![]);
+        return unjudged("no law directory was given", vec![]);
     };
     let mut refusals = vec![];
     let mut laws: Vec<(LawFile, [&Leg; 2])> = vec![];
@@ -1051,7 +1078,7 @@ fn law(
     };
     let (lower, upper) = (fit(0, &mut refusals), fit(1, &mut refusals));
     let (Some(lower), Some(upper)) = (lower, upper) else {
-        return unmeasured("the law could not be tested", refusals);
+        return unjudged("the law could not be tested", refusals);
     };
     AxisResult {
         verdict: Some(OutcomeVerdict::Law {
@@ -1065,8 +1092,11 @@ fn law(
             level(),
             Some(lower.p_value >= alpha && upper.p_value >= alpha),
             format!(
-                "p = {:.4} (lower), {:.4} (upper) against alpha {alpha}",
-                lower.p_value, upper.p_value
+                "p = {:.4} (lower: {}), {:.4} (upper: {}) against alpha {alpha}",
+                lower.p_value,
+                coverage(&lower),
+                upper.p_value,
+                coverage(&upper)
             ),
         )],
         refusals,

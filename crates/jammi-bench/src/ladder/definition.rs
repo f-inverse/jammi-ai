@@ -653,8 +653,20 @@ impl Ladder {
 pub struct SpeedInstrument;
 
 impl SpeedInstrument {
-    /// Fewest post-warmup iterations a leg may carry.
+    /// Fewest settled iterations a leg may carry.
     pub const MIN_SAMPLES: usize = 16;
+    /// Fewest iterations a run files: MSER may cut up to half of a run as its
+    /// initial transient, and what is left must reach [`Self::MIN_SAMPLES`].
+    pub const MIN_RUN: usize = 2 * Self::MIN_SAMPLES;
+    /// Fewest repeats of a `(rung, unit)`: a rung measured against itself —
+    /// its noise band, and the outcome's repeat floor — needs two.
+    pub const MIN_REPEATS: usize = 2;
+    /// The batch MSER cuts a run's initial transient at: White's rule on the
+    /// iterations themselves. Batch means (MSER-5) serve runs of thousands;
+    /// over the tens to hundreds of iterations a leg files, a steady run of
+    /// one-sided timing noise reaches MSER-5's half-way limit several times
+    /// as often as MSER-1's.
+    pub const TRUNCATION_BATCH: usize = 1;
     /// A series is refused as non-stationary when its Mann-Kendall test
     /// rejects at this level *and* its Theil-Sen drift over the whole series
     /// exceeds [`Self::MAX_RELATIVE_DRIFT`] of its median. Significance alone
@@ -674,9 +686,14 @@ pub const MARGIN_BOOTSTRAP_ITERATIONS: usize = 10_000;
 /// A seeded-loss outcome whose two claims — no directional difference, and
 /// the upper rung no worse than the reference by more than the margin —
 /// count as `force`.
+/// The premise-clean seeds a seeded-loss rule is stated for: the count at
+/// which the exact sign test at `sign_alpha` can reach a direction. A
+/// producer's default run is this many seeds, `1..=SEEDED_LOSS_SEEDS`.
+pub const SEEDED_LOSS_SEEDS: usize = 12;
+
 fn seeded_loss(control: Option<ControlRule>, force: RuleForce) -> CrossStackOutcome {
     CrossStackOutcome::SeededLoss {
-        seeds: 12,
+        seeds: SEEDED_LOSS_SEEDS,
         sign_alpha: 0.0064,
         direction_force: force,
         judged_at: JudgedPoint::ReferenceMinimum,
@@ -906,8 +923,11 @@ fn graph_sample_ladder(budgets: &Budgets) -> Ladder {
                 reference: "PyTorch Geometric's node2vec random-walk sampler",
             },
             EdgeRules::of(budgets, w, TORCH, "sampler").cross_stack(
+                // Pearson's: the statistic whose level holds at the
+                // moderate expected counts a pooled cell sits at (Larntz,
+                // JASA 73, 1978); G's exceeds it there.
                 CrossStackOutcome::Law {
-                    statistic: FitStatistic::LikelihoodRatioG,
+                    statistic: FitStatistic::PearsonChiSquare,
                     alpha: 0.001,
                     force: RuleForce::Hard,
                 },

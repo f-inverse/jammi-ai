@@ -90,7 +90,7 @@ text,label
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneMethod;
-use jammi_db::ModelTask;
+use jammi_ai::model::ModelTask;
 
 let job = session.fine_tune(
     "training",

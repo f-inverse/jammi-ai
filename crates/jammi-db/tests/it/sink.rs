@@ -17,8 +17,8 @@ use jammi_db::error::JammiError;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::{StorageError, StorageUrl};
 use jammi_db::store::manifest::{
-    ComputeDevice, InputAnchor, Materialization, MaterializationEnv, ModelContentDigest,
-    ModelIdentity, ProducingDescriptor,
+    ComputeDevice, ContentDigest, InputAnchor, LocalRun, Materialization, MaterializationEnv,
+    ModelIdentity, ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::sink::ProducingEnvironment;
 use jammi_db::store::{
@@ -263,12 +263,12 @@ async fn a_sink_reports_the_environment_of_the_store_that_runs_it() {
         ComputeDevice::Cuda { ordinal: 1 },
         vec![ModelIdentity {
             model_id: "test-model".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::BF16,
-            content_digest: ModelContentDigest::Sha256("it-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::BF16,
+                content_digest: ContentDigest("it-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     );
     assert!(store.install_producing_environment(std::sync::Arc::new(Installed(ran_on.clone()))));

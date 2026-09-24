@@ -33,10 +33,10 @@ all — there is no `weight_quantization = "q8_0"` setting anywhere in the
 config surface. It is a **fact the artifact itself carries**: a model
 directory either has a `model.gguf` file or it does not, and if it does, its
 matmul-site tensors are stored at whatever k-quant format they were quantized
-to when the file was written. `LoadedModel::quantization()` reports this fact
-— `Some(WeightQuantization::Q8_0)` for a GGUF load, `None` for every
-safetensors load — as a **derived observation**, never a caller-set
-value:
+to when the file was written. The model's recorded run reports this fact
+— `quantization: Some(WeightQuantization::Q8_0)` on the `LocalRun` of a GGUF
+load, `None` on every safetensors load — as a **derived observation**, never
+a caller-set value:
 
 ```{python}
 import inspect
@@ -60,9 +60,9 @@ sense than storage-precision/compute-precision are orthogonal to each other
 (the [precision chapters](precision.qmd) still both take caller-set knobs on
 the same `[gpu]`/`embedding.ann` config surface). Here, one side of the pair
 is a *setting* and the other is a *fact about a file on disk*
-(`crates/jammi-ai/src/model/mod.rs:408-423`'s own doc: `quantization()` is
-`Some` "for a `model.gguf` load, `None` for every safetensors load" —
-never a config lookup). A `q8_0` GGUF backbone can still run its densified
+(`LocalRun::quantization`, `crates/jammi-db/src/store/manifest.rs`: `Some`
+for a `model.gguf` load, `None` for dense weights — read from the file, never
+a config lookup). A `q8_0` GGUF backbone can still run its densified
 (non-matmul-site) tensors and its dequantized activations at `compute_precision
 = "f16"` — the two vocabularies compose exactly as freely as storage/compute
 precision do, for the same reason: they describe different stages of the same
@@ -263,15 +263,14 @@ print(f"\nboth mean and min cosine clear the {FLOOR} floor — q8_0 is active an
 
 ## Identity is bound to the weight format — two materializations that never collide
 
-`compute_precision` folds into `ModelIdentity` and, through it, into the
-materialization identity every result table carries — [the compute-precision
+`compute_precision` is a field of a model's recorded run (`LocalRun`, part
+of the `ModelIdentity` every result table's environment carries) and,
+through it, of the materialization identity — [the compute-precision
 chapter](compute-precision.qmd) already measured that two runs differing only
 in compute precision never collide on one `DefinitionHash`. `quantization`
-folds into the same `ModelIdentity` the same way, for the same reason
-(`crates/jammi-db/src/store/manifest.rs:223-245`: `"a WeightQuantization is a
-determinant of the weight BYTES a model loaded, so it must enter the
-definition hash uniformly … two such runs must never collide on one
-materialization identity"`). This chapter reads the consequence off the two
+is a field of the same run, for the same reason (`LocalRun::quantization`:
+a `Q4K` run is output-affecting relative to a full-precision run of the same
+model, so the two must never collide on one materialization identity). This chapter reads the consequence off the two
 tables it just materialized — `f32_dir` and `gguf_dir`, otherwise identical
 producing descriptors — by reading each table's `.materialization.json`
 manifest sidecar directly, the same way [the point-in-time chapter](
@@ -312,6 +311,17 @@ assert hash_f32 != hash_gguf, (
 )
 print("\ndistinct: True — the two materializations never collide.")
 
+# The cause, read off the same sidecars: each table's environment records the
+# model's run, and the GGUF run carries its weight format where the dense
+# run carries none.
+run_f32 = manifest_f32["env"]["models"][0]["run"]
+run_gguf = manifest_gguf["env"]["models"][0]["run"]
+print(f"f32  run: {run_f32['runner']}, quantization={run_f32.get('quantization')}")
+print(f"q8_0 run: {run_gguf['runner']}, quantization={run_gguf.get('quantization')}")
+assert run_f32["runner"] == run_gguf["runner"] == "local"
+assert "quantization" not in run_f32
+assert run_gguf["quantization"] == "q8_0"
+
 verdict_f32 = db.verify_materialization(table_f32, expected_definition=hash_f32)
 verdict_gguf = db.verify_materialization(table_gguf, expected_definition=hash_gguf)
 assert verdict_f32["verdict"] in ("match", "match_with_unpinned_inputs")
@@ -320,19 +330,12 @@ print(f"f32  verify_materialization: {verdict_f32['verdict']}")
 print(f"q8_0 verify_materialization: {verdict_gguf['verdict']}")
 ```
 
-> **What this cell shows, and what it cannot.** The manifest sidecar exposes
-> `definition_hash` (an opaque digest) and `input_anchors` — it does **not**
-> serialize the raw `ModelIdentity.quantization` field back out to a client
-> (`MaterializationManifest`'s own field list,
-> `crates/jammi-db/src/store/manifest.rs:875-899`, carries no `models`/
-> `ModelIdentity` list). So this cell measures the *consequence* Python can
-> see — a distinct hash — not the raw fact itself. The raw fact is proven
-> directly, on the Rust side, by
+> **What this cell shows.** Both halves, off the sidecars a Python caller can
+> read: the consequence (two distinct `definition_hash` values) and its cause
+> (the GGUF table's recorded run carries `quantization: "q8_0"`, the dense
+> one's carries none). The Rust side proves the same pair at the source, in
 > `gguf_model_identity_reports_quantization_and_a_distinct_definition_hash`
-> (`crates/jammi-ai/tests/it/gguf_qlora.rs`), which asserts
-> `gguf_model.quantization() == Some(WeightQuantization::Q8_0)` before hashing
-> it. This chapter's cell is the CI-visible proof that the consequence reaches
-> a Python caller; that oracle is what proves the cause.
+> (`crates/jammi-ai/tests/it/gguf_qlora.rs`).
 
 ## QLoRA — LoRA over a frozen, quantized backbone
 

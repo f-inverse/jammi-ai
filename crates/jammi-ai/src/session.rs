@@ -1552,7 +1552,7 @@ impl InferenceSession {
         // records. Nothing is loaded here — the executing process
         // materializes the weights when the plan runs.
         let description = self.model_cache.describe(source, task).await?;
-        let identity = description.identity().clone();
+        let identity = description.identity();
 
         // The materialization contract is knowable here (model described,
         // source named), so the cache probe keys on the identical definition + anchors

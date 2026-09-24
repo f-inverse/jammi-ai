@@ -16,8 +16,8 @@ use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
-    ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
-    ProducingDescriptor,
+    ComputeDevice, ComputePrecision, ContentDigest, LocalRun, MaterializationEnv, ModelIdentity,
+    ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
@@ -51,12 +51,12 @@ fn env() -> MaterializationEnv {
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "test-model".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("reconcile-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("reconcile-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     )
 }

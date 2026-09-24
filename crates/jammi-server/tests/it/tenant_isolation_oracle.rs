@@ -1812,8 +1812,8 @@ async fn assert_source_resolver_isolated() {
 /// build on. Returns the constructed engine + session and the private table name.
 async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, String, TempDir) {
     use jammi_db::store::manifest::{
-        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelContentDigest, ModelIdentity, ProducingDescriptor,
+        ComputeDevice, ComputePrecision, ContentDigest, InputAnchor, LocalRun, Materialization,
+        MaterializationEnv, ModelIdentity, ModelRun, ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
@@ -1913,12 +1913,12 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 ComputeDevice::Cpu,
                 vec![ModelIdentity {
                     model_id: model_id.into(),
-                    backend: jammi_db::store::manifest::ModelRunner::Backend(
-                        jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                    ),
-                    compute_precision: ComputePrecision::F32,
-                    content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                    quantization: None,
+                    run: ModelRun::Local(LocalRun {
+                        backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                        compute_precision: ComputePrecision::F32,
+                        content_digest: ContentDigest("cpu-fixture-digest".into()),
+                        quantization: None,
+                    }),
                 }],
             );
             let ctx = QueryContext::from(SessionContext::new());
@@ -1944,8 +1944,8 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
 /// The GLOBAL (unscoped) twin of [`materialize_table_for_tenant_a`].
 async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, TempDir) {
     use jammi_db::store::manifest::{
-        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelContentDigest, ModelIdentity, ProducingDescriptor,
+        ComputeDevice, ComputePrecision, ContentDigest, InputAnchor, LocalRun, Materialization,
+        MaterializationEnv, ModelIdentity, ModelRun, ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
@@ -2044,12 +2044,12 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: model_id.into(),
-                backend: jammi_db::store::manifest::ModelRunner::Backend(
-                    jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                ),
-                compute_precision: ComputePrecision::F32,
-                content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-                quantization: None,
+                run: ModelRun::Local(LocalRun {
+                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                    compute_precision: ComputePrecision::F32,
+                    content_digest: ContentDigest("cpu-fixture-digest".into()),
+                    quantization: None,
+                }),
             }],
         );
         let ctx = QueryContext::from(SessionContext::new());
@@ -2950,8 +2950,8 @@ async fn assert_result_table_scan_isolated() {
 /// its table name.
 async fn materialize_embedding_result_table(engine: &InferenceSession, source: &str) -> String {
     use jammi_db::store::manifest::{
-        ComputeDevice, ComputePrecision, InputAnchor, Materialization, MaterializationEnv,
-        ModelContentDigest, ModelIdentity, ProducingDescriptor,
+        ComputeDevice, ComputePrecision, ContentDigest, InputAnchor, LocalRun, Materialization,
+        MaterializationEnv, ModelIdentity, ModelRun, ProducingDescriptor,
     };
 
     const DIMS: usize = 4;
@@ -3011,12 +3011,12 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: model_id.into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("cpu-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     );
     let table_name = info.table_name().to_string();

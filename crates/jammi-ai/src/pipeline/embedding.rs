@@ -37,7 +37,7 @@ pub(crate) async fn embedding_definition(
     let embedding_dim = description.embedding_dim();
     let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),
-        vec![description.identity().clone()],
+        vec![description.identity()],
     );
     Ok(EmbeddingDefinition {
         model_source,

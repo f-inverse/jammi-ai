@@ -20,8 +20,8 @@ use jammi_db::catalog::model_repo::{ModelLocation, RegisterModelParams};
 use jammi_db::catalog::status::{ArtifactState, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::store::manifest::{
-    ArtifactDigest, ComputeDevice, ComputePrecision, InputAnchor, Materialization,
-    MaterializationEnv, ModelContentDigest, ModelIdentity, ProducingDescriptor,
+    ArtifactDigest, ComputeDevice, ComputePrecision, ContentDigest, InputAnchor, LocalRun,
+    Materialization, MaterializationEnv, ModelIdentity, ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::{ReconcileOptions, ResultStore};
 use jammi_db::tenant_scope::TenantBinding;
@@ -136,12 +136,12 @@ async fn attest(store: &ResultStore, staged: &StagedArtifact) -> Materialization
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "q-base".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     );
     let anchors: Vec<InputAnchor> = vec![InputAnchor::result_digest(

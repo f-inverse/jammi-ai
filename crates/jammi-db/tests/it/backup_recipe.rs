@@ -15,8 +15,8 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
-    ComputeDevice, ComputePrecision, MaterializationEnv, ModelContentDigest, ModelIdentity,
-    ProducingDescriptor,
+    ComputeDevice, ComputePrecision, ContentDigest, LocalRun, MaterializationEnv, ModelIdentity,
+    ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::{EmbeddingTableSpec, Materialization, ResultStore};
 use tempfile::tempdir;
@@ -39,12 +39,12 @@ fn env() -> MaterializationEnv {
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "backup-model".into(),
-            backend: jammi_db::store::manifest::ModelRunner::Backend(
-                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-            ),
-            compute_precision: ComputePrecision::F32,
-            content_digest: ModelContentDigest::Sha256("backup-fixture-digest".into()),
-            quantization: None,
+            run: ModelRun::Local(LocalRun {
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                compute_precision: ComputePrecision::F32,
+                content_digest: ContentDigest("backup-fixture-digest".into()),
+                quantization: None,
+            }),
         }],
     )
 }

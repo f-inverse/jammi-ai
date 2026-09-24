@@ -1021,7 +1021,7 @@ impl ResultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::manifest::{ComputeDevice, ModelContentDigest, ModelIdentity};
+    use crate::store::manifest::{ComputeDevice, ContentDigest, LocalRun, ModelIdentity, ModelRun};
 
     /// What a placed sink hands back crosses the wire as its one summary
     /// row: the counts, the segments, and the environment that produced
@@ -1036,12 +1036,12 @@ mod tests {
                 ComputeDevice::Cuda { ordinal: 0 },
                 vec![ModelIdentity {
                     model_id: "local:/models/encoder".into(),
-                    backend: crate::store::manifest::ModelRunner::Backend(
-                        crate::catalog::model_repo::ModelBackendKind::Candle,
-                    ),
-                    compute_precision: jammi_numerics::ComputePrecision::BF16,
-                    content_digest: ModelContentDigest::Sha256("digest".into()),
-                    quantization: None,
+                    run: ModelRun::Local(LocalRun {
+                        backend: crate::catalog::model_repo::ModelBackendKind::Candle,
+                        compute_precision: jammi_numerics::ComputePrecision::BF16,
+                        content_digest: ContentDigest("digest".into()),
+                        quantization: None,
+                    }),
                 }],
             ),
         };

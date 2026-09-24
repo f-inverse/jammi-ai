@@ -28,11 +28,11 @@ pub use freshness::{
 };
 pub use layout::TenantSegment;
 pub use manifest::{
-    AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, DefinitionHash, DeletePolicy,
-    GraphSampleFields, InputAnchor, LeafDigest, LeafKey, ManifestError, MatchVerdict,
-    Materialization, MaterializationEnv, MaterializationManifest, ModelContentDigest,
-    ModelContentDigestUnavailableReason, ModelIdentity, PartitionVerdict, ProducingDescriptor,
-    GRAPH_READ_ORDER_RULE_V1, TRAINING_SET_ORDER_RULE_V1,
+    AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, ContentDigest, DefinitionHash,
+    DeletePolicy, GraphSampleFields, InputAnchor, LeafDigest, LeafKey, LocalRun, ManifestError,
+    MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest, ModelIdentity,
+    ModelRun, PartitionVerdict, ProducingDescriptor, GRAPH_READ_ORDER_RULE_V1,
+    TRAINING_SET_ORDER_RULE_V1,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;

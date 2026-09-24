@@ -56,6 +56,10 @@
 #   gpu-dev.sh push    [session] [--tree T]           rsync YOUR OWN checkout (this script's
 #                                                      own on-disk location, never $PWD) TO the pod
 #   gpu-dev.sh pull    [session] [--tree T] <path>    rsync <path> back FROM the pod
+#   gpu-dev.sh put     [session] [--tree T] <local> <path>
+#                                                      rsync the local file <local> TO <path> in the pod's <tree>
+#   gpu-dev.sh exec    [session] [--tree T] <cmd...>  run <cmd> in <tree> NOW, synchronously;
+#                                                      its output and exit status are exec's
 #   gpu-dev.sh wait-seed [session] [--timeout SECS]   block until the pod's own build-substrate
 #                                                      seed completes, fails, or the timeout
 #                                                      elapses — never silently misreads an
@@ -148,6 +152,11 @@ gpu-dev.sh — GPU development on RunPod
   push    [session] [--tree T]            rsync YOUR OWN checkout (this script's own on-disk
                                           location, never $PWD) TO the pod's <tree>
   pull    [session] [--tree T] <path>     rsync <path> back FROM the pod's <tree>
+  put     [session] [--tree T] <local> <path>
+                                          rsync the local file <local> TO <path> in the pod's <tree>
+  exec    [session] [--tree T] <cmd...>   run <cmd> in <tree> synchronously — a probe or a
+                                          one-shot step, never a job (`run` owns jobs); its
+                                          output and exit status are exec's
   wait-seed [session] [--timeout SECS]    block until the pod's own build-substrate seed
                                           completes/fails/times out (never misreads an
                                           unreachable pod as "still building" — see below)
@@ -489,7 +498,7 @@ case "$CMD" in
     # actually launches) accept it. A LOOP, not a one-shot `case`: the two
     # flags may appear in either order.
     case "$CMD" in
-      attach|run|logs|push|pull)
+      attach|run|logs|push|pull|put|exec)
         while :; do
           case "${1:-}" in
             --tree)
@@ -1126,6 +1135,23 @@ EOF
         && echo "=== push-stamp written to ${TREE_DIR}/.jammi-push-stamp.json (iteration provenance only — a COMMITTED artifact still requires a pushed sha) ==="
       rm -f "$STAMP"
     fi
+    ;;
+
+  put)
+    require_pod; rp_keep
+    [ $# -eq 2 ] || { echo "put: need a local file and a path in the tree (e.g. put ${SESSION} ./pairs.jsonl cookbook/fixtures/pairs.jsonl)"; exit 2; }
+    [ -f "$1" ] || { echo "put: no local file $1"; exit 2; }
+    # The pod's rsync predates `--mkpath`: the directory is made first.
+    printf 'mkdir -p %q\n' "${TREE_DIR}/$(dirname "$2")" | rp_run_remote \
+      && rsync -az -e "ssh ${RP_SSHO[*]} -p ${RP_PORT}" \
+      "$1" "root@${RP_HOST}:${TREE_DIR}/$2" \
+      && echo "=== put $1 → ${TREE_DIR}/$2 (tree: ${TREE}) ==="
+    ;;
+
+  exec)
+    require_pod; rp_keep
+    [ $# -gt 0 ] || { echo "exec: need a command"; exit 2; }
+    printf 'cd %q && %s\n' "$TREE_DIR" "$*" | rp_run_remote
     ;;
 
   pull)

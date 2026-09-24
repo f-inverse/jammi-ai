@@ -1091,8 +1091,11 @@ rp_job_env_lines() {
 # digest of the empty string (a clean `git status --porcelain` and a clean
 # `git diff HEAD` at push time — the emitted python computes that digest
 # rather than hardcoding it, so the comparison cannot rot into a stale
-# literal). Anything else leaves the variable UNSET: build.rs bakes
-# "unknown", the producer refuses loudly, and the message says why.
+# literal). Anything else leaves the variable UNSET, and build.rs resolves
+# the sha itself: from the tree's own git when the tree is a checkout (a
+# pod's bootstrap checkout moved to a commit with `git checkout` — `<sha>`,
+# or `<sha>-dirty` when its tracked files differ), else "unknown", which the
+# producer refuses loudly; the message says which.
 #
 # A caller-supplied `JAMMI_BUILD_SHA` always wins and is never overwritten —
 # it is the manual override for the dirty-tree case.
@@ -1104,6 +1107,7 @@ rp_job_env_lines() {
 # $1=tree_dir.
 rp_job_build_sha_lines() {
   local tree_dir="${1:?rp_job_build_sha_lines needs a tree dir}"
+  printf "__jammi_tree='%s'\n" "$tree_dir"
   printf "__jammi_push_stamp='%s/.jammi-push-stamp.json'\n" "$tree_dir"
   cat <<'BUILDSHAEOF'
 if [ -z "${JAMMI_BUILD_SHA:-}" ]; then
@@ -1132,10 +1136,14 @@ JAMMIPUSHSTAMPEOF
     echo "jammi: JAMMI_BUILD_SHA=${JAMMI_BUILD_SHA} (from ${__jammi_push_stamp} — the pushed tree was CLEAN at that commit)" >&2
   else
     unset JAMMI_BUILD_SHA
-    echo "::warning::JAMMI_BUILD_SHA left UNSET — ${__jammi_push_stamp} is absent or unreadable, or records a push whose working tree was DIRTY (its bytes are not any one commit). A binary built here bakes build_sha=\"unknown\" and every provenance cross-check will refuse its output. Commit and re-push, or set JAMMI_BUILD_SHA=<the 40-hex tip the pushed tree actually is> yourself — never a sha these bytes are not." >&2
+    if [ ! -e "$__jammi_push_stamp" ] && git -C "$__jammi_tree" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+      echo "jammi: no push stamp — ${__jammi_tree} is a git checkout, so build.rs resolves build_sha from its HEAD ($(git -C "$__jammi_tree" rev-parse HEAD), '-dirty' if its tracked files differ)" >&2
+    else
+      echo "::warning::JAMMI_BUILD_SHA left UNSET — ${__jammi_push_stamp} is absent or unreadable with no git checkout to read, or records a push whose working tree was DIRTY (its bytes are not any one commit). A binary built here bakes build_sha=\"unknown\" (or the checkout's '-dirty' sha) and every provenance cross-check will refuse its output. Commit and re-push, or set JAMMI_BUILD_SHA=<the 40-hex tip the pushed tree actually is> yourself — never a sha these bytes are not." >&2
+    fi
   fi
 fi
-unset __jammi_push_stamp
+unset __jammi_push_stamp __jammi_tree
 BUILDSHAEOF
 }
 

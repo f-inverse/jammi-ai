@@ -29,6 +29,43 @@ def test_download_checksum_gate(tmp_path):
     assert not dest.exists()
 
 
+def test_download_retries_a_source_that_fails_before_it_serves(tmp_path, monkeypatch):
+    import hashlib
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    payload = b"pinned-content"
+    served = []
+
+    class FlakyThenServes(BaseHTTPRequestHandler):
+        def do_GET(self):
+            served.append(self.path)
+            if len(served) < 3:
+                self.send_response(503)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), FlakyThenServes)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(datasets._FETCH_RETRY, "backoff_factor", 0.0)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/blob.bin"
+        dest = tmp_path / "blob.bin"
+        good = hashlib.sha256(payload).hexdigest()
+        assert datasets._download(url, good, dest=dest) == dest
+        assert dest.read_bytes() == payload
+        assert len(served) == 3, "two 503s retried, the third request served"
+    finally:
+        server.shutdown()
+
+
 def _line_graph(n: int) -> _ArxivRaw:
     """A path graph 0-1-2-…-(n-1): trivially connected, every node degree ≤2."""
     edges = [(i, i + 1) for i in range(n - 1)]

@@ -86,7 +86,9 @@ No Python runs in the serving or training path.
   content digest and precision, a remote endpoint's declaration, or an
   import). Definition hashes, verification and recompute apply to model
   outputs as they do to any other table
-  ([The Materialization Contract](./materialization-contract.md)).
+  ([The Materialization Contract](./materialization-contract.md); the book's
+  recompute chapter, `cookbook/book/chapters/20-recompute/`, runs a
+  recompute over unmoved inputs and asserts it byte-identical).
 - **Training on the same plane as queries.** A fine-tuning job is placed,
   admitted and recorded by the same machinery as an embedding plan.
 - **One binary, every topology.** Embedded, single server and Ballista

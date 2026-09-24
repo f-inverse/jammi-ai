@@ -102,7 +102,7 @@ def main() -> None:
         #    batch; `max_batches=2` matches that count so the replay read does not
         #    block waiting on the live tail.
         events = db.subscribe_collect(
-            "jammi.audit.session_lifecycle.v1", from_offset=0, max_batches=2
+            "jammi.audit.session_lifecycle.v1", from_offset=0
         )
         import json
 

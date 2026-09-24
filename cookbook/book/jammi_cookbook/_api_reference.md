@@ -110,7 +110,7 @@ bound tenant. Each dict carries `{model_id, backend, task, status}`.
 - `db.drop_topic(name, *, if_exists=False) -> None` — drop a topic; `if_exists=True` makes a missing topic a no-op.
 - `db.list_topics() -> list[str]` — control-plane catalog read of the registered topic names.
 - `db.publish_topic(topic, *, batch) -> int` — publish an Arrow `batch` of rows onto a topic; returns the 0-based offset the batch landed at.
-- `db.subscribe_collect(topic, *, predicate=None, from_offset=None, max_batches=64) -> pyarrow.Table` — replay a topic from `from_offset` into one table; `predicate` is a SQL filter over the topic schema (a batch whose rows all filter out is dropped, not yielded). `max_batches` is the **terminator**: the call replays the backing table then tails the live broker, so it returns synchronously only when `max_batches` equals the number of yielded batches available from `from_offset` (`num_published - from_offset` unfiltered; the matching-batch count under a predicate). A larger `max_batches` blocks on the broker tail.
+- `db.subscribe_collect(topic, *, predicate=None, from_offset=None, replay_only=True, max_batches=None) -> pyarrow.Table` — collect a topic's batches into one table; `predicate` is a SQL filter over the topic schema (a batch whose rows all filter out is dropped). By default the collect drains the backing table from `from_offset` and returns (no `from_offset` replays nothing), capped at `max_batches` when given. `replay_only=False` follows the live tail after the replay and returns once `max_batches` batches arrive; it requires `max_batches`.
 
 ## Point-in-time join + materialization / incremental recompute (H4, `0.31.0`)
 

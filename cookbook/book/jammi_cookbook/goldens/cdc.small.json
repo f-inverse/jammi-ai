@@ -1,0 +1,14 @@
+{
+  "events": {
+    "tol": 0.0,
+    "value": 1977.0
+  },
+  "tail_cites": {
+    "tol": 0.0,
+    "value": 605.0
+  },
+  "tail_events": {
+    "tol": 0.0,
+    "value": 701.0
+  }
+}

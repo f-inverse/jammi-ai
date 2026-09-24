@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -834,24 +834,35 @@ impl PyDatabase {
         Ok(offset.value())
     }
 
-    /// Open a subscription, collect up to `max_batches` matching batches
-    /// (replay + live tail joined), then close. Returns the concatenated
-    /// payload as a `pyarrow.Table`.
+    /// Collect a topic's matching batches as one `pyarrow.Table`.
     ///
-    /// Synchronous collect API: streaming iteration is left to the gRPC
-    /// `TriggerService.Subscribe` surface where back-pressure flows
-    /// through HTTP/2 naturally. This binding is the script-friendly
-    /// equivalent for one-shot Python workflows.
-    #[pyo3(signature = (topic, *, predicate=None, from_offset=None, max_batches=64))]
+    /// With `replay_only` (the default) this is the finite drain: every
+    /// batch in the backing table at offset `>= from_offset` the predicate
+    /// accepts, at most `max_batches` of them. Without it the collect joins
+    /// the live tail after the replay, which never ends on its own, so it
+    /// needs `max_batches` and returns once that many batches arrive.
+    /// Streaming iteration is the gRPC `TriggerService.Subscribe` surface.
+    #[pyo3(signature = (topic, *, predicate=None, from_offset=None, replay_only=true, max_batches=None))]
     fn subscribe_collect(
         &self,
         py: Python<'_>,
         topic: &str,
         predicate: Option<&str>,
         from_offset: Option<u64>,
-        max_batches: usize,
+        replay_only: bool,
+        max_batches: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
         self.check_open()?;
+        let tail_bound = match (replay_only, max_batches) {
+            (true, bound) => bound,
+            (false, Some(bound)) => Some(bound),
+            (false, None) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "a collect that follows the live tail (replay_only=False) needs \
+                     max_batches: the tail never ends on its own",
+                ))
+            }
+        };
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
@@ -867,17 +878,15 @@ impl PyDatabase {
         .map_err(to_pyerr)?;
         let from = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
         let subscriber = self.session.subscriber();
+        let limit = tail_bound.unwrap_or(usize::MAX);
         let collected: Vec<RecordBatch> = crate::released(&self.runtime, async move {
-            let mut stream = subscriber.subscribe(&topic_def, predicate, from).await?;
-            let mut out: Vec<RecordBatch> = Vec::new();
-            while out.len() < max_batches {
-                match StreamExt::next(&mut stream).await {
-                    Some(Ok(d)) => out.push(d.batch),
-                    Some(Err(e)) => return Err(e),
-                    None => break,
-                }
+            if replay_only {
+                let replayed = subscriber.replay_only(&topic_def, predicate, from).await?;
+                Ok(replayed.into_iter().take(limit).map(|d| d.batch).collect())
+            } else {
+                let tail = subscriber.subscribe(&topic_def, predicate, from).await?;
+                tail.take(limit).map_ok(|d| d.batch).try_collect().await
             }
-            Ok::<_, jammi_db::trigger::TriggerError>(out)
         })
         .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &collected)

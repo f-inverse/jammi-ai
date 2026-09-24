@@ -24,6 +24,7 @@ from ._generated.jammi.v1 import inference_pb2
 from ._generated.jammi.v1 import job_pb2
 from ._generated.jammi.v1 import pipeline_pb2
 from ._generated.jammi.v1 import training_pb2
+from ._generated.jammi.v1 import trigger_pb2
 from .errors import BackendError, InvalidArgument
 
 # snake-case modality string → the `Modality` enum the wire carries. One map,
@@ -1824,3 +1825,28 @@ def expiry_report_to_dict(report: embedding_pb2.ExpiryReport) -> Dict[str, Any]:
         "expired_versions": list(report.expired_versions),
         "objects_deleted": report.objects_deleted,
     }
+
+
+def build_subscribe_request(
+    topic: str,
+    *,
+    predicate: Optional[str],
+    from_offset: Optional[int],
+    replay_only: bool,
+    max_batches: Optional[int],
+) -> trigger_pb2.SubscribeRequest:
+    """Assemble the `SubscribeRequest` a collect drives. A collect that follows
+    the live tail needs `max_batches`: the tail never ends on its own."""
+    if not replay_only and max_batches is None:
+        raise ValueError(
+            "a collect that follows the live tail (replay_only=False) needs "
+            "max_batches: the tail never ends on its own"
+        )
+    request = trigger_pb2.SubscribeRequest(
+        topic=trigger_pb2.TopicName(name=topic),
+        predicate=predicate or "",
+        replay_only=replay_only,
+    )
+    if from_offset is not None:
+        request.from_offset = from_offset
+    return request

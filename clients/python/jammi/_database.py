@@ -58,6 +58,7 @@ from ._assembly import (
     build_register_channel_request,
     build_register_topic_request,
     build_search_request,
+    build_subscribe_request,
     recompute_report_to_dict,
     build_refresh_embeddings_request,
     build_compact_embeddings_request,
@@ -1468,56 +1469,46 @@ class RemoteDatabase:
         *,
         predicate: Optional[str] = None,
         from_offset: Optional[int] = None,
-        max_batches: int = 64,
+        replay_only: bool = True,
+        max_batches: Optional[int] = None,
     ) -> pa.Table:
-        """Open a subscription, collect up to `max_batches` matching batches
-        (replay + live tail joined), then close — returning the concatenated
-        payload as a `pyarrow.Table`.
+        """Collect a topic's matching batches as one table.
 
-        This mirrors the embedded `Database.subscribe_collect` exactly: it drives
-        the open-ended `Subscribe` stream (``replay_only`` unset — replay AND live
-        tail, NOT a bounded replay-only drain), accumulates up to `max_batches`
-        delivered batches, then cancels the gRPC call client-side so the server's
-        tail task stops (its send fails on the cancel and the spawned forwarder
-        breaks) rather than leaking. `predicate` is an optional SQL filter applied
-        server-side; `from_offset` starts the replay at an offset (unset == live
-        tail only). Maps to `TriggerService.Subscribe`.
+        With `replay_only` (the default) the server drains the backing table —
+        every batch at offset >= `from_offset` that `predicate` accepts — and
+        closes the stream, capped at `max_batches` when given (no `from_offset`
+        replays nothing). With `replay_only=False` the collect follows the live
+        tail after the replay and returns once `max_batches` batches arrive —
+        required, since the tail never ends on its own. Either way the call is
+        cancelled client-side when the collect is done, so no subscription is
+        left running on the server. Maps to `TriggerService.Subscribe`.
 
-        This call sends no `grpc-timeout` header of its own (the header-less
-        shape a deployment's `[server.limits] wait_timeout_secs` budget is
-        meant to bound, per that key's own doc). When a deployment configures
-        that budget, the server itself ends the stream with
-        `DEADLINE_EXCEEDED` once it elapses, wherever the collect then
-        stands — and this method RAISES the mapped :class:`JammiError` at
-        that point (via `_rpc_to_jammi`); it does NOT return whatever batches
-        were collected so far. Those already-collected batches are simply
-        lost — this method has no side channel to hand them back once the
-        exception path is taken, so a caller that needs a partial result on a
-        budget-driven cutoff cannot get one from `subscribe_collect`; use a
-        `max_batches` the budget is known to satisfy, or drive the stream
-        manually instead. With no such budget configured, this genuinely
-        waits until `max_batches` is reached.
+        This call sends no `grpc-timeout` header of its own. When a deployment
+        configures `[server.limits] wait_timeout_secs`, the server ends a
+        live-tail stream with `DEADLINE_EXCEEDED` once it elapses, and this
+        method raises the mapped :class:`JammiError` — the batches collected
+        before the cutoff are not returned.
         """
         # The streaming lane opens its call directly rather than through `_call`,
         # so the closed-session guard is applied here explicitly.
         self._check_open()
-        request = trigger_pb2.SubscribeRequest(
-            topic=trigger_pb2.TopicName(name=topic),
-            predicate=predicate or "",
+        request = build_subscribe_request(
+            topic,
+            predicate=predicate,
+            from_offset=from_offset,
+            replay_only=replay_only,
+            max_batches=max_batches,
         )
-        if from_offset is not None:
-            request.from_offset = from_offset
+        limit = max_batches if max_batches is not None else float("inf")
 
         call = self._trigger.Subscribe(request, metadata=self._metadata)
         collected: List[pa.Table] = []
         try:
-            # Mirror the embedded `while out.len() < max_batches { next() }`: pull a
-            # batch only while under the bound, so a satisfied collect never blocks
-            # on one more read of the live tail. The stream ends on its own only if
-            # the server closes it (it does not for a live-tail subscription), so
-            # `max_batches` is the terminator — identical to the embedded contract.
+            # Pull a batch only while under the bound, so a satisfied collect
+            # never blocks on one more read of the live tail. A replay-only
+            # stream ends on its own when the server has drained the replay.
             stream = iter(call)
-            while len(collected) < max_batches:
+            while len(collected) < limit:
                 try:
                     delivered = next(stream)
                 except StopIteration:

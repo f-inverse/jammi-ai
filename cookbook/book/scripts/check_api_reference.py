@@ -152,7 +152,7 @@ REQUIRED: dict[str, list[str]] = {
     "drop_topic": ["if_exists"],
     "list_topics": [],
     "publish_topic": ["batch"],
-    "subscribe_collect": ["predicate", "from_offset", "max_batches"],
+    "subscribe_collect": ["predicate", "from_offset", "replay_only", "max_batches"],
 }
 
 MODULE_FUNCTIONS = ["connect"]

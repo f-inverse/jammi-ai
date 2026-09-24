@@ -340,13 +340,23 @@ class EmbeddedBackend:
         *,
         predicate: Optional[str] = None,
         from_offset: Optional[int] = None,
-        max_batches: int = 64,
+        replay_only: bool = True,
+        max_batches: Optional[int] = None,
     ) -> pa.Table:
-        """Collect up to `max_batches` matching batches (replay + live tail)."""
+        """Collect a topic's matching batches as one table.
+
+        With `replay_only` (the default) this drains the backing table: every
+        batch at offset >= `from_offset` that `predicate` accepts, capped at
+        `max_batches` when given (no `from_offset` replays nothing). With
+        `replay_only=False` the collect follows the live tail after the replay
+        and returns once `max_batches` batches arrive — required, since the tail
+        never ends on its own.
+        """
         return self._native.subscribe_collect(
             topic,
             predicate=predicate,
             from_offset=from_offset,
+            replay_only=replay_only,
             max_batches=max_batches,
         )
 

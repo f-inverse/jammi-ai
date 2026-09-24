@@ -51,7 +51,7 @@ def main() -> int:
         # `max_batches=1` matches the published batch count so the
         # subscribe does not race the live tail.
         collected = db.subscribe_collect(
-            "events.demo", from_offset=0, max_batches=1
+            "events.demo", from_offset=0
         )
         assert collected.column("event_id").to_pylist() == [1, 2, 3]
         assert collected.column("payload").to_pylist() == ["a", "b", "c"]

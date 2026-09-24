@@ -139,7 +139,6 @@ def test_c2_topic_pub_sub_round_trip_matches_embedded(live_server, tmp_path):
                 "events.demo",
                 predicate="kind = 'click'",
                 from_offset=0,
-                max_batches=1,
             )
             collected[name] = got
 
@@ -151,12 +150,12 @@ def test_c2_topic_pub_sub_round_trip_matches_embedded(live_server, tmp_path):
         # Backing-table replay: an unfiltered `subscribe_collect(from_offset=0)`
         # drains the topic's durable backing table (the persisted event log behind
         # the stream) and returns every published row — identical across
-        # transports. This is the replay half of the replay+live-tail join.
+        # transports.
         remote_replay = remote.subscribe_collect(
-            "events.demo", from_offset=0, max_batches=1
+            "events.demo", from_offset=0
         )
         embedded_replay = embedded.subscribe_collect(
-            "events.demo", from_offset=0, max_batches=1
+            "events.demo", from_offset=0
         )
         assert remote_replay.to_pydict() == embedded_replay.to_pydict()
         assert remote_replay.num_rows == 3

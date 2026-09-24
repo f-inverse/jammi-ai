@@ -12,7 +12,7 @@
 //!
 //! The engine `_offset` (a per-topic monotone counter assigned transactionally
 //! by [`crate::trigger::Publisher`]) is the *only* sequence the seam keys on.
-//! A broker's own native sequence (JetStream's stream sequence) is an
+//! A broker's own native sequence (a log broker's stream sequence) is an
 //! independent counter: after any post-commit fan-out failure — the
 //! best-effort path in [`crate::trigger::Publisher`] — the engine offset and
 //! the native sequence skew permanently. The tail never hands an engine

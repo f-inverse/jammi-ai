@@ -8,8 +8,8 @@
 //! channels driven through the proto-generated stubs, and the IPC
 //! round-trip on the `ArrowBatch` payload.
 //!
-//! The broker is always the in-memory implementation (no JetStream, no
-//! external services); the tests are hermetic and run in microseconds.
+//! The broker is always the in-memory implementation (no external
+//! services); the tests are hermetic and run in microseconds.
 //! Each fixture seeds its own `JammiSession` with the topics it needs and
 //! is torn down via the fixture's `Drop` impl, which signals the server's
 //! `oneshot::Receiver<()>` shutdown future. No background tasks survive a

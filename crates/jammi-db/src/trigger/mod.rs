@@ -7,8 +7,6 @@ pub mod consumer;
 pub mod error;
 pub mod ids;
 pub mod in_memory;
-#[cfg(feature = "jetstream-broker")]
-pub mod jetstream;
 pub mod offset;
 pub mod postgres;
 pub mod predicate;
@@ -23,8 +21,6 @@ pub use consumer::ConsumerOffsetSnapshot;
 pub use error::TriggerError;
 pub use ids::{SubscriptionId, TopicId};
 pub use in_memory::InMemoryBroker;
-#[cfg(feature = "jetstream-broker")]
-pub use jetstream::JetStreamBroker;
 pub use offset::Offset;
 pub use postgres::PostgresBroker;
 pub use predicate::Predicate;

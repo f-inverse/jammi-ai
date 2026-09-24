@@ -206,10 +206,8 @@ impl FromStr for LogFormat {
 /// pool_size = 16
 /// max_lifetime_secs = 1800
 ///
-/// [broker.jet_stream]
-/// url = "nats://${NATS_HOST}:4222"
-/// retention_seconds = 604800
-/// credentials = { file = "/var/run/secrets/nats.creds" }
+/// [broker.postgres]
+/// idle_poll_secs = 5
 /// ```
 ///
 /// `catalog.postgres.url` should carry `?sslmode=verify-full` (plus
@@ -224,9 +222,8 @@ impl FromStr for LogFormat {
 ///
 /// # Secrets
 ///
-/// Secret-valued fields (`catalog.postgres.url`, `broker.jet_stream.url`,
-/// `broker.jet_stream.credentials`, `storage.cloud.*`'s credential
-/// fields) are
+/// Secret-valued fields (`catalog.postgres.url`, `broker.postgres.url`,
+/// `storage.cloud.*`'s credential fields) are
 /// typed [`Secret`]: they accept either the value inline or `{ file = "…" }`
 /// naming a file that holds it, resolve at load, and render as `Secret(***)`
 /// in every `Debug` — so a `{:?}` of the whole config carries no secret. See
@@ -563,10 +560,8 @@ fn default_pool_size() -> u32 {
 /// ```
 ///
 /// ```toml
-/// [broker.jet_stream]
-/// url = "nats://${NATS_HOST}:4222"
-/// retention_seconds = 604800
-/// credentials = { file = "/var/run/secrets/nats.creds" }
+/// [broker.postgres]
+/// idle_poll_secs = 5
 /// ```
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -574,27 +569,6 @@ pub enum BrokerConfig {
     /// In-process broker. Default; matches the laptop / dev workflow.
     #[default]
     InMemory,
-    /// JetStream (NATS). Requires the `jetstream-broker` cargo feature on
-    /// `jammi-db`; building a session whose config selects `JetStream`
-    /// without the feature returns [`crate::error::JammiError::Config`].
-    JetStream {
-        /// NATS server URL, e.g. `nats://nats.svc:4222`. A [`Secret`]: NATS
-        /// URLs carry userinfo/token auth inline (`nats://user:pass@host`),
-        /// the same class of leak `catalog.postgres.url` guards against —
-        /// inline or `{ file = "…" }`; never printed.
-        url: Secret,
-        /// Default per-stream retention in seconds. Per-topic
-        /// `broker_metadata.retention_seconds` overrides this value.
-        /// Default: 7 days (604 800).
-        #[serde(default = "default_retention_secs")]
-        retention_seconds: u64,
-        /// Optional NATS credentials — the **contents** of a `.creds` file
-        /// (user JWT + NKEY seed), as a [`Secret`]: inline, or
-        /// `{ file = "/run/secrets/nats.creds" }` to read the file at load.
-        /// When unset the broker connects anonymously.
-        #[serde(default)]
-        credentials: Option<Secret>,
-    },
     /// Postgres `LISTEN`/`NOTIFY` wake-up transport
     /// ([`crate::trigger::PostgresBroker`]) — a topology change, not a
     /// cargo feature: `sqlx`'s `postgres` feature is unconditional in the
@@ -635,10 +609,6 @@ pub enum BrokerConfig {
         #[serde(default = "default_idle_poll_secs")]
         idle_poll_secs: u64,
     },
-}
-
-fn default_retention_secs() -> u64 {
-    7 * 24 * 60 * 60
 }
 
 fn default_idle_poll_secs() -> u64 {

@@ -848,7 +848,7 @@ def _synthetic(ai_cuda: list[str], kernels_extra: dict | None = None) -> dict:
             {
                 "name": "jammi-server",
                 "features": {"cuda": ["jammi-ai/cuda"],
-                             "jetstream-broker": [], "storage-cloud": []},
+                             "storage-cloud": []},
                 "dependencies": [
                     {"name": "jammi-ai", "optional": False, "uses_default_features": True, "features": []},
                 ],
@@ -1047,11 +1047,11 @@ def self_test() -> int:
         "a capability-less lane whose derived closure reaches jammi-kernels/cuda must FAIL"
     )
     # Positive control: a genuinely CPU-only lane (its OWN cargo_features,
-    # `jetstream-broker`, maps to an empty feature spec on jammi-server --
+    # `storage-cloud`, maps to an empty feature spec on jammi-server --
     # never reaches jammi-kernels at all) with no `capabilities` block must stay
     # clean.
     capability_less_and_clean = {
-        "cpu-tarball": {"package": "jammi-server", "cargo_features": ["jetstream-broker"]},
+        "cpu-tarball": {"package": "jammi-server", "cargo_features": ["storage-cloud"]},
     }
     assert verdict(g, _default_lanes(), verbose=False, all_lanes=capability_less_and_clean) == 0, (
         "a genuinely CPU-only lane (no capabilities block, closure reaches neither cuda nor "
@@ -1063,7 +1063,7 @@ def self_test() -> int:
     capabilities_but_no_reach = {
         "cpu-tarball": {
             "package": "jammi-server",
-            "cargo_features": ["jetstream-broker"],
+            "cargo_features": ["storage-cloud"],
             "capabilities": {"flash_compiled": False},
         },
     }
@@ -1176,7 +1176,7 @@ def self_test() -> int:
 # --------------------------------------------------------------------------- #
 
 _FIXTURE_CRATE_FEATURES = {
-    "jammi-server": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud", "live-gpu-tests"],
+    "jammi-server": ["cuda", "flash-attn", "storage-cloud", "live-gpu-tests"],
     "jammi-ai": ["cuda", "flash-attn", "live-gpu-tests"],
     "jammi-bench": ["cuda", "flash-attn"],
     "jammi-kernels": ["cuda", "flash-attn", "default"],
@@ -1185,10 +1185,10 @@ _FIXTURE_CRATE_FEATURES = {
 _FIXTURE_MANIFEST = {
     "lanes": {
         "cu12-tarball": {
-            "cargo_features": ["cuda", "flash-attn", "jetstream-broker", "storage-cloud"],
+            "cargo_features": ["cuda", "flash-attn", "storage-cloud"],
         }
     },
-    "server_only_cargo_features": {"features": ["jetstream-broker", "storage-cloud"]},
+    "server_only_cargo_features": {"features": ["storage-cloud"]},
     "prove_lane": {
         "crates": {
             "jammi-server": {"kinds": ["release", "test"], "prove_only": ["live-gpu-tests"]},
@@ -1203,12 +1203,12 @@ _FIXTURE_MANIFEST = {
 def _fixture_good_prove_script() -> str:
     lines = [
         "#!/usr/bin/env bash",
-        'echo "PROVE_TUPLE crate=jammi-server kind=release features=cuda,flash-attn,jetstream-broker,storage-cloud"',
-        "cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,jetstream-broker,storage-cloud",
+        'echo "PROVE_TUPLE crate=jammi-server kind=release features=cuda,flash-attn,storage-cloud"',
+        "cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-cloud",
         'echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"',
         "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run",
-        'echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud"',
-        "cargo test -p jammi-server --features cuda,flash-attn,jetstream-broker,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu -- --nocapture",
+        'echo "PROVE_TUPLE crate=jammi-server kind=test features=cuda,flash-attn,live-gpu-tests,storage-cloud"',
+        "cargo test -p jammi-server --features cuda,flash-attn,live-gpu-tests,storage-cloud --test it grpc_embedding_gpu -- --nocapture",
         'echo "PROVE_TUPLE crate=jammi-ai kind=test features=cuda,flash-attn,live-gpu-tests"',
         "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --skip capability_surface",
         'echo "PROVE_TUPLE crate=jammi-kernels kind=default features="',
@@ -1319,7 +1319,7 @@ def _self_test_prove_surface() -> None:
     # longer carries flash-attn, so every pair's expected surface shrinks --
     # the UNCHANGED script now disagrees with the manifest.
     m = json.loads(json.dumps(_FIXTURE_MANIFEST))
-    m["lanes"]["cu12-tarball"]["cargo_features"] = ["cuda", "jetstream-broker", "storage-cloud"]
+    m["lanes"]["cu12-tarball"]["cargo_features"] = ["cuda", "storage-cloud"]
     assert _run_prove_surface_fixture(good, m) == 1, "lane minus flash-attn must change the verdict"
 
     # Reverted literal: jammi-ai test invocation (both echo AND actual
@@ -1481,7 +1481,7 @@ def load_manifest_lanes_skips_capability_less_lane() -> bool:
             "lanes": {
                 "cpu-tarball": {
                     "package": "jammi-ai",
-                    "cargo_features": ["jetstream-broker"],
+                    "cargo_features": ["storage-cloud"],
                 },
                 "cu12-tarball": {
                     "package": "jammi-ai",
@@ -1511,7 +1511,7 @@ def load_manifest_lanes_all_capability_less_still_errors() -> bool:
         manifest = Path(td) / "release-feature-manifest.json"
         manifest.write_text(json.dumps({
             "lanes": {
-                "cpu-tarball": {"package": "jammi-ai", "cargo_features": ["jetstream-broker"]},
+                "cpu-tarball": {"package": "jammi-ai", "cargo_features": ["storage-cloud"]},
             }
         }))
         global MANIFEST_PATH

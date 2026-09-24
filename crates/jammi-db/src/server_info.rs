@@ -32,7 +32,7 @@ pub struct ServerInfo {
     /// The engine version — the lockstep workspace crate version.
     pub version: String,
     /// Optional engine capabilities compiled into this build (e.g. `"postgres"`,
-    /// `"mysql"`, `"jetstream-broker"`), sorted.
+    /// `"mysql"`), sorted.
     pub features: Vec<String>,
     /// Storage URL schemes this build can address (always `"file"` and
     /// `"memory"`; cloud schemes appear when their driver feature is compiled
@@ -43,7 +43,7 @@ pub struct ServerInfo {
     /// runtime-resolved tier set. See `jammi-server`'s service-tier mechanism.
     pub services: Vec<String>,
     /// The RUNTIME trigger-broker driver this session is actually running:
-    /// `"in_memory"` | `"jet_stream"` | `"postgres"` (see
+    /// `"in_memory"` | `"postgres"` (see
     /// [`crate::trigger::BrokerKind::as_str`]). Unlike the first three
     /// fields this is not a compile-time fact — [`ServerInfo::current`]
     /// leaves it empty (the same way it leaves `services` empty, since it
@@ -80,9 +80,6 @@ impl ServerInfo {
         }
         if cfg!(feature = "mysql") {
             features.push("mysql".to_string());
-        }
-        if cfg!(feature = "jetstream-broker") {
-            features.push("jetstream-broker".to_string());
         }
         features.sort();
 

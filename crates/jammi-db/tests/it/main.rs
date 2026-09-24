@@ -72,8 +72,6 @@ mod store;
 mod tenant_scope;
 mod terminality_source_gate;
 mod trigger;
-#[cfg(feature = "live-broker-tests")]
-mod trigger_jetstream;
 mod trigger_multi_replica_offsets;
 mod trigger_replay_column_types;
 mod trigger_replay_row_order;

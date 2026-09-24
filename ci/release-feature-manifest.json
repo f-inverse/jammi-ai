@@ -148,7 +148,6 @@
       "cargo_features": [
         "cuda",
         "flash-attn",
-        "jetstream-broker",
         "storage-cloud"
       ],
       "capabilities": {
@@ -192,7 +191,6 @@
       "cargo_features": [
         "cuda",
         "flash-attn",
-        "jetstream-broker",
         "storage-cloud"
       ],
       "capabilities": {
@@ -236,7 +234,6 @@
       "cargo_features": [
         "cuda",
         "flash-attn",
-        "jetstream-broker",
         "storage-cloud"
       ],
       "capabilities": {
@@ -278,7 +275,6 @@
       "workflow": ".github/workflows/release-binaries.yml:server-cpu-promote",
       "package": "jammi-server",
       "cargo_features": [
-        "jetstream-broker",
         "storage-cloud"
       ]
     },
@@ -287,7 +283,6 @@
       "workflow": ".github/workflows/pypi-server.yml:publish",
       "package": "jammi-server",
       "cargo_features": [
-        "jetstream-broker",
         "storage-cloud"
       ]
     },
@@ -296,7 +291,6 @@
       "workflow": ".github/workflows/server-image.yml:build-and-push-main / build-and-push / build-and-push-selfcontained (Dockerfile builder stage); .github/workflows/kube-smoke.yml and compose-smoke.yml (load-only smoke builds of the same builder stage)",
       "package": "jammi-server",
       "cargo_features": [
-        "jetstream-broker",
         "storage-cloud"
       ]
     }
@@ -382,16 +376,16 @@
   "server_only_cargo_features": {
     "_doc": [
       "Features that exist on `jammi-server` with no `jammi-ai` equivalent",
-      "(broker/cloud-storage plumbing the embedded engine crate does not",
+      "(cloud-storage plumbing the embedded engine crate does not",
       "carry). A consumer deriving the `jammi-ai`-applicable subset of a",
       "lane's `cargo_features` (e.g. `runpod_gpu_prove.sh`'s capability-",
       "surface build, which runs `cargo test -p jammi-ai --features <subset>`",
       "rather than `-p jammi-server`) subtracts this list from",
-      "`lanes.<lane>.cargo_features`. Every lane above resolves to",
-      "`[\"cuda\", \"flash-attn\"]` on `jammi-ai` once these are removed."
+      "`lanes.<lane>.cargo_features`. Every CUDA lane above resolves to",
+      "`[\"cuda\", \"flash-attn\"]` on `jammi-ai` once these are removed,",
+      "every CPU lane to `[]`."
     ],
     "features": [
-      "jetstream-broker",
       "storage-cloud"
     ]
   }

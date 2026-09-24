@@ -5,9 +5,9 @@
 A *trigger-stream topic* is a catalog-registered Arrow schema plus a
 backing mutable table. Publishers append `RecordBatch`es; subscribers
 filter and receive them. The engine owns the offset counter and the
-durable event log; the broker (in-memory by default, NATS JetStream
-in clustered deployments) fans live deliveries out to attached
-subscribers.
+durable event log; the broker (in-memory by default, Postgres
+`LISTEN`/`NOTIFY` in multi-replica deployments) fans live deliveries out
+to attached subscribers.
 
 Reach for the trigger stream when a tenant needs event semantics — a
 CDC pipeline, a feature-store update bus, a job-completion notification
@@ -25,10 +25,10 @@ search index) and publish a batch of events from Rust.
 
 ## Setup
 
-Assumes a `JammiSession` whose `JammiConfig.trigger_broker` is left at
-its default — the embedded `InMemoryBroker`. Production deployments
-swap in `JetStreamBroker` via configuration; the publisher API does
-not change.
+Assumes a `JammiSession` whose `JammiConfig.broker` is left at its
+default — the embedded `InMemoryBroker`. Multi-replica deployments select
+the Postgres broker via configuration (`[broker.postgres]`); the publisher
+API does not change.
 
 ## Define the topic schema
 

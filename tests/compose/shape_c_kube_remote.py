@@ -17,8 +17,8 @@ after-restart property (`remote_smoke.shared_catalog_after_restart`).
 What this proves: readiness after a rollout restart, the runtime oracle on
 `get_server_info().broker`, an exact self-hit search, and — via the
 after-restart callback — that the NEW pod shares the OLD pod's catalog
-(Postgres) and broker (JetStream): the registered source is still visible,
-the sources count is unchanged, and the broker is still `jet_stream`.
+(Postgres) and broker (Postgres): the registered source is still visible,
+the sources count is unchanged, and the broker is still `postgres`.
 
 What this does NOT prove: result-table DURABILITY across the restart, and
 the after-restart callback deliberately never queries the result table to
@@ -164,7 +164,7 @@ def main() -> int:
             f"  kubectl -n {args.namespace} port-forward svc/{args.service} "
             "8081:8081 8080:8080"
         )
-        print("  assert get_server_info().broker == \"jet_stream\"")
+        print("  assert get_server_info().broker == \"postgres\"")
         print("  add_source(\"patents\", url=SOURCE_URL, format=\"parquet\")")
         print("  SELECT count(*) FROM patents.public.patents")
         print(
@@ -181,7 +181,7 @@ def main() -> int:
         )
         print("  assert describe_source(\"patents\") is not None")
         print("  assert len(list_sources()) unchanged  # NOT the result table -- emptyDir, see docstring")
-        print("  assert get_server_info().broker == \"jet_stream\"  # re-check")
+        print("  assert get_server_info().broker == \"postgres\"  # re-check")
         return 0
 
     return run(

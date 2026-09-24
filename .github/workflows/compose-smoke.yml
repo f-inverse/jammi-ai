@@ -1,8 +1,8 @@
 name: Compose smoke (Shape B)
 
 # Builds the CPU `jammi-ai-server` image from THIS commit's Dockerfile, brings
-# up `deploy/docker-compose.yml` (Shape B: server + Postgres catalog +
-# JetStream broker) with the CI fixture-mount override, and drives it with a
+# up `deploy/docker-compose.yml` (Shape B: server + one Postgres serving as
+# catalog and broker) with the CI fixture-mount override, and drives it with a
 # remote Python client (`tests/compose/shape_b_remote.py`) — proving the
 # compose file, the image's env-only config resolution, and a restart's
 # result durability together, not any one of them in isolation.
@@ -10,7 +10,7 @@ name: Compose smoke (Shape B)
 # Deliberately NOT run on every PR: not because the build is slow (a warm
 # rebuild is ~3 minutes, Dockerfile:27-29 — the ~30-minute figure only
 # applies to a cold gha cache), but because the per-PR lanes already build
-# and test the binary itself, and a Docker + Postgres + JetStream stack on
+# and test the binary itself, and a Docker + Postgres stack on
 # every push to every branch is runner-minute cost with no incremental
 # coverage over the already-cached-build case. It runs on every push to
 # `main` (catches a regression the moment it merges), nightly (catches drift
@@ -132,7 +132,7 @@ jobs:
           provenance: "false"
           cache-scope: cpu-${{ matrix.arch }}
 
-      - name: Bring up Shape B (server + Postgres + JetStream)
+      - name: Bring up Shape B (server + Postgres)
         run: |
           set -euo pipefail
           docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait
@@ -172,7 +172,7 @@ jobs:
       - name: Run the Shape B release smoke script (RELEASE via SIGINT)
         run: python3 tests/compose/shape_b_release.py
 
-      - name: Assert the Postgres catalog and JetStream broker were exercised at runtime
+      - name: Assert the Postgres catalog was exercised at runtime
         run: |
           set -euo pipefail
           catalog_count="$(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml exec -T postgres \

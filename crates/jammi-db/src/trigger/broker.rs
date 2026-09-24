@@ -65,7 +65,7 @@ pub trait TriggerBroker: Send + Sync + 'static {
     ///
     /// This contract is what keeps the at-least-once guarantee correct across
     /// drivers whose native sequence is an independent counter from the engine
-    /// `_offset` (JetStream's stream sequence): the engine never hands an
+    /// `_offset` (a log broker's own stream sequence): the engine never hands an
     /// engine offset to a driver as if it were a native sequence, because the
     /// two skew permanently after any post-commit fan-out failure (the
     /// best-effort path in [`crate::trigger::Publisher`]). A driver that cannot
@@ -113,8 +113,9 @@ pub trait TriggerBroker: Send + Sync + 'static {
 /// Discriminates the available broker implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerKind {
+    /// [`crate::trigger::InMemoryBroker`] — in-process fan-out; carries the
+    /// published batches itself.
     InMemory,
-    JetStream,
     /// [`crate::trigger::PostgresBroker`] — a wake-up transport over
     /// `LISTEN`/`NOTIFY`; the topic's mutable backing table is the
     /// authoritative log (see `crate::trigger::postgres`'s module docs).
@@ -124,11 +125,10 @@ pub enum BrokerKind {
 impl BrokerKind {
     /// The runtime string `ServerInfo::broker` reports and the
     /// `[broker.<kind>]` config section tag uses for this kind:
-    /// `"in_memory"` | `"jet_stream"` | `"postgres"`.
+    /// `"in_memory"` | `"postgres"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InMemory => "in_memory",
-            Self::JetStream => "jet_stream",
             Self::Postgres => "postgres",
         }
     }

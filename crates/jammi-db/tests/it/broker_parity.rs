@@ -1,9 +1,7 @@
 //! Cross-driver trigger-broker parity suite.
 //!
-//! Parameterised over [`Arm::InMemory`] (always), [`Arm::Postgres`]
-//! (`live-postgres-tests`, against `JAMMI_TEST_PG_URL`), and
-//! [`Arm::JetStream`] (`live-broker-tests`, against `JAMMI_TEST_NATS_URL`).
-//! Every arm exercises the SAME
+//! Parameterised over [`Arm::InMemory`] (always) and [`Arm::Postgres`]
+//! (`live-postgres-tests`, against `JAMMI_TEST_PG_URL`). Every arm exercises the SAME
 //! engine-facing surface (`Subscriber`/`Publisher`/`TopicRepo`) over a fresh
 //! SQLite catalog, so a passing suite proves the `Subscriber`/`TopicTail`
 //! seam behaves identically regardless of which driver sits underneath it —
@@ -45,8 +43,6 @@ use jammi_db::store::mutable::sqlite::SqliteMutableBackend;
 use jammi_db::store::mutable::MutableBackend;
 use jammi_db::tenant::TenantId;
 use jammi_db::tenant_scope::TenantBinding;
-#[cfg(feature = "live-broker-tests")]
-use jammi_db::trigger::JetStreamBroker;
 #[cfg(feature = "live-postgres-tests")]
 use jammi_db::trigger::LiveEvent;
 #[cfg(feature = "live-postgres-tests")]
@@ -63,8 +59,6 @@ enum Arm {
     InMemory,
     #[cfg(feature = "live-postgres-tests")]
     Postgres,
-    #[cfg(feature = "live-broker-tests")]
-    JetStream,
 }
 
 /// `idle_poll` for every `Arm::Postgres` broker built in this suite: short
@@ -84,12 +78,6 @@ async fn broker_for(arm: Arm) -> Arc<dyn TriggerBroker> {
             PostgresBroker::connect(&jammi_test_utils::postgres_url(), TEST_IDLE_POLL)
                 .await
                 .expect("connect to Postgres broker"),
-        ),
-        #[cfg(feature = "live-broker-tests")]
-        Arm::JetStream => Arc::new(
-            JetStreamBroker::connect(&jammi_test_resources::env("JAMMI_TEST_NATS_URL"), 60)
-                .await
-                .expect("connect to JetStream"),
         ),
     }
 }
@@ -187,7 +175,6 @@ where
 /// once, in ascending order.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -232,7 +219,6 @@ async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
 /// exactly-once stream.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -301,7 +287,6 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
 /// twice.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -362,7 +347,6 @@ async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
 /// concurrent writer a real chance to land a commit inside it.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -442,7 +426,6 @@ async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
 /// tenants.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -500,7 +483,6 @@ async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
 /// into ONE `DeliveredBatch` in original row order.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -589,7 +571,6 @@ async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm)
 /// predicate's matches.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -652,7 +633,6 @@ async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
 /// so the oracle pins the persisted type-name table.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -1113,8 +1093,8 @@ async fn postgres_listener_killed_recovers_via_replay() {
 /// the CONCRETE `PostgresBroker` type directly (its own `TriggerBroker`
 /// methods, not `Publisher`/`Subscriber`) because only this driver's
 /// `ConsumerOffsetSnapshot` is best-effort/informational in this way — the
-/// in-memory and JetStream drivers carry the delivered batch itself, so
-/// their consumer's last-delivered offset is authoritative from the first
+/// in-memory driver carries the delivered batch itself, so its consumer's
+/// last-delivered offset is authoritative from the first
 /// event.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
@@ -1229,7 +1209,6 @@ async fn postgres_suppressed_notify_recovers_via_idle_tick() {
 /// reseed replayed past `N`.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
     let broker = broker_for(arm).await;
@@ -1295,7 +1274,6 @@ async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
 /// it.
 #[test_case(Arm::InMemory ; "in_memory")]
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
-#[cfg_attr(feature = "live-broker-tests", test_case(Arm::JetStream ; "jetstream"))]
 #[tokio::test]
 async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_window(arm: Arm) {
     let broker = broker_for(arm).await;

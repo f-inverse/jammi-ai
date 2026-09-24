@@ -1,14 +1,15 @@
 # Trigger streams
 
 End-to-end publish + subscribe on a Jammi topic, plus the registration
-and listing surface. Uses the embedded in-process broker — no NATS or
-external broker needed.
+and listing surface. Uses the embedded in-process broker — no external
+broker needed.
 
 **When to use this pattern.** You need a low-friction event bus inside
 your application — for fan-out to downstream consumers, fan-in from
-batch jobs, or replay-from-offset semantics — without bringing up Kafka
-or NATS in dev/test. The same surface scales out to NATS JetStream by
-flipping a config flag at deploy time.
+batch jobs, or replay-from-offset semantics — without bringing up a
+separate message broker. The same surface scales out across replicas on
+the Postgres broker (`[broker.postgres]`) by a config change at deploy
+time.
 
 ## What `example.py` does
 

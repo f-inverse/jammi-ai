@@ -8,7 +8,7 @@ metadata:
   name: jammi-server
 spec:
   # Every replica runs the identical config against the same Postgres catalog
-  # and JetStream broker; the one lease + advisory-lock mechanism
+  # and Postgres broker; the one lease + advisory-lock mechanism
   # (docs/guide/src/reference-topologies.md#shape-c--multi-tenant-server,
   # docs/guide/src/catalog-and-broker.md#multi-writer-safety)
   # is what makes concurrent replicas safe. Raise or lower freely.
@@ -48,7 +48,7 @@ spec:
             periodSeconds: 10
           envFrom:
             # JAMMI_AUDIT_MASTER_KEY, JAMMI_CATALOG__POSTGRES__URL,
-            # JAMMI_BROKER__JET_STREAM__URL -- no Secret manifest ships in
+            # JAMMI_BROKER__POSTGRES__URL -- no Secret manifest ships in
             # git; create it out-of-band (see the README).
             - secretRef: { name: jammi-server-secrets, optional: false }
           volumeMounts:

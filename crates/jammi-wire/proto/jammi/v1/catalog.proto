@@ -228,7 +228,7 @@ message ServerInfo {
   // The engine version (the `jammi` workspace version, e.g. "0.17.0").
   string version = 1;
   // Engine capability feature flags compiled into this build (e.g. "postgres",
-  // "mysql", "jetstream-broker"), sorted.
+  // "mysql"), sorted.
   repeated string features = 2;
   // Storage URL schemes this build can address (always "file" and "memory";
   // cloud schemes appear when their driver feature is compiled in), sorted.
@@ -244,7 +244,7 @@ message ServerInfo {
   // reports an empty list.
   repeated string services = 4;
   // The RUNTIME trigger-broker driver this deployment is actually running:
-  // "in_memory" | "jet_stream" | "postgres". Unlike the fields above, an
+  // "in_memory" | "postgres". Unlike the fields above, an
   // embedded (in-process) client and a remote server built from the same
   // config report the IDENTICAL value here -- every engine session holds a
   // real broker whether or not it also serves gRPC.

@@ -39,8 +39,8 @@ knobs.
   to hold a rank (the coordinator's included). This overlay is
   kubeconform-validated only — no GPU node is available in CI, so it never
   runs a real pod there.
-- **`overlays/ci/`** — the kind smoke's stack: upstream `postgres:16` and
-  `nats:2.10-alpine` `StatefulSet`s alongside the base query tier, pinned to
+- **`overlays/ci/`** — the kind smoke's stack: an upstream `postgres:16`
+  `StatefulSet` (catalog and broker) alongside the base query tier, pinned to
   the image the workflow already built and `kind load`ed. Never a production
   shape.
 
@@ -54,7 +54,7 @@ namespace, with the three env keys the Deployment's `envFrom` names
 kubectl -n <namespace> create secret generic jammi-server-secrets \
   --from-literal=JAMMI_AUDIT_MASTER_KEY=<...> \
   --from-literal=JAMMI_CATALOG__POSTGRES__URL=<...> \
-  --from-literal=JAMMI_BROKER__JET_STREAM__URL=<...>
+  --from-literal=JAMMI_BROKER__POSTGRES__URL=<...>
 ```
 
 `base/jammi.toml`'s `result_root = "s3://jammi-results/prod"` is an example, not a

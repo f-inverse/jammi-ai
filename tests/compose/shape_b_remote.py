@@ -7,7 +7,7 @@ deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait` has
 brought the stack up healthy. Deliberately outside `tests/uat/` — ci.yml's
 `test-python` job globs `tests/uat/shape_b_*.py` / `tests/uat/shape_c_*.py`
 on every PR against the EMBEDDED engine; this script needs a running remote
-server + Postgres + JetStream, which only this workflow provisions.
+server + Postgres, which only this workflow provisions.
 
 This is now a thin driver over `remote_smoke.py`'s shared oracle (same
 directory, so `import remote_smoke` resolves whether this script is run
@@ -91,7 +91,7 @@ def main() -> int:
         print(f"  health url   = {args.health_url}")
         print(f"  source url   = {SOURCE_URL}")
         print(f"  model        = {MODEL}")
-        print("  assert get_server_info().broker == \"jet_stream\"")
+        print("  assert get_server_info().broker == \"postgres\"")
         print("  add_source(\"patents\", url=SOURCE_URL, format=\"parquet\")")
         print("  SELECT count(*) FROM patents.public.patents")
         print(

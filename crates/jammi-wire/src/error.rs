@@ -1757,7 +1757,7 @@ mod tests {
                 table: "topics".into(),
                 detail: "duplicate key value violates unique constraint".into(),
             }),
-            TriggerError::Driver("nats: connection closed".into()),
+            TriggerError::Driver("postgres LISTEN: connection closed".into()),
             TriggerError::Catalog("topic_id parse: invalid".into()),
         ];
         for err in &cases {

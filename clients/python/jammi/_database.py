@@ -1182,8 +1182,7 @@ class RemoteDatabase:
         ``"eval"`` appear only when this server enabled them). A
         client reads ``services`` to know which verbs are reachable here before
         calling them. ``broker`` is the RUNTIME trigger-broker driver this
-        deployment is running (``"in_memory"`` / ``"jet_stream"`` /
-        ``"postgres"``) — unlike ``services``, the embedded and the remote
+        deployment is running (``"in_memory"`` / ``"postgres"``) — unlike ``services``, the embedded and the remote
         surfaces report the IDENTICAL value here when built from the same
         config.
 

@@ -63,8 +63,8 @@ impl Stream for Subscription {
 /// One item a [`crate::trigger::broker::TriggerBroker`] driver hands the
 /// engine's subscribe seam ([`crate::trigger::Subscriber`]).
 ///
-/// A driver that carries the published bytes itself (the in-memory broker,
-/// JetStream) yields [`LiveEvent::Batch`]. A driver that carries no payload
+/// A driver that carries the published bytes itself (the in-memory broker)
+/// yields [`LiveEvent::Batch`]. A driver that carries no payload
 /// — a wake-up transport over the authoritative backing table — yields only
 /// [`LiveEvent::Wake`]. `Wake` is payload-free: it means "the backing table
 /// MAY have new rows past what this subscriber has already seen", never a

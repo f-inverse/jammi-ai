@@ -70,74 +70,6 @@ fn broker_config_round_trip_in_memory() {
 }
 
 #[test]
-fn broker_config_round_trip_jetstream() {
-    let toml_src = r#"
-        [broker.jet_stream]
-        url = "nats://nats.svc:4222"
-        retention_seconds = 86400
-        credentials = "-----BEGIN NATS USER JWT-----\nabc\n------END NATS USER JWT------"
-    "#;
-    let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-    assert_eq!(
-        cfg.broker,
-        BrokerConfig::JetStream {
-            url: "nats://nats.svc:4222".into(),
-            retention_seconds: 86400,
-            credentials: Some(Secret::from(
-                "-----BEGIN NATS USER JWT-----\nabc\n------END NATS USER JWT------"
-            )),
-        }
-    );
-    assert!(!format!("{cfg:?}").contains("abc"));
-}
-
-/// `broker.credentials` carries what `async_nats::ConnectOptions::
-/// with_credentials` takes — the `.creds` file CONTENTS — not a path. The
-/// file form reads the file at load, so what reaches the session builder
-/// is the JWT + seed text with its one trailing newline trimmed.
-#[test]
-fn jetstream_credentials_are_contents_not_a_path() {
-    let dir = tempfile::tempdir().unwrap();
-    let creds_path = dir.path().join("nats.creds");
-    let contents = "-----BEGIN NATS USER JWT-----\neyJ0.abc\n------END NATS USER JWT------\n\
-                    -----BEGIN USER NKEY SEED-----\nSUAB\n------END USER NKEY SEED------";
-    std::fs::write(&creds_path, format!("{contents}\n")).unwrap();
-    let toml_src = format!(
-        r#"
-        [broker.jet_stream]
-        url = "nats://nats.svc:4222"
-        credentials = {{ file = {:?} }}
-    "#,
-        creds_path.to_str().unwrap()
-    );
-    let cfg: JammiConfig = toml::from_str(&toml_src).unwrap();
-    let BrokerConfig::JetStream { credentials, .. } = &cfg.broker else {
-        panic!("expected jet_stream, got {:?}", cfg.broker);
-    };
-    let resolved = credentials.as_ref().expect("credentials set");
-    assert_eq!(resolved.expose(), contents);
-    assert_ne!(resolved.expose(), creds_path.to_str().unwrap());
-    assert!(!format!("{cfg:?}").contains("SUAB"));
-}
-
-#[test]
-fn broker_config_jetstream_defaults() {
-    let toml_src = r#"
-        [broker.jet_stream]
-        url = "nats://nats.svc:4222"
-    "#;
-    let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-    assert_eq!(
-        cfg.broker,
-        BrokerConfig::JetStream {
-            url: "nats://nats.svc:4222".into(),
-            retention_seconds: 7 * 24 * 60 * 60,
-            credentials: None,
-        }
-    );
-}
-
-#[test]
 fn jammi_config_default_uses_sqlite_and_in_memory() {
     let cfg = JammiConfig::default();
     assert_eq!(cfg.catalog, CatalogConfig::Sqlite { path: None });
@@ -171,8 +103,7 @@ fn jammi_config_debug_never_prints_a_secret() {
     let plaintexts = [
         "hunter2-pw",
         "Bearer tok-4f9a-secret",
-        "nats-jwt-secret-abc",
-        "nats-url-token-secret",
+        "pg-broker-url-secret",
         "hf-inline-hubtoken-xyz",
         "s3-inline-secret-xyz",
         "s3-file-secret-xyz",
@@ -188,9 +119,8 @@ fn jammi_config_debug_never_prints_a_secret() {
         [catalog.postgres]
         url = "postgres://jammi:hunter2-pw@db.internal:5432/jammi"
 
-        [broker.jet_stream]
-        url = "nats://nats-user:nats-url-token-secret@nats.svc:4222"
-        credentials = "nats-jwt-secret-abc"
+        [broker.postgres]
+        url = "postgres://jammi:pg-broker-url-secret@notify.internal:5432/jammi"
 
         [observability.otlp_headers]
         Authorization = "Bearer tok-4f9a-secret"
@@ -391,27 +321,6 @@ fn env_whole_value_at_an_enum_position_via_override_never_echoes_the_value() {
         }
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
-}
-
-/// `broker.jet_stream.url` is `Secret`-typed —
-/// a NATS URL can carry userinfo/token auth inline
-/// (`nats://user:pass@host`), the same class of leak `catalog.postgres.url`
-/// guards against.
-#[test]
-fn broker_jetstream_url_is_redacted_like_catalog_postgres_url() {
-    let toml_src = r#"
-        [broker.jet_stream]
-        url = "nats://nats-user:hunter2-nats-url-secret@nats.svc:4222"
-    "#;
-    let cfg: JammiConfig = toml::from_str(toml_src).unwrap();
-    let BrokerConfig::JetStream { url, .. } = &cfg.broker else {
-        panic!("expected jet_stream, got {:?}", cfg.broker);
-    };
-    assert_eq!(
-        url.expose(),
-        "nats://nats-user:hunter2-nats-url-secret@nats.svc:4222"
-    );
-    assert!(!format!("{cfg:?}").contains("hunter2-nats-url-secret"));
 }
 
 /// `ServiceSelection`'s array form trims and
@@ -1625,11 +1534,11 @@ fn effective_oversample_for_none_on_binary_resolves_to_thirty_two() {
 
 // ── Layered `JAMMI_*` env overrides ─────────────────────────────────────
 
-/// An env-only selection of Postgres + JetStream must actually run
-/// Postgres + JetStream — every `JAMMI_CATALOG__*` / `JAMMI_BROKER__*` path is
+/// An env-only selection of a Postgres catalog + Postgres broker must actually
+/// run both — every `JAMMI_CATALOG__*` / `JAMMI_BROKER__*` path is
 /// config, never a silently ignored variable that leaves SQLite running.
 #[test]
-fn env_only_postgres_and_jetstream_selection_round_trips() {
+fn env_only_postgres_catalog_and_broker_selection_round_trips() {
     let cfg = JammiConfig::parse_from(
         "",
         vec![
@@ -1638,8 +1547,8 @@ fn env_only_postgres_and_jetstream_selection_round_trips() {
                 "postgres://u:p@h/db".to_string(),
             ),
             (
-                "JAMMI_BROKER__JET_STREAM__URL".to_string(),
-                "nats://nats.svc:4222".to_string(),
+                "JAMMI_BROKER__POSTGRES__IDLE_POLL_SECS".to_string(),
+                "2".to_string(),
             ),
         ],
     )
@@ -1654,10 +1563,9 @@ fn env_only_postgres_and_jetstream_selection_round_trips() {
     );
     assert_eq!(
         cfg.broker,
-        BrokerConfig::JetStream {
-            url: "nats://nats.svc:4222".into(),
-            retention_seconds: 7 * 24 * 60 * 60,
-            credentials: None,
+        BrokerConfig::Postgres {
+            url: None,
+            idle_poll_secs: 2,
         }
     );
 }
@@ -2409,20 +2317,21 @@ fn parse_from_empty_is_the_defaults_control() {
     assert_eq!(cfg.models, ModelsConfig::default());
 }
 
-// ── unknown credentials_path key oracle ──────────────────────────────────
+// ── broker selection is closed over the shipped drivers ─────────────────
 
-/// An unknown `credentials_path` key is never silently ignored:
-/// `BrokerConfig::JetStream` has `deny_unknown_fields`, so a config that
-/// spells it is refused, naming it.
+/// `BrokerConfig` names exactly the drivers this build ships (`in_memory`,
+/// `postgres`), so a config selecting any other broker section is refused at
+/// load, naming the section — never parsed into a silent fallback to the
+/// in-memory default.
 #[test]
-fn broker_jetstream_credentials_path_is_a_refused_unknown_key() {
+fn broker_section_naming_no_shipped_driver_is_refused() {
     let err = JammiConfig::parse_from(
-        "[broker.jet_stream]\nurl = \"nats://nats.svc:4222\"\ncredentials_path = \"/var/run/secrets/nats.creds\"\n",
+        "[broker.jet_stream]\nurl = \"nats://nats.svc:4222\"\n",
         std::iter::empty(),
     )
     .unwrap_err();
     match err {
-        JammiError::Config(msg) => assert!(msg.contains("credentials_path"), "msg = {msg}"),
+        JammiError::Config(msg) => assert!(msg.contains("jet_stream"), "msg = {msg}"),
         other => panic!("expected JammiError::Config, got {other:?}"),
     }
 }

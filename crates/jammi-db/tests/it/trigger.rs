@@ -1195,8 +1195,7 @@ async fn crash_mid_publish_replays_committed_offsets_with_no_loss(backend: Backe
 #[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
 #[tokio::test]
 async fn live_tail_resumes_with_no_loss_after_post_commit_fan_out_failure(backend: BackendKind) {
-    // The in-memory analogue of the JetStream consumer-recreate
-    // resume test. A late subscriber attaches at `from_offset` AFTER a
+    // A late subscriber attaches at `from_offset` AFTER a
     // post-commit fan-out failure has skewed the broker's view from the
     // engine `_offset`, then keeps consuming as new publishes arrive live.
     // Every committed offset in `[from..max]` must be delivered with no skip,

@@ -9,10 +9,10 @@ its own `after_restart` callback (what property must still hold once the
 server answers again), and both call `run()` here.
 
 `run(target, health_url, *, restart, after_restart)`:
-  1. connects, asserts the compile-time `jetstream-broker` feature AND the
-     RUNTIME `get_server_info().broker == "jet_stream"` (the latter is the
-     real oracle: deleting the broker URL from a deployment's config would
-     still leave the former passing);
+  1. connects and asserts the RUNTIME `get_server_info().broker ==
+     "postgres"` — the driver the session is actually running, which a
+     deployment that dropped its broker URL would fail (it falls back to
+     `in_memory`);
   2. registers the bundled `patents.parquet` fixture, embeds one column with
      the bundled `tiny_bert` fixture, searches for the stored vector's own
      nearest neighbor (an exact self-hit);
@@ -28,7 +28,7 @@ server answers again), and both call `run()` here.
      own docstring) instead asserts the NEW pod can see what the OLD pod
      wrote to the shared catalog/broker: the registered source is still
      visible, the sources count is unchanged, and the broker is still
-     `jet_stream`.
+     `postgres`.
 
 Every assertion prints what it compared before raising, so a CI failure log
 shows the mismatch without a re-run.
@@ -128,7 +128,7 @@ def shared_catalog_after_restart(ctx: Ctx) -> None:
     deliberately NOT done. What must hold instead is that a NEW pod,
     reconnecting to the SAME catalog and broker, sees what the OLD pod
     wrote to the catalog: the registered source is visible, the sources
-    count is unchanged, and the broker is still `jet_stream`."""
+    count is unchanged, and the broker is still `postgres`."""
     described = ctx.db.describe_source("patents")
     assert described is not None, (
         "expected describe_source('patents') to be visible to the pod after "
@@ -144,9 +144,9 @@ def shared_catalog_after_restart(ctx: Ctx) -> None:
 
     info = ctx.db.get_server_info()
     broker = info["broker"]
-    assert broker == "jet_stream", (
-        f"expected get_server_info().broker == 'jet_stream' after restart, got {broker!r} -- "
-        "the new pod is not backed by the same JetStream broker"
+    assert broker == "postgres", (
+        f"expected get_server_info().broker == 'postgres' after restart, got {broker!r} -- "
+        "the new pod is not backed by the shared Postgres broker"
     )
 
 
@@ -163,24 +163,15 @@ def run(
 
     info = db.get_server_info()
 
-    # Compile-time capability check only: this build was compiled with the
-    # jetstream-broker feature. It does NOT prove the RUNNING deployment is
-    # actually using JetStream as its broker -- deleting the broker URL from
-    # the deployment's config would still leave this assertion passing.
-    features = info["features"]
-    assert "jetstream-broker" in features, (
-        f"expected 'jetstream-broker' in get_server_info().features, got {features}"
-    )
-
     # Runtime oracle: the broker this session is ACTUALLY running, per
-    # `BrokerKind::as_str` (crates/jammi-db/src/trigger/broker.rs). Unlike
-    # `features` above, this would fail if the deployment's
-    # `JAMMI_BROKER__JET_STREAM__URL` were deleted (the server would fall
-    # back to the in-memory broker and report `"in_memory"` here instead).
+    # `BrokerKind::as_str` (crates/jammi-db/src/trigger/broker.rs). This
+    # fails if the deployment's `JAMMI_BROKER__POSTGRES__URL` were deleted
+    # (the server would fall back to the in-memory broker and report
+    # `"in_memory"` here instead).
     broker = info["broker"]
-    assert broker == "jet_stream", (
-        f"expected get_server_info().broker == 'jet_stream', got {broker!r} -- "
-        "the running deployment is not actually backed by the JetStream service"
+    assert broker == "postgres", (
+        f"expected get_server_info().broker == 'postgres', got {broker!r} -- "
+        "the running deployment is not actually backed by the Postgres broker"
     )
 
     db.add_source("patents", url=SOURCE_URL, format="parquet")

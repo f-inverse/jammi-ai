@@ -118,7 +118,7 @@ The five pluggable backends — the entire deployment-knob surface:
 | Catalog | SQLite | Postgres |
 | Result-table storage | Local filesystem | S3 / GCS / R2 / Azure Blob (via the `object_store` crate) |
 | Mutable companion tables | SQLite | Postgres |
-| Trigger broker | In-memory | Kafka / NATS / Redis Streams / a cloud queue |
+| Trigger broker | In-memory | Postgres |
 | Model artifact source | Local cache + HF Hub | Mirror, private registry, object-store-backed store |
 
 Everything else — load balancing, ingress, TLS, secrets, IAM, observability stack,

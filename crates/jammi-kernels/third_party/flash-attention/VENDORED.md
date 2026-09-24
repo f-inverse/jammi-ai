@@ -341,7 +341,7 @@ default feature. Two guards:
 
 - `ci/scripts/check_flash_attn_closure.py` — walks `cargo metadata
   --no-deps` from `jammi-server` under `default`, the release lane's
-  `cuda,jetstream-broker,storage-cloud` and `--all-features`, and fails
+  `cuda,storage-cloud` and `--all-features`, and fails
   if `jammi-kernels/flash-attn` is reached (positive control: the cuda
   lane MUST reach `jammi-kernels/cuda`). `--self-test` exercises a leaked
   edge, a self-implication and a weak-dep edge.

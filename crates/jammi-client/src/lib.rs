@@ -24,11 +24,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::{Stream, StreamExt, TryStreamExt};
 use tonic::transport::Endpoint;
@@ -56,7 +54,7 @@ use jammi_wire::proto::embedding::embedding_service_client::EmbeddingServiceClie
 use jammi_wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
     CompactEmbeddingsRequest, EncodeQueryRequest, ExpireVersionsRequest, GenerateEmbeddingsRequest,
-    QueryVector, RefreshEmbeddingsRequest, SearchRequest as ProtoSearchRequest, SearchResponse,
+    QueryVector, RefreshEmbeddingsRequest, SearchRequest as ProtoSearchRequest,
 };
 use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
@@ -74,9 +72,9 @@ use jammi_wire::request::{
     FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
 };
 use jammi_wire::{
-    audit_error_from_status, cohorts_to_proto, config_to_proto, decode_ipc_stream,
-    decode_subscribed_batch, encode_publish_batch, error_from_status, eval_task_to_proto,
-    method_to_proto, model_task_to_proto, record_from_wire, result_table_from_proto,
+    audit_error_from_status, cohorts_to_proto, config_to_proto, decode_subscribed_batch,
+    encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
+    model_task_to_proto, record_from_wire, result_rows_from_proto, result_table_from_proto,
     trigger_error_from_status, SessionChannel, SessionTransport, SESSION_HEADER,
 };
 
@@ -333,13 +331,13 @@ impl DataClient {
                 k: k as u32,
                 embedding_table,
                 filter,
-                select: select.clone(),
+                select,
                 oversample: oversample.map(|v| v as u32),
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        hits_to_batch(resp, &select)
+        result_rows_from_proto(resp.result).map_err(|s| error_from_status(&s))
     }
 
     // --- inference -------------------------------------------------------
@@ -370,9 +368,7 @@ impl DataClient {
             .into_inner();
         let outcome = jammi_wire::cache_outcome_from_proto(resp.cache_outcome)
             .map_err(|s| error_from_status(&s))?;
-        let batch = resp.result.unwrap_or_default();
-        let batches = decode_ipc_stream(&batch.data_header, &batch.data_body)
-            .map_err(|s| error_from_status(&s))?;
+        let batches = result_rows_from_proto(resp.result).map_err(|s| error_from_status(&s))?;
         Ok((batches, outcome))
     }
 
@@ -916,44 +912,6 @@ fn proto_modality(modality: Modality) -> jammi_wire::proto::embedding::Modality 
         Modality::Image => Pb::Image,
         Modality::Audio => Pb::Audio,
     }
-}
-
-/// Rebuild the terminal `Vec<RecordBatch>` shape a search verb returns from the
-/// wire `SearchResponse`.
-///
-/// The wire surface carries each hit as `key` + `score` + a `columns` map of
-/// stringified projections, so the client rehydrates one batch with the
-/// `_row_id` (key) and `similarity` (score) columns the in-process hydrated
-/// batch carries, plus a `Utf8` column per requested `select` name.
-fn hits_to_batch(resp: SearchResponse, select: &[String]) -> Result<Vec<RecordBatch>> {
-    if resp.hits.is_empty() {
-        return Ok(Vec::new());
-    }
-    let keys: Vec<&str> = resp.hits.iter().map(|h| h.key.as_str()).collect();
-    let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
-
-    let mut fields: Vec<Field> = vec![
-        Field::new("_row_id", DataType::Utf8, false),
-        Field::new("similarity", DataType::Float32, false),
-    ];
-    let mut arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(keys)),
-        Arc::new(Float32Array::from(scores)),
-    ];
-    for name in select {
-        let values: Vec<String> = resp
-            .hits
-            .iter()
-            .map(|h| h.columns.get(name).cloned().unwrap_or_default())
-            .collect();
-        fields.push(Field::new(name, DataType::Utf8, false));
-        arrays.push(Arc::new(StringArray::from(values)));
-    }
-
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| JammiError::Other(format!("rebuild search batch: {e}")))?;
-    Ok(vec![batch])
 }
 
 /// `wait_job`/`subscribe` must send NO

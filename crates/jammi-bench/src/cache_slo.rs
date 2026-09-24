@@ -150,7 +150,7 @@ async fn embedding_session(
     let config = JammiConfig {
         artifact_dir: dir.path().to_path_buf(),
         gpu: GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         ..Default::default()

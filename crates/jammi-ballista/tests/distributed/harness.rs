@@ -183,7 +183,7 @@ pub async fn harness_session_with(
         inference,
         artifact_dir: dir.path().to_path_buf(),
         gpu: jammi_db::config::GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {

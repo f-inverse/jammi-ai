@@ -24,7 +24,7 @@ use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::deletes::DeletionMask;
-use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, ProducingDescriptor};
+use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, ModelRun, ProducingDescriptor};
 use jammi_db::store::{layout, CachePolicy, StaleReason, Staleness};
 use jammi_db::TenantId;
 use jammi_test_utils::vq;
@@ -1862,6 +1862,62 @@ async fn read_vectors_follows_the_refreshed_version_in_key_order() {
     }
     assert_eq!(vectors.len(), 24);
     assert_eq!(vectors, expected);
+}
+
+/// `describe_table` returns the table's recorded materialization verbatim:
+/// the embedding descriptor, the one local model it ran (with the digest of
+/// its files), the input anchor on its source, and the definition hash the
+/// catalog summarises. That hash is the one `staleness` compares, so passing
+/// it back decides no `DefinitionChanged` reason. With the
+/// sidecar gone the read is the typed `MissingManifest` refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_table_reads_the_recorded_materialization() {
+    let h = harness(12).await;
+    let svc = Session::new(Arc::clone(&h.session));
+    let record = h.record().await;
+
+    let described = svc.describe_table(&h.table).await.unwrap();
+    assert_eq!(
+        Some(described.definition_hash.0.clone()),
+        record.definition_hash
+    );
+    assert!(matches!(
+        described.descriptor,
+        ProducingDescriptor::Embedding { .. }
+    ));
+    let [model] = described.env.models.as_slice() else {
+        panic!("one model ran: {:?}", described.env.models);
+    };
+    assert_eq!(
+        model.model_id,
+        common::cookbook_fixture("tiny_bert").display().to_string(),
+        "the canonical id is the checkpoint path"
+    );
+    match &model.run {
+        ModelRun::Local(run) => assert_eq!(run.content_digest.0.len(), 64),
+        other => panic!("tiny_bert ran locally, got {other:?}"),
+    }
+    assert_eq!(described.input_anchors.len(), 1);
+    assert_eq!(described.input_anchors[0].source, h.source);
+    // The source is a plain file, anchored at a read instant, so staleness
+    // cannot be decided — but the recorded definition compares equal, so no
+    // reason is `DefinitionChanged`.
+    assert_eq!(
+        svc.staleness(&h.table, described.definition_hash.clone())
+            .await
+            .unwrap(),
+        Staleness::Undecidable {
+            unpinned: vec![h.source.clone()],
+            decided_reasons: Vec::new(),
+        }
+    );
+
+    let parquet = common::url_to_path(&record.parquet_path);
+    std::fs::remove_file(parquet.with_extension("materialization.json")).unwrap();
+    match svc.describe_table(&h.table).await {
+        Err(JammiError::MissingManifest { table }) => assert_eq!(table, h.table),
+        other => panic!("a table without a sidecar is MissingManifest, got {other:?}"),
+    }
 }
 
 /// `verify_materialization` on a versioned table: the base check is

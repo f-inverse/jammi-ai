@@ -33,7 +33,7 @@
 //! ones — `Source`, `SourceNotFound`, `Model`, `ModelNotFound`, `ModelReferenced`, `Inference`,
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
-//! `NotRecomputable`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
+//! `NotRecomputable`, `MissingManifest`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
 //! `ParentMoved`, `JobAttemptSuperseded`, `JobCancelled`, `SourceBusy`,
 //! `InvalidKey`, `VersionUnavailable`, `NotRefreshable`, `DefinitionDrift`,
 //! `NonUniqueKey`, `Unavailable`, `EmptyTrainingSet`, `ResourcesExhausted`,
@@ -207,6 +207,11 @@ impl From<&JammiError> for pb::JammiErrorDetail {
             }
             JammiError::NotRecomputable { table } => {
                 Variant::NotRecomputable(pb::NotRecomputableError {
+                    table: table.clone(),
+                })
+            }
+            JammiError::MissingManifest { table } => {
+                Variant::MissingManifest(pb::MissingManifestError {
                     table: table.clone(),
                 })
             }
@@ -410,6 +415,7 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         },
         Some(Variant::DependencyCycle(e)) => JammiError::DependencyCycle { table: e.table },
         Some(Variant::NotRecomputable(e)) => JammiError::NotRecomputable { table: e.table },
+        Some(Variant::MissingManifest(e)) => JammiError::MissingManifest { table: e.table },
         Some(Variant::InvalidKey(e)) => JammiError::InvalidKey {
             column: e.column,
             null_count: e.null_count,
@@ -1269,6 +1275,7 @@ mod tests {
             | JammiError::IncompatibleFormat { .. }
             | JammiError::DependencyCycle { .. }
             | JammiError::NotRecomputable { .. }
+            | JammiError::MissingManifest { .. }
             | JammiError::RowGone { .. }
             | JammiError::TenantMismatch { .. }
             | JammiError::LeaseLost { .. }
@@ -1370,6 +1377,9 @@ mod tests {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
             },
             JammiError::NotRecomputable {
+                table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
+            },
+            JammiError::MissingManifest {
                 table: "src1__text_embedding__m__20260101T000000_deadbeef".into(),
             },
             JammiError::InvalidKey {

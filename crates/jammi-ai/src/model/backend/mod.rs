@@ -113,7 +113,7 @@ impl DeviceConfig {
     /// Derive device configuration from the application config.
     pub fn from_config(config: &jammi_db::config::JammiConfig) -> Self {
         Self {
-            gpu_device: config.gpu.device,
+            gpu_device: config.gpu.primary(),
             // The ONE reconciliation of the two arities lives on
             // `GpuConfig`: an absent plural and a one-entry plural are the
             // same deployment, and this reads the resolved answer rather

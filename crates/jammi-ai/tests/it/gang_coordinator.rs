@@ -443,7 +443,7 @@ async fn a_moved_claim_exits_the_coordinator_body_with_no_write() {
 async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_publishes_the_gangs_bytes(
 ) {
     let (session, _dir) = coordinating_session(|config| {
-        config.gpu.device = 0;
+        config.gpu.device = Some(0);
         config.gpu.devices = Some(vec![0, 1]);
         config.worker.local_ranks = 2;
         // The gang deadline: a rank left without its peer (a mutation that

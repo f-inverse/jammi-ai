@@ -1297,7 +1297,7 @@ async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
         .await
         .expect("search")
         .into_inner();
-    assert_eq!(hits.hits.len(), 5);
+    assert_eq!(super::common::grpc::ranked(hits).len(), 5);
     let _ = catalog
         .list_index_segments(ListIndexSegmentsRequest {
             table_name: table.clone(),

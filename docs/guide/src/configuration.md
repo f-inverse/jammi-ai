@@ -76,7 +76,8 @@ memory_limit = "75%"
 batch_size = 8192
 
 [gpu]
-# GPU device index. -1 for CPU only. Default: 0.
+# GPU device index. -1 for CPU only. Default: 0 in a build with an accelerator
+# (the CUDA server or wheel, a Metal build), -1 in a CPU-only build.
 device = -1
 # Each device's model-residency budget, in the same grammar as
 # [engine] memory_limit: "<n>%" of the device's total memory, or an absolute

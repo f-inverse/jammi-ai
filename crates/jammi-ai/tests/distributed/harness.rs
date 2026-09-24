@@ -82,7 +82,7 @@ fn shared_config(
         artifact_dir: artifact_dir.to_path_buf(),
         // CPU-only: the lane validates orchestration/durability, not kernels.
         gpu: jammi_db::config::GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {

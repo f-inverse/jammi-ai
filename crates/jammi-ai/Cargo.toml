@@ -315,6 +315,7 @@ live-gpu-cluster-tests = ["live-gpu-tests"]
 # `libnccl` present -- not only the runtime host.
 cuda = [
     "local",
+    "jammi-db/accelerator",
     "candle-core/cuda",
     "candle-core/nccl",
     "candle-nn/cuda",
@@ -322,7 +323,7 @@ cuda = [
     "jammi-lora/cuda",
     "jammi-kernels/cuda",
 ]
-metal = ["local", "candle-core/metal", "candle-nn/metal"]
+metal = ["local", "jammi-db/accelerator", "candle-core/metal", "candle-nn/metal"]
 # Forwards to `jammi-encoders`'s and `jammi-kernels`'s own `flash-attn`
 # features — one link of the declared 1:1 chain
 # `jammi-server`/`jammi-bench` -> `jammi-ai` -> `{jammi-encoders,jammi-kernels}`

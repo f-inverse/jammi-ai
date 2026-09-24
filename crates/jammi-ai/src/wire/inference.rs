@@ -1,8 +1,8 @@
 //! `InferenceService` engine-spec conversions: the declared-edge gather and the
 //! served predictive distribution.
 //!
-//! The candle-free `infer_result_to_proto` lives on the wire substrate
-//! ([`jammi_wire`]); what stays here are the `Predict` conversions that touch the
+//! The candle-free result-row encoding (`result_rows_to_proto`) lives on the
+//! wire substrate ([`jammi_wire`]); what stays here are the `Predict` conversions that touch the
 //! engine-side `EdgeGather` / `PredictedDistribution` types, only reachable in a
 //! `local` build.
 //!

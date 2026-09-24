@@ -258,6 +258,12 @@ pub fn map_engine_error(err: JammiError) -> Status {
             Code::InvalidArgument,
             format!("key column `{column}` has {null_count} null value(s)"),
         ),
+        // No recorded materialization to describe — the absent-resource
+        // convention `VersionUnavailable` follows.
+        JammiError::MissingManifest { table } => (
+            Code::NotFound,
+            format!("result table `{table}` has no recorded materialization manifest"),
+        ),
         // The current version of a versioned table cannot be served — the
         // absent-resource convention `ModelNotFound` / `RowGone` follow.
         JammiError::VersionUnavailable { table, version } => (

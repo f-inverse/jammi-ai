@@ -735,9 +735,11 @@ impl EngineConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GpuConfig {
-    /// CUDA device ordinal, and the PRIMARY of [`Self::devices`]. `-1` is the
-    /// CPU. Default: 0.
-    pub device: i32,
+    /// CUDA device ordinal of the PRIMARY device, as configured; `-1` is the
+    /// CPU. Unset, the primary is the first of [`Self::devices`], else
+    /// [`Self::DEFAULT_DEVICE`] — the accelerator (`0`) in a build that carries
+    /// one, the CPU otherwise. Read it through [`Self::primary`].
+    pub device: Option<i32>,
     /// The ordered device list a multi-rank worker places its ranks on: rank
     /// `i` runs on `devices[i]`.
     ///
@@ -784,8 +786,26 @@ impl GpuConfig {
     /// "no CUDA device, run on the host".
     pub const CPU_DEVICE: i32 = -1;
 
+    /// The device an unconfigured deployment runs on: the first accelerator in
+    /// a build that carries one (the `accelerator` feature), the CPU in a
+    /// build that carries none — so a CPU-only build's defaults never request
+    /// a device it cannot have.
+    pub const DEFAULT_DEVICE: i32 = if cfg!(feature = "accelerator") {
+        0
+    } else {
+        Self::CPU_DEVICE
+    };
+
+    /// The primary device: `device` when configured, else the first of
+    /// `devices`, else [`Self::DEFAULT_DEVICE`].
+    pub fn primary(&self) -> i32 {
+        self.device
+            .or_else(|| self.devices.as_ref().and_then(|d| d.first().copied()))
+            .unwrap_or(Self::DEFAULT_DEVICE)
+    }
+
     /// The resolved device list: the configured plural when one was given,
-    /// and otherwise the one-device list `[device]`.
+    /// and otherwise the one-device list `[primary]`.
     ///
     /// This is the ONE reconciliation of the two arities — a caller never
     /// reads [`Self::devices`] directly to decide where to place work, so an
@@ -795,7 +815,7 @@ impl GpuConfig {
     pub fn device_list(&self) -> Vec<i32> {
         match &self.devices {
             Some(devices) => devices.clone(),
-            None => vec![self.device],
+            None => vec![self.primary()],
         }
     }
 
@@ -807,7 +827,7 @@ impl GpuConfig {
     ///
     /// - an explicit `devices = []` — a deployment with nowhere to run, and
     ///   a different statement from omitting the key;
-    /// - a first entry that is not `device` — the plural and the primary
+    /// - a first entry that is not a configured `device` — the plural and the primary
     ///   disagree about which device is rank 0's, and guessing one of them is
     ///   how a "CPU-pinned" session ends up on a GPU.
     ///
@@ -829,11 +849,12 @@ impl GpuConfig {
                         .into(),
                 ));
             }
-            if devices[0] != self.device {
+            if let Some(device) = self.device.filter(|d| *d != devices[0]) {
                 return Err(JammiError::Config(format!(
-                    "[gpu] devices = {:?} disagrees with device = {}: the first entry is rank \
-                     0's device and must equal `device` (set `device = {}` or list it first)",
-                    devices, self.device, devices[0]
+                    "[gpu] devices = {devices:?} disagrees with device = {device}: the first \
+                     entry is rank 0's device and must equal `device` (set `device = {}` or \
+                     list it first)",
+                    devices[0]
                 )));
             }
         }
@@ -2763,8 +2784,8 @@ impl Default for EngineConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
-            device: 0,
-            // Unset, NOT `[0]`: a `GpuConfig { device: -1, ..default() }`
+            device: None,
+            // Unset, NOT `[0]`: a `GpuConfig { device: Some(-1), ..default() }`
             // must resolve to the CPU, which it does only while the plural
             // stays absent and `device_list()` derives it from `device`.
             devices: None,

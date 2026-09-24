@@ -157,7 +157,7 @@ fn open_local(
         cfg.artifact_dir = dir.into();
     }
     if let Some(dev) = gpu_device {
-        cfg.gpu.device = dev;
+        cfg.gpu.device = Some(dev);
     }
     if let Some(bs) = inference_batch_size {
         cfg.inference.batch_size = bs;

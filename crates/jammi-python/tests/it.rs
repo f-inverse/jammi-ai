@@ -32,7 +32,7 @@ fn test_config(artifact_dir: &std::path::Path) -> JammiConfig {
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: jammi_db::config::GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         inference: jammi_db::config::InferenceConfig {

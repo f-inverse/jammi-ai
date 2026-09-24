@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_db::TenantId;
+use jammi_server::grpc::proto::embedding::SearchResponse;
 use jammi_server::grpc::session::{SessionStore, SESSION_HEADER};
 use jammi_test_utils::test_config;
 use tempfile::TempDir;
@@ -19,8 +20,7 @@ use tonic::transport::Channel;
 use tonic::Request;
 
 /// Well-known tenant UUIDs used as fixtures across the gRPC integration
-/// tests. These are generic UUIDs not coupled to any downstream tenant
-/// (jammi is the substrate; accurisk/lace/etc. live in product crates).
+/// tests: opaque UUIDs, no real tenant's.
 pub const TENANT_A: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a";
 pub const TENANT_B: &str = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b";
 
@@ -479,7 +479,7 @@ pub fn with_session(
 pub async fn start_engine_server_with_devices(devices: usize) -> EngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = jammi_test_utils::test_config(dir.path());
-    cfg.gpu.device = 0;
+    cfg.gpu.device = Some(0);
     cfg.gpu.devices = Some((0..devices as i32).collect());
     // The submit edge is bounded by the serveable world (`[distributed]
     // max_world_size`), not by this host's device count: a
@@ -838,4 +838,26 @@ pub async fn start_engine_server_over_session(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (addr, handle) = spawn_bound_chain(chain, shutdown_rx).await;
     (addr, shutdown_tx, AbortOnDropHandle(handle))
+}
+
+/// A search response's hits in rank order, as `(_row_id, similarity)`.
+pub fn ranked(resp: SearchResponse) -> Vec<(String, f32)> {
+    use arrow::array::{Array, Float32Array, StringArray};
+    jammi_wire::result_rows_from_proto(resp.result)
+        .expect("search rows decode")
+        .iter()
+        .flat_map(|batch| {
+            let keys = batch
+                .column_by_name("_row_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("a `_row_id` column");
+            let scores = batch
+                .column_by_name("similarity")
+                .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+                .expect("a `similarity` column");
+            (0..batch.num_rows())
+                .map(|i| (keys.value(i).to_string(), scores.value(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }

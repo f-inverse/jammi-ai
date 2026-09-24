@@ -2896,7 +2896,7 @@ fn gpu_devices_default_is_the_absent_plural_resolving_to_the_primary() {
     // configured", and it resolves to the ONE device `device` names.
     let gpu = GpuConfig::default();
     assert_eq!(gpu.devices, None);
-    assert_eq!(gpu.device_list(), vec![0]);
+    assert_eq!(gpu.device_list(), vec![GpuConfig::DEFAULT_DEVICE]);
     assert!(gpu.validate().is_ok());
 
     // The state the type must not be able to hold: a `GpuConfig` built in
@@ -2910,7 +2910,7 @@ fn gpu_devices_default_is_the_absent_plural_resolving_to_the_primary() {
     // and every one of them fills the rest from `..Default::default()`, so
     // the `devices: None` default is what each of them holds.
     let cpu = GpuConfig {
-        device: -1,
+        device: Some(-1),
         ..Default::default()
     };
     assert_eq!(cpu.device_list(), vec![-1]);
@@ -2919,7 +2919,7 @@ fn gpu_devices_default_is_the_absent_plural_resolving_to_the_primary() {
     // And a config file with no `[gpu]` section at all resolves the same.
     let cfg = load_src("artifact_dir = \"/tmp/jammi\"\n").unwrap();
     assert_eq!(cfg.gpu.devices, None);
-    assert_eq!(cfg.gpu.device_list(), vec![0]);
+    assert_eq!(cfg.gpu.device_list(), vec![GpuConfig::DEFAULT_DEVICE]);
 }
 
 #[test]
@@ -2989,13 +2989,11 @@ fn load_refuses_a_devices_list_that_disagrees_with_device() {
         msg.contains("devices") && msg.contains("device = 1"),
         "the refusal must name both keys: {msg}"
     );
-    // `device` left at its default is still `device`: a plural that does not
-    // start at the primary is refused whether the primary was spelled or not.
-    let err = load_src("[gpu]\ndevices = [1, 2]\n").unwrap_err();
-    assert!(
-        matches!(&err, JammiError::Config(m) if m.contains("devices")),
-        "{err:?}"
-    );
+    // With `device` unset there is nothing to disagree with: the plural's
+    // first entry IS the primary.
+    let cfg = load_src("[gpu]\ndevices = [1, 2]\n").unwrap();
+    assert_eq!(cfg.gpu.primary(), 1);
+    assert_eq!(cfg.gpu.device_list(), vec![1, 2]);
     // Agreement is first-entry equality, so the documented pairing loads.
     assert!(load_src("[gpu]\ndevice = 1\ndevices = [1, 0]\n").is_ok());
 }
@@ -3076,8 +3074,8 @@ fn worker_rank_knobs_default_to_the_single_rank_deployment() {
     assert_eq!(cfg.worker, WorkerConfig::default());
     let topo = cfg.worker.topology(&cfg.gpu).unwrap();
     assert_eq!(topo.local_ranks(), 1);
-    assert_eq!(topo.devices(), &[0]);
-    assert_eq!(topo.rank_devices(), &[0]);
+    assert_eq!(topo.devices(), &[GpuConfig::DEFAULT_DEVICE]);
+    assert_eq!(topo.rank_devices(), &[GpuConfig::DEFAULT_DEVICE]);
     assert_eq!(topo.collective(), CollectiveSelection::Auto);
     assert_eq!(topo.rank_timeout(), std::time::Duration::from_secs(120));
     assert!(!topo.is_distributed());
@@ -3277,7 +3275,7 @@ fn load_of_a_pre_distributed_config_is_unchanged() {
         "#,
     )
     .unwrap();
-    assert_eq!(cfg.gpu.device, -1);
+    assert_eq!(cfg.gpu.primary(), -1);
     assert_eq!(cfg.gpu.device_list(), vec![-1]);
     assert_eq!(cfg.worker.idle_poll_secs, 2);
     assert_eq!(cfg.worker.local_ranks, 1);
@@ -4279,4 +4277,17 @@ fn a_remote_model_no_request_could_be_built_from_is_refused_at_load() {
         err.contains("protocol_version"),
         "an unknown key is refused: {err}"
     );
+}
+
+/// An unconfigured deployment runs on the accelerator its build carries, and a
+/// build that carries none runs on the CPU — its defaults never request a
+/// device it cannot have.
+#[test]
+fn the_default_device_is_the_builds_accelerator_or_the_cpu() {
+    let expected = if cfg!(feature = "accelerator") {
+        0
+    } else {
+        GpuConfig::CPU_DEVICE
+    };
+    assert_eq!(GpuConfig::default().primary(), expected);
 }

@@ -49,7 +49,7 @@ use jammi_test_utils::{cookbook_fixture, fixture, test_config};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use crate::common::grpc::{catalog_client, channel};
+use crate::common::grpc::{catalog_client, channel, ranked};
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", cookbook_fixture("tiny_bert").display())
@@ -70,7 +70,7 @@ async fn start_gpu_embedding_server() -> (
 ) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
-    cfg.gpu.device = 0;
+    cfg.gpu.device = Some(0);
     cfg.gpu.require_gpu = true;
 
     let session = Arc::new(
@@ -194,15 +194,15 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
         .expect("search by GPU-encoded query vector")
         .into_inner();
 
+    let hits = ranked(resp);
     assert!(
-        !resp.hits.is_empty() && resp.hits.len() <= 5,
+        !hits.is_empty() && hits.len() <= 5,
         "k=5 search returns between 1 and 5 hits, got {}",
-        resp.hits.len()
+        hits.len()
     );
     assert!(
-        resp.hits.windows(2).all(|w| w[0].score >= w[1].score),
-        "hits must be ordered by descending score, got {:?}",
-        resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+        hits.windows(2).all(|w| w[0].1 >= w[1].1),
+        "hits must be ordered by descending score, got {hits:?}"
     );
 
     let _ = shutdown.send(());

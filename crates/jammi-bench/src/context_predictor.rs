@@ -269,7 +269,7 @@ async fn local_session(
     let config = JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         ..Default::default()

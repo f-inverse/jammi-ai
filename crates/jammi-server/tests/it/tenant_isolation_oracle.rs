@@ -1000,6 +1000,18 @@ fn cases() -> Vec<IsolationCase> {
                 assert_verify_materialization_isolated().await;
             }
         ),
+        // `describe_table` reads the table's recorded manifest after the same
+        // tenant-filtered `get_result_table`, so a peer cannot read the
+        // provenance of a table it cannot resolve.
+        case!(
+            "CatalogService",
+            "DescribeTable",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_describe_table_isolated().await;
+            }
+        ),
         // --- sensing layer (staleness + lineage) -----------------------------
         // `staleness` and `derives_from` both resolve their table through the
         // tenant-filtered `get_result_table` before sensing it, so a peer cannot
@@ -2096,6 +2108,28 @@ async fn assert_verify_materialization_isolated() {
     assert!(
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved and verified tenant A's materialization: {b_result:?}"
+    );
+}
+
+/// `describe_table` resolves its table through the tenant-filtered
+/// `get_result_table`: tenant A reads its own table's recorded manifest; tenant
+/// B, naming A's table, resolves no row and errors, never reading A's
+/// provenance.
+async fn assert_describe_table_isolated() {
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    let described = engine
+        .with_tenant_scoped(tenant_a(), |_scope| session.describe_table(&table_name))
+        .await
+        .expect("tenant A must describe its own materialization");
+    assert_eq!(described.env.models[0].model_id, "sensing-model");
+
+    let b_result = engine
+        .with_tenant_scoped(tenant_b(), |_scope| session.describe_table(&table_name))
+        .await;
+    assert!(
+        b_result.is_err(),
+        "CROSS-TENANT LEAK: tenant B read tenant A's materialization: {b_result:?}"
     );
 }
 

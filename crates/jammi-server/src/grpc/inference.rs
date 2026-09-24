@@ -8,7 +8,7 @@
 //! `Session::infer` returns `Vec<RecordBatch>`; the handler carries them as one
 //! Arrow IPC stream in the response's `ArrowBatch` — the same Flight-IPC
 //! pairing `TriggerService` uses, encoded through the shared
-//! [`jammi_wire::infer_result_to_proto`] helper.
+//! [`jammi_wire::result_rows_to_proto`] helper.
 //!
 //! Tenant scope is read from the request's [`crate::grpc::session::
 //! SessionTenant`] extension (set upstream by the async tenant-binding layer)
@@ -24,7 +24,7 @@ use jammi_ai::pipeline::context_set::HybridMerge;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::{edge_gather_from_proto, predicted_distribution_to_proto};
 use jammi_ai::Session;
-use jammi_wire::infer_result_to_proto;
+use jammi_wire::result_rows_to_proto;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::inference::inference_service_server::InferenceService;
@@ -80,7 +80,7 @@ impl InferenceService for InferenceServer {
         .map_err(map_engine_error)?;
 
         Ok(Response::new(InferResponse {
-            result: Some(infer_result_to_proto(batches)?),
+            result: Some(result_rows_to_proto(&batches)?),
             cache_outcome: Some(jammi_wire::cache_outcome_to_proto(&outcome)),
         }))
     }

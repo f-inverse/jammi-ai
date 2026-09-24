@@ -20,7 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, StringArray};
+use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_ai::session::InferenceSession;
@@ -40,7 +40,7 @@ use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use super::common::grpc::{catalog_client, channel};
+use super::common::grpc::{catalog_client, channel, ranked};
 
 fn htsat_clap_model_id() -> String {
     format!("local:{}", cookbook_fixture("htsat_clap_tiny").display())
@@ -361,16 +361,12 @@ async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
         .expect("search by vector")
         .into_inner();
 
-    assert_eq!(resp.hits.len(), 3, "k=3 over a three-row corpus");
-    assert_eq!(resp.hits[0].key, "clip_1", "self-match ranks first");
+    let hits = ranked(resp);
+    assert_eq!(hits.len(), 3, "k=3 over a three-row corpus");
+    assert_eq!(hits[0].0, "clip_1", "self-match ranks first");
     assert!(
-        resp.hits[0].score >= resp.hits[1].score && resp.hits[1].score >= resp.hits[2].score,
-        "hits must be ordered by descending score, got {:?}",
-        resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
-    );
-    assert!(
-        resp.hits.iter().all(|h| h.columns.is_empty()),
-        "empty select returns key + score only, no columns"
+        hits.windows(2).all(|w| w[0].1 >= w[1].1),
+        "hits must be ordered by descending score, got {hits:?}"
     );
 
     let _ = shutdown.send(());
@@ -399,8 +395,9 @@ async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
         .expect("search by row_key")
         .into_inner();
 
-    assert_eq!(resp.hits.len(), 3, "k=3 over a three-row corpus");
-    assert_eq!(resp.hits[0].key, "clip_2", "the query row ranks first");
+    let hits = ranked(resp);
+    assert_eq!(hits.len(), 3, "k=3 over a three-row corpus");
+    assert_eq!(hits[0].0, "clip_2", "the query row ranks first");
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -413,7 +410,8 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
     embed_corpus(addr, &mut client, &dir).await;
 
     // Filter pushes a predicate over the hydrated source columns; select
-    // projects `clip_id` into each hit's columns map.
+    // projects the named source columns, beside the retrieval provenance and
+    // the similarity every search row carries.
     let resp = client
         .search(SearchRequest {
             source_id: "clips".into(),
@@ -421,24 +419,48 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
             k: 3,
             embedding_table: None,
             filter: Some("clip_id != 'clip_0'".into()),
-            select: vec!["clip_id".into()],
+            select: vec!["_row_id".into(), "clip_id".into()],
             oversample: None,
         })
         .await
         .expect("search with filter + select")
         .into_inner();
 
+    let batches = jammi_wire::result_rows_from_proto(resp.result).expect("search rows decode");
+    let columns: Vec<String> = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        columns,
+        [
+            "_row_id",
+            "clip_id",
+            "retrieved_by",
+            "annotated_by",
+            "similarity"
+        ],
+        "select projects the named columns plus provenance and similarity"
+    );
+    let rows: Vec<(String, String)> = batches
+        .iter()
+        .flat_map(|b| {
+            let key = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let clip = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            (0..b.num_rows())
+                .map(|i| (key.value(i).to_string(), clip.value(i).to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     assert!(
-        !resp.hits.is_empty() && resp.hits.len() <= 2,
+        !rows.is_empty() && rows.len() <= 2,
         "filter excludes clip_0, leaving at most the two other rows"
     );
-    for hit in &resp.hits {
-        assert_ne!(hit.key, "clip_0", "filtered row must not appear");
-        assert_eq!(
-            hit.columns.get("clip_id").map(String::as_str),
-            Some(hit.key.as_str()),
-            "projected clip_id must equal the hit key"
-        );
+    for (key, clip_id) in &rows {
+        assert_ne!(key, "clip_0", "filtered row must not appear");
+        assert_eq!(clip_id, key, "projected clip_id must equal the row key");
     }
 
     let _ = shutdown.send(());
@@ -717,24 +739,27 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
         .expect("search over the imported table")
         .into_inner();
 
+    let batches = jammi_wire::result_rows_from_proto(resp.result).expect("search rows decode");
+    let bodies: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let body = b
+                .column_by_name("body")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("the projected `body` column");
+            (0..b.num_rows())
+                .map(|i| body.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     assert_eq!(
-        resp.hits.len(),
+        bodies.len(),
         IMPORT_DOC_IDS.len(),
         "k over the imported corpus returns every row"
     );
     assert_eq!(
-        resp.hits[0].key, "doc-1",
-        "the query row is its own nearest neighbor"
-    );
-    assert!(
-        resp.hits[0].score >= resp.hits[1].score && resp.hits[1].score >= resp.hits[2].score,
-        "hits ordered by descending score, got {:?}",
-        resp.hits.iter().map(|h| h.score).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        resp.hits[0].columns.get("body").map(String::as_str),
-        Some("body of doc-1"),
-        "the imported table hydrates its source's projected columns"
+        bodies[0], "body of doc-1",
+        "the query row is its own nearest neighbor, hydrated with its source's column"
     );
 
     let _ = shutdown.send(());

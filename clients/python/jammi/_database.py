@@ -278,30 +278,6 @@ def _model_to_dict(m: catalog_pb2.Model) -> Dict[str, Any]:
     }
 
 
-def _hits_to_table(hits: List[embedding_pb2.SearchHit]) -> pa.Table:
-    """Build a `pyarrow.Table` from search hits.
-
-    The columns are `key` + `score` plus one column per projected `select`
-    field (stringified on the wire), matching the keyed+scored shape the embed
-    wheel's `search` returns.
-    """
-    keys = [h.key for h in hits]
-    scores = [h.score for h in hits]
-    columns: Dict[str, List[Any]] = {"key": keys, "score": scores}
-    # Projected columns are sparse per-hit on the wire; union the key set so a
-    # hit missing a projected column gets a null rather than a ragged table.
-    projected: List[str] = []
-    for h in hits:
-        for col in h.columns:
-            if col not in columns:
-                columns[col] = [None] * len(hits)
-                projected.append(col)
-    for i, h in enumerate(hits):
-        for col, val in h.columns.items():
-            columns[col][i] = val
-    return pa.table(columns)
-
-
 def _arrow_batch_to_table(batch: Any) -> pa.Table:
     """Decode an `ArrowBatch` (one self-describing IPC stream in `data_body`)
     into a `pyarrow.Table`.
@@ -1657,15 +1633,16 @@ class RemoteDatabase:
         """Nearest-neighbor search over a source's embedding table.
 
         `query` is the query vector; `filter` is an optional SQL predicate over
-        the hydrated results; `select` projects columns (empty keeps the
-        keyed+scored shape). `embedding_table` names which of the source's
+        the hydrated results; `select` projects columns (empty keeps every
+        hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned
         table); ``None`` searches the most-recent ready table. `oversample`
         overrides, for this one call, a quantized-`storage_precision` table's
         retrieve→rescore candidate breadth (`k * oversample`); ``None`` defers
         to the table's own stamped default, and the knob is irrelevant for an
-        `f32`-precision table (single-stage, no rescore). Returns a
-        `pyarrow.Table`. Maps to `EmbeddingService.Search`.
+        `f32`-precision table (single-stage, no rescore). Returns the same
+        hydrated `pyarrow.Table` the embedded engine returns. Maps to
+        `EmbeddingService.Search`.
         """
         request = build_search_request(
             source,
@@ -1677,7 +1654,7 @@ class RemoteDatabase:
             oversample=oversample,
         )
         resp = self._call(self._embedding.Search, request)
-        return _hits_to_table(list(resp.hits))
+        return _arrow_batch_to_table(resp.result)
 
     # --- Training (submitted to the remote server; run where `[worker] enabled`) ---
     #
@@ -2583,6 +2560,25 @@ class RemoteDatabase:
         """
         resp = self._call(self._catalog.ListChannels, catalog_pb2.ListChannelsRequest())
         return [_channel_spec_to_dict(c) for c in resp.channels]
+
+    def describe_table(self, table: str) -> Dict[str, Any]:
+        """The recorded materialization of a result table — its
+        ``.materialization.json`` manifest.
+
+        Returns the same dict the embed `Database` produces: ``definition_hash``,
+        ``artifact``, ``leaves``, ``descriptor`` (the producing verb and its
+        output-affecting parameters), ``env`` (``engine_version``, ``device``,
+        and ``models`` — one entry per invoked model, its ``run`` tagged
+        ``local`` / ``remote`` / ``external_import``), ``input_anchors``,
+        ``produced_by``, ``produced_at``, ``engine_version`` and
+        ``manifest_version``. The wire carries the manifest in its own
+        canonical serialization, so the dict is the engine's record exactly. A
+        table with no manifest raises :class:`~jammi.errors.BackendError`
+        (``NOT_FOUND``). Read-only. Maps to `CatalogService.DescribeTable`.
+        """
+        request = catalog_pb2.DescribeTableRequest(table=table)
+        resp = self._call(self._catalog.DescribeTable, request)
+        return json.loads(resp.manifest_json)
 
     def verify_materialization(
         self, table: str, expected_definition: Optional[str] = None

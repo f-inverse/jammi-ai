@@ -492,8 +492,9 @@ pub struct GraphSampleFields {
 /// producer with the same parameters
 /// serialise identically; any output-affecting parameter change changes the
 /// bytes and therefore the hash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
 #[serde(tag = "producer", rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ProducingDescriptor {
     /// A `CREATE TABLE … AS <query>` statement's output: the query's rows as
     /// they were produced. (`ResultStore::create_table_as`.) Replayed by
@@ -1265,6 +1266,12 @@ pub enum EdgeSourceBinding {
 }
 
 impl ProducingDescriptor {
+    /// The producer this descriptor records — its `producer` tag in the
+    /// manifest (`"embedding"`, `"graph_propagation"`, …).
+    pub fn producer(&self) -> &'static str {
+        self.into()
+    }
+
     /// The chain link of a version descriptor: the parent's identity for an
     /// `EmbeddingDelta` / `EmbeddingCompaction`, `None` for a base descriptor.
     pub fn parent_identity(&self) -> Option<&str> {
@@ -1944,6 +1951,33 @@ mod tests {
                 }),
             }],
         )
+    }
+
+    /// `producer()` names a descriptor exactly as its manifest's `producer`
+    /// tag does: both derive the name from the variant under one rule.
+    #[test]
+    fn producer_is_the_manifest_tag() {
+        let descriptors = [
+            ProducingDescriptor::Statement {
+                query: "SELECT 1".into(),
+            },
+            ProducingDescriptor::External {
+                producer_id: "p".into(),
+                params: BTreeMap::new(),
+            },
+            ProducingDescriptor::Embedding {
+                model_id: "m".into(),
+                task: ModelTask::TextEmbedding,
+                source_id: "s".into(),
+                columns: vec!["c".into()],
+                key_column: "k".into(),
+                dimensions: 4,
+            },
+        ];
+        for d in descriptors {
+            let tagged = serde_json::to_value(&d).unwrap();
+            assert_eq!(tagged["producer"], d.producer());
+        }
     }
 
     #[test]

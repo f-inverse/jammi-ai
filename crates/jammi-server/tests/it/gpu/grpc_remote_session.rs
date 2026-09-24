@@ -112,7 +112,7 @@ struct GpuEngineServer {
 async fn start_gpu_engine_server() -> GpuEngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
-    cfg.gpu.device = 0;
+    cfg.gpu.device = Some(0);
     cfg.gpu.require_gpu = true;
 
     // `open` (not `new`) registers the compound-query SQL functions on the

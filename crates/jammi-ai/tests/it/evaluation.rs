@@ -955,3 +955,88 @@ async fn eval_image_embeddings_end_to_end() {
         );
     }
 }
+
+// ─── The query encoder of a derived embedding table ─────────────────────────
+//
+// A golden's text queries are encoded by the model that produced the evaluated
+// table's vector space. A propagated table mixes its input table's vectors in
+// that table's space, so it is evaluated through its input's encoder; a
+// structure-embedding table's vectors come from graph shape alone, so no text
+// query can be encoded into it — a typed refusal, never a model load of the
+// producer's tag.
+
+#[tokio::test]
+async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
+    use jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef;
+    use jammi_ai::pipeline::graph_propagation::PropagateRequest;
+    use jammi_ai::pipeline::graph_structure::StructureRequest;
+    use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
+    use jammi_db::error::JammiError;
+    use jammi_db::store::CachePolicy;
+    use std::collections::HashMap;
+
+    let (session, base, _dir) = session_with_embeddings_and_golden().await;
+    let graph = session
+        .build_neighbor_graph(
+            "patents",
+            Some(&base),
+            &BuildNeighborGraph {
+                k: 3,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap()
+        .0;
+    let edges = EdgeSourceRef::NeighborGraph {
+        table_name: graph.table_name.clone(),
+    };
+    let propagated = session
+        .propagate_embeddings(
+            &PropagateRequest::new("patents", edges.clone())
+                .with_embedding_table(&base)
+                .with_hops(1),
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let comparison = session
+        .eval_compare(
+            &[base.clone(), propagated.table_name.clone()],
+            "patents",
+            "golden_rel.public.golden_relevance",
+            10,
+        )
+        .await
+        .expect("a propagated table evaluates through its input's encoder");
+    assert_eq!(comparison.per_table.len(), 2);
+
+    let structure = session
+        .generate_structure_embeddings(
+            &StructureRequest::new("patents", edges).with_key_column("id"),
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap()
+        .0;
+    match session
+        .eval_embeddings(
+            "patents",
+            Some(&structure.table_name),
+            "golden_rel.public.golden_relevance",
+            10,
+            &HashMap::new(),
+        )
+        .await
+    {
+        Err(JammiError::Eval(message)) => assert!(
+            message.contains("graph_structure"),
+            "the refusal names the producer: {message}"
+        ),
+        other => panic!("a structure table has no query encoder, got {other:?}"),
+    }
+}

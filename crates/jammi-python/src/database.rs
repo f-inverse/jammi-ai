@@ -957,6 +957,20 @@ impl PyDatabase {
         Ok(out.into_any().unbind())
     }
 
+    /// The recorded materialization of a result table — its
+    /// `.materialization.json` manifest as a dict: `definition_hash`,
+    /// `artifact`, `leaves`, `descriptor`, `env` (`engine_version`, `device`,
+    /// and `models`, one entry per invoked model tagged by its `run`),
+    /// `input_anchors`, `produced_by`, `produced_at`, `engine_version`,
+    /// `manifest_version`. A table with no manifest raises `MissingManifest`.
+    /// Read-only.
+    fn describe_table(&self, py: Python<'_>, table: &str) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let manifest = crate::released(&self.runtime, self.local_session().describe_table(table))
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &manifest)
+    }
+
     /// Recompute a materialised result table's artifact digest and check it
     /// (and, if given, an expected definition hash) against its
     /// `.materialization.json` manifest. Returns the verdict as a dict tagged

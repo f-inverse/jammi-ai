@@ -35,18 +35,14 @@ use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
+use jammi_wire::result_rows_to_proto;
 use tonic::{Request, Response, Status};
-
-use std::collections::HashMap;
-
-use arrow::array::{Array, Float32Array, RecordBatch, StringArray};
-use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
     CompactEmbeddingsRequest, EncodeQueryRequest, EncodeQueryResponse, ExpireVersionsRequest,
     ExpiryReport, GenerateEmbeddingsRequest, ImportEmbeddingsRequest, RefreshEmbeddingsRequest,
-    RefreshReport, ResultTable, SearchHit, SearchRequest, SearchResponse,
+    RefreshReport, ResultTable, SearchRequest, SearchResponse,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
@@ -219,97 +215,16 @@ impl EmbeddingService for EmbeddingServer {
     ) -> Result<Response<SearchResponse>, Status> {
         let tenant = session_tenant_traced(&request);
         // Decode the request through the shared `jammi_ai::wire` seam — the same
-        // decode the embedded binding's `_search_proto` drives — so both
-        // transports validate and submit an identical request. Only the request
-        // is collapsed: the response is transport-specific (wire hits here, Arrow
-        // in the embedded binding), so the hit projection stays in this handler.
-        let mut request = jammi_ai::wire::search_from_proto(request.into_inner())?;
-        // The client's `select` is what each hit's `columns` map carries; keep it
-        // before expanding the engine projection.
-        let select = std::mem::take(&mut request.select);
-        // The abstraction projects exactly the requested columns; the handler
-        // needs `_row_id` + `similarity` for every hit's key and score, so add
-        // them when a non-empty select would otherwise drop them. An empty select
-        // keeps every hydrated column (key + score included).
-        request.select = search_select(&select);
+        // decode the embedded binding's `_search_proto` drives — and return the
+        // engine's hydrated rows as they are, so both transports hand the caller
+        // one result.
+        let request = jammi_ai::wire::search_from_proto(request.into_inner())?;
         let session = self.local();
-
         let batches = scoped(&self.session, tenant, || session.search(request))
             .await
             .map_err(map_engine_error)?;
-
-        let hits = batches_to_hits(&batches, &select)?;
-        Ok(Response::new(SearchResponse { hits }))
+        Ok(Response::new(SearchResponse {
+            result: Some(result_rows_to_proto(&batches)?),
+        }))
     }
-}
-
-/// The projection the abstraction's `search` runs for a client `select`. An
-/// empty `select` projects nothing (all hydrated columns survive, so key and
-/// score are present). A non-empty `select` projects the requested columns
-/// **plus** `_row_id` and `similarity` — the handler always needs those to
-/// build each hit's key and score, even when the client did not list them.
-fn search_select(select: &[String]) -> Vec<String> {
-    if select.is_empty() {
-        return Vec::new();
-    }
-    let mut columns: Vec<String> = vec!["_row_id".to_string(), "similarity".to_string()];
-    for name in select {
-        if name != "_row_id" && name != "similarity" {
-            columns.push(name.clone());
-        }
-    }
-    columns
-}
-
-/// Map each result row to a [`SearchHit`]: `_row_id` → key, `similarity` →
-/// score, and each requested `select` column stringified into `columns`.
-///
-/// `select` columns are read from the projected batch via the type-general
-/// Arrow formatter, so any scalar column the engine returns is carried on the
-/// wire without a per-dtype branch here.
-fn batches_to_hits(batches: &[RecordBatch], select: &[String]) -> Result<Vec<SearchHit>, Status> {
-    let mut hits = Vec::new();
-    let format = FormatOptions::default();
-    for batch in batches {
-        let keys = column_as::<StringArray>(batch, "_row_id")?;
-        let scores = column_as::<Float32Array>(batch, "similarity")?;
-        let formatters: Vec<(String, ArrayFormatter)> = select
-            .iter()
-            .map(|name| {
-                let array = batch.column_by_name(name).ok_or_else(|| {
-                    Status::invalid_argument(format!("select column '{name}' not in results"))
-                })?;
-                let formatter = ArrayFormatter::try_new(array.as_ref(), &format)
-                    .map_err(|e| Status::internal(format!("format column '{name}': {e}")))?;
-                Ok((name.clone(), formatter))
-            })
-            .collect::<Result<_, Status>>()?;
-
-        for row in 0..batch.num_rows() {
-            let columns: HashMap<String, String> = formatters
-                .iter()
-                .map(|(name, fmt)| (name.clone(), fmt.value(row).to_string()))
-                .collect();
-            hits.push(SearchHit {
-                key: keys.value(row).to_string(),
-                score: scores.value(row),
-                columns,
-            });
-        }
-    }
-    Ok(hits)
-}
-
-/// Downcast a named column to a concrete Arrow array, mapping a missing or
-/// wrong-typed column to an internal [`Status`] (the search plan owns these
-/// columns, so a mismatch is a server-side invariant break, not a bad input).
-fn column_as<'a, A: Array + 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a A, Status> {
-    batch
-        .column_by_name(name)
-        .ok_or_else(|| Status::internal(format!("search result missing '{name}' column")))?
-        .as_any()
-        .downcast_ref::<A>()
-        .ok_or_else(|| {
-            Status::internal(format!("search result '{name}' column has unexpected type"))
-        })
 }

@@ -42,7 +42,7 @@ use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
+use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::store::{DerivesFromEdge, PinnedSource, Staleness};
 
@@ -426,6 +426,30 @@ impl Session {
 
     // --- materialization contract ----------------------------------------
 
+    /// The recorded materialization of a result table — its
+    /// `.materialization.json` manifest, verbatim: the definition hash and
+    /// artifact digest, the producing descriptor, the environment (engine
+    /// version, device, and every invoked model's run), the input anchors,
+    /// and who produced it when. Read-only. A table that carries no manifest
+    /// is the typed [`JammiError::MissingManifest`] refusal, never an empty
+    /// description.
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// `get_result_table`, so a peer cannot describe a table it cannot resolve.
+    pub async fn describe_table(&self, table: &str) -> Result<MaterializationManifest> {
+        let record = self.result_table(table).await?;
+        self.engine.result_store().describe_table(&record).await
+    }
+
+    /// Resolve a result table by name under this session's tenant binding.
+    async fn result_table(&self, table: &str) -> Result<ResultTableRecord> {
+        self.engine
+            .catalog()
+            .get_result_table(table)
+            .await?
+            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))
+    }
+
     /// Recompute a materialised result table's artifact digest and check it
     /// (and, if given, an expected definition hash) against its
     /// `.materialization.json` manifest. Read-only; returns a [`MatchVerdict`],
@@ -441,12 +465,7 @@ impl Session {
         table: &str,
         expected_definition: Option<DefinitionHash>,
     ) -> Result<MatchVerdict> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         let store = self.engine.result_store();
         let pin = store.pin_current_version(record).await?;
         store
@@ -474,12 +493,7 @@ impl Session {
         table: &str,
         current_definition: DefinitionHash,
     ) -> Result<Staleness> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         self.engine
             .result_store()
             .staleness(&record, &current_definition)
@@ -495,12 +509,7 @@ impl Session {
     /// enumerate the lineage of a table it cannot resolve. The returned edges are
     /// likewise drawn only from the tenant's own (and GLOBAL) `ready` tables.
     pub async fn derives_from(&self, table: &str) -> Result<Vec<DerivesFromEdge>> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         self.engine
             .result_store()
             .derives_from(&record.table_name)
@@ -543,12 +552,7 @@ impl Session {
     /// Tenant-scoped: the table is resolved through the tenant-filtered
     /// `get_result_table`, so a peer cannot recompute a table it cannot resolve.
     pub async fn recompute(&self, table: &str, cascade: Cascade) -> Result<RecomputeReport> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         self.engine.recompute(&record, cascade).await
     }
 

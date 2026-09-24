@@ -356,6 +356,10 @@ class EmbeddedBackend:
         """List every evidence channel registered to the current tenant."""
         return self._native.list_channels()
 
+    def describe_table(self, table: str) -> Dict[str, Any]:
+        """The recorded materialization of a result table — its manifest, as a dict."""
+        return self._native.describe_table(table)
+
     def verify_materialization(
         self, table: str, expected_definition: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -1223,8 +1227,8 @@ class EmbeddedBackend:
         """Nearest-neighbor search over a source's embedding table.
 
         `query` is the query vector; `filter` is an optional SQL predicate over
-        the hydrated results; `select` projects columns (empty keeps the
-        keyed+scored shape). `embedding_table` names which of the source's
+        the hydrated results; `select` projects columns (empty keeps every
+        hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned table);
         ``None`` searches the most-recent ready table. `oversample` overrides,
         for this one call, a quantized-`storage_precision` table's retrieve→

@@ -3,6 +3,7 @@ syntax = "proto3";
 package jammi.v1.embedding;
 
 import "jammi/v1/inference.proto";
+import "jammi/v1/trigger.proto";
 
 // EmbeddingService — the wire surface for the engine's embedding compute
 // verbs. These are imperative session methods, not SQL queries, so they live
@@ -257,17 +258,12 @@ message SearchRequest {
   optional uint32 oversample = 8;
 }
 
+// The search result: the hydrated rows the engine's `search` returns — the
+// key (`_row_id`), the source's columns (or exactly the `select`ed ones), the
+// retrieval provenance and the `similarity` — as one Arrow IPC stream, typed
+// as the engine typed them.
 message SearchResponse {
-  repeated SearchHit hits = 1;
-}
-
-message SearchHit {
-  // The matched row's key (the source's key-column value).
-  string key = 1;
-  // Similarity score from the ANN search.
-  float score = 2;
-  // Projected scalar columns, stringified, when `select` is non-empty.
-  map<string, string> columns = 3;
+  jammi.v1.trigger.ArrowBatch result = 1;
 }
 
 // What a refresh does with a key the source no longer has. UNSPECIFIED maps

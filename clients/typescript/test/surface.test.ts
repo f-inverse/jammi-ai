@@ -31,6 +31,7 @@ import {
   type SubmitJobResponse,
   type JobStatusResponse,
   type CreateMutableTableResponse,
+  type DescribeTableResponse,
   type RegisterTopicResponse,
   type SubscribedBatch,
   type AuditFetchRecentResponse,
@@ -87,6 +88,9 @@ async function verbSurface(c: JammiClient): Promise<void> {
     await c.catalog.describeSource({ sourceId: "s1" });
     await c.catalog.listModels({});
     await c.catalog.describeModel({ modelId: "m" });
+    // Materialization contract: the recorded manifest of a result table.
+    const described: DescribeTableResponse = await c.catalog.describeTable({ table: "t" });
+    expectTypeOf(described.manifestJson).toEqualTypeOf<string>();
     // Channels.
     await c.catalog.registerChannel({ channelId: "ch1" });
     await c.catalog.addChannelColumns({ channelId: "ch1" });
@@ -123,7 +127,7 @@ async function verbSurface(c: JammiClient): Promise<void> {
       k: 5,
       select: ["title"],
     });
-    expectTypeOf(search.hits).toBeArray();
+    expectTypeOf(search.result?.dataBody).toEqualTypeOf<Uint8Array | undefined>();
 
     // ── InferenceService: infer ───────────────────────────────────────────
     const inf: InferResponse = await c.inference.infer({

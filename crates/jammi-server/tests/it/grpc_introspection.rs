@@ -459,3 +459,136 @@ async fn remote_server_info_reports_postgres_broker_kind() {
     let _ = server.shutdown.send(());
     let _ = server.handle.await;
 }
+
+/// The materialization-contract reads cross the wire unchanged: a real
+/// `tiny_bert` embedding table and the neighbor graph derived from it are
+/// described, verified, sensed and walked through the remote `CatalogClient`
+/// and the local `Session`, and every answer is equal. The description is the
+/// recorded manifest itself (decoded through the strict reader), so its
+/// definition hash is what `staleness` compares — passed back, it decides no
+/// `DefinitionChanged` reason. A table whose sidecar is gone crosses as the
+/// typed `MissingManifest` on both transports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialization_reads_cross_the_wire_like_local() {
+    use jammi_db::error::JammiError;
+    use jammi_db::store::manifest::{MatchVerdict, ProducingDescriptor};
+    use jammi_db::store::Staleness;
+
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+
+    local
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect("add_source");
+    let table = local
+        .generate_embeddings(
+            "patents",
+            &tiny_bert_model_id(),
+            &["abstract".to_string()],
+            "id",
+            Modality::Text,
+            CachePolicy::Bypass,
+        )
+        .await
+        .expect("generate_embeddings")
+        .0;
+    let graph = server
+        .engine
+        .build_neighbor_graph(
+            "patents",
+            Some(&table.table_name),
+            &BuildNeighborGraph {
+                k: 5,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .expect("build_neighbor_graph")
+        .0;
+
+    let described = remote
+        .describe_table(&table.table_name)
+        .await
+        .expect("remote describe_table");
+    assert_eq!(
+        described,
+        local
+            .describe_table(&table.table_name)
+            .await
+            .expect("local describe_table"),
+        "describe_table returns the recorded manifest through either transport"
+    );
+    assert!(matches!(
+        described.descriptor,
+        ProducingDescriptor::Embedding { .. }
+    ));
+    assert_eq!(described.env.models.len(), 1, "one model ran");
+
+    let definition = described.definition_hash.clone();
+    let remote_verdict = remote
+        .verify_materialization(&table.table_name, Some(&definition))
+        .await
+        .expect("remote verify");
+    assert!(matches!(
+        remote_verdict,
+        MatchVerdict::Match | MatchVerdict::MatchWithUnpinnedInputs { .. }
+    ));
+    assert_eq!(
+        remote_verdict,
+        local
+            .verify_materialization(&table.table_name, Some(definition.clone()))
+            .await
+            .expect("local verify")
+    );
+    // `patents` is a plain file source, anchored at a read instant: the
+    // verdict is undecidable, and the recorded definition decides no reason.
+    assert_eq!(
+        remote
+            .staleness(&table.table_name, &definition)
+            .await
+            .expect("remote staleness"),
+        Staleness::Undecidable {
+            unpinned: vec!["patents".to_string()],
+            decided_reasons: Vec::new(),
+        }
+    );
+    let edges = remote
+        .derives_from(&table.table_name)
+        .await
+        .expect("remote derives_from");
+    assert_eq!(
+        edges,
+        local
+            .derives_from(&table.table_name)
+            .await
+            .expect("local derives_from")
+    );
+    assert!(edges.iter().any(|e| e.derived == graph.table_name));
+
+    let parquet = std::path::PathBuf::from(
+        table
+            .parquet_path
+            .strip_prefix("file://")
+            .expect("a file-backed artifact"),
+    );
+    std::fs::remove_file(parquet.with_extension("materialization.json"))
+        .expect("remove the sidecar");
+    for (arm, result) in [
+        ("remote", remote.describe_table(&table.table_name).await),
+        ("local", local.describe_table(&table.table_name).await),
+    ] {
+        match result {
+            Err(JammiError::MissingManifest { table: named }) => {
+                assert_eq!(named, table.table_name, "{arm}")
+            }
+            other => panic!("{arm}: expected MissingManifest, got {other:?}"),
+        }
+    }
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}

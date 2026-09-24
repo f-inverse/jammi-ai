@@ -10430,7 +10430,7 @@ mod tests {
     fn worker_devices_is_decided_from_configuration_alone() {
         let mut config = jammi_db::config::JammiConfig {
             gpu: jammi_db::config::GpuConfig {
-                device: -1,
+                device: Some(-1),
                 ..Default::default()
             },
             ..Default::default()
@@ -10445,7 +10445,7 @@ mod tests {
             "{devices:?}"
         );
 
-        config.gpu.device = 0;
+        config.gpu.device = Some(0);
         config.gpu.devices = Some(vec![0, 1]);
         config.worker.local_ranks = 2;
         let devices = worker_devices(&config, ComputeDevice::Cpu);

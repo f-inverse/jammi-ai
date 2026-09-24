@@ -498,12 +498,40 @@ impl ResultStore {
     /// The base artifact's sidecar, or [`JammiError::NotRecomputable`] for a
     /// table that has none.
     async fn base_manifest(&self, table: &ResultTableRecord) -> Result<MaterializationManifest> {
-        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
-        self.read_materialization_manifest(&parquet_url)
+        self.recorded_manifest(table)
             .await?
             .ok_or_else(|| JammiError::NotRecomputable {
                 table: table.table_name.clone(),
             })
+    }
+
+    /// The materialization a result table's base artifact recorded — its
+    /// `.materialization.json` sidecar, verbatim — or
+    /// [`JammiError::MissingManifest`] for a table that carries none. The
+    /// read-only `describe_table` verb: what produced the table (descriptor,
+    /// environment, every invoked model's run), over what (input anchors),
+    /// and the digests a verifier matches. A versioned table's later versions
+    /// share this definition (a refresh refuses on drift); their fragment
+    /// digests are attested by the version chain `verify_materialization`
+    /// walks.
+    pub async fn describe_table(
+        &self,
+        table: &ResultTableRecord,
+    ) -> Result<MaterializationManifest> {
+        self.recorded_manifest(table)
+            .await?
+            .ok_or_else(|| JammiError::MissingManifest {
+                table: table.table_name.clone(),
+            })
+    }
+
+    /// The base artifact's sidecar, `None` when it has none.
+    async fn recorded_manifest(
+        &self,
+        table: &ResultTableRecord,
+    ) -> Result<Option<MaterializationManifest>> {
+        let parquet_url = StorageUrl::parse(&table.parquet_path)?;
+        self.read_materialization_manifest(&parquet_url).await
     }
 
     /// The full transitive downstream subgraph of `source`: every result table

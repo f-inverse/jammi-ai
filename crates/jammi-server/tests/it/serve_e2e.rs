@@ -232,7 +232,11 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
         .await
         .expect("search")
         .into_inner();
-    assert_eq!(search.hits.len(), 3, "k=3 over a three-row corpus");
+    assert_eq!(
+        super::common::grpc::ranked(search).len(),
+        3,
+        "k=3 over a three-row corpus"
+    );
 
     // Flight SQL round-trip — `execute` issues GetFlightInfo, `do_get`
     // issues DoGet, which anchors `flight_queries`.

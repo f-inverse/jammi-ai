@@ -190,6 +190,14 @@ class BackendError(JammiError, RuntimeError):
     """
 
 
+class MissingManifest(BackendError):
+    """A result table carries no recorded materialization manifest, so
+    ``describe_table`` has no definition to return. Refines
+    :class:`BackendError` (the class the remote transport raises for the same
+    ``NOT_FOUND`` status).
+    """
+
+
 class NotRefreshable(BackendError):
     """A refresh or compaction was asked of a table it cannot serve
     incrementally (not ready, not an embedding table, its current version

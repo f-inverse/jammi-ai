@@ -2098,7 +2098,7 @@ fn train_streamed(
     let config = JammiConfig {
         artifact_dir: engine_dir.clone(),
         gpu: GpuConfig {
-            device: gpu_device,
+            device: Some(gpu_device),
             devices: Some(vec![gpu_device]),
             require_gpu: gpu_device >= 0,
             ..Default::default()

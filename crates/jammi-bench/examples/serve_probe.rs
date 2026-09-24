@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = JammiConfig {
         artifact_dir: artifact_dir.path().to_path_buf(),
         gpu: GpuConfig {
-            device: cuda,
+            device: Some(cuda),
             require_gpu: true,
             compute_precision: jammi_numerics::ComputePrecision::BF16,
             ..Default::default()

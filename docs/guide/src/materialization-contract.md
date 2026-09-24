@@ -127,6 +127,47 @@ this funnel too: `ResultStore::materialize_embedding_table` writes the table and
 then calls `finish` with the producer's `Materialization` (descriptor,
 environment, and resolved input anchors).
 
+## How to read a table's recorded materialization
+
+`describe_table` is the read-only verb that returns a table's manifest as the
+producer recorded it: the definition hash and artifact digest, the producing
+descriptor, the environment (engine version, device, and every invoked model's
+run — for a local model its backend, precision, content digest and weight
+quantization; for a remote one its declaration, never its credentials; or an
+external import), the input anchors, and who produced it when. A table with no
+manifest is the typed `MissingManifest` refusal, never an empty description.
+It runs on every surface: the embedded and remote Python clients, the Rust
+`Session` and `jammi_admin::CatalogClient`, and `CatalogService.DescribeTable`,
+whose response carries the manifest in its own canonical serialization.
+
+The recorded definition hash is the left side `staleness` compares against, and
+the input to `verify_materialization`'s expected-definition check, so a reader
+reads it here rather than recomputing it:
+
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate jammi_db;
+# use jammi_ai::Session;
+# use jammi_db::store::manifest::ModelRun;
+# async fn ex(session: &Session, table: &str) -> jammi_db::error::Result<()> {
+let manifest = session.describe_table(table).await?;
+for model in &manifest.env.models {
+    if let ModelRun::Local(run) = &model.run {
+        println!("{} ran at {:?}, weights {}", model.model_id, run.compute_precision, run.content_digest);
+    }
+}
+let staleness = session.staleness(table, manifest.definition_hash.clone()).await?;
+# let _ = staleness;
+# Ok(()) }
+```
+
+```python
+manifest = db.describe_table("results__text_embedding__…")
+manifest["definition_hash"]              # what `staleness` compares
+manifest["env"]["models"][0]["run"]      # {"runner": "local", "content_digest": …}
+db.staleness("results__text_embedding__…", manifest["definition_hash"])
+```
+
 ## How to verify a table
 
 `verify_materialization` is the read-only verb that recomputes a `ready` table's

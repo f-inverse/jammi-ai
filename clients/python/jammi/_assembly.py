@@ -1467,7 +1467,7 @@ def build_search_request(
 
     `query` is the query vector (carried in the `query_vector` oneof arm);
     `filter` is an optional SQL predicate over the hydrated results; `select`
-    projects columns (empty keeps the keyed+scored shape); `embedding_table`
+    projects columns (empty keeps every hydrated column); `embedding_table`
     names which of the source's embedding tables to search (unset = the
     most-recent ready table). `oversample` overrides, for this one call, the
     retrieve→rescore candidate-breadth multiplier (`k * oversample`) a

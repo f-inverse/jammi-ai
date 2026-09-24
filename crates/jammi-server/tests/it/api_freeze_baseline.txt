@@ -63,6 +63,7 @@ RPC CatalogService/DeleteModel
 RPC CatalogService/DerivesFrom
 RPC CatalogService/DescribeModel
 RPC CatalogService/DescribeSource
+RPC CatalogService/DescribeTable
 RPC CatalogService/DropMutableTable
 RPC CatalogService/DropTopic
 RPC CatalogService/GetServerInfo

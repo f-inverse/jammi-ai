@@ -64,6 +64,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::{Array, StringArray};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
@@ -211,11 +212,18 @@ async fn search_via(
             oversample: None,
         })
         .await?;
-    Ok(response
-        .into_inner()
-        .hits
-        .into_iter()
-        .map(|h| h.key)
+    let batches = jammi_wire::result_rows_from_proto(response.into_inner().result)?;
+    Ok(batches
+        .iter()
+        .flat_map(|batch| {
+            let keys = batch
+                .column_by_name("_row_id")
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .expect("a `_row_id` column");
+            (0..batch.num_rows())
+                .map(|i| keys.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
         .collect())
 }
 

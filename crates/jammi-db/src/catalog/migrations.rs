@@ -225,6 +225,13 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
             postgres: schema::MIGRATION_042_RESULT_TABLE_REPLACEMENT_POSTGRES,
         },
     ),
+    (
+        "043_models_backend_required",
+        MigrationSql::PerBackend {
+            sqlite: schema::MIGRATION_043_MODELS_BACKEND_REQUIRED_SQLITE,
+            postgres: schema::MIGRATION_043_MODELS_BACKEND_REQUIRED_POSTGRES,
+        },
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

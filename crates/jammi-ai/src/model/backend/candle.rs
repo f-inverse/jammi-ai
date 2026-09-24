@@ -867,7 +867,7 @@ fn content_digest_entries(resolved: &ResolvedModel) -> Result<Vec<(String, std::
 /// slot models mutually SUBSTITUTABLE alternates only (the config/tokenizer
 /// slots' resolver chain picks exactly one filename; the weights slot's
 /// three named arms — `model.safetensors` / `open_clip_model.safetensors` /
-/// `model.onnx` — are likewise alternates, never a set the loader needs
+/// `model.gguf` — are likewise alternates, never a set the loader needs
 /// jointly). A sharded HF download's shard files are each their OWN
 /// single-arm, always-gated, `absence_tolerated: false` slot — never
 /// additional arms folded into the weights slot above, because a shard is CONJUNCTIVELY required
@@ -887,16 +887,14 @@ struct SlotArm {
 /// isolation. The grouping carries two properties, both real for the config
 /// slot (`config.json` / `open_clip_config.json`), the tokenizer slot, and
 /// the weights slot (`model.safetensors` / `open_clip_model.safetensors` /
-/// `model.onnx`):
+/// `model.gguf`):
 ///
 /// 1. **An unselected arm's appearance is tracked.** A NEW file appearing in
 ///    a currently-unselected arm (`open_clip_config.json` appearing next to
-///    an existing `config.json`; `model.onnx` appearing next to
-///    `model.safetensors`, which ALSO flips the backend a COLD resolve would
-///    pick — `resolve_local` prefers ORT the instant `model.onnx` exists)
-///    means a cold reload might pick a different arm, or a different
-///    backend entirely. Fingerprinting only the selected arm would leave
-///    `probe` reporting fresh forever.
+///    an existing `config.json`; `model.safetensors` appearing next to a
+///    loaded `model.gguf`, which a cold resolve would now prefer) means a
+///    cold reload might pick a different arm. Fingerprinting only the
+///    selected arm would leave `probe` reporting fresh forever.
 /// 2. **"Required unless an alternate exists".** The selected arm's OWN
 ///    deletion, with an alternate arm already present on disk, is not a
 ///    hard failure — a cold resolve would simply pick the alternate. A
@@ -1059,19 +1057,18 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     });
 
     // Weights ALTERNATES slot: the resolver's OWN `model.safetensors` /
-    // `open_clip_model.safetensors` / `model.onnx` preference chain
-    // (`try_catalog_lookup`; `resolve_local`'s
-    // `has_onnx`/`has_safetensors` backend auto-selection;
-    // `download_safetensors`'s two single-name tries). Every known filename is a
-    // tracked arm regardless of which one THIS load actually selected —
-    // `model.onnx` APPEARING next to a currently-loaded `model.safetensors`
-    // is exactly the case that flips the backend a cold resolve would choose
-    // (`resolve_local` prefers ORT the instant `has_onnx` is true), so its
-    // appearance must be just as detectable as its own disappearance. This
-    // slot models ONLY these three mutually SUBSTITUTABLE named alternates —
-    // a cold resolve picks exactly one of them — never a sharded download's
-    // extra files (see the per-shard slots pushed separately, immediately
-    // below, for why a shard cannot be an arm here).
+    // `open_clip_model.safetensors` / `model.gguf` preference chain
+    // (`model::arch::WEIGHTS_CANDIDATE_NAMES`, which `try_catalog_lookup`,
+    // `resolve_local` and `download_safetensors` all walk). Every name is a
+    // tracked arm regardless of which one THIS load selected: an
+    // `open_clip_model.safetensors` or `model.gguf` appearing, or the
+    // selected arm vanishing while another remains, changes what a cold
+    // resolve would load, so each must be as detectable as the selected
+    // arm's own change. This slot models ONLY these three mutually
+    // SUBSTITUTABLE named alternates — a cold resolve picks exactly one of
+    // them — never a sharded download's extra files (see the per-shard slots
+    // pushed separately, immediately below, for why a shard cannot be an arm
+    // here).
     //
     // **Primary-file edge**: `download_safetensors` returns as
     // soon as EITHER single-name `repo.get` succeeds,
@@ -1089,52 +1086,7 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // mixed shape (a named primary alongside extra shard-like entries) is
     // still classified honestly rather than by accident.
     //
-    // **Known limitation — this slot is `backend_hint`-blind.**
-    // `DigestSlot`/`probe` decide arm (b) "stale, a cold resolve would
-    // succeed via the alternate" purely from which named files exist on
-    // disk — they never see the `backend_hint` the ORIGINAL `get_or_load`
-    // call was made with. `resolve_local`, when
-    // `backend_hint == Some(Candle)`, pins `backend` to `Candle`
-    // UNCONDITIONALLY and never falls back to `model.onnx` even if it
-    // exists (`resolve_local`'s ORT auto-pick applies
-    // ONLY when `backend_hint` is `None`) — so `model.safetensors` deleted
-    // while an ungated `model.onnx` sits alongside it, under a Candle-pinned
-    // load, is a case where THIS slot still reports arm (b) `Ok(false)`
-    // stale (an arm — `model.onnx` — is present now), even though a cold
-    // `resolve_local` call carrying that SAME `backend_hint` would hit the
-    // `resolve_local`'s typed refusal ("No safetensors weights found
-    // for Candle backend"), not succeed via a different backend. The probe
-    // therefore does not itself refuse here, contrary to arm (c)'s contract
-    // doc above ("no arm can satisfy a cold resolve" -> `Err`) — this is
-    // arm (b) by the slot's own on-disk-only view, whether or not the
-    // RECORDED hint would actually doom the reload.
-    //
-    // `backend_hint` is not plumbed into `ResolvedModel`/`ModelFingerprint`
-    // because the reported "stale" verdict is not a silent wrong-answer — `ModelCache::get_or_load`
-    // (cache.rs) evicts on `Ok(false)` and falls through to `do_load`, which
-    // calls `self.resolver.resolve(source, task, backend_hint)` with the
-    // SAME `backend_hint` this `get_or_load` invocation was itself called
-    // with (the hint is a parameter of the whole retry loop, not something
-    // `probe` re-derives) — so the reload immediately hits the identical
-    // typed refusal a direct probe-time `Err` would have produced, one hop
-    // later, surfaced to the SAME caller as the SAME typed `JammiError`.
-    // The only externally observable difference from a hypothetical
-    // hint-aware `Err` here is that the stale `CacheEntry` is evicted before
-    // the reload's refusal — strictly conservative (never serves the
-    // now-incomplete entry again) and not a correctness gap. A caller that
-    // varies `backend_hint` across calls for the SAME model id (no call site
-    // in this codebase does) could observe a DIFFERENT backend's reload
-    // attempt than the one that built this fingerprint — a property of
-    // `get_or_load`'s per-call `backend_hint` parameter, not of this slot.
-    // `model.gguf`: a fourth mutually-substitutable named arm, for the SAME
-    // "appearance flips the backend/format a cold resolve would pick"
-    // reason as `model.onnx` — a `model.gguf`
-    // appearing alongside an existing `model.safetensors` is exactly the
-    // shape the resolver's own FROZEN precedence (safetensors wins) makes
-    // invisible to a cold resolve, so it must be just as tracked here.
-    // Sourced from `model::arch` so the tracked-candidate list and every
-    // resolution chain in the crate name the same files. The ORDER and
-    // CONTENT determine the emitted digests (pinned by
+    // The ORDER and CONTENT determine the emitted digests (pinned by
     // `tests/it/content_digest.rs`).
     let weight_arms: Vec<RawArm> = crate::model::arch::WEIGHTS_CANDIDATE_NAMES
         .into_iter()
@@ -1324,11 +1276,11 @@ struct FingerprintSlot {
 /// **Scope.** This fingerprint enforces a NARROW staleness guarantee: detect
 /// in-place mutation — content change, deletion, or appearance — of the
 /// FILES the resolver selected (and their preference-chain alternates)
-/// under the resolve inputs recorded at load (`source`, `task`,
-/// `backend_hint`, catalog state). It deliberately does NOT re-verify
+/// under the resolve inputs recorded at load (`source`, `task`, catalog
+/// state). It deliberately does NOT re-verify
 /// non-file resolve inputs:
 ///
-/// - catalog location/`backend` rewrites — a retrained fine-tuned
+/// - catalog location rewrites — a retrained fine-tuned
 ///   model whose adapter dir is content-addressed and immutable will probe
 ///   fresh until process restart: `fetch_artifact` never touches bytes this
 ///   type is already watching, and the catalog ROW pointing at a NEW dir is
@@ -1337,8 +1289,8 @@ struct FingerprintSlot {
 /// - catalog-vs-local precedence (`ModelResolver::try_catalog_lookup`'s
 ///   catalog-first ordering vs. a shadowed `ModelSource::Local` fallthrough
 ///   that could resolve differently on a cold path);
-/// - task/backend_hint cache keying — cache entries are keyed by `ModelId`
-///   alone, narrower than the `(source, task, backend_hint)` resolve key;
+/// - task cache keying — cache entries are keyed by `ModelId` alone,
+///   narrower than the `(source, task)` resolve key;
 /// - HF `refs/<rev>` revision moves — the mutable pointer hf-hub resolves
 ///   through (`refs/<rev> -> snapshots/<sha>`) sits outside this type's
 ///   file-set anchor entirely and is structurally inexpressible as an arm;
@@ -1443,23 +1395,6 @@ impl ModelFingerprint {
     /// the cause was transient (e.g. a catalog-vs-local precedence change
     /// outside this type's scope), the cold reload succeeds and the system self-heals
     /// instead of staying wedged on a dead in-memory entry forever.
-    ///
-    /// **Known limitation — arm (b) is `backend_hint`-blind for the
-    /// weights slot.** "Some arm of this slot present now" is an on-disk-only
-    /// check; it does not know whether the ORIGINAL `get_or_load` call's
-    /// `backend_hint` would make a cold resolve reject that surviving arm
-    /// anyway (e.g. `model.safetensors` deleted while an ungated
-    /// `model.onnx` survives, under a Candle-pinned `backend_hint`:
-    /// `resolve_local` never auto-falls-back to ORT when the hint is `Some`).
-    /// Such a load reports arm (b) `Ok(false)` here
-    /// even though a cold resolve carrying that SAME hint would in fact hit
-    /// arm (c)'s typed refusal. This is NOT a silent wrong answer:
-    /// `ModelCache::get_or_load` evicts on `Ok(false)` and immediately
-    /// re-resolves with the SAME `backend_hint` this call was made with, so
-    /// the caller gets the identical typed `JammiError` one hop later
-    /// instead of directly from `probe`. See [`all_candidate_paths`]'s
-    /// weights-alternates-slot doc for why `backend_hint` is not plumbed
-    /// into this type.
     ///
     /// **Slot evaluation is per-slot-local and first-change-wins.** The loop below walks
     /// `self.slots` in [`all_candidate_paths`]'s push order and returns as soon as ONE slot
@@ -2676,9 +2611,7 @@ fn config_model_type(resolved: &ResolvedModel) -> &str {
 /// count — or `None` for a safetensors checkpoint. The resolver already
 /// classified the weight-storage format at resolve time
 /// (`ResolvedModel.weights_format`); it is never re-derived by
-/// extension-sniffing here. `Ort` never resolves a GGUF path (the
-/// resolver's local/HF arms only ever look for `model.onnx`), so
-/// `(Ort, Gguf)` cannot reach this backend at all. GGUF loading is threaded
+/// extension-sniffing here. GGUF loading is threaded
 /// only through the BERT-family/DistilBERT/ModernBERT text towers, so a
 /// quantized cross-modal checkpoint is a typed refusal. Shared by the
 /// description (the checkpoint's quantization format) and the load (its
@@ -2820,7 +2753,9 @@ impl ModelBackend for CandleBackend {
         Ok(ModelDescription {
             identity: jammi_db::store::manifest::ModelIdentity {
                 model_id: resolved.model_id.0.clone(),
-                backend: "candle".to_string(),
+                backend: jammi_db::store::manifest::ModelRunner::Backend(
+                    jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                ),
                 compute_precision,
                 content_digest,
                 quantization,
@@ -3549,18 +3484,8 @@ impl ModelBackend for CandleBackend {
         // dtype-blind — it under-reports true residency whenever the
         // on-disk dtype is narrower than the `compute_dtype`
         // `VarBuilder::from_mmaped_safetensors` (below) actually
-        // materializes every weight at. The ONNX arm below (the only
-        // `WeightsFormat` a Candle-backend resolve never produces, kept for
-        // an exhaustive match) is the plain file-byte sum.
-        match resolved.weights_format {
-            WeightsFormat::Gguf | WeightsFormat::Safetensors => resolved.estimated_memory,
-            WeightsFormat::Onnx => resolved
-                .weights_paths
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() as usize)
-                .sum(),
-        }
+        // materializes every weight at.
+        resolved.estimated_memory
     }
 }
 
@@ -4686,7 +4611,9 @@ mod ner_nonfinite_logit_tests {
         let description = Arc::new(ModelDescription {
             identity: jammi_db::store::manifest::ModelIdentity {
                 model_id: "synthetic-ner".to_string(),
-                backend: "candle".to_string(),
+                backend: jammi_db::store::manifest::ModelRunner::Backend(
+                    jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                ),
                 compute_precision: jammi_numerics::ComputePrecision::F32,
                 // No real model directory backs this synthetic fixture, so
                 // there is nothing to hash — an arbitrary fixed placeholder
@@ -4855,7 +4782,6 @@ mod digest_fingerprint_tests {
             serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
-            backend: crate::model::BackendType::Candle,
             weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path: dst.join("config.json"),
@@ -5603,7 +5529,6 @@ mod digest_fingerprint_tests {
             serde_json::from_reader(std::fs::File::open(&config_path).unwrap()).unwrap();
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
-            backend: crate::model::BackendType::Candle,
             weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path,
@@ -5705,11 +5630,9 @@ mod digest_fingerprint_tests {
 
     /// Build a `ResolvedModel` whose WEIGHTS SLOT is selected via
     /// `selected_name` (one of the three well-known weight filenames) —
-    /// writing ONLY that one file initially. `backend` is set to match
-    /// (`Ort` for `"model.onnx"`, `Candle` otherwise), mirroring what
-    /// `resolve_local`'s own `has_onnx` branch would have picked, even
-    /// though this fixture is hand-built rather than routed through the
-    /// resolver.
+    /// writing ONLY that one file initially. `weights_format` is set to
+    /// match, as the resolver would have classified it, even though this
+    /// fixture is hand-built rather than routed through the resolver.
     fn resolved_with_weights_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
         std::fs::create_dir_all(dst).unwrap();
         let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
@@ -5720,21 +5643,13 @@ mod digest_fingerprint_tests {
         std::fs::copy(fixture.join("model.safetensors"), &weights_path).unwrap();
         let model_config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
-        let backend = if selected_name == "model.onnx" {
-            crate::model::BackendType::Ort
-        } else {
-            crate::model::BackendType::Candle
-        };
-        let weights_format = if selected_name == "model.onnx" {
-            crate::model::WeightsFormat::Onnx
-        } else if selected_name == "model.gguf" {
+        let weights_format = if selected_name == "model.gguf" {
             crate::model::WeightsFormat::Gguf
         } else {
             crate::model::WeightsFormat::Safetensors
         };
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
-            backend,
             weights_format,
             task: ModelTask::TextEmbedding,
             config_path: dst.join("config.json"),
@@ -5749,23 +5664,18 @@ mod digest_fingerprint_tests {
         }
     }
 
-    /// (a) appearance: load with ONLY `model.safetensors` selected;
-    /// `model.onnx` — an arm this load did NOT select — then appears. A
-    /// weights slot that fingerprinted only the resolved `weights_paths`
-    /// entries, never the OTHER well-known filenames, would make this
-    /// appearance invisible to `probe` — masking the fact that a cold
-    /// resolve (`resolve_local`'s `has_onnx` branch) would now pick the ORT
-    /// backend instead. The
-    /// backend flip itself is a COLD-side property, verified independently
-    /// at the resolver level by `models.rs`'s
-    /// `resolve_local_prefers_onnx_once_it_appears_alongside_existing_safetensors`
-    /// — this test asserts what the warm probe can honestly assert:
-    /// staleness was detected.
+    /// (a) appearance: load with ONLY `open_clip_model.safetensors`
+    /// selected; `model.safetensors` — an arm this load did NOT select, and
+    /// the one a cold resolve now prefers — then appears. A weights slot that
+    /// fingerprinted only the resolved `weights_paths` entries, never the
+    /// OTHER well-known filenames, would make this appearance invisible to
+    /// `probe`. A file outside the chain (an ONNX export shipped beside the
+    /// weights) changes nothing a cold resolve loads, so it never trips it.
     #[test]
     fn weights_slot_alternate_arm_appearing_trips_the_probe() {
         let model_tmp = tempfile::tempdir().unwrap();
         let dst = model_tmp.path().join("model");
-        let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
+        let resolved = resolved_with_weights_arm(&dst, "open_clip_model.safetensors");
 
         let fingerprint = compute_model_fingerprint(&resolved).unwrap();
         assert!(
@@ -5773,15 +5683,24 @@ mod digest_fingerprint_tests {
             "sanity: fresh immediately after capture"
         );
 
-        // model.onnx — the UNSELECTED arm — APPEARS.
-        std::fs::write(dst.join("model.onnx"), b"fake-onnx-bytes").unwrap();
+        std::fs::write(dst.join("model.onnx"), b"onnx-export-bytes").unwrap();
+        assert!(
+            fingerprint.probe().unwrap(),
+            "a file outside the weights chain must not trip the probe"
+        );
+
+        // model.safetensors — the UNSELECTED, preferred arm — APPEARS.
+        std::fs::copy(
+            jammi_test_utils::cookbook_fixture("tiny_bert").join("model.safetensors"),
+            dst.join("model.safetensors"),
+        )
+        .unwrap();
 
         assert!(
             !fingerprint.probe().unwrap(),
-            "model.onnx appearing alongside a load resolved via model.safetensors must \
-             trip the probe to stale — it is not \
-             a candle-side-irrelevant file: resolve_local prefers ORT the instant \
-             model.onnx exists"
+            "model.safetensors appearing beside a load resolved via \
+             open_clip_model.safetensors must trip the probe to stale: a cold \
+             resolve now loads it instead"
         );
     }
 
@@ -5824,7 +5743,7 @@ mod digest_fingerprint_tests {
         let model_tmp = tempfile::tempdir().unwrap();
         let dst = model_tmp.path().join("model");
         let resolved = resolved_with_weights_arm(&dst, "model.safetensors");
-        // No open_clip_model.safetensors or model.onnx exists at all.
+        // Neither open_clip_model.safetensors nor model.gguf exists.
 
         let fingerprint = compute_model_fingerprint(&resolved).unwrap();
         std::fs::remove_file(dst.join("model.safetensors")).unwrap();
@@ -5872,7 +5791,6 @@ mod digest_fingerprint_tests {
             serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
-            backend: crate::model::BackendType::Candle,
             weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::TextEmbedding,
             config_path: dst.join("config.json"),
@@ -5936,7 +5854,7 @@ mod digest_fingerprint_tests {
         let model_tmp = tempfile::tempdir().unwrap();
         let dst = model_tmp.path().join("model");
         let resolved = resolved_with_primary_and_shards(&dst, 2);
-        // No open_clip_model.safetensors or model.onnx exists at all, so
+        // Neither open_clip_model.safetensors nor model.gguf exists, so
         // deleting the primary leaves EVERY arm of the alternates slot gone.
 
         let fingerprint = compute_model_fingerprint(&resolved).unwrap();
@@ -5947,7 +5865,7 @@ mod digest_fingerprint_tests {
         assert!(
             result.is_err(),
             "deleting the sole named primary, with no open_clip_model.safetensors or \
-             model.onnx alternate present, must remain a typed refusal for the \
+             model.gguf alternate present, must remain a typed refusal for the \
              ALTERNATES slot regardless of the per-shard slots being entirely \
              untouched and healthy — each slot refuses independently. Got {result:?}"
         );
@@ -6023,7 +5941,6 @@ mod r5_f2_classification_pooling_tests {
             serde_json::from_reader(std::fs::File::open(dst.join("config.json")).unwrap()).unwrap();
         ResolvedModel {
             model_id: crate::model::ModelId(format!("local:{}", dst.display())),
-            backend: crate::model::BackendType::Candle,
             weights_format: crate::model::WeightsFormat::Safetensors,
             task: ModelTask::Classification,
             config_path: dst.join("config.json"),

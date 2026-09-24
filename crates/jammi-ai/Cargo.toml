@@ -79,7 +79,6 @@ flate2 = { workspace = true, optional = true }
 # use it, so it rides `local` like `image` / `symphonia`.
 rayon = { workspace = true, optional = true }
 # HTTP backend
-reqwest = { workspace = true, optional = true }
 # `#[async_trait]` for the `annotate` table function's `TableProvider` impl
 # (the in-process compound-query surface); only the `local` engine builds it.
 async-trait = { workspace = true, optional = true }
@@ -147,6 +146,7 @@ tracing-subscriber = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
+reqwest.workspace = true
 tokenizers.workspace = true
 jammi-test-resources = { workspace = true, features = ["candle"] }
 # A recording `ObjectStore` wrapper for the rank read-path oracle: proves
@@ -223,7 +223,6 @@ local = [
     "dep:symphonia",
     "dep:flate2",
     "dep:rayon",
-    "dep:reqwest",
     "dep:async-trait",
     "dep:tempfile",
     "dep:bytes",

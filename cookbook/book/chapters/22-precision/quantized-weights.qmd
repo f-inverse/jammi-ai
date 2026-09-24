@@ -35,7 +35,7 @@ directory either has a `model.gguf` file or it does not, and if it does, its
 matmul-site tensors are stored at whatever k-quant format they were quantized
 to when the file was written. `LoadedModel::quantization()` reports this fact
 — `Some(WeightQuantization::Q8_0)` for a GGUF load, `None` for every
-safetensors/ONNX load — as a **derived observation**, never a caller-set
+safetensors load — as a **derived observation**, never a caller-set
 value:
 
 ```{python}
@@ -61,7 +61,7 @@ sense than storage-precision/compute-precision are orthogonal to each other
 the same `[gpu]`/`embedding.ann` config surface). Here, one side of the pair
 is a *setting* and the other is a *fact about a file on disk*
 (`crates/jammi-ai/src/model/mod.rs:408-423`'s own doc: `quantization()` is
-`Some` "for a `model.gguf` load, `None` for every safetensors/ONNX load" —
+`Some` "for a `model.gguf` load, `None` for every safetensors load" —
 never a config lookup). A `q8_0` GGUF backbone can still run its densified
 (non-matmul-site) tensors and its dequantized activations at `compute_precision
 = "f16"` — the two vocabularies compose exactly as freely as storage/compute
@@ -132,7 +132,7 @@ checkpoint every other chapter in this book already uses) and `gguf_dir` (the
 *same* weight values, `q8_0`-quantized at every matmul site). Neither carries
 the other's weights file — `f32_dir` has no `model.gguf`, `gguf_dir` has no
 `model.safetensors` — so the frozen safetensors-wins precedence
-(`crates/jammi-ai/src/model/resolver.rs`: a `model.safetensors` or ONNX file
+(`crates/jammi-ai/src/model/resolver.rs`: a safetensors file
 always wins, and only when NEITHER is present does a `model.gguf` file enter
 the picture at all) is not exercised by this pair; the next chapter section
 walks each directory through the resolve→load→embed path on its own.
@@ -143,7 +143,7 @@ walks each directory through the resolve→load→embed path on its own.
 call* [the compute-precision chapter](compute-precision.qmd) makes against a
 safetensors directory — `ModelResolver::resolve` (`resolver.rs`) reads
 `config.json` for architecture and layer count, finds `model.gguf` because
-neither `model.safetensors` nor `model.onnx` is present, and the Candle
+no safetensors file is present, and the Candle
 backend's GGUF branch (`crates/jammi-ai/src/model/backend/gguf.rs`) loads it:
 every matmul-site tensor stored at `q8_0` stays resident as an `Arc<QTensor>`
 (never dequantized at load), and every other tensor is densified to the

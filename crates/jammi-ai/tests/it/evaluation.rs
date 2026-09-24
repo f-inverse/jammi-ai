@@ -272,7 +272,7 @@ async fn catalog_eval_run_crud_and_latest() {
             model_id: "model-a",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,

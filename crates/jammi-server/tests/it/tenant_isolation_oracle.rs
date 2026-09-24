@@ -304,13 +304,13 @@ async fn ab_catalogs() -> (TempDir, Catalog, Catalog, Catalog) {
     (dir, cat_a, cat_b, cat_global)
 }
 
-fn register_params<'a>(model_id: &'a str, backend: &'a str) -> RegisterModelParams<'a> {
+fn register_params(model_id: &str, task: ModelTask) -> RegisterModelParams<'_> {
     RegisterModelParams {
         model_id,
         version: 1,
         model_type: "embedding",
-        backend,
-        task: ModelTask::TextEmbedding,
+        backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+        task,
         base_model_id: None,
         external_location: None,
         config_json: None,
@@ -573,7 +573,7 @@ fn cases() -> Vec<IsolationCase> {
         case!("CatalogService", "ListModels", CaseKind::Hermetic, None, {
             let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
             cat_a
-                .register_model(register_params("m_a", "candle"))
+                .register_model(register_params("m_a", ModelTask::TextEmbedding))
                 .await
                 .unwrap();
             let b_names: Vec<String> = cat_b
@@ -598,17 +598,25 @@ fn cases() -> Vec<IsolationCase> {
                 // keys a DISTINCT tenant-qualified PK and never overwrites A's row.
                 let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
                 cat_a
-                    .register_model(register_params("collide", "candle"))
+                    .register_model(register_params("collide", ModelTask::TextEmbedding))
                     .await
                     .unwrap();
                 cat_b
-                    .register_model(register_params("collide", "vllm"))
+                    .register_model(register_params("collide", ModelTask::Classification))
                     .await
                     .unwrap();
                 let a = cat_a.get_model("collide").await.unwrap().unwrap();
                 let b = cat_b.get_model("collide").await.unwrap().unwrap();
-                assert_eq!(a.backend, "candle", "tenant A sees its own model backend");
-                assert_eq!(b.backend, "vllm", "tenant B sees its own model backend");
+                assert_eq!(
+                    a.task,
+                    ModelTask::TextEmbedding,
+                    "tenant A sees its own model"
+                );
+                assert_eq!(
+                    b.task,
+                    ModelTask::Classification,
+                    "tenant B sees its own model"
+                );
             }
         ),
         case!("CatalogService", "DeleteModel", CaseKind::Hermetic, None, {
@@ -616,7 +624,7 @@ fn cases() -> Vec<IsolationCase> {
             // row survives.
             let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
             cat_a
-                .register_model(register_params("m_a", "candle"))
+                .register_model(register_params("m_a", ModelTask::TextEmbedding))
                 .await
                 .unwrap();
             assert!(
@@ -1458,7 +1466,7 @@ fn live_event_label(batch: &RecordBatch) -> String {
 async fn assert_eval_run_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a
-        .register_model(register_params("m_a", "candle"))
+        .register_model(register_params("m_a", ModelTask::TextEmbedding))
         .await
         .unwrap();
     let pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
@@ -1905,7 +1913,9 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                 ComputeDevice::Cpu,
                 vec![ModelIdentity {
                     model_id: model_id.into(),
-                    backend: "candle".into(),
+                    backend: jammi_db::store::manifest::ModelRunner::Backend(
+                        jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                    ),
                     compute_precision: ComputePrecision::F32,
                     content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                     quantization: None,
@@ -2034,7 +2044,9 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
             ComputeDevice::Cpu,
             vec![ModelIdentity {
                 model_id: model_id.into(),
-                backend: "candle".into(),
+                backend: jammi_db::store::manifest::ModelRunner::Backend(
+                    jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                ),
                 compute_precision: ComputePrecision::F32,
                 content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
                 quantization: None,
@@ -2584,7 +2596,7 @@ async fn assert_refresh_isolated(verb: RefreshVerb) {
 async fn assert_model_resolver_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a
-        .register_model(register_params("m_a", "candle"))
+        .register_model(register_params("m_a", ModelTask::TextEmbedding))
         .await
         .unwrap();
     assert!(
@@ -2604,7 +2616,7 @@ async fn assert_model_resolver_isolated() {
 async fn assert_training_create_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a
-        .register_model(register_params("m_a", "candle"))
+        .register_model(register_params("m_a", ModelTask::TextEmbedding))
         .await
         .unwrap();
     let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
@@ -2636,7 +2648,7 @@ async fn assert_training_create_isolated() {
 async fn assert_training_list_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a
-        .register_model(register_params("m_a", "candle"))
+        .register_model(register_params("m_a", ModelTask::TextEmbedding))
         .await
         .unwrap();
     let base_pk = cat_a.get_model("m_a").await.unwrap().unwrap().catalog_pk;
@@ -2999,7 +3011,9 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: model_id.into(),
-            backend: "candle".into(),
+            backend: jammi_db::store::manifest::ModelRunner::Backend(
+                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+            ),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("cpu-fixture-digest".into()),
             quantization: None,

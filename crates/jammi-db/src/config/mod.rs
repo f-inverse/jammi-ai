@@ -26,44 +26,6 @@ use layers::Node;
 
 // ─── Config-layer enums ─────────────────────────────────────────────────────
 
-/// Backend selection strategy for model inference.
-///
-/// `Auto` defers to the model resolver; concrete variants force a specific backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendSelection {
-    Auto,
-    Candle,
-    Ort,
-    Http,
-}
-
-impl fmt::Display for BackendSelection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Auto => write!(f, "auto"),
-            Self::Candle => write!(f, "candle"),
-            Self::Ort => write!(f, "ort"),
-            Self::Http => write!(f, "http"),
-        }
-    }
-}
-
-impl FromStr for BackendSelection {
-    type Err = JammiError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "auto" => Ok(Self::Auto),
-            "candle" => Ok(Self::Candle),
-            "ort" => Ok(Self::Ort),
-            "http" => Ok(Self::Http),
-            other => Err(JammiError::Config(format!(
-                "Unknown backend '{other}'. Expected: auto, candle, ort, http"
-            ))),
-        }
-    }
-}
-
 /// Which collective a multi-rank worker reduces gradients over.
 ///
 /// This is *configuration*, not a build feature: the same binary answers
@@ -259,8 +221,8 @@ impl FromStr for LogFormat {
 /// # Secrets
 ///
 /// Secret-valued fields (`catalog.postgres.url`, `broker.jet_stream.url`,
-/// `broker.jet_stream.credentials`, `inference.http.headers` values,
-/// `storage.cloud.*`'s credential fields) are
+/// `broker.jet_stream.credentials`, `storage.cloud.*`'s credential
+/// fields) are
 /// typed [`Secret`]: they accept either the value inline or `{ file = "…" }`
 /// naming a file that holds it, resolve at load, and render as `Secret(***)`
 /// in every `Debug` — so a `{:?}` of the whole config carries no secret. See
@@ -976,8 +938,6 @@ impl GpuConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InferenceConfig {
-    /// Backend selection strategy. Default: `Auto`.
-    pub default_backend: BackendSelection,
     /// The most rows one model forward takes. A forward chunk is cut from
     /// the input ordered by row cost (token count, then key) under this cap
     /// and [`Self::batch_tokens`], whatever the fan-out. Default: 32.
@@ -999,21 +959,6 @@ pub struct InferenceConfig {
     /// the rows a model forwards together are decided by the row costs and
     /// the chunk budget alone. Default: 1.
     pub partitions: usize,
-    /// HTTP backend configuration (for remote inference endpoints).
-    pub http: HttpConfig,
-}
-
-/// HTTP backend configuration for remote inference endpoints.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HttpConfig {
-    /// Request timeout in seconds. Default: 60.
-    pub timeout_secs: u64,
-    /// Extra HTTP headers sent with every inference request. Header values
-    /// are [`Secret`]s (an `Authorization` bearer token is the common case):
-    /// each accepts the value inline or `{ file = "…" }`, and none is ever
-    /// printed. Ordered so the request header set is deterministic.
-    pub headers: BTreeMap<String, Secret>,
 }
 
 /// The precision the ANN sidecar index quantizes its stored vectors to.
@@ -2863,13 +2808,11 @@ impl Default for GpuConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            default_backend: BackendSelection::Auto,
             batch_size: 32,
             batch_tokens: 16384,
             batch_timeout_secs: 300,
             max_loaded_models: 0,
             partitions: 1,
-            http: HttpConfig::default(),
         }
     }
 }
@@ -2936,15 +2879,6 @@ impl InferenceConfig {
         self.chunk_budget()?;
         self.fan_out()?;
         Ok(())
-    }
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            timeout_secs: 60,
-            headers: BTreeMap::new(),
-        }
     }
 }
 

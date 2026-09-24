@@ -39,12 +39,6 @@ use jammi_datafusion::ModelSource;
 /// engine's one-way naming rule holds.
 const IMPORT_PRODUCER_ID: &str = "external_import";
 
-/// The backend identity recorded for an imported table. No inference backend
-/// ran (the vectors were produced outside the engine), so the model identity's
-/// backend is the import mechanism itself — an honest, deterministic value that
-/// folds into the definition hash alongside the canonical model id.
-const IMPORT_BACKEND: &str = "external_import";
-
 /// Orchestrates a precomputed-vector import: read `(_row_id, vector)` rows →
 /// materialize them through [`ResultStore::materialize_computed_embedding_table`],
 /// which lands a ready embedding table with a content-complete
@@ -134,7 +128,7 @@ impl<'a> ImportPipeline<'a> {
             self.session.compute_device(),
             vec![ModelIdentity {
                 model_id: canonical_model_id.clone(),
-                backend: IMPORT_BACKEND.to_string(),
+                backend: jammi_db::store::manifest::ModelRunner::ExternalImport,
                 // No inference ran (the vectors were produced outside the
                 // engine), so there is no resolved compute precision to
                 // report; the descriptor is `External` and therefore
@@ -142,8 +136,8 @@ impl<'a> ImportPipeline<'a> {
                 // content digest the verb auto-folds into `params` is what
                 // actually distinguishes two imports, not this field. The
                 // default is recorded rather than a fabricated non-default
-                // value, matching `IMPORT_BACKEND`'s "honest mechanism
-                // placeholder" stance.
+                // value, as the runner records the import mechanism rather
+                // than a backend that never ran.
                 compute_precision: jammi_numerics::ComputePrecision::default(),
                 // The external-producer import path has no local model
                 // directory — no config, pooling config, tokenizer, or

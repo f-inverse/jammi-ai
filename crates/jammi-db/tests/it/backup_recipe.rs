@@ -39,7 +39,9 @@ fn env() -> MaterializationEnv {
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "backup-model".into(),
-            backend: "candle".into(),
+            backend: jammi_db::store::manifest::ModelRunner::Backend(
+                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+            ),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("backup-fixture-digest".into()),
             quantization: None,

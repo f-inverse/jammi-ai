@@ -51,7 +51,7 @@ fine-tuning, Flight SQL — see [`cookbook/`](./cookbook/).
 
 - **SQL over local files** — query Parquet, CSV, JSON, and JSONL via DataFusion
 - **Federated queries** — join local files with PostgreSQL or MySQL
-- **Text embeddings** — load any BERT-family model from Hugging Face Hub (or local safetensors / ONNX) and persist results to Parquet with ANN indexes
+- **Text embeddings** — load any BERT-family model from Hugging Face Hub (or local safetensors / GGUF) and persist results to Parquet with ANN indexes
 - **Image embeddings** — CLIP-style vision encoders
 - **Vector search** — ANN similarity search with automatic brute-force fallback; `search` returns a table directly, same shape embedded or remote
 - **Similarity graphs** — `build_neighbor_graph` materializes the whole k-nearest-neighbour edge set of an embedding table as a queryable relation, for dedup, clustering, and graph-aware training-data prep

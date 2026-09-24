@@ -76,7 +76,9 @@ impl Definition {
                 ComputeDevice::Cpu,
                 vec![ModelIdentity {
                     model_id: "q-base".into(),
-                    backend: "candle".into(),
+                    backend: jammi_db::store::manifest::ModelRunner::Backend(
+                        jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                    ),
                     compute_precision: ComputePrecision::F32,
                     content_digest: ModelContentDigest::Sha256("fixture-digest".into()),
                     quantization: None,
@@ -107,7 +109,7 @@ fn model_row(name: &str) -> ModelRow<'_> {
         model_id: name,
         version: 1,
         model_type: "fine-tuned",
-        backend: "candle",
+        backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
         task: ModelTask::TextEmbedding,
         base_model_id: Some(BASE_MODEL_ID),
         config_json: None,

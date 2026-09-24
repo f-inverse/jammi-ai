@@ -1706,7 +1706,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
                             model_id: &output_name,
                             version: 1,
                             model_type: "fine-tuned",
-                            backend: "candle",
+                            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                             task: ModelTask::TextEmbedding,
                             base_model_id: None,
                             config_json: None,

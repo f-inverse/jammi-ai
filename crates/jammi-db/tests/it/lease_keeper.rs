@@ -50,7 +50,7 @@ async fn seeded_catalog(dir: &std::path::Path) -> Catalog {
             model_id: "keeper-base",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,

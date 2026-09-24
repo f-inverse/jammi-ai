@@ -71,6 +71,45 @@ impl std::fmt::Display for ModelLocation {
     }
 }
 
+/// The backend that runs a registered model (`models.backend`).
+///
+/// Persisted as its canonical lowercase spelling; the
+/// [`as_str`](Self::as_str) / [`parse`](Self::parse) pair is the one mapping,
+/// and a row naming any other backend is refused where it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelBackendKind {
+    /// Candle: safetensors or GGUF weights, run natively.
+    Candle,
+}
+
+impl ModelBackendKind {
+    /// The canonical spelling a catalog row and a materialization identity
+    /// record.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Candle => "candle",
+        }
+    }
+
+    /// Decode the canonical spelling, refusing any backend this engine does
+    /// not run.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "candle" => Ok(Self::Candle),
+            other => Err(JammiError::Config(format!(
+                "unknown model backend '{other}': the engine runs 'candle'"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for ModelBackendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Materialized row from the `models` catalog table.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelRecord {
@@ -90,8 +129,8 @@ pub struct ModelRecord {
     pub model_type: String,
     /// Parent model this was derived from (fine-tuned or adapted).
     pub base_model_id: Option<String>,
-    /// Inference backend (e.g., `"candle"`, `"vllm"`, `"http"`).
-    pub backend: String,
+    /// The backend that runs this model.
+    pub backend: ModelBackendKind,
     /// Task this model performs.
     pub task: ModelTask,
     /// Where the model's bytes live, or `None` for a row registered before
@@ -119,8 +158,8 @@ pub struct ModelRecord {
 pub struct ModelDescriptor {
     /// The model's name (an HF repo id or a fine-tuned id).
     pub model_id: String,
-    /// Inference backend (e.g. `"candle"`, `"vllm"`, `"http"`).
-    pub backend: String,
+    /// The backend that runs this model.
+    pub backend: ModelBackendKind,
     /// Task this model performs.
     pub task: ModelTask,
     /// Lifecycle status (e.g. `"registered"`, `"loaded"`, `"failed"`).
@@ -131,7 +170,7 @@ impl From<&ModelRecord> for ModelDescriptor {
     fn from(record: &ModelRecord) -> Self {
         Self {
             model_id: record.model_id.clone(),
-            backend: record.backend.clone(),
+            backend: record.backend,
             task: record.task,
             status: record.status.clone(),
         }
@@ -147,8 +186,8 @@ pub struct RegisterModelParams<'a> {
     pub version: i32,
     /// Model category (e.g., `"embedding"`, `"llm"`).
     pub model_type: &'a str,
-    /// Inference backend identifier.
-    pub backend: &'a str,
+    /// The backend that runs this model.
+    pub backend: ModelBackendKind,
     /// Task this model performs.
     pub task: ModelTask,
     /// Optional parent model ID (for fine-tuned variants).
@@ -187,7 +226,7 @@ impl Catalog {
         let model_id = params.model_id.to_string();
         let model_type = params.model_type.to_string();
         let task = params.task.as_str();
-        let backend = params.backend.to_string();
+        let backend = params.backend.as_str();
         let version = params.version as i64;
         let external_location = params.external_location.map(str::to_string);
         // `models.created_at` is compared (`list_models`'s `ORDER BY
@@ -219,7 +258,7 @@ impl Catalog {
                             SqlValue::TextOwned(model_id),
                             SqlValue::TextOwned(model_type),
                             SqlValue::Text(task),
-                            SqlValue::TextOwned(backend),
+                            SqlValue::Text(backend),
                             SqlValue::Int(version),
                             SqlValue::TextOwned(metadata),
                             SqlValue::from(external_location),
@@ -624,7 +663,12 @@ fn parse_model_row(row: &Row<'_>) -> std::result::Result<ModelRecord, BackendErr
         column: "task".into(),
         detail: e.to_string(),
     })?;
-    let backend: String = row.try_get("backend")?.unwrap_or_default();
+    let backend_raw: String = row.get("backend")?;
+    let backend =
+        ModelBackendKind::parse(&backend_raw).map_err(|e| BackendError::TypeConversion {
+            column: "backend".into(),
+            detail: e.to_string(),
+        })?;
     let version: i32 = row.try_get("version")?.unwrap_or(1);
     let status: String = row.get("status")?;
     let metadata: Option<String> = row.try_get("metadata")?;

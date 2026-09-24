@@ -1255,11 +1255,7 @@ pub async fn measure_legs(
         let load = Instant::now();
         let guard = session
             .model_cache()
-            .get_or_load(
-                &ModelSource::parse(&model_id),
-                params.task.model_task(),
-                None,
-            )
+            .get_or_load(&ModelSource::parse(&model_id), params.task.model_task())
             .await?;
         sessions.push(RungSession {
             rung,
@@ -2323,7 +2319,7 @@ mod tests {
             let model_source = ModelSource::parse(&model_id);
             let model_guard = session
                 .model_cache()
-                .get_or_load(&model_source, ModelTask::TextEmbedding, None)
+                .get_or_load(&model_source, ModelTask::TextEmbedding)
                 .await
                 .expect("load model");
             let pooling = model_guard

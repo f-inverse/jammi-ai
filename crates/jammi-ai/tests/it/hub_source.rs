@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use jammi_ai::model::hub::HubSource;
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::BackendType;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
@@ -229,7 +228,6 @@ async fn hf_hub_offline_env_refuses_by_name_with_no_config_override() {
         .resolve(
             &ModelSource::hf("acme/env-only-offline"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
     {
@@ -284,7 +282,6 @@ async fn hf_hub_offline_on_refuses_by_name_with_no_config_override() {
         .resolve(
             &ModelSource::hf("acme/env-only-offline-on"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
     {
@@ -341,7 +338,6 @@ async fn transformers_offline_env_refuses_by_name_with_no_config_override() {
         .resolve(
             &ModelSource::hf("acme/transformers-offline-only"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
     {
@@ -399,7 +395,6 @@ async fn hf_hub_offline_empty_falls_through_to_transformers_offline_refuses_by_n
         .resolve(
             &ModelSource::hf("acme/empty-offline-alias"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
     {
@@ -514,7 +509,7 @@ async fn config_offline_false_wins_over_hf_hub_offline_env() {
     let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store(), hub).unwrap();
 
     let resolved = resolver
-        .resolve(&ModelSource::hf(repo_id), ModelTask::TextEmbedding, None)
+        .resolve(&ModelSource::hf(repo_id), ModelTask::TextEmbedding)
         .await
         .expect(
             "config `offline = false` must win over HF_HUB_OFFLINE=1 -- expected the \
@@ -812,7 +807,7 @@ async fn offline_hit_serves_from_catalog_without_hub_access() {
             model_id: "acme/hit-repo",
             version: 1,
             model_type: "huggingface",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: Some(model_dir.to_str().unwrap()),
@@ -837,11 +832,7 @@ async fn offline_hit_serves_from_catalog_without_hub_access() {
     .unwrap();
 
     let resolved = resolver
-        .resolve(
-            &ModelSource::hf("acme/hit-repo"),
-            ModelTask::TextEmbedding,
-            Some(BackendType::Candle),
-        )
+        .resolve(&ModelSource::hf("acme/hit-repo"), ModelTask::TextEmbedding)
         .await
         .unwrap();
     assert_eq!(resolved.model_id.0, "acme/hit-repo");
@@ -875,7 +866,6 @@ async fn offline_miss_refuses_by_name_with_no_catalog_row() {
         .resolve(
             &ModelSource::hf("acme/never-resolved"),
             ModelTask::TextEmbedding,
-            None,
         )
         .await
     {
@@ -935,7 +925,7 @@ async fn offline_warm_cache_without_catalog_row_still_refuses() {
         ModelResolver::new(catalog, crate::common::test_artifact_store(), offline_hub).unwrap();
 
     let err = match resolver
-        .resolve(&ModelSource::hf(REPO_ID), ModelTask::TextEmbedding, None)
+        .resolve(&ModelSource::hf(REPO_ID), ModelTask::TextEmbedding)
         .await
     {
         Ok(_) => panic!("expected an offline refusal, got a resolved model"),

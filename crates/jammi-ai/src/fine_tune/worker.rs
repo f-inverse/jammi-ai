@@ -3893,7 +3893,7 @@ impl JobWorker {
         // shared-latent width the head must match.
         let guard = session
             .model_cache()
-            .get_or_load(&model_source, task, None)
+            .get_or_load(&model_source, task)
             .await
             .map_err(WorkerJobError::from)?;
         let base_model_arc = Arc::clone(&guard.model);
@@ -4017,7 +4017,7 @@ impl JobWorker {
                     let device_config = rank_device_configs[rank as usize].clone();
                     let model = session
                         .model_cache()
-                        .get_or_load_on(devices[rank as usize], &model_source, task, None)
+                        .get_or_load_on(devices[rank as usize], &model_source, task)
                         .await
                         .map_err(WorkerJobError::from)?;
                     let base_model_arc = Arc::clone(&model.model);
@@ -5426,7 +5426,7 @@ async fn fine_tune_materialization(
     let model_source = ModelSource::parse(&common.base_model);
     let guard = session
         .model_cache()
-        .get_or_load(&model_source, task, None)
+        .get_or_load(&model_source, task)
         .await
         .map_err(WorkerJobError::from)?;
     let canonical_model_id = model_source.to_string();
@@ -6754,11 +6754,7 @@ async fn member_rank_body(
         };
 
     let model_source = ModelSource::parse(&common.base_model);
-    let guard = match session
-        .model_cache()
-        .get_or_load(&model_source, task, None)
-        .await
-    {
+    let guard = match session.model_cache().get_or_load(&model_source, task).await {
         Ok(guard) => guard,
         Err(e) => return failed(e.to_string()),
     };
@@ -6875,7 +6871,7 @@ impl ModelRegistration {
             model_id: name,
             version: self.version,
             model_type: self.model_type,
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: self.task,
             base_model_id: self.base_model_id.as_deref(),
             config_json: self.config_json.as_deref(),
@@ -9689,7 +9685,7 @@ fn build_encoder_adapters(
     let weights_path = arch::weights_candidates(&artifact_dir).ok_or_else(|| {
         JammiError::FineTune(format!(
             "No weights found at {artifact_dir:?} (need one of {:?})",
-            arch::CANDLE_WEIGHTS_CANDIDATE_NAMES
+            arch::WEIGHTS_CANDIDATE_NAMES
         ))
     })?;
     let gguf_weights_path = artifact_dir.join(arch::GGUF_WEIGHTS_FILENAME);
@@ -10724,7 +10720,7 @@ mod tests {
                 model_id: "panic-base",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -11050,7 +11046,7 @@ mod tests {
                 model_id: "oom-base",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -11852,7 +11848,7 @@ mod tests {
             jammi_datafusion::ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
         session
             .model_cache()
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .unwrap()
             .model
@@ -11993,7 +11989,7 @@ mod tests {
                 model_id: base_model_id,
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -12065,7 +12061,7 @@ mod tests {
                 model_id: &base_model_id,
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: Some(dir.to_str().unwrap()),
@@ -12487,7 +12483,7 @@ mod tests {
                 model_id: "sweep-base",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,

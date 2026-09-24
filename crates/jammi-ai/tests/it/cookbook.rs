@@ -791,7 +791,10 @@ async fn recipe_model_management() {
     assert_eq!(models.len(), 1);
     let model = &models[0];
     assert!(model.model_id.contains("tiny_bert"));
-    assert_eq!(model.backend, "candle");
+    assert_eq!(
+        model.backend,
+        jammi_db::catalog::model_repo::ModelBackendKind::Candle
+    );
     assert_eq!(model.task, ModelTask::TextEmbedding);
 
     // Inspect specific model

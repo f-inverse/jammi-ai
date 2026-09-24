@@ -331,7 +331,7 @@ async fn gaussian_regression_separates_groups_through_public_path() {
     // nothing.
     let described = session
         .model_cache()
-        .describe(&model_source, ModelTask::Regression, None)
+        .describe(&model_source, ModelTask::Regression)
         .await
         .expect("a published regression head describes");
     assert_eq!(
@@ -348,7 +348,7 @@ async fn gaussian_regression_separates_groups_through_public_path() {
     );
     let loaded = session
         .model_cache()
-        .get_or_load(&model_source, ModelTask::Regression, None)
+        .get_or_load(&model_source, ModelTask::Regression)
         .await
         .unwrap();
     assert_eq!(loaded.model.description().identity(), described.identity());

@@ -22,18 +22,6 @@
 //! all is [`UNDECLARED_MODEL_TYPE_FAMILY`], the one answer every reader in
 //! this workspace gives; the candidate-name lists are in the precedence the
 //! resolver freezes and the fingerprint tracks.
-//!
-//! # The two candidate lists are NOT one list
-//!
-//! [`WEIGHTS_CANDIDATE_NAMES`] is the IDENTITY list: every file name whose
-//! appearance in a model directory could change which bytes a cold resolve
-//! loads, so the model fingerprint must track all four. It is deliberately
-//! **not** a resolution chain: `model.onnx` selects a different BACKEND (the
-//! resolver's ORT arm), not a different weights file for the same backend, so
-//! collapsing the four into one "first existing wins" chain would make an
-//! ONNX file shadow a `model.gguf` for a Candle load — a behaviour change.
-//! [`weights_candidates`] therefore walks [`CANDLE_WEIGHTS_CANDIDATE_NAMES`],
-//! the Candle-backend chain the resolver's own local arm froze.
 
 use std::path::{Path, PathBuf};
 
@@ -44,24 +32,13 @@ use jammi_lora::Tower;
 /// OpenCLIP `open_clip_config.json` second.
 pub const CONFIG_CANDIDATE_NAMES: [&str; 2] = ["config.json", "open_clip_config.json"];
 
-/// Every weights file name whose PRESENCE is identity-bearing for a resolved
-/// model directory, in the frozen order the model fingerprint tracks them
-/// (`compute_model_fingerprint`'s weights slot).
-///
-/// Read the module doc before using this as a resolution chain — it is not
-/// one. Use [`weights_candidates`] / [`CANDLE_WEIGHTS_CANDIDATE_NAMES`] to
-/// pick the file a Candle load actually reads.
-pub const WEIGHTS_CANDIDATE_NAMES: [&str; 4] = [
-    "model.safetensors",
-    "open_clip_model.safetensors",
-    "model.onnx",
-    "model.gguf",
-];
-
-/// The Candle-backend weights chain, in its frozen precedence:
-/// `model.safetensors` wins, then the OpenCLIP-named safetensors, and only
-/// when NEITHER is present does `model.gguf` enter the picture at all.
-pub const CANDLE_WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
+/// Weights file names in their frozen precedence: `model.safetensors` wins,
+/// then the OpenCLIP-named safetensors, and only when NEITHER is present does
+/// `model.gguf` enter the picture at all. The resolver picks the first that
+/// exists, and the model fingerprint tracks every one of them, so a file
+/// whose appearance would change what a cold resolve loads is never
+/// invisible to the staleness probe.
+pub const WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
     "model.safetensors",
     "open_clip_model.safetensors",
     "model.gguf",
@@ -70,10 +47,6 @@ pub const CANDLE_WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
 /// The canonical GGUF weights file name. A directory carrying some other
 /// `*.gguf` file is a typed refusal at the resolver, never a silent load.
 pub const GGUF_WEIGHTS_FILENAME: &str = "model.gguf";
-
-/// The ONNX weights file name — the resolver's ORT-arm selector. Named here
-/// so the identity list and the ORT arm share one spelling.
-pub const ONNX_WEIGHTS_FILENAME: &str = "model.onnx";
 
 /// The encoder architecture families this crate can load, train and serve.
 ///
@@ -315,11 +288,10 @@ pub fn config_candidates(dir: &Path) -> Option<PathBuf> {
     first_existing(dir, &CONFIG_CANDIDATE_NAMES)
 }
 
-/// The first EXISTING Candle-loadable weights file under `dir`, walking
-/// [`CANDLE_WEIGHTS_CANDIDATE_NAMES`] in the frozen precedence. See the
-/// module doc for why `model.onnx` is not in this chain.
+/// The first EXISTING weights file under `dir`, walking
+/// [`WEIGHTS_CANDIDATE_NAMES`] in the frozen precedence.
 pub fn weights_candidates(dir: &Path) -> Option<PathBuf> {
-    first_existing(dir, &CANDLE_WEIGHTS_CANDIDATE_NAMES)
+    first_existing(dir, &WEIGHTS_CANDIDATE_NAMES)
 }
 
 /// Every candidate path under `dir` for `names`, existing or not — the shape
@@ -518,16 +490,13 @@ mod tests {
         assert!(!EncoderFamily::ClapAudio.has_tower(Some(Tower::Text)));
     }
 
-    /// The identity list and the Candle chain are DIFFERENT lists, and the
-    /// chain's precedence is the frozen one. A regression that folded
-    /// `model.onnx` into the chain would make this fail.
+    /// The weights chain keeps its frozen precedence, and a file outside it
+    /// (an ONNX export shipped beside the weights) is never picked.
     #[test]
-    fn weights_chain_excludes_onnx_and_keeps_the_frozen_precedence() {
-        assert!(WEIGHTS_CANDIDATE_NAMES.contains(&ONNX_WEIGHTS_FILENAME));
-        assert!(!CANDLE_WEIGHTS_CANDIDATE_NAMES.contains(&ONNX_WEIGHTS_FILENAME));
-        assert_eq!(CANDLE_WEIGHTS_CANDIDATE_NAMES[0], "model.safetensors");
+    fn weights_chain_keeps_the_frozen_precedence() {
+        assert_eq!(WEIGHTS_CANDIDATE_NAMES[0], "model.safetensors");
         assert_eq!(
-            CANDLE_WEIGHTS_CANDIDATE_NAMES[2], GGUF_WEIGHTS_FILENAME,
+            WEIGHTS_CANDIDATE_NAMES[2], GGUF_WEIGHTS_FILENAME,
             "GGUF is last: it enters only when neither safetensors name exists"
         );
 
@@ -537,7 +506,7 @@ mod tests {
         assert_eq!(
             weights_candidates(dir.path()),
             Some(dir.path().join("model.gguf")),
-            "an ONNX file must not shadow the GGUF a Candle load reads"
+            "an ONNX file must not shadow the GGUF a load reads"
         );
         std::fs::write(dir.path().join("open_clip_model.safetensors"), b"s").unwrap();
         assert_eq!(

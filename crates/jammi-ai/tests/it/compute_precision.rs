@@ -57,7 +57,7 @@ async fn resolve_and_load(
         common::test_hub_source(),
     )
     .unwrap();
-    let resolved = resolver.resolve(source, task, None).await.unwrap();
+    let resolved = resolver.resolve(source, task).await.unwrap();
 
     let backend = CandleBackend;
     let device_config = DeviceConfig {
@@ -415,7 +415,7 @@ async fn bf16_inference_request_is_rejected_loudly() {
     .unwrap();
     let source = tiny_bert_source();
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
@@ -468,11 +468,7 @@ async fn a_serve_records_its_kernel_admission_on_the_loaded_model() {
 
     let guard = session
         .model_cache()
-        .get_or_load(
-            &ModelSource::parse(&model_id),
-            ModelTask::TextEmbedding,
-            None,
-        )
+        .get_or_load(&ModelSource::parse(&model_id), ModelTask::TextEmbedding)
         .await
         .unwrap();
     let ledger = guard.model.kernel_admission();

@@ -2,9 +2,7 @@ pub mod candle;
 /// GGUF/k-quant loading and residency-estimation helpers shared by
 /// [`super::resolver`] and [`candle`] — see the module's own doc.
 pub(crate) mod gguf;
-pub mod http;
 pub mod open_clip_text;
-pub mod ort;
 /// Safetensors header-parsed residency-estimation helper shared by
 /// [`super::resolver`] and [`candle`] — see the module's own doc.
 pub(crate) mod safetensors_residency;

@@ -108,7 +108,7 @@ pub(crate) async fn claimed_loop_env(tag: &str) -> (Arc<jammi_db::catalog::Catal
             model_id: &model_id,
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
@@ -165,7 +165,7 @@ pub(crate) async fn reference_rank0_adapter_bytes(
     let source = ModelSource::parse(&tiny_bert_model());
     let guard = session
         .model_cache()
-        .get_or_load(&source, ModelTask::TextEmbedding, None)
+        .get_or_load(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
     let base = Arc::clone(&guard.model);

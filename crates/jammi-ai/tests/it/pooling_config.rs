@@ -142,7 +142,7 @@ pub(crate) async fn resolve_and_load(dir: &Path) -> LoadedModel {
     .unwrap();
     let source = ModelSource::local(dir);
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 
@@ -291,9 +291,7 @@ async fn corrupt_pooling_config_json_is_a_hard_error_at_resolve() {
     )
     .unwrap();
     let source = ModelSource::local(&dir);
-    let result = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
-        .await;
+    let result = resolver.resolve(&source, ModelTask::TextEmbedding).await;
 
     assert!(
         result.is_err(),
@@ -325,7 +323,7 @@ async fn unsupported_pooling_mode_fails_model_load() {
     .unwrap();
     let source = ModelSource::local(&dir);
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, None)
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 

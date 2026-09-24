@@ -136,7 +136,9 @@ async fn attest(store: &ResultStore, staged: &StagedArtifact) -> Materialization
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "q-base".into(),
-            backend: "candle".into(),
+            backend: jammi_db::store::manifest::ModelRunner::Backend(
+                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+            ),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("fixture-digest".into()),
             quantization: None,
@@ -512,7 +514,7 @@ async fn a_name_occupied_checkpoint_is_retired_with_the_jobs_unpublished_checkpo
             model_id: &occupied_name,
             version: 7,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: Some("/weights/unrelated"),
@@ -612,7 +614,7 @@ async fn the_output_row_is_scoped_by_tenant_and_version(backend: BackendKind) {
         model_id: &tuned,
         version,
         model_type: "embedding",
-        backend: "candle",
+        backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
         task: ModelTask::TextEmbedding,
         base_model_id: None,
         external_location: Some("/weights/acme"),

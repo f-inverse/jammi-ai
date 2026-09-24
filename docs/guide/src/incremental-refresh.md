@@ -127,9 +127,7 @@ first refresh is retained; it is downstream-invisible).
 
 ## Empty texts
 
-Per-row validity is the backend's: the candle backend marks an empty or null
-text a per-row error (`dropped_rows`); the HTTP backend forwards texts
-verbatim, so validity is the remote's. A delta whose every row is dropped is
+An empty or null text is a per-row error (`dropped_rows`). A delta whose every row is dropped is
 still a legitimate publish — a mask-only version with no fragment and no
 segment, so an edit-to-empty removes the row from the table.
 

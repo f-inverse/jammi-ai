@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use jammi_db::catalog::model_repo::ModelDescriptor;
+use jammi_db::catalog::model_repo::{ModelBackendKind, ModelDescriptor};
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -204,7 +204,7 @@ pub fn source_descriptor_from_proto(
 pub fn model_to_proto(descriptor: &ModelDescriptor) -> pb::Model {
     pb::Model {
         model_id: descriptor.model_id.clone(),
-        backend: descriptor.backend.clone(),
+        backend: descriptor.backend.as_str().to_string(),
         task: super::model_task_to_proto(descriptor.task) as i32,
         status: descriptor.status.clone(),
     }
@@ -215,12 +215,15 @@ pub fn model_to_proto(descriptor: &ModelDescriptor) -> pb::Model {
 /// `Model` carries exactly the descriptor's fields, so the round-trip is
 /// lossless: there is no server-internal bookkeeping to synthesize. The message
 /// is self-describing in `task`, so an out-of-range / unspecified task surfaces
-/// as the faithful `invalid_argument` the shared decoder builds.
+/// as the faithful `invalid_argument` the shared decoder builds; a backend the
+/// engine does not run is refused the same way.
 pub fn model_from_proto(model: pb::Model) -> Result<ModelDescriptor, Status> {
     let task = super::model_task_from_proto(model.task)?;
+    let backend = ModelBackendKind::parse(&model.backend)
+        .map_err(|e| Status::invalid_argument(e.to_string()))?;
     Ok(ModelDescriptor {
         model_id: model.model_id,
-        backend: model.backend,
+        backend,
         task,
         status: model.status,
     })

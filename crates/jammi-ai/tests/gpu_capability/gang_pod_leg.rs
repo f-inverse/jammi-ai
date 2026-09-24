@@ -418,7 +418,7 @@ async fn claimed_job(
             model_id: &model_id,
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: jammi_datafusion::ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
@@ -464,7 +464,6 @@ async fn load_tiny_bert_on(device_ordinal: i32) -> std::sync::Arc<jammi_ai::mode
     use jammi_ai::model::backend::candle::CandleBackend;
     use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
     use jammi_ai::model::resolver::ModelResolver;
-    use jammi_ai::model::BackendType;
     use jammi_datafusion::ModelSource;
     use jammi_datafusion::ModelTask;
 
@@ -478,7 +477,7 @@ async fn load_tiny_bert_on(device_ordinal: i32) -> std::sync::Arc<jammi_ai::mode
         .unwrap_or_else(|e| panic!("ModelResolver::new failed: {e}"));
     let source = ModelSource::local(crate::harness::cookbook_fixture("tiny_bert"));
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, Some(BackendType::Candle))
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap_or_else(|e| panic!("failed to resolve the tiny_bert fixture: {e}"));
     let backend = CandleBackend;

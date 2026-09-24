@@ -160,7 +160,7 @@ async fn remote_list_models_matches_local() {
             model_id: "acme/embed-mini",
             version: 1,
             model_type: "embedding",
-            backend: "candle",
+            backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
             task: ModelTask::TextEmbedding,
             base_model_id: None,
             external_location: None,
@@ -191,7 +191,10 @@ async fn remote_list_models_matches_local() {
         .iter()
         .find(|m| m.model_id == "acme/embed-mini")
         .expect("registered model present");
-    assert_eq!(registered.backend, "candle");
+    assert_eq!(
+        registered.backend,
+        jammi_db::catalog::model_repo::ModelBackendKind::Candle
+    );
     assert_eq!(registered.task, ModelTask::TextEmbedding);
 
     server.shutdown.send(()).ok();

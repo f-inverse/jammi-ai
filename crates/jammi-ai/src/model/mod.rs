@@ -22,7 +22,6 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use backend::candle::CandleModel;
 use jammi_db::error::Result;
-use serde::{Deserialize, Serialize};
 
 use jammi_datafusion::BackendOutput;
 
@@ -42,37 +41,14 @@ impl From<&ModelSource> for ModelId {
     }
 }
 
-/// Which backend to use for this model.
-///
-/// `Hash` because a caller's backend HINT is part of a cached model's
-/// identity (`model::cache::CacheKey`): the same checkpoint asked for
-/// through two backends is two different loaded objects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendType {
-    /// Candle — native Rust inference via safetensors weights.
-    Candle,
-    /// ONNX Runtime — cross-platform inference via ONNX models.
-    Ort,
-    /// HTTP — remote model endpoint (REST/gRPC).
-    Http,
-}
-
 /// The on-disk STORAGE format of a resolved model's weight files — an
 /// explicit marker so a downstream consumer (the candle backend's load
 /// dispatch, the digest/fingerprint machinery) branches on THIS, never on
-/// sniffing `weights_paths`' file extension. Orthogonal to [`BackendType`]:
-/// `Gguf` is a weight-storage format the `Candle` backend alone knows how to
-/// load — an `Ort`-backed resolve never produces `Gguf` (the
-/// resolver's ORT arm only ever looks for `model.onnx`), so the pairing
-/// `(BackendType::Ort, WeightsFormat::Gguf)` is structurally unreachable
-/// through the resolver, not a case this type itself forbids.
+/// sniffing `weights_paths`' file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightsFormat {
     /// One or more `*.safetensors` files (the default).
     Safetensors,
-    /// A single `model.onnx` file (the `Ort` backend).
-    Onnx,
     /// A single GGUF file (`model.gguf`, the literal canonical name — see
     /// [`resolver::ModelResolver`]'s module doc) carrying k-quant and/or
     /// dense tensors, loaded by the `Candle` backend's GGUF path.
@@ -110,19 +86,17 @@ impl TokenizerSource {
     }
 }
 
-/// A resolved model — files located, backend determined, NOT yet loaded.
+/// A resolved model — files located, NOT yet loaded.
 pub struct ResolvedModel {
     /// HuggingFace or local identifier for this model.
     pub model_id: ModelId,
-    /// Selected inference backend.
-    pub backend: BackendType,
     /// Weight-file storage format — see [`WeightsFormat`]'s own doc.
     pub weights_format: WeightsFormat,
     /// ML task this model performs.
     pub task: ModelTask,
     /// Path to the model's `config.json`.
     pub config_path: std::path::PathBuf,
-    /// Paths to weight files (safetensors shards or ONNX).
+    /// Paths to weight files (safetensors shards or one GGUF file).
     pub weights_paths: Vec<std::path::PathBuf>,
     /// Tokenizer source (HF JSON or OpenCLIP BPE), if present.
     pub tokenizer: Option<TokenizerSource>,
@@ -328,10 +302,9 @@ impl ModelDescription {
         &self.identity
     }
 
-    /// The backend kind that runs this model, as the canonical lowercase
-    /// token the materialization contract records (`candle`).
-    pub fn backend_kind(&self) -> &str {
-        &self.identity.backend
+    /// What runs this model, as the materialization contract records it.
+    pub fn runner(&self) -> jammi_db::store::manifest::ModelRunner {
+        self.identity.backend
     }
 
     /// The compute precision the model's backbone runs at — the resolved

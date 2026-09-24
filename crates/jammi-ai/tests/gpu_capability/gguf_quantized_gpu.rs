@@ -64,7 +64,7 @@ use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::resolver::ModelResolver;
-use jammi_ai::model::{BackendType, LoadedModel};
+use jammi_ai::model::LoadedModel;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::Catalog;
@@ -859,7 +859,7 @@ async fn gguf_gpu_load_admission_estimate_is_truthful_against_measured_device_me
         ModelResolver::new(catalog, ephemeral_artifact_store(), ephemeral_hub_source()).unwrap();
     let source = ModelSource::local(gguf_dir.as_path());
     let resolved = resolver
-        .resolve(&source, ModelTask::TextEmbedding, Some(BackendType::Candle))
+        .resolve(&source, ModelTask::TextEmbedding)
         .await
         .unwrap();
 

@@ -448,12 +448,7 @@ fn read_gguf_header(path: &Path, model_id: &str) -> Result<gguf_file::Content> {
 /// — the SAME widest-width clamp this function applies to every densified
 /// GGUF tensor, for the same reason (conservative under every reachable
 /// effective precision, including a persisted adapter's own
-/// `backbone_dtype`). `jammi_ai::model::backend::ort`'s own residency
-/// estimator still separately applies a 1.3x multiplier over its file-size
-/// sum (`OrtBackend::estimate_memory`) — a constant this module's own
-/// reasoning neither derives nor explains (the ORT backend is unavailable
-/// in this build regardless — `OrtBackend::load` always returns a typed
-/// refusal).
+/// `backbone_dtype`).
 pub(crate) fn estimate_gguf_residency(
     path: &Path,
     model_config: &serde_json::Value,

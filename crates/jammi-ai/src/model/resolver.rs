@@ -11,12 +11,12 @@ use super::arch;
 use super::backend::gguf::estimate_gguf_residency;
 use super::backend::safetensors_residency::estimate_safetensors_residency;
 use super::hub::HubSource;
-use super::{BackendType, ModelId, ResolvedModel, TokenizerSource, WeightsFormat};
+use super::{ModelId, ResolvedModel, TokenizerSource, WeightsFormat};
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 
 /// The canonical GGUF weight filename: mirrors
-/// `model.safetensors`/`model.onnx`'s own literal-filename convention — the
+/// `model.safetensors`'s own literal-filename convention — the
 /// digest-slot machinery (`backend::candle::all_candidate_paths`) stats
 /// known names only, so a GGUF checkpoint must be named exactly this, never
 /// sniffed by extension. A directory carrying some OTHER `*.gguf` filename
@@ -42,7 +42,7 @@ const GGUF_WEIGHTS_FILENAME: &str = arch::GGUF_WEIGHTS_FILENAME;
 /// refuses such a row by name rather than serving it as a base checkpoint.
 const FINE_TUNED_ID_PREFIX: &str = "jammi:fine-tuned:";
 
-/// Resolves a `ModelSource` to file paths and backend selection.
+/// Resolves a `ModelSource` to the files a load reads.
 pub struct ModelResolver {
     catalog: Arc<Catalog>,
     /// Reloads a fine-tuned model's adapter: the artifact its catalog row
@@ -73,23 +73,16 @@ impl ModelResolver {
         &self.catalog
     }
 
-    /// Resolve a model source to file paths and backend selection.
-    pub async fn resolve(
-        &self,
-        source: &ModelSource,
-        task: ModelTask,
-        backend_hint: Option<BackendType>,
-    ) -> Result<ResolvedModel> {
+    /// Resolve a model source to the files a load reads.
+    pub async fn resolve(&self, source: &ModelSource, task: ModelTask) -> Result<ResolvedModel> {
         // Check catalog first — if this model has already been resolved and
         // registered, reuse the stored metadata instead of re-downloading.
-        if let Some(resolved) =
-            Box::pin(self.try_catalog_lookup(source, task, backend_hint)).await?
-        {
+        if let Some(resolved) = Box::pin(self.try_catalog_lookup(source, task)).await? {
             return Ok(resolved);
         }
 
         match source {
-            ModelSource::Local(path) => self.resolve_local(path, source, task, backend_hint),
+            ModelSource::Local(path) => self.resolve_local(path, source, task),
             ModelSource::HuggingFace(repo_id) => {
                 // `[models] offline`: the catalog lookup above is offline's
                 // entire source of truth — reaching this arm means no
@@ -112,7 +105,7 @@ impl ModelResolver {
                         ),
                     });
                 }
-                self.resolve_hf_hub(repo_id, source, task, backend_hint)
+                self.resolve_hf_hub(repo_id, source, task)
             }
         }
     }
@@ -123,7 +116,6 @@ impl ModelResolver {
         &self,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<Option<ResolvedModel>> {
         let model_id = ModelId::from(source);
         let record = match self.catalog.get_model(&model_id.0).await? {
@@ -196,7 +188,7 @@ impl ModelResolver {
                 });
             };
             let base_source = ModelSource::parse(base_id);
-            let base_resolved = Box::pin(self.resolve(&base_source, task, backend_hint)).await?;
+            let base_resolved = Box::pin(self.resolve(&base_source, task)).await?;
 
             let adapter_path = match &record.location {
                 Some(location) => {
@@ -283,7 +275,6 @@ impl ModelResolver {
 
             return Ok(Some(ResolvedModel {
                 model_id,
-                backend: base_resolved.backend,
                 weights_format: base_resolved.weights_format,
                 task,
                 config_path: base_resolved.config_path,
@@ -325,63 +316,19 @@ impl ModelResolver {
             None => serde_json::from_reader(std::fs::File::open(&config_path)?)?,
         };
 
-        let backend = backend_hint.unwrap_or_else(|| {
-            serde_json::from_str::<BackendType>(&format!("\"{}\"", record.backend))
-                .unwrap_or(BackendType::Candle)
-        });
-
-        // Reconstruct weights paths from the artifact directory
-        let (weights_paths, weights_format): (Vec<PathBuf>, WeightsFormat) = match backend {
-            BackendType::Candle => {
-                // `arch::weights_candidates` walks the FROZEN Candle chain
-                // (`model.safetensors` -> `open_clip_model.safetensors` ->
-                // `model.gguf`); the format label follows from which name
-                // won, so the chain and the label cannot disagree.
-                match arch::weights_candidates(&artifact_dir) {
-                    Some(p) if p.ends_with(GGUF_WEIGHTS_FILENAME) => (vec![p], WeightsFormat::Gguf),
-                    Some(p) => (vec![p], WeightsFormat::Safetensors),
-                    None => return Ok(None),
-                }
-            }
-            BackendType::Ort => {
-                let p = artifact_dir.join(arch::ONNX_WEIGHTS_FILENAME);
-                if p.exists() {
-                    (vec![p], WeightsFormat::Onnx)
-                } else {
-                    return Ok(None);
-                }
-            }
-            _ => return Ok(None),
+        // The row's backend is typed at the catalog edge: a row naming any
+        // backend this engine does not run was refused when it was read.
+        let Some((weights_paths, weights_format)) = local_weights(&artifact_dir) else {
+            return Ok(None);
         };
-
         let tokenizer = discover_local_tokenizer(&artifact_dir);
-
-        // Exhaustive on `WeightsFormat`: GGUF and safetensors both estimate
-        // from the artifact's own header at RESOLVE time (see
-        // `estimate_gguf_residency`/`estimate_safetensors_residency`'s own
-        // docs for why a plain file-byte sum under-reports true residency
-        // for either format) — only ONNX falls back to the raw file-byte
-        // sum, which `OrtBackend::estimate_memory`'s own 1.3x multiplier
-        // treats as untrustworthy on its own terms.
-        let estimated_memory: usize = match weights_format {
-            WeightsFormat::Gguf => {
-                estimate_gguf_residency(&weights_paths[0], &model_config, &model_id.0)?
-            }
-            WeightsFormat::Safetensors => {
-                estimate_safetensors_residency(&weights_paths, &model_id.0)?
-            }
-            WeightsFormat::Onnx => weights_paths
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() as usize)
-                .sum(),
-        };
+        let estimated_memory =
+            estimate_residency(weights_format, &weights_paths, &model_config, &model_id.0)?;
 
         let pooling_config = read_local_pooling_config(&artifact_dir, &model_id.0)?;
 
         Ok(Some(ResolvedModel {
             model_id,
-            backend,
             weights_format,
             task,
             config_path,
@@ -401,7 +348,6 @@ impl ModelResolver {
         path: &Path,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
         if !path.exists() {
             return Err(JammiError::Model {
@@ -421,95 +367,29 @@ impl ModelResolver {
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
-        // Every name comes from `arch`: `weights_candidates`
-        // returns the two safetensors names before `model.gguf`, so a
-        // non-GGUF hit is exactly the `has_safetensors` predicate — true
-        // whenever either safetensors name is present.
-        let candle_weights = arch::weights_candidates(path);
-        let has_safetensors = candle_weights
-            .as_ref()
-            .is_some_and(|p| !p.ends_with(GGUF_WEIGHTS_FILENAME));
-        let has_onnx = path.join(arch::ONNX_WEIGHTS_FILENAME).exists();
-        let has_gguf = path.join(GGUF_WEIGHTS_FILENAME).exists();
-
-        // Precedence FROZEN: safetensors-or-onnx wins, byte-for-byte. Only
-        // when NEITHER is present does a `model.gguf` file (or the typed "found *.gguf but
-        // not model.gguf" refusal) enter the picture at all.
-        if !has_safetensors && !has_onnx && !has_gguf {
+        // The frozen chain (`arch::WEIGHTS_CANDIDATE_NAMES`): either
+        // safetensors name wins, and only when neither is present does a
+        // `model.gguf` file (or the typed "found *.gguf but not model.gguf"
+        // refusal) enter the picture at all.
+        let Some((weights_paths, weights_format)) = local_weights(path) else {
             if let Some(other) = other_gguf_refusal(source, path) {
                 return Err(other);
             }
             return Err(JammiError::Model {
                 model_id: source.to_string(),
                 message: "No model weights found (need model.safetensors, \
-                          open_clip_model.safetensors, model.onnx, or model.gguf)"
+                          open_clip_model.safetensors, or model.gguf)"
                     .into(),
             });
-        }
-
-        let backend = backend_hint.unwrap_or(if has_onnx {
-            BackendType::Ort
-        } else {
-            BackendType::Candle
-        });
-
-        let (weights_paths, weights_format) = match backend {
-            BackendType::Candle => match candle_weights {
-                Some(p) if p.ends_with(GGUF_WEIGHTS_FILENAME) => (vec![p], WeightsFormat::Gguf),
-                Some(p) => (vec![p], WeightsFormat::Safetensors),
-                None => {
-                    return Err(JammiError::Model {
-                        model_id: source.to_string(),
-                        message: "No safetensors weights found for Candle backend".into(),
-                    });
-                }
-            },
-            BackendType::Ort => {
-                let p = path.join(arch::ONNX_WEIGHTS_FILENAME);
-                if p.exists() {
-                    (vec![p], WeightsFormat::Onnx)
-                } else {
-                    // Reached when the directory carries `model.gguf` (or a
-                    // non-canonical `*.gguf` file) but the caller pinned the
-                    // ORT backend — GGUF is a Candle-only weight-storage
-                    // format, so this is the same typed refusal as any
-                    // ONNX-missing case.
-                    return Err(JammiError::Model {
-                        model_id: source.to_string(),
-                        message: "No ONNX weights found for ORT backend".into(),
-                    });
-                }
-            }
-            other => {
-                return Err(JammiError::Model {
-                    model_id: source.to_string(),
-                    message: format!("Backend {other:?} not supported for local resolution"),
-                })
-            }
         };
 
         let tokenizer = discover_local_tokenizer(path);
-
-        // See the catalog-lookup arm's identical match above for why this is
-        // exhaustive on `WeightsFormat` rather than a Gguf/else split.
-        let estimated_memory: usize = match weights_format {
-            WeightsFormat::Gguf => {
-                estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
-            }
-            WeightsFormat::Safetensors => {
-                estimate_safetensors_residency(&weights_paths, &source.to_string())?
-            }
-            WeightsFormat::Onnx => weights_paths
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() as usize)
-                .sum(),
-        };
+        let estimated_memory =
+            estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
 
         Ok(ResolvedModel {
             model_id: ModelId::from(source),
             weights_format,
-            backend,
             task,
             config_path,
             weights_paths,
@@ -528,7 +408,6 @@ impl ModelResolver {
         repo_id: &str,
         source: &ModelSource,
         task: ModelTask,
-        backend_hint: Option<BackendType>,
     ) -> Result<ResolvedModel> {
         let repo = self.hub.api().model(repo_id.to_string());
 
@@ -574,36 +453,24 @@ impl ModelResolver {
             }
         };
 
-        // Fetch the repo listing at most ONCE for the two DECISIONS that can
-        // consume it — backend auto-selection and the Candle weights-format
-        // plan — never two separate live `info()` calls that could observe
-        // two different snapshots of a repo being pushed to concurrently. A
+        // Fetch the repo listing at most ONCE for the weights-format plan,
+        // never two separate live `info()` calls that could observe two
+        // different snapshots of a repo being pushed to concurrently. A
         // failed fetch becomes `None`, not a fatal error here — hf-hub 0.5's
         // `ApiRepo::get` is CACHE-FIRST and network-free on a hit
         // (sync.rs:758-764) while `ApiRepo::info` is network-only
         // (sync.rs:860-878), so a warm-cache repo must keep resolving with
-        // no network at all. What `None` means to each decision is owned by
-        // that decision's own pure function (`select_backend_from_listing`,
-        // `hub_candle_weights_plan`), never decided at this call site.
-        //
-        // Lazy: a HINTED resolve for a non-Candle backend (e.g.
-        // `Some(BackendType::Ort)`) consumes neither decision above, so it
-        // makes NO listing call at all.
-        let listing: Option<Vec<String>> =
-            if backend_hint.is_none() || backend_hint == Some(BackendType::Candle) {
-                repo.info()
-                    .ok()
-                    .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect())
-            } else {
-                None
-            };
-
-        let backend =
-            backend_hint.unwrap_or_else(|| select_backend_from_listing(listing.as_deref()));
+        // no network at all. What `None` means is owned by the plan's own
+        // pure function (`hub_weights_plan`), never decided at this
+        // call site.
+        let listing: Option<Vec<String>> = repo
+            .info()
+            .ok()
+            .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect());
 
         // Precedence FROZEN: safetensors wins, byte-for-byte. The choice
         // between safetensors/gguf/refusal/attempt is made from the repo
-        // LISTING (`hub_candle_weights_plan` over `repo.info()`'s siblings)
+        // LISTING (`hub_weights_plan` over `repo.info()`'s siblings)
         // alone, never from a download outcome — a transient download
         // failure on a repo that lists BOTH formats must propagate as the
         // failure it is, not silently substitute the other weight format
@@ -612,57 +479,47 @@ impl ModelResolver {
         // `SafetensorsOnlyAttempt` arm below — the safetensors-only path,
         // never a guessed gguf format and never the listing-failure or
         // rename-refusal error.
-        let (weights_paths, weights_format) = match backend {
-            BackendType::Candle => {
-                match hub_candle_weights_plan(listing.as_deref(), GGUF_WEIGHTS_FILENAME) {
-                    HubCandleWeightsPlan::Safetensors(listed_safetensors) => {
-                        // The listing PROVED at least one safetensors
-                        // sibling is present, so a download failure here is
-                        // worth naming that fact: distinguishes "listed but
-                        // every download failed" from the bare message
-                        // `SafetensorsOnlyAttempt` below also returns when
-                        // there was no listing to make that claim from. The
-                        // names come straight off the plan arm that decided
-                        // this branch, not re-derived from `listing` here.
-                        (
-                            self.download_safetensors(&repo, source).map_err(|e| {
-                                annotate_listed_safetensors_download_failure(e, &listed_safetensors)
-                            })?,
-                            WeightsFormat::Safetensors,
-                        )
-                    }
-                    HubCandleWeightsPlan::SafetensorsOnlyAttempt => (
-                        self.download_safetensors(&repo, source)?,
+        let (weights_paths, weights_format) =
+            match hub_weights_plan(listing.as_deref(), GGUF_WEIGHTS_FILENAME) {
+                HubWeightsPlan::Safetensors(listed_safetensors) => {
+                    // The listing PROVED at least one safetensors
+                    // sibling is present, so a download failure here is
+                    // worth naming that fact: distinguishes "listed but
+                    // every download failed" from the bare message
+                    // `SafetensorsOnlyAttempt` below also returns when
+                    // there was no listing to make that claim from. The
+                    // names come straight off the plan arm that decided
+                    // this branch, not re-derived from `listing` here.
+                    (
+                        self.download_safetensors(&repo, source).map_err(|e| {
+                            annotate_listed_safetensors_download_failure(e, &listed_safetensors)
+                        })?,
                         WeightsFormat::Safetensors,
-                    ),
-                    HubCandleWeightsPlan::Gguf => {
-                        let p = repo
-                            .get(GGUF_WEIGHTS_FILENAME)
-                            .map_err(|e| JammiError::Model {
-                                model_id: source.to_string(),
-                                message: format!("Failed to download {GGUF_WEIGHTS_FILENAME}: {e}"),
-                            })?;
-                        (vec![p], WeightsFormat::Gguf)
-                    }
-                    HubCandleWeightsPlan::NonCanonicalGguf(others) => {
-                        return Err(gguf_rename_refusal(source, others));
-                    }
-                    HubCandleWeightsPlan::Neither => {
-                        return Err(JammiError::Model {
-                            model_id: source.to_string(),
-                            message: "No safetensors weights found".into(),
-                        });
-                    }
+                    )
                 }
-            }
-            BackendType::Ort => (self.download_onnx(&repo, source)?, WeightsFormat::Onnx),
-            other => {
-                return Err(JammiError::Model {
-                    model_id: source.to_string(),
-                    message: format!("Backend {other:?} not supported in resolve"),
-                })
-            }
-        };
+                HubWeightsPlan::SafetensorsOnlyAttempt => (
+                    self.download_safetensors(&repo, source)?,
+                    WeightsFormat::Safetensors,
+                ),
+                HubWeightsPlan::Gguf => {
+                    let p = repo
+                        .get(GGUF_WEIGHTS_FILENAME)
+                        .map_err(|e| JammiError::Model {
+                            model_id: source.to_string(),
+                            message: format!("Failed to download {GGUF_WEIGHTS_FILENAME}: {e}"),
+                        })?;
+                    (vec![p], WeightsFormat::Gguf)
+                }
+                HubWeightsPlan::NonCanonicalGguf(others) => {
+                    return Err(gguf_rename_refusal(source, others));
+                }
+                HubWeightsPlan::Neither => {
+                    return Err(JammiError::Model {
+                        model_id: source.to_string(),
+                        message: "No safetensors weights found".into(),
+                    });
+                }
+            };
 
         // Prefer the HF-converted tokenizer.json if it exists; otherwise
         // fall back to the OpenCLIP native vocab file for stock OpenCLIP
@@ -677,25 +534,11 @@ impl ModelResolver {
                     .map(TokenizerSource::OpenClipBpe)
             });
 
-        // See the catalog-lookup arm's identical match above for why this is
-        // exhaustive on `WeightsFormat` rather than a Gguf/else split.
-        let estimated_memory: usize = match weights_format {
-            WeightsFormat::Gguf => {
-                estimate_gguf_residency(&weights_paths[0], &config, &source.to_string())?
-            }
-            WeightsFormat::Safetensors => {
-                estimate_safetensors_residency(&weights_paths, &source.to_string())?
-            }
-            WeightsFormat::Onnx => weights_paths
-                .iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() as usize)
-                .sum(),
-        };
+        let estimated_memory =
+            estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
 
         Ok(ResolvedModel {
             model_id: ModelId::from(source),
-            backend,
             weights_format,
             task,
             config_path,
@@ -717,10 +560,10 @@ impl ModelResolver {
     ) -> Result<Vec<PathBuf>> {
         // Try standard naming first, then OpenCLIP naming — the same two
         // names, in the same order, the local chain walks.
-        if let Ok(path) = repo.get(arch::CANDLE_WEIGHTS_CANDIDATE_NAMES[0]) {
+        if let Ok(path) = repo.get(arch::WEIGHTS_CANDIDATE_NAMES[0]) {
             return Ok(vec![path]);
         }
-        if let Ok(path) = repo.get(arch::CANDLE_WEIGHTS_CANDIDATE_NAMES[1]) {
+        if let Ok(path) = repo.get(arch::WEIGHTS_CANDIDATE_NAMES[1]) {
             return Ok(vec![path]);
         }
         if let Ok(info) = repo.info() {
@@ -739,18 +582,36 @@ impl ModelResolver {
             message: "No safetensors weights found".into(),
         })
     }
+}
 
-    fn download_onnx(
-        &self,
-        repo: &hf_hub::api::sync::ApiRepo,
-        source: &ModelSource,
-    ) -> Result<Vec<PathBuf>> {
-        repo.get(arch::ONNX_WEIGHTS_FILENAME)
-            .map(|p| vec![p])
-            .map_err(|e| JammiError::Model {
-                model_id: source.to_string(),
-                message: format!("No ONNX model found: {e}"),
-            })
+/// The weights file a load reads from a local directory, and its storage
+/// format: the first existing name of the frozen chain
+/// ([`arch::weights_candidates`]), labelled by which name won, so the chain
+/// and the label cannot disagree. `None` when the directory carries none.
+fn local_weights(dir: &Path) -> Option<(Vec<PathBuf>, WeightsFormat)> {
+    arch::weights_candidates(dir).map(|path| {
+        let format = if path.ends_with(GGUF_WEIGHTS_FILENAME) {
+            WeightsFormat::Gguf
+        } else {
+            WeightsFormat::Safetensors
+        };
+        (vec![path], format)
+    })
+}
+
+/// A resolved model's estimated residency, read from its weights' own
+/// headers at resolve time: a plain file-byte sum under-reports what either
+/// format occupies once loaded (see [`estimate_gguf_residency`] and
+/// [`estimate_safetensors_residency`]).
+fn estimate_residency(
+    format: WeightsFormat,
+    weights_paths: &[PathBuf],
+    model_config: &serde_json::Value,
+    model_id: &str,
+) -> Result<usize> {
+    match format {
+        WeightsFormat::Gguf => estimate_gguf_residency(&weights_paths[0], model_config, model_id),
+        WeightsFormat::Safetensors => estimate_safetensors_residency(weights_paths, model_id),
     }
 }
 
@@ -820,7 +681,7 @@ fn decide_hub_weights_format(siblings: &[String], canonical_gguf: &str) -> HubWe
     HubWeightsDecision::NonCanonicalGguf(others)
 }
 
-/// The FULL decision the Candle-backend Hub-path resolve makes about which
+/// The FULL decision the Hub-path resolve makes about which
 /// weight format to load, including the case the repo LISTING itself is
 /// unavailable — a strict superset of [`HubWeightsDecision`]'s four
 /// listing-present arms plus a fifth. `None` listing here means
@@ -828,10 +689,10 @@ fn decide_hub_weights_format(siblings: &[String], canonical_gguf: &str) -> HubWe
 /// outcome: `ApiRepo::get` is CACHE-FIRST and network-free on a hit
 /// (sync.rs:758-764), while `ApiRepo::info` is network-only
 /// (sync.rs:860-878) — so a warm-cache safetensors-only repo must keep
-/// resolving offline. `hub_candle_weights_plan` is the single pure function that owns this
+/// resolving offline. `hub_weights_plan` is the single pure function that owns this
 /// decision; every arm below is unit-tested without a live repo.
 #[derive(Debug, PartialEq, Eq)]
-enum HubCandleWeightsPlan {
+enum HubWeightsPlan {
     /// Listing available, safetensors sibling(s) listed — download them; a
     /// failure here PROPAGATES (never falls back to gguf). Carries the
     /// LISTED `*.safetensors` sibling name(s), taken from the same listing
@@ -854,18 +715,15 @@ enum HubCandleWeightsPlan {
     SafetensorsOnlyAttempt,
 }
 
-/// Decide the Candle-backend Hub-path weights plan from an OPTIONAL repo
+/// Decide the Hub-path weights plan from an OPTIONAL repo
 /// listing. `None` means the listing itself is unavailable (`repo.info()`
 /// failed) — NOT "no siblings"; `Some(&[])`/a listing with no weight
 /// siblings is the ordinary `Neither` arm. Pure and independent of
 /// `hf_hub`/network types, so every one of the five arms is unit-testable
 /// without a live repo.
-fn hub_candle_weights_plan(
-    listing: Option<&[String]>,
-    canonical_gguf: &str,
-) -> HubCandleWeightsPlan {
+fn hub_weights_plan(listing: Option<&[String]>, canonical_gguf: &str) -> HubWeightsPlan {
     let Some(siblings) = listing else {
-        return HubCandleWeightsPlan::SafetensorsOnlyAttempt;
+        return HubWeightsPlan::SafetensorsOnlyAttempt;
     };
     match decide_hub_weights_format(siblings, canonical_gguf) {
         HubWeightsDecision::Safetensors => {
@@ -874,29 +732,12 @@ fn hub_candle_weights_plan(
                 .filter(|name| name.ends_with(".safetensors"))
                 .cloned()
                 .collect();
-            HubCandleWeightsPlan::Safetensors(listed)
+            HubWeightsPlan::Safetensors(listed)
         }
-        HubWeightsDecision::Gguf => HubCandleWeightsPlan::Gguf,
-        HubWeightsDecision::NonCanonicalGguf(others) => {
-            HubCandleWeightsPlan::NonCanonicalGguf(others)
-        }
-        HubWeightsDecision::Neither => HubCandleWeightsPlan::Neither,
+        HubWeightsDecision::Gguf => HubWeightsPlan::Gguf,
+        HubWeightsDecision::NonCanonicalGguf(others) => HubWeightsPlan::NonCanonicalGguf(others),
+        HubWeightsDecision::Neither => HubWeightsPlan::Neither,
     }
-}
-
-/// Decide Hub backend auto-selection (the ONNX arm) from an OPTIONAL repo
-/// listing — pure, and deliberately shares the SAME listing
-/// `hub_candle_weights_plan` decides the weights format from (one live
-/// `repo.info()` fetch per resolve, not two separate snapshots of a repo
-/// that could be pushed to concurrently between them). `None` (listing
-/// unavailable) falls back to `Candle`.
-fn select_backend_from_listing(listing: Option<&[String]>) -> BackendType {
-    if let Some(siblings) = listing {
-        if siblings.iter().any(|s| s == "model.onnx") {
-            return BackendType::Ort;
-        }
-    }
-    BackendType::Candle
 }
 
 /// Wrap a failed [`ModelResolver::download_safetensors`] error with context
@@ -933,7 +774,7 @@ fn gguf_rename_refusal(source: &ModelSource, mut others: Vec<String>) -> JammiEr
         model_id: source.to_string(),
         message: format!(
             "Found GGUF file(s) {} but no '{GGUF_WEIGHTS_FILENAME}' — the canonical \
-             quantized-weights filename (mirrors model.safetensors/model.onnx); rename to \
+             quantized-weights filename (mirrors model.safetensors); rename to \
              '{GGUF_WEIGHTS_FILENAME}' to load it",
             others.join(", ")
         ),
@@ -1064,7 +905,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // `hub_candle_weights_plan`: the FULL five-arm
+    // `hub_weights_plan`: the FULL five-arm
     // decision, including the `None`-listing arm `decide_hub_weights_format`
     // alone can't express. Plan arm 1: `Some` + safetensors-listed.
     // ─────────────────────────────────────────────────────────────────────
@@ -1073,8 +914,8 @@ mod tests {
     fn plan_arm_1_some_listing_with_safetensors_selects_safetensors() {
         let siblings = names(&["config.json", "model.safetensors", "model.gguf"]);
         assert_eq!(
-            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
+            hub_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
         );
     }
 
@@ -1083,8 +924,8 @@ mod tests {
     fn plan_arm_2_some_listing_with_only_canonical_gguf_selects_gguf() {
         let siblings = names(&["config.json", "model.gguf"]);
         assert_eq!(
-            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::Gguf
+            hub_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::Gguf
         );
     }
 
@@ -1094,8 +935,8 @@ mod tests {
     fn plan_arm_3_some_listing_with_non_canonical_gguf_only_refuses_with_names() {
         let siblings = names(&["config.json", "weights.q4.gguf", "other.gguf"]);
         assert_eq!(
-            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::NonCanonicalGguf(vec![
+            hub_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::NonCanonicalGguf(vec![
                 "other.gguf".to_string(),
                 "weights.q4.gguf".to_string(),
             ])
@@ -1107,8 +948,8 @@ mod tests {
     fn plan_arm_4_some_listing_with_neither_format_is_neither() {
         let siblings = names(&["config.json", "tokenizer.json"]);
         assert_eq!(
-            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::Neither
+            hub_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::Neither
         );
     }
 
@@ -1121,8 +962,8 @@ mod tests {
     #[test]
     fn plan_arm_5_none_listing_attempts_safetensors_only_never_decides_gguf() {
         assert_eq!(
-            hub_candle_weights_plan(None, GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::SafetensorsOnlyAttempt
+            hub_weights_plan(None, GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::SafetensorsOnlyAttempt
         );
     }
 
@@ -1134,40 +975,28 @@ mod tests {
     fn plan_agrees_with_decide_hub_weights_format_when_listing_is_present() {
         let siblings = names(&["model.safetensors", "model.gguf"]);
         assert_eq!(
-            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
+            hub_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
         );
         assert_ne!(
-            hub_candle_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
-            HubCandleWeightsPlan::SafetensorsOnlyAttempt
+            hub_weights_plan(Some(&siblings), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::SafetensorsOnlyAttempt
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // `select_backend_from_listing`: shares the SAME optional listing —
-    // `None` falls back to `Candle`.
-    // ─────────────────────────────────────────────────────────────────────
-
+    /// An ONNX export listed beside the weights is not a weights file: it
+    /// never changes the plan, and alone it is no weights at all.
     #[test]
-    fn select_backend_from_listing_picks_ort_when_model_onnx_is_listed() {
-        let siblings = names(&["config.json", "model.onnx"]);
+    fn plan_ignores_a_listed_onnx_export() {
+        let with_safetensors = names(&["config.json", "model.onnx", "model.safetensors"]);
         assert_eq!(
-            select_backend_from_listing(Some(&siblings)),
-            BackendType::Ort
+            hub_weights_plan(Some(&with_safetensors), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::Safetensors(vec!["model.safetensors".to_string()])
         );
-    }
-
-    #[test]
-    fn select_backend_from_listing_falls_back_to_candle_when_listing_is_none() {
-        assert_eq!(select_backend_from_listing(None), BackendType::Candle);
-    }
-
-    #[test]
-    fn select_backend_from_listing_falls_back_to_candle_when_onnx_absent() {
-        let siblings = names(&["config.json", "model.safetensors"]);
+        let onnx_only = names(&["config.json", "model.onnx"]);
         assert_eq!(
-            select_backend_from_listing(Some(&siblings)),
-            BackendType::Candle
+            hub_weights_plan(Some(&onnx_only), GGUF_WEIGHTS_FILENAME),
+            HubWeightsPlan::Neither
         );
     }
 

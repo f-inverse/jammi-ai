@@ -33,10 +33,7 @@ pub(crate) async fn embedding_definition(
     task: ModelTask,
 ) -> Result<EmbeddingDefinition> {
     let model_source = ModelSource::parse(model_id);
-    let description = session
-        .model_cache()
-        .describe(&model_source, task, None)
-        .await?;
+    let description = session.model_cache().describe(&model_source, task).await?;
     let embedding_dim = description.embedding_dim();
     let env = jammi_db::store::manifest::MaterializationEnv::of_models(
         session.compute_device(),

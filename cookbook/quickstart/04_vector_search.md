@@ -23,7 +23,6 @@ where it left off.
   `model.safetensors`, `tokenizer.json` (the fixture under `cookbook/fixtures/tiny_bert`)
 - `hf:<user>/<model>` or a bare Hugging Face Hub ID like
   `sentence-transformers/all-MiniLM-L6-v2`
-- `onnx:/abs/path/to/model.onnx` for an ONNX backend
 
 ## Encode the query
 

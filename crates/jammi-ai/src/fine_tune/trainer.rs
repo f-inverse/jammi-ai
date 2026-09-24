@@ -7373,7 +7373,7 @@ mod test_fixtures {
         let source = ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
         let guard = session
             .model_cache()
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .unwrap();
         guard.model.clone()
@@ -7395,7 +7395,7 @@ mod test_fixtures {
                 model_id: &model_id,
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -10128,7 +10128,7 @@ mod standardization_contract {
                 model_id: "oracle-model",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: jammi_datafusion::ModelTask::Regression,
                 base_model_id: None,
                 external_location: None,
@@ -11976,7 +11976,7 @@ mod determinism_through_forward {
                 model_id: "det-model",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: jammi_datafusion::ModelTask::Regression,
                 base_model_id: None,
                 external_location: None,
@@ -12303,7 +12303,7 @@ mod resume_invariant {
                 model_id: "resume-model",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: jammi_datafusion::ModelTask::Regression,
                 base_model_id: None,
                 external_location: None,
@@ -12989,7 +12989,7 @@ mod resume_invariant {
                 model_id: "r5-model",
                 version: 1,
                 model_type: "embedding",
-                backend: "candle",
+                backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
                 task: jammi_datafusion::ModelTask::TextEmbedding,
                 base_model_id: None,
                 external_location: None,
@@ -14066,7 +14066,6 @@ mod media_front_end_wall_tests {
             .resolve(
                 &ModelSource::local(htsat_clap_tiny_dir()),
                 ModelTask::AudioEmbedding,
-                None,
             )
             .await
             .expect("htsat_clap_tiny fixture must resolve");
@@ -14449,7 +14448,7 @@ mod encode_texts_bucketing_oracle {
         );
         let guard = session
             .model_cache()
-            .get_or_load(&source, ModelTask::TextEmbedding, None)
+            .get_or_load(&source, ModelTask::TextEmbedding)
             .await
             .unwrap();
         guard.model.clone()

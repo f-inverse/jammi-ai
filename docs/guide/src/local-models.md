@@ -25,14 +25,13 @@ the directory must exist there.
 ## What the directory must contain
 
 - A config: `config.json` (or `open_clip_config.json` for OpenCLIP models).
-- Weights: `model.safetensors` (or `open_clip_model.safetensors`),
-  `model.onnx`, and/or `model.gguf`.
+- Weights: `model.safetensors` (or `open_clip_model.safetensors`), or
+  `model.gguf`.
 
-When both safetensors and ONNX weights are present, the ONNX file wins and the
-model runs on the ORT backend; safetensors alone selects the Candle backend. An
-explicit backend hint overrides this choice. `model.gguf` is considered only
-when neither safetensors nor ONNX weights are present — see [Quantized (GGUF)
-checkpoints](#quantized-gguf-checkpoints) below.
+`model.safetensors` wins, then `open_clip_model.safetensors`; `model.gguf` is
+considered only when neither is present — see [Quantized (GGUF)
+checkpoints](#quantized-gguf-checkpoints) below. Other files in the directory,
+such as an ONNX export, are ignored.
 
 Resolution is fail-loud: a nonexistent directory, a directory with no config,
 and a directory with no recognized weights file each produce a typed error
@@ -40,8 +39,8 @@ naming what is missing — there is no silent fallback to the Hub.
 
 ## Quantized (GGUF) checkpoints
 
-A directory with no `model.safetensors`/`model.onnx` but a `model.gguf` loads
-on the Candle backend as a quantized checkpoint — matmul-site weights stored
+A directory with no safetensors weights but a `model.gguf` loads as a
+quantized checkpoint — matmul-site weights stored
 at a k-quant format (`q4_0` through `q6k`) stay resident in that compressed
 form; everything else (embeddings, norms, classifier/NER heads, and any
 matmul-site weight that happens to be stored densely) is dequantized to the

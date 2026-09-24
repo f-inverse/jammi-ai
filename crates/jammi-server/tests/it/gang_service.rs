@@ -280,7 +280,9 @@ async fn materialize_ready_table_for_tenant(
         ComputeDevice::Cpu,
         vec![ModelIdentity {
             model_id: "rt-base".into(),
-            backend: "candle".into(),
+            backend: jammi_db::store::manifest::ModelRunner::Backend(
+                jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+            ),
             compute_precision: ComputePrecision::F32,
             content_digest: ModelContentDigest::Sha256("gang-fixture-digest".into()),
             quantization: None,

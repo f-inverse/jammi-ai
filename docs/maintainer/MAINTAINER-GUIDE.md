@@ -3095,7 +3095,9 @@ note below.
 - **`ModelBackend`** — `crates/jammi-ai/src/model/backend/mod.rs` (the `ModelBackend`
   trait): `load` (synchronous, blocking, no cache lock held) + `estimate_memory` (cheap,
   side-effect-free; the **admission currency** — under-estimating risks OOM).
-  Implementors dispatch behind `BackendType`.
+  `CandleBackend` is its one implementor; the `models.backend` column records it as
+  `ModelBackendKind::Candle` (`crates/jammi-db/src/catalog/model_repo.rs`), and a row
+  naming anything else is refused where it is read.
 - **`GpuScheduler` / `GpuPermit`** — `crates/jammi-ai/src/concurrency/gpu_scheduler.rs`
   (the `GpuScheduler` and `GpuPermit` types). `GpuScheduler::try_acquire(bytes) ->
   Option<GpuPermit>` is non-blocking CAS on `reserved_memory`; `Drop for GpuPermit`
@@ -3118,20 +3120,20 @@ note below.
   left); an entry that is idle by ref-count but still has an outstanding guard-held clone
   is skipped, not removed.
   `ModelCache::preload` is a thin `get_or_load`-then-`drop` warmer taking an *explicit*
-  `(source, task, backend_hint)` — it reads no config list itself. Its callers are the
+  `(source, task)` — it reads no config list itself. Its callers are the
   server's warm-before-ready step (`crates/jammi-server/src/runtime.rs`
   `preload_models`, driven by `[server] preload_models: Vec<PreloadEntry>` — a bare id
   whose task is resolved from the `models` row at the startup edge, or `{ id, task }`;
   `/readyz` is 503 "preloading i/n" and the claim loop is parked at the session's worker
   gate until every entry is cached; a failed entry is `ServerError::Preload`, exit
-  non-zero) and the Python `preload_model` verb. The cache key is task-free, so the head
-  is chosen from the task the preload names — never guessed.
+  non-zero) and the Python `preload_model` verb. The head is chosen from the task the
+  preload names — never guessed.
 - **`ModelSource` / `ModelId`** — `crates/jammi-ai/src/model/mod.rs` (`ModelId` and
-  `ModelSource`): `HuggingFace(String)` | `Local(PathBuf)`. **`ModelId` = `Display` of the
-  source is the entire cache key** — `task` and `backend_hint` are NOT part of it [§5
-  gotcha].
+  `ModelSource`): `HuggingFace(String)` | `Local(PathBuf)`. `ModelId` = `Display` of the
+  source; the cache key (`CacheKey`, `crates/jammi-ai/src/model/cache.rs`) is the model id,
+  the device and the task [§5 gotcha].
 - **`ResolvedModel`** — `crates/jammi-ai/src/model/mod.rs` (the `ResolvedModel` struct):
-  the frozen "files located, backend chosen, not loaded" struct (resolver → backend
+  the frozen "files located, not loaded" struct (resolver → backend
   contract).
 
 **Architecture identity — the ONE chain (`jammi-ai/src/model/arch.rs`)**
@@ -3165,10 +3167,9 @@ the copies disagreed.
   keep loading the checkpoint while the fine-tune worker refused the identical bytes. A
   non-BERT checkpoint that omitted the field still cannot mis-load silently: its geometry
   must deserialize as a `BertConfig` and its tensors must carry BERT's names.
-- **Two candidate-name lists, two questions** — `WEIGHTS_CANDIDATE_NAMES` (4 names,
-  including `model.onnx`) is the IDENTITY list: every file name that can BE a model's
-  weights, used for digest/fingerprint slots. `CANDLE_WEIGHTS_CANDIDATE_NAMES` (3, no
-  ONNX) is the RESOLUTION list `weights_candidates` walks in the frozen precedence.
+- **One weights list** — `WEIGHTS_CANDIDATE_NAMES` (`model.safetensors`,
+  `open_clip_model.safetensors`, `model.gguf`) is both the chain `weights_candidates`
+  walks in the frozen precedence and the arm set the digest/fingerprint slots track.
   `config_candidates` walks `CONFIG_CANDIDATE_NAMES` (`config.json`,
   `open_clip_config.json`). Hardcoding `config.json` / `model.safetensors` instead of
   walking these lists is exactly how an OpenCLIP checkpoint — whose files are
@@ -3185,15 +3186,11 @@ the copies disagreed.
 **GGUF/k-quant weight loading (`jammi-ai/model/resolver.rs` + `model/backend/gguf.rs`)**
 
 - **`WeightsFormat`** — `crates/jammi-ai/src/model/mod.rs` (the `WeightsFormat`
-  enum): `Safetensors` | `Onnx` | `Gguf`, the on-disk STORAGE format of a
+  enum): `Safetensors` | `Gguf`, the on-disk STORAGE format of a
   resolved model's weight files, carried on `ResolvedModel.weights_format`.
-  Orthogonal to `BackendType`: `Gguf` is a weight-storage format only the
-  `Candle` backend loads — the resolver's ORT arm only ever looks for
-  `model.onnx`, so `(Ort, Gguf)` is structurally unreachable through the
-  resolver, not a case this type itself forbids.
 - **The `model.gguf` literal-filename contract** —
   `crates/jammi-ai/src/model/resolver.rs` (`GGUF_WEIGHTS_FILENAME`): mirrors
-  `model.safetensors`/`model.onnx`'s own convention — the digest-slot
+  `model.safetensors`'s own convention — the digest-slot
   machinery (`backend::candle::all_candidate_paths`) stats known names only,
   never sniffs by extension, so a quantized checkpoint must be named exactly
   `model.gguf`. **Precedence is FROZEN:** `model.safetensors` (or
@@ -3263,7 +3260,7 @@ the copies disagreed.
   `crates/jammi-db/src/store/manifest.rs` (`ModelIdentity::quantization:
   Option<jammi_numerics::WeightQuantization>`): the MODAL `WeightQuantization`
   among a GGUF backbone's matmul-site tensors (ties broken by that type's
-  own `Ord`, i.e. GGUF wire-ID order), `None` for every safetensors/ONNX
+  own `Ord`, i.e. GGUF wire-ID order), `None` for every safetensors
   load. Folds in alongside `compute_precision`/`content_digest` (`#[serde
   (default, skip_serializing_if = "Option::is_none")]`, preserving every
   pre-existing `DefinitionHash` byte-for-byte — a `None` serialises to no
@@ -4560,7 +4557,7 @@ the worker's sole authority.**
 
 ### 3.6 get_or_load (model lifecycle, end to end)
 
-`ModelCache::get_or_load(source, task, backend_hint)` (`crates/jammi-ai/src/model/cache.rs`),
+`ModelCache::get_or_load(source, task)` (`crates/jammi-ai/src/model/cache.rs`),
 retry loop re-taking the write lock:
 - **Fast path**: entry hit → `ref_count.fetch_add(1)` → build `ModelGuard` → `touch_lru` →
   return. No resolver/backend/permit churn.
@@ -5182,14 +5179,13 @@ auto-available to every encoder.)
 
 ### 4.7 Add a new model backend / source / tokenizer (lifecycle)
 
-- **Backend:** `BackendType` variant (`crates/jammi-ai/src/model/mod.rs`); `LoadedModel`
-  variant + extend *every* match (`estimate_batch_memory`, `embedding_dim`, `regression_form`,
-  `regression_std_scale`, `forward`, …) — no catch-all arm by design;
-  `crates/jammi-ai/src/model/backend/<name>.rs` impl `ModelBackend`; register in `Backends`
-  (`crates/jammi-ai/src/model/cache.rs`) + construct in `ModelCache::new` + add dispatch in
-  BOTH `do_load` and `load_owned_for_test`; teach the resolver to recognize your weights.
-  (Cautionary tale: `HttpBackend` does *not* impl `ModelBackend`, so `BackendType::Http` is
-  unreachable via the cache, [§7].)
+- **Backend:** a second backend arrives as a capability with a loader: a
+  `ModelBackendKind` variant (`crates/jammi-db/src/catalog/model_repo.rs`) the catalog
+  records, a `crates/jammi-ai/src/model/backend/<name>.rs` impl of `ModelBackend`, the
+  cache's dispatch from the resolved model to it, and the resolver recognizing its
+  weights. `LoadedModel` gains a variant, and *every* match over it is extended
+  (`estimate_batch_memory`, `embedding_dim`, `regression_form`, `regression_std_scale`,
+  `forward`, …) — no catch-all arm by design.
 - **Model source:** `ModelSource` variant (`crates/jammi-ai/src/model/mod.rs`) + update
   `Display`/`parse`/`from_canonical` + the `model_type` match in `do_load`; a
   `resolve_<source>` method dispatched in `resolve`.
@@ -5385,8 +5381,8 @@ auto-available to every encoder.)
 
 **Model lifecycle**
 
-- **Cache key = `ModelSource.to_string()` only** — `task`/`backend_hint` are not in `ModelId`; the
-  first `get_or_load` for a source pins its backend/task.
+- **Cache key = model id + device + task** (`CacheKey`) — the same weights on two devices, or
+  loaded for two tasks, are two entries.
 - **Single-flight: a waiter must `continue` and re-check the fast path on wake** — the loader may
   have *failed*. Keep `in_flight.remove` + `notify` paired on every exit, both Ok and Err arms.
 - **Admission uses `try_acquire` + evict, not `acquire`** (the async `acquire` and `GpuPriority`

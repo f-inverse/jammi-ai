@@ -105,6 +105,7 @@ async-nats = { workspace = true, optional = true }
 
 # Utilities
 uuid.workspace = true
+rand.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

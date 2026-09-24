@@ -4758,6 +4758,7 @@ dependencies = [
  "parking_lot",
  "parquet",
  "proc-macro2",
+ "rand 0.8.6",
  "seahash",
  "secrecy",
  "serde",

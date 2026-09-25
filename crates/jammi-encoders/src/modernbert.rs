@@ -2432,21 +2432,31 @@ impl<'a> ModernBertBuilder<'a> {
             device,
         )?);
 
+        // Two checkpoint layouts: a task model (`ModernBertForMaskedLM` and
+        // its kin) wraps the backbone in `"model."`; a bare `ModernBertModel`
+        // — the layout most embedding checkpoints publish — carries no
+        // prefix. One probe for the embeddings tensor decides, as the BERT
+        // loader does.
+        let base_vb = if frozen_vb.contains_tensor("model.embeddings.tok_embeddings.weight") {
+            frozen_vb.pp("model")
+        } else {
+            frozen_vb.clone()
+        };
         let word_embeddings = embedding(
             config.vocab_size,
             config.hidden_size,
-            frozen_vb.pp("model.embeddings.tok_embeddings"),
+            base_vb.pp("embeddings.tok_embeddings"),
         )?;
         let emb_norm = LayerNorm::new(
             config.hidden_size,
             config.layer_norm_eps,
             false,
-            frozen_vb.pp("model.embeddings.norm"),
+            base_vb.pp("embeddings.norm"),
         )?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for n in 0..config.num_hidden_layers {
-            let layer_vb = frozen_vb.pp(format!("model.layers.{n}"));
+            let layer_vb = base_vb.pp(format!("layers.{n}"));
             let lora_layer_vb = lora_vb.pp(format!("layer.{n}"));
             let site = LoraSite {
                 layer_vb: &layer_vb,
@@ -2538,7 +2548,7 @@ impl<'a> ModernBertBuilder<'a> {
             config.hidden_size,
             config.layer_norm_eps,
             false,
-            frozen_vb.pp("model.final_norm"),
+            base_vb.pp("final_norm"),
         )?;
 
         Ok(ModernBert {
@@ -3227,6 +3237,50 @@ mod tests {
     /// arm's own dispatch/output is UNCHANGED — re-asserting the SAME
     /// properties that sibling test proves — so a declining cascade changes
     /// nothing numerically.
+    /// A bare `ModernBertModel` checkpoint — the layout embedding models
+    /// publish, with no `"model."` wrapper — builds, and serves the same
+    /// hidden states as the wrapped task-model layout of the same weights.
+    #[test]
+    fn a_bare_backbone_checkpoint_serves_what_the_wrapped_one_does() {
+        let _lock = crate::test_support::seam_counter_lock();
+        let device = Device::Cpu;
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tiny_modernbert_head64");
+        let config: ModernBertConfig =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let wrapped = dir.join("model.safetensors");
+        let tensors = candle_core::safetensors::load(&wrapped, &device).unwrap();
+        assert!(
+            tensors.keys().any(|k| k.starts_with("model.")),
+            "the fixture is the wrapped layout"
+        );
+        let bare: std::collections::HashMap<String, Tensor> = tensors
+            .into_iter()
+            .map(|(k, v)| (k.strip_prefix("model.").map(str::to_string).unwrap_or(k), v))
+            .collect();
+        let out = tempfile::tempdir().unwrap();
+        let bare_path = out.path().join("model.safetensors");
+        candle_core::safetensors::save(&bare, &bare_path).unwrap();
+
+        let input_ids = Tensor::new(&[[2u32, 5, 10, 3, 7, 9]], &device).unwrap();
+        let mask = Tensor::ones((1, 6), DType::U32, &device).unwrap();
+        let hidden = |weights: &std::path::Path| {
+            let varmap = candle_nn::VarMap::new();
+            let model = ModernBert::builder()
+                .build(&[weights], &config, &device, &varmap)
+                .unwrap();
+            model
+                .forward_hidden(&input_ids, &mask)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        assert_eq!(hidden(&bare_path), hidden(&wrapped));
+    }
+
     #[test]
     fn flash_cascade_never_changes_the_block_arm_dispatch_or_output() {
         let _lock = crate::test_support::seam_counter_lock();

@@ -161,7 +161,7 @@ class CommittedList(unittest.TestCase):
 
     def test_every_guard_runs_a_tracked_file(self):
         for guard in self.parsed.guards:
-            scripts = re.findall(r"(?:^|\s)((?:ci|tests|crates)/\S+\.(?:py|sh))", guard.run)
+            scripts = re.findall(r"(?:^|\s)((?:ci|tests|crates|cookbook)/\S+\.(?:py|sh))", guard.run)
             self.assertTrue(scripts, f"{guard.name}: `run` names no script")
             for script in scripts:
                 self.assertTrue((rg.REPO_ROOT / script).is_file(), f"{guard.name}: {script} does not exist")

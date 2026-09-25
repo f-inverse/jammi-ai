@@ -170,7 +170,10 @@ ROOT_ALL_FEATURES_EXEMPT_SPEC = [f"jammi-ai/{FORBIDDEN_FEATURE}"]
 # exemption to apply — a verified 1:1 passthrough, not "any leak from this
 # crate is fine": if a future edit adds a second spec (e.g. also pulling in
 # a heavier dependency), the exemption stops matching and this script goes
-# back to FAILing on it.
+# back to FAILing on it. `jammi-python` is the embedded engine's extension:
+# its `flash-attn` is the one `jammi-ai-native-cu12` declares in its own
+# `[tool.maturin] features` (`packaging/native-cu12/pyproject.toml`), the
+# embedded counterpart of the server's cu12 lanes.
 #
 # `--all-features` is a synthetic "build everything" selection no release
 # lane uses; an opt-in feature `--all-features` could never reach would be
@@ -185,6 +188,7 @@ ALL_FEATURES_FLASH_EXEMPT: dict[str, list[str]] = {
     "jammi-encoders": [f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"],
     "jammi-ai": ["cuda", f"jammi-encoders/{FORBIDDEN_FEATURE}", f"{TARGET_PKG}/{FORBIDDEN_FEATURE}"],
     "jammi-bench": [f"jammi-ai/{FORBIDDEN_FEATURE}"],
+    "jammi-python": [f"jammi-ai/{FORBIDDEN_FEATURE}"],
 }
 
 

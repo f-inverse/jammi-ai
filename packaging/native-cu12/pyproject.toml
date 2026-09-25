@@ -1,0 +1,57 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+# The `-cu12` lives in the PROJECT NAME only — PyPI rejects a `+cu12` local
+# version segment. Install this OR `jammi-ai-native`: both provide the
+# `jammi_native` module, and `jammi-ai` discovers whichever is present.
+name = "jammi-ai-native-cu12"
+requires-python = ">=3.9"
+dynamic = ["version"]
+description = "CUDA (cu12, sm_80+) build of the compiled in-process Jammi engine — the `jammi_native` PyO3 extension"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "F-Inverse" }]
+keywords = ["embeddings", "vector-search", "fine-tuning", "inference", "cuda", "gpu"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+# The CUDA libraries the extension links dynamically, delivered by NVIDIA's
+# wheels so no system CUDA install is needed — only a driver. The same five
+# pins as `jammi-server-cu12` (see that pyproject for why each is pinned as it
+# is); `ci/scripts/test_cu12_component_contract.py` keeps the two in step and
+# with the RUNPATH `crates/jammi-python/build.rs` gives the extension.
+dependencies = [
+    "nvidia-cuda-runtime-cu12==12.6.*",
+    "nvidia-cublas-cu12==12.6.*",
+    "nvidia-curand-cu12==10.3.7.*",
+    "nvidia-cuda-nvrtc-cu12==12.6.*",
+    "nvidia-nccl-cu12==2.23.4.*",
+]
+
+[project.urls]
+Homepage = "https://github.com/f-inverse/jammi-ai"
+Documentation = "https://f-inverse.github.io/jammi-ai/"
+Repository = "https://github.com/f-inverse/jammi-ai"
+"Bug Tracker" = "https://github.com/f-inverse/jammi-ai/issues"
+
+[tool.maturin]
+# The same crate and module as `jammi-ai-native`; only the features differ.
+manifest-path = "../../crates/jammi-python/Cargo.toml"
+module-name = "jammi_native"
+# `python/jammi_native/__init__.py` links to the CPU dist's re-export shim, so
+# the two wheels ship one module surface.
+python-source = "python"
+# `cuda` and `flash-attn` (fused kernels for sm_80/86/89/90), built in the CUDA
+# image (`.docker/ci-cuda.Dockerfile`, CUDA_COMPUTE_CAP=80).
+features = ["extension-module", "cuda", "flash-attn"]

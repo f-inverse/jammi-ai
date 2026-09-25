@@ -67,3 +67,11 @@ tokio.workspace = true
 # means `cargo test --workspace` links the integration test binary
 # against libpython and runs cleanly without per-crate flags.
 extension-module = ["pyo3/extension-module"]
+# The accelerator the embedded engine runs on, by-name passthroughs to
+# `jammi-ai`'s own features — the same surface `jammi-server` forwards, so the
+# library is never less capable than the server. `jammi-ai-native-cu12`
+# (`packaging/native-cu12`) builds with `cuda` and `flash-attn`; `build.rs`
+# points a `cuda` build's extension at the `nvidia-*-cu12` wheels' libraries.
+cuda = ["jammi-ai/cuda"]
+metal = ["jammi-ai/metal"]
+flash-attn = ["jammi-ai/flash-attn"]

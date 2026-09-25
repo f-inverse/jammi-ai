@@ -793,3 +793,105 @@ async fn cross_modal_text_to_image_search() {
         );
     }
 }
+
+/// A source whose columns share names with the search result's own columns:
+/// its key column named `_row_id` is carried once, by the result's `_row_id`;
+/// any other such column is refused rather than emitted twice.
+#[tokio::test]
+async fn hydration_carries_a_source_key_named_row_id_once_and_refuses_other_collisions() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let titles = [
+        "graph neural networks",
+        "protein folding",
+        "quantum error correction",
+    ];
+    let write = |name: &str, second: &str| {
+        let path = dir.path().join(format!("{name}.parquet"));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_row_id", DataType::Utf8, false),
+            Field::new(second, DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(titles.to_vec())),
+            ],
+        )
+        .unwrap();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&path).unwrap(),
+            schema,
+            None,
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        format!("file://{}", path.display())
+    };
+
+    let search = |name: &'static str, text_column: &'static str, url: String| {
+        let session = Arc::clone(&session);
+        async move {
+            session
+                .add_source(
+                    name,
+                    SourceType::File,
+                    SourceConnection {
+                        url: Some(url),
+                        format: Some(FileFormat::Parquet),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            session
+                .generate_text_embeddings(
+                    name,
+                    &tiny_bert_model(),
+                    &[text_column.to_string()],
+                    "_row_id",
+                    jammi_db::store::CachePolicy::Bypass,
+                    None,
+                )
+                .await
+                .unwrap();
+            session
+                .search_by_id(name, "a", 3, None, SearchMethod::default())
+                .await?
+                .run()
+                .await
+        }
+    };
+
+    let batches = search("keyed", "title", write("keyed", "title"))
+        .await
+        .unwrap();
+    let schema = batches[0].schema();
+    let row_ids = schema
+        .fields()
+        .iter()
+        .filter(|f| f.name() == "_row_id")
+        .count();
+    assert_eq!(
+        row_ids, 1,
+        "the key column is carried once, by the result's _row_id"
+    );
+    assert!(schema.field_with_name("title").is_ok());
+
+    let err = search("clashing", "similarity", write("clashing", "similarity"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, jammi_db::error::JammiError::Schema { ref column, .. } if column == "similarity"),
+        "a non-key source column named like a result column is refused: {err}"
+    );
+}

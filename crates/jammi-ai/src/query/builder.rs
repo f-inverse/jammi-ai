@@ -100,7 +100,9 @@ impl QueryBuilder {
             let source_table_name = session.find_table_name(&table.source_id).await?;
             let relation = source_relation(&table.source_id, &source_table_name);
             // Build column list that casts string columns to VARCHAR for compatibility
-            let source_cols = build_hydration_select(session.context(), &relation, key_col).await?;
+            let source_cols =
+                build_hydration_select(session.context(), &relation, key_col, &plan.schema())
+                    .await?;
             let sql = format!("SELECT {source_cols} FROM {relation}");
             let df = session
                 .context()
@@ -420,6 +422,7 @@ async fn build_hydration_select(
     ctx: &QueryContext,
     table_ref: &str,
     key_col: &str,
+    result: &arrow::datatypes::Schema,
 ) -> Result<String> {
     let df = ctx
         .sql(&format!("SELECT * FROM {table_ref} LIMIT 0"))
@@ -430,6 +433,22 @@ async fn build_hydration_select(
     let mut cols = Vec::new();
     for field in schema.fields() {
         let name = field.name();
+        // A source column named like one of the search result's own columns
+        // cannot be emitted beside it. The key column is carried by the
+        // result's `_row_id`; any other such column is refused, never
+        // silently shadowed.
+        if result.field_with_name(name).is_ok() {
+            if name == key_col {
+                continue;
+            }
+            return Err(JammiError::Schema {
+                table: table_ref.to_string(),
+                column: name.to_string(),
+                expected: "a source column named unlike the search result's own columns"
+                    .to_string(),
+                actual: format!("`{name}`, which the search result already carries"),
+            });
+        }
         let cast = match field.data_type() {
             arrow::datatypes::DataType::Utf8View | arrow::datatypes::DataType::LargeUtf8 => {
                 format!("arrow_cast(\"{name}\", 'Utf8') AS \"{name}\"")

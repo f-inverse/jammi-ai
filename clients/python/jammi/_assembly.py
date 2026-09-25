@@ -1461,7 +1461,8 @@ def build_encode_query_request(
 def build_search_request(
     source: str,
     *,
-    query: List[float],
+    query: Optional[List[float]] = None,
+    row_key: Optional[str] = None,
     k: int,
     filter: Optional[str] = None,
     select: Optional[List[str]] = None,
@@ -1472,27 +1473,30 @@ def build_search_request(
     """Assemble the `SearchRequest` for a nearest-neighbour search from the
     binding's flat kwargs.
 
-    `query` is the query vector (carried in the `query_vector` oneof arm);
-    `filter` is an optional SQL predicate over the hydrated results; `select`
-    projects columns (empty keeps every hydrated column); `embedding_table`
-    names which of the source's embedding tables to search (unset = the
-    most-recent ready table). `oversample` overrides, for this one call, the
-    retrieve→rescore candidate-breadth multiplier (`k * oversample`) a
-    quantized-`storage_precision` table's sidecar resolves at search time
-    (`None` defers to the table's own stamped default); irrelevant for an
-    `f32`-precision table (single-stage, no rescore). `exact` scores every
-    vector instead of searching the index — the true nearest neighbours, and
-    the baseline an approximate search's recall is measured against; it takes
-    no `oversample`. The same request the embed binding submits in-process.
+    The search ranks by exactly one of `query` (a query vector) or `row_key`
+    (query-by-example: the vector stored for that row, resolved inside the
+    engine — it never crosses the API). `filter` is an optional SQL predicate
+    over the hydrated results; `select` projects columns (empty keeps every
+    hydrated column); `embedding_table` names which of the source's embedding
+    tables to search (unset = the most-recent ready table). `oversample`
+    overrides, for this one call, the retrieve→rescore candidate-breadth
+    multiplier (`k * oversample`) a quantized-`storage_precision` table's
+    sidecar resolves at search time (`None` defers to the table's own stamped
+    default); irrelevant for an `f32`-precision table (single-stage, no
+    rescore). `exact` scores every vector instead of searching the index — the
+    true nearest neighbours, and the baseline an approximate search's recall
+    is measured against; it takes no `oversample`. The same request the embed
+    binding submits in-process.
     """
+    if (query is None) == (row_key is None):
+        raise ValueError("search ranks by exactly one of query (a vector) or row_key")
     if exact and oversample is not None:
         raise ValueError("an exact search scores every vector; it takes no oversample")
-    request = embedding_pb2.SearchRequest(
-        source_id=source,
-        query_vector=embedding_pb2.QueryVector(values=list(query)),
-        k=k,
-        select=list(select or []),
-    )
+    request = embedding_pb2.SearchRequest(source_id=source, k=k, select=list(select or []))
+    if query is not None:
+        request.query_vector.CopyFrom(embedding_pb2.QueryVector(values=list(query)))
+    else:
+        request.row_key = row_key
     if filter is not None:
         request.filter = filter
     if embedding_table is not None:

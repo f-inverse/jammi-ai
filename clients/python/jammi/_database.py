@@ -1614,7 +1614,8 @@ class RemoteDatabase:
         self,
         source: str,
         *,
-        query: List[float],
+        query: Optional[List[float]] = None,
+        row_key: Optional[str] = None,
         k: int,
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
@@ -1624,7 +1625,10 @@ class RemoteDatabase:
     ) -> pa.Table:
         """Nearest-neighbor search over a source's embedding table.
 
-        `query` is the query vector; `filter` is an optional SQL predicate over
+        The search ranks by `query` (a query vector) or by `row_key`
+        (query-by-example: the vector stored for that row, resolved inside
+        the engine — it never crosses the API); exactly one is given.
+        `filter` is an optional SQL predicate over
         the hydrated results; `select` projects columns (empty keeps every
         hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned
@@ -1641,6 +1645,7 @@ class RemoteDatabase:
         request = build_search_request(
             source,
             query=query,
+            row_key=row_key,
             k=k,
             filter=filter,
             select=select,

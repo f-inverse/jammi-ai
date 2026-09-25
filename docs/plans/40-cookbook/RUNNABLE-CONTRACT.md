@@ -187,6 +187,79 @@ for the embedded engine — through one formatter
 (`jammi_ai::telemetry::fmt_layer`), and `RUST_LOG` overrides both. ANSI colour
 is used only on a terminal. The unused `jammi_db::init_tracing` is deleted.
 
+### D18 — what running at `full` scale found in the engine
+
+Each was found by a chapter failing on an L4 at `full` and fixed at its cause:
+
+- **Hard-negative mining ran out of GPU memory** encoding every positive in one
+  batch. It encodes them in the training batch size.
+- **A mutable-table write wider than one statement failed** with "too many SQL
+  variables". Each backend declares its bind-parameter ceiling (SQLite 32,766,
+  Postgres 65,535) and writes and key deletes are chunked under it.
+- **An OpenCLIP checkpoint resolved a config and weights from different
+  conventions.** Resolution reads the repo listing first and picks the config
+  and weights as a pair.
+- **A bare `ModernBertModel` checkpoint did not load.** It now loads the way a
+  bare `BertModel` already did.
+- **The context-predictor bench's committed baseline named a serving table**
+  that exists only in the session that trained it. The committed baseline is
+  the model's trained shape, without that key; the determinism tests register
+  it naming their own session's table.
+
+### D19 — the `full` text encoder is embedding-trained, and full fine-tunes run in bf16
+
+`answerdotai/ModernBERT-base` is a masked-LM checkpoint, not an embedding model:
+raw same-subject precision@10 0.358, and propagation did nothing (−0.003).
+`Alibaba-NLP/gte-modernbert-base` gives 0.513 raw and 0.551 propagated, and every
+`full` finding was re-measured on it. Several chapter claims made on the old
+encoder did not survive and were rewritten (D21–D23). Full-scale fine-tunes
+train at `encoders.training_dtype(scale)` — bf16 on the sm_80+ GPU they need,
+f32 on the small scale's CPU — which needed `fine_tune_graph` to take every
+shared training knob.
+
+### D20 — the dataset cache is written by atomic rename
+
+Two sessions sharing the cache (two chapters or notebooks at once) re-cache the
+same table, and the in-place write truncated the parquet under the other
+session's scan ("Corrupt footer"). Downloads and cached tables now land through
+one temp-file-and-rename helper.
+
+### D21 — the tier-04 predictor's budget is one it descends
+
+At the default learning rate (5e-3) the year predictor never descended its
+objective at `full` scale: a step is one whole subject task, and the year is only
+weakly predictable from a paper's neighbours (a kNN-mean regressor over the
+propagated table reaches RMSE 1.00 against the mean's 1.04). The held-out CRPS
+oscillated above its starting value, and two pods on different NVIDIA drivers
+agreed for fifteen epochs and then diverged to interval coverages of 0.961 and
+0.892. At 1e-4 it descends smoothly to its floor by epoch 30; the pods agree to
+three decimals. The chapters' conformal findings are the ones measured on that
+predictor: the year interval under-covers (0.689) and a density-ratio reweight
+lifts it only to 0.702; the subject set holds nominal (0.908), its score
+orthogonal to the shift.
+
+### D22 — weighted conformal holds the test row's own mass
+
+The book's weighted split-conformal quantile normalized over the calibration rows
+alone, while its marginal pass used the finite-sample ⌈(n+1)(1−α)⌉ rule — the two
+passes differed in more than their weights, and the weighted one was
+anti-conservative. `shift.quantiles` is one routine (Tibshirani et al. 2019):
+each test row's own weight sits at +∞, and uniform weights are the marginal
+quantile. The conformal chapter's synthetic shift drew 90% of its pool without
+replacement — barely a bias, and not the likelihood ratio its weights assumed —
+so each paper is now kept independently with a known probability, the weight is
+its exact inverse, and coverage is reported as the mean over 200 draws, the
+expectation the guarantee is stated in.
+
+### D23 — a finding the data does not support is rewritten, not re-tuned
+
+Where a `full` measurement refuted a chapter's claim, the chapter now says what
+was measured: rank fusion is judged by a paired per-query difference and is a
+wash; the regression fine-tunes land on the predict-the-mean baseline and their
+Gaussian heads under-cover out of sample; the declared-edge fine-tune lifts
+precision about as much as propagation, not more. No budget or seed was searched
+to make an old claim pass.
+
 ## Cuts
 
 - **T4 / sm_75.** The CUDA wheel targets sm_80+; a T4 Colab runtime runs the

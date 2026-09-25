@@ -2409,16 +2409,20 @@ impl TrainingLoop {
         let batch = self.config.batch_size.max(1);
         let result = (|| {
             // Candidate corpus = the positives, keyed by row index so a mined id
-            // maps back to its positive text. The positive vectors are moved into
-            // the index and dropped here — the index is their only owner.
-            let candidates: Vec<Candidate> = embed(self, &positives)?
-                .into_iter()
-                .enumerate()
-                .map(|(i, embedding)| Candidate {
-                    id: i.to_string(),
-                    embedding,
-                })
-                .collect();
+            // maps back to its positive text, encoded a training batch at a time
+            // like the anchors below: one forward over the whole corpus would
+            // hold every row's activations at once. The positive vectors are
+            // moved into the index and dropped here — the index is their only
+            // owner.
+            let mut candidates: Vec<Candidate> = Vec::with_capacity(positives.len());
+            for chunk in positives.chunks(batch) {
+                for embedding in embed(self, chunk)? {
+                    candidates.push(Candidate {
+                        id: candidates.len().to_string(),
+                        embedding,
+                    });
+                }
+            }
             let miner = HardNegativeMiner::build(&candidates, self.config.hard_negatives)?;
             drop(candidates);
 

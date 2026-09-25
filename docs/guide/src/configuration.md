@@ -215,12 +215,12 @@ metrics_sample_secs = 5
 # the single-rank deployment: no gang, no collective) and never more than
 # the configured device count. Orthogonal to a submitted job's own
 # `world_size` (a separate, per-job knob) and to `[distributed]
-# max_world_size` (the fleet-wide bound on a `Peer` gang across hosts) -
-# the three knobs load independently, with no cross-check between any
-# pair. A claimed job whose `world_size` is within `local_ranks` runs every
-# rank in this process over a `Local` gang; one wider than `local_ranks`
-# makes this process rank 0 of a `Peer` gang whose other ranks are fleet
-# members it assembles and dials.
+# max_world_size` (the fleet-wide bound on a `Peer` gang across hosts). A
+# job is admitted at submit when its `world_size` is within the wider of
+# the two - the widest gang this deployment can form. A claimed job whose
+# `world_size` is within `local_ranks` runs every rank in this process over
+# a `Local` gang; one wider than `local_ranks` makes this process rank 0 of
+# a `Peer` gang whose other ranks are fleet members it assembles and dials.
 local_ranks = 1
 # Which collective a multi-rank worker reduces gradients over. Default:
 # "auto" (the best collective this process can actually reach: NCCL on a
@@ -237,12 +237,11 @@ rank_timeout_secs = 120
 
 [distributed]
 # The widest `Peer` gang any coordinator on this deployment may admit,
-# bounding a job's own `world_size` ACROSS FLEET MEMBERS: a submitted
-# `world_size` past it is refused at submit, from configuration alone; one
-# within it submits even when it is wider than this host's own `[gpu]
-# devices`, and is decided by assembly on the claiming coordinator. Loads
-# independently of `[worker]`'s own per-host rank count -- the two knobs
-# are checked against each other by nothing. Must be >= 1 (1, the default,
+# bounding a job's own `world_size` ACROSS FLEET MEMBERS. A submitted
+# `world_size` past both this and `[worker] local_ranks` is refused at
+# submit, from configuration alone; one within this bound submits even when
+# it is wider than this host's own `[gpu] devices`, and is decided by
+# assembly on the claiming coordinator. Must be >= 1 (1, the default,
 # admits no fleet gang at all).
 max_world_size = 1
 

@@ -635,9 +635,10 @@ the process that claimed the job:
 5. the run as rank 0 over `Peer`;
 6. exactly one assembly outcome recorded on the row, then the lease settled (below).
 
-`world_size` is checked at submit against `[distributed] max_world_size` only
-(`crates/jammi-ai/src/fine_tune/spec.rs::RankAdmission`): a world size within it but beyond this
-host's own devices submits and is decided by assembly, never refused at submit.
+`world_size` is checked at submit against the serveable world — the wider of `[worker]
+local_ranks` and `[distributed] max_world_size`, the widest gang the configuration can form
+(`crates/jammi-ai/src/fine_tune/spec.rs::RankAdmission`): a world size within the fleet bound but
+beyond this host's own devices submits and is decided by assembly, never refused at submit.
 
 **Assembly outcomes are a total table**
 (`crates/jammi-db/src/catalog/jobs_repo.rs::AssemblyOutcome`; a new variant with no rule is a

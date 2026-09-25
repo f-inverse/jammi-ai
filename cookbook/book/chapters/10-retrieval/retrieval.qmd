@@ -26,6 +26,7 @@ import tempfile
 from collections import defaultdict
 
 import jammi
+import numpy as np
 from jammi_cookbook import contracts, datasets, encoders, keystone, scale
 
 SCALE = scale.current()
@@ -67,15 +68,15 @@ def dense(table: str):
     return rank
 
 
-def score(ranked: dict[str, list[str]]) -> tuple[float, float]:
-    """precision@10 and nDCG@10 against the same-subject golden."""
-    precision = ndcg = 0.0
-    for q, ranks in ranked.items():
-        hits = [1.0 if r in relevant[q] else 0.0 for r in ranks[:10]]
+def per_query(ranked: dict[str, list[str]]) -> np.ndarray:
+    """Each query's precision@10 and nDCG@10 against the same-subject golden,
+    one row per query in ``queries`` order."""
+    rows = []
+    for q in queries:
+        hits = [1.0 if r in relevant[q] else 0.0 for r in ranked[q][:10]]
         ideal = sum(1 / math.log2(i + 2) for i in range(min(10, len(relevant[q]))))
-        precision += sum(hits) / 10
-        ndcg += sum(h / math.log2(i + 2) for i, h in enumerate(hits)) / ideal
-    return precision / len(ranked), ndcg / len(ranked)
+        rows.append((sum(hits) / 10, sum(h / math.log2(i + 2) for i, h in enumerate(hits)) / ideal))
+    return np.array(rows)
 
 
 rankers = {"dense_raw": dense(raw), "dense_prop": dense(propagated)}
@@ -125,7 +126,8 @@ ranked["rrf_raw_bm25"] = {
     for q in queries
 }
 
-metrics = {name: score(r) for name, r in ranked.items()}
+by_query = {name: per_query(r) for name, r in ranked.items()}
+metrics = {name: tuple(float(m) for m in rows.mean(axis=0)) for name, rows in by_query.items()}
 print(f"{'method':<14}{'precision@10':>14}{'nDCG@10':>10}")
 for name, (p, n) in metrics.items():
     print(f"{name:<14}{p:>14.3f}{n:>10.3f}")
@@ -140,32 +142,42 @@ for name, (p, n) in metrics.items():
 
 ## The honest fusion finding
 
-This is the part a benchmark table would quietly drop.
+This is the part a benchmark table would quietly drop. A fused list "helps" only
+if it beats the best single arm by more than the queries' own noise, so the
+comparison is **paired**: the same 200 queries, each scored under both lists, and
+the mean per-query difference set against its standard error.
 
 ```{python}
-best_single = max(metrics[m][0] for m in ("dense_raw", "dense_prop", "bm25"))
-best_fused = max(metrics[m][0] for m in ("rrf_raw_prop", "rrf_raw_bm25"))
-print(f"best single arm: {best_single:.3f}   best fusion: {best_fused:.3f}   "
-      f"fusion helps: {best_fused > best_single}")
+single = max(("dense_raw", "dense_prop", "bm25"), key=lambda m: metrics[m][0])
+fused = max(("rrf_raw_prop", "rrf_raw_bm25"), key=lambda m: metrics[m][0])
+diff = by_query[fused] - by_query[single]
+gain, se = diff.mean(axis=0), diff.std(axis=0, ddof=1) / np.sqrt(len(diff))
+print(f"best single arm: {single}   best fusion: {fused}")
+for i, metric in enumerate(("precision@10", "nDCG@10")):
+    print(f"{metric:<13} fused − single: {gain[i]:+.3f}   (standard error {se[i]:.3f})")
 ```
 
 ```{python}
 # | echo: false
+contracts.assert_close("retrieval.fusion_gain_precision", float(gain[0]), tol=0.02)
+contracts.assert_close("retrieval.fusion_gain_ndcg", float(gain[1]), tol=0.02)
 if SCALE is scale.Scale.FULL:
-    assert best_fused <= best_single  # no fused list beats the dominant single arm
+    # Neither metric moves by two standard errors: fusion is a wash.
+    assert all(abs(g) < 2 * e for g, e in zip(gain, se))
+    assert fused == "rrf_raw_prop" and single == "dense_prop"
+    assert metrics["rrf_raw_bm25"][0] < metrics["dense_prop"][0]
 ```
 
-At `full` scale **fusion does not help**: RRF of the two dense arms beats the
-*weaker* raw arm but sits below the propagated arm, and the hybrid dense + lexical
-list is dragged down by the weaker lexical ranker. The reason is structural:
-**RRF cannot exceed the best single ranker it contains when one ranker
-dominates** — mixing in a weaker list only dilutes the strong list's top ranks.
-Fusion pays off when the arms are *complementary and comparably strong*; here
-the propagated arm already dominates, so the strongest move is to use it alone —
-the lesson tier 02 taught from the other side: **graph propagation, not fusion,
-is the lever on this target.** Measure each arm first; fuse only when a weaker
-arm contributes relevant documents the strong arm misses, and confirm the fused
-list actually beats the best single arm.
+At `full` scale **fusion is a wash**. RRF of the two dense arms lands next to the
+propagated arm it contains — a hair ahead on one metric, a hair behind on the
+other, neither by two standard errors — and the hybrid dense + lexical list
+lands on its raw dense arm, well below the propagated one. Rank fusion adds
+something only when a weaker arm reliably surfaces relevant papers the stronger
+one misses; on this target neither the raw dense arm nor BM25 does it often
+enough to show. The large lever is the one tier 02 taught — **graph propagation**, which
+moves precision@10 by several points, where fusion moves it by less than its
+noise. Measure each arm first; fuse only when the paired difference says the
+fused list beats the best single arm.
 
 ## `assemble_context(hybrid=True)` — a context from similarity and citations
 

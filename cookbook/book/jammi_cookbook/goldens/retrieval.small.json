@@ -23,6 +23,14 @@
     "tol": 0.02,
     "value": 0.39899999999999997
   },
+  "fusion_gain_ndcg": {
+    "tol": 0.02,
+    "value": 0.004518001890365229
+  },
+  "fusion_gain_precision": {
+    "tol": 0.02,
+    "value": -0.048
+  },
   "rrf_raw_bm25.ndcg_at_10": {
     "tol": 0.02,
     "value": 0.4306204930034031

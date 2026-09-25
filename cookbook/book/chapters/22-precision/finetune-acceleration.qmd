@@ -43,9 +43,10 @@ the kernel's own admission gate recorded) — read back through the SAME handle 
 surface that can ever reach a *flash-compiled* binary: FlashAttention is vendored CUTLASS/CUDA
 source (`crates/jammi-kernels/third_party/flash-attention`), gated behind the `flash-attn` cargo
 feature, and only the CUDA release lanes (the tarball, the `cu12` wheel, the container image)
-compile it in. The `jammi-server` this render's own `grpc://` cell talks to is **not** one of
-those builds — it is a plain `cargo build --release -p jammi-server`, no `cuda` feature, no
-`flash-attn` feature (the same binary this book's CI provisions through `setup-jammi-py`'s
+compile it in. The servers this chapter starts are pinned to the CPU (`[gpu] device = -1`,
+set through the environment below), whichever `jammi-server` is installed — a CUDA build's
+kernels have no CUDA device to run on here. In CI that server is a plain `cargo build --release -p
+jammi-server`, no `cuda` feature, no `flash-attn` feature (the same binary this book's CI provisions through `setup-jammi-py`'s
 `build-server: "true"` input, which is exactly that bare `cargo build --release -p jammi-server`:
 the nightly full-book render always builds it — `cookbook-render.yml` — and the PR book gate
 builds it when its chapter selector picks a chapter that needs a live server, as this one always
@@ -124,7 +125,9 @@ ARTIFACT_DIR = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
 
 # Server A: the training surface is mounted and accepts submissions, but this
 # process never claims — `[worker] enabled = false`.
-server_a = LiveServer(ARTIFACT_DIR, env={"JAMMI_WORKER__ENABLED": "false"}).__enter__()
+server_a = LiveServer(
+    ARTIFACT_DIR, env={"JAMMI_WORKER__ENABLED": "false", "JAMMI_GPU__DEVICE": "-1"}
+).__enter__()
 # The literal `grpc://` target — the same public front door every other
 # remote-transport chapter in this book opens, over a real live server this
 # render itself just started.
@@ -272,7 +275,7 @@ print(f"server A closed (returncode={server_a.returncode})")
 
 # Server B: today's all-in-one, no override, `enabled` at its default. That
 # this open SUCCEEDS on the same directory is the release proof.
-server_b = LiveServer(ARTIFACT_DIR).__enter__()
+server_b = LiveServer(ARTIFACT_DIR, env={"JAMMI_GPU__DEVICE": "-1"}).__enter__()
 remote = jammi.connect(server_b.endpoint)
 print(f"server B (worker enabled, the default) up at {server_b.endpoint}, same artifact dir")
 ```
@@ -323,7 +326,7 @@ print(json.dumps(report_f16, indent=2, sort_keys=True))
 
 assert report_f16["state"] == "determined"
 assert report_f16["dtype"] == "f16"
-assert report_f16["device"] == "cpu"  # this render's server has no CUDA device
+assert report_f16["device"] == "cpu"  # both servers are pinned to the CPU
 ```
 
 ## Reading `Holds` and `Miss` — the real vocabulary, on a real (CPU) job
@@ -376,7 +379,12 @@ assert report_f16["ops"]["attention_block"] == {
     "holds": False,
     "reason": "dtype_f32_matching_between_qkv_and_mask_on_cpu",
 }, report_f16["ops"]["attention_block"]
-assert report_f16["flash"] == {"holds": False, "reason": "cuda_not_compiled"}, report_f16["flash"]
+# Why flash is out of reach depends on the installed server, never on this job: a CPU
+# build has no CUDA code at all; a CUDA build has it, but its device is the CPU.
+assert report_f16["flash"] in (
+    {"holds": False, "reason": "cuda_not_compiled"},
+    {"holds": False, "reason": "device_is_cpu_or_metal_not_cuda"},
+), report_f16["flash"]
 
 n_hold = sum(1 for e in report_f16["ops"].values() if e["holds"])
 print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
@@ -425,9 +433,11 @@ print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
   cannot route around here). ModernBERT-base *and* ModernBERT-large both clear the shape gate in
   practice — `768 / 12 = 64` heads-to-hidden, `1024 / 16 = 64` — this render's own fixture is
   simply built too small to reach it, on purpose (hermetic, CPU-fast).
-- **`flash` → `Miss`, `cuda_not_compiled`.** The flash cascade short-circuits on a
-  compiled/device-level fact *before* it ever consults a domain check — this build has no `cuda`
-  feature at all, so this is the honest floor every dtype gets on this render, discussed next.
+- **`flash` → `Miss`, `cuda_not_compiled` or `device_is_cpu_or_metal_not_cuda`.** The flash
+  cascade short-circuits on a compiled/device-level fact *before* it ever consults a domain
+  check: a CPU `jammi-server` has no `cuda` feature at all (`cuda_not_compiled`), and a CUDA one
+  pinned to the CPU has the code but not the device. Either is the honest floor every dtype gets
+  on a CPU, discussed next.
 
 ## `bf16` is refused, loud — the training-side peer of the inference gate
 
@@ -435,8 +445,8 @@ print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
 load time on a CPU-only build. Fine-tuning's own gate is a different function
 (`validate_backbone_precision`, checked once the claiming worker resolves a device) with a
 **coarser** predicate: it refuses `bf16` on *any* non-CUDA device, not specifically below an
-Ampere compute-capability floor — because a CPU-only build (like this render's) is exactly the
-build class `bf16` never runs on, floor or no floor.
+Ampere compute-capability floor — because a CPU (like this chapter's servers') is exactly the
+device class `bf16` never runs on, floor or no floor.
 
 ```{python}
 try:

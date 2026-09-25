@@ -74,10 +74,10 @@ and the worker fleet:
   `worker_id`.
 
 Logs are emitted as structured records, JSON or human-readable text per
-`logging.format` (`LogFormat`). The filter comes from `logging.level`, with
-`RUST_LOG` as an optional override. Output always goes to stdout — a server runs
-non-interactively by design — and ANSI colour is enabled only when stdout is a
-terminal.
+`logging.format` (`LogFormat`). The filter comes from `logging.level` (`info`
+when unset), with `RUST_LOG` as an optional override. Output always goes to
+stdout — a server runs non-interactively by design — and ANSI colour is enabled
+only when stdout is a terminal.
 
 ```json
 {"timestamp":"2026-06-15T04:17:33.114Z","level":"INFO","fields":{"message":"job completed"},"target":"jammi_ai::fine_tune::worker","span":{"job_id":"job-7af3","worker_id":"worker-2","tenant_id":"acme","name":"run_claimed_job"}}

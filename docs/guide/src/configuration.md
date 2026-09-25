@@ -506,7 +506,9 @@ max_job_waits = 1024
 # `127.0.0.1`); an ephemeral `:0` never collides with anything.
 
 [logging]
-# Log level: "trace", "debug", "info", "warn", "error". Default: "info".
+# Log filter: "trace", "debug", "info", "warn", "error", or a per-target
+# directive ("jammi_ai=debug"). Unset: "info" for jammi-server, "warn" for the
+# engine embedded in a Python process. RUST_LOG, when set, overrides it.
 level = "info"
 # Log format: "text" or "json". Default: "text".
 format = "text"

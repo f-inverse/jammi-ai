@@ -138,7 +138,7 @@ fn config_for(artifact_dir: &Path, device: i32) -> JammiConfig {
             ..Default::default()
         },
         logging: LoggingConfig {
-            level: "info".into(),
+            level: Some("info".into()),
             ..Default::default()
         },
         ..Default::default()

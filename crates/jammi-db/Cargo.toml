@@ -108,7 +108,6 @@ uuid.workspace = true
 rand.workspace = true
 chrono.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 thiserror.workspace = true
 directories.workspace = true
 tokio.workspace = true
@@ -136,6 +135,9 @@ jammi-test-resources.workspace = true
 test-case = { workspace = true }
 # `libc` is a regular dependency above, so tests use it from there.
 parquet = { workspace = true }
+# `materialization.rs` captures a `tracing::warn!` through a real `fmt`
+# subscriber.
+tracing-subscriber.workspace = true
 # The `models_delete_call_sites.rs` source oracle keys its reviewed
 # raw-byte-delete-call-site table by (file, enclosing fn, ordinal-within-that-fn),
 # which only a real AST walk can determine (a text scan cannot tell a doc

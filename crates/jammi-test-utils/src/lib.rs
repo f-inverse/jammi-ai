@@ -396,7 +396,7 @@ pub fn test_config(artifact_dir: &Path) -> jammi_db::config::JammiConfig {
             ..Default::default()
         },
         logging: jammi_db::config::LoggingConfig {
-            level: "debug".into(),
+            level: Some("debug".into()),
             ..Default::default()
         },
         ..Default::default()

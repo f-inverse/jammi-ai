@@ -3,9 +3,10 @@
 //! Both the standalone `jammi-server` binary and the `jammi serve`
 //! subcommand install the *same* global subscriber so that a server's
 //! logs behave identically however it is launched. Logging is wired to
-//! the resolved [`LoggingConfig`](jammi_db::config::LoggingConfig): the
-//! level/filter comes from the config (with `RUST_LOG` as an optional
-//! override) and the formatter is JSON or text per `logging.format`.
+//! the resolved [`LoggingConfig`](jammi_db::config::LoggingConfig) through
+//! [`jammi_ai::telemetry::fmt_layer`]: the filter comes from the config (with
+//! `RUST_LOG` as an optional override, and `info` when neither is set) and
+//! the formatter is JSON or text per `logging.format`.
 //!
 //! Output always goes to stdout regardless of whether stdout is a
 //! terminal — a server runs non-interactively (containers, redirected
@@ -28,12 +29,17 @@
 
 use std::io::{self, IsTerminal};
 
-use jammi_db::config::{JammiConfig, LogFormat};
+use jammi_db::config::JammiConfig;
 use jammi_db::error::Result;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer, Registry};
+use tracing_subscriber::{Layer, Registry};
+
+/// A server's log level when neither `[logging] level` nor `RUST_LOG` names
+/// one: a daemon logs its operations.
+const LOG_DEFAULT: LevelFilter = LevelFilter::INFO;
 
 /// Keeps the OTLP tracer-provider's background flush thread and gRPC
 /// channel alive for the process, once [`init_tracing`] configures one.
@@ -47,8 +53,8 @@ static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProvid
 
 /// Install the global tracing subscriber from the engine config.
 ///
-/// Honours `RUST_LOG` when set; otherwise falls back to the config's
-/// `logging.level`. Emits JSON when `logging.format = "json"`, otherwise
+/// Honours `RUST_LOG` when set; otherwise the config's `logging.level`, else
+/// `info`. Emits JSON when `logging.format = "json"`, otherwise
 /// a human-readable text layer. Writes to stdout unconditionally; ANSI
 /// colour is enabled only when stdout is a terminal. Also installs the
 /// OTLP export layer per `[observability]` — see the module docs.
@@ -77,15 +83,7 @@ where
     // anything else — present in every build of `jammi-ai`, feature or not.
     jammi_ai::telemetry::refuse_if_endpoint_without_feature(&config.observability)?;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(config.logging.level.clone()));
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_writer(writer)
-        .with_ansi(ansi);
-    let fmt_layer: Box<dyn Layer<Registry> + Send + Sync> = match config.logging.format {
-        LogFormat::Json => Box::new(fmt_layer.json().with_filter(filter)),
-        LogFormat::Text => Box::new(fmt_layer.with_filter(filter)),
-    };
+    let fmt_layer = jammi_ai::telemetry::fmt_layer(&config.logging, LOG_DEFAULT, writer, ansi);
 
     // A `Vec<Box<dyn Layer<Registry>>>` is itself one `Layer<Registry>` —
     // tracing_subscriber's blanket impl applies each element to the SAME
@@ -176,18 +174,9 @@ mod tests {
         let writer = BufferWriter(buffer.clone());
 
         let mut config = JammiConfig::default();
-        config.logging.level = "info".into();
         config.logging.format = format;
-
-        let filter = EnvFilter::new(config.logging.level.clone());
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(writer)
-            // A redirected sink is never a terminal.
-            .with_ansi(false);
-        let fmt_layer: Box<dyn Layer<Registry> + Send + Sync> = match config.logging.format {
-            LogFormat::Json => Box::new(fmt_layer.json().with_filter(filter)),
-            LogFormat::Text => Box::new(fmt_layer.with_filter(filter)),
-        };
+        // A redirected sink is never a terminal.
+        let fmt_layer = jammi_ai::telemetry::fmt_layer(&config.logging, LOG_DEFAULT, writer, false);
 
         let _guard: DefaultGuard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(fmt_layer));

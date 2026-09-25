@@ -104,9 +104,10 @@ impl CollectiveSelection {
 }
 
 /// Log output format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogFormat {
+    #[default]
     Text,
     Json,
 }
@@ -2478,11 +2479,15 @@ impl BallistaConfig {
 }
 
 /// Tracing/logging configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Log level filter (e.g., `"info"`, `"debug"`, `"warn"`). Default: `"info"`.
-    pub level: String,
+    /// Log filter directive (e.g. `"info"`, `"warn"`, `"jammi_ai=debug"`).
+    /// Unset, the host's own default applies: `info` for `jammi-server`, a
+    /// daemon that logs its operations, and `warn` for an engine embedded in
+    /// another process, which stays quiet unless asked. `RUST_LOG`, when set,
+    /// overrides either.
+    pub level: Option<String>,
     /// Output format. Default: `Text`.
     pub format: LogFormat,
 }
@@ -2867,15 +2872,6 @@ impl Default for ServerConfig {
             peer_advertise: None,
             peer_local_load_bytes: None,
             placement: PlacementMode::default(),
-        }
-    }
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: "info".into(),
-            format: LogFormat::Text,
         }
     }
 }

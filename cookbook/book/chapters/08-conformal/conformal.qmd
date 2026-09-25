@@ -22,8 +22,8 @@ predictions. It carries two payloads:
    year-regression intervals. Every coverage and size is measured here and
    checked against a frozen golden.
 2. **The score-aligned weighted restore** — the keystone (tier 04) showed that on
-   the *real* ogbn-arxiv time-split, importance-weighting is a **no-op** because the
-   shift is nearly orthogonal to the conformal score. Here we demonstrate the
+   the *real* ogbn-arxiv time-split, importance-weighting is a **no-op** for the
+   subject sets, because the shift is nearly orthogonal to their conformal score. Here we demonstrate the
    **complement**: a *transparently-synthetic, clearly-labelled* covariate shift that
    **moves the score distribution**, on which weighted split-conformal [@tibshirani2019covariateshift]
    **genuinely restores** coverage to nominal. The two results are the two halves of one
@@ -184,29 +184,30 @@ contracts.assert_close("arxiv.conformal.interval_width", iv_width, tol=0.6)
 contracts.assert_close("arxiv.conformal.cqr_coverage", cqr_cov, tol=0.04)
 contracts.assert_close("arxiv.conformal.cqr_width", cqr_width, tol=0.6)
 if SCALE is scale.Scale.FULL:
-    # Both under-cover under the time split; CQR is wider (it inherits the
-    # predictor's spread) and recovers a little more coverage.
-    assert iv_cov < 1 - alpha and cqr_cov < 1 - alpha
-    assert cqr_width > iv_width and cqr_cov > iv_cov
+    # Both under-cover under the time split; CQR recovers a little more
+    # coverage, still far short of nominal.
+    assert iv_cov < cqr_cov < 1 - alpha - 0.1
 ```
 
-At `full` scale both intervals **under-cover** under the time split — the same non-exchangeability
-lesson as the classification sets. CQR's interval is **wider** (it inherits the
-predictor's $\hat\sigma$ rather than imposing one constant half-width) and recovers a
-little more coverage, but not to nominal. The keystone (tier 04) carries the *why*:
-the predictor's point prediction is essentially unbiased across eras, but the test
-era's residuals genuinely run larger — yet residual size is uncorrelated with
-test-likeness *within* the calibration set, so no amount of importance-reweighting
-on the calibration era can see (or repair) that bias. Weighting that interval is a
-no-op there.
+At `full` scale both intervals **under-cover** under the time split — unlike the
+classification sets, which hold. CQR's interval scales with the predictor's own
+$\hat\sigma$ rather than imposing one constant half-width; here the predictor
+serves nearly the same $\hat\sigma$ for every paper, so the two bands are about
+as wide, and CQR recovers only a little more coverage. The keystone (tier 04)
+carries the *why*: the test era's residuals run about one and a half times the
+calibration era's. Residual size does track test-era likeness within the
+calibration set, so importance-reweighting widens the interval a little — but
+the weights only redistribute mass over residuals the calibration era already
+has, and it has too few of the test era's size to reach nominal.
 
 ## Part C — the score-aligned weighted restore (the keystone's complement)
 
 Here is the genuinely novel payoff of this chapter. The keystone showed that on the
 **real** ogbn-arxiv time-split, importance-weighted conformal [@tibshirani2019covariateshift] is a
-**no-op**, with the diagnostic that the shift is nearly **orthogonal** to the
-conformal score: `corr(nonconformity, test-likeness)` is near zero. The lesson there was
-the *negative* one — weighting cannot repair a shift the score cannot see.
+**no-op** for the subject sets, with the diagnostic that the shift is nearly **orthogonal**
+to their conformal score: `corr(nonconformity, test-likeness)` is near zero. The lesson
+there was the *negative* one — weighting cannot move a quantile along a shift the score
+cannot see.
 
 This is the **complement**, and we are explicit about its status:
 
@@ -216,8 +217,8 @@ This is the **complement**, and we are explicit about its status:
 The covariate shift in this section is **transparently synthetic and deliberately
 constructed**. It is **not** a property of the real ogbn-arxiv time-split, and we make
 **no** claim that the real time-split is repairable by weighting — it is not (the
-keystone shows the orthogonal-shift no-op, and the regression case is a location
-shift). The purpose here is to exhibit the *other half* of the theorem: the case where
+keystone shows the orthogonal-shift no-op for the subject sets, and a year-interval
+shift that reaches past what the calibration era's residuals can cover). The purpose here is to exhibit the *other half* of the theorem: the case where
 the shift **does** move the nonconformity-score distribution, so that the weighted
 restore is real. We label it as a device precisely so the two halves stay honest.
 :::
@@ -342,12 +343,11 @@ db.close()
 
 > **Weighted conformal repairs a covariate shift if and only if the shift moves the
 > nonconformity-score distribution.** The keystone (tier 04) is one half: on the real
-> ogbn-arxiv time-split the shift is *orthogonal* to the score (a near-zero correlation for
-> classification; for regression, residual magnitude is uncorrelated with
-> test-likeness *within* the calibration set, even though the residuals themselves do
-> shift across eras), so reweighting the calibration CDF along a direction the score
-> barely depends on cannot move the quantile — a no-op, and the honest remedy is a
-> governed, time-aware cohort. This chapter is the other half: a
+> ogbn-arxiv time-split the classification shift is *orthogonal* to the score (a
+> near-zero correlation), so coverage holds and reweighting has nothing to move; the
+> regression residuals *do* shift across eras, further than a reweight of the
+> calibration era's residuals can reach — and the honest remedy there is a governed,
+> time-aware cohort. This chapter is the other half: a
 > transparently-constructed, score-aligned
 > shift, positively correlated with the score, on which marginal under-covers and the
 > weighted restore [@tibshirani2019covariateshift] is real. Together they are the complete statement —

@@ -89,8 +89,16 @@ def fine_tune_on_graph(
     )
 
 
-# Tier 04's context-predictor meta-training epochs.
-PREDICTOR_EPOCHS = {Scale.SMALL: 20, Scale.FULL: 80}
+# Tier 04's context-predictor meta-training budget. A step is one whole subject
+# task, and a paper's year is only weakly predictable from its neighbours, so at
+# full scale a larger step oscillates above the objective's starting value
+# rather than descending it: at 1e-4 the held-out score falls smoothly to its
+# floor by about epoch 30 and is flat around it. The small scale's random-weight
+# encoder has nothing to learn, so its short run exercises the same path.
+PREDICTOR_BUDGET = {
+    Scale.SMALL: {"epochs": 20, "learning_rate": 5e-3},
+    Scale.FULL: {"epochs": 30, "learning_rate": 1e-4},
+}
 
 
 def train_year_predictor(db, arxiv: Arxiv, scale: Scale, embeddings: str) -> str:
@@ -107,8 +115,8 @@ def train_year_predictor(db, arxiv: Arxiv, scale: Scale, embeddings: str) -> str
         architecture="attncnp",
         output="gaussian",
         objective="crps",
-        epochs=PREDICTOR_EPOCHS[scale],
         seed=0,
+        **PREDICTOR_BUDGET[scale],
     )
     job.wait()
     return job.output_model_id

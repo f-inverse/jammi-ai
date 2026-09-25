@@ -147,7 +147,7 @@ The tier with **no monograph and no Neptune analogue** — the non-redundant cor
 - **Conformal under graph dependence.** Conformal gives finite-sample coverage
   *under exchangeability* (Vovk et al. [@vovk2005conformal]; Angelopoulos & Bates
   [@angelopoulos2021conformal]). Under graph dependence and a time-split that
-  coverage breaks (Barber et al. [@barber2023beyond]); the graph-aware remedies are
+  coverage can break (Barber et al. [@barber2023beyond]); the graph-aware remedies are
   CF-GNN [@huang2023cfgnn] and NAPS [@clarkson2023naps], and the covariate-shift
   remedy is weighted conformal (Tibshirani et al. [@tibshirani2019covariateshift]).
 - **Jammi calls.** `train_context_predictor` / `predict_with_context_predictor` →
@@ -155,9 +155,10 @@ The tier with **no monograph and no Neptune analogue** — the non-redundant cor
 
 This is the crux the [tier-04 chapter](../04-predict/predict.qmd) works in full.
 The signature here is the moat's worked example: the predictor fits a real
-posterior, and **both** the regression interval and the classification set
-under-cover under the time-split — the honest finding weighted conformal cannot
-repair (it moves the quantile only when the shift is score-aligned).
+posterior, and under the time-split the regression interval under-covers — the
+test era's residuals run past anything the calibration era holds, so weighted
+conformal cannot repair it — while the classification set holds its coverage,
+the shift being orthogonal to its score.
 
 ```{python}
 predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
@@ -181,7 +182,7 @@ print(f"regression interval coverage:  {reg_cov:.3f}   (nominal 0.90)")
 ```{python}
 # | echo: false
 if SCALE is scale.Scale.FULL:
-    assert reg_cov < 0.90  # the graph-dependence break, at the scale it is about
+    assert reg_cov < 0.80  # the time-split break, at the scale it is about
 ```
 
 ## The Neptune-contrast framing

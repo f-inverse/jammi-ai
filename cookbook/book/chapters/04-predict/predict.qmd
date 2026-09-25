@@ -24,10 +24,11 @@ prediction** with an honest coverage guarantee. It carries two results:
    Writing this recipe found that collapse; the engine now standardizes the
    predictor's target and its context members' values in z-space and
    de-standardizes what it serves. The recipe runs because of that fix.
-2. **The conformal-under-shift lesson.** Under the dataset's time split, both
-   the year interval and the subject-classification set *under-cover*, and the
-   textbook weighted-conformal remedy **restores neither**, for two different
-   reasons — each with the diagnostic that explains it.
+2. **The conformal-under-shift lesson.** The dataset's time split breaks one
+   crux and spares the other. The year interval *under-covers*, and the
+   textbook weighted-conformal remedy moves it only a little; the
+   subject-classification set *holds* its coverage, because the shift barely
+   touches its score. Each outcome comes with the diagnostic that explains it.
 
 Both are findings at `full` scale (4,000 papers, `gte-modernbert-base`). At `small` scale
 every cell below runs the same computation on the 400-paper core with a
@@ -132,8 +133,8 @@ only help if the calibration papers most like the test era carry the larger
 residuals the test era has. Whether they do is a property of the data, and the
 correlation below measures it. At `full` scale they do: residual size tracks
 test-era likeness, so reweighting toward the test era widens the interval and
-coverage rises. But the test era's residuals run close to twice the
-calibration set's — a spread shift no reweighting of the *calibration*
+coverage rises. But the test era's residuals run about one and a half times
+the calibration set's — a spread shift no reweighting of the *calibration*
 residuals can reach, since the weights only redistribute mass over residuals
 the calibration set already has — so the weighted interval still falls far
 short of 0.90. On the small core the calibration papers most like the test era
@@ -186,7 +187,7 @@ if SCALE is scale.Scale.FULL:
     # Residual size tracks test-era likeness, so the reweight helps, and the
     # test era's larger residuals keep it well short of nominal.
     assert reg_corr > 0 and reg_cov < wt_reg_cov < 1 - ALPHA
-    assert test_resid.mean() > 1.5 * cal_resid.mean()
+    assert test_resid.mean() > 1.25 * cal_resid.mean()
 ```
 
 ### The provenance rail
@@ -242,7 +243,7 @@ print(f"{len(scores.classes)} classes; test-era accuracy: {accuracy:.3f}")
 contracts.assert_close("arxiv.tier04.classifier_accuracy", accuracy, tol=0.04)
 ```
 
-### Marginal conformal under-covers on the graph
+### Marginal conformal holds under this shift
 
 Marginal split-APS conformal (`conformalize`) takes the calibration scores,
 finds the finite-sample $(1-\alpha)$ APS quantile, and forms a prediction *set*
@@ -263,14 +264,17 @@ print(f"engine APS marginal coverage: {marg_cov:.3f}   (mean set size {marg_size
 contracts.assert_close("arxiv.tier04.marginal_coverage", marg_cov, tol=0.03)
 contracts.assert_close("arxiv.tier04.marginal_set_size", marg_size, tol=0.6)
 if SCALE is scale.Scale.FULL:
-    assert marg_cov < 1 - ALPHA
+    # Within three binomial standard errors of nominal on the test era.
+    assert abs(marg_cov - (1 - ALPHA)) < 3 * np.sqrt(ALPHA * (1 - ALPHA) / len(sets))
 ```
 
-At `full` scale realised coverage falls **below** the nominal 0.90: a covariate
-shift carried along the homophilous citation graph mis-calibrates the marginal
-quantile.
+At `full` scale realised coverage sits **at** the nominal 0.90, to within
+sampling error: the later papers are a different population, yet the marginal
+quantile carries over. Exchangeability is sufficient for the guarantee, not
+necessary — what coverage needs is that the nonconformity *score* be
+distributed alike in the two eras, and the diagnostic below shows why it is.
 
-### The textbook remedy moves coverage but does not restore it
+### Weighting has nothing to repair
 
 Weighted split-conformal (Tibshirani et al. 2019) reweights the calibration
 nonconformity toward the test era. To compare apples to apples,
@@ -303,14 +307,14 @@ contracts.assert_close("arxiv.tier04.local_marginal_coverage", local_cov, tol=0.
 max_delta = max(abs(d) for d in deltas.values())
 contracts.assert_close("arxiv.tier04.weighting_max_abs_delta", max_delta, tol=0.01)
 if SCALE is scale.Scale.FULL:
-    assert all(local_cov + d < 1 - ALPHA for d in deltas.values())  # none restores nominal
-    assert min(deltas.values()) < 0  # not systematically toward nominal
+    assert max_delta < 0.02  # every scheme moves coverage by under two points
+    assert min(deltas.values()) < 0  # and not systematically in one direction
 ```
 
 At `full` scale the density ratio estimated over three neighbourhood sizes moves
-coverage a little, **not consistently toward nominal**, and **none reaches
-0.90**. Weighting nudges
-coverage but cannot restore it here.
+coverage by a point or two, **in no consistent direction**: there is no
+under-coverage to repair, and reweighting toward the test era leaves the
+quantile where it was.
 
 ### Why: the shift is orthogonal to the conformal score
 
@@ -331,16 +335,18 @@ if SCALE is scale.Scale.FULL:
 ```
 
 At `full` scale the correlation is near zero: the time-split shift lies almost
-entirely **orthogonal to the conformal score**, so reweighting the calibration
-distribution toward the test era redistributes mass along a direction the
-nonconformity barely depends on — the weighted quantile is essentially the
-marginal one. Weighted conformal is not a universal patch: it repairs
-under-coverage only when the shift is score-aligned (the conformal chapter
-builds that case).
+entirely **orthogonal to the conformal score**. That is why the marginal
+quantile carries over, and why reweighting cannot move it: the calibration
+distribution is redistributed along a direction the nonconformity barely
+depends on, so the weighted quantile is essentially the marginal one. The
+regression residual is the contrast — it *does* track test-era likeness, the
+era shifts it, and coverage breaks. Weighted conformal repairs under-coverage
+only when the shift is score-aligned, and fully only when the calibration set
+spans what the test era needs (the conformal chapter builds that case).
 
 ## The honest remedy: a governed calibration cohort
 
-If a client-side reweight cannot restore coverage in *either* crux, what does?
+If a client-side reweight cannot restore the year interval's coverage, what does?
 A **governed, time-aware (or simply larger) calibration cohort**: choose the
 calibration set so it is exchangeable with the deployment era — a Mondrian or
 time-stratified cohort the consumer owns. The engine exposes the **marginal**
@@ -358,8 +364,9 @@ db.close()
 > (Garnelo et al. 2018 CNP; Kim et al. 2019 ANP; the TabPFN/PFN line) — the
 > context set is a `search`/walk over the citation graph. Conformal gives
 > finite-sample coverage *under exchangeability* (Vovk; Angelopoulos & Bates
-> 2021); under this dataset's time split both the regression interval and the
-> classification set under-cover (Barber et al. 2023). The textbook remedy is
+> 2021); under this dataset's time split the regression interval under-covers
+> while the classification set holds, as the score shift predicts (Barber et
+> al. 2023). The textbook remedy is
 > weighted / stratified conformal (Tibshirani et al. 2019; NAPS, Clarkson et al.
 > 2023; CF-GNN, Huang et al. 2023) — but it repairs only a shift the
 > nonconformity score can *see*. This is the tier with **no monograph and no

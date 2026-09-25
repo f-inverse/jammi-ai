@@ -101,18 +101,21 @@ print(f"subject APS set coverage:     {marg_cov:.3f}   (nominal {1 - ALPHA:.2f})
 ```{python}
 # | echo: false
 if SCALE is scale.Scale.FULL:
-    assert raw < prop < ft          # propagation denoises; the declared fine-tune helps most
-    assert reg_cov < 1 - ALPHA and marg_cov < 1 - ALPHA  # both cruxes under-cover
+    assert raw < min(prop, ft)  # propagation and the declared fine-tune both lift precision
+    assert reg_cov < 1 - ALPHA - 0.1  # the year interval under-covers
+    # The subject set holds nominal, to within three binomial standard errors.
+    assert abs(marg_cov - (1 - ALPHA)) < 3 * np.sqrt(ALPHA * (1 - ALPHA) / len(sets))
 ```
 
 ## The loop, closed
 
 Every stage above ran live and matched the golden its own chapter froze. At
 `full` scale the spine reads: citation homophily ≈ 0.50 (the precondition);
-propagation lifts same-subject precision; the declared-edge fine-tune lifts it
-most; and under the time split both the year interval and the subject set
-under-cover — the honest finding the governed calibration cohort (tier 04)
-answers. At `small` scale the same pass runs in seconds on a CPU and holds its
+propagation lifts same-subject precision, and the declared-edge fine-tune lifts
+it by about as much, though propagation trains nothing. Under the time split the
+year interval under-covers — the finding the governed calibration cohort
+(tier 04) answers — while the subject set holds its coverage, the shift being
+orthogonal to its score. At `small` scale the same pass runs in seconds on a CPU and holds its
 own frozen numbers.
 
 ```{python}

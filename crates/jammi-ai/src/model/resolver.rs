@@ -126,6 +126,15 @@ impl ModelResolver {
         let model_id = ModelId::from(source);
         let record = match self.catalog.get_model(&model_id.0).await? {
             Some(r) => r,
+            // A trained-output id names a row of this catalog and nothing
+            // else — never a Hub repository to fall back on — so a caller
+            // that cannot see the row (another tenant's model, a deleted
+            // one) is told it does not exist.
+            None if model_id.0.starts_with(FINE_TUNED_ID_PREFIX) => {
+                return Err(JammiError::ModelNotFound {
+                    model_id: model_id.0,
+                })
+            }
             None => return Ok(None),
         };
 

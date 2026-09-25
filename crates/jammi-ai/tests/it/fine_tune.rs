@@ -272,6 +272,87 @@ pub(crate) async fn session_with_training_data() -> (Arc<InferenceSession>, Temp
     (session, dir)
 }
 
+/// A caller scoped to its tenant — the binding every gRPC request runs under —
+/// embeds with the fine-tuned model it trained: the inference runner binds the
+/// model on its own task, where only the tenant the plan captured, never the
+/// caller's task-local scope, can resolve the tenant's model. Another tenant
+/// cannot use it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scoped_tenant_embeds_with_its_own_fine_tuned_model() {
+    use std::str::FromStr;
+
+    let (session, _dir) = session_with_training_data().await;
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+        .expect("default worker intervals are valid");
+    session
+        .add_source(
+            "patents",
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let alice = jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e01").unwrap();
+    let bob = jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e02").unwrap();
+
+    let tuned = session
+        .with_tenant_scoped(alice, |_scope| async {
+            let job = session
+                .fine_tune(
+                    "training",
+                    &tiny_bert_model(),
+                    &[
+                        "text_a".to_string(),
+                        "text_b".to_string(),
+                        "score".to_string(),
+                    ],
+                    FineTuneMethod::Lora,
+                    ModelTask::TextEmbedding,
+                    Some(FineTuneConfig {
+                        epochs: 1,
+                        batch_size: 8,
+                        lora_rank: 4,
+                        warmup: Warmup::Steps(0),
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            job.wait().await?;
+            Ok::<_, jammi_db::error::JammiError>(job.model_id().to_string())
+        })
+        .await
+        .expect("alice trains her own model");
+
+    let embed = |model: String| jammi_ai::local_session::EmbeddingRequest {
+        source_id: "patents".to_string(),
+        model_id: model,
+        columns: vec!["abstract".to_string()],
+        key_column: "id".to_string(),
+        modality: jammi_ai::local_session::Modality::Text,
+        dimensions: None,
+        cache: jammi_db::store::CachePolicy::Bypass,
+    };
+    let table = session
+        .with_tenant_scoped(alice, |_scope| {
+            session.generate_embeddings(embed(tuned.clone()))
+        })
+        .await
+        .expect("alice embeds with her own fine-tuned model")
+        .0;
+    assert!(table.row_count > 0);
+
+    let refused = session
+        .with_tenant_scoped(bob, |_scope| {
+            session.generate_embeddings(embed(tuned.clone()))
+        })
+        .await;
+    assert!(refused.is_err(), "bob cannot embed with alice's model");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fine_tune_job_lifecycle_and_artifacts() {
     let (session, _dir) = session_with_training_data().await;

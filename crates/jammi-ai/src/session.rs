@@ -937,10 +937,14 @@ impl InferenceSession {
     }
 
     /// The handles an `InferenceExec` bound in this process runs against:
-    /// this session's model cache and observer.
+    /// this session's model cache, bound under the tenant effective where the
+    /// plan is built (the caller's scope, captured here), and its observer.
     pub fn inference_runtime(&self) -> InferenceRuntime {
         InferenceRuntime {
-            model: Arc::clone(&self.model_cache) as Arc<dyn jammi_datafusion::ModelRuntime>,
+            model: Arc::new(crate::inference::runtime::TenantScopedModels::capture(
+                Arc::clone(&self.model_cache),
+                self.tenant_binding_arc(),
+            )),
             observer: self.observer.clone(),
         }
     }

@@ -1077,18 +1077,19 @@ fn cases() -> Vec<IsolationCase> {
             assert_audit_verify_isolated().await;
         }),
         // --- compute verbs (resolver-isolated; covered_by names the e2e) -----
+        // GenerateEmbeddings runs for real on the CPU: tenant A embeds with
+        // the model it fine-tuned, under the scope the gRPC handler installs,
+        // and tenant B is refused A's model. The model binds on the inference
+        // runner's own task, so this proves the planning tenant reaches it.
+        // The source leg is covered by the AddSource/ListSources/DescribeSource
+        // cases.
         case!(
             "EmbeddingService",
             "GenerateEmbeddings",
-            CaseKind::ComputeResolver,
-            Some(E2E_ISOLATION_TEST),
+            CaseKind::Hermetic,
+            None,
             {
-                // GenerateEmbeddings loads its embedding model (tenant-filtered
-                // `get_model`) and reads the input source (tenant-scoped SQL); it
-                // does NOT call `resolve_embedding_table` (it writes a fresh table).
-                // The model leg is asserted here; the source leg is covered by the
-                // AddSource/ListSources/DescribeSource cases.
-                assert_model_resolver_isolated().await;
+                assert_embedding_with_own_model_isolated().await;
             }
         ),
         case!(
@@ -2710,6 +2711,88 @@ async fn assert_refresh_isolated(verb: RefreshVerb) {
 /// `get_model`, which is tenant-filtered: a peer cannot resolve a tenant's
 /// private model. (Infer / Predict additionally read a source scan via
 /// tenant-scoped SQL, covered by the Flight SQL and source cases.)
+/// Tenant A fine-tunes a model and embeds a source with it under
+/// `with_tenant_scoped(A)` — the binding `scoped(engine, tenant, …)` gives a
+/// gRPC request; tenant B, embedding with A's model under its own scope, is
+/// refused `ModelNotFound`.
+async fn assert_embedding_with_own_model_isolated() {
+    use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, Warmup};
+    use jammi_ai::local_session::{EmbeddingRequest, Modality};
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&engine).unwrap();
+    for (name, file, format) in [
+        ("training", "training_pairs.csv", FileFormat::Csv),
+        ("patents", "patents.parquet", FileFormat::Parquet),
+    ] {
+        engine
+            .add_source(
+                name,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(fixture_url(file)),
+                    format: Some(format),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let base = format!(
+        "local:{}",
+        jammi_test_utils::cookbook_fixture("tiny_bert").display()
+    );
+    let tuned = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let job = engine
+                .fine_tune(
+                    "training",
+                    &base,
+                    &["text_a".into(), "text_b".into(), "score".into()],
+                    FineTuneMethod::Lora,
+                    ModelTask::TextEmbedding,
+                    Some(FineTuneConfig {
+                        epochs: 1,
+                        batch_size: 8,
+                        lora_rank: 4,
+                        warmup: Warmup::Steps(0),
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            job.wait().await?;
+            Ok::<_, JammiError>(job.model_id().to_string())
+        })
+        .await
+        .expect("tenant A trains its own model");
+    let embed = || EmbeddingRequest {
+        source_id: "patents".into(),
+        model_id: tuned.clone(),
+        columns: vec!["abstract".into()],
+        key_column: "id".into(),
+        modality: Modality::Text,
+        dimensions: None,
+        cache: jammi_db::store::CachePolicy::Bypass,
+    };
+
+    let own = engine
+        .with_tenant_scoped(tenant_a(), |_scope| engine.generate_embeddings(embed()))
+        .await;
+    assert!(own.is_ok(), "tenant A embeds with its own model: {own:?}");
+    let peer = engine
+        .with_tenant_scoped(tenant_b(), |_scope| engine.generate_embeddings(embed()))
+        .await;
+    assert!(
+        matches!(peer, Err(JammiError::ModelNotFound { .. })),
+        "CROSS-TENANT LEAK: tenant B embedded with tenant A's model: {peer:?}"
+    );
+}
+
 async fn assert_model_resolver_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a

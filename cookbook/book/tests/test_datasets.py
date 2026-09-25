@@ -2,8 +2,9 @@
 
 The chapters run the register path at both scales. These cover the pure logic
 the `full` scale's tables are built with — the checksum gate, the fetch retry,
-the breadth-first ball and its best-connected core, the time split — and that
-the committed `small` fixture is the core of the ball it names.
+the atomic cache write, the breadth-first ball and its best-connected core, the
+time split — and that the committed `small` fixture is the core of the ball it
+names.
 """
 
 from __future__ import annotations
@@ -36,6 +37,31 @@ def test_a_cached_download_is_checked_and_a_mismatch_is_removed(cache):
     with pytest.raises(ValueError, match="checksum mismatch"):
         datasets._download("https://unused", "0" * 64, name="blob.bin")
     assert not dest.exists()
+
+
+def test_a_recache_never_exposes_a_partial_file_to_another_session(cache):
+    # Two sessions share the cache: while one re-caches a table, the other's
+    # scan of the registered path must still read a whole file, and a write
+    # that dies leaves the published file and no stray temp behind.
+    papers = pa.table({"paper_id": ["a", "b"], "year": [2018, 2019]})
+    path = cache / "full" / "arxiv_papers.parquet"
+    datasets._cached_parquet(papers, "full/arxiv_papers")
+
+    def write_while_another_session_scans(tmp):
+        assert pq.read_table(path).equals(papers)
+        pq.write_table(papers, tmp)
+
+    datasets._publish(path, write_while_another_session_scans)
+    assert pq.read_table(path).equals(papers)
+
+    def dies(tmp):
+        tmp.write_bytes(b"PAR1 half a file")
+        raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        datasets._publish(path, dies)
+    assert pq.read_table(path).equals(papers)
+    assert sorted(p.name for p in path.parent.iterdir()) == ["arxiv_papers.parquet"]
 
 
 def test_a_source_that_fails_before_it_serves_is_retried(cache, monkeypatch):

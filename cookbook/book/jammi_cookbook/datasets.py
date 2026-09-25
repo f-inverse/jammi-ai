@@ -28,8 +28,10 @@ import csv
 import gzip
 import hashlib
 import os
+import tempfile
 import zipfile
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -354,7 +356,7 @@ def _download(url: str, sha256: str, *, name: str) -> Path:
             session.mount("http://", HTTPAdapter(max_retries=_RETRY))
             resp = session.get(url, timeout=(30, 300))
             resp.raise_for_status()
-            dest.write_bytes(resp.content)
+            _publish(dest, lambda tmp: tmp.write_bytes(resp.content))
     digest = hashlib.sha256(dest.read_bytes()).hexdigest()
     if digest != sha256:
         dest.unlink()
@@ -369,8 +371,24 @@ def _cached_parquet(table: pa.Table, name: str) -> str:
     """``table`` written to the cache, as the URL ``add_source`` registers."""
     path = _CACHE / f"{name}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, path)
+    _publish(path, lambda tmp: pq.write_table(table, tmp))
     return path.as_uri()
+
+
+def _publish(path: Path, write: Callable[[Path], None]) -> None:
+    """Land ``write``'s output at ``path`` in one atomic rename. The cache is
+    shared by every session on the machine — two chapters or notebooks at once
+    — and a source registered over ``path`` reopens it on every scan: an
+    in-place rewrite would hand another session's scan a truncated file, where
+    after a rename every scan opens a whole one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    os.close(fd)
+    try:
+        write(Path(tmp))
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 if __name__ == "__main__":

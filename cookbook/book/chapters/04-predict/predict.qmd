@@ -26,8 +26,8 @@ prediction** with an honest coverage guarantee. It carries two results:
    de-standardizes what it serves. The recipe runs because of that fix.
 2. **The conformal-under-shift lesson.** Under the dataset's time split, both
    the year interval and the subject-classification set *under-cover*, and the
-   textbook weighted-conformal remedy is a **no-op in both cases**, for two
-   complementary reasons — each with the diagnostic that explains it.
+   textbook weighted-conformal remedy **restores neither**, for two different
+   reasons — each with the diagnostic that explains it.
 
 Both are findings at `full` scale (4,000 papers, ModernBERT). At `small` scale
 every cell below runs the same computation on the 400-paper core with a
@@ -130,11 +130,15 @@ The textbook covariate-shift fix is importance-weighted conformal: reweight the
 calibration residuals toward the test era before taking the quantile. It can
 only help if the calibration papers most like the test era carry the larger
 residuals the test era has. Whether they do is a property of the data, and the
-correlation below measures it. At `full` scale the test era's residuals run
-larger — a real spread shift — but within the calibration set residual size is
-unrelated to test-era likeness, so reweighting barely moves the quantile. On
-the small core the calibration papers most like the test era carry *smaller*
-residuals, so reweighting toward them narrows the interval and loses coverage.
+correlation below measures it. At `full` scale they do: residual size tracks
+test-era likeness, so reweighting toward the test era widens the interval and
+coverage rises. But the test era's residuals run close to twice the
+calibration set's — a spread shift no reweighting of the *calibration*
+residuals can reach, since the weights only redistribute mass over residuals
+the calibration set already has — so the weighted interval still falls far
+short of 0.90. On the small core the calibration papers most like the test era
+carry *smaller* residuals, so reweighting toward them narrows the interval and
+loses coverage.
 
 A calibration paper's **test-era likeness** is read off its neighbourhood: the
 share of test-era papers among its nearest calibration- and test-era papers,
@@ -169,7 +173,10 @@ contracts.assert_close("arxiv.tier04.reg_test_resid_mag", float(test_resid.mean(
 contracts.assert_close("arxiv.tier04.reg_weighted_coverage", wt_reg_cov, tol=0.04)
 contracts.assert_close("arxiv.tier04.reg_resid_corr", reg_corr, tol=0.2)
 if SCALE is scale.Scale.FULL:
-    assert abs(wt_reg_cov - reg_cov) <= 0.02  # the reweight barely moves coverage
+    # Residual size tracks test-era likeness, so the reweight helps, and the
+    # test era's larger residuals keep it well short of nominal.
+    assert reg_corr > 0 and reg_cov < wt_reg_cov < 1 - ALPHA
+    assert test_resid.mean() > 1.5 * cal_resid.mean()
 ```
 
 ### The provenance rail

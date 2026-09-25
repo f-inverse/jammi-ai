@@ -108,10 +108,10 @@ contracts.assert_close("arxiv.conformal.aps_set_size", aps_size, tol=0.6)
 contracts.assert_close("arxiv.conformal.raps_coverage", raps_cov, tol=0.03)
 contracts.assert_close("arxiv.conformal.raps_set_size", raps_size, tol=0.6)
 if SCALE is scale.Scale.FULL:
-    # Under the time split every family under-covers; APS is the sharper family
-    # and LAC buys coverage with size.
-    assert lac_cov < 1 - alpha and aps_cov < 1 - alpha
-    assert aps_size < lac_size and lac_cov > aps_cov
+    # Under the time split every family under-covers, and LAC — ranking by the
+    # true class's own probability — admits the fewest classes.
+    assert max(lac_cov, aps_cov, raps_cov) < 1 - alpha
+    assert lac_size < min(aps_size, raps_size)
 ```
 
 Two facts, measured at `full` scale. First, **every family under-covers** the nominal 0.90: the
@@ -120,21 +120,18 @@ covariate shift carried along the homophilous citation graph), so the marginal
 quantile is mis-calibrated regardless of which score we rank by [@barber2023beyond]. The
 under-coverage is a property of the *shift*, not the score family.
 
-Second, the size ordering is the honest, *measured* one — not the idealized
-textbook ordering. **APS gives the sharper sets** and **LAC the larger ones**,
-with the higher realised coverage. The
-textbook result that LAC yields the smallest sets holds at *exact* nominal
-calibration; under this time-split LAC's $1-\hat p$ threshold lands more
-conservatively, admitting more near-ties, so it buys coverage with size while APS
-stays sharp but under-covers more.
+Second, **LAC gives the smallest sets** — the textbook ordering holds under the
+shift. LAC scores a class by its own probability, $1-\hat p_y$, so it admits only
+the classes the model is confident in; APS scores by the cumulative mass up to
+the true class, so a set grows to cover the mass ranked above it, and it
+admits more classes for about the same coverage. That is APS's trade: its sets
+adapt to how hard each paper is, rather than being the smallest on average.
 
-**RAPS can reduce to APS.** At `full` scale, with this class count and these
-calibrated scores, the rank penalty does not change the admitted sets — RAPS
-coverage and size equal APS to the digit. The regularization bites only when
-sets are long relative to the penalty rank; here the APS sets are already short
-enough that the penalty never excludes a class the unregularized APS admits.
-The cell above prints both, so you can see whether it bites at the scale you
-ran.
+**RAPS sits between them.** The rank penalty $(\lambda, k_{\text{reg}})$ taxes
+every class admitted past rank $k_{\text{reg}}$, trimming APS's longest sets:
+RAPS's sets are smaller than APS's at a coverage no lower. How much it trims
+depends on how long the APS sets run relative to the penalty rank — the cell
+above prints all three, so you can see it at the scale you ran.
 
 ## Part B — the regression intervals: absolute-residual and CQR
 

@@ -534,67 +534,38 @@ impl ModelCache {
         backend: ModelBackendKind,
         location: Option<&str>,
         task: ModelTask,
-    ) {
+    ) -> Result<()> {
         const GENERIC_COMPLETABLE_TYPES: &[&str] = &["local", "huggingface", "remote", "embedding"];
-        // A catalog READ error is not "no row" — collapsing it to `None`
-        // would fall through to the write below and could clobber a row this
-        // call never actually inspected. This bookkeeping is best-effort (a `register_model`
-        // failure already only `warn!`s and keeps serving), so a read failure fails closed:
-        // skip the write entirely rather than guess the row is absent.
-        match self
-            .resolver
-            .catalog()
-            .get_model_version(source_str, 1)
-            .await
+        let catalog = self.resolver.catalog();
+        let existing = catalog.get_model_version(source_str, 1).await?;
+        if existing
+            .as_ref()
+            .is_some_and(|r| !GENERIC_COMPLETABLE_TYPES.contains(&r.model_type.as_str()))
         {
-            Err(e) => {
-                tracing::warn!(
-                    model_id = %source_str,
-                    "Failed to read catalog row before load bookkeeping ({e}); skipping \
-                     best-effort registration rather than writing over a row this call \
-                     could not inspect"
-                );
-            }
-            Ok(existing) => {
-                let can_complete = existing
-                    .as_ref()
-                    .is_none_or(|r| GENERIC_COMPLETABLE_TYPES.contains(&r.model_type.as_str()));
-                if !can_complete {
-                    tracing::debug!(
-                        model_id = %source_str,
-                        model_type = existing.as_ref().map(|r| r.model_type.as_str()).unwrap_or(""),
-                        "skipping generic load-bookkeeping registration: this id is already a \
-                         catalog-managed record of a different kind"
-                    );
-                } else {
-                    let model_type = match source {
-                        ModelSource::HuggingFace(_) => "huggingface",
-                        ModelSource::Local(_) => "local",
-                        ModelSource::Remote(_) => "remote",
-                    };
-                    if let Err(e) = self
-                        .resolver
-                        .catalog()
-                        .register_model(RegisterModelParams {
-                            model_id: source_str,
-                            version: 1,
-                            model_type,
-                            backend,
-                            task,
-                            base_model_id: None,
-                            external_location: location,
-                            config_json: None,
-                        })
-                        .await
-                    {
-                        tracing::warn!(
-                            model_id = %source_str,
-                            "Failed to register model in catalog: {e}"
-                        );
-                    }
-                }
-            }
+            tracing::debug!(
+                model_id = %source_str,
+                "skipping generic load-bookkeeping registration: this id is already a \
+                 catalog-managed record of a different kind"
+            );
+            return Ok(());
         }
+        let model_type = match source {
+            ModelSource::HuggingFace(_) => "huggingface",
+            ModelSource::Local(_) => "local",
+            ModelSource::Remote(_) => "remote",
+        };
+        catalog
+            .register_shared_model(RegisterModelParams {
+                model_id: source_str,
+                version: 1,
+                model_type,
+                backend,
+                task,
+                base_model_id: None,
+                external_location: location,
+                config_json: None,
+            })
+            .await
     }
 
     /// Resolve, describe, admit and materialize `id`: the entry the model
@@ -742,7 +713,7 @@ impl ModelCache {
             resolved.weights_dir(),
             task,
         )
-        .await;
+        .await?;
 
         // The permit is `Arc`-shared between this `CacheEntry` and every
         // guard handed out of it — see `ModelGuard::gpu_permit`'s doc for why.
@@ -774,7 +745,7 @@ impl ModelCache {
             None,
             task,
         )
-        .await;
+        .await?;
         Ok(CacheEntry {
             model: Arc::new(LoadedModel::remote(
                 Arc::clone(&endpoint.model),
@@ -2185,7 +2156,8 @@ mod load_bookkeeping_tests {
                 resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
-            .await;
+            .await
+            .unwrap();
 
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(
@@ -2248,7 +2220,8 @@ mod load_bookkeeping_tests {
                 resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
-            .await;
+            .await
+            .unwrap();
 
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(after.model_type, before.model_type);
@@ -2290,7 +2263,8 @@ mod load_bookkeeping_tests {
                 resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
-            .await;
+            .await
+            .unwrap();
 
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(after.model_type, "local");
@@ -2338,7 +2312,8 @@ mod load_bookkeeping_tests {
                 resolved.weights_dir(),
                 ModelTask::TextEmbedding,
             )
-            .await;
+            .await
+            .unwrap();
 
         let after = catalog.get_model(model_id).await.unwrap().unwrap();
         assert_eq!(
@@ -2354,119 +2329,42 @@ mod load_bookkeeping_tests {
         );
     }
 
-    /// A catalog READ error must skip the write entirely — never collapse
-    /// to "no row" and clobber a row this call never actually inspected.
-    /// Both the read AND a subsequent write attempt fail on the SAME closed
-    /// pool, so the final DB state alone cannot distinguish "skipped" from
-    /// "attempted and also failed" — the oracle instead captures which
-    /// `tracing::warn!` fires: the read-failure message, and no call to
-    /// `register_model` (whose own failure, on the same closed pool, would
-    /// log the register-failure message). A read error swallowed as "no
-    /// row" flips `saw_write_attempt` to `true` and `saw_read_failure_log`
-    /// to `false`.
+    /// A catalog read error before load bookkeeping is the load's error: it
+    /// is never taken for "no row", which would fall through to a write that
+    /// could clobber a row this call never inspected.
     ///
     /// Fault injection: two `Catalog` handles share the SAME backend `Arc`
     /// (`Catalog::pinned_to_tenant`); closing one closes the shared
     /// connection pool out from under the other, which is the closed/dropped
     /// connection this crate's own `Catalog::close` doc describes as making
     /// every sibling handle's next query fail.
-    #[test]
-    fn catalog_read_error_skips_bookkeeping_write() {
-        use std::io;
-        use std::sync::Mutex;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct BufferWriter(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for BufferWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'w> MakeWriter<'w> for BufferWriter {
-            type Writer = BufferWriter;
-            fn make_writer(&'w self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(BufferWriter(buffer.clone()))
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        runtime.block_on(async {
-            let tmp = tempfile::tempdir().unwrap();
-            let catalog_dir = tempfile::tempdir().unwrap();
-            let owner = Catalog::open(catalog_dir.path()).await.unwrap();
-            let model_id = "read-error-probe-model";
-
-            // Seed a pre-existing "local" row (a completable type) through
-            // the live handle, BEFORE the pool is closed, so a
-            // wrongly-proceeding write would have something real to clobber.
-            owner
-                .register_model(RegisterModelParams {
-                    model_id,
-                    version: 1,
-                    model_type: "local",
-                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                    task: ModelTask::TextEmbedding,
-                    base_model_id: None,
-                    external_location: None,
-                    config_json: None,
-                })
-                .await
-                .unwrap();
-
-            let shared = owner.pinned_to_tenant(None);
-            owner.close().await;
-
-            // Confirm the fault actually landed: the shared handle's own
-            // read must now be an `Err`, not a `None` — otherwise this test
-            // would not be exercising the read-error path at all.
-            let probe_err = shared.get_model_version(model_id, 1).await;
-            assert!(
-                probe_err.is_err(),
-                "fault injection failed to land: expected the closed pool to make a \
-                 read error, got {probe_err:?}"
-            );
-
-            let cache = new_cache(Arc::new(shared));
-            let resolved = fake_resolved(model_id, tmp.path());
-            cache
-                .complete_generic_registration(
-                    &ModelSource::local(tmp.path()),
-                    model_id,
-                    ModelBackendKind::Candle,
-                    resolved.weights_dir(),
-                    ModelTask::TextEmbedding,
-                )
-                .await;
-        });
-
-        let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf-8 logs");
-        let saw_read_failure_log =
-            logs.contains("Failed to read catalog row before load bookkeeping");
-        let saw_write_attempt = logs.contains("Failed to register model in catalog");
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_catalog_read_error_fails_the_bookkeeping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tempfile::tempdir().unwrap();
+        let owner = Catalog::open(catalog_dir.path()).await.unwrap();
+        let model_id = "read-error-probe-model";
+        let shared = owner.pinned_to_tenant(None);
+        owner.close().await;
         assert!(
-            saw_read_failure_log,
-            "expected the read-error path to log its own skip warning; captured logs:\n{logs}"
+            shared.get_model_version(model_id, 1).await.is_err(),
+            "fault injection must make the shared handle's read fail"
         );
+
+        let cache = new_cache(Arc::new(shared));
+        let resolved = fake_resolved(model_id, tmp.path());
+        let outcome = cache
+            .complete_generic_registration(
+                &ModelSource::local(tmp.path()),
+                model_id,
+                ModelBackendKind::Candle,
+                resolved.weights_dir(),
+                ModelTask::TextEmbedding,
+            )
+            .await;
         assert!(
-            !saw_write_attempt,
-            "a catalog read error must skip the write entirely, never fall through to \
-             attempting (and separately failing) a `register_model` call; captured logs:\n{logs}"
+            outcome.is_err(),
+            "the read error is the bookkeeping's error"
         );
     }
 }

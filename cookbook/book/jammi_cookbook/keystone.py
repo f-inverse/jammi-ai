@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
-from . import datasets, encoders, shift
+from . import datasets, encoders
 from .datasets import Arxiv
 from .scale import Scale
 
@@ -101,13 +101,6 @@ def register_edges(db, table: str, name: str) -> str:
     return name
 
 
-def vectors_of(db, table: str) -> tuple[list[str], np.ndarray]:
-    """An embedding table's row keys and its vectors as a matrix, in key order."""
-    rows = db.sql(f'SELECT _row_id, vector FROM "jammi.{table}" ORDER BY _row_id')
-    ids = [str(k) for k in rows.column("_row_id").to_pylist()]
-    return ids, np.asarray(rows.column("vector").to_pylist(), dtype=np.float32)
-
-
 # Tier 04's context-predictor meta-training epochs.
 PREDICTOR_EPOCHS = {Scale.SMALL: 20, Scale.FULL: 80}
 
@@ -156,26 +149,43 @@ def predict_years(db, arxiv: Arxiv, predictor: str, keys: list[str]) -> tuple[np
     return np.array([s["mean"] for s in served]), np.array([s["std"] for s in served])
 
 
+# Neighbours a paper's subject is voted by, and a vote's temperature on the
+# neighbour's similarity.
+NEIGHBOURS = 25
+VOTE_TEMP = 20.0
+# A class no neighbour voted for keeps this share, so every set can grow to it.
+VOTE_FLOOR = 1e-3
+
+
+def neighbours(db, arxiv: Arxiv, embeddings: str, key: str, among: str, k: int) -> list[dict]:
+    """``key``'s ``k`` nearest other papers in ``embeddings`` that satisfy
+    ``among`` (a SQL predicate), nearest first — a query-by-example
+    ``search``: the paper's stored vector never leaves the engine."""
+    return db.search(
+        arxiv.papers, row_key=key, k=k, embedding_table=embeddings,
+        filter=f"({among}) AND paper_id <> '{key}'",
+        select=["paper_id", "subject", "year", "similarity"],
+    ).to_pylist()
+
+
 @dataclass(frozen=True)
 class SubjectScores:
-    """Tier 04's subject classifier over one embedding table: softmax class
-    scores and true labels for the calibration (2018) and test (2019–) eras,
-    and each era's unit embeddings."""
+    """Tier 04's subject classifier over one embedding table: class scores and
+    true labels for the calibration (2018) and test (2019–) eras, and each
+    era's paper keys."""
 
     classes: list[str]
     cal_scores: np.ndarray
     cal_labels: np.ndarray
     test_scores: np.ndarray
     test_labels: np.ndarray
-    cal_embeddings: np.ndarray
-    test_embeddings: np.ndarray
+    cal_keys: list[str]
+    test_keys: list[str]
 
 
 def subject_scores(db, arxiv: Arxiv, embeddings: str) -> SubjectScores:
-    """Tier 04: a nearest-centroid softmax head over ``embeddings``, fitted on
-    the training era and scored on the calibration and test eras."""
-    ids, vectors = vectors_of(db, embeddings)
-    row = {k: i for i, k in enumerate(ids)}
+    """Tier 04: a paper's class scores are a vote of its nearest training-era
+    papers in ``embeddings``, each weighted by its similarity."""
     subject = {
         r["paper_id"]: r["subject"]
         for r in db.sql(
@@ -183,17 +193,36 @@ def subject_scores(db, arxiv: Arxiv, embeddings: str) -> SubjectScores:
         ).to_pylist()
     }
     classes = sorted(set(subject.values()))
-    labels = np.array([classes.index(subject[k]) for k in ids])
-    train, cal, test = (
-        np.array([row[k] for k in arxiv.split[era]]) for era in ("train", "valid", "test")
-    )
-    unit = shift.unit_rows(vectors)
+
+    def scores(key: str) -> np.ndarray:
+        hood = neighbours(db, arxiv, embeddings, key, f"year <= {datasets.TRAIN_UNTIL}", NEIGHBOURS)
+        top = hood[0]["similarity"]
+        votes = np.full(len(classes), VOTE_FLOOR)
+        for n in hood:
+            votes[classes.index(n["subject"])] += np.exp(VOTE_TEMP * (n["similarity"] - top))
+        return votes / votes.sum()
+
+    cal, test = arxiv.split["valid"], arxiv.split["test"]
     return SubjectScores(
         classes=classes,
-        cal_scores=shift.nearest_centroid_scores(vectors, labels, train, cal, len(classes)),
-        cal_labels=labels[cal],
-        test_scores=shift.nearest_centroid_scores(vectors, labels, train, test, len(classes)),
-        test_labels=labels[test],
-        cal_embeddings=unit[cal],
-        test_embeddings=unit[test],
+        cal_scores=np.array([scores(k) for k in cal]),
+        cal_labels=np.array([classes.index(subject[k]) for k in cal]),
+        test_scores=np.array([scores(k) for k in test]),
+        test_labels=np.array([classes.index(subject[k]) for k in test]),
+        cal_keys=cal,
+        test_keys=test,
     )
+
+
+def test_era_shares(db, arxiv: Arxiv, embeddings: str, keys: list[str], sizes: tuple[int, ...]) -> dict[int, np.ndarray]:
+    """Each paper's share of test-era (2019–) papers among its nearest
+    calibration- and test-era neighbours, at each neighbourhood size — how
+    test-era-like its neighbourhood is."""
+    hoods = [
+        neighbours(db, arxiv, embeddings, key, f"year >= {datasets.VALID_YEAR}", max(sizes))
+        for key in keys
+    ]
+    return {
+        size: np.array([np.mean([n["year"] > datasets.VALID_YEAR for n in h[:size]]) for h in hoods])
+        for size in sizes
+    }

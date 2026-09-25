@@ -46,7 +46,7 @@ import tempfile
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, datasets, keystone, scale
+from jammi_cookbook import contracts, datasets, encoders, scale
 from jammi_cookbook.rails import assert_listing_isolated, assert_rows_isolated, tenant
 
 SCALE = scale.current()
@@ -57,7 +57,7 @@ work = tempfile.mkdtemp()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 arxiv = datasets.arxiv(db, SCALE)
 papers = db.sql(
-    f"SELECT paper_id, title, subject FROM {arxiv.papers}.public.{arxiv.papers}"
+    f"SELECT paper_id, title, abstract, subject FROM {arxiv.papers}.public.{arxiv.papers}"
 ).to_pylist()
 subject = {p["paper_id"]: p["subject"] for p in papers}
 subjects = sorted({p["subject"] for p in papers})
@@ -105,8 +105,11 @@ scan, so A sees only its own rows — none of B's.
 ```{python}
 db.set_tenant("")  # register the shared tagged source as a global
 write_src("papers_tagged", pa.table({
-    "paper_id": a_papers + b_papers,
-    "tenant_id": [TENANT_A] * len(a_papers) + [TENANT_B] * len(b_papers),
+    "paper_id": [p["paper_id"] for p in papers],
+    "title": [p["title"] for p in papers],
+    "abstract": [p["abstract"] for p in papers],
+    "subject": [p["subject"] for p in papers],
+    "tenant_id": [TENANT_A if p["subject"] in a_subjects else TENANT_B for p in papers],
 }))
 
 with tenant(db, TENANT_A):
@@ -154,67 +157,53 @@ assert listing_leak == 0 and discriminator_leak == 0  # the two hard zeros
 contracts.assert_close("tenancy_b.caveat_visible", caveat_visible)
 ```
 
-## Property 4 — tenant-conditioned metric parity
+## Property 4 — the same recipe, scoped per tenant
 
-The consequence worth measuring directly: the **same recipe** under two tenants gives each
-its own scoped result. We embed the papers (tier 01) and run same-subject retrieval
-under each tenant, over only the rows the discriminator filter lets that tenant see —
-same recipe, two scopes, two answers.
+The consequence worth measuring directly: the **same recipe** run under each tenant
+gives that tenant its own answer, over only its own rows. The recipe is the book's
+retrieval measurement — embed the papers (tier 01), build the same-subject golden, and
+score it with `eval_embeddings` — run once inside each tenant's scope. Each embedding
+table is built from, and each search reads, only the rows the discriminator lets that
+tenant see; an unscoped session sees none of them.
 
 ```{python}
-import numpy as np
-
-ids, vecs = keystone.vectors_of(db, keystone.embed(db, arxiv, SCALE))
-pos = {i: n for n, i in enumerate(ids)}
-golden = keystone.subject_golden(db, arxiv)
-relevant: dict[str, set[str]] = {}
-for g in db.sql(f"SELECT query_id, relevant_id FROM {golden}").to_pylist():
-    relevant.setdefault(g["query_id"], set()).add(g["relevant_id"])
-
-
-def scoped_recall(tenant_id):
+def scoped_precision(tenant_id: str) -> tuple[float, int, int]:
     with tenant(db, tenant_id):
-        visible = {r["paper_id"] for r in db.sql(
-            "SELECT paper_id FROM papers_tagged.public.papers_tagged").to_pylist()}
-    local_ids = [i for i in ids if i in visible]
-    sub = vecs[[pos[i] for i in local_ids]]
-    norm = sub / (np.linalg.norm(sub, axis=1, keepdims=True) + 1e-12)
-    local_pos = {i: n for n, i in enumerate(local_ids)}
-    scored = total = 0.0
-    for qid in sorted(relevant):
-        if qid not in local_pos:
-            continue
-        rel = {r for r in relevant[qid] if r in visible}
-        if not rel:
-            continue
-        sims = norm @ norm[local_pos[qid]]
-        sims[local_pos[qid]] = -np.inf
-        top = np.argpartition(-sims, 10)[:10]
-        scored += len({local_ids[t] for t in top} & rel) / min(10, len(rel))
-        total += 1
-    return scored / total, len(visible), int(total)
+        rows = db.sql(
+            "SELECT paper_id, title, subject FROM papers_tagged.public.papers_tagged"
+        ).to_pylist()
+        embedded = db.generate_embeddings(
+            source="papers_tagged", model=encoders.text(SCALE),
+            columns=["title", "abstract"], key="paper_id",
+        )
+        golden = datasets.same_label_golden(
+            db, rows, key="paper_id", label="subject", text="title", queries=100,
+            name=f"golden_{tenant_id[:8]}",
+        )
+        report = db.eval_embeddings(
+            source="papers_tagged", golden_source=golden, embedding_table=embedded, k=10,
+        )
+    return report["aggregate"]["precision_at_k"], len(rows), len(report["per_query"])
 
 
-a_recall, a_visible, a_queries = scoped_recall(TENANT_A)
-b_recall, b_visible, b_queries = scoped_recall(TENANT_B)
-print(f"tenant A: recall@10 {a_recall:.3f}  over {a_visible} rows / {a_queries} queries")
-print(f"tenant B: recall@10 {b_recall:.3f}  over {b_visible} rows / {b_queries} queries")
+a_precision, a_visible, a_queries = scoped_precision(TENANT_A)
+b_precision, b_visible, b_queries = scoped_precision(TENANT_B)
+print(f"tenant A: precision@10 {a_precision:.3f}  over {a_visible} rows / {a_queries} queries")
+print(f"tenant B: precision@10 {b_precision:.3f}  over {b_visible} rows / {b_queries} queries")
 print(f"scopes tile the corpus: {a_visible} + {b_visible} = {a_visible + b_visible}")
 ```
 
 ```{python}
 # | echo: false
-contracts.assert_close("tenancy_b.parity_a_recall_at_10", a_recall, tol=0.03)
-contracts.assert_close("tenancy_b.parity_b_recall_at_10", b_recall, tol=0.03)
+contracts.assert_close("tenancy_b.parity_a_precision_at_10", a_precision, tol=0.03)
+contracts.assert_close("tenancy_b.parity_b_precision_at_10", b_precision, tol=0.03)
 assert a_visible + b_visible == len(subject), "the tenant scopes tile the corpus"
 ```
 
-The two recalls differ because the tenants hold different subjects, and some subjects
+The two numbers differ because the tenants hold different subjects, and some subjects
 are easier to retrieve than others — but the point is the **parity**: one recipe, the
 engine scoping the data per tenant, each tenant getting its own measured answer over rows
-it alone can see. (Recall here is capped at the query's relevant count: hits in the top
-10 over `min(10, |relevant|)`, so a query with three visible same-subject papers can
-still score 1.)
+it alone can see.
 
 The session's work is done, so it is closed. An embedded engine holds its catalog until
 `close()` returns, which is why `close()` comes before anything removes the directory the

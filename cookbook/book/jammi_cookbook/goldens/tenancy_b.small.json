@@ -3,12 +3,12 @@
     "tol": 0.0,
     "value": 379.0
   },
-  "parity_a_recall_at_10": {
+  "parity_a_precision_at_10": {
     "tol": 0.03,
-    "value": 0.6185897435897437
+    "value": 0.32499999999999996
   },
-  "parity_b_recall_at_10": {
+  "parity_b_precision_at_10": {
     "tol": 0.03,
-    "value": 0.4438502673796793
+    "value": 0.3760000000000002
   }
 }

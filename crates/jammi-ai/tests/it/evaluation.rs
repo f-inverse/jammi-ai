@@ -1040,3 +1040,72 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
         other => panic!("a structure table has no query encoder, got {other:?}"),
     }
 }
+
+/// A base model loaded by one tenant is a shared, global catalog row: a second
+/// tenant embedding with the same model (a warm cache hit, no fresh load) and
+/// then evaluating under its own scope binds that row, rather than finding no
+/// model at all.
+#[tokio::test]
+async fn a_base_model_resolves_for_every_tenant_that_uses_it() {
+    use std::str::FromStr;
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let tenants = [
+        jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap(),
+        jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap(),
+    ];
+    for (i, tenant) in tenants.into_iter().enumerate() {
+        // The sticky binding a client session uses: the first tenant's load
+        // is the cold one, the second's is a warm hit on the same model.
+        session.bind_tenant(tenant);
+        let (patents, golden) = (format!("patents_{i}"), format!("golden_{i}"));
+        for (name, file, format) in [
+            (&patents, "patents.parquet", FileFormat::Parquet),
+            (&golden, "golden_relevance.csv", FileFormat::Csv),
+        ] {
+            session
+                .add_source(
+                    name,
+                    SourceType::File,
+                    SourceConnection {
+                        url: Some(common::fixture_url(file)),
+                        format: Some(format),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let table = session
+            .generate_text_embeddings(
+                &patents,
+                &tiny_bert_model(),
+                &["abstract".to_string()],
+                "id",
+                jammi_db::store::CachePolicy::Bypass,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        let report = session
+            .eval_embeddings(
+                &patents,
+                Some(&table.table_name),
+                &format!("{golden}.public.golden_relevance"),
+                10,
+                &Default::default(),
+            )
+            .await;
+        assert!(
+            report.is_ok(),
+            "tenant {i} evaluates with the shared base model: {:?}",
+            report.err()
+        );
+    }
+}

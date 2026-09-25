@@ -224,7 +224,23 @@ impl Catalog {
     /// untouched: a registration can neither rewrite its type and lineage nor
     /// give it a second location.
     pub async fn register_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
-        let tenant = self.current_tenant();
+        self.insert_model(params, self.current_tenant()).await
+    }
+
+    /// Record a reference to a model no tenant owns — one loaded from a hub,
+    /// a local path, or a remote endpoint — as a global row, whatever tenant
+    /// the session is bound to. Every tenant resolves it (a model lookup reads
+    /// the tenant's own rows and the global ones), so a second tenant using
+    /// the same external model binds the same row instead of finding none.
+    pub async fn register_shared_model(&self, params: RegisterModelParams<'_>) -> Result<()> {
+        self.insert_model(params, None).await
+    }
+
+    async fn insert_model(
+        &self,
+        params: RegisterModelParams<'_>,
+        tenant: Option<TenantId>,
+    ) -> Result<()> {
         let pk = model_pk(tenant, params.model_id, params.version as i64);
         let metadata = model_metadata(params.base_model_id, params.config_json);
         let model_id = params.model_id.to_string();

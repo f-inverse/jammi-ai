@@ -124,25 +124,36 @@ if SCALE is scale.Scale.FULL:
 At `full` scale the interval **under-covers**: realised coverage falls below
 the nominal 0.90 — the later papers are not exchangeable with the earlier ones.
 
-### Weighting the interval is a no-op — residual size is uninformative
+### Weighting the interval does not restore coverage
 
 The textbook covariate-shift fix is importance-weighted conformal: reweight the
 calibration residuals toward the test era before taking the quantile. It can
-only move the quantile if residual size varies with test-era likeness *within*
-the calibration set. At `full` scale the test era's residuals do run larger — a
-real spread shift — but within the calibration set residual size is
-uncorrelated with test-era likeness, so no reweighting of the calibration
-residuals can favour the larger ones.
+only help if the calibration papers most like the test era carry the larger
+residuals the test era has. Whether they do is a property of the data, and the
+correlation below measures it. At `full` scale the test era's residuals run
+larger — a real spread shift — but within the calibration set residual size is
+unrelated to test-era likeness, so reweighting barely moves the quantile. On
+the small core the calibration papers most like the test era carry *smaller*
+residuals, so reweighting toward them narrows the interval and loses coverage.
+
+A calibration paper's **test-era likeness** is read off its neighbourhood: the
+share of test-era papers among its nearest calibration- and test-era papers,
+one query-by-example `search` each. Its odds estimate the paper's
+test-to-calibration likelihood ratio, the weight weighted conformal needs.
 
 ```{python}
-scores = keystone.subject_scores(db, arxiv, propagated)  # carries each era's embeddings
-cal_emb, test_emb = scores.cal_embeddings, scores.test_embeddings
+# | echo: false
+keystone.show(keystone.test_era_shares)
+```
+
+```{python}
+shares = keystone.test_era_shares(db, arxiv, propagated, cal_ids, sizes=(10, 25, 50))
+likeness = shares[keystone.NEIGHBOURS]
 
 cal_resid = np.abs(cal_mean - cal_year)
 test_resid = np.abs(test_mean - test_year)
-likeness = shift.test_likeness(cal_emb, test_emb)
 wt_reg_cov = shift.residual_coverage(
-    cal_resid, test_resid, weights=np.exp(shift.WEIGHTED_TEMP * likeness), alpha=ALPHA
+    cal_resid, test_resid, weights=shift.density_ratio(likeness, keystone.NEIGHBOURS), alpha=ALPHA
 )
 reg_corr = float(np.corrcoef(cal_resid, likeness)[0, 1])
 print(f"cal  mean |y−ŷ|: {cal_resid.mean():.3f}")
@@ -192,9 +203,11 @@ assert all(ref in year for ref in by_citation["context_ref"])
 ## Part B — subject classification under the same shift
 
 The same lesson on a second task, with a complementary mechanism. The task is
-subject classification; the predictor is a nearest-centroid softmax head over
-the **propagated** (citation-graph-conditioned, tier 02) embeddings, fitted on
-the training era, calibrated on 2018, tested on 2019 onward.
+subject classification; the predictor is a nearest-neighbour vote over the
+**propagated** (citation-graph-conditioned, tier 02) embeddings: a paper's class
+scores are the similarity-weighted subjects of its nearest training-era papers,
+found by a query-by-example `search` filtered to the training era. It is
+calibrated on 2018 and tested on 2019 onward.
 
 ```{python}
 # | echo: false
@@ -202,6 +215,7 @@ keystone.show(keystone.subject_scores)
 ```
 
 ```{python}
+scores = keystone.subject_scores(db, arxiv, propagated)
 accuracy = float(np.mean(scores.test_scores.argmax(1) == scores.test_labels))
 print(f"{len(scores.classes)} classes; test-era accuracy: {accuracy:.3f}")
 ```
@@ -254,7 +268,7 @@ local_cov, _ = shift.aps_coverage(
     scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
     weights=None, alpha=ALPHA,
 )
-schemes = shift.weight_schemes(cal_emb, test_emb)
+schemes = {f"knn-{size}": shift.density_ratio(share, size) for size, share in shares.items()}
 deltas = {}
 for name, weights in schemes.items():
     cov, size = shift.aps_coverage(
@@ -276,9 +290,9 @@ if SCALE is scale.Scale.FULL:
     assert min(deltas.values()) < 0  # not systematically toward nominal
 ```
 
-At `full` scale the three schemes (centroid likeness, a kNN density ratio, a
-domain-classifier logistic regression) move coverage a little, **not
-consistently toward nominal**, and **none reaches 0.90**. Weighting nudges
+At `full` scale the density ratio estimated over three neighbourhood sizes moves
+coverage a little, **not consistently toward nominal**, and **none reaches
+0.90**. Weighting nudges
 coverage but cannot restore it here.
 
 ### Why: the shift is orthogonal to the conformal score

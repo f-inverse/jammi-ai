@@ -2145,9 +2145,8 @@ impl InferenceSession {
         // registration).
         let canonical_name = ModelSource::parse(base_model).to_string();
         if self.catalog().get_model(&canonical_name).await?.is_none() {
-            if let Err(e) = self
-                .catalog()
-                .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
+            self.catalog()
+                .register_shared_model(jammi_db::catalog::model_repo::RegisterModelParams {
                     model_id: &canonical_name,
                     version: 1,
                     model_type: "embedding",
@@ -2157,10 +2156,7 @@ impl InferenceSession {
                     external_location: None,
                     config_json: None,
                 })
-                .await
-            {
-                tracing::error!(model_id = %canonical_name, error = %e, "Failed to register base model in catalog");
-            }
+                .await?;
         }
         Ok(self
             .catalog()

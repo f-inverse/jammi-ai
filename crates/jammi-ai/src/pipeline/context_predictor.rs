@@ -704,7 +704,7 @@ impl InferenceSession {
             Some(m) => m.catalog_pk,
             None => {
                 self.catalog()
-                    .register_model(RegisterModelParams {
+                    .register_shared_model(RegisterModelParams {
                         model_id: &table.model_id,
                         version: 1,
                         model_type: "embedding",

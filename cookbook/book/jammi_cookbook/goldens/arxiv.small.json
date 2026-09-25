@@ -25,11 +25,11 @@
   },
   "conformal.aps_coverage": {
     "tol": 0.03,
-    "value": 0.9479166666666666
+    "value": 0.9583333333333334
   },
   "conformal.aps_set_size": {
     "tol": 0.6,
-    "value": 4.208333333333333
+    "value": 3.0416666666666665
   },
   "conformal.cqr_coverage": {
     "tol": 0.04,
@@ -49,31 +49,31 @@
   },
   "conformal.lac_coverage": {
     "tol": 0.03,
-    "value": 0.9791666666666666
+    "value": 0.90625
   },
   "conformal.lac_set_size": {
     "tol": 0.6,
-    "value": 4.40625
+    "value": 1.8229166666666667
   },
   "conformal.raps_coverage": {
     "tol": 0.03,
-    "value": 0.9479166666666666
+    "value": 0.9583333333333334
   },
   "conformal.raps_set_size": {
     "tol": 0.6,
-    "value": 4.208333333333333
+    "value": 2.875
   },
   "conformal.synthetic_marginal_coverage": {
     "tol": 0.03,
-    "value": 0.8688524590163934
+    "value": 0.8524590163934426
   },
   "conformal.synthetic_shift_corr": {
     "tol": 0.08,
-    "value": 0.6331129775859415
+    "value": 0.38548597409172974
   },
   "conformal.synthetic_weighted_coverage": {
     "tol": 0.03,
-    "value": 0.8852459016393442
+    "value": 0.9180327868852459
   },
   "tier01.cite_homophily": {
     "tol": 1e-09,
@@ -85,11 +85,11 @@
   },
   "tier01.precision_at_10": {
     "tol": 0.02,
-    "value": 0.40349999999999986
+    "value": 0.4035000000000001
   },
   "tier02.precision_at_10": {
     "tol": 0.02,
-    "value": 0.4260000000000001
+    "value": 0.4260000000000002
   },
   "tier02.precision_delta": {
     "tol": 0.02,
@@ -101,7 +101,7 @@
   },
   "tier03.declared_precision_at_10": {
     "tol": 0.02,
-    "value": 0.4049999999999999
+    "value": 0.40499999999999986
   },
   "tier03.random_precision_at_10": {
     "tol": 0.02,
@@ -113,19 +113,19 @@
   },
   "tier04.classifier_accuracy": {
     "tol": 0.04,
-    "value": 0.6666666666666666
+    "value": 0.6354166666666666
   },
   "tier04.local_marginal_coverage": {
     "tol": 0.03,
-    "value": 0.9479166666666666
+    "value": 0.9583333333333334
   },
   "tier04.marginal_coverage": {
     "tol": 0.03,
-    "value": 0.9479166666666666
+    "value": 0.9583333333333334
   },
   "tier04.marginal_set_size": {
     "tol": 0.6,
-    "value": 4.208333333333333
+    "value": 3.0416666666666665
   },
   "tier04.reg_cal_mean": {
     "tol": 1.0,
@@ -149,7 +149,7 @@
   },
   "tier04.reg_resid_corr": {
     "tol": 0.2,
-    "value": -0.759484401858868
+    "value": -0.7951556672932873
   },
   "tier04.reg_test_mean": {
     "tol": 1.0,
@@ -161,14 +161,14 @@
   },
   "tier04.reg_weighted_coverage": {
     "tol": 0.04,
-    "value": 0.9375
+    "value": 0.6979166666666666
   },
   "tier04.score_shift_corr": {
     "tol": 0.12,
-    "value": -0.3121501451803838
+    "value": 0.24479706398858486
   },
   "tier04.weighting_max_abs_delta": {
     "tol": 0.01,
-    "value": 0.02083333333333326
+    "value": 0.0
   }
 }

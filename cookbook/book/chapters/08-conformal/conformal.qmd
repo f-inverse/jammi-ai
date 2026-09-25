@@ -23,7 +23,7 @@ predictions. It carries two payloads:
    checked against a frozen golden.
 2. **The score-aligned weighted restore** — the keystone (tier 04) showed that on
    the *real* ogbn-arxiv time-split, importance-weighting is a **no-op** because the
-   shift is orthogonal to the conformal score (corr ≈ −0.12). Here we demonstrate the
+   shift is nearly orthogonal to the conformal score. Here we demonstrate the
    **complement**: a *transparently-synthetic, clearly-labelled* covariate shift that
    **moves the score distribution**, on which weighted split-conformal [@tibshirani2019covariateshift]
    **genuinely restores** coverage to nominal. The two results are the two halves of one
@@ -54,9 +54,10 @@ print(f"target coverage 1 − α = {1 - alpha:.2f}")
 
 ## Part A — the classification scores: LAC, APS, RAPS
 
-The classification task is subject prediction; the predictor is the
-nearest-centroid softmax head on the **propagated** (citation-graph
-conditioned) embeddings. We form prediction *sets* with each nonconformity
+The classification task is subject prediction; the predictor is the tier-04
+nearest-neighbour vote on the **propagated** (citation-graph conditioned)
+embeddings — a paper's class scores are the similarity-weighted subjects of its
+nearest training-era papers. We form prediction *sets* with each nonconformity
 family.
 
 ```{python}
@@ -203,7 +204,7 @@ no-op there.
 Here is the genuinely novel payoff of this chapter. The keystone showed that on the
 **real** ogbn-arxiv time-split, importance-weighted conformal [@tibshirani2019covariateshift] is a
 **no-op**, with the diagnostic that the shift is nearly **orthogonal** to the
-conformal score: `corr(nonconformity, test-likeness) ≈ −0.12`. The lesson there was
+conformal score: `corr(nonconformity, test-likeness)` is near zero. The lesson there was
 the *negative* one — weighting cannot repair a shift the score cannot see.
 
 This is the **complement**, and we are explicit about its status:
@@ -223,24 +224,28 @@ restore is real. We label it as a device precisely so the two halves stay honest
 The construction. We take only the genuinely-exchangeable **calibration-era pool** and
 split it 50/50 into a synthetic test holdout and a calibration pool — so the *base*
 data is exchangeable and the **only** shift is the one we inject. We then bias the
-calibration subsample along a **real covariate**: the 1-D least-squares projection of
-the propagated embedding onto the APS nonconformity. That projection is a genuine
-feature of the data that *correlates with the score* (by construction of the
-direction), so over-sampling its low end pulls the calibration toward **easy**
-(low-nonconformity) points — a shift that **moves the score distribution**. We use one
+calibration subsample along a **real covariate**: a nearest-neighbour regression of
+the APS nonconformity on the paper's neighbourhood — the mean nonconformity of its
+nearest calibration-era papers, one query-by-example `search` each. It is a genuine
+feature of each paper's position in the embedding space that *correlates with the
+score* (by construction of the regression), so over-sampling its low end pulls the
+calibration toward **easy** (low-nonconformity) points — a shift that **moves the
+score distribution**. We use one
 consistent APS nonconformity throughout, so the marginal and weighted passes differ
 only in the weights.
 
 ```{python}
-pool_emb = scores.cal_embeddings
 nc = shift.aps_nonconformity(scores.cal_scores, scores.cal_labels)
 
-# A REAL covariate axis along which the score varies: the LS projection of the
-# embedding onto the nonconformity. (This is the transparently-synthetic part — we
-# pick the direction that is score-aligned, on purpose.)
-emb_centered = pool_emb - pool_emb.mean(0)
-beta, *_ = np.linalg.lstsq(emb_centered, nc - nc.mean(), rcond=None)
-shift_axis = emb_centered @ beta
+# A REAL covariate axis along which the score varies: each paper's neighbours' mean
+# nonconformity. (This is the transparently-synthetic part — we regress onto the
+# score, on purpose.)
+nc_of = dict(zip(scores.cal_keys, nc))
+shift_axis = np.array([
+    np.mean([nc_of[n["paper_id"]] for n in keystone.neighbours(
+        db, arxiv, propagated, key, f"year = {datasets.VALID_YEAR}", 10)])
+    for key in scores.cal_keys
+])
 ```
 
 ```{python}
@@ -269,12 +274,12 @@ print(f"holdout   mean nonconformity: {test_nc.mean():.3f}   (cal pulled lower �
 ```
 
 The diagnostic that distinguishes this from the keystone: on the biased calibration
-set, the **nonconformity correlates strongly and positively with the shift feature**.
+set, the **nonconformity correlates clearly and positively with the shift feature**.
 This is the inverse of the keystone's ≈ 0.
 
 ```{python}
 shift_corr = float(np.corrcoef(cal_nc, cal_s)[0, 1])
-print(f"corr(nonconformity, shift-feature): {shift_corr:+.3f}   (keystone time-split: -0.12)")
+print(f"corr(nonconformity, shift-feature): {shift_corr:+.3f}")
 contracts.assert_close("arxiv.conformal.synthetic_shift_corr", shift_corr, tol=0.08)
 ```
 
@@ -319,12 +324,11 @@ if SCALE is scale.Scale.FULL:
     assert shift_corr > 0.4
 ```
 
-At `full` scale marginal split-conformal **under-covers** (≈ 0.83) and weighted
-split-conformal **restores** coverage to nominal (≈ 0.94). Weighted conformal's
+Marginal split-conformal **under-covers** on the biased calibration set, and
+weighted split-conformal **restores** coverage to nominal. Weighted conformal's
 guarantee is in expectation over the calibration draw; at `small` scale the
-biased calibration set is a few dozen papers, too few for its weighted quantile
-to land reliably, so the small run shows the mechanism and its numbers, and
-the restore is the full-scale finding.
+biased calibration set is a few dozen papers, so its weighted quantile lands less
+reliably, and the restore is asserted as the full-scale finding.
 
 Note these are **client-local numpy** computations. The engine's `conformalize*`
 surface is the **marginal** one (valid under exchangeability); Mondrian / weighted
@@ -344,15 +348,15 @@ db.close()
 
 > **Weighted conformal repairs a covariate shift if and only if the shift moves the
 > nonconformity-score distribution.** The keystone (tier 04) is one half: on the real
-> ogbn-arxiv time-split the shift is *orthogonal* to the score (corr ≈ −0.12 for
+> ogbn-arxiv time-split the shift is *orthogonal* to the score (a near-zero correlation for
 > classification; for regression, residual magnitude is uncorrelated with
 > test-likeness *within* the calibration set, even though the residuals themselves do
 > shift across eras), so reweighting the calibration CDF along a direction the score
 > barely depends on cannot move the quantile — a no-op, and the honest remedy is a
 > governed, time-aware cohort. This chapter is the other half: a
 > transparently-constructed, score-aligned
-> shift (corr ≈ +0.73) on which marginal under-covers (≈ 0.83) and the weighted restore
-> [@tibshirani2019covariateshift] is real (≈ 0.94). Together they are the complete statement —
+> shift, positively correlated with the score, on which marginal under-covers and the
+> weighted restore [@tibshirani2019covariateshift] is real. Together they are the complete statement —
 > neither half alone is the theorem. A graph-aware, productionized version of the governed
 > cohort is out of scope here [@huang2023cfgnn]; the OSS Python surface exposes the
 > marginal `conformalize*` and leaves the cohort/weight choice to you.

@@ -18,11 +18,14 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 jammi-datafusion.workspace = true
 jammi-db.workspace = true
+# The shared wire vocabulary: the engine-error → status classification the
+# embedded error classes are derived from, the same one the server sends.
+jammi-wire.workspace = true
 # LOCAL-ONLY. The embed wheel is the in-process engine (default = `local`); its
 # remote arm is the pure-Python `jammi` client (composition, dispatched
 # in `jammi/__init__.py`), NOT a second Rust gRPC client. The Rust wire
-# client lives in the separate `jammi-wire` / `jammi-admin` / `jammi-client`
-# crates for Rust consumers + `jammi-server`; none is compiled into this wheel.
+# clients live in the separate `jammi-admin` / `jammi-client` crates for Rust
+# consumers + `jammi-server`; neither is compiled into this wheel.
 #
 # The embedded training verbs build their request with the same pure-Python
 # assembly the remote client uses, then hand the serialized body to the shared

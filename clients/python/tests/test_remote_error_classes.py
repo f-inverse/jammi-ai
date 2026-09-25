@@ -9,7 +9,15 @@ from google.protobuf import any_pb2
 
 from jammi._database import _rpc_to_jammi
 from jammi._generated.jammi.v1 import error_pb2
-from jammi.errors import BackendError, InvalidArgument, ModelNotFound, ModelReferenced
+from jammi.errors import (
+    AlreadyExists,
+    BackendError,
+    FailedPrecondition,
+    InvalidArgument,
+    ModelNotFound,
+    ModelReferenced,
+    NotFound,
+)
 
 
 class _FailedCall(grpc.RpcError):
@@ -41,13 +49,18 @@ def test_a_typed_detail_raises_its_leaf_class() -> None:
     missing = error_pb2.JammiErrorDetail(model_not_found=error_pb2.ModelNotFoundError())
 
     raised = _rpc_to_jammi(_with_detail(grpc.StatusCode.FAILED_PRECONDITION, referenced))
-    assert isinstance(raised, ModelReferenced) and isinstance(raised, BackendError)
+    assert isinstance(raised, ModelReferenced) and isinstance(raised, FailedPrecondition)
     assert raised.code == grpc.StatusCode.FAILED_PRECONDITION
     assert isinstance(_rpc_to_jammi(_with_detail(grpc.StatusCode.NOT_FOUND, missing)), ModelNotFound)
 
 
 def test_without_a_detail_the_code_decides() -> None:
-    assert type(_rpc_to_jammi(_FailedCall(grpc.StatusCode.NOT_FOUND, "m"))) is BackendError
+    assert type(_rpc_to_jammi(_FailedCall(grpc.StatusCode.NOT_FOUND, "m"))) is NotFound
+    assert type(_rpc_to_jammi(_FailedCall(grpc.StatusCode.ALREADY_EXISTS, "m"))) is AlreadyExists
+    assert isinstance(
+        _rpc_to_jammi(_FailedCall(grpc.StatusCode.FAILED_PRECONDITION, "m")), FailedPrecondition
+    )
+    assert type(_rpc_to_jammi(_FailedCall(grpc.StatusCode.INTERNAL, "m"))) is BackendError
     assert isinstance(
         _rpc_to_jammi(_FailedCall(grpc.StatusCode.INVALID_ARGUMENT, "m")), InvalidArgument
     )

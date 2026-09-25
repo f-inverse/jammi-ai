@@ -1234,6 +1234,164 @@ impl From<TaskErrorEnvelopeError> for JammiError {
     }
 }
 
+/// The gRPC status code an engine error surfaces as — the one classification
+/// every transport shares. The server sends it, with the error's own message
+/// and its typed detail; the embedded Python binding derives the same
+/// `jammi.errors` class from it, so a failure raises one class, with one
+/// message, in process and over the wire. The standard code set is coarser than
+/// the error enum (Source / Model / Tenant / Config / Schema / Eval all land on
+/// `InvalidArgument`); the typed detail carries the rest.
+pub fn status_code(err: &JammiError) -> Code {
+    match err {
+        JammiError::Source { .. } => Code::InvalidArgument,
+        // An absent source row — never registered, or removed on any replica —
+        // is a NotFound, not the bad-argument `Source` fault; the source's
+        // analogue of `ModelNotFound`.
+        JammiError::SourceNotFound { .. } => Code::NotFound,
+        JammiError::Model { .. } => Code::InvalidArgument,
+        // An absent model row a lifecycle verb resolved nothing for — a NotFound,
+        // not the bad-argument `Model` fault. Mirrors the `ModelReferenced` arm.
+        JammiError::ModelNotFound { .. } => Code::NotFound,
+        JammiError::ModelReferenced { .. } => Code::FailedPrecondition,
+        JammiError::Tenant(_) => Code::InvalidArgument,
+        JammiError::Config(_) => Code::InvalidArgument,
+        JammiError::Schema { .. } => Code::InvalidArgument,
+        JammiError::Eval(_) => Code::InvalidArgument,
+        JammiError::Inference(_) => Code::Internal,
+        // The mutable-table kind carries a typed failure the coarse gRPC code set
+        // must preserve so a remote client distinguishes a missing table (the
+        // `if_exists` no-op signal) and an id collision from a genuine fault — the
+        // mutable-table analogue of the `TopicNotFound` → `NotFound` mapping. The
+        // validation variants are caller errors (`InvalidArgument`); a backend
+        // fault falls through to `Internal`.
+        JammiError::MutableTable(mt) => match mt {
+            MutableTableError::NotFound(_) => Code::NotFound,
+            MutableTableError::AlreadyExists(_) => Code::AlreadyExists,
+            MutableTableError::InvalidId(_)
+            | MutableTableError::Schema(_)
+            | MutableTableError::MissingPrimaryKey(_)
+            | MutableTableError::ReservedColumn(_)
+            | MutableTableError::NoOrderColumn => Code::InvalidArgument,
+            MutableTableError::Backend(_) => Code::Internal,
+        },
+        // A channel-catalog op carries a typed caller condition the coarse gRPC
+        // code set must preserve so a remote client distinguishes a duplicate
+        // channel, an absent channel, a column conflict, and bad input. A
+        // same-type redeclare and a duplicate channel are both `AlreadyExists`
+        // (the resource is already present); a different-type redeclare is a
+        // `FailedPrecondition` conflict against the stored declaration; an
+        // unregistered channel is `NotFound`; a bad slug or column-type token is
+        // `InvalidArgument`. (The two input variants are pre-rejected at the wire
+        // boundary — slugs by `parse_channel_id`, dtype tokens by the closed
+        // proto enum — so they are reachable only from the embedded surfaces.)
+        JammiError::ChannelCatalog(c) => match c {
+            ChannelCatalogError::AlreadyExists(_)
+            | ChannelCatalogError::ColumnAlreadyDeclared { .. } => Code::AlreadyExists,
+            ChannelCatalogError::NotRegistered(_) => Code::NotFound,
+            ChannelCatalogError::ColumnConflict { .. } => Code::FailedPrecondition,
+            ChannelCatalogError::InvalidId(_) | ChannelCatalogError::InvalidColumnType(_) => {
+                Code::InvalidArgument
+            }
+        },
+        // Channel-assembly failures are reached only from the engine-internal
+        // search-merge path on engine-derived inputs — an engine invariant, not a
+        // caller condition — so they fall through to `Internal`.
+        JammiError::ChannelAssembly(_) => Code::Internal,
+        // The building-row CAS zero-row classification (`catalog::result_repo`'s
+        // `ResultTableCas`): each of the four outcomes is a distinct
+        // caller condition, never a bare `Internal`. `RowGone` — the row was
+        // already deleted underneath the caller — is `NotFound`. `TenantMismatch`
+        // — the STRICT tenant arm refused the write — is `PermissionDenied`, the
+        // same code a forged-tenant read is refused with elsewhere. `LeaseLost`
+        // and `CasFailed` are both "the caller's view of the row was already
+        // stale by the time its CAS ran" — a transient, retryable conflict, not
+        // a permanent precondition failure — so both map to `Aborted` (gRPC's
+        // code for "the operation was aborted, typically due to a concurrency
+        // issue …; the client should retry").
+        JammiError::RowGone { .. } => Code::NotFound,
+        JammiError::TenantMismatch { .. } => Code::PermissionDenied,
+        JammiError::LeaseLost { .. } => Code::Aborted,
+        JammiError::CasFailed { .. } => Code::Aborted,
+        // A parent-pinned version CAS (allocation or publish) lost a race
+        // against a concurrent refresh/compaction that published first: the
+        // same "the caller's view was already stale" shape `LeaseLost` /
+        // `CasFailed` carry, so the same retryable `Aborted` code.
+        JammiError::ParentMoved { .. } => Code::Aborted,
+        // A job-row attempt guard missed under the caller: a peer's reclaim
+        // superseded this attempt mid-run. `Aborted` — the same "lost the
+        // race, retry from a fresh claim" mapping `LeaseLost`/`CasFailed`
+        // carry for a result-table lease.
+        JammiError::JobAttemptSuperseded { .. } => Code::Aborted,
+        // The executor honoured a `cancel_request` at a checkpoint: the
+        // caller asked for exactly this outcome, so it is `Cancelled`, not a
+        // fault.
+        JammiError::JobCancelled { .. } => Code::Cancelled,
+        // `delete_result_tables_for_source`'s atomic guard refused: a live-lease
+        // `building` row still references the source. `FailedPrecondition` — a
+        // retry once the writer finishes or its lease expires, mirroring
+        // `ModelReferenced`'s delete-precondition mapping above.
+        JammiError::SourceBusy { .. } => Code::FailedPrecondition,
+        // A null key in the scanned source is a data-shape fault of the
+        // caller's input — the same `InvalidArgument` convention `Schema` and
+        // `Source` follow above.
+        JammiError::InvalidKey { .. } => Code::InvalidArgument,
+        // No recorded materialization to describe — the absent-resource
+        // convention `VersionUnavailable` follows.
+        // The caller asked to encode a query into a space no encoder produced.
+        JammiError::NoQueryEncoder { .. } => Code::InvalidArgument,
+        JammiError::MissingManifest { .. } => Code::NotFound,
+        // The current version of a versioned table cannot be served — the
+        // absent-resource convention `ModelNotFound` / `RowGone` follow.
+        JammiError::VersionUnavailable { .. } => Code::NotFound,
+        // "Fix state, then retry" — the `ModelReferenced` / `SourceBusy`
+        // convention: the table must be recomputed (or its version restored)
+        // before a refresh can proceed.
+        JammiError::NotRefreshable { .. } => Code::FailedPrecondition,
+        // The environment (model / device), not the argument, must change
+        // before a retry.
+        JammiError::DefinitionDrift { .. } => Code::FailedPrecondition,
+        // A non-unique key space is a data-shape fault of the caller's
+        // input, like `InvalidKey`.
+        JammiError::NonUniqueKey { .. } => Code::InvalidArgument,
+        // The placed-search failure ladder was exhausted for a segment another
+        // replica owns: the owner, its retry candidate and the local load all
+        // failed. `Unavailable` — gRPC's code for "the service is currently
+        // unavailable; retry with backoff" — naming the segment, so a peer
+        // outage is visible and never masked by a silent full scan.
+        JammiError::Unavailable { .. } => Code::Unavailable,
+        // A training set whose projection yields no rows is a degenerate
+        // input the caller must change — the same `InvalidArgument`
+        // convention `InvalidKey` / `NonUniqueKey` follow, never the
+        // `Internal` a fold would give it.
+        JammiError::EmptyTrainingSet { .. } => Code::InvalidArgument,
+        // A DataFusion plan operator or an engine-side memory reservation
+        // tried to grow past the session's `[engine] memory_limit`-bounded
+        // pool. `ResourceExhausted` — gRPC's code for exactly this ("some
+        // resource has been exhausted, perhaps a per-user quota, or perhaps
+        // the entire file system is out of space"); a retry with a smaller
+        // request, a higher `memory_limit`, or backoff is the caller's
+        // remedy, never a bare `Internal`.
+        JammiError::ResourcesExhausted { .. } => Code::ResourceExhausted,
+        // A plan requiring a device kind no holder lists: the plan is
+        // well-formed and the caller cannot change it into one the plane
+        // holds — the plane's device inventory is what must change.
+        // `FailedPrecondition`, gRPC's code for "the system is not in a
+        // state required for the operation's execution".
+        JammiError::DeviceKindUnheld { .. } => Code::FailedPrecondition,
+        // The plane's live inventory cannot hold the plan right now — the
+        // same runtime state, whichever reason: `FailedPrecondition`, never
+        // a caller fault.
+        JammiError::Unheld(_) => Code::FailedPrecondition,
+        // The plane lost the executor holding a placed job's task: the
+        // submitter's attempt is spent and its successor runs the job on
+        // the executors that remain — `Unavailable`, the code the
+        // `Unavailable` variant carries for a peer that went away, never a
+        // precondition the caller could fix.
+        JammiError::ExecutorLost { .. } => Code::Unavailable,
+        _ => Code::Internal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

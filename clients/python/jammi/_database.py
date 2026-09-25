@@ -76,13 +76,16 @@ from ._credentials import (
     _bearer_metadata,
 )
 from .errors import (
+    AlreadyExists,
     BackendError,
     DefinitionDrift,
+    FailedPrecondition,
     InvalidArgument,
     InvalidKey,
     JammiError,
     MissingManifest,
     ModelNotFound,
+    NotFound,
     ModelReferenced,
     NoQueryEncoder,
     NonUniqueKey,
@@ -131,6 +134,16 @@ _DETAIL_CLASS = {
 }
 
 
+# The class each status code raises when the status carries no leaf detail.
+_CODE_CLASS = {
+    grpc.StatusCode.INVALID_ARGUMENT: InvalidArgument,
+    grpc.StatusCode.UNIMPLEMENTED: NotSupportedOnBackend,
+    grpc.StatusCode.NOT_FOUND: NotFound,
+    grpc.StatusCode.ALREADY_EXISTS: AlreadyExists,
+    grpc.StatusCode.FAILED_PRECONDITION: FailedPrecondition,
+}
+
+
 def _error_detail(exc: grpc.RpcError) -> Optional[str]:
     """The typed engine detail a server attached to a failed call — the
     `JammiErrorDetail` variant packed in the `grpc-status-details-bin`
@@ -160,8 +173,10 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
       argument, the SAME class the embedded engine raises for the same rejection.
     * ``UNIMPLEMENTED`` → :class:`NotSupportedOnBackend` — a verb this deployment
       did not mount.
+    * ``NOT_FOUND`` / ``ALREADY_EXISTS`` / ``FAILED_PRECONDITION`` →
+      :class:`NotFound` / :class:`AlreadyExists` / :class:`FailedPrecondition`.
     * everything else (``RESOURCE_EXHAUSTED`` — the receive-cap edge —,
-      ``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, ``INTERNAL``, ``NOT_FOUND``, …) →
+      ``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, ``INTERNAL``, …) →
       :class:`BackendError`.
 
     The originating grpc ``StatusCode`` rides on the mapped exception's ``code``
@@ -173,12 +188,8 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
     leaf = _DETAIL_CLASS.get(_error_detail(exc))
     if leaf is not None:
         mapped: JammiError = leaf(detail)
-    elif code == grpc.StatusCode.INVALID_ARGUMENT:
-        mapped = InvalidArgument(detail)
-    elif code == grpc.StatusCode.UNIMPLEMENTED:
-        mapped = NotSupportedOnBackend(detail)
     else:
-        mapped = BackendError(detail)
+        mapped = _CODE_CLASS.get(code, BackendError)(detail)
     mapped.code = code
     return mapped
 

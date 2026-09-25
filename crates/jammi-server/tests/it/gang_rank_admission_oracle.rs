@@ -313,7 +313,7 @@ fn only_the_gang_resolution_site_calls_get_result_table_for_tenant() {
         "crates/jammi-db/src/catalog/result_repo.rs", // the definition itself
         "crates/jammi-server/src/grpc/gang.rs",       // the ONE production caller
         "crates/jammi-db/tests/it/result_tables.rs",  // jammi-db's own strict-predicate tests
-        // The SECOND production caller, reviewed: `JammiCodec`'s `AnnSearchExec`
+        // The SECOND production caller, reviewed: `JammiCodec`'s `VectorSearchExec`
         // decode rebuilds the operator on a Ballista executor from the table
         // name AND the tenant the SUBMITTER's own session carried onto the
         // wire — a read pinned to the carried tenant, never to the decoding

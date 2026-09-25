@@ -30,6 +30,7 @@ use jammi_ai::pipeline::context_predictor::{
 use jammi_ai::pipeline::context_set::ContextSourceKind;
 use jammi_ai::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_encoders::{AnyContextPredictor, ContextArchitecture, ContextPredictorConfig};
@@ -335,7 +336,7 @@ async fn hyphenated_source_name_survives_generated_read_sql() {
     // clause that embeds the source name — the breaking site.
     let query = rows[0].x.clone();
     let results = session
-        .search("my-source-2024", query, 5, None, None)
+        .search("my-source-2024", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()

@@ -169,6 +169,7 @@ class Session(Protocol):
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
         oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> Any: ...
     def infer(
         self,

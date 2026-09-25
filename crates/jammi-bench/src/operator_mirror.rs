@@ -3,7 +3,7 @@
 //! ([`SidecarIndex::search`], [`SidecarIndex::get_exact`],
 //! [`jammi_numerics::distance::cosine_distance`]).
 //!
-//! The real implementation lives in `jammi_ai::operator::ann_search_exec` as a
+//! The real implementation lives in `jammi_ai::operator::vector_search_exec` as a
 //! private function of a `DataFusion` physical-plan node — a server-execution
 //! concern jammi-bench has no business depending on (the bench measures the
 //! engine's storage/index *primitives*, not its query-planning surface). This

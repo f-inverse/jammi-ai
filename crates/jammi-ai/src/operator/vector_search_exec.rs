@@ -14,13 +14,14 @@ use futures::stream;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::Result;
 use jammi_db::index::exact::exact_vector_search;
-use jammi_db::index::ValidatedQuery;
+use jammi_db::index::{SearchMethod, ValidatedQuery};
 use jammi_db::session::QueryContext;
 use jammi_db::store::ResultStore;
 
-/// ANN vector search over an embedding table.
+/// Vector search over an embedding table, by the request's [`SearchMethod`].
 ///
-/// Delegates to `ResultStore::resolve_search_mode()` — the table's whole
+/// An exact search scores every vector through `exact_vector_search()`. An
+/// approximate one delegates to `ResultStore::resolve_search_mode()` — the table's whole
 /// segment set as a
 /// [`SegmentedIndex`](jammi_db::index::SegmentedIndex) when available,
 /// brute-force via `exact_vector_search()` otherwise — and returns the final
@@ -31,28 +32,28 @@ use jammi_db::store::ResultStore;
 /// per-segment approximate candidates are exact-rescored down to a
 /// cross-segment comparable top-`k`. The per-request `oversample` override
 /// (resolved against the table's stamped default) is threaded here.
-pub struct AnnSearchExec {
+pub struct VectorSearchExec {
     table: ResultTableRecord,
     query_vector: ValidatedQuery,
     k: usize,
-    /// Per-request oversample override (`SearchRequest::oversample`). `None`
-    /// defers to the table's own stamped default
-    /// (`ResultTableRecord::oversample`), which itself falls back to the
-    /// deployment's current
+    /// Exact, or approximate with an optional per-request oversample
+    /// override. An override of `None` defers to the table's own stamped
+    /// default (`ResultTableRecord::oversample`), which itself falls back to
+    /// the deployment's current
     /// [`jammi_db::config::AnnIndexConfig::effective_oversample`] only for a
     /// pre-migration-023 table with no stamped column.
-    oversample_override: Option<usize>,
+    method: SearchMethod,
     result_store: Arc<ResultStore>,
     session_ctx: QueryContext,
     properties: Arc<PlanProperties>,
 }
 
-impl AnnSearchExec {
+impl VectorSearchExec {
     pub fn new(
         table: ResultTableRecord,
         query_vector: ValidatedQuery,
         k: usize,
-        oversample_override: Option<usize>,
+        method: SearchMethod,
         result_store: Arc<ResultStore>,
         session_ctx: QueryContext,
     ) -> Result<Self> {
@@ -71,7 +72,7 @@ impl AnnSearchExec {
             table,
             query_vector,
             k,
-            oversample_override,
+            method,
             result_store,
             session_ctx,
             properties: Arc::new(properties),
@@ -93,9 +94,9 @@ impl AnnSearchExec {
         self.k
     }
 
-    /// The per-request oversample override, if any.
-    pub fn oversample_override(&self) -> Option<usize> {
-        self.oversample_override
+    /// How this node ranks the table's vectors.
+    pub fn method(&self) -> SearchMethod {
+        self.method
     }
 
     fn output_schema() -> SchemaRef {
@@ -107,28 +108,28 @@ impl AnnSearchExec {
     }
 }
 
-impl std::fmt::Debug for AnnSearchExec {
+impl std::fmt::Debug for VectorSearchExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AnnSearchExec")
+        f.debug_struct("VectorSearchExec")
             .field("table", &self.table.table_name)
             .field("k", &self.k)
             .finish()
     }
 }
 
-impl DisplayAs for AnnSearchExec {
+impl DisplayAs for VectorSearchExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "AnnSearchExec: table={}, k={}",
+            "VectorSearchExec: table={}, k={}",
             self.table.table_name, self.k
         )
     }
 }
 
-impl ExecutionPlan for AnnSearchExec {
+impl ExecutionPlan for VectorSearchExec {
     fn name(&self) -> &str {
-        "AnnSearchExec"
+        "VectorSearchExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -157,16 +158,20 @@ impl ExecutionPlan for AnnSearchExec {
         let table = self.table.clone();
         let query = self.query_vector.clone();
         let k = self.k;
-        let oversample_override = self.oversample_override;
+        let method = self.method;
         let ctx = self.session_ctx.clone();
 
         let result_stream = stream::once(async move {
-            let search_results = match result_store
-                .resolve_search_mode(&table)
-                .await
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-            {
-                Some(index) => {
+            let placed = match method {
+                SearchMethod::Exact => None,
+                SearchMethod::Approximate { oversample } => result_store
+                    .resolve_search_mode(&table)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+                    .map(|index| (index, oversample)),
+            };
+            let search_results = match placed {
+                Some((index, oversample_override)) => {
                     let oversample = result_store
                         .ann_config()
                         .resolve_oversample(oversample_override, table.oversample);

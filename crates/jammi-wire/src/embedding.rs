@@ -11,6 +11,7 @@
 //! ([`super::catalog`]); only the compute verbs' shapes are here.
 
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::index::SearchMethod;
 use tonic::Status;
 
 use crate::proto::embedding as pb;
@@ -393,5 +394,28 @@ mod result_table_kind_tests {
         let back = result_table_from_proto(wire).expect("the projection reconstructs");
         assert_eq!(back.kind, ResultTableKind::TrainingSet);
         assert_eq!(back.row_count, 7);
+    }
+}
+
+/// A search's `method` on the wire: unset for an approximate search at the
+/// table's own oversample. [`search_method_from_proto`] is the inverse.
+pub fn search_method_to_proto(method: SearchMethod) -> Option<pb::search_request::Method> {
+    match method {
+        SearchMethod::Approximate { oversample: None } => None,
+        SearchMethod::Approximate {
+            oversample: Some(v),
+        } => Some(pb::search_request::Method::Oversample(v as u32)),
+        SearchMethod::Exact => Some(pb::search_request::Method::Exact(pb::ExactSearch {})),
+    }
+}
+
+/// The [`SearchMethod`] a wire `method` names.
+pub fn search_method_from_proto(method: Option<pb::search_request::Method>) -> SearchMethod {
+    match method {
+        None => SearchMethod::default(),
+        Some(pb::search_request::Method::Oversample(v)) => SearchMethod::Approximate {
+            oversample: Some(v as usize),
+        },
+        Some(pb::search_request::Method::Exact(_)) => SearchMethod::Exact,
     }
 }

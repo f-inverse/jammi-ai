@@ -14,6 +14,7 @@ use std::sync::Arc;
 use arrow::array::{Array, StringArray};
 use jammi_ai::pipeline::context_set::{ContextRequest, MaterializedContext, SetAggregator};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
@@ -182,7 +183,13 @@ async fn exclude_self_drops_the_targets_own_row() {
     // Pick a real key and query by its own stored vector — it is the nearest
     // neighbour of itself, so without the guard it would head the context.
     let hydrated = session
-        .search("patents", vec![0.0_f32; 32], 1, None, None)
+        .search(
+            "patents",
+            vec![0.0_f32; 32],
+            1,
+            None,
+            SearchMethod::default(),
+        )
         .await
         .unwrap()
         .run()

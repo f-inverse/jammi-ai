@@ -126,14 +126,28 @@ results = db.sql("""
 
 See [Compound Retrieval and Inference over Flight SQL](./remote-compound-query.md) for the full compound surface — it runs the same SQL in-process or against a remote engine over Flight SQL.
 
-## ANN vs exact search
+## Approximate vs exact search
 
-Search automatically selects the best path:
+By default a search is **approximate**: it walks the table's ANN sidecar
+index (`.usearch` + `.rowmap` + `.manifest.json`), and falls back to scoring
+every vector when the sidecar is missing or corrupt — deleting sidecar files
+degrades speed, never correctness. On a quantized table (`int8` / `binary`
+`storage_precision`) the index retrieves `k * oversample` candidates and
+rescores them exactly; `oversample` widens that breadth for one call.
 
-- **ANN (fast)** — when sidecar index files (`.usearch` + `.rowmap` + `.manifest.json`) exist and load successfully
-- **Exact (brute-force)** — fallback when sidecar files are missing or corrupt
+An **exact** search scores every vector and returns the true nearest
+neighbours — the baseline an approximate search's recall is measured
+against:
 
-The caller never knows the difference. Deleting sidecar files degrades performance but not correctness.
+```python
+approximate = db.search("patents", query=vector, k=10)
+exact = db.search("patents", query=vector, k=10, exact=True)
+recall = len(set(approximate.column("_row_id").to_pylist())
+             & set(exact.column("_row_id").to_pylist())) / 10
+```
+
+In Rust the choice is a `SearchMethod`: `SearchMethod::Approximate {
+oversample }` or `SearchMethod::Exact`. An exact search takes no oversample.
 
 ## Embedding table resolution
 
@@ -155,10 +169,10 @@ A `SearchRequest` carries the source, a `k`, an optional SQL `filter` (predicate
 ```text
 // encode-then-search
 embedding = EncodeAudioQuery{ model_id, audio_bytes }.embedding
-hits      = Search{ source_id, query_vector: { values: embedding }, k: 10 }.hits
+result    = Search{ source_id, query_vector: { values: embedding }, k: 10 }.result
 
 // query-by-example (no re-encode round-trip; vector stays in the engine)
-hits      = Search{ source_id, row_key: "clip_1", k: 10 }.hits
+result    = Search{ source_id, row_key: "clip_1", k: 10 }.result
 ```
 
-Each `SearchHit` carries the `key` (the matched row's key-column value), the `score` (similarity), and a `columns` map. `columns` is empty unless `select` is non-empty, in which case it holds the requested columns stringified — the engine always projects the key and score alongside them so a hit is fully formed. Heavy clients that want Arrow batches keep using Flight SQL; `Search` returns lightweight structured rows so an edge bundle needs no Arrow reader.
+`result` is the hydrated rows as one Arrow IPC stream — the key (`_row_id`), the source's columns (or exactly the `select`ed ones), the retrieval provenance, and the `similarity` — typed as the engine typed them, the same table `db.search` returns. `method` chooses an exact search (`exact`) or overrides the approximate search's `oversample`; unset is an approximate search at the table's own oversample.

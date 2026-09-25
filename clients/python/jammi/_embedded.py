@@ -1237,6 +1237,7 @@ class EmbeddedBackend:
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
         oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> pa.Table:
         """Nearest-neighbor search over a source's embedding table.
 
@@ -1248,7 +1249,9 @@ class EmbeddedBackend:
         for this one call, a quantized-`storage_precision` table's retrieve→
         rescore candidate breadth (`k * oversample`); ``None`` defers to the
         table's own stamped default, and the knob is irrelevant for an
-        `f32`-precision table (single-stage, no rescore). Returns a
+        `f32`-precision table (single-stage, no rescore). `exact` scores every
+        vector instead of searching the index: the true nearest neighbours.
+        Returns a
         `pyarrow.Table`. Mirrors the remote `RemoteDatabase.search`; the request
         is assembled with the shared `SearchRequest` builder and submitted
         through the engine's wire seam (only the request is shared — the Arrow
@@ -1262,6 +1265,7 @@ class EmbeddedBackend:
             select=select,
             embedding_table=embedding_table,
             oversample=oversample,
+            exact=exact,
         )
         return self._native._search_proto(request.SerializeToString())
 

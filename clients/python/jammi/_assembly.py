@@ -1467,6 +1467,7 @@ def build_search_request(
     select: Optional[List[str]] = None,
     embedding_table: Optional[str] = None,
     oversample: Optional[int] = None,
+    exact: bool = False,
 ) -> embedding_pb2.SearchRequest:
     """Assemble the `SearchRequest` for a nearest-neighbour search from the
     binding's flat kwargs.
@@ -1479,9 +1480,13 @@ def build_search_request(
     retrieve→rescore candidate-breadth multiplier (`k * oversample`) a
     quantized-`storage_precision` table's sidecar resolves at search time
     (`None` defers to the table's own stamped default); irrelevant for an
-    `f32`-precision table (single-stage, no rescore). The same request the
-    embed binding submits in-process.
+    `f32`-precision table (single-stage, no rescore). `exact` scores every
+    vector instead of searching the index — the true nearest neighbours, and
+    the baseline an approximate search's recall is measured against; it takes
+    no `oversample`. The same request the embed binding submits in-process.
     """
+    if exact and oversample is not None:
+        raise ValueError("an exact search scores every vector; it takes no oversample")
     request = embedding_pb2.SearchRequest(
         source_id=source,
         query_vector=embedding_pb2.QueryVector(values=list(query)),
@@ -1494,6 +1499,8 @@ def build_search_request(
         request.embedding_table = embedding_table
     if oversample is not None:
         request.oversample = oversample
+    if exact:
+        request.exact.SetInParent()
     return request
 
 

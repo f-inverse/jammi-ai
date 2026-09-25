@@ -8,6 +8,7 @@
 use arrow::array::StringArray;
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, LrSchedule};
 use jammi_ai::local_session::FineTuneJobId;
+use jammi_ai::SearchMethod;
 use jammi_ai::{Jammi, Modality, SearchQuery, SearchRequest, Session, Target};
 use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
@@ -65,7 +66,7 @@ async fn open_local_yields_a_working_embedded_session() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: SearchMethod::default(),
         })
         .await
         .expect("search through the opened session");

@@ -5,6 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::index::SearchMethod;
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
@@ -1012,21 +1013,15 @@ impl InferenceSession {
     /// thin wrapper over this — vector-search then optional `filter`/`select`
     /// then `run`.
     ///
-    /// `oversample` overrides the table's own stamped retrieve→rescore
-    /// default for this one call (`SearchRequest::oversample` on the wire
-    /// path); `None` defers to the table's stamped
-    /// (`ResultTableRecord::oversample`) default, falling back to the
-    /// deployment's current
-    /// [`jammi_db::config::AnnIndexConfig::effective_oversample`] only for a
-    /// pre-migration table with no stamped column. Irrelevant for a `F32`
-    /// table (single-stage, no rescore).
+    /// `method` chooses an approximate search through the table's ANN index
+    /// (with an optional per-call oversample) or an exact one.
     pub async fn search(
         self: &Arc<Self>,
         source_id: &str,
         query: Vec<f32>,
         k: usize,
         embedding_table: Option<&str>,
-        oversample: Option<usize>,
+        method: SearchMethod,
     ) -> Result<QueryBuilder> {
         QueryBuilder::new(
             Arc::clone(self),
@@ -1034,7 +1029,7 @@ impl InferenceSession {
             query,
             k,
             embedding_table,
-            oversample,
+            method,
             jammi_db::index::QuerySource::Caller,
         )
         .await
@@ -1057,7 +1052,7 @@ impl InferenceSession {
         row_key: &str,
         k: usize,
         embedding_table: Option<&str>,
-        oversample: Option<usize>,
+        method: SearchMethod,
     ) -> Result<QueryBuilder> {
         let table = self
             .catalog()
@@ -1077,7 +1072,7 @@ impl InferenceSession {
             query,
             k,
             embedding_table,
-            oversample,
+            method,
             jammi_db::index::QuerySource::Stored {
                 table: pin.table_name().to_string(),
             },

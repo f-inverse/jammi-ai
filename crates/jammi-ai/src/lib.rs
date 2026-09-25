@@ -70,7 +70,7 @@ pub mod wire;
 /// vocabulary ([`Modality`], the query and search shapes) lives on the
 /// `jammi-wire` substrate and is re-exported through it.
 #[cfg(feature = "local")]
-pub use local_session::{Modality, QueryInput, SearchQuery, SearchRequest, Session};
+pub use local_session::{Modality, QueryInput, SearchMethod, SearchQuery, SearchRequest, Session};
 
 /// Engine introspection shapes the [`Session`] surface returns: a per-source
 /// [`SourceDescriptor`] (registry identity joined with its embedding result

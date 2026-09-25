@@ -227,7 +227,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search")

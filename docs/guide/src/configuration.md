@@ -130,11 +130,8 @@ max_described_models = 1024
 partitions = 1
 
 [embedding]
-# Distance metric for vector indices. Default: "cosine".
-default_distance_metric = "cosine"
-# Index type for vector storage. Default: "ivf_hnsw_sq".
-default_index_type = "ivf_hnsw_sq"
-# Rows between embedding index checkpoints. Default: 1000.
+# Batches between two progress checkpoints on a building embedding table's
+# catalog row; 0 never checkpoints. Default: 1000.
 checkpoint_interval = 1000
 # Rows per ANN segment of a written embedding table. The segments are
 # consecutive runs of the table's rows (key order) at this budget, each built
@@ -142,6 +139,26 @@ checkpoint_interval = 1000
 # smaller budget builds sooner and wider, a larger one searches fewer graphs.
 # Default: 4096.
 index_segment_rows = 4096
+
+[embedding.ann]
+# The HNSW sidecar index built beside every embedding table. 0 = the
+# backend's default for each graph knob.
+# Edges per graph node (HNSW M): larger builds a bigger, slower-to-build,
+# higher-recall graph.
+connectivity = 0
+# Candidate-list width while building the graph (ef_construction).
+build_expansion = 0
+# Candidate-list width while searching (ef_search), at least k: wider finds
+# more of the true neighbours per query at more work. A query-time setting —
+# it applies to indexes already built. Measure it against `search(exact=True)`.
+search_expansion = 0
+# Precision new tables' indexes are built at: "f32", "f16", "int8", "binary".
+# A quantized index retrieves k * oversample candidates and rescores them
+# exactly. Default: "f32".
+storage_precision = "f32"
+# That candidate multiplier; unset uses the precision's own default
+# (32 for binary, 4 otherwise). A table keeps the value it was created with.
+# oversample = 4
 
 [fine_tuning]
 # LoRA rank for fine-tuning. Default: 8.

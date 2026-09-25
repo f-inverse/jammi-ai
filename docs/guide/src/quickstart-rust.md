@@ -10,6 +10,7 @@ This walkthrough registers a local data file, runs a SQL query, generates embedd
 # extern crate tokio;
 use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
@@ -51,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "quantum computing applications",
     ).await?;
 
-    let results = session.search("patents", query, 5, None, None).await?
+    let results = session.search("patents", query, 5, None, SearchMethod::default()).await?
         .sort("similarity", true)?
         .run().await?;
 

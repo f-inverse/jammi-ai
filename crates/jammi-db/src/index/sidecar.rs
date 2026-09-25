@@ -1383,7 +1383,7 @@ mod tests {
         // (`crates/jammi-ai/tests/it/storage_precision.rs`) one layer down, at
         // the `SidecarIndex` this engine unit owns: build a `Binary` sidecar
         // over a small corpus, run the retrieve->rescore mechanism production
-        // uses (`jammi_ai::operator::ann_search_exec::retrieve_then_rescore`)
+        // uses (`jammi_ai::operator::vector_search_exec::retrieve_then_rescore`)
         // by hand over `SidecarIndex::search` + `get_exact`, and compare
         // against an independently-computed exact brute-force cosine ranking
         // over the ORIGINAL `f32` vectors.

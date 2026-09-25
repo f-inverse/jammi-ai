@@ -1,5 +1,6 @@
 //! Hermetic codec round-trip oracles.
 
+use jammi_ai::SearchMethod;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
@@ -441,7 +442,7 @@ async fn graph_propagation_operators_round_trip() {
 // this crate documents rather than papers over; every jammi-server process
 // runs one, so this test runs on one too.
 #[tokio::test(flavor = "multi_thread")]
-async fn ann_search_exec_round_trips() {
+async fn vector_search_exec_round_trips() {
     let session = session().await;
     let table_name = format!("bal_test_{}", uuid::Uuid::new_v4().simple());
     session
@@ -483,30 +484,37 @@ async fn ann_search_exec_round_trips() {
         },
     )
     .unwrap();
-    let node = jammi_ai::operator::ann_search_exec::AnnSearchExec::new(
-        table,
-        query.clone(),
-        5,
-        Some(8),
-        session.result_store(),
-        session.context().clone(),
-    )
-    .unwrap();
-    let node: Arc<dyn ExecutionPlan> = Arc::new(node);
-
     let codec = JammiCodec::new(&session);
-    let mut buf = Vec::new();
-    codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
-
     let ctx = session.context().task_ctx();
-    let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
-    let decoded = decoded
-        .downcast_ref::<jammi_ai::operator::ann_search_exec::AnnSearchExec>()
+    for method in [
+        SearchMethod::Approximate {
+            oversample: Some(8),
+        },
+        SearchMethod::Approximate { oversample: None },
+        SearchMethod::Exact,
+    ] {
+        let node = jammi_ai::operator::vector_search_exec::VectorSearchExec::new(
+            table.clone(),
+            query.clone(),
+            5,
+            method,
+            session.result_store(),
+            session.context().clone(),
+        )
         .unwrap();
-    assert_eq!(decoded.table().table_name, table_name);
-    assert_eq!(decoded.k(), 5);
-    assert_eq!(decoded.oversample_override(), Some(8));
-    assert_eq!(decoded.query_vector(), &query);
+        let node: Arc<dyn ExecutionPlan> = Arc::new(node);
+
+        let mut buf = Vec::new();
+        codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+        let decoded = decoded
+            .downcast_ref::<jammi_ai::operator::vector_search_exec::VectorSearchExec>()
+            .unwrap();
+        assert_eq!(decoded.table().table_name, table_name);
+        assert_eq!(decoded.k(), 5);
+        assert_eq!(decoded.method(), method);
+        assert_eq!(decoded.query_vector(), &query);
+    }
 }
 
 /// `MaskExec` (a masked result-table scan) is the named v1 cut: neither
@@ -699,7 +707,7 @@ async fn dead_session_is_refused_typed() {
 }
 
 /// Tenant isolation at the codec's decode site (the oracle's per-RPC
-/// invariant, applied to the Ballista listeners): `AnnSearchExec` is rebuilt
+/// invariant, applied to the Ballista listeners): `VectorSearchExec` is rebuilt
 /// on an executor from the table name AND the tenant the SUBMITTER's session
 /// carried onto the wire, through the strict tenant-pinned read
 /// `get_result_table_for_tenant`. A descriptor naming tenant A's table under
@@ -744,17 +752,17 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
         .expect("seed tenant A's result table row");
 
     let descriptor = |tenant: Option<String>| {
-        let msg = pb::AnnSearchExecNode {
+        let msg = pb::VectorSearchExecNode {
             table_name: table_name.clone(),
             tenant_id: tenant,
             query_vector: vec![0.1, 0.2, 0.3, 0.4],
             k: 5,
-            oversample_override: None,
+            method: None,
             query_stored_table: None,
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC);
-        buf.push(NodeTag::AnnSearch as u8);
+        buf.push(NodeTag::VectorSearch as u8);
         msg.encode(&mut buf).unwrap();
         buf
     };
@@ -777,7 +785,7 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
         .try_decode(&descriptor(Some(tenant_a.to_string())), &[], &ctx)
         .expect("the owning tenant resolves its own table");
     let decoded = decoded
-        .downcast_ref::<jammi_ai::operator::ann_search_exec::AnnSearchExec>()
+        .downcast_ref::<jammi_ai::operator::vector_search_exec::VectorSearchExec>()
         .unwrap();
     assert_eq!(decoded.table().table_name, table_name);
 }
@@ -850,17 +858,17 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
     // decides the class on THIS process exactly as it would have there.
     let refused =
         |query_stored_table: Option<String>| {
-            let msg = pb::AnnSearchExecNode {
+            let msg = pb::VectorSearchExecNode {
                 table_name: table_name.clone(),
                 tenant_id: None,
                 query_vector: vec![0.1, 0.2, 0.3],
                 k: 5,
-                oversample_override: None,
+                method: None,
                 query_stored_table,
             };
             let mut buf = Vec::new();
             buf.extend_from_slice(&MAGIC);
-            buf.push(NodeTag::AnnSearch as u8);
+            buf.push(NodeTag::VectorSearch as u8);
             msg.encode(&mut buf).unwrap();
             let codec = JammiCodec::new(&session);
             let ctx = session.context().task_ctx();

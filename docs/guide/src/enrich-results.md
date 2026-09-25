@@ -21,6 +21,7 @@ Join search results with a registered source to add context columns (e.g., compa
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 # use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
 session.add_source("assignees", SourceType::File, SourceConnection {
@@ -29,7 +30,7 @@ session.add_source("assignees", SourceType::File, SourceConnection {
     ..Default::default()
 }).await?;
 
-let results = session.search("patents", query, 10, None, None).await?
+let results = session.search("patents", query, 10, None, SearchMethod::default()).await?
     .join("assignees", "assignee_id=id", None).await?  // left join by default
     .run().await?;
 // Results now include company_name, country from assignees
@@ -65,9 +66,10 @@ Run a model over search results to add new columns:
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_ai::model::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 10, None, None).await?
+let results = session.search("patents", query, 10, None, SearchMethod::default()).await?
     .annotate(
         "sentence-transformers/all-MiniLM-L6-v2",
         ModelTask::TextEmbedding,
@@ -115,9 +117,10 @@ All operations compose freely:
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_ai::model::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 100, None, None).await?
+let results = session.search("patents", query, 100, None, SearchMethod::default()).await?
     .join("assignees", "assignee_id=id", None).await?
     .annotate("all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?
     .filter("country = 'US'")?

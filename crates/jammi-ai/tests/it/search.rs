@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, Int64Array, ListArray, StringArray};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_datafusion::ModelTask;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -52,7 +53,7 @@ async fn search_returns_hydrated_results_with_provenance() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -124,7 +125,13 @@ async fn search_by_id_ranks_the_query_row_first() {
 
     // Discover a real key by reading one row's `_row_id` from a plain search.
     let seed = session
-        .search("patents", vec![0.5_f32; 32], 1, None, None)
+        .search(
+            "patents",
+            vec![0.5_f32; 32],
+            1,
+            None,
+            SearchMethod::default(),
+        )
         .await
         .unwrap()
         .run()
@@ -141,7 +148,7 @@ async fn search_by_id_ranks_the_query_row_first() {
     // search_by_id resolves that row's stored vector internally and ranks by
     // it; a row is its own nearest neighbor, so it must come back first.
     let results = session
-        .search_by_id("patents", &row_key, 5, None, None)
+        .search_by_id("patents", &row_key, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -173,7 +180,7 @@ async fn search_by_id_ranks_the_query_row_first() {
 async fn search_by_id_rejects_an_unknown_key() {
     let (session, _dir) = session_with_embeddings().await;
     let err = match session
-        .search_by_id("patents", "no-such-key", 5, None, None)
+        .search_by_id("patents", "no-such-key", 5, None, SearchMethod::default())
         .await
     {
         Ok(_) => panic!("an unknown key must error, not silently return nothing"),
@@ -193,7 +200,7 @@ async fn search_sort_and_limit_compose() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 10, None, None)
+        .search("patents", query, 10, None, SearchMethod::default())
         .await
         .unwrap()
         .sort("similarity", true)
@@ -241,7 +248,13 @@ async fn search_fails_without_embedding_table() {
         .unwrap();
 
     let result = session
-        .search("patents", vec![0.0f32; 32], 5, None, None)
+        .search(
+            "patents",
+            vec![0.0f32; 32],
+            5,
+            None,
+            SearchMethod::default(),
+        )
         .await;
     assert!(
         result.is_err(),
@@ -270,7 +283,7 @@ async fn search_with_join_on_real_foreign_key() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .join("assignees", "assignee_id=id", None)
@@ -315,7 +328,7 @@ async fn search_with_annotate_on_real_column() {
 
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 3, None, None)
+        .search("patents", query, 3, None, SearchMethod::default())
         .await
         .unwrap()
         .annotate(
@@ -460,7 +473,7 @@ async fn search_resolves_to_latest_embedding_table() {
     // Search should work using the resolved (latest) table.
     let query = vec![0.5_f32; 32];
     let results = session
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -559,7 +572,13 @@ async fn search_embedding_table_selector_picks_the_named_table() {
         async move {
             neighbour_keys(
                 &session
-                    .search("patents", query, k, table.as_deref(), None)
+                    .search(
+                        "patents",
+                        query,
+                        k,
+                        table.as_deref(),
+                        SearchMethod::default(),
+                    )
                     .await
                     .unwrap()
                     .sort("similarity", true)
@@ -615,7 +634,7 @@ async fn search_returns_semantically_relevant_results() {
     // k=20 is deliberately >= the number of patents to verify we never return
     // more rows than exist.
     let results = session
-        .search("patents", query_vec, 20, None, None)
+        .search("patents", query_vec, 20, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -741,7 +760,7 @@ async fn cross_modal_text_to_image_search() {
 
     // 3. Run vector search against the image embeddings using the text vector.
     let results = session
-        .search("figures", text_vec, 5, None, None)
+        .search("figures", text_vec, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()

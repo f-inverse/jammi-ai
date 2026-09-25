@@ -1,7 +1,7 @@
 //! [`AsofJoinExec`] — the hand-built physical operator for the as-of join.
 //!
 //! Matches the engine's existing operator idiom ([`crate::operator`]'s
-//! `InferenceExec`/`AnnSearchExec`): a concrete [`ExecutionPlan`] the verb wraps
+//! `InferenceExec`/`VectorSearchExec`): a concrete [`ExecutionPlan`] the verb wraps
 //! its inputs in and drives directly, not a logical node behind an
 //! `ExtensionPlanner` (the engine plans no `LogicalPlan` for its compute verbs).
 //!

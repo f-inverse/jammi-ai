@@ -167,7 +167,7 @@ Breaking changes to this surface in the current release:
   `jammi_db::index::exact::exact_vector_search`,
   `jammi_db::index::placed::PlacedIndex::search_final_placed`,
   `jammi_db::store::ResultStore::{search_vectors, search_vectors_local}`,
-  `jammi_ai::operator::ann_search_exec::AnnSearchExec::new` (and its
+  `jammi_ai::operator::vector_search_exec::VectorSearchExec::new` (and its
   `query_vector` field), and `jammi_ai::pipeline::neighbor_graph::Node`'s
   `vector` field accept for a query vector.
   `jammi_db::index::segment::verify_query_width` (a free `pub fn`) is

@@ -9,6 +9,7 @@
 use std::num::NonZeroU32;
 
 use jammi_datafusion::ModelTask;
+use jammi_db::index::SearchMethod;
 use jammi_db::store::CachePolicy;
 
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -69,13 +70,9 @@ pub struct SearchRequest {
     pub filter: Option<String>,
     /// Columns to project. Empty keeps every hydrated column.
     pub select: Vec<String>,
-    /// Per-request override of the table's own stamped retrieve→rescore
-    /// oversample default (market parity with Qdrant's per-query
-    /// oversampling knob). `None` defers to the table's stamped default,
-    /// falling back to the deployment's current oversample default only for
-    /// a pre-migration table with no stamped column. Irrelevant for a `F32`
-    /// table (single-stage, no rescore).
-    pub oversample: Option<usize>,
+    /// Approximate (through the ANN index, with an optional per-request
+    /// oversample) or exact.
+    pub method: SearchMethod,
 }
 
 /// A flattened column-source fine-tune submission. Every knob the submit

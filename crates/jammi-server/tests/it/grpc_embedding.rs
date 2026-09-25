@@ -355,7 +355,7 @@ async fn search_by_query_vector_ranks_self_match_first_over_the_wire() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search by vector")
@@ -389,7 +389,7 @@ async fn search_by_row_key_ranks_that_row_first_over_the_wire() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search by row_key")
@@ -420,7 +420,7 @@ async fn search_applies_filter_and_select_projection_over_the_wire() {
             embedding_table: None,
             filter: Some("clip_id != 'clip_0'".into()),
             select: vec!["_row_id".into(), "clip_id".into()],
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search with filter + select")
@@ -491,7 +491,7 @@ async fn remove_source_drops_the_source_over_the_wire() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect_err("search against a removed source must fail: the source no longer resolves");
@@ -513,7 +513,7 @@ async fn search_requires_a_query_over_the_wire() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect_err("a search with no query must be rejected");
@@ -733,7 +733,7 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
             embedding_table: None,
             filter: None,
             select: vec!["body".into()],
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search over the imported table")

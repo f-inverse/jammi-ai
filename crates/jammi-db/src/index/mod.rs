@@ -18,6 +18,26 @@ pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 
 use crate::error::Result;
 
+/// How a search ranks a table's vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMethod {
+    /// Through the table's ANN index — an exact scan when the table has
+    /// none. `oversample` overrides, for this one search, a quantized
+    /// index's retrieve→rescore breadth (`k * oversample`); `None` defers to
+    /// the table's own stamped default. Irrelevant for an `F32` index
+    /// (single-stage, no rescore).
+    Approximate { oversample: Option<usize> },
+    /// Every vector scored: the true nearest neighbours, and the baseline an
+    /// approximate search's recall is measured against.
+    Exact,
+}
+
+impl Default for SearchMethod {
+    fn default() -> Self {
+        Self::Approximate { oversample: None }
+    }
+}
+
 /// Whether a distance may enter a merge, a rank, or a result.
 ///
 /// The domain is exactly `is_finite`, and it is the SAME predicate on both

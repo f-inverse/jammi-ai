@@ -64,6 +64,7 @@ pub use jammi_wire::request::{
 };
 
 pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
+pub use jammi_db::index::SearchMethod;
 
 /// The in-process consumer session: a handle over an [`InferenceSession`].
 ///
@@ -378,19 +379,19 @@ impl Session {
             embedding_table,
             filter,
             select,
-            oversample,
+            method,
         } = request;
         let embedding_table = embedding_table.as_deref();
 
         let builder = match query {
             SearchQuery::Vector(vector) => {
                 self.engine
-                    .search(&source_id, vector, k, embedding_table, oversample)
+                    .search(&source_id, vector, k, embedding_table, method)
                     .await?
             }
             SearchQuery::RowKey(row_key) => {
                 self.engine
-                    .search_by_id(&source_id, &row_key, k, embedding_table, oversample)
+                    .search_by_id(&source_id, &row_key, k, embedding_table, method)
                     .await?
             }
         };

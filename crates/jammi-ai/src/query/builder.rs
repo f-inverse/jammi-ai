@@ -15,13 +15,13 @@ use futures::TryStreamExt;
 
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::{FiniteQuery, QuerySource};
+use jammi_db::index::{FiniteQuery, QuerySource, SearchMethod};
 use jammi_db::session::QueryContext;
 use jammi_db::sql::source_relation;
 use jammi_db::ChannelId;
 
 use crate::evidence::{merge_channels, ChannelContribution};
-use crate::operator::ann_search_exec::AnnSearchExec;
+use crate::operator::vector_search_exec::VectorSearchExec;
 use crate::session::InferenceSession;
 
 /// Fluent API for constructing vector-search-seeded compound queries.
@@ -68,7 +68,7 @@ impl QueryBuilder {
         query_vec: Vec<f32>,
         k: usize,
         embedding_table: Option<&str>,
-        oversample: Option<usize>,
+        method: SearchMethod,
         source: QuerySource,
     ) -> Result<Self> {
         let query = FiniteQuery::new(query_vec, source)?;
@@ -80,11 +80,11 @@ impl QueryBuilder {
         let width = result_store.query_width(session.context(), &table).await?;
         let query_vec = query.against_authority(width)?;
 
-        let ann = AnnSearchExec::new(
+        let ann = VectorSearchExec::new(
             table.clone(),
             query_vec,
             k,
-            oversample,
+            method,
             result_store,
             session.context().clone(),
         )?;

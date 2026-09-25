@@ -103,63 +103,6 @@ impl CollectiveSelection {
     }
 }
 
-/// Distance metric for ANN indices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DistanceMetric {
-    Cosine,
-    L2,
-}
-
-impl fmt::Display for DistanceMetric {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cosine => write!(f, "cosine"),
-            Self::L2 => write!(f, "l2"),
-        }
-    }
-}
-
-impl FromStr for DistanceMetric {
-    type Err = JammiError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "cosine" => Ok(Self::Cosine),
-            "l2" => Ok(Self::L2),
-            other => Err(JammiError::Config(format!(
-                "Unknown distance metric '{other}'. Expected: cosine, l2"
-            ))),
-        }
-    }
-}
-
-/// ANN index type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IndexType {
-    IvfHnswSq,
-}
-
-impl fmt::Display for IndexType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IvfHnswSq => write!(f, "ivf_hnsw_sq"),
-        }
-    }
-}
-
-impl FromStr for IndexType {
-    type Err = JammiError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "ivf_hnsw_sq" => Ok(Self::IvfHnswSq),
-            other => Err(JammiError::Config(format!(
-                "Unknown index type '{other}'. Expected: ivf_hnsw_sq"
-            ))),
-        }
-    }
-}
-
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1137,11 +1080,8 @@ impl AnnIndexConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// Distance metric for ANN indices. Default: `Cosine`.
-    pub default_distance_metric: DistanceMetric,
-    /// ANN index type. Default: `IvfHnswSq`.
-    pub default_index_type: IndexType,
-    /// Rows between index checkpoint writes. Default: 1000.
+    /// Batches between two progress checkpoints on a building embedding
+    /// table's catalog row; `0` never checkpoints. Default: 1000.
     pub checkpoint_interval: usize,
     /// Rows per ANN segment of a written embedding table: the segments are
     /// consecutive runs of the table's rows at this budget, each built on
@@ -2885,8 +2825,6 @@ impl InferenceConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            default_distance_metric: DistanceMetric::Cosine,
-            default_index_type: IndexType::IvfHnswSq,
             checkpoint_interval: 1000,
             index_segment_rows: NonZeroUsize::new(4096).expect("a positive segment budget"),
             ann: AnnIndexConfig::default(),

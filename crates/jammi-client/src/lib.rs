@@ -317,7 +317,7 @@ impl DataClient {
             embedding_table,
             filter,
             select,
-            oversample,
+            method,
         } = request;
         let query = match query {
             SearchQuery::Vector(values) => ProtoSearchQuery::QueryVector(QueryVector { values }),
@@ -332,7 +332,7 @@ impl DataClient {
                 embedding_table,
                 filter,
                 select,
-                oversample: oversample.map(|v| v as u32),
+                method: jammi_wire::search_method_to_proto(method),
             })
             .await
             .map_err(|s| error_from_status(&s))?

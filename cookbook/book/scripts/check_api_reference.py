@@ -45,7 +45,7 @@ REQUIRED: dict[str, list[str]] = {
     # tier 01
     "build_neighbor_graph": ["k", "exact", "cache"],
     # tier 02
-    "search": ["query", "k"],
+    "search": ["query", "k", "embedding_table", "oversample", "exact"],
     "assemble_context": ["query", "k", "edge_source", "edge_direction", "edge_hops"],
     "propagate_embeddings": [
         "embedding_table",

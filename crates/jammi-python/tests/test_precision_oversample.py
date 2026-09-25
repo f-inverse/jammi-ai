@@ -193,6 +193,27 @@ def test_int8_storage_precision_and_oversample_reachable_through_public_api(
     assert not request_without_override.HasField("oversample")
 
 
+def test_exact_search_scores_every_vector(tmp_path: Path) -> None:
+    """`search(exact=True)` bypasses the quantized index and scores every
+    vector, so it recovers each query's own source row (distance zero) on the
+    narrow `oversample = 1` table with no widening; it takes no oversample."""
+    import pytest
+
+    from jammi._assembly import build_search_request
+
+    db = _connect_with_ann_defaults(tmp_path, storage_precision="int8", oversample=1)
+    corpus_url, ids, vectors = _write_corpus(tmp_path)
+    _register_table(db, corpus_url)
+
+    for i in range(0, N_CORPUS, QUERY_ROW_STRIDE):
+        hit = db.search("vectors", query=vectors[i], k=1, exact=True).to_pylist()[0]
+        assert hit["_row_id"] == ids[i]
+
+    assert build_search_request("vectors", query=vectors[0], k=1, exact=True).HasField("exact")
+    with pytest.raises(ValueError, match="no oversample"):
+        db.search("vectors", query=vectors[0], k=1, exact=True, oversample=4)
+
+
 def test_f32_storage_precision_is_unaffected_by_oversample_control(
     tmp_path: Path,
 ) -> None:

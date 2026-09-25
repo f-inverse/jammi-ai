@@ -548,7 +548,7 @@ maintainer's, with the invariant each seam implementation holds.
 | DataFusion `PhysicalOptimizerRule` | `InferenceFanOut` | `crates/jammi-datafusion/src/inference/exec.rs` | Restores the node's own declared fan-out after `EnforceDistribution`; the exchange hashes on `_chunk`, so bytes are identical at every width |
 | DataFusion `ExecutionPlan` | `TrainingExec` | `crates/jammi-datafusion/src/training/exec.rs` | A claimed training job as one task, run by the `TrainingRunner` it was bound to |
 | DataFusion `ExecutionPlan` + `ExtensionPlanner` + `UserDefinedLogicalNodeCore` | `ResultTableSinkExec`, `MaterializationPlanner`, `StoreStatementNode` | `crates/jammi-db/src/store/sink.rs`, `crates/jammi-db/src/compute_plane.rs` | Every result table, `CREATE TABLE … AS` included, roots in the one sink; `BuildingTable::finish` is the sole building→ready transition |
-| DataFusion `ExecutionPlan` | `AnnSearchExec`, `AsofJoinExec`, `InitialStateExec`/`HopFoldExec`/`ReadoutExec` | `crates/jammi-ai/src/operator/`, `crates/jammi-ai/src/pipeline/{asof,graph_propagation}/` | Out-of-core under the session pool; graph hops walk with an explicit work stack |
+| DataFusion `ExecutionPlan` | `VectorSearchExec`, `AsofJoinExec`, `InitialStateExec`/`HopFoldExec`/`ReadoutExec` | `crates/jammi-ai/src/operator/`, `crates/jammi-ai/src/pipeline/{asof,graph_propagation}/` | Out-of-core under the session pool; graph hops walk with an explicit work stack |
 | DataFusion `TableProvider` | `MaskedTableProvider`, `MutableTableProvider` | `crates/jammi-db/src/store/masked_provider.rs`, `crates/jammi-db/src/store/mutable/provider.rs` | A versioned read resolves one version; mutable tables expose CRUD through DML only |
 | DataFusion UDF/UDAF/UDTF | `annotate`, `jammi_content_hash`, `vector_{mean,sum,max}` | `crates/jammi-ai/src/query/` | Pure functions of their inputs |
 | DataFusion `MemoryPool` | `ActiveSpillPool` | `crates/jammi-db/src/memory_pool.rs` | A spilling consumer is held to an equal share among the consumers actually holding memory |
@@ -945,8 +945,8 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `add`/`build`/`search`/`save`/`len`/`is_empty`. Invariants:
   - **Keyed by `_row_id` (string), never an internal integer.**
   - **`search` returns `(row_id, cosine_distance)` ascending** — *distance*, not
-    similarity; the `1.0 - dist` flip happens in `AnnSearchExec`
-    (`crates/jammi-ai/src/operator/ann_search_exec.rs`).
+    similarity; the `1.0 - dist` flip happens in `VectorSearchExec`
+    (`crates/jammi-ai/src/operator/vector_search_exec.rs`).
   - `build()` after all `add()`s (a no-op marker for USearch,
     `crates/jammi-db/src/index/sidecar.rs`, `SidecarIndex::build`).
   - `Send + Sync` (shared into the async DataFusion plan).
@@ -997,7 +997,7 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `ceil(m * DEFAULT_SEGMENT_OVERFETCH_FACTOR)` = `2.0×` otherwise), concatenated,
   ordered `(distance, row_id, segment_id)`, deduped by row id keeping the
   nearest, truncated to `m`. `search_final(query, k, oversample)` is the **single
-  final-results entry** every consumer routes through — `AnnSearchExec::execute`,
+  final-results entry** every consumer routes through — `VectorSearchExec::execute`,
   `ResultStore::search_vectors`, and the neighbor-graph `IndexAssisted` driver:
   for an `F32` set it is `search(query, k)` (already exact-comparable), for a
   quantized/`Binary` set it retrieves `k * oversample` candidates and
@@ -1035,9 +1035,9 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   (`crates/jammi-db/src/store/manifest.rs`) folds the source table's precision
   into the materialization identity when the index-assisted driver ran
   (`None` when `exact = true`, which never touches the index).
-- **`AnnSearchExec`** (`crates/jammi-ai/src/operator/ann_search_exec.rs`) and
+- **`VectorSearchExec`** (`crates/jammi-ai/src/operator/vector_search_exec.rs`) and
   **`QueryBuilder`** (`crates/jammi-ai/src/query/builder.rs`) are the DataFusion
-  overlay: `AnnSearchExec` is the leaf that hits the index; `QueryBuilder` seeds the
+  overlay: `VectorSearchExec` is the leaf that hits the index; `QueryBuilder` seeds the
   plan, hydrates back to source rows, and composes
   filter/select/join/sort/limit/annotate.
 
@@ -1777,7 +1777,7 @@ only over a numeric key (`is_numeric`). Typed error set: `AsofError` =
 #### AsofJoinExec — the physical operator (`exec.rs`)
 
 A hand-built `ExecutionPlan` in the engine's existing operator idiom
-(`InferenceExec`/`AnnSearchExec`), **not** a logical node behind an
+(`InferenceExec`/`VectorSearchExec`), **not** a logical node behind an
 `ExtensionPlanner` — the engine plans no `LogicalPlan` for its compute verbs.
 `AsofJoinExec::try_new` (`crates/jammi-ai/src/pipeline/asof/exec.rs`) validates the
 spec against both child schemas, resolves the right-projection to indices
@@ -4247,7 +4247,7 @@ with the rest of the workspace, no cargo feature — a process's role is
 `[ballista]` config (§2.1 above), decided at runtime by `jammi-server`.
 
 - **`JammiCodec`** (`codec.rs`, `PhysicalExtensionCodec`) — encodes
-  `AnnSearchExec`/`AsofJoinExec`/`KeyCheckExec` as prost
+  `VectorSearchExec`/`AsofJoinExec`/`KeyCheckExec` as prost
   messages of a package it compiles itself, `jammi.ballista.v1`, and frames
   `InferenceExec`/`NumberedInputExec` and `TrainingExec` in the wire forms
   `jammi-datafusion` owns (`jammi_datafusion::inference::wire`, package
@@ -4469,12 +4469,12 @@ as the holder derived on its own host — the same body as every
    (`crates/jammi-ai/src/query/builder.rs`). (`InferenceSession::search_by_id`,
    `crates/jammi-ai/src/session.rs`, first resolves the example row's vector *inside the
    engine* via `read_vector_by_key` so the vector never crosses the API boundary.)
-2. `QueryBuilder::new`: `resolve_embedding_table` picks the table; builds `AnnSearchExec`
+2. `QueryBuilder::new`: `resolve_embedding_table` picks the table; builds `VectorSearchExec`
    as the plan leaf; **hydration** joins ANN output `(_row_id, _source_id, similarity)`
    back to the source table on `_row_id = _join_key`, casts string cols to VARCHAR, drops
    `_join_key`, re-sorts by `similarity` descending
    (`crates/jammi-ai/src/query/builder.rs`).
-3. `AnnSearchExec::execute` (`crates/jammi-ai/src/operator/ann_search_exec.rs`): lazily
+3. `VectorSearchExec::execute` (`crates/jammi-ai/src/operator/vector_search_exec.rs`): lazily
    inside `stream::once`, calls `result_store.resolve_search_mode(&table)`
    (`crates/jammi-db/src/store/mod.rs`): `index_path.is_none()` → exact fallback; else
    `open_index` + `load_sidecar` → `Some(SidecarIndex)`; **on any load error logs a warning
@@ -5165,7 +5165,7 @@ and "published" are two different exclusion sets.
 3. **Dispatch (the real work):** `ResultStore::resolve_search_mode`
    (`crates/jammi-db/src/store/mod.rs`) today returns concrete `Option<SidecarIndex>`. Widen to
    `Option<Box<dyn VectorIndex>>` (or an enum) and update the two call sites:
-   `AnnSearchExec::execute` and `ResultStore::search_vectors`. This is the only place the
+   `VectorSearchExec::execute` and `ResultStore::search_vectors`. This is the only place the
    abstraction currently leaks the concrete type [§7].
 4. Selection key: wire `EmbeddingConfig::default_index_type` (`crates/jammi-db/src/config/mod.rs`)
    — currently dead — through the build site (`crates/jammi-ai/src/pipeline/embedding.rs`).
@@ -5367,7 +5367,7 @@ auto-available to every encoder.)
 - **rowmap index == USearch key == insertion order** — anything that reorders or sparsely
   populates `row_map` breaks the key↔id mapping silently (there is no delete on the trait).
 - **Search speaks cosine *distance* ascending; the `1.0 - dist` similarity flip happens once** in
-  `AnnSearchExec`. New backends must emit distance or they invert the ranking.
+  `VectorSearchExec`. New backends must emit distance or they invert the ranking.
 - **ANN load failure silently degrades to exact** — correct but slow; the only signal is a
   `warn!`.
 - **Metric is hardcoded `Cos`**; `default_distance_metric`/`default_index_type` config is inert

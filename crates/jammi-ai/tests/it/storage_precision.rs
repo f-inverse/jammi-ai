@@ -9,6 +9,7 @@
 // over the *ground-truth* Parquet vectors, never against the quantized
 // index's own (lossy) distances.
 
+use jammi_ai::SearchMethod;
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, StringArray};
@@ -156,7 +157,7 @@ async fn int8_search_with_rescore_matches_exact_f32_baseline() {
     let expected = exact_top_k(&ground_truth, &query, k);
 
     let hits = session
-        .search("patents", query, k, None, None)
+        .search("patents", query, k, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -239,7 +240,7 @@ async fn stale_manifest_precision_falls_back_to_exact_search_not_a_crash() {
     let expected = exact_top_k(&ground_truth, &query, k);
 
     let hits = session
-        .search("patents", query, k, None, None)
+        .search("patents", query, k, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -337,7 +338,15 @@ async fn per_request_oversample_overrides_table_default() {
     raw_ids.sort();
 
     let hits = session
-        .search("patents", query, k, None, Some(1))
+        .search(
+            "patents",
+            query,
+            k,
+            None,
+            SearchMethod::Approximate {
+                oversample: Some(1),
+            },
+        )
         .await
         .unwrap()
         .run()
@@ -403,7 +412,7 @@ async fn table_stamped_oversample_drives_rescore_not_deployment_config() {
     );
 
     let hits = reopened_session
-        .search("patents", query, k, None, None)
+        .search("patents", query, k, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -419,6 +428,62 @@ async fn table_stamped_oversample_drives_rescore_not_deployment_config() {
          oversample (7), not the reopening session's deployment default (1) — \
          otherwise the rescore narrows to the raw quantized top-k and misses a \
          true top-k neighbour"
+    );
+}
+
+/// (7) An exact search scores every vector and returns the true top-k, where
+/// the approximate search of the same table does not. The table is stamped
+/// with `oversample = 1`, so its approximate search is the raw quantized
+/// top-k, which misses a true neighbour of this query (test (6) establishes
+/// the divergence); `SearchMethod::Exact` bypasses the index entirely.
+#[tokio::test]
+async fn exact_search_returns_the_true_top_k_the_index_misses() {
+    let dir = TempDir::new().unwrap();
+    let session = session_with_patents_at(dir.path(), StoragePrecision::Int8, 1).await;
+    let table = session
+        .catalog()
+        .resolve_embedding_table("patents", None)
+        .await
+        .unwrap();
+    let ground_truth = read_ground_truth(&session, &table.table_name).await;
+    let k = 3;
+    let query = ground_truth[1].1.clone();
+    let mut expected: Vec<String> = exact_top_k(&ground_truth, &query, k)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    expected.sort();
+
+    let ids = |method| {
+        let session = Arc::clone(&session);
+        let query = query.clone();
+        async move {
+            let hits = session
+                .search("patents", query, k, None, method)
+                .await
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+            let mut ids: Vec<String> = hit_ids_and_scores(&hits)
+                .0
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+
+    assert_ne!(
+        ids(SearchMethod::default()).await,
+        expected,
+        "the approximate search at oversample 1 misses a true neighbour of this query"
+    );
+    assert_eq!(
+        ids(SearchMethod::Exact).await,
+        expected,
+        "an exact search returns the brute-force top-k"
     );
 }
 

@@ -251,12 +251,21 @@ message SearchRequest {
   // most-recent ready table. Naming a table searches that one (e.g. a raw,
   // propagated, or fine-tuned table when a source carries several).
   optional string embedding_table = 7;
-  // Per-request override of the table's config-default retrieve→rescore
-  // oversample multiplier for a quantized sidecar index (market parity with
-  // Qdrant's per-query oversampling knob). Unset = the table's default.
-  // Irrelevant for an `f32`-precision table (single-stage, no rescore).
-  optional uint32 oversample = 8;
+  // How the search ranks. Unset = approximately, through the table's ANN
+  // index, at the table's own oversample.
+  oneof method {
+    // Approximately, overriding for this one search a quantized index's
+    // retrieve→rescore breadth (`k * oversample`). Irrelevant for an
+    // `f32`-precision index (single-stage, no rescore).
+    uint32 oversample = 8;
+    // Exactly: every vector scored, the true nearest neighbours.
+    ExactSearch exact = 9;
+  }
 }
+
+// An exact search: every vector scored. Carries nothing; its presence in
+// `SearchRequest.method` is the choice.
+message ExactSearch {}
 
 // The search result: the hydrated rows the engine's `search` returns — the
 // key (`_row_id`), the source's columns (or exactly the `select`ed ones), the

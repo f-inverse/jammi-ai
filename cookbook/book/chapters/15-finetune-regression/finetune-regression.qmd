@@ -40,7 +40,7 @@ from jammi_cookbook import contracts, datasets, encoders, scale
 SCALE = scale.current()
 # The run's budget: a small run needs a larger step to leave its initial output.
 BUDGET = {
-    scale.Scale.SMALL: {"epochs": 20, "learning_rate": 1e-2},
+    scale.Scale.SMALL: {"epochs": 20, "learning_rate": 5e-2},
     scale.Scale.FULL: {"epochs": 3, "learning_rate": 1e-3},
 }[SCALE]
 QUANTILES = [0.05, 0.5, 0.95]  # a 90% central interval and the median
@@ -146,13 +146,15 @@ sizeable fraction of the target's own spread, which is what fitting a
 high-offset target *without* collapse looks like: a head that degenerated would
 serve a near-zero width around a near-constant prediction.
 
-The `pinball` head is the contrast, and the reason is structural. A task head is
-a low-rank LoRA adapter on a zero base with no trainable intercept, and every
-quantile level starts at the same output. A Gaussian head needs only its mean
-and one scale to move; a quantile head must pull its levels apart, and the
-extreme levels are the ones whose pinball gradients are weighted least. Read
-its width and coverage against the budget: a short run barely separates the
-levels, so its band is narrow and its coverage low.
+The `pinball` head reaches its band differently. Every quantile level starts at
+the same output, and the pinball loss moves each by a bounded, sign-driven
+gradient — `q` or `1 − q` per row, whatever the size of the miss — so the levels
+separate only as fast as the optimiser's steps carry them. A Gaussian head
+needs only its mean and one scale to move. The budget above is sized for that:
+the same run at a fifth of the learning rate leaves the pinball levels a
+narrow, under-covering band while the Gaussian heads are already calibrated.
+Read each row's coverage against its width to see whether the budget carried
+it.
 
 ```{python}
 db.close()

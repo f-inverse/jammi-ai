@@ -108,28 +108,32 @@ contracts.assert_close("arxiv.conformal.aps_set_size", aps_size, tol=0.6)
 contracts.assert_close("arxiv.conformal.raps_coverage", raps_cov, tol=0.03)
 contracts.assert_close("arxiv.conformal.raps_set_size", raps_size, tol=0.6)
 if SCALE is scale.Scale.FULL:
-    # Under the time split every family under-covers, and LAC — ranking by the
-    # true class's own probability — admits the fewest classes.
-    assert max(lac_cov, aps_cov, raps_cov) < 1 - alpha
-    assert lac_size < min(aps_size, raps_size)
+    # Every family holds nominal to within three binomial standard errors of
+    # the test era's size, and the set sizes order LAC < RAPS < APS.
+    se = float(np.sqrt(alpha * (1 - alpha) / len(test_labels)))
+    assert all(abs(c - (1 - alpha)) < 3 * se for c in (lac_cov, aps_cov, raps_cov))
+    assert lac_size < raps_size < aps_size
 ```
 
-Two facts, measured at `full` scale. First, **every family under-covers** the nominal 0.90: the
-later-era test papers are not exchangeable with the earlier-era calibration papers (a
-covariate shift carried along the homophilous citation graph), so the marginal
-quantile is mis-calibrated regardless of which score we rank by [@barber2023beyond]. The
-under-coverage is a property of the *shift*, not the score family.
+Two facts, measured at `full` scale. First, **every family holds its
+coverage** across the time split: each lands within sampling error of the
+nominal 0.90 — a binomial standard error on the test era is about 0.01, and no
+family sits more than a little over one of them away. The later-era papers are
+not exchangeable with the calibration era in general, but the guarantee needs
+less than that: it needs the *nonconformity score's* distribution to carry
+over, and here it does. The keystone (tier 04) measures why — the score barely
+correlates with how test-era-like a calibration paper is.
 
-Second, **LAC gives the smallest sets** — the textbook ordering holds under the
-shift. LAC scores a class by its own probability, $1-\hat p_y$, so it admits only
-the classes the model is confident in; APS scores by the cumulative mass up to
-the true class, so a set grows to cover the mass ranked above it, and it
-admits more classes for about the same coverage. That is APS's trade: its sets
-adapt to how hard each paper is, rather than being the smallest on average.
+Second, **LAC gives the smallest sets.** LAC scores a class by its own
+probability, $1-\hat p_y$, so it admits only the classes the model is confident
+in; APS scores by the cumulative mass up to the true class, so a set grows to
+cover the mass ranked above it, and it admits more classes for about the same
+coverage. That is APS's trade: its sets adapt to how hard each paper is, rather
+than being the smallest on average.
 
 **RAPS sits between them.** The rank penalty $(\lambda, k_{\text{reg}})$ taxes
-every class admitted past rank $k_{\text{reg}}$, trimming APS's longest sets:
-RAPS's sets are smaller than APS's at a coverage no lower. How much it trims
+every class admitted past rank $k_{\text{reg}}$, trimming APS's longest sets —
+and with them some of the slack APS carries above nominal. How much it trims
 depends on how long the APS sets run relative to the penalty rank — the cell
 above prints all three, so you can see it at the scale you ran.
 
@@ -220,16 +224,12 @@ restore is real. We label it as a device precisely so the two halves stay honest
 
 The construction. We take only the genuinely-exchangeable **calibration-era pool** and
 split it 50/50 into a synthetic test holdout and a calibration pool — so the *base*
-data is exchangeable and the **only** shift is the one we inject. We then bias the
-calibration subsample along a **real covariate**: a nearest-neighbour regression of
-the APS nonconformity on the paper's neighbourhood — the mean nonconformity of its
-nearest calibration-era papers, one query-by-example `search` each. It is a genuine
-feature of each paper's position in the embedding space that *correlates with the
-score* (by construction of the regression), so over-sampling its low end pulls the
-calibration toward **easy** (low-nonconformity) points — a shift that **moves the
-score distribution**. We use one
-consistent APS nonconformity throughout, so the marginal and weighted passes differ
-only in the weights.
+data is exchangeable and the **only** shift is the one we inject. The shift runs
+along a **real covariate**: a nearest-neighbour regression of the APS nonconformity
+on the paper's neighbourhood — the mean nonconformity of its nearest calibration-era
+papers, one query-by-example `search` each. It is a genuine feature of each paper's
+position in the embedding space that *correlates with the score* (by construction of
+the regression).
 
 ```{python}
 nc = shift.aps_nonconformity(scores.cal_scores, scores.cal_labels)
@@ -243,89 +243,86 @@ shift_axis = np.array([
         db, arxiv, propagated, key, f"year = {datasets.VALID_YEAR}", 10)])
     for key in scores.cal_keys
 ])
-```
-
-```{python}
-# Deterministic split + biased subsample (seed pinned). gamma is the shift
-# strength; the biased calibration set is 90% of its pool.
-SEED, GAMMA = 0, 1.2
-rng = np.random.default_rng(SEED)
-order = rng.permutation(len(nc))
-half = len(nc) // 2
-test_idx, calpool_idx = order[:half], order[half:]
-CAL_SIZE = int(0.9 * len(calpool_idx))
-
-# standardize the shift feature on the cal pool
-s = (shift_axis - shift_axis[calpool_idx].mean()) / (shift_axis[calpool_idx].std() + 1e-12)
-# bias the cal subsample toward LOW shift-feature (easy / low-nonconformity) points:
-# biased density ∝ exp(-gamma·s). The true test/cal likelihood ratio is then ∝ exp(+gamma·s).
-p = np.exp(-GAMMA * s[calpool_idx])
-p /= p.sum()
-cal_sel = rng.choice(calpool_idx, size=CAL_SIZE, replace=False, p=p)
-
-cal_nc = nc[cal_sel]
-test_nc = nc[test_idx]
-cal_s = s[cal_sel]
-print(f"biased-cal mean nonconformity: {cal_nc.mean():.3f}")
-print(f"holdout   mean nonconformity: {test_nc.mean():.3f}   (cal pulled lower — the shift)")
-```
-
-The diagnostic that distinguishes this from the keystone: on the biased calibration
-set, the **nonconformity correlates clearly and positively with the shift feature**.
-This is the inverse of the keystone's ≈ 0.
-
-```{python}
-shift_corr = float(np.corrcoef(cal_nc, cal_s)[0, 1])
-print(f"corr(nonconformity, shift-feature): {shift_corr:+.3f}")
-contracts.assert_close("arxiv.conformal.synthetic_shift_corr", shift_corr, tol=0.08)
-```
-
-Now the two passes, apples-to-apples — same APS nonconformity, the **only** difference
-is the weights. The marginal pass takes the finite-sample $(1-\alpha)$ quantile of the
-calibration nonconformity; the weighted pass takes the *weighted* quantile under the
-Tibshirani likelihood-ratio weights $w \propto \exp(+\gamma s)$ that up-weight the
-under-represented hard points [@tibshirani2019covariateshift].
-
-```{python}
-m = len(cal_nc)
-asc = np.argsort(cal_nc)
-
-# Marginal split-conformal quantile.
-k = int(np.ceil((m + 1) * (1 - alpha)))
-q_marginal = cal_nc[asc][min(k, m) - 1]
-marginal_cov = float(np.mean(test_nc <= q_marginal))
-
-# Weighted split-conformal quantile (Tibshirani 2019): the LR weights ∝ exp(+gamma·s).
-w = np.exp(GAMMA * cal_s)
-w = w / w.sum()
-cw = np.cumsum(w[asc])
-q_weighted = cal_nc[asc][min(int(np.searchsorted(cw, 1 - alpha)), m - 1)]
-weighted_cov = float(np.mean(test_nc <= q_weighted))
-
-print(f"nominal coverage:            {1 - alpha:.2f}")
-print(f"MARGINAL coverage:           {marginal_cov:.3f}   (under-covers)")
-print(f"WEIGHTED  coverage:          {weighted_cov:.3f}   (restored to ≥ nominal)")
-print(f"Δ (weighted − marginal):     {weighted_cov - marginal_cov:+.3f}")
+shift_axis = (shift_axis - shift_axis.mean()) / shift_axis.std()
+shift_corr = float(np.corrcoef(nc, shift_axis)[0, 1])
+print(f"corr(nonconformity, shift feature): {shift_corr:+.3f}")
 ```
 
 ```{python}
 # | echo: false
-contracts.assert_close("arxiv.conformal.synthetic_marginal_coverage", marginal_cov, tol=0.03)
-contracts.assert_close("arxiv.conformal.synthetic_weighted_coverage", weighted_cov, tol=0.03)
-if SCALE is scale.Scale.FULL:
-    # The inverse of the keystone's no-op: weighting moves coverage from clear
-    # under-coverage to nominal, because the shift is score-aligned.
-    assert marginal_cov < 1 - alpha
-    assert weighted_cov >= 1 - alpha
-    assert weighted_cov - marginal_cov > 0.05
-    assert shift_corr > 0.4
+contracts.assert_close("arxiv.conformal.synthetic_shift_corr", shift_corr, tol=0.08)
 ```
 
-Marginal split-conformal **under-covers** on the biased calibration set, and
-weighted split-conformal **restores** coverage to nominal. Weighted conformal's
-guarantee is in expectation over the calibration draw; at `small` scale the
-biased calibration set is a few dozen papers, so its weighted quantile lands less
-reliably, and the restore is asserted as the full-scale finding.
+The diagnostic that distinguishes this from the keystone: the nonconformity
+correlates clearly and positively with the shift feature — the inverse of the
+keystone's ≈ 0. That is what lets a shift along this axis move the score
+distribution.
+
+The biased calibration set keeps each pool paper **independently**, with probability
+$\pi(s) = 1/(1 + e^{\gamma s})$ — likelier the lower its shift feature $s$, so the
+calibration set leans toward **easy** (low-nonconformity) papers, and about half the
+pool survives. Because each paper's inclusion is its own coin, the calibration
+density is exactly the pool's times $\pi(s)$, and the test-to-calibration likelihood
+ratio is exactly $1/\pi(s) = 1 + e^{\gamma s}$ — the weights are known, not
+estimated, so any failure to restore would be the method's, not an estimator's.
+
+Weighted split-conformal [@tibshirani2019covariateshift] takes, for each test paper,
+the quantile of the calibration nonconformity where calibration paper $i$ holds mass
+$w_i / (\sum_j w_j + w_{\text{test}})$ and the test paper's own weight sits at $+\infty$;
+with every weight one, that is exactly the marginal $\lceil (n+1)(1-\alpha) \rceil$-th
+smallest. `shift.score_coverage` is that one routine, so the two passes differ
+**only** in the weights. Its guarantee is **in expectation over the calibration
+draw**, and one draw of a few hundred papers swings coverage by several points
+either way — so we measure both passes over many draws, the way the theorem states
+them.
+
+```{python}
+# gamma is the shift strength; every draw is a fresh 50/50 split and a fresh
+# biased calibration set, seeded so the book reproduces.
+GAMMA, DRAWS = 3.0, 200
+rng = np.random.default_rng(0)
+
+
+def draw():
+    order = rng.permutation(len(nc))
+    test_idx, pool_idx = order[: len(nc) // 2], order[len(nc) // 2 :]
+    kept = rng.random(len(pool_idx)) < 1 / (1 + np.exp(GAMMA * shift_axis[pool_idx]))
+    cal_idx = pool_idx[kept]
+    weights = shift.Weights(
+        cal=1 + np.exp(GAMMA * shift_axis[cal_idx]),
+        test=1 + np.exp(GAMMA * shift_axis[test_idx]),
+    )
+    marginal = shift.score_coverage(nc[cal_idx], nc[test_idx], weights=None, alpha=alpha)
+    weighted = shift.score_coverage(nc[cal_idx], nc[test_idx], weights=weights, alpha=alpha)
+    return marginal, weighted, nc[cal_idx].mean() - nc[test_idx].mean()
+
+
+marginal_covs, weighted_covs, lean = np.array([draw() for _ in range(DRAWS)]).T
+marginal_cov, weighted_cov = float(marginal_covs.mean()), float(weighted_covs.mean())
+print(f"calibration − holdout mean nonconformity: {lean.mean():+.3f}   (the lean toward easy)")
+print(f"nominal coverage:                   {1 - alpha:.2f}")
+print(f"MARGINAL coverage, mean of {DRAWS}:    {marginal_cov:.3f}")
+print(f"WEIGHTED coverage, mean of {DRAWS}:    {weighted_cov:.3f}")
+print(f"Δ (weighted − marginal):            {weighted_cov - marginal_cov:+.3f}")
+```
+
+```{python}
+# | echo: false
+contracts.assert_close("arxiv.conformal.synthetic_marginal_coverage", marginal_cov, tol=0.02)
+contracts.assert_close("arxiv.conformal.synthetic_weighted_coverage", weighted_cov, tol=0.02)
+if SCALE is scale.Scale.FULL:
+    # The inverse of the keystone's no-op: on a score-aligned shift the marginal
+    # pass under-covers and the exact-weight pass holds nominal, on average.
+    assert shift_corr > 0.3
+    assert marginal_cov < 1 - alpha - 0.01
+    assert weighted_cov >= 1 - alpha
+```
+
+Averaged over the draws, marginal split-conformal **under-covers** on the biased
+calibration set, and weighted split-conformal **restores** coverage to nominal. Any
+one draw can land on either side of 0.90 — the guarantee never promised otherwise. At
+`small` scale the calibration pool is a few dozen papers, so the average is noisier
+still, and the restore is asserted as the full-scale finding.
 
 Note these are **client-local numpy** computations. The engine's `conformalize*`
 surface is the **marginal** one (valid under exchangeability); Mondrian / weighted

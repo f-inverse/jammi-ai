@@ -65,15 +65,15 @@
   },
   "conformal.synthetic_marginal_coverage": {
     "tol": 0.03,
-    "value": 0.8524590163934426
+    "value": 0.9181147540983607
   },
   "conformal.synthetic_shift_corr": {
     "tol": 0.08,
-    "value": 0.38548597409172974
+    "value": 0.378968396289259
   },
   "conformal.synthetic_weighted_coverage": {
     "tol": 0.03,
-    "value": 0.9180327868852459
+    "value": 0.9323770491803279
   },
   "tier01.cite_homophily": {
     "tol": 1e-09,
@@ -161,7 +161,7 @@
   },
   "tier04.reg_weighted_coverage": {
     "tol": 0.04,
-    "value": 0.6979166666666666
+    "value": 0.71875
   },
   "tier04.score_shift_corr": {
     "tol": 0.12,

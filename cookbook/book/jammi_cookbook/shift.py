@@ -5,23 +5,35 @@ The engine ships the marginal split-conformal surface (``conformalize``,
 ``conformalize_interval``, ``conformalize_cqr``). Whether a covariate shift can
 be repaired by *weighting* the calibration set toward the test distribution
 (Tibshirani et al. 2019) is the consumer's question, so it is answered here,
-in plain numpy: one self-consistent local APS routine for both the marginal
-and the weighted passes (so a coverage change is attributable to the weights
-alone), the kNN density-ratio weights, and the diagnostics that explain a
-no-op.
+in plain numpy: one weighted split-conformal quantile for both the marginal
+and the weighted passes — the marginal pass is the uniform-weight case, so a
+coverage change is attributable to the weights alone — the kNN density-ratio
+weights, and the diagnostics that explain a no-op.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 
+@dataclass(frozen=True)
+class Weights:
+    """Test-to-calibration likelihood ratios: one per calibration row and one
+    per test row. Weighted split-conformal needs both — each test row's own
+    weight is the mass its quantile holds back at +∞."""
+
+    cal: np.ndarray
+    test: np.ndarray
+
+
 def density_ratio(test_share: np.ndarray, neighbours: int) -> np.ndarray:
-    """Each calibration row's test-to-calibration likelihood ratio, estimated
-    as the Laplace-smoothed odds of a test-era neighbour among its
-    ``neighbours`` nearest (a kNN density-ratio estimate; Tibshirani et al.
-    2019). Smoothing bounds the odds by ``neighbours + 1``, so no single row
-    dominates the weighted quantile."""
+    """Each row's test-to-calibration likelihood ratio, estimated as the
+    Laplace-smoothed odds of a test-era neighbour among its ``neighbours``
+    nearest (a kNN density-ratio estimate; Tibshirani et al. 2019). Smoothing
+    bounds the odds by ``neighbours + 1``, so no single row dominates the
+    weighted quantile."""
     tests = test_share * neighbours
     return (tests + 1) / (neighbours - tests + 1)
 
@@ -40,17 +52,30 @@ def aps_nonconformity(scores: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return out
 
 
-def _quantile(values: np.ndarray, weights: np.ndarray | None, alpha: float) -> float:
-    """The finite-sample ``1−α`` quantile of ``values``: unweighted, the
-    ⌈(n+1)(1−α)⌉-th smallest; weighted, the smallest value whose reweighted
-    empirical CDF reaches ``1−α``."""
-    n = len(values)
-    order = np.argsort(values)
-    if weights is None:
-        return float(values[order][min(int(np.ceil((n + 1) * (1 - alpha))), n) - 1])
-    w = np.asarray(weights, dtype=float)
-    cdf = np.cumsum((w / w.sum())[order])
-    return float(values[order][min(int(np.searchsorted(cdf, 1 - alpha)), n - 1)])
+def quantiles(
+    cal: np.ndarray, n_test: int, *, weights: Weights | None, alpha: float
+) -> np.ndarray:
+    """Each test row's split-conformal ``1−α`` quantile of the calibration
+    nonconformity ``cal`` (Tibshirani et al. 2019): calibration row ``i`` holds
+    mass ``w_i / (Σw + w_test)`` and the test row its own ``w_test`` at +∞, so
+    the quantile is +∞ when the calibration mass cannot reach ``1−α``. With no
+    weights every row weighs one and this is the ⌈(n+1)(1−α)⌉-th smallest — the
+    marginal quantile."""
+    w = np.ones(len(cal)) if weights is None else np.asarray(weights.cal, dtype=float)
+    w_test = np.ones(n_test) if weights is None else np.asarray(weights.test, dtype=float)
+    order = np.argsort(cal)
+    sorted_cal = np.append(np.asarray(cal, dtype=float)[order], np.inf)
+    reach = np.searchsorted(np.cumsum(w[order]), (1 - alpha) * (w.sum() + w_test))
+    return sorted_cal[np.minimum(reach, len(cal))]
+
+
+def score_coverage(
+    cal: np.ndarray, test: np.ndarray, *, weights: Weights | None, alpha: float
+) -> float:
+    """The share of test rows whose nonconformity is within their conformal
+    quantile — the coverage of any split-conformal set or interval built on
+    this score (an absolute residual's ``ŷ ± q̂``, an APS set)."""
+    return float(np.mean(test <= quantiles(cal, len(test), weights=weights, alpha=alpha)))
 
 
 def aps_coverage(
@@ -59,30 +84,23 @@ def aps_coverage(
     test_scores: np.ndarray,
     test_labels: np.ndarray,
     *,
-    weights: np.ndarray | None,
+    weights: Weights | None,
     alpha: float,
 ) -> tuple[float, float]:
     """Split-APS coverage and mean set size, marginal (``weights=None``) or
     weighted. A class is admitted while the cumulative mass up to and including
     it stays ≤ q̂ — the class that crosses q̂ is excluded; ties break by class
     index. One convention for both passes, so only the weights differ."""
-    q = _quantile(aps_nonconformity(cal_scores, cal_labels), weights, alpha)
+    q = quantiles(
+        aps_nonconformity(cal_scores, cal_labels), len(test_labels), weights=weights, alpha=alpha
+    )
     covered = size = 0
-    for scores, label in zip(test_scores, test_labels, strict=True):
+    for scores, label, q_row in zip(test_scores, test_labels, q, strict=True):
         cum, admitted = 0.0, set()
         for c in sorted(range(len(scores)), key=lambda c: (-scores[c], c)):
             cum += scores[c]
-            if cum <= q:
+            if cum <= q_row:
                 admitted.add(c)
         covered += int(label in admitted)
         size += len(admitted)
     return covered / len(test_labels), size / len(test_labels)
-
-
-def residual_coverage(
-    cal_residuals: np.ndarray, test_residuals: np.ndarray, *, weights: np.ndarray, alpha: float
-) -> float:
-    """Coverage of the ``ŷ ± q̂`` interval whose q̂ is the weighted quantile of
-    the calibration absolute residuals."""
-    q = _quantile(cal_residuals, weights, alpha)
-    return float(np.mean(test_residuals <= q))

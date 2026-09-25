@@ -151,13 +151,23 @@ keystone.show(keystone.test_era_shares)
 ```
 
 ```{python}
-shares = keystone.test_era_shares(db, arxiv, propagated, cal_ids, sizes=(10, 25, 50))
+SIZES = (10, 25, 50)
+shares = keystone.test_era_shares(db, arxiv, propagated, cal_ids, sizes=SIZES)
+test_shares = keystone.test_era_shares(db, arxiv, propagated, test_ids, sizes=SIZES)
 likeness = shares[keystone.NEIGHBOURS]
+# Weighted conformal weighs the calibration rows and each test row alike.
+schemes = {
+    size: shift.Weights(
+        cal=shift.density_ratio(shares[size], size),
+        test=shift.density_ratio(test_shares[size], size),
+    )
+    for size in SIZES
+}
 
 cal_resid = np.abs(cal_mean - cal_year)
 test_resid = np.abs(test_mean - test_year)
-wt_reg_cov = shift.residual_coverage(
-    cal_resid, test_resid, weights=shift.density_ratio(likeness, keystone.NEIGHBOURS), alpha=ALPHA
+wt_reg_cov = shift.score_coverage(
+    cal_resid, test_resid, weights=schemes[keystone.NEIGHBOURS], alpha=ALPHA
 )
 reg_corr = float(np.corrcoef(cal_resid, likeness)[0, 1])
 print(f"cal  mean |y−ŷ|: {cal_resid.mean():.3f}")
@@ -275,15 +285,15 @@ local_cov, _ = shift.aps_coverage(
     scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
     weights=None, alpha=ALPHA,
 )
-schemes = {f"knn-{size}": shift.density_ratio(share, size) for size, share in shares.items()}
 deltas = {}
-for name, weights in schemes.items():
-    cov, size = shift.aps_coverage(
+for size, weights in schemes.items():
+    cov, set_size = shift.aps_coverage(
         scores.cal_scores, scores.cal_labels, scores.test_scores, scores.test_labels,
         weights=weights, alpha=ALPHA,
     )
-    deltas[name] = cov - local_cov
-    print(f"weighted ({name:<9}) coverage {cov:.3f}   Δ {cov - local_cov:+.4f}   set size {size:.2f}")
+    deltas[size] = cov - local_cov
+    print(f"weighted (knn-{size:<2}) coverage {cov:.3f}   Δ {cov - local_cov:+.4f}   "
+          f"set size {set_size:.2f}")
 print(f"local marginal coverage          {local_cov:.3f}")
 ```
 

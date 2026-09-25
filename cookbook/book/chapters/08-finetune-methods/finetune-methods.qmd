@@ -114,7 +114,7 @@ def tuned(source: str, columns: list[str], **knobs) -> str:
     job = db.fine_tune(
         source=source, base_model=BASE, columns=columns, method="lora",
         task="text_embedding", epochs=EPOCHS, batch_size=16, max_seq_length=128,
-        seed=0, **knobs,
+        backbone_dtype=encoders.training_dtype(SCALE), seed=0, **knobs,
     )
     job.wait()
     return job.output_model_id

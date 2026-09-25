@@ -75,6 +75,7 @@ def fine_tune_on_graph(
         edge_provenance=provenance,
         epochs=epochs,
         batch_size=32,
+        backbone_dtype=encoders.training_dtype(scale),
         walks_per_node=2,
         walk_length=4,
         sample_seed=0,

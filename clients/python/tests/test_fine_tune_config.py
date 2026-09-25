@@ -311,3 +311,27 @@ def test_warmup_is_steps_or_a_fraction_of_the_run() -> None:
     assert _build(warmup_fraction=0.05).warmup_fraction == 0.05
     with pytest.raises(ValueError, match="not both"):
         _build(warmup_steps=10, warmup_fraction=0.1)
+
+
+def test_graph_fine_tune_carries_fine_tunes_training_knobs() -> None:
+    """The graph verb trains with `fine_tune`'s own knobs, through the one
+    config builder — a bf16 backbone, a sequence length, the LoRA shape, a
+    validation split — and refuses an objective graph walks cannot feed."""
+    request = _capture_graph_request(
+        backbone_dtype="bf16",
+        max_seq_length=256,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        validation_fraction=0.1,
+        warmup_fraction=0.05,
+        gradient_accumulation_steps=2,
+    )
+    cfg = request.config
+    expected = build_fine_tune_config(
+        **{**_UNSET, "backbone_dtype": "bf16", "max_seq_length": 256, "lora_alpha": 16.0,
+           "lora_dropout": 0.0, "validation_fraction": 0.1, "warmup_fraction": 0.05,
+           "gradient_accumulation_steps": 2, "embedding_loss": "mnrl"}
+    )
+    assert cfg == expected
+    with pytest.raises(ValueError, match="for graph fine-tune"):
+        _capture_graph_request(embedding_loss="cosent")

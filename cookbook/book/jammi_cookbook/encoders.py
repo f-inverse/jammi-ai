@@ -39,3 +39,10 @@ def image(scale: Scale) -> str:
 def audio(scale: Scale) -> str:
     """The audio encoder's model id at ``scale``."""
     return _model(_AUDIO, scale)
+
+
+def training_dtype(scale: Scale) -> str:
+    """The backbone precision a chapter fine-tunes at: `bf16` at `full` — the
+    tensor-core precision of the sm_80+ GPU a full run needs, at half f32's
+    memory — and `f32` at `small`, on a CPU, where `bf16` is refused."""
+    return "bf16" if scale is Scale.FULL else "f32"

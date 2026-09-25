@@ -90,7 +90,8 @@ def fit(loss: str) -> pa.Table:
     job = db.fine_tune(
         source="years_train", base_model=encoders.text(SCALE), columns=["text", "target"],
         method="lora", task="regression", regression_loss=loss, batch_size=16,
-        max_seq_length=128, seed=0, **BUDGET, **knobs,
+        max_seq_length=128, backbone_dtype=encoders.training_dtype(SCALE), seed=0,
+        **BUDGET, **knobs,
     )
     job.wait()
     return db.infer(

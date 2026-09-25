@@ -682,10 +682,24 @@ def build_fine_tune_graph_request(
     sample_seed: Optional[int] = None,
     embedding_loss: Optional[str] = None,
     mnrl_temperature: Optional[float] = None,
+    triplet_margin: Optional[float] = None,
     epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
     learning_rate: Optional[float] = None,
     lora_rank: Optional[int] = None,
+    lora_alpha: Optional[float] = None,
+    lora_dropout: Optional[float] = None,
+    max_seq_length: Optional[int] = None,
+    validation_fraction: Optional[float] = None,
+    early_stopping_patience: Optional[int] = None,
+    early_stopping_metric: Optional[str] = None,
+    warmup_steps: Optional[int] = None,
+    warmup_fraction: Optional[float] = None,
+    gradient_accumulation_steps: Optional[int] = None,
+    target_modules: Optional[List[str]] = None,
+    backbone_dtype: Optional[str] = None,
+    weight_decay: Optional[float] = None,
+    max_grad_norm: Optional[float] = None,
     matryoshka_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
     keep_last_n_checkpoints: Optional[int] = None,
@@ -738,43 +752,48 @@ def build_fine_tune_graph_request(
         seed=sample_seed if sample_seed is not None else 0,
     )
 
-    # The default graph embedding loss is MNRL (S10), matching the embed
-    # binding; only 'mnrl' / 'triplet' are accepted for graph supervision.
-    if embedding_loss in (None, "mnrl"):
-        loss = training_pb2.EmbeddingLoss(
-            multiple_negatives_ranking=training_pb2.EmbeddingLoss.MultipleNegativesRanking(
-                temperature=mnrl_temperature if mnrl_temperature is not None else 20.0
-            )
-        )
-    elif embedding_loss == "triplet":
-        loss = training_pb2.EmbeddingLoss(
-            triplet=training_pb2.EmbeddingLoss.Triplet(margin=0.3)
-        )
-    else:
+    # Graph supervision emits (anchor, positive[, negative]) walks, so only an
+    # in-batch-negative objective applies: MNRL (the default) or triplet. The
+    # training knobs are `fine_tune`'s own, through the one config builder;
+    # the graph sampler's `sample_seed` and the LoRA `seed` stay distinct.
+    if embedding_loss not in (None, "mnrl", "triplet"):
         raise ValueError(
             f"Unknown embedding_loss {embedding_loss!r} for graph fine-tune. "
             f"Use 'mnrl' (default) or 'triplet'."
         )
-    config = training_pb2.FineTuneConfig(embedding_loss=loss)
-    if epochs is not None:
-        config.epochs = epochs
-    if batch_size is not None:
-        config.batch_size = batch_size
-    if learning_rate is not None:
-        config.learning_rate = learning_rate
-    if lora_rank is not None:
-        config.lora_rank = lora_rank
-    if matryoshka_dims is not None:
-        config.matryoshka_dims.extend(matryoshka_dims)
-    # The graph sampler's `sample_seed` and the LoRA `seed` are distinct: one
-    # seeds the node2vec walk, the other the adapter init / dropout.
-    if seed is not None:
-        config.seed = seed
-    # Per-epoch checkpointing enable + retention cap (unit 348, field 30),
-    # cross-surface parity with `build_fine_tune_config`. Unset (`None`, the
-    # default) DISABLES it entirely on this surface too — absent stays off.
-    if keep_last_n_checkpoints is not None:
-        config.keep_last_n_checkpoints = keep_last_n_checkpoints
+    config = build_fine_tune_config(
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        learning_rate=learning_rate,
+        epochs=epochs,
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        validation_fraction=validation_fraction,
+        early_stopping_patience=early_stopping_patience,
+        warmup_steps=warmup_steps,
+        warmup_fraction=warmup_fraction,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        triplet_margin=triplet_margin,
+        target_modules=target_modules,
+        early_stopping_metric=early_stopping_metric,
+        backbone_dtype=backbone_dtype,
+        weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        embedding_loss=embedding_loss or "mnrl",
+        mnrl_temperature=mnrl_temperature,
+        cached=None,
+        mine_hard_negatives=None,
+        hard_negative_k=None,
+        hard_negative_exclude_hops=None,
+        hard_negative_refresh_every=None,
+        matryoshka_dims=matryoshka_dims,
+        seed=seed,
+        regression_loss=None,
+        regression_beta=None,
+        quantile_levels=None,
+        keep_last_n_checkpoints=keep_last_n_checkpoints,
+    )
 
     return job_pb2.SubmitJobRequest(
         graph_fine_tune=training_pb2.GraphFineTuneSpec(

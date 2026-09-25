@@ -3209,8 +3209,8 @@ fn load_refuses_local_ranks_zero() {
 }
 
 #[test]
-fn load_refuses_local_ranks_wider_than_the_devices() {
-    let err = load_src("[worker]\nlocal_ranks = 4\n").unwrap_err();
+fn load_refuses_local_ranks_wider_than_the_accelerators() {
+    let err = load_src("[gpu]\ndevice = 0\n\n[worker]\nlocal_ranks = 4\n").unwrap_err();
     let JammiError::Config(msg) = &err else {
         panic!("expected a typed Config error, got {err:?}");
     };
@@ -3227,6 +3227,18 @@ fn load_refuses_local_ranks_wider_than_the_devices() {
         matches!(&over, JammiError::Config(m) if m.contains("local_ranks = 3")),
         "{over:?}"
     );
+}
+
+#[test]
+fn a_cpu_deployment_runs_every_local_rank_on_the_cpu() {
+    // The CPU is the one device ranks share by nature: a deployment whose
+    // only device is the CPU places each of its ranks there.
+    let cpu = load_src("[gpu]\ndevice = -1\n\n[worker]\nlocal_ranks = 3\n").unwrap();
+    let topology = cpu.worker.topology(&cpu.gpu).unwrap();
+    assert_eq!(topology.local_ranks(), 3);
+    assert_eq!(topology.rank_devices(), [GpuConfig::CPU_DEVICE; 3]);
+    assert_eq!(topology.device_for_rank(2), Some(GpuConfig::CPU_DEVICE));
+    assert_eq!(topology.device_for_rank(3), None);
 }
 
 #[test]

@@ -211,9 +211,10 @@ idle_poll_secs = 1
 metrics_sample_secs = 5
 # How many ranks THIS HOST places on its own `[gpu] devices` for a
 # distributed training job it runs entirely in-process - one rank per
-# device, rank `i` on `[gpu] devices[i]`. Must be >= 1 (the default, 1, is
-# the single-rank deployment: no gang, no collective) and never more than
-# the configured device count. Orthogonal to a submitted job's own
+# accelerator, rank `i` on `[gpu] devices[i]`, or every rank on the CPU when
+# the CPU (`device = -1`) is the only device. Must be >= 1 (the default, 1,
+# is the single-rank deployment: no gang, no collective) and, on
+# accelerators, never more than the configured device count. Orthogonal to a submitted job's own
 # `world_size` (a separate, per-job knob) and to `[distributed]
 # max_world_size` (the fleet-wide bound on a `Peer` gang across hosts). A
 # job is admitted at submit when its `world_size` is within the wider of

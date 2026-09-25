@@ -3934,12 +3934,18 @@ impl JobWorker {
                 )
             }
             RankTopology::Local { world } => {
-                // Rank `r` on `[gpu] devices[r]` (local ranks are threads
-                // pinned to devices); `[worker] local_ranks <=
-                // devices.len()` is enforced at config load and `world <=
-                // local_ranks` by `TopologyDecision::decide`, so every rank
-                // has its own device — restated here rather than assumed.
-                let devices = session.device_config().devices.clone();
+                // Rank `r` on the topology's rank `r` device (local ranks are
+                // threads pinned to devices: each its own accelerator, or all
+                // of them the CPU); `world <= local_ranks` by
+                // `TopologyDecision::decide`, so every rank has a device —
+                // restated here rather than assumed.
+                let config = session.inner_config();
+                let devices = config
+                    .worker
+                    .topology(&config.gpu)
+                    .map_err(WorkerJobError::from)?
+                    .rank_devices()
+                    .to_vec();
                 if (world as usize) > devices.len() {
                     return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                         "a Local gang of {world} ranks needs {world} configured [gpu] devices; \

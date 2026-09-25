@@ -1403,8 +1403,11 @@ impl WorkerConfig {
     ///
     /// - `local_ranks == 0` — a deployment with no rank cannot run anything,
     ///   and `0` is not "unset" (the unset value is the default `1`);
-    /// - `local_ranks > devices` — there is no device for the last rank, and
-    ///   the alternative to refusing is two ranks silently sharing one;
+    /// - `local_ranks > devices` on accelerators — there is no device for the
+    ///   last rank, and the alternative to refusing is two ranks silently
+    ///   sharing one card's memory. The CPU is the one device ranks do share
+    ///   by nature: a deployment whose only device is the CPU runs every rank
+    ///   on it;
     /// - `rank_timeout_secs == 0` — a deadline that has already passed.
     ///
     /// `gpu`'s own domain rules ([`GpuConfig::validate`]) are checked first,
@@ -1420,15 +1423,20 @@ impl WorkerConfig {
                     .into(),
             ));
         }
-        if self.local_ranks as usize > devices.len() {
+        let devices = if devices == [GpuConfig::CPU_DEVICE] {
+            vec![GpuConfig::CPU_DEVICE; self.local_ranks as usize]
+        } else if self.local_ranks as usize > devices.len() {
             return Err(JammiError::Config(format!(
                 "[worker] local_ranks = {} exceeds the {} configured device(s) {:?}: one rank \
-                 per device, so list more in `[gpu] devices` or lower `local_ranks`",
+                 per accelerator, so list more in `[gpu] devices`, lower `local_ranks`, or run \
+                 the ranks on the CPU (`[gpu] device = -1`)",
                 self.local_ranks,
                 devices.len(),
                 devices
             )));
-        }
+        } else {
+            devices
+        };
         if self.rank_timeout_secs == 0 {
             return Err(JammiError::Config(
                 "[worker] rank_timeout_secs must be > 0 (a zero deadline expires before any \
@@ -1451,8 +1459,8 @@ impl WorkerConfig {
 ///
 /// [`WorkerConfig::topology`] is the only constructor, so every instance has
 /// already cleared the bounds: `local_ranks >= 1`, `local_ranks <=
-/// devices.len()`, the devices distinct and placeable, and a non-zero
-/// timeout. The fields are private for the same reason — the bounds hold for
+/// devices.len()`, the accelerators distinct and placeable (the CPU, the one
+/// device ranks share, is listed once per rank), and a non-zero timeout. The fields are private for the same reason — the bounds hold for
 /// the lifetime of the value, not just at the moment it was built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerTopology {

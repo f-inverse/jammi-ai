@@ -538,6 +538,41 @@ async fn a_local_ranks_two_host_fans_a_two_rank_job_out_through_run_spec_and_pub
     );
 }
 
+/// A CPU host (`[gpu] device = -1`) runs a `local_ranks = 2` gang with every
+/// rank on the CPU — the one device ranks share — and publishes the same
+/// bytes as the two-rank `LocalGang` reference: no GPU ordinal has to be
+/// named, and none degraded, to train on the host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cpu_host_runs_a_two_rank_gang_on_the_cpu_and_publishes_the_gangs_bytes() {
+    let (session, _dir) = coordinating_session(|config| {
+        config.gpu.device = Some(-1);
+        config.gpu.devices = None;
+        config.worker.local_ranks = 2;
+        config.worker.rank_timeout_secs = 10;
+    })
+    .await;
+    let worker = JobWorker::new(&session).unwrap();
+    let record = submit_and_claim(&session, &worker, two_rank_graph_spec()).await;
+    let job_id = record.job_id.clone();
+
+    worker.run_claimed_job(&session, record).await;
+
+    assert_eq!(
+        training_test_hooks::topology_for(&job_id),
+        Some(TopologyDecision::Local { world: 2 })
+    );
+    let after = row(session.catalog(), &job_id).await;
+    assert_eq!(after.status, "completed", "{after:?}");
+    let published = published_adapter_bytes(&session, &job_id).await;
+    let reference =
+        reference_rank0_adapter_bytes(&session, "cpu-fanout", graph_loader, fan_out_config()).await;
+    assert!(!published.is_empty());
+    assert_eq!(
+        published, reference,
+        "the CPU gang publishes the reference gang's bytes"
+    );
+}
+
 /// A crashed coordinator's live `building` training-set row is NEVER met
 /// by the successor, so the training path needs no `BackOff`
 /// disposition. The

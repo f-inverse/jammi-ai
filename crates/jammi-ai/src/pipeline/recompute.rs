@@ -461,6 +461,22 @@ impl InferenceSession {
                 // replay is unconditionally a fresh `Computed`.
                 Ok((record.table_name, CacheOutcome::Computed))
             }
+            ProducingDescriptor::LexicalIndex {
+                source_id,
+                key_column,
+                text_columns,
+                analyzer,
+            } => {
+                let params = crate::pipeline::lexical::BuildLexicalIndex {
+                    columns: text_columns,
+                    key_column,
+                    analyzer,
+                };
+                // A lexical build reads an unpinned source and has no cache
+                // dial, so the replay is unconditionally a fresh `Computed`.
+                let record = self.build_lexical_index(&source_id, &params).await?;
+                Ok((record.table_name, CacheOutcome::Computed))
+            }
             ProducingDescriptor::TrainingSet {
                 source,
                 columns,

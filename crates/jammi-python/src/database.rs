@@ -1241,6 +1241,19 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
+    /// Lexical (BM25) search from a serialized `LexicalSearchRequest` body —
+    /// the same request assembly the remote client sends, decoded through
+    /// `jammi_ai::wire::lexical_search_from_bytes`. Returns the hydrated rows
+    /// as a `pyarrow.Table`. A malformed or invalid body raises `ValueError`.
+    fn _lexical_search_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let request =
+            jammi_ai::wire::lexical_search_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let batches = crate::released(&self.runtime, self.local_session().lexical_search(request))
+            .map_err(to_pyerr)?;
+        batches_to_pyarrow(py, &batches)
+    }
+
     /// Submit a training job from a serialized `SubmitJobRequest` body.
     ///
     /// The thin Python `Database` wrapper builds this request with the same
@@ -1624,6 +1637,23 @@ impl PyDatabase {
         let (record, _outcome) = crate::released(
             &self.runtime,
             self.session.generate_structure_embeddings(&request, cache),
+        )
+        .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
+    /// Materialise a lexical index over a source's text from a serialized
+    /// `BuildLexicalIndexRequest` body — the same request assembly the remote
+    /// client sends, decoded through
+    /// `jammi_ai::wire::build_lexical_index_from_bytes`. Returns the lexical
+    /// table's name. A malformed or invalid body raises `ValueError`.
+    fn _build_lexical_index_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
+        let (source_id, params) =
+            jammi_ai::wire::build_lexical_index_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let record = crate::released(
+            &self.runtime,
+            self.session.build_lexical_index(&source_id, &params),
         )
         .map_err(to_pyerr)?;
         Ok(record.table_name)

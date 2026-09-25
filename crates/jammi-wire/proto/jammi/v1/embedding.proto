@@ -67,6 +67,12 @@ service EmbeddingService {
   // model, only an additional transport for the existing capability.
   rpc Search(SearchRequest) returns (SearchResponse);
 
+  // Lexical (BM25) search over a source's lexical table: the query text is
+  // analysed into terms by the table's analyzer, and the best-ranked rows are
+  // hydrated from the source, each carrying its `bm25_score` and `bm25_rank`.
+  // Peer of the abstraction's `lexical_search`.
+  rpc LexicalSearch(LexicalSearchRequest) returns (SearchResponse);
+
   // Re-embed only the source rows whose content hash changed since the
   // table's current version and publish the result as a new version (a
   // never-refreshed table first publishes its base version). Every refusal is
@@ -141,6 +147,10 @@ enum ResultTableKind {
   // promoted, so it is never `ready` and no verb returns it; listed for
   // completeness of the catalog's own kind set.
   WORKING = 6;
+  // A source's text as `(_row_id, text)` rows, which lexical (BM25) search
+  // ranks. Data of record with no ANN sidecar, excluded from embedding-table
+  // resolution.
+  LEXICAL = 7;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
@@ -266,6 +276,23 @@ message SearchRequest {
 // An exact search: every vector scored. Carries nothing; its presence in
 // `SearchRequest.method` is the choice.
 message ExactSearch {}
+
+message LexicalSearchRequest {
+  // Source whose lexical table is searched.
+  string source_id = 1;
+  // The query text. Its words are the query: no syntax is interpreted.
+  string text = 2;
+  // Number of rows to return.
+  uint32 k = 3;
+  // Optional SQL predicate over the result columns: the search returns the `k`
+  // best-ranked rows that satisfy it (fewer only when fewer exist).
+  optional string filter = 4;
+  // Columns to project into each hit's `columns` map. Empty = key + score only.
+  repeated string select = 5;
+  // Which lexical table of the source to search. Unset = the source's
+  // most-recent ready one.
+  optional string lexical_table = 6;
+}
 
 // The search result: the hydrated rows the engine's `search` returns — the
 // key (`_row_id`), the source's columns (or exactly the `select`ed ones), the

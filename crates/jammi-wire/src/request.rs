@@ -76,6 +76,25 @@ pub struct SearchRequest {
     pub method: SearchMethod,
 }
 
+/// A flattened lexical-search request: [`SearchRequest`]'s peer for a text
+/// query ranked by BM25 over a source's lexical table.
+pub struct LexicalSearchRequest {
+    /// Source whose lexical table is searched.
+    pub source_id: String,
+    /// The query text, analysed into terms by the lexical table's analyzer.
+    pub text: String,
+    /// Number of rows to retrieve.
+    pub k: usize,
+    /// Which lexical table of the source to search. `None` selects the
+    /// source's most-recent ready one.
+    pub lexical_table: Option<String>,
+    /// Optional SQL predicate over the hydrated columns: the search returns
+    /// the `k` best-ranked rows that satisfy it.
+    pub filter: Option<String>,
+    /// Columns to project. Empty keeps every hydrated column.
+    pub select: Vec<String>,
+}
+
 /// A flattened column-source fine-tune submission. Every knob the submit
 /// carries — the spec's own fields, the hyperparameter block, and the
 /// data-parallel rank count — is a field here, the same way [`SearchRequest`]

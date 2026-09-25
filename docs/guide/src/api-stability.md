@@ -26,10 +26,10 @@ verb list:
 
 | Verb set (conformance constant) | Verbs |
 |---|---|
-| `_REMOTE_VERBS` | `add_source`, `generate_embeddings`, `encode_query`, `search`, `sql`, `list_sources`, `describe_source`, `set_tenant`, `tenant_scope`, `tenant`, `get_server_info` |
+| `_REMOTE_VERBS` | `add_source`, `generate_embeddings`, `encode_query`, `search`, `lexical_search`, `sql`, `list_sources`, `describe_source`, `set_tenant`, `tenant_scope`, `tenant`, `get_server_info` |
 | `_TRAINING_VERBS` | `fine_tune`, `fine_tune_graph`, `train_context_predictor`, `predict_with_context_predictor`, `training_job`, `list_training_jobs` |
 | `_INFERENCE_VERBS` | `infer` |
-| `_PIPELINE_VERBS` | `build_neighbor_graph`, `propagate_embeddings`, `generate_structure_embeddings`, `asof_join`, `assemble_context`, `recompute`, `verify_materialization`, `staleness`, `derives_from` |
+| `_PIPELINE_VERBS` | `build_neighbor_graph`, `build_lexical_index`, `propagate_embeddings`, `generate_structure_embeddings`, `asof_join`, `assemble_context`, `recompute`, `verify_materialization`, `staleness`, `derives_from` |
 | `_EVAL_VERBS` | `eval_embeddings`, `eval_per_query`, `eval_inference`, `eval_compare`, `eval_calibration` |
 | `_CHANNEL_VERBS` | `register_channel`, `add_channel_columns`, `list_channels` |
 | `_NUMERIC_VERBS` | `conformalize`, `conformalize_interval`, `conformalize_cqr`, `rrf_fuse` |
@@ -87,7 +87,7 @@ version with reject-newer (or strict) semantics — the full contract is on the
 
 | Format | Stamp | Current version |
 |---|---|---|
-| Materialization manifest (`.materialization.json`) | `MANIFEST_VERSION` | `4` |
+| Materialization manifest (`.materialization.json`) | `MANIFEST_VERSION` | `5` |
 | ANN row map (`.rowmap`) | `ROWMAP_VERSION` | `1` |
 | ANN sidecar manifest (`.manifest.json`) | `ANN_MANIFEST_VERSION` | `3` |
 | Catalog schema | append-only migration ledger | see `crates/jammi-db/src/catalog/migrations.rs` |

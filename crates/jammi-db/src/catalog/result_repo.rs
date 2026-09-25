@@ -48,6 +48,11 @@ pub enum ResultTableKind {
     /// record like [`AsofJoin`](Self::AsofJoin): no ANN sidecar, excluded
     /// from embedding-table resolution, named by the statement.
     Statement,
+    /// A source's text, one `(_row_id, text)` row per source row, that
+    /// lexical (BM25) search ranks. Data of record: no ANN sidecar, excluded
+    /// from embedding-table resolution; its inverted index is rebuilt from
+    /// these rows, never stored.
+    Lexical,
     /// A producer's working relation — a graph propagation's adjacency
     /// snapshot, or the state one of its hops hands the next. Not data of
     /// record: the producer that writes it holds the `building` row for as
@@ -85,6 +90,7 @@ impl ResultTableKind {
             Self::AsofJoin => "asof_join",
             Self::TrainingSet => "training_set",
             Self::Statement => "statement",
+            Self::Lexical => "lexical",
             Self::Working => "working",
         }
     }
@@ -2116,9 +2122,7 @@ impl Catalog {
         // Derive the embedding-task list from `ModelTask::ALL` so that
         // adding a future embedding variant automatically extends this
         // resolver — the enum is the single source of truth, not a
-        // hardcoded `task IN ('text_embedding', 'image_embedding')`
-        // literal. Mirrors the dynamic-placeholder idiom that
-        // `find_result_tables` above uses for its conditional binds.
+        // hardcoded `task IN ('text_embedding', 'image_embedding')` literal.
         let embedding_tasks: Vec<&'static str> = ModelTask::ALL
             .iter()
             .filter(|t| t.is_embedding())
@@ -2129,51 +2133,89 @@ impl Catalog {
                 "ModelTask defines no embedding variants — resolver cannot run".into(),
             ));
         }
-
-        let sid = source_id.to_string();
-        let tenant = self.current_tenant();
-
-        // $1 = source_id; $2..$(1+N) = embedding tasks; $(2+N) = tenant.
-        let mut params: Vec<SqlValue<'static>> = Vec::with_capacity(embedding_tasks.len() + 2);
-        params.push(SqlValue::TextOwned(sid));
-        let task_placeholders: Vec<String> = (0..embedding_tasks.len())
-            .map(|i| format!("${}", i + 2))
-            .collect();
-        for t in &embedding_tasks {
-            params.push(SqlValue::Text(t));
-        }
-        let tenant_placeholder = format!("${}", params.len() + 1);
-        params.push(SqlValue::from(tenant.map(|t| t.to_string())));
-
         // `kind = 'model'` excludes derived tables (e.g. a neighbor-graph edge
         // relation) whose `task` column still names the source embedding's
         // task — only genuine model outputs resolve as an embedding source.
-        //
-        // `created_at` is app-supplied (`lease::canonical_stamp_now`) at
-        // microsecond resolution and identical in shape on both backends, so
-        // it is the correct primary ordering key — no `rowid` (SQLite has
-        // one, Postgres does not). `table_name DESC` is a deterministic final
-        // tiebreak, not a correctness guarantee: `canonical_stamp_now` is
-        // wall-clock (`chrono::Utc::now`), which is not monotonic, so a
-        // coarse or backward clock step could in principle collide two
-        // genuinely distinct creation instants. The tiebreak resolves a true
-        // same-microsecond collision correctly (every table name carries a
-        // uuid suffix, so the pick is at least deterministic); it does not
-        // repair a clock-caused false collision between otherwise-ordered
-        // rows.
+        self.newest_ready_table(source_id, ResultTableKind::Model, &embedding_tasks)
+            .await?
+            .ok_or_else(|| {
+                JammiError::Catalog(format!("No ready embedding table for source '{source_id}'"))
+            })
+    }
+
+    /// Resolve which lexical index to search for a source: the named one,
+    /// which must be a lexical index, or the source's newest ready one.
+    /// Tenant-filtered.
+    pub async fn resolve_lexical_table(
+        &self,
+        source_id: &str,
+        table_name: Option<&str>,
+    ) -> Result<ResultTableRecord> {
+        let Some(name) = table_name else {
+            return self
+                .newest_ready_table(source_id, ResultTableKind::Lexical, &[])
+                .await?
+                .ok_or_else(|| {
+                    JammiError::Catalog(format!("No ready lexical index for source '{source_id}'"))
+                });
+        };
+        let table = self
+            .get_result_table(name)
+            .await?
+            .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")))?;
+        if table.kind != ResultTableKind::Lexical {
+            return Err(JammiError::Catalog(format!(
+                "Result table '{name}' is a {} table, not a lexical index",
+                table.kind.as_db_str()
+            )));
+        }
+        Ok(table)
+    }
+
+    /// The newest ready table of `kind` over `source_id` visible to the bound
+    /// tenant, restricted to `tasks` when any are given.
+    ///
+    /// `created_at` is app-supplied (`lease::canonical_stamp_now`) at
+    /// microsecond resolution and identical in shape on both backends, so
+    /// it is the correct primary ordering key — no `rowid` (SQLite has
+    /// one, Postgres does not). `table_name DESC` is a deterministic final
+    /// tiebreak, not a correctness guarantee: `canonical_stamp_now` is
+    /// wall-clock (`chrono::Utc::now`), which is not monotonic, so a
+    /// coarse or backward clock step could in principle collide two
+    /// genuinely distinct creation instants. The tiebreak resolves a true
+    /// same-microsecond collision correctly (every table name carries a
+    /// uuid suffix, so the pick is at least deterministic); it does not
+    /// repair a clock-caused false collision between otherwise-ordered
+    /// rows.
+    async fn newest_ready_table(
+        &self,
+        source_id: &str,
+        kind: ResultTableKind,
+        tasks: &[&'static str],
+    ) -> Result<Option<ResultTableRecord>> {
+        // $1 = source_id; $2 = kind; $3..$(2+N) = tasks; $(3+N) = tenant.
+        let mut params: Vec<SqlValue<'static>> = Vec::with_capacity(tasks.len() + 3);
+        params.push(SqlValue::TextOwned(source_id.to_string()));
+        params.push(SqlValue::Text(kind.as_db_str()));
+        let task_filter = if tasks.is_empty() {
+            String::new()
+        } else {
+            let placeholders: Vec<String> =
+                (0..tasks.len()).map(|i| format!("${}", i + 3)).collect();
+            params.extend(tasks.iter().map(|t| SqlValue::Text(t)));
+            format!("AND task IN ({}) ", placeholders.join(", "))
+        };
+        let tenant_placeholder = format!("${}", params.len() + 1);
+        params.push(SqlValue::from(self.current_tenant().map(|t| t.to_string())));
+
         let sql = format!(
             "SELECT * FROM result_tables \
-             WHERE source_id = $1 AND task IN ({tasks}) \
-               AND kind = 'model' \
+             WHERE source_id = $1 AND kind = $2 {task_filter}\
                AND status = 'ready' \
-               AND (tenant_id = {tenant} OR tenant_id IS NULL) \
+               AND (tenant_id = {tenant_placeholder} OR tenant_id IS NULL) \
              ORDER BY created_at DESC, table_name DESC LIMIT 1",
-            tasks = task_placeholders.join(", "),
-            tenant = tenant_placeholder,
         );
-
-        let found = self
-            .backend()
+        self.backend()
             .transaction(
                 TxOptions {
                     read_only: true,
@@ -2181,10 +2223,8 @@ impl Catalog {
                 },
                 |tx| Box::pin(async move { tx.query_opt(&sql, &params, parse_row).await }),
             )
-            .await?;
-        found.ok_or_else(|| {
-            JammiError::Catalog(format!("No ready embedding table for source '{source_id}'"))
-        })
+            .await
+            .map_err(Into::into)
     }
 
     /// Retrieve the last checkpoint for a result table.

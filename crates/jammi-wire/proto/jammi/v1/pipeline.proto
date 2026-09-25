@@ -35,6 +35,11 @@ service PipelineService {
   // client reads the table via `sql(...)`.
   rpc BuildNeighborGraph(BuildNeighborGraphRequest) returns (jammi.v1.embedding.ResultTable);
 
+  // Materialise a lexical index over a source's text: one `(_row_id, text)` row
+  // per source row, which `LexicalSearch` ranks by BM25. Peer of the engine's
+  // `build_lexical_index`.
+  rpc BuildLexicalIndex(BuildLexicalIndexRequest) returns (jammi.v1.embedding.ResultTable);
+
   // Propagate an embedding table's features over a declared graph (the
   // decoupled-GNN forward pass) into a new, searchable embedding table. Peer of
   // the engine's `propagate_embeddings`; the client reads the table via
@@ -216,6 +221,27 @@ message BuildNeighborGraphRequest {
   // neighbour-graph is anchored on the immutable source-table digest, so it is
   // genuinely cacheable: a `Use` request reuses an exact prior build.
   jammi.v1.inference.CachePolicy cache = 7;
+}
+
+// How a lexical index tokenises its text and every query. Mirrors the engine's
+// `LexicalAnalyzer`; UNSPECIFIED maps to the engine default (`English`).
+enum LexicalAnalyzer {
+  LEXICAL_ANALYZER_UNSPECIFIED = 0;
+  // Lowercase, Porter (English) stemming, over-long tokens dropped.
+  LEXICAL_ANALYZER_ENGLISH = 1;
+  // Lowercase and over-long tokens dropped, no stemming.
+  LEXICAL_ANALYZER_RAW = 2;
+}
+
+message BuildLexicalIndexRequest {
+  // Source whose text is indexed.
+  string source_id = 1;
+  // The text columns, joined in this order by a space into each row's text.
+  repeated string columns = 2;
+  // The source column each row is keyed by.
+  string key_column = 3;
+  // How the text and every query are tokenised.
+  LexicalAnalyzer analyzer = 4;
 }
 
 // Which neighbour-contribution normalisation a propagation hop uses. Mirrors the

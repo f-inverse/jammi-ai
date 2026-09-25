@@ -1,9 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{
+    new_null_array, Array, ArrayRef, AsArray, Float32Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{JoinType, NullEquality};
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -13,14 +16,17 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
 
+use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{FiniteQuery, QuerySource, SearchMethod};
 use jammi_db::session::QueryContext;
 use jammi_db::sql::source_relation;
+use jammi_db::store::manifest::ProducingDescriptor;
 use jammi_db::ChannelId;
 
 use crate::evidence::{merge_channels, ChannelContribution};
+use crate::index::{LexicalHit, LexicalIndex};
 use crate::operator::vector_search_exec::VectorSearchExec;
 use crate::session::InferenceSession;
 
@@ -88,18 +94,62 @@ impl QueryBuilder {
             result_store,
             session.context().clone(),
         )?;
+        Self::ranked(
+            session,
+            &table,
+            Arc::new(ann),
+            Ranking::SIMILARITY,
+            "vector",
+        )
+        .await
+    }
 
-        let mut plan: Arc<dyn ExecutionPlan> = Arc::new(ann);
+    /// Start a lexical (BM25) search over a source's lexical table.
+    ///
+    /// Resolves the named lexical table (or the source's newest) through the
+    /// tenant-scoped catalog, ranks its rows against `text` with the table
+    /// version's BM25 index — built from the version's rows the first time
+    /// this process searches it — and hydrates the top `k` from the source
+    /// like a dense search. Each row carries the `bm25` channel's
+    /// `bm25_score` and 0-based `bm25_rank`.
+    pub(crate) async fn lexical(
+        session: Arc<InferenceSession>,
+        source_id: &str,
+        text: &str,
+        k: usize,
+        lexical_table: Option<&str>,
+    ) -> Result<Self> {
+        let table = session
+            .catalog()
+            .resolve_lexical_table(source_id, lexical_table)
+            .await?;
+        let pin = session.result_store().pin_current_version(table).await?;
+        let index = session
+            .lexical_indexes()
+            .get_or_build(pin.input_anchor(), build_lexical_index(&session, &pin))
+            .await?;
+        let hits = index.search(text, k)?;
+        let plan = lexical_hits_plan(&pin.record().source_id, hits)?;
+        Self::ranked(session, pin.record(), plan, Ranking::BM25_RANK, "bm25").await
+    }
 
-        // Hydration: join ANN results back to the source to get original columns.
-        // ANN output is (_row_id Utf8, _source_id Utf8, similarity Float32).
-        // The source key column may be a different type, so we cast it to Utf8.
-        // We also cast all string columns to VARCHAR to avoid Utf8View/Utf8 mismatches
-        // from the Parquet reader.
+    /// Hydrate a ranked plan — `_row_id`, `_source_id` and its channel's score
+    /// columns — by joining it back to `table`'s source on the table's key
+    /// column, in `ranking` order, contributing on `channel`.
+    ///
+    /// The ranked rows' key is a string; the source key column may be another
+    /// type, so it is cast to Utf8, as are the source's string columns, to
+    /// avoid Utf8View/Utf8 mismatches from the Parquet reader.
+    async fn ranked(
+        session: Arc<InferenceSession>,
+        table: &ResultTableRecord,
+        mut plan: Arc<dyn ExecutionPlan>,
+        ranking: Ranking,
+        channel: &str,
+    ) -> Result<Self> {
         if let Some(ref key_col) = table.key_column {
             let source_table_name = session.find_table_name(&table.source_id).await?;
             let relation = source_relation(&table.source_id, &source_table_name);
-            // Build column list that casts string columns to VARCHAR for compatibility
             let source_cols =
                 build_hydration_select(session.context(), &relation, key_col, &plan.schema())
                     .await?;
@@ -136,13 +186,13 @@ impl QueryBuilder {
             // Drop the _join_key column (redundant with _row_id)
             plan = drop_column(Arc::new(join), "_join_key")?;
 
-            // Re-sort by similarity descending (join doesn't preserve order)
-            let sim_col = col("similarity", plan.schema().as_ref())
+            // Re-sort into the ranking (the join does not preserve order).
+            let rank_col = col(ranking.column, plan.schema().as_ref())
                 .map_err(|e| JammiError::Other(format!("Hydration sort: {e}")))?;
             let sort_expr = datafusion::physical_expr::PhysicalSortExpr {
-                expr: sim_col,
+                expr: rank_col,
                 options: arrow::compute::SortOptions {
-                    descending: true,
+                    descending: ranking.descending,
                     nulls_first: false,
                 },
             };
@@ -156,7 +206,7 @@ impl QueryBuilder {
         Ok(Self {
             session,
             plan,
-            channels: vec![ChannelId::new("vector")?],
+            channels: vec![ChannelId::new(channel)?],
             annotated: false,
         })
     }
@@ -354,12 +404,14 @@ impl QueryBuilder {
 /// per-channel contributions, alongside the batch with those columns
 /// removed.
 ///
-/// A channel contributes only if **all** of its declared columns are
-/// present in the source batch under their declared names. If any are
-/// missing, the channel produces no contribution and its declared
-/// columns become all-null in the merged output. Dtype mismatches are
-/// not coerced here; `merge_channels`'s validator surfaces them as a
-/// typed `ChannelAssembly` error so callers see the real mismatch.
+/// A channel contributes when any of its declared columns is present in the
+/// batch under its declared name; a declared column the batch lacks (a
+/// selection kept only some of the channel's columns) contributes all-null. A
+/// channel with none present produces no contribution, and its declared
+/// columns become all-null in the merged output. Every declared column is
+/// stripped from the batch either way, so none appears twice. Dtype mismatches
+/// are not coerced here; `merge_channels`'s validator surfaces them as a typed
+/// `ChannelAssembly` error so callers see the real mismatch.
 async fn extract_channel_contributions(
     batch: &RecordBatch,
     participating: &[ChannelId],
@@ -372,24 +424,27 @@ async fn extract_channel_contributions(
         let spec = catalog.channels().get(id).await?.ok_or_else(|| {
             JammiError::ChannelAssembly(format!("channel '{id}': not registered"))
         })?;
-        let positions: Option<Vec<usize>> = spec
+        let positions: Vec<Option<usize>> = spec
             .columns
             .iter()
             .map(|c| batch.schema().index_of(&c.name).ok())
             .collect();
-        if let Some(positions) = positions {
-            let columns: Vec<ArrayRef> = positions
-                .iter()
-                .map(|&i| Arc::clone(batch.column(i)))
-                .collect();
-            for i in positions {
-                to_remove.insert(i);
-            }
-            contributions.push(ChannelContribution {
-                channel: id.clone(),
-                columns,
-            });
+        if positions.iter().all(Option::is_none) {
+            continue;
         }
+        let columns: Vec<ArrayRef> = positions
+            .iter()
+            .zip(&spec.columns)
+            .map(|(position, declared)| match position {
+                Some(i) => Arc::clone(batch.column(*i)),
+                None => new_null_array(&declared.data_type.to_arrow(), batch.num_rows()),
+            })
+            .collect();
+        to_remove.extend(positions.into_iter().flatten());
+        contributions.push(ChannelContribution {
+            channel: id.clone(),
+            columns,
+        });
     }
 
     let new_fields: Vec<Arc<Field>> = batch
@@ -494,6 +549,124 @@ fn drop_column(
 /// engine error; when none is found the ORIGINAL error's own `Display` text
 /// — its context description and `caused by` chain included — is kept
 /// exactly, under the `"{stage}: "` prefix it always had.
+/// The column a ranked plan is ordered by, and its direction.
+struct Ranking {
+    column: &'static str,
+    descending: bool,
+}
+
+impl Ranking {
+    /// A dense search: most similar first.
+    const SIMILARITY: Self = Self {
+        column: "similarity",
+        descending: true,
+    };
+    /// A lexical search: rank 0 first — the index's own order, ties broken.
+    const BM25_RANK: Self = Self {
+        column: "bm25_rank",
+        descending: false,
+    };
+}
+
+/// Build the BM25 index of the lexical table version `pin` names from its
+/// `(_row_id, text)` rows, under the analyzer its producing descriptor records.
+async fn build_lexical_index(
+    session: &InferenceSession,
+    pin: &jammi_db::store::PinnedSource,
+) -> Result<LexicalIndex> {
+    let result_store = session.result_store();
+    let analyzer = match result_store.producing_descriptor(pin).await? {
+        ProducingDescriptor::LexicalIndex { analyzer, .. } => analyzer,
+        other => {
+            return Err(JammiError::Lexical(format!(
+                "table '{}' records a {other:?} descriptor, not a lexical index",
+                pin.table_name()
+            )))
+        }
+    };
+    let ctx = session.context();
+    let batches = ctx
+        .read_table(result_store.pinned_provider(ctx, pin).await?)
+        .map_err(JammiError::from)?
+        .select_columns(&["_row_id", "text"])
+        .map_err(JammiError::from)?
+        .collect()
+        .await
+        .map_err(JammiError::from)?;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for batch in &batches {
+        let row_ids = utf8_column(batch, "_row_id", pin.table_name())?;
+        let texts = utf8_column(batch, "text", pin.table_name())?;
+        for i in 0..batch.num_rows() {
+            if row_ids.is_null(i) {
+                return Err(JammiError::Schema {
+                    table: pin.table_name().to_string(),
+                    column: "_row_id".into(),
+                    expected: "a key on every row".into(),
+                    actual: "null".into(),
+                });
+            }
+            let text = if texts.is_null(i) { "" } else { texts.value(i) };
+            rows.push((row_ids.value(i).to_string(), text.to_string()));
+        }
+    }
+    LexicalIndex::build(rows, analyzer)
+}
+
+/// `column` of `batch` as a Utf8 array (the Parquet reader may hand back a
+/// `Utf8View`).
+fn utf8_column(batch: &RecordBatch, column: &str, table: &str) -> Result<StringArray> {
+    let array = batch
+        .column_by_name(column)
+        .ok_or_else(|| JammiError::Schema {
+            table: table.to_string(),
+            column: column.to_string(),
+            expected: "Utf8".into(),
+            actual: "missing".into(),
+        })?;
+    let cast = arrow::compute::cast(array, &DataType::Utf8).map_err(|e| JammiError::Schema {
+        table: table.to_string(),
+        column: column.to_string(),
+        expected: "Utf8".into(),
+        actual: format!("{:?} ({e})", array.data_type()),
+    })?;
+    Ok(cast.as_string::<i32>().clone())
+}
+
+/// The lexical hits as a ranked plan: `_row_id`, `_source_id`, and the `bm25`
+/// channel's `bm25_score` and `bm25_rank`, in rank order.
+fn lexical_hits_plan(source_id: &str, hits: Vec<LexicalHit>) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_row_id", DataType::Utf8, false),
+        Field::new("_source_id", DataType::Utf8, false),
+        Field::new("bm25_score", DataType::Float32, false),
+        Field::new("bm25_rank", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from_iter_values(
+                hits.iter().map(|h| h.row_id.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                hits.iter().map(|_| source_id),
+            )),
+            Arc::new(Float32Array::from_iter_values(
+                hits.iter().map(|h| h.bm25_score),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                hits.iter().map(|h| h.rank as i64),
+            )),
+        ],
+    )
+    .map_err(|e| JammiError::Lexical(format!("lexical hits batch: {e}")))?;
+    Ok(MemorySourceConfig::try_new_exec(
+        &[vec![batch]],
+        schema,
+        None,
+    )?)
+}
+
 fn plan_error(stage: &str, e: datafusion::error::DataFusionError) -> JammiError {
     match extract_engine_error(e) {
         Ok(engine) => engine,

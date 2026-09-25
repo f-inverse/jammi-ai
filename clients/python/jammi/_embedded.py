@@ -73,6 +73,8 @@ from ._assembly import (
     build_generate_embeddings_request,
     build_import_embeddings_request,
     build_infer_request,
+    build_lexical_index_request,
+    build_lexical_search_request,
     build_neighbor_graph_request,
     build_generate_structure_embeddings_request,
     build_propagate_embeddings_request,
@@ -1283,6 +1285,54 @@ class EmbeddedBackend:
             exact=exact,
         )
         return self._native._search_proto(request.SerializeToString())
+
+    def build_lexical_index(
+        self,
+        source: str,
+        *,
+        columns: List[str],
+        key: str,
+        analyzer: str = "english",
+    ) -> str:
+        """Materialise a lexical index over a source's text and return its table
+        name: one ``(_row_id, text)`` row per source row, keyed by `key`, with
+        the text `columns` joined in order by a space. :meth:`lexical_search`
+        ranks it by BM25. `analyzer` is how the text and every query are
+        tokenised — ``"english"`` (lowercase, Porter stemming; the default) or
+        ``"raw"`` (lowercase, no stemming, for codes and identifiers). The
+        index's only input is a registered source, which has no version to
+        pin, so a build always recomputes. Mirrors the remote `RemoteDatabase.build_lexical_index`.
+        """
+        request = build_lexical_index_request(source, columns=columns, key=key, analyzer=analyzer)
+        return self._native._build_lexical_index_proto(request.SerializeToString())
+
+    def lexical_search(
+        self,
+        source: str,
+        *,
+        text: str,
+        k: int,
+        filter: Optional[str] = None,
+        select: Optional[List[str]] = None,
+        lexical_table: Optional[str] = None,
+    ) -> pa.Table:
+        """Lexical (BM25) search of `text` over a source's lexical table.
+
+        `text`'s words are the query: each analysed term is one clause, so a
+        row matching more of them, or rarer ones, ranks higher; no query syntax
+        is interpreted. Returns the `k` best-ranked rows hydrated from the
+        source, each with its ``bm25_score`` and 0-based ``bm25_rank`` and
+        ``retrieved_by == ["bm25"]``. `filter` is an optional SQL predicate
+        over the hydrated columns — the search returns the `k` best-ranked rows
+        that satisfy it; `select` projects columns (empty keeps every hydrated
+        column). `lexical_table` names which of the source's lexical tables to
+        search; ``None`` searches the most-recent ready one. Returns a
+        `pyarrow.Table`. Mirrors the remote `RemoteDatabase.lexical_search`.
+        """
+        request = build_lexical_search_request(
+            source, text=text, k=k, filter=filter, select=select, lexical_table=lexical_table
+        )
+        return self._native._lexical_search_proto(request.SerializeToString())
 
     def register_channel(
         self,

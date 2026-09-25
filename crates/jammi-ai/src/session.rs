@@ -38,6 +38,8 @@ pub struct InferenceSession {
     artifact_store: Arc<ArtifactStore>,
     observer: Option<Arc<dyn InferenceObserver>>,
     ann_cache: Arc<AnnCache>,
+    /// The lexical indexes this process has built from lexical tables.
+    lexical_indexes: crate::index::LexicalIndexes,
     device_config: DeviceConfig,
     /// The one Hugging Face Hub client this session's resolver and fine-tune
     /// worker share — built once, below, from `[models]`.
@@ -441,6 +443,7 @@ impl InferenceSession {
             artifact_store,
             observer,
             ann_cache,
+            lexical_indexes: crate::index::LexicalIndexes::default(),
             device_config,
             hub,
             ephemeral_sessions: jammi_db::ephemeral::ActiveSessions::new(),
@@ -891,6 +894,20 @@ impl InferenceSession {
         self.inner.with_tenant_scoped(tenant, f).await
     }
 
+    /// Run `f` inside the bound tenant's scope when one is bound, so every
+    /// catalog read it makes resolves only that tenant's relations — a caller
+    /// cannot point a producer at another tenant's table.
+    async fn in_bound_tenant<'a, F, Fut, T>(&'a self, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T> + 'a,
+    {
+        match self.tenant() {
+            Some(tenant) => self.with_tenant_scoped(tenant, |_scope| f()).await,
+            None => f().await,
+        }
+    }
+
     /// Run `f` with the tenant analyzer rule disabled for the duration of
     /// the closure's future.
     ///
@@ -1005,6 +1022,11 @@ impl InferenceSession {
         &self.ann_cache
     }
 
+    /// The lexical indexes this process has built.
+    pub(crate) fn lexical_indexes(&self) -> &crate::index::LexicalIndexes {
+        &self.lexical_indexes
+    }
+
     /// Start a vector-search-seeded compound query over an embedding table.
     ///
     /// Returns the fluent [`QueryBuilder`]: the first node is the ANN search,
@@ -1033,6 +1055,20 @@ impl InferenceSession {
             jammi_db::index::QuerySource::Caller,
         )
         .await
+    }
+
+    /// Start a lexical (BM25) search of `text` over a source's lexical table
+    /// — the named one, or the source's newest. Resolves through the
+    /// tenant-scoped catalog and hydrates the `k` best-ranked rows from the
+    /// source, each carrying its `bm25_score` and `bm25_rank`.
+    pub async fn lexical_search(
+        self: &Arc<Self>,
+        source_id: &str,
+        text: &str,
+        k: usize,
+        lexical_table: Option<&str>,
+    ) -> Result<QueryBuilder> {
+        QueryBuilder::lexical(Arc::clone(self), source_id, text, k, lexical_table).await
     }
 
     /// Start a search ranked by an existing row (query-by-example).
@@ -1180,28 +1216,7 @@ impl InferenceSession {
             modality,
             cache,
         };
-        match self.run_now(spec).await? {
-            crate::jobs::JobResult::Table {
-                table,
-                cache_outcome,
-            } => {
-                let record = self
-                    .catalog()
-                    .get_result_table(&table)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "generate_embeddings: run_now's own table '{table}' vanished \
-                             before it could be read back"
-                        ))
-                    })?;
-                Ok((record, cache_outcome))
-            }
-            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
-                "generate_embeddings: run_now returned a training JobResult for a compute spec"
-                    .into(),
-            )),
-        }
+        self.run_now_record("generate_embeddings", spec).await
     }
 
     /// Generate embeddings for a source and persist to Jammi DB.
@@ -1476,19 +1491,9 @@ impl InferenceSession {
             key_column: key_column.to_string(),
             cache,
         };
-        match self.run_now(spec).await? {
-            crate::jobs::JobResult::Table {
-                table,
-                cache_outcome,
-            } => {
-                let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
-                let batches = normalize_view_batches(batches)?;
-                Ok((batches, cache_outcome))
-            }
-            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
-                "infer: run_now returned a training JobResult for a compute spec".into(),
-            )),
-        }
+        let (table, cache_outcome) = self.run_now_table("infer", spec).await?;
+        let batches = self.sql(&infer_ordered_read_back_sql(&table)).await?;
+        Ok((normalize_view_batches(batches)?, cache_outcome))
     }
 
     /// `infer`'s actual materializer — dispatched to by
@@ -1772,28 +1777,7 @@ impl InferenceSession {
             params: params.clone(),
             cache,
         };
-        match self.run_now(spec).await? {
-            crate::jobs::JobResult::Table {
-                table,
-                cache_outcome,
-            } => {
-                let record = self
-                    .catalog()
-                    .get_result_table(&table)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "build_neighbor_graph: run_now's own table '{table}' vanished \
-                             before it could be read back"
-                        ))
-                    })?;
-                Ok((record, cache_outcome))
-            }
-            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
-                "build_neighbor_graph: run_now returned a training JobResult for a compute spec"
-                    .into(),
-            )),
-        }
+        self.run_now_record("build_neighbor_graph", spec).await
     }
 
     /// `build_neighbor_graph`'s actual materializer — see
@@ -1818,30 +1802,15 @@ impl InferenceSession {
         cache: jammi_db::store::CachePolicy,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        match self.tenant() {
-            // A bound tenant runs the build inside its scope, so the catalog
-            // resolves only that tenant's embedding table — a caller cannot
-            // point the build at another tenant's table.
-            Some(tenant) => {
-                self.with_tenant_scoped(tenant, |_scope| async move {
-                    crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
-                        self,
-                        self.result_store.as_ref(),
-                    )
-                    .run(source_id, embedding_table, params, cache, job_attempt)
-                    .await
-                })
-                .await
-            }
-            None => {
-                crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
-                    self,
-                    self.result_store.as_ref(),
-                )
-                .run(source_id, embedding_table, params, cache, job_attempt)
-                .await
-            }
-        }
+        self.in_bound_tenant(|| async move {
+            crate::pipeline::neighbor_graph::NeighborGraphPipeline::new(
+                self,
+                self.result_store.as_ref(),
+            )
+            .run(source_id, embedding_table, params, cache, job_attempt)
+            .await
+        })
+        .await
     }
 
     /// Assemble a point-in-time-correct table — the thin [`Self::run_now`]
@@ -1868,21 +1837,7 @@ impl InferenceSession {
             facts: facts.to_string(),
             spec: spec.clone(),
         };
-        match self.run_now(job_spec).await? {
-            crate::jobs::JobResult::Table { table, .. } => self
-                .catalog()
-                .get_result_table(&table)
-                .await?
-                .ok_or_else(|| {
-                    JammiError::Catalog(format!(
-                        "asof_join: run_now's own table '{table}' vanished before it could be \
-                         read back"
-                    ))
-                }),
-            crate::jobs::JobResult::Model { .. } => Err(JammiError::Inference(
-                "asof_join: run_now returned a training JobResult for a compute spec".into(),
-            )),
-        }
+        Ok(self.run_now_record("asof_join", job_spec).await?.0)
     }
 
     /// `asof_join`'s actual materializer — see `Self::infer_materialize`'s
@@ -1902,15 +1857,49 @@ impl InferenceSession {
         spec: &crate::pipeline::asof::AsofJoinSpec,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<ResultTableRecord> {
-        match self.tenant() {
-            Some(tenant) => {
-                self.with_tenant_scoped(tenant, |_scope| async move {
-                    crate::pipeline::asof::verb::run(self, spine, facts, spec, job_attempt).await
-                })
-                .await
-            }
-            None => crate::pipeline::asof::verb::run(self, spine, facts, spec, job_attempt).await,
-        }
+        self.in_bound_tenant(|| async move {
+            crate::pipeline::asof::verb::run(self, spine, facts, spec, job_attempt).await
+        })
+        .await
+    }
+
+    /// Materialise a lexical index over a source's text — the thin
+    /// [`Self::run_now`] wrapper: submits a
+    /// [`crate::jobs::ComputeSpec::LexicalIndex`] and returns the lexical table
+    /// it produced, so a direct call and a queued-and-claimed `lexical_index`
+    /// job run identical code (`Self::build_lexical_index_materialize`).
+    ///
+    /// The table holds one `(_row_id, text)` row per source row: the source's
+    /// `key_column` and its text `columns` joined by a space.
+    /// [`Self::lexical_search`] ranks it by BM25. Its only input is a
+    /// registered source, which has no version to pin, so a build always
+    /// recomputes.
+    pub async fn build_lexical_index(
+        self: &Arc<Self>,
+        source_id: &str,
+        params: &crate::pipeline::lexical::BuildLexicalIndex,
+    ) -> Result<ResultTableRecord> {
+        let spec = crate::jobs::ComputeSpec::LexicalIndex {
+            source_id: source_id.to_string(),
+            params: params.clone(),
+        };
+        Ok(self.run_now_record("build_lexical_index", spec).await?.0)
+    }
+
+    /// `build_lexical_index`'s actual materializer — see
+    /// `Self::infer_materialize`'s doc for the `job_attempt` convention every
+    /// `*_materialize` method shares. The source resolves through the bound
+    /// tenant's scope.
+    pub(crate) async fn build_lexical_index_materialize(
+        &self,
+        source_id: &str,
+        params: &crate::pipeline::lexical::BuildLexicalIndex,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
+    ) -> Result<ResultTableRecord> {
+        self.in_bound_tenant(|| async move {
+            crate::pipeline::lexical::run(self, source_id, params, job_attempt).await
+        })
+        .await
     }
 
     // =====================================================================

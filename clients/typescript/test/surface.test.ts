@@ -26,6 +26,7 @@ import {
   type EmbeddingEvalReport,
   type CalibrationEvalReport,
   CalibrationShape,
+  LexicalAnalyzer,
   type ResultTable,
   type AssembleContextResponse,
   type SubmitJobResponse,
@@ -128,6 +129,13 @@ async function verbSurface(c: JammiClient): Promise<void> {
       select: ["title"],
     });
     expectTypeOf(search.result?.dataBody).toEqualTypeOf<Uint8Array | undefined>();
+    const lexical: SearchResponse = await c.embedding.lexicalSearch({
+      sourceId: "s1",
+      text: "turbine blade",
+      k: 5,
+      lexicalTable: "lexical_s1",
+    });
+    expectTypeOf(lexical.result?.dataBody).toEqualTypeOf<Uint8Array | undefined>();
 
     // ── InferenceService: infer ───────────────────────────────────────────
     const inf: InferResponse = await c.inference.infer({
@@ -160,6 +168,13 @@ async function verbSurface(c: JammiClient): Promise<void> {
       k: 10,
     });
     expectTypeOf(graph.tableName).toBeString();
+    const lexicalIndex: ResultTable = await c.pipeline.buildLexicalIndex({
+      sourceId: "s1",
+      columns: ["title", "abstract"],
+      keyColumn: "id",
+      analyzer: LexicalAnalyzer.RAW,
+    });
+    expectTypeOf(lexicalIndex.tableName).toBeString();
     const propagated: ResultTable = await c.pipeline.propagateEmbeddings({
       sourceId: "s1",
       graph: { case: "edgeGraphTable", value: graph.tableName },

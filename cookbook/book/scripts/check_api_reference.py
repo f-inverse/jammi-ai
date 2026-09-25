@@ -46,6 +46,8 @@ REQUIRED: dict[str, list[str]] = {
     "build_neighbor_graph": ["k", "exact", "embedding_table", "cache"],
     # tier 02
     "search": ["query", "row_key", "k", "embedding_table", "oversample", "exact"],
+    "build_lexical_index": ["columns", "key", "analyzer"],
+    "lexical_search": ["text", "k", "filter", "select", "lexical_table"],
     "assemble_context": ["query", "k", "edge_source", "edge_direction", "edge_hops"],
     "propagate_embeddings": [
         "embedding_table",

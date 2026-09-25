@@ -7,7 +7,8 @@ title: "Retrieval: dense, lexical, and RRF-fused — does fusion help?"
 import jammi_cookbook
 ```
 
-**Recipe:** `encode_query` + `search(embedding_table=…)` · `rrf_fuse` ·
+**Recipe:** `encode_query` + `search(embedding_table=…)` ·
+`build_lexical_index` + `lexical_search` · `rrf_fuse` ·
 `assemble_context(hybrid=True)` · **Theory:** dense vs sparse retrieval,
 reciprocal rank fusion [@cormack2009rrf], the BM25 probabilistic-relevance
 baseline [@robertson2009bm25] · **Rail:** measurement (per-method
@@ -21,9 +22,8 @@ scored against tier 01's embedding-independent golden) and the *retriever* varie
 
 ```{python}
 import math
-import re
 import tempfile
-from collections import Counter, defaultdict
+from collections import defaultdict
 
 import jammi
 from jammi_cookbook import contracts, datasets, encoders, keystone, scale
@@ -86,34 +86,27 @@ rankers = {"dense_raw": dense(raw), "dense_prop": dense(propagated)}
 BM25 [@robertson2009bm25] is the probabilistic-relevance lexical score — term
 frequency saturated and length-normalized, weighted by inverse document
 frequency. It scores the *same* papers against the *same* relevance target, from
-the query's words alone. The engine carries a BM25 index internally but no verb
-exposes it yet, so this arm is scored in the notebook:
+the query's words alone. `build_lexical_index` materialises the papers' text as a
+lexical table — one row per paper, its title and abstract joined — and
+`lexical_search` ranks it against the query's words, hydrating the papers the
+way `search` does, each hit carrying its `bm25_score` and `bm25_rank`.
 
 ```{python}
-TOKEN = re.compile(r"[a-z0-9]+")
-papers = db.sql(
-    f"SELECT paper_id, title, abstract FROM {arxiv.papers}.public.{arxiv.papers}"
-).to_pylist()
-docs = {p["paper_id"]: TOKEN.findall(f"{p['title']} {p['abstract']}".lower()) for p in papers}
-avgdl = sum(len(t) for t in docs.values()) / len(docs)
-df = Counter(w for toks in docs.values() for w in set(toks))
-idf = {w: math.log(1 + (len(docs) - n + 0.5) / (n + 0.5)) for w, n in df.items()}
-tf = {pid: Counter(toks) for pid, toks in docs.items()}
+lexical = db.build_lexical_index(arxiv.papers, columns=["title", "abstract"], key="paper_id")
 
 
-def bm25(q: str, k1: float = 1.5, b: float = 0.75) -> list[str]:
-    words = TOKEN.findall(query_text[q].lower())
-    scores = {}
-    for pid, counts in tf.items():
-        norm = k1 * (1 - b + b * len(docs[pid]) / avgdl)
-        s = sum(idf[w] * counts[w] * (k1 + 1) / (counts[w] + norm) for w in words if counts[w])
-        if s > 0:
-            scores[pid] = s
-    return [pid for pid, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:DEPTH]]
+def bm25(q: str) -> list[str]:
+    hits = db.lexical_search(arxiv.papers, text=query_text[q], k=DEPTH, lexical_table=lexical)
+    return hits.column("_row_id").to_pylist()
 
 
+example = db.lexical_search(arxiv.papers, text=query_text[queries[0]], k=3, lexical_table=lexical)
+print(example.select(["_row_id", "bm25_score", "bm25_rank", "retrieved_by"]).to_pylist())
 rankers["bm25"] = bm25
 ```
+
+The analyzer stems English (`"raw"` would not), and the query's words are
+terms, not syntax: a title's colon or quote is text.
 
 ## RRF fusion — the engine's `rrf_fuse`
 

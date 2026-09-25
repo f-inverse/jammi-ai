@@ -17,7 +17,9 @@
 use prost::Message;
 use tonic::Status;
 
-use crate::local_session::{Modality, QueryInput, SearchQuery, SearchRequest};
+use crate::local_session::{
+    LexicalSearchRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+};
 use jammi_wire::proto::embedding as pb;
 use jammi_wire::ProtoQueryInput;
 
@@ -225,5 +227,34 @@ pub fn search_from_proto(req: pb::SearchRequest) -> Result<SearchRequest, Status
         filter: req.filter,
         select: req.select,
         method: jammi_wire::search_method_from_proto(req.method),
+    })
+}
+
+/// Decode a serialized [`pb::LexicalSearchRequest`] body into the engine
+/// [`LexicalSearchRequest`] — the embedded binding's seam onto
+/// [`lexical_search_from_proto`].
+pub fn lexical_search_from_bytes(body: &[u8]) -> Result<LexicalSearchRequest, Status> {
+    let req = pb::LexicalSearchRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed LexicalSearch request: {e}")))?;
+    lexical_search_from_proto(req)
+}
+
+/// Decode a [`pb::LexicalSearchRequest`] into the engine
+/// [`LexicalSearchRequest`]. The required `source_id` is validated at decode;
+/// `filter` / `select` / `lexical_table` carry through with their wire
+/// presence.
+pub fn lexical_search_from_proto(
+    req: pb::LexicalSearchRequest,
+) -> Result<LexicalSearchRequest, Status> {
+    if req.source_id.is_empty() {
+        return Err(Status::invalid_argument("source_id is required"));
+    }
+    Ok(LexicalSearchRequest {
+        source_id: req.source_id,
+        text: req.text,
+        k: req.k as usize,
+        lexical_table: req.lexical_table,
+        filter: req.filter,
+        select: req.select,
     })
 }

@@ -172,6 +172,24 @@ class Session(Protocol):
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Any: ...
+    def build_lexical_index(
+        self,
+        source: str,
+        *,
+        columns: List[str],
+        key: str,
+        analyzer: str = "english",
+    ) -> str: ...
+    def lexical_search(
+        self,
+        source: str,
+        *,
+        text: str,
+        k: int,
+        filter: Optional[str] = None,
+        select: Optional[List[str]] = None,
+        lexical_table: Optional[str] = None,
+    ) -> Any: ...
     def infer(
         self,
         *,

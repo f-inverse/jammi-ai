@@ -24,8 +24,8 @@ use std::sync::Arc;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::wire::{
     asof_join_from_proto, assemble_context_request_from_proto, assemble_context_to_proto,
-    build_neighbor_graph_from_proto, propagate_request_from_proto, recompute_from_proto,
-    recompute_report_to_proto, structure_request_from_proto,
+    build_lexical_index_from_proto, build_neighbor_graph_from_proto, propagate_request_from_proto,
+    recompute_from_proto, recompute_report_to_proto, structure_request_from_proto,
 };
 use jammi_db::error::JammiError;
 use tonic::{Request, Response, Status};
@@ -33,8 +33,8 @@ use tonic::{Request, Response, Status};
 use crate::grpc::proto::embedding::ResultTable;
 use crate::grpc::proto::pipeline::pipeline_service_server::PipelineService;
 use crate::grpc::proto::pipeline::{
-    AsofJoinRequest, AssembleContextRequest, AssembleContextResponse, BuildNeighborGraphRequest,
-    GenerateStructureEmbeddingsRequest, PropagateEmbeddingsRequest,
+    AsofJoinRequest, AssembleContextRequest, AssembleContextResponse, BuildLexicalIndexRequest,
+    BuildNeighborGraphRequest, GenerateStructureEmbeddingsRequest, PropagateEmbeddingsRequest,
     RecomputeReport as ProtoRecomputeReport, RecomputeRequest,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
@@ -155,6 +155,21 @@ impl PipelineService for PipelineServer {
         .await
         .map_err(map_engine_error)?;
 
+        Ok(Response::new(record.into()))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn build_lexical_index(
+        &self,
+        request: Request<BuildLexicalIndexRequest>,
+    ) -> Result<Response<ResultTable>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let (source_id, params) = build_lexical_index_from_proto(request.into_inner())?;
+        let record = scoped(&self.session, tenant, || async {
+            self.session.build_lexical_index(&source_id, &params).await
+        })
+        .await
+        .map_err(map_engine_error)?;
         Ok(Response::new(record.into()))
     }
 

@@ -234,6 +234,67 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     let _ = server.handle.await;
 }
 
+/// Lexical search over the wire returns the rows a local `Session` returns —
+/// same keys, same BM25 ranks and scores — and names the same failure when the
+/// source has no lexical index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_lexical_search_ranks_like_local() {
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    local
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect("add_source");
+    let request = || jammi_ai::local_session::LexicalSearchRequest {
+        source_id: "patents".to_string(),
+        text: "quantum networks".to_string(),
+        k: 5,
+        lexical_table: None,
+        filter: Some("year >= 2020".to_string()),
+        select: vec!["id".to_string()],
+    };
+
+    let remote_err = remote.lexical_search(request()).await.unwrap_err();
+    let local_err = local.lexical_search(request()).await.unwrap_err();
+    assert_eq!(remote_err.to_string(), local_err.to_string());
+
+    local
+        .build_lexical_index(
+            "patents",
+            &jammi_ai::local_session::BuildLexicalIndex {
+                columns: vec!["title".to_string(), "abstract".to_string()],
+                key_column: "id".to_string(),
+                analyzer: jammi_ai::local_session::LexicalAnalyzer::English,
+            },
+        )
+        .await
+        .expect("build_lexical_index");
+    let over_the_wire = remote.lexical_search(request()).await.expect("remote");
+    let in_process = local.lexical_search(request()).await.expect("local");
+    let rows = |batches: Vec<RecordBatch>| -> Vec<String> {
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let schema = batch.schema();
+        let columns: Vec<usize> = ["id", "bm25_score", "bm25_rank"]
+            .iter()
+            .map(|name| schema.index_of(name).unwrap())
+            .collect();
+        let formatted =
+            arrow::util::pretty::pretty_format_batches(&[batch.project(&columns).unwrap()])
+                .unwrap();
+        formatted.to_string().lines().map(str::to_string).collect()
+    };
+    let (remote_rows, local_rows) = (rows(over_the_wire), rows(in_process));
+    assert!(
+        local_rows.len() > 4,
+        "the fixture has quantum patents: {local_rows:?}"
+    );
+    assert_eq!(remote_rows, local_rows);
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
 /// `add_source` over the wire, proven interchangeable with a local `Session`. The
 /// remote transport registers the `patents` corpus through
 /// `EmbeddingService.AddSource` (the typed RPC the server and the TS gRPC-web

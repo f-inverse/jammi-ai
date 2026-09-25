@@ -1109,6 +1109,19 @@ fn cases() -> Vec<IsolationCase> {
                 assert_embedding_resolver_isolated().await;
             }
         ),
+        // `lexical_search` resolves its lexical table through the tenant-scoped
+        // catalog before ranking anything: tenant A builds a lexical index over
+        // its own source and searches it; tenant B resolves no lexical table for
+        // that source, reads no row of A's, and its search refuses.
+        case!(
+            "EmbeddingService",
+            "LexicalSearch",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_lexical_isolated().await;
+            }
+        ),
         // ImportEmbeddings writes a tenant-scoped ready embedding table from
         // PRECOMPUTED vectors — no GPU, no source scan — so it is covered as a
         // real Hermetic case (not a resolver stand-in): tenant A drives the whole
@@ -1210,6 +1223,19 @@ fn cases() -> Vec<IsolationCase> {
         case!("PipelineService", "AsofJoin", CaseKind::Hermetic, None, {
             assert_source_resolver_isolated().await;
         }),
+        // `build_lexical_index` reads one registered SOURCE, resolved through
+        // the session's tenant-scoped catalog (`find_table_name`) before any
+        // row is planned, so source resolution is its whole tenant boundary —
+        // the gate `AsofJoin` rides.
+        case!(
+            "PipelineService",
+            "BuildLexicalIndex",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_source_resolver_isolated().await;
+            }
+        ),
         // `generate_structure_embeddings` reads no embedding table and runs no
         // model: its one input is the edge relation, a registered SOURCE it
         // resolves through the session's tenant-scoped catalog
@@ -1766,6 +1792,69 @@ async fn assert_import_isolated() {
     assert!(
         cat_b.get_result_table(&table_name).await.unwrap().is_none(),
         "CROSS-TENANT LEAK: tenant B read tenant A's imported table row"
+    );
+}
+
+/// Tenant A builds a lexical index over its own source and searches it; tenant
+/// B, over the same engine, resolves no lexical table for the source, cannot
+/// read A's table row, and its search refuses — the same scoping the gRPC
+/// handler applies with `scoped(engine, tenant, …)`.
+async fn assert_lexical_isolated() {
+    use jammi_ai::local_session::{BuildLexicalIndex, LexicalAnalyzer, LexicalSearchRequest};
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let session = Session::new(Arc::clone(&engine));
+    let search = || LexicalSearchRequest {
+        source_id: "patents".into(),
+        text: "quantum".into(),
+        k: 3,
+        lexical_table: None,
+        filter: None,
+        select: Vec::new(),
+    };
+
+    let table = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            session
+                .add_source("patents", SourceType::File, parquet_connection())
+                .await?;
+            let table = session
+                .build_lexical_index(
+                    "patents",
+                    &BuildLexicalIndex {
+                        columns: vec!["title".into()],
+                        key_column: "id".into(),
+                        analyzer: LexicalAnalyzer::English,
+                    },
+                )
+                .await?;
+            let hits = session.lexical_search(search()).await?;
+            assert!(!hits.is_empty(), "tenant A searches its own lexical index");
+            Ok::<_, JammiError>(table.table_name)
+        })
+        .await
+        .expect("tenant A builds and searches its own lexical index");
+
+    let cat_b = engine.catalog().pinned_to_tenant(Some(tenant_b()));
+    assert!(
+        cat_b.resolve_lexical_table("patents", None).await.is_err(),
+        "CROSS-TENANT LEAK: tenant B resolved tenant A's lexical index"
+    );
+    assert!(
+        cat_b.get_result_table(&table).await.unwrap().is_none(),
+        "CROSS-TENANT LEAK: tenant B read tenant A's lexical table row"
+    );
+    let refused = engine
+        .with_tenant_scoped(tenant_b(), |_scope| session.lexical_search(search()))
+        .await;
+    assert!(
+        refused.is_err(),
+        "CROSS-TENANT LEAK: tenant B searched tenant A's lexical index"
     );
 }
 

@@ -234,7 +234,7 @@ pub(crate) fn mint_instance_id() -> String {
 /// Every job kind this binary can execute — the vocabulary
 /// `resolve_kinds` validates `[worker] kinds` against at startup.
 /// The three training kinds dispatch through `JobWorker::run_spec`; the
-/// six compute kinds (every embedded synchronous compute verb is one of
+/// seven compute kinds (every embedded synchronous compute verb is one of
 /// [`crate::jobs::ComputeSpec`]'s variants) dispatch through
 /// [`crate::jobs::execute_compute`].
 pub const COMPILED_KINDS: &[&str] = &[
@@ -245,6 +245,7 @@ pub const COMPILED_KINDS: &[&str] = &[
     "propagate",
     "graph_structure",
     "asof_join",
+    "lexical_index",
     "embedding",
     "infer",
 ];
@@ -255,7 +256,13 @@ pub const COMPILED_KINDS: &[&str] = &[
 pub(crate) fn is_compute_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "neighbor_graph" | "propagate" | "graph_structure" | "asof_join" | "embedding" | "infer"
+        "neighbor_graph"
+            | "propagate"
+            | "graph_structure"
+            | "asof_join"
+            | "lexical_index"
+            | "embedding"
+            | "infer"
     )
 }
 

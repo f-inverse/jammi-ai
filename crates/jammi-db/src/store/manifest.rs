@@ -507,6 +507,20 @@ pub enum ProducingDescriptor {
         /// every recorded query replays.
         query: String,
     },
+    /// A lexical index's rows: a source's text columns projected into one
+    /// `(_row_id, text)` row per source row. (`build_lexical_index`.)
+    /// Replayed by projecting the source's current rows again.
+    LexicalIndex {
+        /// The source the text was read from.
+        source_id: String,
+        /// The source column each row is keyed by, as `_row_id`.
+        key_column: String,
+        /// The text columns, in declared order, joined by a space into `text`.
+        text_columns: Vec<String>,
+        /// How the index tokenises the text and every query: it changes what
+        /// a search over the table ranks, so it is part of the definition.
+        analyzer: crate::index::LexicalAnalyzer,
+    },
     /// Inference output: a model run over a source's content columns, keyed by
     /// `key_column`. (`InferenceSession::infer`.)
     Inference {

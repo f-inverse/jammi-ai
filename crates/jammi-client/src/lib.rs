@@ -54,7 +54,8 @@ use jammi_wire::proto::embedding::embedding_service_client::EmbeddingServiceClie
 use jammi_wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
     CompactEmbeddingsRequest, EncodeQueryRequest, ExpireVersionsRequest, GenerateEmbeddingsRequest,
-    QueryVector, RefreshEmbeddingsRequest, SearchRequest as ProtoSearchRequest,
+    LexicalSearchRequest as ProtoLexicalSearchRequest, QueryVector, RefreshEmbeddingsRequest,
+    SearchRequest as ProtoSearchRequest,
 };
 use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
@@ -69,7 +70,8 @@ use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use jammi_wire::request::{
-    FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+    FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput, SearchQuery,
+    SearchRequest,
 };
 use jammi_wire::{
     audit_error_from_status, cohorts_to_proto, config_to_proto, decode_subscribed_batch,
@@ -333,6 +335,32 @@ impl DataClient {
                 filter,
                 select,
                 method: jammi_wire::search_method_to_proto(method),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        result_rows_from_proto(resp.result).map_err(|s| error_from_status(&s))
+    }
+
+    /// Run a lexical (BM25) search and return the terminal hydrated batches.
+    pub async fn lexical_search(&self, request: LexicalSearchRequest) -> Result<Vec<RecordBatch>> {
+        let LexicalSearchRequest {
+            source_id,
+            text,
+            k,
+            lexical_table,
+            filter,
+            select,
+        } = request;
+        let resp = self
+            .embedding_client()
+            .lexical_search(ProtoLexicalSearchRequest {
+                source_id,
+                text,
+                k: k as u32,
+                filter,
+                select,
+                lexical_table,
             })
             .await
             .map_err(|s| error_from_status(&s))?

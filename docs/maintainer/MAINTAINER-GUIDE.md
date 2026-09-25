@@ -334,9 +334,9 @@ RPCs (it also covers module functions `open_local`/`connect`, the pure-Python
 | `CatalogService` | `CreateMutableTable`/`DropMutableTable`/`ListMutableTables` | `grpc/catalog.rs` |
 | `CatalogService` | `RegisterTopic`/`DropTopic`/`ListTopics` | `grpc/catalog.rs` |
 | `CatalogService` | `Reconcile` | `grpc/catalog.rs` (`CatalogService::reconcile`; `all = true` gated by `AdminAuthorizer` [§2.8]) |
-| `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search` | `grpc/embedding.rs` |
+| `EmbeddingService` | `GenerateEmbeddings`/`EncodeQuery`/`Search`/`LexicalSearch` | `grpc/embedding.rs` |
 | `InferenceService` | `Infer`/`Predict` | `grpc/inference.rs` |
-| `PipelineService` | `BuildNeighborGraph`/`PropagateEmbeddings`/`GenerateStructureEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
+| `PipelineService` | `BuildNeighborGraph`/`BuildLexicalIndex`/`PropagateEmbeddings`/`GenerateStructureEmbeddings`/`AssembleContext` | `grpc/pipeline.rs` |
 | `PipelineService` | `AsofJoin` | `grpc/pipeline.rs` (`PipelineService::asof_join`) |
 | `PipelineService` | `Recompute` | `grpc/pipeline.rs` (`PipelineService::recompute`) |
 | `AuditService` | `AuditLog`/`AuditFetchByQueryId`/`AuditFetchRecent` | `grpc/audit.rs` |
@@ -2190,6 +2190,7 @@ CI if the guide and the code diverge:
 
 <!-- BEGIN PRODUCING-DESCRIPTOR-VARIANTS -->
 - `Statement` — a `CREATE TABLE … AS <query>` table: the query recorded as SQL (`query`, the plan rendered back by DataFusion's unparser at planning; a query the unparser cannot render — a `WITH RECURSIVE` query, a `VALUES` list — is refused typed at planning naming the node, so every recorded query replays); replayed by re-issuing `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry, keeping the table's name.
+- `LexicalIndex` — a source's text columns projected into one `(_row_id, text)` row per source row, with the analyzer its BM25 index tokenises under; the inverted index is rebuilt in memory from these rows per table version, never stored; replayed by projecting the source's current rows again.
 - `Inference` — a model run over a source's content columns, keyed by `key_column`.
 - `Embedding` — a model embedding over a source's columns.
 - `NeighborGraph` — a k-NN edge relation derived from an embedding table.

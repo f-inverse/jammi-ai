@@ -70,6 +70,7 @@ _RESULT_TABLE_KIND_NAME = {
     embedding_pb2.ResultTableKind.ASOF_JOIN: "AsofJoin",
     embedding_pb2.ResultTableKind.TRAINING_SET: "TrainingSet",
     embedding_pb2.ResultTableKind.STATEMENT: "Statement",
+    embedding_pb2.ResultTableKind.LEXICAL: "Lexical",
     embedding_pb2.ResultTableKind.WORKING: "Working",
 }
 
@@ -1525,6 +1526,65 @@ def build_search_request(
         request.oversample = oversample
     if exact:
         request.exact.SetInParent()
+    return request
+
+
+_LEXICAL_ANALYZER = {
+    "english": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_ENGLISH,
+    "raw": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_RAW,
+}
+
+
+def build_lexical_index_request(
+    source: str,
+    *,
+    columns: List[str],
+    key: str,
+    analyzer: str = "english",
+) -> pipeline_pb2.BuildLexicalIndexRequest:
+    """Assemble the `BuildLexicalIndexRequest` for a lexical index over a
+    source's text: one `(_row_id, text)` row per source row, keyed by `key`,
+    with its text `columns` joined in order by a space. `analyzer` is how the
+    text and every query are tokenised: ``"english"`` (lowercase, Porter
+    stemming) or ``"raw"`` (lowercase, no stemming). The same request the
+    embed binding submits in-process.
+    """
+    try:
+        wire_analyzer = _LEXICAL_ANALYZER[analyzer]
+    except KeyError:
+        raise ValueError(
+            f"analyzer must be one of {sorted(_LEXICAL_ANALYZER)} (got {analyzer!r})"
+        ) from None
+    return pipeline_pb2.BuildLexicalIndexRequest(
+        source_id=source, columns=list(columns), key_column=key, analyzer=wire_analyzer
+    )
+
+
+def build_lexical_search_request(
+    source: str,
+    *,
+    text: str,
+    k: int,
+    filter: Optional[str] = None,
+    select: Optional[List[str]] = None,
+    lexical_table: Optional[str] = None,
+) -> embedding_pb2.LexicalSearchRequest:
+    """Assemble the `LexicalSearchRequest` for a BM25 search of `text` over a
+    source's lexical table. `text`'s words are the query — no syntax is
+    interpreted. `filter` is an optional SQL predicate over the hydrated
+    columns (the search returns the `k` best-ranked rows that satisfy it),
+    `select` projects columns (empty keeps every hydrated column), and
+    `lexical_table` names which of the source's lexical tables to search
+    (unset = the most-recent ready one). The same request the embed binding
+    submits in-process.
+    """
+    request = embedding_pb2.LexicalSearchRequest(
+        source_id=source, text=text, k=k, select=list(select or [])
+    )
+    if filter is not None:
+        request.filter = filter
+    if lexical_table is not None:
+        request.lexical_table = lexical_table
     return request
 
 

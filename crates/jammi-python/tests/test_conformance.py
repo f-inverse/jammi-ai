@@ -100,6 +100,7 @@ _REMOTE_VERBS = {
     "generate_embeddings",
     "encode_query",
     "search",
+    "lexical_search",
     "sql",
     "list_sources",
     "describe_source",
@@ -158,6 +159,7 @@ _INFERENCE_VERBS = {
 # embed `jammi.EmbeddedBackend`.
 _PIPELINE_VERBS = {
     "build_neighbor_graph",
+    "build_lexical_index",
     "propagate_embeddings",
     "generate_structure_embeddings",
     "asof_join",

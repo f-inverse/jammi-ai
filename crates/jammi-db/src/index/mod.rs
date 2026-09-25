@@ -18,6 +18,21 @@ pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 
 use crate::error::Result;
 
+/// How a lexical index tokenises text — its own rows and every query, which
+/// must match for BM25's term statistics to line up. Recorded in the index's
+/// producing descriptor, so a different analyzer is a different index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalAnalyzer {
+    /// Lowercase, Porter (English) stemming, over-long tokens dropped: the
+    /// default for English prose.
+    #[default]
+    English,
+    /// Lowercase and over-long tokens dropped, no stemming: for text a
+    /// stemmer would corrupt (codes, identifiers, other languages).
+    Raw,
+}
+
 /// How a search ranks a table's vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMethod {

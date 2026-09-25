@@ -7,6 +7,7 @@ pub mod graph_neighbourhood;
 pub mod graph_propagation;
 pub mod graph_structure;
 pub mod import;
+pub mod lexical;
 pub mod neighbor_graph;
 pub mod parallel_train;
 pub mod recompute;

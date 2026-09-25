@@ -41,8 +41,8 @@ use tonic::{Request, Response, Status};
 use crate::grpc::proto::embedding::embedding_service_server::EmbeddingService;
 use crate::grpc::proto::embedding::{
     CompactEmbeddingsRequest, EncodeQueryRequest, EncodeQueryResponse, ExpireVersionsRequest,
-    ExpiryReport, GenerateEmbeddingsRequest, ImportEmbeddingsRequest, RefreshEmbeddingsRequest,
-    RefreshReport, ResultTable, SearchRequest, SearchResponse,
+    ExpiryReport, GenerateEmbeddingsRequest, ImportEmbeddingsRequest, LexicalSearchRequest,
+    RefreshEmbeddingsRequest, RefreshReport, ResultTable, SearchRequest, SearchResponse,
 };
 use crate::grpc::wire::{map_engine_error, scoped, session_tenant_traced};
 
@@ -221,6 +221,22 @@ impl EmbeddingService for EmbeddingServer {
         let request = jammi_ai::wire::search_from_proto(request.into_inner())?;
         let session = self.local();
         let batches = scoped(&self.session, tenant, || session.search(request))
+            .await
+            .map_err(map_engine_error)?;
+        Ok(Response::new(SearchResponse {
+            result: Some(result_rows_to_proto(&batches)?),
+        }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn lexical_search(
+        &self,
+        request: Request<LexicalSearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let request = jammi_ai::wire::lexical_search_from_proto(request.into_inner())?;
+        let session = self.local();
+        let batches = scoped(&self.session, tenant, || session.lexical_search(request))
             .await
             .map_err(map_engine_error)?;
         Ok(Response::new(SearchResponse {

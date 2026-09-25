@@ -37,6 +37,7 @@ _EXPECTED_KIND_NAME = {
     "ASOF_JOIN": "AsofJoin",
     "TRAINING_SET": "TrainingSet",
     "STATEMENT": "Statement",
+    "LEXICAL": "Lexical",
     "WORKING": "Working",
 }
 

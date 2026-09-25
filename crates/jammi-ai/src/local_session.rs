@@ -60,8 +60,12 @@ use jammi_datafusion::ModelSource;
 /// converters can satisfy the orphan rule; re-exported here so an embedded
 /// consumer reaches it as `jammi_ai::*`, alongside the [`Session`] it drives.
 pub use jammi_wire::request::{
-    FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+    FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput, SearchQuery,
+    SearchRequest,
 };
+
+pub use crate::pipeline::lexical::BuildLexicalIndex;
+pub use jammi_db::index::LexicalAnalyzer;
 
 pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
 pub use jammi_db::index::SearchMethod;
@@ -379,27 +383,86 @@ impl Session {
     /// exact search over every row of the table, where fewer than `k`
     /// passing rows means fewer than `k` exist.
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<RecordBatch>> {
-        if request.filter.is_none() {
-            return self.ranked(&request, request.k, request.method).await;
-        }
-        let rows = self
+        let rows = match request.filter {
+            Some(_) => {
+                self.engine
+                    .catalog()
+                    .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
+                    .await?
+                    .row_count
+            }
+            None => 0,
+        };
+        until_k_pass(request.k, rows, |breadth| {
+            let method = if breadth >= rows && request.filter.is_some() {
+                SearchMethod::Exact
+            } else {
+                request.method
+            };
+            self.ranked(&request, breadth, method)
+        })
+        .await
+    }
+
+    /// Materialise a lexical index over a source's text: one `(_row_id, text)`
+    /// row per source row, keyed by `params.key_column`, with its text
+    /// `params.columns` joined by a space. [`Self::lexical_search`] ranks it by
+    /// BM25.
+    pub async fn build_lexical_index(
+        &self,
+        source_id: &str,
+        params: &BuildLexicalIndex,
+    ) -> Result<ResultTableRecord> {
+        self.engine.build_lexical_index(source_id, params).await
+    }
+
+    /// Run a lexical (BM25) search and return the terminal hydrated batches:
+    /// the `k` best-ranked rows for `request.text`, or with a `filter`, the
+    /// `k` best-ranked rows that satisfy it — the breadth widening as a
+    /// filtered [`Self::search`]'s does. Each row carries its `bm25_score`
+    /// and `bm25_rank`.
+    pub async fn lexical_search(&self, request: LexicalSearchRequest) -> Result<Vec<RecordBatch>> {
+        let rows = match request.filter {
+            Some(_) => {
+                self.engine
+                    .catalog()
+                    .resolve_lexical_table(&request.source_id, request.lexical_table.as_deref())
+                    .await?
+                    .row_count
+            }
+            None => 0,
+        };
+        until_k_pass(request.k, rows, |breadth| {
+            self.lexical_ranked(&request, breadth)
+        })
+        .await
+    }
+
+    /// One ranked pass of a lexical `request`: the `breadth` best-ranked rows,
+    /// hydrated, then the first `request.k` of them that satisfy
+    /// `request.filter`, projected to `request.select`.
+    async fn lexical_ranked(
+        &self,
+        request: &LexicalSearchRequest,
+        breadth: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let builder = self
             .engine
-            .catalog()
-            .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
-            .await?
-            .row_count;
-        let (mut breadth, mut method) = (request.k, request.method);
-        loop {
-            let found = self.ranked(&request, breadth, method).await?;
-            let exhaustive = method == SearchMethod::Exact && breadth >= rows;
-            if exhaustive || found.iter().map(RecordBatch::num_rows).sum::<usize>() >= request.k {
-                return Ok(found);
-            }
-            breadth = breadth.saturating_mul(4).min(rows.max(request.k));
-            if breadth >= rows {
-                method = SearchMethod::Exact;
-            }
-        }
+            .lexical_search(
+                &request.source_id,
+                &request.text,
+                breadth,
+                request.lexical_table.as_deref(),
+            )
+            .await?;
+        refine(
+            builder,
+            request.filter.as_deref(),
+            request.k,
+            &request.select,
+        )?
+        .run()
+        .await
     }
 
     /// One ranked pass of `request` by `method`: the `breadth` nearest rows,
@@ -425,16 +488,14 @@ impl Session {
                     .await?
             }
         };
-        let builder = match request.filter.as_deref() {
-            Some(predicate) => builder.filter(predicate)?.limit(request.k),
-            None => builder,
-        };
-        let builder = if request.select.is_empty() {
-            builder
-        } else {
-            builder.select(&request.select)?
-        };
-        builder.run().await
+        refine(
+            builder,
+            request.filter.as_deref(),
+            request.k,
+            &request.select,
+        )?
+        .run()
+        .await
     }
 
     // --- inference -------------------------------------------------------
@@ -997,5 +1058,43 @@ pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result
             "{modality} embeddings take exactly one content column, got {}",
             columns.len()
         ))),
+    }
+}
+
+/// Run `ranked` at widening breadths — `k`, then four times as many, and so
+/// on — until it returns `k` rows or the breadth covers all `rows`. A `rows`
+/// of 0 (an unfiltered search, which returns its `k` best at once) runs one
+/// pass at `k`.
+async fn until_k_pass<F, Fut>(k: usize, rows: usize, mut ranked: F) -> Result<Vec<RecordBatch>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<RecordBatch>>>,
+{
+    let mut breadth = k;
+    loop {
+        let found = ranked(breadth).await?;
+        if breadth >= rows || found.iter().map(RecordBatch::num_rows).sum::<usize>() >= k {
+            return Ok(found);
+        }
+        breadth = breadth.saturating_mul(4).min(rows);
+    }
+}
+
+/// The first `k` ranked rows that satisfy `filter`, projected to `select`
+/// (every hydrated column when empty).
+fn refine(
+    builder: crate::query::QueryBuilder,
+    filter: Option<&str>,
+    k: usize,
+    select: &[String],
+) -> Result<crate::query::QueryBuilder> {
+    let builder = match filter {
+        Some(predicate) => builder.filter(predicate)?.limit(k),
+        None => builder,
+    };
+    if select.is_empty() {
+        Ok(builder)
+    } else {
+        builder.select(select)
     }
 }

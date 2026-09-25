@@ -1443,13 +1443,6 @@ pub(crate) enum ExpiredRowOutcome {
     Promote {
         /// Every key this row references RIGHT NOW.
         keeps: BTreeSet<String>,
-        /// Directory-shaped sidecar prefixes (`SidecarKind::Lexical`'s
-        /// `.tantivy`) this row currently references — carried separately
-        /// because [`ReferencedKeys`](crate::store::reconcile::ReferencedKeys)
-        /// matches these by PREFIX, never exact equality. Always empty in
-        /// practice (an embedding-task building row's segments are
-        /// ANN-only — see [`ResultStore::append_segment`]).
-        dir_prefixes: BTreeSet<String>,
     },
     /// The Parquet itself is absent: nothing to reap, promote, or protect —
     /// only the `building -> failed` CAS runs (apply).
@@ -2835,10 +2828,7 @@ impl ResultStore {
         let referenced = self
             .referenced_result_keys(std::slice::from_ref(table), &[])
             .await?;
-        Ok(ExpiredRowOutcome::Promote {
-            keeps: referenced.exact,
-            dir_prefixes: referenced.dir_prefixes,
-        })
+        Ok(ExpiredRowOutcome::Promote { keeps: referenced })
     }
 
     /// The root-relative ANN sidecar-sibling keys a table's CURRENT

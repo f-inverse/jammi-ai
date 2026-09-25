@@ -7,8 +7,10 @@ Every book chapter (``chapters/**/*.qmd``) and every recipe
 first cell installs the release it was built for — ``jammi-ai`` with the CUDA
 engine (``jammi-ai-native-cu12``) on an sm_80+ GPU runtime and the CPU engine
 otherwise, ``jammi-server`` when the chapter starts one, and
-``jammi-cookbook`` (the library and the fixtures) — and picks the chapter's
-scale: ``full`` on that GPU, ``small`` elsewhere.
+``jammi-cookbook`` (the library and the fixtures). It runs the chapter at
+``small`` scale, in minutes; ``full`` — the published data and real encoders,
+where a keystone fine-tune alone takes hours on an L4 — is one line to opt
+into.
 
 A notebook and its Colab link name the workspace version: the notebooks at tag
 ``py-v<version>`` install exactly that release, so a link never runs a chapter
@@ -116,9 +118,10 @@ def setup_cell(release: str, *, server: bool) -> dict:
         packages += f', server + "=={release}"'
     return code(
         f"""# Setup: jammi {release} — the CUDA engine on an sm_80+ GPU (L4, A100, …), the
-# CPU engine otherwise — and the cookbook's library and fixtures. On that GPU the
-# chapter runs at `full` scale, over the published data; set SCALE = "small" to
-# run the seconds-long version over the committed fixtures instead.
+# CPU engine otherwise — and the cookbook's library and fixtures. The chapter runs
+# at `small` scale, over the committed fixtures, in minutes. SCALE = "full" runs
+# it over the published data and real encoders instead: meant for a GPU, and the
+# chapters that fine-tune take hours there.
 import os
 import subprocess
 import sys
@@ -139,7 +142,7 @@ gpu = compute_capability() >= 8.0
 engine = "jammi-ai-native-cu12" if gpu else "jammi-ai-native"
 server = "jammi-server-cu12" if gpu else "jammi-server"
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", {packages}], check=True)
-SCALE = "full" if gpu else "small"
+SCALE = "small"
 os.environ["JAMMI_COOKBOOK_SCALE"] = SCALE
 print(f"engine: {{engine}}   scale: {{SCALE}}")"""
     )

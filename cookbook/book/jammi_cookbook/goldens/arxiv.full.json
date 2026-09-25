@@ -1,1 +1,22 @@
-{}
+{
+  "tier01.precision_at_10": {
+    "tol": 0.0,
+    "value": 0.513
+  },
+  "tier03.base_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5129999999999999
+  },
+  "tier03.declared_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5399999999999999
+  },
+  "tier03.random_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5035000000000003
+  },
+  "tier03.similarity_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5259999999999998
+  }
+}

@@ -14,14 +14,13 @@ definition hash + input as-of anchors) · the contrast against a naive current-s
 bitemporal valid-time vs transaction-time [@snodgrass1999temporal], the feature store's
 reason to exist is the as-of join [@orr2021featurestore], and why a leaky split breaks the
 exchangeability conformal coverage rests on [@barber2023beyond]. · **Rail:** measurement
-(the leakage delta and the train/serve-skew, each asserted against the frozen golden —
-skew exactly zero, leak strictly positive).
+(the leakage delta and the conformal coverage, live) + parity (the same as-of join in
+process and from a server, row for row).
 
-Chapter 12 demonstrated the *easy half* of a feature store: a mutable companion table
-federated into a query by key. It was honest about its limit — it federates
-**current-state** features, with no notion of "the value as it was known at time T."
-That is exactly the half a plain `JOIN` already does well, and the half that leaks the
-future into the past the moment a label carries a timestamp.
+Chapter 12 kept a feature current in a mutable companion table and federated it into a
+query by key: the *current* value. That is the half of a feature store a plain `JOIN`
+already does well — and the half that leaks the future into the past the moment a label
+carries a timestamp.
 
 This chapter demonstrates the **hard half**, the half that makes a feature store a
 feature store rather than a join: **point-in-time correctness**. It is built on the
@@ -30,31 +29,17 @@ sharp and uncomfortable: assembling a labelled set with a current-state join sil
 inflates a downstream metric *and* breaks conformal coverage, while the as-of join keeps
 both honest. The chapter ends in real numbers that show the leak and show it closed.
 
-```{python}
-from jammi_cookbook import contracts
-
-rec = contracts.load_artifact("point_in_time.record")
-facts = rec["facts"]
-print(f"citation-edge facts:  {facts['n_edges']}")
-print(f"future-leak edges:    {facts['n_leaked']} ({facts['leak_fraction']:.1%} of edges)")
-print(f"cited_at:             {facts['cited_at']}")
-print(f"label:                {facts['label']}")
-```
-
 ## The leak, stated plainly
 
-A paper $p$ carries a label observed at a horizon $T$ — here, "does $p$ keep being cited
-*beyond its first year*." A feature `citation_in_degree(p)` is computed over the committed
-declared citation graph. The **naive** recipe joins the label spine to the **current**
-in-degree — which counts citations that arrived *after* $T$. That is leakage: the feature
-knows the future of the label [@kaufman2012leakage].
+A paper $p$ carries a label observed at a horizon $T$, one year after publication: "is
+$p$ cited again *after* $T$?" A feature is its citation in-degree. The **naive** recipe
+joins the label to the **current** in-degree — which counts citations that arrived
+*after* $T$. That is leakage: the feature knows the future of the label
+[@kaufman2012leakage].
 
-The fix is to build a **time-stamped fact relation**: each citation edge carries the
-`cited_at` of the citing paper (the citing paper's publication year). The as-of in-degree
-at horizon $T$ counts only edges with `cited_at <= T` — the citations *knowable* at $T$.
-On the committed ogbn-arxiv graph, the gap is enormous: of the committed citation edges,
-the large majority are future-relative to the one-year horizon, so the naive in-degree
-massively over-counts what was known when the label was set.
+The fix is to keep the feature as a **time series** — each paper's in-degree as of each
+year a citation arrived, stamped with the citing paper's year — and to read, for each
+label, the value *as of* its horizon.
 
 This is the valid-time vs transaction-time distinction [@snodgrass1999temporal] made
 operational: the citation edge's *event time* (`cited_at`) bounds the join; the as-of
@@ -76,9 +61,10 @@ import tempfile
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
+from jammi_cookbook import fixtures
 
-work = tempfile.mkdtemp(prefix="jammi_pit_")
-db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_pit_catalog_')}")
+work = tempfile.mkdtemp()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
 # A tiny spine (one entity 'p', as-of horizon T = 20) and four facts at increasing
 # event times, one of them stamped EXACTLY at the spine instant (t = 20).
@@ -109,10 +95,10 @@ most recent fact *at or before* the spine instant. `forward` would import a fact
 *after* the label — leakage by construction.
 
 ```{python}
-print(f"backward (leakage-safe): val = {asof('backward', 'inclusive')}  "
-      f"# most recent fact at t <= 20")
-print(f"forward  (LEAKS):        val = {asof('forward', 'inclusive')}  "
-      f"# first fact at t >= 20 — imports the future")
+print(f"backward (leakage-safe): val = {asof('backward', 'exclusive')}  "
+      f"# the most recent fact before t = 20")
+print(f"forward  (LEAKS):        val = {asof('forward', 'exclusive')}  "
+      f"# the first fact after t = 20 — imports the future")
 ```
 
 **Boundary** — `inclusive` (`<=`) lets a fact stamped *exactly* at the spine instant
@@ -157,168 +143,235 @@ try:
                  facts_by=["entity"], facts_time="t",
                  direction="backward", boundary="inclusive", project=["val"])
     print("no error — unexpected")
-except RuntimeError as e:
+except jammi.errors.JammiError as e:
     print(f"duplicate at the matched instant, no tie-break → loud failure: "
           f"{type(e).__name__}")
 ```
 
-These are the same four knobs the backtester matching trades to prevailing quotes, and the
-clinical fabric matching observations to the lab value in effect, reach for — no domain
-vocabulary in the verb. Here they assemble a leakage-free labelled set.
+These are the same four knobs a backtester matching trades to prevailing quotes, or a
+clinical pipeline matching observations to the lab value in effect, reaches for — no
+domain vocabulary in the verb. Here they assemble a leakage-free labelled set.
+
+## The feature as a time series
+
+Over the whole citation graph, the engine derives each paper's in-degree as a time
+series in SQL — for each year a citation to it arrived, how many citations it had by
+then — and the label spine: every paper, with its horizon one year after publication.
+
+```{python}
+import numpy as np
+from jammi_cookbook import contracts, datasets, scale
+
+SCALE = scale.current()
+HORIZON = 1
+arxiv = datasets.arxiv(db, SCALE)
+PAPERS = f"{arxiv.papers}.public.{arxiv.papers}"
+CITES = f"{arxiv.cites}.public.{arxiv.cites}"
+
+series = db.sql(f"""
+    SELECT paper_id, cited_at,
+           SUM(n) OVER (PARTITION BY paper_id ORDER BY cited_at) AS in_degree
+    FROM (SELECT c.dst AS paper_id, p.year AS cited_at, COUNT(*) AS n
+          FROM {CITES} c JOIN {PAPERS} p ON c.src = p.paper_id
+          GROUP BY c.dst, p.year)
+""")
+spine = db.sql(f"SELECT paper_id, year + {HORIZON} AS as_of FROM {PAPERS} ORDER BY paper_id")
+pq.write_table(series, f"{work}/in_degree.parquet")
+pq.write_table(spine, f"{work}/labels.parquet")
+print(f"{series.num_rows} (paper, year) in-degree values; {spine.num_rows} labelled papers")
+```
+
+## The two pipelines
+
+The **naive** pipeline joins each label to the current in-degree. The **as-of**
+pipeline asks `asof_join` for each paper's in-degree at the latest time-series point
+at or before its horizon — backward, inclusive — and a paper with no citation known by
+then keeps a null, which is an in-degree of zero. The label is what happens *after*
+the horizon: whether any citation arrives later.
+
+```{python}
+def as_of_in_degree(db) -> dict:
+    """The one definition: each paper's in-degree as known at its horizon."""
+    db.add_source("labels", url=f"{work}/labels.parquet", format="parquet")
+    db.add_source("in_degree", url=f"{work}/in_degree.parquet", format="parquet")
+    table = db.asof_join(
+        "labels", "in_degree", spine_by=["paper_id"], spine_time="as_of",
+        facts_by=["paper_id"], facts_time="cited_at",
+        direction="backward", boundary="inclusive", project=["in_degree"],
+    )
+    rows = db.sql(f'SELECT paper_id, in_degree FROM "jammi.{table}" ORDER BY paper_id')
+    return table, {r["paper_id"]: r["in_degree"] or 0 for r in rows.to_pylist()}
+
+
+asof_table, known = as_of_in_degree(db)
+current = {r["paper_id"]: r["n"] for r in db.sql(
+    f"SELECT dst AS paper_id, COUNT(*) AS n FROM {CITES} GROUP BY dst").to_pylist()}
+ids = sorted(known)
+naive = np.array([current.get(p, 0) for p in ids], dtype=float)
+asof = np.array([known[p] for p in ids], dtype=float)
+label = (naive > asof).astype(int)  # cited again after the horizon
+print(f"{int(label.sum())} of {len(ids)} papers are cited after their horizon")
+print(f"in-degree the naive join counts that was unknowable at the horizon: "
+      f"{int((naive - asof).sum())} of {int(naive.sum())} citations")
+```
 
 ## Leakage delta — measured
 
-On the full committed graph, the downstream task is to predict a *genuinely independent*
-future event — "does this paper keep being cited beyond its horizon" — from the citation
-in-degree. The **leaky** pipeline serves the current (full) in-degree, which peeks at
-exactly that future; the **as-of** pipeline serves the leakage-safe count. Both are scored
-on the same as-of-correct test split. The leaky number is optimistically inflated.
+Both features score the same label on the same held-out papers. The leaky feature
+contains the answer — a paper cited after its horizon has a current in-degree larger
+than its as-of one by construction — so its AUC is inflated.
 
 ```{python}
-from jammi_cookbook import rails
+def auc(score: np.ndarray, y: np.ndarray) -> float:
+    """Rank-based ROC AUC (Mann–Whitney), ties averaged."""
+    order = np.argsort(score, kind="mergesort")
+    ranks = np.empty(len(score))
+    ranks[order] = np.arange(1, len(score) + 1)
+    for value in np.unique(score):
+        tied = score == value
+        ranks[tied] = ranks[tied].mean()
+    pos, neg = y.sum(), len(y) - y.sum()
+    return float((ranks[y == 1].sum() - pos * (pos + 1) / 2) / (pos * neg))
 
-leak = rec["leak"]
-print(f"naive (leaky) AUC: {leak['naive_auc']:.4f}   # the feature peeks at the future")
-print(f"as-of (honest) AUC: {leak['asof_auc']:.4f}   # leakage-safe in-degree only")
 
-# The leakage delta, asserted against the frozen golden — strictly positive.
-delta = rails.measure("point_in_time.pit.leakage_delta", leak["leakage_delta"])
-rails.measure("point_in_time.pit.naive_auc", leak["naive_auc"])
-rails.measure("point_in_time.pit.asof_auc", leak["asof_auc"])
-print(f"\nleakage_delta = naive - asof = {delta:.4f}  (strictly > 0)")
-assert delta > 0.0
-```
-
-The leaky pipeline reports a markedly higher AUC — not because its model is better, but
-because its feature has seen the answer. The gap is the leak, measured.
-
-## The conformal honesty result — the killer measurement
-
-A split-conformal predictor at nominal 90% coverage [@barber2023beyond], calibrated two
-ways: on a **leaky** calibration view vs an **as-of-correct** one, both evaluated on the
-as-of-correct test set. Leakage is a non-exchangeability: the leaky calibration's
-nonconformity scores look artificially easy, so its prediction sets come out too tight and
-it **breaks the nominal guarantee**. The as-of calibration tracks nominal.
-
-```{python}
-nominal = leak["nominal_coverage"]
-cov_leaky = rails.measure("point_in_time.pit.coverage_leaky", leak["coverage_leaky"])
-cov_asof = rails.measure("point_in_time.pit.coverage_asof", leak["coverage_asof"])
-rails.measure("point_in_time.pit.nominal_coverage", nominal)
-
-print(f"nominal coverage:          {nominal:.2f}")
-print(f"leaky calibration:         {cov_leaky:.4f}   # breaks nominal (under-covers)")
-print(f"as-of calibration:         {cov_asof:.4f}   # holds nominal")
-assert abs(cov_asof - nominal) <= abs(cov_leaky - nominal), (
-    "the as-of calibration must track nominal at least as tightly as the leaky one")
-```
-
-This is [@barber2023beyond] made concrete: the guarantee rests on the calibration and
-deployment scores being exchangeable; leakage breaks that, and the *claimed* coverage no
-longer holds. The as-of join restores exchangeability, and the coverage with it.
-
-## Train == serve, by construction
-
-The same `asof_join` definition runs on the offline training path (the embedded
-`Database`) and the serving-read path (a live `grpc://` `RemoteDatabase`), over the same
-committed inputs. The feature vectors are byte-identical — one definition, both paths;
-skew collapses because the definition is *shared*, not re-implemented.
-
-```{python}
-print(f"asof_join definition:\n  {rec['asof']['definition']}\n")
-print(f"matched (non-null) rows:   {rec['asof']['matched_rows']}")
-print(f"papers cited by horizon:   {rec['asof']['asof_cited_papers']}")
-
-if rec.get("skew_measured"):
-    skew = rails.measure("point_in_time.pit.train_serve_skew", rec["train_serve_skew"])
-    print(f"\ntrain_serve_skew = {skew}  (embedded == live grpc:// — byte-identical)")
-    assert skew == 0.0
-else:
-    print("\n(skew arm emitted with --target embedded; the dual-transport check is "
-          "recorded when a grpc:// server is provided)")
-```
-
-The matched-fact mass is exactly the set of papers with a citation *known by the horizon* —
-every spine row is preserved (a left-outer as-of), and a paper with no such citation
-carries a null fact, never a stale or future one.
-
-```{python}
-contracts.assert_close("point_in_time.pit.asof_matched_rows",
-                       float(rec["asof"]["matched_rows"]))
-assert rec["asof"]["matched_rows"] == rec["asof"]["asof_cited_papers"]
-```
-
-## The artifact knows what it is — the four-verdict matrix {#sec-verify}
-
-`verify_materialization` recomputes a materialized table's artifact digest against its
-`.materialization.json` manifest and returns one of four verdicts. It is **read-only** —
-it attests, it never acts. We freeze the full matrix; the committed verdicts are asserted
-against the golden.
-
-```{python}
-matrix = rec["verdict_matrix"]
-for name in ("match", "match_with_unpinned_inputs", "mismatch", "missing_manifest"):
-    print(f"{name:30s} -> {matrix[name]}")
+rng = np.random.default_rng(0)
+split = rng.permutation(len(ids))
+train, cal, test = np.split(split, [len(ids) // 2, 3 * len(ids) // 4])
+naive_auc, asof_auc = auc(naive[test], label[test]), auc(asof[test], label[test])
+print(f"naive (leaky) AUC: {naive_auc:.3f}   as-of (honest) AUC: {asof_auc:.3f}   "
+      f"leakage delta {naive_auc - asof_auc:+.3f}")
 ```
 
 ```{python}
 # | echo: false
-contracts.assert_close("point_in_time.pit.verdict_match", 1.0)
-contracts.assert_close("point_in_time.pit.verdict_match_with_unpinned", 1.0)
-contracts.assert_close("point_in_time.pit.verdict_mismatch", 1.0)
-contracts.assert_close("point_in_time.pit.verdict_missing_manifest", 1.0)
-contracts.assert_close("point_in_time.pit.verdict_match_roundtrip", 1.0)
+assert naive_auc > asof_auc
+contracts.assert_close("point_in_time.naive_auc", naive_auc, tol=0.03)
+contracts.assert_close("point_in_time.asof_auc", asof_auc, tol=0.03)
 ```
 
-The four verdicts, and what anchors each:
+## The conformal honesty result
 
-- **`match`** — the artifact is the output of the expected definition. A clean `match`
-  requires every input to be reproducibly pinned. A producer that reads a **result-table
-  input** anchors it by that table's content digest (a `ResultDigest` anchor); here the
-  `match` case is a neighbor graph built over an embeddings result table, whose sole input
-  is `ResultDigest`-anchored.
+A split-conformal classifier at nominal 90% coverage [@barber2023beyond], built two
+ways. The **leaky** pipeline is fitted and calibrated on the current in-degree — the
+view the training table carried — but at serving time only the in-degree known at the
+horizon exists, so that is what it scores. The **as-of** pipeline is fitted,
+calibrated and served on the as-of in-degree throughout. The engine's `conformalize`
+sets each pipeline's quantile from its own calibration scores.
 
 ```{python}
-anchors = matrix["match_input_anchors"]
-print(f"match-case input anchors: {[a['kind'] for a in anchors]}")
-assert all(a["kind"] == "result_digest" for a in anchors)
-```
+ALPHA = 0.10
 
-- **`match_with_unpinned_inputs`** — the artifact verifies, but at least one input had no
-  version surface (a registered *file* source is `UnpinnedAtInstant`), so reproducibility
-  cannot be *fully* asserted. This is the honest verdict for the as-of training set itself:
-  its inputs are registered file sources. The engine never claims a guarantee it cannot
-  keep — it names the unpinned inputs.
+
+def fitted(feature: np.ndarray):
+    """A classifier from the empirical label rate at each feature value, fitted on the
+    training papers; it scores a feature vector into two-class scores."""
+    rate = {v: label[train][feature[train] == v].mean() for v in np.unique(feature[train])}
+    base = label[train].mean()
+    return lambda values: np.c_[1 - (p := np.array([rate.get(v, base) for v in values])), p]
+
+
+coverage, width = {}, {}
+for name, built_on in (("leaky", naive), ("as-of", asof)):
+    model = fitted(built_on)
+    sets = db.conformalize(model(built_on[cal]).tolist(), label[cal].tolist(),
+                           model(asof[test]).tolist(), alpha=ALPHA, score="lac")
+    coverage[name] = float(np.mean([y in s for y, s in zip(label[test], sets)]))
+    width[name] = float(np.mean([len(s) for s in sets]))
+    print(f"{name:<6} pipeline: coverage {coverage[name]:.3f} (nominal {1 - ALPHA:.2f}), "
+          f"mean set size {width[name]:.2f}")
+```
 
 ```{python}
-print(f"unpinned inputs named: {matrix['match_with_unpinned_inputs']['unpinned']}")
+# | echo: false
+contracts.assert_close("point_in_time.coverage_leaky", coverage["leaky"], tol=0.03)
+contracts.assert_close("point_in_time.coverage_asof", coverage["as-of"], tol=0.03)
+if SCALE is scale.Scale.FULL:
+    assert coverage["leaky"] < 1 - ALPHA <= coverage["as-of"] + 0.02
 ```
 
-- **`mismatch`** — the recomputed digest or definition hash differs from the expectation:
-  the served artifact is *not* the output of the expected definition. A stale copy, or a
-  changed producing query (a different `definition_hash`), is detectable. The verdict
-  carries both sides.
+The leaky pipeline's calibration scores came from a feature that already knew the
+label, so they look easier than anything it meets at serving time; its quantile is too
+tight and its sets fall short of the promised coverage. The as-of pipeline calibrates
+on exactly the distribution it serves — exchangeable, so the guarantee holds
+[@barber2023beyond]. Its sets are honest about how little a known-at-the-horizon
+in-degree says about the future: where the feature is weak they grow, which is the
+price of a guarantee that holds.
+
+## Train == serve, by construction
+
+The same `as_of_in_degree` definition, run against a live server over the same inputs,
+returns the same feature for every paper — one definition on both paths, so there is
+no skew to measure.
 
 ```{python}
-mm = matrix["mismatch"]
-print(f"expected != found:  {mm['expected'][:16]}… != {mm['found'][:16]}…")
-assert mm["expected"] != mm["found"]
+from jammi.testing import LiveServer
+
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as remote:
+    _, served = as_of_in_degree(remote)
+print(f"papers whose served feature differs from the trained one: "
+      f"{sum(served[p] != known[p] for p in ids)}")
 ```
 
-- **`missing_manifest`** — no manifest sidecar exists (a pre-contract table). A truthful
-  "unknown," never a fabricated match.
+```{python}
+# | echo: false
+assert served == known
+```
 
-> **A note on the definition hash.** The `match`-case `definition_hash` folds in its
-> input's content digest, and the CPU embedding output is not bit-reproducible across runs,
-> so the *literal* hash varies run to run. We therefore record it as provenance and assert
-> the reproducible fact instead — the **round-trip**: the materialized table verifies
-> `match` against *its own* hash within the run (`pit.verdict_match_roundtrip`). The
-> verdict mechanics are pinned; the per-run content digest is not. The
-> `definition_hash` recorded for this run was `{python} matrix['definition_hash'][:16]`….
+## The artifact knows what it is — the verdicts {#sec-verify}
 
-The session's work is done, so it is closed. An embedded engine holds its catalog until
-`close()` returns, which is why `close()` comes before anything removes the directory the
-catalog lives in.
+`verify_materialization` recomputes a materialized table's digest against its
+materialization manifest and returns a verdict. It is **read-only** — it attests, it
+never acts.
+
+```{python}
+print(f"the as-of training set:        {db.verify_materialization(asof_table)['verdict']}")
+print(f"  unpinned inputs named:       {db.verify_materialization(asof_table).get('unpinned')}")
+```
+
+The as-of training set verifies as `match_with_unpinned_inputs`: its inputs are
+registered *files*, which have no version surface, so the engine can attest the
+artifact but not that re-running would read the same input bytes — and it names the
+inputs it cannot pin rather than claiming a guarantee it cannot keep.
+
+A table whose every input is itself a result table verifies as a clean `match`: its
+inputs are anchored by their content digests. A neighbour graph built over an
+embedding table is one:
+
+```{python}
+docs = tempfile.mkdtemp()
+pq.write_table(pa.table({
+    "_row_id": ["d0", "d1", "d2", "d3"],
+    "text": ["graph signal processing", "node embeddings for citation networks",
+             "spectral kernels and the laplacian", "conformal prediction under shift"],
+}), f"{docs}/docs.parquet")
+db.add_source("docs", url=f"{docs}/docs.parquet", format="parquet")
+db.generate_embeddings(source="docs", model=fixtures.model("tiny_bert"), columns=["text"],
+                       key="_row_id")
+graph = db.build_neighbor_graph("docs", k=2, exact=True)
+manifest = db.describe_table(graph)
+verdicts = {
+    "match": db.verify_materialization(graph)["verdict"],
+    "match (expected definition)": db.verify_materialization(
+        graph, expected_definition=manifest["definition_hash"])["verdict"],
+    "mismatch (another definition)": db.verify_materialization(
+        graph, expected_definition="0" * len(manifest["definition_hash"]))["verdict"],
+}
+for case, verdict in verdicts.items():
+    print(f"{case:<32} {verdict}")
+print(f"input anchors: {[a['kind'] for a in manifest['input_anchors']]}")
+```
+
+```{python}
+# | echo: false
+assert verdicts == {"match": "match", "match (expected definition)": "match",
+                    "mismatch (another definition)": "mismatch"}
+assert db.verify_materialization(asof_table)["verdict"] == "match_with_unpinned_inputs"
+```
+
+A `mismatch` says the served artifact is not the output of the expected definition — a
+stale copy, or a changed producing query, is detectable, and the verdict carries both
+hashes. And a table with no manifest at all verifies as `missing_manifest`, a truthful
+"unknown" rather than a fabricated match.
 
 ```{python}
 db.close()
@@ -326,8 +379,8 @@ db.close()
 
 ## The honest limit
 
-This chapter proves the primitive composes into a **leakage-free, skew-free training
-surface** — on CPU, against the committed cache. It does **not** serve those features from
+This chapter shows the primitive composing into a **leakage-free, skew-free training
+surface**. It does **not** serve those features from
 a low-latency online tier behind auth with a live coverage SLA; carrying the
 materialization contract across that boundary so an online read can assert "what I serve
 matches what trained this, as of $T$" is a production online-serving concern, not something

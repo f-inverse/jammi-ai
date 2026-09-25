@@ -1,1 +1,30 @@
-{}
+{
+  "classification.accuracy": {
+    "tol": 0.0,
+    "value": 0.4
+  },
+  "compare.precision_delta": {
+    "tol": 0.01,
+    "value": 0.03799999999999992
+  },
+  "ner.f1": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "retrieval.mrr": {
+    "tol": 0.01,
+    "value": 0.39547619047619054
+  },
+  "retrieval.ndcg": {
+    "tol": 0.01,
+    "value": 0.45149147201662054
+  },
+  "retrieval.precision_at_k": {
+    "tol": 0.01,
+    "value": 0.513
+  },
+  "retrieval.recall_at_k": {
+    "tol": 0.01,
+    "value": 0.009148492190553963
+  }
+}

@@ -1,1 +1,50 @@
-{}
+{
+  "bm25.ndcg_at_10": {
+    "tol": 0.02,
+    "value": 0.40993312766649415
+  },
+  "bm25.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.46349999999999997
+  },
+  "dense_prop.ndcg_at_10": {
+    "tol": 0.02,
+    "value": 0.5563117777058527
+  },
+  "dense_prop.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5529999999999997
+  },
+  "dense_raw.ndcg_at_10": {
+    "tol": 0.02,
+    "value": 0.45108359567931516
+  },
+  "dense_raw.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5125
+  },
+  "fusion_gain_ndcg": {
+    "tol": 0.02,
+    "value": -0.010583985966788645
+  },
+  "fusion_gain_precision": {
+    "tol": 0.02,
+    "value": 0.008499999999999999
+  },
+  "rrf_raw_bm25.ndcg_at_10": {
+    "tol": 0.02,
+    "value": 0.44658809529702476
+  },
+  "rrf_raw_bm25.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5109999999999999
+  },
+  "rrf_raw_prop.ndcg_at_10": {
+    "tol": 0.02,
+    "value": 0.5457277917390639
+  },
+  "rrf_raw_prop.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5614999999999999
+  }
+}

@@ -97,6 +97,8 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         JammiError::NotRefreshable { .. } => "NotRefreshable",
         JammiError::DefinitionDrift { .. } => "DefinitionDrift",
         JammiError::NonUniqueKey { .. } => "NonUniqueKey",
+        JammiError::ModelNotFound { .. } => "ModelNotFound",
+        JammiError::ModelReferenced { .. } => "ModelReferenced",
         _ => "BackendError",
     }
 }

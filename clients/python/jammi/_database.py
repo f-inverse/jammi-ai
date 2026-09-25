@@ -77,13 +77,22 @@ from ._credentials import (
 )
 from .errors import (
     BackendError,
+    DefinitionDrift,
     InvalidArgument,
+    InvalidKey,
     JammiError,
+    MissingManifest,
+    ModelNotFound,
+    ModelReferenced,
+    NoQueryEncoder,
+    NonUniqueKey,
+    NotRefreshable,
     NotSupportedOnBackend,
     JobCancelled,
     TrainingError,
+    VersionUnavailable,
 )
-from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc
+from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc, error_pb2
 from ._generated.jammi.v1 import embedding_pb2, embedding_pb2_grpc
 from ._generated.jammi.v1 import eval_pb2, eval_pb2_grpc
 from ._generated.jammi.v1 import inference_pb2, inference_pb2_grpc
@@ -107,17 +116,48 @@ SESSION_HEADER = "jammi-session-id"
 MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024
 
 
+# The leaf class each typed engine error detail raises — the same class the
+# embedded engine raises for that error, so one `except` holds on both transports.
+_DETAIL_CLASS = {
+    "invalid_key": InvalidKey,
+    "non_unique_key": NonUniqueKey,
+    "no_query_encoder": NoQueryEncoder,
+    "missing_manifest": MissingManifest,
+    "not_refreshable": NotRefreshable,
+    "definition_drift": DefinitionDrift,
+    "version_unavailable": VersionUnavailable,
+    "model_not_found": ModelNotFound,
+    "model_referenced": ModelReferenced,
+}
+
+
+def _error_detail(exc: grpc.RpcError) -> Optional[str]:
+    """The typed engine detail a server attached to a failed call — the
+    `JammiErrorDetail` variant packed in the `grpc-status-details-bin`
+    trailer's `google.rpc.Status` envelope — or None when it carries none."""
+    trailers = exc.trailing_metadata() if hasattr(exc, "trailing_metadata") else None
+    for key, value in trailers or ():
+        if key != "grpc-status-details-bin":
+            continue
+        for packed in error_pb2.RpcStatus.FromString(value).details:
+            detail = error_pb2.JammiErrorDetail()
+            if packed.Unpack(detail):
+                return detail.WhichOneof("variant")
+    return None
+
+
 def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
     """Map a gRPC transport/status fault onto the :class:`JammiError` taxonomy.
 
     So every remote failure — not only the client-constructed validation and
     malformed-response ones, but a live transport fault — descends from
     ``JammiError``, and one ``except JammiError`` catches the whole remote
-    surface. The status code decides the class:
+    surface. A typed engine detail on the status raises its leaf class — the
+    class the embedded engine raises for the same error. Otherwise the status
+    code decides:
 
     * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — a server-detected bad
-      argument, the SAME class the embedded engine raises for the same rejection
-      (two-sided parity, §5.4).
+      argument, the SAME class the embedded engine raises for the same rejection.
     * ``UNIMPLEMENTED`` → :class:`NotSupportedOnBackend` — a verb this deployment
       did not mount.
     * everything else (``RESOURCE_EXHAUSTED`` — the receive-cap edge —,
@@ -130,8 +170,11 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
     """
     code = exc.code()
     detail = exc.details() or str(exc)
-    if code == grpc.StatusCode.INVALID_ARGUMENT:
-        mapped: JammiError = InvalidArgument(detail)
+    leaf = _DETAIL_CLASS.get(_error_detail(exc))
+    if leaf is not None:
+        mapped: JammiError = leaf(detail)
+    elif code == grpc.StatusCode.INVALID_ARGUMENT:
+        mapped = InvalidArgument(detail)
     elif code == grpc.StatusCode.UNIMPLEMENTED:
         mapped = NotSupportedOnBackend(detail)
     else:

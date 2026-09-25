@@ -225,6 +225,20 @@ class DefinitionDrift(BackendError):
     """
 
 
+class ModelNotFound(BackendError):
+    """No model with this id is in the catalog. Refines :class:`BackendError`
+    (``NOT_FOUND`` on the remote transport); ``delete_model(if_exists=True)``
+    is the no-op form.
+    """
+
+
+class ModelReferenced(BackendError):
+    """A model other catalog rows still point at — a job that trained it, a
+    model built on it — cannot be deleted until they are gone. Refines
+    :class:`BackendError` (``FAILED_PRECONDITION`` on the remote transport).
+    """
+
+
 class VersionUnavailable(BackendError):
     """A versioned result table's CURRENT version cannot be served.
 

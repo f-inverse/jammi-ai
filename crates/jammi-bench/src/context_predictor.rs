@@ -263,6 +263,19 @@ async fn dataset_session(
     Ok((session, dir))
 }
 
+/// The config key under which a trained context predictor records the embedding
+/// table it serves from — a fact of the session that trained it, so the
+/// committed baseline never carries it: [`portable_config`] drops it when the
+/// baseline is rebuilt, and the committed weights are registered naming the
+/// serving session's own table.
+const SERVING_TABLE_KEY: &str = "embedding_table";
+
+fn portable_config(config_json: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut config: serde_json::Map<String, serde_json::Value> = serde_json::from_str(config_json)?;
+    config.remove(SERVING_TABLE_KEY);
+    Ok(serde_json::to_string(&config)?)
+}
+
 /// A hermetic `Device::Cpu` session of this leg's own, over `artifact_dir`.
 async fn local_session(
     artifact_dir: &Path,
@@ -1105,10 +1118,12 @@ pub async fn rebuild_spec(
         .get_model(PREDICTOR_MODEL_ID)
         .await?
         .ok_or("rebuild: trained predictor was not registered")?;
-    spec.config_json = record
-        .config_json
-        .clone()
-        .ok_or("rebuild: trained predictor carries no config_json")?;
+    spec.config_json = portable_config(
+        record
+            .config_json
+            .as_deref()
+            .ok_or("rebuild: trained predictor carries no config_json")?,
+    )?;
 
     // Stage 2: copy the trained weight bundle into the committed weights dir.
     let prefix_url = record
@@ -1231,12 +1246,29 @@ mod tests {
     /// architecture / `context_k` / scaler the loader rebuilds the predictor from;
     /// `model_id` lets the gate register a second row under a *perturbed* config for
     /// the teeth test.
+    /// The committed config, naming `session`'s own dataset embedding table as
+    /// the one the predictor serves from.
+    async fn serving_config(
+        session: &Arc<InferenceSession>,
+        config_json: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let table = session
+            .catalog()
+            .resolve_embedding_table(SOURCE_ID, None)
+            .await?;
+        let mut config: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(config_json)?;
+        config.insert(SERVING_TABLE_KEY.into(), table.table_name.into());
+        Ok(serde_json::to_string(&config)?)
+    }
+
     async fn register_committed_weights(
         session: &Arc<InferenceSession>,
         model_id: &str,
         weights_dir: &std::path::Path,
         config_json: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let config_json = serving_config(session, config_json).await?;
         let artifact = format!(
             "file://{}",
             weights_dir
@@ -1253,7 +1285,7 @@ mod tests {
                 task: ModelTask::Regression,
                 base_model_id: None,
                 external_location: Some(&artifact),
-                config_json: Some(config_json),
+                config_json: Some(&config_json),
             })
             .await?;
         Ok(())

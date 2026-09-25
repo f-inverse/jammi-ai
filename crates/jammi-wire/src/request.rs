@@ -66,7 +66,8 @@ pub struct SearchRequest {
     /// Which embedding table of the source to search. `None` selects the
     /// source's most-recent ready table; `Some(name)` searches that table.
     pub embedding_table: Option<String>,
-    /// Optional SQL predicate applied to the hydrated results.
+    /// Optional SQL predicate over the hydrated columns: the search returns
+    /// the `k` nearest rows that satisfy it.
     pub filter: Option<String>,
     /// Columns to project. Empty keeps every hydrated column.
     pub select: Vec<String>,

@@ -54,10 +54,14 @@ Results are `RecordBatch` / `pyarrow.Table` with:
 ## Refining a search
 
 `search` carries the two knobs the bounded primitive owns directly: a SQL `filter`
-predicate over the hydrated results and a `select` column projection. In Python they
-are keyword arguments and `search` returns the table; in Rust they are methods on the
-fluent `QueryBuilder` (`session.search(...)` returns the builder, which also carries
-`sort` / `limit` / `join` / `annotate` and a `.run()`).
+predicate over the hydrated columns and a `select` column projection. In Python they
+are keyword arguments and `search` returns the table: with a `filter`, the `k`
+nearest rows that satisfy it (fewer only when fewer exist) — the engine widens the
+ranked candidates until `k` rows pass, ending in an exact search over the whole
+table. In Rust they are methods on the fluent `QueryBuilder` (`session.search(...)`
+returns the builder, which also carries `sort` / `limit` / `join` / `annotate` and a
+`.run()`); there `filter` composes over the `k` rows the search ranked, as every
+builder step does.
 
 ### Filter and select
 
@@ -161,7 +165,7 @@ When multiple embedding tables exist for a source, search uses the most recently
 
 `EmbeddingService` exposes `Search` on the typed gRPC surface, so a process that reaches the engine over gRPC-web — an edge function that cannot speak Flight SQL's bidirectional HTTP/2 — can run the same similarity search it already uses for `AddSource`, `GenerateAudioEmbeddings`, and `EncodeAudioQuery`. It is the same engine capability on an additional transport, not a second search path.
 
-A `SearchRequest` carries the source, a `k`, an optional SQL `filter` (predicate pushdown), and an optional `select` column list. The query is a `oneof`:
+A `SearchRequest` carries the source, a `k`, an optional SQL `filter` (the `k` nearest rows that satisfy it), and an optional `select` column list. The query is a `oneof`:
 
 - **`query_vector`** — a precomputed vector. The usual flow is encode-then-search: call `EncodeAudioQuery` (or any client-side encoder) to get the vector, then feed it back as the query.
 - **`row_key`** — query-by-example. The engine resolves that row's stored vector **internally** and ranks by it ("rows like this row"). The vector never crosses the wire.

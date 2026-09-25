@@ -1475,8 +1475,7 @@ def build_search_request(
 
     The search ranks by exactly one of `query` (a query vector) or `row_key`
     (query-by-example: the vector stored for that row, resolved inside the
-    engine — it never crosses the API). `filter` is an optional SQL predicate
-    over the hydrated results; `select` projects columns (empty keeps every
+    engine — it never crosses the API). `filter` is an optional SQL predicate over the hydrated columns — the search returns the `k` nearest rows that satisfy it; `select` projects columns (empty keeps every
     hydrated column); `embedding_table` names which of the source's embedding
     tables to search (unset = the most-recent ready table). `oversample`
     overrides, for this one call, the retrieve→rescore candidate-breadth

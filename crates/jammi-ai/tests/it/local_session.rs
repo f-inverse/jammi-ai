@@ -218,3 +218,72 @@ fn row_ids(batches: &[arrow::array::RecordBatch]) -> Vec<String> {
     }
     ids
 }
+
+/// A filtered search returns the `k` nearest rows that satisfy the filter,
+/// not the rows of the first `k` that happen to: six patents are from 2021,
+/// and the four nearest of them come back even when they are not among the
+/// four nearest overall.
+#[tokio::test]
+async fn a_filtered_search_returns_the_k_nearest_passing_rows() {
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    seed(&engine).await;
+    let session = Session::new(Arc::clone(&engine));
+    session
+        .generate_embeddings(
+            "patents",
+            &tiny_bert(),
+            &["abstract".to_string()],
+            "id",
+            Modality::Text,
+            jammi_db::store::CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    let query = engine
+        .encode_text_query(&tiny_bert(), "quantum error correction")
+        .await
+        .unwrap();
+    let filtered = session
+        .search(SearchRequest {
+            source_id: "patents".to_string(),
+            query: SearchQuery::Vector(query.clone()),
+            k: 4,
+            embedding_table: None,
+            filter: Some("year = 2021".to_string()),
+            select: Vec::new(),
+            method: SearchMethod::default(),
+        })
+        .await
+        .unwrap();
+
+    // The truth: every row ranked exactly, then filtered.
+    let truth = engine
+        .search("patents", query.clone(), 20, None, SearchMethod::Exact)
+        .await
+        .unwrap()
+        .filter("year = 2021")
+        .unwrap()
+        .limit(4)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&filtered).len(), 4);
+    assert_eq!(row_ids(&filtered), row_ids(&truth));
+
+    // The first ranked breadth alone could not have answered it: the four
+    // nearest rows overall are not the four nearest 2021 rows.
+    let nearest = engine
+        .search("patents", query, 4, None, SearchMethod::Exact)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert_ne!(row_ids(&nearest), row_ids(&filtered));
+}

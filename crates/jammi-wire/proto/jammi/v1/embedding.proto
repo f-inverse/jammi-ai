@@ -240,9 +240,9 @@ message SearchRequest {
   }
   // Number of nearest neighbors to return.
   uint32 k = 4;
-  // Optional SQL predicate pushed into the search (predicate pushdown). The
-  // engine treats it as an opaque expression over the result columns; it
-  // carries no domain semantics.
+  // Optional SQL predicate over the result columns: the search returns the
+  // `k` nearest rows that satisfy it (fewer only when fewer exist). The
+  // engine treats it as an opaque expression; it carries no domain semantics.
   optional string filter = 5;
   // Columns to project into each hit's `columns` map. Empty = key + score
   // only (no projected columns).

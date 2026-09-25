@@ -370,39 +370,69 @@ impl Session {
 
     // --- search ----------------------------------------------------------
 
-    /// Run a vector search and return the terminal hydrated batches.
+    /// Run a vector search and return the terminal hydrated batches: the `k`
+    /// nearest rows, or with a `filter`, the `k` nearest rows that satisfy it.
+    ///
+    /// The filter reads hydrated source columns, so it applies after the
+    /// vectors are ranked. The ranked breadth therefore widens — `k`, then
+    /// four times as many, and so on — until `k` rows pass, ending in an
+    /// exact search over every row of the table, where fewer than `k`
+    /// passing rows means fewer than `k` exist.
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<RecordBatch>> {
-        let SearchRequest {
-            source_id,
-            query,
-            k,
-            embedding_table,
-            filter,
-            select,
-            method,
-        } = request;
-        let embedding_table = embedding_table.as_deref();
+        if request.filter.is_none() {
+            return self.ranked(&request, request.k, request.method).await;
+        }
+        let rows = self
+            .engine
+            .catalog()
+            .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
+            .await?
+            .row_count;
+        let (mut breadth, mut method) = (request.k, request.method);
+        loop {
+            let found = self.ranked(&request, breadth, method).await?;
+            let exhaustive = method == SearchMethod::Exact && breadth >= rows;
+            if exhaustive || found.iter().map(RecordBatch::num_rows).sum::<usize>() >= request.k {
+                return Ok(found);
+            }
+            breadth = breadth.saturating_mul(4).min(rows.max(request.k));
+            if breadth >= rows {
+                method = SearchMethod::Exact;
+            }
+        }
+    }
 
-        let builder = match query {
+    /// One ranked pass of `request` by `method`: the `breadth` nearest rows,
+    /// hydrated, then the first `request.k` of them that satisfy
+    /// `request.filter`, projected to `request.select`.
+    async fn ranked(
+        &self,
+        request: &SearchRequest,
+        breadth: usize,
+        method: SearchMethod,
+    ) -> Result<Vec<RecordBatch>> {
+        let source_id = request.source_id.as_str();
+        let embedding_table = request.embedding_table.as_deref();
+        let builder = match &request.query {
             SearchQuery::Vector(vector) => {
                 self.engine
-                    .search(&source_id, vector, k, embedding_table, method)
+                    .search(source_id, vector.clone(), breadth, embedding_table, method)
                     .await?
             }
             SearchQuery::RowKey(row_key) => {
                 self.engine
-                    .search_by_id(&source_id, &row_key, k, embedding_table, method)
+                    .search_by_id(source_id, row_key, breadth, embedding_table, method)
                     .await?
             }
         };
-        let builder = match filter.as_deref() {
-            Some(predicate) => builder.filter(predicate)?,
+        let builder = match request.filter.as_deref() {
+            Some(predicate) => builder.filter(predicate)?.limit(request.k),
             None => builder,
         };
-        let builder = if select.is_empty() {
+        let builder = if request.select.is_empty() {
             builder
         } else {
-            builder.select(&select)?
+            builder.select(&request.select)?
         };
         builder.run().await
     }

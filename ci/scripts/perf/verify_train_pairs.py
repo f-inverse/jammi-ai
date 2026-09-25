@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""Byte-verify a re-derived ``train_pairs.jsonl`` against the committed
-``cookbook/fixtures/finetune_heldout/train_ids_sha256.json`` (the pre-run
-provisioning step of a fine-tune A/B leg).
+"""Byte-verify a ``train_pairs.jsonl`` against the committed
+``cookbook/fixtures/finetune_heldout/train_ids_sha256.json`` before a
+``ci/scripts/perf/finetune_run_ab.sh`` leg reads it.
 
-``train_pairs.jsonl`` is never committed (repo-size discipline — see
-``cookbook/fixtures/finetune_heldout/README.md`` "Why train text isn't
-committed"); the only committed identity for the 1372 TRAIN-side pairs is a
-per-pair SHA-256 in ``train_ids_sha256.json``. Whenever a producer
-re-derives (or an operator hand-places) a ``train_pairs.jsonl`` before a real
-``ci/scripts/perf/finetune_run_ab.sh`` leg, this module is the SINGLE
-reviewable unit that decides whether that file is trustworthy: same pair
-identity set (no missing id, no extra id, no duplicate), same per-pair
-content (each pair's SHA-256, computed the exact same way
-``cookbook/book/scripts/derive_heldout_fixture.py::_pair_sha256`` computed it
-when the committed hashes were written), and the exact committed count
-(1372) on both sides.
-
-This is deliberately its own file (not inlined into
-``finetune_run_ab.sh`` or ``derive_heldout_fixture.py``): a producer's
-pre-run provisioning step and a fixture-derivation script are both
-callers of this ONE verification, never two independent re-implementations
-of the same byte-check that could silently drift apart.
+The check is the pair identity set (no missing id, no extra id, no
+duplicate), each pair's content (its SHA-256), and the exact count (1372).
+The committed file passes by construction; the check exists because
+``TRAIN_JSONL`` may point anywhere, and a file is never trusted on its name.
 
 Run: ``python3 ci/scripts/perf/verify_train_pairs.py``
      (defaults to the committed fixture paths under
@@ -47,19 +33,15 @@ FIXTURE_DIR = REPO_ROOT / "cookbook" / "fixtures" / "finetune_heldout"
 DEFAULT_PAIRS = FIXTURE_DIR / "train_pairs.jsonl"
 DEFAULT_HASHES = FIXTURE_DIR / "train_ids_sha256.json"
 
-# The committed train-side pair count (N_PAIRS=1500, N_HELDOUT=128,
-# 1500-128=1372 -- cookbook/book/scripts/
-# derive_heldout_fixture.py's own N_PAIRS/N_HELDOUT constants). A self-test
+# The committed train-side pair count (1500 pairs, 128 held out). A self-test
 # fixture overrides this via --expected-count to exercise the same logic on
 # a tiny synthetic pair set without needing 1372 real rows.
 EXPECTED_TRAIN_COUNT = 1372
 
 
 def _pair_sha256(pair: dict) -> str:
-    """MUST match cookbook/book/scripts/derive_heldout_fixture.py::_pair_sha256
-    exactly -- this is the one hash definition both the producer (writing
-    train_ids_sha256.json) and this verifier (checking a re-derived
-    train_pairs.jsonl against it) share."""
+    """The per-pair hash ``train_ids_sha256.json`` records; the same
+    definition ``check_heldout_fixture_integrity.py`` recomputes."""
     payload = "\x00".join([
         pair["anchor_id"], pair["anchor_text"],
         pair["positive_id"], pair["positive_text"],

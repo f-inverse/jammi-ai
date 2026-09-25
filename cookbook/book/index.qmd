@@ -44,9 +44,10 @@ book *is* the closed evaluation loop: `construct → propagate → learn → MEA
 
 ## How it stays honest
 
-Every recipe executes in continuous integration and ends in a **real number**
-computed from committed artifacts — never a stand-in figure. The heavy work runs
-**once** in the keystone slice and is committed as a small-subset cache; every
-later chapter *reads* that cache and asserts its measured verdict against frozen
-golden metrics within a tolerance. The engine itself is never edited — the book
+Every recipe executes in continuous integration and ends in a **real number** it
+just measured — never a stand-in figure — checked against a frozen golden within
+a tolerance. Every chapter runs at two scales with the same code: `small`, over
+committed fixtures and tiny encoders, in seconds on a CPU (what CI and a CPU
+Colab runtime run); and `full`, over the published datasets and real encoders
+on a GPU, where the findings are about the data they name. The engine itself is never edited — the book
 only *calls* the pinned `jammi` API, listed in the [API reference](chapters/api-reference.qmd).

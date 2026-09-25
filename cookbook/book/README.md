@@ -22,16 +22,31 @@ Rails woven through every tier: **provenance**, **tenancy**, **measurement**.
 ## Repository layout
 
 ```
-jammi_cookbook/   the shared lib: composes jammi, enforces contracts + rails
+jammi_cookbook/   the shared lib: datasets, encoders, frozen goldens, rails
+  goldens/        the frozen measurements, one file per dataset and scale
 chapters/         the book (Quarto .qmd with executable Python cells)
-artifacts/        the committed golden-sample cache (small subset only)
-data/ids/         committed seeded subset _row_id lists
-scripts/          the API-reference guard + the no-deferral grep
+scripts/          the API-reference, citation and no-deferral guards
+tests/            the lib's unit tests
 ```
 
 The book lives in the engine monorepo at `cookbook/book/`; the engine CI builds
-the HEAD embed wheel and runs this book's gate against it (see
+the HEAD wheels and renders the chapters a diff can move against them (see
 `.github/workflows/cookbook-book.yml` at the repo root).
+
+## Two scales, one code path
+
+Every chapter runs its capability live and checks what it measured against a
+frozen golden. `JAMMI_COOKBOOK_SCALE` picks what it runs over:
+
+* `small` (the default) — the committed fixtures and tiny fixture encoders, on
+  the CPU, in seconds per chapter. What CI renders.
+* `full` — the published datasets (fetched once, checksum-gated, into
+  `~/.cache/jammi-cookbook`) and real encoders, on a GPU.
+
+The chapter code is identical at both; only the data, the encoders and the
+goldens differ. A golden is never typed in: `JAMMI_COOKBOOK_FREEZE=1` records
+what a run measured, and re-freezing after a deliberate change is running the
+chapter once at that scale and reviewing the diff.
 
 ## Develop
 
@@ -48,20 +63,15 @@ pip install -e 'cookbook/book[book,dev]'   # the jammi-ai client is unpinned; th
 cd cookbook/book
 python scripts/check_api_reference.py      # confirm the API reference matches the wheel
 pytest                                     # lib unit tests
-quarto render                              # build + execute the book (reads the committed cache)
+quarto render                              # run every chapter at `small` scale
+JAMMI_COOKBOOK_SCALE=full quarto render chapters/03-learn/learn.qmd   # one chapter at `full`, on a GPU
 ```
 
-The book's spine is **`connect(target)` parity**: a recipe is written once and the
-only thing that changes is the target — `connect("file://…")` for the embedded CPU
-engine the chapters and CI run on, `connect("grpc://…")` for the GPU
-`jammi-server` the keystone slice uses to produce the cache.
-
-The heavy work (embedding, fine-tune, context-predictor train) runs **once** in
-the keystone slice, on the GPU server (`scripts/build_arxiv_cache.py --target
-grpc://…`), and is committed as the small-subset cache; CI and every later chapter
-*read* that cache on CPU and assert measured verdicts against frozen golden metrics
-within a tolerance. See `docs/plans/40-cookbook/` (in the monorepo) for the
-cookbook's specs and build state (`EXECUTION-STATUS.md`).
+The chapters that start a `jammi-server` of their own need the binary on `PATH`
+(`cargo build --release -p jammi-server`). The book's spine is **`connect(target)`
+parity**: a recipe is written once and the only thing that changes is the target —
+`connect("file://…")` for the embedded engine, `connect("grpc://…")` for a
+`jammi-server`.
 
 ## License
 

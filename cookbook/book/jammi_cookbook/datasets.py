@@ -134,7 +134,8 @@ def arxiv(db, scale: Scale) -> Arxiv:
 def time_split(papers: pa.Table) -> dict[str, list[str]]:
     """The ogbn-arxiv time split of ``papers``, by year."""
     split: dict[str, list[str]] = {"train": [], "valid": [], "test": []}
-    for pid, year in zip(papers.column("paper_id").to_pylist(), papers.column("year").to_pylist()):
+    ids, years = papers.column("paper_id").to_pylist(), papers.column("year").to_pylist()
+    for pid, year in zip(ids, years, strict=True):
         name = "train" if year <= TRAIN_UNTIL else "valid" if year == VALID_YEAR else "test"
         split[name].append(pid)
     return split
@@ -320,7 +321,8 @@ def write_fixtures() -> None:
     fixtures from the pinned sources."""
     airports, routes, contains = air_routes_tables()
     air = fixtures.path("air_routes")
-    for table, name in ((airports, "air_airports"), (routes, "air_routes"), (contains, "air_contains")):
+    for table, name in ((airports, "air_airports"), (routes, "air_routes"),
+                        (contains, "air_contains")):
         pq.write_table(table, air / f"{name}.parquet")
     papers, cites = arxiv_tables(Scale.SMALL)
     small = fixtures.path("arxiv_small")

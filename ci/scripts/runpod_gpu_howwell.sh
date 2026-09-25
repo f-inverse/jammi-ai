@@ -138,42 +138,6 @@ cd jammi-ai
 # any build step runs.
 git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
-# --- python provisioning: a bare pod has no pip
-# on PATH and finetune_run_ab.sh's own cargo build/jammi-bench run never
-# needs python beyond the stdlib (verify_train_pairs.py) --
-# the ONE exception is that script's own PRE-RUN provisioning step
-# (\`derive_heldout_fixture.py --emit-train-pairs\`), which imports
-# jammi_cookbook + numpy and pulls pyarrow/requests transitively
-# through \`jammi_cookbook.datasets\`. This venv exists FOR THAT ONE STEP
-# ONLY -- every measured leg, and the jammi-bench build/binary itself, stay
-# venv-free (system python3, when they touch python at all). Fails loudly
-# (never silently skips provisioning) if python3/venv is unavailable.
-echo "::group::python provisioning (jammi_cookbook/numpy/pyarrow/requests -- the finetune_run_ab.sh PRE-RUN provisioning step ONLY, never the measured legs)"
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "::error::python3 not found on this pod -- refusing (the PRE-RUN provisioning step cannot run without it)." >&2
-  exit 1
-fi
-if ! python3 -m venv /root/howwell-venv; then
-  echo "::error::'python3 -m venv /root/howwell-venv' failed -- refusing (python3-venv unavailable on this pod)." >&2
-  exit 1
-fi
-# Only what derive_heldout_fixture.py --emit-train-pairs's own import chain
-# actually touches (jammi_cookbook/__init__.py -> contracts/determinism/
-# rails, stdlib only, + datasets -> pyarrow/requests; the script itself
-# imports numpy directly) -- version pins read verbatim off cookbook/book/
-# pyproject.toml's own \`dependencies\` list. \`--no-deps\` on jammi_cookbook
-# itself so this venv never pulls in that pyproject's jammi-ai/usearch/
-# numkong entries -- the FULL book's own heavier deps (a maturin-built
-# engine wheel, a pinned ANN backend), unneeded for this one script and
-# requiring toolchains this bare pod does not carry.
-/root/howwell-venv/bin/pip install --quiet --upgrade pip \
-  || { echo "::error::'pip install --upgrade pip' failed in /root/howwell-venv -- refusing." >&2; exit 1; }
-/root/howwell-venv/bin/pip install --quiet 'numpy>=1.26,<3' 'pyarrow>=15' 'requests>=2.31' \
-  || { echo "::error::provisioning numpy/pyarrow/requests into /root/howwell-venv failed -- refusing." >&2; exit 1; }
-/root/howwell-venv/bin/pip install --quiet --no-deps -e cookbook/book \
-  || { echo "::error::'pip install --no-deps -e cookbook/book' into /root/howwell-venv failed -- refusing." >&2; exit 1; }
-echo "::endgroup::"
-
 echo "::group::torch venv (torch_venv.py --provision)"
 python3 ci/scripts/perf/torch_venv.py --provision \
   || { echo "::error::the torch venv could not be provisioned on this pod -- refusing before any leg." >&2; exit 1; }
@@ -192,7 +156,6 @@ MODEL_DIR="${HOWWELL_MODEL_DIR}" \
   FINETUNE_RUN_AB_OBJECTIVE="${HOWWELL_OBJECTIVE}" \
   FINETUNE_RUN_AB_LR0_SEEDS="${lr0}" FINETUNE_RUN_AB_ALLOW_NO_LR0="${allow_no_lr0}" \
   FINETUNE_RUN_AB_LORA_DROPOUT=0 \
-  FINETUNE_RUN_AB_PROVISION_PYTHON=/root/howwell-venv/bin/python3 \
   bash ci/scripts/perf/finetune_run_ab.sh
 rc=\$?
 echo "::endgroup::"

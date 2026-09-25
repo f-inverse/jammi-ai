@@ -15,11 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-import jammi
 
 from . import datasets, encoders
 from .scale import Scale
@@ -110,7 +109,7 @@ def recall(db, c: Corpus, k: int = K, oversample: int | None = None) -> float:
     ``k = 1``, the fraction of queries whose best hit is the true nearest."""
     knob = {} if oversample is None else {"oversample": oversample}
     scores = []
-    for q, truth in zip(c.queries, c.exact):
+    for q, truth in zip(c.queries, c.exact, strict=True):
         got = db.search(SOURCE, query=q.tolist(), k=k, **knob).column("_row_id").to_pylist()
         scores.append(len(set(truth[:k]) & set(got)) / k)
     return float(np.mean(scores))

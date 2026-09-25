@@ -128,8 +128,8 @@ why = "The committed cu12 loader report is the real build's, never a provisional
 
 [[guard]]
 name = "held-out fixture integrity"
-run = "python3 ci/scripts/perf/check_heldout_fixture_integrity.py"
-why = "The committed held-out evaluation fixture's files agree with each other: ids, order, hashes and manifest."
+run = "python3 ci/scripts/perf/check_heldout_fixture_integrity.py && python3 ci/scripts/perf/verify_train_pairs.py"
+why = "The committed held-out evaluation fixture's files agree with each other: ids, order, hashes and manifest, and every train pair matches its recorded hash."
 
 [[guard]]
 name = "CUDA run artifact schema"

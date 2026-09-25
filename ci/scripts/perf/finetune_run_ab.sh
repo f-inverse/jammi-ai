@@ -12,42 +12,19 @@
 # path (the fixture under `cookbook/fixtures/finetune_heldout/`, a local
 # `--model-dir` checkpoint the operator already has on-box); no leg itself
 # builds the cookbook corpus, starts a `jammi-server`, or touches the
-# network. The ONE exception is the PRE-RUN provisioning step below,
-# which runs strictly BEFORE any measured
-# leg and is never counted as one: it may invoke the book-side
-# `cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs`
-# (network-backed, checksum-gated) to (re)populate `train_pairs.jsonl`, then
-# ALWAYS byte-verifies it against the committed `train_ids_sha256.json`
-# before letting any leg proceed.
+# network.
 #
 # HELD-OUT FIXTURE LAYOUT (cookbook/fixtures/finetune_heldout/):
-#   heldout_ids.txt      the committed held-out id list -- what
+#   heldout_ids.txt       the committed held-out id list -- what
 #                         `heldout_ids_sha256` hashes.
-#   heldout_pairs.jsonl  the FULL held-out pair text (committed).
-#   train_ids_sha256.json ids + a per-pair SHA-256 for the 1372 TRAIN-side
-#                         pairs -- deliberately NOT full text (repo-size
-#                         discipline, that directory's own README.md "Why
-#                         train text isn't committed" section). This means
-#                         `--train-jsonl` (a required `jammi-bench
-#                         finetune-run` flag) has no committed source of its
-#                         own text in this checkout.
+#   heldout_pairs.jsonl   the held-out pair text.
+#   train_pairs.jsonl     the 1372 train-side pairs' text.
+#   train_ids_sha256.json ids + a per-pair SHA-256 for the train-side pairs.
 #
-# PRE-RUN PROVISIONING: before any measured
-# leg, if `$TRAIN_JSONL` (default `$REPO_ROOT/cookbook/fixtures/
-# finetune_heldout/train_pairs.jsonl`, gitignored -- never committed) is
-# absent, this script invokes the book-side producer's own
-# `--emit-train-pairs` mode (network-backed, checksum-gated; reuses the
-# exact `mine_pairs()`/`_text()` code path `--check` already re-derives
-# against) to write it. Then -- REGARDLESS of whether the file was just
-# emitted or was already present on this pod from a prior run -- this
-# script ALWAYS byte-verifies every pair against the committed
-# `train_ids_sha256.json` via the standalone
-# `ci/scripts/perf/verify_train_pairs.py` (sha256 per pair id, exact count
-# 1372, no extras/duplicates), refusing loudly with the first mismatching
-# id on any divergence, before a single leg runs. A pre-existing
-# `train_pairs.jsonl` is never trusted on name alone: a stale or
-# hand-edited file left over from an earlier checkout fails this exactly
-# like a corrupted fresh fetch would.
+# Before any measured leg, `$TRAIN_JSONL` is byte-verified against the
+# committed `train_ids_sha256.json` via `ci/scripts/perf/verify_train_pairs.py`
+# (sha256 per pair id, exact count 1372, no extras/duplicates): an overridden
+# path is never trusted on name alone.
 #
 # Batch size: 32 (`cookbook/fixtures/finetune_heldout/README.md` -- the
 # chapter-config value every real `db.fine_tune(...)` call over this exact
@@ -213,34 +190,11 @@
 #                              own CLI doc names) -- never both.
 #   TRAIN_JSONL / HELDOUT_IDS / HELDOUT_JSONL
 #                              override the committed-fixture paths (see
-#                              "HELD-OUT FIXTURE LAYOUT" / "PRE-RUN
-#                              PROVISIONING" above -- TRAIN_JSONL's default
-#                              is auto-provisioned + byte-verified before any
-#                              leg runs, never committed itself).
+#                              "HELD-OUT FIXTURE LAYOUT" above; TRAIN_JSONL
+#                              is byte-verified before any leg runs).
 #   FINETUNE_RUN_AB_OUT_DIR    where the raw legs + merged report land
 #                              (default "<repo>/.finetune-run-ab-report/
 #                              <UTC timestamp>").
-#   FINETUNE_RUN_AB_PROVISION_PYTHON
-#                              the python interpreter invoked for the ONE
-#                              provisioning step above (`derive_heldout_
-#                              fixture.py --emit-train-pairs`) -- default
-#                              "python3" (a bare checkout's system
-#                              interpreter, which is enough when
-#                              `train_pairs.jsonl` is already pre-staged, so
-#                              this step never actually runs). A pod driver
-#                              (e.g. `ci/scripts/runpod_gpu_howwell.sh`) that
-#                              provisions a dedicated venv for
-#                              `jammi_cookbook`/numpy/pyarrow/requests (a
-#                              bare pod has no pip on PATH and this script's
-#                              own producer binary
-#                              build/run never needs any of those packages)
-#                              points this at that venv's own interpreter
-#                              instead; every OTHER step in this script
-#                              (verification, the cargo build, every measured
-#                              leg) stays on plain "python3"/the system
-#                              toolchain -- MEASURED legs are deliberately
-#                              venv-free, only this one pre-run provisioning
-#                              call is not.
 #   FINETUNE_RUN_AB_DRY_RUN=1  print every command this script would run
 #                              instead of executing it, and write a
 #                              `{"tool":"dry-run",...}` stub per leg so the
@@ -328,9 +282,6 @@ arm_selected() {
     *) return 1 ;;
   esac
 }
-# Interpreter for the one provisioning step -- see the env-var doc above.
-FINETUNE_RUN_AB_PROVISION_PYTHON="${FINETUNE_RUN_AB_PROVISION_PYTHON:-python3}"
-
 FIXTURE_DIR="$REPO_ROOT/cookbook/fixtures/finetune_heldout"
 TRAIN_JSONL="${TRAIN_JSONL:-$FIXTURE_DIR/train_pairs.jsonl}"
 HELDOUT_IDS="${HELDOUT_IDS:-$FIXTURE_DIR/heldout_ids.txt}"
@@ -359,35 +310,7 @@ if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
     fi
   done
 
-  # --- PRE-RUN provisioning -- see module
-  # doc "PRE-RUN PROVISIONING" above. Outside every measured leg: this runs
-  # once, before the sweep loop, never inside run_leg. Emit is SKIPPED
-  # whenever `$TRAIN_JSONL` is already present (an operator/pod driver may
-  # pre-stage it) -- byte-verification below still ALWAYS runs regardless.
-  #
-  # Invoked from `cookbook/book` as cwd, per that
-  # directory's own fixture README ("cd cookbook/book && python scripts/
-  # derive_heldout_fixture.py ...") -- `derive_heldout_fixture.py` itself
-  # resolves every path it reads/writes off `__file__`, never cwd, so this
-  # is the DOCUMENTED invocation convention, not a functional requirement of
-  # that script; `$FINETUNE_RUN_AB_PROVISION_PYTHON` (default "python3") is
-  # this call's own interpreter knob -- a bare checkout's system Python
-  # cannot `import jammi_cookbook`/numpy, so a pod driver that provisions a
-  # dedicated venv for this ONE step points this env var at that venv's
-  # interpreter instead (see the env-var's own doc above).
-  if [ ! -f "$TRAIN_JSONL" ]; then
-    echo "::notice::$TRAIN_JSONL not found -- provisioning via 'derive_heldout_fixture.py --emit-train-pairs' (network-backed, checksum-gated fetch of train text; outside measured legs)."
-    (cd "$REPO_ROOT/cookbook/book" && "$FINETUNE_RUN_AB_PROVISION_PYTHON" scripts/derive_heldout_fixture.py --emit-train-pairs) \
-      || { echo "::error::train-pairs provisioning failed (cookbook/book/scripts/derive_heldout_fixture.py --emit-train-pairs, invoked from cookbook/book via \$FINETUNE_RUN_AB_PROVISION_PYTHON='$FINETUNE_RUN_AB_PROVISION_PYTHON') — refusing before any leg runs." >&2; exit 1; }
-  else
-    echo "::notice::$TRAIN_JSONL already present -- skipping the emit step (pre-staged); byte-verification below still always runs."
-  fi
-  # ALWAYS byte-verify -- whether train_pairs.jsonl was just emitted above or
-  # was already present on this pod from a prior run. A stale/hand-edited
-  # file must fail exactly like a corrupted fresh fetch would; this is the
-  # ONE reviewable unit both this producer and any other caller share
-  # (ci/scripts/perf/verify_train_pairs.py), never a second hand-rolled
-  # comparator.
+  # A stale or hand-edited file fails here, before any leg runs.
   python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL" \
     || { echo "::error::$TRAIN_JSONL failed byte-verification against cookbook/fixtures/finetune_heldout/train_ids_sha256.json — refusing before any leg runs." >&2; exit 1; }
 fi

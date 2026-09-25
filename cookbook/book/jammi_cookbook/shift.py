@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
+
 def density_ratio(test_share: np.ndarray, neighbours: int) -> np.ndarray:
     """Each calibration row's test-to-calibration likelihood ratio, estimated
     as the Laplace-smoothed odds of a test-era neighbour among its
@@ -67,7 +68,7 @@ def aps_coverage(
     index. One convention for both passes, so only the weights differ."""
     q = _quantile(aps_nonconformity(cal_scores, cal_labels), weights, alpha)
     covered = size = 0
-    for scores, label in zip(test_scores, test_labels):
+    for scores, label in zip(test_scores, test_labels, strict=True):
         cum, admitted = 0.0, set()
         for c in sorted(range(len(scores)), key=lambda c: (-scores[c], c)):
             cum += scores[c]

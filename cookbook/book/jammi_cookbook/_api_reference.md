@@ -26,7 +26,7 @@ the pin moves, re-introspect and update this file
 surface is identical across planes:
 
 - `jammi.connect("file:///path")  -> EmbeddedBackend` — embedded, in-process engine
-  (CPU). The committed cache and CI read the book on this arm.
+  (CPU). CI and a `small`-scale run render the book on this arm.
 - `jammi.connect("grpc://host:port") -> RemoteDatabase` — the pure-Python
   client (`jammi`) over a running `jammi-server`. The **GPU** compute tier
   (embedding, fine-tune, context-predictor training) runs here; the CPU embed

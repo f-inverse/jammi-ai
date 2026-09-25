@@ -8,19 +8,16 @@ name: Cookbook book
 # could move. It runs on every PR, so chapter re-execution never depends on
 # someone remembering to run it.
 #
-# Still deliberately NOT a full-book render: `ci/scripts/select_render_chapters.py`
-# classifies every chapter (LIVE_COMPUTE / LIVE_COMPUTE_NEEDS_SERVER /
-# CACHE_READ / STATIC — see its own docstring) and returns only the O(affected)
-# subset a GIVEN diff could move: the live-compute chapters on an engine-code
-# diff, plus whichever CACHE_READ chapters a touched `build_*_cache.py` script
-# feeds, plus any chapter the diff touches directly. The full nightly render
-# (every chapter + the release-recipe leg) stays in the separate
-# `cookbook-render.yml` — full-book quarto render is not something a PR gate
-# should pay for on every push; the selector is what keeps this gate
-# cost-bounded instead of reverting to "render everything". No skip flag, no
-# continue-on-error on the render step: a flaky chapter under this gate is a
-# chapter bug to fix, not a gate to soften. The engine's own SDK-recipes smoke
-# (cookbook.yml) and it/cookbook.rs are separate.
+# Every chapter runs its capability live and checks a frozen golden, so a
+# render IS the check. This gate renders, at `small` scale on CPU, the chapters
+# THIS diff could move — `ci/scripts/select_render_chapters.py` (see its
+# docstring): every live chapter on an engine, book-library or fixture diff,
+# the chapters checking a dataset whose goldens moved, and any chapter the diff
+# touches directly. The every-chapter render on a schedule stays in
+# `cookbook-render.yml`. No skip flag, no continue-on-error on the render step:
+# a flaky chapter under this gate is a chapter bug to fix, not a gate to soften.
+# The engine's own SDK-recipes smoke (cookbook.yml) and it/cookbook.rs are
+# separate.
 #
 # A grpc:// chapter needs a running `jammi-server`, and that is a LANE
 # CAPABILITY this job provisions, not a chapter property that excludes it: the
@@ -71,9 +68,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The scale-tier vector cache (cookbook/book/artifacts/scale/) lives in
-          # Git LFS; pull it so the gate reads the real cache, not LFS pointers.
-          lfs: true
           # fetch-depth: 0 so the PR base ref (or the pre-push `before` SHA) is
           # present for select_render_chapters.py's `git diff <base>...HEAD`.
           fetch-depth: 0
@@ -83,11 +77,10 @@ jobs:
           # never wanted -D warnings (a book-render lane, not the lint gate).
           deny-warnings: false
 
-      # The selector's own house-guard self-test: RED-proves the misclassification
-      # shapes named in its docstring (a live-compute call in an otherwise
-      # cache-read chapter, a live call in prose-only, a grpc:// chapter
-      # classified needs-server AND still selected, etc.) against synthetic
-      # fixtures — never against the real book, so it keeps proving something
+      # The selector's own self-test: RED-proves its classification and
+      # selection rules (an import-only or prose-only chapter is static, a
+      # grpc:// chapter needs a server AND is still selected, a golden diff
+      # selects only its dataset's chapters, etc.) against synthetic fixtures — never against the real book, so it keeps proving something
       # even the day the real book stops containing an edge case. Runs before
       # the classifier is trusted with a real diff below.
       - name: Forward-render selector self-test
@@ -104,10 +97,7 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       # The forward render gate itself: classify every chapter and print the
-      # subset THIS diff could move (the live-compute chapters on any
-      # engine-code diff, plus CACHE_READ chapters whose build_*_cache.py
-      # producer or committed artifact directory changed, plus any chapter
-      # the diff touches directly). `needs_server` is the LANE CAPABILITY the
+      # subset THIS diff could move. `needs_server` is the LANE CAPABILITY the
       # selected set asks for; the wheel-build step below reads it. This runs
       # BEFORE that build precisely so the build can be told whether to
       # produce a server — never so the render set can be trimmed to whatever
@@ -190,18 +180,11 @@ jobs:
       # Render exactly the selected set with the PR wheel already installed
       # above — the chapter asserts against a frozen golden ARE the check; a
       # nonzero `quarto render` (an assertion failure, an artifact-shape
-      # mismatch, a live-compute call that behaves differently) fails this
+      # mismatch, a verb that behaves differently) fails this
       # step, and this step carries no `continue-on-error` and no skip flag: a
       # flaky chapter here is a chapter bug to fix, not a gate to soften.
-      # Cost: one LIVE_COMPUTE chapter (compute-precision.qmd, a CPU-only
-      # local-BERT generate_embeddings call) — its own render span in the
-      # nightly full-book run (cookbook-render.yml) measures ~3.5s.
-      # This step pays that render cost once more, plus this job's own
-      # already-paid-for cold-start (wheel install, jammi_cookbook import) —
-      # low seconds, not minutes. The selector is what keeps this O(affected)
-      # as more chapters/scripts are added, not O(book): a future live-compute
-      # or newly-touched CACHE_READ chapter widens this set, never the whole
-      # book at once.
+      # Cost: the selected chapters at `small` scale — committed fixtures and
+      # tiny encoders, seconds to a minute per chapter on CPU.
       #
       # `target/release` goes on PATH exactly as `cookbook-render.yml` does,
       # for the grpc:// chapters that shell out to `jammi-server`. The

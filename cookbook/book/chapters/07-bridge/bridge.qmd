@@ -11,7 +11,7 @@ The book's thesis, made explicit: **one Jammi recipe is one equation in the
 monograph and one line in the GNN/conformal canon.** The verticals carried short
 bridge notes; this chapter writes the full bridge — four signature chapters that
 each take one operation and show it is the *same object at three altitudes*, then
-run it on the committed cache; the Neptune-contrast framing; and the **verified
+run it live; the Neptune-contrast framing; and the **verified
 citation map** that pins every recipe to its sources.
 
 Every signature below runs its call live and checks what it measured against

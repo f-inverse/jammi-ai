@@ -1,8 +1,8 @@
 name: Cookbook render
 
 # The heavy leg of the Theory↔Computation book (cookbook/book/): a full quarto
-# render that re-executes every chapter (incl. the grpc:// live-server chapters)
-# against the committed cache, plus a release-recipe leg that re-runs the CPU gate
+# render that runs every chapter live at `small` scale (incl. the grpc://
+# live-server chapters) and checks each against its frozen goldens, plus a release-recipe leg that re-runs the CPU gate
 # against the LAST PUBLISHED PyPI wheel. Runs nightly (and on demand) — never on a
 # PR — and caches the rendered `_book`, which the Docs workflow restores to publish
 # the /cookbook subpath. Split out from the fast PR/push gate (cookbook-book.yml) so
@@ -40,8 +40,6 @@ jobs:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
       - uses: ./.github/actions/setup-rust-ci
         with:
           # mold applies unconditionally from .cargo/config.toml; this lane
@@ -66,10 +64,9 @@ jobs:
           . .venv/bin/activate
           pip install -e 'cookbook/book[book,dev]'
 
-      - name: Render + execute the book (reads the committed cache)
-        # Render re-executes every chapter against the committed cache and fails on
-        # any drifted or moved artifact. jammi-server is on the path for the
-        # grpc:// chapters.
+      - name: Render + execute the book
+        # Every chapter runs live and fails on a measurement outside its frozen
+        # golden. jammi-server is on the path for the grpc:// chapters.
         working-directory: cookbook/book
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
@@ -89,8 +86,7 @@ jobs:
         # The published artifact against the book it shipped with: install the
         # last released jammi-ai from PyPI into a clean venv, check out the
         # cookbook at that release's tag, and run its API-reference check and
-        # CPU gate (the pytest suite reads the committed cache; it never
-        # retrains or re-embeds). HEAD's book documents unreleased API, so it
+        # library tests. HEAD's book documents unreleased API, so it
         # is tested against the HEAD wheels above, never against a release.
         run: |
           python3 -m venv .venv-release

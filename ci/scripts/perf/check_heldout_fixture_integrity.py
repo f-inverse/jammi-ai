@@ -2,14 +2,9 @@
 """Hermetic self-consistency guard for the committed how-well held-out
 fixture (`cookbook/fixtures/finetune_heldout/`).
 
-Everything `cookbook/book/scripts/derive_heldout_fixture.py::check()` proves
-is network-backed (it re-downloads the pinned ogbn-arxiv sources and
-re-derives the whole 1500-pair mining run from scratch). This guard proves a
-DIFFERENT, strictly weaker property that needs none of that: the fixture
-FILES ALREADY COMMITTED here agree with EACH OTHER. No network, no re-mining
--- every check below is a pure function of checkout content, so it can run
-on every PR (unlike `--check`, which nobody wants gating merge on a
-best-effort external download).
+The fixture FILES COMMITTED there agree with EACH OTHER. No network, no
+re-mining -- every check below is a pure function of checkout content, so it
+runs on every PR.
 
 Checks:
 
@@ -22,8 +17,7 @@ Checks:
    actually hold.
 2. **`heldout_ids_sha256` recomputation** -- `manifest.json`'s
    `heldout_ids_sha256` must equal a fresh SHA-256 over `heldout_ids.txt`'s
-   own committed bytes (the exact definition
-   `derive_heldout_fixture.py::_file_sha256`/`generate()` uses).
+   own committed bytes.
 3. **`dataset_sha256` recomputation** -- `manifest.json`'s `dataset_sha256`
    must equal a fresh SHA-256 over `"\n".join(per_pair_hashes)` where
    `per_pair_hashes` is the TRAIN pairs' already-committed `pair_sha256`
@@ -62,13 +56,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_DIR = REPO_ROOT / "cookbook" / "fixtures" / "finetune_heldout"
 
-# The exact per-pair hash definition
-# cookbook/book/scripts/derive_heldout_fixture.py::_pair_sha256 uses --
-# duplicated here (not imported) because that script lives on the BOOK side
-# (one-way rule, ci/scripts/check_cookbook_one_way.sh) and is network-backed
-# besides; this guard's whole point is running WITHOUT either dependency.
-# ci/scripts/perf/verify_train_pairs.py duplicates the SAME definition for
-# the SAME reason -- both cite this docstring as the shared source of truth.
+# The per-pair hash definition the fixture's hashes were computed with.
+# ci/scripts/perf/verify_train_pairs.py uses the SAME definition -- both cite
+# this comment as the shared source of truth.
 
 
 def _pair_sha256(pair: dict) -> str:

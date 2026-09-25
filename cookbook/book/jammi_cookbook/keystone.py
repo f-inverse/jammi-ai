@@ -17,7 +17,7 @@ from .datasets import Arxiv
 from .scale import Scale
 
 
-def show(step) -> "object":
+def show(step) -> object:
     """``step``'s source as a rendered code block — the exact code a cell runs."""
     from IPython.display import Markdown
 
@@ -126,7 +126,9 @@ def subject_golden(db, arxiv: Arxiv) -> str:
     )
 
 
-def predict_years(db, arxiv: Arxiv, predictor: str, keys: list[str]) -> tuple[np.ndarray, np.ndarray]:
+def predict_years(
+    db, arxiv: Arxiv, predictor: str, keys: list[str]
+) -> tuple[np.ndarray, np.ndarray]:
     """Tier 04: the predictor's served year distribution — mean and standard
     deviation — for each paper in ``keys``."""
     served = [
@@ -201,7 +203,9 @@ def subject_scores(db, arxiv: Arxiv, embeddings: str) -> SubjectScores:
     )
 
 
-def test_era_shares(db, arxiv: Arxiv, embeddings: str, keys: list[str], sizes: tuple[int, ...]) -> dict[int, np.ndarray]:
+def test_era_shares(
+    db, arxiv: Arxiv, embeddings: str, keys: list[str], sizes: tuple[int, ...]
+) -> dict[int, np.ndarray]:
     """Each paper's share of test-era (2019–) papers among its nearest
     calibration- and test-era neighbours, at each neighbourhood size — how
     test-era-like its neighbourhood is."""
@@ -210,6 +214,7 @@ def test_era_shares(db, arxiv: Arxiv, embeddings: str, keys: list[str], sizes: t
         for key in keys
     ]
     return {
-        size: np.array([np.mean([n["year"] > datasets.VALID_YEAR for n in h[:size]]) for h in hoods])
+        size: np.array([np.mean([n["year"] > datasets.VALID_YEAR for n in h[:size]])
+                        for h in hoods])
         for size in sizes
     }

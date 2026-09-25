@@ -1,10 +1,10 @@
 finetune_heldout fixture (cookbook/fixtures/finetune_heldout/)
 
 This directory redistributes derived text from the Open Graph Benchmark
-"ogbn-arxiv" dataset: `heldout_pairs.jsonl` and `train_ids_sha256.json`
-carry title+abstract-derived text (clipped to 1500 characters) for a
-128+1372-pair same-subject supervision split mined from the committed
-4000-paper ogbn-arxiv subset (see `arxiv_subset_ids.txt`, `manifest.json`).
+"ogbn-arxiv" dataset: `heldout_pairs.jsonl` and `train_pairs.jsonl` carry
+title+abstract-derived text (clipped to 1500 characters) for a 128+1372-pair
+same-subject supervision split mined from a 4000-paper ogbn-arxiv subset (see
+`arxiv_subset_ids.txt`, `manifest.json`).
 
 --------------------------------------------------------------------------------
 License

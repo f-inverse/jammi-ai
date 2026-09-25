@@ -5,20 +5,23 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 It depends on, and is published separately from, the jammi_ai engine
 (https://pypi.org/project/jammi_ai/, Apache-2.0). The cookbook imports jammi_ai
-as a pinned dependency and contains no engine source.
+as a dependency and contains no engine source.
 
 Dataset attributions are recorded by the loaders that fetch them, in
 jammi_cookbook/datasets.py and below.
 
 --------------------------------------------------------------------------------
-Datasets (fetched on demand, checksum-gated; not redistributed in this repo,
-EXCEPT the ogbn-arxiv held-out fixture excerpt noted below)
+Datasets. A `full`-scale run fetches the published datasets on demand,
+checksum-gated, and never commits them. A `small`-scale run reads small derived
+copies committed under cookbook/fixtures/, redistributed under each source's
+own terms below.
 
 Air Routes
   Source: https://github.com/krlawrence/graph (sample-data), pinned to commit
     efd3b1ae636f602577cfbccb16ecfe358a02ee36 (graph version 0.89).
   Author: Kelvin R. Lawrence. Permissive use as published with the book
     "Practical Gremlin." Used here as a graph-construction/algorithms teaching set.
+  Committed whole: cookbook/fixtures/air_routes/.
 
 ogbn-arxiv
   Source: Open Graph Benchmark (https://ogb.stanford.edu/), arxiv.zip +
@@ -26,13 +29,7 @@ ogbn-arxiv
   License: ODC-BY 1.0 (Open Data Commons Attribution License). Built on the
     Microsoft Academic Graph. Citation: Hu et al., "Open Graph Benchmark:
     Datasets for Machine Learning on Graphs," NeurIPS 2020.
-  This book's own pipelines (build_arxiv_cache.py, build_finetune_cache.py,
-    etc.) fetch ogbn-arxiv on demand at emit time and never commit it — the
-    "not redistributed in this repo" posture above holds for those.
-  CARVE-OUT: a small (~740 KB) derived excerpt of ogbn-arxiv title/abstract
-    text IS committed and redistributed under
-    cookbook/fixtures/finetune_heldout/ (the "how-well" held-out fixture)
-    — an engine-owned fixture produced by this book's
-    cookbook/book/scripts/derive_heldout_fixture.py. Its full ODC-BY 1.0
-    attribution lives in cookbook/fixtures/finetune_heldout/NOTICE.
-
+  Committed excerpts: cookbook/fixtures/arxiv_small/ (a citation-connected
+    subset of papers and their citations) and cookbook/fixtures/finetune_heldout/
+    (supervised title/abstract pairs; its full ODC-BY 1.0 attribution is in
+    that directory's NOTICE).

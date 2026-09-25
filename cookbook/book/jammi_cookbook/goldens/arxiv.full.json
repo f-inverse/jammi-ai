@@ -135,10 +135,6 @@
     "tol": 0.04,
     "value": 0.721
   },
-  "tier04.reg_weighting_delta": {
-    "tol": 0.02,
-    "value": 0.0
-  },
   "tier04.score_shift_corr": {
     "tol": 0.12,
     "value": -0.121

@@ -41,7 +41,7 @@ SCALE = scale.current()
 # The run's budget: a small run needs a larger step to leave its initial output.
 BUDGET = {
     scale.Scale.SMALL: {"epochs": 20, "learning_rate": 5e-2},
-    scale.Scale.FULL: {"epochs": 3, "learning_rate": 1e-3},
+    scale.Scale.FULL: {"epochs": 3, "learning_rate": 3e-2},
 }[SCALE]
 QUANTILES = [0.05, 0.5, 0.95]  # a 90% central interval and the median
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")

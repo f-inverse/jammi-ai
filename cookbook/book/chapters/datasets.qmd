@@ -24,8 +24,9 @@ Every chapter runs its capability live. What it runs over is a **scale**:
 - **`small`** — the committed fixtures and the tiny fixture encoders, on the
   CPU: seconds per chapter. This is what the book's CI renders, and what a
   CPU Colab runtime runs.
-- **`full`** — the published datasets and real encoders (ModernBERT for text),
-  on a GPU: the book's findings at the size they are about.
+- **`full`** — the published datasets and real encoders (for text,
+  `gte-modernbert-base`, a ModernBERT trained for embeddings), on a GPU: the
+  book's findings at the size they are about.
 
 The chapter code is the same at both; the data, the encoders and the frozen
 goldens a run is checked against differ. Choose with the environment variable

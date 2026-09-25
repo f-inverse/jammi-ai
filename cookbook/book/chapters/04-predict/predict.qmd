@@ -29,7 +29,7 @@ prediction** with an honest coverage guarantee. It carries two results:
    textbook weighted-conformal remedy **restores neither**, for two different
    reasons — each with the diagnostic that explains it.
 
-Both are findings at `full` scale (4,000 papers, ModernBERT). At `small` scale
+Both are findings at `full` scale (4,000 papers, `gte-modernbert-base`). At `small` scale
 every cell below runs the same computation on the 400-paper core with a
 random-weight encoder: the numbers check the pipeline and are frozen as
 regression goldens, and the findings are asserted at `full` only.

@@ -12,7 +12,10 @@ from __future__ import annotations
 from . import fixtures
 from .scale import Scale
 
-_TEXT = {Scale.SMALL: "tiny_bert", Scale.FULL: "answerdotai/ModernBERT-base"}
+# `full`'s text encoder is embedding-trained: a masked-LM backbone's pooled
+# states (ModernBERT-base's own) retrieve poorly, and graph propagation has
+# nothing to denoise in them.
+_TEXT = {Scale.SMALL: "tiny_bert", Scale.FULL: "Alibaba-NLP/gte-modernbert-base"}
 # One OpenCLIP checkpoint carries both an image and a text tower.
 _IMAGE = {Scale.SMALL: "tiny_open_clip", Scale.FULL: "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"}
 _AUDIO = {Scale.SMALL: "htsat_clap_tiny", Scale.FULL: "laion/clap-htsat-fused"}

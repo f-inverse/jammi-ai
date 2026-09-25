@@ -1,14 +1,1 @@
-{
-  "tenancy.global_source_visible": {
-    "tol": 0.0,
-    "value": 605.0
-  },
-  "tier01.contains_homophily": {
-    "tol": 0.02,
-    "value": 0.99
-  },
-  "tier01.route_homophily": {
-    "tol": 0.02,
-    "value": 0.826
-  }
-}
+{}

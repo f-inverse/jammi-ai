@@ -87,9 +87,12 @@ contracts.assert_close("arxiv.tier02.precision_delta", delta, tol=0.02)
 assert abs((prop_precision - raw_precision) - delta) < 1e-9
 ```
 
-At `full` scale propagation lifts same-subject precision: ModernBERT's vectors
-carry the topic, and averaging over citation neighbours — who mostly share it
-— sharpens it. At `small` scale the random-weight encoder's vectors carry
+At `full` scale propagation lifts same-subject precision: an embedding model's
+vectors carry the topic, and averaging over citation neighbours — who mostly
+share it — sharpens it. The encoder matters: a masked-language-model backbone
+(`answerdotai/ModernBERT-base`, mean-pooled) retrieves far worse (precision\@10
+0.36 against 0.51 here) and its vectors carry too little topic for
+propagation to sharpen — measured, it moves precision by −0.003. At `small` scale the random-weight encoder's vectors carry
 little to sharpen, so read the small numbers as a check that the pipeline runs
 and holds its values, not as a finding.
 

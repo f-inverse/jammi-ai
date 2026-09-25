@@ -129,33 +129,43 @@ for loss, r in results.items():
     contracts.assert_close(f"finetune_regression.{loss}.coverage_90", r["coverage"], tol=0.05)
 gaussian = [results[loss] for loss in ("beta_nll", "gaussian_nll", "crps")]
 assert all(r["width"] > 0.1 * spread for r in gaussian)  # the Gaussian heads serve a spread
+if SCALE is scale.Scale.FULL:
+    # Every objective lands on the mean baseline; the Gaussian heads' σ sits
+    # below the held-out error, so their 90% bands under-cover; the pinball
+    # levels have not separated as far as the Gaussian bands.
+    assert all(abs(r["rmse"] - spread) < 0.02 for r in results.values())
+    assert all(r["width"] / (2 * 1.6449) < r["rmse"] and r["coverage"] < 0.9 for r in gaussian)
+    assert results["pinball"]["width"] < min(r["width"] for r in gaussian)
 ```
 
 ## Reading the table
 
 The last row is the baseline every regression must beat: predicting the
 held-out mean for every paper has an RMSE equal to the held-out standard
-deviation. An objective whose RMSE sits at that line has learned the
-conditional mean and little beyond it — a publication year is only weakly
-predictable from a title and abstract. Coverage and width say how honest each
-head is about that: a 90% interval should contain about 90% of the held-out
-years, and it can only do so by being wide enough to admit how little the text
-predicts.
+deviation. At `full` scale every objective lands on that line — a publication
+year is only weakly predictable from a title and abstract. What separates the objectives is how
+honest each is about that.
 
-The Gaussian heads serve a real spread in years — their interval widths are a
-sizeable fraction of the target's own spread, which is what fitting a
-high-offset target *without* collapse looks like: a head that degenerated would
-serve a near-zero width around a near-constant prediction.
+A 90% interval should contain about 90% of the held-out years. The Gaussian
+heads serve a real spread — their bands are a sizeable fraction of the target's
+own, which is what fitting a high-offset target *without* collapse looks like —
+but not enough of one: each head's served $\sigma$ (the band's width over
+$2 \times 1.645$) sits below its held-out RMSE, so the band under-covers. The
+heads fit their scale on the training papers and are over-confident on papers
+they have not seen, which is the general case, and the reason split-conformal
+calibration exists: calibrate the band's width on held-out residuals and the
+coverage is guaranteed (the conformal chapter's CQR does exactly this to a
+served $\pm\sigma$ band). Coverage also moves in steps here, because a
+publication year is an integer: with the centre near one value for every
+paper, coverage changes only when a band edge crosses a whole year.
 
 The `pinball` head reaches its band differently. Every quantile level starts at
 the same output, and the pinball loss moves each by a bounded, sign-driven
 gradient — `q` or `1 − q` per row, whatever the size of the miss — so the levels
 separate only as fast as the optimiser's steps carry them. A Gaussian head
-needs only its mean and one scale to move. The budget above is sized for that:
-the same run at a fifth of the learning rate leaves the pinball levels a
-narrow, under-covering band while the Gaussian heads are already calibrated.
-Read each row's coverage against its width to see whether the budget carried
-it.
+needs only its mean and one scale to move. At this budget the pinball levels
+are still close together — the narrowest band in the table, well short of 90% —
+and at a smaller learning rate they barely leave their shared starting output.
 
 ```{python}
 db.close()

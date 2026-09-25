@@ -8,6 +8,7 @@ import jammi_cookbook
 ```
 
 **Recipe:** `fine_tune` (the loss / hard-negative / Matryoshka knobs) +
+`generate_embeddings(dimensions=…)` +
 `fine_tune_graph` · `eval_compare` · **Theory:** contrastive metric learning —
 in-batch softmax (MNRL / InfoNCE, van den Oord et al. 2018), triplet margin
 (Schroff et al. 2015 FaceNet), CoSENT, hard-negative mining, Matryoshka
@@ -109,19 +110,25 @@ width = len(db.encode_query(model=BASE, query="a probe"))
 
 
 def tuned(source: str, columns: list[str], **knobs) -> str:
+    """The fine-tuned model's id."""
     job = db.fine_tune(
         source=source, base_model=BASE, columns=columns, method="lora",
         task="text_embedding", epochs=EPOCHS, batch_size=16, max_seq_length=128,
         seed=0, **knobs,
     )
     job.wait()
+    return job.output_model_id
+
+
+def embedded(model: str, dimensions: int | None = None) -> str:
+    """Every paper embedded by `model`, at `dimensions` or the model's width."""
     return db.generate_embeddings(
-        source=arxiv.papers, model=job.output_model_id,
-        columns=["title", "abstract"], key="paper_id",
+        source=arxiv.papers, model=model, columns=["title", "abstract"],
+        key="paper_id", dimensions=dimensions,
     )
 
 
-methods = {
+models = {
     "mnrl": tuned(pairs, ["anchor", "positive"], embedding_loss="mnrl"),
     "mnrl_t50": tuned(pairs, ["anchor", "positive"], embedding_loss="mnrl", mnrl_temperature=50.0),
     "triplet": tuned(triplets, ["anchor", "positive", "negative"], embedding_loss="triplet"),
@@ -130,10 +137,11 @@ methods = {
                       mine_hard_negatives=True, hard_negative_k=5),
     "matryoshka": tuned(pairs, ["anchor", "positive"], embedding_loss="mnrl",
                         matryoshka_dims=[width, width // 2, width // 4]),
-    "graph": keystone.fine_tune_on_graph(
-        db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared", epochs=EPOCHS,
-    ),
 }
+methods = {name: embedded(model) for name, model in models.items()}
+methods["graph"] = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared", epochs=EPOCHS,
+)
 ```
 
 ## The measurement
@@ -192,9 +200,44 @@ point estimates sort. Three things hold whatever the ranking:
   learns who-cited-whom, a signal the text cannot reconstruct; it is scored on
   the same target for contrast.
 - **Matryoshka is a nesting constraint, not a new loss.** It trains the leading
-  coordinates to be an embedding on their own, and its full-width precision is
-  measured above. `generate_embeddings` emits the model's full width, so the
-  index-size win of serving a shorter prefix is not measured here.
+  coordinates to be an embedding on their own; its full-width precision is
+  measured above, and what the constraint buys is measured next.
+
+## Serving a Matryoshka prefix
+
+`generate_embeddings(dimensions=d)` serves a model's leading `d` coordinates,
+each vector renormalised to unit length — an index a half or a quarter the size.
+`eval_compare` encodes each query at its table's width, so every table below is
+scored as it would be searched. The Matryoshka model was trained for these
+prefixes; the plain MNRL model, from the same pairs and budget, was not.
+
+```{python}
+widths = [width, width // 2, width // 4]
+served = {name: [embedded(models[name], w) for w in widths] for name in ("mnrl", "matryoshka")}
+by_width = db.eval_compare(
+    embedding_tables=[table for tables in served.values() for table in tables],
+    source=arxiv.papers, golden_source=golden, k=10,
+)
+scores = iter(e["embedding_eval"]["aggregate"]["precision_at_k"] for e in by_width["per_table"])
+prefix = {name: dict(zip(widths, scores)) for name in served}
+print(f"{'model':<12}" + "".join(f"{f'{w} dims':>11}" for w in widths))
+for name, row in prefix.items():
+    print(f"{name:<12}" + "".join(f"{row[w]:>11.3f}" for w in widths))
+```
+
+```{python}
+# | echo: false
+for name, row in prefix.items():
+    for w, value in row.items():
+        contracts.assert_close(f"finetune.prefix.{name}.{w}", value, tol=0.03)
+```
+
+Read each row left to right: how much retrieval quality a model keeps as its
+index shrinks. A model trained without the nesting constraint spreads its
+information over every coordinate, so a prefix of it is only an accident of
+its basis; the Matryoshka model's leading coordinates were optimised to stand
+alone at each trained width. The difference between the two rows at the
+narrowest width is the index-size saving the constraint pays for.
 
 ```{python}
 db.close()

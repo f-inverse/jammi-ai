@@ -33,6 +33,53 @@ pub enum Modality {
     Audio,
 }
 
+impl Modality {
+    /// The embedding task this tower runs.
+    pub fn task(self) -> ModelTask {
+        match self {
+            Self::Text => ModelTask::TextEmbedding,
+            Self::Image => ModelTask::ImageEmbedding,
+            Self::Audio => ModelTask::AudioEmbedding,
+        }
+    }
+
+    /// The tower that runs `task`, when it is an embedding task.
+    pub fn of_task(task: ModelTask) -> Option<Self> {
+        [Self::Text, Self::Image, Self::Audio]
+            .into_iter()
+            .find(|modality| modality.task() == task)
+    }
+}
+
+/// A flattened generate-embeddings request: the source rows and columns to
+/// embed, the model and tower that embed them, the width served, and the
+/// cache policy.
+///
+/// `Serialize`/`Deserialize`: persisted on `jobs.spec` as the payload of
+/// `jammi_ai::jobs::ComputeSpec::Embedding`, so a call submitted through
+/// `InferenceSession::run_now` replays byte-for-byte on a fresh process.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingRequest {
+    /// Source whose rows are embedded.
+    pub source_id: String,
+    /// The encoder: `local:<path>`, a Hub repo id, or a fine-tuned id.
+    pub model_id: String,
+    /// Content columns embedded. The text tower joins them; the image and
+    /// audio towers take exactly one.
+    pub columns: Vec<String>,
+    /// Column whose value keys each embedding row.
+    pub key_column: String,
+    /// Which tower runs over the columns.
+    pub modality: Modality,
+    /// Serve the model's leading `dimensions` coordinates, each vector
+    /// L2-renormalised — a Matryoshka prefix. `None` serves the model's own
+    /// width; a width larger than the model's is refused.
+    pub dimensions: Option<usize>,
+    /// Opt-in memoization.
+    pub cache: CachePolicy,
+}
+
 /// A single query to encode into a vector. Text is encoded by the text tower;
 /// raw bytes are encoded by the image or audio tower, with the [`Modality`] the
 /// caller passes selecting which.

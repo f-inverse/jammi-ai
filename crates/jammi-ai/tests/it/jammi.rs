@@ -44,14 +44,15 @@ async fn open_local_yields_a_working_embedded_session() {
         .expect("add_source through the opened session");
 
     let record = session
-        .generate_embeddings(
-            "patents",
-            &tiny_bert(),
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .expect("generate_embeddings through the opened session")
         .0;

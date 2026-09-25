@@ -85,7 +85,6 @@ use crate::pipeline::asof::{
 use crate::pipeline::context_set::{
     ContextRequest, ContextSource, HybridMerge, MaterializedContext, SetAggregator,
 };
-use crate::pipeline::embedding::EmbeddingPipeline;
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather, EdgeSourceRef};
 use crate::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput as AiPropagationOutput,
@@ -251,38 +250,24 @@ impl InferenceSession {
                     .await?;
                 Ok((recomputed, outcome))
             }
+            // A versioned table's replay is a full embed of the current source
+            // into a NEW table at the recorded width: value-equivalent, a new
+            // chain root.
             ProducingDescriptor::Embedding {
                 model_id,
                 task,
                 source_id,
                 columns,
                 key_column,
-                dimensions: _,
-            } => {
-                let (record, outcome) =
-                    EmbeddingPipeline::new(self.as_ref(), &self.result_store(), task)
-                        .run(
-                            &source_id,
-                            &model_id,
-                            &columns,
-                            &key_column,
-                            CachePolicy::Bypass,
-                            // Recompute replays the unmodified materialization
-                            // funnel directly — it is not itself a job, so it
-                            // creates no `partial_result` link.
-                            None,
-                        )
-                        .await?;
-                Ok((record.table_name, outcome))
+                dimensions,
             }
-            // A versioned table's replay is a full embed of the current source
-            // into a NEW table: value-equivalent, a new chain root.
-            ProducingDescriptor::EmbeddingDelta {
+            | ProducingDescriptor::EmbeddingDelta {
                 model_id,
                 task,
                 source_id,
                 columns,
                 key_column,
+                dimensions,
                 ..
             }
             | ProducingDescriptor::EmbeddingCompaction {
@@ -291,19 +276,30 @@ impl InferenceSession {
                 source_id,
                 columns,
                 key_column,
+                dimensions,
                 ..
             } => {
+                let modality = jammi_wire::request::Modality::of_task(task).ok_or_else(|| {
+                    JammiError::Inference(format!(
+                        "table '{}' records an embedding descriptor over the non-embedding \
+                         task {task:?}",
+                        table.table_name
+                    ))
+                })?;
+                let request = jammi_wire::request::EmbeddingRequest {
+                    source_id,
+                    model_id,
+                    columns,
+                    key_column,
+                    modality,
+                    dimensions: Some(dimensions),
+                    cache: CachePolicy::Bypass,
+                };
+                // Recompute replays the unmodified materialization funnel
+                // directly — it is not itself a job, so it creates no
+                // `partial_result` link.
                 let (record, outcome) =
-                    EmbeddingPipeline::new(self.as_ref(), &self.result_store(), task)
-                        .run(
-                            &source_id,
-                            &model_id,
-                            &columns,
-                            &key_column,
-                            CachePolicy::Bypass,
-                            None,
-                        )
-                        .await?;
+                    self.generate_embeddings_materialize(&request, None).await?;
                 Ok((record.table_name, outcome))
             }
             ProducingDescriptor::NeighborGraph {

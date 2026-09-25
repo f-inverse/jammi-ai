@@ -1,34 +1,58 @@
 {
   "base_precision_at_10": {
     "tol": 0.01,
-    "value": 0.40349999999999997
+    "value": 0.4034999999999998
   },
   "cosent.precision_at_10": {
     "tol": 0.03,
-    "value": 0.40199999999999997
+    "value": 0.4019999999999997
   },
   "graph.precision_at_10": {
     "tol": 0.03,
-    "value": 0.4049999999999998
+    "value": 0.4050000000000001
   },
   "hard_neg.precision_at_10": {
     "tol": 0.03,
-    "value": 0.40400000000000014
+    "value": 0.4039999999999999
   },
   "matryoshka.precision_at_10": {
     "tol": 0.03,
-    "value": 0.40449999999999986
+    "value": 0.4045
   },
   "mnrl.precision_at_10": {
     "tol": 0.03,
-    "value": 0.40399999999999986
+    "value": 0.40399999999999975
   },
   "mnrl_t50.precision_at_10": {
     "tol": 0.03,
-    "value": 0.40399999999999964
+    "value": 0.40399999999999986
+  },
+  "prefix.matryoshka.16": {
+    "tol": 0.03,
+    "value": 0.3809999999999998
+  },
+  "prefix.matryoshka.32": {
+    "tol": 0.03,
+    "value": 0.40449999999999986
+  },
+  "prefix.matryoshka.8": {
+    "tol": 0.03,
+    "value": 0.3795000000000001
+  },
+  "prefix.mnrl.16": {
+    "tol": 0.03,
+    "value": 0.38149999999999984
+  },
+  "prefix.mnrl.32": {
+    "tol": 0.03,
+    "value": 0.4040000000000001
+  },
+  "prefix.mnrl.8": {
+    "tol": 0.03,
+    "value": 0.3794999999999999
   },
   "triplet.precision_at_10": {
     "tol": 0.03,
-    "value": 0.40349999999999964
+    "value": 0.4035
   }
 }

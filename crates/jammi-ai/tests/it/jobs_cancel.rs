@@ -254,14 +254,15 @@ async fn run_now_reports_superseded_when_its_row_went_terminal_before_the_finish
     let (session, _dir) = session_with_source(&source).await;
     let park = arm(&source, ParkPoint::BeforeFinish);
 
-    let spec = ComputeSpec::Embedding {
+    let spec = ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: source.clone(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality: jammi_wire::request::Modality::Text,
         cache: CachePolicy::Bypass,
-    };
+        dimensions: None,
+    });
     let runner = Arc::clone(&session);
     let run = tokio::spawn(async move { runner.run_now(spec).await });
 

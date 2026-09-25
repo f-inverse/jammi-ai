@@ -59,25 +59,27 @@ async fn embedding_run_now_and_a_claimed_job_are_byte_identical() {
     let modality = jammi_wire::request::Modality::Text;
 
     let (record_a, _) = session
-        .generate_embeddings(
-            "patents",
-            &tiny_bert_model(),
-            &["abstract".to_string()],
-            "id",
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert_model().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
             modality,
-            CachePolicy::Bypass,
-        )
+            dimensions: None,
+            cache: CachePolicy::Bypass,
+        })
         .await
         .unwrap();
 
-    let spec = ComputeSpec::Embedding {
+    let spec = ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: "patents".to_string(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality,
         cache: CachePolicy::Bypass,
-    };
+        dimensions: None,
+    });
     let (job_id, instance_id, attempts) = common::submit_and_claim(&session, &spec).await;
     let job_attempt = JobAttempt {
         job_id: &job_id,
@@ -322,14 +324,15 @@ async fn n1_reclaimed_attempt_adopts_the_ready_partial_result_table() {
     let (session, _dir) = session_with_patents().await;
     let lease = Duration::from_millis(60);
 
-    let spec = ComputeSpec::Embedding {
+    let spec = ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: "patents".to_string(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality: jammi_wire::request::Modality::Text,
         cache: CachePolicy::Bypass,
-    };
+        dimensions: None,
+    });
     let job_id = uuid::Uuid::new_v4().to_string();
     let spec_json = serde_json::to_string(&spec).unwrap();
     session
@@ -476,14 +479,15 @@ async fn expired_compute_attempt_re_materializes_on_the_successor() {
     let lease = Duration::from_millis(60);
     let writer_id = session.result_store().writer_id().to_string();
 
-    let spec = ComputeSpec::Embedding {
+    let spec = ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: "patents".to_string(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality: jammi_wire::request::Modality::Text,
         cache: CachePolicy::Bypass,
-    };
+        dimensions: None,
+    });
     let job_id = uuid::Uuid::new_v4().to_string();
     let spec_json = serde_json::to_string(&spec).unwrap();
     session

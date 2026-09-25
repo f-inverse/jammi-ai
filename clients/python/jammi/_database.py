@@ -1594,16 +1594,20 @@ class RemoteDatabase:
         model: str,
         query: Union[str, bytes],
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
     ) -> List[float]:
         """Encode a single query into an embedding vector with the given model.
 
         `query` is a string for the text tower or raw bytes for the image/audio
         tower; `modality` selects the tower. Maps to `EmbeddingService.EncodeQuery`.
+        `dimensions` encodes to the model's leading coordinates, L2-renormalised
+        — the width of a table generated with the same `dimensions`.
         """
         request = build_encode_query_request(
             model=model,
             query=query,
             modality=modality,
+            dimensions=dimensions,
         )
         resp = self._call(self._embedding.EncodeQuery, request)
         return list(resp.embedding)
@@ -1616,9 +1620,14 @@ class RemoteDatabase:
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Embed `columns` of a registered source, persisting one vector per row.
+
+        `dimensions` serves the model's leading coordinates, each vector
+        L2-renormalised — a Matryoshka prefix: a smaller index from a model
+        trained with `matryoshka_dims` — instead of its full width.
 
         `modality` selects the tower; `cache` opts into memoization (``"use"``)
         or keeps the default recompute (``None``/``"bypass"``). Returns the
@@ -1630,6 +1639,7 @@ class RemoteDatabase:
             columns=columns,
             key=key,
             modality=modality,
+            dimensions=dimensions,
             cache=cache,
         )
         resp = self._call(self._embedding.GenerateEmbeddings, request)

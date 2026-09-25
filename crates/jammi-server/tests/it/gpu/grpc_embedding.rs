@@ -134,6 +134,7 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
             key_column: "id".into(),
             modality: Modality::Text as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings")
@@ -155,6 +156,7 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
             model_id,
             modality: Modality::Text as i32,
             input: Some(EncodeInput::Text("quantum computing applications".into())),
+            dimensions: None,
         })
         .await
         .expect("encode_query")

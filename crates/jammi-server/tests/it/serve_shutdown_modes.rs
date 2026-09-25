@@ -703,6 +703,7 @@ async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
                 key_column: "id".into(),
                 modality: Modality::Text as i32,
                 cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+                dimensions: None,
             })
             .await
     });
@@ -1268,6 +1269,7 @@ async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
             key_column: "id".into(),
             modality: Modality::Text as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings")

@@ -215,6 +215,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings");
@@ -301,6 +302,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             key_column: "id".into(),
             modality: Modality::Text as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings for eval")

@@ -989,7 +989,7 @@ impl InferenceSession {
             key_column: params.key_column.clone(),
             source_id: params.source_id.clone(),
             chunk: inference.chunk_budget()?,
-            embedding_dim: Some(definition.embedding_dim),
+            embedding_dim: Some(params.dimensions),
             regression_form: None,
             passthrough: vec![CONTENT_HASH_COLUMN.to_string()],
             device_kind: self.required_device_kind(),
@@ -1011,7 +1011,7 @@ impl InferenceSession {
             .write_version_fragment(
                 version,
                 SinkKind::Embeddings {
-                    dimensions: definition.embedding_dim,
+                    dimensions: params.dimensions,
                     ann: *store.ann_config(),
                     segment_rows: self.inner_config().embedding.index_segment_rows,
                     checkpoint_interval: 0,

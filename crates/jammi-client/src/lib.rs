@@ -70,8 +70,8 @@ use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use jammi_wire::request::{
-    FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput, SearchQuery,
-    SearchRequest,
+    EmbeddingRequest, FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput,
+    SearchQuery, SearchRequest,
 };
 use jammi_wire::{
     audit_error_from_status, cohorts_to_proto, config_to_proto, decode_subscribed_batch,
@@ -204,26 +204,31 @@ impl DataClient {
 
     // --- embeddings ------------------------------------------------------
 
-    /// Generate embeddings for `columns` of a source with the given model and
-    /// modality, persisting one vector per row.
+    /// Generate embeddings for a source's `columns` with the request's model
+    /// and modality, persisting one vector per row at the request's width.
     pub async fn generate_embeddings(
         &self,
-        source_id: &str,
-        model_id: &str,
-        columns: &[String],
-        key_column: &str,
-        modality: Modality,
-        cache: CachePolicy,
+        request: EmbeddingRequest,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
+        let EmbeddingRequest {
+            source_id,
+            model_id,
+            columns,
+            key_column,
+            modality,
+            dimensions,
+            cache,
+        } = request;
         let table = self
             .embedding_client()
             .generate_embeddings(GenerateEmbeddingsRequest {
-                source_id: source_id.to_string(),
-                model_id: model_id.to_string(),
-                columns: columns.to_vec(),
-                key_column: key_column.to_string(),
+                source_id,
+                model_id,
+                columns,
+                key_column,
                 modality: proto_modality(modality) as i32,
                 cache: jammi_wire::cache_policy_to_proto(cache) as i32,
+                dimensions: dimensions.map(|d| d as u32),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -234,12 +239,14 @@ impl DataClient {
         Ok((record, outcome))
     }
 
-    /// Encode a single query into a vector with the given model.
+    /// Encode a single query into a vector with the given model, at
+    /// `dimensions` (a Matryoshka prefix) or the model's own width.
     pub async fn encode_query(
         &self,
         model_id: &str,
         input: QueryInput,
         modality: Modality,
+        dimensions: Option<usize>,
     ) -> Result<Vec<f32>> {
         let input = match input {
             QueryInput::Text(text) => ProtoEncodeInput::Text(text),
@@ -251,6 +258,7 @@ impl DataClient {
                 model_id: model_id.to_string(),
                 modality: proto_modality(modality) as i32,
                 input: Some(input),
+                dimensions: dimensions.map(|d| d as u32),
             })
             .await
             .map_err(|s| error_from_status(&s))?

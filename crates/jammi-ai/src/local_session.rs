@@ -60,8 +60,8 @@ use jammi_datafusion::ModelSource;
 /// converters can satisfy the orphan rule; re-exported here so an embedded
 /// consumer reaches it as `jammi_ai::*`, alongside the [`Session`] it drives.
 pub use jammi_wire::request::{
-    FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput, SearchQuery,
-    SearchRequest,
+    EmbeddingRequest, FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput,
+    SearchQuery, SearchRequest,
 };
 
 pub use crate::pipeline::lexical::BuildLexicalIndex;
@@ -287,21 +287,15 @@ impl Session {
 
     // --- embeddings ------------------------------------------------------
 
-    /// Generate embeddings for `columns` of a source with the given model and
-    /// modality, persisting one vector per row. `key_column` carries each row's
-    /// stable key into the result table.
+    /// Generate embeddings for a source's `columns` with the request's model
+    /// and modality, persisting one vector per row keyed by its `key_column`,
+    /// at the request's `dimensions` (a Matryoshka prefix) or the model's
+    /// width.
     pub async fn generate_embeddings(
         &self,
-        source_id: &str,
-        model_id: &str,
-        columns: &[String],
-        key_column: &str,
-        modality: Modality,
-        cache: jammi_db::store::CachePolicy,
+        request: EmbeddingRequest,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        self.engine
-            .generate_embeddings(source_id, model_id, columns, key_column, modality, cache)
-            .await
+        self.engine.generate_embeddings(request).await
     }
 
     /// Register precomputed per-row vectors as a ready `(source, model)`
@@ -339,8 +333,21 @@ impl Session {
 
     /// Encode a single query into a vector with the given model. The `modality`
     /// selects the tower; `input` must match it (text for [`Modality::Text`],
-    /// bytes for image/audio).
+    /// bytes for image/audio). `dimensions` encodes to the model's leading
+    /// coordinates, L2-renormalised — the width of a table generated with the
+    /// same `dimensions` — and `None` to the model's own width.
     pub async fn encode_query(
+        &self,
+        model_id: &str,
+        input: QueryInput,
+        modality: Modality,
+        dimensions: Option<usize>,
+    ) -> Result<Vec<f32>> {
+        let vector = self.encode_full_width(model_id, input, modality).await?;
+        crate::pipeline::embedding::serve_query(model_id, vector, dimensions)
+    }
+
+    async fn encode_full_width(
         &self,
         model_id: &str,
         input: QueryInput,

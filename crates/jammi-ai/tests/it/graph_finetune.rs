@@ -1454,14 +1454,15 @@ async fn a_graph_fine_tune_walks_an_engine_built_neighbour_graph() {
     let graph = two_community_graph(dir.path()).await;
     let session = &graph.session;
     let (embeddings, _) = session
-        .generate_embeddings(
-            "nodes",
-            &graph.model,
-            &["text".to_string()],
-            "id",
-            jammi_wire::request::Modality::Text,
-            CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "nodes".to_string(),
+            model_id: graph.model.to_string(),
+            columns: vec!["text".to_string()],
+            key_column: "id".to_string(),
+            modality: jammi_wire::request::Modality::Text,
+            dimensions: None,
+            cache: CachePolicy::Bypass,
+        })
         .await
         .unwrap();
     let (neighbours, _) = session

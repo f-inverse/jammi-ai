@@ -10,13 +10,45 @@ use crate::inference::output::BackendOutput;
 
 /// Adapt raw float embeddings into a `FixedSizeList<Float32>` Arrow column.
 pub struct EmbeddingAdapter {
+    /// The width the model emits.
+    native: usize,
+    /// The width the adapter serves: `native`, or a Matryoshka prefix of it.
     dimensions: usize,
 }
 
 impl EmbeddingAdapter {
-    /// Create an adapter for embeddings of the given dimensionality.
+    /// Create an adapter serving embeddings at the model's own width.
     pub fn new(dimensions: usize) -> Self {
-        Self { dimensions }
+        Self {
+            native: dimensions,
+            dimensions,
+        }
+    }
+
+    /// Create an adapter serving the leading `dimensions` coordinates of a
+    /// model that emits `native`, each row L2-renormalised
+    /// ([`matryoshka_prefix`]). A width of zero, or wider than the model's, is
+    /// refused.
+    pub fn serving(native: usize, dimensions: usize) -> Result<Self> {
+        if dimensions == 0 || dimensions > native {
+            return Err(Error::Inference(format!(
+                "cannot serve {dimensions} dimensions of an embedding {native} wide"
+            )));
+        }
+        Ok(Self { native, dimensions })
+    }
+}
+
+/// The leading `width` coordinates of `row`, L2-renormalised: a Matryoshka
+/// prefix served as an embedding of its own. A prefix with zero norm is
+/// returned as is.
+pub fn matryoshka_prefix(row: &[f32], width: usize) -> Vec<f32> {
+    let prefix = &row[..width.min(row.len())];
+    let norm = prefix.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        prefix.iter().map(|v| v / norm).collect()
+    } else {
+        prefix.to_vec()
     }
 }
 
@@ -53,15 +85,15 @@ impl OutputAdapter for EmbeddingAdapter {
             ));
         }
         let flat_values = float_outputs.swap_remove(0);
-        // `row_count * self.dimensions` with a raw multiply can silently
-        // overflow on an adversarial `row_count`/`dimensions` pair; the
+        // `row_count * self.native` with a raw multiply can silently
+        // overflow on an adversarial `row_count`/`native` pair; the
         // checked multiply refuses by name instead (mirrors
         // `BackendOutput::checked_rows`'s `rows.checked_mul(dim)`).
-        let expected = row_count.checked_mul(self.dimensions).ok_or_else(|| {
+        let expected = row_count.checked_mul(self.native).ok_or_else(|| {
             Error::Inference(format!(
                 "embedding adapter: row_count*dim overflows (row_count={row_count}, \
                  dim={})",
-                self.dimensions
+                self.native
             ))
         })?;
         if flat_values.len() != expected {
@@ -69,9 +101,17 @@ impl OutputAdapter for EmbeddingAdapter {
                 "embedding adapter: head has {} floats, expected rows({row_count}) * \
                  dim({})",
                 flat_values.len(),
-                self.dimensions
+                self.native
             )));
         }
+        let flat_values = if self.dimensions == self.native {
+            flat_values
+        } else {
+            flat_values
+                .chunks_exact(self.native)
+                .flat_map(|row| matryoshka_prefix(row, self.dimensions))
+                .collect()
+        };
         // `FixedSizeListArray::new` panics (rather than returning an error)
         // when the null buffer's length disagrees with the values array's
         // row count. Refuse by name here, before construction, rather than
@@ -195,5 +235,43 @@ mod tests {
         assert_eq!(array.len(), 2);
         assert!(array.is_valid(0));
         assert!(array.is_null(1));
+    }
+
+    #[test]
+    fn a_served_prefix_is_each_rows_leading_coordinates_renormalised() {
+        let out = two_rows_dim3(vec![true, true]);
+        let cols = EmbeddingAdapter::serving(3, 2)
+            .unwrap()
+            .adapt(out, 2)
+            .unwrap();
+        let array = cols[0]
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(array.value_length(), 2);
+        let values = array
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        let (a, b) = (1.0 / 5f32.sqrt(), 2.0 / 5f32.sqrt());
+        let (c, d) = (4.0 / 41f32.sqrt(), 5.0 / 41f32.sqrt());
+        for (got, want) in values.iter().zip([a, b, c, d]) {
+            assert!((got - want).abs() < 1e-6, "{values:?}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_wider_than_the_model_or_empty_is_refused() {
+        assert!(EmbeddingAdapter::serving(3, 4).is_err());
+        assert!(EmbeddingAdapter::serving(3, 0).is_err());
+        assert!(EmbeddingAdapter::serving(3, 3).is_ok());
+    }
+
+    #[test]
+    fn a_zero_prefix_is_served_unscaled() {
+        assert_eq!(matryoshka_prefix(&[0.0, 0.0, 1.0], 2), vec![0.0, 0.0]);
     }
 }

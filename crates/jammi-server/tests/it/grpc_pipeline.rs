@@ -86,6 +86,7 @@ where
             key_column: "id".into(),
             modality: Modality::Text as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings")

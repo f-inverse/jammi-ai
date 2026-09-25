@@ -33,7 +33,7 @@ pub use embedding::{
     encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,
     generate_embeddings_from_proto, import_embeddings_from_bytes, import_embeddings_from_proto,
     lexical_search_from_bytes, lexical_search_from_proto, search_from_bytes, search_from_proto,
-    EncodeQueryArgs, GenerateEmbeddingsArgs, ImportEmbeddingsArgs,
+    EncodeQueryArgs, ImportEmbeddingsArgs,
 };
 pub use embedding_refresh::{
     compact_embeddings_from_bytes, compact_embeddings_from_proto, expire_versions_from_bytes,

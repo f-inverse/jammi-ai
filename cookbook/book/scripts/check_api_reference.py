@@ -38,8 +38,8 @@ REQUIRED: dict[str, list[str]] = {
     "set_tenant": [],
     "tenant_scope": [],
     "tenant": [],
-    "generate_embeddings": ["source", "model", "columns", "key", "cache"],
-    "encode_query": ["model", "query"],
+    "generate_embeddings": ["source", "model", "columns", "key", "dimensions", "cache"],
+    "encode_query": ["model", "query", "dimensions"],
     "sql": [],
     "rrf_fuse": [],
     # tier 01

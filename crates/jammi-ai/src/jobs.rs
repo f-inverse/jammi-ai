@@ -133,14 +133,7 @@ pub enum ComputeSpec {
         params: BuildLexicalIndex,
     },
     /// [`InferenceSession::generate_embeddings`]'s inputs.
-    Embedding {
-        source_id: String,
-        model_id: String,
-        columns: Vec<String>,
-        key_column: String,
-        modality: jammi_wire::request::Modality,
-        cache: CachePolicy,
-    },
+    Embedding(jammi_wire::request::EmbeddingRequest),
     /// [`InferenceSession::infer`]'s inputs.
     Infer {
         source_id: String,
@@ -161,7 +154,8 @@ impl ComputeSpec {
     /// for the kinds that take no model.
     pub fn model_source(&self) -> Option<String> {
         match self {
-            ComputeSpec::Embedding { model_id, .. } | ComputeSpec::Infer { model_id, .. } => {
+            ComputeSpec::Embedding(jammi_wire::request::EmbeddingRequest { model_id, .. })
+            | ComputeSpec::Infer { model_id, .. } => {
                 Some(jammi_datafusion::ModelSource::parse(model_id).to_string())
             }
             ComputeSpec::NeighborGraph { .. }
@@ -180,7 +174,7 @@ impl ComputeSpec {
         match self {
             ComputeSpec::NeighborGraph { source_id, .. }
             | ComputeSpec::LexicalIndex { source_id, .. }
-            | ComputeSpec::Embedding { source_id, .. }
+            | ComputeSpec::Embedding(jammi_wire::request::EmbeddingRequest { source_id, .. })
             | ComputeSpec::Infer { source_id, .. } => source_id,
             ComputeSpec::Propagate { request, .. } => &request.source_id,
             ComputeSpec::GraphStructure { request, .. } => &request.source_id,
@@ -200,7 +194,7 @@ impl ComputeSpec {
             ComputeSpec::GraphStructure { .. } => "graph_structure",
             ComputeSpec::AsofJoin { .. } => "asof_join",
             ComputeSpec::LexicalIndex { .. } => "lexical_index",
-            ComputeSpec::Embedding { .. } => "embedding",
+            ComputeSpec::Embedding(_) => "embedding",
             ComputeSpec::Infer { .. } => "infer",
         }
     }
@@ -315,14 +309,7 @@ pub enum JobSpec {
         params: BuildLexicalIndex,
     },
     /// Field-for-field identical to [`ComputeSpec::Embedding`].
-    Embedding {
-        source_id: String,
-        model_id: String,
-        columns: Vec<String>,
-        key_column: String,
-        modality: jammi_wire::request::Modality,
-        cache: CachePolicy,
-    },
+    Embedding(jammi_wire::request::EmbeddingRequest),
     /// Field-for-field identical to [`ComputeSpec::Infer`].
     Infer {
         source_id: String,
@@ -346,7 +333,7 @@ impl JobSpec {
             JobSpec::GraphStructure { .. } => "graph_structure",
             JobSpec::AsofJoin { .. } => "asof_join",
             JobSpec::LexicalIndex { .. } => "lexical_index",
-            JobSpec::Embedding { .. } => "embedding",
+            JobSpec::Embedding(_) => "embedding",
             JobSpec::Infer { .. } => "infer",
         }
     }
@@ -402,7 +389,7 @@ impl JobSpec {
             | JobSpec::GraphStructure { .. }
             | JobSpec::AsofJoin { .. }
             | JobSpec::LexicalIndex { .. }
-            | JobSpec::Embedding { .. }
+            | JobSpec::Embedding(_)
             | JobSpec::Infer { .. } => return None,
         })
     }
@@ -443,21 +430,7 @@ impl JobSpec {
                 source_id: source_id.clone(),
                 params: params.clone(),
             },
-            JobSpec::Embedding {
-                source_id,
-                model_id,
-                columns,
-                key_column,
-                modality,
-                cache,
-            } => ComputeSpec::Embedding {
-                source_id: source_id.clone(),
-                model_id: model_id.clone(),
-                columns: columns.clone(),
-                key_column: key_column.clone(),
-                modality: *modality,
-                cache: *cache,
-            },
+            JobSpec::Embedding(request) => ComputeSpec::Embedding(request.clone()),
             JobSpec::Infer {
                 source_id,
                 model_id,
@@ -487,7 +460,8 @@ impl JobSpec {
     /// column pair).
     fn model_source(&self) -> Option<String> {
         match self {
-            JobSpec::Embedding { model_id, .. } | JobSpec::Infer { model_id, .. } => {
+            JobSpec::Embedding(jammi_wire::request::EmbeddingRequest { model_id, .. })
+            | JobSpec::Infer { model_id, .. } => {
                 Some(jammi_datafusion::ModelSource::parse(model_id).to_string())
             }
             _ => None,
@@ -519,21 +493,7 @@ impl From<ComputeSpec> for JobSpec {
             ComputeSpec::LexicalIndex { source_id, params } => {
                 JobSpec::LexicalIndex { source_id, params }
             }
-            ComputeSpec::Embedding {
-                source_id,
-                model_id,
-                columns,
-                key_column,
-                modality,
-                cache,
-            } => JobSpec::Embedding {
-                source_id,
-                model_id,
-                columns,
-                key_column,
-                modality,
-                cache,
-            },
+            ComputeSpec::Embedding(request) => JobSpec::Embedding(request),
             ComputeSpec::Infer {
                 source_id,
                 model_id,
@@ -843,54 +803,10 @@ pub async fn execute_compute(
                 cache_outcome: CacheOutcome::Computed,
             })
         }
-        ComputeSpec::Embedding {
-            source_id,
-            model_id,
-            columns,
-            key_column,
-            modality,
-            cache,
-        } => {
-            let (record, outcome) = match modality {
-                jammi_wire::request::Modality::Text => {
-                    session
-                        .generate_text_embeddings(
-                            source_id,
-                            model_id,
-                            columns,
-                            key_column,
-                            *cache,
-                            Some(job_attempt),
-                        )
-                        .await?
-                }
-                jammi_wire::request::Modality::Image => {
-                    let image_column = crate::local_session::single_column(columns, "image")?;
-                    session
-                        .generate_image_embeddings(
-                            source_id,
-                            model_id,
-                            image_column,
-                            key_column,
-                            *cache,
-                            Some(job_attempt),
-                        )
-                        .await?
-                }
-                jammi_wire::request::Modality::Audio => {
-                    let audio_column = crate::local_session::single_column(columns, "audio")?;
-                    session
-                        .generate_audio_embeddings(
-                            source_id,
-                            model_id,
-                            audio_column,
-                            key_column,
-                            *cache,
-                            Some(job_attempt),
-                        )
-                        .await?
-                }
-            };
+        ComputeSpec::Embedding(request) => {
+            let (record, outcome) = session
+                .generate_embeddings_materialize(request, Some(job_attempt))
+                .await?;
             Ok(table_result(record, outcome))
         }
         ComputeSpec::Infer {
@@ -1796,14 +1712,15 @@ mod tests {
                 )
                 .build(),
             },
-            ComputeSpec::Embedding {
+            ComputeSpec::Embedding(jammi_wire::request::EmbeddingRequest {
                 source_id: "s".into(),
                 model_id: "m".into(),
                 columns: vec!["text".into()],
                 key_column: "id".into(),
                 modality: jammi_wire::request::Modality::Text,
+                dimensions: Some(16),
                 cache: CachePolicy::Bypass,
-            },
+            }),
             ComputeSpec::Infer {
                 source_id: "s".into(),
                 model_id: "m".into(),

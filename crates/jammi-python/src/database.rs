@@ -712,18 +712,11 @@ impl PyDatabase {
     /// table name. A malformed or invalid body raises `ValueError`.
     fn _generate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
         self.check_open()?;
-        let args =
+        let request =
             jammi_ai::wire::generate_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let (record, _outcome) = crate::released(
             &self.runtime,
-            self.local_session().generate_embeddings(
-                &args.source_id,
-                &args.model_id,
-                &args.columns,
-                &args.key_column,
-                args.modality,
-                args.cache,
-            ),
+            self.local_session().generate_embeddings(request),
         )
         .map_err(to_pyerr)?;
         Ok(record.table_name)
@@ -1558,8 +1551,12 @@ impl PyDatabase {
         let args = jammi_ai::wire::encode_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         crate::released(
             &self.runtime,
-            self.local_session()
-                .encode_query(&args.model_id, args.input, args.modality),
+            self.local_session().encode_query(
+                &args.model_id,
+                args.input,
+                args.modality,
+                args.dimensions,
+            ),
         )
         .map_err(to_pyerr)
     }

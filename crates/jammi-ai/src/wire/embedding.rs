@@ -4,8 +4,9 @@
 //!
 //! The transport-neutral modality / query-input conversions live on the wire
 //! substrate ([`jammi_wire`]); what stays here are the request decoders that
-//! return the engine's flat call args (`GenerateEmbeddingsArgs`,
-//! `EncodeQueryArgs`) and the [`SearchRequest`] the session search verb takes.
+//! return the requests the session verbs take ([`EmbeddingRequest`],
+//! [`SearchRequest`], [`LexicalSearchRequest`]) and the `EncodeQueryArgs` of a
+//! query encode.
 //!
 //! The embedded binding builds each request with the same pure-Python assembly
 //! the remote client uses, serializes it, and hands the bytes here — so the
@@ -18,33 +19,18 @@ use prost::Message;
 use tonic::Status;
 
 use crate::local_session::{
-    LexicalSearchRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+    EmbeddingRequest, LexicalSearchRequest, Modality, QueryInput, SearchQuery, SearchRequest,
 };
 use jammi_wire::proto::embedding as pb;
 use jammi_wire::ProtoQueryInput;
 
-/// The decoded identity + tower a `GenerateEmbeddings` request carries. The
-/// engine method (`Session::generate_embeddings`) takes these separately, so the
-/// decode returns them as a struct the binding destructures.
-pub struct GenerateEmbeddingsArgs {
-    pub source_id: String,
-    pub model_id: String,
-    pub columns: Vec<String>,
-    pub key_column: String,
-    pub modality: Modality,
-    /// The opt-in memoization policy (the engine method's `cache` arg). Embedding
-    /// anchors its source `UnpinnedAtInstant`, so `Use` is honestly always a
-    /// miss; the field rides for surface uniformity with the cacheable producers.
-    pub cache: jammi_db::store::CachePolicy,
-}
-
 /// Decode a serialized [`pb::GenerateEmbeddingsRequest`] body into the engine
-/// [`GenerateEmbeddingsArgs`]. The embedded binding builds the request with the
+/// [`EmbeddingRequest`]. The embedded binding builds the request with the
 /// same pure-Python assembly the remote client uses, serializes it, and hands
 /// the bytes here — so the in-process and remote embedding paths decode through
 /// one shared seam ([`generate_embeddings_from_proto`]). A body that is not a
 /// valid `GenerateEmbeddingsRequest` is a client error (`InvalidArgument`).
-pub fn generate_embeddings_from_bytes(body: &[u8]) -> Result<GenerateEmbeddingsArgs, Status> {
+pub fn generate_embeddings_from_bytes(body: &[u8]) -> Result<EmbeddingRequest, Status> {
     let req = pb::GenerateEmbeddingsRequest::decode(body).map_err(|e| {
         Status::invalid_argument(format!("malformed GenerateEmbeddings request: {e}"))
     })?;
@@ -52,13 +38,13 @@ pub fn generate_embeddings_from_bytes(body: &[u8]) -> Result<GenerateEmbeddingsA
 }
 
 /// Decode a [`pb::GenerateEmbeddingsRequest`] into the engine
-/// [`GenerateEmbeddingsArgs`]. The required identity fields (`source_id` /
+/// [`EmbeddingRequest`]. The required identity fields (`source_id` /
 /// `model_id` / `key_column`) and a non-empty `columns` list are validated at
 /// decode rather than deferred to the engine, and the modality is resolved
 /// (an unspecified tower is rejected) — matching the gRPC handler's edge checks.
 pub fn generate_embeddings_from_proto(
     req: pb::GenerateEmbeddingsRequest,
-) -> Result<GenerateEmbeddingsArgs, Status> {
+) -> Result<EmbeddingRequest, Status> {
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
@@ -71,12 +57,13 @@ pub fn generate_embeddings_from_proto(
     if req.columns.is_empty() {
         return Err(Status::invalid_argument("columns is required"));
     }
-    Ok(GenerateEmbeddingsArgs {
+    Ok(EmbeddingRequest {
         source_id: req.source_id,
         model_id: req.model_id,
         columns: req.columns,
         key_column: req.key_column,
         modality: Modality::try_from(req.modality)?,
+        dimensions: req.dimensions.map(|d| d as usize),
         cache: jammi_wire::cache_policy_from_proto(req.cache)?,
     })
 }
@@ -151,6 +138,8 @@ pub struct EncodeQueryArgs {
     pub model_id: String,
     pub input: QueryInput,
     pub modality: Modality,
+    /// The width to encode to (a Matryoshka prefix); `None` is the model's.
+    pub dimensions: Option<usize>,
 }
 
 /// Decode a serialized [`pb::EncodeQueryRequest`] body into the engine
@@ -184,6 +173,7 @@ pub fn encode_query_from_proto(req: pb::EncodeQueryRequest) -> Result<EncodeQuer
         model_id: req.model_id,
         input,
         modality,
+        dimensions: req.dimensions.map(|d| d as usize),
     })
 }
 

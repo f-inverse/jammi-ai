@@ -30,6 +30,7 @@ pub mod training;
 
 pub use device::ComputeDeviceKind;
 pub use error::{Error, Result};
+pub use inference::adapter::matryoshka_prefix;
 pub use inference::exec::{inference_specs, plan_inference, InferenceExec, InferenceFanOut};
 pub use inference::numbered::NumberedInputExec;
 pub use inference::output::BackendOutput;

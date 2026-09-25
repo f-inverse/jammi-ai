@@ -175,6 +175,7 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings")
@@ -196,6 +197,7 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
             model_id,
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Data(query_wav)),
+            dimensions: None,
         })
         .await
         .expect("encode_query")
@@ -246,6 +248,7 @@ async fn generate_and_encode_text_modality_over_the_wire() {
             key_column: "id".into(),
             modality: Modality::Text as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings")
@@ -267,6 +270,7 @@ async fn generate_and_encode_text_modality_over_the_wire() {
             model_id,
             modality: Modality::Text as i32,
             input: Some(EncodeInput::Text("quantum computing applications".into())),
+            dimensions: None,
         })
         .await
         .expect("encode_query")
@@ -315,6 +319,7 @@ async fn embed_corpus(
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings");
@@ -330,6 +335,7 @@ async fn encode_audio_query(
             model_id: htsat_clap_model_id(),
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Data(clip)),
+            dimensions: None,
         })
         .await
         .expect("encode_query")
@@ -536,6 +542,7 @@ async fn generate_embeddings_rejects_unspecified_modality() {
             key_column: "clip_id".into(),
             modality: Modality::Unspecified as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect_err("unspecified modality must be rejected");
@@ -556,6 +563,7 @@ async fn encode_query_rejects_input_modality_mismatch() {
             model_id: tiny_bert_model_id(),
             modality: Modality::Text as i32,
             input: Some(EncodeInput::Data(vec![1, 2, 3])),
+            dimensions: None,
         })
         .await
         .expect_err("text modality with bytes input must be rejected");
@@ -567,6 +575,7 @@ async fn encode_query_rejects_input_modality_mismatch() {
             model_id: htsat_clap_model_id(),
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Text("not audio".into())),
+            dimensions: None,
         })
         .await
         .expect_err("audio modality with text input must be rejected");
@@ -825,6 +834,7 @@ async fn encode_query_rejects_empty_data() {
             model_id: htsat_clap_model_id(),
             modality: Modality::Audio as i32,
             input: Some(EncodeInput::Data(Vec::new())),
+            dimensions: None,
         })
         .await
         .expect_err("empty data must be rejected");

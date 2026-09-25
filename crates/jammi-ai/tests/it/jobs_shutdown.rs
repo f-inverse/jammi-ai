@@ -127,14 +127,15 @@ fn fine_tune(epochs: usize) -> JobSpec {
 
 /// A compute kind that materializes a real table over the patents fixture.
 fn embedding_spec(source: &str) -> ComputeSpec {
-    ComputeSpec::Embedding {
+    ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: source.to_string(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality: jammi_wire::request::Modality::Text,
         cache: CachePolicy::Bypass,
-    }
+        dimensions: None,
+    })
 }
 
 /// A compute kind whose producer can never run (the model does not exist):

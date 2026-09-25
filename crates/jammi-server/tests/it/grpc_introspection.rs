@@ -126,14 +126,15 @@ async fn remote_list_and_describe_sources_like_local() {
         .await
         .expect("add_source");
     let table = local
-        .generate_embeddings(
-            "patents",
-            &tiny_bert_model_id(),
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert_model_id().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .expect("generate_embeddings")
         .0;
@@ -483,14 +484,15 @@ async fn materialization_reads_cross_the_wire_like_local() {
         .await
         .expect("add_source");
     let table = local
-        .generate_embeddings(
-            "patents",
-            &tiny_bert_model_id(),
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert_model_id().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: CachePolicy::Bypass,
+        })
         .await
         .expect("generate_embeddings")
         .0;

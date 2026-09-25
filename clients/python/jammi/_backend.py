@@ -137,7 +137,12 @@ class Session(Protocol):
 
     # --- Embeddings + search ----------------------------------------------------
     def encode_query(
-        self, *, model: str, query: Union[str, bytes], modality: Optional[str] = None
+        self,
+        *,
+        model: str,
+        query: Union[str, bytes],
+        modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
     ) -> List[float]: ...
     def generate_embeddings(
         self,
@@ -147,6 +152,7 @@ class Session(Protocol):
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
         cache: Optional[str] = None,
     ) -> str: ...
     def import_embeddings(

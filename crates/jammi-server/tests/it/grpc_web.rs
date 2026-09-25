@@ -368,6 +368,7 @@ async fn grpc_web_error_carries_in_body_trailer_with_detail() {
         model_id: "local:/does/not/exist".into(),
         modality: Modality::Text as i32,
         input: Some(Input::Text("a query".into())),
+        dimensions: None,
     };
     let mut payload = Vec::new();
     request_proto.encode(&mut payload).expect("encode proto");

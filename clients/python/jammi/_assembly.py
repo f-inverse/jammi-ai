@@ -1401,6 +1401,7 @@ def build_generate_embeddings_request(
     columns: List[str],
     key: str,
     modality: Optional[str] = None,
+    dimensions: Optional[int] = None,
     cache: Optional[str] = None,
 ) -> embedding_pb2.GenerateEmbeddingsRequest:
     """Assemble the `GenerateEmbeddingsRequest` for a bulk embedding run from the
@@ -1408,11 +1409,13 @@ def build_generate_embeddings_request(
 
     `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
     text); `key` names the column whose value becomes each embedding row's key;
-    `cache` opts into memoization (``"use"``) or keeps the default recompute
+    `dimensions` serves the model's leading coordinates, L2-renormalised — a
+    Matryoshka prefix — instead of its full width; `cache` opts into
+    memoization (``"use"``) or keeps the default recompute
     (``None``/``"bypass"``). The same request the embed binding submits
     in-process.
     """
-    return embedding_pb2.GenerateEmbeddingsRequest(
+    request = embedding_pb2.GenerateEmbeddingsRequest(
         source_id=source,
         model_id=model,
         columns=list(columns),
@@ -1420,6 +1423,9 @@ def build_generate_embeddings_request(
         modality=_modality_value(modality),
         cache=_cache_policy_value(cache),
     )
+    if dimensions is not None:
+        request.dimensions = dimensions
+    return request
 
 
 def build_import_embeddings_request(
@@ -1456,6 +1462,7 @@ def build_encode_query_request(
     model: str,
     query: Union[str, bytes],
     modality: Optional[str] = None,
+    dimensions: Optional[int] = None,
 ) -> embedding_pb2.EncodeQueryRequest:
     """Assemble the `EncodeQueryRequest` for a single-query encode from the
     binding's flat kwargs.
@@ -1463,12 +1470,16 @@ def build_encode_query_request(
     `query` is a string for the text tower or raw bytes for the image/audio
     tower; `modality` selects the tower (defaulting to text). The `input` oneof
     carries the text or the bytes — exactly one, matched to the modality at the
-    decode edge. The same request the embed binding submits in-process.
+    decode edge. `dimensions` encodes to the model's leading coordinates,
+    L2-renormalised — the width of a table generated with the same
+    `dimensions`. The same request the embed binding submits in-process.
     """
     request = embedding_pb2.EncodeQueryRequest(
         model_id=model,
         modality=_modality_value(modality),
     )
+    if dimensions is not None:
+        request.dimensions = dimensions
     if isinstance(query, str):
         request.text = query
     elif isinstance(query, (bytes, bytearray)):

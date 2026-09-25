@@ -284,9 +284,10 @@ mod result_table_kind_tests {
         assert_eq!(pb::ResultTableKind::TrainingSet as i32, 4);
         assert_eq!(pb::ResultTableKind::Statement as i32, 5);
         assert_eq!(pb::ResultTableKind::Working as i32, 6);
+        assert_eq!(pb::ResultTableKind::Lexical as i32, 7);
         assert_eq!(
             wire_kind_values(),
-            vec![0, 1, 2, 3, 4, 5, 6],
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
             "the served ResultTableKind values are frozen; adding one is an \
              append to this list, renumbering or removing one is breaking"
         );

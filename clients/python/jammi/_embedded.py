@@ -1156,6 +1156,7 @@ class EmbeddedBackend:
         model: str,
         query: Union[str, bytes],
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
     ) -> List[float]:
         """Encode a single query into an embedding vector with the given model.
 
@@ -1164,11 +1165,14 @@ class EmbeddedBackend:
         defaulting to text). Same handle shape and verb signature as the remote
         `RemoteDatabase.encode_query`; the request is assembled with the shared
         `EncodeQueryRequest` builder and submitted through the engine's wire seam.
+        `dimensions` encodes to the model's leading coordinates, L2-renormalised
+        — the width of a table generated with the same `dimensions`.
         """
         request = build_encode_query_request(
             model=model,
             query=query,
             modality=modality,
+            dimensions=dimensions,
         )
         return self._native._encode_query_proto(request.SerializeToString())
 
@@ -1180,9 +1184,14 @@ class EmbeddedBackend:
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Embed `columns` of a registered source, persisting one vector per row.
+
+        `dimensions` serves the model's leading coordinates, each vector
+        L2-renormalised — a Matryoshka prefix: a smaller index from a model
+        trained with `matryoshka_dims` — instead of its full width.
 
         `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
         text); `key` names the column whose value becomes each embedding row's
@@ -1200,6 +1209,7 @@ class EmbeddedBackend:
             columns=columns,
             key=key,
             modality=modality,
+            dimensions=dimensions,
             cache=cache,
         )
         return self._native._generate_embeddings_proto(request.SerializeToString())

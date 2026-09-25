@@ -42,14 +42,15 @@ async fn two_sessions() -> (
 }
 
 fn embedding_spec(source_id: &str) -> ComputeSpec {
-    ComputeSpec::Embedding {
+    ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: source_id.to_string(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality: jammi_wire::request::Modality::Text,
         cache: CachePolicy::Bypass,
-    }
+        dimensions: None,
+    })
 }
 
 /// Run `spec` on `session` as a claimed queued job — the compute-replica

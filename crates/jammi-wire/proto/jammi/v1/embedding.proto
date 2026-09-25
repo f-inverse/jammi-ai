@@ -119,6 +119,10 @@ message GenerateEmbeddingsRequest {
   // honestly always a miss — the cache is off here until sources expose a
   // version surface.
   jammi.v1.inference.CachePolicy cache = 6;
+  // Serve the model's leading `dimensions` coordinates, each vector
+  // L2-renormalised — a Matryoshka prefix. Unset serves the model's own width;
+  // a width larger than the model's is refused.
+  optional uint32 dimensions = 7;
 }
 
 // Which kind of derivation a `ResultTable` is — the wire mirror of the
@@ -225,6 +229,10 @@ message EncodeQueryRequest {
     string text = 3;
     bytes data = 4;
   }
+  // Encode to the model's leading `dimensions` coordinates, L2-renormalised —
+  // the width of a table generated with the same `dimensions`. Unset encodes
+  // at the model's own width.
+  optional uint32 dimensions = 5;
 }
 
 message EncodeQueryResponse {

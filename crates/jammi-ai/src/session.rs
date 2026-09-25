@@ -1201,22 +1201,59 @@ impl InferenceSession {
     /// same spec run identical code.
     pub async fn generate_embeddings(
         self: &Arc<Self>,
+        request: jammi_wire::request::EmbeddingRequest,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        self.run_now_record(
+            "generate_embeddings",
+            crate::jobs::ComputeSpec::Embedding(request),
+        )
+        .await
+    }
+
+    /// `generate_embeddings`'s actual materializer — see
+    /// `Self::infer_materialize`'s doc for the `job_attempt` convention every
+    /// `*_materialize` method shares. The image and audio towers read exactly
+    /// one content column. Invalidates the ANN cache for the source.
+    pub(crate) async fn generate_embeddings_materialize(
+        &self,
+        request: &jammi_wire::request::EmbeddingRequest,
+        job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
+    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
+        match request.modality {
+            jammi_wire::request::Modality::Text => {}
+            jammi_wire::request::Modality::Image => {
+                crate::local_session::single_column(&request.columns, "image")?;
+            }
+            jammi_wire::request::Modality::Audio => {
+                crate::local_session::single_column(&request.columns, "audio")?;
+            }
+        }
+        let result = EmbeddingPipeline::new(self, &self.result_store)
+            .run(request, job_attempt)
+            .await?;
+        self.ann_cache.invalidate_source(&request.source_id)?;
+        Ok(result)
+    }
+
+    /// The embedding request a modality-specific materializer runs: the
+    /// model's own width, cache `cache`.
+    fn full_width_request(
         source_id: &str,
         model_id: &str,
-        columns: &[String],
+        columns: Vec<String>,
         key_column: &str,
         modality: jammi_wire::request::Modality,
         cache: jammi_db::store::CachePolicy,
-    ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        let spec = crate::jobs::ComputeSpec::Embedding {
+    ) -> jammi_wire::request::EmbeddingRequest {
+        jammi_wire::request::EmbeddingRequest {
             source_id: source_id.to_string(),
             model_id: model_id.to_string(),
-            columns: columns.to_vec(),
+            columns,
             key_column: key_column.to_string(),
             modality,
+            dimensions: None,
             cache,
-        };
-        self.run_now_record("generate_embeddings", spec).await
+        }
     }
 
     /// Generate embeddings for a source and persist to Jammi DB.
@@ -1237,11 +1274,16 @@ impl InferenceSession {
         cache: jammi_db::store::CachePolicy,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::TextEmbedding)
-            .run(source_id, model_id, columns, key_column, cache, job_attempt)
-            .await?;
-        self.ann_cache.invalidate_source(source_id)?;
-        Ok(result)
+        let request = Self::full_width_request(
+            source_id,
+            model_id,
+            columns.to_vec(),
+            key_column,
+            jammi_wire::request::Modality::Text,
+            cache,
+        );
+        self.generate_embeddings_materialize(&request, job_attempt)
+            .await
     }
 
     /// Read the `vector` column of a pinned embedding result table into one
@@ -1313,18 +1355,16 @@ impl InferenceSession {
         cache: jammi_db::store::CachePolicy,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::ImageEmbedding)
-            .run(
-                source_id,
-                model_id,
-                &[image_column.to_string()],
-                key_column,
-                cache,
-                job_attempt,
-            )
-            .await?;
-        self.ann_cache.invalidate_source(source_id)?;
-        Ok(result)
+        let request = Self::full_width_request(
+            source_id,
+            model_id,
+            vec![image_column.to_string()],
+            key_column,
+            jammi_wire::request::Modality::Image,
+            cache,
+        );
+        self.generate_embeddings_materialize(&request, job_attempt)
+            .await
     }
 
     /// Encode a single image into a vector using the given vision model.
@@ -1366,18 +1406,16 @@ impl InferenceSession {
         cache: jammi_db::store::CachePolicy,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        let result = EmbeddingPipeline::new(self, &self.result_store, ModelTask::AudioEmbedding)
-            .run(
-                source_id,
-                model_id,
-                &[audio_column.to_string()],
-                key_column,
-                cache,
-                job_attempt,
-            )
-            .await?;
-        self.ann_cache.invalidate_source(source_id)?;
-        Ok(result)
+        let request = Self::full_width_request(
+            source_id,
+            model_id,
+            vec![audio_column.to_string()],
+            key_column,
+            jammi_wire::request::Modality::Audio,
+            cache,
+        );
+        self.generate_embeddings_materialize(&request, job_attempt)
+            .await
     }
 
     /// Encode a single audio clip into a vector using the given audio model.

@@ -78,18 +78,11 @@ impl EmbeddingService for EmbeddingServer {
         // Decode through the shared `jammi_ai::wire` seam — the same decode the
         // embedded binding's `_generate_embeddings_proto` drives — so both
         // transports validate and submit an identical request.
-        let args = jammi_ai::wire::generate_embeddings_from_proto(request.into_inner())?;
+        let request = jammi_ai::wire::generate_embeddings_from_proto(request.into_inner())?;
         let session = self.local();
 
         let (record, outcome) = scoped(&self.session, tenant, || {
-            session.generate_embeddings(
-                &args.source_id,
-                &args.model_id,
-                &args.columns,
-                &args.key_column,
-                args.modality,
-                args.cache,
-            )
+            session.generate_embeddings(request)
         })
         .await
         .map_err(map_engine_error)?;
@@ -146,7 +139,7 @@ impl EmbeddingService for EmbeddingServer {
         let session = self.local();
 
         let embedding = scoped(&self.session, tenant, || {
-            session.encode_query(&args.model_id, args.input, args.modality)
+            session.encode_query(&args.model_id, args.input, args.modality, args.dimensions)
         })
         .await
         .map_err(map_engine_error)?;

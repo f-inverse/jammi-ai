@@ -320,6 +320,71 @@ async fn edit_one_row_refresh_infers_exactly_one() {
     assert_eq!(h.count_key("4242").await, 1);
 }
 
+/// A table served at a Matryoshka prefix refreshes at that prefix: the edited
+/// row's new vector is the prefix of the model's full-width embedding of the
+/// new text, renormalised, and the table keeps its recorded width.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_serves_the_tables_recorded_prefix() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("engine");
+    std::fs::create_dir_all(&root).unwrap();
+    let source_path = dir.path().join("src.parquet");
+    write_parquet(&source_path, &rows(50));
+    let session = open_session(&root, 1).await;
+    let source = unique_source();
+    add_source(
+        &session,
+        &source,
+        format!("file://{}", source_path.display()),
+    )
+    .await;
+    let (table, _) = session
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: source.clone(),
+            model_id: tiny_bert_id(),
+            columns: vec!["text".to_string()],
+            key_column: "id".to_string(),
+            modality: jammi_ai::local_session::Modality::Text,
+            dimensions: Some(8),
+            cache: CachePolicy::Bypass,
+        })
+        .await
+        .unwrap();
+    let h = Harness {
+        _dir: dir,
+        root,
+        session,
+        source_path,
+        source,
+        table: table.table_name,
+    };
+
+    let mut edited = rows(50);
+    let text = "a completely different sentence about something else";
+    edited[7].1 = text.into();
+    write_parquet(&h.source_path, &edited);
+    let report = h.refresh().await.unwrap();
+    assert_eq!(
+        (report.outcome, report.inferred_rows),
+        (RefreshOutcome::Published, 1)
+    );
+
+    let full = h
+        .session
+        .encode_text_query(&tiny_bert_id(), text)
+        .await
+        .unwrap();
+    let served = h.vector_of("7").await.unwrap();
+    let expected = jammi_datafusion::matryoshka_prefix(&full, 8);
+    let diff: f32 = served
+        .iter()
+        .zip(&expected)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(diff < 1e-4, "{served:?} vs {expected:?}");
+    assert_eq!(h.record().await.dimensions_raw(), Some(8));
+}
+
 /// Edit a row to empty text: the model refuses it per row, so
 /// the refresh publishes a mask-only version (no fragment, no segment),
 /// `row_count` drops by one, and the key is never served.

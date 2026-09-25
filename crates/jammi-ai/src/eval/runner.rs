@@ -187,6 +187,10 @@ impl<'a> EvalRunner<'a> {
                     self.session.encode_audio_query(&encode_id, bytes).await?
                 }
             };
+            // The table's recorded model encodes the query; a table served at
+            // a Matryoshka prefix of that model's width is searched at it.
+            let query_vec =
+                crate::pipeline::embedding::serve_query(&encode_id, query_vec, Some(query_width))?;
 
             // The encoder's output for this query is the query the run
             // supplied — a CALLER's vector, checked against the table's

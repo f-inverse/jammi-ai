@@ -170,15 +170,17 @@ pub(crate) async fn replace_rows(
     rows: &RecordBatch,
 ) -> Result<u64, BackendError> {
     if let Some(keys) = keys.filter(|k| k.num_rows() > 0) {
-        let dml = backend.delete_keys_dml(def, keys.num_rows(), &owned_rows(tx.tenant()));
-        let params = batch_to_params(keys, None).map_err(execution)?;
-        // `batch_to_params` appends a tenant slot per row; a key tuple has none.
         let width = keys.num_columns();
-        let params: Vec<_> = params
-            .chunks(width + 1)
-            .flat_map(|row| row[..width].iter().cloned())
-            .collect();
-        tx.execute(&dml, &params).await?;
+        for chunk in row_chunks(keys, width, backend) {
+            let dml = backend.delete_keys_dml(def, chunk.num_rows(), &owned_rows(tx.tenant()));
+            let params = batch_to_params(&chunk, None).map_err(execution)?;
+            // `batch_to_params` appends a tenant slot per row; a key tuple has none.
+            let params: Vec<_> = params
+                .chunks(width + 1)
+                .flat_map(|row| row[..width].iter().cloned())
+                .collect();
+            tx.execute(&dml, &params).await?;
+        }
     }
     insert_rows(tx, backend, def, rows).await
 }
@@ -196,9 +198,27 @@ pub(crate) async fn insert_rows(
     }
     let schema = rows.schema();
     let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    let dml = backend.insert_dml(def, &cols, rows.num_rows());
-    let params = batch_to_params(rows, tx.tenant()).map_err(execution)?;
-    tx.execute(&dml, &params).await
+    // Each row binds its columns plus the tenant slot.
+    let mut written = 0;
+    for chunk in row_chunks(rows, cols.len() + 1, backend) {
+        let dml = backend.insert_dml(def, &cols, chunk.num_rows());
+        let params = batch_to_params(&chunk, tx.tenant()).map_err(execution)?;
+        written += tx.execute(&dml, &params).await?;
+    }
+    Ok(written)
+}
+
+/// `batch` in consecutive slices small enough that one statement binding
+/// `params_per_row` parameters for each of a slice's rows fits the backend.
+fn row_chunks<'a>(
+    batch: &'a RecordBatch,
+    params_per_row: usize,
+    backend: &dyn MutableBackend,
+) -> impl Iterator<Item = RecordBatch> + 'a {
+    let per_statement = (backend.max_bind_params() / params_per_row.max(1)).max(1);
+    (0..batch.num_rows())
+        .step_by(per_statement)
+        .map(move |start| batch.slice(start, per_statement.min(batch.num_rows() - start)))
 }
 
 /// The primary-key columns of `rows`, in declared key order.

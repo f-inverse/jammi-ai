@@ -195,6 +195,71 @@ async fn affected(session: &jammi_db::session::JammiSession, statement: &str) ->
         .value(0)
 }
 
+/// A write wider than one statement can bind — 25,000 rows at four
+/// parameters each (three columns and the tenant slot), past both SQLite's
+/// 32,766 and Postgres's 65,535 — lands whole: the insert, and the update
+/// that deletes every row's key and re-inserts it, are each split into
+/// statements that fit, inside one transaction.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_wider_than_one_statement_lands_whole(backend: BackendKind) {
+    const ROWS: i64 = 25_000;
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let id = unique_id("wide");
+    let table = id.as_str().to_string();
+    let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+
+    let batch = RecordBatch::try_new(
+        widget_schema(),
+        vec![
+            Arc::new(Int64Array::from((0..ROWS).collect::<Vec<_>>())),
+            Arc::new(StringArray::from(
+                (0..ROWS).map(|i| format!("w{i}")).collect::<Vec<_>>(),
+            )),
+            Arc::new(Float64Array::from(
+                (0..ROWS).map(|i| i as f64).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let registry = session.mutable_tables_arc();
+    let written = session
+        .catalog()
+        .backend_arc()
+        .transaction(TxOptions::default(), move |tx| {
+            let (id, batch, registry) = (id.clone(), batch.clone(), Arc::clone(&registry));
+            Box::pin(async move {
+                registry
+                    .insert_batch(tx, &id, &batch)
+                    .await
+                    .map_err(|e| jammi_db::BackendError::Execution(e.to_string()))
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(written, ROWS as u64);
+
+    let updated = affected(
+        &session,
+        &format!("UPDATE mutable.public.{table} SET name = 'renamed'"),
+    )
+    .await;
+    assert_eq!(updated, ROWS as u64);
+    let rows = widget_rows(&session, &table).await;
+    assert_eq!(rows.len(), ROWS as usize);
+    assert!(rows.iter().all(|(_, name, _)| name == "renamed"));
+    assert_eq!(rows.last().unwrap().2, Some((ROWS - 1) as f64));
+}
+
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",

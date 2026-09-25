@@ -40,6 +40,11 @@ pub trait MutableBackend: Send + Sync {
     /// `DROP TABLE` statement. Backend-specific CASCADE semantics.
     fn drop_table_ddl(&self, def: &MutableTableDefinition) -> String;
 
+    /// The most parameters one statement may bind on this backend. A write
+    /// wider than this is split into statements that each fit, inside the
+    /// same transaction, so it stays one atomic unit.
+    fn max_bind_params(&self) -> usize;
+
     /// Multi-row `INSERT` statement with parameter placeholders. `n_rows` controls
     /// how many rows of `VALUES (…),(…),…` are emitted; total parameter count is
     /// `n_rows * (columns.len() + 1)` (the +1 is the implicit `tenant_id`).

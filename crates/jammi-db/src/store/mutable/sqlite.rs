@@ -21,6 +21,12 @@ impl SqliteMutableBackend {
 }
 
 impl MutableBackend for SqliteMutableBackend {
+    /// `SQLITE_MAX_VARIABLE_NUMBER`'s default since SQLite 3.32, and the
+    /// bundled amalgamation's value.
+    fn max_bind_params(&self) -> usize {
+        32_766
+    }
+
     fn create_table_ddl(&self, def: &MutableTableDefinition) -> String {
         let mut cols: Vec<String> = def
             .schema

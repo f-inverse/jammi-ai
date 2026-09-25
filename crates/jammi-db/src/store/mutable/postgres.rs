@@ -21,6 +21,12 @@ impl PostgresMutableBackend {
 }
 
 impl MutableBackend for PostgresMutableBackend {
+    /// The protocol's limit: a `Bind` message counts its parameters in an
+    /// `Int16`.
+    fn max_bind_params(&self) -> usize {
+        65_535
+    }
+
     fn create_table_ddl(&self, def: &MutableTableDefinition) -> String {
         let mut cols: Vec<String> = def
             .schema

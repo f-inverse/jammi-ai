@@ -82,6 +82,9 @@ book:
     - part: "Fan-out inference"
       chapters:
         - chapters/26-fanout/fanout.qmd
+    - part: "Running jammi for real"
+      chapters:
+        - chapters/27-distributed-training/distributed-training.qmd
   appendices:
     - chapters/api-reference.qmd
 

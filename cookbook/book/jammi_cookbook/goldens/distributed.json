@@ -1,0 +1,18 @@
+{
+  "local_w2_max_embedding_diff": {
+    "tol": 1e-06,
+    "value": 3.725290298461914e-09
+  },
+  "local_w2_max_loss_diff": {
+    "tol": 1e-06,
+    "value": 0.0
+  },
+  "local_w3_max_embedding_diff": {
+    "tol": 1e-06,
+    "value": 7.450580596923828e-09
+  },
+  "local_w3_max_loss_diff": {
+    "tol": 1e-06,
+    "value": 1.9073486345888568e-07
+  }
+}

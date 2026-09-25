@@ -1,0 +1,145 @@
+---
+title: "One job, many ranks — distributed training as a gang"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `fine_tune(world_size=…)` · `[worker] local_ranks` · **Theory:** data-parallel
+training — each rank computes gradients on its shard of a global batch and the ranks
+sum them, so N ranks take the step one process would take over the whole batch
+[@li2020pytorchddp] · **Rail:** measurement (a gang's training compared with one
+process's over the same global batch, loss by loss and vector by vector).
+
+A training job names a `world_size`: how many **ranks** train it together. The ranks
+are a **gang** — scheduled as one unit, failing as one unit. Every step, the gang
+splits a global batch of `world_size × batch_size` rows across its ranks; each rank
+encodes its shard, the ranks gather each other's representations so every rank
+computes the *same* global loss (a contrastive loss needs every row's negatives, not
+only its own shard's), and the adapter gradients are summed before one shared optimizer
+step. So a gang is not an approximation of one process: it is one process's step,
+computed by N.
+
+This chapter measures exactly that claim. A gang runs where the engine's worker
+places it:
+
+* in **one process**, one rank per accelerator — `[worker] local_ranks` ranks on
+  `[gpu] devices`, or every rank on the CPU when the CPU is the only device;
+* **across processes**, when a job is wider than one host: the claiming worker becomes
+  rank 0 of a *peer* gang and assembles the other ranks from its fleet
+  (`[distributed] max_world_size` bounds how wide).
+
+```{python}
+import tempfile
+from pathlib import Path
+
+import jammi
+import numpy as np
+from jammi_cookbook import contracts, fixtures
+
+MODEL = fixtures.model("tiny_bert")
+PAIRS = fixtures.url("tiny_pairs.csv")
+PROBES = ["quantum error correction methods", "protein folding with transformers",
+          "graph kernels for chemistry", "solid electrolyte interphase control"]
+
+
+def engine(local_ranks: int):
+    """An embedded engine whose worker runs `local_ranks` ranks, all on the CPU."""
+    home = Path(tempfile.mkdtemp())
+    (home / "jammi.toml").write_text(
+        f"[gpu]\ndevice = -1\n\n[worker]\nlocal_ranks = {local_ranks}\n")
+    db = jammi.connect(f"file://{home / 'engine'}", config=str(home / "jammi.toml"))
+    db.add_source("pairs", url=PAIRS, format="csv")
+    return db
+
+
+def train(db, world_size: int, batch_size: int):
+    """Fine-tune the tiny encoder on the scored pairs; return the loss curve and
+    the adapted model's embedding of every probe."""
+    job = db.fine_tune(
+        source="pairs", base_model=MODEL, columns=["text_a", "text_b", "score"],
+        method="lora", task="text_embedding", epochs=3, batch_size=batch_size,
+        lora_dropout=0.0, validation_fraction=0.0, early_stopping_metric="train_loss",
+        seed=0, world_size=world_size,
+    )
+    job.wait()
+    curve = [point["loss"] for point in job.metrics()["train_loss_curve"]]
+    vectors = np.asarray([db.encode_query(model=job.output_model_id, query=p) for p in PROBES])
+    return np.asarray(curve), vectors
+```
+
+## One process, three rank counts, one global batch
+
+Three runs over the same 30 scored pairs, each with a global batch of six rows: one
+rank taking six, two ranks taking three each, three ranks taking two each. Dropout is
+off (`lora_dropout = 0`): with it on, every rank draws its own dropout mask, which is
+correct training but not the same arithmetic as one process's mask.
+
+```{python}
+runs = {}
+for world_size, batch_size in [(1, 6), (2, 3), (3, 2)]:
+    db = engine(local_ranks=world_size)
+    runs[world_size] = train(db, world_size, batch_size)
+    db.close()
+    curve, _ = runs[world_size]
+    print(f"world_size={world_size}  batch_size={batch_size}  loss by epoch "
+          + "  ".join(f"{x:.6f}" for x in curve))
+
+reference_curve, reference_vectors = runs[1]
+for world_size in (2, 3):
+    curve, vectors = runs[world_size]
+    print(f"{world_size} ranks vs 1: max |Δ loss| {np.abs(curve - reference_curve).max():.2e}"
+          f"   max |Δ embedding| {np.abs(vectors - reference_vectors).max():.2e}")
+```
+
+```{python}
+# | echo: false
+for world_size in (2, 3):
+    curve, vectors = runs[world_size]
+    contracts.assert_close(f"distributed.local_w{world_size}_max_loss_diff",
+                           float(np.abs(curve - reference_curve).max()), tol=1e-6)
+    contracts.assert_close(f"distributed.local_w{world_size}_max_embedding_diff",
+                           float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
+```
+
+The loss curves and the adapted model's embeddings agree across rank counts: the gang
+computes one process's step. What the ranks buy is capacity — each holds a third, or a
+half, of the global batch's activations — not a different optimisation.
+
+## What a gang refuses
+
+Two objectives exist only for one process — GradCache (`cached=True`), whose second
+pass runs over the whole batch on one rank, and hard-negative mining, which searches
+one process's own index. A gang would not compute them, so the engine refuses the
+combination at submit rather than training something else. So does a rank count wider
+than any gang the deployment can form.
+
+```{python}
+from jammi.errors import InvalidArgument
+
+db = engine(local_ranks=2)
+refusals = {}
+for label, kwargs in [
+    ("GradCache", dict(world_size=2, cached=True)),
+    ("hard-negative mining", dict(world_size=2, mine_hard_negatives=True)),
+    ("three ranks on a two-rank host", dict(world_size=3)),
+]:
+    try:
+        db.fine_tune(source="pairs", base_model=MODEL, columns=["text_a", "text_b", "score"],
+                     method="lora", task="text_embedding", epochs=1, **kwargs)
+        refusals[label] = None
+    except InvalidArgument as refused:
+        refusals[label] = str(refused)
+    print(f"{label}: {refusals[label]}")
+db.close()
+```
+
+```{python}
+# | echo: false
+assert all(refusals.values()), refusals
+assert "serveable world of 2" in refusals["three ranks on a two-rank host"]
+```
+
+Each refusal names the knob that would change the answer.

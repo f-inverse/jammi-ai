@@ -480,7 +480,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
                         epochs: 20_000,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
@@ -655,7 +655,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
                         epochs: 1,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
@@ -843,7 +843,7 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
                         epochs: 20_000,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,

@@ -1,0 +1,34 @@
+{
+  "base_precision_at_10": {
+    "tol": 0.01,
+    "value": 0.40349999999999997
+  },
+  "cosent.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.40199999999999997
+  },
+  "graph.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.4049999999999998
+  },
+  "hard_neg.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.40400000000000014
+  },
+  "matryoshka.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.40449999999999986
+  },
+  "mnrl.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.40399999999999986
+  },
+  "mnrl_t50.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.40399999999999964
+  },
+  "triplet.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.40349999999999964
+  }
+}

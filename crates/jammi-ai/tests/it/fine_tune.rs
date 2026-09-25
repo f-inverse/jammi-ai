@@ -6,6 +6,7 @@ use tempfile::TempDir;
 
 use jammi_ai::fine_tune::{
     data::TrainingDataLoader, trainer::compute_lr, FineTuneConfig, FineTuneMethod, LrSchedule,
+    Warmup,
 };
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelSource;
@@ -98,7 +99,7 @@ fn lora_layer_mechanics() {
 fn lr_schedule_warmup_and_cosine_decay() {
     let config = FineTuneConfig {
         learning_rate: 1e-3,
-        warmup_steps: 200,
+        warmup: Warmup::Steps(200),
         lr_schedule: LrSchedule::CosineDecay,
         ..Default::default()
     };
@@ -125,11 +126,36 @@ fn lr_schedule_warmup_and_cosine_decay() {
     );
 }
 
+/// The default warmup is a fraction of the run, so a short run reaches its
+/// base learning rate: twelve steps warm up over two, not over a fixed count
+/// longer than the run.
+#[test]
+fn the_default_warmup_scales_with_the_run() {
+    let config = FineTuneConfig {
+        learning_rate: 1e-3,
+        lr_schedule: LrSchedule::Constant,
+        ..Default::default()
+    };
+    assert_eq!(config.warmup, Warmup::Fraction(0.1));
+    assert!(
+        compute_lr(&config, 1, 12) < 1e-3,
+        "step 1 of 12 is still warming up"
+    );
+    assert!(
+        (compute_lr(&config, 2, 12) - 1e-3).abs() < 1e-12,
+        "step 2 of 12 is at the base rate"
+    );
+    assert!(
+        (compute_lr(&config, 100, 1000) - 1e-3).abs() < 1e-12,
+        "a tenth of a thousand-step run"
+    );
+}
+
 #[test]
 fn lr_schedule_linear_decay() {
     let config = FineTuneConfig {
         learning_rate: 1e-3,
-        warmup_steps: 0,
+        warmup: Warmup::Steps(0),
         lr_schedule: LrSchedule::LinearDecay,
         ..Default::default()
     };
@@ -149,7 +175,7 @@ fn lr_schedule_linear_decay() {
 fn lr_schedule_constant_after_warmup() {
     let config = FineTuneConfig {
         learning_rate: 2e-4,
-        warmup_steps: 10,
+        warmup: Warmup::Steps(10),
         lr_schedule: LrSchedule::Constant,
         ..Default::default()
     };
@@ -200,7 +226,7 @@ fn contract_lr_schedule_is_monotonic_after_warmup() {
     for schedule in [LrSchedule::CosineDecay, LrSchedule::LinearDecay] {
         let config = FineTuneConfig {
             learning_rate: 1e-3,
-            warmup_steps: 100,
+            warmup: Warmup::Steps(100),
             lr_schedule: schedule,
             ..Default::default()
         };
@@ -270,7 +296,7 @@ async fn fine_tune_job_lifecycle_and_artifacts() {
                 epochs: 2,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -411,7 +437,7 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
                 epochs: 2,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -574,7 +600,7 @@ async fn epoch_checkpoints_default_off_publishes_nothing() {
                 epochs: 3,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 // Deliberately absent — the default this test pins.
                 keep_last_n_checkpoints: None,
                 ..Default::default()
@@ -681,7 +707,7 @@ async fn epoch_checkpoints_registered_and_loadable_when_enabled() {
                 epochs: 3,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 // n == epochs: the documented "n >= epochs retains every
                 // epoch" equivalence, no separate keep-all sentinel needed.
                 keep_last_n_checkpoints: Some(3),
@@ -784,7 +810,7 @@ async fn epoch_checkpoints_retention_prunes_oldest() {
                 epochs: 3,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 keep_last_n_checkpoints: Some(2),
                 ..Default::default()
             }),
@@ -1150,7 +1176,7 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
                 batch_size: 4,
                 learning_rate: 5e-3,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 validation_fraction: 0.0,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
@@ -1549,7 +1575,7 @@ async fn training_divergence_detection() {
             batch_size: 1,
             validation_fraction: 0.0,
             early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
-            warmup_steps: 0,
+            warmup: Warmup::Steps(0),
             ..Default::default()
         },
     )
@@ -1681,7 +1707,7 @@ async fn training_early_stopping_triggers() {
             batch_size: 10,
             validation_fraction: 0.2,   // 20% holdout
             early_stopping_patience: 1, // stop after 1 epoch without improvement
-            warmup_steps: 0,
+            warmup: Warmup::Steps(0),
             learning_rate: 1e-4,
             ..Default::default()
         },
@@ -1792,7 +1818,7 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
                 batch_size: 8,
                 learning_rate: 1e-3,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 ..Default::default()
             }),
@@ -1981,7 +2007,7 @@ async fn durable_job_runs_on_separately_started_worker() {
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -2073,7 +2099,7 @@ async fn worker_that_lost_lease_does_not_finalize() {
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -2243,7 +2269,7 @@ fn worker_run_span_carries_job_and_tenant() {
                     epochs: 1,
                     batch_size: 8,
                     lora_rank: 4,
-                    warmup_steps: 0,
+                    warmup: Warmup::Steps(0),
                     ..Default::default()
                 }),
             )
@@ -2369,7 +2395,7 @@ async fn configured_short_lease_drives_reclaim() {
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -2460,7 +2486,7 @@ async fn loser_prefix_is_never_the_committed_artifact() {
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -2617,7 +2643,7 @@ async fn a_lease_lost_runs_epoch_checkpoints_survive_for_the_successor() {
                 epochs: 20_000,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 // Retain every epoch, so the epoch-0 bytes proven to exist
                 // below are the ones asserted on after the loss (a window of
                 // one would have retired them as epoch 1 landed).
@@ -2867,7 +2893,7 @@ async fn the_finisher_retries_a_persistently_failed_retirement_and_warns() {
                 epochs: 3,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 keep_last_n_checkpoints: Some(1),
                 ..Default::default()
             }),
@@ -3032,7 +3058,7 @@ async fn zombie_loser_after_winner_cannot_corrupt_the_commit() {
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -3215,7 +3241,7 @@ async fn training_bails_when_lease_lost_mid_run() {
             batch_size: 2,
             validation_fraction: 0.0,
             early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
-            warmup_steps: 0,
+            warmup: Warmup::Steps(0),
             ..Default::default()
         },
     )
@@ -3314,7 +3340,7 @@ async fn short_lease_job(dir: &TempDir) -> (Arc<InferenceSession>, String) {
                 epochs: 3,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: Warmup::Steps(0),
                 keep_last_n_checkpoints: Some(3),
                 ..Default::default()
             }),

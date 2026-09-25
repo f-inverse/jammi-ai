@@ -954,7 +954,7 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
         epochs: 1,
         batch_size: 4,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         validation_fraction: 0.0,
         early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
         ..Default::default()
@@ -1301,7 +1301,7 @@ async fn two_community_graph(dir: &std::path::Path) -> TwoCommunityGraph {
         epochs: 1,
         batch_size: 4,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         validation_fraction: 0.0,
         early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
         embedding_loss: Some(

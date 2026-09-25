@@ -182,7 +182,7 @@ fn cheap_fine_tune_config() -> FineTuneConfig {
     FineTuneConfig {
         epochs: 1,
         batch_size: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
         ..Default::default()
     }

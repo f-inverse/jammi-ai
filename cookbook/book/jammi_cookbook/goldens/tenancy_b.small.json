@@ -5,10 +5,10 @@
   },
   "parity_a_precision_at_10": {
     "tol": 0.03,
-    "value": 0.32499999999999996
+    "value": 0.325
   },
   "parity_b_precision_at_10": {
     "tol": 0.03,
-    "value": 0.3760000000000002
+    "value": 0.3759999999999999
   }
 }

@@ -78,5 +78,5 @@ pub fn media_front_end_pool_threads() -> usize {
 pub use jammi_wire::fine_tune::{
     ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, ExampleLoss,
     FineTuneConfig, FineTuneMethod, HardNegativeConfig, HeldOutLoss, LoraInitMode, LrSchedule,
-    RegressionLoss, DEFAULT_MAX_SEQ_LENGTH,
+    RegressionLoss, Warmup, DEFAULT_MAX_SEQ_LENGTH,
 };

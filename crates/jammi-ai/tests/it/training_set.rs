@@ -49,7 +49,7 @@ fn parity_config() -> FineTuneConfig {
         epochs: 1,
         batch_size: 8,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         ..Default::default()
     }
 }
@@ -277,7 +277,7 @@ fn regression_parity_config() -> FineTuneConfig {
         epochs: 1,
         batch_size: 8,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         ..Default::default()
     }
 }
@@ -394,7 +394,7 @@ async fn gradcache_completes_at_w1_with_a_pinned_adapter_digest() {
                 epochs: 1,
                 batch_size: 4,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 cached: true,
                 embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),
                 ..Default::default()
@@ -522,7 +522,7 @@ async fn hard_negative_mining_at_w1_moves_the_adapter_bytes_mining_off_leaves_it
                     epochs: 1,
                     batch_size: 4,
                     lora_rank: 4,
-                    warmup_steps: 0,
+                    warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                     cached: false,
                     embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking {
                         temperature: 20.0,

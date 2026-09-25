@@ -85,31 +85,31 @@
   },
   "tier01.precision_at_10": {
     "tol": 0.02,
-    "value": 0.4035000000000001
+    "value": 0.40349999999999975
   },
   "tier02.precision_at_10": {
     "tol": 0.02,
-    "value": 0.4260000000000002
+    "value": 0.426
   },
   "tier02.precision_delta": {
     "tol": 0.02,
-    "value": 0.02250000000000052
+    "value": 0.02249999999999963
   },
   "tier03.base_precision_at_10": {
     "tol": 0.02,
-    "value": 0.40349999999999986
+    "value": 0.4034999999999998
   },
   "tier03.declared_precision_at_10": {
     "tol": 0.02,
-    "value": 0.40499999999999986
+    "value": 0.40499999999999964
   },
   "tier03.random_precision_at_10": {
     "tol": 0.02,
-    "value": 0.40099999999999986
+    "value": 0.4035000000000001
   },
   "tier03.similarity_precision_at_10": {
     "tol": 0.02,
-    "value": 0.41050000000000003
+    "value": 0.4090000000000002
   },
   "tier04.classifier_accuracy": {
     "tol": 0.04,

@@ -241,7 +241,9 @@ async fn submit_fine_tune(ch: Channel, epochs: u32) -> String {
                 epochs: Some(epochs),
                 batch_size: Some(8),
                 lora_rank: Some(4),
-                warmup_steps: Some(0),
+                warmup: Some(
+                    jammi_server::grpc::proto::training::fine_tune_config::Warmup::WarmupSteps(0),
+                ),
                 ..Default::default()
             }),
             idempotency_key: String::new(),

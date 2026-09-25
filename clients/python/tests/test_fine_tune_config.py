@@ -28,6 +28,7 @@ _UNSET = dict(
     validation_fraction=None,
     early_stopping_patience=None,
     warmup_steps=None,
+    warmup_fraction=None,
     gradient_accumulation_steps=None,
     triplet_margin=None,
     target_modules=None,
@@ -281,3 +282,15 @@ def test_remote_fine_tune_threads_beta_nll_to_the_proto() -> None:
     cfg = request.config
     assert cfg.regression_loss.HasField("beta_nll")
     assert abs(cfg.regression_loss.beta_nll.beta - 0.2) < 1e-9
+
+
+def test_warmup_is_steps_or_a_fraction_of_the_run() -> None:
+    """Unset leaves the engine's default (a fraction of the run); a step count
+    and a fraction each reach the wire's `warmup` oneof; both is refused."""
+    import pytest
+
+    assert _build().WhichOneof("warmup") is None
+    assert _build(warmup_steps=0).WhichOneof("warmup") == "warmup_steps"
+    assert _build(warmup_fraction=0.05).warmup_fraction == 0.05
+    with pytest.raises(ValueError, match="not both"):
+        _build(warmup_steps=10, warmup_fraction=0.1)

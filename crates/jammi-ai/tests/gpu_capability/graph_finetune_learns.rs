@@ -125,7 +125,7 @@ async fn fine_tune_graph_learns_on_gpu() {
         epochs: 6,
         batch_size: 4,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         validation_fraction: 0.0,
         early_stopping_metric: EarlyStoppingMetric::TrainLoss,
         embedding_loss: Some(EmbeddingLoss::MultipleNegativesRanking { temperature: 20.0 }),

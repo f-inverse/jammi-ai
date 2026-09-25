@@ -163,7 +163,13 @@ message FineTuneConfig {
   optional uint32 gradient_accumulation_steps = 10;
   optional double validation_fraction = 11;
   optional uint32 early_stopping_patience = 12;
-  optional uint32 warmup_steps = 13;
+  // Linear warmup from 0 to the base learning rate. Unset = a tenth of the run.
+  oneof warmup {
+    // A fixed number of optimizer steps.
+    uint32 warmup_steps = 13;
+    // A fraction of the run's optimizer steps, in [0, 1).
+    double warmup_fraction = 31;
+  }
   LrSchedule lr_schedule = 14;
   EarlyStoppingMetric early_stopping_metric = 15;
   // Layer-name suffixes that receive LoRA adapters. Empty = projection head

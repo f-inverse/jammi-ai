@@ -295,7 +295,7 @@ fn lane_fine_tune_config(size: JobSize) -> FineTuneConfig {
         epochs: size.epochs(),
         batch_size: 8,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         ..Default::default()
     }
 }

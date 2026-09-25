@@ -374,7 +374,7 @@ fn world_two_spec_json() -> String {
                 epochs: 2,
                 batch_size: 2,
                 validation_fraction: 0.0,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 gradient_accumulation_steps: 1,
                 lora_rank: 2,
                 lora_dropout: 0.0,

@@ -370,6 +370,7 @@ def build_fine_tune_config(
     validation_fraction: Optional[float],
     early_stopping_patience: Optional[int],
     warmup_steps: Optional[int],
+    warmup_fraction: Optional[float],
     gradient_accumulation_steps: Optional[int],
     triplet_margin: Optional[float],
     target_modules: Optional[List[str]],
@@ -427,8 +428,12 @@ def build_fine_tune_config(
         config.validation_fraction = validation_fraction
     if early_stopping_patience is not None:
         config.early_stopping_patience = early_stopping_patience
+    if warmup_steps is not None and warmup_fraction is not None:
+        raise ValueError("warmup is a step count or a fraction of the run, not both")
     if warmup_steps is not None:
         config.warmup_steps = warmup_steps
+    if warmup_fraction is not None:
+        config.warmup_fraction = warmup_fraction
     if gradient_accumulation_steps is not None:
         config.gradient_accumulation_steps = gradient_accumulation_steps
     if target_modules is not None:
@@ -579,6 +584,7 @@ def build_fine_tune_request(
     validation_fraction: Optional[float] = None,
     early_stopping_patience: Optional[int] = None,
     warmup_steps: Optional[int] = None,
+    warmup_fraction: Optional[float] = None,
     gradient_accumulation_steps: Optional[int] = None,
     triplet_margin: Optional[float] = None,
     target_modules: Optional[List[str]] = None,
@@ -640,6 +646,7 @@ def build_fine_tune_request(
         validation_fraction=validation_fraction,
         early_stopping_patience=early_stopping_patience,
         warmup_steps=warmup_steps,
+        warmup_fraction=warmup_fraction,
         gradient_accumulation_steps=gradient_accumulation_steps,
         triplet_margin=triplet_margin,
         target_modules=target_modules,

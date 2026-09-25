@@ -363,22 +363,24 @@ pub struct TrainingResult {
 
 /// Compute the learning rate for a given step.
 ///
-/// Warmup: linear ramp from 0 to base LR over `warmup_steps`.
+/// Warmup: linear ramp from 0 to base LR over the config's warmup, resolved
+/// against the run's `total_steps`.
 /// After warmup: decay per `lr_schedule` (Constant, CosineDecay, or LinearDecay).
 pub fn compute_lr(config: &FineTuneConfig, step: usize, total_steps: usize) -> f64 {
     let base_lr = config.learning_rate;
 
     // Warmup phase: linear ramp
-    if step < config.warmup_steps {
-        return base_lr * (step as f64 / config.warmup_steps.max(1) as f64);
+    let warmup_steps = config.warmup.steps(total_steps);
+    if step < warmup_steps {
+        return base_lr * (step as f64 / warmup_steps.max(1) as f64);
     }
 
     // Decay phase. `progress` is clamped to [0, 1] and the returned lr floored at
     // 0 so the schedule is total-domain-valid for any step: stepping past the
     // horizon holds the lr at its end-of-schedule value rather than continuing
     // the curve into negative (gradient-ascent) territory.
-    let decay_steps = total_steps.saturating_sub(config.warmup_steps);
-    let decay_step = step - config.warmup_steps;
+    let decay_steps = total_steps.saturating_sub(warmup_steps);
+    let decay_step = step - warmup_steps;
     let progress = (decay_step as f64 / decay_steps.max(1) as f64).clamp(0.0, 1.0);
 
     let lr = match config.lr_schedule {
@@ -2067,6 +2069,8 @@ impl TrainingLoop {
             // `Self::accumulate_sim_stats`'s doc). `SimStats` makes "a
             // populated count implies both sums are populated" structural, so
             // there is no `.expect()` here to fire.
+            // `None` when this loss records no similarity statistics — never a
+            // `0.0` that would read as a measured similarity.
             let (avg_pos_sim, avg_neg_sim) =
                 match &sim_stats {
                     Some(stats) => {
@@ -2077,11 +2081,11 @@ impl TrainingLoop {
                             JammiError::FineTune(format!("epoch neg sim read: {e}"))
                         })?;
                         (
-                            pos_sum as f64 / stats.count as f64,
-                            neg_sum as f64 / stats.count as f64,
+                            Some(pos_sum as f64 / stats.count as f64),
+                            Some(neg_sum as f64 / stats.count as f64),
                         )
                     }
-                    None => (0.0, 0.0),
+                    None => (None, None),
                 };
 
             // Validation — skip entirely when monitoring train loss to avoid wasting time.
@@ -7765,7 +7769,7 @@ mod last_step_run_harness {
             epochs: 1,
             batch_size: 2,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: 1,
             lora_rank: 2,
             early_stopping_metric: EarlyStoppingMetric::TrainLoss,
@@ -8105,7 +8109,7 @@ mod gang_lockstep_oracle {
             epochs: 1,
             batch_size,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: 1,
             lora_rank: 2,
             lora_dropout: 0.0,
@@ -8516,7 +8520,7 @@ mod runner_role_and_agreement_oracle {
             epochs: 1,
             batch_size: 2,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: 1,
             lora_rank: 2,
             lora_dropout: 0.0,
@@ -8801,7 +8805,7 @@ mod gang_determinism_oracle {
             epochs,
             batch_size: 2,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: 1,
             lora_rank: 2,
             lora_dropout,
@@ -11926,7 +11930,7 @@ mod determinism_through_forward {
             epochs: 1,
             batch_size: 1,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: 1,
             lora_dropout: 0.1,
             regression_loss: Some(RegressionLoss::BetaNll { beta: 0.5 }),
@@ -12213,7 +12217,7 @@ mod resume_invariant {
             epochs: 1,
             batch_size: 1,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: 1,
             lora_dropout: 0.1,
             regression_loss: Some(RegressionLoss::BetaNll { beta: 0.5 }),
@@ -13192,7 +13196,7 @@ mod held_out_eval_tests {
             validation_fraction: 0.5,
             early_stopping_metric: metric,
             early_stopping_patience: 10_000,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             ..mnrl_config(2)
         };
         let mut loop_ = minimal_pairs_loop(&device, config).await;
@@ -14165,7 +14169,7 @@ mod media_front_end_wall_tests {
                 batch_size: 1,
                 validation_fraction: 0.0,
                 early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
-                warmup_steps: 0,
+                warmup: crate::fine_tune::Warmup::Steps(0),
                 ..Default::default()
             },
         )
@@ -14249,7 +14253,7 @@ mod media_front_end_wall_tests {
                 batch_size: 1,
                 validation_fraction: 0.0,
                 early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
-                warmup_steps: 0,
+                warmup: crate::fine_tune::Warmup::Steps(0),
                 ..Default::default()
             },
         )
@@ -14362,7 +14366,7 @@ mod media_front_end_wall_tests {
                 batch_size: 1,
                 validation_fraction: 0.0,
                 early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,
-                warmup_steps: 0,
+                warmup: crate::fine_tune::Warmup::Steps(0),
                 ..Default::default()
             },
         )

@@ -98,7 +98,7 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
                 epochs: 2,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 // Non-empty target_modules triggers the encoder-adapters target.
                 target_modules: vec!["query".to_string(), "value".to_string()],
@@ -156,7 +156,7 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
                 epochs: 2,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 // ModernBERT-specific targets: fused QKV + output projection.
                 target_modules: vec!["Wqkv".to_string(), "Wo".to_string()],
@@ -209,7 +209,7 @@ async fn encoder_adapters_changes_embeddings_versus_base() {
                 batch_size: 4,
                 lora_rank: 4,
                 learning_rate: 1e-3,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 target_modules: vec!["query".to_string(), "value".to_string()],
                 ..Default::default()

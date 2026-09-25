@@ -791,7 +791,7 @@ async fn qlora_learns_on_metal_with_gguf_base() {
                 epochs: 6, // >=2 so first->last carries a decrease signal
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 ..Default::default()
             }),
         )

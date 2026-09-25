@@ -107,7 +107,7 @@ fn tower_config(target_modules: &[&str], epochs: usize, learning_rate: f64) -> F
         batch_size: 4,
         learning_rate,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
         validation_fraction: 0.0,
         early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,

@@ -11671,7 +11671,7 @@ mod tests {
             epochs: 2,
             batch_size: 2,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             learning_rate: 1e-3,
             lr_schedule: crate::fine_tune::LrSchedule::Constant,
             early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,

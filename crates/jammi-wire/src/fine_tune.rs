@@ -182,6 +182,34 @@ pub enum EarlyStoppingMetric {
     TrainLoss,
 }
 
+/// How long the learning rate ramps linearly from 0 to its base value.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Warmup {
+    /// A fixed number of optimizer steps.
+    Steps(usize),
+    /// A fraction of the run's optimizer steps, in `[0, 1)` — the same
+    /// proportion of a short run and a long one.
+    Fraction(f64),
+}
+
+impl Warmup {
+    /// The warmup's length in optimizer steps, for a run of `total_steps`.
+    pub fn steps(self, total_steps: usize) -> usize {
+        match self {
+            Self::Steps(steps) => steps,
+            Self::Fraction(fraction) => (total_steps as f64 * fraction).ceil() as usize,
+        }
+    }
+}
+
+impl Default for Warmup {
+    /// A tenth of the run.
+    fn default() -> Self {
+        Self::Fraction(0.1)
+    }
+}
+
 /// Learning rate schedule applied after warmup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -274,8 +302,8 @@ pub struct FineTuneConfig {
     pub validation_fraction: f64,
     /// Epochs without improvement before stopping. Default: 3.
     pub early_stopping_patience: usize,
-    /// Steps of linear warmup from 0 to base LR. Default: 100.
-    pub warmup_steps: usize,
+    /// Linear warmup from 0 to base LR. Default: a tenth of the run.
+    pub warmup: Warmup,
     /// Decay schedule after warmup. Default: CosineDecay.
     pub lr_schedule: LrSchedule,
     /// Which loss to monitor for early stopping.
@@ -506,7 +534,7 @@ impl Default for FineTuneConfig {
             gradient_accumulation_steps: 1,
             validation_fraction: 0.1,
             early_stopping_patience: 3,
-            warmup_steps: 100,
+            warmup: Warmup::default(),
             lr_schedule: LrSchedule::CosineDecay,
             early_stopping_metric: EarlyStoppingMetric::ValLoss,
             target_modules: Vec::new(),
@@ -533,6 +561,13 @@ impl FineTuneConfig {
 
         if self.lora_rank == 0 {
             return Err(JammiError::FineTune("lora_rank must be > 0".into()));
+        }
+        if let Warmup::Fraction(fraction) = self.warmup {
+            if !(0.0..1.0).contains(&fraction) {
+                return Err(JammiError::FineTune(format!(
+                    "warmup fraction must be in [0, 1), got {fraction}"
+                )));
+            }
         }
         if self.lora_alpha <= 0.0 {
             return Err(JammiError::FineTune("lora_alpha must be > 0".into()));

@@ -9,7 +9,7 @@
   },
   "tier01.precision_at_10": {
     "tol": 0.02,
-    "value": 0.14749999999999977
+    "value": 0.1474999999999998
   },
   "tier01.route_homophily": {
     "tol": 1e-09,
@@ -21,6 +21,6 @@
   },
   "tier02.precision_delta": {
     "tol": 0.02,
-    "value": 0.007000000000000228
+    "value": 0.0070000000000002005
   }
 }

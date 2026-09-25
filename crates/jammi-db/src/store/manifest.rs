@@ -89,7 +89,7 @@ pub use jammi_numerics::ComputePrecision;
 /// already knows) — that shape still deserializes under the old
 /// definition, so nothing else would catch the older reader comparing a
 /// stale hash computed over a different determinant set.
-pub const MANIFEST_VERSION: u32 = 4;
+pub const MANIFEST_VERSION: u32 = 5;
 
 /// The row-order rule version 1 of the training-set producer commits and
 /// records in [`ProducingDescriptor::TrainingSet::order_rule`]: the rows are
@@ -848,18 +848,8 @@ pub enum ProducingDescriptor {
     /// (`f64::to_bits`) rather than the `f64` itself — a fixed, exact,
     /// byte-stable fold, never a float compared/hashed directly.
     GraphTrainingSet {
-        /// Catalog source holding the node text.
-        node_source: String,
-        /// Catalog source holding the edges.
-        edge_source: String,
-        /// Column in `node_source` holding the node id.
-        id_column: String,
-        /// Column in `node_source` holding the node text.
-        text_column: String,
-        /// Column in `edge_source` holding the edge source endpoint.
-        src_column: String,
-        /// Column in `edge_source` holding the edge destination endpoint.
-        dst_column: String,
+        /// The node text and the edge relation the rows were sampled from.
+        sources: GraphTrainingSources,
         /// The model task the sampled rows are read as.
         task: ModelTask,
         /// The training format the consumer parses the rows under
@@ -1265,6 +1255,20 @@ pub enum EdgeSourceBinding {
     },
 }
 
+/// The node text and edge relation a graph training set is sampled from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphTrainingSources {
+    /// Catalog source holding the node text.
+    pub node_source: String,
+    /// Column in `node_source` holding the node id (edge endpoints join to it).
+    pub id_column: String,
+    /// Column in `node_source` holding the text the encoder embeds.
+    pub text_column: String,
+    /// The edge relation walked: an engine-produced edge table, or a registered
+    /// source read through its endpoint columns.
+    pub edges: EdgeSourceBinding,
+}
+
 impl ProducingDescriptor {
     /// The producer this descriptor records — its `producer` tag in the
     /// manifest (`"embedding"`, `"graph_propagation"`, …).
@@ -1335,25 +1339,14 @@ impl ProducingDescriptor {
 
     /// Build a [`Self::GraphTrainingSet`] descriptor — the graph fine-tune
     /// arm's identity, at [`GRAPH_READ_ORDER_RULE_V1`].
-    #[allow(clippy::too_many_arguments)]
     pub fn graph_training_set(
-        node_source: impl Into<String>,
-        edge_source: impl Into<String>,
-        id_column: impl Into<String>,
-        text_column: impl Into<String>,
-        src_column: impl Into<String>,
-        dst_column: impl Into<String>,
+        sources: GraphTrainingSources,
         task: ModelTask,
         format: impl Into<String>,
         sample: GraphSampleFields,
     ) -> Self {
         Self::GraphTrainingSet {
-            node_source: node_source.into(),
-            edge_source: edge_source.into(),
-            id_column: id_column.into(),
-            text_column: text_column.into(),
-            src_column: src_column.into(),
-            dst_column: dst_column.into(),
+            sources,
             task,
             format: format.into(),
             sample,
@@ -2029,7 +2022,7 @@ mod tests {
     #[test]
     fn definition_hash_golden_at_this_manifest_version() {
         assert_eq!(
-            MANIFEST_VERSION, 4,
+            MANIFEST_VERSION, 5,
             "a new manifest version takes a fresh golden"
         );
         let d = embedding_descriptor();
@@ -3161,12 +3154,7 @@ mod tests {
     /// silently escaping the definition hash.
     #[derive(Clone)]
     struct GraphTrainingSetFields {
-        node_source: String,
-        edge_source: String,
-        id_column: String,
-        text_column: String,
-        src_column: String,
-        dst_column: String,
+        sources: GraphTrainingSources,
         task: ModelTask,
         format: String,
         sample: GraphSampleFields,
@@ -3177,24 +3165,14 @@ mod tests {
         // Exhaustive construction: no `..`, so the fixture and the variant
         // stay in lock-step.
         let GraphTrainingSetFields {
-            node_source,
-            edge_source,
-            id_column,
-            text_column,
-            src_column,
-            dst_column,
+            sources,
             task,
             format,
             sample,
             read_order_rule,
         } = f.clone();
         ProducingDescriptor::GraphTrainingSet {
-            node_source,
-            edge_source,
-            id_column,
-            text_column,
-            src_column,
-            dst_column,
+            sources,
             task,
             format,
             sample,
@@ -3207,12 +3185,19 @@ mod tests {
     /// exactly where the identity is lossy.
     fn graph_training_set_fields() -> GraphTrainingSetFields {
         GraphTrainingSetFields {
-            node_source: "kb_nodes".into(),
-            edge_source: "kb_edges".into(),
-            id_column: "id".into(),
-            text_column: "text".into(),
-            src_column: "src".into(),
-            dst_column: "dst".into(),
+            sources: GraphTrainingSources {
+                node_source: "kb_nodes".into(),
+                id_column: "id".into(),
+                text_column: "text".into(),
+                edges: EdgeSourceBinding::Registered {
+                    source_id: "kb_edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                    type_column: None,
+                    weight_column: None,
+                    as_of_column: None,
+                },
+            },
             task: ModelTask::TextEmbedding,
             format: "triplet".into(),
             sample: GraphSampleFields {
@@ -3249,12 +3234,13 @@ mod tests {
         // The `let` below is the enumeration of record: adding a field to the
         // variant fails to compile here until it is bound and mutated.
         let GraphTrainingSetFields {
-            node_source: _,
-            edge_source: _,
-            id_column: _,
-            text_column: _,
-            src_column: _,
-            dst_column: _,
+            sources:
+                GraphTrainingSources {
+                    node_source: _,
+                    id_column: _,
+                    text_column: _,
+                    edges: _,
+                },
             task: _,
             format: _,
             sample: _,
@@ -3266,12 +3252,31 @@ mod tests {
             &no_model_env(),
             graph_training_set_descriptor,
             &[
-                ("node_source", |f| f.node_source = "kb_nodes_v2".into()),
-                ("edge_source", |f| f.edge_source = "kb_edges_v2".into()),
-                ("id_column", |f| f.id_column = "node_id".into()),
-                ("text_column", |f| f.text_column = "body".into()),
-                ("src_column", |f| f.src_column = "from".into()),
-                ("dst_column", |f| f.dst_column = "to".into()),
+                ("node_source", |f| {
+                    f.sources.node_source = "kb_nodes_v2".into()
+                }),
+                ("id_column", |f| f.sources.id_column = "node_id".into()),
+                ("text_column", |f| f.sources.text_column = "body".into()),
+                ("edges: another source", |f| {
+                    if let EdgeSourceBinding::Registered { source_id, .. } = &mut f.sources.edges {
+                        *source_id = "kb_edges_v2".into();
+                    }
+                }),
+                ("edges: another src column", |f| {
+                    if let EdgeSourceBinding::Registered { src_column, .. } = &mut f.sources.edges {
+                        *src_column = "from".into();
+                    }
+                }),
+                ("edges: another dst column", |f| {
+                    if let EdgeSourceBinding::Registered { dst_column, .. } = &mut f.sources.edges {
+                        *dst_column = "to".into();
+                    }
+                }),
+                ("edges: an engine edge table", |f| {
+                    f.sources.edges = EdgeSourceBinding::NeighborGraph {
+                        table_name: "kb_graph".into(),
+                    }
+                }),
                 ("task", |f| f.task = ModelTask::Classification),
                 ("format", |f| f.format = "pairs".into()),
                 ("sample.seed", |f| f.sample.seed = 7),

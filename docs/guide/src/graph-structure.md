@@ -83,6 +83,7 @@ an edge source that does not exist, a graph with no node.
 # use jammi_db::config::JammiConfig;
 use jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef;
 use jammi_ai::pipeline::graph_structure::StructureRequest;
+use jammi_db::index::SearchMethod;
 use jammi_db::store::CachePolicy;
 # async fn ex(config: JammiConfig) -> jammi_db::error::Result<()> {
 # let session = Arc::new(InferenceSession::new(config).await?);
@@ -111,7 +112,7 @@ let (table, _outcome) = session
 // Query by example: the accounts placed like this one, hydrated from
 // `accounts` through the key column.
 let similar = session
-    .search_by_id("accounts", "acct-0007", 10, Some(&table.table_name), None)
+    .search_by_id("accounts", "acct-0007", 10, Some(&table.table_name), SearchMethod::default())
     .await?
     .run()
     .await?;

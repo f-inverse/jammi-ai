@@ -3,17 +3,8 @@
 `world_size` is the data-parallel rank count: how many ranks train one job
 cooperatively. It rides `SubmitJobRequest.world_size`, whose `0` means UNSET and
 resolves to the engine's default of one rank — so the builder writes the field
-ONLY when the caller asked for more than one rank, and a call that never names
-the keyword produces byte-for-byte the request it produced before the keyword
-existed. The golden hex below pins exactly that: it was captured from the
-builders at `main` @ 9db8d395 (pre-`world_size`) with
-
-    python -c "from jammi._assembly import build_fine_tune_request as b; \
-               print(b(**FT).SerializeToString(deterministic=True).hex())"
-
-over the `_FINE_TUNE` / `_GRAPH` / `_CONTEXT_PREDICTOR` fixtures in this module.
-Regenerating a golden is only ever correct when the request shape changed for a
-reason unrelated to this keyword — read the diff before touching one.
+ONLY when the caller asked for more than one rank: one rank has one encoding,
+the unset field, whether or not the caller named it.
 
 The context-predictor verb deliberately carries NO `world_size`: the field is
 the wire form of `TrainingCommon.world_size`, and `ContextPredictorSpec` folds
@@ -55,8 +46,6 @@ _GRAPH = dict(
     id_column="id",
     text_column="text",
     edge_source="edges",
-    src_column="src",
-    dst_column="dst",
     base_model="sentence-transformers/all-MiniLM-L6-v2",
     edge_provenance="declared",
     epochs=2,
@@ -68,24 +57,6 @@ _CONTEXT_PREDICTOR = dict(
     task_column="t",
     value_column="v",
     idempotency_key="k-3",
-)
-
-# Serialized bytes of each builder's output at `main` @ 9db8d395, BEFORE the
-# `world_size` keyword existed. See the module docstring.
-_GOLDEN_FINE_TUNE = (
-    "0a100a04646f637312047465787418012001222673656e74656e63652d7472616e73"
-    "666f726d6572732f616c6c2d4d696e694c4d2d4c362d76322a02280332036b2d31"
-)
-_GOLDEN_GRAPH = (
-    "12440a240a056e6f646573120269641a0474657874220565646765732a0373726332"
-    "036473743801121c0804100219000000000000f03f21000000000000f03f28013001"
-    "3801222673656e74656e63652d7472616e73666f726d6572732f616c6c2d4d696e69"
-    "4c4d2d4c362d76322a0f2802420b1a0909000000000000344032036b2d32"
-)
-_GOLDEN_CONTEXT_PREDICTOR = (
-    "1a580a036f627312510a156f62732d636f6e746578742d707265646963746f721002"
-    "1a016b2201742a0176302038404004480252060a040a0212005864617b14ae47e17a"
-    "743f69000000000000f03f719a9999999999c93f780432036b2d33"
 )
 
 # Every public client verb that submits through one of the two LoRA fine-tune
@@ -112,25 +83,7 @@ def _hex(message) -> str:
     return message.SerializeToString(deterministic=True).hex()
 
 
-# --- default call: byte-identical to the pre-`world_size` request -------------
-
-
-def test_fine_tune_default_bytes_are_the_pre_world_size_bytes() -> None:
-    """A `fine_tune` request built without naming `world_size` serializes to
-    exactly the bytes the builder produced before the keyword existed."""
-    assert _hex(build_fine_tune_request(**_FINE_TUNE)) == _GOLDEN_FINE_TUNE
-
-
-def test_graph_default_bytes_are_the_pre_world_size_bytes() -> None:
-    assert _hex(build_fine_tune_graph_request(**_GRAPH)) == _GOLDEN_GRAPH
-
-
-def test_context_predictor_bytes_are_the_pre_world_size_bytes() -> None:
-    """The context-predictor request is untouched by this change end to end."""
-    assert (
-        _hex(build_context_predictor_request("obs", **_CONTEXT_PREDICTOR))
-        == _GOLDEN_CONTEXT_PREDICTOR
-    )
+# --- default call: the field stays off the wire -----------------------------
 
 
 def test_world_size_one_is_the_same_bytes_as_omitting_it() -> None:
@@ -146,7 +99,7 @@ def test_world_size_one_is_the_same_bytes_as_omitting_it() -> None:
 
 def test_default_leaves_the_field_off_the_encoding_entirely() -> None:
     """Not merely "equal to zero": the field is absent from the encoded
-    message, so a decoder sees the same field set it saw before."""
+    message."""
     for build, kwargs in (
         (build_fine_tune_request, _FINE_TUNE),
         (build_fine_tune_graph_request, _GRAPH),

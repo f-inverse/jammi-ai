@@ -52,7 +52,7 @@ keystone.show(keystone.fine_tune_on_graph)
 
 ```{python}
 declared = keystone.fine_tune_on_graph(
-    db, arxiv, SCALE, edges=arxiv.cites, provenance="declared",
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
     epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
 )
 print("fine-tuned embeddings:", declared)
@@ -60,15 +60,14 @@ print("fine-tuned embeddings:", declared)
 
 ## The two controls
 
-A training job reads its graph from a registered source, so the similarity
-graph — an engine-produced table — is registered first
-(`keystone.register_edges` writes its rows to a Parquet file and registers
-it). The random graph has as many edges as the similarity graph, drawn
-uniformly over the same papers.
+The similarity graph is the engine's own `build_neighbor_graph` table over the
+base embeddings, which the fine-tune walks directly as `edge_graph_table` — the
+training set then pins that table by its content digest, as any derived table
+pins a result-table input. The random graph has as many edges as the similarity
+graph, drawn uniformly over the same papers, and is registered as a source.
 
 ```{python}
-similarity_graph = db.build_neighbor_graph(arxiv.papers, table=base, k=10, exact=True)
-similarity_edges = keystone.register_edges(db, similarity_graph, "similarity_edges")
+similarity_graph = db.build_neighbor_graph(arxiv.papers, embedding_table=base, k=10, exact=True)
 
 ids = np.array(arxiv.split["train"] + arxiv.split["valid"] + arxiv.split["test"])
 n_edges = db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{similarity_graph}"').to_pylist()[0]["n"]
@@ -81,11 +80,11 @@ pq.write_table(
 db.add_source("random_edges", url=random_path, format="parquet")
 
 similarity = keystone.fine_tune_on_graph(
-    db, arxiv, SCALE, edges=similarity_edges, provenance="similarity",
+    db, arxiv, SCALE, edge_graph_table=similarity_graph, provenance="similarity",
     epochs=keystone.CONTROL_EPOCHS[SCALE],
 )
 random_graph = keystone.fine_tune_on_graph(
-    db, arxiv, SCALE, edges="random_edges", provenance="declared",
+    db, arxiv, SCALE, edge_source="random_edges", provenance="declared",
     epochs=keystone.CONTROL_EPOCHS[SCALE],
 )
 ```

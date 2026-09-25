@@ -1,7 +1,7 @@
 //! The one write every mutable-table statement is, and the `DataSink` that
 //! runs it for `INSERT` / `REPLACE INTO`.
 //!
-//! Every statement — append, upsert, update, delete — is [`replace_rows`]:
+//! Every statement — append, upsert, update, delete — is `replace_rows`:
 //! remove the session-owned rows at some primary keys, then insert some rows,
 //! in one transaction. Per DataFusion: *"This method will be called exactly
 //! once during each DML statement. Thus prior to return, the sink should do

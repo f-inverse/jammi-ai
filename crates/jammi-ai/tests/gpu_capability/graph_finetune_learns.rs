@@ -23,7 +23,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
+use jammi_ai::fine_tune::graph_sampler::{
+    EdgeProvenance, GraphEdges, GraphFineTuneSources, GraphSampleConfig,
+};
 use jammi_ai::fine_tune::{EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig};
 use jammi_ai::session::InferenceSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -106,9 +108,11 @@ async fn fine_tune_graph_learns_on_gpu() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {

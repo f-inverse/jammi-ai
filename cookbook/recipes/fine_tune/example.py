@@ -68,8 +68,6 @@ def main() -> int:
             id_column="id",
             text_column="text",
             edge_source="cites",
-            src_column="src",
-            dst_column="dst",
             base_model=BASE_MODEL,
             lora_rank=4,
             epochs=1,

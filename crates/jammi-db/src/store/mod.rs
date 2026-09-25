@@ -29,10 +29,10 @@ pub use freshness::{
 pub use layout::TenantSegment;
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, ContentDigest, DefinitionHash,
-    DeletePolicy, GraphSampleFields, InputAnchor, LeafDigest, LeafKey, LocalRun, ManifestError,
-    MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest, ModelIdentity,
-    ModelRun, PartitionVerdict, ProducingDescriptor, GRAPH_READ_ORDER_RULE_V1,
-    TRAINING_SET_ORDER_RULE_V1,
+    DeletePolicy, EdgeSourceBinding, GraphSampleFields, GraphTrainingSources, InputAnchor,
+    LeafDigest, LeafKey, LocalRun, ManifestError, MatchVerdict, Materialization,
+    MaterializationEnv, MaterializationManifest, ModelIdentity, ModelRun, PartitionVerdict,
+    ProducingDescriptor, GRAPH_READ_ORDER_RULE_V1, TRAINING_SET_ORDER_RULE_V1,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
@@ -805,12 +805,19 @@ mod from_record_tests {
     #[test]
     fn from_record_with_a_graph_training_set_descriptor_orders_by_its_ordinal() {
         let descriptor = ProducingDescriptor::graph_training_set(
-            "nodes",
-            "edges",
-            "id",
-            "text",
-            "src",
-            "dst",
+            manifest::GraphTrainingSources {
+                node_source: "nodes".into(),
+                id_column: "id".into(),
+                text_column: "text".into(),
+                edges: manifest::EdgeSourceBinding::Registered {
+                    source_id: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                    type_column: None,
+                    weight_column: None,
+                    as_of_column: None,
+                },
+            },
             ModelTask::TextEmbedding,
             "pairs",
             manifest::GraphSampleFields {

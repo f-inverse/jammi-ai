@@ -131,7 +131,7 @@ methods = {
     "matryoshka": tuned(pairs, ["anchor", "positive"], embedding_loss="mnrl",
                         matryoshka_dims=[width, width // 2, width // 4]),
     "graph": keystone.fine_tune_on_graph(
-        db, arxiv, SCALE, edges=arxiv.cites, provenance="declared", epochs=EPOCHS,
+        db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared", epochs=EPOCHS,
     ),
 }
 ```

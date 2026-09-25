@@ -59,7 +59,7 @@ use jammi_wire::proto::embedding::{
 use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_wire::proto::inference::inference_service_client::InferenceServiceClient;
-use jammi_wire::proto::inference::{CachePolicy as ProtoCachePolicy, InferRequest};
+use jammi_wire::proto::inference::InferRequest;
 use jammi_wire::proto::job::job_service_client::JobServiceClient;
 use jammi_wire::proto::job::{
     submit_job_request::Spec as ProtoTrainingSpec, CancelJobRequest as JobCancelJobRequest,
@@ -221,7 +221,7 @@ impl DataClient {
                 columns: columns.to_vec(),
                 key_column: key_column.to_string(),
                 modality: proto_modality(modality) as i32,
-                cache: proto_cache_policy(cache) as i32,
+                cache: jammi_wire::cache_policy_to_proto(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -361,7 +361,7 @@ impl DataClient {
                 columns: content_columns.to_vec(),
                 key_column: key_column.to_string(),
                 tenant_id: String::new(),
-                cache: proto_cache_policy(cache) as i32,
+                cache: jammi_wire::cache_policy_to_proto(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -440,33 +440,16 @@ impl DataClient {
                 base_model,
                 config: config.as_ref().map(config_to_proto),
                 idempotency_key: String::new(),
-                // `0` IS the unset value of the wire's implicit-presence
-                // `uint32`, so an unchosen count sends the same bytes a caller
-                // sent before the field existed and the engine resolves it to
-                // one rank. An explicit `1` denotes that same single-rank job,
-                // so it takes that same encoding: one wire value per intent,
-                // matching what the Python client puts on the wire
-                // (`_wire_world_size`). Only a count above one is written.
+                // `0` is the implicit-presence `uint32`'s unset value, which the
+                // engine resolves to one rank. An explicit `1` is that same
+                // single-rank job, so it takes the same encoding — one wire
+                // value per intent, as the Python client's `_wire_world_size`.
+                // Only a count above one is written.
                 world_size: world_size
                     .map(NonZeroU32::get)
                     .filter(|&ranks| ranks > 1)
                     .unwrap_or(0),
-                // `Bypass` (the engine default) leaves the field OFF the
-                // encoding entirely — `UNSPECIFIED` is `0`, the implicit-
-                // presence enum's unset value, and `Bypass`/`UNSPECIFIED`
-                // decode identically (`crates/jammi-ai/src/wire/training.rs`,
-                // `unspecified_and_bypass_cache_both_decode_to_bypass`) — so a
-                // caller that never asks for reuse submits byte-for-byte the
-                // request it submitted before this field existed, matching
-                // the Python client's `_wire_cache_policy_for_submit_job`
-                // (`clients/python/jammi/_assembly.py`), which leaves the
-                // field unset the same way. Only `Use` costs a byte on the
-                // wire, the one case that changes what the engine does with
-                // the request.
-                cache: match cache {
-                    CachePolicy::Use => ProtoCachePolicy::Use as i32,
-                    CachePolicy::Bypass => ProtoCachePolicy::Unspecified as i32,
-                },
+                cache: jammi_wire::cache_policy_to_proto(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -890,15 +873,6 @@ impl DataClient {
             .map_err(|s| audit_error_from_status(&s))?
             .into_inner();
         resp.records.into_iter().map(record_from_wire).collect()
-    }
-}
-
-/// Map the engine [`CachePolicy`] onto the wire enum. Encode is total.
-fn proto_cache_policy(cache: CachePolicy) -> jammi_wire::proto::inference::CachePolicy {
-    use jammi_wire::proto::inference::CachePolicy as Pb;
-    match cache {
-        CachePolicy::Use => Pb::Use,
-        CachePolicy::Bypass => Pb::Bypass,
     }
 }
 
@@ -1525,12 +1499,11 @@ mod world_size_tests {
     /// reference's field is `0` by construction, not by mirroring the
     /// production code under test). A regression back to an explicit
     /// `CACHE_POLICY_BYPASS` (`2`) diverges from this reference and fails —
-    /// the same no-regression property
+    /// the same one-encoding property
     /// `an_explicit_single_rank_encodes_as_the_unset_request` pins for
-    /// `world_size`, and the Python client's own golden-bytes oracle
+    /// `world_size`, and the Python client pins for `cache`
     /// (`clients/python/tests/test_cache_policy.py`,
-    /// `test_default_leaves_the_field_off_the_encoding_entirely`) pins for
-    /// `cache`.
+    /// `test_default_leaves_the_field_off_the_encoding_entirely`).
     #[tokio::test]
     async fn a_bypass_cache_policy_leaves_the_field_off_the_wire() {
         use jammi_wire::method_to_proto;

@@ -43,7 +43,7 @@ REQUIRED: dict[str, list[str]] = {
     "sql": [],
     "rrf_fuse": [],
     # tier 01
-    "build_neighbor_graph": ["k", "exact", "cache"],
+    "build_neighbor_graph": ["k", "exact", "embedding_table", "cache"],
     # tier 02
     "search": ["query", "row_key", "k", "embedding_table", "oversample", "exact"],
     "assemble_context": ["query", "k", "edge_source", "edge_direction", "edge_hops"],
@@ -70,10 +70,11 @@ REQUIRED: dict[str, list[str]] = {
         "node_source",
         "id_column",
         "text_column",
-        "edge_source",
-        "src_column",
-        "dst_column",
         "base_model",
+        "edge_graph_table",
+        "edge_source",
+        "edge_src_column",
+        "edge_dst_column",
         "edge_provenance",
     ],
     # attach-by-id + the tenant-scoped listing (every job kind): a job handle outlives the

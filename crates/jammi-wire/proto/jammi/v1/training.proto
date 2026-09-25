@@ -233,14 +233,27 @@ message GraphFineTuneSources {
   string id_column = 2;
   // Column in `node_source` holding the text the encoder embeds.
   string text_column = 3;
-  // Catalog source holding the edges.
-  string edge_source = 4;
-  // Column in `edge_source` holding the edge source endpoint.
-  string src_column = 5;
-  // Column in `edge_source` holding the edge destination endpoint.
-  string dst_column = 6;
-  // Provenance every edge in `edge_source` carries.
+  reserved 4, 5, 6;
+  // The edge relation the walks follow — exactly one arm, as a propagation's.
+  oneof edges {
+    // An engine-produced edge table (a `build_neighbor_graph` output), read
+    // through its `src` / `dst` columns.
+    string edge_graph_table = 8;
+    // A registered edge source and its endpoint columns.
+    GraphEdgeSource edge_source = 9;
+  }
+  // Provenance every edge carries.
   EdgeProvenance provenance = 7;
+}
+
+// A registered source holding a graph fine-tune's edges.
+message GraphEdgeSource {
+  // The registered source id.
+  string source_id = 1;
+  // Column holding the edge's source endpoint.
+  string src_column = 2;
+  // Column holding the edge's destination endpoint.
+  string dst_column = 3;
 }
 
 // node2vec walk + structure-aware negative-sampling knobs. Mirrors the engine's

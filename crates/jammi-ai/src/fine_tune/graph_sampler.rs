@@ -153,12 +153,11 @@ pub fn sort_into_graph_read_order(nodes: &mut [TextNode], edges: &mut [GraphEdge
     edges.sort_by(|a, b| a.src.cmp(&b.src).then_with(|| a.dst.cmp(&b.dst)));
 }
 
-/// The two sources and their column bindings a graph fine-tune reads from: a
-/// node-text source (id + text) and an edge source (src + dst), plus the
-/// provenance every edge in the edge source carries. Bundled so the
-/// graph-fine-tune entry point takes one typed argument instead of a long
-/// positional list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The two relations a graph fine-tune reads from: a node-text source (id +
+/// text) and an edge relation, plus the provenance every edge carries. Bundled
+/// so the graph-fine-tune entry point takes one typed argument instead of a
+/// long positional list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphFineTuneSources {
     /// Catalog source holding the node text.
@@ -167,15 +166,98 @@ pub struct GraphFineTuneSources {
     pub id_column: String,
     /// Column in `node_source` holding the text the encoder embeds.
     pub text_column: String,
-    /// Catalog source holding the edges.
-    pub edge_source: String,
-    /// Column in `edge_source` holding the edge source endpoint.
-    pub src_column: String,
-    /// Column in `edge_source` holding the edge destination endpoint.
-    pub dst_column: String,
-    /// Provenance every edge in `edge_source` carries (the edge source is
-    /// homogeneous in origin — declared *or* similarity, not mixed).
+    /// The edge relation the walks follow.
+    pub edges: GraphEdges,
+    /// Provenance every edge carries (the relation is homogeneous in origin —
+    /// declared *or* similarity, not mixed).
     pub provenance: EdgeProvenance,
+}
+
+/// The edge relation a graph fine-tune walks — the same two shapes a graph
+/// propagation takes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GraphEdges {
+    /// An engine-produced edge table (a `build_neighbor_graph` output), read
+    /// through its `src` / `dst` columns and anchored by its content digest.
+    Table(String),
+    /// A registered source, read through its endpoint columns.
+    Source {
+        /// The registered source holding the edge rows.
+        source: String,
+        /// Column holding the edge's source endpoint.
+        src_column: String,
+        /// Column holding the edge's destination endpoint.
+        dst_column: String,
+    },
+}
+
+impl GraphEdges {
+    /// The name of the relation the edges live in: the edge table, or the
+    /// registered source.
+    pub fn relation_name(&self) -> &str {
+        match self {
+            Self::Table(table) => table,
+            Self::Source { source, .. } => source,
+        }
+    }
+
+    /// The endpoint columns the walk reads.
+    pub fn columns(&self) -> (&str, &str) {
+        match self {
+            Self::Table(_) => ("src", "dst"),
+            Self::Source {
+                src_column,
+                dst_column,
+                ..
+            } => (src_column, dst_column),
+        }
+    }
+
+    /// The manifest's record of this edge relation.
+    pub fn binding(&self) -> jammi_db::store::EdgeSourceBinding {
+        match self {
+            Self::Table(table) => jammi_db::store::EdgeSourceBinding::NeighborGraph {
+                table_name: table.clone(),
+            },
+            Self::Source {
+                source,
+                src_column,
+                dst_column,
+            } => jammi_db::store::EdgeSourceBinding::Registered {
+                source_id: source.clone(),
+                src_column: src_column.clone(),
+                dst_column: dst_column.clone(),
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            },
+        }
+    }
+
+    /// The edge relation a recorded binding names. A registered binding that
+    /// filters by type, weight or time names a relation a graph fine-tune
+    /// never reads, and is refused.
+    pub fn from_binding(binding: &jammi_db::store::EdgeSourceBinding) -> Option<Self> {
+        match binding {
+            jammi_db::store::EdgeSourceBinding::NeighborGraph { table_name } => {
+                Some(Self::Table(table_name.clone()))
+            }
+            jammi_db::store::EdgeSourceBinding::Registered {
+                source_id,
+                src_column,
+                dst_column,
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            } => Some(Self::Source {
+                source: source_id.clone(),
+                src_column: src_column.clone(),
+                dst_column: dst_column.clone(),
+            }),
+            jammi_db::store::EdgeSourceBinding::Registered { .. } => None,
+        }
+    }
 }
 
 /// Sampling configuration: node2vec walk knobs plus the structure-aware

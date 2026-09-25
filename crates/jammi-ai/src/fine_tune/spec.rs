@@ -790,6 +790,7 @@ fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fine_tune::graph_sampler::GraphEdges;
 
     /// The JSON shape a writer that has no rank count queues: a `fine_tune`
     /// spec whose `common` block carries `base_model` and `config` and
@@ -903,9 +904,11 @@ mod tests {
                 node_source: "nodes".into(),
                 id_column: "id".into(),
                 text_column: "text".into(),
-                edge_source: "edges".into(),
-                src_column: "src".into(),
-                dst_column: "dst".into(),
+                edges: GraphEdges::Source {
+                    source: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                },
                 provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
             },
             sample_config: GraphSampleConfig::default(),
@@ -1112,9 +1115,11 @@ mod tests {
             node_source: "nodes".into(),
             id_column: "id".into(),
             text_column: "text".into(),
-            edge_source: "edges".into(),
-            src_column: "src".into(),
-            dst_column: "dst".into(),
+            edges: GraphEdges::Source {
+                source: "edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+            },
             provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
         };
         let sample_config = GraphSampleConfig {

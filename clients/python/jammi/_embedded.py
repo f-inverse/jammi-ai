@@ -650,10 +650,11 @@ class EmbeddedBackend:
         node_source: str,
         id_column: str,
         text_column: str,
-        edge_source: str,
-        src_column: str,
-        dst_column: str,
         base_model: str,
+        edge_graph_table: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
         edge_provenance: str = "declared",
         walk_length: Optional[int] = None,
         walks_per_node: Optional[int] = None,
@@ -681,7 +682,10 @@ class EmbeddedBackend:
         Returns a `Job`, mirroring the remote `RemoteDatabase.fine_tune_graph`.
         The request is assembled with the shared `GraphFineTuneSpec` builder
         (which carries the graph-only embedding-loss guard) and submitted
-        through the engine's wire seam. `edge_provenance` is the load-bearing
+        through the engine's wire seam. The walks follow an engine-built
+        neighbour graph (``edge_graph_table``) or a registered edge source
+        (``edge_source`` with ``edge_src_column``/``edge_dst_column``) — pass
+        exactly one. `edge_provenance` is the load-bearing
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
         `idempotency_key`, when non-empty, dedupes the submission (migration
@@ -699,10 +703,11 @@ class EmbeddedBackend:
             node_source=node_source,
             id_column=id_column,
             text_column=text_column,
-            edge_source=edge_source,
-            src_column=src_column,
-            dst_column=dst_column,
             base_model=base_model,
+            edge_graph_table=edge_graph_table,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
             edge_provenance=edge_provenance,
             walk_length=walk_length,
             walks_per_node=walks_per_node,
@@ -835,7 +840,7 @@ class EmbeddedBackend:
         min_similarity: Optional[float] = None,
         mutual: bool = False,
         exact: bool = False,
-        table: Optional[str] = None,
+        embedding_table: Optional[str] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Materialise the k-NN graph of a source's embedding table and return the
@@ -844,7 +849,9 @@ class EmbeddedBackend:
         The returned table has columns ``(src, dst, rank, similarity)``. The
         default driver is index-assisted and approximate; pass ``exact=True`` for
         a deterministic, complete graph. ``min_similarity`` floors weak edges;
-        ``mutual=True`` keeps only reciprocal edges. Mirrors the remote
+        ``mutual=True`` keeps only reciprocal edges. ``embedding_table`` names
+        the embedding table the graph is built over; omitted, the source's
+        newest. Mirrors the remote
         `RemoteDatabase.build_neighbor_graph`; the request is assembled with the
         shared `BuildNeighborGraphRequest` builder and submitted through the
         engine's wire seam. Read the table via :meth:`sql`.
@@ -855,7 +862,7 @@ class EmbeddedBackend:
             min_similarity=min_similarity,
             mutual=mutual,
             exact=exact,
-            table=table,
+            embedding_table=embedding_table,
             cache=cache,
         )
         return self._native._build_neighbor_graph_proto(request.SerializeToString())

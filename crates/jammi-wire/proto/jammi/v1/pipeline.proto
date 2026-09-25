@@ -211,7 +211,7 @@ message BuildNeighborGraphRequest {
   bool exact = 5;
   // Optional specific embedding table to build the graph over; unset resolves
   // the source's default embedding table.
-  optional string table = 6;
+  optional string embedding_table = 6;
   // Opt-in memoization. UNSPECIFIED maps to the engine default (`Bypass`). A
   // neighbour-graph is anchored on the immutable source-table digest, so it is
   // genuinely cacheable: a `Use` request reuses an exact prior build.

@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use jammi_ai::fine_tune::data::TrainingDataLoader;
 use jammi_ai::fine_tune::graph_sampler::{
-    sort_into_graph_read_order, EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig,
-    GraphSampler, TextNode,
+    sort_into_graph_read_order, EdgeProvenance, GraphEdge, GraphEdges, GraphFineTuneSources,
+    GraphSampleConfig, GraphSampler, TextNode,
 };
 use jammi_ai::fine_tune::role::{LeaseHolder, RunnerRole};
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec};
@@ -124,9 +124,11 @@ fn graph_sources() -> GraphFineTuneSources {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     }
 }

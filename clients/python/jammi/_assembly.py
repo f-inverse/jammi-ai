@@ -105,12 +105,15 @@ def _cache_policy_value(cache: Optional[str]) -> int:
     """Resolve a `cache=` argument to its wire `CachePolicy` enum.
 
     `None` (the default) and ``"bypass"`` both resolve to the engine default
-    (always recompute); ``"use"`` opts into memoization. Any other string is a
-    loud `ValueError`, never a silent default — the same honesty the engine's
-    decode keeps for an out-of-range enum.
+    (always recompute), encoded as `UNSPECIFIED` — proto3's unset value, so the
+    field stays off the wire — the one encoding every writer of the engine
+    default shares (`jammi_wire::cache_policy_to_proto`). ``"use"`` opts into
+    memoization. Any other string is a loud `ValueError`, never a silent
+    default — the same honesty the engine's decode keeps for an out-of-range
+    enum.
     """
     if cache is None or cache == "bypass":
-        return inference_pb2.CachePolicy.CACHE_POLICY_BYPASS
+        return inference_pb2.CachePolicy.CACHE_POLICY_UNSPECIFIED
     if cache == "use":
         return inference_pb2.CachePolicy.CACHE_POLICY_USE
     raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
@@ -541,32 +544,6 @@ def _wire_world_size(world_size: int) -> Optional[int]:
     return world_size if world_size > 1 else None
 
 
-def _wire_cache_policy_for_submit_job(cache: Optional[str]) -> Optional[int]:
-    """Convert a `cache` kwarg into the value `SubmitJobRequest.cache` should
-    carry — the SubmitJob-specific sibling of :func:`_wire_world_size`, NOT
-    :func:`_cache_policy_value` (which every other producer verb's `cache`
-    field uses).
-
-    `SubmitJobRequest` is the frozen wire surface `world_size` was appended
-    to (`crates/jammi-wire/proto/jammi/v1/job.proto`), and `cache` is a
-    SECOND field appended there the same way: a caller that never names the
-    keyword (or explicitly asks for the engine default, `"bypass"`) must
-    submit byte-for-byte the request it submitted before this field existed
-    — the same no-regression property `tests/test_world_size.py`'s golden
-    hex pins for `world_size`. Returning ``None`` here leaves the field OFF
-    the encoding entirely (the proto constructor skips a ``None`` kwarg),
-    which is also what an explicit `CACHE_POLICY_UNSPECIFIED` would encode
-    to, since a proto3 enum's zero value is never serialized either way; only
-    `"use"` costs a byte on the wire, the one case that changes what the
-    engine does with the request.
-    """
-    if cache is None or cache == "bypass":
-        return None
-    if cache == "use":
-        return inference_pb2.CachePolicy.CACHE_POLICY_USE
-    raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
-
-
 def build_fine_tune_request(
     *,
     source: str,
@@ -623,10 +600,10 @@ def build_fine_tune_request(
     `cache="use"` opts into model-level reuse: the worker completes the job
     against an already-published model of the same definition when one
     exists and trains only on a miss; `cache=None` or ``"bypass"`` (the
-    default) always trains — see :func:`_wire_cache_policy_for_submit_job`.
+    default) always trains — see :func:`_cache_policy_value`.
     """
     wire_world_size = _wire_world_size(world_size)
-    wire_cache = _wire_cache_policy_for_submit_job(cache)
+    wire_cache = _cache_policy_value(cache)
     try:
         wire_method = _FINE_TUNE_METHOD[method]
     except KeyError:
@@ -688,10 +665,11 @@ def build_fine_tune_graph_request(
     node_source: str,
     id_column: str,
     text_column: str,
-    edge_source: str,
-    src_column: str,
-    dst_column: str,
     base_model: str,
+    edge_graph_table: Optional[str] = None,
+    edge_source: Optional[str] = None,
+    edge_src_column: Optional[str] = None,
+    edge_dst_column: Optional[str] = None,
     edge_provenance: str = "declared",
     walk_length: Optional[int] = None,
     walks_per_node: Optional[int] = None,
@@ -717,6 +695,11 @@ def build_fine_tune_graph_request(
     """Assemble the `SubmitJobRequest` for a graph-supervised fine-tune (S11,
     the `GraphFineTuneSpec` arm) from the embed binding's flat kwargs.
 
+    The walks follow either an engine-built neighbour graph
+    (`edge_graph_table`, a `build_neighbor_graph` output) or a registered edge
+    source (`edge_source` with its endpoint columns) — exactly one, the same
+    vocabulary as `propagate_embeddings`.
+
     Validates the `edge_provenance` vocabulary, fills the `GraphSampleConfig`
     defaults (matching the engine's `GraphSampleConfig::default()`), and applies
     the graph-only embedding-loss guard (only `mnrl`/`triplet` for graph
@@ -729,10 +712,10 @@ def build_fine_tune_graph_request(
     the job against an already-published model of the same sampled graph, spec
     and base model when one exists and trains only on a miss; `cache=None` or
     ``"bypass"`` (the default) always trains — see
-    :func:`_wire_cache_policy_for_submit_job`.
+    :func:`_cache_policy_value`.
     """
     wire_world_size = _wire_world_size(world_size)
-    wire_cache = _wire_cache_policy_for_submit_job(cache)
+    wire_cache = _cache_policy_value(cache)
     try:
         provenance = _EDGE_PROVENANCE[edge_provenance]
     except KeyError:
@@ -798,10 +781,13 @@ def build_fine_tune_graph_request(
                 node_source=node_source,
                 id_column=id_column,
                 text_column=text_column,
-                edge_source=edge_source,
-                src_column=src_column,
-                dst_column=dst_column,
                 provenance=provenance,
+                **_graph_fine_tune_edges(
+                    edge_graph_table=edge_graph_table,
+                    edge_source=edge_source,
+                    edge_src_column=edge_src_column,
+                    edge_dst_column=edge_dst_column,
+                ),
             ),
             sample_config=sample,
         ),
@@ -963,13 +949,13 @@ def build_neighbor_graph_request(
     min_similarity: Optional[float] = None,
     mutual: bool = False,
     exact: bool = False,
-    table: Optional[str] = None,
+    embedding_table: Optional[str] = None,
     cache: Optional[str] = None,
 ) -> pipeline_pb2.BuildNeighborGraphRequest:
     """Assemble the `BuildNeighborGraphRequest` for a k-NN graph materialisation
     from the binding's flat kwargs.
 
-    The optional `min_similarity` floor and `table` selector carry explicit
+    The optional `min_similarity` floor and `embedding_table` selector carry explicit
     presence — left unset when omitted so the engine resolves the default.
     `cache` opts into memoization (``"use"``) or keeps the default recompute
     (``None``/``"bypass"``). The same request the embed binding submits
@@ -984,8 +970,8 @@ def build_neighbor_graph_request(
     )
     if min_similarity is not None:
         request.min_similarity = min_similarity
-    if table is not None:
-        request.table = table
+    if embedding_table is not None:
+        request.embedding_table = embedding_table
     return request
 
 
@@ -1083,11 +1069,7 @@ def _set_graph_arm(
     """Fill a graph verb's `graph` oneof: an S9 similarity graph
     (`edge_graph_table`) or a registered external edge source (`edge_source`)
     — exactly one."""
-    if edge_graph_table is not None and edge_source is not None:
-        raise ValueError(
-            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
-            "(registered edges), not both"
-        )
+    _require_one_graph(verb, edge_graph_table, edge_source)
     if edge_graph_table is not None:
         request.edge_graph_table = edge_graph_table
     elif edge_source is not None:
@@ -1100,8 +1082,40 @@ def _set_graph_arm(
         )
         if edge_weight_column is not None:
             request.edge_source.weight_column = edge_weight_column
-    else:
+
+
+def _require_one_graph(
+    verb: str, edge_graph_table: Optional[str], edge_source: Optional[str]
+) -> None:
+    """A graph verb names its edges exactly once: an engine-built graph table or
+    a registered edge source."""
+    if edge_graph_table is not None and edge_source is not None:
+        raise ValueError(
+            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
+            "(registered edges), not both"
+        )
+    if edge_graph_table is None and edge_source is None:
         raise ValueError(f"{verb} requires a graph: edge_graph_table or edge_source")
+
+
+def _graph_fine_tune_edges(
+    *,
+    edge_graph_table: Optional[str],
+    edge_source: Optional[str],
+    edge_src_column: Optional[str],
+    edge_dst_column: Optional[str],
+) -> dict:
+    """The `edges` oneof of a graph fine-tune's sources, as constructor kwargs."""
+    _require_one_graph("fine_tune_graph", edge_graph_table, edge_source)
+    if edge_graph_table is not None:
+        return {"edge_graph_table": edge_graph_table}
+    return {
+        "edge_source": training_pb2.GraphEdgeSource(
+            source_id=edge_source,
+            src_column=edge_src_column if edge_src_column is not None else "src",
+            dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+        )
+    }
 
 
 def build_generate_structure_embeddings_request(

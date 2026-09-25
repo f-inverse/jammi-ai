@@ -170,7 +170,8 @@ use crate::fine_tune::decode::{
     build_training_data_loader, detect_training_format, extract_string_column,
 };
 use crate::fine_tune::graph_sampler::{
-    GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, SampledPair, TextNode,
+    GraphEdge, GraphEdges, GraphFineTuneSources, GraphSampleConfig, GraphSampler, SampledPair,
+    TextNode,
 };
 use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
 use crate::fine_tune::role::{LeaseHolder, RunnerRole};
@@ -181,6 +182,7 @@ use crate::fine_tune::FineTuneConfig;
 use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
+use crate::pipeline::graph_neighbourhood::EdgeSourceRef;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingJob, TrainingOutcome};
@@ -1572,33 +1574,33 @@ pub(crate) async fn materialize_graph_training_set(
         }
     }
 
-    let edge_table = session.find_table_name(&sources.edge_source).await?;
-    let src_col = quote_ident(&sources.src_column);
-    let dst_col = quote_ident(&sources.dst_column);
+    let (src_name, dst_name) = sources.edges.columns();
+    let edge_relation = match &sources.edges {
+        GraphEdges::Table(table) => jammi_db::store::result_table_relation(table).to_string(),
+        GraphEdges::Source { source, .. } => {
+            source_relation(source, &session.find_table_name(source).await?)
+        }
+    };
+    let src_col = quote_ident(src_name);
+    let dst_col = quote_ident(dst_name);
     let edge_query = format!(
-        "SELECT {src_col}, {dst_col} FROM {} ORDER BY {src_col} ASC NULLS FIRST, {dst_col} ASC NULLS FIRST",
-        source_relation(&sources.edge_source, &edge_table)
+        "SELECT {src_col}, {dst_col} FROM {edge_relation} \
+         ORDER BY {src_col} ASC NULLS FIRST, {dst_col} ASC NULLS FIRST"
     );
     let edge_batches = session.sql(&edge_query).await?;
     let mut edges = Vec::new();
     for batch in &edge_batches {
         let srcs = batch
-            .column_by_name(&sources.src_column)
+            .column_by_name(src_name)
             .and_then(|c| extract_string_column(c.as_ref()))
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "edge src column '{}' is not text",
-                    sources.src_column
-                ))
+                JammiError::FineTune(format!("edge src column '{src_name}' is not text"))
             })?;
         let dsts = batch
-            .column_by_name(&sources.dst_column)
+            .column_by_name(dst_name)
             .and_then(|c| extract_string_column(c.as_ref()))
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "edge dst column '{}' is not text",
-                    sources.dst_column
-                ))
+                JammiError::FineTune(format!("edge dst column '{dst_name}' is not text"))
             })?;
         for (src, dst) in srcs.into_iter().zip(dsts) {
             edges.push(GraphEdge {
@@ -1745,12 +1747,12 @@ pub(crate) async fn materialize_graph_training_set(
         exclude_hops: exclude_hops as u64,
     };
     let descriptor = ProducingDescriptor::graph_training_set(
-        sources.node_source.clone(),
-        sources.edge_source.clone(),
-        sources.id_column.clone(),
-        sources.text_column.clone(),
-        sources.src_column.clone(),
-        sources.dst_column.clone(),
+        jammi_db::store::GraphTrainingSources {
+            node_source: sources.node_source.clone(),
+            id_column: sources.id_column.clone(),
+            text_column: sources.text_column.clone(),
+            edges: sources.edges.binding(),
+        },
         ModelTask::TextEmbedding,
         format_tag,
         sample_fields,
@@ -1769,7 +1771,8 @@ pub(crate) async fn materialize_graph_training_set(
     // have to escape.
     let source_display = format!(
         "graph__node-{}__edge-{}",
-        sources.node_source, sources.edge_source
+        sources.node_source,
+        sources.edges.relation_name()
     );
     let order_columns = vec!["_ordinal".to_string()];
     let spec = TrainingSetSpec {
@@ -3518,9 +3521,20 @@ impl JobWorker {
                         },
                     ) => {
                         let now = chrono::Utc::now().to_rfc3339();
+                        let edge_anchor = match &sources.edges {
+                            GraphEdges::Table(table) => session
+                                .edge_source_anchor(&EdgeSourceRef::NeighborGraph {
+                                    table_name: table.clone(),
+                                })
+                                .await
+                                .map_err(WorkerJobError::from)?,
+                            GraphEdges::Source { source, .. } => {
+                                InputAnchor::unpinned_at_instant(source, now.clone())
+                            }
+                        };
                         let inputs = vec![
-                            InputAnchor::unpinned_at_instant(&sources.node_source, now.clone()),
-                            InputAnchor::unpinned_at_instant(&sources.edge_source, now),
+                            InputAnchor::unpinned_at_instant(&sources.node_source, now),
+                            edge_anchor,
                         ];
                         materialize_graph_training_set(
                             session,
@@ -10297,11 +10311,13 @@ mod tests {
                 let graph = TrainingSpec::GraphFineTune {
                     sources: crate::fine_tune::graph_sampler::GraphFineTuneSources {
                         node_source: "n".into(),
-                        edge_source: "e".into(),
                         id_column: "id".into(),
                         text_column: "text".into(),
-                        src_column: "src".into(),
-                        dst_column: "dst".into(),
+                        edges: crate::fine_tune::graph_sampler::GraphEdges::Source {
+                            source: "e".into(),
+                            src_column: "src".into(),
+                            dst_column: "dst".into(),
+                        },
                         provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
                     },
                     sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),

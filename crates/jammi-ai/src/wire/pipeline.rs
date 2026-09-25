@@ -94,9 +94,9 @@ pub fn build_neighbor_graph_from_proto(
     };
     Ok(BuildNeighborGraphArgs {
         source_id: req.source_id,
-        embedding_table: req.table,
+        embedding_table: req.embedding_table,
         params,
-        cache: crate::wire::cache_policy_from_proto(req.cache)?,
+        cache: jammi_wire::cache_policy_from_proto(req.cache)?,
     })
 }
 
@@ -128,7 +128,7 @@ pub fn propagate_request_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    let cache = crate::wire::cache_policy_from_proto(req.cache)?;
+    let cache = jammi_wire::cache_policy_from_proto(req.cache)?;
     let edge_source = edge_source_from_arm(req.graph.map(|graph| match graph {
         pb::propagate_embeddings_request::Graph::EdgeGraphTable(table) => GraphArm::Table(table),
         pb::propagate_embeddings_request::Graph::EdgeSource(source) => GraphArm::Source(source),
@@ -283,7 +283,7 @@ pub fn structure_request_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    let cache = crate::wire::cache_policy_from_proto(req.cache)?;
+    let cache = jammi_wire::cache_policy_from_proto(req.cache)?;
     let edge_source = edge_source_from_arm(req.graph.map(|graph| match graph {
         pb::generate_structure_embeddings_request::Graph::EdgeGraphTable(table) => {
             GraphArm::Table(table)

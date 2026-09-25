@@ -78,6 +78,7 @@ let spec = ContextPredictorTrainConfig {
     test_task_fraction: 0.2,                    // tasks held out for eval
     min_task_count: 4,                          // the meta-overfitting guard
     seed: 0,
+    embedding_table: None,                      // the source's default table
 };
 // Training is a durable, lease-claimed job: `train_context_predictor` submits a
 // queued job and returns a handle immediately; a worker claims it, re-samples

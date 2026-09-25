@@ -53,7 +53,7 @@ the raw embeddings in one `eval_compare`.
 ```{python}
 propagated = keystone.propagate(db, arxiv, embeddings)
 tuned = keystone.fine_tune_on_graph(
-    db, arxiv, SCALE, edges=arxiv.cites, provenance="declared",
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
     epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
 )
 compared = db.eval_compare(

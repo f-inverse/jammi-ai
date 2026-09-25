@@ -52,7 +52,7 @@ db.add_source("papers", url=str(work / "papers.parquet"), format="parquet")
 
 embeddings = db.generate_embeddings(source="papers", model=MODEL,
                                     columns=["title", "abstract"], key="paper_id")
-graph = db.build_neighbor_graph("papers", k=10, table=embeddings, cache="use")
+graph = db.build_neighbor_graph("papers", k=10, embedding_table=embeddings, cache="use")
 propagated = db.propagate_embeddings("papers", embedding_table=embeddings,
                                      edge_graph_table=graph, hops=2, alpha=0.1,
                                      output="final", cache="use")
@@ -68,9 +68,9 @@ visible: a reuse returns the *same* name, a computation a new one.
 ```{python}
 outcomes = {
     "the same neighbour graph": db.build_neighbor_graph(
-        "papers", k=10, table=embeddings, cache="use") == graph,
+        "papers", k=10, embedding_table=embeddings, cache="use") == graph,
     "a graph with k = 5": db.build_neighbor_graph(
-        "papers", k=5, table=embeddings, cache="use") == graph,
+        "papers", k=5, embedding_table=embeddings, cache="use") == graph,
     "the same propagation": db.propagate_embeddings(
         "papers", embedding_table=embeddings, edge_graph_table=graph, hops=2, alpha=0.1,
         output="final", cache="use") == propagated,

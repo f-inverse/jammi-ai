@@ -8,12 +8,9 @@ runnable from a fresh engine, and there is one definition of every step.
 from __future__ import annotations
 
 import inspect
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 
 from . import datasets, encoders
 from .datasets import Arxiv
@@ -63,19 +60,18 @@ CONTROL_EPOCHS = {Scale.SMALL: 2, Scale.FULL: 5}
 
 
 def fine_tune_on_graph(
-    db, arxiv: Arxiv, scale: Scale, *, edges: str, provenance: str, epochs: int
+    db, arxiv: Arxiv, scale: Scale, *, provenance: str, epochs: int, **graph: str
 ) -> str:
-    """Tier 03: fine-tune the text encoder contrastively over random walks on
-    ``edges`` (a registered source of ``src``/``dst`` paper ids), then embed
+    """Tier 03: fine-tune the text encoder contrastively over random walks on a
+    graph of paper ids — ``edge_source=`` a registered source of ``src``/``dst``
+    rows, or ``edge_graph_table=`` a ``build_neighbor_graph`` table — then embed
     every paper with the fine-tuned model. Returns the new embedding table."""
     job = db.fine_tune_graph(
         node_source=arxiv.papers,
         id_column="paper_id",
         text_column="abstract",
-        edge_source=edges,
-        src_column="src",
-        dst_column="dst",
         base_model=encoders.text(scale),
+        **graph,
         edge_provenance=provenance,
         epochs=epochs,
         batch_size=32,
@@ -90,15 +86,6 @@ def fine_tune_on_graph(
         columns=["title", "abstract"],
         key="paper_id",
     )
-
-
-def register_edges(db, table: str, name: str) -> str:
-    """Register an engine-produced edge table's ``src``/``dst`` rows as a
-    source named ``name`` — a training job's graph must be a registered source."""
-    path = Path(tempfile.mkdtemp()) / f"{name}.parquet"
-    pq.write_table(db.sql(f'SELECT src, dst FROM "jammi.{table}"'), path)
-    db.add_source(name, url=str(path), format="parquet")
-    return name
 
 
 # Tier 04's context-predictor meta-training epochs.

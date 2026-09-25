@@ -3,11 +3,13 @@
 //! Lives in one module because the enum is shared across the embedding /
 //! inference / pipeline services (the proto defines it once in
 //! `jammi.v1.inference`), so its decode/encode is shared too rather than
-//! duplicated per service converter. The response half, `CacheOutcome`, is
-//! `jammi_wire::cache_outcome_to_proto` / `cache_outcome_from_proto`.
+//! duplicated per service converter — and shared by every writer, the engine's
+//! re-encode and the Rust client alike, so a policy has one wire encoding. The
+//! response half, `CacheOutcome`, is [`crate::cache_outcome_to_proto`] /
+//! [`crate::cache_outcome_from_proto`].
 
+use crate::proto::inference as pb;
 use jammi_db::store::CachePolicy;
-use jammi_wire::proto::inference as pb;
 use tonic::Status;
 
 /// Decode the wire [`pb::CachePolicy`] into the engine [`CachePolicy`].

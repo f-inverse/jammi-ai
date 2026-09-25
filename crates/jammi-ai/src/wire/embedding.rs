@@ -75,7 +75,7 @@ pub fn generate_embeddings_from_proto(
         columns: req.columns,
         key_column: req.key_column,
         modality: Modality::try_from(req.modality)?,
-        cache: crate::wire::cache_policy_from_proto(req.cache)?,
+        cache: jammi_wire::cache_policy_from_proto(req.cache)?,
     })
 }
 

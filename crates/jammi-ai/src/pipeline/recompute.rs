@@ -70,12 +70,15 @@ use jammi_db::error::{JammiError, Result};
 use jammi_db::sql::quote_ident;
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, ContextAggregator, ContextCandidateSource,
-    ContextEdgeGather, GraphSampleFields, InputAnchor, ProducingDescriptor, PropagationDirection,
-    PropagationOutput, PropagationWeighting, GRAPH_READ_ORDER_RULE_V1, TRAINING_SET_ORDER_RULE_V1,
+    ContextEdgeGather, GraphSampleFields, GraphTrainingSources, InputAnchor, ProducingDescriptor,
+    PropagationDirection, PropagationOutput, PropagationWeighting, GRAPH_READ_ORDER_RULE_V1,
+    TRAINING_SET_ORDER_RULE_V1,
 };
 use jammi_db::store::{CacheOutcome, CachePolicy};
 
-use crate::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
+use crate::fine_tune::graph_sampler::{
+    EdgeProvenance, GraphEdges, GraphFineTuneSources, GraphSampleConfig,
+};
 use crate::pipeline::asof::{
     AsofJoinSpecBuilder, AsofKey, Boundary, MatchDirection, TieBreak, Tolerance,
 };
@@ -499,12 +502,7 @@ impl InferenceSession {
                 self.recompute_statement(table, &query).await
             }
             ProducingDescriptor::GraphTrainingSet {
-                node_source,
-                edge_source,
-                id_column,
-                text_column,
-                src_column,
-                dst_column,
+                sources,
                 task,
                 format,
                 sample,
@@ -512,12 +510,7 @@ impl InferenceSession {
             } => {
                 self.recompute_graph_training_set(
                     table,
-                    node_source,
-                    edge_source,
-                    id_column,
-                    text_column,
-                    src_column,
-                    dst_column,
+                    sources,
                     task,
                     format,
                     sample,
@@ -743,16 +736,10 @@ impl InferenceSession {
     /// re-derivation to still agree with what the original run recorded (a
     /// change to either derivation would otherwise silently diverge a replay
     /// from its original recorded meaning with no signal at all).
-    #[allow(clippy::too_many_arguments)]
     async fn recompute_graph_training_set(
         self: &Arc<Self>,
         table: &ResultTableRecord,
-        node_source: String,
-        edge_source: String,
-        id_column: String,
-        text_column: String,
-        src_column: String,
-        dst_column: String,
+        recorded: GraphTrainingSources,
         task: jammi_datafusion::ModelTask,
         format: String,
         sample: GraphSampleFields,
@@ -790,13 +777,16 @@ impl InferenceSession {
             inputs.push(self.reresolve_recorded_anchor(table, anchor, &now).await?);
         }
 
+        let edges = GraphEdges::from_binding(&recorded.edges).ok_or_else(|| {
+            JammiError::NotRecomputable {
+                table: table.table_name.clone(),
+            }
+        })?;
         let sources = GraphFineTuneSources {
-            node_source,
-            id_column,
-            text_column,
-            edge_source,
-            src_column,
-            dst_column,
+            node_source: recorded.node_source,
+            id_column: recorded.id_column,
+            text_column: recorded.text_column,
+            edges,
             provenance: EdgeProvenance::Declared,
         };
         // Domain-validity at the decode edge: `f64::from_bits`

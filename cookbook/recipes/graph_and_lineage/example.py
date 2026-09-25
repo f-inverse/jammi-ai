@@ -39,7 +39,7 @@ def main() -> int:
         )
 
         # 1. The k-NN graph over the corpus's embeddings. Graph verbs take the
-        #    SOURCE id; the embedding table is the source's (or pass `table=`).
+        #    SOURCE id; the embedding table is the source's (or pass `embedding_table=`).
         graph = db.build_neighbor_graph("corpus", k=3, exact=True)
         edges = db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{graph}"').to_pylist()[0]["n"]
         print(f"neighbor graph: {edges} edges (20 rows x k=3)")

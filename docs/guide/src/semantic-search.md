@@ -14,6 +14,7 @@ Perform ANN vector similarity search over embedding tables. Results include all 
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::config::JammiConfig;
+# use jammi_db::index::SearchMethod;
 # async fn ex(config: JammiConfig) -> jammi_db::error::Result<()> {
 use std::sync::Arc;
 
@@ -25,8 +26,8 @@ let query = session.encode_text_query(
     "quantum computing applications",
 ).await?;
 
-// Search — returns top 10 results
-let results = session.search("patents", query, 10, None, None).await?
+// Search — returns top 10 results through the table's ANN index
+let results = session.search("patents", query, 10, None, SearchMethod::default()).await?
     .run().await?;
 # Ok(()) }
 ```
@@ -72,8 +73,9 @@ builder step does.
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::index::SearchMethod;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-session.search("patents", query, 20, None, None).await?
+session.search("patents", query, 20, None, SearchMethod::default()).await?
     .filter("year > 2020")?
     .sort("similarity", true)?  // descending
     .limit(5)
@@ -105,8 +107,9 @@ function for inference. In Rust the same operations compose on the fluent builde
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
+# use jammi_db::index::SearchMethod;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 100, None, None).await?
+let results = session.search("patents", query, 100, None, SearchMethod::default()).await?
     .filter("year > 2020")?
     .sort("similarity", true)?
     .limit(10)

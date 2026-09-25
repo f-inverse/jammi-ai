@@ -87,7 +87,7 @@ retrieval that produced it — its `similarity` and its `rank` among the source
 row's neighbours — and a paper's edges are its top `search` hits.
 
 ```{python}
-graph = db.build_neighbor_graph(arxiv.papers, table=embeddings, k=10, exact=True)
+graph = db.build_neighbor_graph(arxiv.papers, embedding_table=embeddings, k=10, exact=True)
 edges = db.sql(f'SELECT src, dst, rank, similarity FROM "jammi.{graph}" ORDER BY src, rank')
 first = edges.slice(0, 3).to_pylist()
 print(f"self-kNN edges: {edges.num_rows}")
@@ -125,7 +125,7 @@ random < base < similarity < declared):
 
 ```{python}
 tuned = keystone.fine_tune_on_graph(
-    db, arxiv, SCALE, edges=arxiv.cites, provenance="declared",
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
     epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
 )
 ft_compared = db.eval_compare(

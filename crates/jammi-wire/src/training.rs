@@ -938,7 +938,7 @@ mod cache_tests {
     /// what a request that never set the field carries, matching how
     /// `world_size`'s `0` is its unset value. It resolves to the engine's
     /// `CachePolicy::Bypass` default at the decode
-    /// (`jammi_ai::wire::cache::cache_policy_from_proto`), never on the wire.
+    /// ([`crate::cache_policy_from_proto`]), never on the wire.
     #[test]
     fn cache_is_an_implicit_presence_enum_of_the_shared_cache_policy_type() {
         let field = submit_job_request_field("cache");

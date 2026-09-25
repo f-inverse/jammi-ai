@@ -50,6 +50,7 @@ mod transport;
 
 mod audit;
 mod cache_outcome;
+mod cache_policy;
 mod catalog;
 mod channel;
 mod embedding;
@@ -63,6 +64,7 @@ pub use transport::{SessionChannel, SessionHeader, SessionTransport, SESSION_HEA
 
 pub use audit::{parse_query_id, record_from_wire};
 pub use cache_outcome::{cache_outcome_from_proto, cache_outcome_to_proto};
+pub use cache_policy::{cache_policy_from_proto, cache_policy_to_proto};
 pub use catalog::{
     derives_from_edge_from_proto, derives_from_edge_to_proto, describe_table_from_proto,
     describe_table_to_proto, index_segment_from_proto, index_segment_to_proto,

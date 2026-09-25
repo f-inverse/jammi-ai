@@ -59,6 +59,16 @@ run = "python3 ci/scripts/check_cookbook_coverage.py"
 why = "Every public Python surface of jammi is run by a recipe or an executed book-chapter cell, so a verb cannot ship without its runnable example."
 
 [[guard]]
+name = "lockstep versions"
+run = "python3 ci/scripts/check_lockstep_versions.py"
+why = "Every Python and npm dist ships at the workspace version and every exact sibling pin names it, so a release never publishes a pin that cannot resolve."
+
+[[guard]]
+name = "cookbook notebooks"
+run = "python3 cookbook/book/scripts/build_notebooks.py --check"
+why = "Every chapter and recipe has a Colab notebook built from its current source and pinned to the workspace version, so a link never opens a stale chapter or an engine it was not written for."
+
+[[guard]]
 name = "SQLite-ism tripwire"
 run = "python3 ci/scripts/check_sqlite_isms.py"
 why = "No backend-specific SQL token in jammi-db's shared catalog code; the Postgres test matrix is the real parity proof."

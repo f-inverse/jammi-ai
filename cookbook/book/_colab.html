@@ -1,0 +1,13 @@
+<script>
+(function () {
+  var page = location.pathname.match(/\/chapters\/(.+)\.html$/);
+  var title = document.querySelector("#title-block-header");
+  if (!page || !title) return;
+  var link = document.createElement("a");
+  link.href = "https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.49.1/cookbook/notebooks/book/" + page[1] + ".ipynb";
+  link.target = "_blank";
+  link.rel = "noopener";
+  link.innerHTML = '<img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">';
+  title.appendChild(link);
+})();
+</script>

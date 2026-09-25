@@ -84,7 +84,9 @@ No Python runs in the serving or training path.
   are decided once, by row cost, and carried as a chunk id the exchange
   hashes on. A plan fanned over one partition or sixteen, in one process or
   across a Ballista cluster, forwards identical chunks and writes identical
-  bytes.
+  bytes ([The Cookbook → Fan-out inference](https://f-inverse.github.io/jammi-ai/cookbook/chapters/26-fanout/fanout.html)
+  builds one table at one, two and four partitions and asserts the artifact
+  digests equal).
 - **Model outputs under a correctness contract.** Every result table
   records what produced it: the producing descriptor and the environment,
   including a typed record of each model's run (local weights with their

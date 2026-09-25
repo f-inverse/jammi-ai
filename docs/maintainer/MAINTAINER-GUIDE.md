@@ -5269,16 +5269,15 @@ auto-available to every encoder.)
 - **New crate:** `crates/<name>/Cargo.toml` with `version.workspace = true`; add to `members`
   (and `default-members` if a shippable OSS crate); `[workspace.dependencies]` entry pinned to
   the exact version + `path`; insert into the publish topological order in
-  `.github/workflows/crates.yml` after every dep; bump in the lockstep version-file set if it
-  ships to PyPI/npm.
+  `.github/workflows/crates.yml` after every dep; if it ships to PyPI/npm, add its manifest to
+  `ci/scripts/check_lockstep_versions.py`.
 - **New gated (live) test lane:** empty-list `[features]` entry; gate test code behind `#[cfg(feature
   = "…")]` (never `#[ignore]`); `[[test]]` target with `required-features` if it needs its own
   binary; **skip cleanly** (`tracing::warn`) without the feature; a CI job modeled on
   `test-pg` + a `--no-run` compile-check in `compile-check-gated`.
-- **Cut a release:** PR bumping the version across the lockstep version files
-  (`docs/plans/50-open-core-hardening-roadmap/ROADMAP.md`, the version-bump file list) + `cargo
-  update --workspace` + `CHANGELOG.md`; run the full gate; on merge tag both `vX.Y.Z` and
-  `py-vX.Y.Z`. [§6]
+- **Cut a release:** PR bumping the version across the lockstep sites (the `lockstep versions`
+  guard names each) + the rebuilt cookbook notebooks + `cargo update --workspace` +
+  `CHANGELOG.md`; run the full gate; on merge tag both `vX.Y.Z` and `py-vX.Y.Z`. [§6]
 
 ---
 
@@ -5589,11 +5588,11 @@ a gate: no CI job asserts against it.
 `require_gpu=true` so a GPU-less build fails fast rather than faking parity. GPU is not testable in CI
 (no GPU runners) — compile-checked only; live GPU is an A10G host gate.
 
-**Release (tag-driven, all OIDC trusted publishing, no tokens).** A version bump PR touches the
-lockstep version files (`docs/plans/50-open-core-hardening-roadmap/ROADMAP.md`, the version-bump file
-list): `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`, `pyproject.toml`, `clients/python/pyproject.toml`,
-`clients/typescript/package.json`, `packaging/server-cpu/pyproject.toml`,
-`packaging/server-cu12/pyproject.toml`. On merge, **prove before tagging**: dispatch
+**Release (tag-driven, all OIDC trusted publishing, no tokens).** A version bump PR moves
+`Cargo.toml`'s `[workspace.package] version` (and `Cargo.lock`, `CHANGELOG.md`), every dist and
+exact sibling pin the `lockstep versions` guard lists (`ci/scripts/check_lockstep_versions.py`), and
+rebuilds the cookbook notebooks (`python cookbook/book/scripts/build_notebooks.py`), which pin the
+release they install. On merge, **prove before tagging**: dispatch
 `.github/workflows/gpu-prove.yml` on the commit to be released (`--ref main` at the tip, or on the
 pushed tag once it exists) and wait for all four shipped arches to go green — **EVERY** release
 publishing job (all-or-nothing: not only the CUDA lanes) gates on that recorded

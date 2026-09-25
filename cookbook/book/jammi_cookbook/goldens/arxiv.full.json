@@ -1,4 +1,28 @@
 {
+  "calibration.adaptive_ece": {
+    "tol": 0.05,
+    "value": 0.2137206243974452
+  },
+  "calibration.central_coverage": {
+    "tol": 0.05,
+    "value": 0.932387706855792
+  },
+  "calibration.crps": {
+    "tol": 0.05,
+    "value": 0.4355386678922887
+  },
+  "calibration.nll": {
+    "tol": 0.1,
+    "value": 1.1738463828617698
+  },
+  "calibration.pit_ks": {
+    "tol": 0.05,
+    "value": 0.5634951225108182
+  },
+  "calibration.sharpness": {
+    "tol": 0.2,
+    "value": 2.9973844072741676
+  },
   "conformal.aps_coverage": {
     "tol": 0.03,
     "value": 0.9078014184397163
@@ -61,7 +85,7 @@
   },
   "tier01.precision_at_10": {
     "tol": 0.02,
-    "value": 0.5129999999999998
+    "value": 0.5130000000000001
   },
   "tier02.precision_at_10": {
     "tol": 0.02,

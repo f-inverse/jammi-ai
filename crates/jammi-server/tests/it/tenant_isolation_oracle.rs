@@ -3551,6 +3551,8 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
             storage_precision: StoragePrecision::F32 as i32,
             query: vec![1.0],
             width: 1,
+            target: 1,
+            version: None,
             phase: jammi_wire::proto::peer::SegmentSearchPhase::Final as i32,
         })
         .await

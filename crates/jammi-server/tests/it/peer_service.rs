@@ -164,6 +164,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -186,6 +188,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -208,6 +212,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::Int8 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -223,6 +229,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: 0,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -240,6 +248,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: 99,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -252,6 +262,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: 99,
         })
         .await
@@ -267,6 +279,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -414,6 +428,8 @@ async fn owner_refuses_non_conforming_requests() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         width: 3,
+        target: 3,
+        version: None,
         phase: pb::SegmentSearchPhase::Approximate as i32,
     };
     let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {
@@ -573,6 +589,8 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         width: 3,
+        target: 3,
+        version: None,
         phase: pb::SegmentSearchPhase::Approximate as i32,
     };
     let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {

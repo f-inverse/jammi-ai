@@ -85,8 +85,8 @@ pub struct SegmentUnit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentSearchRequest {
     /// The table the segments belong to. The owner verifies every id in
-    /// `segment_ids` against this table's catalog segment list and refuses the
-    /// whole request otherwise.
+    /// `segment_ids` against the segment set `version` of this table serves
+    /// and refuses the whole request otherwise.
     pub table_name: String,
     /// Every segment of `table_name` this owner should search — all of one
     /// owner's segments go in ONE request.
@@ -97,8 +97,16 @@ pub struct SegmentSearchRequest {
     /// The query vector — validated (finite) before it ever crosses the seam;
     /// the owner re-validates what it receives at its own edge.
     pub query: ValidatedQuery,
-    /// The per-segment fetch width (`over_fetch(candidate_k, N)`).
+    /// The per-segment fetch width (`over_fetch(candidate_k, N)`) a segment's
+    /// search starts from.
     pub width: usize,
+    /// How many live hits each segment's search widens toward
+    /// (`candidate_k`) while its version's mask hides rows of it.
+    pub target: usize,
+    /// The table version the coordinator pinned, whose segment set and
+    /// deletion mask the owner serves; `None` for a never-refreshed table's
+    /// base set.
+    pub version: Option<i64>,
     /// Which stage of the protocol this search is.
     pub phase: SegmentSearchPhase,
 }
@@ -981,6 +989,8 @@ mod tests {
             query: crate::index::validate_query(vec![1.0], 1, crate::index::QuerySource::Caller)
                 .unwrap(),
             width: 1,
+            target: 1,
+            version: None,
             phase: SegmentSearchPhase::Final,
         };
         let err = NoPeers

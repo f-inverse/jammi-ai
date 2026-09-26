@@ -61,6 +61,14 @@ RUN yum install -y perl-IPC-Cmd perl-Time-Piece \
 RUN python3 -m ensurepip --upgrade \
     && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors
 
+# The system interpreter's development link (`libpython3.12.so`, beside the
+# runtime `libpython3.12.so.1.0`). `jammi-python` built without pyo3's
+# `extension-module` — its `cargo test`, outside maturin — links
+# `-lpython3.12` against this interpreter, and the runtime library alone
+# carries no unversioned link name for the linker to find.
+RUN yum install -y python3.12-devel \
+    && yum clean all
+
 # Per-arch download variables. TARGETARCH is set by buildx per platform
 # (`linux/amd64` -> `amd64`, `linux/arm64` -> `arm64`) and is NOT the same
 # spelling any of the four upstream releases use in their own asset names, so

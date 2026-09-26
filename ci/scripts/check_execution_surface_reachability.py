@@ -76,8 +76,8 @@ not per-workflow — `docs.yml` carries DIFFERENT `paths:` lists under its
 specific tuple's origin path (its `ci/scripts/**` source file) before that
 trigger credits anything: a workflow whose `on:` block otherwise fires on
 the merge path but whose `paths:` allowlist can never match a change under
-`ci/scripts/**` (eight such workflows exist: `docs.yml`, `image.yml`,
-`image-cuda.yml`, `dep-dag.yml` — whose one `ci/scripts/` entry is the
+`ci/scripts/**` (seven such workflows exist: `docs.yml`, `image.yml`,
+`dep-dag.yml` — whose one `ci/scripts/` entry is the
 single literal file `ci/scripts/gen_dep_dag.py`, never a glob covering the
 whole directory — `devcontainer-image.yml`, `pypi-server.yml`,
 `pypi-server-cuda.yml`, `server-image.yml`) would never actually RUN in

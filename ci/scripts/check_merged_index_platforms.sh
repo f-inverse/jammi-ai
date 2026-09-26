@@ -62,7 +62,7 @@ _assert() {
 
 # Four fixtures, hermetic (no docker, no network): the two PASS shapes and
 # the two FAIL shapes production actually hits, plus the single-platform
-# shape `image-cuda.yml`'s one-arch caller exercises. Each asserts the
+# shape image.yml's one-arch `build-cuda` job exercises. Each asserts the
 # EXACT exit code `_assert` returns, never just "did it print something".
 _self_test() {
   local failures=0

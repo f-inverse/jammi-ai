@@ -107,7 +107,7 @@ deleting the registry from being the way around it.
 
 That last clause is a determinant of its own, and it is the one a
 trigger-only notion of "merge path" misses. A workflow can qualify under
-Rule 1a and still never see the PR that breaks the lint: `image-cuda.yml`
+Rule 1a and still never see the PR that breaks the lint: `image.yml`
 is `push:`-to-main-only (no `pull_request` trigger at all), and
 `pypi-server-cuda.yml`'s `pull_request` trigger is filtered to
 `packaging/server-cu12/**`, `crates/jammi-server/**` and the two wheel
@@ -135,7 +135,7 @@ exists for: with every `-p jammi-ai` lane filtered out of the real corpus
 corpus every real row must read SATISFIED. It runs the host-workflow
 mutations end-to-end as well, through the real workflow parser: a copy of
 `.github/workflows/` with that step's `run:` line MOVED out of `ci.yml`
-into a synthetic job in `image-cuda.yml` (push-to-main + `paths:`), and the
+into a synthetic job in `image.yml` (push-to-main + `paths:`), and the
 same move into `pypi-server-cuda.yml` (a `pull_request` whose `paths:` do
 not list `crates/jammi-ai/**`), must each read UNSATISFIED, while the
 same copy with nothing moved reads SATISFIED — so the mutation's verdict
@@ -284,7 +284,7 @@ class PrTriggerLane:
 class LaneOrigin:
     """The workflow that hosts a parsed lane, with the `pull_request`-to-main
     triggers it fires on. `pr_lanes == ()` means the hosting workflow has NO
-    qualifying `pull_request`-to-main trigger at all (`image-cuda.yml`'s
+    qualifying `pull_request`-to-main trigger at all (`image.yml`'s
     `push:`-to-main-only shape) — such a host can never be credited for a
     registry row, whatever its `paths:` say."""
 
@@ -1002,7 +1002,7 @@ def self_test() -> int:
         ".github/workflows -- the mutation controls below would prove nothing"
     )
     for host, why in (
-        ("image-cuda.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
+        ("image.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
         (
             "pypi-server-cuda.yml",
             "a workflow whose `pull_request` `paths:` do not list `crates/jammi-ai/**`",
@@ -1037,14 +1037,14 @@ def self_test() -> int:
         "self-test FAILED: pypi-server-cuda.yml no longer carries a paths-filtered "
         "`pull_request` trigger, so the control above tests something else now"
     )
-    image_cuda_origin = LaneOrigin(
-        workflow="image-cuda.yml",
+    image_origin = LaneOrigin(
+        workflow="image.yml",
         pr_lanes=workflow_pr_lanes(
-            exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / "image-cuda.yml"
+            exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / "image.yml"
         ),
     )
-    assert image_cuda_origin.pr_lanes == (), (
-        "self-test FAILED: image-cuda.yml now has a `pull_request`-to-main trigger, so the "
+    assert image_origin.pr_lanes == (), (
+        "self-test FAILED: image.yml now has a `pull_request`-to-main trigger, so the "
         "push-only control above tests something else now"
     )
     host_probe = parse_clippy_lane(

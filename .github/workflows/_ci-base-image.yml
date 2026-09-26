@@ -3,7 +3,8 @@ name: _ci-base-image
 # Reusable CI base-image builder. The CPU base (jammi-ai-ci) and the CUDA base
 # (jammi-ai-ci-cuda) build identically — same login → metadata → build-push —
 # differing only in the image name and the Dockerfile. One reusable, two thin
-# callers (image.yml / image-cuda.yml), instead of two byte-identical workflows.
+# calling jobs (image.yml's `build` / `build-cuda`), instead of two
+# byte-identical workflows.
 #
 # Multi-arch shape: `build-and-push` is a matrix over the caller's `platforms`
 # input, one NATIVE runner per platform (`linux/amd64` -> `ubuntu-latest`,
@@ -27,7 +28,7 @@ name: _ci-base-image
 # EXACT requested platform set no matter which run's tag it merged.
 # `merge-manifest` (`needs: [plan,
 # build-and-push]`, runs for every caller including a ONE-platform caller —
-# `image-cuda.yml` passes no `platforms` at all, i.e. the single-element
+# image.yml's `build-cuda` passes no `platforms` at all, i.e. the single-element
 # default) re-derives the SAME real tags this workflow has always published,
 # DRY-RUNS the merge and asserts the resulting index BEFORE promoting
 # anything, then merges the per-arch immutable sources into one multi-arch
@@ -212,8 +213,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # Runs UNCONDITIONALLY -- also for a one-platform caller (image-cuda.yml
-  # passes no `platforms` input at all, i.e. the single-element default) --
+  # Runs UNCONDITIONALLY -- also for a one-platform caller (image.yml's
+  # `build-cuda` passes no `platforms` input at all, i.e. the single-element default) --
   # because this is now the ONLY job that ever produces the real
   # (`latest`/bare `sha-<sha>`) tags every consumer's `container:`/
   # `JAMMI_CI_IMAGE[_CUDA]` expression resolves. A one-platform run still
@@ -260,7 +261,7 @@ jobs:
 
       # The next step's own `SHA_TAG: sha-${{ github.sha }}` agrees with
       # metadata-action's `type=sha,format=long` output above ONLY because
-      # both this workflow's callers (`image.yml`, `image-cuda.yml`) trigger
+      # this workflow's one caller (`image.yml`, both jobs) triggers
       # on push-to-main + `workflow_dispatch` and never on `pull_request` --
       # on a `pull_request` trigger, metadata-action's `type=sha` resolves
       # the PR's HEAD sha, which need not equal `github.sha` (a merge-commit

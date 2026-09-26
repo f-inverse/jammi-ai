@@ -119,6 +119,7 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
             connection: Some(SourceConnection {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await

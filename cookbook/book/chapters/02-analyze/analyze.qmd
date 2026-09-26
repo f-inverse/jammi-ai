@@ -178,13 +178,15 @@ print(f"Δ (denoising gain):   {air_delta:+.3f}")
 contracts.assert_close("air.tier01.precision_at_10", air_raw_precision, tol=0.02)
 contracts.assert_close("air.tier02.precision_at_10", air_prop_precision, tol=0.02)
 contracts.assert_close("air.tier02.precision_delta", air_delta, tol=0.02)
-assert air_delta > 0  # the flight network is intracontinental: it sharpens continent
+if SCALE is scale.Scale.FULL:
+    assert air_delta > 0.03  # the flight network is intracontinental: it sharpens continent
 ```
 
-Propagating over routes lifts same-continent precision at both scales: the route
-graph is mostly intracontinental (tier 01), so an airport's route-neighbours
-carry its continent — even when the airport's own vector, at `small` scale,
-carries nothing but its words.
+At `full` scale propagating over routes lifts same-continent precision by several
+points: the route graph is mostly intracontinental (tier 01), so an airport's
+route-neighbours carry its continent. At `small` scale the random-weight encoder's
+vectors carry nothing to sharpen, and the delta sits within noise of zero — a
+pipeline check, not a finding.
 
 This is where the Air Routes on-ramp **stops** (tier 02). Its text is too thin
 and its label too near-deterministic for a credible learn/predict tier — those

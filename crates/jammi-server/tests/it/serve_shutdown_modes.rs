@@ -685,19 +685,24 @@ async fn sigint_while_draining_releases_and_returns_released_within_two_heartbea
 async fn release_preempts_a_drain_blocked_on_an_in_flight_unary() {
     let dir = TempDir::new().unwrap();
     let served = serve(dir.path(), FAST_TIMING).await;
+    // A source this test alone registers: the park is process-global and
+    // one-shot, so arming a name another test also embeds would let that
+    // test's run take it.
+    let source = format!("patents_{}", jammi_test_utils::unique_suffix());
     add_source(
         channel(served.flight_addr).await,
-        "patents",
+        &source,
         "patents.parquet",
         FileFormat::Parquet,
     )
     .await;
-    let park = compute_test_hooks::arm("patents", compute_test_hooks::ParkPoint::BeforeDispatch);
+    let park = compute_test_hooks::arm(&source, compute_test_hooks::ParkPoint::BeforeDispatch);
     let ch = channel(served.flight_addr).await;
+    let source_id = source.clone();
     let mut unary = tokio::spawn(async move {
         EmbeddingServiceClient::new(ch)
             .generate_embeddings(GenerateEmbeddingsRequest {
-                source_id: "patents".into(),
+                source_id,
                 model_id: tiny_bert_model_id(),
                 columns: vec!["abstract".into()],
                 key_column: "id".into(),

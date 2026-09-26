@@ -5,6 +5,13 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **Logs no longer drop the line that follows a dependency's disabled-level check.** A per-layer
+  filter's `enabled()` verdict is parked per thread until the next event consumes it, and a caller
+  that asks `enabled()` and emits nothing (sqlx does, on every statement, through the `log` bridge)
+  left a "disabled" verdict that silently dropped the next always-enabled event on that thread
+  (tokio-rs/tracing#2519). The server's and the embedded engine's log layer now decide an event
+  only when it is dispatched. The distributed lane's intermittent placed-gang timeout was this: a
+  log line the test awaited went missing after the job had completed.
 - **A placed search serves the table's current version under its mask.** On a table whose segments
   are placed on peers, the search read every version's segments with no deletion mask — at its own
   segments, at every owner and at the local-load rung — so a row a refresh re-embedded came back at

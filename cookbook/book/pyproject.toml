@@ -40,6 +40,11 @@ cloud = [
 postgres = [
     "pgserver>=0.1",
 ]
+# The OTLP trace protocol the operations chapter's in-process collector receives
+# spans with (`chapters/29-production/operations.qmd`).
+otlp = [
+    "opentelemetry-proto>=1.20",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
@@ -60,7 +65,7 @@ packages = ["jammi_cookbook"]
 jammi_cookbook = [
     "goldens/*.json",
     "_api_reference.md",
-    "_programs/one_program/*",
+    "_programs/*/*",
     "_fixtures/air_routes/*",
     "_fixtures/arxiv_small/*",
     "_fixtures/htsat_clap_tiny/*",

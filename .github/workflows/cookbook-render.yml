@@ -62,7 +62,7 @@ jobs:
       - name: Install the book (against the HEAD wheel)
         run: |
           . .venv/bin/activate
-          pip install -e 'cookbook/book[book,dev,postgres]'
+          pip install -e 'cookbook/book[book,dev,postgres,otlp]'
 
       - name: Render + execute the book
         # Every chapter runs live and fails on a measurement outside its frozen
@@ -101,7 +101,7 @@ jobs:
           git worktree add --detach "$RUNNER_TEMP/release-v$version" "v$version"
           cd "$RUNNER_TEMP/release-v$version"
           git lfs pull
-          pip install -e 'cookbook/book[book,dev,postgres]'
+          pip install -e 'cookbook/book[book,dev,postgres,otlp]'
           cd cookbook/book
           python scripts/check_api_reference.py
           pytest -q

@@ -1,5 +1,7 @@
 # Catalog Backend and Trigger Broker
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/production.html).
+
 Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through
 two fields on `JammiConfig`: `catalog` and `broker`. The dev-laptop default
@@ -22,6 +24,11 @@ url = "postgres://user:pass@host:5432/jammi?sslmode=verify-full&sslrootcert=/etc
 pool_size = 16
 max_lifetime_secs = 1800
 ```
+
+A Postgres reached over a Unix socket still names a host in the URL, with the socket
+directory in the `host` parameter: `postgres://user@localhost/jammi?host=/run/postgresql`.
+libpq's empty-host spelling (`postgres://user@/jammi?host=…`) is refused at load as an
+empty host.
 
 `url` should carry `?sslmode=verify-full` for any connection that leaves a
 trusted network: `sslmode=require` upgrades the connection to TLS but never

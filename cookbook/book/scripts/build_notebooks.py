@@ -60,10 +60,12 @@ _QMD_LINK = re.compile(r"\]\(\s*([^)\s#]+)\.qmd(#[^)\s]*)?\s*\)")
 _NEEDS_SERVER = re.compile(r"\bLiveServer\(|connect\(\s*f?[\"']grpc://")
 # The cookbook extras a notebook installs, by the lines only each one serves:
 # `cloud`, a local S3-compatible server; `postgres`, a pip-installed Postgres a
-# fleet of servers shares as its catalog.
+# fleet of servers shares as its catalog; `otlp`, the trace protocol an
+# in-process collector receives spans with.
 _EXTRAS = {
     "cloud": re.compile(r"\bThreadedMotoServer\b"),
     "postgres": re.compile(r"\bpgserver\b"),
+    "otlp": re.compile(r"\bopentelemetry\.proto\b"),
 }
 
 

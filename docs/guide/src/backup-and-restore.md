@@ -1,5 +1,7 @@
 # Backup and Restore
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Operating It](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/operations.html).
+
 How to back up and restore a Jammi deployment safely, for each of the
 [deployment shapes](./philosophy.md#how-it-deploys-one-binary-pluggable-backends)
 the engine ships. The catalog (models, sources, eval runs, mutable companion

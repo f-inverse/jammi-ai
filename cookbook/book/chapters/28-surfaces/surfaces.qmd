@@ -102,7 +102,7 @@ The Rust program is the Rust quickstart's shape: an `InferenceSession` over a
 from the environment, as any other setting would.
 
 ```{python}
-print((programs.PROGRAM / "main.rs").read_text())
+print((programs.program("one_program") / "main.rs").read_text())
 ```
 
 It builds against the crates of this release: from crates.io in a fresh runtime, or from
@@ -110,7 +110,7 @@ the workspace when the book renders in a checkout. The first build compiles the 
 so it takes minutes; a rerun takes seconds.
 
 ```{python}
-project = programs.rust_program(work, VERSION)
+project = programs.rust_program(work, VERSION, "one_program")
 rust_env = dict(os.environ, JAMMI_ARTIFACT_DIR=str(work / "rust"))
 build = subprocess.run([programs.cargo(), "run", "-q", "--manifest-path",
                         str(project / "Cargo.toml"), "--", CORPUS, MODEL, ROW_KEY],
@@ -127,7 +127,7 @@ browser, or a Worker. It reads the search result, an Arrow IPC stream, with Apac
 Arrow's JavaScript library.
 
 ```{python}
-print((programs.PROGRAM / "search.ts").read_text())
+print((programs.program("one_program") / "search.ts").read_text())
 ```
 
 ```{python}

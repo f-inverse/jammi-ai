@@ -86,6 +86,8 @@ book:
     - part: "Running jammi for real"
       chapters:
         - chapters/27-distributed-training/distributed-training.qmd
+        - chapters/29-production/production.qmd
+        - chapters/29-production/operations.qmd
   appendices:
     - chapters/api-reference.qmd
 

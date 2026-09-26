@@ -1,5 +1,7 @@
 # Operability
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Operating It](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/operations.html).
+
 How to run a Jammi server in production: what it exposes for observability, how
 it shuts down cleanly, the resource limits it enforces, and how it behaves when
 a dependency fails. Everything below describes the system as it ships today.

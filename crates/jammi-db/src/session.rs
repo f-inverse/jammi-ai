@@ -50,10 +50,6 @@ pub struct JammiSession {
     catalog: Arc<Catalog>,
     config: Arc<JammiConfig>,
     tenant: TenantBinding,
-    /// Shared with the `TenantScopeAnalyzerRule` so callers can register
-    /// per-source tenant columns at `add_source` time (for federated sources
-    /// whose tenant discriminator has a non-`tenant_id` name).
-    source_tenant_columns: Arc<SourceTenantColumns>,
     /// Process-wide cache of `object_store` drivers keyed by (scheme, bucket).
     /// Used to register `s3://` / `gs://` / `azure://` URLs with both the
     /// engine's own writers and DataFusion's `ListingTable` reader.
@@ -336,7 +332,6 @@ impl JammiSession {
             catalog,
             config,
             tenant: tenant_binding,
-            source_tenant_columns,
             storage_registry,
             sources,
             mutable,
@@ -498,14 +493,6 @@ impl JammiSession {
         TenantBinding::admin_scope(f(scope)).await
     }
 
-    /// Register a tenant-discriminator column for a federated source. The
-    /// `TenantScopeAnalyzerRule` consults this lookup when a `TableScan`'s
-    /// schema does *not* itself declare a `tenant_id` column — i.e., when
-    /// the user's source carries the discriminator under a different name.
-    pub fn set_source_tenant_column(&self, source: &str, column: Option<String>) {
-        self.source_tenant_columns.set(source, column);
-    }
-
     /// Build providers for every source persisted in the catalog, up front.
     ///
     /// Resolution reads through to the catalog on its own (see
@@ -550,6 +537,30 @@ impl JammiSession {
             connection,
         };
         let built = self.sources.build(source_id, &definition).await?;
+
+        // A declared tenant column is what every tenant's scan of the source
+        // is filtered by, so it must be a column of every table the source
+        // serves, and the only discriminator there: a table's own `tenant_id`
+        // column scopes it first. Refused here, before anything is persisted,
+        // rather than silently ignored or failed at a tenant's first query.
+        if let Some(column) = &definition.connection.tenant_column {
+            for (table, provider) in &built.tables {
+                let schema = provider.schema();
+                let actual = if schema.index_of(column).is_err() {
+                    "no such column"
+                } else if column != "tenant_id" && schema.index_of("tenant_id").is_ok() {
+                    "the table's own `tenant_id` column already scopes it"
+                } else {
+                    continue;
+                };
+                return Err(JammiError::Schema {
+                    table: format!("{source_id}.public.{table}"),
+                    column: column.clone(),
+                    expected: "the one tenant column of every table of the source".into(),
+                    actual: actual.into(),
+                });
+            }
+        }
 
         // Registration is the ONLY adaptive moment for a `FileFormat::JsonLines`
         // source with no explicit `file_extension` override: pin whichever

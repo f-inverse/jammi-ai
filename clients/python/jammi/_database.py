@@ -1240,12 +1240,17 @@ class RemoteDatabase:
 
     # --- Sources -----------------------------------------------------------------
 
-    def add_source(self, name: str, *, url: str, format: str) -> None:
+    def add_source(
+        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+    ) -> None:
         """Register a file-shaped data source on the remote engine.
 
         `url` accepts a local path (wrapped into `file://...` server-side) or any
         storage URL the server was compiled with (`s3://`, `gs://`, `azure://`).
-        Maps to `CatalogService.AddSource`.
+        `tenant_column` names the column whose value is each row's tenant: a
+        tenant-bound session then reads only its own rows and the rows with no
+        tenant, through every verb that reads the source. Maps to
+        `CatalogService.AddSource`.
         """
         try:
             file_format = _FILE_FORMAT[format]
@@ -1261,6 +1266,7 @@ class RemoteDatabase:
                 connection=catalog_pb2.SourceConnection(
                     url=_local_source_url(url),
                     format=file_format,
+                    tenant_column=tenant_column,
                 ),
             ),
         )

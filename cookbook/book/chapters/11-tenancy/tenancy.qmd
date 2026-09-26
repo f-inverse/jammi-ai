@@ -8,7 +8,7 @@ import jammi_cookbook
 ```
 
 **Recipe:** `set_tenant` · `list_sources` · `sql` (the analyzer's discriminator rewrite)
-· **Theory:** tenant isolation as a property of the catalog + the query analyzer, not a
+· `add_source(tenant_column=…)` · `generate_embeddings` · `search` · **Theory:** tenant isolation as a property of the catalog + the query analyzer, not a
 feature flag · **Rail:** tenancy (`rails.tenant` / `assert_listing_isolated` /
 `assert_rows_isolated`) + measurement.
 
@@ -23,7 +23,9 @@ The model has exactly two genuine isolation layers and one honest caveat:
    `tenant_id = $cur OR IS NULL`; tenant A's listing excludes B's registration.
 2. **row-level discriminator-column isolation** — the analyzer injects
    `tenant_id = $cur OR IS NULL` onto a `TableScan` *only when* the queried table carries
-   a `tenant_id` column, so the SAME tagged source returns disjoint rows under A vs B.
+   a discriminator — a `tenant_id` column, or the column the source declared as its
+   `tenant_column` when it was registered — so the SAME tagged source returns disjoint
+   rows under A vs B.
 3. **the caveat** — a discriminator-**less** source is globally readable: A sees ALL of
    B's rows when it names the source. The engine does not authenticate; access-gating
    lives above it.
@@ -128,7 +130,7 @@ reads, enforced by the analyzer because the discriminator column exists.
 ## Property 3 — the caveat: a discriminator-less source is globally readable
 
 The honest limit, asserted as a *positive* count, not hidden. A source with **no**
-`tenant_id` column gets no scan rewrite — it is globally readable by any tenant that names
+discriminator — no `tenant_id` column and no declared `tenant_column` — gets no scan rewrite — it is globally readable by any tenant that names
 it. We register B's papers under B with no discriminator column, then read it under A: A
 sees **all** of B's rows.
 
@@ -213,9 +215,91 @@ catalog lives in.
 db.close()
 ```
 
+## Property 5 — a discriminator under its own name, on both transports
+
+Property 2's source happened to name its discriminator `tenant_id`. A federated source
+usually does not: it carries `customer_id`, `workspace`, `organization`. The source
+declares that column once, when it is registered — `add_source(..., tenant_column=...)` —
+and the declaration is persisted with the source, so every session and every server
+replica that reads it scopes it the same way.
+
+The measurement is the one Property 2 made, widened to every verb that reads the source:
+one shared source whose discriminator is `workspace`, and for each tenant the rows `sql`
+returns, the rows `generate_embeddings` embeds, and the rows `search` over that embedding
+table can reach. It runs twice — in process, and against a `jammi-server` — because the
+declaration crosses the wire.
+
+```{python}
+from jammi.testing import LiveServer
+
+workspace_path = f"{work}/papers_by_workspace.parquet"
+pq.write_table(pa.table({
+    "paper_id": [p["paper_id"] for p in papers],
+    "title": [p["title"] for p in papers],
+    "abstract": [p["abstract"] for p in papers],
+    "workspace": [TENANT_A if p["subject"] in a_subjects else TENANT_B for p in papers],
+}), workspace_path)
+
+
+def per_verb(db) -> dict:
+    """Each tenant's view of the shared source through `sql`, `generate_embeddings`,
+    and `search`."""
+    db.add_source("papers_by_workspace", url=workspace_path, format="parquet",
+                  tenant_column="workspace")
+    views = {}
+    for tenant_id, own in ((TENANT_A, a_papers), (TENANT_B, b_papers)):
+        with tenant(db, tenant_id):
+            read = db.sql("SELECT paper_id FROM papers_by_workspace.public.papers_by_workspace"
+                          ).column("paper_id").to_pylist()
+            table = db.generate_embeddings(
+                source="papers_by_workspace", model=encoders.text(SCALE),
+                columns=["title", "abstract"], key="paper_id",
+            )
+            embedded = db.sql(f'SELECT _row_id FROM "jammi.{table}"').column("_row_id").to_pylist()
+            hits = db.search("papers_by_workspace", row_key=own[0], k=len(subject),
+                             select=["paper_id"]).column("paper_id").to_pylist()
+        other = set(subject) - set(own)
+        views[tenant_id] = {
+            "sql rows": len(read), "embedded rows": len(embedded), "search reach": len(hits),
+            "rows of the other tenant": len((set(read) | set(embedded) | set(hits)) & other),
+        }
+    return views
+
+
+with jammi.connect(f"file://{tempfile.mkdtemp()}") as local_db:
+    in_process = per_verb(local_db)
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as remote_db:
+    served = per_verb(remote_db)
+
+for name, tenant_id, own in (("A", TENANT_A, a_papers), ("B", TENANT_B, b_papers)):
+    print(f"tenant {name} owns {len(own)} papers")
+    for measure in in_process[tenant_id]:
+        print(f"  {measure:<26} in process {in_process[tenant_id][measure]:>5}"
+              f"   over the wire {served[tenant_id][measure]:>5}")
+```
+
+```{python}
+# | echo: false
+assert served == in_process, "the declaration scopes both transports identically"
+for tenant_id, own in ((TENANT_A, a_papers), (TENANT_B, b_papers)):
+    view = in_process[tenant_id]
+    assert view["rows of the other tenant"] == 0  # the hard zero, through every verb
+    assert view["sql rows"] == view["embedded rows"] == len(own)
+    assert view["search reach"] <= len(own)
+```
+
+Every verb reads the source through the same scan, so the one declaration scopes all of
+them: `generate_embeddings` embeds only the tenant's rows, so the table `search` ranks
+holds nothing of the other tenant's. A row whose `workspace` is empty belongs to no
+tenant and is read by every tenant, as a `tenant_id`-tagged row with no tenant is. A
+declaration the source cannot honour — a column it does not have, or a second
+discriminator beside its own `tenant_id` — is refused when the source is registered,
+never at a tenant's first query.
+
 ## What this chapter does not claim
 
-The engine isolates at the catalog listing and at a discriminator-column scan rewrite.
+The engine isolates at the catalog listing and at a discriminator-column scan rewrite —
+over a `tenant_id` column or the column a source declared when it was registered.
 It does **not** authenticate, and a discriminator-less source is globally readable — the
 caveat is measured (Property 3), not glossed. Tenant isolation as a complete access-control
 story is built *above* the engine (a discriminator column on every tenant-scoped table, or

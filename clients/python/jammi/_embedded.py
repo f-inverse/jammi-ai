@@ -278,9 +278,16 @@ class EmbeddedBackend:
 
     # --- Sources + model lifecycle ---------------------------------------------
 
-    def add_source(self, name: str, *, url: str, format: str) -> None:
-        """Register a file-shaped data source on the embedded engine."""
-        self._native.add_source(name, url=url, format=format)
+    def add_source(
+        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+    ) -> None:
+        """Register a file-shaped data source on the embedded engine.
+
+        `tenant_column` names the column whose value is each row's tenant: a
+        tenant-bound session then reads only its own rows and the rows with no
+        tenant, through every verb that reads the source.
+        """
+        self._native.add_source(name, url=url, format=format, tenant_column=tenant_column)
 
     def list_sources(self) -> List[Dict[str, Any]]:
         """A descriptor for every source registered to the current tenant."""

@@ -1,6 +1,7 @@
 //! Tenant-scoped sessions deliver disjoint views of mutable companion
 //! tables. Engine-only scope (no wire-surface tests).
 
+use jammi_db::error::JammiError;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
@@ -701,19 +702,15 @@ async fn federated_source_tenant_column_filters_split_6_4(backend: BackendKind) 
             .unwrap();
     }
 
-    // Session A: bind tenant A and declare the federated source's tenant
-    // discriminator column. The source row in the catalog is `tenant_id
-    // NULL`, so both per-tenant sessions can see it via the read-side
-    // predicate (`tenant_id = $bound OR tenant_id IS NULL`).
+    // The source row in the catalog is `tenant_id NULL`, so both per-tenant
+    // sessions can see it; its `tenant_id` column is the discriminator the
+    // analyzer scopes each session's scan by, with no declaration needed.
     let session_a = make_test_session(backend, dir.path())
         .await
         .with_tenant(tenant_a);
-    session_a.set_source_tenant_column(&notes_src, Some("tenant_id".into()));
-
     let session_b = make_test_session(backend, dir.path())
         .await
         .with_tenant(tenant_b);
-    session_b.set_source_tenant_column(&notes_src, Some("tenant_id".into()));
 
     async fn count_for(session: &JammiSession, notes_src: &str) -> i64 {
         let rows = session
@@ -855,8 +852,8 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
     }
 
     // Register both sources against the catalog, then drop the session. The
-    // discriminator is carried on the connection — never via
-    // `set_source_tenant_column` — so the persist path is what's exercised.
+    // discriminator is carried on the connection, the one place it is
+    // declared, so the persist path is what's exercised.
     {
         let registrar = make_test_session(backend, dir.path()).await;
         registrar
@@ -888,7 +885,7 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
 
     // Rebuild a fresh session against the SAME catalog DB. The startup
     // preload builds every persisted source and must replay the persisted
-    // discriminator — no `set_source_tenant_column` call here.
+    // discriminator.
     let session_a = make_test_session(backend, dir.path())
         .await
         .with_tenant(tenant_a);
@@ -948,6 +945,66 @@ async fn source_tenant_column_persists_and_replays_on_reload(backend: BackendKin
         .await,
         5,
         "the un-scoped source is visible in full to every tenant"
+    );
+}
+
+/// A tenant column that names no column of the source is refused at
+/// registration with a typed `Schema` error naming the column, and nothing is
+/// persisted — never accepted and left to fail at a tenant's first query.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(feature = "live-postgres-tests", test_case(BackendKind::Postgres ; "postgres"))]
+#[tokio::test]
+async fn a_tenant_column_the_source_lacks_is_refused_at_registration(backend: BackendKind) {
+    use arrow::array::{ArrayRef, RecordBatch};
+    use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+    use parquet::arrow::ArrowWriter;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("notes.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("note_id", DataType::Int64, false),
+        Field::new("customer_id", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let session = make_test_session(backend, dir.path()).await;
+    let source = format!("notes_{}", unique_suffix());
+    let refused = session
+        .add_source(
+            &source,
+            SourceType::File,
+            SourceConnection {
+                url: Some(format!("file://{}", path.display())),
+                format: Some(FileFormat::Parquet),
+                tenant_column: Some("workspace".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    match refused {
+        JammiError::Schema { column, .. } => assert_eq!(column, "workspace"),
+        other => panic!("expected a Schema refusal naming the column, got {other:?}"),
+    }
+    assert!(
+        session
+            .catalog()
+            .get_source(&source)
+            .await
+            .unwrap()
+            .is_none(),
+        "a refused registration persists nothing"
     );
 }
 

@@ -307,6 +307,12 @@ message SourceConnection {
   string url = 1;
   // File format — required for a FILE source, ignored otherwise.
   FileFormat format = 2;
+  // The column whose value names each row's tenant, when the source carries
+  // its tenant discriminator under a name other than `tenant_id`. A scan of
+  // the source under a tenant-bound session reads only that tenant's rows
+  // and the rows with no tenant. Unset: the source is scoped by a `tenant_id`
+  // column if it has one, and readable by every tenant otherwise.
+  optional string tenant_column = 3;
 }
 
 message AddSourceRequest {

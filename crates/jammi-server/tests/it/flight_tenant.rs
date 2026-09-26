@@ -88,7 +88,6 @@ async fn start_flight_test_server() -> (SocketAddr, TempDir, tokio::task::JoinHa
         )
         .await
         .expect("add notes source");
-    session.set_source_tenant_column("notes", Some("tenant_id".into()));
 
     // Flight SQL + the control-plane `CatalogService` on one listener — the same
     // surface the multi-tenant Flight shape serves (Flight bound through the

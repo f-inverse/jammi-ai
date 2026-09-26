@@ -89,6 +89,45 @@ def test_set_tenant_filters_federated_source(tmp_path):
     assert ids_a.isdisjoint(ids_b)
 
 
+def test_a_declared_tenant_column_scopes_the_source(tmp_path):
+    """A source whose discriminator is `workspace`, registered with
+    `tenant_column="workspace"`, serves tenant A its 6 rows and tenant B its 4 —
+    the declaration persisted with the source, replayed by every session over
+    the catalog. A declaration naming a column the source lacks is refused as
+    `InvalidArgument` and registers nothing."""
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    pq_path = tmp_path / "notes.parquet"
+    table = pa.table({
+        "note_id": pa.array(list(range(10)), type=pa.int64()),
+        "workspace": [TENANT_A] * 6 + [TENANT_B] * 4,
+    })
+    pq.write_table(table, str(pq_path))
+
+    registrar = jammi.connect(f"file://{artifact_dir}")
+    registrar.add_source(
+        "notes", url=str(pq_path), format="parquet", tenant_column="workspace"
+    )
+    with pytest.raises(jammi.InvalidArgument):
+        registrar.add_source(
+            "misdeclared", url=str(pq_path), format="parquet", tenant_column="team"
+        )
+    assert [s["source_id"] for s in registrar.list_sources()] == ["notes"]
+    registrar.close()
+
+    counts = {}
+    for tenant in (TENANT_A, TENANT_B):
+        db = jammi.connect(f"file://{artifact_dir}")
+        with db.tenant_scope(tenant):
+            counts[tenant] = (
+                db.sql("SELECT COUNT(*) AS n FROM notes.public.notes")
+                .column("n")
+                .to_pylist()[0]
+            )
+        db.close()
+    assert counts == {TENANT_A: 6, TENANT_B: 4}
+
+
 def test_set_tenant_rejects_invalid_uuid(tmp_path):
     """Tenant-identifier discipline invariant (see
     docs/guide/src/philosophy.md#the-one-rule-everything-else-follows-from):

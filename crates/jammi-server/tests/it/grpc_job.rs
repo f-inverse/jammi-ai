@@ -83,6 +83,7 @@ async fn add_training_source(
         connection: Some(SourceConnection {
             url: training_url(),
             format: FileFormat::Csv as i32,
+            tenant_column: None,
         }),
     };
     match session {

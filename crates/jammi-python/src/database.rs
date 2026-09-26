@@ -552,12 +552,22 @@ impl PyDatabase {
     /// Register a file-shaped data source. `url` accepts a local path
     /// (parsed into `file://...`) or any storage URL the build was
     /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
-    /// `azure://container/blob`.
-    #[pyo3(signature = (name, *, url, format))]
-    fn add_source(&self, name: &str, url: &str, format: &str) -> PyResult<()> {
+    /// `azure://container/blob`. `tenant_column` names the column whose value
+    /// is each row's tenant, persisted with the source.
+    #[pyo3(signature = (name, *, url, format, tenant_column=None))]
+    fn add_source(
+        &self,
+        name: &str,
+        url: &str,
+        format: &str,
+        tenant_column: Option<String>,
+    ) -> PyResult<()> {
         self.check_open()?;
         let file_format = parse_file_format(format)?;
-        let connection = SourceConnection::parse(url, file_format).map_err(to_pyerr)?;
+        let connection = SourceConnection {
+            tenant_column,
+            ..SourceConnection::parse(url, file_format).map_err(to_pyerr)?
+        };
         crate::released(
             &self.runtime,
             self.session.add_source(name, SourceType::File, connection),

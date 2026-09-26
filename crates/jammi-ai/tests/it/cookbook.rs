@@ -1745,7 +1745,7 @@ async fn cookbook_scope_source_by_tenant_recipe_runs_end_to_end() {
     let cfg = common::test_config(dir.path());
     let url = format!("file://{}", pq_path.display());
 
-    // Register once unscoped.
+    // Register once unscoped, declaring the discriminator column.
     {
         let registrar = JammiSession::new(cfg.clone()).await.unwrap();
         registrar
@@ -1755,6 +1755,7 @@ async fn cookbook_scope_source_by_tenant_recipe_runs_end_to_end() {
                 SourceConnection {
                     url: Some(url.clone()),
                     format: Some(FileFormat::Parquet),
+                    tenant_column: Some("customer_id".into()),
                     ..Default::default()
                 },
             )
@@ -1762,18 +1763,15 @@ async fn cookbook_scope_source_by_tenant_recipe_runs_end_to_end() {
             .unwrap();
     }
 
-    // Per-tenant sessions declare the override.
+    // Each tenant's session replays the persisted discriminator.
     let session_a = JammiSession::new(cfg.clone())
         .await
         .unwrap()
         .with_tenant(alice);
-    session_a.set_source_tenant_column("notes", Some("customer_id".into()));
-
     let session_b = JammiSession::new(cfg.clone())
         .await
         .unwrap()
         .with_tenant(bob);
-    session_b.set_source_tenant_column("notes", Some("customer_id".into()));
 
     let n_a = single_int_count(&session_a, "SELECT COUNT(*) AS n FROM notes.public.notes").await;
     let n_b = single_int_count(&session_b, "SELECT COUNT(*) AS n FROM notes.public.notes").await;

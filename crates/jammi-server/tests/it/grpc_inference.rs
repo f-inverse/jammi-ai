@@ -47,6 +47,7 @@ async fn add_patents(client_channel: tonic::transport::Channel) {
             connection: Some(SourceConnection {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await
@@ -149,6 +150,7 @@ async fn infer_under_a_tenant_scope_succeeds_over_the_wire() {
                 connection: Some(SourceConnection {
                     url: patents_url(),
                     format: FileFormat::Parquet as i32,
+                    tenant_column: None,
                 }),
             })
             .await

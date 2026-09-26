@@ -8,9 +8,10 @@
 //! The owner is deliberately tenant-free (invariant I-PEER): the request
 //! carries no tenant, and this handler reads no `result_tables` row. Tenant
 //! scope was enforced by the COORDINATOR, which resolved the table through its
-//! own tenant-scoped catalog read before fanning out. A `SegmentSearch` names
-//! the table version the coordinator pinned; the owner resolves that
-//! version's segment set and deletion mask from the table name alone
+//! own tenant-scoped catalog read before fanning out. A `SegmentSearch` and
+//! an `ExactRescore` both name the table version the coordinator pinned; the
+//! owner resolves that version's segment set (and, for a search, its
+//! deletion mask) from the table name alone
 //! ([`jammi_db::store::ResultStore::served_segments`]), so it serves exactly
 //! the rows the coordinator's version does. What the owner enforces,
 //! at its input edge, splits on WHOSE fault a refusal is — never on how it
@@ -95,33 +96,9 @@ impl PeerServer {
         Self { session }
     }
 
-    /// The catalog's segment list for `table_name` — the set every
-    /// `ExactRescore` segment id must be a member of. No tenant filter: see
-    /// the module docs (I-PEER).
-    async fn segments_of(
-        &self,
-        store: &ResultStore,
-        table_name: &str,
-    ) -> Result<Vec<OwnedSegment>, Status> {
-        store
-            .catalog()
-            .list_index_segments(table_name)
-            .await
-            .map_err(map_engine_error)?
-            .into_iter()
-            .map(|row| {
-                Ok(OwnedSegment {
-                    id: row.segment_id,
-                    version: row.version.unwrap_or(0),
-                    index_url: StorageUrl::parse(&row.index_path)
-                        .map_err(|e| map_engine_error(JammiError::from(e)))?,
-                })
-            })
-            .collect()
-    }
-
     /// The segments `version` of `table_name` serves and their mask — the
-    /// set every `SegmentSearch` segment id must be a member of. A version
+    /// set every `SegmentSearch` and `ExactRescore` segment id must be a
+    /// member of. No tenant filter: see the module docs (I-PEER). A version
     /// this owner cannot resolve is own-data (`FAILED_PRECONDITION`, ladders).
     async fn served_of(
         &self,
@@ -232,9 +209,9 @@ fn none_named(table_name: &str) -> Status {
 
 /// Every requested id must be named once and at least one must be named
 /// (request malformation, `INVALID_ARGUMENT`); each named id must ALSO be in
-/// this owner's own segment list — own-data, `FAILED_PRECONDITION`, since the
-/// owner's `list_index_segments` read can race a concurrent
-/// `purge_segments`/append and disagree with the coordinator's. The first
+/// the set the pinned version serves at this owner — own-data,
+/// `FAILED_PRECONDITION`, since the owner's read of that set can race a
+/// concurrent `purge_segments`/append and disagree with the coordinator's. The first
 /// violation refuses the WHOLE request (a unit-less or partial answer would
 /// be a silent shrink at the coordinator).
 fn verify_membership(
@@ -464,7 +441,12 @@ impl PeerService for PeerServer {
         let precision = decode_precision(req.storage_precision)?;
         let finite = finite_query(req.query)?;
         let store = self.session.result_store();
-        let segments = self.segments_of(&store, &req.table_name).await?;
+        // The candidates came from phase 1's masked search; a rescore needs
+        // only the set they must belong to.
+        let segments = self
+            .served_of(&store, &req.table_name, req.version)
+            .await?
+            .0;
         let requested: Vec<i64> = req
             .row_ids_by_segment
             .iter()

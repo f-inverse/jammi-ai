@@ -349,6 +349,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
                 segment_id: 0,
                 row_ids: vec!["d".into(), "a".into(), "b".into()],
             }],
+            version: None,
         })
         .await
         .expect("ExactRescore over peer_bind")
@@ -365,6 +366,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
                 segment_id: 0,
                 row_ids: vec!["a".into(), "ghost".into()],
             }],
+            version: None,
         })
         .await
         .expect_err("a row id the segment does not index is own-data, not a caller fault");
@@ -384,6 +386,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
                 segment_id: 3,
                 row_ids: vec!["a".into()],
             }],
+            version: None,
         })
         .await
         .expect_err("segment 3 is not a segment of the table");
@@ -437,6 +440,7 @@ async fn owner_refuses_non_conforming_requests() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         row_ids_by_segment: groups,
+        version: None,
     };
     let rows = |ids: &[&str]| SegmentRowIds {
         segment_id: 0,
@@ -598,6 +602,7 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         row_ids_by_segment: groups,
+        version: None,
     };
     let rows = |ids: &[&str]| SegmentRowIds {
         segment_id: 0,

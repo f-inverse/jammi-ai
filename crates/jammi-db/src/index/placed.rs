@@ -548,6 +548,7 @@ impl PlacedIndex {
                 storage_precision: precision,
                 query: query.clone(),
                 row_ids_by_segment: rows.clone(),
+                version,
             };
             let req = &req;
             self.call_with_retry(group, |owner| async move {

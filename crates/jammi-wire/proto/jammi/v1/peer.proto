@@ -110,6 +110,10 @@ message ExactRescoreRequest {
   StoragePrecision storage_precision = 2;
   repeated float query = 3;
   repeated SegmentRowIds row_ids_by_segment = 4;
+  // The table version the coordinator pinned, as `SegmentSearchRequest`
+  // names it: every segment named must be one that version serves. Unset
+  // for a never-refreshed table's base set.
+  optional int64 version = 5;
 }
 
 message ExactRescoreResponse {

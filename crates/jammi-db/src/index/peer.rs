@@ -123,6 +123,11 @@ pub struct ExactRescoreRequest {
     pub query: ValidatedQuery,
     /// The candidates to rescore, grouped by the segment that owns each.
     pub row_ids_by_segment: Vec<(SegmentId, Vec<String>)>,
+    /// The table version the coordinator pinned, as
+    /// [`SegmentSearchRequest::version`]: the owner verifies every segment
+    /// named against the set that version serves; `None` for a
+    /// never-refreshed table's base set.
+    pub version: Option<i64>,
 }
 
 /// Why one peer call failed — the label the failure counters and the

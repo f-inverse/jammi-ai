@@ -258,6 +258,7 @@ impl PeerTransport for GrpcPeerTransport {
                     row_ids: row_ids.clone(),
                 })
                 .collect(),
+            version: req.version,
         });
         request.set_timeout(deadline);
         let response: pb::ExactRescoreResponse = bounded(deadline, client.exact_rescore(request))

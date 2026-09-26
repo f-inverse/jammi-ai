@@ -72,6 +72,8 @@ use jammi_server::grpc::proto::embedding::{QueryVector, SearchRequest as WireSea
 use jammi_server::grpc::wire::map_engine_error;
 use jammi_test_utils::vq;
 use jammi_wire::peer::GrpcPeerTransport;
+use jammi_wire::proto::peer as pb;
+use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
 use jammi_wire::request::{SearchQuery, SearchRequest};
 use parquet::arrow::ArrowWriter;
 use std::time::Duration;
@@ -1739,6 +1741,52 @@ async fn versioned_table(store: &ResultStore, source_id: &str) -> ResultTableRec
         .await
         .unwrap()
         .unwrap()
+}
+
+/// An `ExactRescore` names the version its coordinator pinned, and the owner
+/// rescores only segments that version serves — the same set a
+/// `SegmentSearch` of that version is verified against, never every segment
+/// the table has ever had. Segment 1 exists only from version 1 on: named
+/// under the base set it is refused as own-data, named under version 1 it is
+/// rescored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_rescore_is_verified_against_the_pinned_versions_segments() {
+    let b = start_engine_server_with_peer_bind().await;
+    let store = b.engine.result_store();
+    let record = versioned_table(&store, "rescore_versioned").await;
+    let mut client = PeerServiceClient::new(channel(b.peer_addr).await);
+    let rescore = |version: Option<i64>| pb::ExactRescoreRequest {
+        table_name: record.table_name.clone(),
+        storage_precision: pb::StoragePrecision::F32 as i32,
+        query: A_REEMBEDDED.to_vec(),
+        row_ids_by_segment: vec![pb::SegmentRowIds {
+            segment_id: 1,
+            row_ids: vec!["a".into()],
+        }],
+        version,
+    };
+
+    let refused = client
+        .exact_rescore(rescore(None))
+        .await
+        .expect_err("the base set serves no segment 1");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+
+    let served = client
+        .exact_rescore(rescore(Some(1)))
+        .await
+        .expect("version 1 serves segment 1")
+        .into_inner();
+    assert_eq!(served.hits.len(), 1);
+    assert_eq!(served.hits[0].row_id, "a");
+    assert!(
+        served.hits[0].distance.abs() < 1e-6,
+        "`a`'s version-1 vector is the query: {:?}",
+        served.hits[0]
+    );
+
+    let _ = b.shutdown.send(());
+    let _ = b.handle.await;
 }
 
 /// A versioned table whose superseded segment is placed on a peer: the placed

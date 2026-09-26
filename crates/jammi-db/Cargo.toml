@@ -22,7 +22,7 @@ default = []
 # Each source feature turns on the matching `datafusion-table-providers`
 # backend (whose own `federation` default pushes the query down) plus what
 # `source/{postgres,mysql}.rs` reads a connection URL with.
-postgres = ["datafusion-table-providers/postgres", "dep:percent-encoding", "dep:secrecy", "dep:native-tls"]
+postgres = ["datafusion-table-providers/postgres", "dep:secrecy", "dep:native-tls"]
 mysql = ["datafusion-table-providers/mysql", "dep:mysql_async", "dep:secrecy", "dep:native-tls", "dep:libz-sys"]
 # Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL),
 # the Postgres source's among them.
@@ -72,7 +72,6 @@ arrow-array.workspace = true
 # External sources (feature-gated — not a workspace dep to avoid sqlite3 links conflict)
 datafusion-table-providers = { version = "0.13.1", default-features = false, optional = true }
 secrecy = { version = "0.10", optional = true }
-percent-encoding = { version = "2", optional = true }
 mysql_async = { version = "0.37", optional = true }
 # Named only to turn on `vendored` (see `[features]`); the drivers above depend
 # on it themselves.
@@ -122,6 +121,7 @@ thiserror.workspace = true
 directories.workspace = true
 tokio.workspace = true
 url.workspace = true
+percent-encoding = "2"
 async-trait.workspace = true
 
 # Audit-record signing

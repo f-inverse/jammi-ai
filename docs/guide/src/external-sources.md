@@ -64,10 +64,11 @@ let results = session.sql(
 A PostgreSQL URL means what it means to libpq. The host, port, user, password and
 database come from the URL, and the query parameters `host`, `port`, `user`,
 `password`, `dbname`, `sslmode`, `sslrootcert`, `application_name` and `options`
-override them; any other parameter is refused. A `host` that is a path names a
-Unix-socket directory, so a local server's socket URL works as handed out:
-`postgresql://postgres:@/postgres?host=/tmp/pgdata`. `sslmode` is `disable`, `prefer`
-(the default, as in libpq), `require`, `verify-ca` or `verify-full`.
+override them; any other parameter is refused, and so is a list of hosts. Every part
+is percent-decoded (a `+` stays a `+`), and an empty value is no value. A `host` that
+is a path names a Unix-socket directory, so a local server's socket URL works as handed
+out: `postgresql://postgres:@/postgres?host=/tmp/pgdata`. `sslmode` is `disable`,
+`prefer` (the default, as in libpq), `require`, `verify-ca` or `verify-full`.
 
 A MySQL URL is `mysql://user:password@host:port/database`, and must name its database.
 Its `sslmode` parameter is `required` (the default), `preferred` or `disabled`; a server

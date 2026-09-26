@@ -8,28 +8,14 @@ use std::sync::Arc;
 use datafusion::catalog::TableProvider;
 use datafusion_table_providers::postgres::PostgresTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
-use percent_encoding::percent_decode_str;
 use secrecy::SecretString;
 
 use crate::error::{JammiError, Result};
+use crate::pg_uri::{Keyword, PgUri};
 use crate::source::{database, SourceConnection};
 
 /// The schema whose tables a Postgres source serves.
 const SCHEMA: &str = "public";
-
-/// The URI query parameters a source takes, each with the driver parameter it
-/// sets.
-const QUERY_PARAMETERS: [(&str, &str); 9] = [
-    ("host", "host"),
-    ("port", "port"),
-    ("user", "user"),
-    ("password", "pass"),
-    ("dbname", "db"),
-    ("sslmode", "sslmode"),
-    ("sslrootcert", "sslrootcert"),
-    ("application_name", "application_name"),
-    ("options", "options"),
-];
 
 /// Create table providers for all public tables in a Postgres database.
 ///
@@ -58,87 +44,47 @@ pub async fn create_postgres_tables(
 
 /// The driver's pool parameters for a libpq connection URI.
 ///
-/// The driver reads a connection string in libpq's keyword form only — a URI
-/// passed as one would lose every component — so the URI is taken apart here
-/// with libpq's meaning: the authority and path give the host, port, user,
-/// password and database; a query parameter overrides the component it names
-/// (a `host` that is a path names a Unix-socket directory, and the authority
-/// may then be empty); and an absent `sslmode` is `prefer`, as it is to libpq
-/// and to the catalog's driver reading the same URL. A query parameter the
-/// driver has no use for is refused rather than dropped. `options` are the
-/// driver's own parameters and override what the URI says.
-///
-/// The grammar is libpq's, not the WHATWG URL standard's, which refuses an
-/// empty host after a user (`postgresql://user@/db?host=/run/pg`).
+/// The driver reads its connection in keyword form only — a URI passed as
+/// one would lose every component — so the URI's keywords (read as libpq
+/// reads them, [`PgUri`]) become the driver's, and an absent `sslmode` is
+/// `prefer`, libpq's default, as it is to the catalog's driver reading the
+/// same URL. The driver takes no client certificate, so a URI naming one is
+/// refused rather than connected without it. `options` are the driver's own
+/// parameters and override what the URI says.
 fn pool_params(
     url: &str,
     options: &HashMap<String, String>,
 ) -> std::result::Result<HashMap<String, SecretString>, String> {
-    let decoded = |part: &str| percent_decode_str(part).decode_utf8_lossy().into_owned();
-    let rest = ["postgresql://", "postgres://"]
-        .iter()
-        .find_map(|scheme| url.strip_prefix(scheme))
-        .ok_or_else(|| format!("`{url}` is not a postgres:// or postgresql:// URI"))?;
-    let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let (authority, db) = rest.split_once('/').unwrap_or((rest, ""));
-    let (userinfo, hostport) = authority
-        .rsplit_once('@')
-        .map_or((None, authority), |(userinfo, hostport)| {
-            (Some(userinfo), hostport)
-        });
-    let (user, password) = match userinfo.map(|u| u.split_once(':')) {
-        Some(Some((user, password))) => (Some(user), Some(password)),
-        Some(None) => (userinfo, None),
-        None => (None, None),
-    };
-    let (host, port) = match hostport.strip_prefix('[') {
-        Some(bracketed) => {
-            let (host, after) = bracketed
-                .split_once(']')
-                .ok_or_else(|| format!("unclosed `[` in the host of `{url}`"))?;
-            (host, after.strip_prefix(':'))
-        }
-        None => hostport
-            .rsplit_once(':')
-            .map_or((hostport, None), |(host, port)| (host, Some(port))),
-    };
-    let authority = [
-        ("host", Some(host)),
-        ("port", port),
-        ("user", user),
-        ("db", Some(db)),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| Some((key.to_string(), decoded(value.filter(|v| !v.is_empty())?))))
-    .chain(password.map(|p| ("pass".to_string(), decoded(p))));
-    let query = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = pair
-                .split_once('=')
-                .ok_or_else(|| format!("the Postgres URL parameter `{pair}` has no value"))?;
-            let param = QUERY_PARAMETERS
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, param)| param.to_string())
-                .ok_or_else(|| format!("the Postgres URL parameter `{key}` is not supported"))?;
-            Ok((param, decoded(value)))
-        })
+    let uri = PgUri::parse(url).map_err(|e| e.to_string())?;
+    let from_uri = uri
+        .params()
+        .map(|(keyword, value)| Ok((driver_parameter(keyword)?.to_string(), value.to_string())))
         .collect::<std::result::Result<Vec<_>, String>>()?;
-    let params: HashMap<String, String> = [("sslmode".to_string(), "prefer".to_string())]
+    Ok([("sslmode".to_string(), "prefer".to_string())]
         .into_iter()
-        .chain(authority)
-        .chain(query)
+        .chain(from_uri)
         .chain(options.clone())
-        .collect();
-    if params.get("host").is_some_and(|host| host.contains(',')) {
-        return Err("a Postgres source connects to one host".into());
-    }
-    Ok(params
-        .into_iter()
         .map(|(key, value)| (key, SecretString::from(value)))
         .collect())
+}
+
+/// The driver's parameter for a libpq keyword.
+fn driver_parameter(keyword: Keyword) -> std::result::Result<&'static str, String> {
+    match keyword {
+        Keyword::Host => Ok("host"),
+        Keyword::Port => Ok("port"),
+        Keyword::User => Ok("user"),
+        Keyword::Password => Ok("pass"),
+        Keyword::Dbname => Ok("db"),
+        Keyword::Sslmode => Ok("sslmode"),
+        Keyword::Sslrootcert => Ok("sslrootcert"),
+        Keyword::ApplicationName => Ok("application_name"),
+        Keyword::Options => Ok("options"),
+        Keyword::Sslcert | Keyword::Sslkey => Err(format!(
+            "a Postgres source takes no client certificate (`{}`)",
+            <&str>::from(keyword)
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -177,19 +123,6 @@ mod tests {
     }
 
     #[test]
-    fn a_host_query_parameter_names_a_unix_socket_directory() {
-        assert_eq!(
-            params("postgres://postgres@localhost/catalog?host=/tmp/pg.sock.d"),
-            expected(&[
-                ("host", "/tmp/pg.sock.d"),
-                ("user", "postgres"),
-                ("db", "catalog"),
-                ("sslmode", "prefer"),
-            ])
-        );
-    }
-
-    #[test]
     fn an_empty_authority_takes_its_socket_from_the_query() {
         // The form a local server hands out: no host before the path at all.
         assert_eq!(
@@ -197,7 +130,6 @@ mod tests {
             expected(&[
                 ("host", "/tmp/pgdata"),
                 ("user", "postgres"),
-                ("pass", ""),
                 ("db", "postgres"),
                 ("sslmode", "prefer"),
             ])
@@ -222,9 +154,9 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_multi_host_or_unsupported_uri_is_refused() {
+    fn a_uri_the_driver_cannot_honour_is_refused() {
         assert!(pool_params("not a url", &HashMap::new()).is_err());
-        assert!(pool_params("postgres://u@h/d?frobnicate=1", &HashMap::new()).is_err());
         assert!(pool_params("postgres://u@h/d?host=a,b", &HashMap::new()).is_err());
+        assert!(pool_params("postgres://u@h/d?sslcert=/etc/ssl/me.pem", &HashMap::new()).is_err());
     }
 }

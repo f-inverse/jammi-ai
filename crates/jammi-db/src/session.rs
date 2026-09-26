@@ -1408,13 +1408,8 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
                     }
                 },
             };
-            if !(resolved_url.starts_with("postgres://")
-                || resolved_url.starts_with("postgresql://"))
-            {
-                return Err(JammiError::Config(
-                    "[broker.postgres] url must be a postgres:// (or postgresql://) URL".into(),
-                ));
-            }
+            crate::pg_uri::PgUri::parse(&resolved_url)
+                .map_err(|e| JammiError::Config(format!("[broker.postgres] url: {e}")))?;
             let broker =
                 PostgresBroker::connect(&resolved_url, Duration::from_secs(*idle_poll_secs))
                     .await?;

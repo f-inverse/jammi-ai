@@ -43,9 +43,26 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
-/// The log formatter a host installs over `writer`: filtered by `RUST_LOG`
-/// when set, else by `[logging] level`, else by `host_default`; JSON or text
-/// per `[logging] format`. `ansi` colours the output — for a terminal only.
+/// The filter every layer a host installs reads: `RUST_LOG` when set, else
+/// `[logging] level`, else `host_default`. One filter for the formatter and
+/// the export layer, so a span or event a host does not log is not exported
+/// either — a layer with no filter of its own is interested in every
+/// callsite in the process, transport internals included. Every layer reads
+/// it as a per-layer filter, so each is [`EventsDecidedAtDispatch`].
+fn log_filter(logging: &LoggingConfig, host_default: LevelFilter) -> EventsDecidedAtDispatch {
+    EventsDecidedAtDispatch(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            logging
+                .level
+                .clone()
+                .unwrap_or_else(|| host_default.to_string()),
+        )
+    }))
+}
+
+/// The log formatter a host installs over `writer`, filtered by
+/// [`log_filter`]; JSON or text per `[logging] format`. `ansi` colours the
+/// output — for a terminal only.
 pub fn fmt_layer<W>(
     logging: &LoggingConfig,
     host_default: LevelFilter,
@@ -55,15 +72,7 @@ pub fn fmt_layer<W>(
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            logging
-                .level
-                .clone()
-                .unwrap_or_else(|| host_default.to_string()),
-        )
-    });
-    let filter = EventsDecidedAtDispatch(filter);
+    let filter = log_filter(logging, host_default);
     let layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_ansi(ansi);
@@ -380,7 +389,7 @@ pub type HostLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 /// The tracing layers a host installs over a [`Registry`]: the log formatter
 /// over `writer` ([`fmt_layer`]) and, when `[observability] otlp_endpoint`
-/// is configured, the OTLP export layer. An endpoint this build cannot
+/// is configured, the OTLP export layer — both filtered by [`log_filter`]. An endpoint this build cannot
 /// honour is refused before anything is built
 /// ([`refuse_if_endpoint_without_feature`]).
 ///
@@ -405,7 +414,11 @@ where
     refuse_if_endpoint_without_feature(&config.observability)?;
     let formatter = fmt_layer(&config.logging, host_default, writer, ansi);
     Ok(std::iter::once(formatter)
-        .chain(export_layer(&config.observability)?)
+        .chain(export_layer(
+            &config.observability,
+            &config.logging,
+            host_default,
+        )?)
         .collect())
 }
 
@@ -414,19 +427,37 @@ where
 #[cfg(feature = "telemetry-otlp")]
 static OTLP_PROVIDER: std::sync::OnceLock<OtlpProviderHandle> = std::sync::OnceLock::new();
 
-/// The OTLP export layer `config` names, if any.
+/// The OTLP export layer `config` names, if any, filtered as the formatter
+/// is ([`log_filter`]).
 #[cfg(feature = "telemetry-otlp")]
-fn export_layer(config: &ObservabilityConfig) -> Result<Option<HostLayer>> {
+fn export_layer(
+    config: &ObservabilityConfig,
+    logging: &LoggingConfig,
+    host_default: LevelFilter,
+) -> Result<Option<HostLayer>> {
     Ok(otlp_layer(config)?.map(|otlp| {
         OTLP_PROVIDER.get_or_init(|| otlp.provider_handle());
-        Box::new(otlp.layer) as HostLayer
+        filtered_export(otlp.layer, logging, host_default)
     }))
+}
+
+/// `layer` behind the host's log filter.
+#[cfg(feature = "telemetry-otlp")]
+fn filtered_export<L>(layer: L, logging: &LoggingConfig, host_default: LevelFilter) -> HostLayer
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+{
+    Box::new(layer.with_filter(log_filter(logging, host_default)))
 }
 
 /// Without the `telemetry-otlp` feature there is no export layer to build;
 /// a configured endpoint was already refused.
 #[cfg(not(feature = "telemetry-otlp"))]
-fn export_layer(_config: &ObservabilityConfig) -> Result<Option<HostLayer>> {
+fn export_layer(
+    _config: &ObservabilityConfig,
+    _logging: &LoggingConfig,
+    _host_default: LevelFilter,
+) -> Result<Option<HostLayer>> {
     Ok(None)
 }
 
@@ -527,6 +558,47 @@ mod tests {
         tracing::subscriber::with_default(tracing_subscriber::registry().with(layers), || {
             tracing::warn!("layers_with_an_endpoint_add_the_otlp_export_layer");
         });
+    }
+
+    /// The export layer exports only what the host's log filter admits: a
+    /// request span at `info` is exported; a `debug` span and a transport
+    /// crate's `trace` span are not.
+    #[test]
+    #[cfg(feature = "telemetry-otlp")]
+    fn the_export_layer_exports_only_what_the_log_filter_admits() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+
+        #[derive(Debug, Clone, Default)]
+        struct Collected(Arc<Mutex<Vec<String>>>);
+        impl SpanExporter for Collected {
+            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+                let mut names = self.0.lock().unwrap();
+                names.extend(batch.into_iter().map(|span| span.name.into_owned()));
+                Ok(())
+            }
+        }
+
+        let collected = Collected::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(collected.clone())
+            .build();
+        let otel = tracing_opentelemetry::layer().with_tracer(provider.tracer("test"));
+        let logging = LoggingConfig {
+            level: Some("info".into()),
+            ..LoggingConfig::default()
+        };
+        let layer = filtered_export(otel, &logging, LevelFilter::WARN);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info_span!("request").in_scope(|| {
+                tracing::debug_span!("detail").in_scope(|| {});
+                tracing::span!(target: "h2::codec", tracing::Level::TRACE, "poll_next")
+                    .in_scope(|| {});
+            });
+        });
+        provider.force_flush().unwrap();
+        assert_eq!(*collected.0.lock().unwrap(), vec!["request".to_string()]);
     }
 
     /// A configured endpoint in a build without the feature is refused

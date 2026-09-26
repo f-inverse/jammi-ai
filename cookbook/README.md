@@ -32,6 +32,7 @@ nothing runs):
 | Submit, watch and cancel jobs | [`recipes/jobs/`](./recipes/jobs/) |
 | List, describe, preload and delete models | [`recipes/model_catalog/`](./recipes/model_catalog/) |
 | Create, insert into and query a mutable table | [`recipes/mutable_tables/`](./recipes/mutable_tables/) |
+| Read sources from and write results to S3 / GCS / Azure / R2 | [`recipes/cloud_storage/`](./recipes/cloud_storage/) |
 | Publish and subscribe on a topic | [`recipes/trigger_streams/`](./recipes/trigger_streams/) |
 | Store data deleted when the session ends | [`recipes/session_lifecycle/`](./recipes/session_lifecycle/) |
 | Audit every search a session runs | [`recipes/search_audit/`](./recipes/search_audit/) |

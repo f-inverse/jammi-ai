@@ -134,8 +134,9 @@
     "other shape) reads one of these sites rather than a literal \u2014 that is a",
     "stated residual, tracked on #507.",
     "`crates/jammi-db/tests/it/shipped_feature_exposure.rs` covers the",
-    "manifest half (all six families present under `lanes`, the generated",
-    "`deny.toml` exposure line) plus the Dockerfile arm (both",
+    "manifest half (all eight families present under `lanes`, each native",
+    "wheel's `pyproject.toml` building exactly its lane's features, the",
+    "generated `deny.toml` exposure line) plus the Dockerfile arm (both",
     "`ARG CARGO_FEATURES` declarations carry no default, and each builder",
     "stage's own `RUN` carries the `${CARGO_FEATURES:?...}` required-",
     "argument guard)."
@@ -293,6 +294,57 @@
       "cargo_features": [
         "storage-cloud"
       ]
+    },
+    "native-cpu-wheel": {
+      "_doc": "The `jammi-ai-native` PyPI wheel (the embedded CPU engine), linux x86_64/aarch64 and macOS, built by maturin from `packaging/native/pyproject.toml`, whose `[tool.maturin] features` beyond `extension-module` must equal this list (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`). No `capabilities` block: reaches neither cuda nor flash-attn.",
+      "workflow": ".github/workflows/pypi.yml:build-native-linux / build-native-macos",
+      "package": "jammi-python",
+      "cargo_features": [
+        "storage-cloud"
+      ]
+    },
+    "native-cu12-wheel": {
+      "_doc": "The `jammi-ai-native-cu12` PyPI wheel (the embedded CUDA engine), linux x86_64, built by maturin from `packaging/native-cu12/pyproject.toml`, whose `[tool.maturin] features` beyond `extension-module` must equal this list (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`). The same engine build the other CUDA lanes ship, so the same capability surface.",
+      "workflow": ".github/workflows/pypi-native-cuda.yml:build",
+      "package": "jammi-python",
+      "cargo_features": [
+        "cuda",
+        "flash-attn",
+        "storage-cloud"
+      ],
+      "capabilities": {
+        "cuda_compiled": true,
+        "flash_compiled": true,
+        "flash_dtypes": [
+          "bf16",
+          "f16"
+        ],
+        "fused_op_admission": [
+          "layer_norm",
+          "softmax",
+          "geglu",
+          "gelu_erf",
+          "rope",
+          "attention_block",
+          "mem_efficient_attention",
+          "low_rank_residual_linear",
+          "dropout",
+          "cast_scale",
+          "cast_add",
+          "adamw_step",
+          "attention_block_flash"
+        ],
+        "internal_subkernels": {
+          "rope_positions": {
+            "parent": "attention_block_flash",
+            "launch_site": "crates/jammi-kernels/src/ops/flash_attention.rs"
+          },
+          "scaled_cast_add": {
+            "parent": "low_rank_residual_linear",
+            "launch_site": "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs"
+          }
+        }
+      }
     }
   },
   "prove_lane": {

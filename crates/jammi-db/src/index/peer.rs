@@ -993,7 +993,6 @@ mod tests {
             query: crate::index::validate_query(vec![1.0], 1, crate::index::QuerySource::Caller)
                 .unwrap(),
             width: 1,
-            target: 1,
             version: None,
             phase: SegmentSearchPhase::Final,
             admission: crate::index::Admission::Every,

@@ -32,7 +32,7 @@ use futures::StreamExt;
 use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, Transaction, TxOptions};
 
 use super::definition::MutableTableDefinition;
-use super::{owned_rows, MutableBackend};
+use super::{keys_predicate, owned_rows, MutableBackend};
 
 /// How an incoming row relates to an existing row with the same primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,19 +170,27 @@ pub(crate) async fn replace_rows(
     rows: &RecordBatch,
 ) -> Result<u64, BackendError> {
     if let Some(keys) = keys.filter(|k| k.num_rows() > 0) {
-        let width = keys.num_columns();
-        for chunk in row_chunks(keys, width, backend) {
-            let dml = backend.delete_keys_dml(def, chunk.num_rows(), &owned_rows(tx.tenant()));
-            let params = batch_to_params(&chunk, None).map_err(execution)?;
-            // `batch_to_params` appends a tenant slot per row; a key tuple has none.
-            let params: Vec<_> = params
-                .chunks(width + 1)
-                .flat_map(|row| row[..width].iter().cloned())
-                .collect();
-            tx.execute(&dml, &params).await?;
+        for chunk in row_chunks(keys, keys.num_columns(), backend) {
+            let owned = owned_rows(tx.tenant());
+            let dml = backend.delete_dml(
+                def,
+                &format!("{} AND {owned}", keys_predicate(def, chunk.num_rows())),
+            );
+            tx.execute(&dml, &key_params(&chunk)?).await?;
         }
     }
     insert_rows(tx, backend, def, rows).await
+}
+
+/// The parameters [`keys_predicate`] binds for the key tuples in `keys`.
+pub(crate) fn key_params(keys: &RecordBatch) -> Result<Vec<SqlValue<'static>>, BackendError> {
+    let width = keys.num_columns();
+    let params = batch_to_params(keys, None).map_err(execution)?;
+    // `batch_to_params` appends a tenant slot per row; a key tuple has none.
+    Ok(params
+        .chunks(width + 1)
+        .flat_map(|row| row[..width].iter().cloned())
+        .collect())
 }
 
 /// Append `rows` inside `tx`, stamped with the transaction's tenant. Returns
@@ -210,7 +218,7 @@ pub(crate) async fn insert_rows(
 
 /// `batch` in consecutive slices small enough that one statement binding
 /// `params_per_row` parameters for each of a slice's rows fits the backend.
-fn row_chunks<'a>(
+pub(crate) fn row_chunks<'a>(
     batch: &'a RecordBatch,
     params_per_row: usize,
     backend: &dyn MutableBackend,

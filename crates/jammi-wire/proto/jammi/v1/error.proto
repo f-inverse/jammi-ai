@@ -481,7 +481,23 @@ message MutableTableErrorDetail {
     // `MutableTableError::NoOrderColumn` carries no payload.
     bool no_order_column = 7;
     BackendErrorDetail backend = 8;
+    MutableWriteConflict write_conflict = 9;
+    MutableAmbiguousUpdate ambiguous_update = 10;
   }
+}
+
+// `MutableTableError::WriteConflict { table, rows }`: rows an UPDATE / DELETE
+// selected changed before its write; nothing was written.
+message MutableWriteConflict {
+  string table = 1;
+  uint64 rows = 2;
+}
+
+// `MutableTableError::AmbiguousUpdate { table, key }`: an UPDATE gave one row
+// more than one new value.
+message MutableAmbiguousUpdate {
+  string table = 1;
+  string key = 2;
 }
 
 // `MutableTableError::Backend(BackendError)`. The backend taxonomy is

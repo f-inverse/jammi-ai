@@ -550,6 +550,18 @@ impl From<&MutableTableError> for pb::MutableTableErrorDetail {
             MutableTableError::NotFound(id) => Variant::NotFound(id.to_string()),
             MutableTableError::AlreadyExists(id) => Variant::AlreadyExists(id.to_string()),
             MutableTableError::NoOrderColumn => Variant::NoOrderColumn(true),
+            MutableTableError::WriteConflict { table, rows } => {
+                Variant::WriteConflict(pb::MutableWriteConflict {
+                    table: table.to_string(),
+                    rows: *rows,
+                })
+            }
+            MutableTableError::AmbiguousUpdate { table, key } => {
+                Variant::AmbiguousUpdate(pb::MutableAmbiguousUpdate {
+                    table: table.to_string(),
+                    key: key.clone(),
+                })
+            }
             MutableTableError::Backend(e) => Variant::Backend(e.into()),
         };
         pb::MutableTableErrorDetail {
@@ -574,11 +586,15 @@ fn mutable_table_error_from_detail(
     message: &str,
 ) -> MutableTableError {
     use pb::mutable_table_error_detail::Variant;
-    let reconstruct_id =
-        |s: String, wrap: fn(MutableTableId) -> MutableTableError| match MutableTableId::new(&s) {
+    fn reconstruct_id(
+        s: String,
+        wrap: impl FnOnce(MutableTableId) -> MutableTableError,
+    ) -> MutableTableError {
+        match MutableTableId::new(&s) {
             Ok(id) => wrap(id),
             Err(_) => MutableTableError::InvalidId(s),
-        };
+        }
+    }
     match detail.variant {
         Some(Variant::InvalidId(m)) => MutableTableError::InvalidId(m),
         Some(Variant::Schema(m)) => MutableTableError::Schema(m),
@@ -587,6 +603,15 @@ fn mutable_table_error_from_detail(
         Some(Variant::NotFound(s)) => reconstruct_id(s, MutableTableError::NotFound),
         Some(Variant::AlreadyExists(s)) => reconstruct_id(s, MutableTableError::AlreadyExists),
         Some(Variant::NoOrderColumn(_)) => MutableTableError::NoOrderColumn,
+        Some(Variant::WriteConflict(e)) => {
+            reconstruct_id(e.table, |table| MutableTableError::WriteConflict {
+                table,
+                rows: e.rows,
+            })
+        }
+        Some(Variant::AmbiguousUpdate(e)) => reconstruct_id(e.table, |table| {
+            MutableTableError::AmbiguousUpdate { table, key: e.key }
+        }),
         Some(Variant::Backend(e)) => {
             MutableTableError::Backend(backend_error_from_detail(e, message))
         }
@@ -1271,7 +1296,10 @@ pub fn status_code(err: &JammiError) -> Code {
             | MutableTableError::Schema(_)
             | MutableTableError::MissingPrimaryKey(_)
             | MutableTableError::ReservedColumn(_)
-            | MutableTableError::NoOrderColumn => Code::InvalidArgument,
+            | MutableTableError::NoOrderColumn
+            | MutableTableError::AmbiguousUpdate { .. } => Code::InvalidArgument,
+            // Lost a race with another writer: retryable, like `CasFailed`.
+            MutableTableError::WriteConflict { .. } => Code::Aborted,
             MutableTableError::Backend(_) => Code::Internal,
         },
         // A channel-catalog op carries a typed caller condition the coarse gRPC
@@ -1812,6 +1840,14 @@ mod tests {
             MutableTableError::NotFound(table_id.clone()),
             MutableTableError::AlreadyExists(table_id.clone()),
             MutableTableError::NoOrderColumn,
+            MutableTableError::WriteConflict {
+                table: table_id.clone(),
+                rows: 3,
+            },
+            MutableTableError::AmbiguousUpdate {
+                table: table_id.clone(),
+                key: "(\"W2031\")".into(),
+            },
             MutableTableError::Backend(BackendError::Constraint {
                 table: "patents_dim".into(),
                 detail: "duplicate key value violates unique constraint".into(),

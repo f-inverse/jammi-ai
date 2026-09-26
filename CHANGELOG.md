@@ -5,6 +5,16 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A mutable table's `UPDATE` / `DELETE` chooses its rows with any predicate a query can use.**
+  A subquery (`DELETE … WHERE key IN (SELECT …)`, `EXISTS`), an `UPDATE … FROM` join, and a
+  `LIMIT` now select exactly the rows they name: the statement's own plan runs as a query, and the
+  table rewrites the rows it yields in one serializable transaction (`RowRewriteNode`). The
+  transaction re-reads the selected rows and refuses the statement, writing nothing, when another
+  writer changed one in between (`MutableTableError::WriteConflict`, gRPC `ABORTED`); an
+  `UPDATE … FROM` whose join gives one row two different new values is refused as
+  `MutableTableError::AmbiguousUpdate` (`INVALID_ARGUMENT`). `EXPLAIN` of an `UPDATE` / `DELETE`
+  explains this plan rather than running the write. Such a predicate on any other table provider
+  stays refused (`RefusalReason::DmlBeyondTarget`).
 - **Postgres is the production trigger broker; the NATS JetStream driver is gone.** The Postgres
   broker's `LISTEN`/`NOTIFY` wake-ups over the topic's backing table (the authoritative log) give
   replayable cross-replica delivery on the database a shared deployment already runs, so the second

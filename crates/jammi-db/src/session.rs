@@ -31,6 +31,7 @@ use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
 use crate::source::{SourceConnection, SourceDefinition, SourceType};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
+use crate::store::mutable::rewrite::RowRewritePlanner;
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::{TenantContext, TenantId};
@@ -1089,10 +1090,8 @@ impl QueryContext {
     /// TABLE … AS`, a `SET`) has executed when this returns, as
     /// `SessionContext::sql` has it.
     pub async fn sql(&self, sql: &str) -> DfResult<DataFrame> {
-        let plan = self.0.state().create_logical_plan(sql).await?;
-        self.0
-            .execute_logical_plan(StatementClass::of(plan)?.into_plan())
-            .await
+        let class = StatementClass::plan(&self.0.state(), sql).await?;
+        self.0.execute_logical_plan(class.into_plan()).await
     }
 
     /// A [`DataFrame`] scanning the table `table_ref` resolves to.
@@ -1265,8 +1264,9 @@ pub enum QueryFunction {
 
 /// The session's physical planner: DataFusion's default planner with the
 /// federation extension planner (a federated sub-plan pushed to its
-/// source) and [`MaterializationPlanner`] (a statement's materialization
-/// rooted in the node that decides where it runs).
+/// source), [`MaterializationPlanner`] (a statement's materialization
+/// rooted in the node that decides where it runs) and [`RowRewritePlanner`]
+/// (an `UPDATE` / `DELETE` of a mutable table's selected rows).
 #[derive(Debug)]
 struct JammiQueryPlanner;
 
@@ -1280,6 +1280,7 @@ impl QueryPlanner for JammiQueryPlanner {
         DefaultPhysicalPlanner::with_extension_planners(vec![
             Arc::new(FederatedPlanner::new()),
             Arc::new(MaterializationPlanner),
+            Arc::new(RowRewritePlanner),
         ])
         .create_physical_plan(logical_plan, session_state)
         .await

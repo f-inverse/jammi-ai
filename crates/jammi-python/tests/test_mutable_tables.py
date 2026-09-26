@@ -199,3 +199,54 @@ def test_drop_missing_with_if_exists_succeeds(tmp_path):
     no-op — the binding short-circuits on the typed NotFound variant."""
     db = jammi.connect(f"file://{tmp_path}")
     db.drop_mutable_table("never_registered", if_exists=True)
+
+
+def test_a_subquery_or_join_chooses_the_rows_rewritten(tmp_path):
+    """An `UPDATE … FROM` and a `DELETE` with a subquery rewrite exactly the
+    rows their join or subquery selects; a join giving one row two new
+    values is refused with the typed `InvalidArgument`, writing nothing."""
+    db = jammi.connect(f"file://{tmp_path}")
+    db.create_mutable_table("notes", schema=_notes_schema(), primary_key=["note_id"])
+    db.create_mutable_table(
+        "edits",
+        schema=pa.schema(
+            [
+                pa.field("edit_id", pa.int64(), nullable=False),
+                pa.field("note_id", pa.int64(), nullable=False),
+                pa.field("body", pa.string(), nullable=False),
+            ]
+        ),
+        primary_key=["edit_id"],
+    )
+    db.sql(
+        "INSERT INTO mutable.public.notes (note_id, body) VALUES "
+        "(1, 'first'), (2, 'second'), (3, 'third')"
+    )
+    db.sql(
+        "INSERT INTO mutable.public.edits (edit_id, note_id, body) VALUES "
+        "(10, 1, 'first, revised'), (11, 3, 'third, revised'), (12, 3, 'third, again')"
+    )
+
+    def bodies():
+        rows = db.sql("SELECT note_id, body FROM mutable.public.notes ORDER BY note_id")
+        return list(zip(rows.column("note_id").to_pylist(), rows.column("body").to_pylist()))
+
+    with pytest.raises(jammi.errors.InvalidArgument) as info:
+        db.sql(
+            "UPDATE mutable.public.notes AS n SET body = e.body "
+            "FROM mutable.public.edits AS e WHERE n.note_id = e.note_id"
+        )
+    assert "more than one new value" in str(info.value)
+    assert bodies() == [(1, "first"), (2, "second"), (3, "third")]
+
+    updated = db.sql(
+        "UPDATE mutable.public.notes AS n SET body = e.body "
+        "FROM mutable.public.edits AS e WHERE n.note_id = e.note_id AND e.edit_id < 12"
+    )
+    assert updated.column("count").to_pylist() == [2]
+    deleted = db.sql(
+        "DELETE FROM mutable.public.notes WHERE note_id NOT IN "
+        "(SELECT note_id FROM mutable.public.edits)"
+    )
+    assert deleted.column("count").to_pylist() == [1]
+    assert bodies() == [(1, "first, revised"), (3, "third, revised")]

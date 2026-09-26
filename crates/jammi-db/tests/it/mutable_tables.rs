@@ -1,7 +1,8 @@
 //! End-to-end integration tests for Phase 2 — mutable companion tables.
 //!
 //! Coverage: register/list/drop lifecycle, atomic catalog + storage commit,
-//! DataFusion DML through `INSERT INTO mutable.public.<id>`, federation
+//! DataFusion DML through `INSERT INTO mutable.public.<id>`, `UPDATE` /
+//! `DELETE` choosing rows by a subquery or a join, write conflicts, federation
 //! between mutable tables and Parquet result tables, tenant filtering on
 //! list, order-column round-trip, direct-access `insert_batch` and
 //! `scan_after` paths, schema-mismatch rejection.
@@ -23,6 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use futures::StreamExt;
 use jammi_db::catalog::backend::{BackendKind, TxOptions};
+use jammi_db::error::JammiError;
 use jammi_db::store::mutable::definition::{
     MutableIndexDef, MutableTableDefinitionBuilder, MutableTableError, MutableTableId,
 };
@@ -328,23 +330,302 @@ async fn update_delete_and_replace_rewrite_rows_in_place(backend: BackendKind) {
         ]
     );
 
-    // A predicate beyond the table's own columns is refused before it can
-    // run, so it never rewrites rows it did not select.
-    assert!(session
-        .sql(&format!(
-            "DELETE FROM mutable.public.{table} WHERE id IN \
-             (SELECT id FROM mutable.public.{table} WHERE name = 'beta')"
-        ))
-        .await
-        .is_err());
-    assert_eq!(widget_rows(&session, table).await.len(), 4);
-
     // An unfiltered DELETE empties the table.
     assert_eq!(
         affected(&session, &format!("DELETE FROM mutable.public.{table}")).await,
         4
     );
     assert!(widget_rows(&session, table).await.is_empty());
+}
+
+/// Registers a `widgets` table holding `(1, alpha, 0.5)`, `(2, beta, 1.5)`,
+/// `(3, gamma, 2.5)` and `(4, delta, NULL)`; returns its name.
+async fn seeded_widgets(session: &jammi_db::session::JammiSession) -> String {
+    let id = unique_id("widgets");
+    let def = MutableTableDefinitionBuilder::new(id.clone(), widget_schema())
+        .primary_key(vec!["id".into()])
+        .build()
+        .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{id} (id, name, score) VALUES \
+             (1, 'alpha', 0.5), (2, 'beta', 1.5), (3, 'gamma', 2.5), (4, 'delta', NULL)",
+            id = id.as_str()
+        ))
+        .await
+        .unwrap();
+    id.as_str().to_string()
+}
+
+/// An `UPDATE … FROM` or a `DELETE` whose predicate is a subquery rewrites
+/// exactly the rows its join or subquery selects: price adjustments land on
+/// the widgets they name, a recall list removes the widgets it names, and
+/// every other row stays as it was.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_or_subquery_chooses_the_rows_an_update_or_delete_rewrites(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let widgets = seeded_widgets(&session).await;
+    let adjustments = unique_id("adjustments");
+    let def = MutableTableDefinitionBuilder::new(
+        adjustments.clone(),
+        Arc::new(Schema::new(vec![
+            Field::new("widget_id", DataType::Int64, false),
+            Field::new("delta", DataType::Float64, false),
+            Field::new("recalled", DataType::Boolean, false),
+        ])),
+    )
+    .primary_key(vec!["widget_id".into()])
+    .build()
+    .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+    let adjustments = adjustments.as_str();
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{adjustments} (widget_id, delta, recalled) VALUES \
+             (2, 10.0, false), (3, 20.0, true), (9, 1.0, true)"
+        ))
+        .await
+        .unwrap();
+
+    // Widget 9 has no row, so the join matches two widgets.
+    let updated = affected(
+        &session,
+        &format!(
+            "UPDATE mutable.public.{widgets} AS w SET score = w.score + a.delta \
+             FROM mutable.public.{adjustments} AS a WHERE w.id = a.widget_id"
+        ),
+    )
+    .await;
+    assert_eq!(updated, 2);
+
+    let deleted = affected(
+        &session,
+        &format!(
+            "DELETE FROM mutable.public.{widgets} WHERE id IN \
+             (SELECT widget_id FROM mutable.public.{adjustments} WHERE recalled)"
+        ),
+    )
+    .await;
+    assert_eq!(deleted, 1, "widget 3 is recalled; widget 9 does not exist");
+
+    let renamed = affected(
+        &session,
+        &format!(
+            "UPDATE mutable.public.{widgets} SET name = upper(name) WHERE EXISTS \
+             (SELECT 1 FROM mutable.public.{adjustments} a WHERE a.delta > 5.0) AND score IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(renamed, 1, "only widget 4 has no score");
+
+    assert_eq!(
+        widget_rows(&session, &widgets).await,
+        vec![
+            (1, "alpha".into(), Some(0.5)),
+            (2, "beta".into(), Some(11.5)),
+            (4, "DELTA".into(), None),
+        ]
+    );
+}
+
+/// A join that selects one row several times is one rewrite of that row
+/// when every match agrees on its new value, and is refused, writing
+/// nothing, when the matches disagree.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_the_join_matches_twice_needs_one_new_value(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let widgets = seeded_widgets(&session).await;
+    let tags = unique_id("tags");
+    let def = MutableTableDefinitionBuilder::new(
+        tags.clone(),
+        Arc::new(Schema::new(vec![
+            Field::new("tag_id", DataType::Int64, false),
+            Field::new("widget_id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ])),
+    )
+    .primary_key(vec!["tag_id".into()])
+    .build()
+    .unwrap();
+    session.create_mutable_table(def).await.unwrap();
+    let tags = tags.as_str();
+    session
+        .sql(&format!(
+            "INSERT INTO mutable.public.{tags} (tag_id, widget_id, label) VALUES \
+             (10, 1, 'sale'), (11, 1, 'sale'), (12, 2, 'new'), (13, 2, 'clearance')"
+        ))
+        .await
+        .unwrap();
+
+    let updated = affected(
+        &session,
+        &format!(
+            "UPDATE mutable.public.{widgets} AS w SET name = t.label \
+             FROM mutable.public.{tags} AS t WHERE w.id = t.widget_id AND w.id = 1"
+        ),
+    )
+    .await;
+    assert_eq!(updated, 1, "both of widget 1's tags say 'sale'");
+
+    let refused = session
+        .sql(&format!(
+            "UPDATE mutable.public.{widgets} AS w SET name = t.label \
+             FROM mutable.public.{tags} AS t WHERE w.id = t.widget_id"
+        ))
+        .await
+        .unwrap_err();
+    match refused {
+        JammiError::MutableTable(MutableTableError::AmbiguousUpdate { table, key }) => {
+            assert_eq!(table.as_str(), widgets);
+            assert_eq!(key, "(2)");
+        }
+        other => panic!("expected AmbiguousUpdate, got {other:?}"),
+    }
+    assert_eq!(
+        widget_rows(&session, &widgets).await,
+        vec![
+            (1, "sale".into(), Some(0.5)),
+            (2, "beta".into(), Some(1.5)),
+            (3, "gamma".into(), Some(2.5)),
+            (4, "delta".into(), None),
+        ],
+        "the refused statement wrote nothing"
+    );
+}
+
+/// A statement reads the rows it selects before its write transaction opens.
+/// A row another writer changes in between fails the statement whole —
+/// the other writer's change is kept, not overwritten — and the statement
+/// re-run selects against the new rows.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_changed_after_the_read_fails_the_rewrite_whole(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let widgets = seeded_widgets(&session).await;
+    let raise = format!("UPDATE mutable.public.{widgets} SET score = score + 1 WHERE score > 1");
+
+    // Planning reads the selected rows: widgets 2 and 3.
+    let frame = session.context().sql(&raise).await.unwrap();
+    let task = frame.task_ctx();
+    let plan = frame.create_physical_plan().await.unwrap();
+    assert_eq!(
+        affected(
+            &session,
+            &format!("UPDATE mutable.public.{widgets} SET score = 100 WHERE id = 3")
+        )
+        .await,
+        1
+    );
+    let conflict = JammiError::from(
+        datafusion::physical_plan::collect(plan, Arc::new(task))
+            .await
+            .unwrap_err(),
+    );
+    match conflict {
+        JammiError::MutableTable(MutableTableError::WriteConflict { table, rows }) => {
+            assert_eq!(table.as_str(), widgets);
+            assert_eq!(rows, 1, "widget 3 changed; widget 2 did not");
+        }
+        other => panic!("expected WriteConflict, got {other:?}"),
+    }
+    assert_eq!(
+        widget_rows(&session, &widgets).await[1..3],
+        [
+            (2, "beta".into(), Some(1.5)),
+            (3, "gamma".into(), Some(100.0))
+        ],
+        "nothing was written, and the other writer's change stands"
+    );
+
+    assert_eq!(affected(&session, &raise).await, 2);
+    assert_eq!(
+        widget_rows(&session, &widgets).await[1..3],
+        [
+            (2, "beta".into(), Some(2.5)),
+            (3, "gamma".into(), Some(101.0))
+        ]
+    );
+}
+
+/// A `DELETE … LIMIT n` removes `n` of the rows its predicate matches, and
+/// an `EXPLAIN` of a rewrite shows its plan without writing anything.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limit_bounds_a_delete_and_an_explain_writes_nothing(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let widgets = seeded_widgets(&session).await;
+
+    let explained = session
+        .sql(&format!(
+            "EXPLAIN UPDATE mutable.public.{widgets} SET score = 0"
+        ))
+        .await
+        .unwrap();
+    let plans = arrow::util::pretty::pretty_format_batches(&explained)
+        .unwrap()
+        .to_string();
+    assert!(plans.contains("RowRewrite"), "{plans}");
+    assert_eq!(widget_rows(&session, &widgets).await[0].2, Some(0.5));
+
+    assert_eq!(
+        affected(
+            &session,
+            &format!("DELETE FROM mutable.public.{widgets} WHERE score IS NOT NULL LIMIT 2")
+        )
+        .await,
+        2
+    );
+    let rows = widget_rows(&session, &widgets).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().any(|(id, _, _)| *id == 4),
+        "widget 4 has no score, so the predicate never matched it"
+    );
+}
+
+/// `TRUNCATE` removes every row the session owns.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn truncate_empties_the_table(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let session = make_test_session(backend, dir.path()).await;
+    let widgets = seeded_widgets(&session).await;
+    assert_eq!(
+        affected(
+            &session,
+            &format!("TRUNCATE TABLE mutable.public.{widgets}")
+        )
+        .await,
+        4
+    );
+    assert!(widget_rows(&session, &widgets).await.is_empty());
 }
 
 #[test_case(BackendKind::Sqlite ; "sqlite")]

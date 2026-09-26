@@ -113,9 +113,9 @@ when = ["cargo-graph"]
 needs = ["cargo-registry"]
 
 [[guard]]
-name = "release postgres/mysql closure"
-run = "python3 ci/scripts/check_release_manifest_pg_mysql_closure.py"
-why = "No release lane's feature closure reaches jammi-db's postgres or mysql features: they link an OpenSSL the release images do not carry."
+name = "database drivers link statically"
+run = "python3 ci/scripts/check_database_drivers_static.py"
+why = "jammi-db's postgres and mysql features, which every release artifact enables, vendor OpenSSL and link zlib statically, so no artifact carries a DT_NEEDED libssl or libz its platform tag does not promise."
 when = ["cargo-graph"]
 needs = ["cargo-registry"]
 

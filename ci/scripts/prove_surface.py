@@ -215,12 +215,12 @@ def _self_test() -> int:
     manifest = load_manifest()
 
     # Anchor self-test: jammi-server's real Cargo.toml must declare (at
-    # least) the three lane features -- a broken tomllib read or a stripped
+    # least) the lane features -- a broken tomllib read or a stripped
     # Cargo.toml would silently narrow `declared()` and this would trip.
     d = declared("jammi-server")
     check(
         "anchor-jammi-server-declares-lane",
-        {"cuda", "flash-attn", "storage-cloud"} <= d,
+        {"cuda", "flash-attn", "mysql", "postgres", "storage-cloud"} <= d,
         f"declared(jammi-server)={sorted(d)}",
     )
 
@@ -228,13 +228,14 @@ def _self_test() -> int:
     # prove_only (jammi-server declares every lane feature).
     check(
         "jammi-server-release",
-        expected("jammi-server", "release", manifest) == ["cuda", "flash-attn", "storage-cloud"],
+        expected("jammi-server", "release", manifest)
+        == ["cuda", "flash-attn", "mysql", "postgres", "storage-cloud"],
         f"{expected('jammi-server', 'release', manifest)}",
     )
     check(
         "jammi-server-test",
         expected("jammi-server", "test", manifest)
-        == ["cuda", "flash-attn", "live-gpu-tests", "storage-cloud"],
+        == ["cuda", "flash-attn", "live-gpu-tests", "mysql", "postgres", "storage-cloud"],
         f"{expected('jammi-server', 'test', manifest)}",
     )
 

@@ -17,7 +17,7 @@ use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::{Offset, Predicate};
 
@@ -551,28 +551,32 @@ impl PyDatabase {
         ))
     }
 
-    /// Register a file-shaped data source. `url` accepts a local path
-    /// (parsed into `file://...`) or any storage URL the build was
-    /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
-    /// `azure://container/blob`. `tenant_column` names the column whose value
-    /// is each row's tenant, persisted with the source.
-    #[pyo3(signature = (name, *, url, format, tenant_column=None))]
+    /// Register a data source by the URL that names it
+    /// ([`SourceDefinition::from_url`]): a `postgres://` / `mysql://` URL is a
+    /// database source, federated table by table; anything else is a file
+    /// read in `format` — a local path (parsed into `file://...`) or any
+    /// storage URL the build was compiled with (`s3://`, `gs://`, `azure://`).
+    /// `tenant_column` names the column whose value is each row's tenant,
+    /// persisted with the source.
+    #[pyo3(signature = (name, *, url, format=None, tenant_column=None))]
     fn add_source(
         &self,
         name: &str,
         url: &str,
-        format: &str,
+        format: Option<&str>,
         tenant_column: Option<String>,
     ) -> PyResult<()> {
         self.check_open()?;
-        let file_format = parse_file_format(format)?;
+        let format = format.map(parse_file_format).transpose()?;
+        let definition = SourceDefinition::from_url(url, format).map_err(to_pyerr)?;
         let connection = SourceConnection {
             tenant_column,
-            ..SourceConnection::parse(url, file_format).map_err(to_pyerr)?
+            ..definition.connection
         };
         crate::released(
             &self.runtime,
-            self.session.add_source(name, SourceType::File, connection),
+            self.session
+                .add_source(name, definition.source_type, connection),
         )
         .map_err(to_pyerr)
     }

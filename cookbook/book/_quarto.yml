@@ -83,6 +83,9 @@ book:
     - part: "Fan-out inference"
       chapters:
         - chapters/26-fanout/fanout.qmd
+    - part: "Databases as sources"
+      chapters:
+        - chapters/30-federation/federation.qmd
     - part: "Running jammi for real"
       chapters:
         - chapters/27-distributed-training/distributed-training.qmd

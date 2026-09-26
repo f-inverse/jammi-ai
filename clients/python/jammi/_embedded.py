@@ -279,10 +279,18 @@ class EmbeddedBackend:
     # --- Sources + model lifecycle ---------------------------------------------
 
     def add_source(
-        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+        self,
+        name: str,
+        *,
+        url: str,
+        format: Optional[str] = None,
+        tenant_column: Optional[str] = None,
     ) -> None:
-        """Register a file-shaped data source on the embedded engine.
+        """Register a data source on the embedded engine, by the URL that names it.
 
+        A `postgres://` / `postgresql://` URL is a PostgreSQL database and a
+        `mysql://` URL a MySQL / MariaDB database, federated table by table;
+        they take no `format`. Anything else is a file read in `format`.
         `tenant_column` names the column whose value is each row's tenant: a
         tenant-bound session then reads only its own rows and the rows with no
         tenant, through every verb that reads the source.

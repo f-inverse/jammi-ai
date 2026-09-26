@@ -1,0 +1,224 @@
+---
+title: "Databases as sources — Postgres, MySQL and a file in one query"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `add_source(url="postgres://…")` · `add_source(url="mysql://…")` ·
+`add_source(url=…, format=…)` · `sql` · `generate_embeddings` · `search` ·
+`jammi.testing.LiveServer` · **Rail:** measurement (the database-backed rows are the
+file-backed rows: the same joins, the same vectors, on the embedded engine and on a
+server).
+
+Every chapter so far read its data from files. The data a real system holds rarely
+sits in one place: the documents live in an operational Postgres, a reference table
+in a MySQL database another team runs, a label set in a CSV someone exported. Jammi
+reads all three where they are. A database is registered by its URL, like a file,
+and each of its tables becomes a table in the SQL surface — queried in place, with
+filters, projections and limits pushed down to the database, and joined with
+anything else the engine can read.
+
+This chapter runs that: a Postgres installed with `pip` (`pgserver`), a MariaDB
+installed with the system package manager, and a CSV file, federated into one query,
+then an embedding table built straight from a Postgres table.
+
+```{python}
+import contextlib
+import tempfile
+from pathlib import Path
+
+import jammi
+import pgserver
+import pyarrow.parquet as pq
+from jammi.testing import LiveServer
+from jammi_cookbook import contracts, fixtures, mariadb
+
+MODEL = fixtures.model("tiny_bert")
+LABELS = str(fixtures.path("tiny_labels.csv"))
+work = Path(tempfile.mkdtemp(prefix="jammi_federation_"))
+stack = contextlib.ExitStack()
+postgres = pgserver.get_server(work / "pgdata", cleanup_mode="stop")
+maria = stack.enter_context(mariadb.server())
+
+
+def rows(table) -> str:
+    """`table`'s rows, one per line under its column names."""
+    names = table.column_names
+    lines = [names] + [[str(r[n]) for n in names] for r in table.to_pylist()]
+    widths = [max(len(line[i]) for line in lines) for i in range(len(names))]
+    return "\n".join("  ".join(v.ljust(w) for v, w in zip(line, widths)) for line in lines)
+```
+
+## Three stores
+
+The documents go into Postgres: the twenty rows of the book's `tiny_corpus`, each
+naming the organisation that filed it by `assignee_id`.
+
+```{python}
+corpus = pq.read_table(fixtures.path("tiny_corpus.parquet")).to_pylist()
+
+
+def literal(value) -> str:
+    return str(value) if isinstance(value, int) else "'" + str(value).replace("'", "''") + "'"
+
+
+values = ",\n".join(
+    "(" + ", ".join(literal(r[c]) for c in ("id", "title", "content", "assignee_id")) + ")"
+    for r in corpus
+)
+postgres.psql(
+    "CREATE TABLE documents (id BIGINT PRIMARY KEY, title TEXT NOT NULL, "
+    f"content TEXT NOT NULL, assignee_id BIGINT NOT NULL);\nINSERT INTO documents VALUES\n{values};"
+)
+print(postgres.psql("SELECT COUNT(*) AS documents FROM documents;"))
+```
+
+The organisations go into MariaDB, in a database of their own:
+
+```{python}
+ASSIGNEES = [
+    (101, "Coldwater Quantum", "US"), (102, "Pellucid Robotics", "DE"),
+    (103, "Verdant Genomics", "US"), (104, "Foldline Bio", "GB"),
+    (105, "Ashgrove Catalysis", "NL"), (106, "Lattice Nine", "CA"),
+    (107, "Meridian Therapeutics", "US"), (108, "Brightcell Energy", "KR"),
+    (109, "Chiral Works", "CH"), (110, "Sparrow AI", "GB"),
+]
+maria.execute(
+    "CREATE DATABASE registry; CREATE TABLE registry.assignees ("
+    "assignee_id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL, country CHAR(2) NOT NULL);"
+    "INSERT INTO registry.assignees VALUES "
+    + ", ".join(f"({i}, '{name}', '{country}')" for i, name, country in ASSIGNEES) + ";"
+)
+```
+
+And the labels stay a CSV file: `id,label`, one subject label per document.
+
+## One engine, three sources
+
+`add_source` takes the URL that names the data. A `postgres://` URL is a Postgres
+database and a `mysql://` URL a MySQL or MariaDB database, and neither takes a
+format; anything else is a file, which does. The Postgres URL is the one `pgserver`
+hands out — the libpq form that reaches the server over its Unix socket. The
+MariaDB instance has no TLS, and its URL says so with `sslmode=disabled`; a database
+reached over a network would carry `sslmode=required` (the default) instead.
+
+```{python}
+URLS = {"docs": postgres.get_uri(), "registry": maria.url("registry")}
+for name, url in URLS.items():
+    print(f"{name:<10}{url}")
+
+db = jammi.connect(f"file://{work / 'engine'}")
+db.add_source("docs", url=URLS["docs"])
+db.add_source("registry", url=URLS["registry"])
+db.add_source("labels", url=LABELS, format="csv")
+for source in db.list_sources():
+    print(source)
+```
+
+Each database's tables are now tables of the engine, under the source's name:
+`docs.public.documents` and `registry.public.assignees`, beside the CSV's
+`labels.public.tiny_labels`. One query joins all three — how the documents of each
+subject spread over the countries their organisations sit in:
+
+```{python}
+JOIN = """
+SELECT a.country, l.label, COUNT(*) AS documents
+FROM docs.public.documents d
+JOIN registry.public.assignees a ON d.assignee_id = a.assignee_id
+JOIN labels.public.tiny_labels l ON d.id = l.id
+GROUP BY a.country, l.label
+ORDER BY a.country, l.label
+"""
+spread = db.sql(JOIN)
+print(rows(spread))
+```
+
+```{python}
+# | echo: false
+contracts.assert_close("federation.groups", spread.num_rows, tol=0.0)
+contracts.assert_close("federation.documents", sum(spread.column("documents").to_pylist()),
+                       tol=0.0)
+```
+
+Every one of the twenty documents found its organisation and its label: the join
+counts all twenty, spread over the groups above.
+
+## Embedding a database table
+
+A database source feeds every verb a file does. `generate_embeddings` reads the
+documents straight out of Postgres and writes one vector per row, keyed by `id`;
+`search` then ranks them — here by example, the rows nearest document `1`.
+
+```{python}
+db.generate_embeddings(source="docs", model=MODEL, columns=["content"], key="id")
+hits = db.search("docs", row_key="1", k=3, select=["id", "similarity"]).to_pylist()
+ranked = [(int(h["id"]), round(float(h["similarity"]), 5)) for h in hits]
+print(ranked)
+```
+
+The same corpus read from its Parquet file embeds to the same vectors, so the two
+rankings agree row for row: where the text came from does not change what the model
+sees.
+
+```{python}
+db.add_source("corpus", url=fixtures.url("tiny_corpus.parquet"), format="parquet")
+db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id")
+file_hits = db.search("corpus", row_key="1", k=3, select=["id", "similarity"]).to_pylist()
+file_ranked = [(int(h["id"]), round(float(h["similarity"]), 5)) for h in file_hits]
+print(file_ranked)
+```
+
+```{python}
+# | echo: false
+assert ranked == file_ranked, (ranked, file_ranked)
+contracts.assert_close("federation.nearest_id", ranked[1][0], tol=0.0)
+contracts.assert_close("federation.nearest_similarity", ranked[1][1], tol=1e-4)
+```
+
+The hits are keys into the database, so the other stores describe them — who filed
+each neighbour, and what it is about:
+
+```{python}
+ids = ", ".join(str(i) for i, _ in ranked)
+print(rows(db.sql(f"""
+SELECT d.id, d.title, a.name AS assignee, l.label
+FROM docs.public.documents d
+JOIN registry.public.assignees a ON d.assignee_id = a.assignee_id
+JOIN labels.public.tiny_labels l ON d.id = l.id
+WHERE d.id IN ({ids})
+ORDER BY d.id
+""")))
+db.close()
+```
+
+## The same sources on a server
+
+A server takes the same URLs. The client sends the source's kind — Postgres, MySQL
+or file — on the wire, chosen from the URL exactly as the embedded engine chooses
+it, and the server opens the connection itself; here it reaches the same two local
+databases.
+
+```{python}
+server = stack.enter_context(LiveServer(work / "server"))
+with jammi.connect(server.endpoint) as remote:
+    remote.add_source("docs", url=URLS["docs"])
+    remote.add_source("registry", url=URLS["registry"])
+    remote.add_source("labels", url=LABELS, format="csv")
+    remote_spread = remote.sql(JOIN)
+print(rows(remote_spread))
+stack.close()
+postgres.cleanup()
+```
+
+```{python}
+# | echo: false
+assert remote_spread.to_pylist() == spread.to_pylist(), (remote_spread, spread)
+```
+
+The server's join is the embedded engine's, row for row. The database drivers ship in
+every published engine — the `jammi-ai-native` wheels and the `jammi-server`
+wheels, tarballs and images — linked statically, so a `pip install` federates
+Postgres and MySQL with nothing else to install.

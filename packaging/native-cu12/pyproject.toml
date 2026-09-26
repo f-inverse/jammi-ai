@@ -57,4 +57,4 @@ python-source = "python"
 # storage drivers. Besides `extension-module`, this is the
 # `native-cu12-wheel` lane of `ci/release-feature-manifest.json`, gated equal to
 # it (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`).
-features = ["extension-module", "cuda", "flash-attn", "storage-cloud"]
+features = ["extension-module", "cuda", "flash-attn", "storage-cloud", "mysql", "postgres"]

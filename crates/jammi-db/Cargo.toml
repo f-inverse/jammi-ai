@@ -11,19 +11,22 @@ readme = "README.md"
 [features]
 default = []
 # `postgres` and `mysql` pull `datafusion-table-providers`'s federation
-# drivers, which link a native TLS stack (`native-tls` -> OpenSSL) rather than
-# `rustls`. Building either feature therefore requires OpenSSL's development
-# headers on the build host (e.g. `libssl-dev`/`openssl-devel`, or `openssl`
-# + `pkg-config` on macOS via Homebrew) — a requirement this crate does not
-# vendor or otherwise satisfy for a consumer of the published crate.
+# drivers, which depend on `native-tls` unconditionally (no `rustls` option).
+# Both features turn on `native-tls`'s `vendored` feature: on Linux OpenSSL is
+# built from source (`openssl-src`) and linked statically, so a published
+# artifact carries no `DT_NEEDED libssl` the manylinux platform tag does not
+# promise, and a build host needs a C toolchain and Perl (OpenSSL's
+# `Configure`, with `IPC::Cmd` and `Time::Piece`) rather than OpenSSL's
+# headers. macOS and Windows use the platform TLS stack.
 #
 # Each source feature turns on the matching `datafusion-table-providers`
-# backend (whose own `federation` default pushes the query down) plus the
-# driver crate `source/{postgres,mysql}.rs` uses directly for table discovery.
-postgres = ["datafusion-table-providers/postgres", "dep:tokio-postgres", "dep:secrecy"]
-mysql = ["datafusion-table-providers/mysql", "dep:mysql_async", "dep:secrecy"]
-# Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL).
-live-postgres-tests = []
+# backend (whose own `federation` default pushes the query down) plus what
+# `source/{postgres,mysql}.rs` reads a connection URL with.
+postgres = ["datafusion-table-providers/postgres", "dep:percent-encoding", "dep:secrecy", "dep:native-tls"]
+mysql = ["datafusion-table-providers/mysql", "dep:mysql_async", "dep:secrecy", "dep:native-tls", "dep:libz-sys"]
+# Gates tests that require a live Postgres instance (JAMMI_TEST_PG_URL),
+# the Postgres source's among them.
+live-postgres-tests = ["postgres"]
 # Compiles the mutable-sink crash-recovery checkpoint hook. Pure test
 # infrastructure: the hook is a single `await` on a notifier that only
 # arms when env vars are set. Off by default; the
@@ -69,8 +72,15 @@ arrow-array.workspace = true
 # External sources (feature-gated — not a workspace dep to avoid sqlite3 links conflict)
 datafusion-table-providers = { version = "0.13.1", default-features = false, optional = true }
 secrecy = { version = "0.10", optional = true }
-tokio-postgres = { version = "0.7", optional = true }
+percent-encoding = { version = "2", optional = true }
 mysql_async = { version = "0.37", optional = true }
+# Named only to turn on `vendored` (see `[features]`); the drivers above depend
+# on it themselves.
+native-tls = { version = "0.2", features = ["vendored"], optional = true }
+# Named only to turn on `static`: `mysql_async`'s compression (`flate2`'s zlib
+# backend) would otherwise link the system `libz.so.1`, which the manylinux
+# platform tag does not promise either.
+libz-sys = { version = "1", features = ["static"], optional = true }
 
 # Storage
 parquet.workspace = true

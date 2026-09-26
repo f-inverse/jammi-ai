@@ -15,7 +15,7 @@ Every route that constructs a NEW resource-owning session is exercised here:
 * `jammi.connect("grpc://…")` — the remote dispatch factory (`open_remote`).
 * Direct construction of `jammi.RemoteDatabase` over a bare `grpc.insecure_channel`
   (hermetic: grpcio channels are lazy — no server is dialed at construction,
-  the same fact `test_target.py` and `test_add_source_format.py` rely on).
+  the same fact `test_target.py` and `test_add_source.py` rely on).
 
 `tenant_scope()` on both backends yields the SAME already-registered instance
 (see `_embedded._TenantScope.__enter__` and `RemoteDatabase.tenant_scope`), so
@@ -108,7 +108,7 @@ def test_embedded_unclosed_session_disappears_once_collected():
 
 def test_connect_grpc_route_appears_and_disappears():
     # No server is dialed: grpcio channels are lazy (see test_target.py /
-    # test_add_source_format.py), so this is hermetic.
+    # test_add_source.py), so this is hermetic.
     db = jammi.connect("grpc://127.0.0.1:1")
     try:
         assert db in jammi.open_sessions()

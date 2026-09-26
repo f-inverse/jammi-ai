@@ -22,10 +22,10 @@
 # shipped family — the CPU PyPI wheel, the CPU tarball, the CPU container
 # image, all three CUDA lanes and both embedded-engine wheels
 # (`jammi-ai-native`, `jammi-ai-native-cu12`), every one of which builds
-# `storage-cloud`; see `.github/workflows/pypi-server.yml`,
-# `release-binaries.yml`, `Dockerfile`, `packaging/native*/pyproject.toml`
-# and `ci/release-feature-manifest.json` — plus jammi-db's `postgres`/`mysql`
-# backends). A copyleft license, a git
+# `storage-cloud`, `postgres` and `mysql`; see
+# `.github/workflows/pypi-server.yml`, `release-binaries.yml`, `Dockerfile`,
+# `packaging/native*/pyproject.toml` and `ci/release-feature-manifest.json`).
+# A copyleft license, a git
 # source, a second engine line or an advisory hiding behind an optional
 # feature is caught by the second run; the default-only run cannot see it.
 # `crates/jammi-db/tests/it/shipped_feature_exposure.rs` derives and gates the
@@ -162,7 +162,7 @@ multiple-versions = "allow"
 # features (only the bare crates.io `jammi-server` crate) and once with
 # `--all-features` (the CPU PyPI wheel, the CPU tarball, the CPU container
 # image and all three CUDA lanes, every one of which builds
-# `storage-cloud`). The second run is the load-bearing one for the optional
+# `storage-cloud`, `postgres` and `mysql`). The second run is the load-bearing one for the optional
 # backends: every crate reachable only through jammi-db's `postgres`/`mysql`
 # features — the whole `datafusion-table-providers{,-common,-mysql,-postgres}`
 # subtree, the likeliest carrier of a second DataFusion — is ABSENT from the

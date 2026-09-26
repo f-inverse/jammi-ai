@@ -85,3 +85,7 @@ storage-gcs = ["jammi-db/storage-gcs"]
 storage-azure = ["jammi-db/storage-azure"]
 storage-r2 = ["jammi-db/storage-r2"]
 storage-cloud = ["jammi-db/storage-cloud"]
+# The external-database source drivers, forwarded as `jammi-server` forwards
+# them; both native wheels build them.
+postgres = ["jammi-db/postgres"]
+mysql = ["jammi-db/mysql"]

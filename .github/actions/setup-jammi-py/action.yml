@@ -34,9 +34,10 @@ inputs:
     default: "false"
   build-server:
     description: >
-      "true" also builds the release `jammi-server` binary and puts it on
-      PATH for the steps that follow (a recipe or chapter that starts a live
-      server finds it there).
+      "true" also builds the release `jammi-server` binary, with the CPU
+      wheel's features from `ci/release-feature-manifest.json`, and puts it
+      on PATH for the steps that follow (a recipe or chapter that starts a
+      live server finds it there).
     required: false
     default: "false"
   extra-pip-packages:
@@ -91,7 +92,11 @@ runs:
             ;;
         esac
         if [ "$BUILD_SERVER" = "true" ]; then
-          cargo build --release -p jammi-server
+          # The server a published CPU wheel ships: the same capability
+          # surface (object stores, database sources) a reader's pip-installed
+          # `jammi-server` has, read from the release manifest.
+          features="$(jq -r '.lanes["cpu-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          cargo build --release -p jammi-server --features "$features"
           # The built binary is the `jammi-server` on PATH for every later
           # step: a chapter or recipe that starts a live server finds it the
           # way an installed wheel's would be found.

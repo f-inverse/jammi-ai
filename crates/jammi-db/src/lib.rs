@@ -14,6 +14,7 @@ pub mod config;
 pub mod ephemeral;
 pub mod error;
 pub mod evidence_channel;
+mod federation;
 pub mod index;
 pub mod memory_pool;
 pub mod server_info;

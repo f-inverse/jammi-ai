@@ -62,4 +62,4 @@ python-source = "python"
 # The rest is this wheel's shipped feature list, declared by
 # `ci/release-feature-manifest.json`'s `native-cpu-wheel` lane and gated equal
 # to it (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`).
-features = ["extension-module", "storage-cloud"]
+features = ["extension-module", "storage-cloud", "mysql", "postgres"]

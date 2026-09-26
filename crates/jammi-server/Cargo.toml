@@ -112,6 +112,11 @@ storage-gcs = ["jammi-db/storage-gcs"]
 storage-azure = ["jammi-db/storage-azure"]
 storage-r2 = ["jammi-db/storage-r2"]
 storage-cloud = ["jammi-db/storage-cloud"]
+# The external-database source drivers, by-name passthroughs to `jammi-db`'s
+# (OpenSSL vendored and linked statically, see `jammi-db`'s `[features]`).
+# Every published server artifact enables both.
+postgres = ["jammi-db/postgres"]
+mysql = ["jammi-db/mysql"]
 # The engine's test-only rendezvous hooks (`jammi_ai::fine_tune::worker::
 # loop_test_hooks`, `jammi_ai::jobs::compute_test_hooks`, `jammi_db::catalog::
 # claim_test_hooks`, the store's materialization park), named here so CI's

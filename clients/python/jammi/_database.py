@@ -33,6 +33,7 @@ from ._assembly import (
     _MODEL_TASK_NAME,
     _RESULT_TABLE_KIND_NAME,
     _SOURCE_KIND_NAME,
+    _database_source_kind,
     _local_source_url,
     build_add_channel_columns_request,
     build_asof_join_request,
@@ -1247,34 +1248,47 @@ class RemoteDatabase:
     # --- Sources -----------------------------------------------------------------
 
     def add_source(
-        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+        self,
+        name: str,
+        *,
+        url: str,
+        format: Optional[str] = None,
+        tenant_column: Optional[str] = None,
     ) -> None:
-        """Register a file-shaped data source on the remote engine.
+        """Register a data source on the remote engine, by the URL that names it.
 
-        `url` accepts a local path (wrapped into `file://...` server-side) or any
-        storage URL the server was compiled with (`s3://`, `gs://`, `azure://`).
-        `tenant_column` names the column whose value is each row's tenant: a
-        tenant-bound session then reads only its own rows and the rows with no
-        tenant, through every verb that reads the source. Maps to
-        `CatalogService.AddSource`.
+        A `postgres://` / `postgresql://` URL is a PostgreSQL database and a
+        `mysql://` URL a MySQL / MariaDB database, each federated table by
+        table through the connection string as given; they take no `format`.
+        Anything else is a file read in `format`: a local path (wrapped into
+        `file://...`) or any storage URL the server was compiled with (`s3://`,
+        `gs://`, `azure://`). `tenant_column` names the column whose value is
+        each row's tenant: a tenant-bound session then reads only its own rows
+        and the rows with no tenant, through every verb that reads the source.
+        Maps to `CatalogService.AddSource`.
         """
-        try:
-            file_format = _FILE_FORMAT[format]
-        except KeyError:
-            raise InvalidArgument(
-                f"format must be one of {sorted(_FILE_FORMAT)} (got {format!r})"
-            ) from None
+        kind = _database_source_kind(url)
+        if kind is not None:
+            if format is not None:
+                raise InvalidArgument(
+                    f"a database source takes no format (got {format!r} for {url!r})"
+                )
+            connection = catalog_pb2.SourceConnection(url=url, tenant_column=tenant_column)
+        else:
+            try:
+                file_format = _FILE_FORMAT[format]
+            except KeyError:
+                raise InvalidArgument(
+                    f"a file source needs a format, one of {sorted(_FILE_FORMAT)} "
+                    f"(got {format!r}); a database source is a postgres:// or mysql:// URL"
+                ) from None
+            kind = catalog_pb2.SourceKind.SOURCE_KIND_FILE
+            connection = catalog_pb2.SourceConnection(
+                url=_local_source_url(url), format=file_format, tenant_column=tenant_column
+            )
         self._call(
             self._catalog.AddSource,
-            catalog_pb2.AddSourceRequest(
-                source_id=name,
-                source_kind=catalog_pb2.SourceKind.SOURCE_KIND_FILE,
-                connection=catalog_pb2.SourceConnection(
-                    url=_local_source_url(url),
-                    format=file_format,
-                    tenant_column=tenant_column,
-                ),
-            ),
+            catalog_pb2.AddSourceRequest(source_id=name, source_kind=kind, connection=connection),
         )
 
     def list_sources(self) -> List[Dict[str, Any]]:

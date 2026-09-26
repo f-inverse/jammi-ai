@@ -126,7 +126,12 @@ class Session(Protocol):
 
     # --- Sources + model lifecycle ---------------------------------------------
     def add_source(
-        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+        self,
+        name: str,
+        *,
+        url: str,
+        format: Optional[str] = None,
+        tenant_column: Optional[str] = None,
     ) -> None: ...
     def list_sources(self) -> List[Dict[str, Any]]: ...
     def describe_source(self, source_id: str) -> Optional[Dict[str, Any]]: ...

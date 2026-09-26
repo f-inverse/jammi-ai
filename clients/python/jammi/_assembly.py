@@ -89,6 +89,22 @@ _FILE_FORMAT = {
     "avro": catalog_pb2.FileFormat.FILE_FORMAT_AVRO,
 }
 
+# URL scheme → wire `SourceKind` for a database source. Mirrors the engine's
+# `SourceDefinition::from_url` (which the embed wheel calls directly): a
+# `postgres://` / `postgresql://` URL is PostgreSQL, a `mysql://` URL MySQL;
+# any other URL or path is a file.
+_DATABASE_SCHEME = {
+    "postgres": catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES,
+    "postgresql": catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES,
+    "mysql": catalog_pb2.SourceKind.SOURCE_KIND_MYSQL,
+}
+
+
+def _database_source_kind(url: str) -> Optional[int]:
+    """The wire `SourceKind` of the database `url` names, or None for a file."""
+    scheme, sep, _ = url.partition("://")
+    return _DATABASE_SCHEME.get(scheme) if sep else None
+
 
 def _modality_value(modality: Optional[str]) -> int:
     """Resolve a `modality=` argument to its wire enum, defaulting to text."""

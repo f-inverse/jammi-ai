@@ -134,19 +134,6 @@ run_sh() {
 export GITHUB_EVENT_NAME=pull_request GITHUB_BASE_REF="$BASE_REF" GITHUB_HEAD_REF="$HEAD_REF" \
   GITHUB_ACTOR="${GITHUB_ACTOR:-local}" GITHUB_WORKSPACE="$ROOT"
 
-# provide_in_image STAGE PACKAGE PROBE... — inside the CI image (root, yum),
-# install PACKAGE when PROBE fails. The hosted runners a ci.yml job uses carry
-# tools the image deliberately leaves out, and some jobs install one for a
-# single step; this supplies the same thing to a run inside the image. On a
-# developer host it does nothing: PROBE passes, or there is no yum to call.
-provide_in_image() {
-  local stage="$1" package="$2"; shift 2
-  if "$@" >/dev/null 2>&1; then return 0; fi
-  if command -v yum >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
-    run "$stage" "provide $package (absent from the CI image)" yum install -y -q "$package"
-  fi
-}
-
 # ci_step JOB 'STEP NAME' — the `run:` block of that ci.yml step, so a lane
 # this runner shares with CI is written once, in the workflow.
 ci_step() {
@@ -181,10 +168,6 @@ if stage_wanted static; then
   run static "clippy workspace" cargo clippy --workspace --all-targets -- -D warnings
   run_sh static "clippy feature-gated test surfaces" \
     "$(ci_step check 'Clippy (feature-gated test surfaces)')"
-  # The `postgres`/`mysql` source providers pull `openssl-sys`, whose build
-  # script needs OpenSSL headers the CI image deliberately omits; ci.yml
-  # installs them for this one lint (its "OpenSSL headers" step says why).
-  provide_in_image static openssl-devel pkg-config --exists openssl
   run static "clippy jammi-db postgres,mysql" \
     cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
   run static "rustdoc -D warnings" \

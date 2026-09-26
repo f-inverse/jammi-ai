@@ -36,7 +36,7 @@ impl PostgresBackend {
         pool_size: u32,
         max_lifetime_secs: Option<u32>,
     ) -> Result<Arc<Self>, BackendError> {
-        let opts: PgConnectOptions = url.parse().map_err(classify)?;
+        let opts = pg_connect_options(url).map_err(classify)?;
         let mut builder = PgPoolOptions::new().max_connections(pool_size);
         if let Some(secs) = max_lifetime_secs {
             builder = builder.max_lifetime(Duration::from_secs(secs as u64));
@@ -163,5 +163,112 @@ impl PostgresBackend {
     /// dispatcher in `backend.rs` calls this.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
+    }
+}
+
+/// The connect options a Postgres URL names, read in libpq's connection-URI
+/// form (<https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING-URIS>):
+/// `postgresql://[userspec@][hostspec][/dbname][?paramspec]`. The one parser
+/// for every Postgres URL the engine takes through sqlx (the catalog, the
+/// trigger broker).
+///
+/// sqlx reads the URL with the WHATWG URL grammar, which refuses credentials
+/// beside an empty host — the form libpq uses for a Unix-socket connection
+/// (`postgresql://user:@/db?host=/run/postgresql`: the host is empty and the
+/// `host` parameter names the socket directory). libpq defines the `user` and
+/// `password` parameters as equivalent to the userinfo, so a URL whose host
+/// is empty is read with its userinfo moved into them; every other URL is
+/// read as written. sqlx's own parameter handling reads `host=/dir` as the
+/// socket directory.
+pub(crate) fn pg_connect_options(url: &str) -> Result<PgConnectOptions, sqlx::Error> {
+    socket_form_with_parameters(url)
+        .as_deref()
+        .unwrap_or(url)
+        .parse()
+}
+
+/// `url` with its userinfo moved into `user` / `password` parameters, when
+/// its authority carries a userinfo and an empty host; `None` otherwise.
+fn socket_form_with_parameters(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (userinfo, host) = authority.rsplit_once('@')?;
+    if !host.is_empty() {
+        return None;
+    }
+    let (user, password) = match userinfo.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (userinfo, None),
+    };
+    // The userinfo is percent-encoded; a query value is form-encoded, where a
+    // literal `+` reads as a space, so a `+` is carried as `%2B`.
+    let parameter = |name: &str, value: &str| format!("{name}={}", value.replace('+', "%2B"));
+    let moved = [
+        (!user.is_empty()).then(|| parameter("user", user)),
+        password
+            .filter(|p| !p.is_empty())
+            .map(|p| parameter("password", p)),
+    ];
+    let (path, query) = match tail.split_once('?') {
+        Some((path, query)) => (path, Some(query.to_string())),
+        None => (tail, None),
+    };
+    let query = query
+        .into_iter()
+        .chain(moved.into_iter().flatten())
+        .collect::<Vec<_>>()
+        .join("&");
+    Some(if query.is_empty() {
+        format!("{scheme}://{path}")
+    } else {
+        format!("{scheme}://{path}?{query}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// libpq's Unix-socket URI — credentials beside an empty host, the
+    /// socket directory as the `host` parameter — reads as the socket, the
+    /// user and the database.
+    #[test]
+    fn a_socket_uri_with_credentials_reads_as_libpq_reads_it() {
+        let opts = pg_connect_options("postgresql://postgres:@/jammi?host=/tmp/pg_sock").unwrap();
+        assert_eq!(
+            opts.get_socket().map(|p| p.to_string_lossy().into_owned()),
+            Some("/tmp/pg_sock".to_string())
+        );
+        assert_eq!(opts.get_username(), "postgres");
+        assert_eq!(opts.get_database(), Some("jammi"));
+    }
+
+    /// A password beside an empty host moves with its percent-encoding
+    /// intact, a literal `+` included.
+    #[test]
+    fn a_moved_password_keeps_its_encoding() {
+        assert_eq!(
+            socket_form_with_parameters("postgres://app:p%40ss+w@/db?host=/run/pg").as_deref(),
+            Some("postgres:///db?host=/run/pg&user=app&password=p%40ss%2Bw")
+        );
+        assert!(pg_connect_options("postgres://app:p%40ss+w@/db?host=/run/pg").is_ok());
+    }
+
+    /// A URL with a host, or with no userinfo, is read exactly as written.
+    #[test]
+    fn a_host_or_a_bare_socket_uri_is_read_as_written() {
+        assert_eq!(
+            socket_form_with_parameters("postgres://u:p@localhost:5433/db"),
+            None
+        );
+        assert_eq!(socket_form_with_parameters("postgresql:///db?host=/tmp"), None);
+        let opts = pg_connect_options("postgres://u:p@localhost:5433/db").unwrap();
+        assert_eq!(opts.get_host(), "localhost");
+        assert_eq!(opts.get_port(), 5433);
+        assert_eq!(opts.get_username(), "u");
+        let opts = pg_connect_options("postgresql:///db?host=/tmp&user=u").unwrap();
+        assert_eq!(opts.get_username(), "u");
+        assert!(opts.get_socket().is_some());
     }
 }

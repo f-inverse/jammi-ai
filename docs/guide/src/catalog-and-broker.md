@@ -30,9 +30,15 @@ path is already trusted), and `sqlx` verifies against the **webpki** root
 store rather than the OS trust store, so a private CA needs its own
 `sslrootcert=` path even on a host that already trusts it system-wide.
 
-The engine hands this URL to the Postgres driver unchanged
-(`backend_postgres.rs::open_with_options`) — but "unchanged" only means the
-driver's own URL parser sees every key you wrote. `sqlx`'s parser
+`url` is a libpq connection URI, and a Unix-socket connection takes libpq's
+form: an empty host and the socket directory as the `host` parameter —
+`postgresql://user:@/jammi?host=/run/postgresql`, the form a pip-installed or
+embedded Postgres hands out. The same holds for `[broker.postgres] url`.
+
+The engine hands this URL to the Postgres driver with every key you wrote
+(`backend_postgres.rs::pg_connect_options`; a socket URI's credentials ride
+as the `user` / `password` parameters libpq defines as their equivalent) —
+but that only means the driver's own URL parser sees those keys. `sqlx`'s parser
 (`PgConnectOptions::parse_from_url`) starts from options already populated
 from the process environment (`PGSSLMODE`, `PGSSLROOTCERT`, and the rest of
 the `PGSSL*`/`PGPASSWORD`/… family) and then overrides *only the keys the

@@ -70,10 +70,11 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use sqlx::postgres::{PgConnectOptions, PgListener, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::catalog::backend_postgres::pg_connect_options;
 use crate::tenant::TenantId;
 use crate::trigger::broker::{BrokerKind, TriggerBroker};
 use crate::trigger::consumer::ConsumerOffsetSnapshot;
@@ -178,8 +179,7 @@ impl PostgresBroker {
             ));
         }
 
-        let listener_opts: PgConnectOptions = url
-            .parse()
+        let listener_opts = pg_connect_options(url)
             .map_err(|e| TriggerError::Driver(format!("postgres broker: parse url: {e}")))?;
         let listener_opts = listener_opts.application_name(LISTENER_APPLICATION_NAME);
         // A dedicated 1-connection pool, exactly what `PgListener::connect`
@@ -201,8 +201,7 @@ impl PostgresBroker {
             TriggerError::Driver(format!("postgres broker: LISTEN {NOTIFY_CHANNEL}: {e}"))
         })?;
 
-        let notify_opts: PgConnectOptions = url
-            .parse()
+        let notify_opts = pg_connect_options(url)
             .map_err(|e| TriggerError::Driver(format!("postgres broker: parse url: {e}")))?;
         let notify_opts = notify_opts.application_name(NOTIFY_APPLICATION_NAME);
         let notify_pool = PgPoolOptions::new()

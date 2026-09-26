@@ -56,7 +56,7 @@ async fn create_building(store: &ResultStore) -> BuildingTable {
 async fn create_building_for(store: &ResultStore, source_id: &str) -> BuildingTable {
     store
         .create_table(ResultTableOrigin {
-            source_id: source_id,
+            source_id,
             producer: Producer::Model {
                 model_id: "test-model".to_string(),
                 task: ModelTask::TextEmbedding,

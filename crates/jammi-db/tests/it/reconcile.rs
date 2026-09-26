@@ -139,7 +139,7 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
 ) -> BuildingTable {
     let info = store
         .create_table(ResultTableOrigin {
-            source_id: source_id,
+            source_id,
             producer: Producer::Model {
                 model_id: "test-model".to_string(),
                 task: ModelTask::TextEmbedding,

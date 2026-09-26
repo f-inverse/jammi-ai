@@ -119,7 +119,7 @@ async fn build_placed_table(
     let store = harness.result_store();
     let table = store
         .create_table(ResultTableOrigin {
-            source_id: source_id,
+            source_id,
             producer: Producer::Model {
                 model_id: "model".to_string(),
                 task: ModelTask::TextEmbedding,

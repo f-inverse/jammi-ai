@@ -238,17 +238,17 @@ impl<'a> EmbeddingPipeline<'a> {
         let mut building = self
             .result_store
             .create_table(ResultTableOrigin {
-                source_id: source_id,
+                source_id,
                 producer: Producer::Model {
                     model_id: canonical_model_id.to_string(),
-                    task: task,
+                    task,
                 },
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 dimensions: Some(embedding_dim as i32),
                 key_column: Some(key_column),
                 text_columns: Some(&col_list),
-                job_attempt: job_attempt,
+                job_attempt,
             })
             .instrument(tracing::debug_span!("embed.create_table"))
             .await?;

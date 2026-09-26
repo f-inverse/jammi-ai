@@ -1934,7 +1934,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
             let store = engine.result_store();
             let info = store
                 .create_table(ResultTableOrigin {
-                    source_id: source_id,
+                    source_id,
                     producer: Producer::Model {
                         model_id: model_id.to_string(),
                         task: ModelTask::TextEmbedding,
@@ -2067,7 +2067,7 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
         let store = engine.result_store();
         let info = store
             .create_table(ResultTableOrigin {
-                source_id: source_id,
+                source_id,
                 producer: Producer::Model {
                     model_id: model_id.to_string(),
                     task: ModelTask::TextEmbedding,

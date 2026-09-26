@@ -45,7 +45,7 @@ use jammi_datafusion::InferenceExec;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_datafusion::{TrainingExec, TrainingJob};
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::SINK_WRITE_LOG;
 

@@ -2125,9 +2125,9 @@ ALTER TABLE topics DROP COLUMN broker_metadata;
 /// so dropping the old table would delete their rows: they are parked in
 /// FK-free copies first, dropped, and restored against the rebuilt table. The
 /// new table's `derived_from` references itself by its own name, which the
-/// rename carries over; `defer_foreign_keys` lets its rows copy in any order.
+/// rename carries over; its rows copy with `derived_from` unset, and one
+/// `UPDATE` restores it once every row it can name is present.
 pub(super) const MIGRATION_045_RESULT_TABLE_PRODUCER_SQLITE: &str = r#"
-PRAGMA defer_foreign_keys = ON;
 CREATE TABLE result_tables_new (
     table_name         TEXT PRIMARY KEY,
     source_id          TEXT NOT NULL,
@@ -2156,8 +2156,10 @@ CREATE TABLE result_tables_new (
     next_version       INTEGER NOT NULL DEFAULT 0,
     replaces           TEXT
 );
-INSERT INTO result_tables_new (table_name, source_id, model_id, task, parquet_path, dimensions, distance_metric, row_count, status, key_column, text_columns, checkpoint, created_at, completed_at, tenant_id, kind, derived_from, definition_hash, input_anchors_json, storage_precision, oversample, writer_id, lease_expires_at, current_version, next_version, replaces)
-    SELECT table_name, source_id, model_id, task, parquet_path, dimensions, distance_metric, row_count, status, key_column, text_columns, checkpoint, created_at, completed_at, tenant_id, kind, derived_from, definition_hash, input_anchors_json, storage_precision, oversample, writer_id, lease_expires_at, current_version, next_version, replaces FROM result_tables;
+INSERT INTO result_tables_new (table_name, source_id, model_id, task, parquet_path, dimensions, distance_metric, row_count, status, key_column, text_columns, checkpoint, created_at, completed_at, tenant_id, kind, definition_hash, input_anchors_json, storage_precision, oversample, writer_id, lease_expires_at, current_version, next_version, replaces)
+    SELECT table_name, source_id, model_id, task, parquet_path, dimensions, distance_metric, row_count, status, key_column, text_columns, checkpoint, created_at, completed_at, tenant_id, kind, definition_hash, input_anchors_json, storage_precision, oversample, writer_id, lease_expires_at, current_version, next_version, replaces FROM result_tables;
+UPDATE result_tables_new
+    SET derived_from = (SELECT old.derived_from FROM result_tables old WHERE old.table_name = result_tables_new.table_name);
 CREATE TABLE index_segments_parked AS SELECT * FROM index_segments;
 CREATE TABLE result_table_versions_parked AS SELECT * FROM result_table_versions;
 DROP TABLE index_segments;

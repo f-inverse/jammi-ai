@@ -1686,17 +1686,17 @@ impl InferenceSession {
         let mut building = self
             .result_store
             .create_table(ResultTableOrigin {
-                source_id: source_id,
+                source_id,
                 producer: Producer::Model {
                     model_id: source.to_string(),
-                    task: task,
+                    task,
                 },
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 dimensions: None,
                 key_column: None,
                 text_columns: None,
-                job_attempt: job_attempt,
+                job_attempt,
             })
             .await?;
         let summary = self

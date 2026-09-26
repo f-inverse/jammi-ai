@@ -57,7 +57,7 @@ pub fn built_index(rows: &[(&str, [f32; 4])], precision: StoragePrecision) -> Si
 pub async fn building_table(store: &ResultStore, source_id: &str) -> BuildingTable {
     store
         .create_table(ResultTableOrigin {
-            source_id: source_id,
+            source_id,
             producer: Producer::Model {
                 model_id: "model".to_string(),
                 task: ModelTask::TextEmbedding,

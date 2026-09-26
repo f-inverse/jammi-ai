@@ -200,14 +200,14 @@ async fn two_segment_table(
 ) -> (BuildingTable, ResultTableRecord) {
     let table = store
         .create_table(ResultTableOrigin {
-            source_id: source_id,
+            source_id,
             producer: Producer::Model {
                 model_id: "model".to_string(),
                 task: ModelTask::TextEmbedding,
             },
             kind: ResultTableKind::Model,
             derived_from: None,
-            dimensions: dimensions,
+            dimensions,
             key_column: Some("_row_id"),
             text_columns: None,
             job_attempt: None,
@@ -704,7 +704,7 @@ async fn ready_table_with_poisoned_row(
     let store = a.result_store();
     let building = store
         .create_table(ResultTableOrigin {
-            source_id: source_id,
+            source_id,
             producer: Producer::Model {
                 model_id: "test-model".to_string(),
                 task: ModelTask::TextEmbedding,

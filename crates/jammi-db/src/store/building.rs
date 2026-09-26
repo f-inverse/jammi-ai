@@ -24,7 +24,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::{warn, Instrument};
+use tracing::{debug, warn, Instrument};
 
 use crate::catalog::lease_keeper::{LeaseHold, LeaseTarget};
 use crate::catalog::result_repo::{ResultTableCas, ResultTableRecord};
@@ -457,12 +457,28 @@ impl Drop for BuildingTable {
         let cas = self.cas();
         let table = self.table_name.clone();
         handle.spawn(async move {
-            if let Err(e) = catalog.fail_building_table(&cas).await {
-                warn!(
+            match catalog.fail_building_table(&cas).await {
+                // The row is already where this guard would put it in the
+                // second arm: a sink that failed the write marks the row
+                // failed itself, and the handle that dropped here never
+                // learnt of it.
+                Ok(()) => debug!(
+                    table,
+                    "BuildingTable dropped without finish/abort: row failed"
+                ),
+                Err(JammiError::CasFailed { status, .. })
+                    if status == ResultTableStatus::Failed.to_string() =>
+                {
+                    debug!(
+                        table,
+                        "BuildingTable dropped without finish/abort: row failed"
+                    )
+                }
+                Err(e) => warn!(
                     table,
                     error = %e,
                     "BuildingTable dropped without finish/abort: mark-failed CAS did not apply"
-                );
+                ),
             }
         });
     }

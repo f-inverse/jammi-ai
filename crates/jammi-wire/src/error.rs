@@ -30,7 +30,7 @@
 //! The contract's fidelity boundary is precise, and faithfulness is a property
 //! of the error type — not of any one verb surface — so the mapping is complete
 //! over `JammiError`: every owned-shape variant (the String- and struct-carrying
-//! ones — `Source`, `NotFound`, `Model`, `ModelReferenced`, `Inference`,
+//! ones — `Source`, `NotFound`, `AmbiguousAsofMatch`, `Model`, `ModelReferenced`, `Inference`,
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `MissingManifest`, `NoQueryEncoder`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
@@ -94,6 +94,11 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 message: message.clone(),
             }),
             JammiError::NotFound(missing) => Variant::NotFound(missing.into()),
+            JammiError::AmbiguousAsofMatch { instant } => {
+                Variant::AmbiguousAsofMatch(pb::AmbiguousAsofMatchError {
+                    instant: instant.clone(),
+                })
+            }
             JammiError::ModelReferenced {
                 model_id,
                 referenced_by,
@@ -353,6 +358,9 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             model_id: e.model_id,
             message: e.message,
         },
+        Some(Variant::AmbiguousAsofMatch(e)) => {
+            JammiError::AmbiguousAsofMatch { instant: e.instant }
+        }
         Some(Variant::NotFound(e)) => match missing_from_detail(e) {
             Some(missing) => JammiError::NotFound(missing),
             None => JammiError::Other(message.to_string()),
@@ -1298,6 +1306,8 @@ pub fn status_code(err: &JammiError) -> Code {
         // An absent row is a NotFound, never the bad-argument `Source` /
         // `Model` fault.
         JammiError::NotFound(_) => Code::NotFound,
+        // The remedy is an argument: a tie-break column.
+        JammiError::AmbiguousAsofMatch { .. } => Code::InvalidArgument,
         JammiError::ModelReferenced { .. } => Code::FailedPrecondition,
         JammiError::Tenant(_) => Code::InvalidArgument,
         JammiError::Config(_) => Code::InvalidArgument,
@@ -1468,6 +1478,7 @@ mod tests {
             | JammiError::Catalog(_)
             | JammiError::Source { .. }
             | JammiError::NotFound(_)
+            | JammiError::AmbiguousAsofMatch { .. }
             | JammiError::Model { .. }
             | JammiError::ModelReferenced { .. }
             | JammiError::Inference(_)
@@ -1547,6 +1558,9 @@ mod tests {
                 source_id: "patents".into(),
                 index: IndexKind::Lexical,
             }),
+            JammiError::AmbiguousAsofMatch {
+                instant: "20".into(),
+            },
             JammiError::Model {
                 model_id: "local:/models/tiny_bert".into(),
                 message: "Model directory does not exist".into(),

@@ -2,6 +2,7 @@
 //! lease from its OWN runtime and OWN catalog connection, immune to the
 //! caller's main runtime being starved by CPU-bound work.
 
+use jammi_db::catalog::result_repo::Producer;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -605,8 +606,10 @@ async fn release_job_holds_flips_lost_and_skips_inline_holds() {
         .create_result_table(CreateResultTableParams {
             table_name: "rjh_building",
             source_id: "src",
-            model_id: "keeper-base",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "keeper-base".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/rjh.parquet",

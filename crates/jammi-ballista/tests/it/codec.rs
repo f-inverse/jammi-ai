@@ -18,10 +18,12 @@ use jammi_datafusion::ComputeDeviceKind;
 use jammi_datafusion::ModelTask;
 use jammi_datafusion::{InferenceExec, InferenceSpec};
 use jammi_datafusion::{NumberedInputExec, RowOrder};
-use jammi_db::catalog::result_repo::CreateResultTableParams;
 use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer};
 use jammi_db::config::StoragePrecision;
-use jammi_db::store::{ResultStore, ResultTableSinkExec, SinkKind, SinkLeaseKind};
+use jammi_db::store::{
+    ResultStore, ResultTableOrigin, ResultTableSinkExec, SinkKind, SinkLeaseKind,
+};
 
 async fn session() -> Arc<InferenceSession> {
     let dir = tempfile::tempdir().unwrap();
@@ -384,7 +386,6 @@ async fn graph_propagation_operators_round_trip() {
         Emit {
             dimensions: 8,
             source_id: "ledger",
-            model_id: "graph_structure",
         },
     )
     .unwrap();
@@ -450,8 +451,10 @@ async fn vector_search_exec_round_trips() {
         .create_result_table(CreateResultTableParams {
             table_name: &table_name,
             source_id: "src-1",
-            model_id: "model-1",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model-1".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "",
@@ -732,8 +735,10 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
         .create_result_table(CreateResultTableParams {
             table_name: &table_name,
             source_id: "src-1",
-            model_id: "model-1",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model-1".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "",
@@ -833,8 +838,10 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
         .create_result_table(CreateResultTableParams {
             table_name: &table_name,
             source_id: "src-1",
-            model_id: "model-1",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model-1".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "",
@@ -901,17 +908,19 @@ async fn result_table_sink_exec_round_trips_and_arrives_placed() {
     let session = session().await;
     let store = session.result_store();
     let building = store
-        .create_table(
-            "docs",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "sentence-transformers/all-MiniLM-L6-v2",
-            Some(4),
-            Some("text"),
-            Some("text"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "docs",
+            producer: Producer::Model {
+                model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("text"),
+            text_columns: Some("text"),
+            job_attempt: None,
+        })
         .await
         .expect("a building row");
     let spec = jammi_db::store::ResultTableSinkSpec {

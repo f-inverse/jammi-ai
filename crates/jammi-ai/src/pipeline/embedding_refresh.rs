@@ -615,10 +615,10 @@ impl InferenceSession {
             });
         }
         if record.kind != ResultTableKind::Model
-            || !matches!(
-                record.task,
-                ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding
-            )
+            || !record
+                .producer
+                .task()
+                .is_some_and(|task| task.is_embedding())
         {
             return Err(JammiError::NotRefreshable {
                 table: table.to_string(),

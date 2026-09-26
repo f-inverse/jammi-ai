@@ -144,6 +144,10 @@ message JammiErrorDetail {
     // `JammiError::NotFound(Missing)` — a catalog row the call names or
     // needs does not exist for the caller's tenant. Maps to `NOT_FOUND`.
     NotFoundError not_found = 49;
+    // `JammiError::AmbiguousAsofMatch { instant }` — an as-of join found
+    // several facts at a matched instant and was given no tie-break column.
+    // Maps to `INVALID_ARGUMENT`.
+    AmbiguousAsofMatchError ambiguous_asof_match = 50;
   }
   // Retired tags and names are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -410,6 +414,11 @@ message NotFoundError {
     string result_table = 4;
     ReadyIndexMissing ready_index = 5;
   }
+}
+
+// `JammiError::AmbiguousAsofMatch { instant }`.
+message AmbiguousAsofMatchError {
+  string instant = 1;
 }
 
 // `Missing::ReadyIndex { source_id, index }`.

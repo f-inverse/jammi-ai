@@ -166,17 +166,19 @@ enum ResultTableKind {
 message ResultTable {
   string table_name = 1;
   string source_id = 2;
-  string model_id = 3;
+  // The model that produced the rows; unset for a derivation that runs no
+  // model (an as-of join, a lexical index, a graph derivation).
+  optional string model_id = 3;
   // Embedding dimensionality; unset on the wire as 0 when the engine did
   // not record one (an empty source produces no vectors).
   int32 dimensions = 4;
   uint64 row_count = 5;
   // Lifecycle status reported by the engine ("ready" on success).
   string status = 6;
-  // The task that produced this table (the embedding tower: text / image /
-  // audio). Carried so the record reconstructs its `ModelTask` faithfully on
-  // the wire rather than from a guessed default.
-  jammi.v1.inference.ModelTask task = 7;
+  // The model task whose output shape the rows have (the embedding tower:
+  // text / image / audio); unset when the rows are no task's (an as-of join,
+  // a lexical index). Set whenever `model_id` is.
+  optional jammi.v1.inference.ModelTask task = 7;
   // Which path the producer that returned this table took under its
   // `CachePolicy` — computed for a fresh build, reused for an exact cache hit.
   // Unset on a `ResultTable` that did not come from a producer (e.g. a

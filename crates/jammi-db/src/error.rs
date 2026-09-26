@@ -425,6 +425,19 @@ pub enum JammiError {
         total: u64,
     },
 
+    /// An as-of join found more than one fact at the instant a spine row
+    /// matched, in the same group, and the call named no tie-break column
+    /// to choose among them. Refused rather than picked arbitrarily; the
+    /// caller names a `tie_break_column`. A caller error: `InvalidArgument`.
+    #[error(
+        "as-of join: more than one fact at matched instant {instant} in one group; name a \
+         tie_break_column to choose among them"
+    )]
+    AmbiguousAsofMatch {
+        /// The matched instant, as the temporal key's integer tick.
+        instant: String,
+    },
+
     /// A resource the request needs could not be reached after the bounded
     /// failure ladder: a placed segment whose owner and retry candidate both
     /// failed and whose local load was not admitted (or not attempted). Names

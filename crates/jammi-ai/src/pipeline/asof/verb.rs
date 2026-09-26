@@ -15,22 +15,16 @@ use arrow::compute::SortOptions;
 use datafusion::physical_expr::{expressions::col, LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::ExecutionPlan;
-use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::store::manifest::{
     AsofBoundary, AsofDirection, AsofTolerance, InputAnchor, Materialization, ProducingDescriptor,
 };
-use jammi_db::store::SinkKind;
+use jammi_db::store::{ResultTableOrigin, SinkKind};
 
 use super::exec::AsofJoinExec;
 use super::spec::{AsofJoinSpec, Boundary, MatchDirection, TieBreak, Tolerance};
 use crate::session::InferenceSession;
-
-/// The provenance id recorded in the result table's `model_id` column — an
-/// as-of join invokes no model, but the column is NOT NULL, so a stable sentinel
-/// rides it (mirroring the neighbor-graph derivation's sentinel).
-const ASOF_JOIN_MODEL_ID: &str = "asof-join";
 
 /// Run an as-of temporal join of two registered relations and materialise the
 /// point-in-time-correct result table. Resolves `spine` and `facts` through the
@@ -57,8 +51,7 @@ pub async fn run(
         tie_break_column(&spec.tie_break),
     )?;
 
-    let exec = AsofJoinExec::try_new(spine_sorted, facts_sorted, spec.clone())
-        .map_err(|e| JammiError::Other(format!("asof_join planning failed: {e}")))?;
+    let exec = AsofJoinExec::try_new(spine_sorted, facts_sorted, spec.clone())?;
     let exec: Arc<dyn ExecutionPlan> = Arc::new(exec);
 
     // The output rows belong to the spine's source. `derived_from` is the
@@ -67,17 +60,16 @@ pub async fn run(
     // reproducibility lineage rides the manifest's input anchors instead.
     let mut building = session
         .result_store()
-        .create_table(
-            spine,
-            ModelTask::TextEmbedding,
-            ResultTableKind::AsofJoin,
-            None,
-            ASOF_JOIN_MODEL_ID,
-            None,
-            None,
-            None,
+        .create_table(ResultTableOrigin {
+            source_id: spine,
+            producer: Producer::Derivation { task: None },
+            kind: ResultTableKind::AsofJoin,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
             job_attempt,
-        )
+        })
         .await?;
 
     // Every row the join produces, written through the sink where the

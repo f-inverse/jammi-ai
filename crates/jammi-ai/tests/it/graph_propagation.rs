@@ -177,7 +177,7 @@ async fn graph_session_with_partitions(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id: "nodes",
-                model_id: "synthetic-embed",
+                model_id: Some("synthetic-embed"),
                 derived_from: None,
                 dimensions: DIM,
                 key_column: Some("_row_id"),
@@ -1185,7 +1185,7 @@ async fn origin_keyed_session(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id: "papers",
-                model_id: "synthetic-embed",
+                model_id: Some("synthetic-embed"),
                 derived_from: None,
                 dimensions: DIM,
                 key_column: Some(key_col),

@@ -42,7 +42,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::config::{AnnIndexConfig, ServerConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::peer::{
@@ -58,7 +58,7 @@ use jammi_db::store::manifest::{
     ModelIdentity, ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_db::TenantId;
 use jammi_numerics::distance::cosine_distance;
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
@@ -199,17 +199,19 @@ async fn two_segment_table(
     dimensions: Option<i32>,
 ) -> (BuildingTable, ResultTableRecord) {
     let table = store
-        .create_table(
-            source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            dimensions,
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source_id,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: dimensions,
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let precision = table.storage_precision();
@@ -701,17 +703,19 @@ async fn ready_table_with_poisoned_row(
     .unwrap();
     let store = a.result_store();
     let building = store
-        .create_table(
-            source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(4),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source_id,
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let schema = embedding_table_schema(4);
@@ -1319,17 +1323,19 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     // coordinator has no local index to catch before fan-out (that check
     // only exists in the all-remote shape).
     let table = store
-        .create_table(
-            "src_o3_drift",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src_o3_drift",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let precision = table.storage_precision();

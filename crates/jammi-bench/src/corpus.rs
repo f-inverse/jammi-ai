@@ -83,7 +83,7 @@ fn batch(start_row: usize, count: usize, dim: usize, lcg: &mut Lcg) -> RecordBat
     // `_source_id`/`_model_id` are constant — they are not read by the search,
     // only the schema requires them present; `_content_hash` is NULL (no
     // source row was embedded) through the engine's one null-hash builder.
-    embedding_batch_with_null_hash(&schema, "src", "model", &rows, dim)
+    embedding_batch_with_null_hash(&schema, "src", Some("model"), &rows, dim)
         .expect("record batch matches the embedding schema by construction")
 }
 
@@ -141,7 +141,7 @@ pub async fn write_vectors(
     let handle = registry.handle_for(&url, None)?;
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
 
-    let batch = embedding_batch_with_null_hash(&schema, "src", "model", rows, dim)?;
+    let batch = embedding_batch_with_null_hash(&schema, "src", Some("model"), rows, dim)?;
     writer.write_batch(&batch).await?;
     writer.close().await?;
     Ok(url)

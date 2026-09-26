@@ -27,6 +27,7 @@
 //! for real — and each carries a `covered_by` pointer at the end-to-end
 //! distributed isolation test.
 
+use jammi_db::store::ResultTableOrigin;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelS
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Missing};
@@ -346,8 +347,10 @@ fn result_params<'a>(
         lease: None,
         table_name: name,
         source_id: source,
-        model_id: model,
-        task: ModelTask::TextEmbedding,
+        producer: Producer::Model {
+            model_id: model.to_string(),
+            task: ModelTask::TextEmbedding,
+        },
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "file:///tmp/rt.parquet",
@@ -1930,17 +1933,19 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
         .with_tenant_scoped(tenant_a(), |_scope| async {
             let store = engine.result_store();
             let info = store
-                .create_table(
-                    source_id,
-                    ModelTask::TextEmbedding,
-                    ResultTableKind::Model,
-                    None,
-                    model_id,
-                    Some(DIMS as i32),
-                    Some("_row_id"),
-                    Some("body"),
-                    None,
-                )
+                .create_table(ResultTableOrigin {
+                    source_id: source_id,
+                    producer: Producer::Model {
+                        model_id: model_id.to_string(),
+                        task: ModelTask::TextEmbedding,
+                    },
+                    kind: ResultTableKind::Model,
+                    derived_from: None,
+                    dimensions: Some(DIMS as i32),
+                    key_column: Some("_row_id"),
+                    text_columns: Some("body"),
+                    job_attempt: None,
+                })
                 .await
                 .unwrap();
 
@@ -2061,17 +2066,19 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
     let table_name = async {
         let store = engine.result_store();
         let info = store
-            .create_table(
-                source_id,
-                ModelTask::TextEmbedding,
-                ResultTableKind::Model,
-                None,
-                model_id,
-                Some(DIMS as i32),
-                Some("_row_id"),
-                Some("body"),
-                None,
-            )
+            .create_table(ResultTableOrigin {
+                source_id: source_id,
+                producer: Producer::Model {
+                    model_id: model_id.to_string(),
+                    task: ModelTask::TextEmbedding,
+                },
+                kind: ResultTableKind::Model,
+                derived_from: None,
+                dimensions: Some(DIMS as i32),
+                key_column: Some("_row_id"),
+                text_columns: Some("body"),
+                job_attempt: None,
+            })
             .await
             .unwrap();
 
@@ -2371,8 +2378,10 @@ async fn tenant_scoped_reconcile_never_touches_a_global_expired_building_row() {
         .create_result_table(CreateResultTableParams {
             table_name: &table_name,
             source_id: "global-src",
-            model_id: "global-model",
-            task: jammi_datafusion::ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "global-model".to_string(),
+                task: jammi_datafusion::ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: &parquet_url,
@@ -3158,17 +3167,19 @@ async fn materialize_embedding_result_table(engine: &InferenceSession, source: &
     let model_id = "embed-model";
     let store = engine.result_store();
     let info = store
-        .create_table(
-            source,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            model_id,
-            Some(DIMS as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source,
+            producer: Producer::Model {
+                model_id: model_id.to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -3250,17 +3261,19 @@ async fn materialize_asof_result_table(
 
     let store = engine.result_store();
     let info = store
-        .create_table(
-            spine,
-            ModelTask::TextEmbedding,
-            ResultTableKind::AsofJoin,
-            None,
-            "asof-model",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: spine,
+            producer: Producer::Model {
+                model_id: "asof-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::AsofJoin,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 

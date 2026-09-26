@@ -2110,3 +2110,141 @@ ALTER TABLE models ALTER COLUMN backend SET NOT NULL;
 pub(super) const MIGRATION_044_TOPICS_DROP_BROKER_METADATA: &str = r#"
 ALTER TABLE topics DROP COLUMN broker_metadata;
 "#;
+
+/// Migration 045: a result table records a model and a task only when a model
+/// produced its rows.
+///
+/// A derivation that runs no model — an as-of join, a lexical index, a graph
+/// derivation — has no model and, unless its rows are a model task's output
+/// shape (a propagated embedding is still a text embedding), no task: both
+/// columns hold `NULL` for it rather than a sentinel.
+///
+/// SQLite cannot drop a column-level `NOT NULL` in place, so `result_tables`
+/// is rebuilt. `PRAGMA foreign_keys` is ON in the migration transaction, and
+/// `index_segments` and `result_table_versions` cascade from `result_tables`,
+/// so dropping the old table would delete their rows: they are parked in
+/// FK-free copies first, dropped, and restored against the rebuilt table. The
+/// new table's `derived_from` references itself by its own name, which the
+/// rename carries over; `defer_foreign_keys` lets its rows copy in any order.
+pub(super) const MIGRATION_045_RESULT_TABLE_PRODUCER_SQLITE: &str = r#"
+PRAGMA defer_foreign_keys = ON;
+CREATE TABLE result_tables_new (
+    table_name         TEXT PRIMARY KEY,
+    source_id          TEXT NOT NULL,
+    model_id           TEXT,
+    task               TEXT,
+    parquet_path       TEXT NOT NULL,
+    dimensions         INTEGER,
+    distance_metric    TEXT DEFAULT 'cosine',
+    row_count          INTEGER NOT NULL DEFAULT 0,
+    status             TEXT NOT NULL DEFAULT 'building',
+    key_column         TEXT,
+    text_columns       TEXT,
+    checkpoint         INTEGER,
+    created_at         TEXT NOT NULL,
+    completed_at       TEXT,
+    tenant_id          TEXT,
+    kind               TEXT NOT NULL DEFAULT 'model',
+    derived_from       TEXT REFERENCES result_tables_new(table_name),
+    definition_hash    TEXT,
+    input_anchors_json TEXT,
+    storage_precision  TEXT,
+    oversample         INTEGER,
+    writer_id          TEXT,
+    lease_expires_at   TEXT,
+    current_version    INTEGER,
+    next_version       INTEGER NOT NULL DEFAULT 0,
+    replaces           TEXT
+);
+INSERT INTO result_tables_new (table_name, source_id, model_id, task, parquet_path, dimensions, distance_metric, row_count, status, key_column, text_columns, checkpoint, created_at, completed_at, tenant_id, kind, derived_from, definition_hash, input_anchors_json, storage_precision, oversample, writer_id, lease_expires_at, current_version, next_version, replaces)
+    SELECT table_name, source_id, model_id, task, parquet_path, dimensions, distance_metric, row_count, status, key_column, text_columns, checkpoint, created_at, completed_at, tenant_id, kind, derived_from, definition_hash, input_anchors_json, storage_precision, oversample, writer_id, lease_expires_at, current_version, next_version, replaces FROM result_tables;
+CREATE TABLE index_segments_parked AS SELECT * FROM index_segments;
+CREATE TABLE result_table_versions_parked AS SELECT * FROM result_table_versions;
+DROP TABLE index_segments;
+DROP TABLE result_table_versions;
+DROP TABLE result_tables;
+ALTER TABLE result_tables_new RENAME TO result_tables;
+CREATE INDEX idx_result_tables_source ON result_tables(source_id);
+CREATE INDEX idx_result_tables_task ON result_tables(task);
+CREATE INDEX idx_result_tables_status ON result_tables(status);
+CREATE INDEX idx_result_tables_tenant ON result_tables(tenant_id);
+CREATE INDEX idx_result_tables_kind ON result_tables(kind);
+CREATE INDEX idx_result_tables_definition_hash ON result_tables(definition_hash);
+CREATE INDEX idx_result_tables_lease ON result_tables(status, lease_expires_at);
+CREATE TRIGGER trg_result_tables_lease_expires_at_canonical_ins
+BEFORE INSERT ON result_tables
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER trg_result_tables_lease_expires_at_canonical_upd
+BEFORE UPDATE OF lease_expires_at ON result_tables
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER trg_result_tables_created_at_canonical_ins
+BEFORE INSERT ON result_tables
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.created_at: not a canonical stamp');
+END;
+CREATE TRIGGER trg_result_tables_created_at_canonical_upd
+BEFORE UPDATE OF created_at ON result_tables
+WHEN NEW.created_at IS NOT NULL AND NEW.created_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_tables.created_at: not a canonical stamp');
+END;
+CREATE TABLE index_segments (
+    table_name TEXT NOT NULL REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE,
+    segment_id INTEGER NOT NULL,
+    index_path TEXT NOT NULL,
+    row_count  INTEGER NOT NULL DEFAULT 0,
+    tenant_id  TEXT,
+    created_at TEXT NOT NULL DEFAULT (CAST(CURRENT_TIMESTAMP AS TEXT)),
+    version    INTEGER,
+    PRIMARY KEY (table_name, segment_id)
+);
+INSERT INTO index_segments (table_name, segment_id, index_path, row_count, tenant_id, created_at, version)
+    SELECT table_name, segment_id, index_path, row_count, tenant_id, created_at, version FROM index_segments_parked;
+DROP TABLE index_segments_parked;
+CREATE TABLE result_table_versions (
+    table_name       TEXT NOT NULL REFERENCES result_tables(table_name) ON DELETE CASCADE ON UPDATE CASCADE,
+    version          INTEGER NOT NULL,
+    parent_version   INTEGER,
+    status           TEXT NOT NULL DEFAULT 'building',
+    manifest_path    TEXT NOT NULL,
+    identity         TEXT,
+    live_rows        INTEGER,
+    masked_rows      INTEGER,
+    writer_id        TEXT,
+    lease_expires_at TEXT,
+    tenant_id        TEXT,
+    created_at       TEXT NOT NULL,
+    completed_at     TEXT,
+    PRIMARY KEY (table_name, version)
+);
+INSERT INTO result_table_versions (table_name, version, parent_version, status, manifest_path, identity, live_rows, masked_rows, writer_id, lease_expires_at, tenant_id, created_at, completed_at)
+    SELECT table_name, version, parent_version, status, manifest_path, identity, live_rows, masked_rows, writer_id, lease_expires_at, tenant_id, created_at, completed_at FROM result_table_versions_parked;
+DROP TABLE result_table_versions_parked;
+CREATE INDEX idx_result_table_versions_lease ON result_table_versions(status, lease_expires_at);
+CREATE TRIGGER trg_result_table_versions_lease_expires_at_canonical_ins
+BEFORE INSERT ON result_table_versions
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_table_versions.lease_expires_at: not a canonical stamp');
+END;
+CREATE TRIGGER trg_result_table_versions_lease_expires_at_canonical_upd
+BEFORE UPDATE OF lease_expires_at ON result_table_versions
+WHEN NEW.lease_expires_at IS NOT NULL AND NEW.lease_expires_at NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]Z'
+BEGIN
+    SELECT RAISE(ABORT, 'result_table_versions.lease_expires_at: not a canonical stamp');
+END;
+"#;
+
+/// The Postgres arm of migration 045 — see
+/// [`MIGRATION_045_RESULT_TABLE_PRODUCER_SQLITE`].
+pub(super) const MIGRATION_045_RESULT_TABLE_PRODUCER_POSTGRES: &str = r#"
+ALTER TABLE result_tables ALTER COLUMN model_id DROP NOT NULL;
+ALTER TABLE result_tables ALTER COLUMN task DROP NOT NULL;
+"#;

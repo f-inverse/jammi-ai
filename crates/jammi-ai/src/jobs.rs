@@ -1041,7 +1041,7 @@ impl InferenceSession {
                     self.catalog(),
                     &admitted,
                     &job_id,
-                    &links.model_ref,
+                    links.model_ref.as_deref(),
                     &links.output_model_id,
                     priority,
                     None,

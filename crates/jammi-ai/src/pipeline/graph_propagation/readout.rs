@@ -169,12 +169,12 @@ impl BlockReadout {
 
 /// The columns [`ReadoutExec`] emits — the inference-output columns the
 /// embedding sink reads (`_status = "ok"` on every row: a propagation has no
-/// per-row failure mode).
+/// per-row failure mode; `_model` is `NULL`: a propagation runs no model).
 fn readout_schema(out_dim: usize) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
         Field::new("_source", DataType::Utf8, false),
-        Field::new("_model", DataType::Utf8, false),
+        Field::new("_model", DataType::Utf8, true),
         Field::new("_status", DataType::Utf8, false),
         Field::new(
             "vector",
@@ -196,8 +196,6 @@ pub struct ReadoutSpec {
     pub(crate) dimensions: usize,
     /// Stamped on every row's `_source`.
     pub(crate) source_id: String,
-    /// Stamped on every row's `_model`.
-    pub(crate) model_id: String,
 }
 
 /// Emits a finished propagation: folds the last block `X⁽ᴷ⁾` into each state
@@ -327,7 +325,7 @@ fn emit(spec: &ReadoutSpec, schema: &SchemaRef, batch: &RecordBatch) -> DfResult
         vec![
             keys,
             stamp(&spec.source_id),
-            stamp(&spec.model_id),
+            arrow::array::new_null_array(&DataType::Utf8, rows),
             stamp("ok"),
             Arc::new(vectors),
         ],

@@ -10,13 +10,13 @@ use async_trait::async_trait;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendImpl;
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{PeerAddr, SegmentId, SegmentPlacement, VectorIndex};
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use tempfile::tempdir;
 
 /// A placement that always returns a single, hard-coded, EMPTY owner list —
@@ -47,17 +47,19 @@ async fn fresh_store(dir: &std::path::Path, placement: Arc<dyn SegmentPlacement>
 
 async fn two_segment_table(store: &ResultStore) -> BuildingTable {
     let table = store
-        .create_table(
-            "src",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     for rows in [

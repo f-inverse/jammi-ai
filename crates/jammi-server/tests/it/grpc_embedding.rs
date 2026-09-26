@@ -715,7 +715,8 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
     assert_eq!(table.status, "ready", "imported table must be ready");
     assert_eq!(table.source_id, "docs");
     assert_eq!(
-        table.model_id, "import-model",
+        table.model_id.as_deref(),
+        Some("import-model"),
         "model id recorded canonical"
     );
     assert_eq!(

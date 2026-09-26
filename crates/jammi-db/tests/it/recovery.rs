@@ -60,7 +60,7 @@ use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::result_repo::{
-    Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
+    Owner, Producer, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
 };
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
@@ -75,7 +75,7 @@ use jammi_db::store::manifest::{
     ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 #[cfg(feature = "test-hooks")]
 use jammi_db::tenant_scope::TenantBinding;
 use jammi_db::TenantId;
@@ -128,17 +128,19 @@ fn result_store(dir: &Path, catalog: Arc<Catalog>) -> ResultStore {
 /// lease-owned handle.
 async fn create_building_embedding(store: &ResultStore) -> BuildingTable {
     store
-        .create_table(
-            "src1",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src1",
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }

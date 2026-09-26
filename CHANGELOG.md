@@ -5,6 +5,22 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A result table records a model and a task only when a model produced its rows.** A derivation
+  that runs no model — an as-of join, a lexical index, a neighbor graph, a graph propagation or
+  structure encoding, a SQL statement's table, a training set — records no model (`NULL`
+  `model_id`) and, unless its rows are a model task's output shape (a propagated embedding is still
+  a text embedding), no task, instead of a sentinel. Its name is `{source}__{kind}__{stamp}`. A
+  result table's origin is typed as `Producer::{Model, Derivation}`; `ResultStore::create_table`
+  takes a `ResultTableOrigin`. Migration 045 drops the two `NOT NULL`s; the embedding Parquet
+  schema's `_model_id` is nullable; the wire `ResultTable`'s `model_id` and `task` are `optional`.
+  A context predictor trained over an embedding no model produced has no base model
+  (`jobs.model_ref` NULL) rather than a registered sentinel model. **BREAKING** for the Rust API
+  (`ResultTableRecord::producer`, `ResultTableOrigin`, `EmbeddingTableSpec::model_id:
+  Option<&str>`).
+- **An as-of join's refusals are typed.** Duplicate facts at a matched instant with no
+  `tie_break_column` is `JammiError::AmbiguousAsofMatch` (`INVALID_ARGUMENT`, naming the instant
+  and the argument); a spec that does not fit the relations is a `Schema` refusal. A dropped
+  building handle whose row the sink already failed no longer warns.
 - **A missing catalog row is one typed not-found: `JammiError::NotFound(Missing)`.** A source, a
   model, a job, a named result table, and a source's ready embedding table or lexical index that a
   search resolves when it names none: each is `NotFound` (gRPC `NOT_FOUND`) carrying which row is

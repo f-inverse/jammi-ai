@@ -145,11 +145,11 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     assert!(remote_table.row_count > 0, "patents corpus embeds rows");
     assert!(remote_table.dimensions().is_some(), "dimensions recorded");
     assert_eq!(remote_table.source_id, "patents");
-    // The remote arm reconstructs `task` from the requested modality (the wire
-    // omits it as server-internal bookkeeping); it must match the tower.
+    // The wire carries the producer; the remote record's task must match the
+    // tower.
     assert_eq!(
-        remote_table.task,
-        jammi_datafusion::ModelTask::TextEmbedding
+        remote_table.producer.task(),
+        Some(jammi_datafusion::ModelTask::TextEmbedding)
     );
 
     // encode_query parity: identical query, identical model → identical vector.

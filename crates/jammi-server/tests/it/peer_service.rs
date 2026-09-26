@@ -23,13 +23,13 @@
 //! path an embedded table takes, without a model load.
 
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::segment::{rescore, search_unit};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{SegmentSearchPhase, VectorIndex};
 use jammi_db::storage::StorageUrl;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_test_utils::vq;
 use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
 use jammi_wire::proto::peer::{
@@ -56,17 +56,19 @@ pub fn built_index(rows: &[(&str, [f32; 4])], precision: StoragePrecision) -> Si
 /// handle (the lease-owned row every segment append is a CAS against).
 pub async fn building_table(store: &ResultStore, source_id: &str) -> BuildingTable {
     store
-        .create_table(
-            source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source_id,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }

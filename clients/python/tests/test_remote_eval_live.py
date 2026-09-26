@@ -37,7 +37,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import jammi
-from jammi.errors import BackendError
+from jammi.errors import NotFound
 
 pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
@@ -518,8 +518,8 @@ def test_eval_embeddings_empty_golden_set_zero_aggregate_matches_embedded(
 def test_eval_error_paths_match_embedded(live_server, tmp_path):
     """A bad call is rejected by BOTH transports, mapping the same engine error.
 
-    An unknown `golden_source` is an engine-side planning error, and a caller
-    catches the same `BackendError` on either transport (the server maps the
+    An unknown `golden_source` is a source the engine has no row for, and a
+    caller catches the same `NotFound` on either transport (the server maps the
     engine error onto a status; the client maps the status back onto the
     taxonomy). An unknown `task` string is
     rejected by BOTH transports before any inference runs — the embedded engine
@@ -546,9 +546,9 @@ def test_eval_error_paths_match_embedded(live_server, tmp_path):
         # The error a caller catches is the same typed error on either transport.
         for db in (remote, embedded):
             # Unknown golden_source: the engine has no row for the source and
-            # refuses it by name; the remote client maps the server's status
-            # back onto the same class.
-            with pytest.raises(BackendError, match="Source not found: no_such"):
+            # refuses it by name as a NotFound; the remote client maps the
+            # server's status back onto the same class.
+            with pytest.raises(NotFound, match="source `no_such` not found"):
                 db.eval_embeddings(
                     source=source,
                     golden_source="no_such.public.relevance",

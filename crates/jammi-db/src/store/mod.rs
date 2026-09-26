@@ -68,8 +68,8 @@ use tracing::warn;
 
 use crate::catalog::lease::LeaseIntervals;
 use crate::catalog::result_repo::{
-    CreateResultTableParams, JobAttempt, RemovedResultTable, ResultTableCas, ResultTableKind,
-    ResultTableRecord,
+    CreateResultTableParams, JobAttempt, Producer, RemovedResultTable, ResultTableCas,
+    ResultTableKind, ResultTableRecord,
 };
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
@@ -112,8 +112,9 @@ use jammi_datafusion::ModelTask;
 pub struct EmbeddingTableSpec<'a> {
     /// The source the output rows belong to (catalog `source_id`).
     pub source_id: &'a str,
-    /// The derivation provenance recorded as the catalog `model_id`.
-    pub model_id: &'a str,
+    /// The model that computed the vectors, when one did; `None` for a
+    /// derivation that runs no model (its rows are still text embeddings).
+    pub model_id: Option<&'a str>,
     /// The source embedding result table this output was derived from — the
     /// FK-lineage anchor. `None` when no single source table backs the batch.
     pub derived_from: Option<&'a str>,
@@ -172,12 +173,6 @@ pub struct ComputedEmbeddingProvenance {
     /// order.
     pub inputs: Vec<InputAnchor>,
 }
-
-/// The `model_id` a training-set result table's catalog row carries. Producing
-/// a training set invokes no model — the column is NOT NULL, so a stable
-/// sentinel rides it, the same shape the neighbor-graph and as-of derivations
-/// use.
-pub const TRAINING_SET_MODEL_ID: &str = "training-set";
 
 /// [`ResultStore::materialize_training_set`]'s producer input: SQL run through the caller's session
 /// (the tabular arm), or a one-shot [`RecordBatch`](arrow::array::RecordBatch) stream the caller
@@ -732,8 +727,9 @@ mod from_record_tests {
         let mut record = ResultTableRecord::from_wire_projection(
             table_name.to_string(),
             "training".to_string(),
-            "jammi:training-set".to_string(),
-            ModelTask::TextEmbedding,
+            Producer::Derivation {
+                task: Some(ModelTask::TextEmbedding),
+            },
             ResultTableKind::TrainingSet,
             None,
             0,
@@ -1130,14 +1126,12 @@ pub fn training_set_file_sort_order(columns: &[String]) -> Vec<Vec<SortExpr>> {
 pub struct ResultTableOrigin<'a> {
     /// The registered source the rows belong to (the row's lineage column).
     pub source_id: &'a str,
-    /// The model task the row is filed under.
-    pub task: ModelTask,
+    /// The model that produced the rows, or that a derivation did.
+    pub producer: Producer,
     /// A model output, or which derivation.
     pub kind: ResultTableKind,
     /// The result table a derivation was computed from.
     pub derived_from: Option<&'a str>,
-    /// The producing model's canonical id, or a producer's sentinel.
-    pub model_id: &'a str,
     /// The embedding width, for an embedding table.
     pub dimensions: Option<i32>,
     /// The key column the rows are identified by.
@@ -2040,10 +2034,12 @@ impl ResultStore {
     /// [`BuildingTable`] handle whose heartbeat keeps that lease renewed until
     /// [`BuildingTable::finish`] or [`BuildingTable::abort`].
     ///
-    /// `kind` discriminates a direct model output from a derivation of another
-    /// result table (e.g. a neighbor-graph edge relation); `derived_from` names
-    /// the source result table a derivation was computed from (`None` for a
-    /// `Model` table). No ANN index is created here for any `kind`: an embedding
+    /// The origin's `kind` discriminates a direct model output from a
+    /// derivation of another result table (e.g. a neighbor-graph edge
+    /// relation); `derived_from` names the source result table a derivation
+    /// was computed from (`None` for a `Model` table). The name is
+    /// `{source}__{task}__{model}__{stamp}` for a model's output and
+    /// `{source}__{kind}__{stamp}` for a derivation that runs no model. No ANN index is created here for any `kind`: an embedding
     /// table's index materialises lazily as segments through
     /// [`BuildingTable::append_segment`], and a derived table carries none at
     /// all.
@@ -2061,43 +2057,20 @@ impl ResultStore {
     /// `job_id` alone. `None` for a table created outside the job machinery
     /// (a test fixture, or a caller that materialises with no job of
     /// record).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_table(
-        &self,
-        source_id: &str,
-        task: ModelTask,
-        kind: ResultTableKind,
-        derived_from: Option<&str>,
-        model_id: &str,
-        dimensions: Option<i32>,
-        key_column: Option<&str>,
-        text_columns: Option<&str>,
-        job_attempt: Option<JobAttempt<'_>>,
-    ) -> Result<BuildingTable> {
-        let sanitized = sanitize_model_id(model_id);
+    pub async fn create_table(&self, origin: ResultTableOrigin<'_>) -> Result<BuildingTable> {
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%9f");
         // Nanoseconds plus a short uuid suffix make table names unique even
         // when two tokio tasks call create_table within the same nanosecond
         // (concurrent embedding generation on the same source).
         let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let task_str = task.as_str();
-        let table_name = format!("{source_id}__{task_str}__{sanitized}__{timestamp}_{suffix}");
-        self.create_named_table(
-            table_name,
-            ResultTableOrigin {
-                source_id,
-                task,
-                kind,
-                derived_from,
-                model_id,
-                dimensions,
-                key_column,
-                text_columns,
-                job_attempt,
-            },
-            None,
-        )
-        .await
+        let producer = match &origin.producer {
+            Producer::Model { model_id, task } => {
+                format!("{}__{}", task.as_str(), sanitize_model_id(model_id))
+            }
+            Producer::Derivation { .. } => origin.kind.as_db_str().to_string(),
+        };
+        let table_name = format!("{}__{producer}__{timestamp}_{suffix}", origin.source_id);
+        self.create_named_table(table_name, origin, None).await
     }
 
     /// [`Self::create_table`] under a name the caller chose — a `CREATE
@@ -2134,8 +2107,7 @@ impl ResultStore {
             .create_result_table(CreateResultTableParams {
                 table_name: &table_name,
                 source_id: origin.source_id,
-                model_id: origin.model_id,
-                task: origin.task,
+                producer: origin.producer,
                 kind: origin.kind,
                 derived_from: origin.derived_from,
                 parquet_path: parquet_url.as_str(),
@@ -2996,7 +2968,7 @@ impl ResultStore {
                 // destructive purge; a renew miss abandons this arm silently
                 // (no deletion).
                 let mut promoted_purged = BTreeSet::new();
-                if table.task.is_embedding() {
+                if table.producer.task().is_some_and(|t| t.is_embedding()) {
                     let renew = self
                         .catalog
                         .renew_lease(&recovered.cas(), self.lease.lease())
@@ -4826,18 +4798,26 @@ impl ResultStore {
         // task is the embedding task that drives the sidecar-index sidecar URL.
         // The physical key stays `_row_id` (the output schema is invariant);
         // `key_column` / `text_columns` are the caller's source-side provenance.
+        let producer = match model_id {
+            Some(model_id) => Producer::Model {
+                model_id: model_id.to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            None => Producer::Derivation {
+                task: Some(ModelTask::TextEmbedding),
+            },
+        };
         let building = self
-            .create_table(
+            .create_table(ResultTableOrigin {
                 source_id,
-                ModelTask::TextEmbedding,
-                ResultTableKind::Model,
+                producer,
+                kind: ResultTableKind::Model,
                 derived_from,
-                model_id,
-                Some(dimensions as i32),
+                dimensions: Some(dimensions as i32),
                 key_column,
                 text_columns,
                 job_attempt,
-            )
+            })
             .await?;
 
         // The building row carries this table's persisted precision; the
@@ -4848,7 +4828,9 @@ impl ResultStore {
         let precision = building.storage_precision();
 
         let schema = crate::store::schema::embedding_table_schema(dimensions);
-        let batch = embedding_batch(&schema, source_id, model_id, rows, dimensions)?;
+        let batch = crate::store::schema::embedding_batch_with_null_hash(
+            &schema, source_id, model_id, rows, dimensions,
+        )?;
 
         let mut writer = self.open_writer(building.parquet_url(), schema).await?;
         let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
@@ -5100,23 +5082,24 @@ impl ResultStore {
             .await?;
 
         let mut building = self
-            .create_table(
-                spec.source_id,
-                spec.task,
-                ResultTableKind::TrainingSet,
+            .create_table(ResultTableOrigin {
+                source_id: spec.source_id,
+                producer: Producer::Derivation {
+                    task: Some(spec.task),
+                },
+                kind: ResultTableKind::TrainingSet,
                 // The rows are projected from a registered relation, not
                 // derived from a result table, so there is no FK-lineage
                 // parent; the reproducibility lineage rides the manifest's
                 // input anchors instead (the same shape `asof_join` uses).
-                None,
-                TRAINING_SET_MODEL_ID,
-                None,
-                None,
-                None,
+                derived_from: None,
+                dimensions: None,
+                key_column: None,
+                text_columns: None,
                 // r31: a shared producer output, never this attempt's
                 // partial result.
-                None,
-            )
+                job_attempt: None,
+            })
             .await?;
 
         let kind = SinkKind::TrainingSet {
@@ -5276,21 +5259,6 @@ impl ResultStore {
         }
         Ok(plan)
     }
-}
-
-/// Build the `(_row_id, _source_id, _model_id, vector, _content_hash)` batch
-/// for a materialised embedding table from per-key vectors — a NULL hash in
-/// every row, since no producer that lands here embedded a source row.
-fn embedding_batch(
-    schema: &arrow::datatypes::SchemaRef,
-    source_id: &str,
-    model_id: &str,
-    rows: &[(String, Vec<f32>)],
-    dimensions: usize,
-) -> Result<arrow::array::RecordBatch> {
-    crate::store::schema::embedding_batch_with_null_hash(
-        schema, source_id, model_id, rows, dimensions,
-    )
 }
 
 /// A stable content digest over normalized embedding rows: the hex of a

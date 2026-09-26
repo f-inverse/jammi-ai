@@ -11,7 +11,8 @@ pub const CONTENT_HASH_COLUMN: &str = "_content_hash";
 
 /// Build the Arrow schema for an embedding result table.
 ///
-/// Columns: `_row_id`, `_source_id`, `_model_id`, `vector` (FixedSizeList of
+/// Columns: `_row_id`, `_source_id`, `_model_id` (nullable — `NULL` on the
+/// rows of a derivation that runs no model), `vector` (FixedSizeList of
 /// Float32), `_content_hash` (nullable Utf8 — the hex SHA-256 the embedding
 /// pipeline computes over the embedded source columns, `NULL` on every table
 /// built by hand or by a producer that does not read a source row; see
@@ -20,7 +21,7 @@ pub fn embedding_table_schema(dimensions: usize) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("_row_id", DataType::Utf8, false),
         Field::new("_source_id", DataType::Utf8, false),
-        Field::new("_model_id", DataType::Utf8, false),
+        Field::new("_model_id", DataType::Utf8, true),
         Field::new_fixed_size_list(
             "vector",
             Field::new("item", DataType::Float32, false),
@@ -39,14 +40,14 @@ pub fn embedding_table_schema(dimensions: usize) -> SchemaRef {
 pub fn embedding_batch_with_null_hash(
     schema: &SchemaRef,
     source_id: &str,
-    model_id: &str,
+    model_id: Option<&str>,
     rows: &[(String, Vec<f32>)],
     dimensions: usize,
 ) -> Result<RecordBatch> {
     for (key, vector) in rows {
         if vector.len() != dimensions {
             return Err(JammiError::Schema {
-                table: model_id.to_string(),
+                table: source_id.to_string(),
                 column: "vector".into(),
                 expected: format!("FixedSizeList<Float32> width {dimensions}"),
                 actual: format!("row '{key}' has width {}", vector.len()),
@@ -56,7 +57,7 @@ pub fn embedding_batch_with_null_hash(
 
     let row_ids = StringArray::from_iter_values(rows.iter().map(|(k, _)| k.as_str()));
     let source_ids = StringArray::from_iter_values(rows.iter().map(|_| source_id));
-    let model_ids = StringArray::from_iter_values(rows.iter().map(|_| model_id));
+    let model_ids: StringArray = rows.iter().map(|_| model_id).collect();
     let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
     let item = Arc::new(Field::new("item", DataType::Float32, false));
     let vectors = FixedSizeListArray::try_new(

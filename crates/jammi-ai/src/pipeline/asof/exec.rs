@@ -280,7 +280,9 @@ impl ExecutionPlan for AsofJoinExec {
         let result = stream::once(async move {
             let to_df = |e: AsofError| match e {
                 AsofError::DataFusion(d) => d,
-                other => datafusion::error::DataFusionError::External(Box::new(other)),
+                refused => datafusion::error::DataFusionError::External(Box::new(
+                    jammi_db::error::JammiError::from(refused),
+                )),
             };
 
             let left_batch = collect_concat(&left, Arc::clone(&context), &left_schema).await?;

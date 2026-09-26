@@ -145,7 +145,7 @@ impl<'a> ImportPipeline<'a> {
                 self.session.context(),
                 EmbeddingTableSpec {
                     source_id,
-                    model_id: &canonical_model_id,
+                    model_id: Some(&canonical_model_id),
                     derived_from: None,
                     dimensions,
                     key_column: Some(key_column),

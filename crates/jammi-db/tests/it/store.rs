@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::result_repo::CreateResultTableParams;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -14,7 +14,7 @@ use jammi_db::storage::{
     reader::{count_parquet_rows, is_valid_parquet},
     ObjectParquetWriter, StorageRegistry, StorageUrl,
 };
-use jammi_db::store::ResultStore;
+use jammi_db::store::{ResultStore, ResultTableOrigin};
 use jammi_test_utils::{make_test_session, unique_suffix};
 use tempfile::tempdir;
 use test_case::test_case;
@@ -71,8 +71,10 @@ async fn result_table_crud_lifecycle() {
             lease: None,
             table_name: "t1",
             source_id: "patents",
-            model_id: "sentence-transformers/all-MiniLM-L6-v2",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/test.parquet",
@@ -108,8 +110,10 @@ async fn result_table_crud_lifecycle() {
             lease: None,
             table_name: "t2",
             source_id: "patents",
-            model_id: "m",
-            task: ModelTask::Classification,
+            producer: Producer::Model {
+                model_id: "m".to_string(),
+                task: ModelTask::Classification,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/t2.parquet",
@@ -156,8 +160,10 @@ async fn find_result_tables_filters_by_source_and_task() {
                 lease: None,
                 table_name: name,
                 source_id: source,
-                model_id: "model",
-                task,
+                producer: Producer::Model {
+                    model_id: "model".to_string(),
+                    task,
+                },
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
@@ -207,8 +213,10 @@ async fn resolve_embedding_table_latest_explicit_and_missing() {
                 lease: None,
                 table_name: name,
                 source_id: "patents",
-                model_id: "model",
-                task: ModelTask::TextEmbedding,
+                producer: Producer::Model {
+                    model_id: "model".to_string(),
+                    task: ModelTask::TextEmbedding,
+                },
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
@@ -269,8 +277,10 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
                 lease: None,
                 table_name: &name,
                 source_id: "media",
-                model_id: "model",
-                task: *task,
+                producer: Producer::Model {
+                    model_id: "model".to_string(),
+                    task: *task,
+                },
                 kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
                 derived_from: None,
                 parquet_path: &format!("file:///tmp/{name}.parquet"),
@@ -299,9 +309,9 @@ async fn resolve_embedding_table_accepts_every_embedding_variant() {
         .await
         .unwrap();
     assert!(
-        resolved.task.is_embedding(),
+        resolved.producer.task().is_some_and(|t| t.is_embedding()),
         "resolver returned non-embedding task {:?}",
-        resolved.task
+        resolved.producer.task()
     );
     assert_eq!(
         resolved.table_name,
@@ -354,8 +364,10 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             lease: None,
             table_name: &older_table,
             source_id: &source_id,
-            model_id: "zzz_model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "zzz_model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: &format!("file:///tmp/{older_table}.parquet"),
@@ -388,8 +400,10 @@ async fn resolve_embedding_table_picks_newest_by_created_at_not_table_name(backe
             lease: None,
             table_name: &newer_table,
             source_id: &source_id,
-            model_id: "aaa_model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "aaa_model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: &format!("file:///tmp/{newer_table}.parquet"),
@@ -463,8 +477,10 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
             lease: None,
             table_name: "classify_recover",
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::Classification,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::Classification,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),
@@ -494,7 +510,7 @@ async fn recovery_skips_index_rebuild_for_non_embedding_task() {
     assert_eq!(record.status, "ready");
     assert_eq!(record.row_count, 2);
     assert!(
-        !record.task.is_embedding(),
+        !record.producer.task().is_some_and(|t| t.is_embedding()),
         "test fixture should be a non-embedding task"
     );
 }
@@ -508,17 +524,19 @@ async fn result_store_create_table_generates_correct_paths() {
     let store = ResultStore::new(dir.path(), catalog, AnnIndexConfig::default()).unwrap();
 
     let info = store
-        .create_table(
-            "patents",
-            ModelTask::TextEmbedding,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "sentence-transformers/all-MiniLM-L6-v2",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "patents",
+            producer: Producer::Model {
+                model_id: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -566,17 +584,19 @@ async fn binary_precision_table_stamps_precision_specific_oversample() {
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
 
     let info = store
-        .create_table(
-            "patents",
-            ModelTask::TextEmbedding,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            Some(64),
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "patents",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(64),
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -611,17 +631,19 @@ async fn binary_precision_table_honors_explicit_oversample_override() {
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
 
     let info = store
-        .create_table(
-            "patents",
-            ModelTask::TextEmbedding,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            Some(64),
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "patents",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(64),
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -654,17 +676,19 @@ async fn binary_precision_table_honors_an_explicit_four_not_widened_to_thirty_tw
     let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
 
     let info = store
-        .create_table(
-            "patents",
-            ModelTask::TextEmbedding,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            Some(64),
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "patents",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(64),
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -707,17 +731,19 @@ async fn create_table_couples_rescoring_precision_to_a_present_oversample() {
         let store = ResultStore::new(dir.path(), Arc::clone(&catalog), ann).unwrap();
 
         let info = store
-            .create_table(
-                "patents",
-                ModelTask::TextEmbedding,
-                jammi_db::catalog::result_repo::ResultTableKind::Model,
-                None,
-                "model",
-                Some(64),
-                None,
-                None,
-                None,
-            )
+            .create_table(ResultTableOrigin {
+                source_id: "patents",
+                producer: Producer::Model {
+                    model_id: "model".to_string(),
+                    task: ModelTask::TextEmbedding,
+                },
+                kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+                derived_from: None,
+                dimensions: Some(64),
+                key_column: None,
+                text_columns: None,
+                job_attempt: None,
+            })
             .await
             .unwrap();
 
@@ -764,17 +790,19 @@ async fn result_store_with_memory_root_roots_and_roundtrips() {
     .unwrap();
 
     let info = store
-        .create_table(
-            "patents",
-            ModelTask::Classification,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "patents",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::Classification,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     // The table's parquet URL is rooted at the memory root, not local disk.
@@ -821,8 +849,10 @@ async fn recovery_marks_missing_parquet_as_failed() {
             lease: None,
             table_name: "orphan",
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: missing_url.as_str(),
@@ -870,8 +900,10 @@ async fn recovery_deletes_invalid_parquet_and_marks_failed() {
             lease: None,
             table_name: "corrupt",
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: bad_url.as_str(),
@@ -935,8 +967,10 @@ async fn recovery_promotes_valid_parquet_to_ready() {
             lease: None,
             table_name: "stuck",
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::Classification,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::Classification,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),
@@ -1016,8 +1050,10 @@ async fn result_table_none_dimensions_round_trips_as_null(backend: BackendKind) 
             lease: None,
             table_name: &table_name,
             source_id: &source_id,
-            model_id: "acme/sentiment-classifier",
-            task: ModelTask::Classification,
+            producer: Producer::Model {
+                model_id: "acme/sentiment-classifier".to_string(),
+                task: ModelTask::Classification,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: &format!("file:///tmp/{table_name}.parquet"),

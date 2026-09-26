@@ -376,7 +376,7 @@ fn detect_ambiguous(right: &[Option<i128>]) -> Result<(), AsofError> {
     for pair in right.windows(2) {
         if let [Some(a), Some(b)] = pair {
             if a == b {
-                return Err(AsofError::AmbiguousMatch);
+                return Err(AsofError::AmbiguousMatch { instant: *a });
             }
         }
     }

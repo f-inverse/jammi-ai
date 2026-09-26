@@ -2,6 +2,7 @@
 //! tables are rooted there (here a hermetic `memory://` URL standing in for an
 //! `r2://`/`s3://` deploy root) rather than on local disk under `artifact_dir`.
 
+use jammi_db::catalog::result_repo::Producer;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::instance::MemberRoot;
 use jammi_db::config::StorageConfig;
 use jammi_db::storage::{StorageRegistry, StorageUrl};
-use jammi_db::store::ArtifactStore;
+use jammi_db::store::{ArtifactStore, ResultTableOrigin};
 use tempfile::TempDir;
 
 use crate::common;
@@ -30,17 +31,19 @@ async fn assert_store_rooted_at_resolved_root(config: jammi_db::config::JammiCon
     let session = InferenceSession::new(config).await.unwrap();
     let store = session.result_store();
     let info = store
-        .create_table(
-            "root_parity_probe",
-            ModelTask::Classification,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "root_parity_probe",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::Classification,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     assert!(
@@ -91,17 +94,19 @@ async fn inference_session_roots_result_tables_at_configured_memory_root() {
     let store = session.result_store();
 
     let info = store
-        .create_table(
-            "patents",
-            ModelTask::Classification,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "patents",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::Classification,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     assert!(
@@ -170,17 +175,19 @@ async fn assert_member_row_matches_resolved_root(
     let session = InferenceSession::new(config).await.unwrap();
     let store = session.result_store();
     let info = store
-        .create_table(
-            "member_row_root_probe",
-            ModelTask::Classification,
-            jammi_db::catalog::result_repo::ResultTableKind::Model,
-            None,
-            "model",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "member_row_root_probe",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::Classification,
+            },
+            kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     assert!(

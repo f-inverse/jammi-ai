@@ -67,11 +67,11 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, StringArray};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
-use jammi_db::store::BuildingTable;
+use jammi_db::store::{BuildingTable, ResultTableOrigin};
 use jammi_numerics::distance::cosine_distance;
 use jammi_wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
 use jammi_wire::proto::embedding::search_request::Query as WireQuery;
@@ -118,17 +118,19 @@ async fn build_placed_table(
 ) -> (BuildingTable, ResultTableRecord, Vec<(String, [f32; DIMS])>) {
     let store = harness.result_store();
     let table = store
-        .create_table(
-            source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(DIMS as i32),
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source_id,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .expect("create the placed-search table");
     let precision = table.storage_precision();

@@ -9,7 +9,7 @@ use std::time::Duration;
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::index::sidecar::SidecarIndex;
@@ -22,6 +22,7 @@ use jammi_db::store::manifest::{
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
     BuildingTable, EmbeddingTableSpec, Materialization, ReconcileOptions, ResultStore,
+    ResultTableOrigin,
 };
 use jammi_db::TenantId;
 use tempfile::tempdir;
@@ -81,7 +82,7 @@ async fn materialize_healthy_table(
             ctx,
             EmbeddingTableSpec {
                 source_id,
-                model_id: "test-model",
+                model_id: Some("test-model"),
                 derived_from: None,
                 dimensions: DIMS,
                 key_column: Some("_row_id"),
@@ -137,17 +138,19 @@ async fn create_building_embedding_with_parquet_and_catalog_dims(
     catalog_dims: Option<i32>,
 ) -> BuildingTable {
     let info = store
-        .create_table(
-            source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            catalog_dims,
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source_id,
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: catalog_dims,
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -879,17 +882,19 @@ async fn classify_expired_row_never_collapses_reap_promote_and_untouched() {
     // Untouched: a `building` row whose Parquet was never written at all —
     // the writer crashed before the very first byte landed.
     let untouched_info = store
-        .create_table(
-            "docs-classify-untouched",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "docs-classify-untouched",
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let untouched_table = jammi_test_utils::abandon_building(&catalog, untouched_info).await;
@@ -1235,17 +1240,19 @@ async fn purge_segments_errors_on_an_unparseable_index_path() {
         .with_lease_intervals(short_lease());
 
     let info = store
-        .create_table(
-            "docs-bad-segment-path",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "docs-bad-segment-path",
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     // A raw catalog row naming a scheme `StorageUrl::parse` does not know —

@@ -10,7 +10,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use arrow::datatypes::{DataType, Field, Schema};
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::result_repo::CreateResultTableParams;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
@@ -86,8 +86,10 @@ async fn read_vectors_returns_input_rows_byte_for_byte(backend: BackendKind) {
             lease: None,
             table_name,
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),
@@ -163,8 +165,10 @@ async fn read_vectors_surfaces_typed_engine_fault_on_wrong_column_shape(backend:
             lease: None,
             table_name,
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),

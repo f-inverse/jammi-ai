@@ -55,7 +55,7 @@ fn provenance(
 fn spec<'a>(source_id: &'a str, derived_from: Option<&'a str>) -> EmbeddingTableSpec<'a> {
     EmbeddingTableSpec {
         source_id,
-        model_id: "custom-model",
+        model_id: Some("custom-model"),
         derived_from,
         dimensions: DIMS,
         key_column: Some("_row_id"),

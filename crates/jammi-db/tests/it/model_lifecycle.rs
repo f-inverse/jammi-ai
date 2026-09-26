@@ -27,7 +27,7 @@ use jammi_db::catalog::backend::{BackendKind, TxOptions};
 use jammi_db::catalog::eval_repo::EvalRunRecord;
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::model_repo::RegisterModelParams;
-use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Missing};
@@ -211,8 +211,10 @@ async fn delete_blocked_by_result_table_name_edge(backend: BackendKind) {
         lease: None,
         table_name: "acme_embeddings",
         source_id: "src",
-        model_id: "acme/embed-mini",
-        task: ModelTask::TextEmbedding,
+        producer: Producer::Model {
+            model_id: "acme/embed-mini".to_string(),
+            task: ModelTask::TextEmbedding,
+        },
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "/tmp/p.parquet",
@@ -518,8 +520,10 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
             lease: None,
             table_name: &format!("acme_rt_{i}"),
             source_id: "src",
-            model_id: &base_name,
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: base_name.to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "/tmp/p.parquet",
@@ -546,8 +550,10 @@ async fn delete_blocked_under_volume(backend: BackendKind) {
         lease: None,
         table_name: "acme_target_rt",
         source_id: "src",
-        model_id: "acme/target",
-        task: ModelTask::TextEmbedding,
+        producer: Producer::Model {
+            model_id: "acme/target".to_string(),
+            task: ModelTask::TextEmbedding,
+        },
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "/tmp/p.parquet",

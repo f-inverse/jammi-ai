@@ -1928,7 +1928,7 @@ impl RunContext {
             &catalog,
             &admitted,
             &job_id,
-            &model_catalog_pk,
+            Some(&model_catalog_pk),
             &output_model_id,
             0,
             None,

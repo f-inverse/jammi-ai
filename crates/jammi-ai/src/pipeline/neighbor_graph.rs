@@ -43,10 +43,10 @@ use std::sync::Arc;
 use arrow::array::{Array, Float32Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::{distance_is_admissible, validate_query, QuerySource, ValidatedQuery};
-use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact};
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ResultTableOrigin, ReusedArtifact};
 
 use crate::session::InferenceSession;
 
@@ -429,22 +429,20 @@ impl<'a> NeighborGraphPipeline<'a> {
         inputs: Vec<jammi_db::store::manifest::InputAnchor>,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<ResultTableRecord> {
-        // The edge table is a derivation: its `task` rides the source's so the
-        // NOT NULL column round-trips, but `kind = NeighborGraph` excludes it
-        // from embedding resolution and `create_table` gives it no sidecar.
+        // The edge table is a derivation of its source embedding table
+        // (`derived_from`); its rows are no model task's output.
         let building = self
             .result_store
-            .create_table(
-                &source_table.source_id,
-                source_table.task,
-                ResultTableKind::NeighborGraph,
-                Some(&source_table.table_name),
-                NEIGHBOR_GRAPH_MODEL_ID,
-                None,
-                None,
-                None,
+            .create_table(ResultTableOrigin {
+                source_id: &source_table.source_id,
+                producer: Producer::Derivation { task: None },
+                kind: ResultTableKind::NeighborGraph,
+                derived_from: Some(&source_table.table_name),
+                dimensions: None,
+                key_column: None,
+                text_columns: None,
                 job_attempt,
-            )
+            })
             .await?;
 
         let schema = edge_table_schema();
@@ -537,13 +535,6 @@ fn read_row_id_column(batch: &arrow::array::RecordBatch, table: &str) -> Result<
         })?;
     Ok((0..arr.len()).map(|i| arr.value(i).to_string()).collect())
 }
-
-/// The `model_id` an edge table records. It carries no model, so the column
-/// is a fixed marker naming the derivation kind rather than a model id; the
-/// source embedding table is recorded separately in `derived_from`. Keeping it
-/// short (not the source table name) keeps the generated table name a sane
-/// length for the catalog and the storage path.
-const NEIGHBOR_GRAPH_MODEL_ID: &str = "neighbor_graph";
 
 /// Run `strategy` over every node and emit the raw edge list — the SINK at
 /// which every distance a driver produced is admitted

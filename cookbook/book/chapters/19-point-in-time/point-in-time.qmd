@@ -126,26 +126,45 @@ print(f"backward, no tolerance:      val = "
 ```
 
 **Tie-break** — when more than one fact shares the matched instant, the match is ambiguous
-unless disambiguated by a secondary descending column; otherwise the verb fails *loudly*
-rather than pick non-deterministically. We confirm the loud failure on a true duplicate.
+unless disambiguated by a secondary descending column; otherwise the verb refuses *loudly*
+rather than pick non-deterministically. The refusal is the caller's to fix, so it is an
+`InvalidArgument` that names the missing argument; naming a `tie_break_column` picks the
+fact with the largest value in it.
 
 ```{python}
 pq.write_table(pa.table({"entity": ["q"], "as_of": [20]}),
                f"{work}/spine_dup.parquet")
-pq.write_table(pa.table({"entity": ["q", "q"], "t": [20, 20], "val": [7, 8]}),
+pq.write_table(pa.table({"entity": ["q", "q"], "t": [20, 20], "val": [7, 8],
+                         "revision": [1, 2]}),
                f"{work}/facts_dup.parquet")
 db.add_source("spine_dup", url=f"file://{work}/spine_dup.parquet", format="parquet")
 db.add_source("facts_dup", url=f"file://{work}/facts_dup.parquet", format="parquet")
 
+
+def asof_dup(**tie_break):
+    return db.asof_join("spine_dup", "facts_dup",
+                        spine_by=["entity"], spine_time="as_of",
+                        facts_by=["entity"], facts_time="t",
+                        direction="backward", boundary="inclusive", project=["val"],
+                        **tie_break)
+
+
 try:
-    db.asof_join("spine_dup", "facts_dup",
-                 spine_by=["entity"], spine_time="as_of",
-                 facts_by=["entity"], facts_time="t",
-                 direction="backward", boundary="inclusive", project=["val"])
-    print("no error — unexpected")
-except jammi.errors.JammiError as e:
-    print(f"duplicate at the matched instant, no tie-break → loud failure: "
-          f"{type(e).__name__}")
+    asof_dup()
+    refusal = None
+except jammi.errors.InvalidArgument as e:
+    refusal = str(e)
+print(f"no tie-break → InvalidArgument: {refusal}")
+
+resolved = asof_dup(tie_break_column="revision")
+resolved_val = db.sql(f'SELECT val FROM "jammi.{resolved}"').column("val")[0].as_py()
+print(f"tie_break_column='revision' → val = {resolved_val}  # the revision-2 fact")
+```
+
+```{python}
+# | echo: false
+assert refusal is not None and "tie_break_column" in refusal
+assert resolved_val == 8
 ```
 
 These are the same four knobs a backtester matching trades to prevailing quotes, or a

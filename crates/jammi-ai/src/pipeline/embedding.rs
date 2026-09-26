@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use datafusion::physical_plan::ExecutionPlan;
 
-use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::result_repo::{Producer, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ReusedArtifact, SinkKind};
+use jammi_db::store::{
+    CacheOutcome, CachePolicy, ResultStore, ResultTableOrigin, ReusedArtifact, SinkKind,
+};
 use tracing::Instrument;
 
 use crate::session::InferenceSession;
@@ -235,17 +237,19 @@ impl<'a> EmbeddingPipeline<'a> {
         let col_list = columns.join(",");
         let mut building = self
             .result_store
-            .create_table(
-                source_id,
-                task,
-                jammi_db::catalog::result_repo::ResultTableKind::Model,
-                None,
-                &canonical_model_id,
-                Some(embedding_dim as i32),
-                Some(key_column),
-                Some(&col_list),
-                job_attempt,
-            )
+            .create_table(ResultTableOrigin {
+                source_id: source_id,
+                producer: Producer::Model {
+                    model_id: canonical_model_id.to_string(),
+                    task: task,
+                },
+                kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+                derived_from: None,
+                dimensions: Some(embedding_dim as i32),
+                key_column: Some(key_column),
+                text_columns: Some(&col_list),
+                job_attempt: job_attempt,
+            })
             .instrument(tracing::debug_span!("embed.create_table"))
             .await?;
 

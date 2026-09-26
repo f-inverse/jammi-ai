@@ -10,7 +10,7 @@
 //! `Model`) live with the control-plane catalog wire surface
 //! ([`super::catalog`]); only the compute verbs' shapes are here.
 
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::index::SearchMethod;
 use tonic::Status;
 
@@ -141,11 +141,14 @@ impl From<ResultTableRecord> for pb::ResultTable {
         pb::ResultTable {
             table_name: record.table_name,
             source_id: record.source_id,
-            model_id: record.model_id,
+            model_id: record.producer.model_id().map(str::to_string),
             dimensions,
             row_count: record.row_count as u64,
             status: record.status,
-            task: super::model_task_to_proto(record.task) as i32,
+            task: record
+                .producer
+                .task()
+                .map(|task| super::model_task_to_proto(task) as i32),
             // A bare record carries no producer cache outcome (a catalog
             // projection, not a producer return) → unset, the honest "no
             // producer ran" value. A producer handler uses
@@ -188,7 +191,10 @@ pub fn result_table_with_outcome(
 /// `kind`, so an out-of-range/unspecified value in either is the faithful
 /// `invalid_argument` the shared decoders build.
 pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableRecord, Status> {
-    let task = super::model_task_from_proto(table.task)?;
+    let task = table.task.map(super::model_task_from_proto).transpose()?;
+    let producer = Producer::from_columns(table.model_id, task).ok_or_else(|| {
+        Status::invalid_argument("a result table naming a model names the task it ran")
+    })?;
     let kind = result_table_kind_from_proto(table.kind)?;
     // `ResultTableRecord::from_wire_projection` is the sole authorized
     // cross-crate constructor: `dimensions`'s privacy otherwise closes off
@@ -213,8 +219,7 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
     Ok(ResultTableRecord::from_wire_projection(
         table.table_name,
         table.source_id,
-        table.model_id,
-        task,
+        producer,
         kind,
         table.derived_from,
         table.dimensions,
@@ -254,7 +259,7 @@ mod result_table_kind_tests {
     };
     use crate::proto::embedding as pb;
     use jammi_datafusion::ModelTask;
-    use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+    use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 
     /// Discriminants scanned when deriving the wire enum's value set. Well
     /// above the served range, so the scan below is a genuine enumeration of
@@ -375,8 +380,9 @@ mod result_table_kind_tests {
         let record = ResultTableRecord::from_wire_projection(
             "jammi_train_set_1".to_string(),
             "src-1".to_string(),
-            "model-1".to_string(),
-            ModelTask::TextEmbedding,
+            Producer::Derivation {
+                task: Some(ModelTask::TextEmbedding),
+            },
             ResultTableKind::TrainingSet,
             None,
             0,

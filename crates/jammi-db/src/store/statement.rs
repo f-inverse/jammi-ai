@@ -23,22 +23,15 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use tracing::warn;
 
-use crate::catalog::result_repo::{ResultTableCas, ResultTableKind, ResultTableRecord};
+use crate::catalog::result_repo::{Producer, ResultTableCas, ResultTableKind, ResultTableRecord};
 use crate::error::{JammiError, Result};
 use crate::session::QueryContext;
 use crate::store::building::BuildingTable;
 use crate::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
 use crate::store::{ResultStore, ResultTableOrigin, SinkKind};
-use jammi_datafusion::ModelTask;
 
 #[cfg(doc)]
 use crate::catalog::result_repo::CreateResultTableParams;
-
-/// The provenance id a statement's result table carries in its `model_id`
-/// column — a statement invokes no model, but the column is NOT NULL, so a
-/// stable sentinel rides it (the shape the as-of join and training-set
-/// producers use).
-const STATEMENT_MODEL_ID: &str = "statement";
 
 /// What a `CREATE TABLE <name> AS <query>` asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
@@ -108,13 +101,9 @@ impl ResultStore {
                 table_name,
                 ResultTableOrigin {
                     source_id,
-                    // A statement's rows are filed under no model task; the
-                    // column is NOT NULL, so the same filler every non-model
-                    // producer stamps.
-                    task: ModelTask::TextEmbedding,
+                    producer: Producer::Derivation { task: None },
                     kind: ResultTableKind::Statement,
                     derived_from: None,
-                    model_id: STATEMENT_MODEL_ID,
                     dimensions: None,
                     key_column: None,
                     text_columns: None,

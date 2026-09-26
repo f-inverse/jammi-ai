@@ -26,6 +26,13 @@ RUN yum install -y sqlite-libs \
 RUN yum install -y jq openssh-clients rsync tmux util-linux perl-Digest-SHA glibc-langpack-en \
     && yum clean all
 
+# The Perl modules OpenSSL's `Configure` needs to build OpenSSL from source —
+# what `native-tls`'s `vendored` feature does (`openssl-src`), so an artifact
+# links OpenSSL statically rather than carrying a `DT_NEEDED libssl` the
+# manylinux platform tag does not promise.
+RUN yum install -y perl-IPC-Cmd perl-Time-Piece \
+    && yum clean all
+
 # PyYAML: a declared prerequisite of `ci/scripts/check_execution_surface_
 # reachability.py`'s shared workflow loader (the `on:`/`jobs:` YAML parse
 # every gate built on it -- `check_gpu_prove_once.py`, `check_lint_surface_

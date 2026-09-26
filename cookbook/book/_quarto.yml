@@ -65,6 +65,7 @@ book:
     - part: "The unified client surface"
       chapters:
         - chapters/21-unified-client/unified-client.qmd
+        - chapters/28-surfaces/surfaces.qmd
     - part: "Precision — storage and compute"
       chapters:
         - chapters/22-precision/precision.qmd

@@ -4577,12 +4577,15 @@ dependencies = [
 name = "jammi-cli"
 version = "0.49.1"
 dependencies = [
+ "arrow",
  "arrow-schema",
  "assert_cmd",
  "clap",
  "jammi-admin",
+ "jammi-client",
  "jammi-datafusion",
  "jammi-db",
+ "jammi-wire",
  "predicates",
  "serde",
  "serde_json",

@@ -1,5 +1,7 @@
 # Quickstart: Rust
 
+> **Measured companion:** the [One program, four surfaces](https://f-inverse.github.io/jammi-ai/cookbook/chapters/28-surfaces/surfaces.html) chapter builds and runs this program's shape — `add_source`, `generate_text_embeddings`, `search_by_id` — beside the CLI, Python and TypeScript and checks they return the same rows.
+
 This walkthrough registers a local data file, runs a SQL query, generates embeddings, and performs a semantic search — all in one program.
 
 ## Full example

@@ -1,17 +1,19 @@
-//! `jammi` — the strict gRPC control-plane client CLI.
+//! `jammi` — the strict gRPC client CLI.
 //!
 //! The CLI talks to a running `jammi-server` over the `jammi.v1` wire surface
 //! and never touches the catalog or storage in-process: it opens a
-//! [`CatalogClient`] against a `--target` endpoint and dispatches each
-//! subcommand to one or more control verbs. There is no embedded engine here —
-//! `jammi serve` lives in the `jammi-server` binary, not this CLI — and the
-//! crate depends on `jammi-admin`, not `jammi-ai`, so the candle stack never
+//! [`DataClient`] against a `--target` endpoint and dispatches each
+//! subcommand — `embed` and `search` to the data verbs, every other one to the
+//! control verbs of the [`jammi_admin::CatalogClient`] the data client composes over the
+//! same session. There is no embedded engine here — `jammi serve` lives in the
+//! `jammi-server` binary, not this CLI — and the crate depends on
+//! `jammi-admin` and `jammi-client`, not `jammi-ai`, so the candle stack never
 //! reaches the `jammi` binary.
 
 mod commands;
 
 use clap::{Parser, Subcommand};
-use jammi_admin::CatalogClient;
+use jammi_client::DataClient;
 
 /// Default endpoint: the server's Flight-SQL + gRPC listener
 /// (`flight_listen = "0.0.0.0:8081"`).
@@ -68,6 +70,10 @@ enum Commands {
         #[command(subcommand)]
         action: commands::mutable::MutableAction,
     },
+    /// Embed a source's columns on the server, persisting one vector per row
+    Embed(commands::embed::EmbedArgs),
+    /// Search a source's embedding table for the rows nearest a row's vector
+    Search(commands::search::SearchArgs),
     /// Observe/manage durable jobs (list, per-job status, cancel, prune).
     /// Jobs are submitted through the data-plane client / SDK — this surface
     /// is the control-plane read + cancel + prune peer, over every job kind
@@ -106,7 +112,7 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    // `--help` / `--version` / no-subcommand must not connect: `CatalogClient
+    // `--help` / `--version` / no-subcommand must not connect: `DataClient
     // ::connect` eagerly dials the endpoint, so the no-verb path prints help and
     // returns before any connection is attempted.
     let Some(command) = cli.command else {
@@ -129,7 +135,7 @@ async fn run(
     tenant: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = endpoint_from_target(target)?;
-    let client = CatalogClient::connect(endpoint).await?;
+    let client = DataClient::connect(endpoint).await?;
 
     // Bind the tenant before any verb. An unbound/unknown session id maps to an
     // *unscoped* (all-tenants) view server-side with no error, so a `--tenant`
@@ -138,30 +144,38 @@ async fn run(
     // (gRPC header) carries.
     if let Some(t) = tenant {
         use std::str::FromStr;
-        client.bind_tenant(jammi_db::TenantId::from_str(t)?).await?;
+        client
+            .catalog()
+            .bind_tenant(jammi_db::TenantId::from_str(t)?)
+            .await?;
     }
 
     dispatch(&client, command).await
 }
 
+/// Run `command` over `client`: a data verb through the data client, every
+/// other verb through the control client it composes over the same session.
 async fn dispatch(
-    client: &CatalogClient,
+    client: &DataClient,
     command: Commands,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let catalog = client.catalog();
     match command {
-        Commands::Status => commands::status::run(client).await,
-        Commands::Sources { action } => commands::sources::run(client, action).await,
-        Commands::Models { action } => commands::models::run(client, action).await,
-        Commands::Trigger { action } => commands::trigger::run(client, action).await,
-        Commands::Channels { action } => commands::channels::run(client, action).await,
-        Commands::Mutable { action } => commands::mutable::run(client, action).await,
-        Commands::Jobs { action } => commands::jobs::run(client, action).await,
-        Commands::Workers { action } => commands::workers::run(client, action).await,
+        Commands::Status => commands::status::run(catalog).await,
+        Commands::Sources { action } => commands::sources::run(catalog, action).await,
+        Commands::Models { action } => commands::models::run(catalog, action).await,
+        Commands::Trigger { action } => commands::trigger::run(catalog, action).await,
+        Commands::Channels { action } => commands::channels::run(catalog, action).await,
+        Commands::Mutable { action } => commands::mutable::run(catalog, action).await,
+        Commands::Embed(args) => commands::embed::run(client, args).await,
+        Commands::Search(args) => commands::search::run(client, args).await,
+        Commands::Jobs { action } => commands::jobs::run(catalog, action).await,
+        Commands::Workers { action } => commands::workers::run(catalog, action).await,
         Commands::Reconcile {
             apply,
             grace_secs,
             all,
-        } => commands::reconcile::run(client, apply, grace_secs, all).await,
+        } => commands::reconcile::run(catalog, apply, grace_secs, all).await,
     }
 }
 

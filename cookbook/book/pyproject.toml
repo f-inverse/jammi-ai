@@ -54,6 +54,7 @@ packages = ["jammi_cookbook"]
 jammi_cookbook = [
     "goldens/*.json",
     "_api_reference.md",
+    "_programs/one_program/*",
     "_fixtures/air_routes/*",
     "_fixtures/arxiv_small/*",
     "_fixtures/htsat_clap_tiny/*",

@@ -6,8 +6,9 @@ Every book chapter (``chapters/**/*.qmd``) and every recipe
 ``cookbook/notebooks/``, opened in Colab straight from GitHub. A notebook's
 first cell installs the release it was built for — ``jammi-ai`` with the CUDA
 engine (``jammi-ai-native-cu12``) on an sm_80+ GPU runtime and the CPU engine
-otherwise, ``jammi-server`` when the chapter starts one, and
-``jammi-cookbook`` (the library and the fixtures). It runs the chapter at
+otherwise, ``jammi-server`` when the chapter starts one, and the cookbook's
+library and fixtures from the release's own tag on GitHub (the book is not a
+published package). It runs the chapter at
 ``small`` scale, in minutes; ``full`` — the published data and real encoders,
 where a keystone fine-tune alone takes hours on an L4 — is one line to opt
 into.
@@ -113,12 +114,17 @@ def notebook(cells: list[dict]) -> dict:
 def setup_cell(release: str, *, server: bool) -> dict:
     """Install the release this notebook was built for, on the engine the
     runtime can run, and choose the scale."""
-    packages = f'"jammi-ai=={release}", engine + "=={release}", "jammi-cookbook=={release}"'
+    cookbook = (
+        f"jammi-cookbook @ git+https://github.com/{GITHUB}@py-v{release}"
+        "#subdirectory=cookbook/book"
+    )
+    packages = f'"jammi-ai=={release}", engine + "=={release}", "{cookbook}"'
     if server:
         packages += f', server + "=={release}"'
     return code(
         f"""# Setup: jammi {release} — the CUDA engine on an sm_80+ GPU (L4, A100, …), the
-# CPU engine otherwise — and the cookbook's library and fixtures. The chapter runs
+# CPU engine otherwise — and the cookbook's library and fixtures, from the release's
+# tag on GitHub. The chapter runs
 # at `small` scale, over the committed fixtures, in minutes. SCALE = "full" runs
 # it over the published data and real encoders instead: meant for a GPU, and the
 # chapters that fine-tune take hours there.

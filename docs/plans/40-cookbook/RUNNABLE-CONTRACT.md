@@ -260,6 +260,17 @@ Gaussian heads under-cover out of sample; the declared-edge fine-tune lifts
 precision about as much as propagation, not more. No budget or seed was searched
 to make an old claim pass.
 
+### D24 — the cookbook installs from its release tag, not from PyPI
+
+Phase 3 first published the book's library and fixtures as a `jammi-cookbook`
+PyPI package. Nothing installs cookbook helpers outside a notebook, so the
+package bought a second PyPI project, a trusted publisher and a release workflow
+for no reader. A notebook now installs the library from the tag its release was
+built at (`jammi-cookbook @ git+…@py-vX#subdirectory=cookbook/book`): the same
+pin, and the same wheel contents, since pip builds it from the book's own
+`pyproject.toml`. The cost is the setup cell cloning the tagged tree (≈120 MB)
+where the wheel was 2.6 MB. `pypi-cookbook.yml` is deleted.
+
 ## Cuts
 
 - **T4 / sm_75.** The CUDA wheel targets sm_80+; a T4 Colab runtime runs the

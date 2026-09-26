@@ -111,7 +111,11 @@ def test_a_chapter_keeps_its_cells_in_order_and_drops_their_options(tree):
 def test_the_setup_pins_the_release_and_installs_a_server_only_when_needed(tree):
     served = _text(build.setup_cell("9.9.9", server=True))
     plain = _text(build.setup_cell("9.9.9", server=False))
-    assert '"jammi-ai==9.9.9", engine + "==9.9.9", "jammi-cookbook==9.9.9"' in plain
+    assert '"jammi-ai==9.9.9", engine + "==9.9.9"' in plain
+    assert (
+        f'"jammi-cookbook @ git+https://github.com/{build.GITHUB}@py-v9.9.9'
+        '#subdirectory=cookbook/book"'
+    ) in plain
     assert 'server + "==9.9.9"' in served and 'server + "' not in plain
 
 

@@ -51,6 +51,10 @@ from jammi_cookbook import contracts, precision, scale
 SCALE = scale.current()
 K = precision.K
 corpus = precision.corpus(SCALE)
+# Recall@1 moves a whole query at a time, and a coordinate at the sign boundary
+# can quantize to either bit on another CPU: its tolerance admits one query's
+# difference and never two.
+AT_1_TOL = max(0.02, 1.5 / len(corpus.queries))
 print(f"corpus {len(corpus.corpus_ids):,} papers × {corpus.dims} dims, "
       f"{len(corpus.queries)} held-out queries")
 ```
@@ -92,7 +96,8 @@ assert (default_at_1, default_at_10) == (explicit_at_1, explicit_at_10), \
     "an unset oversample resolves to binary's own default of 32"
 for metric, value in [("f32_at_1", f32_at_1), ("f32_at_10", f32_at_10),
                       ("binary_default_at_1", default_at_1), ("binary_default_at_10", default_at_10)]:
-    contracts.assert_close(f"binary_precision.{metric}", value, tol=0.02)
+    contracts.assert_close(f"binary_precision.{metric}", value,
+                           tol=AT_1_TOL if metric.endswith("_at_1") else 0.02)
 contracts.assert_close("binary_precision.graph_ratio", graph_ratio, tol=0.03)
 ```
 
@@ -184,7 +189,7 @@ for ov in GRID:
 ```{python}
 # | echo: false
 for ov in GRID:
-    contracts.assert_close(f"binary_precision.os{ov}_at_1", sweep[ov][0], tol=0.02)
+    contracts.assert_close(f"binary_precision.os{ov}_at_1", sweep[ov][0], tol=AT_1_TOL)
     contracts.assert_close(f"binary_precision.os{ov}_at_10", sweep[ov][1], tol=0.02)
 assert sweep[1][1] < sweep[32][1], "a narrow candidate set loses true neighbours"
 assert all(sweep[a][1] <= sweep[b][1] + 1e-9 for a, b in zip(GRID, GRID[1:])), sweep

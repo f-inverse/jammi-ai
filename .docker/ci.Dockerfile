@@ -26,6 +26,13 @@ RUN yum install -y sqlite-libs \
 RUN yum install -y jq openssh-clients rsync tmux util-linux perl-Digest-SHA glibc-langpack-en \
     && yum clean all
 
+# The Perl modules OpenSSL's `Configure` needs to build OpenSSL from source —
+# what `native-tls`'s `vendored` feature does (`openssl-src`), so an artifact
+# links OpenSSL statically rather than carrying a `DT_NEEDED libssl` the
+# manylinux platform tag does not promise.
+RUN yum install -y perl-IPC-Cmd perl-Time-Piece \
+    && yum clean all
+
 # PyYAML: a declared prerequisite of `ci/scripts/check_execution_surface_
 # reachability.py`'s shared workflow loader (the `on:`/`jobs:` YAML parse
 # every gate built on it -- `check_gpu_prove_once.py`, `check_lint_surface_
@@ -53,6 +60,14 @@ RUN yum install -y jq openssh-clients rsync tmux util-linux perl-Digest-SHA glib
 # actually protects the gates, not an assumption about this RUN line.
 RUN python3 -m ensurepip --upgrade \
     && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors
+
+# The system interpreter's development link (`libpython3.12.so`, beside the
+# runtime `libpython3.12.so.1.0`). `jammi-python` built without pyo3's
+# `extension-module` — its `cargo test`, outside maturin — links
+# `-lpython3.12` against this interpreter, and the runtime library alone
+# carries no unversioned link name for the linker to find.
+RUN yum install -y python3.12-devel \
+    && yum clean all
 
 # Per-arch download variables. TARGETARCH is set by buildx per platform
 # (`linux/amd64` -> `amd64`, `linux/arm64` -> `arm64`) and is NOT the same

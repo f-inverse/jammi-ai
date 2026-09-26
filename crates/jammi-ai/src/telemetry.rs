@@ -1,6 +1,6 @@
 //! The tracing layers a host installs: the log formatter
-//! ([`fmt_layer`]), vendor-neutral OTLP trace export, and W3C `traceparent`
-//! continuation.
+//! ([`fmt_layer`](crate::telemetry::fmt_layer)), vendor-neutral OTLP trace
+//! export, and W3C `traceparent` continuation.
 //!
 //! This module is the ONE place `jammi-server`'s `telemetry::install` /
 //! `TraceContextLayer` and `jammi-python`'s `open_local` subscriber wiring

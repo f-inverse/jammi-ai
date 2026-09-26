@@ -190,7 +190,7 @@ async fn text_embeddings_served_over_the_wire_on_gpu() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search by GPU-encoded query vector")

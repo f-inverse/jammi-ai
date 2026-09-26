@@ -251,7 +251,7 @@ fn config_for(artifact_dir: &Path, device: i32, precision: ComputePrecision) -> 
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
-            device,
+            device: Some(device),
             require_gpu: device >= 0,
             compute_precision: precision,
             ..Default::default()

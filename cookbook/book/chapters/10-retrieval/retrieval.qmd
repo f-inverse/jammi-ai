@@ -8,7 +8,7 @@ import jammi_cookbook
 ```
 
 **Recipe:** `encode_query` + `search(embedding_table=…)` ·
-`build_lexical_index` + `lexical_search` · `rrf_fuse` ·
+`build_lexical_index` + `lexical_search` · `search(filter=…)` · `rrf_fuse` ·
 `assemble_context(hybrid=True)` · **Theory:** dense vs sparse retrieval,
 reciprocal rank fusion [@cormack2009rrf], the BM25 probabilistic-relevance
 baseline [@robertson2009bm25] · **Rail:** measurement (per-method
@@ -178,6 +178,68 @@ enough to show. The large lever is the one tier 02 taught — **graph propagatio
 moves precision@10 by several points, where fusion moves it by less than its
 noise. Measure each arm first; fuse only when the paired difference says the
 fused list beats the best single arm.
+
+## Filtered retrieval — ranking only the rows a predicate admits
+
+A `filter` is a SQL predicate over the source's columns, and both searches rank
+**only the rows it admits**: the predicate is evaluated once, and the index is
+searched within that set — each segment scores a small admitted set exactly, or
+walks its graph admitting only those rows when the set is large. A selective
+filter therefore costs work in proportion to the rows it admits, and returns the
+exact filtered answer however far those rows sit from the query.
+
+The filter here is deliberately selective: the papers of the sparsest
+publication year. The truth for each search is computed independently — the
+admitted keys from SQL, the full unfiltered ranking (an exact dense search, a
+BM25 search over every row), and its first `k` admitted rows.
+
+```{python}
+PAPERS = f"{arxiv.papers}.public.{arxiv.papers}"
+sparse = db.sql(
+    f"SELECT year, COUNT(*) AS n FROM {PAPERS} GROUP BY year ORDER BY n, year LIMIT 1"
+).to_pylist()[0]
+predicate = f"year = {sparse['year']}"
+admitted = set(db.sql(f"SELECT paper_id FROM {PAPERS} WHERE {predicate}").column(0).to_pylist())
+n_papers = db.sql(f"SELECT COUNT(*) AS n FROM {PAPERS}").column(0)[0].as_py()
+K = 5
+q = queries[0]
+
+
+def first_admitted(ranking: list[str]) -> list[str]:
+    return [r for r in ranking if r in admitted][:K]
+
+
+everything = db.search(
+    arxiv.papers, query=query_vectors[q], k=n_papers, embedding_table=raw, exact=True
+).column("_row_id").to_pylist()
+dense_filtered = db.search(
+    arxiv.papers, query=query_vectors[q], k=K, embedding_table=raw, filter=predicate
+).column("_row_id").to_pylist()
+lexical_all = db.lexical_search(
+    arxiv.papers, text=query_text[q], k=n_papers, lexical_table=lexical
+).column("_row_id").to_pylist()
+lexical_filtered = db.lexical_search(
+    arxiv.papers, text=query_text[q], k=K, lexical_table=lexical, filter=predicate
+).column("_row_id").to_pylist()
+
+reach = min(everything.index(r) for r in admitted) + 1
+print(f"filter: {predicate} admits {len(admitted)} of {n_papers} papers")
+print(f"nearest admitted paper sits at rank {reach} of the unfiltered ranking")
+print(f"dense   filtered top-{K}: {dense_filtered}")
+print(f"lexical filtered top-{K}: {lexical_filtered}")
+```
+
+```{python}
+# | echo: false
+assert len(admitted) < n_papers
+assert dense_filtered == first_admitted(everything)
+assert lexical_filtered == first_admitted(lexical_all)
+assert set(dense_filtered) <= admitted and set(lexical_filtered) <= admitted
+```
+
+A search that ranked first and filtered after would have had to rank the
+`reach` nearest rows to find even the first admitted one; ranking within the
+admitted set gets the same answer without that breadth.
 
 ## `assemble_context(hybrid=True)` — a context from similarity and citations
 

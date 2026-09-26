@@ -8549,7 +8549,7 @@ struct RunFineTuneParams {
     cancel: Arc<AtomicBool>,
     /// The session's one shared [`crate::model::hub::HubSource`] —
     /// `build_encoder_adapters`'s HF-fallback arm threads this through
-    /// rather than building its own `hf_hub::api::sync::Api`.
+    /// rather than building a Hub client of its own.
     hub: HubSource,
 }
 
@@ -9465,8 +9465,8 @@ struct BuildEncoderAdaptersParams<'a> {
     varmap: &'a candle_nn::VarMap,
     device: &'a candle_core::Device,
     /// The session's one shared [`crate::model::hub::HubSource`] —
-    /// the HF-fallback arm threads this through rather than building its own
-    /// `hf_hub::api::sync::Api`.
+    /// the HF-fallback arm threads this through rather than building a Hub
+    /// client of its own.
     hub: &'a HubSource,
     /// This rank's dropout-mask seed (`RankContext::dropout_seed(config.seed)`
     /// — rank 0 is the identity, so a single-rank run passes `config.seed`):
@@ -9547,7 +9547,7 @@ fn build_encoder_adapters(
                 // resolved the model — see `super::super::model::resolver`
                 // and `crate::model::hub`'s module docs for why the promise
                 // is Hub-only. This arm reaches the Hub exactly the same way
-                // (`hub.api().model(..).get(..)`), so it must refuse
+                // (`hub.model(..).get(..)`), so it must refuse
                 // identically rather than silently falling through to a
                 // live network fetch offline was supposed to forbid.
                 if hub.offline() {
@@ -9559,16 +9559,18 @@ fn build_encoder_adapters(
                         ),
                     });
                 }
-                // Shared `HubSource` — the session's ONE Hub client, not a
-                // fresh `Api::new()` built here (which would not read
-                // `HF_TOKEN`, would ignore `[models]` entirely, and can panic
-                // outright when `HOME` is unset).
-                let repo = hub.api().model(catalog_model_id.clone());
-                let weights = repo.get("model.safetensors").map_err(|e| {
-                    JammiError::FineTune(format!(
-                        "Cannot locate '{catalog_model_id}' in HF hub cache: {e}"
-                    ))
-                })?;
+                // Shared `HubSource` — the session's ONE Hub client, with
+                // `[models]`'s cache root, token and idle timeout. A stalled
+                // or unreachable Hub stays the retryable `Unavailable` it is;
+                // only a repo without the file is this fine-tune's refusal.
+                let weights = tokio::runtime::Handle::current()
+                    .block_on(hub.model(&catalog_model_id).get("model.safetensors"))?
+                    .ok_or_else(|| {
+                        JammiError::FineTune(format!(
+                            "Cannot locate '{catalog_model_id}' on the Hub: the repo has no \
+                             model.safetensors"
+                        ))
+                    })?;
                 weights
                     .parent()
                     .ok_or_else(|| {
@@ -11941,7 +11943,7 @@ mod tests {
 
     /// `build_encoder_adapters`'s HF-fallback arm (reached
     /// when a fine-tune base model's catalog row carries no
-    /// `artifact_path`) calls `hub.api().model(..).get(..)` exactly like
+    /// `artifact_path`) calls `hub.model(..).get(..)` exactly like
     /// the resolver's own `HuggingFace` arm, so `[models] offline = true`
     /// must refuse it identically — never fall through to a live network
     /// fetch offline is supposed to forbid. No mock server is configured

@@ -96,6 +96,7 @@ from .errors import (
     NotSupportedOnBackend,
     JobCancelled,
     TrainingError,
+    Unavailable,
     VersionUnavailable,
 )
 from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc, error_pb2
@@ -143,6 +144,7 @@ _CODE_CLASS = {
     grpc.StatusCode.INVALID_ARGUMENT: InvalidArgument,
     grpc.StatusCode.UNIMPLEMENTED: NotSupportedOnBackend,
     grpc.StatusCode.NOT_FOUND: NotFound,
+    grpc.StatusCode.UNAVAILABLE: Unavailable,
     grpc.StatusCode.ALREADY_EXISTS: AlreadyExists,
     grpc.StatusCode.FAILED_PRECONDITION: FailedPrecondition,
 }
@@ -184,9 +186,9 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
       did not mount.
     * ``NOT_FOUND`` / ``ALREADY_EXISTS`` / ``FAILED_PRECONDITION`` →
       :class:`NotFound` / :class:`AlreadyExists` / :class:`FailedPrecondition`.
+    * ``UNAVAILABLE`` → :class:`Unavailable` — retryable.
     * everything else (``RESOURCE_EXHAUSTED`` — the receive-cap edge —,
-      ``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, ``INTERNAL``, …) →
-      :class:`BackendError`.
+      ``DEADLINE_EXCEEDED``, ``INTERNAL``, …) → :class:`BackendError`.
 
     The originating grpc ``StatusCode`` rides on the mapped exception's ``code``
     attribute so the few call-sites that branch on ``NOT_FOUND`` (``describe_*``

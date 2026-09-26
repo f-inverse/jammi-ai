@@ -205,6 +205,14 @@ class NotFound(BackendError):
     """
 
 
+class Unavailable(BackendError):
+    """What the call needs could not be reached right now — a Hugging Face
+    Hub download that stalled or could not connect, a peer that holds a
+    segment. The same call may succeed later: this is the condition to retry
+    on. ``UNAVAILABLE`` on the remote transport.
+    """
+
+
 class AlreadyExists(BackendError):
     """The thing being created exists already — a channel id, a mutable table,
     a column declared twice. ``ALREADY_EXISTS`` on the remote transport.

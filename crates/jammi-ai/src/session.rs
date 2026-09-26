@@ -328,8 +328,7 @@ impl InferenceSession {
         // The Hub choke point: `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
         // HuggingFace arm, the fine-tune worker's HF fallback) shares this
-        // one client rather than each re-deriving its own from
-        // `hf_hub::api::sync::Api::new()`/`ApiBuilder::from_env()`. Process
+        // one client rather than each re-deriving its own. Process
         // env is read HERE (the `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`
         // fallbacks) — never inside `JammiConfig::load_from`, which stays
         // process-env-free.

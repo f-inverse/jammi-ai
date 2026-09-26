@@ -438,17 +438,22 @@ pub enum JammiError {
         instant: String,
     },
 
-    /// A resource the request needs could not be reached after the bounded
-    /// failure ladder: a placed segment whose owner and retry candidate both
-    /// failed and whose local load was not admitted (or not attempted). Names
-    /// the resource (`segment {table}/{id}`) and the last failure's reason. A
-    /// peer outage is visible — never masked by a silent full scan of a
-    /// larger-than-memory table. Maps to gRPC `Unavailable`.
+    /// A resource the request needs could not be reached right now; the same
+    /// request may succeed later. Names the resource and why:
+    /// - a placed segment (`segment {table}/{id}`) whose owner and retry
+    ///   candidate both failed and whose local load was not admitted (or not
+    ///   attempted) — a peer outage is visible, never masked by a silent full
+    ///   scan of a larger-than-memory table;
+    /// - a Hugging Face Hub file (`hf://{repo}/{file}`) whose transfer could
+    ///   not connect, or went `[models] hub_idle_timeout_secs` without a byte
+    ///   — a stalled download fails, never waits forever.
+    ///
+    /// Maps to gRPC `Unavailable`, the retryable code.
     #[error("unavailable: {resource}: {reason}")]
     Unavailable {
         /// The resource that could not be served.
         resource: String,
-        /// Why the last rung of the ladder failed.
+        /// Why it could not be reached.
         reason: String,
     },
 

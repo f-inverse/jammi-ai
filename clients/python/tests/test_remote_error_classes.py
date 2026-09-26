@@ -18,6 +18,7 @@ from jammi.errors import (
     ModelReferenced,
     NoReadyIndex,
     NotFound,
+    Unavailable,
 )
 
 
@@ -70,6 +71,10 @@ def test_without_a_detail_the_code_decides() -> None:
         _rpc_to_jammi(_FailedCall(grpc.StatusCode.FAILED_PRECONDITION, "m")), FailedPrecondition
     )
     assert type(_rpc_to_jammi(_FailedCall(grpc.StatusCode.INTERNAL, "m"))) is BackendError
+    # A stalled Hub download (and any other unreachable resource) is the
+    # retryable refinement of BackendError.
+    stalled = _rpc_to_jammi(_FailedCall(grpc.StatusCode.UNAVAILABLE, "m"))
+    assert type(stalled) is Unavailable and isinstance(stalled, BackendError)
     assert isinstance(
         _rpc_to_jammi(_FailedCall(grpc.StatusCode.INVALID_ARGUMENT, "m")), InvalidArgument
     )

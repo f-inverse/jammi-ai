@@ -2054,7 +2054,9 @@ def test_remote_rpc_status_errors_map_onto_the_taxonomy():
     * ``INVALID_ARGUMENT`` → :class:`InvalidArgument` — the SAME class the
       embedded engine raises for a server-detected bad argument (``status_to_pyerr``),
       the two-sided parity the client-side format pre-rejection could NOT prove;
-    * ``RESOURCE_EXHAUSTED`` (the 64 MiB receive-cap edge) / ``UNAVAILABLE`` /
+    * ``UNAVAILABLE`` → :class:`Unavailable`, the retryable refinement of
+      :class:`BackendError`;
+    * ``RESOURCE_EXHAUSTED`` (the 64 MiB receive-cap edge) /
       ``DEADLINE_EXCEEDED`` / ``INTERNAL`` → :class:`BackendError`;
     * ``UNIMPLEMENTED`` → :class:`NotSupportedOnBackend`.
 
@@ -2064,12 +2066,14 @@ def test_remote_rpc_status_errors_map_onto_the_taxonomy():
         BackendError,
         InvalidArgument,
         NotSupportedOnBackend,
+        Unavailable,
     )
 
+    assert issubclass(Unavailable, BackendError)
     cases = [
         (grpc.StatusCode.INVALID_ARGUMENT, InvalidArgument),
         (grpc.StatusCode.RESOURCE_EXHAUSTED, BackendError),
-        (grpc.StatusCode.UNAVAILABLE, BackendError),
+        (grpc.StatusCode.UNAVAILABLE, Unavailable),
         (grpc.StatusCode.DEADLINE_EXCEEDED, BackendError),
         (grpc.StatusCode.INTERNAL, BackendError),
         (grpc.StatusCode.UNIMPLEMENTED, NotSupportedOnBackend),

@@ -64,8 +64,9 @@ tokio.workspace = true
 # right choice when the produced cdylib is loaded by a Python interpreter.
 # The maturin build activates it explicitly via `features =
 # ["extension-module"]` in `pyproject.toml`. Leaving it OFF by default
-# means `cargo test --workspace` links the integration test binary
-# against libpython and runs cleanly without per-crate flags.
+# means `cargo test -p jammi-python` links the crate's test binaries against
+# libpython — the CI image carries the interpreter's development link — so
+# they run as ordinary Rust tests.
 extension-module = ["pyo3/extension-module"]
 # The accelerator the embedded engine runs on, by-name passthroughs to
 # `jammi-ai`'s own features — the same surface `jammi-server` forwards, so the

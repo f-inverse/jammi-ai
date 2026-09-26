@@ -2,9 +2,12 @@
 //! ([`fmt_layer`](crate::telemetry::fmt_layer)), vendor-neutral OTLP trace
 //! export, and W3C `traceparent` continuation.
 //!
-//! This module is the ONE place `jammi-server`'s `telemetry::install` /
-//! `TraceContextLayer` and `jammi-python`'s `open_local` subscriber wiring
-//! both reach for the OTLP mechanism: the factory that turns a
+//! This module is the ONE place a host's subscriber comes from:
+//! [`layers`](crate::telemetry::layers) composes the formatter and the OTLP
+//! export layer for `jammi-server`'s `telemetry::init_tracing` and
+//! `jammi-python`'s `open_local` alike, keeps the export layer's tracer
+//! provider alive for the process, and
+//! [`flush_otlp`](crate::telemetry::flush_otlp) stops it at shutdown. The factory that turns a
 //! [`jammi_db::config::ObservabilityConfig`] into a live exporter lives in
 //! the library, not duplicated per consumer.
 //!
@@ -31,7 +34,7 @@
 //! provider. A process with no configured endpoint opens no network
 //! connection for tracing, full stop.
 
-use jammi_db::config::{LogFormat, LoggingConfig, ObservabilityConfig};
+use jammi_db::config::{JammiConfig, LogFormat, LoggingConfig, ObservabilityConfig};
 use jammi_db::error::{JammiError, Result};
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::Interest;
@@ -372,6 +375,79 @@ mod otlp {
 #[cfg(feature = "telemetry-otlp")]
 pub use otlp::{otlp_layer, set_parent_from_headers, Otlp, OtlpLayer, OtlpProviderHandle};
 
+/// A boxed layer over the one base subscriber every host composes on.
+pub type HostLayer = Box<dyn Layer<Registry> + Send + Sync>;
+
+/// The tracing layers a host installs over a [`Registry`]: the log formatter
+/// over `writer` ([`fmt_layer`]) and, when `[observability] otlp_endpoint`
+/// is configured, the OTLP export layer. An endpoint this build cannot
+/// honour is refused before anything is built
+/// ([`refuse_if_endpoint_without_feature`]).
+///
+/// The export layer's tracer provider is kept alive for the process —
+/// dropping it would stop every span exporting — and [`flush_otlp`] flushes
+/// and stops it at shutdown. A host that builds layers more than once (an
+/// embedded engine a script connects to twice) keeps the first provider;
+/// the exporter a later build drives is configured identically.
+///
+/// A `Vec` of boxed layers is itself one `Layer<Registry>`: each element
+/// applies to the same base `Registry` as a sibling, which a chain of boxed
+/// `.with()` calls could not name.
+pub fn layers<W>(
+    config: &JammiConfig,
+    host_default: LevelFilter,
+    writer: W,
+    ansi: bool,
+) -> Result<Vec<HostLayer>>
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    refuse_if_endpoint_without_feature(&config.observability)?;
+    let formatter = fmt_layer(&config.logging, host_default, writer, ansi);
+    Ok(std::iter::once(formatter)
+        .chain(export_layer(&config.observability)?)
+        .collect())
+}
+
+/// The tracer provider [`layers`] built an export layer from, kept alive for
+/// the process.
+#[cfg(feature = "telemetry-otlp")]
+static OTLP_PROVIDER: std::sync::OnceLock<OtlpProviderHandle> = std::sync::OnceLock::new();
+
+/// The OTLP export layer `config` names, if any.
+#[cfg(feature = "telemetry-otlp")]
+fn export_layer(config: &ObservabilityConfig) -> Result<Option<HostLayer>> {
+    Ok(otlp_layer(config)?.map(|otlp| {
+        OTLP_PROVIDER.get_or_init(|| otlp.provider_handle());
+        Box::new(otlp.layer) as HostLayer
+    }))
+}
+
+/// Without the `telemetry-otlp` feature there is no export layer to build;
+/// a configured endpoint was already refused.
+#[cfg(not(feature = "telemetry-otlp"))]
+fn export_layer(_config: &ObservabilityConfig) -> Result<Option<HostLayer>> {
+    Ok(None)
+}
+
+/// Flush and stop the OTLP exporter [`layers`] started, when one was
+/// configured: `force_flush` (every buffered span sent, or the exporter's own
+/// timeout), then `shutdown` (the batch processor's thread and gRPC channel
+/// released). A no-op without the `telemetry-otlp` feature or without a
+/// configured endpoint. A host calls it once its last span-producing work
+/// is done.
+pub fn flush_otlp() {
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(handle) = OTLP_PROVIDER.get() {
+        if let Err(e) = handle.force_flush() {
+            tracing::warn!(error = %e, "OTLP force_flush at shutdown failed");
+        }
+        if let Err(e) = handle.shutdown() {
+            tracing::warn!(error = %e, "OTLP shutdown failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +494,52 @@ mod tests {
         };
         let overridden = emitted(&configured, LevelFilter::WARN);
         assert!(overridden.contains("routine progress"));
+    }
+
+    /// With no endpoint the host installs the formatter alone, and the
+    /// composed subscriber accepts events.
+    #[test]
+    fn layers_without_an_endpoint_are_the_formatter_alone() {
+        let config = JammiConfig::default();
+        let layers = layers(&config, LevelFilter::WARN, std::io::sink, false)
+            .expect("no endpoint must not error");
+        assert_eq!(layers.len(), 1, "no otlp_endpoint -> the formatter alone");
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layers), || {
+            tracing::warn!("layers_without_an_endpoint_are_the_formatter_alone");
+        });
+    }
+
+    /// A configured endpoint adds the export layer beside the formatter.
+    /// Building the tonic `Channel` (lazily — no connection attempt) needs
+    /// an active Tokio reactor.
+    #[tokio::test]
+    #[cfg(feature = "telemetry-otlp")]
+    async fn layers_with_an_endpoint_add_the_otlp_export_layer() {
+        let mut config = JammiConfig::default();
+        config.observability.otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+        let layers = layers(&config, LevelFilter::WARN, std::io::sink, false)
+            .expect("a well-formed endpoint must build");
+        assert_eq!(
+            layers.len(),
+            2,
+            "a configured otlp_endpoint -> formatter + export layer"
+        );
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layers), || {
+            tracing::warn!("layers_with_an_endpoint_add_the_otlp_export_layer");
+        });
+    }
+
+    /// A configured endpoint in a build without the feature is refused
+    /// before any layer is built.
+    #[test]
+    #[cfg(not(feature = "telemetry-otlp"))]
+    fn layers_refuse_an_endpoint_this_build_cannot_honour() {
+        let mut config = JammiConfig::default();
+        config.observability.otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
+        let refused = layers(&config, LevelFilter::WARN, std::io::sink, false)
+            .map(|_| ())
+            .expect_err("the endpoint cannot be honoured");
+        assert!(refused.to_string().contains("telemetry-otlp"), "{refused}");
     }
 
     #[test]

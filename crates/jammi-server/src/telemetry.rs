@@ -17,15 +17,13 @@
 //! # OTLP
 //!
 //! The global subscriber is a [`tracing_subscriber::Registry`] layered with
-//! the `fmt` formatter above, PLUS — when `[observability] otlp_endpoint`
-//! is configured — [`jammi_ai::telemetry::otlp_layer`]'s export layer. A
+//! [`jammi_ai::telemetry::layers`]: the `fmt` formatter above, PLUS — when
+//! `[observability] otlp_endpoint` is configured — the OTLP export layer. A
 //! configured endpoint this build cannot honour (compiled without
 //! `jammi-ai`'s `telemetry-otlp` feature) is a typed startup refusal,
-//! checked BEFORE anything else in [`init_tracing`] — never a silently
-//! dropped span. The tracer-provider handle the exporter depends on is kept
-//! alive for the process in `OTLP_PROVIDER_HANDLE` (private, below): dropping
-//! it would tear down the batch processor's background thread and stop every
-//! future span from ever being sent.
+//! checked BEFORE anything else — never a silently dropped span. The
+//! library keeps the exporter's tracer provider alive for the process, and
+//! both shutdown arms stop it with [`jammi_ai::telemetry::flush_otlp`].
 
 use std::io::{self, IsTerminal};
 
@@ -35,21 +33,10 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{Layer, Registry};
 
 /// A server's log level when neither `[logging] level` nor `RUST_LOG` names
 /// one: a daemon logs its operations.
 const LOG_DEFAULT: LevelFilter = LevelFilter::INFO;
-
-/// Keeps the OTLP tracer-provider's background flush thread and gRPC
-/// channel alive for the process, once [`init_tracing`] configures one.
-/// `OnceLock` rather than an owned return value from [`init_tracing`]
-/// because both server entry points (the standalone binary and `jammi
-/// serve`) call it the same way, before either constructs anything that
-/// would otherwise hold it.
-#[cfg(feature = "telemetry-otlp")]
-static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProviderHandle> =
-    std::sync::OnceLock::new();
 
 /// Install the global tracing subscriber from the engine config.
 ///
@@ -79,58 +66,9 @@ fn install<W>(config: &JammiConfig, writer: W, ansi: bool) -> Result<()>
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    // Refuse a configuration this build cannot honour BEFORE building
-    // anything else — present in every build of `jammi-ai`, feature or not.
-    jammi_ai::telemetry::refuse_if_endpoint_without_feature(&config.observability)?;
-
-    let fmt_layer = jammi_ai::telemetry::fmt_layer(&config.logging, LOG_DEFAULT, writer, ansi);
-
-    // A `Vec<Box<dyn Layer<Registry>>>` is itself one `Layer<Registry>` —
-    // tracing_subscriber's blanket impl applies each element to the SAME
-    // base `Registry` as siblings, exactly like two sequential `.with()`
-    // calls would, but without each successive box needing to satisfy
-    // `Layer<Layered<PriorBox, Registry>>` (a DIFFERENT, ever-growing type
-    // per layer added, which a `Box<dyn Layer<Registry>>` cannot name).
-    // `mut` is only exercised (`.push`ed into) under `telemetry-otlp` — a
-    // `--no-default-features` build never pushes a second layer, so the
-    // binding would otherwise warn as unused in that one configuration.
-    #[cfg_attr(not(feature = "telemetry-otlp"), allow(unused_mut))]
-    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![fmt_layer];
-
-    #[cfg(feature = "telemetry-otlp")]
-    if let Some(otlp) = jammi_ai::telemetry::otlp_layer(&config.observability)? {
-        // Keep the tracer-provider handle alive for the process BEFORE
-        // `.layer` moves into `layers` below — see `OTLP_PROVIDER_HANDLE`'s
-        // docs. `set` returning `Err` (a second `init_tracing` call in the
-        // same process, e.g. a test harness) is not this function's
-        // problem to report; the SAME handle from the first call keeps the
-        // exporter alive regardless.
-        let _ = OTLP_PROVIDER_HANDLE.set(otlp.provider_handle());
-        layers.push(Box::new(otlp.layer));
-    }
-
+    let layers = jammi_ai::telemetry::layers(config, LOG_DEFAULT, writer, ansi)?;
     tracing_subscriber::registry().with(layers).init();
-
     Ok(())
-}
-
-/// Flush and stop the OTLP exporter at shutdown, when one was configured:
-/// `force_flush` (every buffered span sent, or the exporter's own timeout)
-/// then `shutdown` (the batch processor's thread and gRPC channel released).
-/// The `OnceLock` handle itself is never dropped. A no-op without the
-/// `telemetry-otlp` feature or without a configured endpoint. Called by
-/// both shutdown arms after the session has closed — the last
-/// span-producing work is done by then.
-pub fn flush_otlp() {
-    #[cfg(feature = "telemetry-otlp")]
-    if let Some(handle) = OTLP_PROVIDER_HANDLE.get() {
-        if let Err(e) = handle.force_flush() {
-            tracing::warn!(error = %e, "OTLP force_flush at shutdown failed");
-        }
-        if let Err(e) = handle.shutdown() {
-            tracing::warn!(error = %e, "OTLP shutdown failed");
-        }
-    }
 }
 
 #[cfg(test)]

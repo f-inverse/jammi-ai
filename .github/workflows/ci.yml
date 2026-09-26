@@ -85,8 +85,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # `jammi-python` links libpython unless maturin builds it, so it is tested
-      # by the `Test (Python)` job instead.
+      # `jammi-python` links libpython unless maturin builds it, so its Rust
+      # tests run in the `Test (Python)` job, beside its pytest suite.
       - name: Run tests
         run: cargo test --workspace --exclude jammi-python
 
@@ -265,9 +265,9 @@ jobs:
           # > `HF_TOKEN` > the cache's own `token` file) — hf-hub 0.5 itself
           # never reads this variable.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        # Same `jammi-python` exclusion as the hermetic lane: the cdylib
-        # plus integration test need libpython on the linker path, which
-        # only the maturin-managed build (Test (Python) job) provides.
+        # Same `jammi-python` exclusion as the hermetic lane: its cdylib and
+        # integration test link libpython, and the `Test (Python)` job runs
+        # them.
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests
 
   test-clients:
@@ -563,6 +563,12 @@ jobs:
         run: |
           . .venv/bin/activate
           pytest crates/jammi-python/tests -v
+
+      # The crate's Rust tests (`src` unit tests and `tests/it.rs`, which
+      # drives `PyDatabase` from Rust): built without `extension-module`, they
+      # link libpython against the image's system interpreter.
+      - name: Rust tests (jammi-python)
+        run: cargo test -p jammi-python --no-fail-fast
 
       # This lane has the native engine, so it runs the client tests that need it;
       # the ones that also need a built server run in cookbook.yml, which builds one.

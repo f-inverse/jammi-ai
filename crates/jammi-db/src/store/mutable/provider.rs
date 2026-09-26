@@ -4,7 +4,7 @@
 //! [`MutableTableSink`]) and `truncate`. Predicate pushdown, projection, and limit are translated
 //! to backend SQL when straightforward; otherwise DataFusion's planner handles them above the scan
 //! node. An `UPDATE` / `DELETE` plans to [`super::rewrite::RowRewriteNode`], which hands the rows
-//! the statement selected to [`MutableTableProvider::rewrite_rows`].
+//! the statement selected to `MutableTableProvider::rewrite_rows`.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;

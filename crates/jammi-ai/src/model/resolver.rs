@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Missing, Result};
 use jammi_db::storage::StorageError;
 use jammi_db::store::ArtifactStore;
 
@@ -131,9 +131,9 @@ impl ModelResolver {
             // that cannot see the row (another tenant's model, a deleted
             // one) is told it does not exist.
             None if model_id.0.starts_with(FINE_TUNED_ID_PREFIX) => {
-                return Err(JammiError::ModelNotFound {
+                return Err(JammiError::NotFound(Missing::Model {
                     model_id: model_id.0,
-                })
+                }))
             }
             None => return Ok(None),
         };

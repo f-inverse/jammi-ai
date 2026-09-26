@@ -49,7 +49,7 @@ use super::lease::{
 };
 use super::status::{ArtifactState, JobExecution, JobStatus};
 use super::Catalog;
-use crate::error::{JammiError, Result};
+use crate::error::{JammiError, Missing, Result};
 use crate::store::manifest::{DefinitionHash, InputAnchor, PinnedAnchors};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
@@ -1322,7 +1322,7 @@ impl Catalog {
                 },
             )
             .await?;
-        found.ok_or_else(|| JammiError::Catalog(format!("Job '{id_for_err}' not found")))
+        found.ok_or_else(|| JammiError::NotFound(Missing::Job { job_id: id_for_err }))
     }
 
     /// List jobs visible to the session tenant, most recent first. Inside a

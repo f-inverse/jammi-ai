@@ -58,7 +58,7 @@ use super::file_format;
 use super::schema_provider::PublicSchemaCatalog;
 use super::{table_name_from_url, SourceDefinition, SourceType};
 use crate::catalog::Catalog;
-use crate::error::{JammiError, Result};
+use crate::error::{JammiError, Missing, Result};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::tenant_scope::SourceTenantColumns;
 
@@ -145,16 +145,16 @@ impl SourceRegistry {
 
     /// Resolve `source_id` from its catalog row: the cached providers when
     /// the row still carries the definition they were built from, freshly
-    /// built ones when it does not, and [`JammiError::SourceNotFound`] —
+    /// built ones when it does not, and [`JammiError::NotFound`] —
     /// after evicting whatever was cached — when there is no row.
     pub(crate) async fn resolve(&self, source_id: &str) -> Result<Arc<ResolvedSource>> {
         match self.catalog.get_source_across_tenants(source_id).await? {
             Some(record) => self.adopt(source_id, record.into_definition()).await,
             None => {
                 self.evict(source_id);
-                Err(JammiError::SourceNotFound {
+                Err(JammiError::NotFound(Missing::Source {
                     source_id: source_id.into(),
-                })
+                }))
             }
         }
     }

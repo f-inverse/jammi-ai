@@ -599,11 +599,7 @@ impl InferenceSession {
     /// current version whose row is not `ready` or whose manifest is gone is
     /// the typed `NotRefreshable { CurrentVersionUnavailable }`.
     pub(crate) async fn refreshable_pin(&self, table: &str) -> Result<PinnedSource> {
-        let record = self
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.catalog().require_result_table(table).await?;
         if !TenantBinding::is_admin_scope() {
             let caller = self.catalog().current_tenant().map(|t| t.to_string());
             if record.tenant_id != caller {

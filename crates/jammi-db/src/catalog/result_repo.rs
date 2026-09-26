@@ -10,7 +10,7 @@ use crate::catalog::lease::{lease_deadline_expr, lease_expired_clause};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::config::StoragePrecision;
-use crate::error::{JammiError, Result};
+use crate::error::{IndexKind, JammiError, Missing, Result};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 use jammi_datafusion::ModelTask;
@@ -1703,6 +1703,16 @@ impl Catalog {
             .await?)
     }
 
+    /// [`Self::get_result_table`], with an absent row the typed
+    /// [`JammiError::NotFound`]: for a verb whose caller named the table.
+    pub async fn require_result_table(&self, name: &str) -> Result<ResultTableRecord> {
+        self.get_result_table(name).await?.ok_or_else(|| {
+            JammiError::NotFound(Missing::ResultTable {
+                table: name.to_string(),
+            })
+        })
+    }
+
     /// Fetch a single result table by name. Tenant-filtered; inside a
     /// [`crate::session::JammiSession::with_admin_scope`] closure the tenant
     /// predicate is dropped and the row resolves by its primary key alone
@@ -2113,10 +2123,7 @@ impl Catalog {
         table_name: Option<&str>,
     ) -> Result<ResultTableRecord> {
         if let Some(name) = table_name {
-            return self
-                .get_result_table(name)
-                .await?
-                .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")));
+            return self.require_result_table(name).await;
         }
 
         // Derive the embedding-task list from `ModelTask::ALL` so that
@@ -2139,7 +2146,10 @@ impl Catalog {
         self.newest_ready_table(source_id, ResultTableKind::Model, &embedding_tasks)
             .await?
             .ok_or_else(|| {
-                JammiError::Catalog(format!("No ready embedding table for source '{source_id}'"))
+                JammiError::NotFound(Missing::ReadyIndex {
+                    source_id: source_id.to_string(),
+                    index: IndexKind::Embedding,
+                })
             })
     }
 
@@ -2156,18 +2166,20 @@ impl Catalog {
                 .newest_ready_table(source_id, ResultTableKind::Lexical, &[])
                 .await?
                 .ok_or_else(|| {
-                    JammiError::Catalog(format!("No ready lexical index for source '{source_id}'"))
+                    JammiError::NotFound(Missing::ReadyIndex {
+                        source_id: source_id.to_string(),
+                        index: IndexKind::Lexical,
+                    })
                 });
         };
-        let table = self
-            .get_result_table(name)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")))?;
+        let table = self.require_result_table(name).await?;
         if table.kind != ResultTableKind::Lexical {
-            return Err(JammiError::Catalog(format!(
-                "Result table '{name}' is a {} table, not a lexical index",
-                table.kind.as_db_str()
-            )));
+            return Err(JammiError::Schema {
+                table: name.to_string(),
+                column: "<kind>".to_string(),
+                expected: "a lexical index".to_string(),
+                actual: format!("a {} table", table.kind.as_db_str()),
+            });
         }
         Ok(table)
     }

@@ -186,6 +186,7 @@ pub async fn submit_physical_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jammi_db::error::Missing;
 
     use jammi_db::catalog::instance::DeviceFact;
     use jammi_db::catalog::status::ComputeExecutorStatus;
@@ -262,16 +263,16 @@ mod tests {
     /// in-process path raises.
     #[test]
     fn a_placed_refusal_classifies_as_the_in_process_one() {
-        let envelope = TaskErrorEnvelope::new(JammiError::SourceNotFound {
+        let envelope = TaskErrorEnvelope::new(JammiError::NotFound(Missing::Source {
             source_id: "patents".into(),
-        });
+        }));
         let arrived = DataFusionError::Execution(format!(
             "Job 7bY2 failed: Job failed due to stage 1 failed: Task failed due to runtime \
              execution error: DataFusionError(External({envelope:?}))\n"
         ));
         match JammiError::from(restore_task_error(arrived)) {
-            JammiError::SourceNotFound { source_id } => assert_eq!(source_id, "patents"),
-            other => panic!("expected SourceNotFound, got {other:?}"),
+            JammiError::NotFound(Missing::Source { source_id }) => assert_eq!(source_id, "patents"),
+            other => panic!("expected a source NotFound, got {other:?}"),
         }
     }
 

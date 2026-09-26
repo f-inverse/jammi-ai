@@ -1447,7 +1447,7 @@ async fn placed_inference_refusing_a_null_key_classifies_as_the_in_process_one()
 }
 
 /// A placed gang whose training source is removed between the job's
-/// submission and its placement fails its attempt with `SourceNotFound`
+/// submission and its placement fails its attempt with a source `NotFound`
 /// naming the source — on the job row (the executor's own terminal
 /// write, the same message the in-process path records) and to the
 /// submitter (the task's typed error, named on the submitter's log).
@@ -1475,9 +1475,9 @@ async fn placed_gang_over_a_removed_source_fails_typed_on_the_row_and_to_the_sub
     await_fleet_registered(&session, &fleet).await;
     let submitter_id = instance_id_of_label(&session, fleet.label(0)).await;
 
-    let expected = JammiError::SourceNotFound {
+    let expected = JammiError::NotFound(Missing::Source {
         source_id: source.clone(),
-    }
+    })
     .to_string();
     let record = harness::await_job(
         &mut fleet,

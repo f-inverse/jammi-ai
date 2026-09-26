@@ -75,7 +75,6 @@ message JammiErrorDetail {
     MutableTableErrorDetail mutable_table = 14;
     StringError channel_assembly = 16;
     ModelReferencedError model_referenced = 17;
-    ModelNotFoundError model_not_found = 18;
     RowGoneError row_gone = 19;
     TenantMismatchError tenant_mismatch = 20;
     LeaseLostError lease_lost = 21;
@@ -116,10 +115,6 @@ message JammiErrorDetail {
     // to grow past the session's `[engine] memory_limit`-bounded pool.
     // Maps to `RESOURCE_EXHAUSTED`.
     ResourcesExhaustedError resources_exhausted = 41;
-    // `JammiError::SourceNotFound { source_id }` — a source id that resolved
-    // no `sources` row. Maps to `NOT_FOUND`, the absent-row convention
-    // `ModelNotFound` carries.
-    SourceNotFoundError source_not_found = 42;
     // `JammiError::DeviceKindUnheld { required, held }` — a plan requiring
     // a device kind reached a holder (the compute plane before submission,
     // one executor at stage creation) that lists none of it. Maps to
@@ -146,8 +141,11 @@ message JammiErrorDetail {
     // encoded into a table whose vectors no engine encoder produced. The
     // caller's request names an impossible encode: `INVALID_ARGUMENT`.
     NoQueryEncoderError no_query_encoder = 48;
+    // `JammiError::NotFound(Missing)` — a catalog row the call names or
+    // needs does not exist for the caller's tenant. Maps to `NOT_FOUND`.
+    NotFoundError not_found = 49;
   }
-  // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
+  // Retired tags and names are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
   // reads an unknown field rather than a silently-reinterpreted one -- an
   // older peer decoding a payload that sets a variant it does not know (a
@@ -156,8 +154,8 @@ message JammiErrorDetail {
   // `JammiError::Other` carrying the enclosing `Status`'s message verbatim --
   // the peer keeps the fault's text even though it cannot keep the fault's
   // specific shape, never a fabricated empty string.
-  reserved 15;
-  reserved "model_retired";
+  reserved 15, 18, 42;
+  reserved "model_retired", "model_not_found", "source_not_found";
 }
 
 // `JammiError::RowGone { table }`. A building-row compare-and-set matched no
@@ -400,21 +398,24 @@ message ModelReferencedError {
   repeated string referenced_by = 2;
 }
 
-// `JammiError::ModelNotFound { model_id }`. A `delete_model` call resolved no
-// model row for the caller's tenant. Distinct from
-// `ModelError` (a bad-argument model fault → `InvalidArgument`): an absent row
-// is a NotFound → `NotFound`, so it carries its own variant rather than folding
-// onto the generic model error.
-message ModelNotFoundError {
-  string model_id = 1;
+// `JammiError::NotFound(Missing)`: which catalog row is absent. A row the
+// caller named carries its id; a source's ready index carries the source and
+// the index kind (`embedding` / `lexical`), which names the verb that builds
+// one.
+message NotFoundError {
+  oneof missing {
+    string source_id = 1;
+    string model_id = 2;
+    string job_id = 3;
+    string result_table = 4;
+    ReadyIndexMissing ready_index = 5;
+  }
 }
 
-// `JammiError::SourceNotFound { source_id }`. A source id resolved no
-// `sources` row — never registered, or removed on any replica sharing the
-// catalog. Distinct from `SourceError` (a bad-argument source fault →
-// `InvalidArgument`): an absent row is a NotFound → `NotFound`.
-message SourceNotFoundError {
+// `Missing::ReadyIndex { source_id, index }`.
+message ReadyIndexMissing {
   string source_id = 1;
+  string index = 2;
 }
 
 // `JammiError::DeviceKindUnheld { required, held }`. `required` is the kind

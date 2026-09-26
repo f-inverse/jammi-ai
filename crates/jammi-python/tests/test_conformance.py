@@ -1138,6 +1138,29 @@ def test_bad_format_add_source_raises_invalid_argument_on_both_backends(tmp_path
         embed.add_source("s", url="/tmp/x.parquet", format="bogus")
 
 
+def test_search_before_any_index_raises_no_ready_index_naming_the_verb(tmp_path):
+    """A search or lexical search that names no table, on a source with no
+    ready index of that kind, raises `NoReadyIndex` (a `NotFound`) whose
+    message names the verb that builds the index; a named table never built is
+    a plain `NotFound`. Embedded arm; the remote arm is the server's
+    error-parity test and the cookbook's error-taxonomy chapter."""
+    from jammi import errors as client_errors
+
+    fixture = tmp_path / "notes.jsonl"
+    fixture.write_text('{"id": 1, "body": "protein folding"}\n{"id": 2, "body": "graph search"}\n')
+    embed = jammi.connect(f"file://{tmp_path}")
+    embed.add_source("notes", url=f"file://{fixture}", format="jsonl")
+
+    with pytest.raises(client_errors.NoReadyIndex, match="generate_embeddings"):
+        embed.search("notes", query=[0.0] * 8, k=1)
+    with pytest.raises(client_errors.NoReadyIndex, match="build_lexical_index"):
+        embed.lexical_search("notes", text="protein", k=1)
+    with pytest.raises(client_errors.NotFound) as named:
+        embed.describe_table("notes_never_built")
+    assert type(named.value) is client_errors.NotFound
+    assert issubclass(client_errors.NoReadyIndex, client_errors.NotFound)
+
+
 def test_jsonl_and_ndjson_add_source_are_accepted_on_both_backends(tmp_path):
     """Cross-surface parity: `"jsonl"`/`"ndjson"` must be accepted on
     BOTH transports, not just one.

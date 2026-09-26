@@ -2,6 +2,7 @@
 //! text as a lexical table, and `lexical_search` ranks it and hydrates the
 //! source's rows — over the patents fixture, through the embedded [`Session`].
 
+use jammi_db::error::{IndexKind, JammiError, Missing};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -263,7 +264,15 @@ async fn a_named_table_must_be_a_lexical_index() {
         })
         .await
         .unwrap_err();
-    assert!(named.to_string().contains("not a lexical index"), "{named}");
+    match named {
+        JammiError::Schema {
+            table, expected, ..
+        } => {
+            assert_eq!(table, "recent");
+            assert_eq!(expected, "a lexical index");
+        }
+        other => panic!("naming a table of another kind is a Schema refusal, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -290,7 +299,13 @@ async fn a_lexical_index_resolves_only_for_its_tenant() {
         .await
         .unwrap_err();
     assert!(
-        refused.to_string().contains("No ready lexical index"),
-        "{refused}"
+        matches!(
+            &refused,
+            JammiError::NotFound(Missing::ReadyIndex {
+                index: IndexKind::Lexical,
+                ..
+            })
+        ),
+        "another tenant's index is not this tenant's: {refused}"
     );
 }

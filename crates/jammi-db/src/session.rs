@@ -584,7 +584,7 @@ impl JammiSession {
     /// The table names a source serves, in discovery order — resolved
     /// through the catalog's `sources` row like every SQL reference to the
     /// source is, so a source registered on another replica resolves here
-    /// and a source removed there is [`JammiError::SourceNotFound`] here.
+    /// and a source removed there is [`JammiError::NotFound`] here.
     pub async fn source_table_names(&self, source_id: &str) -> Result<Vec<String>> {
         Ok(self.sources.resolve(source_id).await?.table_names())
     }

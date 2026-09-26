@@ -790,15 +790,7 @@ impl InferenceSession {
     ) -> Result<InputAnchor> {
         match edge_source {
             EdgeSourceRef::NeighborGraph { table_name } => {
-                let record = self
-                    .catalog()
-                    .get_result_table(table_name)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "propagate: edge relation '{table_name}' not found in the catalog"
-                        ))
-                    })?;
+                let record = self.catalog().require_result_table(table_name).await?;
                 Ok(self
                     .result_store()
                     .pin_current_version(record)

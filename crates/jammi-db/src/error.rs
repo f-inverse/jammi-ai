@@ -25,37 +25,24 @@ pub enum JammiError {
         message: String,
     },
 
-    /// A source resolved no `sources` row: it was never registered, or it was
-    /// removed — on this process or on any other replica sharing the catalog.
-    /// An absent row is a NotFound, not a bad argument, so it maps to gRPC
-    /// `NotFound` rather than `InvalidArgument`. Raised wherever a source id
-    /// is resolved: a SQL scan of `<source>.public.<table>`, and every verb
-    /// that names a source.
-    #[error("Source not found: {source_id}")]
-    SourceNotFound {
-        /// Identifier of the source that resolved no row.
-        source_id: String,
-    },
+    /// A catalog row the call names, or needs, does not exist for the
+    /// caller's tenant — never registered, removed (on this process or any
+    /// replica sharing the catalog), or visible only to another tenant. An
+    /// absent row is a NotFound, not a bad argument: it maps to gRPC
+    /// `NotFound`, and [`Missing`] says which row and, when a verb builds it,
+    /// which verb.
+    #[error("{0}")]
+    NotFound(Missing),
 
     /// Model lifecycle error, scoped to a specific model. A genuine bad-argument
-    /// fault (e.g. an invalid version) — distinct from [`Self::ModelNotFound`],
-    /// which an absent row raises. Maps to gRPC `InvalidArgument`.
+    /// fault (e.g. an invalid version) — distinct from [`Self::NotFound`], which
+    /// an absent model row raises. Maps to gRPC `InvalidArgument`.
     #[error("Model error: {model_id}: {message}")]
     Model {
         /// Identifier of the failing model.
         model_id: String,
         /// Human-readable error description.
         message: String,
-    },
-
-    /// A `delete_model` call resolved no model row for the caller's tenant — the
-    /// model does not exist, or exists only outside the caller's scope. An absent
-    /// row is a NotFound, not a bad argument, so it maps to gRPC `NotFound` rather
-    /// than `InvalidArgument`.
-    #[error("Model not found: {model_id}")]
-    ModelNotFound {
-        /// Identifier of the model that resolved no row.
-        model_id: String,
     },
 
     /// A `delete_model` was refused because the model is still the target of one
@@ -577,6 +564,93 @@ fn wire_kinds(kinds: &[jammi_datafusion::ComputeDeviceKind]) -> String {
         .map(|k| k.wire_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The catalog row a [`JammiError::NotFound`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// A source id.
+    Source {
+        /// The source id.
+        source_id: String,
+    },
+    /// A model id.
+    Model {
+        /// The model id.
+        model_id: String,
+    },
+    /// A job id.
+    Job {
+        /// The job id.
+        job_id: String,
+    },
+    /// A result table named by the caller.
+    ResultTable {
+        /// The table name.
+        table: String,
+    },
+    /// A source's ready index of one kind, which the verb resolves when the
+    /// caller names no table.
+    ReadyIndex {
+        /// The source.
+        source_id: String,
+        /// The kind of index.
+        index: IndexKind,
+    },
+}
+
+/// The kind of index a search resolves over a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// An embedding table, searched by `search`.
+    Embedding,
+    /// A lexical (BM25) index, searched by `lexical_search`.
+    Lexical,
+}
+
+impl IndexKind {
+    /// The stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedding => "embedding",
+            Self::Lexical => "lexical",
+        }
+    }
+
+    /// Parse the wire token; `None` for an unknown one.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "embedding" => Some(Self::Embedding),
+            "lexical" => Some(Self::Lexical),
+            _ => None,
+        }
+    }
+
+    /// What the index is called, and the verb that builds one.
+    fn described(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Embedding => ("embedding table", "generate_embeddings"),
+            Self::Lexical => ("lexical index", "build_lexical_index"),
+        }
+    }
+}
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Source { source_id } => write!(f, "source `{source_id}` not found"),
+            Self::Model { model_id } => write!(f, "model `{model_id}` not found"),
+            Self::Job { job_id } => write!(f, "job `{job_id}` not found"),
+            Self::ResultTable { table } => write!(f, "result table `{table}` not found"),
+            Self::ReadyIndex { source_id, index } => {
+                let (what, verb) = index.described();
+                write!(
+                    f,
+                    "source `{source_id}` has no ready {what}; `{verb}` builds one"
+                )
+            }
+        }
+    }
 }
 
 /// Why a table is [`JammiError::NotRefreshable`].

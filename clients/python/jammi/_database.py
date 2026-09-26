@@ -87,6 +87,7 @@ from .errors import (
     JammiError,
     MissingManifest,
     ModelNotFound,
+    NoReadyIndex,
     NotFound,
     ModelReferenced,
     NoQueryEncoder,
@@ -131,7 +132,8 @@ _DETAIL_CLASS = {
     "not_refreshable": NotRefreshable,
     "definition_drift": DefinitionDrift,
     "version_unavailable": VersionUnavailable,
-    "model_not_found": ModelNotFound,
+    "not_found.model_id": ModelNotFound,
+    "not_found.ready_index": NoReadyIndex,
     "model_referenced": ModelReferenced,
 }
 
@@ -149,7 +151,9 @@ _CODE_CLASS = {
 def _error_detail(exc: grpc.RpcError) -> Optional[str]:
     """The typed engine detail a server attached to a failed call — the
     `JammiErrorDetail` variant packed in the `grpc-status-details-bin`
-    trailer's `google.rpc.Status` envelope — or None when it carries none."""
+    trailer's `google.rpc.Status` envelope, as `variant` or, for a variant that
+    names a case of its own (`not_found`), `variant.case` — or None when it
+    carries none."""
     trailers = exc.trailing_metadata() if hasattr(exc, "trailing_metadata") else None
     for key, value in trailers or ():
         if key != "grpc-status-details-bin":
@@ -157,7 +161,10 @@ def _error_detail(exc: grpc.RpcError) -> Optional[str]:
         for packed in error_pb2.RpcStatus.FromString(value).details:
             detail = error_pb2.JammiErrorDetail()
             if packed.Unpack(detail):
-                return detail.WhichOneof("variant")
+                variant = detail.WhichOneof("variant")
+                if variant == "not_found":
+                    return f"not_found.{detail.not_found.WhichOneof('missing')}"
+                return variant
     return None
 
 

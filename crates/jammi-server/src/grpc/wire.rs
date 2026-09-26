@@ -159,17 +159,18 @@ pub fn map_trigger_error(err: TriggerError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jammi_db::error::Missing;
     use jammi_wire::error_from_status;
 
-    /// An absent model from a lifecycle verb is `ModelNotFound`, which maps to
+    /// An absent model from a lifecycle verb is a model `NotFound`, which maps to
     /// gRPC `NotFound` — distinct from the bad-argument `Model` fault, which maps
     /// to `InvalidArgument`. The catalog handlers rely on this mapping; they
     /// carry no manual `Model → not_found` interception.
     #[test]
     fn model_not_found_maps_to_not_found() {
-        let status = map_engine_error(JammiError::ModelNotFound {
+        let status = map_engine_error(JammiError::NotFound(Missing::Model {
             model_id: "acme/embed-mini".into(),
-        });
+        }));
         assert_eq!(status.code(), Code::NotFound);
 
         // The bad-argument model fault keeps mapping to InvalidArgument.
@@ -526,15 +527,17 @@ mod tests {
     }
 
     /// The faithful detail attached to the Status reconstructs the exact
-    /// `ModelNotFound` variant on the client side — not a coarse code guess.
+    /// model `NotFound` on the client side — not a coarse code guess.
     #[test]
     fn model_not_found_detail_round_trips() {
-        let status = map_engine_error(JammiError::ModelNotFound {
+        let status = map_engine_error(JammiError::NotFound(Missing::Model {
             model_id: "acme/embed-mini".into(),
-        });
+        }));
         match error_from_status(&status) {
-            JammiError::ModelNotFound { model_id } => assert_eq!(model_id, "acme/embed-mini"),
-            other => panic!("expected ModelNotFound to round-trip, got {other:?}"),
+            JammiError::NotFound(Missing::Model { model_id }) => {
+                assert_eq!(model_id, "acme/embed-mini")
+            }
+            other => panic!("expected the model NotFound to round-trip, got {other:?}"),
         }
     }
 

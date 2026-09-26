@@ -5,6 +5,16 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A missing catalog row is one typed not-found: `JammiError::NotFound(Missing)`.** A source, a
+  model, a job, a named result table, and a source's ready embedding table or lexical index that a
+  search resolves when it names none: each is `NotFound` (gRPC `NOT_FOUND`) carrying which row is
+  missing, and the ready-index case names the verb that builds it (`generate_embeddings`,
+  `build_lexical_index`). Python raises `NoReadyIndex` (a `NotFound`) for the ready-index case on both
+  transports, `ModelNotFound` for a model, and `NotFound` otherwise. **BREAKING:**
+  `JammiError::SourceNotFound` / `ModelNotFound` become `NotFound(Missing::Source | Missing::Model)`;
+  the wire's `model_not_found` (18) and `source_not_found` (42) are replaced by `not_found` (49,
+  `NotFoundError`), and the old tags and names are reserved. Naming a table of another kind for
+  `lexical_search` is a typed `Schema` refusal (`INVALID_ARGUMENT`), not a catalog fault.
 - **A mutable table's `UPDATE` / `DELETE` chooses its rows with any predicate a query can use.**
   A subquery (`DELETE … WHERE key IN (SELECT …)`, `EXISTS`), an `UPDATE … FROM` join, and a
   `LIMIT` now select exactly the rows they name: the statement's own plan runs as a query, and the

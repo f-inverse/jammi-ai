@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::PyErr;
 use tonic::{Code, Status};
 
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 
 /// Raise a `jammi.errors` exception class by name, carrying `message`.
 ///
@@ -59,7 +59,8 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         JammiError::VersionUnavailable { .. } => "VersionUnavailable",
         JammiError::NotRefreshable { .. } => "NotRefreshable",
         JammiError::DefinitionDrift { .. } => "DefinitionDrift",
-        JammiError::ModelNotFound { .. } => "ModelNotFound",
+        JammiError::NotFound(Missing::Model { .. }) => "ModelNotFound",
+        JammiError::NotFound(Missing::ReadyIndex { .. }) => "NoReadyIndex",
         JammiError::ModelReferenced { .. } => "ModelReferenced",
         other => status_class(jammi_wire::status_code(other)),
     }

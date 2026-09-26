@@ -321,7 +321,7 @@ impl StatementClass {
     ///
     /// DataFusion's SQL planner refuses `UPDATE … FROM`; this plans it into
     /// the shape DataFusion gives every other `UPDATE` (see
-    /// [`plan_update_from`]), so the class of an `UPDATE` does not depend on
+    /// `plan_update_from`), so the class of an `UPDATE` does not depend on
     /// whether its rows come from a join.
     pub async fn plan(state: &SessionState, sql: &str) -> DfResult<Self> {
         let dialect = state.config().options().sql_parser.dialect;

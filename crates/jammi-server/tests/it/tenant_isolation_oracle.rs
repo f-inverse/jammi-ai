@@ -45,7 +45,7 @@ use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
 use jammi_db::session::QueryContext;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -2714,7 +2714,7 @@ async fn assert_refresh_isolated(verb: RefreshVerb) {
 /// Tenant A fine-tunes a model and embeds a source with it under
 /// `with_tenant_scoped(A)` — the binding `scoped(engine, tenant, …)` gives a
 /// gRPC request; tenant B, embedding with A's model under its own scope, is
-/// refused `ModelNotFound`.
+/// refused with a model `NotFound`.
 async fn assert_embedding_with_own_model_isolated() {
     use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, Warmup};
     use jammi_ai::local_session::{EmbeddingRequest, Modality};
@@ -2788,7 +2788,7 @@ async fn assert_embedding_with_own_model_isolated() {
         .with_tenant_scoped(tenant_b(), |_scope| engine.generate_embeddings(embed()))
         .await;
     assert!(
-        matches!(peer, Err(JammiError::ModelNotFound { .. })),
+        matches!(peer, Err(JammiError::NotFound(Missing::Model { .. }))),
         "CROSS-TENANT LEAK: tenant B embedded with tenant A's model: {peer:?}"
     );
 }

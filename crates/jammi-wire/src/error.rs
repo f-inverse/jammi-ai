@@ -30,7 +30,7 @@
 //! The contract's fidelity boundary is precise, and faithfulness is a property
 //! of the error type — not of any one verb surface — so the mapping is complete
 //! over `JammiError`: every owned-shape variant (the String- and struct-carrying
-//! ones — `Source`, `SourceNotFound`, `Model`, `ModelNotFound`, `ModelReferenced`, `Inference`,
+//! ones — `Source`, `NotFound`, `Model`, `ModelReferenced`, `Inference`,
 //! `Catalog`, `Schema`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
 //! `ChannelAssembly`, `Lexical`, `IncompatibleFormat`, `DependencyCycle`,
 //! `NotRecomputable`, `MissingManifest`, `NoQueryEncoder`, `RowGone`, `TenantMismatch`, `LeaseLost`, `CasFailed`,
@@ -65,7 +65,7 @@
 use jammi_datafusion::ComputeDeviceKind;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
 use jammi_db::compute_plane::Unheld;
-use jammi_db::error::{JammiError, NonUniqueScan, NotRefreshableReason};
+use jammi_db::error::{IndexKind, JammiError, Missing, NonUniqueScan, NotRefreshableReason};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
 use jammi_db::BackendError;
@@ -93,16 +93,7 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 model_id: model_id.clone(),
                 message: message.clone(),
             }),
-            JammiError::ModelNotFound { model_id } => {
-                Variant::ModelNotFound(pb::ModelNotFoundError {
-                    model_id: model_id.clone(),
-                })
-            }
-            JammiError::SourceNotFound { source_id } => {
-                Variant::SourceNotFound(pb::SourceNotFoundError {
-                    source_id: source_id.clone(),
-                })
-            }
+            JammiError::NotFound(missing) => Variant::NotFound(missing.into()),
             JammiError::ModelReferenced {
                 model_id,
                 referenced_by,
@@ -362,11 +353,9 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             model_id: e.model_id,
             message: e.message,
         },
-        Some(Variant::ModelNotFound(e)) => JammiError::ModelNotFound {
-            model_id: e.model_id,
-        },
-        Some(Variant::SourceNotFound(e)) => JammiError::SourceNotFound {
-            source_id: e.source_id,
+        Some(Variant::NotFound(e)) => match missing_from_detail(e) {
+            Some(missing) => JammiError::NotFound(missing),
+            None => JammiError::Other(message.to_string()),
         },
         Some(Variant::ModelReferenced(e)) => JammiError::ModelReferenced {
             model_id: e.model_id,
@@ -531,6 +520,42 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         // variant a newer peer set.
         None => JammiError::Other(message.to_string()),
     }
+}
+
+/// Encode which catalog row a [`JammiError::NotFound`] names.
+impl From<&Missing> for pb::NotFoundError {
+    fn from(missing: &Missing) -> Self {
+        use pb::not_found_error::Missing as Wire;
+        let wire = match missing {
+            Missing::Source { source_id } => Wire::SourceId(source_id.clone()),
+            Missing::Model { model_id } => Wire::ModelId(model_id.clone()),
+            Missing::Job { job_id } => Wire::JobId(job_id.clone()),
+            Missing::ResultTable { table } => Wire::ResultTable(table.clone()),
+            Missing::ReadyIndex { source_id, index } => Wire::ReadyIndex(pb::ReadyIndexMissing {
+                source_id: source_id.clone(),
+                index: index.as_str().to_string(),
+            }),
+        };
+        pb::NotFoundError {
+            missing: Some(wire),
+        }
+    }
+}
+
+/// The [`Missing`] a wire [`pb::NotFoundError`] names; `None` when a newer
+/// peer set a case, or an index kind, this build does not know.
+fn missing_from_detail(detail: pb::NotFoundError) -> Option<Missing> {
+    use pb::not_found_error::Missing as Wire;
+    Some(match detail.missing? {
+        Wire::SourceId(source_id) => Missing::Source { source_id },
+        Wire::ModelId(model_id) => Missing::Model { model_id },
+        Wire::JobId(job_id) => Missing::Job { job_id },
+        Wire::ResultTable(table) => Missing::ResultTable { table },
+        Wire::ReadyIndex(e) => Missing::ReadyIndex {
+            source_id: e.source_id,
+            index: IndexKind::parse(&e.index)?,
+        },
+    })
 }
 
 /// Encode the engine-owned [`MutableTableError`] into its structured wire
@@ -1269,14 +1294,10 @@ impl From<TaskErrorEnvelopeError> for JammiError {
 pub fn status_code(err: &JammiError) -> Code {
     match err {
         JammiError::Source { .. } => Code::InvalidArgument,
-        // An absent source row — never registered, or removed on any replica —
-        // is a NotFound, not the bad-argument `Source` fault; the source's
-        // analogue of `ModelNotFound`.
-        JammiError::SourceNotFound { .. } => Code::NotFound,
         JammiError::Model { .. } => Code::InvalidArgument,
-        // An absent model row a lifecycle verb resolved nothing for — a NotFound,
-        // not the bad-argument `Model` fault. Mirrors the `ModelReferenced` arm.
-        JammiError::ModelNotFound { .. } => Code::NotFound,
+        // An absent row is a NotFound, never the bad-argument `Source` /
+        // `Model` fault.
+        JammiError::NotFound(_) => Code::NotFound,
         JammiError::ModelReferenced { .. } => Code::FailedPrecondition,
         JammiError::Tenant(_) => Code::InvalidArgument,
         JammiError::Config(_) => Code::InvalidArgument,
@@ -1446,9 +1467,8 @@ mod tests {
             JammiError::Config(_)
             | JammiError::Catalog(_)
             | JammiError::Source { .. }
-            | JammiError::SourceNotFound { .. }
+            | JammiError::NotFound(_)
             | JammiError::Model { .. }
-            | JammiError::ModelNotFound { .. }
             | JammiError::ModelReferenced { .. }
             | JammiError::Inference(_)
             | JammiError::FineTune(_)
@@ -1507,15 +1527,29 @@ mod tests {
                 source_id: "patents".into(),
                 message: "scan failed".into(),
             },
-            JammiError::SourceNotFound {
+            JammiError::NotFound(Missing::Source {
                 source_id: "patents".into(),
-            },
+            }),
+            JammiError::NotFound(Missing::Model {
+                model_id: "local:/models/tiny_bert".into(),
+            }),
+            JammiError::NotFound(Missing::Job {
+                job_id: "0192a4c1-3b7e-7f00-8e2a-5d6c7b8a9f01".into(),
+            }),
+            JammiError::NotFound(Missing::ResultTable {
+                table: "patents__text_embedding__tiny_bert__1".into(),
+            }),
+            JammiError::NotFound(Missing::ReadyIndex {
+                source_id: "patents".into(),
+                index: IndexKind::Embedding,
+            }),
+            JammiError::NotFound(Missing::ReadyIndex {
+                source_id: "patents".into(),
+                index: IndexKind::Lexical,
+            }),
             JammiError::Model {
                 model_id: "local:/models/tiny_bert".into(),
                 message: "Model directory does not exist".into(),
-            },
-            JammiError::ModelNotFound {
-                model_id: "local:/models/tiny_bert".into(),
             },
             JammiError::ModelReferenced {
                 model_id: "local:/models/tiny_bert".into(),
@@ -2123,9 +2157,9 @@ mod tests {
     /// human reading the raw string still sees the fault.
     #[test]
     fn task_error_envelope_carries_the_human_message_after_the_payload() {
-        let err = JammiError::SourceNotFound {
+        let err = JammiError::NotFound(Missing::Source {
             source_id: "patents".into(),
-        };
+        });
         let text = TaskErrorEnvelope::new(err.clone()).to_string();
         assert!(text.starts_with("jammi-error:1:"), "{text}");
         assert!(text.ends_with(&err.to_string()), "{text}");

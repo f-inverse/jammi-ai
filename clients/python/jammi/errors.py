@@ -246,6 +246,14 @@ class ModelNotFound(NotFound):
     """
 
 
+class NoReadyIndex(NotFound):
+    """A search named no table, and the source has no ready index of the kind
+    it searches: ``search`` needs an embedding table (``generate_embeddings``
+    builds one), ``lexical_search`` a lexical index (``build_lexical_index``).
+    Refines :class:`NotFound`.
+    """
+
+
 class ModelReferenced(FailedPrecondition):
     """A model other catalog rows still point at — a job that trained it, a
     model built on it — cannot be deleted until they are gone. Refines

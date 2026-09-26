@@ -1774,7 +1774,7 @@ impl InferenceSession {
     /// The first table a source serves, resolved through the catalog's
     /// `sources` row ([`JammiSession::source_table_names`]) — a source
     /// registered on any replica resolves here, and a missing one is
-    /// [`JammiError::SourceNotFound`].
+    /// [`JammiError::NotFound`].
     pub(crate) async fn find_table_name(&self, source_id: &str) -> Result<String> {
         self.inner
             .source_table_names(source_id)

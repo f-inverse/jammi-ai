@@ -24,7 +24,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_ai::SearchMethod;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 
@@ -550,7 +550,7 @@ async fn invalid_requests_are_typed_refusals() {
     ))
     .await;
     assert!(
-        matches!(err, JammiError::SourceNotFound { .. }),
+        matches!(err, JammiError::NotFound(Missing::Source { .. })),
         "an unknown edge source: {err}"
     );
 }

@@ -8,7 +8,7 @@ import jammi_cookbook
 ```
 
 **Recipe:** `register_channel` · `add_channel_columns` · `list_channels` ·
-`jammi.errors` · **Theory:** a typed error vocabulary — a failure with a known
+`search` · `lexical_search` · `describe_table` · `jammi.errors` · **Theory:** a typed error vocabulary — a failure with a known
 cause names it, as a gRPC status code on the wire [@grpcstatuscodes] and as a
 Python class in the client, so a caller branches on the cause instead of parsing
 a message · **Rail:** parity (each failure raises the same class in process and
@@ -27,9 +27,9 @@ gRPC status code for that condition:
 | the thing being created exists already | `AlreadyExists` | `ALREADY_EXISTS` |
 | the state the operation needs does not hold | `FailedPrecondition` | `FAILED_PRECONDITION` |
 
-A more specific refusal refines one of these — `ModelNotFound` is a `NotFound`,
-`ModelReferenced` a `FailedPrecondition` — so a caller catches as narrowly as it
-needs to. Everything else is a `BackendError`, the class all four refine: the
+A more specific refusal refines one of these — `ModelNotFound` and
+`NoReadyIndex` are `NotFound`s, `ModelReferenced` a `FailedPrecondition` — so a
+caller catches as narrowly as it needs to. Everything else is a `BackendError`, the class all four refine: the
 residual for a fault with no named cause.
 
 ```{python}
@@ -106,11 +106,70 @@ a repeated registration as done, or `NotFound` to register a channel on first
 use, works unchanged in process and against a server — and neither ever reads a
 message.
 
+## Searching before there is anything to search
+
+A missing thing is a `NotFound` whether the caller named it or the verb went
+looking for it. A `search` or `lexical_search` that names no table resolves the
+source's newest ready index; before one is built, that is `NoReadyIndex`, a
+`NotFound` whose message names the verb that builds the index. A table named
+but never built is a plain `NotFound`.
+
+```{python}
+from jammi.errors import NoReadyIndex
+from jammi_cookbook import fixtures
+
+
+def missing(db) -> dict:
+    with db.tenant_scope(str(uuid.uuid4())):
+        db.add_source("corpus", url=fixtures.url("tiny_corpus.parquet"), format="parquet")
+        found = {}
+        for name, action in {
+            "search before any embedding table": lambda: db.search(
+                "corpus", query=[0.0] * 8, k=3),
+            "lexical_search before any index": lambda: db.lexical_search(
+                "corpus", text="protein folding", k=3),
+            "describe a table never built": lambda: db.describe_table("corpus_never_built"),
+        }.items():
+            try:
+                action()
+            except NotFound as raised:
+                code = getattr(raised, "code", None)
+                found[name] = (type(raised).__name__, code.name if code else None, str(raised))
+        return found
+
+
+with jammi.connect(f"file://{tempfile.mkdtemp()}") as db:
+    local_missing = missing(db)
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as db:
+    served_missing = missing(db)
+
+for name, (cls, code, message) in served_missing.items():
+    print(f"{name:<36}{local_missing[name][0]:<14}{cls:<14}{code}")
+    print(f"    {message}")
+```
+
+```{python}
+# | echo: false
+assert local_missing.keys() == served_missing.keys() == {
+    "search before any embedding table",
+    "lexical_search before any index",
+    "describe a table never built",
+}
+for name, (cls, code, message) in served_missing.items():
+    assert local_missing[name][0] == cls and code == "NOT_FOUND", name
+    assert local_missing[name][2] == message, name
+assert served_missing["search before any embedding table"][0] == "NoReadyIndex"
+assert "generate_embeddings" in served_missing["search before any embedding table"][2]
+assert served_missing["lexical_search before any index"][0] == "NoReadyIndex"
+assert "build_lexical_index" in served_missing["lexical_search before any index"][2]
+assert served_missing["describe a table never built"][0] == "NotFound"
+```
+
 ## Bridge note
 
 > **A cause is a type, not a sentence.** The engine names each failure it can
 > explain — malformed, missing, already there, not in the required state — with
 > a gRPC status code on the wire [@grpcstatuscodes] and the matching
 > `jammi.errors` class in the client, refined by resource where a caller needs
-> more (`ModelReferenced`). The classes are the same on both transports because
+> more (`ModelReferenced`, `NoReadyIndex`). The classes are the same on both transports because
 > both derive them from the one classification the server sends.

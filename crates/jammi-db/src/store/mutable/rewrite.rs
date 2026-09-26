@@ -6,7 +6,7 @@
 //! would be lost. Here the statement's input plan runs as a query instead —
 //! whatever it joins, filters or limits — and yields each selected row as it
 //! was read and, for an `UPDATE`, as it becomes. The provider then rewrites
-//! exactly those rows ([`MutableTableProvider::rewrite_rows`]).
+//! exactly those rows (`MutableTableProvider::rewrite_rows`).
 
 use std::any::Any;
 use std::cmp::Ordering;

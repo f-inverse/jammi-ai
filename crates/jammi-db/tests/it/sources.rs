@@ -5,7 +5,7 @@ use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
@@ -1270,8 +1270,8 @@ async fn count_rows(
 
 fn assert_source_not_found(err: &JammiError, source_id: &str) {
     assert!(
-        matches!(err, JammiError::SourceNotFound { source_id: s } if s == source_id),
-        "expected SourceNotFound for '{source_id}', got {err:?}"
+        matches!(err, JammiError::NotFound(Missing::Source { source_id: s }) if s == source_id),
+        "expected a source NotFound for '{source_id}', got {err:?}"
     );
     assert!(
         err.to_string().contains(source_id),

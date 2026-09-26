@@ -30,7 +30,7 @@ use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
 use jammi_db::catalog::status::JobExecution;
 use jammi_db::catalog::Catalog;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::TenantId;
@@ -609,7 +609,7 @@ async fn cross_tenant_delete_is_not_found(backend: BackendKind) {
         .await
         .expect_err("tenant B must not delete tenant A's model");
     assert!(
-        matches!(err, JammiError::ModelNotFound { .. }),
+        matches!(err, JammiError::NotFound(Missing::Model { .. })),
         "cross-tenant delete is a model NotFound, got {err:?}"
     );
     assert!(
@@ -646,7 +646,7 @@ async fn delete_absent_without_if_exists_is_not_found(backend: BackendKind) {
         .await
         .expect_err("a strict delete of an absent model is NotFound");
     assert!(
-        matches!(err, JammiError::ModelNotFound { .. }),
+        matches!(err, JammiError::NotFound(Missing::Model { .. })),
         "absent delete without if_exists is a model NotFound, got {err:?}"
     );
 }

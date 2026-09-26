@@ -14,6 +14,7 @@
 //! pre-contract table (honest `MissingManifest`). The SIGKILL crash-injection
 //! peer lives in `materialization_crash_recovery.rs` (feature `test-hooks`).
 
+use jammi_db::error::{IndexKind, JammiError, Missing};
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
@@ -2215,7 +2216,13 @@ async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: Bac
         .await
         .expect_err("a training set must not resolve as an embedding table");
     assert!(
-        err.to_string().contains("No ready embedding table"),
+        matches!(
+            &err,
+            JammiError::NotFound(Missing::ReadyIndex {
+                index: IndexKind::Embedding,
+                ..
+            })
+        ),
         "{err}"
     );
 

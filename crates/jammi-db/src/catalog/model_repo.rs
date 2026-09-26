@@ -3,7 +3,7 @@ use crate::catalog::backend::{
     BackendError, BackendKind, IsolationLevel, Row, SqlValue, Transaction, TxOptions,
 };
 use crate::catalog::lease::{canonical_stamp_now, stale_before_clause, CanonicalStampColumn};
-use crate::error::{JammiError, Result};
+use crate::error::{JammiError, Missing, Result};
 use crate::storage::{StorageError, StorageUrl};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
@@ -437,9 +437,9 @@ impl Catalog {
             Some(r) => r,
             None if if_exists => return Ok(()),
             None => {
-                return Err(JammiError::ModelNotFound {
+                return Err(JammiError::NotFound(Missing::Model {
                     model_id: model_id.to_string(),
-                })
+                }))
             }
         };
         let pk = record.catalog_pk;
@@ -500,9 +500,9 @@ impl Catalog {
                 model_id: model_id.to_string(),
                 referenced_by,
             }),
-            DeleteOutcome::Deleted(0) => Err(JammiError::ModelNotFound {
+            DeleteOutcome::Deleted(0) => Err(JammiError::NotFound(Missing::Model {
                 model_id: model_id.to_string(),
-            }),
+            })),
             DeleteOutcome::Deleted(_) => Ok(()),
         }
     }

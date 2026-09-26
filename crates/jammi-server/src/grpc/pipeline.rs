@@ -27,7 +27,6 @@ use jammi_ai::wire::{
     build_lexical_index_from_proto, build_neighbor_graph_from_proto, propagate_request_from_proto,
     recompute_from_proto, recompute_report_to_proto, structure_request_from_proto,
 };
-use jammi_db::error::JammiError;
 use tonic::{Request, Response, Status};
 
 use crate::grpc::proto::embedding::ResultTable;
@@ -189,11 +188,8 @@ impl PipelineService for PipelineServer {
             let record = self
                 .session
                 .catalog()
-                .get_result_table(&args.table)
-                .await?
-                .ok_or_else(|| {
-                    JammiError::Catalog(format!("Result table '{}' not found", args.table))
-                })?;
+                .require_result_table(&args.table)
+                .await?;
             self.session.recompute(&record, args.cascade).await
         })
         .await

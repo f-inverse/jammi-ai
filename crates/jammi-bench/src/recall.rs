@@ -156,7 +156,7 @@ use jammi_db::session::QueryContext;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource};
+use jammi_db::index::{validate_query, Admission, QuerySource};
 use jammi_db::index::{SegmentId, SegmentedIndex, VectorIndex};
 use jammi_numerics::stats::{bootstrap_ci, Interval};
 
@@ -370,7 +370,7 @@ async fn recall_samples_at_k_rescored(
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
         let query = &validate_query(query.to_vec(), index.dimensions(), QuerySource::Caller)?;
-        let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
+        let exact = exact_vector_search(ctx, table_name, query, k, None, &Admission::Every).await?;
         let ann = if precision.needs_rescore() {
             crate::operator_mirror::retrieve_then_rescore(&index, query, k, oversample.max(1))?
         } else {
@@ -425,8 +425,8 @@ async fn recall_samples_at_k_segmented(
     let mut samples = Vec::with_capacity(queries.len());
     for query in queries {
         let query = &validate_query(query.to_vec(), dim, QuerySource::Caller)?;
-        let exact = exact_vector_search(ctx, table_name, query, k, None).await?;
-        let ann = merged.search_final(query, k, oversample.max(1))?;
+        let exact = exact_vector_search(ctx, table_name, query, k, None, &Admission::Every).await?;
+        let ann = merged.search_final(query, k, oversample.max(1), &Admission::Every)?;
         samples.push(recall_at_k_for_query(&ann, &exact, k));
     }
     Ok(samples)
@@ -743,7 +743,7 @@ mod tests {
         // the unambiguous top-1 the oracle must return first.
         let query = rows[5].1.clone();
         let query = validate_query(query.to_vec(), dim, QuerySource::Caller).unwrap();
-        let top = exact_vector_search(&ctx, table, &query, 3, None)
+        let top = exact_vector_search(&ctx, table, &query, 3, None, &Admission::Every)
             .await
             .unwrap();
         assert_eq!(top.len(), 3);

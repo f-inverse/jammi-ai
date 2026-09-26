@@ -177,7 +177,14 @@ async fn happy_path_lands_a_ready_searchable_table_with_provenance_and_lineage(
     // uses: the query is the (already-unit) first row, so it is its own
     // nearest neighbour at distance ~0.
     let top1 = store
-        .search_vectors(&ctx, &record, &vq(&[1.0, 0.0, 0.0]), 1)
+        .search_vectors(
+            &ctx,
+            &record,
+            &vq(&[1.0, 0.0, 0.0]),
+            1,
+            jammi_db::index::SearchMethod::default(),
+            &jammi_db::index::Admission::Every,
+        )
         .await
         .unwrap();
     assert_eq!(top1.len(), 1);

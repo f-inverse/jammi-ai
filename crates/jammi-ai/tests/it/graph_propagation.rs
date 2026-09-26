@@ -1016,7 +1016,14 @@ async fn jumping_knowledge_concats_every_hop_normalizes_blocks_and_is_searchable
     let probe = out[probe_key].clone();
     let hits = session
         .result_store()
-        .search_vectors(session.context(), &table, &vq(&probe), 1)
+        .search_vectors(
+            session.context(),
+            &table,
+            &vq(&probe),
+            1,
+            jammi_db::index::SearchMethod::default(),
+            &jammi_db::index::Admission::Every,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1110,7 +1117,14 @@ async fn evaluable_through_eval_embeddings() {
     let probe = common::read_table_vectors(&session, &table).await["c0_0"].clone();
     let hits = session
         .result_store()
-        .search_vectors(session.context(), &resolved, &vq(&probe), 3)
+        .search_vectors(
+            session.context(),
+            &resolved,
+            &vq(&probe),
+            3,
+            jammi_db::index::SearchMethod::default(),
+            &jammi_db::index::Admission::Every,
+        )
         .await
         .unwrap();
     assert!(

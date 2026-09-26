@@ -133,7 +133,7 @@ async fn ring_empty_fallback_is_registered_and_scraped_on_metrics() {
         .expect("one segment exists");
     let query = jammi_test_utils::vq(&[1.0, 0.0, 0.0, 0.0]);
     let _ = placed
-        .search_final_placed(&query, 1, 1)
+        .search_final_placed(&query, 1, 1, &jammi_db::index::Admission::Every)
         .await
         .expect("an all-local fallback plan still searches this process's own segment");
 

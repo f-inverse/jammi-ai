@@ -558,7 +558,13 @@ async fn building_with_valid_parquet_promotes_with_true_count(kind: BackendKind)
         .await
         .unwrap()
         .expect("I6: sidecar rebuilt from Parquet");
-    let hits = index.search(&vq(&[0.0, 1.0, 2.0, 3.0]), 1).unwrap();
+    let hits = index
+        .search(
+            &vq(&[0.0, 1.0, 2.0, 3.0]),
+            1,
+            &jammi_db::index::Admission::Every,
+        )
+        .unwrap();
     assert_eq!(hits.len(), 1, "I6: rebuilt index is queryable");
 
     // I1/I3: a Ready table whose bytes exist IS registered.

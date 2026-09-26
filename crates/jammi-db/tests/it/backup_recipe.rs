@@ -149,6 +149,12 @@ async fn close_copy_reopen_preserves_rows() {
         .await
         .unwrap()
         .expect("the ANN sidecar survived the copy too");
-    let hits = index.search(&vq(&[1.0, 2.0, 3.0, 4.0]), 5).unwrap();
+    let hits = index
+        .search(
+            &vq(&[1.0, 2.0, 3.0, 4.0]),
+            5,
+            &jammi_db::index::Admission::Every,
+        )
+        .unwrap();
     assert_eq!(hits.len(), 5, "every row is still searchable after restore");
 }

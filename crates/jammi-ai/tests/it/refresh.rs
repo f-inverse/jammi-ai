@@ -230,7 +230,14 @@ impl Harness {
         let record = self.record().await;
         self.session
             .result_store()
-            .search_vectors(self.session.context(), &record, &vq(query), k)
+            .search_vectors(
+                self.session.context(),
+                &record,
+                &vq(query),
+                k,
+                jammi_db::index::SearchMethod::default(),
+                &jammi_db::index::Admission::Every,
+            )
             .await
             .unwrap()
     }
@@ -548,7 +555,14 @@ async fn recompute_of_a_versioned_table_is_a_new_table() {
         let old: std::collections::BTreeMap<String, f32> =
             h.search(&query, 200).await.into_iter().collect();
         let new: std::collections::BTreeMap<String, f32> = store
-            .search_vectors(h.session.context(), &new_record, &vq(&query), 200)
+            .search_vectors(
+                h.session.context(),
+                &new_record,
+                &vq(&query),
+                200,
+                jammi_db::index::SearchMethod::default(),
+                &jammi_db::index::Admission::Every,
+            )
             .await
             .unwrap()
             .into_iter()
@@ -672,7 +686,14 @@ async fn current_manifest_loss_is_typed_unavailable_and_recomputable() {
     let refused_query = vq(&[0.1; 32]);
     let err = session
         .with_tenant_scoped(tenant_a, |_| {
-            store.search_vectors(session.context(), &record, &refused_query, 3)
+            store.search_vectors(
+                session.context(),
+                &record,
+                &refused_query,
+                3,
+                jammi_db::index::SearchMethod::default(),
+                &jammi_db::index::Admission::Every,
+            )
         })
         .await
         .expect_err("search refuses");
@@ -1524,7 +1545,14 @@ async fn restart_serves_the_refreshed_version() {
     );
     let hits_after = session
         .result_store()
-        .search_vectors(session.context(), &record, &vq(&query), 5)
+        .search_vectors(
+            session.context(),
+            &record,
+            &vq(&query),
+            5,
+            jammi_db::index::SearchMethod::default(),
+            &jammi_db::index::Admission::Every,
+        )
         .await
         .unwrap();
     assert_eq!(hits_before, hits_after);

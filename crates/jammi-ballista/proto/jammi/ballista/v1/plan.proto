@@ -37,6 +37,13 @@ message VectorSearchExecNode {
     ExactSearch exact = 7;
   }
   optional string query_stored_table = 6;
+  // The rows the search may return; unset admits every row.
+  AdmittedRows admitted = 8;
+}
+
+// The `_row_id`s a search admits.
+message AdmittedRows {
+  repeated string row_ids = 1;
 }
 
 // An exact search. Its presence in `VectorSearchExecNode.method` is the choice.

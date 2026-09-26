@@ -5,7 +5,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use jammi_db::catalog::result_repo::{Producer, ResultTableRecord};
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::SearchMethod;
+use jammi_db::index::{FiniteQuery, SearchMethod};
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
@@ -1040,7 +1040,9 @@ impl InferenceSession {
     /// then `run`.
     ///
     /// `method` chooses an approximate search through the table's ANN index
-    /// (with an optional per-call oversample) or an exact one.
+    /// (with an optional per-call oversample) or an exact one. `filter`, a
+    /// SQL predicate over the source's columns, restricts the search to the
+    /// rows it selects: the `k` nearest of those.
     pub async fn search(
         self: &Arc<Self>,
         source_id: &str,
@@ -1048,15 +1050,16 @@ impl InferenceSession {
         k: usize,
         embedding_table: Option<&str>,
         method: SearchMethod,
+        filter: Option<&str>,
     ) -> Result<QueryBuilder> {
         QueryBuilder::new(
             Arc::clone(self),
             source_id,
-            query,
+            FiniteQuery::new(query, jammi_db::index::QuerySource::Caller)?,
             k,
             embedding_table,
             method,
-            jammi_db::index::QuerySource::Caller,
+            filter,
         )
         .await
     }
@@ -1064,15 +1067,18 @@ impl InferenceSession {
     /// Start a lexical (BM25) search of `text` over a source's lexical table
     /// — the named one, or the source's newest. Resolves through the
     /// tenant-scoped catalog and hydrates the `k` best-ranked rows from the
-    /// source, each carrying its `bm25_score` and `bm25_rank`.
+    /// source, each carrying its `bm25_score` and `bm25_rank`. `filter`
+    /// restricts the ranking to the source rows it selects, as for
+    /// [`Self::search`].
     pub async fn lexical_search(
         self: &Arc<Self>,
         source_id: &str,
         text: &str,
         k: usize,
         lexical_table: Option<&str>,
+        filter: Option<&str>,
     ) -> Result<QueryBuilder> {
-        QueryBuilder::lexical(Arc::clone(self), source_id, text, k, lexical_table).await
+        QueryBuilder::lexical(Arc::clone(self), source_id, text, k, lexical_table, filter).await
     }
 
     /// Start a search ranked by an existing row (query-by-example).
@@ -1093,6 +1099,7 @@ impl InferenceSession {
         k: usize,
         embedding_table: Option<&str>,
         method: SearchMethod,
+        filter: Option<&str>,
     ) -> Result<QueryBuilder> {
         let table = self
             .catalog()
@@ -1109,13 +1116,16 @@ impl InferenceSession {
         QueryBuilder::new(
             Arc::clone(self),
             source_id,
-            query,
+            FiniteQuery::new(
+                query,
+                jammi_db::index::QuerySource::Stored {
+                    table: pin.table_name().to_string(),
+                },
+            )?,
             k,
             embedding_table,
             method,
-            jammi_db::index::QuerySource::Stored {
-                table: pin.table_name().to_string(),
-            },
+            filter,
         )
         .await
     }

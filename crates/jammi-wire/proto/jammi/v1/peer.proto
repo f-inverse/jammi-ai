@@ -82,17 +82,28 @@ message SegmentSearchRequest {
   StoragePrecision storage_precision = 3;
   // The query vector.
   repeated float query = 4;
-  // The per-segment fetch width a segment's search starts from.
+  // The per-segment fetch width.
   uint64 width = 5;
   // Which stage of the protocol this search is.
   SegmentSearchPhase phase = 6;
-  // How many live hits each segment's search widens toward while the
-  // version's deletion mask hides rows of it.
-  uint64 target = 7;
+  // 7 was `target`, the live-hit count a masked segment's search widened
+  // toward — removed (the mask is part of the admission; nothing widens).
+  reserved 7;
+  reserved "target";
   // The table version the coordinator pinned: the owner serves that
   // version's segment set under its deletion mask. Unset for a
   // never-refreshed table's base set.
   optional int64 version = 8;
+  // The rows the search may return, when a caller's filter selected them;
+  // unset admits every row. The owner searches admitting only these and the
+  // version's mask leaves live, and an answer naming any other row does not
+  // reconcile.
+  AdmittedRows admitted = 9;
+}
+
+// The `_row_id`s a search admits.
+message AdmittedRows {
+  repeated string row_ids = 1;
 }
 
 message SegmentSearchResponse {

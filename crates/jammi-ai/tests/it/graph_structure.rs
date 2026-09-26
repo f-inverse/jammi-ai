@@ -447,6 +447,7 @@ async fn search_by_row_key_ranks_the_node_s_community_and_hydrates_its_source() 
             5,
             Some(&table.table_name),
             SearchMethod::default(),
+            None,
         )
         .await
         .unwrap()
@@ -485,6 +486,7 @@ async fn search_by_row_key_ranks_the_node_s_community_and_hydrates_its_source() 
             5,
             Some(&table.table_name),
             SearchMethod::default(),
+            None,
         )
         .await;
     let refused = match refused {

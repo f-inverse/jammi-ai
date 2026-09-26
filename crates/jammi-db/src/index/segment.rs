@@ -75,11 +75,11 @@ use jammi_numerics::distance::cosine_distance;
 
 use crate::config::StoragePrecision;
 use crate::error::{JammiError, Result};
-use crate::index::first_inadmissible_hit;
 use crate::index::peer::SegmentSearchPhase;
 use crate::index::sidecar::SidecarIndex;
 use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
+use crate::index::{first_inadmissible_hit, Admission, EXACT_ADMISSION_MAX};
 use crate::store::deletes::DeletionMask;
 
 /// A segment's position in its table's segment sequence — the `segment_id`
@@ -129,10 +129,52 @@ pub type ExactLookup<'a> = dyn Fn(&str) -> Result<Option<Vec<f32>>> + 'a;
 /// row_id)` for every exact read a multi-segment `search_final` makes.
 pub(crate) type SegmentExactLookup<'a> = dyn Fn(SegmentId, &str) -> Result<Option<Vec<f32>>> + 'a;
 
-/// One segment's hits for one query at `width` — the per-segment kernel.
+/// Which of one segment's rows a search admits: the rows the caller's
+/// [`Admission`] names, less any the version's deletion mask hides in a
+/// segment stamped `version`. The mask and a caller's filter are one thing —
+/// rows the search may not return — so both ride one predicate, applied while
+/// the segment is searched.
+pub struct SegmentAdmission<'a> {
+    admission: &'a Admission,
+    mask: Option<(&'a DeletionMask, i64)>,
+}
+
+impl<'a> SegmentAdmission<'a> {
+    /// `admission` over a segment no mask entry reaches.
+    pub fn unmasked(admission: &'a Admission) -> Self {
+        Self {
+            admission,
+            mask: None,
+        }
+    }
+
+    /// `admission` over a segment stamped `version`, under `mask`.
+    pub fn masked(admission: &'a Admission, mask: &'a DeletionMask, version: i64) -> Self {
+        Self {
+            admission,
+            mask: Some((mask, version)),
+        }
+    }
+
+    fn admits(&self, row_id: &str) -> bool {
+        self.admission.admits(row_id)
+            && !self
+                .mask
+                .is_some_and(|(mask, version)| mask.is_masked(row_id, version))
+    }
+
+    fn is_every(&self) -> bool {
+        self.mask.is_none() && *self.admission == Admission::Every
+    }
+}
+
+/// One segment's hits for one query at `width` — the per-segment kernel —
+/// among the rows `admission` admits.
 ///
 /// Searches the graph at `width` (capped at the segment's row count by the
-/// index itself, never padded). For a [`SegmentSearchPhase::Final`] phase on a
+/// index itself, never padded). When the admission names its rows and at most
+/// [`EXACT_ADMISSION_MAX`] of this segment's are admitted, they are scored
+/// exactly instead, whatever the phase. For a [`SegmentSearchPhase::Final`] phase on a
 /// precision that [`needs_rescore`](StoragePrecision::needs_rescore), every
 /// hit is rescored through `exact` + cosine so the returned distances are
 /// final and comparable across segments (the `Binary` protocol); otherwise the
@@ -145,6 +187,7 @@ pub fn search_unit(
     width: usize,
     phase: SegmentSearchPhase,
     exact: &ExactLookup<'_>,
+    admission: &SegmentAdmission<'_>,
 ) -> Result<Vec<(String, f32)>> {
     // The index enforces the width itself inside `search`; checked here too
     // so the `width == 0` early return cannot skip it. `query` has already
@@ -155,7 +198,27 @@ pub fn search_unit(
     if width == 0 {
         return Ok(Vec::new());
     }
-    let hits = index.search(query, width)?;
+    // The strategy is planned per segment from how many of ITS rows are
+    // admitted: few enough, and every one is scored exactly — the distances
+    // are then final at any precision; otherwise the graph is traversed
+    // admitting only them.
+    if let Some(rows) = admission.admission.row_ids() {
+        let admitted: Vec<(String, f32)> = rows
+            .iter()
+            .filter(|row_id| index.contains_row(row_id) && admission.admits(row_id))
+            .map(|row_id| (row_id.clone(), 0.0))
+            .collect();
+        if admitted.len() <= EXACT_ADMISSION_MAX {
+            let mut scored = rescore(segment, admitted, exact, query)?;
+            scored.truncate(width);
+            return Ok(scored);
+        }
+    }
+    let hits = if admission.is_every() {
+        index.search(query, width)?
+    } else {
+        index.search_admitting(query, width, &|row_id| admission.admits(row_id))?
+    };
     if phase == SegmentSearchPhase::Final && index.storage_precision().needs_rescore() {
         rescore(segment, hits, exact, query)
     } else {
@@ -177,7 +240,8 @@ pub struct ServedIndex<'a> {
     index: &'a SidecarIndex,
     mask: &'a DeletionMask,
     /// `|{K : mask[K] >= version ∧ index contains K}|` — how many of this
-    /// segment's rows the mask hides, which sizes the widened fetch.
+    /// segment's rows the mask hides; none, and the search needs no mask
+    /// predicate.
     dead: usize,
 }
 
@@ -199,58 +263,26 @@ impl<'a> ServedIndex<'a> {
         }
     }
 
-    /// The segment's live hits toward a global top-`target`, starting from
-    /// `base_width`: its own search, every hit the mask hides dropped. While
-    /// the segment hides rows, the width is scaled by `1 / (1 - dead / len)`
-    /// (capped at the segment's length) and doubled until `target` live hits
-    /// survive or the whole segment has been asked for; a segment hiding
-    /// nothing is searched exactly once at `base_width`. A
-    /// [`SegmentSearchPhase::Final`] phase on a precision that
-    /// [`needs_rescore`](StoragePrecision::needs_rescore) rescores the live
+    /// The segment's hits at `width` among the rows `admission` admits and
+    /// the mask leaves live — [`search_unit`] under one [`SegmentAdmission`],
+    /// so a hidden row never takes a place and the fetch is never widened
+    /// after the fact. A [`SegmentSearchPhase::Final`] phase on a precision
+    /// that [`needs_rescore`](StoragePrecision::needs_rescore) rescores the
     /// hits through `exact`.
     pub fn live_hits(
         &self,
         query: &ValidatedQuery,
-        base_width: usize,
-        target: usize,
+        width: usize,
         phase: SegmentSearchPhase,
         exact: &ExactLookup<'_>,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32)>> {
-        let len = self.index.len();
-        let mut width = if self.dead > 0 && len > self.dead {
-            let live_fraction = 1.0 - (self.dead as f32 / len as f32);
-            let scaled = (base_width as f32 / live_fraction).ceil() as usize;
-            scaled.max(base_width).min(len)
-        } else if self.dead > 0 {
-            len
+        let admits = if self.dead > 0 {
+            SegmentAdmission::masked(admission, self.mask, self.version)
         } else {
-            base_width
+            SegmentAdmission::unmasked(admission)
         };
-        let live = loop {
-            // The candidate phase, never rescored here: the width guard and
-            // the admissibility check apply, and these raw distances are the
-            // merge's sort key.
-            let live: Vec<(String, f32)> = search_unit(
-                self.id,
-                self.index,
-                query,
-                width,
-                SegmentSearchPhase::Approximate,
-                exact,
-            )?
-            .into_iter()
-            .filter(|(key, _)| !self.mask.is_masked(key, self.version))
-            .collect();
-            if self.dead == 0 || live.len() >= target || width >= len {
-                break live;
-            }
-            width = (width * 2).min(len);
-        };
-        if phase == SegmentSearchPhase::Final && self.index.storage_precision().needs_rescore() {
-            rescore(self.id, live, exact, query)
-        } else {
-            Ok(live)
-        }
+        search_unit(self.id, self.index, query, width, phase, exact, &admits)
     }
 
     /// Whether the mask hides `key` in this segment.
@@ -363,8 +395,8 @@ struct Segment {
     version: i64,
     index: SidecarIndex,
     /// `|{K : mask[K] >= version ∧ contains(K)}|`, computed once at
-    /// construction — how many of this segment's rows the mask hides, which
-    /// sizes the widened fetch.
+    /// construction — how many of this segment's rows the mask hides; `0`
+    /// means the mask is never consulted for this segment.
     dead: usize,
 }
 
@@ -489,14 +521,15 @@ impl SegmentedIndex {
         &self.mask
     }
 
-    /// Per segment: the live candidates for a global top-`m` — the segment's
-    /// [`ServedIndex::live_hits`] from the over-fetch width, each carrying the
-    /// segment that owns it.
+    /// Per segment: the admitted, live candidates for a global top-`m` — the
+    /// segment's [`ServedIndex::live_hits`] at the over-fetch width, each
+    /// carrying the segment that owns it.
     fn live_candidates(
         &self,
         seg: &Segment,
         query: &ValidatedQuery,
         m: usize,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32, SegmentId)>> {
         let served = ServedIndex {
             id: seg.id,
@@ -505,13 +538,15 @@ impl SegmentedIndex {
             mask: &self.mask,
             dead: seg.dead,
         };
+        // The candidate phase: these raw per-segment distances are the
+        // merge's sort key, and for `F32` they are also the final answer.
         Ok(served
             .live_hits(
                 query,
                 over_fetch(m, self.segments.len()),
-                m,
                 SegmentSearchPhase::Approximate,
                 &|row_id| seg.index.get_exact(row_id),
+                admission,
             )?
             .into_iter()
             .map(|(key, distance)| (key, distance, seg.id))
@@ -526,13 +561,14 @@ impl SegmentedIndex {
         &self,
         query: &ValidatedQuery,
         m: usize,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32, SegmentId)>> {
         if m == 0 {
             return Ok(Vec::new());
         }
         let mut merged: Vec<(String, f32, SegmentId)> = Vec::new();
         for seg in &self.segments {
-            merged.extend(self.live_candidates(seg, query, m)?);
+            merged.extend(self.live_candidates(seg, query, m, admission)?);
         }
         merged.sort_by(|a, b| {
             a.1.total_cmp(&b.1)
@@ -563,22 +599,28 @@ impl SegmentedIndex {
     /// the row-id space: a key present in two segments (re-embedded by a
     /// refresh) is masked in the older one by version, so the dedup is defence
     /// only.
-    pub fn search(&self, query: &ValidatedQuery, m: usize) -> Result<Vec<(String, f32)>> {
+    pub fn search(
+        &self,
+        query: &ValidatedQuery,
+        m: usize,
+        admission: &Admission,
+    ) -> Result<Vec<(String, f32)>> {
         Ok(self
-            .search_candidates(query, m)?
+            .search_candidates(query, m, admission)?
             .into_iter()
             .map(|(k, d, _)| (k, d))
             .collect())
     }
 
-    /// THE single final-results entry. Returns the exact top-`k` in a total
-    /// order comparable across every segment. Sync, all-local: every segment
+    /// THE single final-results entry. Returns the exact top-`k` among the
+    /// rows `admission` admits, in a total order comparable across every
+    /// segment. Sync, all-local: every segment
     /// here is resident in this process.
     ///
     /// Per precision (the module docs' protocol, over the kernels), every
-    /// stage routed through `Self::live_candidates`'s masked, dead-row
-    /// widened fetch — a masked or superseded key is never counted against a
-    /// live `k`:
+    /// stage routed through `Self::live_candidates`'s admitting fetch — a
+    /// masked or superseded key is never admitted, so never counted against
+    /// a live `k`:
     ///
     /// - `F32`: the merge is already exact and final, so this is
     ///   `search(query, k)` and `oversample` is unused.
@@ -605,8 +647,9 @@ impl SegmentedIndex {
         query: &ValidatedQuery,
         k: usize,
         oversample: usize,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32)>> {
-        self.search_final_with(query, k, oversample, &|segment, row_id| {
+        self.search_final_with(query, k, oversample, admission, &|segment, row_id| {
             self.exact_in(segment, row_id)
         })
     }
@@ -620,16 +663,17 @@ impl SegmentedIndex {
         query: &ValidatedQuery,
         k: usize,
         oversample: usize,
+        admission: &Admission,
         exact: &SegmentExactLookup<'_>,
     ) -> Result<Vec<(String, f32)>> {
         if k == 0 {
             return Ok(Vec::new());
         }
         match self.storage_precision {
-            StoragePrecision::F32 => self.search(query, k),
+            StoragePrecision::F32 => self.search(query, k, admission),
             StoragePrecision::F16 | StoragePrecision::Int8 => {
                 let candidate_k = k.saturating_mul(oversample).max(k);
-                let survivors = self.search_candidates(query, candidate_k)?;
+                let survivors = self.search_candidates(query, candidate_k, admission)?;
                 // Group by winning segment so each group rescores through the
                 // one segment that owns it — the same shape a coordinator uses
                 // when the groups are split between local and remote owners.
@@ -658,7 +702,7 @@ impl SegmentedIndex {
                 let mut units = Vec::with_capacity(self.segments.len());
                 for seg in &self.segments {
                     let live: Vec<(String, f32)> = self
-                        .live_candidates(seg, query, candidate_k)?
+                        .live_candidates(seg, query, candidate_k, admission)?
                         .into_iter()
                         .map(|(row_id, distance, _)| (row_id, distance))
                         .collect();
@@ -775,7 +819,7 @@ mod tests {
         for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
             for k in [1usize, 3, 5] {
                 assert_eq!(
-                    ids(&seg.search(q, k).unwrap()),
+                    ids(&seg.search(q, k, &crate::index::Admission::Every).unwrap()),
                     ids(&lone.search(q, k).unwrap()),
                     "N=1 F32 merge must equal the lone sidecar search"
                 );
@@ -806,7 +850,9 @@ mod tests {
                 manual.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
                 manual.truncate(k);
                 assert_eq!(
-                    ids(&seg.search_final(q, k, oversample).unwrap()),
+                    ids(&seg
+                        .search_final(q, k, oversample, &crate::index::Admission::Every)
+                        .unwrap()),
                     ids(&manual),
                     "N=1 Int8 search_final must equal manual retrieve→rescore"
                 );
@@ -827,7 +873,9 @@ mod tests {
         for q in &[vq(&rows[0].1), vq(&rows[3].1), vq(&rows[9].1)] {
             for k in [1usize, 3, 6] {
                 assert_eq!(
-                    ids(&seg.search_final(q, k, 4).unwrap()),
+                    ids(&seg
+                        .search_final(q, k, 4, &crate::index::Admission::Every)
+                        .unwrap()),
                     brute_force(&rows, q, k),
                     "2-segment F32 merge must equal brute-force top-k"
                 );
@@ -851,7 +899,9 @@ mod tests {
         for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
             for k in [1usize, 3] {
                 assert_eq!(
-                    ids(&seg.search_final(q, k, 32).unwrap()),
+                    ids(&seg
+                        .search_final(q, k, 32, &crate::index::Admission::Every)
+                        .unwrap()),
                     brute_force(&rows, q, k),
                     "2-segment Binary search_final must equal exact brute-force top-k"
                 );
@@ -890,14 +940,18 @@ mod tests {
         // raw per-segment Hamming order puts `a0` (Hamming 0 under τ_A) ahead
         // of `b0` (Hamming 1 under τ_B) — the cross-segment incomparability
         // the final-distance merge must not be fooled by.
-        let raw = seg.search(&vq(&q), 1).unwrap();
+        let raw = seg
+            .search(&vq(&q), 1, &crate::index::Admission::Every)
+            .unwrap();
         assert_eq!(
             ids(&raw),
             vec!["a0".to_string()],
             "fixture premise: raw Hamming merge keeps a0 (distance 0 under τ_A)"
         );
         assert_eq!(
-            ids(&seg.search_final(&vq(&q), 1, 1).unwrap()),
+            ids(&seg
+                .search_final(&vq(&q), 1, 1, &crate::index::Admission::Every)
+                .unwrap()),
             brute_force(&rows, &q, 1),
             "2-segment Binary search_final must equal exact brute-force top-1 even when \
              candidate_k = 1: each segment rescores before the merge"
@@ -981,7 +1035,7 @@ mod tests {
         // rescore-everything.
         let k = 5;
         let got: Vec<String> = seg
-            .search_final(&vq(&query), k, 4)
+            .search_final(&vq(&query), k, 4, &crate::index::Admission::Every)
             .unwrap()
             .into_iter()
             .map(|(id, _)| id)
@@ -1041,7 +1095,8 @@ mod tests {
                         lone.search(q, k).unwrap()
                     };
                     assert_eq!(
-                        seg.search_final(q, k, oversample).unwrap(),
+                        seg.search_final(q, k, oversample, &crate::index::Admission::Every)
+                            .unwrap(),
                         reference,
                         "{precision:?} k={k} oversample={oversample}: N=1 search_final must be \
                          byte-identical to the lone sidecar"
@@ -1112,10 +1167,16 @@ mod tests {
     ) -> (Vec<(String, f32)>, usize) {
         let reads = std::cell::Cell::new(0usize);
         let hits = seg
-            .search_final_with(&vq(query), k, oversample, &|segment, row_id| {
-                reads.set(reads.get() + 1);
-                seg.exact_in(segment, row_id)
-            })
+            .search_final_with(
+                &vq(query),
+                k,
+                oversample,
+                &crate::index::Admission::Every,
+                &|segment, row_id| {
+                    reads.set(reads.get() + 1);
+                    seg.exact_in(segment, row_id)
+                },
+            )
             .unwrap();
         (hits, reads.get())
     }
@@ -1171,7 +1232,8 @@ mod tests {
                 );
                 assert_eq!(
                     hits,
-                    seg.search_final(&vq(&query), k, oversample).unwrap(),
+                    seg.search_final(&vq(&query), k, oversample, &crate::index::Admission::Every)
+                        .unwrap(),
                     "{precision:?} N={n}: the counted composition is the production entry"
                 );
                 assert_eq!(hits.len(), k);
@@ -1214,6 +1276,7 @@ mod tests {
                 2,
                 SegmentSearchPhase::Final,
                 &|_| Ok(Some(stored.clone())),
+                &crate::index::SegmentAdmission::unmasked(&crate::index::Admission::Every),
             )
             .unwrap_err();
             assert!(err.to_string().contains("segment 3"), "{poison:?}: {}", err);
@@ -1244,6 +1307,7 @@ mod tests {
                     2,
                     SegmentSearchPhase::Final,
                     &|row_id| index.get_exact(row_id),
+                    &crate::index::SegmentAdmission::unmasked(&crate::index::Admission::Every),
                 )
                 .unwrap_err();
                 let text = err.to_string();
@@ -1263,11 +1327,13 @@ mod tests {
             // coordinator re-runs in process after a local load).
             let seg = segmented(vec![(&rows, precision)]);
             assert!(
-                seg.search_final(&vq(&[0.5f32; 9]), 1, 1).is_err(),
+                seg.search_final(&vq(&[0.5f32; 9]), 1, 1, &crate::index::Admission::Every)
+                    .is_err(),
                 "{precision:?}: search_final must refuse a 9-wide query on an 8-wide set"
             );
             assert!(
-                seg.search(&vq(&[0.5f32; 9]), 1).is_err(),
+                seg.search(&vq(&[0.5f32; 9]), 1, &crate::index::Admission::Every)
+                    .is_err(),
                 "{precision:?}: the raw candidate entry refuses it as well"
             );
         }
@@ -1352,8 +1418,18 @@ mod tests {
         ]);
         let expected = brute_force(&rows, &query, 4);
         // The tie between y and z must resolve y-before-z (row_id order) in both.
-        assert_eq!(ids(&n1.search(&vq(&query), 4).unwrap()), expected);
-        assert_eq!(ids(&n2.search(&vq(&query), 4).unwrap()), expected);
+        assert_eq!(
+            ids(&n1
+                .search(&vq(&query), 4, &crate::index::Admission::Every)
+                .unwrap()),
+            expected
+        );
+        assert_eq!(
+            ids(&n2
+                .search(&vq(&query), 4, &crate::index::Admission::Every)
+                .unwrap()),
+            expected
+        );
         let y = expected.iter().position(|id| id == "y").unwrap();
         let z = expected.iter().position(|id| id == "z").unwrap();
         assert!(y < z, "row_id tiebreak orders y before z");
@@ -1375,8 +1451,12 @@ mod tests {
             (right, StoragePrecision::F32),
         ]);
         assert_eq!(
-            ids(&a.search(&vq(query), 6).unwrap()),
-            ids(&b.search(&vq(query), 6).unwrap())
+            ids(&a
+                .search(&vq(query), 6, &crate::index::Admission::Every)
+                .unwrap()),
+            ids(&b
+                .search(&vq(query), 6, &crate::index::Admission::Every)
+                .unwrap())
         );
     }
 
@@ -1397,7 +1477,13 @@ mod tests {
             (&left, StoragePrecision::F32),
             (&right, StoragePrecision::F32),
         ]);
-        let hits = seg.search(&vq(&[1.0, 0.0, 0.0, 0.0]), 4).unwrap();
+        let hits = seg
+            .search(
+                &vq(&[1.0, 0.0, 0.0, 0.0]),
+                4,
+                &crate::index::Admission::Every,
+            )
+            .unwrap();
         let shared_count = hits.iter().filter(|(id, _)| id == "shared").count();
         assert_eq!(
             shared_count, 1,
@@ -1416,5 +1502,114 @@ mod tests {
             (SegmentId(1), segment(right, StoragePrecision::Int8)),
         ];
         assert!(SegmentedIndex::new(segs).is_err());
+    }
+
+    // Filtered search, few admitted rows: every one is scored exactly — the
+    // exact filtered top-k — by reading exactly the admitted rows' vectors and
+    // nothing else, however far the admitted rows sit from the query (the
+    // shape a widen-and-retry search reaches only by scanning everything).
+    #[test]
+    fn a_selective_admission_reads_exactly_the_admitted_rows() {
+        let rows = corpus();
+        let index = segment(&rows, StoragePrecision::F32);
+        // Near "a" and "g"; the admitted rows are the far side of the corpus.
+        let query = vq(&rows[0].1);
+        let admitted = Admission::rows(["c", "k", "l"].map(String::from));
+        let reads = std::cell::Cell::new(0usize);
+        let hits = search_unit(
+            SegmentId(0),
+            &index,
+            &query,
+            2,
+            SegmentSearchPhase::Final,
+            &|row_id| {
+                reads.set(reads.get() + 1);
+                index.get_exact(row_id)
+            },
+            &SegmentAdmission::unmasked(&admitted),
+        )
+        .unwrap();
+        let admitted_rows: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .filter(|(id, _)| admitted.admits(id))
+            .cloned()
+            .collect();
+        assert_eq!(ids(&hits), brute_force(&admitted_rows, &rows[0].1, 2));
+        assert_eq!(reads.get(), 3, "one exact read per admitted row, no other");
+
+        let set = segmented(vec![
+            (&rows[..6], StoragePrecision::F32),
+            (&rows[6..], StoragePrecision::F32),
+        ]);
+        assert_eq!(
+            ids(&set.search_final(&query, 2, 1, &admitted).unwrap()),
+            brute_force(&admitted_rows, &rows[0].1, 2),
+            "the merged set returns the same exact filtered top-k"
+        );
+    }
+
+    // Filtered search, many admitted rows: past EXACT_ADMISSION_MAX the graph
+    // is traversed admitting only those rows — no exact read, nothing
+    // outside the admission returned, and the filtered top-k tracks the exact
+    // filtered oracle.
+    #[test]
+    fn a_broad_admission_traverses_admitting_only_its_rows() {
+        let n = EXACT_ADMISSION_MAX + 2_000;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+        };
+        let owned: Vec<(String, Vec<f32>)> = (0..n)
+            .map(|i| (format!("r{i:05}"), (0..16).map(|_| next()).collect()))
+            .collect();
+        let rows: Vec<(&str, Vec<f32>)> = owned
+            .iter()
+            .map(|(id, v)| (id.as_str(), v.clone()))
+            .collect();
+        let index = segment(&rows, StoragePrecision::F32);
+        // Every row but each seventh: well past EXACT_ADMISSION_MAX.
+        let admitted = Admission::rows(
+            owned
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 7 != 0)
+                .map(|(_, (id, _))| id.clone()),
+        );
+        let admitted_rows: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .filter(|(id, _)| admitted.admits(id))
+            .cloned()
+            .collect();
+        assert!(admitted_rows.len() > EXACT_ADMISSION_MAX);
+
+        let mut recalled = 0usize;
+        let (queries, k) = (20usize, 10usize);
+        for q in 0..queries {
+            let query_vec = rows[q * 7].1.clone(); // an excluded row's own vector
+            let reads = std::cell::Cell::new(0usize);
+            let hits = search_unit(
+                SegmentId(0),
+                &index,
+                &vq(&query_vec),
+                k,
+                SegmentSearchPhase::Final,
+                &|row_id| {
+                    reads.set(reads.get() + 1);
+                    index.get_exact(row_id)
+                },
+                &SegmentAdmission::unmasked(&admitted),
+            )
+            .unwrap();
+            assert_eq!(reads.get(), 0, "a traversal reads no exact vector");
+            assert_eq!(hits.len(), k);
+            assert!(hits.iter().all(|(id, _)| admitted.admits(id)));
+            let oracle = brute_force(&admitted_rows, &query_vec, k);
+            recalled += ids(&hits).iter().filter(|id| oracle.contains(id)).count();
+        }
+        let recall = recalled as f32 / (queries * k) as f32;
+        assert!(recall >= 0.9, "filtered traversal recall@{k} = {recall}");
     }
 }

@@ -1302,8 +1302,8 @@ class EmbeddedBackend:
         (query-by-example: the vector stored for that row, resolved inside
         the engine — it never crosses the API); exactly one is given.
         `filter` is an optional SQL predicate over
-        the hydrated columns — the search returns the `k` nearest rows that
-        satisfy it; `select` projects columns (empty keeps every
+        the source's columns — the search ranks only the rows it selects and
+        returns the `k` nearest of them; `select` projects columns (empty keeps every
         hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned table);
         ``None`` searches the most-recent ready table. `oversample` overrides,

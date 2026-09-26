@@ -189,6 +189,7 @@ async fn exclude_self_drops_the_targets_own_row() {
             1,
             None,
             SearchMethod::default(),
+            None,
         )
         .await
         .unwrap()

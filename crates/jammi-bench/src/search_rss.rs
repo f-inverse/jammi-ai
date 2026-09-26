@@ -47,7 +47,7 @@ use tempfile::tempdir;
 use tokio::process::Command;
 
 use jammi_db::index::exact::{exact_vector_search, scan_width};
-use jammi_db::index::{validate_query, QuerySource};
+use jammi_db::index::{validate_query, Admission, QuerySource};
 use jammi_db::store::vectors::extend_with_fixed_size_list_f32;
 use jammi_numerics::distance::cosine_distance;
 
@@ -305,6 +305,7 @@ pub async fn measure_once(
                         )?,
                         K,
                         None,
+                        &Admission::Every,
                     )
                     .await?
                 }

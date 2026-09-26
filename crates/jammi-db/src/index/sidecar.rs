@@ -778,6 +778,86 @@ impl SidecarIndex {
     }
 }
 
+impl SidecarIndex {
+    /// The `k` nearest rows `admit` accepts, `(row_id, cosine_distance)`
+    /// ascending: USearch's filtered search, which applies the predicate while
+    /// it traverses the graph rather than to a truncated result
+    /// (<https://unum-cloud.github.io/USearch/>), so a row it rejects never
+    /// takes one of the `k` places.
+    pub fn search_admitting(
+        &self,
+        query: &ValidatedQuery,
+        k: usize,
+        admit: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<(String, f32)>> {
+        self.traverse(query, k, Some(admit))
+    }
+
+    /// The graph search behind [`VectorIndex::search`] and
+    /// [`Self::search_admitting`]: every row when `admit` is `None`.
+    fn traverse(
+        &self,
+        query: &ValidatedQuery,
+        k: usize,
+        admit: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<Vec<(String, f32)>> {
+        // The index is an artifact on width: a `ValidatedQuery` validated
+        // with no width in hand meets it here, typed, before any kernel.
+        // Downstream of the entry (redundant with `search_unit`'s own check
+        // when reached through it, and still safe standalone), so a
+        // disagreement is this index's own drift, never the caller's.
+        query.require_width(self.dimensions, "sidecar index")?;
+        let query: &[f32] = query;
+        if self.row_map.is_empty() {
+            return Ok(Vec::new());
+        }
+        let actual_k = k.min(self.row_map.len());
+        let admitted = |key: u64| {
+            admit.is_none_or(|admit| {
+                self.row_map
+                    .get(key as usize)
+                    .is_some_and(|row_id| admit(row_id))
+            })
+        };
+        let matches = match self.storage_precision {
+            // Same routing as `build`: a Binary graph's typed search path is
+            // `b1x8`, fed the query packed through the identical
+            // `pack_threshold_bits` (against the SAME corpus-fit τ) the
+            // corpus rows were bulk-inserted with.
+            StoragePrecision::Binary => {
+                let threshold = self.binary_threshold.as_deref().ok_or_else(|| {
+                    JammiError::Other(
+                        "Binary search: no threshold τ available — index has not been built or \
+                         loaded"
+                            .into(),
+                    )
+                })?;
+                let packed = pack_threshold_bits(query, threshold);
+                let packed = usearch::b1x8::from_u8s(&packed);
+                match admit {
+                    None => self.index.search(packed, actual_k),
+                    Some(_) => self.index.filtered_search(packed, actual_k, admitted),
+                }
+            }
+            StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => match admit {
+                None => self.index.search(query, actual_k),
+                Some(_) => self.index.filtered_search(query, actual_k, admitted),
+            },
+        }
+        .map_err(|e| JammiError::Other(format!("USearch search: {e}")))?;
+
+        Ok(matches
+            .keys
+            .iter()
+            .zip(matches.distances.iter())
+            .filter_map(|(&key, &dist)| {
+                let idx = key as usize;
+                self.row_map.get(idx).map(|id| (id.clone(), dist))
+            })
+            .collect())
+    }
+}
+
 impl VectorIndex for SidecarIndex {
     fn add(&mut self, row_id: &str, vector: &[f32]) -> Result<()> {
         if vector.len() != self.dimensions {
@@ -852,50 +932,7 @@ impl VectorIndex for SidecarIndex {
     }
 
     fn search(&self, query: &ValidatedQuery, k: usize) -> Result<Vec<(String, f32)>> {
-        // The index is an artifact on width: a `ValidatedQuery` validated
-        // with no width in hand meets it here, typed, before any kernel.
-        // Downstream of the entry (redundant with `search_unit`'s own check
-        // when reached through it, and still safe standalone), so a
-        // disagreement is this index's own drift, never the caller's.
-        query.require_width(self.dimensions, "sidecar index")?;
-        let query: &[f32] = query;
-        if self.row_map.is_empty() {
-            return Ok(Vec::new());
-        }
-        let actual_k = k.min(self.row_map.len());
-        let matches = match self.storage_precision {
-            // Same routing as `build`: a Binary graph's typed search path is
-            // `search_b1x8`, fed the query packed through the identical
-            // `pack_threshold_bits` (against the SAME corpus-fit τ) the
-            // corpus rows were bulk-inserted with.
-            StoragePrecision::Binary => {
-                let threshold = self.binary_threshold.as_deref().ok_or_else(|| {
-                    JammiError::Other(
-                        "Binary search: no threshold τ available — index has not been built or \
-                         loaded"
-                            .into(),
-                    )
-                })?;
-                let packed = pack_threshold_bits(query, threshold);
-                self.index
-                    .search(usearch::b1x8::from_u8s(&packed), actual_k)
-            }
-            StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
-                self.index.search(query, actual_k)
-            }
-        }
-        .map_err(|e| JammiError::Other(format!("USearch search: {e}")))?;
-
-        let results: Vec<(String, f32)> = matches
-            .keys
-            .iter()
-            .zip(matches.distances.iter())
-            .filter_map(|(&key, &dist)| {
-                let idx = key as usize;
-                self.row_map.get(idx).map(|id| (id.clone(), dist))
-            })
-            .collect();
-        Ok(results)
+        self.traverse(query, k, None)
     }
 
     fn save(&self, path: &Path) -> Result<()> {

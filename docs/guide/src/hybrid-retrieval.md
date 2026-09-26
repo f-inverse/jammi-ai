@@ -73,7 +73,8 @@ term is one disjunctive clause, so a row matching more of the terms, or rarer
 ones, ranks higher, and no query syntax is interpreted — a colon, a quote or a
 minus sign is text. It returns the `k` best-ranked rows hydrated from the
 source, with the same `filter` / `select` refinements `search` has: with a
-`filter`, the `k` best-ranked rows that satisfy it.
+`filter`, the `k` best-ranked rows that satisfy it, ranked among only the rows it
+selects (the BM25 query is intersected with them, their scores unchanged).
 
 ### Python
 

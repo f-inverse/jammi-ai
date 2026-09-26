@@ -61,6 +61,7 @@ async fn smoke_full_pipeline() {
             5,
             None,
             SearchMethod::default(),
+            None,
         )
         .await
         .unwrap()

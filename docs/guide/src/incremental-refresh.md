@@ -137,9 +137,10 @@ A reader — `search`, `search_by_id`, every SQL `SELECT`, `read_vectors`,
 `verify_materialization`, `staleness` — resolves the table's
 `current_version` and sees only that version's live rows:
 
-- **ANN.** The version's segments are merged under its mask; a masked
-  candidate is dropped and the search widens until `k` live hits are found,
-  and the exact rescore reads the segment that owns the hit.
+- **ANN.** The version's segments are merged under its mask; each segment
+  is searched admitting only its live rows (the mask is the same admission a
+  search `filter` is), so a masked row never takes one of the `k` places, and
+  the exact rescore reads the segment that owns the hit.
 - **SQL.** The version's fragments are unioned under the mask with `_row_id`
   always projected, so `COUNT(*)`, `SELECT vector` and `LIMIT n` all see live
   rows only.

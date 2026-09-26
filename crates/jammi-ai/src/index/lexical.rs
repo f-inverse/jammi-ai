@@ -29,10 +29,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::LexicalAnalyzer;
+use jammi_db::index::{Admission, LexicalAnalyzer};
 use jammi_db::store::manifest::InputAnchor;
 use tantivy::collector::TopDocs;
-use tantivy::query::BooleanQuery;
+use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermSetQuery};
 use tantivy::schema::{IndexRecordOption, Schema, Value, STORED, STRING, TEXT};
 use tantivy::tokenizer::{LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer};
 use tantivy::{doc, Index, IndexWriter, TantivyDocument, Term};
@@ -156,13 +156,22 @@ impl LexicalIndex {
         terms
     }
 
-    /// The top `k` rows for `text` by BM25 score, highest first, each carrying
-    /// its 0-based rank. Ties break by `_row_id`, so the ranking is stable
-    /// across runs. A query with no terms (empty, or only characters the
-    /// analyzer drops) matches nothing.
-    pub fn search(&self, text: &str, k: usize) -> Result<Vec<LexicalHit>> {
+    /// The top `k` rows for `text` by BM25 score among the rows `admission`
+    /// admits, highest first, each carrying its 0-based rank. Ties break by
+    /// `_row_id`, so the ranking is stable across runs. A query with no terms
+    /// (empty, or only characters the analyzer drops) matches nothing.
+    ///
+    /// An admission naming its rows is a required clause over the `_row_id`
+    /// field (tantivy's `TermSetQuery`, which matches the documents holding
+    /// any of the terms), scored at zero so the BM25 score is the text's
+    /// alone: the inverted index intersects the two posting sets, so the
+    /// ranking only ever sees admitted rows.
+    pub fn search(&self, text: &str, k: usize, admission: &Admission) -> Result<Vec<LexicalHit>> {
         let terms = self.query_terms(text);
         if k == 0 || self.doc_count == 0 || terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        if admission.row_ids().is_some_and(|rows| rows.is_empty()) {
             return Ok(Vec::new());
         }
         let reader = self
@@ -170,13 +179,29 @@ impl LexicalIndex {
             .reader()
             .map_err(|e| JammiError::Lexical(format!("reader: {e}")))?;
         let searcher = reader.searcher();
-        let query = BooleanQuery::new_multiterms_query(terms);
+        let text_query: Box<dyn Query> = Box::new(BooleanQuery::new_multiterms_query(terms));
+        let query: Box<dyn Query> = match admission.row_ids() {
+            None => text_query,
+            Some(rows) => {
+                let admitted = TermSetQuery::new(
+                    rows.iter()
+                        .map(|row_id| Term::from_field_text(self.row_id_field, row_id)),
+                );
+                Box::new(BooleanQuery::new(vec![
+                    (Occur::Must, text_query),
+                    (
+                        Occur::Must,
+                        Box::new(ConstScoreQuery::new(Box::new(admitted), 0.0)),
+                    ),
+                ]))
+            }
+        };
 
         // Over-fetch so the tie-break sees every doc that could land in the
         // top-k, then truncate.
         let fetch = k.saturating_mul(4);
         let top = searcher
-            .search(&query, &TopDocs::with_limit(fetch).order_by_score())
+            .search(&*query, &TopDocs::with_limit(fetch).order_by_score())
             .map_err(|e| JammiError::Lexical(format!("search: {e}")))?;
 
         let mut scored: Vec<(f32, String)> = top
@@ -263,6 +288,36 @@ impl LexicalIndexes {
 mod tests {
     use super::*;
 
+    /// An admission ranks only its rows, and an admitted row keeps the BM25
+    /// score it has unfiltered: the restriction is a zero-scored required
+    /// clause, never a change to the text's score.
+    #[test]
+    fn an_admission_ranks_only_its_rows_at_their_own_scores() {
+        let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
+        let plain = idx.search("turbine engine", 10, &Admission::Every).unwrap();
+        let admitted = Admission::rows(["doc-1", "doc-3"].map(String::from));
+        let filtered = idx.search("turbine engine", 10, &admitted).unwrap();
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|h| h.row_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["doc-1"],
+            "doc-3 is admitted but does not match; doc-2 and doc-4 match but are not admitted"
+        );
+        let unfiltered_score = plain
+            .iter()
+            .find(|h| h.row_id == "doc-1")
+            .unwrap()
+            .bm25_score;
+        assert_eq!(filtered[0].bm25_score, unfiltered_score);
+        assert_eq!(filtered[0].rank, 0);
+        assert!(idx
+            .search("turbine", 10, &Admission::rows(Vec::<String>::new()))
+            .unwrap()
+            .is_empty());
+    }
+
     fn fixture() -> Vec<(&'static str, &'static str)> {
         vec![
             ("doc-1", "a method for reducing turbine blade vibration"),
@@ -275,7 +330,7 @@ mod tests {
     #[test]
     fn bm25_ranks_rows_matching_more_query_terms_higher() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let hits = idx.search("turbine engine", 10).unwrap();
+        let hits = idx.search("turbine engine", 10, &Admission::Every).unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.row_id.as_str()).collect();
         // A disjunction: a row carrying either term matches, one carrying
         // neither does not.
@@ -289,22 +344,27 @@ mod tests {
     #[test]
     fn query_syntax_is_searched_as_text() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let plain = idx.search("turbine engine", 10).unwrap();
-        let punctuated = idx.search("\"turbine: -engine", 10).unwrap();
+        let plain = idx.search("turbine engine", 10, &Admission::Every).unwrap();
+        let punctuated = idx
+            .search("\"turbine: -engine", 10, &Admission::Every)
+            .unwrap();
         assert_eq!(plain, punctuated);
     }
 
     #[test]
     fn a_query_with_no_terms_matches_nothing() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        assert!(idx.search("", 10).unwrap().is_empty());
-        assert!(idx.search("  ?!  ", 10).unwrap().is_empty());
+        assert!(idx.search("", 10, &Admission::Every).unwrap().is_empty());
+        assert!(idx
+            .search("  ?!  ", 10, &Admission::Every)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn ranks_are_dense_and_zero_based() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let hits = idx.search("turbine engine", 10).unwrap();
+        let hits = idx.search("turbine engine", 10, &Admission::Every).unwrap();
         for (i, h) in hits.iter().enumerate() {
             assert_eq!(h.rank, i, "rank must equal position");
         }
@@ -313,7 +373,7 @@ mod tests {
     #[test]
     fn repeated_term_row_outscores_single_mention() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let hits = idx.search("turbine engine", 10).unwrap();
+        let hits = idx.search("turbine engine", 10, &Admission::Every).unwrap();
         // doc-4 mentions both terms repeatedly; it should rank above doc-2.
         let pos = |id: &str| hits.iter().position(|h| h.row_id == id).unwrap();
         assert!(pos("doc-4") < pos("doc-2"));
@@ -322,22 +382,25 @@ mod tests {
     #[test]
     fn search_is_deterministic_across_runs() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let a = idx.search("turbine engine", 10).unwrap();
-        let b = idx.search("turbine engine", 10).unwrap();
+        let a = idx.search("turbine engine", 10, &Admission::Every).unwrap();
+        let b = idx.search("turbine engine", 10, &Admission::Every).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn k_caps_the_result_count() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let hits = idx.search("turbine", 2).unwrap();
+        let hits = idx.search("turbine", 2, &Admission::Every).unwrap();
         assert!(hits.len() <= 2);
     }
 
     #[test]
     fn zero_k_returns_empty() {
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        assert!(idx.search("turbine", 0).unwrap().is_empty());
+        assert!(idx
+            .search("turbine", 0, &Admission::Every)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -345,7 +408,10 @@ mod tests {
         let idx =
             LexicalIndex::build(Vec::<(&str, &str)>::new(), LexicalAnalyzer::English).unwrap();
         assert!(idx.is_empty());
-        assert!(idx.search("anything", 5).unwrap().is_empty());
+        assert!(idx
+            .search("anything", 5, &Admission::Every)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -353,7 +419,7 @@ mod tests {
         // "blades" (built) is reachable via "blade" (queried) under the
         // English analyzer's Porter stemmer.
         let idx = LexicalIndex::build(fixture(), LexicalAnalyzer::English).unwrap();
-        let hits = idx.search("blade", 10).unwrap();
+        let hits = idx.search("blade", 10, &Admission::Every).unwrap();
         let ids: Vec<&str> = hits.iter().map(|h| h.row_id.as_str()).collect();
         assert!(ids.contains(&"doc-2"));
     }
@@ -363,9 +429,15 @@ mod tests {
         // Under Raw, "blade" does not reach the row that only has "blades".
         let rows = vec![("only-plural", "cooling turbine blades assembly")];
         let idx = LexicalIndex::build(rows, LexicalAnalyzer::Raw).unwrap();
-        assert!(idx.search("blade", 10).unwrap().is_empty());
+        assert!(idx
+            .search("blade", 10, &Admission::Every)
+            .unwrap()
+            .is_empty());
         // The exact surface form still matches.
-        assert_eq!(idx.search("blades", 10).unwrap().len(), 1);
+        assert_eq!(
+            idx.search("blades", 10, &Admission::Every).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -374,7 +446,16 @@ mod tests {
         let english = LexicalIndex::build(rows(), LexicalAnalyzer::English).unwrap();
         let raw = LexicalIndex::build(rows(), LexicalAnalyzer::Raw).unwrap();
         // "turbine" reaches the row under English stemming, not under Raw.
-        assert_eq!(english.search("turbine", 5).unwrap().len(), 1);
-        assert!(raw.search("turbine", 5).unwrap().is_empty());
+        assert_eq!(
+            english
+                .search("turbine", 5, &Admission::Every)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(raw
+            .search("turbine", 5, &Admission::Every)
+            .unwrap()
+            .is_empty());
     }
 }

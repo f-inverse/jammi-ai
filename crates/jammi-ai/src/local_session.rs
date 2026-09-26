@@ -384,31 +384,42 @@ impl Session {
     /// Run a vector search and return the terminal hydrated batches: the `k`
     /// nearest rows, or with a `filter`, the `k` nearest rows that satisfy it.
     ///
-    /// The filter reads hydrated source columns, so it applies after the
-    /// vectors are ranked. The ranked breadth therefore widens — `k`, then
-    /// four times as many, and so on — until `k` rows pass, ending in an
-    /// exact search over every row of the table, where fewer than `k`
-    /// passing rows means fewer than `k` exist.
+    /// The filter is evaluated once over the source, and the search ranks
+    /// only the rows it selects — the index admits nothing else while it is
+    /// searched — so a selective filter costs work in proportion to the rows
+    /// it selects, not to the table, and fewer than `k` rows means fewer than
+    /// `k` satisfy it.
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<RecordBatch>> {
-        let rows = match request.filter {
-            Some(_) => {
+        let source_id = request.source_id.as_str();
+        let embedding_table = request.embedding_table.as_deref();
+        let filter = request.filter.as_deref();
+        let builder = match &request.query {
+            SearchQuery::Vector(vector) => {
                 self.engine
-                    .catalog()
-                    .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
+                    .search(
+                        source_id,
+                        vector.clone(),
+                        request.k,
+                        embedding_table,
+                        request.method,
+                        filter,
+                    )
                     .await?
-                    .row_count
             }
-            None => 0,
+            SearchQuery::RowKey(row_key) => {
+                self.engine
+                    .search_by_id(
+                        source_id,
+                        row_key,
+                        request.k,
+                        embedding_table,
+                        request.method,
+                        filter,
+                    )
+                    .await?
+            }
         };
-        until_k_pass(request.k, rows, |breadth| {
-            let method = if breadth >= rows && request.filter.is_some() {
-                SearchMethod::Exact
-            } else {
-                request.method
-            };
-            self.ranked(&request, breadth, method)
-        })
-        .await
+        project(builder, &request.select)?.run().await
     }
 
     /// Materialise a lexical index over a source's text: one `(_row_id, text)`
@@ -425,84 +436,21 @@ impl Session {
 
     /// Run a lexical (BM25) search and return the terminal hydrated batches:
     /// the `k` best-ranked rows for `request.text`, or with a `filter`, the
-    /// `k` best-ranked rows that satisfy it — the breadth widening as a
-    /// filtered [`Self::search`]'s does. Each row carries its `bm25_score`
-    /// and `bm25_rank`.
+    /// `k` best-ranked rows that satisfy it — ranked among only the rows the
+    /// filter selects, as a filtered [`Self::search`] is. Each row carries its
+    /// `bm25_score` and `bm25_rank`.
     pub async fn lexical_search(&self, request: LexicalSearchRequest) -> Result<Vec<RecordBatch>> {
-        let rows = match request.filter {
-            Some(_) => {
-                self.engine
-                    .catalog()
-                    .resolve_lexical_table(&request.source_id, request.lexical_table.as_deref())
-                    .await?
-                    .row_count
-            }
-            None => 0,
-        };
-        until_k_pass(request.k, rows, |breadth| {
-            self.lexical_ranked(&request, breadth)
-        })
-        .await
-    }
-
-    /// One ranked pass of a lexical `request`: the `breadth` best-ranked rows,
-    /// hydrated, then the first `request.k` of them that satisfy
-    /// `request.filter`, projected to `request.select`.
-    async fn lexical_ranked(
-        &self,
-        request: &LexicalSearchRequest,
-        breadth: usize,
-    ) -> Result<Vec<RecordBatch>> {
         let builder = self
             .engine
             .lexical_search(
                 &request.source_id,
                 &request.text,
-                breadth,
+                request.k,
                 request.lexical_table.as_deref(),
+                request.filter.as_deref(),
             )
             .await?;
-        refine(
-            builder,
-            request.filter.as_deref(),
-            request.k,
-            &request.select,
-        )?
-        .run()
-        .await
-    }
-
-    /// One ranked pass of `request` by `method`: the `breadth` nearest rows,
-    /// hydrated, then the first `request.k` of them that satisfy
-    /// `request.filter`, projected to `request.select`.
-    async fn ranked(
-        &self,
-        request: &SearchRequest,
-        breadth: usize,
-        method: SearchMethod,
-    ) -> Result<Vec<RecordBatch>> {
-        let source_id = request.source_id.as_str();
-        let embedding_table = request.embedding_table.as_deref();
-        let builder = match &request.query {
-            SearchQuery::Vector(vector) => {
-                self.engine
-                    .search(source_id, vector.clone(), breadth, embedding_table, method)
-                    .await?
-            }
-            SearchQuery::RowKey(row_key) => {
-                self.engine
-                    .search_by_id(source_id, row_key, breadth, embedding_table, method)
-                    .await?
-            }
-        };
-        refine(
-            builder,
-            request.filter.as_deref(),
-            request.k,
-            &request.select,
-        )?
-        .run()
-        .await
+        project(builder, &request.select)?.run().await
     }
 
     // --- inference -------------------------------------------------------
@@ -1064,37 +1012,11 @@ pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result
     }
 }
 
-/// Run `ranked` at widening breadths — `k`, then four times as many, and so
-/// on — until it returns `k` rows or the breadth covers all `rows`. A `rows`
-/// of 0 (an unfiltered search, which returns its `k` best at once) runs one
-/// pass at `k`.
-async fn until_k_pass<F, Fut>(k: usize, rows: usize, mut ranked: F) -> Result<Vec<RecordBatch>>
-where
-    F: FnMut(usize) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<RecordBatch>>>,
-{
-    let mut breadth = k;
-    loop {
-        let found = ranked(breadth).await?;
-        if breadth >= rows || found.iter().map(RecordBatch::num_rows).sum::<usize>() >= k {
-            return Ok(found);
-        }
-        breadth = breadth.saturating_mul(4).min(rows);
-    }
-}
-
-/// The first `k` ranked rows that satisfy `filter`, projected to `select`
-/// (every hydrated column when empty).
-fn refine(
+/// `builder`'s rows projected to `select` (every hydrated column when empty).
+fn project(
     builder: crate::query::QueryBuilder,
-    filter: Option<&str>,
-    k: usize,
     select: &[String],
 ) -> Result<crate::query::QueryBuilder> {
-    let builder = match filter {
-        Some(predicate) => builder.filter(predicate)?.limit(k),
-        None => builder,
-    };
     if select.is_empty() {
         Ok(builder)
     } else {

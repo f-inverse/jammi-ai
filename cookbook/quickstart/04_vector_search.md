@@ -42,8 +42,9 @@ for row in results.to_pylist():
     print(f"id={row['_row_id']}  score={row['similarity']:.4f}  {row['title']}")
 ```
 
-`db.search` returns a `pyarrow.Table` directly. Pass `filter="year > 2020"` and
-`select=[...]` for the bounded knobs. For compound retrieval — joining sources or
+`db.search` returns a `pyarrow.Table` directly. Pass `filter="year > 2020"` (a
+predicate over the source's columns: the search ranks only the rows it selects)
+and `select=[...]` for the bounded knobs. For compound retrieval — joining sources or
 running a model over the results with the `annotate(...)` table function — use
 `db.sql(...)`; the same SQL runs in-process or against a remote engine over Flight
 SQL.

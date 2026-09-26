@@ -65,7 +65,7 @@ use jammi_datafusion::InferenceExec;
 use jammi_datafusion::NumberedInputExec;
 use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingRunner};
 use jammi_db::error::{JammiError, Missing};
-use jammi_db::index::{FiniteQuery, QuerySource, SearchMethod};
+use jammi_db::index::{Admission, FiniteQuery, QuerySource, SearchMethod};
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
 
@@ -361,6 +361,9 @@ fn encode_vector_search(exec: &VectorSearchExec, buf: &mut Vec<u8>) -> DfResult<
             QuerySource::Caller => None,
             QuerySource::Stored { table } => Some(table.clone()),
         },
+        admitted: exec.admission().row_ids().map(|rows| pb::AdmittedRows {
+            row_ids: rows.iter().cloned().collect(),
+        }),
     };
     buf.extend_from_slice(&MAGIC);
     buf.push(NodeTag::VectorSearch as u8);
@@ -453,6 +456,8 @@ fn decode_vector_search(
             },
             Some(pb::vector_search_exec_node::Method::Exact(_)) => SearchMethod::Exact,
         },
+        msg.admitted
+            .map_or(Admission::Every, |rows| Admission::rows(rows.row_ids)),
         session.result_store(),
         session.context().clone(),
     )

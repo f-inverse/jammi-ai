@@ -151,6 +151,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
         3,
         SegmentSearchPhase::Final,
         &|id| index.get_exact(id),
+        &jammi_db::index::SegmentAdmission::unmasked(&jammi_db::index::Admission::Every),
     )
     .unwrap();
     assert_eq!(want.len(), 3);
@@ -167,6 +168,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
+            admitted: None,
         })
         .await
         .expect("SegmentSearch over peer_bind")
@@ -191,6 +193,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
+            admitted: None,
         })
         .await
         .expect_err("segment 7 is not a segment of the table");
@@ -215,6 +218,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
+            admitted: None,
         })
         .await
         .expect_err("an F32 bundle is not an Int8 bundle");
@@ -232,6 +236,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
+            admitted: None,
         })
         .await
         .expect_err("unspecified precision");
@@ -251,6 +256,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
+            admitted: None,
         })
         .await
         .expect_err("an unrecognised non-zero precision value");
@@ -265,6 +271,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: 99,
+            admitted: None,
         })
         .await
         .expect_err("an unrecognised non-zero phase value");
@@ -282,6 +289,7 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             target: 3,
             version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
+            admitted: None,
         })
         .await
         .expect_err("the public listener must not serve PeerService");
@@ -434,6 +442,7 @@ async fn owner_refuses_non_conforming_requests() {
         target: 3,
         version: None,
         phase: pb::SegmentSearchPhase::Approximate as i32,
+        admitted: None,
     };
     let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {
         table_name: table_name.clone(),
@@ -596,6 +605,7 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         target: 3,
         version: None,
         phase: pb::SegmentSearchPhase::Approximate as i32,
+        admitted: None,
     };
     let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {
         table_name: table_name.clone(),

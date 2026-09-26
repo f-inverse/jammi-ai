@@ -123,7 +123,9 @@ fn index_build_and_search_cost_by_segment_count() {
                 let start = Instant::now();
                 let mut hits = 0usize;
                 for (q, want) in queries.iter().zip(&truth) {
-                    let got = set.search_final(&vq(q), k, 1).unwrap();
+                    let got = set
+                        .search_final(&vq(q), k, 1, &jammi_db::index::Admission::Every)
+                        .unwrap();
                     hits += got.iter().filter(|(id, _)| want.contains(id)).count();
                 }
                 let query = start.elapsed() / queries.len() as u32;

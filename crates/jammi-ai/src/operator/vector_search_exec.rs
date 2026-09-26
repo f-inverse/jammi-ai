@@ -13,25 +13,15 @@ use futures::stream;
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::Result;
-use jammi_db::index::exact::exact_vector_search;
-use jammi_db::index::{SearchMethod, ValidatedQuery};
+use jammi_db::index::{Admission, SearchMethod, ValidatedQuery};
 use jammi_db::session::QueryContext;
 use jammi_db::store::ResultStore;
 
-/// Vector search over an embedding table, by the request's [`SearchMethod`].
-///
-/// An exact search scores every vector through `exact_vector_search()`. An
-/// approximate one delegates to `ResultStore::resolve_search_mode()` — the table's whole
-/// segment set as a
-/// [`SegmentedIndex`](jammi_db::index::SegmentedIndex) when available,
-/// brute-force via `exact_vector_search()` otherwise — and returns the final
-/// top-`k` through the segment index's single
-/// [`search_final`](jammi_db::index::SegmentedIndex::search_final) entry. That
-/// one call owns comparability across segments and precisions: an `F32` table's
-/// merged cosine order is already final, while a quantized / `Binary` table's
-/// per-segment approximate candidates are exact-rescored down to a
-/// cross-segment comparable top-`k`. The per-request `oversample` override
-/// (resolved against the table's stamped default) is threaded here.
+/// Vector search over an embedding table, by the request's [`SearchMethod`],
+/// among the rows its [`Admission`] admits: the `k` nearest admitted rows,
+/// through [`ResultStore::search_vectors`] — the table's placed segment set
+/// when it has one (exact-rescored to a cross-segment comparable top-`k`),
+/// an exact scan otherwise or when the method asks for one.
 pub struct VectorSearchExec {
     table: ResultTableRecord,
     query_vector: ValidatedQuery,
@@ -43,6 +33,8 @@ pub struct VectorSearchExec {
     /// [`jammi_db::config::AnnIndexConfig::effective_oversample`] only for a
     /// pre-migration-023 table with no stamped column.
     method: SearchMethod,
+    /// The rows the search may return.
+    admission: Admission,
     result_store: Arc<ResultStore>,
     session_ctx: QueryContext,
     properties: Arc<PlanProperties>,
@@ -54,6 +46,7 @@ impl VectorSearchExec {
         query_vector: ValidatedQuery,
         k: usize,
         method: SearchMethod,
+        admission: Admission,
         result_store: Arc<ResultStore>,
         session_ctx: QueryContext,
     ) -> Result<Self> {
@@ -73,6 +66,7 @@ impl VectorSearchExec {
             query_vector,
             k,
             method,
+            admission,
             result_store,
             session_ctx,
             properties: Arc::new(properties),
@@ -97,6 +91,11 @@ impl VectorSearchExec {
     /// How this node ranks the table's vectors.
     pub fn method(&self) -> SearchMethod {
         self.method
+    }
+
+    /// The rows this node may return.
+    pub fn admission(&self) -> &Admission {
+        &self.admission
     }
 
     fn output_schema() -> SchemaRef {
@@ -161,37 +160,12 @@ impl ExecutionPlan for VectorSearchExec {
         let method = self.method;
         let ctx = self.session_ctx.clone();
 
+        let admission = self.admission.clone();
         let result_stream = stream::once(async move {
-            let placed = match method {
-                SearchMethod::Exact => None,
-                SearchMethod::Approximate { oversample } => result_store
-                    .resolve_search_mode(&table)
-                    .await
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-                    .map(|index| (index, oversample)),
-            };
-            let search_results = match placed {
-                Some((index, oversample_override)) => {
-                    let oversample = result_store
-                        .ann_config()
-                        .resolve_oversample(oversample_override, table.oversample);
-                    index
-                        .search_final_placed(&query, k, oversample)
-                        .await
-                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-                }
-                None => exact_vector_search(
-                    &ctx,
-                    &table.table_name,
-                    &query,
-                    k,
-                    // The catalog width is a CROSS-CHECK against the scan's own
-                    // width inside; `None` means nothing to cross-check.
-                    table.dimensions().map(std::num::NonZeroUsize::get),
-                )
+            let search_results = result_store
+                .search_vectors(&ctx, &table, &query, k, method, &admission)
                 .await
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
-            };
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
             // Convert Vec<(row_id, cosine_distance)> to RecordBatch
             let row_ids: Vec<&str> = search_results.iter().map(|(id, _)| id.as_str()).collect();

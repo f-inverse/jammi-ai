@@ -55,14 +55,18 @@ Results are `RecordBatch` / `pyarrow.Table` with:
 ## Refining a search
 
 `search` carries the two knobs the bounded primitive owns directly: a SQL `filter`
-predicate over the hydrated columns and a `select` column projection. In Python they
-are keyword arguments and `search` returns the table: with a `filter`, the `k`
-nearest rows that satisfy it (fewer only when fewer exist) — the engine widens the
-ranked candidates until `k` rows pass, ending in an exact search over the whole
-table. In Rust they are methods on the fluent `QueryBuilder` (`session.search(...)`
-returns the builder, which also carries `sort` / `limit` / `join` / `annotate` and a
-`.run()`); there `filter` composes over the `k` rows the search ranked, as every
-builder step does.
+predicate over the source's columns and a `select` column projection. With a
+`filter`, `search` returns the `k` nearest rows that satisfy it (fewer only when
+fewer exist). The filter is evaluated once over the source, and the search ranks
+only the rows it selects: each index segment scores its admitted rows exactly when
+few of them are admitted, and otherwise walks its HNSW graph admitting only them
+(planned per segment by the admitted count, as Qdrant plans between a filtered
+full scan and filterable HNSW). A selective filter therefore costs work in
+proportion to the rows it selects, not to the table. In Python the knobs are
+keyword arguments and `search` returns the table. In Rust they are the `filter`
+argument of `session.search(...)`, which returns the fluent `QueryBuilder` (it also
+carries `sort` / `limit` / `join` / `annotate` and a `.run()`); a builder `filter`
+step composes over the `k` rows the search ranked, as every builder step does.
 
 ### Filter and select
 
@@ -168,7 +172,7 @@ When multiple embedding tables exist for a source, search uses the most recently
 
 `EmbeddingService` exposes `Search` on the typed gRPC surface, so a process that reaches the engine over gRPC-web — an edge function that cannot speak Flight SQL's bidirectional HTTP/2 — can run the same similarity search it already uses for `AddSource`, `GenerateAudioEmbeddings`, and `EncodeAudioQuery`. It is the same engine capability on an additional transport, not a second search path.
 
-A `SearchRequest` carries the source, a `k`, an optional SQL `filter` (the `k` nearest rows that satisfy it), and an optional `select` column list. The query is a `oneof`:
+A `SearchRequest` carries the source, a `k`, an optional SQL `filter` over the source's columns (the `k` nearest rows that satisfy it), and an optional `select` column list. The query is a `oneof`:
 
 - **`query_vector`** — a precomputed vector. The usual flow is encode-then-search: call `EncodeAudioQuery` (or any client-side encoder) to get the vector, then feed it back as the query.
 - **`row_key`** — query-by-example. The engine resolves that row's stored vector **internally** and ranks by it ("rows like this row"). The vector never crosses the wire.

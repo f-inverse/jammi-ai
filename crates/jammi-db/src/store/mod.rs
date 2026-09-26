@@ -80,8 +80,8 @@ use crate::index::peer::{AllLocal, NoPeers, PeerFailureCounters, PeerTransport, 
 use crate::index::placed::{PlacedIndex, SegmentSource, ServedSources};
 use crate::index::segment::{SegmentId, SegmentedIndex};
 use crate::index::sidecar::SidecarIndex;
-use crate::index::ValidatedQuery;
 use crate::index::VectorIndex;
+use crate::index::{Admission, ValidatedQuery};
 use crate::session::QueryContext;
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::sidecar_layout::SidecarKind;
@@ -3310,28 +3310,40 @@ impl ResultStore {
         Ok(())
     }
 
-    /// Search an embedding table for the nearest neighbors of a query vector —
-    /// the PLACED entry, for the online consumers (the `Search` leaf's peer,
-    /// the context-set single-shot retrieval). Uses the placed ANN index when
-    /// available, falls back to exact brute-force search over the whole
-    /// Parquet otherwise.
+    /// Search an embedding table for the `k` nearest neighbors of a query
+    /// vector among the rows `admission` admits — the PLACED entry, for every
+    /// online consumer (the `VectorSearchExec` plan node, its peer on an
+    /// executor, the context-set single-shot retrieval). `method` chooses the
+    /// table's ANN index (with an optional per-request oversample override
+    /// of the table's stamped default) or an exact scan; a table with no
+    /// index is scanned exactly either way.
     ///
     /// Routes through [`PlacedIndex::search_final_placed`], so a multi-segment
     /// quantized / `Binary` table returns the exact-rescored, cross-segment
     /// comparable top-`k` — never raw per-segment candidate distances — and a
-    /// segment a peer owns is searched at that peer. The oversample is the
-    /// table's own stamped default (no per-request override on this lane).
+    /// segment a peer owns is searched at that peer, admitting the same rows.
     pub async fn search_vectors(
         &self,
         ctx: &QueryContext,
         table: &ResultTableRecord,
         query: &ValidatedQuery,
         k: usize,
+        method: crate::index::SearchMethod,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32)>> {
-        match self.resolve_search_mode(table).await? {
-            Some(index) => {
-                let oversample = self.ann.resolve_oversample(None, table.oversample);
-                index.search_final_placed(query, k, oversample).await
+        let placed = match method {
+            crate::index::SearchMethod::Exact => None,
+            crate::index::SearchMethod::Approximate { oversample } => self
+                .resolve_search_mode(table)
+                .await?
+                .map(|index| (index, oversample)),
+        };
+        match placed {
+            Some((index, oversample)) => {
+                let oversample = self.ann.resolve_oversample(oversample, table.oversample);
+                index
+                    .search_final_placed(query, k, oversample, admission)
+                    .await
             }
             None => {
                 crate::index::exact::exact_vector_search(
@@ -3340,6 +3352,7 @@ impl ResultStore {
                     query,
                     k,
                     catalog_width(table),
+                    admission,
                 )
                 .await
             }
@@ -3362,7 +3375,7 @@ impl ResultStore {
         match self.resolve_search_mode_local(table).await? {
             Some(index) => {
                 let oversample = self.ann.resolve_oversample(None, table.oversample);
-                index.search_final(query, k, oversample)
+                index.search_final(query, k, oversample, &Admission::Every)
             }
             None => {
                 crate::index::exact::exact_vector_search(
@@ -3371,6 +3384,7 @@ impl ResultStore {
                     query,
                     k,
                     catalog_width(table),
+                    &Admission::Every,
                 )
                 .await
             }

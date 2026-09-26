@@ -152,11 +152,21 @@ async fn append_does_not_rebuild_prior_segments() {
         .unwrap();
     assert_eq!(index.len(), 4);
     let hit_c = index
-        .search_final(&vq(&[0.0, 0.0, 1.0, 0.0]), 1, 4)
+        .search_final(
+            &vq(&[0.0, 0.0, 1.0, 0.0]),
+            1,
+            4,
+            &jammi_db::index::Admission::Every,
+        )
         .unwrap();
     assert_eq!(hit_c.first().map(|(id, _)| id.as_str()), Some("c"));
     let hit_a = index
-        .search_final(&vq(&[1.0, 0.0, 0.0, 0.0]), 1, 4)
+        .search_final(
+            &vq(&[1.0, 0.0, 0.0, 0.0]),
+            1,
+            4,
+            &jammi_db::index::Admission::Every,
+        )
         .unwrap();
     assert_eq!(hit_a.first().map(|(id, _)| id.as_str()), Some("a"));
 }
@@ -277,7 +287,14 @@ async fn search_vectors_over_two_int8_segments_equals_brute_force() {
     let k = 3;
     for (_, q) in &all {
         let hits = store
-            .search_vectors(&ctx, &record_of(&store, &table).await, &vq(q), k)
+            .search_vectors(
+                &ctx,
+                &record_of(&store, &table).await,
+                &vq(q),
+                k,
+                jammi_db::index::SearchMethod::default(),
+                &jammi_db::index::Admission::Every,
+            )
             .await
             .unwrap();
         let got: Vec<String> = hits.into_iter().map(|(id, _)| id).collect();
@@ -1219,7 +1236,9 @@ async fn masked_merge_is_independent_of_segment_id_order() {
         // The base K is superseded by the shard's K: mask `(k, base_stamp)`.
         let mask = Arc::new(DeletionMask::from_entries([("k".to_string(), base_stamp)]));
         let index = SegmentedIndex::new_masked(loaded, mask).unwrap();
-        let hits = index.search_final(&vq(&query), 6, 4).unwrap();
+        let hits = index
+            .search_final(&vq(&query), 6, 4, &jammi_db::index::Admission::Every)
+            .unwrap();
         assert_eq!(hits[0].0, "k");
         assert!(
             hits[0].1 < 1e-4,

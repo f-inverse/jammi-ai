@@ -92,7 +92,7 @@ use jammi_ai::fine_tune::trainer::{
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::worker::{artifact_files_digest, published_artifact_digest};
 use jammi_ai::fine_tune::{
-    EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule,
+    EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule, Warmup,
 };
 use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
@@ -1384,7 +1384,7 @@ fn base_config(params: &FinetuneRunParams) -> FineTuneConfig {
         gradient_accumulation_steps: params.gradient_accumulation_steps,
         validation_fraction: params.validation_fraction,
         early_stopping_patience: params.early_stopping_patience,
-        warmup_steps: params.warmup_steps,
+        warmup: Warmup::Steps(params.warmup_steps),
         lr_schedule: params.lr_schedule,
         early_stopping_metric: params.early_stopping_metric,
         target_modules: params.target_modules.clone(),
@@ -2098,7 +2098,7 @@ fn train_streamed(
     let config = JammiConfig {
         artifact_dir: engine_dir.clone(),
         gpu: GpuConfig {
-            device: gpu_device,
+            device: Some(gpu_device),
             devices: Some(vec![gpu_device]),
             require_gpu: gpu_device >= 0,
             ..Default::default()

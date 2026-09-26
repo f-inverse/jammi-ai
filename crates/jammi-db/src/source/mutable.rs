@@ -15,7 +15,7 @@ use crate::store::mutable::definition::{
     MutableTableDefinition, MutableTableError, MutableTableId,
 };
 use crate::store::mutable::provider::MutableTableProvider;
-use crate::store::mutable::sink::batch_to_params;
+use crate::store::mutable::sink::insert_rows;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
@@ -212,18 +212,7 @@ impl MutableTableRegistry {
 
         let session_tenant = tx.tenant();
         tx.assert_tenant_matches(session_tenant, table.as_str())?;
-
-        let col_names: Vec<String> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        let cols: Vec<&str> = col_names.iter().map(String::as_str).collect();
-        let dml = self.backend.insert_dml(&def, &cols, batch.num_rows());
-        let params = batch_to_params(batch, session_tenant)
-            .map_err(|e| MutableTableError::Backend(BackendError::Execution(e.into())))?;
-        let rows = tx.execute(&dml, &params).await?;
+        let rows = insert_rows(tx, self.backend.as_ref(), &def, batch).await?;
         #[cfg(feature = "test-hooks")]
         crate::store::mutable::test_hook::maybe_signal(rows).await;
         Ok(rows)

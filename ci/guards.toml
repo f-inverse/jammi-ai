@@ -54,6 +54,21 @@ run = "bash ci/scripts/check_cookbook_one_way.sh"
 why = "The book consumes the engine; no engine crate references cookbook/book/."
 
 [[guard]]
+name = "cookbook coverage"
+run = "python3 ci/scripts/check_cookbook_coverage.py"
+why = "Every public Python surface of jammi is run by a recipe or an executed book-chapter cell, so a verb cannot ship without its runnable example."
+
+[[guard]]
+name = "lockstep versions"
+run = "python3 ci/scripts/check_lockstep_versions.py"
+why = "Every Python and npm dist ships at the workspace version and every exact sibling pin names it, so a release never publishes a pin that cannot resolve."
+
+[[guard]]
+name = "cookbook notebooks"
+run = "python3 cookbook/book/scripts/build_notebooks.py --check"
+why = "Every chapter and recipe has a Colab notebook built from its current source and pinned to the workspace version, so a link never opens a stale chapter or an engine it was not written for."
+
+[[guard]]
 name = "SQLite-ism tripwire"
 run = "python3 ci/scripts/check_sqlite_isms.py"
 why = "No backend-specific SQL token in jammi-db's shared catalog code; the Postgres test matrix is the real parity proof."
@@ -123,8 +138,8 @@ why = "The committed cu12 loader report is the real build's, never a provisional
 
 [[guard]]
 name = "held-out fixture integrity"
-run = "python3 ci/scripts/perf/check_heldout_fixture_integrity.py"
-why = "The committed held-out evaluation fixture's files agree with each other: ids, order, hashes and manifest."
+run = "python3 ci/scripts/perf/check_heldout_fixture_integrity.py && python3 ci/scripts/perf/verify_train_pairs.py"
+why = "The committed held-out evaluation fixture's files agree with each other: ids, order, hashes and manifest, and every train pair matches its recorded hash."
 
 [[guard]]
 name = "CUDA run artifact schema"

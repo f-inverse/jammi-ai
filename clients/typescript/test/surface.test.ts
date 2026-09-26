@@ -26,11 +26,13 @@ import {
   type EmbeddingEvalReport,
   type CalibrationEvalReport,
   CalibrationShape,
+  LexicalAnalyzer,
   type ResultTable,
   type AssembleContextResponse,
   type SubmitJobResponse,
   type JobStatusResponse,
   type CreateMutableTableResponse,
+  type DescribeTableResponse,
   type RegisterTopicResponse,
   type SubscribedBatch,
   type AuditFetchRecentResponse,
@@ -87,6 +89,9 @@ async function verbSurface(c: JammiClient): Promise<void> {
     await c.catalog.describeSource({ sourceId: "s1" });
     await c.catalog.listModels({});
     await c.catalog.describeModel({ modelId: "m" });
+    // Materialization contract: the recorded manifest of a result table.
+    const described: DescribeTableResponse = await c.catalog.describeTable({ table: "t" });
+    expectTypeOf(described.manifestJson).toEqualTypeOf<string>();
     // Channels.
     await c.catalog.registerChannel({ channelId: "ch1" });
     await c.catalog.addChannelColumns({ channelId: "ch1" });
@@ -123,7 +128,14 @@ async function verbSurface(c: JammiClient): Promise<void> {
       k: 5,
       select: ["title"],
     });
-    expectTypeOf(search.hits).toBeArray();
+    expectTypeOf(search.result?.dataBody).toEqualTypeOf<Uint8Array | undefined>();
+    const lexical: SearchResponse = await c.embedding.lexicalSearch({
+      sourceId: "s1",
+      text: "turbine blade",
+      k: 5,
+      lexicalTable: "lexical_s1",
+    });
+    expectTypeOf(lexical.result?.dataBody).toEqualTypeOf<Uint8Array | undefined>();
 
     // ── InferenceService: infer ───────────────────────────────────────────
     const inf: InferResponse = await c.inference.infer({
@@ -156,6 +168,13 @@ async function verbSurface(c: JammiClient): Promise<void> {
       k: 10,
     });
     expectTypeOf(graph.tableName).toBeString();
+    const lexicalIndex: ResultTable = await c.pipeline.buildLexicalIndex({
+      sourceId: "s1",
+      columns: ["title", "abstract"],
+      keyColumn: "id",
+      analyzer: LexicalAnalyzer.RAW,
+    });
+    expectTypeOf(lexicalIndex.tableName).toBeString();
     const propagated: ResultTable = await c.pipeline.propagateEmbeddings({
       sourceId: "s1",
       graph: { case: "edgeGraphTable", value: graph.tableName },

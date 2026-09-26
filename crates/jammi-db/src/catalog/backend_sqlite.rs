@@ -74,8 +74,11 @@
 //! background task, so the lock and the `catalog.db-wal` sidecar outlive the
 //! drop by an unbounded interval. [`CatalogBackend::close`] (surfaced as
 //! [`super::Catalog::close`] and [`crate::session::JammiSession::close`]) is
-//! the release point — after awaiting it, `catalog.db-wal` is gone and another
-//! process opens the directory immediately. It is a *bounded* release rather
+//! the release point — after the close of the LAST pool this process holds on
+//! the file, `catalog.db-wal` is gone and another process opens the directory
+//! immediately. Closing a pool that is not the last drains that pool's own
+//! connections and returns: the file is still held, by design, by the
+//! survivor. The release is *bounded* rather
 //! than an instantaneous barrier: `sqlx` offers no way to await the
 //! connection-return task it spawns on drop, so a straggler close can
 //! re-create the `-wal` for a few milliseconds. The close absorbs that with a
@@ -87,10 +90,12 @@
 //! remains documentation-only on those targets.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use sqlx::sqlite::{
@@ -170,12 +175,9 @@ const CLOSE_SETTLE_STEPS: usize = 25;
 /// would turn a shutdown into a stall; two seconds is three orders of
 /// magnitude above the measured straggler window and still imperceptible.
 ///
-/// This ceiling is also the *whole* cost of closing one pool while a second
-/// pool in this process still holds the same file: the `-wal` belongs to the
-/// file, not to a pool, so it cannot disappear while the survivor is live and
-/// the settle loop necessarily runs to the deadline. Bounded, once, on a
-/// shutdown path — see [`CatalogBackend::close`]'s "evidence about the FILE"
-/// section.
+/// Only the close of a file's last pool waits at all ([`FileClaim`]); a pool
+/// closed while another in this process still holds the file has nothing to
+/// wait for.
 const CLOSE_SIDECAR_CEILING: Duration = Duration::from_secs(2);
 
 /// SQLite's primary result code `SQLITE_BUSY`. `sqlx` surfaces the *extended*
@@ -196,6 +198,61 @@ fn is_busy(err: &sqlx::Error) -> bool {
         .is_some_and(|code| code & 0xff == SQLITE_BUSY_PRIMARY)
 }
 
+/// The pools open on each catalog file in this process, by canonical path.
+static OPEN_POOLS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Mutex::default);
+
+/// One pool's claim on its database file, counted in [`OPEN_POOLS`].
+///
+/// The `-wal` is evidence about the FILE — its deletion coincides with the
+/// last `sqlite3_close` on it in this process — so only the close that gives
+/// up the file's last claim can wait for it. The claim is given up once:
+/// explicitly by [`CatalogBackend::close`], or on drop for a pool that was
+/// never closed (its connections close in the background, and it holds the
+/// file for no longer than they do).
+struct FileClaim {
+    path: PathBuf,
+    released: AtomicBool,
+}
+
+impl FileClaim {
+    fn acquire(path: PathBuf) -> Self {
+        *Self::pools().entry(path.clone()).or_default() += 1;
+        Self {
+            path,
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Give up the claim; true when it was the file's last. Idempotent: a
+    /// second release gives up nothing and is never the last.
+    fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let mut pools = Self::pools();
+        let remaining = pools.get_mut(&self.path).map(|count| {
+            *count -= 1;
+            *count
+        });
+        if remaining == Some(0) {
+            pools.remove(&self.path);
+        }
+        remaining == Some(0)
+    }
+
+    /// The registry holds plain counts, each updated in one statement, so a
+    /// panic elsewhere while it was locked cannot have left it inconsistent.
+    fn pools() -> std::sync::MutexGuard<'static, HashMap<PathBuf, usize>> {
+        OPEN_POOLS.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl Drop for FileClaim {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// SQLite-backed catalog. Wraps a connection pool with WAL mode + 5 s busy
 /// timeout, matching the original `r2d2_sqlite`-based behaviour.
 ///
@@ -204,10 +261,10 @@ fn is_busy(err: &sqlx::Error) -> bool {
 /// and the residual it leaves.
 pub struct SqliteBackend {
     pool: SqlitePool,
-    /// The database file this pool is open on. Kept so [`CatalogBackend::close`]
-    /// can wait on SQLite's own release evidence — the disappearance of the
-    /// sidecars — rather than only on the pool's connection accounting.
-    path: std::path::PathBuf,
+    /// This pool's claim on its database file. [`CatalogBackend::close`]
+    /// waits on SQLite's own release evidence — the disappearance of the
+    /// `-wal` — when giving it up releases the file's last claim.
+    claim: FileClaim,
     /// The park on this pool's connection returns (see
     /// [`super::pool_test_hooks`]).
     #[cfg(feature = "test-hooks")]
@@ -272,9 +329,17 @@ impl SqliteBackend {
             }
         })?;
 
+        // Connecting created the file, so it resolves; the canonical path
+        // makes two spellings of one file one claim.
+        let file = std::fs::canonicalize(path).map_err(|err| {
+            BackendError::Unavailable(format!(
+                "SQLite catalog {} could not be resolved after opening: {err}",
+                path.display()
+            ))
+        })?;
         Ok(Arc::new(Self {
             pool,
-            path: path.to_path_buf(),
+            claim: FileClaim::acquire(file),
             #[cfg(feature = "test-hooks")]
             return_park,
         }))
@@ -282,10 +347,10 @@ impl SqliteBackend {
 
     /// Path of a SQLite sidecar for this backend's database file
     /// (`suffix` is `"-wal"` or `"-shm"`).
-    fn sidecar(&self, suffix: &str) -> std::path::PathBuf {
-        let mut name = self.path.clone().into_os_string();
+    fn sidecar(&self, suffix: &str) -> PathBuf {
+        let mut name = self.claim.path.clone().into_os_string();
         name.push(suffix);
-        std::path::PathBuf::from(name)
+        PathBuf::from(name)
     }
 
     /// The park on this pool's connection returns (see
@@ -434,24 +499,16 @@ impl CatalogBackend for SqliteBackend {
     /// `-wal` disappearance is evidence that the LAST connection to this
     /// database in this process closed — not that *these* connections did. The
     /// seam is single-*process*, so a second pool on the same file inside this
-    /// process is legal and supported (two [`super::Catalog`] handles on one
-    /// directory), and while that second pool is live the `-wal` cannot go
-    /// away. Closing the first pool therefore observes the `-wal` for the whole
-    /// `CLOSE_SIDECAR_CEILING` and then warns, even though that pool's own
-    /// connections were released promptly and nothing is wrong.
-    ///
-    /// That is a cost and a misleading log line, not a correctness defect: the
-    /// wait is bounded by construction, the surviving pool keeps working, and
-    /// the caller's connections are already gone when the settle loop starts
-    /// (`close_pool_and_drain` has returned). Callers that close one of several
-    /// live pools should expect this close to take up to the ceiling. A
-    /// per-pool release signal would need evidence SQLite does not expose at
-    /// this layer, so the mechanism is deliberately unchanged; the warning
-    /// below names this as an expected cause so an operator reading it is not
-    /// sent hunting for a leak that is not there.
+    /// process is legal and supported (a session's lease keeper holds one of
+    /// its own), and while that pool is live the `-wal` cannot go away. So the
+    /// wait runs only when this close gives up the last pool claim on the file;
+    /// closing any other pool drains its own connections and returns.
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             super::backend::close_pool_and_drain(&self.pool, BackendKind::Sqlite).await;
+            if !self.claim.release() {
+                return;
+            }
 
             // Then wait for SQLite's own evidence of release, and require it
             // to be STABLE rather than merely observed once. `sqlx` returns a
@@ -485,14 +542,12 @@ impl CatalogBackend for SqliteBackend {
                 }
                 if std::time::Instant::now() >= deadline {
                     tracing::warn!(
-                        path = %self.path.display(),
+                        path = %self.claim.path.display(),
                         ceiling_secs = CLOSE_SIDECAR_CEILING.as_secs(),
-                        "SQLite catalog close: this pool's connections are released, but `-wal` \
-                         is still present after the bounded settle wait. Expected when ANOTHER \
-                         live pool in this process still holds the same file (the seam is \
-                         single-PROCESS, so that is legal) or when SQLite's close-time PASSIVE \
-                         checkpoint declined to complete. The wait is bounded and the close is \
-                         done; this is not a hang and not a lost write."
+                        "SQLite catalog close: the last pool on this file is closed, but `-wal` \
+                         is still present after the bounded settle wait — SQLite's close-time \
+                         PASSIVE checkpoint declined to complete. The close is done and nothing \
+                         is lost; the next open replays the WAL."
                     );
                     return;
                 }

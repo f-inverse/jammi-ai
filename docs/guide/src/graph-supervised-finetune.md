@@ -102,7 +102,7 @@ radius is likely a missing edge, i.e. a true positive).
 ```python
 job = db.fine_tune_graph(
     node_source="nodes", id_column="id", text_column="text",
-    edge_source="edges", src_column="src", dst_column="dst",
+    edge_source="edges", edge_src_column="src", edge_dst_column="dst",
     base_model="local:/models/tiny_bert",
     edge_provenance="declared",   # "declared" teaches; "similarity" echoes
     walk_length=4, walks_per_node=2, return_p=1.0, in_out_q=1.0,
@@ -120,11 +120,13 @@ job.wait()
 # extern crate jammi_db;
 # use jammi_ai::session::InferenceSession;
 # use jammi_ai::fine_tune::FineTuneConfig;
-# use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
+# use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphEdges, GraphFineTuneSources, GraphSampleConfig};
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
 let sources = GraphFineTuneSources {
     node_source: "nodes".into(), id_column: "id".into(), text_column: "text".into(),
-    edge_source: "edges".into(), src_column: "src".into(), dst_column: "dst".into(),
+    edges: GraphEdges::Source {
+        source: "edges".into(), src_column: "src".into(), dst_column: "dst".into(),
+    },
     // Declared edges carry signal the base metric does not already encode.
     provenance: EdgeProvenance::Declared,
 };
@@ -138,6 +140,26 @@ let job = session
 job.wait().await?;
 # Ok(()) }
 ```
+
+### Walking an engine-built graph
+
+The edges can instead be a [`build_neighbor_graph`](./build-neighbor-graph.md)
+table: name it as `edge_graph_table` (`GraphEdges::Table` in Rust) and the walks
+follow its `src` → `dst` rows directly, with no export or registration. Such a
+graph is a similarity graph, so tag it `edge_provenance="similarity"`:
+
+```python
+graph = db.build_neighbor_graph("nodes", k=10, exact=True)
+job = db.fine_tune_graph(
+    node_source="nodes", id_column="id", text_column="text",
+    edge_graph_table=graph, edge_provenance="similarity",
+    base_model="local:/models/tiny_bert",
+)
+```
+
+The training set pins that table by its content digest, as every derived table
+pins a result-table input, so [`staleness`](./materialization-contract.md) senses a
+rebuilt graph and `recompute` replays over the same table.
 
 The output is a fine-tuned model; regenerate embeddings with it and they encode
 the graph's structure ([`build_neighbor_graph`](./build-neighbor-graph.md),

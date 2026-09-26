@@ -16,7 +16,7 @@ use tonic::Status;
 
 use crate::fine_tune::{
     ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
-    FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
+    FineTuneMethod, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss, Warmup,
 };
 
 use crate::proto::training as pb;
@@ -86,8 +86,14 @@ impl TryFrom<pb::FineTuneConfig> for FineTuneConfig {
         if let Some(v) = c.early_stopping_patience {
             cfg.early_stopping_patience = v as usize;
         }
-        if let Some(v) = c.warmup_steps {
-            cfg.warmup_steps = v as usize;
+        match c.warmup {
+            None => {}
+            Some(pb::fine_tune_config::Warmup::WarmupSteps(steps)) => {
+                cfg.warmup = Warmup::Steps(steps as usize);
+            }
+            Some(pb::fine_tune_config::Warmup::WarmupFraction(fraction)) => {
+                cfg.warmup = Warmup::Fraction(fraction);
+            }
         }
         cfg.lr_schedule = lr_schedule_from_proto(c.lr_schedule, cfg.lr_schedule)?;
         cfg.early_stopping_metric =
@@ -301,7 +307,10 @@ pub fn config_to_proto(config: &FineTuneConfig) -> pb::FineTuneConfig {
         gradient_accumulation_steps: Some(config.gradient_accumulation_steps as u32),
         validation_fraction: Some(config.validation_fraction),
         early_stopping_patience: Some(config.early_stopping_patience as u32),
-        warmup_steps: Some(config.warmup_steps as u32),
+        warmup: Some(match config.warmup {
+            Warmup::Steps(steps) => pb::fine_tune_config::Warmup::WarmupSteps(steps as u32),
+            Warmup::Fraction(fraction) => pb::fine_tune_config::Warmup::WarmupFraction(fraction),
+        }),
         lr_schedule: lr_schedule_to_proto(config.lr_schedule) as i32,
         early_stopping_metric: early_stopping_metric_to_proto(config.early_stopping_metric) as i32,
         target_modules: config.target_modules.clone(),
@@ -436,7 +445,7 @@ mod tests {
         assert_eq!(decoded.weight_decay, 0.01);
         assert_eq!(decoded.max_grad_norm, 1.0);
         assert_eq!(decoded.lora_dropout, 0.05);
-        assert_eq!(decoded.warmup_steps, 100);
+        assert_eq!(decoded.warmup, Warmup::Fraction(0.1));
         assert_eq!(decoded.validation_fraction, 0.1);
         // And the count knobs a literal-zero decode would have failed validation
         // on resolve to their non-zero engine defaults instead.
@@ -490,15 +499,15 @@ mod tests {
 
     /// A partially-set wire config overrides exactly the present fields and
     /// leaves every other field at the engine default — including a legal `0`
-    /// override (`warmup_steps = 0` to disable warmup), which is now
-    /// distinguishable from an unset field.
+    /// override (`warmup_steps = 0` to disable warmup), distinguishable from
+    /// an unset field.
     #[test]
     fn partial_config_overrides_only_present_fields() {
         let proto = pb::FineTuneConfig {
             lora_rank: Some(16),
             learning_rate: Some(1e-3),
             // A legal zero override: explicit "no warmup", distinct from unset.
-            warmup_steps: Some(0),
+            warmup: Some(pb::fine_tune_config::Warmup::WarmupSteps(0)),
             ..Default::default()
         };
         let decoded = FineTuneConfig::try_from(proto).expect("partial config decodes");
@@ -506,7 +515,7 @@ mod tests {
         let defaults = FineTuneConfig::default();
         assert_eq!(decoded.lora_rank, 16);
         assert_eq!(decoded.learning_rate, 1e-3);
-        assert_eq!(decoded.warmup_steps, 0);
+        assert_eq!(decoded.warmup, Warmup::Steps(0));
         // Untouched fields stay at the engine default.
         assert_eq!(decoded.weight_decay, defaults.weight_decay);
         assert_eq!(decoded.max_grad_norm, defaults.max_grad_norm);
@@ -929,7 +938,7 @@ mod cache_tests {
     /// what a request that never set the field carries, matching how
     /// `world_size`'s `0` is its unset value. It resolves to the engine's
     /// `CachePolicy::Bypass` default at the decode
-    /// (`jammi_ai::wire::cache::cache_policy_from_proto`), never on the wire.
+    /// ([`crate::cache_policy_from_proto`]), never on the wire.
     #[test]
     fn cache_is_an_implicit_presence_enum_of_the_shared_cache_policy_type() {
         let field = submit_job_request_field("cache");

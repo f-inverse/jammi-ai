@@ -1,120 +1,142 @@
 ---
-title: "The two datasets"
+title: "The two datasets, at two scales"
 ---
 
 ```{python}
 # | echo: false
-import jammi_cookbook  # applies the determinism contract on import
+import jammi_cookbook
 ```
 
 The book runs on two public graphs, each used where it is strongest.
 
-- **Air Routes** — Neptune's own teaching dataset: ~3.4k airports, a `route`
-  graph (airport↔airport) and a `contains` hierarchy (continent→airport). Numeric
-  and categorical features, thin text. It carries the **tiers 01–02 on-ramp**.
-- **ogbn-arxiv** — ~169k CS papers, ~1.16M citation edges, 40 subject classes,
-  rich title+abstract text. It carries the **tiers 03–04 spine**, and is the
-  dataset the graph-conformal literature reports on, so tier-04 is directly
-  comparable to published results.
+- **Air Routes** — Neptune's own teaching dataset: 3,504 airports, a `route`
+  graph (airport↔airport) and a `contains` hierarchy
+  (continent→country→airport). Numeric and categorical features, thin text.
+  It carries the **tiers 01–02 on-ramp**.
+- **ogbn-arxiv** — ~169k computer-science papers, ~1.17M citation edges, 40
+  subject classes, title + abstract. It carries the **tiers 03–04 spine**, and
+  is the dataset the graph-conformal literature reports on.
 
-Both are fetched on demand and **checksum-gated**: a silently reissued source
-fails loudly rather than drifting the book's numbers. Only the committed subset
-ID lists (`data/ids/`) ship in the repo — subset identity is committed, not
-reproduced from a seed.
+## Two scales, one book
 
-The book's teaching spine is **`connect(target)` parity**: a recipe is written
-once and the only thing that changes between a laptop and a GPU server is the
-target. Here we open the embedded engine on CPU with a `file://` target; the
-keystone's heavy emit opens a GPU server with `connect("grpc://…")` and runs the
-*same* verbs.
+Every chapter runs its capability live. What it runs over is a **scale**:
+
+- **`small`** — the committed fixtures and the tiny fixture encoders, on the
+  CPU: seconds per chapter. This is what the book's CI renders, and what a
+  CPU Colab runtime runs.
+- **`full`** — the published datasets and real encoders (for text,
+  `gte-modernbert-base`, a ModernBERT trained for embeddings), on a GPU: the
+  book's findings at the size they are about.
+
+The chapter code is the same at both; the data, the encoders and the frozen
+goldens a run is checked against differ. Choose with the environment variable
+`JAMMI_COOKBOOK_SCALE` (`small` when unset) before the chapter starts:
+
+```{python}
+from jammi_cookbook import scale
+
+SCALE = scale.current()
+print(f"this run: scale = {SCALE}")
+```
+
+Air Routes is small enough to run whole, so both scales read the same graph
+(committed with the cookbook). ogbn-arxiv at `full` is a **connected ball** of
+the citation graph — 4,000 papers collected breadth-first from the most-cited
+paper, downloaded and checksum-verified on first use; a ball keeps the citation
+density and the subject homophily later chapters depend on. At `small` it is
+that ball's 400 best-connected papers (committed with the cookbook): one
+dataset at two sizes, the smaller keeping the larger's character.
 
 ```{python}
 import tempfile
 
 import jammi
-from jammi_cookbook import datasets
+from jammi_cookbook import contracts, datasets
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
-air = datasets.load_air_routes(db)
-arxiv = datasets.load_ogbn_arxiv(db)
+air = datasets.air_routes(db)
+arxiv = datasets.arxiv(db, SCALE)
 ```
+
+A file source is queried in SQL as `<source>.public.<table>`, where the table
+is the file's name without its extension. The book names each file after its
+source, so every source here reads as `<source>.public.<source>`.
 
 ## Air Routes
 
-A registered source is queried as `<source>.public.<source>`.
-
 ```{python}
-def count(src):
-    return db.sql(f"SELECT COUNT(*) AS n FROM {src}.public.{src}").to_pylist()[0]["n"]
+def count(source: str) -> int:
+    return db.sql(f"SELECT COUNT(*) AS n FROM {source}.public.{source}").to_pylist()[0]["n"]
 
-print(f"airports:       {count(air.airports_source)}")
-print(f"route edges:    {count(air.route_edges_source)}")
-print(f"contains edges: {count(air.contains_edges_source)}")
 
-# Each airport's continent is resolved from the continent→airport hierarchy.
+print(f"airports:       {count(air.airports)}")
+print(f"route edges:    {count(air.routes)}")
+print(f"contains edges: {count(air.contains)}")
+
+# An airport's continent comes from the continent→airport hierarchy.
 atl = db.sql(
-    f"SELECT code, city, country, continent "
-    f"FROM {air.airports_source}.public.{air.airports_source} WHERE code = 'ATL'"
-).to_pylist()
-print("ATL:", atl[0])
+    f"SELECT code, city, country, continent FROM {air.airports}.public.{air.airports} "
+    "WHERE code = 'ATL'"
+).to_pylist()[0]
+print("ATL:", atl)
 ```
 
 ```{python}
 # | echo: false
-assert count(air.airports_source) == len(air.airport_codes) == 3504
-assert count(air.route_edges_source) == 50637
-assert count(air.contains_edges_source) == 7008
-assert atl[0]["continent"] == "NA"
+contracts.assert_close("datasets.air_airports", count(air.airports))
+contracts.assert_close("datasets.air_routes", count(air.routes))
+contracts.assert_close("datasets.air_contains", count(air.contains))
+assert atl["continent"] == "NA"
 ```
 
 ## ogbn-arxiv
 
-The committed subset is a connected induced citation subgraph — a connected ball
-preserves the citation density and label homophily the tier-04 coverage crux
-depends on.
+The time split is the dataset's own: papers up to 2017 train, 2018 validates,
+2019 onward is the test era — a split by publication year.
 
 ```{python}
-papers = arxiv.papers_source
-print(f"papers (subset):     {count(papers)}")
-print(f"citation edges:      {count(arxiv.cite_edges_source)}")
-print("time-split sizes:    ", {k: len(v) for k, v in arxiv.split.items()})
+print(f"papers:          {count(arxiv.papers)}")
+print(f"citation edges:  {count(arxiv.cites)}")
+print("time split:     ", {name: len(ids) for name, ids in arxiv.split.items()})
 
 top = db.sql(
-    f"SELECT subject, COUNT(*) AS c FROM {papers}.public.{papers} "
-    f"GROUP BY subject ORDER BY c DESC LIMIT 3"
+    f"SELECT subject, COUNT(*) AS c FROM {arxiv.papers}.public.{arxiv.papers} "
+    "GROUP BY subject ORDER BY c DESC LIMIT 3"
 ).to_pylist()
-print("top subjects:", [(r["subject"], r["c"]) for r in top])
+print("top subjects:   ", [(r["subject"], r["c"]) for r in top])
 ```
 
-The citation graph is **homophilous** on the subject label — adjacent papers tend
-to share a subject far more than chance. That correlation, together with the
-dataset's time-split, is exactly what breaks conformal exchangeability in tier 04 —
-where marginal subject-classification conformal under-covers and the textbook
-weighted-conformal remedy turns out to be a no-op (the shift is orthogonal to the
-score).
+The citation graph is **homophilous** on the subject label: a paper cites
+papers of its own subject more often than the subject mix alone would give —
+the chance level is the probability that two papers drawn at random share a
+subject, $\sum_s p_s^2$. That correlation, together with the time split, is
+what later breaks conformal exchangeability (tier 04).
 
 ```{python}
 edges = db.sql(
-    f"SELECT e.src AS s, e.dst AS d, a.subject AS sa, b.subject AS sb "
-    f"FROM {arxiv.cite_edges_source}.public.{arxiv.cite_edges_source} e "
-    f"JOIN {papers}.public.{papers} a ON e.src = a.paper_id "
-    f"JOIN {papers}.public.{papers} b ON e.dst = b.paper_id"
+    f"SELECT a.subject AS sa, b.subject AS sb "
+    f"FROM {arxiv.cites}.public.{arxiv.cites} e "
+    f"JOIN {arxiv.papers}.public.{arxiv.papers} a ON e.src = a.paper_id "
+    f"JOIN {arxiv.papers}.public.{arxiv.papers} b ON e.dst = b.paper_id"
 ).to_pylist()
 homophily = sum(r["sa"] == r["sb"] for r in edges) / len(edges)
-print(f"citation-edge subject homophily: {homophily:.3f}  (random ≈ {1 / 40:.3f})")
+mix = db.sql(
+    f"SELECT COUNT(*) AS c FROM {arxiv.papers}.public.{arxiv.papers} GROUP BY subject"
+).column("c").to_pylist()
+chance = sum((c / sum(mix)) ** 2 for c in mix)
+print(f"citation-edge subject homophily: {homophily:.3f}  (chance for this subject mix: {chance:.3f})")
 ```
 
 ```{python}
 # | echo: false
-assert count(papers) == len(arxiv.paper_ids) == 4000
-assert count(arxiv.cite_edges_source) == 9595
-assert all(len(v) > 0 for v in arxiv.split.values())
-assert homophily > 0.4  # strongly homophilous — the tier-04 precondition
+contracts.assert_close("datasets.arxiv_papers", count(arxiv.papers))
+contracts.assert_close("datasets.arxiv_cites", count(arxiv.cites))
+contracts.assert_close("datasets.arxiv_homophily", homophily, tol=1e-9)
+assert homophily > chance
 ```
 
-The session's work is done, so it is closed. An embedded engine holds its catalog until
-`close()` returns, which is why `close()` comes before anything removes the directory the
-catalog lives in.
+An embedded engine holds its catalog until `close()` returns, so a chapter
+closes its session before anything removes the directory the catalog lives in.
 
 ```{python}
 db.close()

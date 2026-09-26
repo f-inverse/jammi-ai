@@ -662,15 +662,17 @@ async fn coordinating_graph_server() -> crate::common::grpc::PeerEngineServer {
 }
 
 fn two_rank_graph_spec() -> TrainingSpec {
-    use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources};
+    use jammi_ai::fine_tune::graph_sampler::{EdgeProvenance, GraphEdges, GraphFineTuneSources};
     TrainingSpec::GraphFineTune {
         sources: GraphFineTuneSources {
             node_source: "graph_nodes".into(),
             id_column: "id".into(),
             text_column: "text".into(),
-            edge_source: "graph_edges".into(),
-            src_column: "src".into(),
-            dst_column: "dst".into(),
+            edges: GraphEdges::Source {
+                source: "graph_edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+            },
             provenance: EdgeProvenance::Declared,
         },
         sample_config: graph_sample_config(),

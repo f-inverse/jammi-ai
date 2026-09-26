@@ -14,11 +14,10 @@ use, but resolved at `binary`'s own **precision-specific default oversample of 3
 for every other precision) when the deployment leaves the knob unset · **Theory:** HNSW as
 the navigable proximity graph every precision's sidecar is built over
 [@malkov2020hnsw], the recall-vs-memory trade quantization buys
-[@johnson2021billion] · **Rail:** measurement (recall@1 *and* recall@10 against an exact-`f32`
-numpy oracle, the sidecar's own on-disk byte count — decomposed into its vector payload and its
-HNSW link overhead, not just read as one opaque number — and an independent numpy replay of the
-raw sign-bit Hamming ranking with no rescore at all; every number recomputed live at render
-time, none transcribed).
+[@johnson2021billion] · **Rail:** measurement (recall@1 *and* recall@10 against the engine's exact search, the
+sidecar's on-disk byte count — decomposed into its vector payload and its HNSW link overhead —
+and an independent numpy replay of the raw sign-bit Hamming ranking with no rescore at all;
+every number measured live).
 
 The [preceding chapter](precision.qmd) measured `f16`/`int8`: both shrink the sidecar's own
 stored vectors while leaving the retrieve→rescore default (`oversample = 4`) untouched, and
@@ -39,521 +38,188 @@ factor once link overhead is counted, and the default oversample of `32` really 
 not a conservative buffer — turn it down towards `1` and recall collapses, because the retrieve
 stage no longer offers the rescore stage enough real candidates to recover from.
 
-## The knob is reachable — through the public front door, `"binary"` included
+## The corpus, the oracle, and the tables
 
-`storage_precision` accepts a fourth literal, `"binary"`, through the exact same
-`jammi.connect(..., config=...)` deployment-default surface the other three precisions use — no
-new front door, no lower-layer escape hatch. We probe the same two keyword surfaces the sibling
-chapter does, then confirm the fourth literal is actually accepted by opening a session at it:
-
-```{python}
-import inspect
-
-import jammi
-from jammi._assembly import build_search_request
-
-connect_params = set(inspect.signature(jammi.connect).parameters)
-search_params = set(inspect.signature(build_search_request).parameters)
-
-print(f"jammi.connect(...) keyword args:        {sorted(connect_params)}")
-print(f"build_search_request(...) keyword args: {sorted(search_params)}")
-
-assert "config" in connect_params, (
-    "jammi.connect() must carry a config= passthrough — the deployment-default knob a "
-    "caller sets embedding.ann.storage_precision = \"binary\" through."
-)
-assert "oversample" in search_params, (
-    "build_search_request() must carry an oversample parameter, so a per-request override "
-    "is reachable through db.search(..., oversample=...) at binary precision too."
-)
-print("\nconfirmed: both knobs are reachable through the documented jammi.connect() / "
-      "Session.search() surface.")
-```
-
-## The corpus — the same held-out slice of the committed cache the sibling chapter reads
-
-Same discipline as every other chapter: a real, clustered-text embedding corpus (never a
-synthetic random-vector one — only real geometry can exhibit a genuine ANN recall trade), read
-off the committed ModernBERT cache the scale-tier chapter also reads, never re-embedded. The
-query set is the cache's own held-out split, disjoint from the indexed corpus by construction.
+The same corpus the [preceding chapter](precision.qmd) measures: the papers embedded once,
+held-out queries, and the engine's exact search as the ground truth — both the true top-`k`
+and its own top-1. Every table imports the same vectors.
 
 ```{python}
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
+from jammi_cookbook import contracts, precision, scale
 
-from jammi_cookbook import contracts
-
-N_CORPUS = 1500
-N_QUERY = 60
-K = 10
-
-corpus_table = contracts.load_artifact("scale.corpus_vectors")
-query_table = contracts.load_artifact("scale.query_vectors")
-
-corpus_ids = [str(x) for x in corpus_table.column("_row_id").to_pylist()[:N_CORPUS]]
-corpus_vecs = np.asarray(corpus_table.column("vector").to_pylist()[:N_CORPUS], dtype=np.float32)
-query_ids = [str(x) for x in query_table.column("_row_id").to_pylist()[:N_QUERY]]
-query_vecs = np.asarray(query_table.column("vector").to_pylist()[:N_QUERY], dtype=np.float32)
-
-assert not (set(corpus_ids) & set(query_ids)), "queries must be held out of the corpus"
-print(f"corpus: {corpus_vecs.shape[0]:,} × {corpus_vecs.shape[1]}  (ModernBERT, real embeddings)")
-print(f"queries: {query_vecs.shape[0]:,} (held out — disjoint from the corpus by construction)")
-```
-
-## The exact oracle — independent numpy cosine-kNN, both the top-1 and the top-`k` truth
-
-Every recall number below — `recall@1` (does the returned single best match equal the *true*
-nearest neighbour?) and `recall@10` (does the returned top-10 set overlap the true top-10?) — is
-scored against this oracle, computed once, independent of the engine's own ANN sidecar.
-
-```{python}
-def normalize(matrix):
-    return matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12)
-
-
-corpus_unit = normalize(corpus_vecs)
-query_unit = normalize(query_vecs)
-sims = query_unit @ corpus_unit.T
-topk = np.argpartition(-sims, K, axis=1)[:, :K]
-rows = np.arange(query_vecs.shape[0])[:, None]
-order = np.argsort(-sims[rows, topk], axis=1)
-exact_idx = topk[rows, order]
-exact_top10 = [[corpus_ids[j] for j in exact_idx[i]] for i in range(query_vecs.shape[0])]
-exact_top1 = [row[0] for row in exact_top10]
-print(f"exact oracle: top-{K} (and its own top-1) computed for {len(exact_top10):,} held-out queries")
-```
-
-## Building a table at `storage_precision = "binary"` — through `jammi.connect(config=...)`
-
-Same helper shape as the sibling chapter: a fresh `jammi.connect(target, config=...)` session
-per build, a temp `JammiConfig` TOML carrying the deployment-default `storage_precision` (and
-`oversample`, when the recipe wants to pin it explicitly), the corpus slice registered as a
-source and promoted to a ready embedding table via `import_embeddings` (precomputed vectors, no
-encoder, GPU-free). Unlike the sibling chapter, `build_table` here treats `oversample=None` as a
-real, meaningful input — an **untouched** deployment default — rather than always stamping a
-value, because the claim this chapter measures first is what a table gets when the deployment
-*never sets the knob at all*. Each build is a `with` block: an embedded engine holds its
-catalog until `close()` returns, so a session is closed as soon as its measurements are
-taken, while the artifact directory and the sidecars in it stay on disk.
-
-```{python}
-import contextlib
-import glob
-import os
-import tempfile
-
-import jammi
-
-SOURCE_ID = "vectors"
-
-sub_dir = tempfile.mkdtemp(prefix="binary_corpus_")
-corpus_url = f"{sub_dir}/corpus.parquet"
-pq.write_table(
-    pa.table({
-        "_row_id": corpus_ids,
-        "vector": pa.array(corpus_vecs.tolist(), type=pa.list_(pa.float32(), corpus_vecs.shape[1])),
-    }),
-    corpus_url,
-)
-
-
-@contextlib.contextmanager
-def build_table(storage_precision: str, oversample: int | None):
-    """Open a fresh session through the public `jammi.connect(config=...)` front
-    door at (storage_precision, oversample), import the corpus slice as a ready
-    embedding table, and yield the session + table name + its artifact dir. The
-    session closes when the caller's `with` block ends.
-    `oversample=None` leaves the TOML's `oversample` key OUT ENTIRELY — the real
-    "deployment never configured this knob" case, not a stand-in for any
-    particular value."""
-    cfg_dir = tempfile.mkdtemp(prefix="binary_cfg_")
-    cfg_path = f"{cfg_dir}/jammi.toml"
-    body = f'[embedding.ann]\nstorage_precision = "{storage_precision}"\n'
-    if oversample is not None:
-        body += f"oversample = {oversample}\n"
-    with open(cfg_path, "w") as f:
-        f.write(body)
-
-    art_dir = tempfile.mkdtemp(prefix="binary_art_")
-    with jammi.connect(f"file://{art_dir}", config=cfg_path) as db:
-        db.add_source(SOURCE_ID, url=f"file://{corpus_url}", format="parquet")
-        table_name = db.import_embeddings(
-            source=SOURCE_ID,
-            model="modernbert-base",
-            vectors_url=f"file://{corpus_url}",
-            key="_row_id",
-            dimensions=corpus_vecs.shape[1],
-        )
-        yield db, table_name, art_dir
-
-
-def recall_at_1(db, oversample_override=None):
-    hits_total = 0
-    for i, qv in enumerate(query_vecs):
-        kwargs = {} if oversample_override is None else {"oversample": oversample_override}
-        hits = db.search(SOURCE_ID, query=qv.tolist(), k=1, **kwargs)
-        got = [str(row["_row_id"]) for row in hits.to_pylist()]
-        if got and got[0] == exact_top1[i]:
-            hits_total += 1
-    return hits_total / len(query_vecs)
-
-
-def recall_at_10(db, oversample_override=None):
-    total = 0.0
-    for i, qv in enumerate(query_vecs):
-        kwargs = {} if oversample_override is None else {"oversample": oversample_override}
-        hits = db.search(SOURCE_ID, query=qv.tolist(), k=K, **kwargs)
-        got = [str(row["_row_id"]) for row in hits.to_pylist()]
-        total += len(set(exact_top10[i]) & set(got)) / K
-    return total / len(query_vecs)
-
-
-def sidecar_bytes(art_dir, ext):
-    matches = glob.glob(f"{art_dir}/**/*.{ext}", recursive=True)
-    return os.path.getsize(matches[0]) if matches else None
-
-
-print("helpers ready")
+SCALE = scale.current()
+K = precision.K
+corpus = precision.corpus(SCALE)
+# Recall@1 moves a whole query at a time, and a coordinate at the sign boundary
+# can quantize to either bit on another CPU: its tolerance admits one query's
+# difference and never two.
+AT_1_TOL = max(0.02, 1.5 / len(corpus.queries))
+print(f"corpus {len(corpus.corpus_ids):,} papers × {corpus.dims} dims, "
+      f"{len(corpus.queries)} held-out queries")
 ```
 
 ## The `f32` baseline — exact, single-stage
 
 ```{python}
-from jammi_cookbook import rails
-
-with build_table("f32", oversample=4) as (db_f32, table_f32, art_f32):  # oversample is irrelevant at f32
-    recall1_f32 = recall_at_1(db_f32)
-    recall10_f32 = recall_at_10(db_f32)
-    f32_usearch = sidecar_bytes(art_f32, "usearch")
-
-print(f"f32 recall@1:  {recall1_f32:.4f}")
-print(f"f32 recall@{K}: {recall10_f32:.4f}")
-print(f"f32 sidecar (.usearch): {f32_usearch:,} bytes")
-
-rails.measure("binary_precision.f32_usearch_bytes", f32_usearch)
-contracts.assert_recall_floor("binary_precision.f32_at_1", recall1_f32)
-contracts.assert_recall_floor("binary_precision.f32_at_10", recall10_f32)
+with precision.built(corpus, "f32", None) as (db, table):
+    f32_at_1 = precision.recall(db, corpus, k=1)
+    f32_at_10 = precision.recall(db, corpus)
+    f32_usearch = precision.bundle_bytes(db, table)["usearch"]
+print(f"f32 recall@1 {f32_at_1:.4f}   recall@{K} {f32_at_10:.4f}   graph {f32_usearch:,} bytes")
 ```
 
-## `binary` at an UNCONFIGURED oversample — does the deployment default really land on 32?
+## `binary` with the knob left unset — does the default land on 32?
 
-This is the claim worth measuring directly, before anything else: a deployment that sets
-`storage_precision = "binary"` and never touches `oversample` at all must get a table stamped
-at `oversample = 32`, not the shared `4` every other precision falls back to. We measure this by
-building the SAME table twice — once leaving `oversample` out of the TOML entirely, once
-pinning it explicitly to `32` — and asserting the two resolve to identical recall. If the
-untouched deployment silently fell back to the shared default of `4` instead, this equality
-would fail (the next section shows `4` is a materially worse operating point for `binary`).
+A deployment that sets `storage_precision = "binary"` and never touches `oversample` must get
+`binary`'s own default of `32`, not the `4` every other precision falls back to. On ONE table
+built with no `oversample` key at all, the search with no override and the search with an
+explicit per-request `32` must be the same search.
 
 ```{python}
-# untouched — no oversample key at all
-with build_table("binary", oversample=None) as (db_default, _, art_default):
-    # The SAME table, no rebuild: the "no override" call resolves through whatever
-    # oversample the table's own catalog row was stamped with; the explicit-32 call
-    # pins the request-level override to exactly 32. Comparing these two on ONE
-    # already-built graph (rather than two independently-built tables) is what makes
-    # this an honest proof of the catalog-row's stamped value, immune to any
-    # build-to-build HNSW construction variance.
-    recall1_default_noarg = recall_at_1(db_default)
-    recall1_default_explicit32 = recall_at_1(db_default, oversample_override=32)
-    recall10_default_noarg = recall_at_10(db_default)
-    recall10_default_explicit32 = recall_at_10(db_default, oversample_override=32)
-    binary_usearch = sidecar_bytes(art_default, "usearch")
-    binary_rawf32 = sidecar_bytes(art_default, "rawf32")
-
-print(f"binary, oversample UNSET, no override:        recall@1 = {recall1_default_noarg:.4f}   "
-      f"recall@{K} = {recall10_default_noarg:.4f}")
-print(f"SAME table, per-request override oversample=32: recall@1 = {recall1_default_explicit32:.4f}   "
-      f"recall@{K} = {recall10_default_explicit32:.4f}")
-
-assert recall1_default_noarg == recall1_default_explicit32, (
-    "on the SAME already-built table, an untouched deployment (no oversample key, no "
-    "per-request override) must resolve to the identical recall as an explicit per-request "
-    "oversample=32 — StoragePrecision::default_oversample() for Binary is 32, not the shared 4"
-)
-assert recall10_default_noarg == recall10_default_explicit32, (
-    "recall@10 must match too — both calls resolve to the same effective oversample"
-)
-
-graph_ratio = binary_usearch / f32_usearch
-
-print(f"\nbinary sidecar (.usearch), default oversample: {binary_usearch:,} bytes  "
-      f"({graph_ratio:.1%} of the f32 sidecar)")
-print(f"binary rescore companion (.rawf32):            {binary_rawf32:,} bytes")
-
-rails.measure("binary_precision.binary_usearch_bytes", binary_usearch)
-rails.measure("binary_precision.binary_rawf32_bytes", binary_rawf32)
-rails.measure("binary_precision.binary_vs_f32_usearch_ratio", round(graph_ratio, 4))
-contracts.assert_recall_floor("binary_precision.binary_default_at_1", recall1_default_noarg)
-contracts.assert_recall_floor("binary_precision.binary_default_at_10", recall10_default_noarg)
+with precision.built(corpus, "binary", None) as (db, table):
+    default_at_1 = precision.recall(db, corpus, k=1)
+    default_at_10 = precision.recall(db, corpus)
+    explicit_at_1 = precision.recall(db, corpus, k=1, oversample=32)
+    explicit_at_10 = precision.recall(db, corpus, oversample=32)
+    binary_bytes = precision.bundle_bytes(db, table)
+graph_ratio = binary_bytes["usearch"] / f32_usearch
+print(f"binary, oversample unset:       recall@1 {default_at_1:.4f}   recall@{K} {default_at_10:.4f}")
+print(f"same table, per-request 32:     recall@1 {explicit_at_1:.4f}   recall@{K} {explicit_at_10:.4f}")
+print(f"binary graph {binary_bytes['usearch']:,} bytes ({graph_ratio:.1%} of f32's), "
+      f"rescore companion {binary_bytes['rawf32']:,} bytes")
 ```
 
-### The honest complication: the whole graph file is NOT 32× smaller
-
-The naive expectation — 1 bit per dimension against `f32`'s 32, so the `.usearch` file should
-shrink ~32× — is not what the number above shows. It shrinks by a real, but much smaller,
-factor. The reason is visible by decomposing the file: an HNSW sidecar is not just the corpus's
-own vectors — it also stores each node's graph links (the navigable-proximity connectivity
-[@malkov2020hnsw] a search walks), and that per-node link overhead is a property of the graph
-*topology*, entirely independent of `storage_precision`. We can compute the vector-only payload
-analytically (`corpus rows × bytes/vector` at each precision) and subtract it from the measured
-file size to isolate the link-overhead remainder:
-
 ```{python}
-vec_bytes_f32 = len(corpus_ids) * corpus_vecs.shape[1] * 4          # f32: 4 bytes/dim
-vec_bytes_binary = len(corpus_ids) * ((corpus_vecs.shape[1] + 7) // 8)  # binary: 1 packed bit/dim
-
-f32_overhead = f32_usearch - vec_bytes_f32
-binary_overhead = binary_usearch - vec_bytes_binary
-
-print(f"{'':>28}{'vector payload':>18}{'graph-link overhead':>22}{'.usearch total':>18}")
-print(f"{'f32':>28}{vec_bytes_f32:>18,}{f32_overhead:>22,}{f32_usearch:>18,}")
-print(f"{'binary':>28}{vec_bytes_binary:>18,}{binary_overhead:>22,}{binary_usearch:>18,}")
-print(f"\nvector-payload ratio (binary/f32):  {vec_bytes_binary / vec_bytes_f32:.4f}  "
-      f"— exactly the 1-bit-vs-32-bit packing ratio")
-print(f"whole-file ratio (binary/f32):      {graph_ratio:.4f}  — the number a caller actually pays for")
-
-# The load-bearing, PLATFORM-INVARIANT claim: both vec_bytes_* terms are pure
-# analytic quantities (corpus rows × bytes/dim), never read off a built file —
-# no HNSW build, no allocator, no SIMD backend enters this ratio at all, so it
-# cannot move between platforms.
-assert abs(vec_bytes_binary / vec_bytes_f32 - 1 / 32) < 1e-9, (
-    "the vector PAYLOAD alone must shrink by exactly the 1-bit-vs-32-bit packing ratio — "
-    "this is computed analytically from row/dim counts, never from a built file, so it is "
-    "identical on every platform by construction"
-)
-
-# The graph-link-overhead COMPARISON below, unlike the payload ratio above, is a
-# live measurement (usearch_bytes minus the exact analytic vec_bytes term) and
-# inherits whatever cross-platform HNSW-build variance binary_usearch/f32_usearch
-# themselves carry — it is NOT platform-invariant, and a bare `<=` against it
-# is not either: on Linux x86_64 CI it held with room to spare;
-# on arm64 macOS, the SAME corpus and SAME graph-construction knobs measured
-# binary_overhead=221,416 > f32_overhead=216,112 — a real ~5.3KB crossover, not
-# a fluke, reproducible every render on this platform. Since vec_bytes_binary is
-# a fixed analytic constant (zero variance), 100% of binary_overhead's measured
-# spread is exactly binary_usearch's own spread — the same cross-platform
-# HNSW/allocator/SIMD-backend build noise `binary_usearch_bytes`'s own committed
-# golden tolerance (golden_metrics.json) already budgets for at the file-size
-# level. Reusing that already-reviewed tolerance as the allowance here — rather
-# than inventing a new constant, or silently loosening/deleting the check — is
-# the honest fix: it is derived from a number a human already reviewed for
-# exactly this kind of platform noise, is far wider than the observed 5.3KB gap
-# (so it holds on every currently-observed platform), and still fails loudly on
-# a gap that isn't platform noise (e.g. the overhead mechanism actually
-# regressing).
-overhead_allowance = contracts.golden("binary_precision.binary_usearch_bytes").tol
-print(f"\ngraph-link-overhead gap (binary − f32): {binary_overhead - f32_overhead:,} bytes  "
-      f"(platform-dependent; allowance ±{overhead_allowance:,} bytes, borrowed from "
-      f"binary_usearch_bytes' own committed golden tolerance)")
-
-assert binary_overhead <= f32_overhead + overhead_allowance, (
-    f"the binary sidecar's graph-link overhead ({binary_overhead:,}) exceeds f32's "
-    f"({f32_overhead:,}) by more than the already-reviewed cross-platform build-variance "
-    f"allowance (±{overhead_allowance:,} bytes, binary_precision.binary_usearch_bytes' own "
-    f"golden tol) — vec_bytes_binary is a fixed analytic quantity with zero platform "
-    f"variance, so ALL of binary_overhead's spread is binary_usearch's own measured spread, "
-    f"exactly what that tolerance already budgets for. A gap wider than this allowance is a "
-    f"genuine regression in the overhead mechanism, not platform noise."
-)
+# | echo: false
+assert (default_at_1, default_at_10) == (explicit_at_1, explicit_at_10), \
+    "an unset oversample resolves to binary's own default of 32"
+for metric, value in [("f32_at_1", f32_at_1), ("f32_at_10", f32_at_10),
+                      ("binary_default_at_1", default_at_1), ("binary_default_at_10", default_at_10)]:
+    contracts.assert_close(f"binary_precision.{metric}", value,
+                           tol=AT_1_TOL if metric.endswith("_at_1") else 0.02)
+contracts.assert_close("binary_precision.graph_ratio", graph_ratio, tol=0.03)
 ```
 
-The two overhead numbers are close, but **not** required to be byte-identical — and are not
-byte-identical on this corpus, on any platform. Most of an HNSW graph's link overhead really is a
-pure property of the topology (connectivity, node count) and does not shrink with
-`storage_precision`. But the `Binary` sidecar's own build is a two-phase process — first the
-per-dimension threshold τ is fit from the corpus, then the graph's underlying storage is
-`reserve`d in one bulk allocation sized exactly to the corpus's row count, rather than grown
-incrementally row-by-row the way the other precisions build — so USearch's own allocator
-bookkeeping legitimately lands a few thousand bytes smaller *or larger* for `Binary` than for
-`f32` depending on the platform's usearch/numkong SIMD backend (each ISA has its own node-level
-byte-alignment stride). On Linux x86_64 that noise happens to land `Binary` below `f32`; on arm64
-macOS it happens to land a few KB above it — a few KB of alignment padding is noise against
-`f32`'s ~3KB-per-node vector footprint, but not against `Binary`'s ~96-byte one, so the same
-absolute noise can flip the sign of the comparison. That is a real, honest, platform-dependent
-difference in *how the sidecar is built*, not a violation of the topology-independence claim —
-which is why the invariant this chapter holds `Binary` to is a **bounded inequality** (never
-worse than `f32` by more than the platform-noise allowance already reviewed for
-`binary_usearch_bytes`), not a bare, zero-tolerance one. The vector payload really does shrink by
-exactly the 1-bit-vs-32-bit packing ratio, on every platform, by construction — and for a corpus
-this size, the (roughly platform-stable) fixed link overhead is large enough relative to the (tiny)
-binary vector payload that the *whole file*'s ratio lands well short of 32×. **"Binary
-shrinks the graph 32×" is only true of the vector payload; the sidecar file a deployment actually
-keeps memory-resident shrinks by the measured, smaller factor above.**
+### The whole graph file is not 32× smaller
 
-### The rescore companion, again
-
-The same caveat the sibling chapter raises for `int8` applies here too, on top of the above: a
-quantized table also writes a `.rawf32` companion — the full, un-quantized corpus, needed so the
-rescore stage has something exact to re-score against. That companion does not shrink with
-`storage_precision` at all; it is the same flat array of exact vectors regardless of how the
-graph itself is quantized.
+One bit per dimension against `f32`'s 32 shrinks the **vector payload** exactly 32×. But an
+HNSW sidecar also stores each node's links — the navigable connectivity a search walks
+[@malkov2020hnsw] — and that overhead is a property of the graph's topology, not of how each
+vector is stored. Subtracting the analytic vector payload from each measured file isolates it:
 
 ```{python}
-binary_total = binary_usearch + binary_rawf32
-print(f"f32 total sidecar-bundle bytes:     {f32_usearch:,}")
-print(f"binary total sidecar-bundle bytes:  {binary_total:,}  (.usearch + .rawf32)")
-print(f"binary graph alone vs f32 total:    {binary_usearch / f32_usearch:.1%}")
-print(f"binary bundle (graph+companion) vs f32 total: {binary_total / f32_usearch:.1%}")
+rows = len(corpus.corpus_ids)
+payload_f32 = rows * corpus.dims * 4
+payload_binary = rows * ((corpus.dims + 7) // 8)
+links_f32 = f32_usearch - payload_f32
+links_binary = binary_bytes["usearch"] - payload_binary
+print(f"{'':>8}{'vector payload':>16}{'link overhead':>16}{'file':>14}")
+print(f"{'f32':>8}{payload_f32:>16,}{links_f32:>16,}{f32_usearch:>14,}")
+print(f"{'binary':>8}{payload_binary:>16,}{links_binary:>16,}{binary_bytes['usearch']:>14,}")
+print(f"payload ratio {payload_binary / payload_f32:.4f} — the 1-bit-vs-32-bit packing, exactly")
+print(f"file ratio    {graph_ratio:.4f} — what a deployment keeps resident")
 ```
 
-So, as with `int8`, stacked with the overhead finding above: the precise claim is about the
-vector payload inside the graph, not the graph file as a whole and certainly not the whole
-on-disk bundle. A deploy that reads "binary is 32× smaller" as "the table's memory or disk
-footprint shrinks 32×" is measuring the wrong number twice over — once for the rescore
-companion (documented already for `int8`), and once more for the graph's own fixed link
-overhead (specific to how aggressively `binary` shrinks the vector payload it sits beside).
-
-## Binary WITHOUT rescore — an honest, independently-computed floor
-
-The engine's own design makes `needs_rescore()` unconditionally `true` for `binary` — there is no
-public knob, and no internal one either, that returns an unrescored Hamming ranking as a search
-answer. That is a deliberate design choice, not an oversight: the two-stage retrieve→rescore is
-what keeps a quantized precision from silently degrading the answer a caller receives. To show
-*why* that choice matters, we compute — independently, in numpy, never through the engine — what
-the raw sign-bit Hamming ranking alone would give if the engine skipped the rescore stage
-entirely. This mirrors the exact-`f32` oracle above: a from-scratch computation against the same
-corpus, not a probe of engine internals.
-
-The packing here is deliberately the OLD, naive rule — a fixed sign-at-`0` threshold: bit = 1
-iff the coordinate is strictly positive — not the engine's own current packing. The engine's
-`Binary` sidecar fits a per-dimension threshold τ from the corpus itself (`sign(v − τ)`, median
-by default — see [`asymmetric-binary.qmd`](asymmetric-binary.qmd) for the full anisotropy
-diagnosis and the fit's own measured effect); this fixed-`0` numpy fold is intentionally the
-cruder baseline, kept here only to show how far a naive no-rescore Hamming ranking is from usable
-at all, not as a claim about what the engine currently does:
-
 ```{python}
-def sign_bits(vecs):
-    return (vecs > 0)  # the OLD fixed-0 rule, deliberately naive — see prose above
-
-
-corpus_bits = sign_bits(corpus_vecs)
-query_bits = sign_bits(query_vecs)
-
-hamming_recall1_hits = 0
-hamming_recall10_total = 0.0
-for i in range(query_vecs.shape[0]):
-    hamming = (query_bits[i] != corpus_bits).sum(axis=1)          # Hamming distance, every corpus row
-    ranked = np.argsort(hamming, kind="stable")                    # nearest (fewest differing bits) first
-    top1 = corpus_ids[ranked[0]]
-    top10 = {corpus_ids[j] for j in ranked[:K]}
-    if top1 == exact_top1[i]:
-        hamming_recall1_hits += 1
-    hamming_recall10_total += len(top10 & set(exact_top10[i])) / K
-
-hamming_recall1 = hamming_recall1_hits / query_vecs.shape[0]
-hamming_recall10 = hamming_recall10_total / query_vecs.shape[0]
-
-print(f"raw Hamming ranking, NO rescore — recall@1:  {hamming_recall1:.4f}")
-print(f"raw Hamming ranking, NO rescore — recall@{K}: {hamming_recall10:.4f}")
-print(f"(engine, default oversample=32, WITH rescore) recall@1:  {recall1_default_noarg:.4f}")
-print(f"(engine, default oversample=32, WITH rescore) recall@{K}: {recall10_default_noarg:.4f}")
-
-# A pure-numpy computation over the same fixed corpus/query arrays — no engine call,
-# no ANN sidecar build, so this number is bit-reproducible (a tight two-sided
-# tolerance is the right gate, unlike the engine-built recall numbers below).
-rails.measure("binary_precision.hamming_no_rescore_at_1", round(hamming_recall1, 4))
-rails.measure("binary_precision.hamming_no_rescore_at_10", round(hamming_recall10, 4))
-
-assert hamming_recall1 < recall1_default_noarg - 0.2, (
-    "the raw, un-rescored Hamming ranking must be materially worse than the engine's own "
-    "rescored default — this is the whole reason rescore is not an optional stage for binary"
-)
+# | echo: false
+assert abs(payload_binary / payload_f32 - 1 / 32) < 1e-9
+assert graph_ratio > payload_binary / payload_f32, "link overhead does not shrink with precision"
 ```
 
-`binary` alone — a single packed sign bit per dimension, ranked by raw Hamming distance, with no
-exact-`f32` rescore afterwards — is nowhere near a usable nearest-neighbour result on this
-corpus. This is the honest floor a 1-bit-per-dimension quantization sits at before rescore does
-anything; the engine never actually ships this number to a caller (rescore always runs), but
-measuring it independently is what makes the oversample sweep below legible: oversample is not
-tuning a small correction, it is recovering the *entire* gap between an unusable coarse ranking
-and the exact answer.
+"Binary is 32× smaller" is true of the vectors inside the graph; the file shrinks by the
+measured, smaller factor above, because the links do not shrink at all. The smaller the
+vectors, the larger the links' share: at a real embedding's hundreds of dimensions the payload
+still dominates an `f32` graph, at the fixture encoder's 32 the links already weigh as much.
+And, as for `int8`, a quantized table also writes the `.rawf32` rescore companion — the exact
+vectors, which do not shrink with `storage_precision` at all.
 
-## Dialing `oversample` — binary needs a much wider recovery than `int8` did
+## `binary` without rescore — an independent floor
 
-The retrieve stage proposes `k * oversample` Hamming candidates for the rescore stage to re-rank
-by exact cosine; a narrower oversample risks the true neighbour never reaching the candidate set
-at all, which no amount of exact rescoring can then recover. We stamp five otherwise-identical
-`binary` tables at different EXPLICIT `oversample` values — the same corpus, the same held-out
-queries, the same exact oracle — to trace the recovery curve directly.
+`binary` always rescores: there is no knob, public or internal, that returns a raw Hamming
+ranking as a search answer. To show why, numpy ranks the whole corpus by the Hamming distance
+of a naive fixed-`0` sign code — bit = 1 iff the coordinate is positive — with no rescore.
+(The engine's own code fits a per-dimension threshold instead; the
+[next chapter](asymmetric-binary.qmd) measures that fit.)
 
 ```{python}
-oversample_grid = [1, 4, 8, 16, 32]
-sweep1 = {}
-sweep10 = {}
-for ov in oversample_grid:
-    with build_table("binary", oversample=ov) as (db_ov, _, _):
-        sweep1[ov] = recall_at_1(db_ov)
-        sweep10[ov] = recall_at_10(db_ov)
+corpus_bits = corpus.vectors > 0
+hits_at_1, overlap_at_10 = 0, 0.0
+for q, truth in zip(corpus.queries, corpus.exact):
+    ranked = np.argsort(((q > 0) != corpus_bits).sum(axis=1), kind="stable")
+    ids = [corpus.corpus_ids[j] for j in ranked[:K]]
+    hits_at_1 += ids[0] == truth[0]
+    overlap_at_10 += len(set(ids) & set(truth)) / K
+hamming_at_1 = hits_at_1 / len(corpus.queries)
+hamming_at_10 = overlap_at_10 / len(corpus.queries)
+print(f"raw Hamming, no rescore:          recall@1 {hamming_at_1:.4f}   recall@{K} {hamming_at_10:.4f}")
+print(f"engine, rescored at the default:  recall@1 {default_at_1:.4f}   recall@{K} {default_at_10:.4f}")
+```
 
+```{python}
+# | echo: false
+contracts.assert_close("binary_precision.hamming_no_rescore_at_1", hamming_at_1, tol=0.0)
+contracts.assert_close("binary_precision.hamming_no_rescore_at_10", hamming_at_10, tol=0.0)
+assert hamming_at_1 < default_at_1 and hamming_at_10 < default_at_10, \
+    "rescore recovers what the raw Hamming ranking loses"
+```
+
+A single sign bit per dimension, ranked by raw Hamming distance, is a coarse ranking; the
+engine never returns it, and measuring it independently is what makes the sweep below legible:
+`oversample` is not tuning a small correction, it is how much of that coarse ranking the exact
+rescore gets to repair.
+
+## Dialing `oversample` — binary needs a wider recovery than `int8`
+
+The retrieve stage proposes `k * oversample` Hamming candidates for the exact rescore; a true
+neighbour outside the candidate set cannot be recovered. Five otherwise-identical `binary`
+tables, each stamped at an explicit `oversample`:
+
+```{python}
+GRID = [1, 4, 8, 16, 32]
+sweep = {}
+for ov in GRID:
+    with precision.built(corpus, "binary", ov) as (db, _):
+        sweep[ov] = (precision.recall(db, corpus, k=1), precision.recall(db, corpus))
 print(f"{'oversample':>10}{'candidates':>12}{'recall@1':>11}{'recall@10':>11}")
-for ov in oversample_grid:
-    print(f"{ov:>10}{K * ov:>12}{sweep1[ov]:>11.4f}{sweep10[ov]:>11.4f}")
-
-contracts.assert_recall_floor("binary_precision.oversample1_at_1", sweep1[1])
-contracts.assert_recall_floor("binary_precision.oversample4_at_1", sweep1[4])
-contracts.assert_recall_floor("binary_precision.oversample8_at_1", sweep1[8])
-contracts.assert_recall_floor("binary_precision.oversample16_at_1", sweep1[16])
-contracts.assert_recall_floor("binary_precision.oversample32_at_1", sweep1[32])
-contracts.assert_recall_floor("binary_precision.oversample1_at_10", sweep10[1])
-contracts.assert_recall_floor("binary_precision.oversample32_at_10", sweep10[32])
-
-assert sweep1[1] < sweep1[4] < sweep1[32], (
-    "recall@1 must strictly rise as oversample widens the candidate set well below saturation"
-)
-assert sweep1[32] >= sweep1[16] - 1e-9, (
-    "widening oversample must never regress recall once it has already reached the engine's "
-    "own default operating point"
-)
+for ov in GRID:
+    print(f"{ov:>10}{K * ov:>12}{sweep[ov][0]:>11.4f}{sweep[ov][1]:>11.4f}")
 ```
-
-Unlike `int8` — whose sibling sweep (`[1, 2, 4, 8]`) had already saturated recall by the
-engine's shared default of `4` — `binary`'s recall is still climbing well past `4`, which is
-exactly why `Binary::default_oversample()` is `32` and not the shared constant every other
-precision uses: at `oversample=1` the retrieve stage offers the rescore stage only `k` raw
-Hamming candidates (no widening at all), and by the time oversample reaches `32` the two-stage
-search has recovered onto (or very near) the `f32` baseline. The default was not picked
-arbitrarily — it is the point on this corpus's own curve where widening further stops buying
-anything.
-
-`oversample=1` is the single most aggressive edge on this curve — no over-fetch at all, so the
-raw coarse-code ranking's own candidate order is the only thing rescore ever sees. The asymmetric
-per-dimension threshold τ ([`asymmetric-binary.qmd`](asymmetric-binary.qmd)) builds a
-measurably different HNSW graph than the old fixed-`0` packing did, and at this one no-slack
-setting it proposes a slightly worse rank-1 candidate on this corpus — the honest floor above
-reflects that real, narrow regression. Every other point on the curve — `oversample=4` and
-wider, the engine's actual default of `32`, and every `recall@10` reading — is unaffected or
-improved: the asymmetric fix eliminates real dead-bit waste everywhere it operates, and this is
-the one aggressive corner where that trade is not free.
-
-## The per-request override — `search(..., oversample=...)`, still no lower layer needed
-
-`oversample` also has a per-request form, resolved *request override > table's own stamped
-default > deployment default*. We reuse the narrowest table from the sweep above — stamped at
-`oversample=1`, the operating point that left the most real recall on the table — and issue the
-same held-out queries with an explicit per-request `oversample=32`.
 
 ```{python}
-with build_table("binary", oversample=1) as (db_narrow, table_narrow, _):
-    recall1_no_override = recall_at_1(db_narrow)
-    recall1_override32 = recall_at_1(db_narrow, oversample_override=32)
-
-print(f"table stamped at oversample=1, no per-request override:  recall@1 = {recall1_no_override:.4f}")
-print(f"same table, per-request override oversample=32:          recall@1 = {recall1_override32:.4f}")
-
-contracts.assert_recall_floor("binary_precision.per_request_override32_on_table_os1_at_1", recall1_override32)
-
-assert recall1_override32 > recall1_no_override, (
-    "a per-request override must actually widen the candidate set beyond the binary table's "
-    "own narrow stamped default, recovering recall on the SAME on-disk graph — no rebuild"
-)
+# | echo: false
+for ov in GRID:
+    contracts.assert_close(f"binary_precision.os{ov}_at_1", sweep[ov][0], tol=AT_1_TOL)
+    contracts.assert_close(f"binary_precision.os{ov}_at_10", sweep[ov][1], tol=0.02)
+assert sweep[1][1] < sweep[32][1], "a narrow candidate set loses true neighbours"
+assert all(sweep[a][1] <= sweep[b][1] + 1e-9 for a, b in zip(GRID, GRID[1:])), sweep
 ```
 
-The mechanism is real at `binary` precision too: a per-request override recovers recall on the
-same on-disk graph, no rebuild, reachable exactly where a caller would look for it —
-`Session.search()`'s own keyword arguments.
+Unlike `int8`, whose recall reached the exact baseline by the shared default of `4`,
+`binary`'s keeps climbing well past it: the coarser the retrieve ranking, the more candidates
+the rescore needs to see. That is why `binary`'s own default is `32` — the point on this curve
+where widening further stops buying recall.
+
+## The per-request override — `search(..., oversample=...)`
+
+On the table stamped at `oversample=1`, the same queries with a per-request `oversample=32`:
+
+```{python}
+with precision.built(corpus, "binary", 1) as (db, _):
+    narrow = precision.recall(db, corpus)
+    widened = precision.recall(db, corpus, oversample=32)
+print(f"table default (1):            recall@{K} {narrow:.4f}")
+print(f"per-request override to 32:   recall@{K} {widened:.4f}")
+```
+
+```{python}
+# | echo: false
+assert widened == sweep[32][1], "a per-request 32 is the table-default 32's search"
+assert widened > narrow
+```
+
+The override recovers, on the same on-disk graph and with no rebuild, the recall a wider table
+default gives — reachable from `search`'s own keywords at `binary` precision too.
 
 ## Bridge note
 

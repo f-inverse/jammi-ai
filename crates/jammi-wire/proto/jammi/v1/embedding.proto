@@ -3,6 +3,7 @@ syntax = "proto3";
 package jammi.v1.embedding;
 
 import "jammi/v1/inference.proto";
+import "jammi/v1/trigger.proto";
 
 // EmbeddingService — the wire surface for the engine's embedding compute
 // verbs. These are imperative session methods, not SQL queries, so they live
@@ -66,6 +67,12 @@ service EmbeddingService {
   // model, only an additional transport for the existing capability.
   rpc Search(SearchRequest) returns (SearchResponse);
 
+  // Lexical (BM25) search over a source's lexical table: the query text is
+  // analysed into terms by the table's analyzer, and the best-ranked rows are
+  // hydrated from the source, each carrying its `bm25_score` and `bm25_rank`.
+  // Peer of the abstraction's `lexical_search`.
+  rpc LexicalSearch(LexicalSearchRequest) returns (SearchResponse);
+
   // Re-embed only the source rows whose content hash changed since the
   // table's current version and publish the result as a new version (a
   // never-refreshed table first publishes its base version). Every refusal is
@@ -112,6 +119,10 @@ message GenerateEmbeddingsRequest {
   // honestly always a miss — the cache is off here until sources expose a
   // version surface.
   jammi.v1.inference.CachePolicy cache = 6;
+  // Serve the model's leading `dimensions` coordinates, each vector
+  // L2-renormalised — a Matryoshka prefix. Unset serves the model's own width;
+  // a width larger than the model's is refused.
+  optional uint32 dimensions = 7;
 }
 
 // Which kind of derivation a `ResultTable` is — the wire mirror of the
@@ -140,6 +151,10 @@ enum ResultTableKind {
   // promoted, so it is never `ready` and no verb returns it; listed for
   // completeness of the catalog's own kind set.
   WORKING = 6;
+  // A source's text as `(_row_id, text)` rows, which lexical (BM25) search
+  // ranks. Data of record with no ANN sidecar, excluded from embedding-table
+  // resolution.
+  LEXICAL = 7;
 }
 
 // Subset of the engine's `ResultTableRecord` a client needs to locate and
@@ -214,6 +229,10 @@ message EncodeQueryRequest {
     string text = 3;
     bytes data = 4;
   }
+  // Encode to the model's leading `dimensions` coordinates, L2-renormalised —
+  // the width of a table generated with the same `dimensions`. Unset encodes
+  // at the model's own width.
+  optional uint32 dimensions = 5;
 }
 
 message EncodeQueryResponse {
@@ -239,9 +258,9 @@ message SearchRequest {
   }
   // Number of nearest neighbors to return.
   uint32 k = 4;
-  // Optional SQL predicate pushed into the search (predicate pushdown). The
-  // engine treats it as an opaque expression over the result columns; it
-  // carries no domain semantics.
+  // Optional SQL predicate over the result columns: the search returns the
+  // `k` nearest rows that satisfy it (fewer only when fewer exist). The
+  // engine treats it as an opaque expression; it carries no domain semantics.
   optional string filter = 5;
   // Columns to project into each hit's `columns` map. Empty = key + score
   // only (no projected columns).
@@ -250,24 +269,45 @@ message SearchRequest {
   // most-recent ready table. Naming a table searches that one (e.g. a raw,
   // propagated, or fine-tuned table when a source carries several).
   optional string embedding_table = 7;
-  // Per-request override of the table's config-default retrieve→rescore
-  // oversample multiplier for a quantized sidecar index (market parity with
-  // Qdrant's per-query oversampling knob). Unset = the table's default.
-  // Irrelevant for an `f32`-precision table (single-stage, no rescore).
-  optional uint32 oversample = 8;
+  // How the search ranks. Unset = approximately, through the table's ANN
+  // index, at the table's own oversample.
+  oneof method {
+    // Approximately, overriding for this one search a quantized index's
+    // retrieve→rescore breadth (`k * oversample`). Irrelevant for an
+    // `f32`-precision index (single-stage, no rescore).
+    uint32 oversample = 8;
+    // Exactly: every vector scored, the true nearest neighbours.
+    ExactSearch exact = 9;
+  }
 }
 
+// An exact search: every vector scored. Carries nothing; its presence in
+// `SearchRequest.method` is the choice.
+message ExactSearch {}
+
+message LexicalSearchRequest {
+  // Source whose lexical table is searched.
+  string source_id = 1;
+  // The query text. Its words are the query: no syntax is interpreted.
+  string text = 2;
+  // Number of rows to return.
+  uint32 k = 3;
+  // Optional SQL predicate over the result columns: the search returns the `k`
+  // best-ranked rows that satisfy it (fewer only when fewer exist).
+  optional string filter = 4;
+  // Columns to project into each hit's `columns` map. Empty = key + score only.
+  repeated string select = 5;
+  // Which lexical table of the source to search. Unset = the source's
+  // most-recent ready one.
+  optional string lexical_table = 6;
+}
+
+// The search result: the hydrated rows the engine's `search` returns — the
+// key (`_row_id`), the source's columns (or exactly the `select`ed ones), the
+// retrieval provenance and the `similarity` — as one Arrow IPC stream, typed
+// as the engine typed them.
 message SearchResponse {
-  repeated SearchHit hits = 1;
-}
-
-message SearchHit {
-  // The matched row's key (the source's key-column value).
-  string key = 1;
-  // Similarity score from the ANN search.
-  float score = 2;
-  // Projected scalar columns, stringified, when `select` is non-empty.
-  map<string, string> columns = 3;
+  jammi.v1.trigger.ArrowBatch result = 1;
 }
 
 // What a refresh does with a key the source no longer has. UNSPECIFIED maps

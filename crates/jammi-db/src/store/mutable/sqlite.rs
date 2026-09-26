@@ -21,6 +21,12 @@ impl SqliteMutableBackend {
 }
 
 impl MutableBackend for SqliteMutableBackend {
+    /// `SQLITE_MAX_VARIABLE_NUMBER`'s default since SQLite 3.32, and the
+    /// bundled amalgamation's value.
+    fn max_bind_params(&self) -> usize {
+        32_766
+    }
+
     fn create_table_ddl(&self, def: &MutableTableDefinition) -> String {
         let mut cols: Vec<String> = def
             .schema
@@ -95,34 +101,6 @@ impl MutableBackend for SqliteMutableBackend {
             quote_ident(def.id.as_str()),
             cols_clause,
             row_clauses.join(", ")
-        )
-    }
-
-    fn update_dml(
-        &self,
-        def: &MutableTableDefinition,
-        set_columns: &[&str],
-        where_predicate: &str,
-    ) -> String {
-        let set_clause: String = set_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{} = ${}", quote_ident(c), i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "UPDATE {} SET {} WHERE {}",
-            quote_ident(def.id.as_str()),
-            set_clause,
-            where_predicate
-        )
-    }
-
-    fn delete_dml(&self, def: &MutableTableDefinition, where_predicate: &str) -> String {
-        format!(
-            "DELETE FROM {} WHERE {}",
-            quote_ident(def.id.as_str()),
-            where_predicate
         )
     }
 

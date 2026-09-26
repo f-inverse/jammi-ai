@@ -135,16 +135,13 @@ prost = { workspace = true, optional = true }
 # `set_parent_from_headers` continues an incoming W3C `traceparent` — both
 # consumed by `jammi-server`'s `telemetry::install` / `TraceContextLayer` and
 # by `jammi-python`'s `open_local` subscriber (the factory lives in the
-# library, not duplicated per consumer). `tracing-subscriber` rides this
-# feature (rather than being an unconditional dependency) because the
-# `Layer<S>` bound `telemetry::otlp_layer` returns only has a reason to exist
-# under this feature; it is otherwise dev-dependency-only (this crate's own
-# GPU-capability test harness).
+# library, not duplicated per consumer).
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, optional = true }
+# `telemetry::fmt_layer`, the log formatter every host installs.
+tracing-subscriber.workspace = true
 http = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -176,10 +173,6 @@ statrs.workspace = true
 # Synthetic exchangeable data generators for the conformal coverage tests.
 rand.workspace = true
 rand_distr.workspace = true
-# The gated GPU-capability suite captures the fine-tune trainer's per-epoch
-# `avg_train_loss` off its `tracing` events (a `Layer` over the in-process
-# worker) to prove on-device learning — the loss-decrease property. Test-only.
-tracing-subscriber.workspace = true
 # The `telemetry-otlp` test's stub OTLP collector: a real (in-process,
 # loopback) tonic server implementing `opentelemetry.proto.collector.trace.v1
 # .TraceService`, generated from the SAME `opentelemetry-proto` version
@@ -254,7 +247,6 @@ telemetry-otlp = [
     "dep:opentelemetry_sdk",
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
-    "dep:tracing-subscriber",
     "dep:http",
     "dep:tonic",
 ]
@@ -315,6 +307,7 @@ live-gpu-cluster-tests = ["live-gpu-tests"]
 # `libnccl` present -- not only the runtime host.
 cuda = [
     "local",
+    "jammi-db/accelerator",
     "candle-core/cuda",
     "candle-core/nccl",
     "candle-nn/cuda",
@@ -322,7 +315,7 @@ cuda = [
     "jammi-lora/cuda",
     "jammi-kernels/cuda",
 ]
-metal = ["local", "candle-core/metal", "candle-nn/metal"]
+metal = ["local", "jammi-db/accelerator", "candle-core/metal", "candle-nn/metal"]
 # Forwards to `jammi-encoders`'s and `jammi-kernels`'s own `flash-attn`
 # features — one link of the declared 1:1 chain
 # `jammi-server`/`jammi-bench` -> `jammi-ai` -> `{jammi-encoders,jammi-kernels}`

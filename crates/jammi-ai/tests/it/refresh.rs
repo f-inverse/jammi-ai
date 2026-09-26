@@ -24,7 +24,7 @@ use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::deletes::DeletionMask;
-use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, ProducingDescriptor};
+use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, ModelRun, ProducingDescriptor};
 use jammi_db::store::{layout, CachePolicy, StaleReason, Staleness};
 use jammi_db::TenantId;
 use jammi_test_utils::vq;
@@ -318,6 +318,71 @@ async fn edit_one_row_refresh_infers_exactly_one() {
         "the old vector never returns 4242 at the old distance: {stale:?}"
     );
     assert_eq!(h.count_key("4242").await, 1);
+}
+
+/// A table served at a Matryoshka prefix refreshes at that prefix: the edited
+/// row's new vector is the prefix of the model's full-width embedding of the
+/// new text, renormalised, and the table keeps its recorded width.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_serves_the_tables_recorded_prefix() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("engine");
+    std::fs::create_dir_all(&root).unwrap();
+    let source_path = dir.path().join("src.parquet");
+    write_parquet(&source_path, &rows(50));
+    let session = open_session(&root, 1).await;
+    let source = unique_source();
+    add_source(
+        &session,
+        &source,
+        format!("file://{}", source_path.display()),
+    )
+    .await;
+    let (table, _) = session
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: source.clone(),
+            model_id: tiny_bert_id(),
+            columns: vec!["text".to_string()],
+            key_column: "id".to_string(),
+            modality: jammi_ai::local_session::Modality::Text,
+            dimensions: Some(8),
+            cache: CachePolicy::Bypass,
+        })
+        .await
+        .unwrap();
+    let h = Harness {
+        _dir: dir,
+        root,
+        session,
+        source_path,
+        source,
+        table: table.table_name,
+    };
+
+    let mut edited = rows(50);
+    let text = "a completely different sentence about something else";
+    edited[7].1 = text.into();
+    write_parquet(&h.source_path, &edited);
+    let report = h.refresh().await.unwrap();
+    assert_eq!(
+        (report.outcome, report.inferred_rows),
+        (RefreshOutcome::Published, 1)
+    );
+
+    let full = h
+        .session
+        .encode_text_query(&tiny_bert_id(), text)
+        .await
+        .unwrap();
+    let served = h.vector_of("7").await.unwrap();
+    let expected = jammi_datafusion::matryoshka_prefix(&full, 8);
+    let diff: f32 = served
+        .iter()
+        .zip(&expected)
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(diff < 1e-4, "{served:?} vs {expected:?}");
+    assert_eq!(h.record().await.dimensions_raw(), Some(8));
 }
 
 /// Edit a row to empty text: the model refuses it per row, so
@@ -1862,6 +1927,62 @@ async fn read_vectors_follows_the_refreshed_version_in_key_order() {
     }
     assert_eq!(vectors.len(), 24);
     assert_eq!(vectors, expected);
+}
+
+/// `describe_table` returns the table's recorded materialization verbatim:
+/// the embedding descriptor, the one local model it ran (with the digest of
+/// its files), the input anchor on its source, and the definition hash the
+/// catalog summarises. That hash is the one `staleness` compares, so passing
+/// it back decides no `DefinitionChanged` reason. With the
+/// sidecar gone the read is the typed `MissingManifest` refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_table_reads_the_recorded_materialization() {
+    let h = harness(12).await;
+    let svc = Session::new(Arc::clone(&h.session));
+    let record = h.record().await;
+
+    let described = svc.describe_table(&h.table).await.unwrap();
+    assert_eq!(
+        Some(described.definition_hash.0.clone()),
+        record.definition_hash
+    );
+    assert!(matches!(
+        described.descriptor,
+        ProducingDescriptor::Embedding { .. }
+    ));
+    let [model] = described.env.models.as_slice() else {
+        panic!("one model ran: {:?}", described.env.models);
+    };
+    assert_eq!(
+        model.model_id,
+        common::cookbook_fixture("tiny_bert").display().to_string(),
+        "the canonical id is the checkpoint path"
+    );
+    match &model.run {
+        ModelRun::Local(run) => assert_eq!(run.content_digest.0.len(), 64),
+        other => panic!("tiny_bert ran locally, got {other:?}"),
+    }
+    assert_eq!(described.input_anchors.len(), 1);
+    assert_eq!(described.input_anchors[0].source, h.source);
+    // The source is a plain file, anchored at a read instant, so staleness
+    // cannot be decided — but the recorded definition compares equal, so no
+    // reason is `DefinitionChanged`.
+    assert_eq!(
+        svc.staleness(&h.table, described.definition_hash.clone())
+            .await
+            .unwrap(),
+        Staleness::Undecidable {
+            unpinned: vec![h.source.clone()],
+            decided_reasons: Vec::new(),
+        }
+    );
+
+    let parquet = common::url_to_path(&record.parquet_path);
+    std::fs::remove_file(parquet.with_extension("materialization.json")).unwrap();
+    match svc.describe_table(&h.table).await {
+        Err(JammiError::MissingManifest { table }) => assert_eq!(table, h.table),
+        other => panic!("a table without a sidecar is MissingManifest, got {other:?}"),
+    }
 }
 
 /// `verify_materialization` on a versioned table: the base check is

@@ -50,12 +50,12 @@ mod transport;
 
 mod audit;
 mod cache_outcome;
+mod cache_policy;
 mod catalog;
 mod channel;
 mod embedding;
 mod error;
 mod eval_wire;
-mod inference;
 mod mutable_table;
 mod training;
 mod trigger;
@@ -64,27 +64,32 @@ pub use transport::{SessionChannel, SessionHeader, SessionTransport, SESSION_HEA
 
 pub use audit::{parse_query_id, record_from_wire};
 pub use cache_outcome::{cache_outcome_from_proto, cache_outcome_to_proto};
+pub use cache_policy::{cache_policy_from_proto, cache_policy_to_proto};
 pub use catalog::{
-    derives_from_edge_from_proto, derives_from_edge_to_proto, index_segment_from_proto,
-    index_segment_to_proto, match_verdict_from_proto, match_verdict_to_proto, model_from_proto,
-    model_to_proto, reconcile_options_from_proto, reconcile_report_from_proto,
-    reconcile_report_to_proto, source_descriptor_from_proto, source_type_from_proto,
-    source_type_to_proto, staleness_from_proto, staleness_to_proto, topic_from_proto,
-    topic_to_proto, DEFAULT_RECONCILE_GRACE_SECS,
+    derives_from_edge_from_proto, derives_from_edge_to_proto, describe_table_from_proto,
+    describe_table_to_proto, index_segment_from_proto, index_segment_to_proto,
+    match_verdict_from_proto, match_verdict_to_proto, model_from_proto, model_to_proto,
+    reconcile_options_from_proto, reconcile_report_from_proto, reconcile_report_to_proto,
+    source_descriptor_from_proto, source_type_from_proto, source_type_to_proto,
+    staleness_from_proto, staleness_to_proto, topic_from_proto, topic_to_proto,
+    DEFAULT_RECONCILE_GRACE_SECS,
 };
 pub use channel::{
     channel_from_proto, channel_to_proto, columns_from_proto, columns_to_proto, parse_channel_id,
 };
-pub use embedding::{result_table_from_proto, result_table_with_outcome, ProtoQueryInput};
+pub use embedding::{
+    result_table_from_proto, result_table_with_outcome, search_method_from_proto,
+    search_method_to_proto, ProtoQueryInput,
+};
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
-    error_from_status, trigger_error_from_status, TaskErrorEnvelope, TaskErrorEnvelopeError,
+    error_from_status, status_code, trigger_error_from_status, TaskErrorEnvelope,
+    TaskErrorEnvelopeError,
 };
 pub use eval_wire::{
     calibration_shape_from_proto, calibration_shape_to_proto, cohorts_from_proto, cohorts_to_proto,
     eval_task_to_proto, EvalTaskFromWire,
 };
-pub use inference::infer_result_to_proto;
 pub use mutable_table::{
     definition_from_proto, definition_list_from_proto, definition_to_proto, parse_table_id,
 };
@@ -194,6 +199,31 @@ pub fn decode_ipc_stream(data_header: &[u8], data_body: &[u8]) -> Result<Vec<Rec
     reader
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| Status::invalid_argument(format!("batch decode: {e}")))
+}
+
+/// Carry a verb's result rows — the `Vec<RecordBatch>` an inference or a
+/// search returns — as one `ArrowBatch`: a single self-describing IPC stream
+/// keyed on the first batch's schema. An empty result has no schema to
+/// encode, so it becomes an empty `ArrowBatch`. [`result_rows_from_proto`] is
+/// the inverse.
+pub fn result_rows_to_proto(batches: &[RecordBatch]) -> Result<proto::trigger::ArrowBatch, Status> {
+    match batches.first() {
+        Some(first) => Ok(proto::trigger::ArrowBatch {
+            data_header: Vec::new(),
+            data_body: encode_ipc_stream(&first.schema(), batches)?,
+            app_metadata: Vec::new(),
+        }),
+        None => Ok(proto::trigger::ArrowBatch::default()),
+    }
+}
+
+/// The result rows an `ArrowBatch` carries; an absent or empty one is no rows.
+/// Inverse of [`result_rows_to_proto`].
+pub fn result_rows_from_proto(
+    batch: Option<proto::trigger::ArrowBatch>,
+) -> Result<Vec<RecordBatch>, Status> {
+    let batch = batch.unwrap_or_default();
+    decode_ipc_stream(&batch.data_header, &batch.data_body)
 }
 
 #[cfg(test)]

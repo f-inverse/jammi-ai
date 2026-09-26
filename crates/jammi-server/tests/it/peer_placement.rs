@@ -31,6 +31,7 @@
 //! before A creates anything); this proves transport + merge + ladder only —
 //! not object-store fetch, process isolation, or network partition.
 
+use jammi_ai::SearchMethod;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -336,7 +337,7 @@ fn search_request(source_id: &str, query: Vec<f32>, k: usize) -> SearchRequest {
         embedding_table: None,
         filter: None,
         select: Vec::new(),
-        oversample: None,
+        method: SearchMethod::default(),
     }
 }
 
@@ -788,7 +789,10 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
         assert_eq!(record.status, "ready");
         // Whatever segment placement says, the refusal must come first.
         placement.set(&record.table_name, 0, vec![owner.clone()]);
-        let err = match a.search_by_id(&source_id, "row-1", 1, None, None).await {
+        let err = match a
+            .search_by_id(&source_id, "row-1", 1, None, SearchMethod::default())
+            .await
+        {
             Err(err) => err,
             Ok(_) => panic!("{poison:?}: a stored non-finite vector must be refused at the entry"),
         };
@@ -808,7 +812,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
         // corrupt artifact (typed, table-named, recovered through the plan
         // boundary), never a top-k over a silently dropped row.
         let err = a
-            .search_by_id(&source_id, "row-0", 1, None, None)
+            .search_by_id(&source_id, "row-0", 1, None, SearchMethod::default())
             .await
             .expect("an honest stored vector validates as a self-query")
             .run()
@@ -829,7 +833,13 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
     let clean = ready_table_with_poisoned_row(&a, "docs_stored_clean", None).await;
     placement.set(&clean.table_name, 0, vec![owner.clone()]);
     let hits = a
-        .search_by_id("docs_stored_clean", "row-0", 1, None, None)
+        .search_by_id(
+            "docs_stored_clean",
+            "row-0",
+            1,
+            None,
+            SearchMethod::default(),
+        )
         .await
         .expect("an honest stored vector is a valid self-query")
         .run()
@@ -985,7 +995,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect_err("the placed table's owners are dead and the budget refuses the load");

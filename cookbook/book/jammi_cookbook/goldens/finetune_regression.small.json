@@ -1,0 +1,34 @@
+{
+  "beta_nll.coverage_90": {
+    "tol": 0.05,
+    "value": 0.925
+  },
+  "beta_nll.rmse_years": {
+    "tol": 0.15,
+    "value": 1.2550796145920948
+  },
+  "crps.coverage_90": {
+    "tol": 0.05,
+    "value": 0.925
+  },
+  "crps.rmse_years": {
+    "tol": 0.15,
+    "value": 1.2592926756630662
+  },
+  "gaussian_nll.coverage_90": {
+    "tol": 0.05,
+    "value": 0.925
+  },
+  "gaussian_nll.rmse_years": {
+    "tol": 0.15,
+    "value": 1.2525875707483252
+  },
+  "pinball.coverage_90": {
+    "tol": 0.05,
+    "value": 0.925
+  },
+  "pinball.rmse_years": {
+    "tol": 0.15,
+    "value": 1.3170463982928446
+  }
+}

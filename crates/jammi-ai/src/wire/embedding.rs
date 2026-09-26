@@ -4,8 +4,9 @@
 //!
 //! The transport-neutral modality / query-input conversions live on the wire
 //! substrate ([`jammi_wire`]); what stays here are the request decoders that
-//! return the engine's flat call args (`GenerateEmbeddingsArgs`,
-//! `EncodeQueryArgs`) and the [`SearchRequest`] the session search verb takes.
+//! return the requests the session verbs take ([`EmbeddingRequest`],
+//! [`SearchRequest`], [`LexicalSearchRequest`]) and the `EncodeQueryArgs` of a
+//! query encode.
 //!
 //! The embedded binding builds each request with the same pure-Python assembly
 //! the remote client uses, serializes it, and hands the bytes here — so the
@@ -17,32 +18,19 @@
 use prost::Message;
 use tonic::Status;
 
-use crate::local_session::{Modality, QueryInput, SearchQuery, SearchRequest};
+use crate::local_session::{
+    EmbeddingRequest, LexicalSearchRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+};
 use jammi_wire::proto::embedding as pb;
 use jammi_wire::ProtoQueryInput;
 
-/// The decoded identity + tower a `GenerateEmbeddings` request carries. The
-/// engine method (`Session::generate_embeddings`) takes these separately, so the
-/// decode returns them as a struct the binding destructures.
-pub struct GenerateEmbeddingsArgs {
-    pub source_id: String,
-    pub model_id: String,
-    pub columns: Vec<String>,
-    pub key_column: String,
-    pub modality: Modality,
-    /// The opt-in memoization policy (the engine method's `cache` arg). Embedding
-    /// anchors its source `UnpinnedAtInstant`, so `Use` is honestly always a
-    /// miss; the field rides for surface uniformity with the cacheable producers.
-    pub cache: jammi_db::store::CachePolicy,
-}
-
 /// Decode a serialized [`pb::GenerateEmbeddingsRequest`] body into the engine
-/// [`GenerateEmbeddingsArgs`]. The embedded binding builds the request with the
+/// [`EmbeddingRequest`]. The embedded binding builds the request with the
 /// same pure-Python assembly the remote client uses, serializes it, and hands
 /// the bytes here — so the in-process and remote embedding paths decode through
 /// one shared seam ([`generate_embeddings_from_proto`]). A body that is not a
 /// valid `GenerateEmbeddingsRequest` is a client error (`InvalidArgument`).
-pub fn generate_embeddings_from_bytes(body: &[u8]) -> Result<GenerateEmbeddingsArgs, Status> {
+pub fn generate_embeddings_from_bytes(body: &[u8]) -> Result<EmbeddingRequest, Status> {
     let req = pb::GenerateEmbeddingsRequest::decode(body).map_err(|e| {
         Status::invalid_argument(format!("malformed GenerateEmbeddings request: {e}"))
     })?;
@@ -50,13 +38,13 @@ pub fn generate_embeddings_from_bytes(body: &[u8]) -> Result<GenerateEmbeddingsA
 }
 
 /// Decode a [`pb::GenerateEmbeddingsRequest`] into the engine
-/// [`GenerateEmbeddingsArgs`]. The required identity fields (`source_id` /
+/// [`EmbeddingRequest`]. The required identity fields (`source_id` /
 /// `model_id` / `key_column`) and a non-empty `columns` list are validated at
 /// decode rather than deferred to the engine, and the modality is resolved
 /// (an unspecified tower is rejected) — matching the gRPC handler's edge checks.
 pub fn generate_embeddings_from_proto(
     req: pb::GenerateEmbeddingsRequest,
-) -> Result<GenerateEmbeddingsArgs, Status> {
+) -> Result<EmbeddingRequest, Status> {
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
@@ -69,13 +57,14 @@ pub fn generate_embeddings_from_proto(
     if req.columns.is_empty() {
         return Err(Status::invalid_argument("columns is required"));
     }
-    Ok(GenerateEmbeddingsArgs {
+    Ok(EmbeddingRequest {
         source_id: req.source_id,
         model_id: req.model_id,
         columns: req.columns,
         key_column: req.key_column,
         modality: Modality::try_from(req.modality)?,
-        cache: crate::wire::cache_policy_from_proto(req.cache)?,
+        dimensions: req.dimensions.map(|d| d as usize),
+        cache: jammi_wire::cache_policy_from_proto(req.cache)?,
     })
 }
 
@@ -149,6 +138,8 @@ pub struct EncodeQueryArgs {
     pub model_id: String,
     pub input: QueryInput,
     pub modality: Modality,
+    /// The width to encode to (a Matryoshka prefix); `None` is the model's.
+    pub dimensions: Option<usize>,
 }
 
 /// Decode a serialized [`pb::EncodeQueryRequest`] body into the engine
@@ -182,6 +173,7 @@ pub fn encode_query_from_proto(req: pb::EncodeQueryRequest) -> Result<EncodeQuer
         model_id: req.model_id,
         input,
         modality,
+        dimensions: req.dimensions.map(|d| d as usize),
     })
 }
 
@@ -203,7 +195,8 @@ pub fn search_from_bytes(body: &[u8]) -> Result<SearchRequest, Status> {
 /// required `source_id` and the `query` oneof (a precomputed vector or a row key
 /// resolved in-engine) are validated at decode; an absent oneof is a client
 /// error. The `k` cap widens to the engine's `usize`, and `filter` / `select` /
-/// `embedding_table` / `oversample` carry through with their wire presence.
+/// `embedding_table` carry through with their wire presence, and an unset
+/// `method` is an approximate search at the table's own oversample.
 pub fn search_from_proto(req: pb::SearchRequest) -> Result<SearchRequest, Status> {
     use pb::search_request::Query as ProtoQuery;
     if req.source_id.is_empty() {
@@ -223,6 +216,35 @@ pub fn search_from_proto(req: pb::SearchRequest) -> Result<SearchRequest, Status
         embedding_table: req.embedding_table,
         filter: req.filter,
         select: req.select,
-        oversample: req.oversample.map(|v| v as usize),
+        method: jammi_wire::search_method_from_proto(req.method),
+    })
+}
+
+/// Decode a serialized [`pb::LexicalSearchRequest`] body into the engine
+/// [`LexicalSearchRequest`] — the embedded binding's seam onto
+/// [`lexical_search_from_proto`].
+pub fn lexical_search_from_bytes(body: &[u8]) -> Result<LexicalSearchRequest, Status> {
+    let req = pb::LexicalSearchRequest::decode(body)
+        .map_err(|e| Status::invalid_argument(format!("malformed LexicalSearch request: {e}")))?;
+    lexical_search_from_proto(req)
+}
+
+/// Decode a [`pb::LexicalSearchRequest`] into the engine
+/// [`LexicalSearchRequest`]. The required `source_id` is validated at decode;
+/// `filter` / `select` / `lexical_table` carry through with their wire
+/// presence.
+pub fn lexical_search_from_proto(
+    req: pb::LexicalSearchRequest,
+) -> Result<LexicalSearchRequest, Status> {
+    if req.source_id.is_empty() {
+        return Err(Status::invalid_argument("source_id is required"));
+    }
+    Ok(LexicalSearchRequest {
+        source_id: req.source_id,
+        text: req.text,
+        k: req.k as usize,
+        lexical_table: req.lexical_table,
+        filter: req.filter,
+        select: req.select,
     })
 }

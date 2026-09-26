@@ -73,6 +73,8 @@ from ._assembly import (
     build_generate_embeddings_request,
     build_import_embeddings_request,
     build_infer_request,
+    build_lexical_index_request,
+    build_lexical_search_request,
     build_neighbor_graph_request,
     build_generate_structure_embeddings_request,
     build_propagate_embeddings_request,
@@ -340,13 +342,23 @@ class EmbeddedBackend:
         *,
         predicate: Optional[str] = None,
         from_offset: Optional[int] = None,
-        max_batches: int = 64,
+        replay_only: bool = True,
+        max_batches: Optional[int] = None,
     ) -> pa.Table:
-        """Collect up to `max_batches` matching batches (replay + live tail)."""
+        """Collect a topic's matching batches as one table.
+
+        With `replay_only` (the default) this drains the backing table: every
+        batch at offset >= `from_offset` that `predicate` accepts, capped at
+        `max_batches` when given (no `from_offset` replays nothing). With
+        `replay_only=False` the collect follows the live tail after the replay
+        and returns once `max_batches` batches arrive — required, since the tail
+        never ends on its own.
+        """
         return self._native.subscribe_collect(
             topic,
             predicate=predicate,
             from_offset=from_offset,
+            replay_only=replay_only,
             max_batches=max_batches,
         )
 
@@ -355,6 +367,10 @@ class EmbeddedBackend:
     def list_channels(self) -> List[Dict[str, Any]]:
         """List every evidence channel registered to the current tenant."""
         return self._native.list_channels()
+
+    def describe_table(self, table: str) -> Dict[str, Any]:
+        """The recorded materialization of a result table — its manifest, as a dict."""
+        return self._native.describe_table(table)
 
     def verify_materialization(
         self, table: str, expected_definition: Optional[str] = None
@@ -396,6 +412,7 @@ class EmbeddedBackend:
         edge_types: Optional[List[str]] = None,
         min_weight: Optional[float] = None,
         hybrid_ann_k: Optional[int] = None,
+        embedding_table: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Predict a target's distribution with a trained context predictor (S19)."""
         return self._native.predict_with_context_predictor(
@@ -414,6 +431,7 @@ class EmbeddedBackend:
             edge_types=edge_types,
             min_weight=min_weight,
             hybrid_ann_k=hybrid_ann_k,
+            embedding_table=embedding_table,
         )
 
     # --- Stateless conformal / RRF numerics (computed in-process) ---------------
@@ -542,6 +560,7 @@ class EmbeddedBackend:
         validation_fraction: Optional[float] = None,
         early_stopping_patience: Optional[int] = None,
         warmup_steps: Optional[int] = None,
+        warmup_fraction: Optional[float] = None,
         gradient_accumulation_steps: Optional[int] = None,
         triplet_margin: Optional[float] = None,
         target_modules: Optional[List[str]] = None,
@@ -598,6 +617,7 @@ class EmbeddedBackend:
             validation_fraction=validation_fraction,
             early_stopping_patience=early_stopping_patience,
             warmup_steps=warmup_steps,
+            warmup_fraction=warmup_fraction,
             gradient_accumulation_steps=gradient_accumulation_steps,
             triplet_margin=triplet_margin,
             target_modules=target_modules,
@@ -632,10 +652,11 @@ class EmbeddedBackend:
         node_source: str,
         id_column: str,
         text_column: str,
-        edge_source: str,
-        src_column: str,
-        dst_column: str,
         base_model: str,
+        edge_graph_table: Optional[str] = None,
+        edge_source: Optional[str] = None,
+        edge_src_column: Optional[str] = None,
+        edge_dst_column: Optional[str] = None,
         edge_provenance: str = "declared",
         walk_length: Optional[int] = None,
         walks_per_node: Optional[int] = None,
@@ -647,10 +668,24 @@ class EmbeddedBackend:
         sample_seed: Optional[int] = None,
         embedding_loss: Optional[str] = None,
         mnrl_temperature: Optional[float] = None,
+        triplet_margin: Optional[float] = None,
         epochs: Optional[int] = None,
         batch_size: Optional[int] = None,
         learning_rate: Optional[float] = None,
         lora_rank: Optional[int] = None,
+        lora_alpha: Optional[float] = None,
+        lora_dropout: Optional[float] = None,
+        max_seq_length: Optional[int] = None,
+        validation_fraction: Optional[float] = None,
+        early_stopping_patience: Optional[int] = None,
+        early_stopping_metric: Optional[str] = None,
+        warmup_steps: Optional[int] = None,
+        warmup_fraction: Optional[float] = None,
+        gradient_accumulation_steps: Optional[int] = None,
+        target_modules: Optional[List[str]] = None,
+        backbone_dtype: Optional[str] = None,
+        weight_decay: Optional[float] = None,
+        max_grad_norm: Optional[float] = None,
         matryoshka_dims: Optional[List[int]] = None,
         seed: Optional[int] = None,
         keep_last_n_checkpoints: Optional[int] = None,
@@ -663,7 +698,10 @@ class EmbeddedBackend:
         Returns a `Job`, mirroring the remote `RemoteDatabase.fine_tune_graph`.
         The request is assembled with the shared `GraphFineTuneSpec` builder
         (which carries the graph-only embedding-loss guard) and submitted
-        through the engine's wire seam. `edge_provenance` is the load-bearing
+        through the engine's wire seam. The walks follow an engine-built
+        neighbour graph (``edge_graph_table``) or a registered edge source
+        (``edge_source`` with ``edge_src_column``/``edge_dst_column``) — pass
+        exactly one. `edge_provenance` is the load-bearing
         circularity distinction — "declared" external edges teach the metric
         something new; "similarity" edges are a weak bootstrap only.
         `idempotency_key`, when non-empty, dedupes the submission (migration
@@ -681,10 +719,11 @@ class EmbeddedBackend:
             node_source=node_source,
             id_column=id_column,
             text_column=text_column,
-            edge_source=edge_source,
-            src_column=src_column,
-            dst_column=dst_column,
             base_model=base_model,
+            edge_graph_table=edge_graph_table,
+            edge_source=edge_source,
+            edge_src_column=edge_src_column,
+            edge_dst_column=edge_dst_column,
             edge_provenance=edge_provenance,
             walk_length=walk_length,
             walks_per_node=walks_per_node,
@@ -696,10 +735,24 @@ class EmbeddedBackend:
             sample_seed=sample_seed,
             embedding_loss=embedding_loss,
             mnrl_temperature=mnrl_temperature,
+            triplet_margin=triplet_margin,
             epochs=epochs,
             batch_size=batch_size,
             learning_rate=learning_rate,
             lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            max_seq_length=max_seq_length,
+            validation_fraction=validation_fraction,
+            early_stopping_patience=early_stopping_patience,
+            early_stopping_metric=early_stopping_metric,
+            warmup_steps=warmup_steps,
+            warmup_fraction=warmup_fraction,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            target_modules=target_modules,
+            backbone_dtype=backbone_dtype,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
             matryoshka_dims=matryoshka_dims,
             seed=seed,
             keep_last_n_checkpoints=keep_last_n_checkpoints,
@@ -735,6 +788,7 @@ class EmbeddedBackend:
         seed: int = 0,
         model_id: Optional[str] = None,
         idempotency_key: str = "",
+        embedding_table: Optional[str] = None,
     ):
         """Submit an amortized in-context predictor (S19) meta-training to the
         in-process engine.
@@ -769,6 +823,7 @@ class EmbeddedBackend:
             seed=seed,
             model_id=model_id,
             idempotency_key=idempotency_key,
+            embedding_table=embedding_table,
         )
         return self._native._start_training_proto(
             request.SerializeToString(), idempotency_key or None
@@ -815,7 +870,7 @@ class EmbeddedBackend:
         min_similarity: Optional[float] = None,
         mutual: bool = False,
         exact: bool = False,
-        table: Optional[str] = None,
+        embedding_table: Optional[str] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Materialise the k-NN graph of a source's embedding table and return the
@@ -824,7 +879,9 @@ class EmbeddedBackend:
         The returned table has columns ``(src, dst, rank, similarity)``. The
         default driver is index-assisted and approximate; pass ``exact=True`` for
         a deterministic, complete graph. ``min_similarity`` floors weak edges;
-        ``mutual=True`` keeps only reciprocal edges. Mirrors the remote
+        ``mutual=True`` keeps only reciprocal edges. ``embedding_table`` names
+        the embedding table the graph is built over; omitted, the source's
+        newest. Mirrors the remote
         `RemoteDatabase.build_neighbor_graph`; the request is assembled with the
         shared `BuildNeighborGraphRequest` builder and submitted through the
         engine's wire seam. Read the table via :meth:`sql`.
@@ -835,7 +892,7 @@ class EmbeddedBackend:
             min_similarity=min_similarity,
             mutual=mutual,
             exact=exact,
-            table=table,
+            embedding_table=embedding_table,
             cache=cache,
         )
         return self._native._build_neighbor_graph_proto(request.SerializeToString())
@@ -1127,6 +1184,7 @@ class EmbeddedBackend:
         model: str,
         query: Union[str, bytes],
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
     ) -> List[float]:
         """Encode a single query into an embedding vector with the given model.
 
@@ -1135,11 +1193,14 @@ class EmbeddedBackend:
         defaulting to text). Same handle shape and verb signature as the remote
         `RemoteDatabase.encode_query`; the request is assembled with the shared
         `EncodeQueryRequest` builder and submitted through the engine's wire seam.
+        `dimensions` encodes to the model's leading coordinates, L2-renormalised
+        — the width of a table generated with the same `dimensions`.
         """
         request = build_encode_query_request(
             model=model,
             query=query,
             modality=modality,
+            dimensions=dimensions,
         )
         return self._native._encode_query_proto(request.SerializeToString())
 
@@ -1151,9 +1212,14 @@ class EmbeddedBackend:
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
         cache: Optional[str] = None,
     ) -> str:
         """Embed `columns` of a registered source, persisting one vector per row.
+
+        `dimensions` serves the model's leading coordinates, each vector
+        L2-renormalised — a Matryoshka prefix: a smaller index from a model
+        trained with `matryoshka_dims` — instead of its full width.
 
         `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
         text); `key` names the column whose value becomes each embedding row's
@@ -1171,6 +1237,7 @@ class EmbeddedBackend:
             columns=columns,
             key=key,
             modality=modality,
+            dimensions=dimensions,
             cache=cache,
         )
         return self._native._generate_embeddings_proto(request.SerializeToString())
@@ -1213,24 +1280,32 @@ class EmbeddedBackend:
         self,
         source: str,
         *,
-        query: List[float],
+        query: Optional[List[float]] = None,
+        row_key: Optional[str] = None,
         k: int,
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
         oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> pa.Table:
         """Nearest-neighbor search over a source's embedding table.
 
-        `query` is the query vector; `filter` is an optional SQL predicate over
-        the hydrated results; `select` projects columns (empty keeps the
-        keyed+scored shape). `embedding_table` names which of the source's
+        The search ranks by `query` (a query vector) or by `row_key`
+        (query-by-example: the vector stored for that row, resolved inside
+        the engine — it never crosses the API); exactly one is given.
+        `filter` is an optional SQL predicate over
+        the hydrated columns — the search returns the `k` nearest rows that
+        satisfy it; `select` projects columns (empty keeps every
+        hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned table);
         ``None`` searches the most-recent ready table. `oversample` overrides,
         for this one call, a quantized-`storage_precision` table's retrieve→
         rescore candidate breadth (`k * oversample`); ``None`` defers to the
         table's own stamped default, and the knob is irrelevant for an
-        `f32`-precision table (single-stage, no rescore). Returns a
+        `f32`-precision table (single-stage, no rescore). `exact` scores every
+        vector instead of searching the index: the true nearest neighbours.
+        Returns a
         `pyarrow.Table`. Mirrors the remote `RemoteDatabase.search`; the request
         is assembled with the shared `SearchRequest` builder and submitted
         through the engine's wire seam (only the request is shared — the Arrow
@@ -1239,13 +1314,63 @@ class EmbeddedBackend:
         request = build_search_request(
             source,
             query=query,
+            row_key=row_key,
             k=k,
             filter=filter,
             select=select,
             embedding_table=embedding_table,
             oversample=oversample,
+            exact=exact,
         )
         return self._native._search_proto(request.SerializeToString())
+
+    def build_lexical_index(
+        self,
+        source: str,
+        *,
+        columns: List[str],
+        key: str,
+        analyzer: str = "english",
+    ) -> str:
+        """Materialise a lexical index over a source's text and return its table
+        name: one ``(_row_id, text)`` row per source row, keyed by `key`, with
+        the text `columns` joined in order by a space. :meth:`lexical_search`
+        ranks it by BM25. `analyzer` is how the text and every query are
+        tokenised — ``"english"`` (lowercase, Porter stemming; the default) or
+        ``"raw"`` (lowercase, no stemming, for codes and identifiers). The
+        index's only input is a registered source, which has no version to
+        pin, so a build always recomputes. Mirrors the remote `RemoteDatabase.build_lexical_index`.
+        """
+        request = build_lexical_index_request(source, columns=columns, key=key, analyzer=analyzer)
+        return self._native._build_lexical_index_proto(request.SerializeToString())
+
+    def lexical_search(
+        self,
+        source: str,
+        *,
+        text: str,
+        k: int,
+        filter: Optional[str] = None,
+        select: Optional[List[str]] = None,
+        lexical_table: Optional[str] = None,
+    ) -> pa.Table:
+        """Lexical (BM25) search of `text` over a source's lexical table.
+
+        `text`'s words are the query: each analysed term is one clause, so a
+        row matching more of them, or rarer ones, ranks higher; no query syntax
+        is interpreted. Returns the `k` best-ranked rows hydrated from the
+        source, each with its ``bm25_score`` and 0-based ``bm25_rank`` and
+        ``retrieved_by == ["bm25"]``. `filter` is an optional SQL predicate
+        over the hydrated columns — the search returns the `k` best-ranked rows
+        that satisfy it; `select` projects columns (empty keeps every hydrated
+        column). `lexical_table` names which of the source's lexical tables to
+        search; ``None`` searches the most-recent ready one. Returns a
+        `pyarrow.Table`. Mirrors the remote `RemoteDatabase.lexical_search`.
+        """
+        request = build_lexical_search_request(
+            source, text=text, k=k, filter=filter, select=select, lexical_table=lexical_table
+        )
+        return self._native._lexical_search_proto(request.SerializeToString())
 
     def register_channel(
         self,

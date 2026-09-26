@@ -1,4 +1,4 @@
-"""Unit tests for the artifact-contract registry."""
+"""Unit tests for the frozen goldens: lookup, the check, and freezing."""
 
 from __future__ import annotations
 
@@ -8,31 +8,20 @@ import pytest
 
 from jammi_cookbook import contracts
 from jammi_cookbook.contracts import Golden
+from jammi_cookbook.scale import Scale
 
 
-def test_registry_is_self_consistent():
-    for name, art in contracts.ARTIFACTS.items():
-        assert art.name == name
-        assert art.dataset == name.split(".", 1)[0]
-        assert art.kind in {
-            "parquet", "edge_table", "model_id", "split",
-            # scale-tier binary sidecar + plain-text artifacts (H2 cross-check)
-            "usearch_bundle", "rowmap", "id_list",
-        }
-        assert art.filename
-        # A graph artifact's declared-edge source names itself.
-        if art.declared_edges is not None:
-            assert art.declared_edges.edge_source == name
+@pytest.fixture
+def goldens(monkeypatch, tmp_path):
+    """An empty goldens directory, at `small` scale, with freezing off."""
+    monkeypatch.setattr(contracts, "GOLDENS", tmp_path)
+    monkeypatch.setenv("JAMMI_COOKBOOK_SCALE", "small")
+    monkeypatch.delenv(contracts.FREEZE_ENV, raising=False)
+    return tmp_path
 
 
-def test_artifact_lookup_unknown_raises():
-    with pytest.raises(KeyError):
-        contracts.artifact("arxiv.not_a_real_artifact")
-
-
-def test_both_datasets_present():
-    datasets = {art.dataset for art in contracts.ARTIFACTS.values()}
-    assert {"arxiv", "air"} <= datasets
+def _write(path, entries):
+    path.write_text(json.dumps(entries))
 
 
 def test_golden_tolerance_band():
@@ -44,44 +33,51 @@ def test_golden_tolerance_band():
     assert not g.contains(0.79)
 
 
-def test_golden_missing_file_raises_with_provenance(monkeypatch, tmp_path):
-    monkeypatch.setattr(contracts, "_ARTIFACT_ROOT", tmp_path)
-    with pytest.raises(FileNotFoundError, match="golden metrics not found"):
+def test_a_per_scale_golden_is_read_at_its_scale(goldens):
+    _write(goldens / "arxiv.small.json", {"tier02.recall_at_10": {"value": 0.5, "tol": 0.01}})
+    _write(goldens / "arxiv.full.json", {"tier02.recall_at_10": {"value": 0.7, "tol": 0.01}})
+    assert contracts.golden("arxiv.tier02.recall_at_10").value == 0.5
+    assert contracts.golden("arxiv.tier02.recall_at_10", Scale.FULL).value == 0.7
+
+
+def test_a_scale_free_golden_serves_every_scale(goldens):
+    _write(goldens / "air.json", {"routes.count": {"value": 42.0, "tol": 0.0}})
+    assert contracts.golden("air.routes.count", Scale.SMALL).value == 42.0
+    assert contracts.golden("air.routes.count", Scale.FULL).value == 42.0
+
+
+def test_a_dataset_both_scale_free_and_per_scale_is_refused(goldens):
+    _write(goldens / "air.json", {})
+    _write(goldens / "air.small.json", {})
+    with pytest.raises(ValueError, match="one kind or the other"):
+        contracts.golden("air.routes.count")
+
+
+def test_an_unfrozen_metric_names_the_gap(goldens):
+    with pytest.raises(KeyError, match="nobody"):
         contracts.golden("arxiv.tier04.marginal_coverage")
 
 
-def test_assert_close_reads_committed_metric(monkeypatch, tmp_path):
-    ds = tmp_path / "arxiv"
-    ds.mkdir()
-    (ds / "golden_metrics.json").write_text(
-        json.dumps({"tier04.marginal_coverage": {"value": 0.83, "tol": 0.03}})
-    )
-    monkeypatch.setattr(contracts, "_ARTIFACT_ROOT", tmp_path)
+def test_a_metric_without_a_dataset_is_refused(goldens):
+    with pytest.raises(ValueError, match="<dataset>.<key>"):
+        contracts.golden("coverage")
 
-    # within tolerance returns the observed value
+
+def test_assert_close_returns_the_observation_or_names_the_gap(goldens):
+    _write(goldens / "arxiv.small.json",
+           {"tier04.marginal_coverage": {"value": 0.83, "tol": 0.03}})
     assert contracts.assert_close("arxiv.tier04.marginal_coverage", 0.85) == 0.85
-    # outside tolerance fails loudly, naming the gap
-    with pytest.raises(AssertionError, match="outside golden"):
+    with pytest.raises(AssertionError, match="off by"):
         contracts.assert_close("arxiv.tier04.marginal_coverage", 0.95)
 
 
-def test_load_artifact_missing_raises(monkeypatch, tmp_path):
-    monkeypatch.setattr(contracts, "_ARTIFACT_ROOT", tmp_path)
-    with pytest.raises(FileNotFoundError, match="not found"):
-        contracts.load_artifact("arxiv.embeddings")
-
-
-def test_load_artifact_names_an_unpulled_lfs_pointer(monkeypatch, tmp_path):
-    """A checkout that has not run `git lfs pull` holds a pointer file where the
-    artifact should be; loading it names that, not a parquet decoding error."""
-    monkeypatch.setattr(contracts, "_ARTIFACT_ROOT", tmp_path)
-    art = contracts.artifact("arxiv.embeddings")
-    pointer = contracts._dataset_dir(art.dataset) / art.filename
-    pointer.parent.mkdir(parents=True)
-    pointer.write_bytes(
-        b"version https://git-lfs.github.com/spec/v1\n"
-        b"oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n"
-        b"size 12345\n"
-    )
-    with pytest.raises(FileNotFoundError, match="git lfs pull"):
-        contracts.load_artifact("arxiv.embeddings")
+def test_freezing_records_the_observation_and_keeps_a_frozen_tolerance(goldens, monkeypatch):
+    path = goldens / "arxiv.small.json"
+    _write(path, {"kept": {"value": 1.0, "tol": 0.2}})
+    monkeypatch.setenv(contracts.FREEZE_ENV, "1")
+    assert contracts.assert_close("arxiv.kept", 3.0, tol=0.9) == 3.0
+    assert contracts.assert_close("arxiv.fresh", 0.5, tol=0.05) == 0.5
+    assert json.loads(path.read_text()) == {
+        "fresh": {"value": 0.5, "tol": 0.05},
+        "kept": {"value": 3.0, "tol": 0.2},
+    }

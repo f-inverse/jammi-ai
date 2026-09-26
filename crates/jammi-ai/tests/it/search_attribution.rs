@@ -8,6 +8,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float32Array, StringArray};
 use jammi_ai::evidence::{merge_channels, ChannelContribution};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_db::catalog::channel_repo::ChannelColumnType;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::ChannelId;
@@ -73,7 +74,7 @@ async fn third_party_scored_by_channel_columns_appear_in_search_results() {
     // already merged in by the engine.
     let query = vec![0.5_f32; 32];
     let batches = session
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -161,7 +162,7 @@ async fn rows_not_touched_by_channel_have_null_in_that_channels_columns() {
 
     let query = vec![0.5_f32; 32];
     let batches = session
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -218,7 +219,7 @@ async fn channel_contribution_arrow_dtypes_must_match_catalog_declaration() {
 
     let query = vec![0.5_f32; 32];
     let batches = session
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()

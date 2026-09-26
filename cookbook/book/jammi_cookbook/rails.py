@@ -1,19 +1,15 @@
-"""The three rails as thin helpers: provenance, tenancy, measurement.
+"""Two of the book's three rails as thin helpers: provenance and tenancy.
 
 The rails are the columns of the book's 4-tier × 3-rail grid — woven through
-every tier, not a chapter of their own. This module keeps them *thin*: it
-composes ``jammi`` and enforces the cookbook's contracts; it implements no
-graph or ML logic. The dedicated rails chapter (K-rails) deepens the prose and
-the worked examples, but every tier recipe calls these same helpers, so the
-rails are real wiring rather than a gesture.
+every tier, not a chapter of their own. These helpers compose ``jammi``; they
+implement no graph or ML logic. The third rail, measurement, is
+:func:`jammi_cookbook.contracts.assert_close`.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Any
-
-from . import contracts
 
 # --------------------------------------------------------------------------- #
 # Rail 1 — provenance
@@ -123,19 +119,3 @@ def assert_rows_isolated(rows_seen: list[str], forbidden: set[str], *, tenant_id
             f"belonging to another tenant: {sorted(leaked)[:5]}"
             f"{'…' if len(leaked) > 5 else ''}. Row-level isolation is violated."
         )
-
-
-# --------------------------------------------------------------------------- #
-# Rail 3 — measurement (R1/R2)
-# --------------------------------------------------------------------------- #
-
-
-def measure(metric: str, observed: float) -> float:
-    """Assert a measured number against the frozen golden metric.
-
-    The no-deferral policy applied to numbers: a recipe without a real number
-    (computed from the committed artifacts) is not done. Delegates to
-    :func:`contracts.assert_close`, returning ``observed`` so a cell asserts and
-    displays at once.
-    """
-    return contracts.assert_close(metric, observed)

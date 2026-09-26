@@ -1,5 +1,5 @@
 ---
-title: "Per-verb tenant isolation — the standing oracle, measured + the BYO-auth seam"
+title: "Per-verb tenant isolation, on both transports — and the bring-your-own-auth seam"
 ---
 
 ```{python}
@@ -9,353 +9,244 @@ import jammi_cookbook
 
 **Recipe:** `set_tenant` / `tenant_scope` across the tenant-scoped verb surface
 (`list_sources` · `describe_source` · `list_mutable_tables` · `list_topics` ·
-`list_channels` · `list_models` · `sql` / Flight SQL · the `create_*` / `drop_*`
-verbs) · **Theory:** tenant isolation as a *per-verb* property of the catalog and
-the query analyzer — a standing oracle the engine guards, measured here from the
-consumer side as hard zeros · **Rail:** tenancy (`rails.tenant` /
-`assert_listing_isolated` / `assert_rows_isolated`, reused verbatim) + measurement.
+`list_channels` · `list_models` · `sql` · the `create_*` / `drop_*` verbs) ·
+**Theory:** tenant isolation as a *per-verb* property of the catalog and the
+query analyzer, measured from the consumer side · **Rail:** tenancy (hard zeros
+where isolation must hold, positive counts where visibility is by design) +
+parity (the same matrix in process and from a server).
 
-Chapter 11 established the engine's *true* tenancy contract as two layers and one
+Chapter 11 established the engine's tenancy contract as two layers and one
 honest caveat: catalog-listing isolation and discriminator-column row isolation,
 both as hard zeros, plus the discriminator-less-source caveat as a positive
-visible count. This chapter does not restate it — it **extends** it to the full
-**per-verb surface**. For each tenant-scoped verb the engine exposes, we measure
-the standing-oracle property from the consumer side: tenant B cannot see or reach
-tenant A's resource. Every cell is a verdict — a hard zero where isolation must
-hold, a documented stated-positive where the engine is honest about visibility.
+visible count. This chapter extends it to the **whole tenant-scoped verb
+surface**. For each verb, tenant A creates a resource under its own scope and
+tenant B's view of it is measured: B cannot see, read, overwrite, or destroy it.
+The measurement is one function, run against an in-process engine and a live
+server; the two matrices must agree.
 
-We measure on the embedded engine and, for every verb reachable on the wire, on a
-live `grpc://` `jammi-server` — and freeze the matrix to golden. Then we
-demonstrate the engine's **BYO-auth seam** from the consumer side, over the **real
-Flight SQL wire** (`jammi-ai` carries the bearer on `db.sql()`'s
-Flight lane — jammi #96): a generic HMAC-signed bearer token, read off a genuine
-`db.sql()` call by an authenticating gateway that maps the verified claim to a
-tenant and binds it *in front of* the engine. The engine enforces auth on no
-transport; the gateway in front is the consumer's.
-
-```{python}
-from jammi_cookbook import contracts
-
-matrix = contracts.load_artifact("tenancy_h3.matrix")
-record = contracts.load_artifact("tenancy_h3.record")
-print(f"transport (canonical): {matrix['transport']}")
-print(f"cross-transport parity: {record['parity_verdict']}")
-```
-
-The tenant ids are opaque UUIDs — the engine validates the form, never who the
-tenant is. There IS a tenant; nothing about who.
+Then it demonstrates the engine's **bring-your-own-auth seam**: the engine
+authenticates nothing, so a gateway in front of it verifies a credential and
+binds the tenant the credential proves — shown over the real Flight SQL wire.
 
 ## Part A — the per-verb isolation matrix
 
-For every verb, tenant A creates or registers a resource under its own scope, and
-tenant B's listing / read / reach is measured. We reuse `jammi_cookbook.rails`
-verbatim — `tenant` (the bind-in-place/restore context manager),
-`assert_listing_isolated`, and `assert_rows_isolated`, the corrected helpers from
-chapter 11, not a re-implementation.
-
-### The hard zeros — B sees none of A's resource
-
-The catalog reads (`list_sources` / `list_mutable_tables` / `list_topics` /
-`list_models`) filter the registry to `tenant_id = $cur OR IS NULL`, so B's
-listing excludes A's registration. For `list_models` the emit registers a **real**
-model under tenant A first — training is the only public path into the model
-catalog, so a tiny CPU `fine_tune` (the §3.6 pattern) puts A's base and fine-tuned
-models in the catalog — and then measures that B's `list_models` carries **none**
-of them: a true cross-tenant model-isolation zero, not an empty catalog.
-`describe_source` on a foreign id returns `None` — B cannot even confirm the
-resource exists. And the load-bearing data layer: a `sql` / Flight SQL read of a
-discriminator-tagged source is rewritten by the analyzer to
-`tenant_id = $cur OR IS NULL`, so A reads only its own rows. Every one is a
-**hard zero leak**.
-
-```{python}
-HARD_ZEROS = {
-    "source_listing_leak":    "list_sources — B's listing excludes A's source",
-    "describe_source_leak":   "describe_source — a foreign source is None (not visible)",
-    "mutable_listing_leak":   "list_mutable_tables — B excludes A's mutable table",
-    "topic_listing_leak":     "list_topics — B excludes A's topic",
-    "channel_listing_leak":   "list_channels — B excludes A's registered channel",
-    "model_listing_leak":     "list_models — B's catalog carries none of A's (real, fine-tuned) models",
-    "sql_row_leak":           "sql / Flight SQL — A reads none of B's discriminator-tagged rows",
-}
-for cell, label in HARD_ZEROS.items():
-    print(f"  {matrix[cell]}   {label}")
-assert all(matrix[c] == 0 for c in HARD_ZEROS), "a hard-zero verb leaked"
-print("\nevery tenant-scoped verb is a HARD ZERO — B reaches none of A's resource")
-```
-
-```{python}
-# | echo: false
-from jammi_cookbook import rails
-
-# Every hard zero asserted to its frozen golden (tol 0 — a leak is not a tolerance).
-for cell in HARD_ZEROS:
-    rails.measure(f"tenancy_h3.hard_zero.{cell}", float(matrix[cell]))
-    assert contracts.golden(f"tenancy_h3.hard_zero.{cell}").tol == 0.0
-```
-
-### The result-table scan — driven live over the `db.sql` lane
-
-Every cell above filters the **catalog registry** — a listing, a describe, a
-topic name. A **result table** (the output of `asof_join`, `generate_embeddings`,
-…) is a different case: its Parquet carries no `tenant_id` column, so the
-predicate-injection analyzer above has nothing to rewrite. Resolution
-visibility is gated a different way — on the **catalog row's owner** — by a
-dedicated schema provider
-(`crates/jammi-db/src/store/result_schema.rs`, `visible(owner)` @112–114): a
-correctly-bound tenant resolves only its own and GLOBAL (`tenant_id IS NULL`)
-result tables over the bare `jammi.{name}` identifier every read lane names it
-by; a peer's private table resolves **not-found**. We drive that live here,
-over the `db.sql` lane, mirroring the engine's own standing oracle
-(`crates/jammi-server/tests/it/tenant_isolation_oracle.rs::assert_result_table_scan_isolated`
-@1943–2026) — the same 3-arm control, driven from the consumer side rather than
-the Rust internals.
-
-> **Honest scope.** This measures the `db.sql` lane only — the lane
-> the oracle drives with `with_tenant_scoped(T, sql(...))`. The provider's
-> `visible()` gate applies to three other lanes too (Flight SQL, the
-> exact-search fallback, vector-by-key — `result_schema.rs` @14), cited here
-> but not independently re-measured in this cell; the SQL lane is the one every
-> other cell in this chapter already exercises, so it is the one this chapter
-> extends.
->
-> **Organizational, not adversarial.** Like every other property in
-> this chapter, this is *resolution-visibility* isolation: a peer's private
-> table resolves not-found because it is out of scope for the current binding —
-> not because a hostile principal was defeated. The trusted-network + BYO-auth
-> posture Part B demonstrates is unchanged; this is not a claim that the engine
-> defends against an attacker on the wire.
-
-Tenant A materializes a real result table the only way one exists — through
-`asof_join`, the same verb Chapter 19 drives — under its own scope; a second
-`asof_join` output is materialized with **no** tenant bound, the GLOBAL case.
-The 3-arm control mirrors the oracle: A reads its own table (`N > 0`); the
-GLOBAL table is visible to *both* A and B; B naming A's private table is
-**refused**.
-
 ```{python}
 import tempfile
+import uuid
+from pathlib import Path
 
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
+from jammi.errors import BackendError, NotFound
+from jammi.testing import LiveServer
+from jammi_cookbook import fixtures
 from jammi_cookbook.rails import tenant
 
 TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-
-rts_work = tempfile.mkdtemp(prefix="jammi_esc024_")
-rts_db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_esc024_catalog_')}")
+work = Path(tempfile.mkdtemp())
 
 
-def rts_materialize(spine_name, facts_name):
-    """A real asof_join output — the actual `create_result_table` /
-    `finalize_with_manifest` funnel, driven through the public verb, exactly
-    the recipe Chapter 19 drives. Returns the result table's bare name."""
-    spine_path = f"{rts_work}/{spine_name}.parquet"
-    facts_path = f"{rts_work}/{facts_name}.parquet"
-    pq.write_table(pa.table({"entity": ["p", "q", "r"], "as_of": [10, 10, 10]}), spine_path)
-    pq.write_table(pa.table({
-        "entity": ["p", "q", "r"], "t": [10, 10, 10], "val": [1.0, 2.0, 3.0],
-    }), facts_path)
-    rts_db.add_source(spine_name, url=spine_path, format="parquet")
-    rts_db.add_source(facts_name, url=facts_path, format="parquet")
-    return rts_db.asof_join(
-        spine_name, facts_name,
-        spine_by=["entity"], spine_time="as_of",
-        facts_by=["entity"], facts_time="t",
-        direction="backward", boundary="inclusive", project=["val"],
-    )
+def parquet(name: str, table: pa.Table) -> str:
+    pq.write_table(table, work / f"{name}.parquet")
+    return str(work / f"{name}.parquet")
 
 
-def rts_scan_count(table_name):
-    """The db.sql lane the oracle mirrors: a bare `jammi.{table}` identifier,
-    scoped by whatever tenant binding is currently in effect."""
-    return rts_db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{table_name}"').to_pylist()[0]["n"]
-
-
-with tenant(rts_db, TENANT_A):
-    rts_table_a = rts_materialize("rts_spine_a", "rts_facts_a")
-
-rts_db.set_tenant("")  # unscoped — the GLOBAL (tenant_id IS NULL) case
-rts_table_global = rts_materialize("rts_spine_global", "rts_facts_global")
-```
-
-Arm 1 (own tenant) and arm 2 (GLOBAL), both live reads over `db.sql`:
-
-```{python}
-with tenant(rts_db, TENANT_A):
-    rts_a_own = rts_scan_count(rts_table_a)
-with tenant(rts_db, TENANT_A):
-    rts_global_a = rts_scan_count(rts_table_global)
-with tenant(rts_db, TENANT_B):
-    rts_global_b = rts_scan_count(rts_table_global)
-
-print(f"A reads its own private result table: N = {rts_a_own}")
-print(f"GLOBAL result table — A sees N = {rts_global_a}, B sees N = {rts_global_b}")
-assert rts_a_own > 0
-assert rts_global_a > 0 and rts_global_a == rts_global_b
-```
-
-Arm 3 (cross-tenant) — B names A's private result table over `db.sql`:
-
-```{python}
-rts_b_refused = False
-with tenant(rts_db, TENANT_B):
+def refused(action) -> bool:
     try:
-        rts_scan_count(rts_table_a)
-    except jammi.BackendError:
-        rts_b_refused = True
+        action()
+        return False
+    except BackendError:
+        return True
 
-print(f"B scanning A's private result table refused: {rts_b_refused}")
-assert rts_b_refused, "CROSS-TENANT SCAN LEAK: B scanned tenant A's private result table"
+
+def isolation(db) -> dict:
+    """Tenant A creates one of each resource; tenant B's view of each is measured."""
+    run = uuid.uuid4().hex[:8]
+    with tenant(db, TENANT_A):
+        db.add_source(f"src_a_{run}", url=parquet(f"src_a_{run}", pa.table({"id": [1]})),
+                      format="parquet")
+        db.create_mutable_table(f"mt_a_{run}", schema=pa.schema([("id", pa.int64())]),
+                                primary_key=["id"])
+        db.register_topic(f"tp_a_{run}", schema=pa.schema([("id", pa.int64())]))
+        db.register_channel(f"ch_a_{run}", priority=5, columns=[("note", "Utf8")])
+        db.add_source(f"pairs_{run}", url=str(fixtures.path("tiny_pairs.csv")), format="csv")
+        job = db.fine_tune(source=f"pairs_{run}", base_model=fixtures.model("tiny_bert"),
+                           columns=["text_a", "text_b", "score"], method="lora",
+                           task="text_embedding", lora_rank=4, epochs=1)
+        job.wait()
+        tuned = job.output_model_id
+    # One shared source whose rows carry their tenant, and one with no discriminator.
+    db.set_tenant("")
+    db.add_source(f"tagged_{run}", url=parquet(f"tagged_{run}", pa.table({
+        "id": [1, 2, 3, 4], "tenant_id": [TENANT_A, TENANT_A, TENANT_B, TENANT_B],
+    })), format="parquet")
+    with tenant(db, TENANT_B):
+        db.add_source(f"nodisc_b_{run}", url=parquet(f"nodisc_b_{run}", pa.table({"id": [7, 8, 9]})),
+                      format="parquet")
+
+    with tenant(db, TENANT_B):
+        sources = {s["source_id"] for s in db.list_sources()}
+        cells = {
+            "list_sources": int(f"src_a_{run}" in sources),
+            "describe_source": int(db.describe_source(f"src_a_{run}") is not None),
+            "list_mutable_tables": int(any(t["id"] == f"mt_a_{run}" for t in db.list_mutable_tables())),
+            "list_topics": int(f"tp_a_{run}" in db.list_topics()),
+            "list_channels": int(any(c["channel_id"] == f"ch_a_{run}" for c in db.list_channels())),
+            "list_models (A's fine-tuned model)": int(any(m["model_id"] == tuned for m in db.list_models())),
+        }
+        shared = {
+            "the engine's global channels": sum(c["channel_id"] in ("vector", "inference", "bm25")
+                                                for c in db.list_channels()),
+            "the shared base model": int(any(m["model_id"] != tuned for m in db.list_models())),
+        }
+        # Collisions: B reuses A's names.
+        collisions = {
+            "create_mutable_table (A's name)": refused(lambda: db.create_mutable_table(
+                f"mt_a_{run}", schema=pa.schema([("id", pa.int64())]), primary_key=["id"])),
+            "register_topic (A's name)": not refused(lambda: db.register_topic(
+                f"tp_a_{run}", schema=pa.schema([("id", pa.int64())]))),
+            "register_channel (A's name)": not refused(lambda: db.register_channel(
+                f"ch_a_{run}", priority=1, columns=[("x", "Utf8")])),
+        }
+        # Destruction: B drops A's names.
+        b_drop_raised = refused(lambda: db.drop_mutable_table(f"mt_a_{run}"))
+        db.drop_topic(f"tp_a_{run}", if_exists=True)
+    with tenant(db, TENANT_A):
+        a_rows = db.sql(f"SELECT id FROM tagged_{run}.public.tagged_{run}").column("id").to_pylist()
+        caveat = db.sql(f"SELECT COUNT(*) FROM nodisc_b_{run}.public.nodisc_b_{run}").column(0)[0].as_py()
+        survives = {
+            "A's mutable table after B's drop": any(t["id"] == f"mt_a_{run}" for t in db.list_mutable_tables()),
+            "A's topic after B's drop": f"tp_a_{run}" in db.list_topics(),
+        }
+    cells["sql (B's tagged rows read by A)"] = sum(1 for i in a_rows if i in (3, 4))
+    return {"leaks": cells, "shared": shared, "caveat": caveat, "collisions": collisions,
+            "b_drop_raised": b_drop_raised, "survives": survives, "a_own_rows": sorted(a_rows)}
 ```
 
-Non-vacuity — proving B's refusal is a **scoping** decision, not an absent or
-empty table. The Rust oracle demonstrates this with an internal
-`admin_scope()` bypass (`crates/jammi-db/src/tenant_scope.rs` @180–197 — "not
-exposed otherwise", @46); that bypass has no public Python surface, so this
-chapter substitutes the witness this SDK *can* reach: A's own re-read of the
-**same** table, taken *after* B's refused attempt, still returns the same `N` —
-the table B was refused was never touched, let alone empty.
+Every cell is measured the same way on each transport:
 
 ```{python}
-with tenant(rts_db, TENANT_A):
-    rts_a_own_after = rts_scan_count(rts_table_a)
-
-print(f"A's own re-read of the same table, after B's refusal: N = {rts_a_own_after}")
-assert rts_a_own_after == rts_a_own, "non-vacuity: A's own table must be unchanged"
-```
-
-```{python}
-# | echo: false
-# Cross-check the freshly-driven live verdict against the frozen committed
-# record (the same recipe run live at the last cache-build) — the same
-# double-check Part B's BYO-auth seam applies before recording.
-rts_record = record["result_table_scan"]
-assert rts_record["b_refused"] is True
-assert (rts_record["a_own_read"] > 0) == (rts_a_own > 0)
-assert rts_record["global_visible_to_a"] == rts_record["global_visible_to_b"]
-
-rts_leak = 0.0 if rts_b_refused else 1.0
-rails.measure("tenancy_h3.result_table_scan", rts_leak)
-assert contracts.golden("tenancy_h3.result_table_scan").tol == 0.0
-
-rails.measure("tenancy_h3.result_table_scan.a_own_read_positive",
-              1.0 if rts_a_own > 0 else 0.0)
-rails.measure("tenancy_h3.result_table_scan.global_visible_both",
-              1.0 if (rts_global_a > 0 and rts_global_a == rts_global_b) else 0.0)
-rails.measure("tenancy_h3.result_table_scan.nonvacuity",
-              1.0 if rts_a_own_after == rts_a_own else 0.0)
-```
-
-### The stated-positives — the honest visibility, as real counts
-
-Two cells are *not* zero, and the chapter asserts them as the positive counts they
-are rather than hiding them. `list_channels` surfaces the engine's **built-in
-global channels** (`vector` / `inference` / `bm25`) to every tenant — they are
-globally scoped, the discriminator-less-global analog. And the chapter-11 caveat:
-a source with **no** `tenant_id` column is globally readable — A sees it whole.
-
-```{python}
-print(f"builtin_channels_visible = {matrix['builtin_channels_visible']}  "
-      f"(B sees the engine's global channels — vector / inference / bm25)")
-print(f"caveat_visible           = {matrix['caveat_visible']}  "
-      f"(A reads a discriminator-less source whole — the engine does not authenticate)")
-assert matrix["builtin_channels_visible"] > 0 and matrix["caveat_visible"] > 0
-```
-
-```{python}
-# | echo: false
-rails.measure("tenancy_h3.stated_positive.builtin_channels_visible",
-              float(matrix["builtin_channels_visible"]))
-rails.measure("tenancy_h3.stated_positive.caveat_visible", float(matrix["caveat_visible"]))
-```
-
-These are the same two honest limits chapter 11 measured, now located precisely on
-the verb surface: the listing layer hides a *separate* per-tenant resource, but a
-*globally-scoped* one (a built-in channel, a discriminator-less source) is visible
-by design. Data isolation is the discriminator column, not source separation.
-
-### The collisions — error or isolate, never a cross-tenant clobber
-
-What happens when tenant B registers a resource under the *same id* tenant A
-already used? The engine never silently overwrites A's resource. A duplicate
-mutable-table name ERRORS on the global catalog primary key; a duplicate topic or
-channel id resolves in B's **own** per-tenant namespace as B's resource, A's
-untouched. Either way: no cross-tenant clobber.
-
-```{python}
-print(f"create_mutable_table dup → errored: {matrix['mutable_dup_errored']}  "
-      f"(global PK collision — does NOT clobber A's table)")
-print(f"register_topic dup       → isolated: {matrix['topic_dup_isolated']}  "
-      f"(per-tenant namespace — B's own topic)")
-print(f"register_channel dup     → isolated: {matrix['channel_dup_isolated']}  "
-      f"(per-tenant namespace — B's own channel)")
-assert matrix["mutable_dup_errored"] is True
-assert matrix["topic_dup_isolated"] is True and matrix["channel_dup_isolated"] is True
-```
-
-### The destructive verbs — A's resource survives B's drop
-
-The highest-stakes property the standing oracle guards: a destructive verb named
-by the wrong tenant must not reach across tenants. When B calls
-`drop_mutable_table` / `drop_topic` on a name A registered, B's call resolves in
-B's **own** namespace — a not-found for the mutable table, a no-op on B's own
-topic — and **A's resource survives**. We measure it directly: A's mutable table
-and topic are still listed after B's destructive call.
-
-```{python}
-print(f"mt_survives_foreign_drop = {matrix['mt_survives_foreign_drop']}  "
-      f"(A's mutable table survives B's drop_mutable_table)")
-print(f"tp_survives_foreign_drop = {matrix['tp_survives_foreign_drop']}  "
-      f"(A's topic survives B's drop_topic)")
-print(f"  (B's drop of A's mutable-table name raised in B's namespace: "
-      f"{matrix['b_drop_mt_raised']})")
-assert matrix["mt_survives_foreign_drop"] is True
-assert matrix["tp_survives_foreign_drop"] is True
+with jammi.connect(f"file://{tempfile.mkdtemp()}") as db:
+    local = isolation(db)
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as db:
+    served = isolation(db)
+print(f"the two transports agree on every cell: {local == served}")
 ```
 
 ```{python}
 # | echo: false
-for cell in ("collision.mutable_dup_errored", "collision.topic_dup_isolated",
-             "collision.channel_dup_isolated", "destructive.mt_survives_foreign_drop",
-             "destructive.tp_survives_foreign_drop"):
-    rails.measure(f"tenancy_h3.{cell}", 1.0)
+assert local == served
 ```
 
-### No leak found
-
-The headline of the whole matrix: **no verb leaks**. Every hard zero is `0`; A's
-resource survives every foreign destructive call; every collision errors or
-isolates. The `drop_mutable_table` cross-tenant-destruction defect that early
-scouting flagged as a candidate is **not present** on the pinned engine — B's drop
-resolves in B's own namespace and A's table survives, measured above. The record
-states the finding explicitly.
+### The hard zeros — B reaches none of A's resource
 
 ```{python}
-print(record["leak_finding"])
-assert record["leak_finding"].startswith("NONE")
-```
-
-### Cross-transport — remote == embedded on the wire
-
-Every verb reachable on the wire (the catalog reads + the discriminator-column sql
-row read) was measured a second time on a live `grpc://` `jammi-server` and
-asserted `remote == embedded` live at emit time. The verdict is recorded; the
-matrix above is the embedded-canonical one.
-
-```{python}
-parity = record["parity"]
-print(f"cross-transport observables checked: {len(parity)}")
-assert all(p["equal"] for p in parity), "a cross-transport observable diverged"
-for p in parity:
-    print(f"  {p['observable']:28s} embedded == remote  (value {p['value']})")
+for verb, leaked in local["leaks"].items():
+    print(f"  {leaked}   {verb}")
 ```
 
 ```{python}
 # | echo: false
-rails.measure("tenancy_h3.parity.cross_transport_equal", 1.0)
+assert all(v == 0 for v in local["leaks"].values()), "a tenant-scoped verb leaked"
+assert local["a_own_rows"] == [1, 2]  # the zero is not vacuous: A reads its own rows
+```
+
+The catalog reads filter each registry to the current tenant's rows and the
+global ones, so B's listing carries none of A's registrations, and a foreign
+`describe_source` is `None` — B cannot even confirm the source exists. The data
+layer is the discriminator column: a read of the shared tagged source is
+rewritten to the reader's own rows.
+
+### The stated positives — visibility by design, as counts
+
+```{python}
+for what, count in local["shared"].items():
+    print(f"  B sees {what}: {count}")
+print(f"  A reads B's discriminator-less source whole: {local['caveat']} rows")
+```
+
+```{python}
+# | echo: false
+assert all(count > 0 for count in local["shared"].values()) and local["caveat"] == 3
+```
+
+Three things are visible to every tenant, on purpose. The engine's built-in
+evidence channels (`vector`, `inference`, `bm25`) are global. So is a model
+referenced from outside — a base encoder loaded from a hub or a path is a shared
+catalog row, not any tenant's data; what a tenant *produces*, its fine-tuned
+model, is its own and does not leak (the hard zero above). And chapter 11's
+caveat: a source with **no** discriminator column is read whole by anyone who
+names it. Data isolation is the discriminator column, not source separation.
+
+### Collisions and destruction — never a cross-tenant clobber
+
+```{python}
+for verb, isolated in local["collisions"].items():
+    print(f"  {verb}: {'refused' if 'mutable' in verb else 'B gets its own'}  ({isolated})")
+print(f"  B's drop of A's mutable-table name refused in B's namespace: {local['b_drop_raised']}")
+for what, alive in local["survives"].items():
+    print(f"  {what}: still there = {alive}")
+```
+
+```{python}
+# | echo: false
+assert all(local["collisions"].values()) and local["b_drop_raised"]
+assert all(local["survives"].values())
+```
+
+A mutable table's name is unique across tenants, so B reusing A's name is
+refused; a topic and a channel live in per-tenant namespaces, so B's reuse makes
+B's own. And a destructive verb named by the wrong tenant resolves in that
+tenant's namespace: B's drop of A's mutable table is a not-found, B's drop of
+A's topic touches nothing — A's resources survive.
+
+### The result-table scan
+
+A result table's Parquet carries no `tenant_id` column, so the discriminator
+rewrite has nothing to act on; resolution is gated instead on the catalog row's
+owner. A table tenant A materializes resolves for A; one materialized with no
+tenant bound is global, visible to both; and B naming A's table is refused —
+while A's own re-read, after B's attempt, is unchanged.
+
+```{python}
+rts = jammi.connect(f"file://{tempfile.mkdtemp()}")
+
+
+def materialize(tag: str) -> str:
+    spine = parquet(f"spine_{tag}", pa.table({"entity": ["p", "q", "r"], "as_of": [10, 10, 10]}))
+    facts = parquet(f"facts_{tag}", pa.table({"entity": ["p", "q", "r"], "t": [10, 10, 10],
+                                               "val": [1.0, 2.0, 3.0]}))
+    rts.add_source(f"spine_{tag}", url=spine, format="parquet")
+    rts.add_source(f"facts_{tag}", url=facts, format="parquet")
+    return rts.asof_join(f"spine_{tag}", f"facts_{tag}", spine_by=["entity"], spine_time="as_of",
+                         facts_by=["entity"], facts_time="t", direction="backward",
+                         boundary="inclusive", project=["val"])
+
+
+def scan(table: str) -> int:
+    return rts.sql(f'SELECT COUNT(*) AS n FROM "jammi.{table}"').to_pylist()[0]["n"]
+
+
+with tenant(rts, TENANT_A):
+    private = materialize("a")
+    own = scan(private)
+rts.set_tenant("")
+shared_table = materialize("global")
+with tenant(rts, TENANT_B):
+    b_refused = refused(lambda: scan(private))
+    b_global = scan(shared_table)
+with tenant(rts, TENANT_A):
+    a_global, own_after = scan(shared_table), scan(private)
+rts.close()
+print(f"A reads its own table: {own} rows; the global table: A {a_global}, B {b_global}")
+print(f"B naming A's table refused: {b_refused}; A's re-read after: {own_after} rows")
+```
+
+```{python}
+# | echo: false
+assert own > 0 and own_after == own and b_refused and a_global == b_global > 0
 ```
 
 ## Part B — the BYO-auth seam, from the consumer side
@@ -435,25 +326,11 @@ through the `JammiError` taxonomy as `jammi.BackendError` (detail:
 to an unscoped global read.
 
 ```{python}
-import socket
-import tempfile
-
-import jammi
 import jammi
 import pyarrow as pa
 import pyarrow.flight as flight
 import pyarrow.parquet as pq
 from jammi_cookbook.rails import tenant
-
-TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-
-
-def _free_port():
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
 
 class AuthMiddleware(flight.ServerMiddleware):
     def __init__(self, authorization):
@@ -517,9 +394,9 @@ write_src("auth_a", TENANT_A)
 write_src("auth_b", TENANT_B)
 
 factory = AuthMiddlewareFactory()
-gateway = AuthGatewayServer(
-    flight.Location.for_grpc_tcp("127.0.0.1", _free_port()), db, factory
-)
+# Port 0: the kernel assigns one and the server reports it — nothing here
+# holds a port number and releases it for someone else to race.
+gateway = AuthGatewayServer(flight.Location.for_grpc_tcp("127.0.0.1", 0), db, factory)
 gateway_endpoint = f"127.0.0.1:{gateway.port}"
 
 
@@ -612,33 +489,6 @@ assert over_flight_eq_embedded
 ```
 
 ```{python}
-# | echo: false
-# The seam verdict, asserted against the frozen committed cache (the same recipe
-# run live at emit time over a REAL jammi-server Flight wire).
-byo = record["byo_auth"]
-assert byo["bearer_on_flight_observed"] is True and byo["anonymous_no_bearer"] is True
-assert byo["a_isolated_over_flight"] is True and byo["b_isolated_over_flight"] is True
-assert byo["missing_rejected_over_flight"] is True
-assert byo["forged_rejected_over_flight"] is True and byo["over_flight_eq_embedded"] is True
-for cell, observed in (
-    ("bearer_on_flight_observed", bearer_on_flight),
-    ("anonymous_no_bearer", anon_no_bearer),
-    ("a_isolated_over_flight", a_isolated),
-    ("b_isolated_over_flight", b_isolated),
-    ("missing_rejected_over_flight", missing_rejected),
-    ("forged_rejected_over_flight", forged_rejected),
-    ("legit_after_forgery_over_flight", legit_after),
-    ("over_flight_eq_embedded", over_flight_eq_embedded),
-):
-    rails.measure(f"tenancy_h3.byo_auth.{cell}", 1.0 if observed else 0.0)
-```
-
-Both sessions' work is done, so they are closed. An embedded engine holds its catalog until
-`close()` returns, which is why `close()` comes before anything removes the directory the
-catalog lives in.
-
-```{python}
-rts_db.close()
 db.close()
 ```
 
@@ -647,9 +497,10 @@ db.close()
 The engine isolates **per verb**: every tenant-scoped catalog read, describe, and
 discriminator-column row read is a hard zero, on both transports, and every
 destructive verb is tenant-scoped so a foreign tenant cannot reach across to
-destroy A's resource. The two honest limits — a globally-scoped resource (a
-built-in channel, a discriminator-less source) is visible to every tenant — are
-measured as positive counts, not glossed. No verb leaks.
+destroy A's resource. What is visible to every tenant by design — a built-in
+channel, a shared base model, a discriminator-less source — is measured as a
+positive count, not glossed. No verb leaks, and the in-process and served
+matrices are identical.
 
 A **result table** (`asof_join`, `generate_embeddings`, …) isolates the same way
 despite carrying no `tenant_id` column of its own: the catalog row's owner gates

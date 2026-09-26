@@ -19,10 +19,12 @@ where
     pyo3::Python::attach(|py| py.detach(|| runtime.block_on(future)))
 }
 
+use std::io::IsTerminal;
+
 use pyo3::prelude::*;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer, Registry};
+use tracing_subscriber::{Layer, Registry};
 
 use jammi_db::config::JammiConfig;
 use jammi_db::error::Result as JammiResult;
@@ -42,9 +44,15 @@ use crate::model_task::PyModelTask;
 static OTLP_PROVIDER_HANDLE: std::sync::OnceLock<jammi_ai::telemetry::OtlpProviderHandle> =
     std::sync::OnceLock::new();
 
+/// The embedded engine's log level when neither `[logging] level` nor
+/// `RUST_LOG` names one: a library inside the caller's process reports what
+/// needs their attention and is otherwise quiet.
+pub const LOG_DEFAULT: tracing::level_filters::LevelFilter =
+    tracing::level_filters::LevelFilter::WARN;
+
 /// Build the tracing layers `open_local` installs: the `fmt` formatter (to
-/// stderr, filtered by `RUST_LOG` or a `jammi_ai=info,jammi_db=info`
-/// default) plus — when `[observability] otlp_endpoint` is configured — the
+/// stderr, filtered by `RUST_LOG`, else `[logging] level`, else
+/// [`LOG_DEFAULT`]) plus — when `[observability] otlp_endpoint` is configured — the
 /// OTLP export layer, via the SAME `jammi_ai::telemetry::otlp_layer`
 /// factory `jammi-server`'s `telemetry::install` uses.
 ///
@@ -63,12 +71,11 @@ pub fn build_tracing_layers(
     // building anything else.
     jammi_ai::telemetry::refuse_if_endpoint_without_feature(&config.observability)?;
 
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("jammi_ai=info,jammi_db=info"));
-    let fmt_layer: Box<dyn Layer<Registry> + Send + Sync> = Box::new(
-        tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
-            .with_filter(filter),
+    let fmt_layer = jammi_ai::telemetry::fmt_layer(
+        &config.logging,
+        LOG_DEFAULT,
+        std::io::stderr,
+        std::io::stderr().is_terminal(),
     );
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![fmt_layer];
 
@@ -157,7 +164,7 @@ fn open_local(
         cfg.artifact_dir = dir.into();
     }
     if let Some(dev) = gpu_device {
-        cfg.gpu.device = dev;
+        cfg.gpu.device = Some(dev);
     }
     if let Some(bs) = inference_batch_size {
         cfg.inference.batch_size = bs;
@@ -175,8 +182,8 @@ fn open_local(
     let runtime = std::sync::Arc::new(runtime);
 
     // Install a stderr tracing subscriber (+ the OTLP export layer per
-    // `[observability]`) the first time connect() is called. Reads
-    // RUST_LOG; falls back to showing INFO from jammi crates only.
+    // `[observability]`) the first time connect() is called; see
+    // `build_tracing_layers` for the filter.
     // try_init() is a no-op if a subscriber was already installed — an
     // endpoint misconfiguration this build cannot honour still
     // surfaces as a Python exception either way, since

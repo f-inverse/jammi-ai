@@ -176,7 +176,7 @@ async fn healthz_stays_200_while_draining() {
                         epochs: 20_000,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,

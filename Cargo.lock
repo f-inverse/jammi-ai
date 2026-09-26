@@ -4765,6 +4765,7 @@ dependencies = [
  "jammi-ai",
  "jammi-datafusion",
  "jammi-db",
+ "jammi-wire",
  "pyo3",
  "pyo3-arrow",
  "serde",

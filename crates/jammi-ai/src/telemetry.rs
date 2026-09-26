@@ -1,4 +1,6 @@
-//! Vendor-neutral OTLP trace export and W3C `traceparent` continuation.
+//! The tracing layers a host installs: the log formatter
+//! ([`fmt_layer`](crate::telemetry::fmt_layer)), vendor-neutral OTLP trace
+//! export, and W3C `traceparent` continuation.
 //!
 //! This module is the ONE place `jammi-server`'s `telemetry::install` /
 //! `TraceContextLayer` and `jammi-python`'s `open_local` subscriber wiring
@@ -29,8 +31,40 @@
 //! provider. A process with no configured endpoint opens no network
 //! connection for tracing, full stop.
 
-use jammi_db::config::ObservabilityConfig;
+use jammi_db::config::{LogFormat, LoggingConfig, ObservabilityConfig};
 use jammi_db::error::{JammiError, Result};
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::{EnvFilter, Layer, Registry};
+
+/// The log formatter a host installs over `writer`: filtered by `RUST_LOG`
+/// when set, else by `[logging] level`, else by `host_default`; JSON or text
+/// per `[logging] format`. `ansi` colours the output — for a terminal only.
+pub fn fmt_layer<W>(
+    logging: &LoggingConfig,
+    host_default: LevelFilter,
+    writer: W,
+    ansi: bool,
+) -> Box<dyn Layer<Registry> + Send + Sync>
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            logging
+                .level
+                .clone()
+                .unwrap_or_else(|| host_default.to_string()),
+        )
+    });
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(ansi);
+    match logging.format {
+        LogFormat::Json => Box::new(layer.json().with_filter(filter)),
+        LogFormat::Text => Box::new(layer.with_filter(filter)),
+    }
+}
 
 /// The name of the cargo feature this module's exporter machinery lives
 /// behind, quoted verbatim in [`refuse_if_endpoint_without_feature`]'s error
@@ -275,6 +309,50 @@ pub use otlp::{otlp_layer, set_parent_from_headers, Otlp, OtlpLayer, OtlpProvide
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// What `fmt_layer` over `logging` and `host_default` writes for one
+    /// `info!` and one `warn!`, captured through a scoped subscriber.
+    fn emitted(logging: &LoggingConfig, host_default: LevelFilter) -> String {
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer(Arc::default());
+        let sink = buffer.clone();
+        let layer = fmt_layer(logging, host_default, move || sink.clone(), false);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::info!("routine progress");
+            tracing::warn!("needs attention");
+        });
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn an_unset_level_takes_the_hosts_default_and_a_configured_one_overrides_it() {
+        let unset = LoggingConfig::default();
+        let quiet = emitted(&unset, LevelFilter::WARN);
+        assert!(quiet.contains("needs attention") && !quiet.contains("routine progress"));
+        let chatty = emitted(&unset, LevelFilter::INFO);
+        assert!(chatty.contains("needs attention") && chatty.contains("routine progress"));
+
+        let configured = LoggingConfig {
+            level: Some("info".into()),
+            ..LoggingConfig::default()
+        };
+        let overridden = emitted(&configured, LevelFilter::WARN);
+        assert!(overridden.contains("routine progress"));
+    }
 
     #[test]
     #[cfg(not(feature = "telemetry-otlp"))]

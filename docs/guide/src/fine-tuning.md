@@ -97,7 +97,7 @@ Model Checkpoint](./local-models.md).
 # extern crate jammi_ai;
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::fine_tune::{FineTuneMethod, LrSchedule};
+# use jammi_ai::fine_tune::{FineTuneMethod, LrSchedule, Warmup};
 # async fn ex(session: &InferenceSession, model: &str, columns: Vec<String>) -> jammi_db::error::Result<()> {
 use jammi_ai::fine_tune::FineTuneConfig;
 use jammi_ai::model::ModelTask;
@@ -107,7 +107,7 @@ let config = FineTuneConfig {
     learning_rate: 5e-4,
     epochs: 5,
     batch_size: 4,
-    warmup_steps: 10,
+    warmup: Warmup::Steps(10),
     lr_schedule: LrSchedule::CosineDecay,
     early_stopping_patience: 2,
     validation_fraction: 0.2,
@@ -135,7 +135,7 @@ let job = session.fine_tune(
 | `gradient_accumulation_steps` | 1 | Steps before optimizer update |
 | `validation_fraction` | 0.1 | Holdout fraction for early stopping |
 | `early_stopping_patience` | 3 | Epochs without improvement before stopping |
-| `warmup_steps` | 100 | Linear warmup from 0 to base LR |
+| `warmup` | `Fraction(0.1)` | Linear warmup from 0 to base LR: `Warmup::Fraction(f)` of the run's steps, or `Warmup::Steps(n)` (Python: `warmup_fraction` or `warmup_steps`) |
 | `lr_schedule` | CosineDecay | Decay after warmup: Constant, CosineDecay, LinearDecay |
 | `embedding_loss` | auto | CoSent (pairs+scores), Triplet, MultipleNegativesRanking |
 | `backbone_dtype` | f32 | Frozen-backbone dtype: f32, f16, or bf16 (bf16 requires CUDA). Applies only when `target_modules` is non-empty (encoder-adapters) — see [Memory](#memory) |

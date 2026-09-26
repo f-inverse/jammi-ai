@@ -183,7 +183,7 @@ pub async fn harness_session_with(
         inference,
         artifact_dir: dir.path().to_path_buf(),
         gpu: jammi_db::config::GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {
@@ -295,7 +295,7 @@ fn lane_fine_tune_config(size: JobSize) -> FineTuneConfig {
         epochs: size.epochs(),
         batch_size: 8,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         ..Default::default()
     }
 }
@@ -377,6 +377,7 @@ pub async fn submit_context_predictor(
         test_task_fraction: 0.25,
         min_task_count: 4,
         seed: 7,
+        embedding_table: None,
     };
     session
         .train_context_predictor(source, &spec)

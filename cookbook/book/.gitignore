@@ -9,11 +9,9 @@ _book/
 .pytest_cache/
 .ruff_cache/
 
-# Downloaded datasets are fetched on demand (checksum-gated) and never committed;
-# only the small committed subset artifacts under artifacts/ and the ID lists
-# under data/ids/ are tracked.
-data/raw/
-data/cache/
+# A single chapter rendered on its own writes its page beside its source.
+chapters/**/*.html
+chapters/**/*_files/
 
 /.quarto/
 /_freeze/

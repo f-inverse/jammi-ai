@@ -4,6 +4,7 @@
 //! [`jammi_wire::SessionTransport`] and exposes every control verb the single
 //! server-side `CatalogService` holds: the source/model registry, the channel
 //! declarations, the mutable-table lifecycle, the topic-admin verbs, the
+//! materialization-contract reads (describe, verify, staleness, lineage), the
 //! server-info handshake, and the tenant trio. It is candle-free — it speaks the
 //! typed gRPC wire only and pulls no embedded engine.
 //!
@@ -24,17 +25,20 @@ use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
+use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
+use jammi_db::store::{DerivesFromEdge, Staleness};
 use jammi_db::trigger::{TopicDefinition, TopicId, TriggerError};
 use jammi_db::{ChannelId, ServerInfo, TenantId};
 
 use jammi_wire::proto::catalog::catalog_service_client::CatalogServiceClient;
 use jammi_wire::proto::catalog::{
     AddChannelColumnsRequest, AddSourceRequest, CreateMutableTableRequest, DeleteModelRequest,
-    DescribeModelRequest, DescribeSourceRequest, DropMutableTableRequest, DropTopicRequest,
-    ListChannelsRequest, ListIndexSegmentsRequest, ListModelsRequest, ListMutableTablesRequest,
-    ListSourcesRequest, ListTopicsRequest, ReconcileRequest, RegisterChannelRequest,
-    RegisterTopicRequest, RemoveSourceRequest, SetTenantRequest, Tenant,
+    DerivesFromRequest, DescribeModelRequest, DescribeSourceRequest, DescribeTableRequest,
+    DropMutableTableRequest, DropTopicRequest, ListChannelsRequest, ListIndexSegmentsRequest,
+    ListModelsRequest, ListMutableTablesRequest, ListSourcesRequest, ListTopicsRequest,
+    ReconcileRequest, RegisterChannelRequest, RegisterTopicRequest, RemoveSourceRequest,
+    SetTenantRequest, StalenessRequest, Tenant, VerifyMaterializationRequest,
 };
 use jammi_wire::proto::job::job_service_client::JobServiceClient;
 use jammi_wire::proto::job::{
@@ -43,8 +47,9 @@ use jammi_wire::proto::job::{
 };
 use jammi_wire::{
     channel_from_proto, columns_to_proto, definition_list_from_proto, definition_to_proto,
-    encode_ipc_stream, error_from_status, index_segment_from_proto, model_from_proto,
-    source_descriptor_from_proto, source_type_to_proto, topic_from_proto,
+    derives_from_edge_from_proto, describe_table_from_proto, encode_ipc_stream, error_from_status,
+    index_segment_from_proto, match_verdict_from_proto, model_from_proto,
+    source_descriptor_from_proto, source_type_to_proto, staleness_from_proto, topic_from_proto,
     trigger_error_from_status, SessionChannel, SessionTransport,
 };
 use tonic::transport::Endpoint;
@@ -405,6 +410,81 @@ impl CatalogClient {
         resp.segments
             .into_iter()
             .map(|s| index_segment_from_proto(s).map_err(|s| error_from_status(&s)))
+            .collect()
+    }
+
+    // --- materialization contract ----------------------------------------
+
+    /// The recorded materialization of `table` — the same
+    /// [`MaterializationManifest`] the embedded `Session::describe_table`
+    /// returns, decoded through the engine's strict manifest reader. A table
+    /// with no manifest is [`JammiError::MissingManifest`].
+    pub async fn describe_table(&self, table: &str) -> Result<MaterializationManifest> {
+        let resp = self
+            .client()
+            .describe_table(DescribeTableRequest {
+                table: table.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        describe_table_from_proto(resp).map_err(|s| error_from_status(&s))
+    }
+
+    /// Recompute `table`'s artifact digest (and, if given, check an expected
+    /// definition hash) against its manifest — the same [`MatchVerdict`] the
+    /// embedded `Session::verify_materialization` returns. Read-only.
+    pub async fn verify_materialization(
+        &self,
+        table: &str,
+        expected_definition: Option<&DefinitionHash>,
+    ) -> Result<MatchVerdict> {
+        let resp = self
+            .client()
+            .verify_materialization(VerifyMaterializationRequest {
+                table: table.to_string(),
+                expected_definition: expected_definition.map(|d| d.0.clone()),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        match_verdict_from_proto(resp.verdict).map_err(|s| error_from_status(&s))
+    }
+
+    /// Whether `table` is still the output of its recorded definition over its
+    /// recorded inputs' current state — the same [`Staleness`] the embedded
+    /// `Session::staleness` reports. Read-only.
+    pub async fn staleness(
+        &self,
+        table: &str,
+        current_definition: &DefinitionHash,
+    ) -> Result<Staleness> {
+        let resp = self
+            .client()
+            .staleness(StalenessRequest {
+                table: table.to_string(),
+                current_definition: current_definition.0.clone(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        staleness_from_proto(resp.staleness).map_err(|s| error_from_status(&s))
+    }
+
+    /// The one-hop reverse-dependency edges of `table` — the same
+    /// [`DerivesFromEdge`]s the embedded `Session::derives_from` returns.
+    pub async fn derives_from(&self, table: &str) -> Result<Vec<DerivesFromEdge>> {
+        let resp = self
+            .client()
+            .derives_from(DerivesFromRequest {
+                table: table.to_string(),
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        resp.edges
+            .into_iter()
+            .map(|e| derives_from_edge_from_proto(e).map_err(|s| error_from_status(&s)))
             .collect()
     }
 

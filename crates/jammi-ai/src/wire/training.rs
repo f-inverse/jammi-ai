@@ -15,7 +15,9 @@ use jammi_db::error::JammiError;
 use prost::Message;
 use tonic::Status;
 
-use crate::fine_tune::graph_sampler::{EdgeProvenance, GraphFineTuneSources, GraphSampleConfig};
+use crate::fine_tune::graph_sampler::{
+    EdgeProvenance, GraphEdges, GraphFineTuneSources, GraphSampleConfig,
+};
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
 use crate::fine_tune::FineTuneConfig;
 use crate::pipeline::context_predictor::{
@@ -154,7 +156,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
             world_size: common.world_size,
-            cache: super::cache::cache_policy_to_proto(common.cache) as i32,
+            cache: jammi_wire::cache_policy_to_proto(common.cache) as i32,
         },
         TrainingSpec::GraphFineTune {
             sources,
@@ -171,7 +173,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
             config: Some(config_to_proto(&common.config)),
             idempotency_key: String::new(),
             world_size: common.world_size,
-            cache: super::cache::cache_policy_to_proto(common.cache) as i32,
+            cache: jammi_wire::cache_policy_to_proto(common.cache) as i32,
         },
         TrainingSpec::ContextPredictor {
             source,
@@ -203,7 +205,7 @@ pub fn training_spec_to_proto(spec: &TrainingSpec) -> pb::SubmitJobRequest {
 /// and its cache policy into a [`TrainingCommon`] for the two LoRA fine-tune
 /// kinds. An empty base model is a client error (the worker has nothing to
 /// adapt); an out-of-range cache value is refused by
-/// [`super::cache_policy_from_proto`].
+/// [`jammi_wire::cache_policy_from_proto`].
 fn lora_common_from_proto(
     base_model: String,
     config: Option<training_pb::FineTuneConfig>,
@@ -221,7 +223,7 @@ fn lora_common_from_proto(
         base_model,
         config,
         world_size: world_size_from_proto(world_size),
-        cache: super::cache_policy_from_proto(cache)?,
+        cache: jammi_wire::cache_policy_from_proto(cache)?,
     })
 }
 
@@ -247,25 +249,47 @@ fn world_size_from_proto(world_size: u32) -> u32 {
 fn graph_sources_from_proto(
     s: training_pb::GraphFineTuneSources,
 ) -> Result<GraphFineTuneSources, Status> {
+    use training_pb::graph_fine_tune_sources::Edges;
+    let edges = match s.edges {
+        Some(Edges::EdgeGraphTable(table)) => GraphEdges::Table(table),
+        Some(Edges::EdgeSource(source)) => GraphEdges::Source {
+            source: source.source_id,
+            src_column: source.src_column,
+            dst_column: source.dst_column,
+        },
+        None => {
+            return Err(Status::invalid_argument(
+                "a graph fine-tune names its edges: edge_graph_table or edge_source",
+            ))
+        }
+    };
     Ok(GraphFineTuneSources {
         node_source: s.node_source,
         id_column: s.id_column,
         text_column: s.text_column,
-        edge_source: s.edge_source,
-        src_column: s.src_column,
-        dst_column: s.dst_column,
+        edges,
         provenance: edge_provenance_from_proto(s.provenance)?,
     })
 }
 
 fn graph_sources_to_proto(s: &GraphFineTuneSources) -> training_pb::GraphFineTuneSources {
+    use training_pb::graph_fine_tune_sources::Edges;
     training_pb::GraphFineTuneSources {
         node_source: s.node_source.clone(),
         id_column: s.id_column.clone(),
         text_column: s.text_column.clone(),
-        edge_source: s.edge_source.clone(),
-        src_column: s.src_column.clone(),
-        dst_column: s.dst_column.clone(),
+        edges: Some(match &s.edges {
+            GraphEdges::Table(table) => Edges::EdgeGraphTable(table.clone()),
+            GraphEdges::Source {
+                source,
+                src_column,
+                dst_column,
+            } => Edges::EdgeSource(training_pb::GraphEdgeSource {
+                source_id: source.clone(),
+                src_column: src_column.clone(),
+                dst_column: dst_column.clone(),
+            }),
+        }),
         provenance: edge_provenance_to_proto(s.provenance) as i32,
     }
 }
@@ -336,6 +360,7 @@ fn predictor_config_from_proto(
         test_task_fraction: c.test_task_fraction,
         min_task_count: c.min_task_count as usize,
         seed: c.seed,
+        embedding_table: c.embedding_table,
     })
 }
 
@@ -359,6 +384,7 @@ fn predictor_config_to_proto(
         test_task_fraction: c.test_task_fraction,
         min_task_count: c.min_task_count as u32,
         seed: c.seed,
+        embedding_table: c.embedding_table.clone(),
     }
 }
 
@@ -461,9 +487,11 @@ mod tests {
                 node_source: "nodes_src".into(),
                 id_column: "node_id".into(),
                 text_column: "node_text".into(),
-                edge_source: "edges_src".into(),
-                src_column: "edge_from".into(),
-                dst_column: "edge_to".into(),
+                edges: GraphEdges::Source {
+                    source: "edges_src".into(),
+                    src_column: "edge_from".into(),
+                    dst_column: "edge_to".into(),
+                },
                 provenance: EdgeProvenance::Similarity,
             },
             sample_config: GraphSampleConfig {
@@ -504,9 +532,14 @@ mod tests {
         assert_eq!(sources.node_source, "nodes_src");
         assert_eq!(sources.id_column, "node_id");
         assert_eq!(sources.text_column, "node_text");
-        assert_eq!(sources.edge_source, "edges_src");
-        assert_eq!(sources.src_column, "edge_from");
-        assert_eq!(sources.dst_column, "edge_to");
+        assert_eq!(
+            sources.edges,
+            GraphEdges::Source {
+                source: "edges_src".into(),
+                src_column: "edge_from".into(),
+                dst_column: "edge_to".into(),
+            }
+        );
         assert_eq!(sources.provenance, EdgeProvenance::Similarity);
 
         assert_eq!(sample_config.walk_length, 7);
@@ -520,6 +553,30 @@ mod tests {
 
         assert_eq!(common.base_model, "graph-base");
         assert_eq!(common.config.lora_rank, 32);
+    }
+
+    /// A graph fine-tune names its edges by exactly one arm: an engine-produced
+    /// edge table round-trips as that table, and a request naming neither arm is
+    /// refused rather than read as an empty edge source.
+    #[test]
+    fn graph_edges_round_trip_by_arm_and_a_request_naming_none_is_refused() {
+        let over_table = GraphFineTuneSources {
+            node_source: "nodes".into(),
+            id_column: "id".into(),
+            text_column: "text".into(),
+            edges: GraphEdges::Table("nodes_neighbor_graph_1".into()),
+            provenance: EdgeProvenance::Similarity,
+        };
+        let decoded = graph_sources_from_proto(graph_sources_to_proto(&over_table))
+            .expect("a table-arm source round-trips");
+        assert_eq!(decoded, over_table);
+
+        let naming_none = training_pb::GraphFineTuneSources {
+            edges: None,
+            ..graph_sources_to_proto(&over_table)
+        };
+        let refused = graph_sources_from_proto(naming_none).expect_err("no edges is refused");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
     }
 
     /// The `ContextPredictor` spec round-trips field-for-field through
@@ -549,6 +606,7 @@ mod tests {
                 test_task_fraction: 0.3,
                 min_task_count: 7,
                 seed: 0xC0FF_EE42,
+                embedding_table: None,
             },
         };
 
@@ -620,6 +678,7 @@ mod tests {
                     test_task_fraction: 0.2,
                     min_task_count: 3,
                     seed: 42,
+                    embedding_table: None,
                 },
             };
 
@@ -795,9 +854,13 @@ mod tests {
                         node_source: "nodes".into(),
                         id_column: "id".into(),
                         text_column: "text".into(),
-                        edge_source: "edges".into(),
-                        src_column: "src".into(),
-                        dst_column: "dst".into(),
+                        edges: Some(training_pb::graph_fine_tune_sources::Edges::EdgeSource(
+                            training_pb::GraphEdgeSource {
+                                source_id: "edges".into(),
+                                src_column: "src".into(),
+                                dst_column: "dst".into(),
+                            },
+                        )),
                         provenance: training_pb::EdgeProvenance::Declared as i32,
                     }),
                     sample_config: Some(training_pb::GraphSampleConfig::default()),
@@ -831,7 +894,7 @@ mod tests {
             assert_eq!(common.cache, expected);
             assert_eq!(
                 training_spec_to_proto(&spec).cache,
-                super::super::cache::cache_policy_to_proto(expected) as i32
+                jammi_wire::cache_policy_to_proto(expected) as i32
             );
         }
     }
@@ -871,6 +934,7 @@ mod tests {
                     test_task_fraction: 0.3,
                     min_task_count: 2,
                     seed: 7,
+                    embedding_table: None,
                 },
             })
         };

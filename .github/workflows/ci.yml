@@ -564,7 +564,7 @@ jobs:
           pytest crates/jammi-python/tests -v
 
       # This lane has the native engine, so it runs the client tests that need it;
-      # the ones that also need a built server run nightly in cookbook.yml.
+      # the ones that also need a built server run in cookbook.yml, which builds one.
       - name: Python client suite (with the embedded engine)
         run: |
           . .venv/bin/activate

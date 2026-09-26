@@ -13,6 +13,8 @@ assembly layer, so it is exercised directly with no transport.
 
 from __future__ import annotations
 
+import pytest
+
 from jammi import RemoteDatabase
 from jammi._assembly import build_fine_tune_config
 
@@ -28,6 +30,7 @@ _UNSET = dict(
     validation_fraction=None,
     early_stopping_patience=None,
     warmup_steps=None,
+    warmup_fraction=None,
     gradient_accumulation_steps=None,
     triplet_margin=None,
     target_modules=None,
@@ -135,8 +138,6 @@ def _capture_graph_request(**overrides):
         id_column="paper_id",
         text_column="title",
         edge_source="cites",
-        src_column="src",
-        dst_column="dst",
         base_model="modernbert",
     )
     kwargs.update(overrides)
@@ -176,6 +177,25 @@ def test_graph_fine_tune_defaults_still_attach_the_loss() -> None:
 
     assert request.HasField("config")
     assert request.config.embedding_loss.HasField("multiple_negatives_ranking")
+
+
+def test_graph_fine_tune_names_exactly_one_graph() -> None:
+    """The walks follow a registered edge source or an engine-built neighbour
+    graph — one `edges` arm on the wire, and naming both or neither is refused
+    before anything is submitted."""
+    registered = _capture_graph_request(edge_dst_column="cited")
+    sources = registered.graph_fine_tune.sources
+    assert sources.WhichOneof("edges") == "edge_source"
+    assert (sources.edge_source.source_id, sources.edge_source.src_column) == ("cites", "src")
+    assert sources.edge_source.dst_column == "cited"
+
+    built = _capture_graph_request(edge_source=None, edge_graph_table="papers_neighbor_graph")
+    assert built.graph_fine_tune.sources.WhichOneof("edges") == "edge_graph_table"
+    assert built.graph_fine_tune.sources.edge_graph_table == "papers_neighbor_graph"
+
+    for edges in ({"edge_graph_table": "papers_neighbor_graph"}, {"edge_source": None}):
+        with pytest.raises(ValueError, match="edge_graph_table"):
+            _capture_graph_request(**edges)
 
 
 # --- Regression objective (W5-PR4) -----------------------------------------
@@ -229,7 +249,6 @@ def test_quantile_levels_cross_the_wire() -> None:
 
 def test_unknown_regression_loss_rejected() -> None:
     """An unknown name raises rather than silently sending an empty oneof."""
-    import pytest
 
     with pytest.raises(ValueError, match="Unknown regression_loss"):
         _build(regression_loss="bogus")
@@ -281,3 +300,38 @@ def test_remote_fine_tune_threads_beta_nll_to_the_proto() -> None:
     cfg = request.config
     assert cfg.regression_loss.HasField("beta_nll")
     assert abs(cfg.regression_loss.beta_nll.beta - 0.2) < 1e-9
+
+
+def test_warmup_is_steps_or_a_fraction_of_the_run() -> None:
+    """Unset leaves the engine's default (a fraction of the run); a step count
+    and a fraction each reach the wire's `warmup` oneof; both is refused."""
+
+    assert _build().WhichOneof("warmup") is None
+    assert _build(warmup_steps=0).WhichOneof("warmup") == "warmup_steps"
+    assert _build(warmup_fraction=0.05).warmup_fraction == 0.05
+    with pytest.raises(ValueError, match="not both"):
+        _build(warmup_steps=10, warmup_fraction=0.1)
+
+
+def test_graph_fine_tune_carries_fine_tunes_training_knobs() -> None:
+    """The graph verb trains with `fine_tune`'s own knobs, through the one
+    config builder — a bf16 backbone, a sequence length, the LoRA shape, a
+    validation split — and refuses an objective graph walks cannot feed."""
+    request = _capture_graph_request(
+        backbone_dtype="bf16",
+        max_seq_length=256,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        validation_fraction=0.1,
+        warmup_fraction=0.05,
+        gradient_accumulation_steps=2,
+    )
+    cfg = request.config
+    expected = build_fine_tune_config(
+        **{**_UNSET, "backbone_dtype": "bf16", "max_seq_length": 256, "lora_alpha": 16.0,
+           "lora_dropout": 0.0, "validation_fraction": 0.1, "warmup_fraction": 0.05,
+           "gradient_accumulation_steps": 2, "embedding_loss": "mnrl"}
+    )
+    assert cfg == expected
+    with pytest.raises(ValueError, match="for graph fine-tune"):
+        _capture_graph_request(embedding_loss="cosent")

@@ -557,6 +557,7 @@ async fn into_layered_axum_router_serves_directly_with_grpc_web_trailer_repair()
         model_id: "local:/does/not/exist".into(),
         modality: Modality::Text as i32,
         input: Some(Input::Text("a query".into())),
+        dimensions: None,
     };
     let mut payload = Vec::new();
     request_proto.encode(&mut payload).expect("encode proto");

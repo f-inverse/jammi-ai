@@ -39,6 +39,7 @@ use crate::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput, PropagationWeighting,
 };
 use crate::pipeline::graph_structure::StructureRequest;
+use crate::pipeline::lexical::BuildLexicalIndex;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::pipeline::recompute::{Cascade, RecomputeReport};
 use crate::wire::edge_gather_from_proto;
@@ -94,10 +95,46 @@ pub fn build_neighbor_graph_from_proto(
     };
     Ok(BuildNeighborGraphArgs {
         source_id: req.source_id,
-        embedding_table: req.table,
+        embedding_table: req.embedding_table,
         params,
-        cache: crate::wire::cache_policy_from_proto(req.cache)?,
+        cache: jammi_wire::cache_policy_from_proto(req.cache)?,
     })
+}
+
+// ─── BuildLexicalIndex ───────────────────────────────────────────────────────
+
+/// Decode a serialized [`pb::BuildLexicalIndexRequest`] body — the embedded
+/// binding's seam onto [`build_lexical_index_from_proto`].
+pub fn build_lexical_index_from_bytes(body: &[u8]) -> Result<(String, BuildLexicalIndex), Status> {
+    let req = pb::BuildLexicalIndexRequest::decode(body).map_err(|e| {
+        Status::invalid_argument(format!("malformed BuildLexicalIndex request: {e}"))
+    })?;
+    build_lexical_index_from_proto(req)
+}
+
+/// Decode a [`pb::BuildLexicalIndexRequest`] into its source and build
+/// params. An unspecified analyzer is the engine default; an out-of-range one
+/// is refused.
+pub fn build_lexical_index_from_proto(
+    req: pb::BuildLexicalIndexRequest,
+) -> Result<(String, BuildLexicalIndex), Status> {
+    if req.source_id.is_empty() {
+        return Err(Status::invalid_argument("source_id is required"));
+    }
+    let analyzer = match pb::LexicalAnalyzer::try_from(req.analyzer) {
+        Ok(pb::LexicalAnalyzer::Unspecified) => jammi_db::index::LexicalAnalyzer::default(),
+        Ok(pb::LexicalAnalyzer::English) => jammi_db::index::LexicalAnalyzer::English,
+        Ok(pb::LexicalAnalyzer::Raw) => jammi_db::index::LexicalAnalyzer::Raw,
+        Err(_) => return Err(Status::invalid_argument("unknown lexical analyzer")),
+    };
+    Ok((
+        req.source_id,
+        BuildLexicalIndex {
+            columns: req.columns,
+            key_column: req.key_column,
+            analyzer,
+        },
+    ))
 }
 
 // ─── PropagateEmbeddings ─────────────────────────────────────────────────────
@@ -128,7 +165,7 @@ pub fn propagate_request_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    let cache = crate::wire::cache_policy_from_proto(req.cache)?;
+    let cache = jammi_wire::cache_policy_from_proto(req.cache)?;
     let edge_source = edge_source_from_arm(req.graph.map(|graph| match graph {
         pb::propagate_embeddings_request::Graph::EdgeGraphTable(table) => GraphArm::Table(table),
         pb::propagate_embeddings_request::Graph::EdgeSource(source) => GraphArm::Source(source),
@@ -283,7 +320,7 @@ pub fn structure_request_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    let cache = crate::wire::cache_policy_from_proto(req.cache)?;
+    let cache = jammi_wire::cache_policy_from_proto(req.cache)?;
     let edge_source = edge_source_from_arm(req.graph.map(|graph| match graph {
         pb::generate_structure_embeddings_request::Graph::EdgeGraphTable(table) => {
             GraphArm::Table(table)

@@ -75,6 +75,8 @@ ENTRY_PATH = PACKAGING / "jammi_server" / "_entry.py"
 PYPROJECT_PATH = PACKAGING / "pyproject.toml"
 README_PATH = PACKAGING / "README.md"
 BUNDLE_SCRIPT = REPO_ROOT / "ci" / "scripts" / "bundle_cuda_libs.sh"
+NATIVE_PYPROJECT_PATH = REPO_ROOT / "packaging" / "native-cu12" / "pyproject.toml"
+NATIVE_BUILD_RS = REPO_ROOT / "crates" / "jammi-python" / "build.rs"
 
 
 def load_verify_module():
@@ -100,14 +102,14 @@ def entry_components() -> tuple:
     raise AssertionError(f"_CUDA_COMPONENTS not found in {ENTRY_PATH}")
 
 
-def pinned_distributions() -> dict:
-    """The `nvidia-*-cu12` requirements in `pyproject.toml`'s `dependencies`,
+def pinned_distributions(pyproject: Path = PYPROJECT_PATH) -> dict:
+    """The `nvidia-*-cu12` requirements in `pyproject`'s `dependencies`,
     as {distribution: specifier}. A plain-text scan, not a TOML parse: python
     3.9 (this package's own `requires-python` floor) has no `tomllib`, and the
     property here is about the literal lines a reviewer reads."""
-    text = PYPROJECT_PATH.read_text()
+    text = pyproject.read_text()
     block = re.search(r"^dependencies = \[(.*?)^\]", text, re.S | re.M)
-    assert block, f"no `dependencies = [...]` block in {PYPROJECT_PATH}"
+    assert block, f"no `dependencies = [...]` block in {pyproject}"
     pins = {}
     for name, spec in re.findall(r'"(nvidia-[a-z0-9-]+-cu12)([^"]*)"', block.group(1)):
         pins[name] = spec
@@ -153,6 +155,30 @@ def bundle_classify(soname: str) -> str:
         f"else echo neither; fi"
     )
     return out.strip()
+
+
+def native_runpath_components() -> tuple:
+    """`crates/jammi-python/build.rs`'s `CUDA_COMPONENTS`: the directories the
+    CUDA extension's RUNPATH names, in order."""
+    m = re.search(r"const CUDA_COMPONENTS: \[&str; \d+\] = \[(.*?)\];",
+                  NATIVE_BUILD_RS.read_text(), re.S)
+    assert m, f"no `CUDA_COMPONENTS` array in {NATIVE_BUILD_RS}"
+    return tuple(re.findall(r'"([^"]+)"', m.group(1)))
+
+
+class NativeWheelContract(unittest.TestCase):
+    """`jammi-ai-native-cu12` states the same contract twice more: its
+    extension's RUNPATH (`build.rs`) is the loader-path half the server's
+    `_entry.py` is, and its `nvidia-*-cu12` pins decide which of those
+    directories exist. Its link set is checked by the same `verify_link_set.py`
+    (`ci/scripts/build_native_cu12_wheel.sh`), so the components must be the
+    server's exactly."""
+
+    def test_the_runpath_names_the_servers_components(self):
+        self.assertEqual(native_runpath_components(), entry_components())
+
+    def test_the_native_wheel_pins_what_the_server_wheel_pins(self):
+        self.assertEqual(pinned_distributions(NATIVE_PYPROJECT_PATH), pinned_distributions())
 
 
 class ComponentContract(unittest.TestCase):

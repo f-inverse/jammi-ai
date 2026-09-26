@@ -34,15 +34,14 @@ fraction, early-stopping patience/metric, warmup, gradient accumulation,
 backbone dtype, weight decay, and gradient clipping — the recipe uses
 the defaults for everything except rank and epochs.
 
-## Performance note
+## Fine-tuning from a graph
 
-This recipe is excluded from the per-PR smoke matrix because even at one
-epoch it runs ~30 seconds on CPU. The nightly cron with
-`JAMMI_COOKBOOK_SLOW=1` includes it. Override the gate locally:
-
-```bash
-JAMMI_COOKBOOK_SLOW=1 python tests/cookbook_smoke.py
-```
+The second half of the recipe trains from a citation graph instead of
+labelled pairs: `fine_tune_graph` samples random walks over the edges
+(`tiny_citation_graph/edges.jsonl`) as positives and the graph's
+non-neighbours as negatives, over the nodes' text
+(`tiny_citation_graph/nodes.jsonl`). Nodes and edges are two ordinary
+registered sources.
 
 ## Run it
 

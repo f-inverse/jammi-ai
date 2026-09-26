@@ -11,7 +11,7 @@ use arrow::datatypes::Field;
 
 pub use classification::ClassificationAdapter;
 pub use distribution::{DistributionAdapter, DistributionForm};
-pub use embedding::EmbeddingAdapter;
+pub use embedding::{matryoshka_prefix, EmbeddingAdapter};
 
 use crate::error::{Error, Result};
 use crate::inference::output::BackendOutput;
@@ -28,11 +28,21 @@ pub trait OutputAdapter: Send + Sync {
     fn adapt(&self, output: BackendOutput, row_count: usize) -> Result<Vec<ArrayRef>>;
 }
 
-/// Create an adapter for a given task with model-derived dimensions.
-pub fn create_adapter(task: ModelTask, model: &dyn BoundModel) -> Result<Box<dyn OutputAdapter>> {
+/// Create an adapter for a given task with model-derived dimensions. An
+/// embedding task serves `embedding_dim` coordinates when given — a
+/// Matryoshka prefix of the model's width — and the model's width otherwise.
+pub fn create_adapter(
+    task: ModelTask,
+    model: &dyn BoundModel,
+    embedding_dim: Option<usize>,
+) -> Result<Box<dyn OutputAdapter>> {
     match task {
         ModelTask::TextEmbedding | ModelTask::ImageEmbedding | ModelTask::AudioEmbedding => {
-            Ok(Box::new(EmbeddingAdapter::new(model.embedding_dim())))
+            let native = model.embedding_dim();
+            Ok(Box::new(EmbeddingAdapter::serving(
+                native,
+                embedding_dim.unwrap_or(native),
+            )?))
         }
         ModelTask::Classification => Ok(Box::new(ClassificationAdapter)),
         ModelTask::Ner => Ok(Box::new(ner::NerAdapter)),

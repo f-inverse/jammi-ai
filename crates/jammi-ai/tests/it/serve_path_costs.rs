@@ -210,14 +210,15 @@ async fn session_over(
 
 async fn serve(session: &Arc<InferenceSession>) -> ResultTableRecord {
     session
-        .generate_embeddings(
-            "corpus",
-            &model(),
-            &["text".to_string()],
-            "id",
-            jammi_wire::request::Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "corpus".to_string(),
+            model_id: model().to_string(),
+            columns: vec!["text".to_string()],
+            key_column: "id".to_string(),
+            modality: jammi_wire::request::Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .unwrap()
         .0

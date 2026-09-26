@@ -40,7 +40,8 @@ use std::sync::Arc;
 
 use jammi_ai::fine_tune::data::{TrainingDataLoader, TrainingFormat};
 use jammi_ai::fine_tune::graph_sampler::{
-    EdgeProvenance, GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, TextNode,
+    EdgeProvenance, GraphEdge, GraphEdges, GraphFineTuneSources, GraphSampleConfig, GraphSampler,
+    TextNode,
 };
 use jammi_ai::fine_tune::spec::{TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE};
 use jammi_ai::fine_tune::worker::JobWorker;
@@ -242,9 +243,11 @@ fn graph_spec_round_trip_resamples_identical_pairs() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample_config = GraphSampleConfig {
@@ -370,9 +373,11 @@ async fn graph_sample_is_a_function_of_the_set_not_the_scan_order() {
             node_source: "nodes".into(),
             id_column: "id".into(),
             text_column: "text".into(),
-            edge_source: "edges".into(),
-            src_column: "src".into(),
-            dst_column: "dst".into(),
+            edges: GraphEdges::Source {
+                source: "edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+            },
             provenance: EdgeProvenance::Declared,
         };
         let sample = GraphSampleConfig {
@@ -492,9 +497,11 @@ async fn fine_tune_graph_duplicate_node_id_fails() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let job = session
@@ -592,9 +599,11 @@ async fn fine_tune_graph_reservation_is_sized_against_a_real_measurement() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {
@@ -687,9 +696,11 @@ async fn fine_tune_graph_reservation_is_released_after_the_write_commits() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {
@@ -787,9 +798,11 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {
@@ -829,23 +842,28 @@ async fn fine_tune_graph_materialises_a_graph_training_set_table() {
         .unwrap();
     match descriptor {
         jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet {
-            node_source,
-            edge_source,
-            id_column,
-            text_column,
-            src_column,
-            dst_column,
+            sources,
             format,
             sample,
             read_order_rule,
             ..
         } => {
-            assert_eq!(node_source, "nodes");
-            assert_eq!(edge_source, "edges");
-            assert_eq!(id_column, "id");
-            assert_eq!(text_column, "text");
-            assert_eq!(src_column, "src");
-            assert_eq!(dst_column, "dst");
+            assert_eq!(
+                sources,
+                jammi_db::store::GraphTrainingSources {
+                    node_source: "nodes".into(),
+                    id_column: "id".into(),
+                    text_column: "text".into(),
+                    edges: jammi_db::store::EdgeSourceBinding::Registered {
+                        source_id: "edges".into(),
+                        src_column: "src".into(),
+                        dst_column: "dst".into(),
+                        type_column: None,
+                        weight_column: None,
+                        as_of_column: None,
+                    },
+                }
+            );
             assert_eq!(
                 format, "triplet",
                 "hard_negatives=1 must record the triplet format"
@@ -936,9 +954,11 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {
@@ -954,7 +974,7 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
         epochs: 1,
         batch_size: 4,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         validation_fraction: 0.0,
         early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
         ..Default::default()
@@ -1105,9 +1125,11 @@ async fn graph_training_set_recompute_is_byte_identical_over_unmoved_sources() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {
@@ -1283,9 +1305,11 @@ async fn two_community_graph(dir: &std::path::Path) -> TwoCommunityGraph {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
     let sample = GraphSampleConfig {
@@ -1301,7 +1325,7 @@ async fn two_community_graph(dir: &std::path::Path) -> TwoCommunityGraph {
         epochs: 1,
         batch_size: 4,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         validation_fraction: 0.0,
         early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
         embedding_loss: Some(
@@ -1416,6 +1440,114 @@ async fn a_repeated_graph_fine_tune_over_unmoved_sources_reuses_the_published_mo
             .await
             .expect("both rows serve the shared bundle");
     }
+}
+
+/// A graph fine-tune walks an engine-built neighbour graph directly: the node
+/// text is embedded, `build_neighbor_graph` materialises its kNN edges, and the
+/// fine-tune names that table as its edges — no export, no re-registration.
+/// The training set anchors the graph by its content digest (a result table is
+/// exactly pinned) and records it as a `NeighborGraph` binding, so a staleness
+/// read or a recompute resolves the same table.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_graph_fine_tune_walks_an_engine_built_neighbour_graph() {
+    let dir = TempDir::new().unwrap();
+    let graph = two_community_graph(dir.path()).await;
+    let session = &graph.session;
+    let (embeddings, _) = session
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "nodes".to_string(),
+            model_id: graph.model.to_string(),
+            columns: vec!["text".to_string()],
+            key_column: "id".to_string(),
+            modality: jammi_wire::request::Modality::Text,
+            dimensions: None,
+            cache: CachePolicy::Bypass,
+        })
+        .await
+        .unwrap();
+    let (neighbours, _) = session
+        .build_neighbor_graph(
+            "nodes",
+            Some(&embeddings.table_name),
+            &jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph {
+                k: 2,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap();
+
+    let sources = GraphFineTuneSources {
+        edges: GraphEdges::Table(neighbours.table_name.clone()),
+        provenance: EdgeProvenance::Similarity,
+        ..graph.sources.clone()
+    };
+    let (_, result) = run_graph_spec(
+        session,
+        TrainingSpec::GraphFineTune {
+            sources,
+            // A 2-NN graph over six nodes leaves every anchor's one-hop
+            // exclusion covering the pool; in-batch negatives train over it.
+            sample_config: GraphSampleConfig {
+                hard_negatives: 0,
+                ..graph.sample
+            },
+            common: TrainingCommon {
+                base_model: graph.model.clone(),
+                config: graph.train.clone(),
+                world_size: DEFAULT_WORLD_SIZE,
+                cache: CachePolicy::Bypass,
+            },
+        },
+    )
+    .await;
+    let JobResult::Model { metrics, .. } = result else {
+        panic!("a training kind's result is a model result: {result:?}");
+    };
+    assert!(metrics.is_some(), "the run trains over the neighbour graph");
+
+    let training_set = session
+        .catalog()
+        .list_result_tables_by_status(jammi_db::catalog::status::ResultTableStatus::Ready)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.kind == jammi_db::catalog::result_repo::ResultTableKind::TrainingSet)
+        .expect("the run materialises its training set");
+    let manifest_of = |record: jammi_db::catalog::result_repo::ResultTableRecord| async move {
+        let url = jammi_db::storage::StorageUrl::parse(&record.parquet_path).unwrap();
+        session
+            .result_store()
+            .read_materialization_manifest(&url)
+            .await
+            .unwrap()
+            .expect("every result table carries a materialization manifest")
+    };
+    let manifest = manifest_of(training_set).await;
+    let graph_digest = manifest_of(neighbours.clone()).await.artifact;
+    assert!(
+        manifest
+            .input_anchors
+            .contains(&jammi_db::store::manifest::InputAnchor::result_digest(
+                &neighbours.table_name,
+                &graph_digest,
+            )),
+        "the training set pins the neighbour graph by digest: {:?}",
+        manifest.input_anchors
+    );
+    let jammi_db::store::manifest::ProducingDescriptor::GraphTrainingSet { sources, .. } =
+        &manifest.descriptor
+    else {
+        panic!("a graph training set: {:?}", manifest.descriptor);
+    };
+    assert_eq!(
+        sources.edges,
+        jammi_db::store::EdgeSourceBinding::NeighborGraph {
+            table_name: neighbours.table_name.clone(),
+        }
+    );
 }
 
 /// `fine_tune_graph` reads a node source + a declared-edge source, samples the
@@ -1561,9 +1693,11 @@ async fn fine_tune_graph_isolated_graph_fails() {
         node_source: "nodes".into(),
         id_column: "id".into(),
         text_column: "text".into(),
-        edge_source: "edges".into(),
-        src_column: "src".into(),
-        dst_column: "dst".into(),
+        edges: GraphEdges::Source {
+            source: "edges".into(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+        },
         provenance: EdgeProvenance::Declared,
     };
 

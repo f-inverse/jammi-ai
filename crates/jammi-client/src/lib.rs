@@ -24,11 +24,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Float32Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use futures::{Stream, StreamExt, TryStreamExt};
 use tonic::transport::Endpoint;
@@ -56,12 +54,13 @@ use jammi_wire::proto::embedding::embedding_service_client::EmbeddingServiceClie
 use jammi_wire::proto::embedding::{
     encode_query_request::Input as ProtoEncodeInput, search_request::Query as ProtoSearchQuery,
     CompactEmbeddingsRequest, EncodeQueryRequest, ExpireVersionsRequest, GenerateEmbeddingsRequest,
-    QueryVector, RefreshEmbeddingsRequest, SearchRequest as ProtoSearchRequest, SearchResponse,
+    LexicalSearchRequest as ProtoLexicalSearchRequest, QueryVector, RefreshEmbeddingsRequest,
+    SearchRequest as ProtoSearchRequest,
 };
 use jammi_wire::proto::eval as eval_pb;
 use jammi_wire::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_wire::proto::inference::inference_service_client::InferenceServiceClient;
-use jammi_wire::proto::inference::{CachePolicy as ProtoCachePolicy, InferRequest};
+use jammi_wire::proto::inference::InferRequest;
 use jammi_wire::proto::job::job_service_client::JobServiceClient;
 use jammi_wire::proto::job::{
     submit_job_request::Spec as ProtoTrainingSpec, CancelJobRequest as JobCancelJobRequest,
@@ -71,12 +70,13 @@ use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use jammi_wire::request::{
-    FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+    EmbeddingRequest, FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput,
+    SearchQuery, SearchRequest,
 };
 use jammi_wire::{
-    audit_error_from_status, cohorts_to_proto, config_to_proto, decode_ipc_stream,
-    decode_subscribed_batch, encode_publish_batch, error_from_status, eval_task_to_proto,
-    method_to_proto, model_task_to_proto, record_from_wire, result_table_from_proto,
+    audit_error_from_status, cohorts_to_proto, config_to_proto, decode_subscribed_batch,
+    encode_publish_batch, error_from_status, eval_task_to_proto, method_to_proto,
+    model_task_to_proto, record_from_wire, result_rows_from_proto, result_table_from_proto,
     trigger_error_from_status, SessionChannel, SessionTransport, SESSION_HEADER,
 };
 
@@ -204,26 +204,31 @@ impl DataClient {
 
     // --- embeddings ------------------------------------------------------
 
-    /// Generate embeddings for `columns` of a source with the given model and
-    /// modality, persisting one vector per row.
+    /// Generate embeddings for a source's `columns` with the request's model
+    /// and modality, persisting one vector per row at the request's width.
     pub async fn generate_embeddings(
         &self,
-        source_id: &str,
-        model_id: &str,
-        columns: &[String],
-        key_column: &str,
-        modality: Modality,
-        cache: CachePolicy,
+        request: EmbeddingRequest,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
+        let EmbeddingRequest {
+            source_id,
+            model_id,
+            columns,
+            key_column,
+            modality,
+            dimensions,
+            cache,
+        } = request;
         let table = self
             .embedding_client()
             .generate_embeddings(GenerateEmbeddingsRequest {
-                source_id: source_id.to_string(),
-                model_id: model_id.to_string(),
-                columns: columns.to_vec(),
-                key_column: key_column.to_string(),
+                source_id,
+                model_id,
+                columns,
+                key_column,
                 modality: proto_modality(modality) as i32,
-                cache: proto_cache_policy(cache) as i32,
+                cache: jammi_wire::cache_policy_to_proto(cache) as i32,
+                dimensions: dimensions.map(|d| d as u32),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -234,12 +239,14 @@ impl DataClient {
         Ok((record, outcome))
     }
 
-    /// Encode a single query into a vector with the given model.
+    /// Encode a single query into a vector with the given model, at
+    /// `dimensions` (a Matryoshka prefix) or the model's own width.
     pub async fn encode_query(
         &self,
         model_id: &str,
         input: QueryInput,
         modality: Modality,
+        dimensions: Option<usize>,
     ) -> Result<Vec<f32>> {
         let input = match input {
             QueryInput::Text(text) => ProtoEncodeInput::Text(text),
@@ -251,6 +258,7 @@ impl DataClient {
                 model_id: model_id.to_string(),
                 modality: proto_modality(modality) as i32,
                 input: Some(input),
+                dimensions: dimensions.map(|d| d as u32),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -319,7 +327,7 @@ impl DataClient {
             embedding_table,
             filter,
             select,
-            oversample,
+            method,
         } = request;
         let query = match query {
             SearchQuery::Vector(values) => ProtoSearchQuery::QueryVector(QueryVector { values }),
@@ -333,13 +341,39 @@ impl DataClient {
                 k: k as u32,
                 embedding_table,
                 filter,
-                select: select.clone(),
-                oversample: oversample.map(|v| v as u32),
+                select,
+                method: jammi_wire::search_method_to_proto(method),
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
-        hits_to_batch(resp, &select)
+        result_rows_from_proto(resp.result).map_err(|s| error_from_status(&s))
+    }
+
+    /// Run a lexical (BM25) search and return the terminal hydrated batches.
+    pub async fn lexical_search(&self, request: LexicalSearchRequest) -> Result<Vec<RecordBatch>> {
+        let LexicalSearchRequest {
+            source_id,
+            text,
+            k,
+            lexical_table,
+            filter,
+            select,
+        } = request;
+        let resp = self
+            .embedding_client()
+            .lexical_search(ProtoLexicalSearchRequest {
+                source_id,
+                text,
+                k: k as u32,
+                filter,
+                select,
+                lexical_table,
+            })
+            .await
+            .map_err(|s| error_from_status(&s))?
+            .into_inner();
+        result_rows_from_proto(resp.result).map_err(|s| error_from_status(&s))
     }
 
     // --- inference -------------------------------------------------------
@@ -363,16 +397,14 @@ impl DataClient {
                 columns: content_columns.to_vec(),
                 key_column: key_column.to_string(),
                 tenant_id: String::new(),
-                cache: proto_cache_policy(cache) as i32,
+                cache: jammi_wire::cache_policy_to_proto(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
             .into_inner();
         let outcome = jammi_wire::cache_outcome_from_proto(resp.cache_outcome)
             .map_err(|s| error_from_status(&s))?;
-        let batch = resp.result.unwrap_or_default();
-        let batches = decode_ipc_stream(&batch.data_header, &batch.data_body)
-            .map_err(|s| error_from_status(&s))?;
+        let batches = result_rows_from_proto(resp.result).map_err(|s| error_from_status(&s))?;
         Ok((batches, outcome))
     }
 
@@ -444,33 +476,16 @@ impl DataClient {
                 base_model,
                 config: config.as_ref().map(config_to_proto),
                 idempotency_key: String::new(),
-                // `0` IS the unset value of the wire's implicit-presence
-                // `uint32`, so an unchosen count sends the same bytes a caller
-                // sent before the field existed and the engine resolves it to
-                // one rank. An explicit `1` denotes that same single-rank job,
-                // so it takes that same encoding: one wire value per intent,
-                // matching what the Python client puts on the wire
-                // (`_wire_world_size`). Only a count above one is written.
+                // `0` is the implicit-presence `uint32`'s unset value, which the
+                // engine resolves to one rank. An explicit `1` is that same
+                // single-rank job, so it takes the same encoding — one wire
+                // value per intent, as the Python client's `_wire_world_size`.
+                // Only a count above one is written.
                 world_size: world_size
                     .map(NonZeroU32::get)
                     .filter(|&ranks| ranks > 1)
                     .unwrap_or(0),
-                // `Bypass` (the engine default) leaves the field OFF the
-                // encoding entirely — `UNSPECIFIED` is `0`, the implicit-
-                // presence enum's unset value, and `Bypass`/`UNSPECIFIED`
-                // decode identically (`crates/jammi-ai/src/wire/training.rs`,
-                // `unspecified_and_bypass_cache_both_decode_to_bypass`) — so a
-                // caller that never asks for reuse submits byte-for-byte the
-                // request it submitted before this field existed, matching
-                // the Python client's `_wire_cache_policy_for_submit_job`
-                // (`clients/python/jammi/_assembly.py`), which leaves the
-                // field unset the same way. Only `Use` costs a byte on the
-                // wire, the one case that changes what the engine does with
-                // the request.
-                cache: match cache {
-                    CachePolicy::Use => ProtoCachePolicy::Use as i32,
-                    CachePolicy::Bypass => ProtoCachePolicy::Unspecified as i32,
-                },
+                cache: jammi_wire::cache_policy_to_proto(cache) as i32,
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -897,15 +912,6 @@ impl DataClient {
     }
 }
 
-/// Map the engine [`CachePolicy`] onto the wire enum. Encode is total.
-fn proto_cache_policy(cache: CachePolicy) -> jammi_wire::proto::inference::CachePolicy {
-    use jammi_wire::proto::inference::CachePolicy as Pb;
-    match cache {
-        CachePolicy::Use => Pb::Use,
-        CachePolicy::Bypass => Pb::Bypass,
-    }
-}
-
 /// Map the engine [`Modality`] onto the wire enum. Encode is total (the engine
 /// never holds an unspecified modality), so this is a plain `From`-shaped match
 /// rather than the fallible decode the server side runs.
@@ -916,44 +922,6 @@ fn proto_modality(modality: Modality) -> jammi_wire::proto::embedding::Modality 
         Modality::Image => Pb::Image,
         Modality::Audio => Pb::Audio,
     }
-}
-
-/// Rebuild the terminal `Vec<RecordBatch>` shape a search verb returns from the
-/// wire `SearchResponse`.
-///
-/// The wire surface carries each hit as `key` + `score` + a `columns` map of
-/// stringified projections, so the client rehydrates one batch with the
-/// `_row_id` (key) and `similarity` (score) columns the in-process hydrated
-/// batch carries, plus a `Utf8` column per requested `select` name.
-fn hits_to_batch(resp: SearchResponse, select: &[String]) -> Result<Vec<RecordBatch>> {
-    if resp.hits.is_empty() {
-        return Ok(Vec::new());
-    }
-    let keys: Vec<&str> = resp.hits.iter().map(|h| h.key.as_str()).collect();
-    let scores: Vec<f32> = resp.hits.iter().map(|h| h.score).collect();
-
-    let mut fields: Vec<Field> = vec![
-        Field::new("_row_id", DataType::Utf8, false),
-        Field::new("similarity", DataType::Float32, false),
-    ];
-    let mut arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(keys)),
-        Arc::new(Float32Array::from(scores)),
-    ];
-    for name in select {
-        let values: Vec<String> = resp
-            .hits
-            .iter()
-            .map(|h| h.columns.get(name).cloned().unwrap_or_default())
-            .collect();
-        fields.push(Field::new(name, DataType::Utf8, false));
-        arrays.push(Arc::new(StringArray::from(values)));
-    }
-
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| JammiError::Other(format!("rebuild search batch: {e}")))?;
-    Ok(vec![batch])
 }
 
 /// `wait_job`/`subscribe` must send NO
@@ -1567,12 +1535,11 @@ mod world_size_tests {
     /// reference's field is `0` by construction, not by mirroring the
     /// production code under test). A regression back to an explicit
     /// `CACHE_POLICY_BYPASS` (`2`) diverges from this reference and fails —
-    /// the same no-regression property
+    /// the same one-encoding property
     /// `an_explicit_single_rank_encodes_as_the_unset_request` pins for
-    /// `world_size`, and the Python client's own golden-bytes oracle
+    /// `world_size`, and the Python client pins for `cache`
     /// (`clients/python/tests/test_cache_policy.py`,
-    /// `test_default_leaves_the_field_off_the_encoding_entirely`) pins for
-    /// `cache`.
+    /// `test_default_leaves_the_field_off_the_encoding_entirely`).
     #[tokio::test]
     async fn a_bypass_cache_policy_leaves_the_field_off_the_wire() {
         use jammi_wire::method_to_proto;

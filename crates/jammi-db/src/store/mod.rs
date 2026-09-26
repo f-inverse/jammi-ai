@@ -29,10 +29,10 @@ pub use freshness::{
 pub use layout::TenantSegment;
 pub use manifest::{
     AnchorKind, AnchorValue, ArtifactDigest, ComputeDevice, ContentDigest, DefinitionHash,
-    DeletePolicy, GraphSampleFields, InputAnchor, LeafDigest, LeafKey, LocalRun, ManifestError,
-    MatchVerdict, Materialization, MaterializationEnv, MaterializationManifest, ModelIdentity,
-    ModelRun, PartitionVerdict, ProducingDescriptor, GRAPH_READ_ORDER_RULE_V1,
-    TRAINING_SET_ORDER_RULE_V1,
+    DeletePolicy, EdgeSourceBinding, GraphSampleFields, GraphTrainingSources, InputAnchor,
+    LeafDigest, LeafKey, LocalRun, ManifestError, MatchVerdict, Materialization,
+    MaterializationEnv, MaterializationManifest, ModelIdentity, ModelRun, PartitionVerdict,
+    ProducingDescriptor, GRAPH_READ_ORDER_RULE_V1, TRAINING_SET_ORDER_RULE_V1,
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
@@ -805,12 +805,19 @@ mod from_record_tests {
     #[test]
     fn from_record_with_a_graph_training_set_descriptor_orders_by_its_ordinal() {
         let descriptor = ProducingDescriptor::graph_training_set(
-            "nodes",
-            "edges",
-            "id",
-            "text",
-            "src",
-            "dst",
+            manifest::GraphTrainingSources {
+                node_source: "nodes".into(),
+                id_column: "id".into(),
+                text_column: "text".into(),
+                edges: manifest::EdgeSourceBinding::Registered {
+                    source_id: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                    type_column: None,
+                    weight_column: None,
+                    as_of_column: None,
+                },
+            },
             ModelTask::TextEmbedding,
             "pairs",
             manifest::GraphSampleFields {
@@ -1436,13 +1443,6 @@ pub(crate) enum ExpiredRowOutcome {
     Promote {
         /// Every key this row references RIGHT NOW.
         keeps: BTreeSet<String>,
-        /// Directory-shaped sidecar prefixes (`SidecarKind::Lexical`'s
-        /// `.tantivy`) this row currently references — carried separately
-        /// because [`ReferencedKeys`](crate::store::reconcile::ReferencedKeys)
-        /// matches these by PREFIX, never exact equality. Always empty in
-        /// practice (an embedding-task building row's segments are
-        /// ANN-only — see [`ResultStore::append_segment`]).
-        dir_prefixes: BTreeSet<String>,
     },
     /// The Parquet itself is absent: nothing to reap, promote, or protect —
     /// only the `building -> failed` CAS runs (apply).
@@ -2828,10 +2828,7 @@ impl ResultStore {
         let referenced = self
             .referenced_result_keys(std::slice::from_ref(table), &[])
             .await?;
-        Ok(ExpiredRowOutcome::Promote {
-            keeps: referenced.exact,
-            dir_prefixes: referenced.dir_prefixes,
-        })
+        Ok(ExpiredRowOutcome::Promote { keeps: referenced })
     }
 
     /// The root-relative ANN sidecar-sibling keys a table's CURRENT

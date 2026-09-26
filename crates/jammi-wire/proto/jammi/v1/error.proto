@@ -138,6 +138,14 @@ message JammiErrorDetail {
     // the attempt is spent and its successor runs on the executors that
     // remain; nothing about the plan or its caller must change.
     ExecutorLostError executor_lost = 46;
+    // `JammiError::MissingManifest { table }` — a read of a result table's
+    // recorded materialization found no sidecar. The absent-resource
+    // convention `VersionUnavailable` follows: maps to `NOT_FOUND`.
+    MissingManifestError missing_manifest = 47;
+    // `JammiError::NoQueryEncoder { table, producer }` — a query could not be
+    // encoded into a table whose vectors no engine encoder produced. The
+    // caller's request names an impossible encode: `INVALID_ARGUMENT`.
+    NoQueryEncoderError no_query_encoder = 48;
   }
   // Tag 15 / `model_retired` are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -247,6 +255,19 @@ message DependencyCycleError {
 // recorded descriptor, or an `External`-producer table).
 message NotRecomputableError {
   string table = 1;
+}
+
+// `JammiError::MissingManifest { table }`. The table carries no
+// `.materialization.json` sidecar, so it has no recorded definition to
+// describe.
+message MissingManifestError {
+  string table = 1;
+}
+
+// `JammiError::NoQueryEncoder { table, producer }`.
+message NoQueryEncoderError {
+  string table = 1;
+  string producer = 2;
 }
 
 // `JammiError::Unavailable`: the resource that could not be served (`segment

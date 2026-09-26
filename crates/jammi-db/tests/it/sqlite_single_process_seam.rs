@@ -38,13 +38,13 @@
 //!    `catalog.db-wal` is best-effort — SQLite removes it only when the last
 //!    close's PASSIVE checkpoint completes, so it can outlive a fully
 //!    released file. `close().await` is the barrier; the files are not.
-//! 4. [`closing_one_of_two_live_pools_is_bounded_and_leaves_the_other_working`]
+//! 4. [`closing_one_of_two_live_pools_skips_the_settle_wait_and_leaves_the_other_working`]
 //!    — the same point from the other direction. The seam is single-*process*,
 //!    so two pools on one file inside this process are supported, and the
-//!    `-wal` the settle wait watches belongs to the FILE: the survivor keeps it
-//!    alive, so the first `close()` runs its settle loop to the ceiling and
-//!    warns. That is a bounded cost and a log line, not a correctness loss —
-//!    the close returns, and the survivor reads and writes across it.
+//!    `-wal` the settle wait watches belongs to the FILE: while the survivor
+//!    holds it there is nothing to wait for, so the first `close()` drains its
+//!    own connections and returns, and the survivor reads and writes across
+//!    it.
 //!
 //! ## Re-demonstrating the failure the seam prevents
 //!
@@ -112,15 +112,8 @@ const RELEASE_ITERATIONS: usize = 8;
 const CONTRACT_PHRASE: &str = "single-process only";
 
 /// Mirror of `backend_sqlite::CLOSE_SIDECAR_CEILING` (private to the crate):
-/// the bound on `close()`'s post-drain wait for `-wal` disappearance.
+/// the bound on the last close's post-drain wait for `-wal` disappearance.
 const CLOSE_SIDECAR_CEILING: Duration = Duration::from_secs(2);
-
-/// What a close that cannot see its evidence is allowed to cost: the settle
-/// ceiling plus slack for the pool drain and a loaded CI box. The point of the
-/// assertion is BOUNDEDNESS — that a second live pool makes the first close
-/// slow, never hung — so the slack is deliberately generous; a regression that
-/// turned the wait unbounded would blow past this by orders of magnitude.
-const CLOSE_CEILING_WITH_SLACK: Duration = Duration::from_secs(20);
 
 // ── Shared probe bodies ─────────────────────────────────────────────────────
 
@@ -775,23 +768,15 @@ fn closing_the_catalog_releases_the_file_and_its_sidecars() {
 /// inside this process are legal and supported — and `close()`'s settle wait
 /// watches `catalog.db-wal`, which is evidence about the FILE, not about the
 /// pool being closed. While the survivor is live the `-wal` cannot disappear,
-/// so the first `close()` necessarily runs its settle loop to the ceiling and
-/// logs the "may still be held" warning.
+/// so a close that is not the file's last has nothing to wait for:
 ///
-/// This pins that as a bounded COST, not a correctness loss:
-///
-///   * the first `close()` RETURNS (within the settle ceiling plus slack) —
-///     the wait is bounded by construction, never a hang; and
+///   * the first `close()` drains its own connections and RETURNS without the
+///     settle wait — well inside the ceiling a wait would run to; and
 ///   * the second pool keeps working across it — it reads what it wrote before
 ///     the first close, writes again after it, and reads that back. Closing
 ///     one pool must not disturb another pool's connections.
-///
-/// The elapsed time is reported rather than asserted tight: a close that finds
-/// the `-wal` gone early is just as correct as one that burns the ceiling, and
-/// asserting the slow shape would pin the current mechanism rather than the
-/// property.
 #[test]
-fn closing_one_of_two_live_pools_is_bounded_and_leaves_the_other_working() {
+fn closing_one_of_two_live_pools_skips_the_settle_wait_and_leaves_the_other_working() {
     dispatch_child();
     let rt = runtime();
     let dir = tempfile::tempdir().unwrap();
@@ -828,10 +813,10 @@ fn closing_one_of_two_live_pools_is_bounded_and_leaves_the_other_working() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < CLOSE_CEILING_WITH_SLACK,
-        "closing one of two live pools took {elapsed:?}; the settle wait must be BOUNDED (the \
-         survivor's `-wal` can never disappear, so the loop runs to its {CLOSE_SIDECAR_CEILING:?} \
-         ceiling and returns — it must not hang)"
+        elapsed < CLOSE_SIDECAR_CEILING,
+        "closing one of two live pools took {elapsed:?}: a close that is not the file's last \
+         must not wait for a `-wal` the survivor keeps alive (the wait would run to its \
+         {CLOSE_SIDECAR_CEILING:?} ceiling)"
     );
 
     // The survivor is untouched: it reads what it wrote, writes again, and
@@ -896,8 +881,8 @@ fn closing_one_of_two_live_pools_is_bounded_and_leaves_the_other_working() {
     );
 
     eprintln!(
-        "[seam] closing 1 of 2 live pools on one file returned in {elapsed:?} (settle \
-         ceiling {CLOSE_SIDECAR_CEILING:?}); the survivor read and wrote across it"
+        "[seam] closing 1 of 2 live pools on one file returned in {elapsed:?}; the survivor \
+         read and wrote across it"
     );
 
     // Closing the survivor is the last close, so this one CAN see the `-wal` go.

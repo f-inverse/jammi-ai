@@ -12,6 +12,7 @@ use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_datafusion::RowOrder;
 use jammi_datafusion::{plan_inference, InferenceSpec};
+use jammi_wire::request::EmbeddingRequest;
 
 /// The described model's identity for one embedding definition: the model
 /// source, its embedding width, and the output-affecting environment the
@@ -43,6 +44,39 @@ pub(crate) async fn embedding_definition(
         model_source,
         embedding_dim,
         env,
+    })
+}
+
+/// The width an embedding of `model_id` is served at: `dimensions` — a
+/// Matryoshka prefix of the model's `native` width — or `native` when `None`.
+/// A width of zero, or wider than the model's, is refused.
+pub(crate) fn served_width(
+    model_id: &str,
+    native: usize,
+    dimensions: Option<usize>,
+) -> Result<usize> {
+    match dimensions {
+        None => Ok(native),
+        Some(width) if (1..=native).contains(&width) => Ok(width),
+        Some(width) => Err(JammiError::Config(format!(
+            "cannot serve {width} dimensions of '{model_id}', whose embeddings are {native} wide"
+        ))),
+    }
+}
+
+/// A query vector served at `dimensions` ([`served_width`]): its leading
+/// coordinates, L2-renormalised, so it searches a table generated at the same
+/// width.
+pub(crate) fn serve_query(
+    model_id: &str,
+    vector: Vec<f32>,
+    dimensions: Option<usize>,
+) -> Result<Vec<f32>> {
+    let width = served_width(model_id, vector.len(), dimensions)?;
+    Ok(if width == vector.len() {
+        vector
+    } else {
+        jammi_datafusion::matryoshka_prefix(&vector, width)
     })
 }
 
@@ -109,24 +143,18 @@ pub async fn build_embedding_plan(
 /// Orchestrates embedding generation: source scan → InferenceExec → the
 /// result-table sink → index.
 ///
-/// Modality-agnostic — works for both text (`ModelTask::TextEmbedding`) and
-/// image (`ModelTask::ImageEmbedding`) by dispatching through InferenceExec.
+/// Modality-agnostic — every tower runs through InferenceExec, the request's
+/// modality naming the task.
 pub struct EmbeddingPipeline<'a> {
     session: &'a InferenceSession,
     result_store: &'a ResultStore,
-    task: ModelTask,
 }
 
 impl<'a> EmbeddingPipeline<'a> {
-    pub fn new(
-        session: &'a InferenceSession,
-        result_store: &'a ResultStore,
-        task: ModelTask,
-    ) -> Self {
+    pub fn new(session: &'a InferenceSession, result_store: &'a ResultStore) -> Self {
         Self {
             session,
             result_store,
-            task,
         }
     }
 
@@ -141,23 +169,30 @@ impl<'a> EmbeddingPipeline<'a> {
     /// runs so the surface is uniform and the honest off-ness is provable.
     pub async fn run(
         &self,
-        source_id: &str,
-        model_id: &str,
-        columns: &[String],
-        key_column: &str,
-        cache: CachePolicy,
+        request: &EmbeddingRequest,
         job_attempt: Option<jammi_db::catalog::result_repo::JobAttempt<'_>>,
     ) -> Result<(ResultTableRecord, CacheOutcome)> {
+        let EmbeddingRequest {
+            source_id,
+            model_id,
+            columns,
+            key_column,
+            modality,
+            dimensions,
+            cache,
+        } = request;
+        let task = modality.task();
         // Describe the model: its embedding width and the output-affecting
         // environment the definition hash folds. Nothing is loaded here —
         // the plan's executing process materializes the weights.
         let EmbeddingDefinition {
             model_source,
-            embedding_dim,
+            embedding_dim: native,
             env,
-        } = embedding_definition(self.session, model_id, self.task)
+        } = embedding_definition(self.session, model_id, task)
             .instrument(tracing::debug_span!("embed.definition"))
             .await?;
+        let embedding_dim = served_width(model_id, native, *dimensions)?;
 
         // The materialization contract is knowable here — the model is
         // described (so `embedding_dim` is fixed) and the source is named — so the cache
@@ -167,7 +202,7 @@ impl<'a> EmbeddingPipeline<'a> {
         let canonical_model_id = model_source.to_string();
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::Embedding {
             model_id: canonical_model_id.clone(),
-            task: self.task,
+            task,
             source_id: source_id.to_string(),
             columns: columns.to_vec(),
             key_column: key_column.to_string(),
@@ -178,7 +213,7 @@ impl<'a> EmbeddingPipeline<'a> {
             chrono::Utc::now().to_rfc3339(),
         )];
 
-        if cache == CachePolicy::Use {
+        if *cache == CachePolicy::Use {
             let def_hash = jammi_db::store::manifest::MaterializationManifest::definition_of(
                 &descriptor,
                 &env,
@@ -202,7 +237,7 @@ impl<'a> EmbeddingPipeline<'a> {
             .result_store
             .create_table(
                 source_id,
-                self.task,
+                task,
                 jammi_db::catalog::result_repo::ResultTableKind::Model,
                 None,
                 &canonical_model_id,
@@ -221,7 +256,7 @@ impl<'a> EmbeddingPipeline<'a> {
             self.session,
             source_id,
             model_source,
-            self.task,
+            task,
             columns,
             key_column,
             embedding_dim,

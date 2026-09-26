@@ -4,274 +4,120 @@ title: "The closed eval loop"
 
 ```{python}
 # | echo: false
-import jammi_cookbook  # applies the determinism contract before any heavy import
+import jammi_cookbook
 ```
 
-This is the closing chapter: the whole spine run as **one measured pass** over
-the committed cache —
+This is the closing chapter of the keystone: the whole spine run as **one
+measured pass** from a fresh engine —
 
 > **construct → propagate → learn → predict & quantify → MEASURE**
 
-— asserting the *full chain* of golden metrics in order. It is the end-to-end
-proof that the substrate delivers: one runnable loop from raw embeddings to a
-calibrated, audited prediction, every stage carrying a measured verdict. Nothing
-upstream is recomputed; every number is read from the committed artifacts or
-recomputed on CPU from them and asserted against `golden_metrics.json` via the
-measurement rail.
+— every stage carrying a measured verdict, each checked against the golden the
+stage's own chapter froze. So this chapter is also the book's consistency check:
+the spine run end to end must reproduce what its tiers measured one at a time.
 
 ```{python}
-import collections
+import tempfile
 
-import numpy as np
 import jammi
+import numpy as np
+from jammi_cookbook import contracts, datasets, keystone, scale
 
-from jammi_cookbook import contracts, rails
-
-db = jammi.connect("file:///tmp/jammi_closed_loop")  # CPU arm; conformal is local math
-alpha = round(1 - contracts.golden("arxiv.tier04.nominal_coverage").value, 4)
-print(f"nominal coverage target: {1 - alpha:.2f}   (alpha = {alpha})")
+SCALE = scale.current()
+ALPHA = 0.10
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+golden = keystone.subject_golden(db, arxiv)
+print(f"scale: {SCALE}")
 ```
 
 ## Stage 1 — Construct: the graph carries signal the embeddings cannot
 
-Tier 01 builds the derived similarity graph and contrasts it with the declared
-citation graph. The load-bearing fact is the **citation graph's homophily** on the
-subject label — the precondition the whole loop turns on (it is what later breaks
-conformal exchangeability). We recompute it from the committed edges + labels.
+```{python}
+embeddings = keystone.embed(db, arxiv, SCALE)
+cites = db.sql(
+    f"SELECT a.subject = b.subject AS same FROM {arxiv.cites}.public.{arxiv.cites} e "
+    f"JOIN {arxiv.papers}.public.{arxiv.papers} a ON e.src = a.paper_id "
+    f"JOIN {arxiv.papers}.public.{arxiv.papers} b ON e.dst = b.paper_id"
+).column("same").to_pylist()
+cite_homophily = contracts.assert_close("arxiv.tier01.cite_homophily", sum(cites) / len(cites))
+print(f"citation-graph subject homophily: {cite_homophily:.3f}")
+```
+
+## Stages 2 and 3 — Propagate and Learn
+
+APPNP over the citation graph (a low-pass filter), then a contrastive
+fine-tune supervised by the declared citations, measured side by side against
+the raw embeddings in one `eval_compare`.
 
 ```{python}
-cite = contracts.load_artifact("arxiv.cite_edges").to_pylist()
-papers = contracts.load_artifact("arxiv.papers").to_pylist()
-subject = {p["paper_id"]: p["subject"] for p in papers}
+propagated = keystone.propagate(db, arxiv, embeddings)
+tuned = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
+    epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
+)
+compared = db.eval_compare(
+    embedding_tables=[embeddings, propagated, tuned],
+    source=arxiv.papers, golden_source=golden, k=10,
+)
+raw, prop, ft = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
+contracts.assert_close("arxiv.tier01.precision_at_10", raw)
+contracts.assert_close("arxiv.tier02.precision_at_10", prop)
+contracts.assert_close("arxiv.tier03.declared_precision_at_10", ft)
+print(f"precision@10  raw {raw:.3f} → propagated {prop:.3f} → declared fine-tune {ft:.3f}")
+```
 
-same = sum(subject.get(e["src"]) == subject.get(e["dst"]) for e in cite
-           if e["src"] in subject and e["dst"] in subject)
-cite_homophily = same / len(cite)
-print(f"citation-graph subject homophily: {cite_homophily:.3f}   (random ≈ {1 / 40:.3f})")
-rails.measure("arxiv.tier01.cite_homophily", cite_homophily)
+## Stage 4 — Predict & Quantify
+
+The year predictor, its conformal interval, and the subject classifier's
+conformal set, over the 2018 calibration era and the 2019-onward test era.
+
+```{python}
+predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
+year = {
+    r["paper_id"]: r["year"]
+    for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
+}
+cal_ids, test_ids = arxiv.split["valid"], arxiv.split["test"]
+cal_mean, _ = keystone.predict_years(db, arxiv, predictor, cal_ids)
+test_mean, _ = keystone.predict_years(db, arxiv, predictor, test_ids)
+intervals = db.conformalize_interval(
+    cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=ALPHA
+)
+reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
+contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
+print(f"year interval coverage:       {reg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
+
+scores = keystone.subject_scores(db, arxiv, propagated)
+sets = db.conformalize(
+    scores.cal_scores.tolist(), scores.cal_labels.tolist(), scores.test_scores.tolist(),
+    alpha=ALPHA, score="aps",
+)
+marg_cov = float(np.mean([y in s for y, s in zip(scores.test_labels, sets)]))
+contracts.assert_close("arxiv.tier04.marginal_coverage", marg_cov)
+print(f"subject APS set coverage:     {marg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
 ```
 
 ```{python}
 # | echo: false
-assert cite_homophily > 0.4  # strongly homophilous — the precondition for stage 4
-```
-
-## Stage 2 — Propagate: a low-pass graph filter is a denoiser
-
-Tier 02 propagates the embeddings over the citation graph (APPNP-flavoured
-`degree_normalized` + teleport). The honest test is a downstream measurement:
-same-subject retrieval recall\@10 must *rise*. We read the raw and propagated
-recall from the cache and assert the denoising gain.
-
-```{python}
-raw_recall = rails.measure("arxiv.tier01.recall_at_10",
-                           contracts.golden("arxiv.tier01.recall_at_10").value)
-prop_recall = rails.measure("arxiv.tier02.recall_at_10",
-                            contracts.golden("arxiv.tier02.recall_at_10").value)
-prop_delta = rails.measure("arxiv.tier02.recall_delta",
-                           contracts.golden("arxiv.tier02.recall_delta").value)
-print(f"recall@10 raw → propagated: {raw_recall:.3f} → {prop_recall:.3f}   (Δ {prop_delta:+.3f})")
-```
-
-```{python}
-# | echo: false
-# The low-pass filter is a denoiser: propagation lifts same-subject recall.
-assert prop_delta > 0
-assert abs((prop_recall - raw_recall) - prop_delta) < 1e-6
-```
-
-## Stage 3 — Learn: external supervision beats a self-similarity bootstrap
-
-Tier 03 fine-tunes the encoder contrastively over **declared** citation walks
-(`fine_tune_graph(edge_provenance="declared")`), trained to convergence. The
-frozen recall confirms the largest gain of the three graphs the keystone tried —
-declared citation supervision (SPECTER, Cohan et al. 2020), a self-similarity
-bootstrap (NNCLR, Dwibedi et al. 2021), and a random null.
-
-```{python}
-ft_recall = rails.measure("arxiv.tier03.recall_at_10",
-                          contracts.golden("arxiv.tier03.recall_at_10").value)
-ft_gain = rails.measure("arxiv.tier03.recall_gain_vs_base",
-                        contracts.golden("arxiv.tier03.recall_gain_vs_base").value)
-sim_gain = rails.measure("arxiv.tier03.control_similarity_recall_gain_vs_base",
-                         contracts.golden("arxiv.tier03.control_similarity_recall_gain_vs_base").value)
-rand_gain = rails.measure("arxiv.tier03.control_random_recall_gain_vs_base",
-                          contracts.golden("arxiv.tier03.control_random_recall_gain_vs_base").value)
-print(f"recall@10 declared-edge fine-tune: {ft_recall:.3f}   (Δ {ft_gain:+.3f} over base)")
-print(f"control gains — similarity graph: {sim_gain:+.3f}   random graph: {rand_gain:+.3f}")
-```
-
-```{python}
-# | echo: false
-# The honest finding: declared external supervision wins outright, a
-# self-similarity bootstrap gives a smaller but real gain (not "nothing"), and a
-# random graph hurts. random < base < similarity < declared.
-assert ft_gain > 0
-assert rand_gain < 0 < sim_gain < ft_gain
-assert abs((ft_recall - raw_recall) - ft_gain) < 1e-6
-```
-
-The construct→propagate→learn chain in three numbers: **0.538 → 0.556 → 0.594**
-(recall\@10). Propagation denoises; the declared-edge fine-tune beats the base by
-the largest margin of the three graphs tried — a self-similarity graph gives a
-smaller but real gain, and a random graph hurts. Each step is a real, asserted
-move.
-
-## Stage 4 — Predict & Quantify: the predictor fits, both cruxes under-cover
-
-Tier 04 is the crux Neptune structurally lacks. Two complementary results, both
-recomputed live on CPU from the committed per-row outputs and asserted.
-
-### 4a — The bidirectional win: the gaussian predictor fits
-
-Authoring the keystone surfaced an engine gaussian-collapse bug; the fix made the
-year-regression-conformal workflow run at all. The proof is that the predictor
-fits a real mean (≈ 2018.4, essentially unbiased across eras) with real spread —
-not the old collapse (~2163 / std 0.001).
-
-```{python}
-reg = contracts.load_artifact("arxiv.tier04_regression").to_pylist()
-reg_cal = [r for r in reg if r["split"] == "calibration"]
-reg_test = [r for r in reg if r["split"] == "test"]
-
-cal_mean = float(np.mean([r["pred_mean"] for r in reg_cal]))
-test_mean = float(np.mean([r["pred_mean"] for r in reg_test]))
-pred_std = float(np.mean([r["pred_std"] for r in reg]))
-print(f"predictor mean (cal era / test era): {cal_mean:.2f} / {test_mean:.2f}")
-print(f"mean predictive std:                 {pred_std:.3f}   (real spread — no collapse)")
-
-rails.measure("arxiv.tier04.reg_cal_mean", cal_mean)
-rails.measure("arxiv.tier04.reg_test_mean", test_mean)
-rails.measure("arxiv.tier04.reg_pred_std", pred_std)
-```
-
-```{python}
-# | echo: false
-# The bidirectional win: the predictor fits (≈ 2018.4, real spread) — the
-# regression-conformal workflow runs.
-assert pred_std > 0.05
-assert 2016 < cal_mean < 2021 and 2016 < test_mean < 2021
-```
-
-### 4b — Both conformal cruxes under-cover under the time-split
-
-We rerun the engine's marginal conformal live on CPU against the committed
-per-row outputs. **Both** the year-regression interval and the
-subject-classification set fall *below* the nominal 0.90 — the citation graph's
-homophily (stage 1) carries a non-exchangeable time-split.
-
-```{python}
-# Regression interval — conformalize_interval on the committed gaussian means.
-cal_year = [float(r["true_year"]) for r in reg_cal]
-test_year = [r["true_year"] for r in reg_test]
-intervals = db.conformalize_interval([r["pred_mean"] for r in reg_cal], cal_year,
-                                     [r["pred_mean"] for r in reg_test], alpha=alpha)
-reg_cov = float(np.mean([lo <= test_year[i] <= hi for i, (lo, hi) in enumerate(intervals)]))
-print(f"year-regression interval coverage: {reg_cov:.3f}   (nominal {1 - alpha:.2f})")
-rails.measure("arxiv.tier04.reg_interval_coverage", reg_cov)
-
-# Subject classification — engine APS marginal on the committed class scores.
-preds = contracts.load_artifact("arxiv.tier04_predictions").to_pylist()
-cal = [r for r in preds if r["split"] == "calibration"]
-test = [r for r in preds if r["split"] == "test"]
-marg_sets = db.conformalize([r["scores"] for r in cal], [r["true_label"] for r in cal],
-                            [r["scores"] for r in test], alpha=alpha, score="aps")
-marg_cov = float(np.mean([test[i]["true_label"] in marg_sets[i] for i in range(len(test))]))
-print(f"subject-classification APS coverage: {marg_cov:.3f}   (nominal {1 - alpha:.2f})")
-rails.measure("arxiv.tier04.marginal_coverage", marg_cov)
-```
-
-```{python}
-# | echo: false
-# Both cruxes UNDER-cover under the time-split — the honest finding, recomputed
-# live and asserted against the frozen goldens (0.721 / 0.867).
-assert reg_cov < 1 - alpha
-assert marg_cov < 1 - alpha
-```
-
-### 4c — Weighting moves coverage but restores neither
-
-The textbook covariate-shift remedy is importance-weighted conformal. The keystone
-ran it and froze the records. **Regression** is an *exact* no-op — not because
-cal/test residual magnitudes match (the test era actually runs larger), but because
-residual size is uncorrelated with test-likeness *within* the calibration set, so
-reweighting cannot move the |residual| quantile. **Classification** moves
-coverage — the kNN scheme is the largest mover — but **no scheme reaches nominal**
-(the shift is ≈orthogonal to the APS score). Weighting nudges; it does not repair.
-
-```{python}
-reg_w = contracts.load_artifact("arxiv.tier04_regression_weighting")
-print(f"regression: weighting Δ = {reg_w['weighting_delta']:+.4f}   (exact no-op)")
-rails.measure("arxiv.tier04.reg_weighting_delta", float(reg_w["weighting_delta"]))
-
-cls_w = contracts.load_artifact("arxiv.tier04_weighting")
-deltas = {name: s["delta_vs_marginal"] for name, s in cls_w["schemes"].items()}
-covs = {name: s["coverage"] for name, s in cls_w["schemes"].items()}
-largest = max(deltas, key=lambda n: abs(deltas[n]))
-print(f"classification scheme Δ vs marginal: "
-      f"{ {n: round(d, 4) for n, d in deltas.items()} }")
-print(f"largest mover: {largest} (Δ {deltas[largest]:+.4f} → {covs[largest]:.3f}); "
-      f"none reaches {1 - alpha:.2f}")
-rails.measure("arxiv.tier04.weighting_max_abs_delta", max(abs(d) for d in deltas.values()))
-```
-
-```{python}
-# | echo: false
-# Regression: exact no-op. Classification: kNN is the largest mover, movements are
-# not all toward nominal, and NO scheme reaches the nominal 0.90 — weighting moves
-# coverage but restores neither crux.
-assert reg_w["weighting_delta"] == 0.0                       # exact no-op
-assert largest == "knn"                                      # kNN is the largest classification mover
-assert all(c < 1 - alpha for c in covs.values())             # none reaches nominal
-assert min(deltas.values()) < 0                              # movements not systematically toward nominal
+if SCALE is scale.Scale.FULL:
+    assert raw < min(prop, ft)  # propagation and the declared fine-tune both lift precision
+    assert reg_cov < 1 - ALPHA - 0.1  # the year interval under-covers
+    # The subject set holds nominal, to within three binomial standard errors.
+    assert abs(marg_cov - (1 - ALPHA)) < 3 * np.sqrt(ALPHA * (1 - ALPHA) / len(sets))
 ```
 
 ## The loop, closed
 
-```{python}
-# | echo: false
-# The full golden chain, asserted in one place as the closing verdict. Every
-# number is read from the committed cache (or recomputed on CPU from it) and
-# asserted via the measurement rail above; this block restates the chain so a
-# single failure is unmissable.
-chain = {
-    "tier01 recall@10":              (raw_recall, contracts.golden("arxiv.tier01.recall_at_10").value),
-    "tier02 recall@10 (propagated)": (prop_recall, contracts.golden("arxiv.tier02.recall_at_10").value),
-    "tier03 recall@10 (declared FT)": (ft_recall, contracts.golden("arxiv.tier03.recall_at_10").value),
-    "tier04 predictor cal-era mean": (cal_mean, contracts.golden("arxiv.tier04.reg_cal_mean").value),
-    "tier04 predictor test-era mean": (test_mean, contracts.golden("arxiv.tier04.reg_test_mean").value),
-    "tier04 reg-interval coverage":  (reg_cov, contracts.golden("arxiv.tier04.reg_interval_coverage").value),
-    "tier04 APS marginal coverage":  (marg_cov, contracts.golden("arxiv.tier04.marginal_coverage").value),
-}
-for name, (observed, expected) in chain.items():
-    print(f"  {name:34s} {observed:8.3f}   (golden ≈ {expected})")
-# the two under-coverage cruxes and the two weighting verdicts, restated:
-assert reg_cov < 0.90 and marg_cov < 0.90               # both cruxes under-cover
-assert reg_w["weighting_delta"] == 0.0                  # regression weighting is an exact no-op
-assert all(c < 0.90 for c in covs.values())             # classification weighting reaches none
-print("\nclosed eval loop: full golden chain asserted ✓")
-```
-
-The session's work is done, so it is closed. An embedded engine holds its catalog until
-`close()` returns, which is why `close()` comes before anything removes the directory the
-catalog lives in.
+Every stage above ran live and matched the golden its own chapter froze. At
+`full` scale the spine reads: citation homophily ≈ 0.50 (the precondition);
+propagation lifts same-subject precision, and the declared-edge fine-tune lifts
+it by about as much, though propagation trains nothing. Under the time split the
+year interval under-covers — the finding the governed calibration cohort
+(tier 04) answers — while the subject set holds its coverage, the shift being
+orthogonal to its score. At `small` scale the same pass runs in seconds on a CPU and holds its
+own frozen numbers.
 
 ```{python}
 db.close()
 ```
-
-The spine, in one measured pass:
-
-| Stage | Recipe | Measured verdict |
-|---|---|---|
-| Construct | `build_neighbor_graph` + declared edges | citation homophily 0.50 (the precondition) |
-| Propagate | `propagate_embeddings` (APPNP) | recall 0.538 → **0.556** (low-pass denoising) |
-| Learn | `fine_tune_graph(declared)` | recall **0.594** (Δ +0.056, the largest of declared/similarity/random) |
-| Predict | `train/predict_with_context_predictor` | predictor fits ≈ **2018.4** (the bidirectional win) |
-| Quantify | `conformalize` / `conformalize_interval` | both cruxes **under-cover** (0.721 / 0.867); weighting restores neither |
-
-Every cell executed against the committed cache; every number was asserted
-against the frozen golden. The loop is closed: raw data to a calibrated, audited,
-honestly-quantified prediction — and where the OSS marginal surface cannot repair
-the under-coverage, the chapter says so plainly and forward-points to the governed
-cohort the consumer owns. That honesty *is* the deliverable.

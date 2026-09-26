@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow::array::{Array, StringArray};
 use jammi_ai::local_session::{Modality, QueryInput, SearchQuery, SearchRequest};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_ai::Session;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
@@ -52,14 +53,15 @@ async fn local_session_matches_engine_for_embed_and_search() {
     let session = Session::new(Arc::clone(&engine));
 
     let record = session
-        .generate_embeddings(
-            "patents",
-            &tiny_bert(),
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .unwrap()
         .0;
@@ -76,14 +78,14 @@ async fn local_session_matches_engine_for_embed_and_search() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: SearchMethod::default(),
         })
         .await
         .unwrap();
 
     // Same query straight through the engine builder.
     let via_engine = engine
-        .search("patents", query, 5, None, None)
+        .search("patents", query, 5, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -92,6 +94,108 @@ async fn local_session_matches_engine_for_embed_and_search() {
 
     assert!(!via_session.is_empty());
     assert_eq!(row_ids(&via_session), row_ids(&via_engine));
+}
+
+/// A table generated at `dimensions` serves the model's leading coordinates,
+/// renormalised: each stored vector is the full-width embedding's prefix, the
+/// catalog and descriptor record the served width, a query encoded at the same
+/// width searches it, recompute replays at it, and a width the model does not
+/// have is refused.
+#[tokio::test]
+async fn a_table_generated_at_a_prefix_serves_the_models_leading_coordinates() {
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    seed(&engine).await;
+    let session = Session::new(Arc::clone(&engine));
+    let request = |dimensions| jammi_ai::local_session::EmbeddingRequest {
+        source_id: "patents".to_string(),
+        model_id: tiny_bert(),
+        columns: vec!["abstract".to_string()],
+        key_column: "id".to_string(),
+        modality: Modality::Text,
+        dimensions,
+        cache: jammi_db::store::CachePolicy::Bypass,
+    };
+    let full = session.generate_embeddings(request(None)).await.unwrap().0;
+    let prefix = session
+        .generate_embeddings(request(Some(8)))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        (full.dimensions_raw(), prefix.dimensions_raw()),
+        (Some(32), Some(8))
+    );
+
+    let full_vectors = common::read_table_vectors(&engine, &full).await;
+    let prefix_vectors = common::read_table_vectors(&engine, &prefix).await;
+    for (key, served) in &prefix_vectors {
+        let expected = jammi_datafusion::matryoshka_prefix(&full_vectors[key], 8);
+        let diff: f32 = served
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff < 1e-4, "row {key}: {served:?} vs {expected:?}");
+    }
+
+    let model = tiny_bert();
+    let query = |dimensions| {
+        session.encode_query(
+            &model,
+            QueryInput::Text("quantum error correction".into()),
+            Modality::Text,
+            dimensions,
+        )
+    };
+    let full_query = query(None).await.unwrap();
+    assert_eq!(
+        query(Some(8)).await.unwrap(),
+        jammi_datafusion::matryoshka_prefix(&full_query, 8)
+    );
+    let hits = session
+        .search(SearchRequest {
+            source_id: "patents".to_string(),
+            query: SearchQuery::Vector(query(Some(8)).await.unwrap()),
+            k: 3,
+            embedding_table: Some(prefix.table_name.clone()),
+            filter: None,
+            select: Vec::new(),
+            method: SearchMethod::Exact,
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&hits).len(), 3);
+
+    let replayed = session
+        .recompute(
+            &prefix.table_name,
+            jammi_ai::pipeline::recompute::Cascade::ReportOnly,
+        )
+        .await
+        .unwrap();
+    let replay = &replayed.recomputed[0].recomputed;
+    let replay = engine
+        .catalog()
+        .get_result_table(replay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.dimensions_raw(), Some(8));
+
+    let refused = session
+        .generate_embeddings(request(Some(33)))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("cannot serve 33 dimensions"),
+        "{refused}"
+    );
+    assert!(query(Some(0)).await.is_err());
 }
 
 /// `Session::encode_query` over the text modality matches the engine's
@@ -108,14 +212,15 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
     let session = Session::new(Arc::clone(&engine));
 
     session
-        .generate_embeddings(
-            "patents",
-            &tiny_bert(),
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .unwrap();
 
@@ -124,6 +229,7 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             &tiny_bert(),
             QueryInput::Text("battery".into()),
             Modality::Text,
+            None,
         )
         .await
         .unwrap();
@@ -161,12 +267,12 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: SearchMethod::default(),
         })
         .await
         .unwrap();
     let via_engine_key = engine
-        .search_by_id("patents", &key, 3, None, None)
+        .search_by_id("patents", &key, 3, None, SearchMethod::default())
         .await
         .unwrap()
         .run()
@@ -192,6 +298,7 @@ async fn encode_query_rejects_modality_input_mismatch() {
             "local:whatever",
             QueryInput::Bytes(vec![0, 1, 2]),
             Modality::Text,
+            None,
         )
         .await
         .unwrap_err();
@@ -216,4 +323,74 @@ fn row_ids(batches: &[arrow::array::RecordBatch]) -> Vec<String> {
         }
     }
     ids
+}
+
+/// A filtered search returns the `k` nearest rows that satisfy the filter,
+/// not the rows of the first `k` that happen to: six patents are from 2021,
+/// and the four nearest of them come back even when they are not among the
+/// four nearest overall.
+#[tokio::test]
+async fn a_filtered_search_returns_the_k_nearest_passing_rows() {
+    let dir = TempDir::new().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    seed(&engine).await;
+    let session = Session::new(Arc::clone(&engine));
+    session
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
+        .await
+        .unwrap();
+
+    let query = engine
+        .encode_text_query(&tiny_bert(), "quantum error correction")
+        .await
+        .unwrap();
+    let filtered = session
+        .search(SearchRequest {
+            source_id: "patents".to_string(),
+            query: SearchQuery::Vector(query.clone()),
+            k: 4,
+            embedding_table: None,
+            filter: Some("year = 2021".to_string()),
+            select: Vec::new(),
+            method: SearchMethod::default(),
+        })
+        .await
+        .unwrap();
+
+    // The truth: every row ranked exactly, then filtered.
+    let truth = engine
+        .search("patents", query.clone(), 20, None, SearchMethod::Exact)
+        .await
+        .unwrap()
+        .filter("year = 2021")
+        .unwrap()
+        .limit(4)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&filtered).len(), 4);
+    assert_eq!(row_ids(&filtered), row_ids(&truth));
+
+    // The first ranked breadth alone could not have answered it: the four
+    // nearest rows overall are not the four nearest 2021 rows.
+    let nearest = engine
+        .search("patents", query, 4, None, SearchMethod::Exact)
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert_ne!(row_ids(&nearest), row_ids(&filtered));
 }

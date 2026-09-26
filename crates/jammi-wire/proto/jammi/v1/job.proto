@@ -314,8 +314,7 @@ message WorkerSummary {
   // This worker's device inventory, as `workers.devices` carries it
   // (`jammi_db::catalog::jobs_repo::WorkerRecord::devices`) — a MIRROR of
   // the process's own registration, informational only (never the
-  // placement policy's authority). An ADDITIVE field on this frozen RPC:
-  // field 8, no prior field renumbered.
+  // placement policy's authority).
   repeated DeviceFact devices = 8;
 }
 

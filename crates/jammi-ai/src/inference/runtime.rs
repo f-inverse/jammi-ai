@@ -15,19 +15,47 @@ use jammi_datafusion::{
 };
 use jammi_numerics::ShapeLadder;
 
+use jammi_db::tenant::TenantContext;
+use jammi_db::tenant_scope::TenantBinding;
+
 use crate::model::cache::ModelCache;
 use crate::model::oom::is_oom_message;
 use crate::model::{ModelGuard, PreparedInput};
 
+/// The model cache as one plan's operators bind it: under the tenant that
+/// was effective where the plan was built. The runner binds a model on its
+/// own task, which a caller's task-local tenant scope does not reach, so the
+/// tenant is captured when the plan is built and re-installed around every
+/// bind — the catalog reads a load makes resolve the planning tenant's
+/// models, whichever task the load runs on.
+pub struct TenantScopedModels {
+    cache: Arc<ModelCache>,
+    binding: TenantBinding,
+    tenant: TenantContext,
+}
+
+impl TenantScopedModels {
+    /// The cache, bound under `binding`'s tenant as it is effective now.
+    pub fn capture(cache: Arc<ModelCache>, binding: TenantBinding) -> Self {
+        let tenant = binding.current();
+        Self {
+            cache,
+            binding,
+            tenant,
+        }
+    }
+}
+
 #[async_trait]
-impl ModelRuntime for ModelCache {
+impl ModelRuntime for TenantScopedModels {
     async fn bind(
         &self,
         source: &ModelSource,
         task: ModelTask,
     ) -> jammi_datafusion::Result<Arc<dyn BoundModel>> {
         let guard = self
-            .get_or_load(source, task)
+            .binding
+            .scope(self.tenant, self.cache.get_or_load(source, task))
             .await
             .map_err(jammi_datafusion::Error::runtime)?;
         Ok(Arc::new(guard))

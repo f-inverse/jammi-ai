@@ -277,14 +277,15 @@ impl ShapeDHost {
         let client = jammi_client::DataClient::connect(self.endpoint.clone()).await?;
         let started = Instant::now();
         let (table, _) = client
-            .generate_embeddings(
-                &self.source,
-                model_id,
-                &[text_column.to_string()],
-                key_column,
-                Modality::Text,
-                CachePolicy::Bypass,
-            )
+            .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+                source_id: self.source.to_string(),
+                model_id: model_id.to_string(),
+                columns: vec![text_column.to_string()],
+                key_column: key_column.to_string(),
+                modality: Modality::Text,
+                dimensions: None,
+                cache: CachePolicy::Bypass,
+            })
             .await?;
         Ok((table.table_name, started.elapsed().as_secs_f64()))
     }

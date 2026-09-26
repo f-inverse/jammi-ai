@@ -39,6 +39,7 @@ mod jammi;
 mod jobs_cancel;
 mod jobs_compute;
 mod jobs_shutdown;
+mod lexical_search;
 mod local_session;
 mod manifest_capability;
 mod media_front_end;

@@ -42,7 +42,7 @@ use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::source::{SourceConnection, SourceType};
-use jammi_db::store::manifest::{DefinitionHash, MatchVerdict};
+use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
 use jammi_db::store::{DerivesFromEdge, PinnedSource, Staleness};
 
@@ -60,10 +60,15 @@ use jammi_datafusion::ModelSource;
 /// converters can satisfy the orphan rule; re-exported here so an embedded
 /// consumer reaches it as `jammi_ai::*`, alongside the [`Session`] it drives.
 pub use jammi_wire::request::{
-    FineTuneJobId, FineTuneRequest, Modality, QueryInput, SearchQuery, SearchRequest,
+    EmbeddingRequest, FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput,
+    SearchQuery, SearchRequest,
 };
 
+pub use crate::pipeline::lexical::BuildLexicalIndex;
+pub use jammi_db::index::LexicalAnalyzer;
+
 pub use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelSpec};
+pub use jammi_db::index::SearchMethod;
 
 /// The in-process consumer session: a handle over an [`InferenceSession`].
 ///
@@ -282,21 +287,15 @@ impl Session {
 
     // --- embeddings ------------------------------------------------------
 
-    /// Generate embeddings for `columns` of a source with the given model and
-    /// modality, persisting one vector per row. `key_column` carries each row's
-    /// stable key into the result table.
+    /// Generate embeddings for a source's `columns` with the request's model
+    /// and modality, persisting one vector per row keyed by its `key_column`,
+    /// at the request's `dimensions` (a Matryoshka prefix) or the model's
+    /// width.
     pub async fn generate_embeddings(
         &self,
-        source_id: &str,
-        model_id: &str,
-        columns: &[String],
-        key_column: &str,
-        modality: Modality,
-        cache: jammi_db::store::CachePolicy,
+        request: EmbeddingRequest,
     ) -> Result<(ResultTableRecord, jammi_db::store::CacheOutcome)> {
-        self.engine
-            .generate_embeddings(source_id, model_id, columns, key_column, modality, cache)
-            .await
+        self.engine.generate_embeddings(request).await
     }
 
     /// Register precomputed per-row vectors as a ready `(source, model)`
@@ -334,8 +333,21 @@ impl Session {
 
     /// Encode a single query into a vector with the given model. The `modality`
     /// selects the tower; `input` must match it (text for [`Modality::Text`],
-    /// bytes for image/audio).
+    /// bytes for image/audio). `dimensions` encodes to the model's leading
+    /// coordinates, L2-renormalised — the width of a table generated with the
+    /// same `dimensions` — and `None` to the model's own width.
     pub async fn encode_query(
+        &self,
+        model_id: &str,
+        input: QueryInput,
+        modality: Modality,
+        dimensions: Option<usize>,
+    ) -> Result<Vec<f32>> {
+        let vector = self.encode_full_width(model_id, input, modality).await?;
+        crate::pipeline::embedding::serve_query(model_id, vector, dimensions)
+    }
+
+    async fn encode_full_width(
         &self,
         model_id: &str,
         input: QueryInput,
@@ -369,41 +381,128 @@ impl Session {
 
     // --- search ----------------------------------------------------------
 
-    /// Run a vector search and return the terminal hydrated batches.
+    /// Run a vector search and return the terminal hydrated batches: the `k`
+    /// nearest rows, or with a `filter`, the `k` nearest rows that satisfy it.
+    ///
+    /// The filter reads hydrated source columns, so it applies after the
+    /// vectors are ranked. The ranked breadth therefore widens — `k`, then
+    /// four times as many, and so on — until `k` rows pass, ending in an
+    /// exact search over every row of the table, where fewer than `k`
+    /// passing rows means fewer than `k` exist.
     pub async fn search(&self, request: SearchRequest) -> Result<Vec<RecordBatch>> {
-        let SearchRequest {
-            source_id,
-            query,
-            k,
-            embedding_table,
-            filter,
-            select,
-            oversample,
-        } = request;
-        let embedding_table = embedding_table.as_deref();
+        let rows = match request.filter {
+            Some(_) => {
+                self.engine
+                    .catalog()
+                    .resolve_embedding_table(&request.source_id, request.embedding_table.as_deref())
+                    .await?
+                    .row_count
+            }
+            None => 0,
+        };
+        until_k_pass(request.k, rows, |breadth| {
+            let method = if breadth >= rows && request.filter.is_some() {
+                SearchMethod::Exact
+            } else {
+                request.method
+            };
+            self.ranked(&request, breadth, method)
+        })
+        .await
+    }
 
-        let builder = match query {
+    /// Materialise a lexical index over a source's text: one `(_row_id, text)`
+    /// row per source row, keyed by `params.key_column`, with its text
+    /// `params.columns` joined by a space. [`Self::lexical_search`] ranks it by
+    /// BM25.
+    pub async fn build_lexical_index(
+        &self,
+        source_id: &str,
+        params: &BuildLexicalIndex,
+    ) -> Result<ResultTableRecord> {
+        self.engine.build_lexical_index(source_id, params).await
+    }
+
+    /// Run a lexical (BM25) search and return the terminal hydrated batches:
+    /// the `k` best-ranked rows for `request.text`, or with a `filter`, the
+    /// `k` best-ranked rows that satisfy it — the breadth widening as a
+    /// filtered [`Self::search`]'s does. Each row carries its `bm25_score`
+    /// and `bm25_rank`.
+    pub async fn lexical_search(&self, request: LexicalSearchRequest) -> Result<Vec<RecordBatch>> {
+        let rows = match request.filter {
+            Some(_) => {
+                self.engine
+                    .catalog()
+                    .resolve_lexical_table(&request.source_id, request.lexical_table.as_deref())
+                    .await?
+                    .row_count
+            }
+            None => 0,
+        };
+        until_k_pass(request.k, rows, |breadth| {
+            self.lexical_ranked(&request, breadth)
+        })
+        .await
+    }
+
+    /// One ranked pass of a lexical `request`: the `breadth` best-ranked rows,
+    /// hydrated, then the first `request.k` of them that satisfy
+    /// `request.filter`, projected to `request.select`.
+    async fn lexical_ranked(
+        &self,
+        request: &LexicalSearchRequest,
+        breadth: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let builder = self
+            .engine
+            .lexical_search(
+                &request.source_id,
+                &request.text,
+                breadth,
+                request.lexical_table.as_deref(),
+            )
+            .await?;
+        refine(
+            builder,
+            request.filter.as_deref(),
+            request.k,
+            &request.select,
+        )?
+        .run()
+        .await
+    }
+
+    /// One ranked pass of `request` by `method`: the `breadth` nearest rows,
+    /// hydrated, then the first `request.k` of them that satisfy
+    /// `request.filter`, projected to `request.select`.
+    async fn ranked(
+        &self,
+        request: &SearchRequest,
+        breadth: usize,
+        method: SearchMethod,
+    ) -> Result<Vec<RecordBatch>> {
+        let source_id = request.source_id.as_str();
+        let embedding_table = request.embedding_table.as_deref();
+        let builder = match &request.query {
             SearchQuery::Vector(vector) => {
                 self.engine
-                    .search(&source_id, vector, k, embedding_table, oversample)
+                    .search(source_id, vector.clone(), breadth, embedding_table, method)
                     .await?
             }
             SearchQuery::RowKey(row_key) => {
                 self.engine
-                    .search_by_id(&source_id, &row_key, k, embedding_table, oversample)
+                    .search_by_id(source_id, row_key, breadth, embedding_table, method)
                     .await?
             }
         };
-        let builder = match filter.as_deref() {
-            Some(predicate) => builder.filter(predicate)?,
-            None => builder,
-        };
-        let builder = if select.is_empty() {
-            builder
-        } else {
-            builder.select(&select)?
-        };
-        builder.run().await
+        refine(
+            builder,
+            request.filter.as_deref(),
+            request.k,
+            &request.select,
+        )?
+        .run()
+        .await
     }
 
     // --- inference -------------------------------------------------------
@@ -426,6 +525,30 @@ impl Session {
 
     // --- materialization contract ----------------------------------------
 
+    /// The recorded materialization of a result table — its
+    /// `.materialization.json` manifest, verbatim: the definition hash and
+    /// artifact digest, the producing descriptor, the environment (engine
+    /// version, device, and every invoked model's run), the input anchors,
+    /// and who produced it when. Read-only. A table that carries no manifest
+    /// is the typed [`JammiError::MissingManifest`] refusal, never an empty
+    /// description.
+    ///
+    /// Tenant-scoped: the table is resolved through the tenant-filtered
+    /// `get_result_table`, so a peer cannot describe a table it cannot resolve.
+    pub async fn describe_table(&self, table: &str) -> Result<MaterializationManifest> {
+        let record = self.result_table(table).await?;
+        self.engine.result_store().describe_table(&record).await
+    }
+
+    /// Resolve a result table by name under this session's tenant binding.
+    async fn result_table(&self, table: &str) -> Result<ResultTableRecord> {
+        self.engine
+            .catalog()
+            .get_result_table(table)
+            .await?
+            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))
+    }
+
     /// Recompute a materialised result table's artifact digest and check it
     /// (and, if given, an expected definition hash) against its
     /// `.materialization.json` manifest. Read-only; returns a [`MatchVerdict`],
@@ -441,12 +564,7 @@ impl Session {
         table: &str,
         expected_definition: Option<DefinitionHash>,
     ) -> Result<MatchVerdict> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         let store = self.engine.result_store();
         let pin = store.pin_current_version(record).await?;
         store
@@ -474,12 +592,7 @@ impl Session {
         table: &str,
         current_definition: DefinitionHash,
     ) -> Result<Staleness> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         self.engine
             .result_store()
             .staleness(&record, &current_definition)
@@ -495,12 +608,7 @@ impl Session {
     /// enumerate the lineage of a table it cannot resolve. The returned edges are
     /// likewise drawn only from the tenant's own (and GLOBAL) `ready` tables.
     pub async fn derives_from(&self, table: &str) -> Result<Vec<DerivesFromEdge>> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         self.engine
             .result_store()
             .derives_from(&record.table_name)
@@ -543,12 +651,7 @@ impl Session {
     /// Tenant-scoped: the table is resolved through the tenant-filtered
     /// `get_result_table`, so a peer cannot recompute a table it cannot resolve.
     pub async fn recompute(&self, table: &str, cascade: Cascade) -> Result<RecomputeReport> {
-        let record = self
-            .engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))?;
+        let record = self.result_table(table).await?;
         self.engine.recompute(&record, cascade).await
     }
 
@@ -962,5 +1065,43 @@ pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result
             "{modality} embeddings take exactly one content column, got {}",
             columns.len()
         ))),
+    }
+}
+
+/// Run `ranked` at widening breadths — `k`, then four times as many, and so
+/// on — until it returns `k` rows or the breadth covers all `rows`. A `rows`
+/// of 0 (an unfiltered search, which returns its `k` best at once) runs one
+/// pass at `k`.
+async fn until_k_pass<F, Fut>(k: usize, rows: usize, mut ranked: F) -> Result<Vec<RecordBatch>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<RecordBatch>>>,
+{
+    let mut breadth = k;
+    loop {
+        let found = ranked(breadth).await?;
+        if breadth >= rows || found.iter().map(RecordBatch::num_rows).sum::<usize>() >= k {
+            return Ok(found);
+        }
+        breadth = breadth.saturating_mul(4).min(rows);
+    }
+}
+
+/// The first `k` ranked rows that satisfy `filter`, projected to `select`
+/// (every hydrated column when empty).
+fn refine(
+    builder: crate::query::QueryBuilder,
+    filter: Option<&str>,
+    k: usize,
+    select: &[String],
+) -> Result<crate::query::QueryBuilder> {
+    let builder = match filter {
+        Some(predicate) => builder.filter(predicate)?.limit(k),
+        None => builder,
+    };
+    if select.is_empty() {
+        Ok(builder)
+    } else {
+        builder.select(select)
     }
 }

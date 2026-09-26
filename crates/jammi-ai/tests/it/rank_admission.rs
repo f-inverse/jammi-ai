@@ -8,10 +8,11 @@
 //! come up and then refuse every job it is handed.
 //!
 //! **The submit edge** decides whether this DEPLOYMENT can serve the count a
-//! particular job asks for — the FLEET's bound, `[distributed]
-//! max_world_size` (the serveable world), never this host's own device
-//! count: a count within the serveable world but beyond this host's devices
-//! submits and is decided by assembly on the claiming coordinator. It is the last point at which refusing costs nothing: past it
+//! particular job asks for — the serveable world, the widest gang its
+//! configuration can form: an in-process gang of `[worker] local_ranks` or a
+//! fleet gang of `[distributed] max_world_size`, whichever is wider. A count
+//! within it but beyond this host's devices submits and is decided by
+//! assembly on the claiming coordinator. It is the last point at which refusing costs nothing: past it
 //! the spec is a durable row a worker will claim, fail and retry. Every
 //! refusal here is asserted on two things — the typed error variant, and
 //! that the `jobs` table is unchanged — because a refusal that leaves a
@@ -129,9 +130,10 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         (
             "a count beyond the deployment's serveable world",
             spec_with_world_size(2),
-            "world_size = 2 exceeds the serveable world of 1 ([distributed] max_world_size): a \
-             gang is assembled from fleet members up to that bound, so raise it on every \
-             coordinator or submit a smaller rank count",
+            "world_size = 2 exceeds the serveable world of 1 (the wider of [worker] local_ranks \
+             and [distributed] max_world_size): raise local_ranks for a gang on this host's \
+             devices, max_world_size on every coordinator for a gang across the fleet, or submit \
+             a smaller rank count",
         ),
     ];
 
@@ -292,6 +294,37 @@ async fn a_single_rank_job_is_admitted_on_a_serveable_world_of_one() {
         .await
         .expect("the single-rank job is what every deployment can serve");
     assert_eq!(job_count(&session).await, before + 1);
+}
+
+/// A host that runs two ranks in-process (`[worker] local_ranks = 2` on two
+/// declared devices) serves a two-rank job with no fleet gang configured at
+/// all (`[distributed] max_world_size = 1`): the serveable world is the widest
+/// gang the configuration can form, and an in-process gang is one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_gang_host_admits_its_rank_count_without_a_fleet_bound() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.gpu.device = Some(0);
+    config.gpu.devices = Some(vec![0, 1]);
+    config.worker.local_ranks = 2;
+    config.distributed.max_world_size = 1;
+    let session = Arc::new(InferenceSession::new(config).await.unwrap());
+    let before = job_count(&session).await;
+    session
+        .run_training_spec(spec_with_world_size(2))
+        .await
+        .expect("a two-rank job within this host's local gang submits");
+    assert_eq!(job_count(&session).await, before + 1);
+    let error = session
+        .run_training_spec(spec_with_world_size(3))
+        .await
+        .expect_err("three ranks is wider than both gangs this deployment can form");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds the serveable world of 2"),
+        "{error}"
+    );
 }
 
 /// The Python entrance's own first call: the embedded binding assembles a
@@ -601,6 +634,7 @@ fn predictor_config() -> jammi_ai::pipeline::context_predictor::ContextPredictor
         test_task_fraction: 0.3,
         min_task_count: 2,
         seed: 7,
+        embedding_table: None,
     }
 }
 

@@ -1,0 +1,117 @@
+name: PyPI (jammi-ai-native-cu12, CUDA)
+
+# Publishes the CUDA (cu12, sm_80+) build of the embedded engine,
+# `jammi-ai-native-cu12`, to PyPI on a `py-v*` tag — the SAME lockstep tag as
+# `jammi-ai`, the CPU `jammi-ai-native` and the servers. It provides the same
+# `jammi_native` module as the CPU wheel, so `jammi-ai` runs on the GPU with
+# no other change. Built in the CUDA CI image by
+# `ci/scripts/build_native_cu12_wheel.sh` (the same recipe a GPU pod verifies
+# the wheel with); its cargo features are `packaging/native-cu12`'s own
+# `[tool.maturin] features`, as the CPU wheel's are. Publishing is gated on
+# the commit's already-recorded GPU-prove verdict, like every release lane.
+#
+# NOTE (release-time, EXTERNAL — do not act in CI): the
+# `jammi-ai-native-cu12` PyPI project's Trusted-Publisher config must authorize
+# THIS workflow (`pypi-native-cuda.yml`, environment `pypi`).
+
+on:
+  push:
+    tags: ["py-v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packaging/native-cu12/**"
+      - "packaging/native/python/**"
+      - "crates/jammi-python/**"
+      - "ci/scripts/build_native_cu12_wheel.sh"
+      - ".github/workflows/pypi-native-cuda.yml"
+
+# Serialize per ref, never cancel: a publish in flight must finish (PyPI
+# uploads are not resumable), matching the other release lanes.
+concurrency:
+  group: pypi-native-cuda-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolves the mutable CUDA CI base-image tag to its index digest once per
+  # run (`.github/actions/resolve-ci-image`), as every release consumer does.
+  resolve-base:
+    name: Resolve CI base image (CUDA)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: resolve
+        uses: ./.github/actions/resolve-ci-image
+        with:
+          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+
+  build:
+    name: Build jammi-ai-native-cu12 (manylinux_2_28_x86_64)
+    needs: resolve-base
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.resolve-base.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # `flash-attn` needs the vendored CUTLASS submodule at build time.
+      - name: Init the CUTLASS submodule
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          # A wheel-build lane, not the lint gate.
+          deny-warnings: false
+
+      - name: Build and check the wheel
+        run: bash ci/scripts/build_native_cu12_wheel.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-cu12-dist
+          path: packaging/native-cu12/dist/
+
+  gpu-proof:
+    name: GPU proof required
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    uses: ./.github/workflows/_gpu-proof-required.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets: inherit
+
+  publish:
+    name: Publish to PyPI
+    # Publishes ONLY from a `py-v*` tag ref. PURE conjunction (no `||`).
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [build, gpu-proof]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-cu12-dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
+        with:
+          packages-dir: dist

@@ -29,6 +29,12 @@ live-postgres-tests = []
 # arms when env vars are set. Off by default; the
 # `mutable_crash_recovery.rs` integration test requires it.
 test-hooks = []
+# This build carries an accelerator backend (CUDA or Metal): the device a
+# deployment runs on by default is the accelerator (`[gpu] device = 0`), not the
+# CPU. Enabled by `jammi-ai`'s `cuda` / `metal` features, which are what
+# compile an accelerator in; a build without one defaults to the CPU, so its
+# default configuration never requests a device it cannot have.
+accelerator = []
 # Object-store backends. The default build only ships `file://` and
 # `memory://`; cloud schemes are opt-in per provider so a tenant who
 # never publishes to S3 does not pull in the AWS SDK chain.
@@ -102,7 +108,6 @@ uuid.workspace = true
 rand.workspace = true
 chrono.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 thiserror.workspace = true
 directories.workspace = true
 tokio.workspace = true
@@ -130,6 +135,9 @@ jammi-test-resources.workspace = true
 test-case = { workspace = true }
 # `libc` is a regular dependency above, so tests use it from there.
 parquet = { workspace = true }
+# `materialization.rs` captures a `tracing::warn!` through a real `fmt`
+# subscriber.
+tracing-subscriber.workspace = true
 # The `models_delete_call_sites.rs` source oracle keys its reviewed
 # raw-byte-delete-call-site table by (file, enclosing fn, ordinal-within-that-fn),
 # which only a real AST walk can determine (a text scan cannot tell a doc

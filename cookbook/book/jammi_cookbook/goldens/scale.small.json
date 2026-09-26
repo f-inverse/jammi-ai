@@ -1,0 +1,14 @@
+{
+  "default_recall_at_10": {
+    "tol": 0.02,
+    "value": 0.9784999999999999
+  },
+  "recall_at_ef10": {
+    "tol": 0.05,
+    "value": 0.725
+  },
+  "recall_at_ef128": {
+    "tol": 0.02,
+    "value": 0.9995
+  }
+}

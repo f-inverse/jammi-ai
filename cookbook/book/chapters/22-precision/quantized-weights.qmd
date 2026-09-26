@@ -165,7 +165,7 @@ _TEXTS = [
 ]
 
 
-def open_session() -> tuple[jammi.Session, Path]:
+def open_session() -> jammi.Session:
     """Open a fresh CPU-pinned session with the corpus registered. The caller
     owns the returned session and closes it; an open that fails part-way closes
     its own."""
@@ -181,17 +181,17 @@ def open_session() -> tuple[jammi.Session, Path]:
     corpus_path = Path(tempfile.mkdtemp(prefix="quantized_weights_corpus_")) / "corpus.parquet"
     pq.write_table(pa.table({"id": list(range(len(_TEXTS))), "text": _TEXTS}), corpus_path)
 
-    art_dir = Path(tempfile.mkdtemp(prefix="quantized_weights_art_"))
-    db = jammi.connect(f"file://{art_dir}", config=cfg_path)
+    db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='quantized_weights_art_')}",
+                       config=cfg_path)
     try:
         db.add_source(SOURCE_ID, url=f"file://{corpus_path}", format="parquet")
     except BaseException:
         db.close()
         raise
-    return db, art_dir
+    return db
 
 
-db, art_dir = open_session()
+db = open_session()
 table_gguf = db.generate_embeddings(
     source=SOURCE_ID, model=f"local:{gguf_dir}", columns=["text"], key="id", modality="text",
 )
@@ -272,33 +272,13 @@ is a field of the same run, for the same reason (`LocalRun::quantization`:
 a `Q4K` run is output-affecting relative to a full-precision run of the same
 model, so the two must never collide on one materialization identity). This chapter reads the consequence off the two
 tables it just materialized — `f32_dir` and `gguf_dir`, otherwise identical
-producing descriptors — by reading each table's `.materialization.json`
-manifest sidecar directly, the same way [the point-in-time chapter](
-../19-point-in-time/point-in-time.qmd) reads a `Match`-case `definition_hash`
-off its own sidecar (`verify_materialization`'s own return dict does not carry
-the hash on a bare `Match`; the manifest sidecar does).
+producing descriptors — through `describe_table`, which returns a table's
+recorded materialization: its `definition_hash`, and the environment that
+produced it.
 
 ```{python}
-import json
-
-# Every result table (and its sidecars) lands under a scope segment beneath
-# jammi_db/ — `_global` for the untenanted binding this chapter's connect()
-# call uses, a tenant's own UUID otherwise
-# (`crates/jammi-db/src/store/layout.rs::TenantSegment`, documented at
-# `docs/guide/src/cloud-storage.md:183`: "{root}/_global/{table}.parquet" for
-# a GLOBAL table). The manifest sidecar shares the table's own stem and
-# parent prefix (`layout.rs::sidecar_url`) — the same direct sidecar read
-# build_point_in_time_cache.py uses for its own Match-case definition_hash.
-_SCOPE_SEGMENT = "_global"
-
-
-def read_manifest(table: str) -> dict:
-    sidecar = art_dir / "jammi_db" / _SCOPE_SEGMENT / f"{table}.materialization.json"
-    return json.loads(sidecar.read_text())
-
-
-manifest_f32 = read_manifest(table_f32)
-manifest_gguf = read_manifest(table_gguf)
+manifest_f32 = db.describe_table(table_f32)
+manifest_gguf = db.describe_table(table_gguf)
 hash_f32 = manifest_f32["definition_hash"]
 hash_gguf = manifest_gguf["definition_hash"]
 
@@ -311,7 +291,7 @@ assert hash_f32 != hash_gguf, (
 )
 print("\ndistinct: True — the two materializations never collide.")
 
-# The cause, read off the same sidecars: each table's environment records the
+# The cause, read off the same records: each table's environment records the
 # model's run, and the GGUF run carries its weight format where the dense
 # run carries none.
 run_f32 = manifest_f32["env"]["models"][0]["run"]
@@ -330,8 +310,8 @@ print(f"f32  verify_materialization: {verdict_f32['verdict']}")
 print(f"q8_0 verify_materialization: {verdict_gguf['verdict']}")
 ```
 
-> **What this cell shows.** Both halves, off the sidecars a Python caller can
-> read: the consequence (two distinct `definition_hash` values) and its cause
+> **What this cell shows.** Both halves, off the record `describe_table`
+> returns: the consequence (two distinct `definition_hash` values) and its cause
 > (the GGUF table's recorded run carries `quantization: "q8_0"`, the dense
 > one's carries none). The Rust side proves the same pair at the source, in
 > `gguf_model_identity_reports_quantization_and_a_distinct_definition_hash`

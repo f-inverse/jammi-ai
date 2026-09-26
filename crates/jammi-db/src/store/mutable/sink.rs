@@ -1,12 +1,12 @@
-//! `DataSink` implementation for mutable companion tables.
+//! The one write every mutable-table statement is, and the `DataSink` that
+//! runs it for `INSERT` / `REPLACE INTO`.
 //!
-//! Per DataFusion: *"This method will be called exactly once during each DML
-//! statement. Thus prior to return, the sink should do any commit or rollback
-//! required."* We wrap the entire write in one
-//! `crate::catalog::backend::CatalogBackend::transaction` closure. Each
-//! [`RecordBatch`] is translated into a multi-row
-//! `INSERT … VALUES (…), (…), …` statement built from the backend's
-//! [`crate::store::mutable::MutableBackend::insert_dml`] renderer.
+//! Every statement — append, upsert, update, delete — is `replace_rows`:
+//! remove the session-owned rows at some primary keys, then insert some rows,
+//! in one transaction. Per DataFusion: *"This method will be called exactly
+//! once during each DML statement. Thus prior to return, the sink should do
+//! any commit or rollback required."* The sink wraps the entire write in one
+//! `crate::catalog::backend::CatalogBackend::transaction` closure.
 
 use std::fmt;
 use std::sync::Arc;
@@ -24,19 +24,46 @@ use datafusion::common::DataFusionError;
 use datafusion::datasource::sink::DataSink;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::DisplayAs;
 use datafusion::physical_plan::DisplayFormatType;
 use futures::StreamExt;
 
-use crate::catalog::backend::{SqlNullType, SqlValue, TxOptions};
+use crate::catalog::backend::{BackendError, SqlNullType, SqlValue, Transaction, TxOptions};
 
 use super::definition::MutableTableDefinition;
-use super::MutableBackend;
+use super::{owned_rows, MutableBackend};
+
+/// How an incoming row relates to an existing row with the same primary key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyConflict {
+    /// The statement fails (`INSERT`).
+    Reject,
+    /// The existing row is replaced (`REPLACE INTO`).
+    Replace,
+}
+
+impl TryFrom<InsertOp> for KeyConflict {
+    type Error = DataFusionError;
+
+    fn try_from(op: InsertOp) -> Result<Self, Self::Error> {
+        match op {
+            InsertOp::Append => Ok(Self::Reject),
+            InsertOp::Replace => Ok(Self::Replace),
+            InsertOp::Overwrite => Err(DataFusionError::NotImplemented(
+                "INSERT OVERWRITE is not supported on mutable tables; \
+                 DELETE then INSERT, or REPLACE INTO by primary key"
+                    .into(),
+            )),
+        }
+    }
+}
 
 pub struct MutableTableSink {
     def: Arc<MutableTableDefinition>,
     backend: Arc<dyn MutableBackend>,
     tenant: crate::tenant_scope::TenantBinding,
+    on_conflict: KeyConflict,
 }
 
 impl MutableTableSink {
@@ -44,11 +71,13 @@ impl MutableTableSink {
         def: Arc<MutableTableDefinition>,
         backend: Arc<dyn MutableBackend>,
         tenant: crate::tenant_scope::TenantBinding,
+        on_conflict: KeyConflict,
     ) -> Self {
         Self {
             def,
             backend,
             tenant,
+            on_conflict,
         }
     }
 }
@@ -92,6 +121,7 @@ impl DataSink for MutableTableSink {
         // so this is the natural unit of consistency.
         let session_tenant = self.tenant.current_tenant();
         let table_name = def.id.as_str().to_string();
+        let on_conflict = self.on_conflict;
         let written = self
             .backend
             .catalog_backend()
@@ -106,19 +136,13 @@ impl DataSink for MutableTableSink {
                     tx.assert_tenant_matches(session_tenant, &table_name)?;
                     let mut total: u64 = 0;
                     for batch in batches {
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-                        let schema = batch.schema();
-                        let col_names: Vec<String> =
-                            schema.fields().iter().map(|f| f.name().clone()).collect();
-                        let cols: Vec<&str> = col_names.iter().map(String::as_str).collect();
-                        let dml = backend.insert_dml(&def, &cols, batch.num_rows());
-                        let params = batch_to_params(&batch, session_tenant).map_err(|e| {
-                            crate::catalog::backend::BackendError::Execution(e.to_string())
-                        })?;
-                        let rows = tx.execute(&dml, &params).await?;
-                        total += rows;
+                        let replaced = match on_conflict {
+                            KeyConflict::Reject => None,
+                            KeyConflict::Replace => Some(primary_key_of(&def, &batch)?),
+                        };
+                        total +=
+                            replace_rows(tx, backend.as_ref(), &def, replaced.as_ref(), &batch)
+                                .await?;
                         #[cfg(feature = "test-hooks")]
                         crate::store::mutable::test_hook::maybe_signal(total).await;
                     }
@@ -130,6 +154,90 @@ impl DataSink for MutableTableSink {
 
         Ok(written)
     }
+}
+
+/// Replace the session-owned rows at the primary keys in `keys` (when given)
+/// with `rows`, inside `tx`: the one write every mutable-table statement is.
+/// An append replaces nothing; a delete writes nothing; an update and an
+/// upsert do both. Rows are stamped with the transaction's tenant, and only
+/// that tenant's rows are removed, so a statement never moves a row across
+/// tenants. Returns the number of rows written.
+pub(crate) async fn replace_rows(
+    tx: &mut Transaction<'_>,
+    backend: &dyn MutableBackend,
+    def: &MutableTableDefinition,
+    keys: Option<&RecordBatch>,
+    rows: &RecordBatch,
+) -> Result<u64, BackendError> {
+    if let Some(keys) = keys.filter(|k| k.num_rows() > 0) {
+        let width = keys.num_columns();
+        for chunk in row_chunks(keys, width, backend) {
+            let dml = backend.delete_keys_dml(def, chunk.num_rows(), &owned_rows(tx.tenant()));
+            let params = batch_to_params(&chunk, None).map_err(execution)?;
+            // `batch_to_params` appends a tenant slot per row; a key tuple has none.
+            let params: Vec<_> = params
+                .chunks(width + 1)
+                .flat_map(|row| row[..width].iter().cloned())
+                .collect();
+            tx.execute(&dml, &params).await?;
+        }
+    }
+    insert_rows(tx, backend, def, rows).await
+}
+
+/// Append `rows` inside `tx`, stamped with the transaction's tenant. Returns
+/// the number of rows written.
+pub(crate) async fn insert_rows(
+    tx: &mut Transaction<'_>,
+    backend: &dyn MutableBackend,
+    def: &MutableTableDefinition,
+    rows: &RecordBatch,
+) -> Result<u64, BackendError> {
+    if rows.num_rows() == 0 {
+        return Ok(0);
+    }
+    let schema = rows.schema();
+    let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    // Each row binds its columns plus the tenant slot.
+    let mut written = 0;
+    for chunk in row_chunks(rows, cols.len() + 1, backend) {
+        let dml = backend.insert_dml(def, &cols, chunk.num_rows());
+        let params = batch_to_params(&chunk, tx.tenant()).map_err(execution)?;
+        written += tx.execute(&dml, &params).await?;
+    }
+    Ok(written)
+}
+
+/// `batch` in consecutive slices small enough that one statement binding
+/// `params_per_row` parameters for each of a slice's rows fits the backend.
+fn row_chunks<'a>(
+    batch: &'a RecordBatch,
+    params_per_row: usize,
+    backend: &dyn MutableBackend,
+) -> impl Iterator<Item = RecordBatch> + 'a {
+    let per_statement = (backend.max_bind_params() / params_per_row.max(1)).max(1);
+    (0..batch.num_rows())
+        .step_by(per_statement)
+        .map(move |start| batch.slice(start, per_statement.min(batch.num_rows() - start)))
+}
+
+/// The primary-key columns of `rows`, in declared key order.
+pub(crate) fn primary_key_of(
+    def: &MutableTableDefinition,
+    rows: &RecordBatch,
+) -> Result<RecordBatch, BackendError> {
+    let schema = rows.schema();
+    let indices = def
+        .primary_key
+        .iter()
+        .map(|c| schema.index_of(c))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(execution)?;
+    rows.project(&indices).map_err(execution)
+}
+
+pub(crate) fn execution(e: impl ToString) -> BackendError {
+    BackendError::Execution(e.to_string())
 }
 
 /// Translate every cell of a `RecordBatch` into the engine's [`SqlValue`]

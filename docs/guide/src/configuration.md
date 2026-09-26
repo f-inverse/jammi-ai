@@ -76,7 +76,8 @@ memory_limit = "75%"
 batch_size = 8192
 
 [gpu]
-# GPU device index. -1 for CPU only. Default: 0.
+# GPU device index. -1 for CPU only. Default: 0 in a build with an accelerator
+# (the CUDA server or wheel, a Metal build), -1 in a CPU-only build.
 device = -1
 # Each device's model-residency budget, in the same grammar as
 # [engine] memory_limit: "<n>%" of the device's total memory, or an absolute
@@ -129,11 +130,8 @@ max_described_models = 1024
 partitions = 1
 
 [embedding]
-# Distance metric for vector indices. Default: "cosine".
-default_distance_metric = "cosine"
-# Index type for vector storage. Default: "ivf_hnsw_sq".
-default_index_type = "ivf_hnsw_sq"
-# Rows between embedding index checkpoints. Default: 1000.
+# Batches between two progress checkpoints on a building embedding table's
+# catalog row; 0 never checkpoints. Default: 1000.
 checkpoint_interval = 1000
 # Rows per ANN segment of a written embedding table. The segments are
 # consecutive runs of the table's rows (key order) at this budget, each built
@@ -141,6 +139,26 @@ checkpoint_interval = 1000
 # smaller budget builds sooner and wider, a larger one searches fewer graphs.
 # Default: 4096.
 index_segment_rows = 4096
+
+[embedding.ann]
+# The HNSW sidecar index built beside every embedding table. 0 = the
+# backend's default for each graph knob.
+# Edges per graph node (HNSW M): larger builds a bigger, slower-to-build,
+# higher-recall graph.
+connectivity = 0
+# Candidate-list width while building the graph (ef_construction).
+build_expansion = 0
+# Candidate-list width while searching (ef_search), at least k: wider finds
+# more of the true neighbours per query at more work. A query-time setting —
+# it applies to indexes already built. Measure it against `search(exact=True)`.
+search_expansion = 0
+# Precision new tables' indexes are built at: "f32", "f16", "int8", "binary".
+# A quantized index retrieves k * oversample candidates and rescores them
+# exactly. Default: "f32".
+storage_precision = "f32"
+# That candidate multiplier; unset uses the precision's own default
+# (32 for binary, 4 otherwise). A table keeps the value it was created with.
+# oversample = 4
 
 [fine_tuning]
 # LoRA rank for fine-tuning. Default: 8.
@@ -193,16 +211,17 @@ idle_poll_secs = 1
 metrics_sample_secs = 5
 # How many ranks THIS HOST places on its own `[gpu] devices` for a
 # distributed training job it runs entirely in-process - one rank per
-# device, rank `i` on `[gpu] devices[i]`. Must be >= 1 (the default, 1, is
-# the single-rank deployment: no gang, no collective) and never more than
-# the configured device count. Orthogonal to a submitted job's own
+# accelerator, rank `i` on `[gpu] devices[i]`, or every rank on the CPU when
+# the CPU (`device = -1`) is the only device. Must be >= 1 (the default, 1,
+# is the single-rank deployment: no gang, no collective) and, on
+# accelerators, never more than the configured device count. Orthogonal to a submitted job's own
 # `world_size` (a separate, per-job knob) and to `[distributed]
-# max_world_size` (the fleet-wide bound on a `Peer` gang across hosts) -
-# the three knobs load independently, with no cross-check between any
-# pair. A claimed job whose `world_size` is within `local_ranks` runs every
-# rank in this process over a `Local` gang; one wider than `local_ranks`
-# makes this process rank 0 of a `Peer` gang whose other ranks are fleet
-# members it assembles and dials.
+# max_world_size` (the fleet-wide bound on a `Peer` gang across hosts). A
+# job is admitted at submit when its `world_size` is within the wider of
+# the two - the widest gang this deployment can form. A claimed job whose
+# `world_size` is within `local_ranks` runs every rank in this process over
+# a `Local` gang; one wider than `local_ranks` makes this process rank 0 of
+# a `Peer` gang whose other ranks are fleet members it assembles and dials.
 local_ranks = 1
 # Which collective a multi-rank worker reduces gradients over. Default:
 # "auto" (the best collective this process can actually reach: NCCL on a
@@ -219,12 +238,11 @@ rank_timeout_secs = 120
 
 [distributed]
 # The widest `Peer` gang any coordinator on this deployment may admit,
-# bounding a job's own `world_size` ACROSS FLEET MEMBERS: a submitted
-# `world_size` past it is refused at submit, from configuration alone; one
-# within it submits even when it is wider than this host's own `[gpu]
-# devices`, and is decided by assembly on the claiming coordinator. Loads
-# independently of `[worker]`'s own per-host rank count -- the two knobs
-# are checked against each other by nothing. Must be >= 1 (1, the default,
+# bounding a job's own `world_size` ACROSS FLEET MEMBERS. A submitted
+# `world_size` past both this and `[worker] local_ranks` is refused at
+# submit, from configuration alone; one within this bound submits even when
+# it is wider than this host's own `[gpu] devices`, and is decided by
+# assembly on the claiming coordinator. Must be >= 1 (1, the default,
 # admits no fleet gang at all).
 max_world_size = 1
 
@@ -488,7 +506,9 @@ max_job_waits = 1024
 # `127.0.0.1`); an ephemeral `:0` never collides with anything.
 
 [logging]
-# Log level: "trace", "debug", "info", "warn", "error". Default: "info".
+# Log filter: "trace", "debug", "info", "warn", "error", or a per-target
+# directive ("jammi_ai=debug"). Unset: "info" for jammi-server, "warn" for the
+# engine embedded in a Python process. RUST_LOG, when set, overrides it.
 level = "info"
 # Log format: "text" or "json". Default: "text".
 format = "text"

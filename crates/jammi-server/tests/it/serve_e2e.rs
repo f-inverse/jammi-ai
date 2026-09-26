@@ -215,6 +215,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             key_column: "clip_id".into(),
             modality: Modality::Audio as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings");
@@ -227,12 +228,16 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search")
         .into_inner();
-    assert_eq!(search.hits.len(), 3, "k=3 over a three-row corpus");
+    assert_eq!(
+        super::common::grpc::ranked(search).len(),
+        3,
+        "k=3 over a three-row corpus"
+    );
 
     // Flight SQL round-trip — `execute` issues GetFlightInfo, `do_get`
     // issues DoGet, which anchors `flight_queries`.
@@ -297,6 +302,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             key_column: "id".into(),
             modality: Modality::Text as i32,
             cache: jammi_wire::proto::inference::CachePolicy::Unspecified as i32,
+            dimensions: None,
         })
         .await
         .expect("generate_embeddings for eval")

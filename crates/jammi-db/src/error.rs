@@ -229,6 +229,30 @@ pub enum JammiError {
         table: String,
     },
 
+    /// A read of a result table's recorded materialization found no
+    /// `.materialization.json` sidecar beside its artifact — a table written
+    /// before the materialization contract, or one whose write was torn before
+    /// its manifest landed. There is no recorded definition to describe, so the
+    /// read refuses rather than answer with an empty description.
+    #[error("result table `{table}` has no recorded materialization manifest")]
+    MissingManifest {
+        /// The table whose sidecar is absent.
+        table: String,
+    },
+
+    /// A query was to be encoded into an embedding table's vector space, but no
+    /// engine encoder produced that space — its vectors come from a graph's
+    /// structure or were imported — so there is no model to encode a text,
+    /// image or audio query with. Query such a table by row key or by a vector
+    /// the caller computed.
+    #[error("table `{table}` has no query encoder: its vectors come from `{producer}`")]
+    NoQueryEncoder {
+        /// The embedding table.
+        table: String,
+        /// The producer that wrote its vectors (the manifest's `producer` tag).
+        producer: String,
+    },
+
     /// A building-row compare-and-set matched no row because the row is gone:
     /// the `result_tables` row the writer (or the reaper) addressed no longer
     /// exists — deleted underneath it (a source removal, a manual purge).

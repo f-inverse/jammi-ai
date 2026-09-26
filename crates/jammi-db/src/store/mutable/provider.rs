@@ -13,21 +13,25 @@ use arrow::array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
 };
+use arrow::compute::filter_record_batch;
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::DFSchema;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
-use crate::catalog::backend::{Row, TxOptions};
+use crate::catalog::backend::{BackendError, Row, Transaction, TxOptions};
 
 use super::definition::MutableTableDefinition;
-use super::sink::MutableTableSink;
-use super::MutableBackend;
+use super::sink::{execution, primary_key_of, replace_rows, KeyConflict, MutableTableSink};
+use super::{owned_rows, visible_rows, MutableBackend};
 
 /// `TableProvider` for one mutable companion table.
 pub struct MutableTableProvider {
@@ -62,16 +66,6 @@ impl MutableTableProvider {
     /// the tenant-scope predicate pushed down to backend SQL, then DataFusion
     /// applies projection / additional filters above the scan node.
     async fn read_to_batch(&self, limit: Option<usize>) -> Result<RecordBatch, DataFusionError> {
-        // Always read the full schema; let DataFusion apply column projection.
-        let projected_cols: Vec<&str> = self
-            .def
-            .schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        let projected_schema: SchemaRef = Arc::clone(&self.def.schema);
-
         // Inject the tenant-scope predicate at the backend SQL layer so we
         // ship the correct row set off the SQLite/Postgres side, not just
         // the union (which DataFusion's AnalyzerRule would also filter, but
@@ -83,60 +77,80 @@ impl MutableTableProvider {
         // rows from every tenant. The analyzer-rule bypass on its own would
         // still leave the provider's SQL filter in place, so the provider
         // must consult the same marker.
-        let tenant_pred = if crate::tenant_scope::TenantBinding::is_admin_scope() {
-            None
-        } else {
-            match self.tenant.current_tenant() {
-                Some(t) => Some(format!("(\"tenant_id\" = '{t}' OR \"tenant_id\" IS NULL)")),
-                None => Some("\"tenant_id\" IS NULL".to_string()),
-            }
-        };
-        let sql = self
-            .backend
-            .scan_dml(&self.def, &projected_cols, tenant_pred.as_deref(), limit);
-
-        // Build an owned copy of the SQL and column descriptors so the closure
-        // can capture them with `'static` lifetimes.
-        let owned_sql = sql.clone();
-        let columns: Vec<(String, DataType)> = projected_schema
-            .fields()
-            .iter()
-            .map(|f| (f.name().clone(), f.data_type().clone()))
-            .collect();
-
-        let rows_per_col: Vec<Vec<DecodedValue>> = self
-            .backend
+        let visible = (!crate::tenant_scope::TenantBinding::is_admin_scope())
+            .then(|| visible_rows(self.tenant.current_tenant()));
+        let def = Arc::clone(&self.def);
+        let backend = Arc::clone(&self.backend);
+        self.backend
             .catalog_backend()
             .transaction(
                 TxOptions {
                     read_only: true,
                     ..Default::default()
                 },
-                |tx| {
-                    let columns = columns.clone();
-                    let owned_sql = owned_sql.clone();
+                move |tx| {
                     Box::pin(async move {
-                        let raw = tx
-                            .query(&owned_sql, &[], |row| decode_row(row, &columns))
-                            .await?;
-                        // Transpose Vec<Row> → Vec<Column>
-                        let mut transposed: Vec<Vec<DecodedValue>> = (0..columns.len())
-                            .map(|_| Vec::with_capacity(raw.len()))
-                            .collect();
-                        for r in raw {
-                            for (i, v) in r.into_iter().enumerate() {
-                                transposed[i].push(v);
-                            }
-                        }
-                        Ok(transposed)
+                        select_rows(tx, backend.as_ref(), &def, visible.as_deref(), limit).await
                     })
                 },
             )
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
 
-        let arrays = build_arrays(&columns, rows_per_col)?;
-        RecordBatch::try_new(projected_schema, arrays)
+    /// Rewrite the session-owned rows `filters` selects, in one transaction:
+    /// read them, then [`replace_rows`] them with `rewrite` applied — the
+    /// rows' new values when `rewrite` is `Some`, nothing (a delete) when it
+    /// is `None`. The read happens inside the write transaction, so the rows
+    /// rewritten are exactly the rows the predicate matched. Returns the
+    /// number of rows matched.
+    async fn rewrite(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        rewrite: Option<&[(String, Expr)]>,
+    ) -> Result<u64, DataFusionError> {
+        let schema = DFSchema::try_from(Arc::clone(&self.def.schema))?;
+        let props = state.execution_props();
+        let predicate = conjunction(filters.iter().cloned())
+            .map(|e| create_physical_expr(&e, &schema, props))
+            .transpose()?;
+        let assignments = rewrite
+            .map(|assignments| {
+                assignments
+                    .iter()
+                    .map(|(column, e)| {
+                        Ok((
+                            self.def.schema.index_of(column)?,
+                            create_physical_expr(e, &schema, props)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, DataFusionError>>()
+            })
+            .transpose()?;
+
+        let def = Arc::clone(&self.def);
+        let backend = Arc::clone(&self.backend);
+        let tenant = self.tenant.current_tenant();
+        self.backend
+            .catalog_backend()
+            .transaction(TxOptions::default(), move |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, def.id.as_str())?;
+                    let owned = owned_rows(tenant);
+                    let rows = select_rows(tx, backend.as_ref(), &def, Some(&owned), None).await?;
+                    let matched = matching(&rows, predicate.as_ref()).map_err(execution)?;
+                    let keys = primary_key_of(&def, &matched)?;
+                    let written = match &assignments {
+                        Some(assignments) => assign(&matched, assignments).map_err(execution)?,
+                        None => RecordBatch::new_empty(Arc::clone(&def.schema)),
+                    };
+                    replace_rows(tx, backend.as_ref(), &def, Some(&keys), &written).await?;
+                    Ok(matched.num_rows() as u64)
+                })
+            })
+            .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 }
@@ -170,19 +184,118 @@ impl TableProvider for MutableTableProvider {
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        if !matches!(insert_op, InsertOp::Append | InsertOp::Replace) {
-            return Err(DataFusionError::NotImplemented(format!(
-                "InsertOp {insert_op:?} not supported on mutable tables; \
-                 use Append or Replace"
-            )));
-        }
         let sink = Arc::new(MutableTableSink::new(
             Arc::clone(&self.def),
             Arc::clone(&self.backend),
             self.tenant.clone(),
+            KeyConflict::try_from(insert_op)?,
         ));
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let deleted = self.rewrite(state, &filters, None).await?;
+        affected(state, deleted).await
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let updated = self.rewrite(state, &filters, Some(&assignments)).await?;
+        affected(state, updated).await
+    }
+
+    async fn truncate(
+        &self,
+        state: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.delete_from(state, Vec::new()).await
+    }
+}
+
+/// The single-row `count` plan a DML statement answers with — the shape
+/// DataFusion's own `DataSinkExec` and `MemTable` DML return.
+async fn affected(
+    state: &dyn Session,
+    rows: u64,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let batch = RecordBatch::try_from_iter_with_nullable(vec![(
+        "count",
+        Arc::new(UInt64Array::from(vec![rows])) as ArrayRef,
+        false,
+    )])?;
+    MemTable::try_new(batch.schema(), vec![vec![batch]])?
+        .scan(state, None, &[], None)
+        .await
+}
+
+/// Every row of `def` that `predicate` selects, read inside `tx`.
+async fn select_rows(
+    tx: &mut Transaction<'_>,
+    backend: &dyn MutableBackend,
+    def: &MutableTableDefinition,
+    predicate: Option<&str>,
+    limit: Option<usize>,
+) -> Result<RecordBatch, BackendError> {
+    let columns: Vec<(String, DataType)> = def
+        .schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    let names: Vec<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
+    let sql = backend.scan_dml(def, &names, predicate, limit);
+    let rows = tx.query(&sql, &[], |row| decode_row(row, &columns)).await?;
+    // Transpose Vec<Row> → Vec<Column>
+    let mut transposed: Vec<Vec<DecodedValue>> = (0..columns.len())
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect();
+    for r in rows {
+        for (i, v) in r.into_iter().enumerate() {
+            transposed[i].push(v);
+        }
+    }
+    let arrays = build_arrays(&columns, transposed).map_err(execution)?;
+    RecordBatch::try_new(Arc::clone(&def.schema), arrays).map_err(execution)
+}
+
+/// The rows of `rows` that `predicate` selects; every row when there is no
+/// predicate. A `NULL` verdict does not select (SQL three-valued logic), which
+/// is how `filter_record_batch` reads a null mask slot.
+fn matching(
+    rows: &RecordBatch,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+) -> Result<RecordBatch, DataFusionError> {
+    let Some(predicate) = predicate else {
+        return Ok(rows.clone());
+    };
+    let verdict = predicate.evaluate(rows)?.into_array(rows.num_rows())?;
+    let verdict = verdict
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            DataFusionError::Plan("a DML predicate must evaluate to a boolean".into())
+        })?;
+    Ok(filter_record_batch(rows, verdict)?)
+}
+
+/// `rows` with each assigned column replaced by its expression's value.
+fn assign(
+    rows: &RecordBatch,
+    assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+) -> Result<RecordBatch, DataFusionError> {
+    let mut columns = rows.columns().to_vec();
+    for (index, expr) in assignments {
+        columns[*index] = expr.evaluate(rows)?.into_array(rows.num_rows())?;
+    }
+    Ok(RecordBatch::try_new(rows.schema(), columns)?)
 }
 
 /// One column value read from a backend row, after **width-faithful**

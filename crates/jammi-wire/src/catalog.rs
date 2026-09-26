@@ -315,6 +315,36 @@ pub fn match_verdict_from_proto(
     }
 }
 
+/// Carry a result table's recorded [`MaterializationManifest`] as
+/// `DescribeTable`'s response: the manifest's own canonical serialization, the
+/// bytes its sidecar holds.
+///
+/// [`MaterializationManifest`]: jammi_db::store::manifest::MaterializationManifest
+pub fn describe_table_to_proto(
+    manifest: &jammi_db::store::manifest::MaterializationManifest,
+) -> Result<pb::DescribeTableResponse, Status> {
+    let bytes = manifest
+        .to_json_bytes()
+        .map_err(|e| Status::internal(format!("materialization manifest encode: {e}")))?;
+    let manifest_json = String::from_utf8(bytes)
+        .map_err(|e| Status::internal(format!("materialization manifest encode: {e}")))?;
+    Ok(pb::DescribeTableResponse { manifest_json })
+}
+
+/// Reconstruct the [`MaterializationManifest`] a `DescribeTable` response
+/// carries, through the engine's strict manifest reader — a manifest of a
+/// format version this build does not read is rejected, never half-decoded.
+///
+/// [`MaterializationManifest`]: jammi_db::store::manifest::MaterializationManifest
+pub fn describe_table_from_proto(
+    resp: pb::DescribeTableResponse,
+) -> Result<jammi_db::store::manifest::MaterializationManifest, Status> {
+    jammi_db::store::manifest::MaterializationManifest::from_json_bytes(
+        resp.manifest_json.as_bytes(),
+    )
+    .map_err(|e| Status::internal(format!("DescribeTableResponse: {e}")))
+}
+
 // === sensing layer (staleness + lineage) ==================================
 
 /// Map the engine's [`StaleReason`](jammi_db::store::StaleReason) onto the proto

@@ -76,7 +76,7 @@ fn spec_with_backbone_dtype(
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 backbone_dtype,
                 ..Default::default()
             },
@@ -440,7 +440,7 @@ async fn every_published_object_sits_flat_under_its_own_row() {
                 epochs: 2,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 // n == epochs: every epoch is retained and gets its OWN row
                 // (the shape this oracle must account for).
                 keep_last_n_checkpoints: Some(2),

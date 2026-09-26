@@ -109,7 +109,7 @@ async fn oracle_epochs_honored_exactly_precomputed() {
                 epochs,
                 batch_size: 1,
                 validation_fraction: 0.0,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 gradient_accumulation_steps: 1,
                 // Monitor train loss, patience huge → early stopping can't fire.
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
@@ -183,7 +183,7 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
             epochs: EPOCHS,
             batch_size: 1,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: jammi_ai::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: GA,
             // Train-loss monitoring with huge patience → early stopping can't fire
             // and truncate the epoch budget.
@@ -261,7 +261,7 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
             epochs: EPOCHS,
             batch_size: 1,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: jammi_ai::fine_tune::Warmup::Steps(0),
             gradient_accumulation_steps: GA,
             lr_schedule: LrSchedule::CosineDecay,
             early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
@@ -320,7 +320,7 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
 fn oracle_compute_lr_goes_negative_past_horizon() {
     let cfg = FineTuneConfig {
         learning_rate: 1e-3,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::LinearDecay,
         ..Default::default()
     };

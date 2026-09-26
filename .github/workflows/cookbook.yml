@@ -1,22 +1,25 @@
 name: Cookbook
 
+# Every recipe under cookbook/ runs against the engine built from this commit,
+# on every change: a recipe is how a new user learns a verb, so a verb that
+# breaks its recipe breaks here, before it merges. The recipes that talk to a
+# server start one through `jammi.testing.LiveServer`, so this lane builds the
+# CPU `jammi-server` and puts it on PATH; the same lane then runs the Python
+# client's live-server suite, which needs exactly the two things it already has
+# — the native engine and a built server.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    # Nightly run includes the slow + integration recipes (fine_tune, flight_sql).
-    - cron: "0 6 * * *"
   workflow_dispatch:
 
 concurrency:
   group: cookbook-${{ github.ref }}
-  # Same rationale as ci.yml's own concurrency blocks: a PR ref
-  # still cancels its own superseded runs, but a run ON MAIN (including the
-  # nightly schedule trigger, whose github.ref is also refs/heads/main) is
-  # evidence a closure can cite and must be allowed to finish rather than
-  # being cancelled by the next merge or the next scheduled tick.
+  # Same rationale as ci.yml's own concurrency blocks: a PR ref still cancels
+  # its own superseded runs, but a run ON MAIN is evidence a closure can cite
+  # and must be allowed to finish rather than being cancelled by the next merge.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: this lane only reads the checkout; nothing publishes.
@@ -28,59 +31,35 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  smoke:
-    name: Smoke (fast)
+  recipes:
+    name: Recipes + live client suite
     runs-on: ubuntu-latest
     container:
       image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    if: github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # `jammi.connect` needs both lockstep dists — the base client `jammi-ai`
-      # (import `jammi`) and the compiled `jammi-ai-native` engine (`maturin
-      # develop`, importable as `jammi_native`), which the base discovers as
-      # its `file://` backend. The shared setup-jammi-py action owns the
-      # venv/maturin mechanics.
-      - name: Build wheel + venv
-        uses: ./.github/actions/setup-jammi-py
-
-      - name: Run cookbook smoke
-        run: |
-          . .venv/bin/activate
-          python tests/cookbook_smoke.py
-
-  smoke-slow:
-    name: Smoke (slow + integration)
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
-
-      # `flight_sql` shells out to `target/release/jammi-server`; build it
-      # (`build-server`) before invoking the smoke runner. `jammi.connect`
-      # needs both lockstep dists — the base client `jammi-ai` and the
-      # compiled `jammi-ai-native` engine (`maturin develop`, importable as
-      # `jammi_native`). The shared setup-jammi-py action owns the
-      # venv/maturin mechanics.
+      # Both lockstep dists — the base client `jammi-ai` and the compiled
+      # `jammi-ai-native` engine — plus the release `jammi-server` on PATH. The
+      # shared setup-jammi-py action owns the venv/maturin/server mechanics.
       - name: Build wheel + jammi-server binary
         uses: ./.github/actions/setup-jammi-py
         with:
           build-server: "true"
 
-      - name: Run cookbook smoke (all recipes)
-        env:
-          JAMMI_COOKBOOK_SLOW: "1"
+      # The recipes resolve their fixtures through the `jammi_cookbook`
+      # package, as a fresh install (a Colab runtime) does.
+      - name: Install the cookbook package
+        run: |
+          . .venv/bin/activate
+          pip install -e cookbook/book
+
+      - name: Run every recipe
         run: |
           . .venv/bin/activate
           python tests/cookbook_smoke.py
 
-      # The client's whole suite, the `live_server` tests included: this lane has
-      # both resources they need — the native engine and a built server.
       - name: Python client suite against a live server
         run: |
           . .venv/bin/activate

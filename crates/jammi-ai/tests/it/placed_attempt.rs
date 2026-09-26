@@ -136,7 +136,7 @@ async fn fleet() -> (Arc<InferenceSession>, Arc<InferenceSession>, TempDir) {
             .unwrap();
     }
     let executor = shared_dir_session(dir.path(), |c| {
-        c.gpu.device = 0;
+        c.gpu.device = Some(0);
         c.gpu.devices = Some(vec![0, 1]);
         c.worker.local_ranks = 2;
         c.worker.rank_timeout_secs = 10;

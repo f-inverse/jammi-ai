@@ -388,7 +388,7 @@ pub fn test_config(artifact_dir: &Path) -> jammi_db::config::JammiConfig {
     jammi_db::config::JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: jammi_db::config::GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         inference: jammi_db::config::InferenceConfig {
@@ -396,7 +396,7 @@ pub fn test_config(artifact_dir: &Path) -> jammi_db::config::JammiConfig {
             ..Default::default()
         },
         logging: jammi_db::config::LoggingConfig {
-            level: "debug".into(),
+            level: Some("debug".into()),
             ..Default::default()
         },
         ..Default::default()

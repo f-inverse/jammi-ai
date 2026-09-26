@@ -170,6 +170,10 @@ message PredictRequest {
   // ANN neighbourhood size for the hybrid arm. Set only with `edges` to pool the
   // embedding-similarity and declared-edge candidate sets.
   optional uint32 hybrid_ann_k = 6;
+  // The serving source's embedding table the context is read from. Unset on
+  // the training source = the table the predictor trained on; unset on another
+  // source = that source's current default embedding table.
+  optional string embedding_table = 7;
 }
 
 message PredictResponse {

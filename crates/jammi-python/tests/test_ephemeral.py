@@ -76,7 +76,7 @@ def test_context_manager_creates_uses_and_deletes(tmp_path):
     # that count exactly so the replay read does not block on the live tail
     # (see test_topics.py for the same pattern).
     events = db.subscribe_collect(
-        "jammi.audit.session_lifecycle.v1", from_offset=0, max_batches=2
+        "jammi.audit.session_lifecycle.v1", from_offset=0
     )
     records = [json.loads(r) for r in events.column("record").to_pylist()]
     closed = [r for r in records if r["event"] == "closed"]

@@ -44,6 +44,34 @@ pub const WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
     "model.gguf",
 ];
 
+/// The OpenCLIP checkpoint's config and weights. A checkpoint carrying both
+/// resolves through them, whatever else it ships: OpenCLIP hub repositories
+/// commonly mirror a transformers `config.json` and `model.safetensors`,
+/// which no loader in this crate reads, and taking the first name of each
+/// frozen chain on such a repository pairs a config with weights of a
+/// different model format.
+pub const OPEN_CLIP_PAIR: [&str; 2] = ["open_clip_config.json", "open_clip_model.safetensors"];
+
+/// The config and weights names, in precedence order, for a checkpoint whose
+/// files `present` reports: the OpenCLIP pair first when both are present,
+/// the frozen [`CONFIG_CANDIDATE_NAMES`] / [`WEIGHTS_CANDIDATE_NAMES`] order
+/// otherwise. Every arm resolves through this — a local directory asks the
+/// disk, a hub repository its listing — so they cannot choose differently.
+pub fn resolution_order(present: impl Fn(&str) -> bool) -> ([&'static str; 2], [&'static str; 3]) {
+    if OPEN_CLIP_PAIR.iter().all(|name| present(name)) {
+        (
+            [OPEN_CLIP_PAIR[0], CONFIG_CANDIDATE_NAMES[0]],
+            [
+                OPEN_CLIP_PAIR[1],
+                WEIGHTS_CANDIDATE_NAMES[0],
+                WEIGHTS_CANDIDATE_NAMES[2],
+            ],
+        )
+    } else {
+        (CONFIG_CANDIDATE_NAMES, WEIGHTS_CANDIDATE_NAMES)
+    }
+}
+
 /// The canonical GGUF weights file name. A directory carrying some other
 /// `*.gguf` file is a typed refusal at the resolver, never a silent load.
 pub const GGUF_WEIGHTS_FILENAME: &str = "model.gguf";
@@ -279,19 +307,19 @@ pub fn config_model_type(config: &serde_json::Value) -> &str {
         .unwrap_or_else(|| UNDECLARED_MODEL_TYPE_FAMILY.adapter_model_type())
 }
 
-/// The first EXISTING config file under `dir`, walking
-/// [`CONFIG_CANDIDATE_NAMES`] in its frozen order. `None` when the directory
+/// The first EXISTING config file under `dir`, walking the config names in
+/// [`resolution_order`]. `None` when the directory
 /// carries neither — the caller owns the typed refusal, because the message
 /// differs per caller (a resolver miss is `Ok(None)` on the catalog arm and a
 /// hard error on the local arm).
 pub fn config_candidates(dir: &Path) -> Option<PathBuf> {
-    first_existing(dir, &CONFIG_CANDIDATE_NAMES)
+    first_existing(dir, &resolution_order(|name| dir.join(name).exists()).0)
 }
 
-/// The first EXISTING weights file under `dir`, walking
-/// [`WEIGHTS_CANDIDATE_NAMES`] in the frozen precedence.
+/// The first EXISTING weights file under `dir`, walking the weights names in
+/// [`resolution_order`].
 pub fn weights_candidates(dir: &Path) -> Option<PathBuf> {
-    first_existing(dir, &WEIGHTS_CANDIDATE_NAMES)
+    first_existing(dir, &resolution_order(|name| dir.join(name).exists()).1)
 }
 
 /// Every candidate path under `dir` for `names`, existing or not — the shape
@@ -312,6 +340,52 @@ fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkpoint that ships the OpenCLIP pair beside a transformers
+    /// mirror — the layout of `laion/CLIP-ViT-B-32-laion2B-s34B-b79K` —
+    /// resolves both files from the OpenCLIP pair, on disk and from a hub
+    /// listing alike; a plain transformers checkpoint keeps the frozen order.
+    #[test]
+    fn an_open_clip_pair_resolves_as_a_pair_beside_a_transformers_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "config.json",
+            "model.safetensors",
+            "open_clip_config.json",
+            "open_clip_model.safetensors",
+        ] {
+            std::fs::write(dir.path().join(name), b"{}").unwrap();
+        }
+        assert_eq!(
+            config_candidates(dir.path()),
+            Some(dir.path().join("open_clip_config.json"))
+        );
+        assert_eq!(
+            weights_candidates(dir.path()),
+            Some(dir.path().join("open_clip_model.safetensors"))
+        );
+        let listing = [
+            "config.json",
+            "model.safetensors",
+            "open_clip_config.json",
+            "open_clip_model.safetensors",
+        ];
+        let (config, weights) = resolution_order(|n| listing.contains(&n));
+        assert_eq!((config[0], weights[0]), OPEN_CLIP_PAIR.into());
+
+        let transformers = tempfile::tempdir().unwrap();
+        for name in ["config.json", "model.safetensors", "open_clip_config.json"] {
+            std::fs::write(transformers.path().join(name), b"{}").unwrap();
+        }
+        assert_eq!(
+            config_candidates(transformers.path()),
+            Some(transformers.path().join("config.json"))
+        );
+        assert_eq!(
+            weights_candidates(transformers.path()),
+            Some(transformers.path().join("model.safetensors"))
+        );
+    }
 
     /// Every family's persisted adapter id maps back to that same family.
     /// Without this, a tower adapter could be written under an id the load

@@ -10,22 +10,17 @@ driver, and BI tools speak natively.
 
 ## What `example.py` does
 
-1. Spawns `target/release/jammi-server` as a child process pointed at a
-   temp `artifact_dir`
-2. Polls the health endpoint (`http://127.0.0.1:8080/healthz`) until the
-   server is ready (5 s budget)
-3. Opens a `pyarrow.flight.FlightClient` against `grpc://127.0.0.1:8081`
-4. Submits `SELECT 1 AS one` over Flight SQL and confirms the response
-5. Tears down the server process cleanly
-
-This recipe is gated out of the per-PR CI matrix — it depends on the
-`jammi-server` binary being built (`cargo build --release -p jammi-server`),
-and the build cost dominates the test wall-clock. The nightly cookbook job
-builds the binary and runs the recipe behind `JAMMI_COOKBOOK_SLOW=1`.
+1. Starts a `jammi-server` over a temp `artifact_dir` with
+   `jammi.testing.LiveServer`, which binds kernel-assigned ports and waits
+   until the server answers a handshake
+2. Opens a `pyarrow.flight.FlightClient` against the server's endpoint
+3. Submits `SELECT 1 AS one` over Flight SQL and confirms the response
+4. Stops the server and waits for it to exit
 
 ## Prerequisites
 
-- `cargo build --release -p jammi-server` — produces `target/release/jammi-server`
+- A `jammi-server` binary on PATH: `pip install jammi-server`, or
+  `cargo build --release -p jammi-server` with `target/release` on PATH
 - `pip install pyarrow` (already a `jammi-ai` dependency)
 
 The script auto-detects `JAMMI_BIN` (env var) or falls back to the

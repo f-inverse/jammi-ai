@@ -1000,6 +1000,18 @@ fn cases() -> Vec<IsolationCase> {
                 assert_verify_materialization_isolated().await;
             }
         ),
+        // `describe_table` reads the table's recorded manifest after the same
+        // tenant-filtered `get_result_table`, so a peer cannot read the
+        // provenance of a table it cannot resolve.
+        case!(
+            "CatalogService",
+            "DescribeTable",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_describe_table_isolated().await;
+            }
+        ),
         // --- sensing layer (staleness + lineage) -----------------------------
         // `staleness` and `derives_from` both resolve their table through the
         // tenant-filtered `get_result_table` before sensing it, so a peer cannot
@@ -1065,18 +1077,19 @@ fn cases() -> Vec<IsolationCase> {
             assert_audit_verify_isolated().await;
         }),
         // --- compute verbs (resolver-isolated; covered_by names the e2e) -----
+        // GenerateEmbeddings runs for real on the CPU: tenant A embeds with
+        // the model it fine-tuned, under the scope the gRPC handler installs,
+        // and tenant B is refused A's model. The model binds on the inference
+        // runner's own task, so this proves the planning tenant reaches it.
+        // The source leg is covered by the AddSource/ListSources/DescribeSource
+        // cases.
         case!(
             "EmbeddingService",
             "GenerateEmbeddings",
-            CaseKind::ComputeResolver,
-            Some(E2E_ISOLATION_TEST),
+            CaseKind::Hermetic,
+            None,
             {
-                // GenerateEmbeddings loads its embedding model (tenant-filtered
-                // `get_model`) and reads the input source (tenant-scoped SQL); it
-                // does NOT call `resolve_embedding_table` (it writes a fresh table).
-                // The model leg is asserted here; the source leg is covered by the
-                // AddSource/ListSources/DescribeSource cases.
-                assert_model_resolver_isolated().await;
+                assert_embedding_with_own_model_isolated().await;
             }
         ),
         case!(
@@ -1095,6 +1108,19 @@ fn cases() -> Vec<IsolationCase> {
             Some(E2E_ISOLATION_TEST),
             {
                 assert_embedding_resolver_isolated().await;
+            }
+        ),
+        // `lexical_search` resolves its lexical table through the tenant-scoped
+        // catalog before ranking anything: tenant A builds a lexical index over
+        // its own source and searches it; tenant B resolves no lexical table for
+        // that source, reads no row of A's, and its search refuses.
+        case!(
+            "EmbeddingService",
+            "LexicalSearch",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_lexical_isolated().await;
             }
         ),
         // ImportEmbeddings writes a tenant-scoped ready embedding table from
@@ -1198,6 +1224,19 @@ fn cases() -> Vec<IsolationCase> {
         case!("PipelineService", "AsofJoin", CaseKind::Hermetic, None, {
             assert_source_resolver_isolated().await;
         }),
+        // `build_lexical_index` reads one registered SOURCE, resolved through
+        // the session's tenant-scoped catalog (`find_table_name`) before any
+        // row is planned, so source resolution is its whole tenant boundary —
+        // the gate `AsofJoin` rides.
+        case!(
+            "PipelineService",
+            "BuildLexicalIndex",
+            CaseKind::Hermetic,
+            None,
+            {
+                assert_source_resolver_isolated().await;
+            }
+        ),
         // `generate_structure_embeddings` reads no embedding table and runs no
         // model: its one input is the edge relation, a registered SOURCE it
         // resolves through the session's tenant-scoped catalog
@@ -1757,6 +1796,69 @@ async fn assert_import_isolated() {
     );
 }
 
+/// Tenant A builds a lexical index over its own source and searches it; tenant
+/// B, over the same engine, resolves no lexical table for the source, cannot
+/// read A's table row, and its search refuses — the same scoping the gRPC
+/// handler applies with `scoped(engine, tenant, …)`.
+async fn assert_lexical_isolated() {
+    use jammi_ai::local_session::{BuildLexicalIndex, LexicalAnalyzer, LexicalSearchRequest};
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let session = Session::new(Arc::clone(&engine));
+    let search = || LexicalSearchRequest {
+        source_id: "patents".into(),
+        text: "quantum".into(),
+        k: 3,
+        lexical_table: None,
+        filter: None,
+        select: Vec::new(),
+    };
+
+    let table = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            session
+                .add_source("patents", SourceType::File, parquet_connection())
+                .await?;
+            let table = session
+                .build_lexical_index(
+                    "patents",
+                    &BuildLexicalIndex {
+                        columns: vec!["title".into()],
+                        key_column: "id".into(),
+                        analyzer: LexicalAnalyzer::English,
+                    },
+                )
+                .await?;
+            let hits = session.lexical_search(search()).await?;
+            assert!(!hits.is_empty(), "tenant A searches its own lexical index");
+            Ok::<_, JammiError>(table.table_name)
+        })
+        .await
+        .expect("tenant A builds and searches its own lexical index");
+
+    let cat_b = engine.catalog().pinned_to_tenant(Some(tenant_b()));
+    assert!(
+        cat_b.resolve_lexical_table("patents", None).await.is_err(),
+        "CROSS-TENANT LEAK: tenant B resolved tenant A's lexical index"
+    );
+    assert!(
+        cat_b.get_result_table(&table).await.unwrap().is_none(),
+        "CROSS-TENANT LEAK: tenant B read tenant A's lexical table row"
+    );
+    let refused = engine
+        .with_tenant_scoped(tenant_b(), |_scope| session.lexical_search(search()))
+        .await;
+    assert!(
+        refused.is_err(),
+        "CROSS-TENANT LEAK: tenant B searched tenant A's lexical index"
+    );
+}
+
 /// `asof_join` resolves its two input relations through the tenant-scoped source
 /// catalog: a peer cannot resolve a tenant's registered source, so it cannot
 /// point either side of the join at that source. This drives the real source
@@ -2096,6 +2198,28 @@ async fn assert_verify_materialization_isolated() {
     assert!(
         b_result.is_err(),
         "CROSS-TENANT LEAK: tenant B resolved and verified tenant A's materialization: {b_result:?}"
+    );
+}
+
+/// `describe_table` resolves its table through the tenant-filtered
+/// `get_result_table`: tenant A reads its own table's recorded manifest; tenant
+/// B, naming A's table, resolves no row and errors, never reading A's
+/// provenance.
+async fn assert_describe_table_isolated() {
+    let (engine, session, table_name, _dir) = materialize_table_for_tenant_a().await;
+
+    let described = engine
+        .with_tenant_scoped(tenant_a(), |_scope| session.describe_table(&table_name))
+        .await
+        .expect("tenant A must describe its own materialization");
+    assert_eq!(described.env.models[0].model_id, "sensing-model");
+
+    let b_result = engine
+        .with_tenant_scoped(tenant_b(), |_scope| session.describe_table(&table_name))
+        .await;
+    assert!(
+        b_result.is_err(),
+        "CROSS-TENANT LEAK: tenant B read tenant A's materialization: {b_result:?}"
     );
 }
 
@@ -2587,6 +2711,88 @@ async fn assert_refresh_isolated(verb: RefreshVerb) {
 /// `get_model`, which is tenant-filtered: a peer cannot resolve a tenant's
 /// private model. (Infer / Predict additionally read a source scan via
 /// tenant-scoped SQL, covered by the Flight SQL and source cases.)
+/// Tenant A fine-tunes a model and embeds a source with it under
+/// `with_tenant_scoped(A)` — the binding `scoped(engine, tenant, …)` gives a
+/// gRPC request; tenant B, embedding with A's model under its own scope, is
+/// refused `ModelNotFound`.
+async fn assert_embedding_with_own_model_isolated() {
+    use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod, Warmup};
+    use jammi_ai::local_session::{EmbeddingRequest, Modality};
+
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(
+        InferenceSession::new(test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&engine).unwrap();
+    for (name, file, format) in [
+        ("training", "training_pairs.csv", FileFormat::Csv),
+        ("patents", "patents.parquet", FileFormat::Parquet),
+    ] {
+        engine
+            .add_source(
+                name,
+                SourceType::File,
+                SourceConnection {
+                    url: Some(fixture_url(file)),
+                    format: Some(format),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let base = format!(
+        "local:{}",
+        jammi_test_utils::cookbook_fixture("tiny_bert").display()
+    );
+    let tuned = engine
+        .with_tenant_scoped(tenant_a(), |_scope| async {
+            let job = engine
+                .fine_tune(
+                    "training",
+                    &base,
+                    &["text_a".into(), "text_b".into(), "score".into()],
+                    FineTuneMethod::Lora,
+                    ModelTask::TextEmbedding,
+                    Some(FineTuneConfig {
+                        epochs: 1,
+                        batch_size: 8,
+                        lora_rank: 4,
+                        warmup: Warmup::Steps(0),
+                        ..Default::default()
+                    }),
+                )
+                .await?;
+            job.wait().await?;
+            Ok::<_, JammiError>(job.model_id().to_string())
+        })
+        .await
+        .expect("tenant A trains its own model");
+    let embed = || EmbeddingRequest {
+        source_id: "patents".into(),
+        model_id: tuned.clone(),
+        columns: vec!["abstract".into()],
+        key_column: "id".into(),
+        modality: Modality::Text,
+        dimensions: None,
+        cache: jammi_db::store::CachePolicy::Bypass,
+    };
+
+    let own = engine
+        .with_tenant_scoped(tenant_a(), |_scope| engine.generate_embeddings(embed()))
+        .await;
+    assert!(own.is_ok(), "tenant A embeds with its own model: {own:?}");
+    let peer = engine
+        .with_tenant_scoped(tenant_b(), |_scope| engine.generate_embeddings(embed()))
+        .await;
+    assert!(
+        matches!(peer, Err(JammiError::ModelNotFound { .. })),
+        "CROSS-TENANT LEAK: tenant B embedded with tenant A's model: {peer:?}"
+    );
+}
+
 async fn assert_model_resolver_isolated() {
     let (_dir, cat_a, cat_b, _g) = ab_catalogs().await;
     cat_a

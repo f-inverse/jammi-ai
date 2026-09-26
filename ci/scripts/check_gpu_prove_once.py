@@ -400,6 +400,10 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "native-wheel": PromotionRow("pypi.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
     "client-wheel": PromotionRow("pypi-client.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
     "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
+    "native-cu12-wheel": PromotionRow(
+        "pypi-native-cuda.yml", "publish", "gpu-proof", "direct", tag_family="py-v"
+    ),
+    "cookbook-wheel": PromotionRow("pypi-cookbook.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
 }
 
 # Local reusable workflows REVIEWED, by direct human inspection, to invoke

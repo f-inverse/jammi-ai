@@ -1,0 +1,18 @@
+{
+  "asof_auc": {
+    "tol": 0.03,
+    "value": 0.7920105347656285
+  },
+  "coverage_asof": {
+    "tol": 0.03,
+    "value": 0.929
+  },
+  "coverage_leaky": {
+    "tol": 0.03,
+    "value": 0.888
+  },
+  "naive_auc": {
+    "tol": 0.03,
+    "value": 0.9653651540980058
+  }
+}

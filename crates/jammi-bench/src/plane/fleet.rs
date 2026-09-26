@@ -610,7 +610,7 @@ pub async fn observer_session(
     let config = JammiConfig {
         artifact_dir,
         gpu: GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {

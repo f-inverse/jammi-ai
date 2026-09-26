@@ -1,0 +1,26 @@
+{
+  "tenancy.global_source_visible": {
+    "tol": 0.0,
+    "value": 605.0
+  },
+  "tier01.contains_homophily": {
+    "tol": 1e-09,
+    "value": 0.9895509743010449
+  },
+  "tier01.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5645000000000001
+  },
+  "tier01.route_homophily": {
+    "tol": 1e-09,
+    "value": 0.8259573039477062
+  },
+  "tier02.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.6295000000000011
+  },
+  "tier02.precision_delta": {
+    "tol": 0.02,
+    "value": 0.06500000000000095
+  }
+}

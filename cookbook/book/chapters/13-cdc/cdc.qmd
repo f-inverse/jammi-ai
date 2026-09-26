@@ -1,5 +1,5 @@
 ---
-title: "Change-data-capture on a trigger topic — publish, predicate-filtered subscribe, replay"
+title: "Change-data-capture on a trigger topic — publish, filtered subscribe, resume"
 ---
 
 ```{python}
@@ -8,238 +8,204 @@ import jammi_cookbook
 ```
 
 **Recipe:** `register_topic` · `publish_topic` · `subscribe_collect`
-(`predicate` / `from_offset` / `max_batches`) · `list_topics` · **Theory:** the
-offset-addressed, append-only commit log — Kafka-style publish → replay-from-offset
-[@kreps2011kafka] — as the streaming complement of the append-only result log
-[@kleppmann2017ddia] · **Rail:** measurement (the bounded replay-collect counts,
-asserted against the frozen golden).
+(`predicate` / `from_offset` / `replay_only` / `max_batches`) · `list_topics` ·
+**Theory:** the offset-addressed, append-only commit log — Kafka-style publish →
+replay-from-offset [@kreps2011kafka] — as the streaming complement of the
+append-only result log [@kleppmann2017ddia] · **Rail:** measurement (every
+collected stream equals the change set it claims to carry, counted from the
+source tables).
 
 The result log writes derived results once, append-only [@kleppmann2017ddia]. A
 **trigger topic** is its streaming complement: an offset-addressed, append-only
-**commit log** of *events*. You `register_topic` with a row schema, `publish_topic`
-discrete batches onto it — each landing at the next 0-based offset — and a consumer
-`subscribe`s by **replaying** the backing table from a chosen offset. That is the
-Kafka model [@kreps2011kafka]: a partitioned commit log a consumer replays from a
-stored offset, exactly the substrate change-data-capture (CDC) rides — a stream of
-record-change events that a downstream selectively subscribes to and resumes from a
-checkpoint.
+**commit log** of *events*. You `register_topic` with a row schema and
+`publish_topic` batches onto it, each landing at the next 0-based offset; a
+consumer collects by **replaying** the log from an offset it chose. That is the
+Kafka model [@kreps2011kafka], and it is the substrate change-data-capture (CDC)
+rides: a stream of record changes that a downstream subscribes to selectively and
+resumes from a checkpoint.
 
-This chapter builds a CDC stream honestly, on CPU, hermetically (the embedded
-`Database` uses the in-memory broker by default — no server, no external broker). The events are
-real and deterministic — `N` record-change events, each an `op` (`add` / `update` /
-`remove`) on a key, keyed by a committed `arxiv` `paper_id` for realism — committed by
-the build script. The chapter re-publishes them onto a live topic, drains them with
-**bounded** offset-addressed replay-collects, and ends in **measured** counts asserted
-against the golden.
-
-```{python}
-from jammi_cookbook import contracts
-
-record = contracts.load_artifact("cdc.record")
-print(f"topic:            {record['topic']} (keyed by {record['key_source']})")
-print(f"published events: {record['num_published']}  op cycle {record['op_cycle']}")
-print(f"op counts:        {record['op_counts']}")
-print(f"predicate:        {record['predicate']}")
-print(f"checkpoint:       offset {record['checkpoint_offset']}")
-```
-
-## The terminator, stated first: `max_batches` is the stop condition, not a ceiling
-
-`subscribe_collect` does two things in sequence: it **replays** the backing table
-from `from_offset`, then it **tails the live broker** for whatever is published next.
-The in-memory broker tail blocks waiting for the next publish — there is no next
-publish in a finished render, so it would block forever. `max_batches` is therefore
-**the terminator**, not a collect ceiling with a timeout: the call returns
-synchronously **iff** `max_batches` equals exactly the number of batches the replay
-will *yield* from `from_offset`. Set it larger and the call hangs uninterruptibly on
-the broker tail.
-
-The yielded-batch count is exact and computable, so we never guess it:
-
-- **with no predicate**, every published batch from the offset is yielded, so
-  `max_batches = num_published - from_offset`;
-- **with a predicate**, a published batch whose rows *all* filter out is **dropped**
-  (not yielded as an empty batch), so `max_batches` is the number of published
-  batches at offset `>= from_offset` that contain **at least one** matching row.
-
-Every `subscribe_collect` below pins `max_batches` to that programmatically-derived
-count. This is the chapter's central teaching point: a bounded replay-collect is the
-honest shape of draining a commit log to a finite result — you collect exactly the
-replay, and you stop.
-
-```{python}
-# The op the predicate selects, and its committed batch counts — the terminators.
-print(f"add batches (offset 0):              {record['add_batches']}")
-print(f"tail batches (offset {record['checkpoint_offset']}):             {record['tail_batches']}")
-print(f"add batches (offset {record['checkpoint_offset']}):              {record['tail_add_batches']}")
-```
-
-## Register the topic and publish the change events
-
-A fresh ephemeral catalog per render keeps this hermetic. We re-derive the *same*
-deterministic event stream the build script committed — the `op` cycle and the keys
-read from the committed `arxiv.papers` cache in a fixed order — and publish each event
-as one single-row batch, so one logical change = one offset. `publish_topic` returns
-the 0-based offset the batch landed at.
+The changes here are real: the ogbn-arxiv corpus as it grew. Each publication
+year is one batch of events — an `add` for every paper published that year and a
+`cite` for every citation those papers make. The embedded `Database` runs the
+topic on its in-process broker, with no server and no external broker.
 
 ```{python}
 import tempfile
+import threading
 
 import jammi
 import pyarrow as pa
+import pyarrow.compute as pc
+from jammi_cookbook import contracts, datasets, scale
 
-OP_CYCLE = tuple(record["op_cycle"])
-NUM_EVENTS = record["num_published"]
-PREDICATE = record["predicate"]
-CHECKPOINT = record["checkpoint_offset"]
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+PAPERS = f"{arxiv.papers}.public.{arxiv.papers}"
+CITES = f"{arxiv.cites}.public.{arxiv.cites}"
+```
 
-TOPIC_SCHEMA = pa.schema([
+## Register the topic and publish the corpus's history
+
+A change event names its operation, the paper it concerns, and the year it
+happened; `ref` is the paper's subject for an `add` and the cited paper for a
+`cite`.
+
+```{python}
+SCHEMA = pa.schema([
     ("op", pa.string()),
-    ("key", pa.string()),
-    ("payload", pa.string()),
-    ("seq", pa.int64()),
+    ("paper_id", pa.string()),
+    ("year", pa.int64()),
+    ("ref", pa.string()),
 ])
+db.register_topic("paper_changes", schema=SCHEMA)
+print(db.list_topics())
 
-# Re-derive the committed deterministic stream: i-th op cycles OP_CYCLE, i-th key is
-# the i-th committed paper id (wrapping). Same cache, same stream — byte-for-byte.
-paper_ids = [p["paper_id"] for p in contracts.load_artifact("arxiv.papers").to_pylist()]
-events = [
-    {"op": OP_CYCLE[i % len(OP_CYCLE)], "key": paper_ids[i % len(paper_ids)],
-     "payload": f"rev{i:03d}", "seq": i}
-    for i in range(NUM_EVENTS)
-]
-
-db = jammi.connect(f"file://{tempfile.mkdtemp(prefix='jammi_cdc_catalog_')}")
-topic_id = db.register_topic("changes", schema=TOPIC_SCHEMA)
-print(f"registered topic: {topic_id!r}")
-print(f"list_topics:      {db.list_topics()}")
-
-
-def batch_of(event):
-    return pa.table(
-        {"op": [event["op"]], "key": [event["key"]],
-         "payload": [event["payload"]], "seq": [event["seq"]]},
-        schema=TOPIC_SCHEMA,
-    )
-
-
-offsets = [db.publish_topic("changes", batch=batch_of(e)) for e in events]
-print(f"published {len(offsets)} events at offsets {offsets[0]}..{offsets[-1]}")
-assert offsets == list(range(NUM_EVENTS)), "each publish lands at the next 0-based offset"
-```
-
-## The full backing-table replay
-
-The simplest drain: replay the whole backing table from offset 0. With no predicate
-every published batch is yielded, so the terminator is `max_batches = num_published`.
-The collected row count is the backing-table replay count — one row per single-row
-batch.
-
-```{python}
-replay_all = db.subscribe_collect("changes", from_offset=0, max_batches=NUM_EVENTS)
-replay_count = replay_all.num_rows
-print(f"full replay (from_offset=0, max_batches={NUM_EVENTS}) -> {replay_count} rows")
-assert replay_count == NUM_EVENTS, "the full replay yields one row per published batch"
-```
-
-```{python}
-from jammi_cookbook import rails
-
-# The backing-table replay count, measured against the frozen golden.
-rails.measure("cdc.replay_count", float(replay_count))
-```
-
-## The predicate-filtered selective subscribe — "only the adds"
-
-The canonical CDC subscribe: a downstream wants only the inserts. We filter the
-replay with a SQL `predicate` over the topic schema. A batch whose row does not match
-is dropped, so the terminator is the count of `add` batches — which we derive
-programmatically from the same event stream, never guess.
-
-```{python}
-# The terminator: published batches matching the predicate from offset 0. Derived
-# from the event stream itself, so it is exact — pinning it is what bounds the call.
-add_batches = sum(1 for e in events if e["op"] == "add")
-adds = db.subscribe_collect(
-    "changes", predicate=PREDICATE, from_offset=0, max_batches=add_batches)
-add_count = adds.num_rows
-print(f"selective subscribe ({PREDICATE!r}, max_batches={add_batches}) -> {add_count} rows")
-
-# The collected set equals the predicate-filtered published set, in order.
-published_adds = [e["seq"] for e in events if e["op"] == "add"]
-assert adds.column("seq").to_pylist() == published_adds, (
-    "the predicate-collected events must equal the published adds, in order")
-print(f"collected seqs: {adds.column('seq').to_pylist()[:8]} … ({add_count} total)")
-```
-
-```{python}
-# The predicate-filtered add count, measured against the frozen golden.
-rails.measure("cdc.add_count", float(add_count))
-```
-
-## Resume from a checkpoint — the CDC tail replay
-
-A CDC consumer stores its progress as an offset and resumes from it. We replay the
-tail from the committed checkpoint offset. With no predicate the terminator is
-`max_batches = num_published - checkpoint`, and the collected tail must equal the
-published tail slice exactly — a faithful "resume from where I left off."
-
-```{python}
-tail_batches = NUM_EVENTS - CHECKPOINT
-tail = db.subscribe_collect("changes", from_offset=CHECKPOINT, max_batches=tail_batches)
-tail_count = tail.num_rows
-print(f"resume tail (from_offset={CHECKPOINT}, max_batches={tail_batches}) -> {tail_count} rows")
-
-published_tail = [e["seq"] for e in events[CHECKPOINT:]]
-assert tail.column("seq").to_pylist() == published_tail, (
-    "the checkpoint-resumed tail must equal the published tail slice, in order")
-print(f"first resumed seq: {tail.column('seq')[0].as_py()} (== checkpoint offset {CHECKPOINT})")
-```
-
-```{python}
-# The checkpoint-resumed tail count, measured against the frozen golden.
-rails.measure("cdc.tail_count", float(tail_count))
-```
-
-## Resume *and* filter — the combined CDC subscribe
-
-The two compose: resume from the checkpoint *and* keep only the adds. The terminator
-is now the count of `add` batches at offset `>= checkpoint`, again derived from the
-stream. The result is the published tail's adds, exactly.
-
-```{python}
-tail_add_batches = sum(1 for e in events[CHECKPOINT:] if e["op"] == "add")
-tail_adds = db.subscribe_collect(
-    "changes", predicate=PREDICATE, from_offset=CHECKPOINT, max_batches=tail_add_batches)
-tail_add_count = tail_adds.num_rows
-print(f"resume + filter ({PREDICATE!r}, from_offset={CHECKPOINT}, "
-      f"max_batches={tail_add_batches}) -> {tail_add_count} rows")
-
-published_tail_adds = [e["seq"] for e in events[CHECKPOINT:] if e["op"] == "add"]
-assert tail_adds.column("seq").to_pylist() == published_tail_adds, (
-    "the resume+filter collect must equal the published tail's adds, in order")
+changes = db.sql(
+    f"SELECT 'add' AS op, paper_id, year, subject AS ref FROM {PAPERS} "
+    f"UNION ALL SELECT 'cite' AS op, c.src AS paper_id, p.year, c.dst AS ref "
+    f"FROM {CITES} c JOIN {PAPERS} p ON c.src = p.paper_id"
+).cast(SCHEMA)
+years = sorted(set(changes.column("year").to_pylist()))
+offset_of = {
+    year: db.publish_topic("paper_changes", batch=changes.filter(pc.equal(changes["year"], year)))
+    for year in years
+}
+print(f"{changes.num_rows} events in {len(years)} yearly batches, offsets 0..{len(years) - 1}")
 ```
 
 ```{python}
 # | echo: false
-# The resume+filter count, measured against the frozen golden, plus the conservation
-# identity: the offset-0 adds split exactly into (pre-checkpoint adds) + (tail adds).
-rails.measure("cdc.tail_add_count", float(tail_add_count))
-pre_checkpoint_adds = sum(1 for e in events[:CHECKPOINT] if e["op"] == "add")
-assert pre_checkpoint_adds + tail_add_count == add_count, (
-    "the checkpoint splits the add stream exactly — replay conserves the events")
-assert add_count == record["add_count"] and tail_add_count == record["tail_add_count"]
+assert list(offset_of.values()) == list(range(len(years)))  # each publish takes the next offset
 ```
 
-The resume-and-filter count plus the pre-checkpoint adds sums back to the full add
-count: the checkpoint partitions the add stream exactly, because offset-addressed
-replay is a faithful, lossless re-read of the commit log. Every count above is
-recomputed **live** through the topic on every render, asserted against the frozen
-golden — real numbers, not transcribed ones.
+## Replay the log — a collect is a finite drain
 
-The session's work is done, so it is closed. An embedded engine holds its catalog until
-`close()` returns, which is why `close()` comes before anything removes the directory the
-catalog lives in.
+`subscribe_collect` replays the topic's backing table from `from_offset` and
+returns: every batch published so far, as one table. The log is the source's
+history, so the replay holds exactly one event per paper and one per citation.
+
+```{python}
+def rows(sql: str) -> int:
+    return db.sql(sql).column(0)[0].as_py()
+
+
+papers, cites = rows(f"SELECT COUNT(*) FROM {PAPERS}"), rows(f"SELECT COUNT(*) FROM {CITES}")
+replay = db.subscribe_collect("paper_changes", from_offset=0)
+print(f"replayed {replay.num_rows} events = {papers} papers + {cites} citations")
+```
+
+```{python}
+# | echo: false
+assert replay.num_rows == papers + cites
+contracts.assert_close("cdc.events", replay.num_rows)
+```
+
+## A selective subscribe — only the new papers
+
+A downstream that indexes papers wants the `add`s alone. The `predicate` is SQL
+over the topic's schema, applied as the log is read; a batch with no matching
+row is not delivered at all.
+
+```{python}
+adds = db.subscribe_collect("paper_changes", predicate="op = 'add'", from_offset=0)
+print(f"{adds.num_rows} add events; the first few:")
+for event in adds.slice(0, 3).to_pylist():
+    print(" ", event)
+```
+
+```{python}
+# | echo: false
+assert adds.num_rows == papers
+assert set(adds.column("op").to_pylist()) == {"add"}
+```
+
+## Resume from a checkpoint
+
+A CDC consumer stores its progress as an offset and resumes from it. One that
+has processed the corpus through 2018 resumes at the first test-era batch, and
+reads exactly the changes it has not seen.
+
+```{python}
+CHECKPOINT = offset_of[min(y for y in years if y >= 2019)]
+tail = db.subscribe_collect("paper_changes", from_offset=CHECKPOINT)
+unseen = rows(
+    f"SELECT (SELECT COUNT(*) FROM {PAPERS} WHERE year >= 2019) + "
+    f"(SELECT COUNT(*) FROM {CITES} c JOIN {PAPERS} p ON c.src = p.paper_id WHERE p.year >= 2019)"
+)
+print(f"resumed at offset {CHECKPOINT}: {tail.num_rows} events ({unseen} changes since 2018)")
+```
+
+```{python}
+# | echo: false
+assert tail.num_rows == unseen
+contracts.assert_close("cdc.tail_events", tail.num_rows)
+```
+
+## Resume *and* filter — a downstream feature, kept current
+
+The two compose. A consumer maintaining each paper's citation in-degree (the
+feature of the feature-store chapter) resumes at its checkpoint and reads only
+the `cite` events: each is one unit of in-degree for the paper it names in
+`ref`. Folded, the stream gives exactly the in-degree the test era added.
+
+```{python}
+new_cites = db.subscribe_collect(
+    "paper_changes", predicate="op = 'cite'", from_offset=CHECKPOINT
+)
+increments = new_cites.group_by("ref").aggregate([("ref", "count")])
+from_source = db.sql(
+    f"SELECT c.dst AS ref, COUNT(*) AS n FROM {CITES} c "
+    f"JOIN {PAPERS} p ON c.src = p.paper_id WHERE p.year >= 2019 GROUP BY c.dst"
+).to_pylist()
+agree = dict(zip(increments["ref"].to_pylist(), increments["ref_count"].to_pylist())) == {
+    r["ref"]: r["n"] for r in from_source
+}
+print(f"{new_cites.num_rows} new citations across {increments.num_rows} papers; "
+      f"stream agrees with the source: {agree}")
+```
+
+```{python}
+# | echo: false
+assert agree
+contracts.assert_close("cdc.tail_cites", new_cites.num_rows)
+```
+
+## Following the live tail
+
+A replay ends; a live consumer does not. With `replay_only=False` the collect
+reads the replay and then **follows** the broker, waiting for what is published
+next, and returns once `max_batches` batches have arrived. The tail never ends
+on its own, so `max_batches` is required; without it the call is refused rather
+than left to wait forever. Here a follower waits on the next offset while a
+correction — a paper retracted — is published.
+
+```{python}
+next_offset = len(years)
+followed = {}
+follower = threading.Thread(
+    target=lambda: followed.setdefault(
+        "batch",
+        db.subscribe_collect(
+            "paper_changes", from_offset=next_offset, replay_only=False, max_batches=1
+        ),
+    )
+)
+follower.start()
+retracted = adds.column("paper_id")[0].as_py()
+db.publish_topic(
+    "paper_changes",
+    batch=pa.table({"op": ["retract"], "paper_id": [retracted], "year": [2020], "ref": [None]},
+                   schema=SCHEMA),
+)
+follower.join(timeout=60)
+print(followed["batch"].to_pylist())
+```
+
+```{python}
+# | echo: false
+assert followed["batch"].column("op").to_pylist() == ["retract"]
+```
 
 ```{python}
 db.close()
@@ -247,16 +213,12 @@ db.close()
 
 ## Bridge note
 
-> **A trigger topic is an offset-addressed commit log, and `max_batches` is what
-> makes a drain terminate.** The engine writes derived results as an append-only log
-> of immutable Parquet [@kleppmann2017ddia]; a topic is the streaming complement — an
-> append-only log of *events* a consumer replays from a stored offset, the Kafka model
-> [@kreps2011kafka]. CDC rides it directly: publish record-change events, subscribe
-> with a predicate, resume from a checkpoint. The load-bearing property is that
-> `subscribe_collect` replays the backing table and then tails the live broker, so a
-> finite drain requires `max_batches` to equal exactly the replay's yielded-batch
-> count — `num_published - from_offset` unfiltered, or the matching-batch count under
-> a predicate. Bounded replay-collect is the honest shape of turning a commit log into
-> a finite result, and its counts are reproducible to the committed golden.
-```
-
+> **A trigger topic is an offset-addressed commit log.** The engine writes
+> derived results as an append-only log of immutable Parquet
+> [@kleppmann2017ddia]; a topic is the streaming complement — an append-only log
+> of *events* a consumer replays from an offset it stored, the Kafka model
+> [@kreps2011kafka]. CDC rides it directly: publish a source's changes, collect
+> them with a predicate, resume from a checkpoint, or follow the live tail. The
+> measured property is the one CDC depends on — the collected stream is exactly
+> the change set it claims to carry: every paper, every citation, the unseen
+> tail, and the feature it folds into.

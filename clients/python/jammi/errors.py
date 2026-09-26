@@ -45,6 +45,15 @@ class InvalidKey(InvalidArgument):
     """
 
 
+class NoQueryEncoder(InvalidArgument):
+    """A query could not be encoded into an embedding table's space: no engine
+    encoder produced its vectors (they come from a graph's structure, or were
+    imported). Query such a table by row key or with a vector you computed.
+    Refines :class:`InvalidArgument` (``INVALID_ARGUMENT`` on the remote
+    transport).
+    """
+
+
 class NonUniqueKey(InvalidArgument):
     """An incremental refresh found the same key more than once on a complete
     scan of the source (or of the parent version's current state).
@@ -190,25 +199,61 @@ class BackendError(JammiError, RuntimeError):
     """
 
 
-class NotRefreshable(BackendError):
+class NotFound(BackendError):
+    """The thing named does not exist — a model, a result table, a channel, a
+    mutable table. ``NOT_FOUND`` on the remote transport.
+    """
+
+
+class AlreadyExists(BackendError):
+    """The thing being created exists already — a channel id, a mutable table,
+    a column declared twice. ``ALREADY_EXISTS`` on the remote transport.
+    """
+
+
+class FailedPrecondition(BackendError):
+    """The operation is valid but the state it needs does not hold — a model
+    still referenced, a column redeclared with another type, a table that
+    cannot refresh. ``FAILED_PRECONDITION`` on the remote transport.
+    """
+
+
+class MissingManifest(NotFound):
+    """A result table carries no recorded materialization manifest, so
+    ``describe_table`` has no definition to return. Refines :class:`NotFound`.
+    """
+
+
+class NotRefreshable(FailedPrecondition):
     """A refresh or compaction was asked of a table it cannot serve
     incrementally (not ready, not an embedding table, its current version
     unavailable, or rows without a ``_content_hash``). ``recompute`` once.
-    Refines :class:`BackendError` (``FAILED_PRECONDITION`` on the remote
-    transport).
+    Refines :class:`FailedPrecondition`.
     """
 
 
-class DefinitionDrift(BackendError):
+class DefinitionDrift(FailedPrecondition):
     """The definition a refresh would run under (the table's recorded
     embedding parameters over the model as loaded now) no longer matches the
     table's recorded definition hash — a model or environment change.
-    ``recompute`` the table. Refines :class:`BackendError`
-    (``FAILED_PRECONDITION`` on the remote transport).
+    ``recompute`` the table. Refines :class:`FailedPrecondition`.
     """
 
 
-class VersionUnavailable(BackendError):
+class ModelNotFound(NotFound):
+    """No model with this id is in the catalog. Refines :class:`NotFound`;
+    ``delete_model(if_exists=True)`` is the no-op form.
+    """
+
+
+class ModelReferenced(FailedPrecondition):
+    """A model other catalog rows still point at — a job that trained it, a
+    model built on it — cannot be deleted until they are gone. Refines
+    :class:`FailedPrecondition`.
+    """
+
+
+class VersionUnavailable(NotFound):
     """A versioned result table's CURRENT version cannot be served.
 
     Its version row is ``failed`` or its ``.version.json`` manifest is absent;

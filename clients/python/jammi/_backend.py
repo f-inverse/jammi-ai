@@ -137,7 +137,12 @@ class Session(Protocol):
 
     # --- Embeddings + search ----------------------------------------------------
     def encode_query(
-        self, *, model: str, query: Union[str, bytes], modality: Optional[str] = None
+        self,
+        *,
+        model: str,
+        query: Union[str, bytes],
+        modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
     ) -> List[float]: ...
     def generate_embeddings(
         self,
@@ -147,6 +152,7 @@ class Session(Protocol):
         columns: List[str],
         key: str,
         modality: Optional[str] = None,
+        dimensions: Optional[int] = None,
         cache: Optional[str] = None,
     ) -> str: ...
     def import_embeddings(
@@ -163,12 +169,32 @@ class Session(Protocol):
         self,
         source: str,
         *,
-        query: List[float],
+        query: Optional[List[float]] = None,
+        row_key: Optional[str] = None,
         k: int,
         filter: Optional[str] = None,
         select: Optional[List[str]] = None,
         embedding_table: Optional[str] = None,
         oversample: Optional[int] = None,
+        exact: bool = False,
+    ) -> Any: ...
+    def build_lexical_index(
+        self,
+        source: str,
+        *,
+        columns: List[str],
+        key: str,
+        analyzer: str = "english",
+    ) -> str: ...
+    def lexical_search(
+        self,
+        source: str,
+        *,
+        text: str,
+        k: int,
+        filter: Optional[str] = None,
+        select: Optional[List[str]] = None,
+        lexical_table: Optional[str] = None,
     ) -> Any: ...
     def infer(
         self,
@@ -206,6 +232,7 @@ class Session(Protocol):
     def refresh_embeddings(self, table: str, **kwargs: Any) -> Dict[str, Any]: ...
     def compact_embeddings(self, table: str) -> Dict[str, Any]: ...
     def expire_versions(self, table: str, *, before: int) -> Dict[str, Any]: ...
+    def describe_table(self, table: str) -> Dict[str, Any]: ...
     def verify_materialization(
         self, table: str, expected_definition: Optional[str] = None
     ) -> Dict[str, Any]: ...

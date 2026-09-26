@@ -13,7 +13,7 @@
 
 use jammi_wire::fine_tune::{
     ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
-    HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss,
+    HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss, Warmup,
 };
 
 /// Every field of [`FineTuneConfig`] is bound below — no `..` — over the
@@ -39,7 +39,7 @@ fn every_field_of_fine_tune_config_is_named_and_checked_against_the_default() {
         gradient_accumulation_steps,
         validation_fraction,
         early_stopping_patience,
-        warmup_steps,
+        warmup,
         lr_schedule,
         early_stopping_metric,
         target_modules,
@@ -71,7 +71,7 @@ fn every_field_of_fine_tune_config_is_named_and_checked_against_the_default() {
     assert_eq!(gradient_accumulation_steps, 1);
     assert_eq!(validation_fraction, 0.1);
     assert_eq!(early_stopping_patience, 3);
-    assert_eq!(warmup_steps, 100);
+    assert_eq!(warmup, Warmup::Fraction(0.1));
     assert_eq!(lr_schedule, LrSchedule::CosineDecay);
     assert_eq!(early_stopping_metric, EarlyStoppingMetric::ValLoss);
     assert_eq!(target_modules, Vec::<String>::new());
@@ -113,7 +113,7 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
         gradient_accumulation_steps: 4,
         validation_fraction: 0.2,
         early_stopping_patience: 5,
-        warmup_steps: 50,
+        warmup: Warmup::Steps(50),
         lr_schedule: LrSchedule::LinearDecay,
         early_stopping_metric: EarlyStoppingMetric::TrainLoss,
         target_modules: vec!["query".to_string(), "value".to_string()],
@@ -151,7 +151,7 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
         gradient_accumulation_steps,
         validation_fraction,
         early_stopping_patience,
-        warmup_steps,
+        warmup,
         lr_schedule,
         early_stopping_metric,
         target_modules,
@@ -183,7 +183,7 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
     assert_eq!(gradient_accumulation_steps, 4);
     assert_eq!(validation_fraction, 0.2);
     assert_eq!(early_stopping_patience, 5);
-    assert_eq!(warmup_steps, 50);
+    assert_eq!(warmup, Warmup::Steps(50));
     assert_eq!(lr_schedule, LrSchedule::LinearDecay);
     assert_eq!(early_stopping_metric, EarlyStoppingMetric::TrainLoss);
     assert_eq!(
@@ -230,7 +230,7 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
             gradient_accumulation_steps,
             validation_fraction,
             early_stopping_patience,
-            warmup_steps,
+            warmup,
             lr_schedule,
             early_stopping_metric,
             target_modules,

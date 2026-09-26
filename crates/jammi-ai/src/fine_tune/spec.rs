@@ -197,12 +197,17 @@ pub struct RankAdmission {
 }
 
 impl RankAdmission {
-    /// The admission this deployment implies: `[distributed] max_world_size`
-    /// as the serveable world, the configured collective, and THIS build's
-    /// CUDA support.
+    /// The admission this deployment implies: the widest gang its
+    /// configuration can form as the serveable world — the wider of an
+    /// in-process gang on this host's devices (`[worker] local_ranks`) and a
+    /// fleet gang (`[distributed] max_world_size`) — the configured
+    /// collective, and THIS build's CUDA support.
     pub fn from_config(config: &jammi_db::config::JammiConfig) -> Self {
         Self {
-            serveable_world: config.distributed.max_world_size,
+            serveable_world: config
+                .worker
+                .local_ranks
+                .max(config.distributed.max_world_size),
             collective: config.worker.collective,
             cuda_build: cfg!(feature = "cuda"),
         }
@@ -225,8 +230,9 @@ impl RankAdmission {
         }
     }
 
-    /// The widest `world_size` this admission serves — `[distributed]
-    /// max_world_size` for a config-derived value.
+    /// The widest `world_size` this admission serves — the wider of `[worker]
+    /// local_ranks` and `[distributed] max_world_size` for a config-derived
+    /// value.
     pub fn serveable_world(&self) -> u32 {
         self.serveable_world
     }
@@ -241,10 +247,10 @@ impl RankAdmission {
     ///   request edge (`FineTuneRequest::world_size` is a `NonZeroU32`) but
     ///   reachable through a hand-built or deserialized spec, so the durable
     ///   edge checks it too.
-    /// - `world_size > serveable_world` — wider than the widest gang any
-    ///   coordinator on this deployment may assemble (`[distributed]
-    ///   max_world_size`); no fleet member could ever be dialed for the
-    ///   ranks past that bound.
+    /// - `world_size > serveable_world` — wider than any gang this deployment
+    ///   can form: this host runs at most `[worker] local_ranks` ranks
+    ///   in-process, and no coordinator may assemble a fleet gang past
+    ///   `[distributed] max_world_size`.
     /// - `collective = "nccl"` on a build without CUDA — the requested
     ///   collective cannot be reached. Also refused at session OPEN
     ///   (`refuse_unreachable_collective`), which is the edge a live session
@@ -279,9 +285,10 @@ impl RankAdmission {
         }
         if world_size > self.serveable_world {
             return Err(JammiError::Config(format!(
-                "world_size = {world_size} exceeds the serveable world of {} ([distributed] \
-                 max_world_size): a gang is assembled from fleet members up to that bound, so \
-                 raise it on every coordinator or submit a smaller rank count",
+                "world_size = {world_size} exceeds the serveable world of {} (the wider of \
+                 [worker] local_ranks and [distributed] max_world_size): raise local_ranks for a \
+                 gang on this host's devices, max_world_size on every coordinator for a gang \
+                 across the fleet, or submit a smaller rank count",
                 self.serveable_world
             )));
         }
@@ -790,6 +797,7 @@ fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fine_tune::graph_sampler::GraphEdges;
 
     /// The JSON shape a writer that has no rank count queues: a `fine_tune`
     /// spec whose `common` block carries `base_model` and `config` and
@@ -903,9 +911,11 @@ mod tests {
                 node_source: "nodes".into(),
                 id_column: "id".into(),
                 text_column: "text".into(),
-                edge_source: "edges".into(),
-                src_column: "src".into(),
-                dst_column: "dst".into(),
+                edges: GraphEdges::Source {
+                    source: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                },
                 provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
             },
             sample_config: GraphSampleConfig::default(),
@@ -1112,9 +1122,11 @@ mod tests {
             node_source: "nodes".into(),
             id_column: "id".into(),
             text_column: "text".into(),
-            edge_source: "edges".into(),
-            src_column: "src".into(),
-            dst_column: "dst".into(),
+            edges: GraphEdges::Source {
+                source: "edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+            },
             provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
         };
         let sample_config = GraphSampleConfig {

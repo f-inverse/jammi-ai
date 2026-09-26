@@ -955,3 +955,157 @@ async fn eval_image_embeddings_end_to_end() {
         );
     }
 }
+
+// ─── The query encoder of a derived embedding table ─────────────────────────
+//
+// A golden's text queries are encoded by the model that produced the evaluated
+// table's vector space. A propagated table mixes its input table's vectors in
+// that table's space, so it is evaluated through its input's encoder; a
+// structure-embedding table's vectors come from graph shape alone, so no text
+// query can be encoded into it — a typed refusal, never a model load of the
+// producer's tag.
+
+#[tokio::test]
+async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
+    use jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef;
+    use jammi_ai::pipeline::graph_propagation::PropagateRequest;
+    use jammi_ai::pipeline::graph_structure::StructureRequest;
+    use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
+    use jammi_db::error::JammiError;
+    use jammi_db::store::CachePolicy;
+    use std::collections::HashMap;
+
+    let (session, base, _dir) = session_with_embeddings_and_golden().await;
+    let graph = session
+        .build_neighbor_graph(
+            "patents",
+            Some(&base),
+            &BuildNeighborGraph {
+                k: 3,
+                exact: true,
+                ..Default::default()
+            },
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap()
+        .0;
+    let edges = EdgeSourceRef::NeighborGraph {
+        table_name: graph.table_name.clone(),
+    };
+    let propagated = session
+        .propagate_embeddings(
+            &PropagateRequest::new("patents", edges.clone())
+                .with_embedding_table(&base)
+                .with_hops(1),
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap()
+        .0;
+
+    let comparison = session
+        .eval_compare(
+            &[base.clone(), propagated.table_name.clone()],
+            "patents",
+            "golden_rel.public.golden_relevance",
+            10,
+        )
+        .await
+        .expect("a propagated table evaluates through its input's encoder");
+    assert_eq!(comparison.per_table.len(), 2);
+
+    let structure = session
+        .generate_structure_embeddings(
+            &StructureRequest::new("patents", edges).with_key_column("id"),
+            CachePolicy::Bypass,
+        )
+        .await
+        .unwrap()
+        .0;
+    match session
+        .eval_embeddings(
+            "patents",
+            Some(&structure.table_name),
+            "golden_rel.public.golden_relevance",
+            10,
+            &HashMap::new(),
+        )
+        .await
+    {
+        Err(JammiError::NoQueryEncoder { table, producer }) => {
+            assert_eq!(table, structure.table_name);
+            assert_eq!(producer, "graph_structure");
+        }
+        other => panic!("a structure table has no query encoder, got {other:?}"),
+    }
+}
+
+/// A base model loaded by one tenant is a shared, global catalog row: a second
+/// tenant embedding with the same model (a warm cache hit, no fresh load) and
+/// then evaluating under its own scope binds that row, rather than finding no
+/// model at all.
+#[tokio::test]
+async fn a_base_model_resolves_for_every_tenant_that_uses_it() {
+    use std::str::FromStr;
+
+    let dir = TempDir::new().unwrap();
+    let session = Arc::new(
+        InferenceSession::new(common::test_config(dir.path()))
+            .await
+            .unwrap(),
+    );
+    let tenants = [
+        jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a").unwrap(),
+        jammi_db::TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap(),
+    ];
+    for (i, tenant) in tenants.into_iter().enumerate() {
+        // The sticky binding a client session uses: the first tenant's load
+        // is the cold one, the second's is a warm hit on the same model.
+        session.bind_tenant(tenant);
+        let (patents, golden) = (format!("patents_{i}"), format!("golden_{i}"));
+        for (name, file, format) in [
+            (&patents, "patents.parquet", FileFormat::Parquet),
+            (&golden, "golden_relevance.csv", FileFormat::Csv),
+        ] {
+            session
+                .add_source(
+                    name,
+                    SourceType::File,
+                    SourceConnection {
+                        url: Some(common::fixture_url(file)),
+                        format: Some(format),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let table = session
+            .generate_text_embeddings(
+                &patents,
+                &tiny_bert_model(),
+                &["abstract".to_string()],
+                "id",
+                jammi_db::store::CachePolicy::Bypass,
+                None,
+            )
+            .await
+            .unwrap()
+            .0;
+        let report = session
+            .eval_embeddings(
+                &patents,
+                Some(&table.table_name),
+                &format!("{golden}.public.golden_relevance"),
+                10,
+                &Default::default(),
+            )
+            .await;
+        assert!(
+            report.is_ok(),
+            "tenant {i} evaluates with the shared base model: {:?}",
+            report.err()
+        );
+    }
+}

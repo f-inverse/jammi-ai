@@ -46,16 +46,40 @@ def test_register_publish_subscribe_round_trips(tmp_path):
     # so the first publish on a fresh topic returns offset 0.
     assert offset == 0
 
-    # Replay the one published batch, then exit before the live tail blocks.
-    # `from_offset=0` triggers backing-table replay; `max_batches=1` matches
-    # the publish count exactly so the read does not race the live broker.
-    collected = db.subscribe_collect(
-        "events.demo", from_offset=0, max_batches=1
-    )
+    # A collect drains the backing table from `from_offset` and returns.
+    collected = db.subscribe_collect("events.demo", from_offset=0)
     event_ids = collected.column("event_id").to_pylist()
     payloads = collected.column("payload").to_pylist()
     assert event_ids == [1, 2, 3]
     assert payloads == ["a", "b", "c"]
+
+
+def test_a_collect_is_a_finite_drain_unless_it_follows_the_tail(tmp_path):
+    """The default collect returns the replay, however many batches it holds;
+    following the live tail takes `max_batches`, and is refused without it."""
+    db = jammi.connect(f"file://{tmp_path}")
+    db.register_topic("events.demo", schema=_events_schema())
+    for event_id in range(3):
+        db.publish_topic(
+            "events.demo",
+            batch=pa.table(
+                {"event_id": [event_id], "payload": [f"e{event_id}"]},
+                schema=_events_schema(),
+            ),
+        )
+
+    assert db.subscribe_collect("events.demo", from_offset=0).num_rows == 3
+    assert db.subscribe_collect("events.demo", from_offset=1, max_batches=1).column(
+        "event_id"
+    ).to_pylist() == [1]
+    assert db.subscribe_collect("events.demo").num_rows == 0  # no offset, no replay
+
+    followed = db.subscribe_collect(
+        "events.demo", from_offset=0, replay_only=False, max_batches=3
+    )
+    assert followed.column("event_id").to_pylist() == [0, 1, 2]
+    with pytest.raises(ValueError, match="max_batches"):
+        db.subscribe_collect("events.demo", from_offset=0, replay_only=False)
 
 
 def test_register_inherits_session_tenant(tmp_path):

@@ -24,6 +24,7 @@ from ._generated.jammi.v1 import inference_pb2
 from ._generated.jammi.v1 import job_pb2
 from ._generated.jammi.v1 import pipeline_pb2
 from ._generated.jammi.v1 import training_pb2
+from ._generated.jammi.v1 import trigger_pb2
 from .errors import BackendError, InvalidArgument
 
 # snake-case modality string → the `Modality` enum the wire carries. One map,
@@ -69,6 +70,7 @@ _RESULT_TABLE_KIND_NAME = {
     embedding_pb2.ResultTableKind.ASOF_JOIN: "AsofJoin",
     embedding_pb2.ResultTableKind.TRAINING_SET: "TrainingSet",
     embedding_pb2.ResultTableKind.STATEMENT: "Statement",
+    embedding_pb2.ResultTableKind.LEXICAL: "Lexical",
     embedding_pb2.ResultTableKind.WORKING: "Working",
 }
 
@@ -104,12 +106,15 @@ def _cache_policy_value(cache: Optional[str]) -> int:
     """Resolve a `cache=` argument to its wire `CachePolicy` enum.
 
     `None` (the default) and ``"bypass"`` both resolve to the engine default
-    (always recompute); ``"use"`` opts into memoization. Any other string is a
-    loud `ValueError`, never a silent default — the same honesty the engine's
-    decode keeps for an out-of-range enum.
+    (always recompute), encoded as `UNSPECIFIED` — proto3's unset value, so the
+    field stays off the wire — the one encoding every writer of the engine
+    default shares (`jammi_wire::cache_policy_to_proto`). ``"use"`` opts into
+    memoization. Any other string is a loud `ValueError`, never a silent
+    default — the same honesty the engine's decode keeps for an out-of-range
+    enum.
     """
     if cache is None or cache == "bypass":
-        return inference_pb2.CachePolicy.CACHE_POLICY_BYPASS
+        return inference_pb2.CachePolicy.CACHE_POLICY_UNSPECIFIED
     if cache == "use":
         return inference_pb2.CachePolicy.CACHE_POLICY_USE
     raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
@@ -369,6 +374,7 @@ def build_fine_tune_config(
     validation_fraction: Optional[float],
     early_stopping_patience: Optional[int],
     warmup_steps: Optional[int],
+    warmup_fraction: Optional[float],
     gradient_accumulation_steps: Optional[int],
     triplet_margin: Optional[float],
     target_modules: Optional[List[str]],
@@ -426,8 +432,12 @@ def build_fine_tune_config(
         config.validation_fraction = validation_fraction
     if early_stopping_patience is not None:
         config.early_stopping_patience = early_stopping_patience
+    if warmup_steps is not None and warmup_fraction is not None:
+        raise ValueError("warmup is a step count or a fraction of the run, not both")
     if warmup_steps is not None:
         config.warmup_steps = warmup_steps
+    if warmup_fraction is not None:
+        config.warmup_fraction = warmup_fraction
     if gradient_accumulation_steps is not None:
         config.gradient_accumulation_steps = gradient_accumulation_steps
     if target_modules is not None:
@@ -535,32 +545,6 @@ def _wire_world_size(world_size: int) -> Optional[int]:
     return world_size if world_size > 1 else None
 
 
-def _wire_cache_policy_for_submit_job(cache: Optional[str]) -> Optional[int]:
-    """Convert a `cache` kwarg into the value `SubmitJobRequest.cache` should
-    carry — the SubmitJob-specific sibling of :func:`_wire_world_size`, NOT
-    :func:`_cache_policy_value` (which every other producer verb's `cache`
-    field uses).
-
-    `SubmitJobRequest` is the frozen wire surface `world_size` was appended
-    to (`crates/jammi-wire/proto/jammi/v1/job.proto`), and `cache` is a
-    SECOND field appended there the same way: a caller that never names the
-    keyword (or explicitly asks for the engine default, `"bypass"`) must
-    submit byte-for-byte the request it submitted before this field existed
-    — the same no-regression property `tests/test_world_size.py`'s golden
-    hex pins for `world_size`. Returning ``None`` here leaves the field OFF
-    the encoding entirely (the proto constructor skips a ``None`` kwarg),
-    which is also what an explicit `CACHE_POLICY_UNSPECIFIED` would encode
-    to, since a proto3 enum's zero value is never serialized either way; only
-    `"use"` costs a byte on the wire, the one case that changes what the
-    engine does with the request.
-    """
-    if cache is None or cache == "bypass":
-        return None
-    if cache == "use":
-        return inference_pb2.CachePolicy.CACHE_POLICY_USE
-    raise ValueError(f"cache must be 'use' or 'bypass' (got {cache!r})")
-
-
 def build_fine_tune_request(
     *,
     source: str,
@@ -578,6 +562,7 @@ def build_fine_tune_request(
     validation_fraction: Optional[float] = None,
     early_stopping_patience: Optional[int] = None,
     warmup_steps: Optional[int] = None,
+    warmup_fraction: Optional[float] = None,
     gradient_accumulation_steps: Optional[int] = None,
     triplet_margin: Optional[float] = None,
     target_modules: Optional[List[str]] = None,
@@ -616,10 +601,10 @@ def build_fine_tune_request(
     `cache="use"` opts into model-level reuse: the worker completes the job
     against an already-published model of the same definition when one
     exists and trains only on a miss; `cache=None` or ``"bypass"`` (the
-    default) always trains — see :func:`_wire_cache_policy_for_submit_job`.
+    default) always trains — see :func:`_cache_policy_value`.
     """
     wire_world_size = _wire_world_size(world_size)
-    wire_cache = _wire_cache_policy_for_submit_job(cache)
+    wire_cache = _cache_policy_value(cache)
     try:
         wire_method = _FINE_TUNE_METHOD[method]
     except KeyError:
@@ -639,6 +624,7 @@ def build_fine_tune_request(
         validation_fraction=validation_fraction,
         early_stopping_patience=early_stopping_patience,
         warmup_steps=warmup_steps,
+        warmup_fraction=warmup_fraction,
         gradient_accumulation_steps=gradient_accumulation_steps,
         triplet_margin=triplet_margin,
         target_modules=target_modules,
@@ -680,10 +666,11 @@ def build_fine_tune_graph_request(
     node_source: str,
     id_column: str,
     text_column: str,
-    edge_source: str,
-    src_column: str,
-    dst_column: str,
     base_model: str,
+    edge_graph_table: Optional[str] = None,
+    edge_source: Optional[str] = None,
+    edge_src_column: Optional[str] = None,
+    edge_dst_column: Optional[str] = None,
     edge_provenance: str = "declared",
     walk_length: Optional[int] = None,
     walks_per_node: Optional[int] = None,
@@ -695,10 +682,24 @@ def build_fine_tune_graph_request(
     sample_seed: Optional[int] = None,
     embedding_loss: Optional[str] = None,
     mnrl_temperature: Optional[float] = None,
+    triplet_margin: Optional[float] = None,
     epochs: Optional[int] = None,
     batch_size: Optional[int] = None,
     learning_rate: Optional[float] = None,
     lora_rank: Optional[int] = None,
+    lora_alpha: Optional[float] = None,
+    lora_dropout: Optional[float] = None,
+    max_seq_length: Optional[int] = None,
+    validation_fraction: Optional[float] = None,
+    early_stopping_patience: Optional[int] = None,
+    early_stopping_metric: Optional[str] = None,
+    warmup_steps: Optional[int] = None,
+    warmup_fraction: Optional[float] = None,
+    gradient_accumulation_steps: Optional[int] = None,
+    target_modules: Optional[List[str]] = None,
+    backbone_dtype: Optional[str] = None,
+    weight_decay: Optional[float] = None,
+    max_grad_norm: Optional[float] = None,
     matryoshka_dims: Optional[List[int]] = None,
     seed: Optional[int] = None,
     keep_last_n_checkpoints: Optional[int] = None,
@@ -708,6 +709,11 @@ def build_fine_tune_graph_request(
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for a graph-supervised fine-tune (S11,
     the `GraphFineTuneSpec` arm) from the embed binding's flat kwargs.
+
+    The walks follow either an engine-built neighbour graph
+    (`edge_graph_table`, a `build_neighbor_graph` output) or a registered edge
+    source (`edge_source` with its endpoint columns) — exactly one, the same
+    vocabulary as `propagate_embeddings`.
 
     Validates the `edge_provenance` vocabulary, fills the `GraphSampleConfig`
     defaults (matching the engine's `GraphSampleConfig::default()`), and applies
@@ -721,10 +727,10 @@ def build_fine_tune_graph_request(
     the job against an already-published model of the same sampled graph, spec
     and base model when one exists and trains only on a miss; `cache=None` or
     ``"bypass"`` (the default) always trains — see
-    :func:`_wire_cache_policy_for_submit_job`.
+    :func:`_cache_policy_value`.
     """
     wire_world_size = _wire_world_size(world_size)
-    wire_cache = _wire_cache_policy_for_submit_job(cache)
+    wire_cache = _cache_policy_value(cache)
     try:
         provenance = _EDGE_PROVENANCE[edge_provenance]
     except KeyError:
@@ -746,43 +752,48 @@ def build_fine_tune_graph_request(
         seed=sample_seed if sample_seed is not None else 0,
     )
 
-    # The default graph embedding loss is MNRL (S10), matching the embed
-    # binding; only 'mnrl' / 'triplet' are accepted for graph supervision.
-    if embedding_loss in (None, "mnrl"):
-        loss = training_pb2.EmbeddingLoss(
-            multiple_negatives_ranking=training_pb2.EmbeddingLoss.MultipleNegativesRanking(
-                temperature=mnrl_temperature if mnrl_temperature is not None else 20.0
-            )
-        )
-    elif embedding_loss == "triplet":
-        loss = training_pb2.EmbeddingLoss(
-            triplet=training_pb2.EmbeddingLoss.Triplet(margin=0.3)
-        )
-    else:
+    # Graph supervision emits (anchor, positive[, negative]) walks, so only an
+    # in-batch-negative objective applies: MNRL (the default) or triplet. The
+    # training knobs are `fine_tune`'s own, through the one config builder;
+    # the graph sampler's `sample_seed` and the LoRA `seed` stay distinct.
+    if embedding_loss not in (None, "mnrl", "triplet"):
         raise ValueError(
             f"Unknown embedding_loss {embedding_loss!r} for graph fine-tune. "
             f"Use 'mnrl' (default) or 'triplet'."
         )
-    config = training_pb2.FineTuneConfig(embedding_loss=loss)
-    if epochs is not None:
-        config.epochs = epochs
-    if batch_size is not None:
-        config.batch_size = batch_size
-    if learning_rate is not None:
-        config.learning_rate = learning_rate
-    if lora_rank is not None:
-        config.lora_rank = lora_rank
-    if matryoshka_dims is not None:
-        config.matryoshka_dims.extend(matryoshka_dims)
-    # The graph sampler's `sample_seed` and the LoRA `seed` are distinct: one
-    # seeds the node2vec walk, the other the adapter init / dropout.
-    if seed is not None:
-        config.seed = seed
-    # Per-epoch checkpointing enable + retention cap (unit 348, field 30),
-    # cross-surface parity with `build_fine_tune_config`. Unset (`None`, the
-    # default) DISABLES it entirely on this surface too — absent stays off.
-    if keep_last_n_checkpoints is not None:
-        config.keep_last_n_checkpoints = keep_last_n_checkpoints
+    config = build_fine_tune_config(
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        learning_rate=learning_rate,
+        epochs=epochs,
+        batch_size=batch_size,
+        max_seq_length=max_seq_length,
+        validation_fraction=validation_fraction,
+        early_stopping_patience=early_stopping_patience,
+        warmup_steps=warmup_steps,
+        warmup_fraction=warmup_fraction,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        triplet_margin=triplet_margin,
+        target_modules=target_modules,
+        early_stopping_metric=early_stopping_metric,
+        backbone_dtype=backbone_dtype,
+        weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        embedding_loss=embedding_loss or "mnrl",
+        mnrl_temperature=mnrl_temperature,
+        cached=None,
+        mine_hard_negatives=None,
+        hard_negative_k=None,
+        hard_negative_exclude_hops=None,
+        hard_negative_refresh_every=None,
+        matryoshka_dims=matryoshka_dims,
+        seed=seed,
+        regression_loss=None,
+        regression_beta=None,
+        quantile_levels=None,
+        keep_last_n_checkpoints=keep_last_n_checkpoints,
+    )
 
     return job_pb2.SubmitJobRequest(
         graph_fine_tune=training_pb2.GraphFineTuneSpec(
@@ -790,10 +801,13 @@ def build_fine_tune_graph_request(
                 node_source=node_source,
                 id_column=id_column,
                 text_column=text_column,
-                edge_source=edge_source,
-                src_column=src_column,
-                dst_column=dst_column,
                 provenance=provenance,
+                **_graph_fine_tune_edges(
+                    edge_graph_table=edge_graph_table,
+                    edge_source=edge_source,
+                    edge_src_column=edge_src_column,
+                    edge_dst_column=edge_dst_column,
+                ),
             ),
             sample_config=sample,
         ),
@@ -828,13 +842,16 @@ def build_context_predictor_request(
     seed: int = 0,
     model_id: Optional[str] = None,
     idempotency_key: str = "",
+    embedding_table: Optional[str] = None,
 ) -> job_pb2.SubmitJobRequest:
     """Assemble the `SubmitJobRequest` for an amortized in-context predictor
     (S19, the `ContextPredictorSpec` arm) from the embed binding's flat kwargs.
 
     Validates the `architecture` vocabulary, builds the gaussian/quantile
     predictive head (with the `output='quantile' requires levels` check), and
-    defaults the model id to `{source}-context-predictor`.
+    defaults the model id to `{source}-context-predictor`. `embedding_table`
+    names the table the contexts are read from (the source's default when
+    unset); the resolved table is recorded with the trained predictor.
     """
     try:
         wire_architecture = _CONTEXT_ARCHITECTURE[architecture]
@@ -900,6 +917,8 @@ def build_context_predictor_request(
         min_task_count=min_task_count,
         seed=seed,
     )
+    if embedding_table is not None:
+        spec.embedding_table = embedding_table
     # The third and last `SubmitJobRequest` construction in this module, and the
     # one that carries NO `world_size`: that field is the wire form of the two
     # LoRA kinds' `TrainingCommon.world_size`, and `ContextPredictorSpec` folds
@@ -950,13 +969,13 @@ def build_neighbor_graph_request(
     min_similarity: Optional[float] = None,
     mutual: bool = False,
     exact: bool = False,
-    table: Optional[str] = None,
+    embedding_table: Optional[str] = None,
     cache: Optional[str] = None,
 ) -> pipeline_pb2.BuildNeighborGraphRequest:
     """Assemble the `BuildNeighborGraphRequest` for a k-NN graph materialisation
     from the binding's flat kwargs.
 
-    The optional `min_similarity` floor and `table` selector carry explicit
+    The optional `min_similarity` floor and `embedding_table` selector carry explicit
     presence — left unset when omitted so the engine resolves the default.
     `cache` opts into memoization (``"use"``) or keeps the default recompute
     (``None``/``"bypass"``). The same request the embed binding submits
@@ -971,8 +990,8 @@ def build_neighbor_graph_request(
     )
     if min_similarity is not None:
         request.min_similarity = min_similarity
-    if table is not None:
-        request.table = table
+    if embedding_table is not None:
+        request.embedding_table = embedding_table
     return request
 
 
@@ -1070,11 +1089,7 @@ def _set_graph_arm(
     """Fill a graph verb's `graph` oneof: an S9 similarity graph
     (`edge_graph_table`) or a registered external edge source (`edge_source`)
     — exactly one."""
-    if edge_graph_table is not None and edge_source is not None:
-        raise ValueError(
-            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
-            "(registered edges), not both"
-        )
+    _require_one_graph(verb, edge_graph_table, edge_source)
     if edge_graph_table is not None:
         request.edge_graph_table = edge_graph_table
     elif edge_source is not None:
@@ -1087,8 +1102,40 @@ def _set_graph_arm(
         )
         if edge_weight_column is not None:
             request.edge_source.weight_column = edge_weight_column
-    else:
+
+
+def _require_one_graph(
+    verb: str, edge_graph_table: Optional[str], edge_source: Optional[str]
+) -> None:
+    """A graph verb names its edges exactly once: an engine-built graph table or
+    a registered edge source."""
+    if edge_graph_table is not None and edge_source is not None:
+        raise ValueError(
+            "pass exactly one of edge_graph_table (S9 graph) or edge_source "
+            "(registered edges), not both"
+        )
+    if edge_graph_table is None and edge_source is None:
         raise ValueError(f"{verb} requires a graph: edge_graph_table or edge_source")
+
+
+def _graph_fine_tune_edges(
+    *,
+    edge_graph_table: Optional[str],
+    edge_source: Optional[str],
+    edge_src_column: Optional[str],
+    edge_dst_column: Optional[str],
+) -> dict:
+    """The `edges` oneof of a graph fine-tune's sources, as constructor kwargs."""
+    _require_one_graph("fine_tune_graph", edge_graph_table, edge_source)
+    if edge_graph_table is not None:
+        return {"edge_graph_table": edge_graph_table}
+    return {
+        "edge_source": training_pb2.GraphEdgeSource(
+            source_id=edge_source,
+            src_column=edge_src_column if edge_src_column is not None else "src",
+            dst_column=edge_dst_column if edge_dst_column is not None else "dst",
+        )
+    }
 
 
 def build_generate_structure_embeddings_request(
@@ -1373,6 +1420,7 @@ def build_generate_embeddings_request(
     columns: List[str],
     key: str,
     modality: Optional[str] = None,
+    dimensions: Optional[int] = None,
     cache: Optional[str] = None,
 ) -> embedding_pb2.GenerateEmbeddingsRequest:
     """Assemble the `GenerateEmbeddingsRequest` for a bulk embedding run from the
@@ -1380,11 +1428,13 @@ def build_generate_embeddings_request(
 
     `modality` selects the tower (`"text"`/`"image"`/`"audio"`, defaulting to
     text); `key` names the column whose value becomes each embedding row's key;
-    `cache` opts into memoization (``"use"``) or keeps the default recompute
+    `dimensions` serves the model's leading coordinates, L2-renormalised — a
+    Matryoshka prefix — instead of its full width; `cache` opts into
+    memoization (``"use"``) or keeps the default recompute
     (``None``/``"bypass"``). The same request the embed binding submits
     in-process.
     """
-    return embedding_pb2.GenerateEmbeddingsRequest(
+    request = embedding_pb2.GenerateEmbeddingsRequest(
         source_id=source,
         model_id=model,
         columns=list(columns),
@@ -1392,6 +1442,9 @@ def build_generate_embeddings_request(
         modality=_modality_value(modality),
         cache=_cache_policy_value(cache),
     )
+    if dimensions is not None:
+        request.dimensions = dimensions
+    return request
 
 
 def build_import_embeddings_request(
@@ -1428,6 +1481,7 @@ def build_encode_query_request(
     model: str,
     query: Union[str, bytes],
     modality: Optional[str] = None,
+    dimensions: Optional[int] = None,
 ) -> embedding_pb2.EncodeQueryRequest:
     """Assemble the `EncodeQueryRequest` for a single-query encode from the
     binding's flat kwargs.
@@ -1435,12 +1489,16 @@ def build_encode_query_request(
     `query` is a string for the text tower or raw bytes for the image/audio
     tower; `modality` selects the tower (defaulting to text). The `input` oneof
     carries the text or the bytes — exactly one, matched to the modality at the
-    decode edge. The same request the embed binding submits in-process.
+    decode edge. `dimensions` encodes to the model's leading coordinates,
+    L2-renormalised — the width of a table generated with the same
+    `dimensions`. The same request the embed binding submits in-process.
     """
     request = embedding_pb2.EncodeQueryRequest(
         model_id=model,
         modality=_modality_value(modality),
     )
+    if dimensions is not None:
+        request.dimensions = dimensions
     if isinstance(query, str):
         request.text = query
     elif isinstance(query, (bytes, bytearray)):
@@ -1455,39 +1513,108 @@ def build_encode_query_request(
 def build_search_request(
     source: str,
     *,
-    query: List[float],
+    query: Optional[List[float]] = None,
+    row_key: Optional[str] = None,
     k: int,
     filter: Optional[str] = None,
     select: Optional[List[str]] = None,
     embedding_table: Optional[str] = None,
     oversample: Optional[int] = None,
+    exact: bool = False,
 ) -> embedding_pb2.SearchRequest:
     """Assemble the `SearchRequest` for a nearest-neighbour search from the
     binding's flat kwargs.
 
-    `query` is the query vector (carried in the `query_vector` oneof arm);
-    `filter` is an optional SQL predicate over the hydrated results; `select`
-    projects columns (empty keeps the keyed+scored shape); `embedding_table`
-    names which of the source's embedding tables to search (unset = the
-    most-recent ready table). `oversample` overrides, for this one call, the
-    retrieve→rescore candidate-breadth multiplier (`k * oversample`) a
-    quantized-`storage_precision` table's sidecar resolves at search time
-    (`None` defers to the table's own stamped default); irrelevant for an
-    `f32`-precision table (single-stage, no rescore). The same request the
-    embed binding submits in-process.
+    The search ranks by exactly one of `query` (a query vector) or `row_key`
+    (query-by-example: the vector stored for that row, resolved inside the
+    engine — it never crosses the API). `filter` is an optional SQL predicate over the hydrated columns — the search returns the `k` nearest rows that satisfy it; `select` projects columns (empty keeps every
+    hydrated column); `embedding_table` names which of the source's embedding
+    tables to search (unset = the most-recent ready table). `oversample`
+    overrides, for this one call, the retrieve→rescore candidate-breadth
+    multiplier (`k * oversample`) a quantized-`storage_precision` table's
+    sidecar resolves at search time (`None` defers to the table's own stamped
+    default); irrelevant for an `f32`-precision table (single-stage, no
+    rescore). `exact` scores every vector instead of searching the index — the
+    true nearest neighbours, and the baseline an approximate search's recall
+    is measured against; it takes no `oversample`. The same request the embed
+    binding submits in-process.
     """
-    request = embedding_pb2.SearchRequest(
-        source_id=source,
-        query_vector=embedding_pb2.QueryVector(values=list(query)),
-        k=k,
-        select=list(select or []),
-    )
+    if (query is None) == (row_key is None):
+        raise ValueError("search ranks by exactly one of query (a vector) or row_key")
+    if exact and oversample is not None:
+        raise ValueError("an exact search scores every vector; it takes no oversample")
+    request = embedding_pb2.SearchRequest(source_id=source, k=k, select=list(select or []))
+    if query is not None:
+        request.query_vector.CopyFrom(embedding_pb2.QueryVector(values=list(query)))
+    else:
+        request.row_key = row_key
     if filter is not None:
         request.filter = filter
     if embedding_table is not None:
         request.embedding_table = embedding_table
     if oversample is not None:
         request.oversample = oversample
+    if exact:
+        request.exact.SetInParent()
+    return request
+
+
+_LEXICAL_ANALYZER = {
+    "english": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_ENGLISH,
+    "raw": pipeline_pb2.LexicalAnalyzer.LEXICAL_ANALYZER_RAW,
+}
+
+
+def build_lexical_index_request(
+    source: str,
+    *,
+    columns: List[str],
+    key: str,
+    analyzer: str = "english",
+) -> pipeline_pb2.BuildLexicalIndexRequest:
+    """Assemble the `BuildLexicalIndexRequest` for a lexical index over a
+    source's text: one `(_row_id, text)` row per source row, keyed by `key`,
+    with its text `columns` joined in order by a space. `analyzer` is how the
+    text and every query are tokenised: ``"english"`` (lowercase, Porter
+    stemming) or ``"raw"`` (lowercase, no stemming). The same request the
+    embed binding submits in-process.
+    """
+    try:
+        wire_analyzer = _LEXICAL_ANALYZER[analyzer]
+    except KeyError:
+        raise ValueError(
+            f"analyzer must be one of {sorted(_LEXICAL_ANALYZER)} (got {analyzer!r})"
+        ) from None
+    return pipeline_pb2.BuildLexicalIndexRequest(
+        source_id=source, columns=list(columns), key_column=key, analyzer=wire_analyzer
+    )
+
+
+def build_lexical_search_request(
+    source: str,
+    *,
+    text: str,
+    k: int,
+    filter: Optional[str] = None,
+    select: Optional[List[str]] = None,
+    lexical_table: Optional[str] = None,
+) -> embedding_pb2.LexicalSearchRequest:
+    """Assemble the `LexicalSearchRequest` for a BM25 search of `text` over a
+    source's lexical table. `text`'s words are the query — no syntax is
+    interpreted. `filter` is an optional SQL predicate over the hydrated
+    columns (the search returns the `k` best-ranked rows that satisfy it),
+    `select` projects columns (empty keeps every hydrated column), and
+    `lexical_table` names which of the source's lexical tables to search
+    (unset = the most-recent ready one). The same request the embed binding
+    submits in-process.
+    """
+    request = embedding_pb2.LexicalSearchRequest(
+        source_id=source, text=text, k=k, select=list(select or [])
+    )
+    if filter is not None:
+        request.filter = filter
+    if lexical_table is not None:
+        request.lexical_table = lexical_table
     return request
 
 
@@ -1819,3 +1946,28 @@ def expiry_report_to_dict(report: embedding_pb2.ExpiryReport) -> Dict[str, Any]:
         "expired_versions": list(report.expired_versions),
         "objects_deleted": report.objects_deleted,
     }
+
+
+def build_subscribe_request(
+    topic: str,
+    *,
+    predicate: Optional[str],
+    from_offset: Optional[int],
+    replay_only: bool,
+    max_batches: Optional[int],
+) -> trigger_pb2.SubscribeRequest:
+    """Assemble the `SubscribeRequest` a collect drives. A collect that follows
+    the live tail needs `max_batches`: the tail never ends on its own."""
+    if not replay_only and max_batches is None:
+        raise ValueError(
+            "a collect that follows the live tail (replay_only=False) needs "
+            "max_batches: the tail never ends on its own"
+        )
+    request = trigger_pb2.SubscribeRequest(
+        topic=trigger_pb2.TopicName(name=topic),
+        predicate=predicate or "",
+        replay_only=replay_only,
+    )
+    if from_offset is not None:
+        request.from_offset = from_offset
+    return request

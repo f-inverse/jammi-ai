@@ -911,7 +911,7 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 cached: true,
                 embedding_loss: Some(
                     jammi_ai::fine_tune::EmbeddingLoss::MultipleNegativesRanking {
@@ -1056,7 +1056,7 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
                 epochs: 1,
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 ..Default::default()
             }),
         )
@@ -1149,7 +1149,7 @@ async fn f4_a_validation_window_not_a_multiple_of_batch_size_completes() {
                 epochs: 1,
                 batch_size: 3,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 validation_fraction: 0.2,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::ValLoss,
                 ..Default::default()
@@ -1222,7 +1222,7 @@ async fn f5_a_nan_target_in_the_validation_suffix_refuses_before_step_zero_under
                 epochs: 3,
                 batch_size: 2,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 validation_fraction: 0.1,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
                 ..Default::default()
@@ -1337,7 +1337,7 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
                         epochs: 1,
                         batch_size: 4,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     }),
                 )

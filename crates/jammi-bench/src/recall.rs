@@ -300,7 +300,7 @@ pub async fn mean_recall_at_k(
 /// ([`StoragePrecision::needs_rescore`] is `false`), so this stays the
 /// original single-stage path: `index.search(query, k)` directly, `oversample`
 /// unused. At a quantized precision (`F16`/`Int8`) this mirrors the production
-/// path in `jammi_ai::operator::ann_search_exec`: the loaded graph's own
+/// path in `jammi_ai::operator::vector_search_exec`: the loaded graph's own
 /// (lossy) `search` proposes `k * oversample` candidates, each candidate's
 /// *exact* `f32` vector is read back via [`SidecarIndex::get_exact`] (the
 /// mmap'd rescore companion, never the quantized graph's own reconstruction),

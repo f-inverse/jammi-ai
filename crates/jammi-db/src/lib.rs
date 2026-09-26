@@ -26,8 +26,6 @@ pub mod tenant;
 pub mod tenant_scope;
 pub mod trigger;
 
-use config::{LogFormat, LoggingConfig};
-
 pub use audit::{AuditError, AuditHandle, PerQueryAudit};
 pub use catalog::backend::{BackendError, BackendKind};
 #[cfg(feature = "test-hooks")]
@@ -41,20 +39,3 @@ pub use server_info::ServerInfo;
 pub use session::{AdminScope, TenantScope};
 pub use tenant::TenantId;
 pub use trigger::TopicId;
-
-/// Initialize the tracing subscriber using the provided logging configuration.
-pub fn init_tracing(config: &LoggingConfig) {
-    use tracing_subscriber::{fmt, EnvFilter};
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
-
-    match config.format {
-        LogFormat::Json => {
-            fmt().with_env_filter(filter).json().init();
-        }
-        LogFormat::Text => {
-            fmt().with_env_filter(filter).init();
-        }
-    }
-}

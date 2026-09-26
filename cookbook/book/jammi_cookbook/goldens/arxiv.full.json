@@ -1,0 +1,174 @@
+{
+  "calibration.adaptive_ece": {
+    "tol": 0.05,
+    "value": 0.2137206243974452
+  },
+  "calibration.central_coverage": {
+    "tol": 0.05,
+    "value": 0.932387706855792
+  },
+  "calibration.crps": {
+    "tol": 0.05,
+    "value": 0.4355386678922887
+  },
+  "calibration.nll": {
+    "tol": 0.1,
+    "value": 1.1738463828617698
+  },
+  "calibration.pit_ks": {
+    "tol": 0.05,
+    "value": 0.5634951225108182
+  },
+  "calibration.sharpness": {
+    "tol": 0.2,
+    "value": 2.9973844072741676
+  },
+  "conformal.aps_coverage": {
+    "tol": 0.03,
+    "value": 0.9078014184397163
+  },
+  "conformal.aps_set_size": {
+    "tol": 0.6,
+    "value": 2.975886524822695
+  },
+  "conformal.cqr_coverage": {
+    "tol": 0.04,
+    "value": 0.7030732860520095
+  },
+  "conformal.cqr_width": {
+    "tol": 0.6,
+    "value": 1.3698606896344088
+  },
+  "conformal.interval_coverage": {
+    "tol": 0.04,
+    "value": 0.6888888888888889
+  },
+  "conformal.interval_width": {
+    "tol": 0.6,
+    "value": 1.363037109375
+  },
+  "conformal.lac_coverage": {
+    "tol": 0.03,
+    "value": 0.8884160756501182
+  },
+  "conformal.lac_set_size": {
+    "tol": 0.6,
+    "value": 2.2397163120567374
+  },
+  "conformal.raps_coverage": {
+    "tol": 0.03,
+    "value": 0.8964539007092198
+  },
+  "conformal.raps_set_size": {
+    "tol": 0.6,
+    "value": 2.6699763593380617
+  },
+  "conformal.synthetic_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.88125
+  },
+  "conformal.synthetic_shift_corr": {
+    "tol": 0.08,
+    "value": 0.4460815311440104
+  },
+  "conformal.synthetic_weighted_coverage": {
+    "tol": 0.03,
+    "value": 0.9121018518518518
+  },
+  "tier01.cite_homophily": {
+    "tol": 1e-09,
+    "value": 0.49984366857738405
+  },
+  "tier01.neighbor_homophily": {
+    "tol": 0.02,
+    "value": 0.637025
+  },
+  "tier01.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5130000000000001
+  },
+  "tier02.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5509999999999997
+  },
+  "tier02.precision_delta": {
+    "tol": 0.02,
+    "value": 0.03799999999999959
+  },
+  "tier03.base_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5129999999999999
+  },
+  "tier03.declared_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5399999999999999
+  },
+  "tier03.random_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5035000000000003
+  },
+  "tier03.similarity_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.5259999999999998
+  },
+  "tier04.classifier_accuracy": {
+    "tol": 0.04,
+    "value": 0.6747044917257683
+  },
+  "tier04.local_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9078014184397163
+  },
+  "tier04.marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9078014184397163
+  },
+  "tier04.marginal_set_size": {
+    "tol": 0.6,
+    "value": 2.975886524822695
+  },
+  "tier04.reg_cal_mean": {
+    "tol": 1.0,
+    "value": 2018.4458441438771
+  },
+  "tier04.reg_cal_resid_mag": {
+    "tol": 0.25,
+    "value": 0.4459929770611702
+  },
+  "tier04.reg_interval_coverage": {
+    "tol": 0.04,
+    "value": 0.6888888888888889
+  },
+  "tier04.reg_interval_width": {
+    "tol": 0.6,
+    "value": 1.363037109375
+  },
+  "tier04.reg_pred_std": {
+    "tol": 0.5,
+    "value": 0.9123788255736586
+  },
+  "tier04.reg_resid_corr": {
+    "tol": 0.2,
+    "value": 0.3563081140755199
+  },
+  "tier04.reg_test_mean": {
+    "tol": 1.0,
+    "value": 2018.5022137725325
+  },
+  "tier04.reg_test_resid_mag": {
+    "tol": 0.25,
+    "value": 0.6509777168291963
+  },
+  "tier04.reg_weighted_coverage": {
+    "tol": 0.04,
+    "value": 0.7016548463356974
+  },
+  "tier04.score_shift_corr": {
+    "tol": 0.12,
+    "value": 0.03341036366381802
+  },
+  "tier04.weighting_max_abs_delta": {
+    "tol": 0.01,
+    "value": 0.016075650118203333
+  }
+}

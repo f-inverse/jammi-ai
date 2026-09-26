@@ -378,6 +378,8 @@ def positive_workflows() -> dict[str, str]:
         "pypi-client.yml": _simple_publish_yml(),
         "pypi-server.yml": _simple_publish_yml(),
         "pypi-server-cuda.yml": _simple_publish_yml(),
+        "pypi-native-cuda.yml": _simple_publish_yml(),
+        "pypi-cookbook.yml": _simple_publish_yml(),
     }
 
 

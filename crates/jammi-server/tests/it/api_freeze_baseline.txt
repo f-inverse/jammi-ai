@@ -63,6 +63,7 @@ RPC CatalogService/DeleteModel
 RPC CatalogService/DerivesFrom
 RPC CatalogService/DescribeModel
 RPC CatalogService/DescribeSource
+RPC CatalogService/DescribeTable
 RPC CatalogService/DropMutableTable
 RPC CatalogService/DropTopic
 RPC CatalogService/GetServerInfo
@@ -95,6 +96,7 @@ RPC EmbeddingService/ExpireVersions
 RPC EmbeddingService/GenerateEmbeddings
 RPC EmbeddingService/ImportEmbeddings
 RPC EmbeddingService/RefreshEmbeddings
+RPC EmbeddingService/LexicalSearch
 RPC EmbeddingService/Search
 RPC EvalService/EvalCalibration
 RPC EvalService/EvalCompare
@@ -125,6 +127,7 @@ RPC PeerService/ExactRescore
 RPC PeerService/SegmentSearch
 RPC PipelineService/AsofJoin
 RPC PipelineService/AssembleContext
+RPC PipelineService/BuildLexicalIndex
 RPC PipelineService/BuildNeighborGraph
 # ADDED (additive, minor-compatible): a graph's structure encoded into an
 # embedding table, for nodes with no content to embed.

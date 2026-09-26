@@ -29,12 +29,12 @@ time.
 - `Database.register_topic(name, *, schema)`
 - `Database.list_topics()`
 - `Database.publish_topic(name, *, batch)` — returns the assigned offset
-- `Database.subscribe_collect(name, *, from_offset, max_batches)`
+- `Database.subscribe_collect(name, *, from_offset)`
 - `Database.drop_topic(name, *, if_exists=False)`
 
-The `subscribe_collect` path drives the replay-from-backing-table flow
-when `from_offset=0`; the live-tail flow is exercised in the broker
-integration suite.
+`subscribe_collect` drains the backing table from `from_offset` and
+returns; `replay_only=False` with `max_batches` follows the live tail
+instead, returning once that many batches arrive.
 
 ## Run it
 

@@ -107,7 +107,7 @@ fn determinism_config(seed: u64) -> FineTuneConfig {
         epochs: 3,
         batch_size: 1,
         validation_fraction: 0.0,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         gradient_accumulation_steps: 1,
         lora_dropout: 0.1,
         early_stopping_metric: EarlyStoppingMetric::TrainLoss,

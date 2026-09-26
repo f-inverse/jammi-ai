@@ -42,6 +42,58 @@ db.generate_embeddings(
 )
 ```
 
+## Serve a shorter prefix
+
+`dimensions` serves a model's leading coordinates instead of its full width,
+each vector renormalised to unit length — an index a half or a quarter the size.
+It is meant for a model trained with `matryoshka_dims`
+([Fine-Tuning](./fine-tuning.md)), whose leading coordinates were optimised to
+be an embedding on their own; a prefix of any other model is only an accident
+of its basis. Encode queries at the same width to search the table; `eval_*`
+does that on its own, and `refresh_embeddings` and `recompute` keep the width
+the table records. A width larger than the model's is refused.
+
+### Python
+
+```python
+table = db.generate_embeddings(source="patents", model=model_id, columns=["abstract"],
+                               key="id", dimensions=128)
+query = db.encode_query(model=model_id, query="solid-state batteries", dimensions=128)
+hits = db.search("patents", query=query, k=10, embedding_table=table)
+```
+
+### Rust
+
+```rust,no_run
+# extern crate jammi_db;
+# extern crate jammi_ai;
+# async fn ex(session: &jammi_ai::Session) -> jammi_db::error::Result<()> {
+use jammi_ai::local_session::{EmbeddingRequest, Modality, QueryInput};
+use jammi_db::store::CachePolicy;
+
+let (table, _outcome) = session
+    .generate_embeddings(EmbeddingRequest {
+        source_id: "patents".into(),
+        model_id: "jammi:fine-tuned:matryoshka".into(),
+        columns: vec!["abstract".into()],
+        key_column: "id".into(),
+        modality: Modality::Text,
+        dimensions: Some(128),
+        cache: CachePolicy::Bypass,
+    })
+    .await?;
+let query = session
+    .encode_query(
+        "jammi:fine-tuned:matryoshka",
+        QueryInput::Text("solid-state batteries".into()),
+        Modality::Text,
+        Some(128),
+    )
+    .await?;
+# let _ = (table, query);
+# Ok(()) }
+```
+
 ## What gets created
 
 Each call creates a timestamped Parquet file plus a sidecar ANN index bundle:

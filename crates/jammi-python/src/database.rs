@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -712,18 +712,11 @@ impl PyDatabase {
     /// table name. A malformed or invalid body raises `ValueError`.
     fn _generate_embeddings_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
         self.check_open()?;
-        let args =
+        let request =
             jammi_ai::wire::generate_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         let (record, _outcome) = crate::released(
             &self.runtime,
-            self.local_session().generate_embeddings(
-                &args.source_id,
-                &args.model_id,
-                &args.columns,
-                &args.key_column,
-                args.modality,
-                args.cache,
-            ),
+            self.local_session().generate_embeddings(request),
         )
         .map_err(to_pyerr)?;
         Ok(record.table_name)
@@ -834,24 +827,35 @@ impl PyDatabase {
         Ok(offset.value())
     }
 
-    /// Open a subscription, collect up to `max_batches` matching batches
-    /// (replay + live tail joined), then close. Returns the concatenated
-    /// payload as a `pyarrow.Table`.
+    /// Collect a topic's matching batches as one `pyarrow.Table`.
     ///
-    /// Synchronous collect API: streaming iteration is left to the gRPC
-    /// `TriggerService.Subscribe` surface where back-pressure flows
-    /// through HTTP/2 naturally. This binding is the script-friendly
-    /// equivalent for one-shot Python workflows.
-    #[pyo3(signature = (topic, *, predicate=None, from_offset=None, max_batches=64))]
+    /// With `replay_only` (the default) this is the finite drain: every
+    /// batch in the backing table at offset `>= from_offset` the predicate
+    /// accepts, at most `max_batches` of them. Without it the collect joins
+    /// the live tail after the replay, which never ends on its own, so it
+    /// needs `max_batches` and returns once that many batches arrive.
+    /// Streaming iteration is the gRPC `TriggerService.Subscribe` surface.
+    #[pyo3(signature = (topic, *, predicate=None, from_offset=None, replay_only=true, max_batches=None))]
     fn subscribe_collect(
         &self,
         py: Python<'_>,
         topic: &str,
         predicate: Option<&str>,
         from_offset: Option<u64>,
-        max_batches: usize,
+        replay_only: bool,
+        max_batches: Option<usize>,
     ) -> PyResult<Py<PyAny>> {
         self.check_open()?;
+        let tail_bound = match (replay_only, max_batches) {
+            (true, bound) => bound,
+            (false, Some(bound)) => Some(bound),
+            (false, None) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "a collect that follows the live tail (replay_only=False) needs \
+                     max_batches: the tail never ends on its own",
+                ))
+            }
+        };
         let topic_repo = self.session.topic_repo();
         let tenant = self.session.tenant();
         let topic_def = crate::released(&self.runtime, topic_repo.lookup_by_name(topic, tenant))
@@ -867,17 +871,15 @@ impl PyDatabase {
         .map_err(to_pyerr)?;
         let from = from_offset.map(|v| Offset::new(v, chrono::Utc::now()));
         let subscriber = self.session.subscriber();
+        let limit = tail_bound.unwrap_or(usize::MAX);
         let collected: Vec<RecordBatch> = crate::released(&self.runtime, async move {
-            let mut stream = subscriber.subscribe(&topic_def, predicate, from).await?;
-            let mut out: Vec<RecordBatch> = Vec::new();
-            while out.len() < max_batches {
-                match StreamExt::next(&mut stream).await {
-                    Some(Ok(d)) => out.push(d.batch),
-                    Some(Err(e)) => return Err(e),
-                    None => break,
-                }
+            if replay_only {
+                let replayed = subscriber.replay_only(&topic_def, predicate, from).await?;
+                Ok(replayed.into_iter().take(limit).map(|d| d.batch).collect())
+            } else {
+                let tail = subscriber.subscribe(&topic_def, predicate, from).await?;
+                tail.take(limit).map_ok(|d| d.batch).try_collect().await
             }
-            Ok::<_, jammi_db::trigger::TriggerError>(out)
         })
         .map_err(to_pyerr)?;
         batches_to_pyarrow(py, &collected)
@@ -955,6 +957,20 @@ impl PyDatabase {
             out.append(entry)?;
         }
         Ok(out.into_any().unbind())
+    }
+
+    /// The recorded materialization of a result table — its
+    /// `.materialization.json` manifest as a dict: `definition_hash`,
+    /// `artifact`, `leaves`, `descriptor`, `env` (`engine_version`, `device`,
+    /// and `models`, one entry per invoked model tagged by its `run`),
+    /// `input_anchors`, `produced_by`, `produced_at`, `engine_version`,
+    /// `manifest_version`. A table with no manifest raises `MissingManifest`.
+    /// Read-only.
+    fn describe_table(&self, py: Python<'_>, table: &str) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let manifest = crate::released(&self.runtime, self.local_session().describe_table(table))
+            .map_err(to_pyerr)?;
+        serializable_to_pydict(py, &manifest)
     }
 
     /// Recompute a materialised result table's artifact digest and check it
@@ -1218,6 +1234,19 @@ impl PyDatabase {
         batches_to_pyarrow(py, &batches)
     }
 
+    /// Lexical (BM25) search from a serialized `LexicalSearchRequest` body —
+    /// the same request assembly the remote client sends, decoded through
+    /// `jammi_ai::wire::lexical_search_from_bytes`. Returns the hydrated rows
+    /// as a `pyarrow.Table`. A malformed or invalid body raises `ValueError`.
+    fn _lexical_search_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
+        let request =
+            jammi_ai::wire::lexical_search_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let batches = crate::released(&self.runtime, self.local_session().lexical_search(request))
+            .map_err(to_pyerr)?;
+        batches_to_pyarrow(py, &batches)
+    }
+
     /// Submit a training job from a serialized `SubmitJobRequest` body.
     ///
     /// The thin Python `Database` wrapper builds this request with the same
@@ -1276,12 +1305,16 @@ impl PyDatabase {
     /// The returned dict also carries `"source"` (`"ann"`/`"edges"`/`"hybrid"` —
     /// how the context was assembled) and `"context_ref"` (the context member
     /// keys), so a graph-conditioned prediction is never unattributed.
+    ///
+    /// `embedding_table` names the serving source's embedding table the context
+    /// is read from; unset on the training source it is the table the predictor
+    /// trained on, unset on another source that source's default table.
     #[pyo3(signature = (
         model_id, *, source, target_key, split = None,
         edge_source = None, edge_src_column = None, edge_dst_column = None,
         edge_type_column = None, edge_weight_column = None, edge_hops = None,
         edge_fanout = None, edge_direction = None, edge_types = None,
-        min_weight = None, hybrid_ann_k = None,
+        min_weight = None, hybrid_ann_k = None, embedding_table = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn predict_with_context_predictor(
@@ -1302,6 +1335,7 @@ impl PyDatabase {
         edge_types: Option<Vec<String>>,
         min_weight: Option<f64>,
         hybrid_ann_k: Option<usize>,
+        embedding_table: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         self.check_open()?;
         use jammi_ai::pipeline::context_predictor::PredictedDistribution;
@@ -1330,6 +1364,7 @@ impl PyDatabase {
         let options = ContextServeOptions {
             source: serve_source,
             split,
+            embedding_table,
         };
 
         let served = crate::released(
@@ -1516,8 +1551,12 @@ impl PyDatabase {
         let args = jammi_ai::wire::encode_query_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
         crate::released(
             &self.runtime,
-            self.local_session()
-                .encode_query(&args.model_id, args.input, args.modality),
+            self.local_session().encode_query(
+                &args.model_id,
+                args.input,
+                args.modality,
+                args.dimensions,
+            ),
         )
         .map_err(to_pyerr)
     }
@@ -1595,6 +1634,23 @@ impl PyDatabase {
         let (record, _outcome) = crate::released(
             &self.runtime,
             self.session.generate_structure_embeddings(&request, cache),
+        )
+        .map_err(to_pyerr)?;
+        Ok(record.table_name)
+    }
+
+    /// Materialise a lexical index over a source's text from a serialized
+    /// `BuildLexicalIndexRequest` body — the same request assembly the remote
+    /// client sends, decoded through
+    /// `jammi_ai::wire::build_lexical_index_from_bytes`. Returns the lexical
+    /// table's name. A malformed or invalid body raises `ValueError`.
+    fn _build_lexical_index_proto(&self, proto_bytes: &[u8]) -> PyResult<String> {
+        self.check_open()?;
+        let (source_id, params) =
+            jammi_ai::wire::build_lexical_index_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let record = crate::released(
+            &self.runtime,
+            self.session.build_lexical_index(&source_id, &params),
         )
         .map_err(to_pyerr)?;
         Ok(record.table_name)

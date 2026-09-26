@@ -1,0 +1,14 @@
+{
+  "caveat_visible": {
+    "tol": 0.0,
+    "value": 1451.0
+  },
+  "parity_a_precision_at_10": {
+    "tol": 0.03,
+    "value": 0.7109999999999999
+  },
+  "parity_b_precision_at_10": {
+    "tol": 0.03,
+    "value": 0.6619999999999999
+  }
+}

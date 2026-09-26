@@ -128,7 +128,7 @@ fn config_for(artifact_dir: &Path, device: i32) -> JammiConfig {
     JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
-            device,
+            device: Some(device),
             require_gpu: device >= 0,
             compute_precision: ComputePrecision::F32,
             ..Default::default()
@@ -138,7 +138,7 @@ fn config_for(artifact_dir: &Path, device: i32) -> JammiConfig {
             ..Default::default()
         },
         logging: LoggingConfig {
-            level: "info".into(),
+            level: Some("info".into()),
             ..Default::default()
         },
         ..Default::default()
@@ -791,7 +791,7 @@ async fn qlora_learns_on_metal_with_gguf_base() {
                 epochs: 6, // >=2 so first->last carries a decrease signal
                 batch_size: 8,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 ..Default::default()
             }),
         )

@@ -1,22 +1,25 @@
-"""Dataset loaders — Air Routes and ogbn-arxiv.
-
-Both datasets are publicly redistributable and are fetched on demand, never
-committed in full: only the small committed subset artifacts (``artifacts/``) and
-the subset ID lists (``data/ids/``) live in the repo. Every download is
-checksum-gated against a pinned digest — a tampered or silently-reissued source
-fails loudly rather than drifting the book's numbers.
+"""The book's two graph datasets, at either scale — Air Routes and ogbn-arxiv.
 
 * **Air Routes** (Neptune's own teaching dataset; permissive, from
-  ``krlawrence/graph``) — airports + ``route`` / ``contains`` edges. The tiers
-  01–02 on-ramp.
-* **ogbn-arxiv** (ODC-BY; Open Graph Benchmark) — ~169k CS papers, ~1.16M
-  citation edges, 40 subject classes, title+abstract text. The tiers 03–04 spine.
+  ``krlawrence/graph``) — 3504 airports, the airport↔airport ``route`` graph
+  and the continent→country→airport ``contains`` hierarchy. Small enough to run
+  whole, so both scales read the committed ``air_routes`` fixture; the scales
+  differ only in the encoder.
+* **ogbn-arxiv** (ODC-BY; Open Graph Benchmark) — ~169k CS papers, ~1.17M
+  citation edges, 40 subject classes, title + abstract. ``full`` runs a
+  connected ball of the citation graph — 4,000 papers collected breadth-first
+  from the highest-degree paper, downloaded from the pinned archive. ``small``
+  runs that ball's 400 best-connected papers (most citations inside the ball),
+  committed as the ``arxiv_small`` fixture: one dataset at two sizes, the
+  small one keeping the full one's citation density and subject homophily.
 
-The loaders register file-shaped sources into a ``jammi`` database and return
-the committed subset; subset identity comes from the committed ID lists
-(:func:`jammi_cookbook.determinism.committed_ids`), not from replaying a seed.
-Both datasets are read with the standard library + pyarrow from their pinned,
-checksum-gated archives — no torch or graph-library dependency.
+The ogbn-arxiv time split (train ≤ 2017, valid 2018, test ≥ 2019) is a
+property of each paper's ``year``, so it is derived, never stored.
+
+Every download is checksum-gated against a pinned digest: a changed source
+fails loudly rather than drifting the book's numbers. Author-time,
+``python -m jammi_cookbook.datasets`` rewrites the committed fixtures from the
+pinned sources.
 """
 
 from __future__ import annotations
@@ -24,7 +27,11 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
+import os
+import tempfile
+import zipfile
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,21 +41,22 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from . import determinism
+from . import fixtures
+from .scale import Scale
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-_RAW_DIR = _REPO_ROOT / "data" / "raw"
-_CACHE_DIR = _REPO_ROOT / "data" / "cache"
-_IDS_DIR = _REPO_ROOT / "data" / "ids"
+# The full scale's breadth-first ball, and the size of its best-connected core
+# the small scale runs.
+ARXIV_BALL = 4000
+ARXIV_CORE = 400
 
+# The time split, by publication year.
+TRAIN_UNTIL, VALID_YEAR = 2017, 2018
 
-# --------------------------------------------------------------------------- #
-# Pinned sources (the determinism contract for downloads)
-# --------------------------------------------------------------------------- #
+# Where downloads and the tables built from them are kept.
+_CACHE = Path(os.environ.get("JAMMI_COOKBOOK_CACHE", Path.home() / ".cache" / "jammi-cookbook"))
 
-# Air Routes is pinned to a single immutable repo commit so the node and edge
-# files are mutually consistent (graph version 0.89); the moving `master` raw URL
-# served stale CDN content, which is exactly what the checksum gate catches.
+# Pinned sources: (url, sha256). Air Routes is pinned to one immutable commit
+# so its node and edge files are mutually consistent (graph version 0.89).
 _AIR_COMMIT = "efd3b1ae636f602577cfbccb16ecfe358a02ee36"
 _AIR_BASE = f"https://raw.githubusercontent.com/krlawrence/graph/{_AIR_COMMIT}/sample-data"
 _AIR_NODES = (
@@ -59,11 +67,6 @@ _AIR_EDGES = (
     f"{_AIR_BASE}/air-routes-latest-edges.csv",
     "01749b2717ccca5efe11c4b1f5e25f8c59ab682014104f3fb8bdb67e23b101b5",
 )
-
-# ogbn-arxiv: the canonical graph/labels/year/split + id/label mappings ship as
-# gzip'd CSVs inside the Open Graph Benchmark zip, read directly (no torch/ogb
-# dependency). The raw title+abstract text is a separate file. Both are
-# checksum-gated, so determinism is a property of the pinned digest.
 _ARXIV_ZIP = (
     "http://snap.stanford.edu/ogb/data/nodeproppred/arxiv.zip",
     "49f85c801589ecdcc52cfaca99693aaea7b8af16a9ac3f41dd85a5f3193fe276",
@@ -73,446 +76,320 @@ _ARXIV_TITLEABS = (
     "7bce99ab3e1604277f12dd49f6e17a0d89867b29ea152f072c0e709ae0bc8ed7",
 )
 
-# Licenses, recorded here and in NOTICE.
 LICENSES = {
     "air_routes": "Permissive (krlawrence/graph sample-data); see NOTICE.",
     "ogbn_arxiv": "ODC-BY 1.0 (Open Graph Benchmark); see NOTICE.",
 }
 
 
-# A pinned source lives on a third party's host: a dropped connection, a read
-# that stalls, or a 429/5xx is retried with exponential backoff rather than
-# failing the fetch. The connect bound is short so a dead connection is
-# retried within seconds; the read bound covers the largest pinned file.
-_FETCH_RETRY = Retry(
+# --------------------------------------------------------------------------- #
+# Registered datasets
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AirRoutes:
+    """The registered Air Routes sources."""
+
+    airports: str
+    routes: str
+    contains: str
+
+
+@dataclass(frozen=True)
+class Arxiv:
+    """The registered ogbn-arxiv sources and the ball's time split."""
+
+    papers: str
+    cites: str
+    split: dict[str, list[str]]  # "train" / "valid" / "test" → paper_ids
+
+
+def air_routes(db) -> AirRoutes:
+    """Register Air Routes into ``db``: ``air_airports`` (key ``code``, text
+    ``desc``, the ``continent`` label), ``air_routes`` (``src``, ``dst``,
+    ``dist``) and ``air_contains`` (``src`` parent, ``dst`` child). Each file
+    is named for its source, so each queries as ``<source>.public.<source>``."""
+    registered = AirRoutes("air_airports", "air_routes", "air_contains")
+    for name in (registered.airports, registered.routes, registered.contains):
+        db.add_source(name, url=fixtures.url(f"air_routes/{name}.parquet"), format="parquet")
+    return registered
+
+
+def arxiv(db, scale: Scale) -> Arxiv:
+    """Register the scale's ogbn-arxiv ball into ``db``: ``arxiv_papers`` (key
+    ``paper_id``, text ``title`` + ``abstract``, label ``subject``, ``year``)
+    and ``arxiv_cites`` (``src`` cites ``dst``)."""
+    if scale is Scale.SMALL:
+        papers_url = fixtures.url("arxiv_small/arxiv_papers.parquet")
+        cites_url = fixtures.url("arxiv_small/arxiv_cites.parquet")
+        papers = pq.read_table(fixtures.path("arxiv_small/arxiv_papers.parquet"))
+    else:
+        papers, cites = arxiv_tables(scale)
+        papers_url = _cached_parquet(papers, f"{scale}/arxiv_papers")
+        cites_url = _cached_parquet(cites, f"{scale}/arxiv_cites")
+    db.add_source("arxiv_papers", url=papers_url, format="parquet")
+    db.add_source("arxiv_cites", url=cites_url, format="parquet")
+    return Arxiv("arxiv_papers", "arxiv_cites", time_split(papers))
+
+
+def time_split(papers: pa.Table) -> dict[str, list[str]]:
+    """The ogbn-arxiv time split of ``papers``, by year."""
+    split: dict[str, list[str]] = {"train": [], "valid": [], "test": []}
+    ids, years = papers.column("paper_id").to_pylist(), papers.column("year").to_pylist()
+    for pid, year in zip(ids, years, strict=True):
+        name = "train" if year <= TRAIN_UNTIL else "valid" if year == VALID_YEAR else "test"
+        split[name].append(pid)
+    return split
+
+
+def same_label_golden(
+    db, rows: list[dict], *, key: str, label: str, text: str, queries: int, name: str
+) -> str:
+    """Register a retrieval golden where a row's relevant rows are the other
+    rows sharing its ``label`` — a target independent of any embedding, so an
+    embedding that retrieves it better is better, not circular. The first
+    ``queries`` rows (in key order) whose label has at least five members are
+    the queries, each asked by its ``text``. Returns the golden's source name.
+    """
+    members: dict[str, list[str]] = {}
+    for r in rows:
+        members.setdefault(r[label], []).append(r[key])
+    asked = [r for r in sorted(rows, key=lambda r: r[key]) if len(members[r[label]]) >= 5]
+    golden = [
+        {"query_id": q[key], "query_text": q[text], "relevant_id": other}
+        for q in asked[:queries]
+        for other in members[q[label]]
+        if other != q[key]
+    ]
+    url = _cached_parquet(pa.Table.from_pylist(golden), f"goldens/{name}")
+    db.add_source(name, url=url, format="parquet")
+    return f"{name}.public.{name}"
+
+
+# --------------------------------------------------------------------------- #
+# Building the tables from the pinned sources
+# --------------------------------------------------------------------------- #
+
+
+def arxiv_tables(scale: Scale) -> tuple[pa.Table, pa.Table]:
+    """The scale's papers and the citations among them, from the pinned
+    archive: papers ``(paper_id, title, abstract, subject, year)`` in ball
+    order. ``full`` is the :data:`ARXIV_BALL`-paper breadth-first ball;
+    ``small`` is its :data:`ARXIV_CORE` papers with the most citations inside
+    the ball (ties to ball order)."""
+    zipped = _download(*_ARXIV_ZIP, name="arxiv.zip")
+    with zipfile.ZipFile(zipped) as zf:
+
+        def lines(member: str) -> list[str]:
+            with zf.open(member) as f:
+                return gzip.decompress(f.read()).decode("utf-8").splitlines()
+
+        num_nodes = int(lines("arxiv/raw/num-node-list.csv.gz")[0])
+        edges = [
+            (int(a), int(b)) for a, b in (ln.split(",") for ln in lines("arxiv/raw/edge.csv.gz"))
+        ]
+        labels = [int(x) for x in lines("arxiv/raw/node-label.csv.gz")]
+        years = [int(x) for x in lines("arxiv/raw/node_year.csv.gz")]
+        node2pid = [
+            int(ln.split(",")[1]) for ln in lines("arxiv/mapping/nodeidx2paperid.csv.gz")[1:]
+        ]
+        subjects = [
+            ln.split(",", 1)[1] for ln in lines("arxiv/mapping/labelidx2arxivcategeory.csv.gz")[1:]
+        ]
+    text = _titleabs()
+
+    ball = _ball(num_nodes, edges, ARXIV_BALL)
+    if scale is Scale.SMALL:
+        ball = _core(ball, edges, ARXIV_CORE)
+    members = set(ball)
+    papers = pa.table(
+        {
+            "paper_id": [str(node2pid[n]) for n in ball],
+            "title": [text[node2pid[n]][0] for n in ball],
+            "abstract": [text[node2pid[n]][1] for n in ball],
+            "subject": [subjects[labels[n]] for n in ball],
+            "year": pa.array([years[n] for n in ball], pa.int64()),
+        }
+    )
+    cited = [(s, d) for s, d in edges if s in members and d in members]
+    cites = pa.table(
+        {
+            "src": [str(node2pid[s]) for s, _ in cited],
+            "dst": [str(node2pid[d]) for _, d in cited],
+        }
+    )
+    return papers, cites
+
+
+def _ball(num_nodes: int, edges: list[tuple[int, int]], size: int) -> list[int]:
+    """``size`` node indices collected breadth-first over the undirected
+    citation graph from the highest-degree node (ties to the lowest index),
+    neighbours in index order. A pure function of the graph: every prefix of a
+    larger ball is the smaller ball."""
+    adj: list[list[int]] = [[] for _ in range(num_nodes)]
+    for s, d in edges:
+        adj[s].append(d)
+        adj[d].append(s)
+    start = max(range(num_nodes), key=lambda i: (len(adj[i]), -i))
+    seen, order, queue = {start}, [start], deque([start])
+    while queue and len(order) < size:
+        for nbr in sorted(adj[queue.popleft()]):
+            if nbr not in seen:
+                seen.add(nbr)
+                order.append(nbr)
+                queue.append(nbr)
+                if len(order) == size:
+                    break
+    return order
+
+
+def _core(ball: list[int], edges: list[tuple[int, int]], size: int) -> list[int]:
+    """The ``size`` nodes of ``ball`` with the most edges inside it, in ball
+    order."""
+    inside = set(ball)
+    degree = {n: 0 for n in ball}
+    for s, d in edges:
+        if s in inside and d in inside:
+            degree[s] += 1
+            degree[d] += 1
+    position = {n: i for i, n in enumerate(ball)}
+    kept = set(sorted(ball, key=lambda n: (-degree[n], position[n]))[:size])
+    return [n for n in ball if n in kept]
+
+
+def _titleabs() -> dict[int, tuple[str, str]]:
+    """paper_id → (title, abstract)."""
+    path = _download(*_ARXIV_TITLEABS, name="titleabs.tsv.gz")
+    text: dict[int, tuple[str, str]] = {}
+    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 3 and parts[0].strip().isdigit():
+                text[int(parts[0])] = (parts[1], parts[2])
+    return text
+
+
+def air_routes_tables() -> tuple[pa.Table, pa.Table, pa.Table]:
+    """Airports, routes and the contains hierarchy, from the pinned CSVs. An
+    airport's ``continent`` is its parent in the continent→airport edges."""
+    nodes_csv = _download(*_AIR_NODES, name="air-routes-nodes.csv")
+    edges_csv = _download(*_AIR_EDGES, name="air-routes-edges.csv")
+    label_code: dict[str, tuple[str, str]] = {}
+    airports: dict[str, dict] = {}
+    with nodes_csv.open(newline="") as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            nid, label, _type, code, _icao, desc, region = row[0:7]
+            runways, longest, elev, country, city, lat, lon = row[7:14]
+            label_code[nid] = (label, code)
+            if label == "airport":
+                airports[code] = {
+                    "code": code, "desc": desc, "city": city, "country": country,
+                    "continent": "", "lat": float(lat), "lon": float(lon),
+                    "elev": int(elev), "runways": int(runways), "longest": int(longest),
+                    "region": region,
+                }
+    routes: list[tuple[str, str, int]] = []
+    contains: list[tuple[str, str]] = []
+    with edges_csv.open(newline="") as f:
+        reader = csv.reader(f)
+        next(reader)
+        for row in reader:
+            src_label, src = label_code[row[1]]
+            _, dst = label_code[row[2]]
+            if row[3] == "route":
+                routes.append((src, dst, int(row[4])))
+            elif row[3] == "contains":
+                contains.append((src, dst))
+                if src_label == "continent" and dst in airports:
+                    airports[dst]["continent"] = src
+    return (
+        pa.Table.from_pylist([airports[c] for c in sorted(airports)]),
+        pa.table(
+            {
+                "src": [s for s, _, _ in routes],
+                "dst": [d for _, d, _ in routes],
+                "dist": pa.array([w for _, _, w in routes], pa.int64()),
+            }
+        ),
+        pa.table({"src": [s for s, _ in contains], "dst": [d for _, d in contains]}),
+    )
+
+
+def write_fixtures() -> None:
+    """Author-time: rewrite the committed ``air_routes`` and ``arxiv_small``
+    fixtures from the pinned sources."""
+    airports, routes, contains = air_routes_tables()
+    air = fixtures.path("air_routes")
+    for table, name in ((airports, "air_airports"), (routes, "air_routes"),
+                        (contains, "air_contains")):
+        pq.write_table(table, air / f"{name}.parquet")
+    papers, cites = arxiv_tables(Scale.SMALL)
+    small = fixtures.path("arxiv_small")
+    pq.write_table(papers, small / "arxiv_papers.parquet")
+    pq.write_table(cites, small / "arxiv_cites.parquet")
+
+
+# --------------------------------------------------------------------------- #
+# Downloads
+# --------------------------------------------------------------------------- #
+
+# A dropped connection, a stalled read, or a 429/5xx from a source's host is
+# retried with backoff rather than failing the fetch.
+_RETRY = Retry(
     total=6,
     backoff_factor=2.0,
     status_forcelist=(429, 500, 502, 503, 504),
     allowed_methods=frozenset({"GET"}),
 )
-_FETCH_TIMEOUT = (30, 300)
 
 
-def _fetch(url: str) -> bytes:
-    with requests.Session() as session:
-        session.mount("https://", HTTPAdapter(max_retries=_FETCH_RETRY))
-        session.mount("http://", HTTPAdapter(max_retries=_FETCH_RETRY))
-        resp = session.get(url, timeout=_FETCH_TIMEOUT)
-        resp.raise_for_status()
-        return resp.content
-
-
-def _download(url: str, sha256: str, *, dest: Path) -> Path:
-    """Fetch ``url`` to ``dest`` (cached) and verify its SHA-256 digest.
-
-    A digest mismatch raises — a changed or tampered source must fail, never
-    silently reshape the data the book is pinned to.
-    """
+def _download(url: str, sha256: str, *, name: str) -> Path:
+    """``url``, fetched once into the cache and verified against ``sha256``."""
+    dest = _CACHE / "raw" / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
-        dest.write_bytes(_fetch(url))
+        with requests.Session() as session:
+            session.mount("https://", HTTPAdapter(max_retries=_RETRY))
+            session.mount("http://", HTTPAdapter(max_retries=_RETRY))
+            resp = session.get(url, timeout=(30, 300))
+            resp.raise_for_status()
+            _publish(dest, lambda tmp: tmp.write_bytes(resp.content))
     digest = hashlib.sha256(dest.read_bytes()).hexdigest()
     if digest != sha256:
-        dest.unlink(missing_ok=True)
+        dest.unlink()
         raise ValueError(
-            f"checksum mismatch for {url}\n  expected {sha256}\n  got      {digest}\n"
-            f"The pinned source changed; the book's determinism contract refuses it."
+            f"checksum mismatch for {url}: expected {sha256}, got {digest}. The pinned "
+            "source changed; the book refuses it rather than drift its numbers."
         )
     return dest
 
 
-def _write_parquet(table: pa.Table, name: str) -> str:
-    """Write a table to the (gitignored) cache and return its path as a URL."""
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = _CACHE_DIR / f"{name}.parquet"
-    pq.write_table(table, path)
-    return str(path)
+def _cached_parquet(table: pa.Table, name: str) -> str:
+    """``table`` written to the cache, as the URL ``add_source`` registers."""
+    path = _CACHE / f"{name}.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _publish(path, lambda tmp: pq.write_table(table, tmp))
+    return path.as_uri()
 
 
-def add_source_idempotent(db, name: str, *, url: str, format: str) -> None:
-    """Register a source, tolerating a prior registration under the same name.
-
-    A keystone emit script re-run against the same still-live server after a
-    later stage failed (this loader's own registration already succeeded) must
-    not treat the earlier, already-registered source as an error — the parquet
-    this call would write is byte-identical (the same committed subset each
-    time), so re-registering is a no-op, not a conflict.
-    """
-    existing = {s["source_id"] for s in db.list_sources()}
-    if name in existing:
-        return
-    db.add_source(name, url=url, format=format)
-
-
-# --------------------------------------------------------------------------- #
-# Air Routes
-# --------------------------------------------------------------------------- #
-
-# The airport node columns the book uses (key first). `continent` is derived from
-# the `contains` hierarchy (continent→airport edges), not a raw column.
-_AIRPORT_COLUMNS = [
-    "code",
-    "desc",
-    "city",
-    "country",
-    "continent",
-    "lat",
-    "lon",
-    "elev",
-    "runways",
-    "longest",
-    "region",
-]
+def _publish(path: Path, write: Callable[[Path], None]) -> None:
+    """Land ``write``'s output at ``path`` in one atomic rename. The cache is
+    shared by every session on the machine — two chapters or notebooks at once
+    — and a source registered over ``path`` reopens it on every scan: an
+    in-place rewrite would hand another session's scan a truncated file, where
+    after a rename every scan opens a whole one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    os.close(fd)
+    try:
+        write(Path(tmp))
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
-@dataclass(frozen=True)
-class AirRoutes:
-    """Registered Air Routes sources + the loaded airport subset."""
-
-    airports_source: str
-    route_edges_source: str
-    contains_edges_source: str
-    airport_codes: list[str]
-
-
-def _parse_air_routes() -> tuple[
-    dict[str, dict], list[tuple[str, str, int]], list[tuple[str, str]]
-]:
-    """Parse the pinned CSVs into (airports-by-code, route edges, contains edges).
-
-    Returns airports keyed by IATA ``code`` with each airport's ``continent``
-    resolved from the continent→airport ``contains`` edges; ``route`` edges as
-    ``(src_code, dst_code, dist)``; and the full ``contains`` hierarchy as
-    ``(parent_code, child_code)``.
-    """
-    nodes_csv = _download(*_AIR_NODES, dest=_RAW_DIR / "air-routes-nodes.csv")
-    edges_csv = _download(*_AIR_EDGES, dest=_RAW_DIR / "air-routes-edges.csv")
-
-    # id -> (label, code) and the airport rows by code.
-    id_label_code: dict[str, tuple[str, str]] = {}
-    airports: dict[str, dict] = {}
-    with nodes_csv.open(newline="") as f:
-        reader = csv.reader(f)
-        next(reader)  # header
-        for row in reader:
-            nid, label, _type, code, _icao, desc, region = row[0:7]
-            runways, longest, elev, country, city, lat, lon = row[7:14]
-            id_label_code[nid] = (label, code)
-            if label == "airport":
-                airports[code] = {
-                    "code": code,
-                    "desc": desc,
-                    "city": city,
-                    "country": country,
-                    "continent": "",
-                    "lat": float(lat),
-                    "lon": float(lon),
-                    "elev": int(elev),
-                    "runways": int(runways),
-                    "longest": int(longest),
-                    "region": region,
-                }
-
-    route_edges: list[tuple[str, str, int]] = []
-    contains_edges: list[tuple[str, str]] = []
-    with edges_csv.open(newline="") as f:
-        reader = csv.reader(f)
-        next(reader)  # header
-        for row in reader:
-            _id, frm, to, label = row[0:4]
-            src_label, src_code = id_label_code[frm]
-            _dst_label, dst_code = id_label_code[to]
-            if label == "route":
-                route_edges.append((src_code, dst_code, int(row[4])))
-            elif label == "contains":
-                contains_edges.append((src_code, dst_code))
-                # continent→airport edge resolves the airport's continent.
-                if src_label == "continent" and dst_code in airports:
-                    airports[dst_code]["continent"] = src_code
-
-    return airports, route_edges, contains_edges
-
-
-def load_air_routes(db) -> AirRoutes:
-    """Register the Air Routes sources into ``db`` and return the airport subset.
-
-    The full small graph is loaded: every committed airport plus its incident
-    ``route`` and ``contains`` edges. Subset identity is the committed
-    ``data/ids/air.txt`` list (the full airport set). License: see
-    :data:`LICENSES`.
-    """
-    airports, route_edges, contains_edges = _parse_air_routes()
-
-    committed = set(determinism.committed_ids("air"))
-    keep = {c for c in airports if c in committed}
-
-    airport_rows = [airports[c] for c in sorted(keep)]
-    airports_table = pa.Table.from_pylist(airport_rows, schema=_airport_schema())
-    routes_table = pa.table(
-        {
-            "src": [s for s, d, _ in route_edges if s in keep and d in keep],
-            "dst": [d for s, d, _ in route_edges if s in keep and d in keep],
-            "dist": [w for s, d, w in route_edges if s in keep and d in keep],
-        }
-    )
-    contains_table = pa.table(
-        {
-            "src": [s for s, d in contains_edges if d in keep],
-            "dst": [d for s, d in contains_edges if d in keep],
-        }
-    )
-
-    airports_source = "air_airports"
-    route_source = "air_route_edges"
-    contains_source = "air_contains_edges"
-    db.add_source(
-        airports_source, url=_write_parquet(airports_table, airports_source), format="parquet"
-    )
-    db.add_source(route_source, url=_write_parquet(routes_table, route_source), format="parquet")
-    db.add_source(
-        contains_source, url=_write_parquet(contains_table, contains_source), format="parquet"
-    )
-
-    return AirRoutes(
-        airports_source=airports_source,
-        route_edges_source=route_source,
-        contains_edges_source=contains_source,
-        airport_codes=sorted(keep),
-    )
-
-
-def _airport_schema() -> pa.Schema:
-    return pa.schema(
-        [
-            ("code", pa.string()),
-            ("desc", pa.string()),
-            ("city", pa.string()),
-            ("country", pa.string()),
-            ("continent", pa.string()),
-            ("lat", pa.float64()),
-            ("lon", pa.float64()),
-            ("elev", pa.int64()),
-            ("runways", pa.int64()),
-            ("longest", pa.int64()),
-            ("region", pa.string()),
-        ]
-    )
-
-
-def write_air_routes_ids() -> list[str]:
-    """Author-time helper: write ``data/ids/air.txt`` with every airport code.
-
-    Air Routes is small enough to run as the full graph, so the committed subset
-    is all airports; recorded for the determinism contract (committed, not seeded).
-    """
-    airports, _, _ = _parse_air_routes()
-    codes = sorted(airports)
-    _IDS_DIR.mkdir(parents=True, exist_ok=True)
-    (_IDS_DIR / "air.txt").write_text("\n".join(codes) + "\n")
-    return codes
-
-
-# --------------------------------------------------------------------------- #
-# ogbn-arxiv
-# --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class OgbnArxiv:
-    """Registered ogbn-arxiv sources + the committed subset and its time-split."""
-
-    papers_source: str
-    cite_edges_source: str
-    paper_ids: list[str]
-    split: dict[str, list[str]]  # "train" / "valid" / "test" → paper_ids in subset
-
-
-@dataclass(frozen=True)
-class _ArxivRaw:
-    """The canonical ogbn-arxiv tables, read straight from the pinned zip."""
-
-    num_nodes: int
-    edges: list[tuple[int, int]]  # directed citation edges, node indices
-    labels: list[int]  # subject-class index per node
-    years: list[int]  # publication year per node
-    node2pid: list[int]  # node index → MAG paper id
-    label_names: list[str]  # class index → arxiv category name
-    split: dict[str, list[int]]  # canonical time-split, node indices
-
-
-def _zip_member_lines(zf, member: str) -> list[str]:
-    import gzip as _gz
-
-    with zf.open(member) as f:
-        return _gz.decompress(f.read()).decode("utf-8").splitlines()
-
-
-def _load_arxiv_raw() -> _ArxivRaw:
-    """Read the canonical ogbn-arxiv tables directly from the checksum-gated zip.
-
-    The Open Graph Benchmark distributes the full graph, labels, years, time-split,
-    and id/label mappings as gzip'd CSVs inside ``arxiv.zip``. Reading them
-    directly — rather than through the ``ogb`` package — keeps the loader free of a
-    heavy, torch-pinned dependency and makes determinism a property of the pinned
-    checksum, not of a pickle cache.
-    """
-    import zipfile
-
-    path = _download(*_ARXIV_ZIP, dest=_RAW_DIR / "arxiv.zip")
-    with zipfile.ZipFile(path) as zf:
-        num_nodes = int(_zip_member_lines(zf, "arxiv/raw/num-node-list.csv.gz")[0])
-        edges = [
-            (int(a), int(b))
-            for a, b in (line.split(",") for line in _zip_member_lines(zf, "arxiv/raw/edge.csv.gz"))
-        ]
-        labels = [int(x) for x in _zip_member_lines(zf, "arxiv/raw/node-label.csv.gz")]
-        years = [int(x) for x in _zip_member_lines(zf, "arxiv/raw/node_year.csv.gz")]
-        node2pid = [
-            int(line.split(",")[1])
-            for line in _zip_member_lines(zf, "arxiv/mapping/nodeidx2paperid.csv.gz")[1:]
-        ]
-        label_names = [
-            line.split(",", 1)[1]
-            for line in _zip_member_lines(zf, "arxiv/mapping/labelidx2arxivcategeory.csv.gz")[1:]
-        ]
-        split = {
-            name: [int(x) for x in _zip_member_lines(zf, f"arxiv/split/time/{name}.csv.gz")]
-            for name in ("train", "valid", "test")
-        }
-    return _ArxivRaw(num_nodes, edges, labels, years, node2pid, label_names, split)
-
-
-def _load_titleabs() -> dict[int, tuple[str, str]]:
-    """paper_id → (title, abstract), from the checksum-gated titleabs file."""
-    path = _download(*_ARXIV_TITLEABS, dest=_RAW_DIR / "titleabs.tsv.gz")
-    text: dict[int, tuple[str, str]] = {}
-    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3 or not parts[0].strip().isdigit():
-                continue  # drops the stray first-line filename artifact
-            text[int(parts[0])] = (parts[1], parts[2])
-    return text
-
-
-def _connected_subset(raw: _ArxivRaw, size: int) -> list[int]:
-    """A deterministic connected induced subgraph of ``size`` node indices.
-
-    BFS over the undirected citation graph from the highest-degree node (ties
-    broken by lowest index) until ``size`` nodes are collected. A connected ball
-    preserves citation density and label homophily — the structure the tier-04
-    coverage crux depends on. A pure function of the graph: no seed needed.
-    """
-    adj: list[list[int]] = [[] for _ in range(raw.num_nodes)]
-    for s, d in raw.edges:
-        adj[s].append(d)
-        adj[d].append(s)
-    start = max(range(raw.num_nodes), key=lambda i: (len(adj[i]), -i))
-
-    seen = {start}
-    order = [start]
-    queue = deque([start])
-    while queue and len(order) < size:
-        node = queue.popleft()
-        for nbr in sorted(adj[node]):  # sorted → deterministic expansion
-            if nbr not in seen:
-                seen.add(nbr)
-                order.append(nbr)
-                queue.append(nbr)
-                if len(order) >= size:
-                    break
-    return order[:size]
-
-
-def load_ogbn_arxiv(db, *, subset: int = 4000) -> OgbnArxiv:
-    """Register the ogbn-arxiv sources into ``db`` and return the committed subset.
-
-    The papers source has ``paper_id`` (key), ``title``, ``abstract`` (the text to
-    embed), ``subject`` (the 40-class label name), and ``year`` (the date split).
-    The ``cite_edges`` source is the declared citation graph — the BYOG signal for
-    tier-04. The subset is the committed ``data/ids/arxiv.txt`` list (a connected
-    induced subgraph); ``subset`` sizes it only on first author-time generation.
-    License: see :data:`LICENSES`.
-    """
-    raw = _load_arxiv_raw()
-    text = _load_titleabs()
-
-    pid_to_node = {raw.node2pid[i]: i for i in range(raw.num_nodes)}
-    committed = _committed_arxiv_ids(raw, subset)
-    keep_pids = [int(p) for p in committed]
-    keep_nodes = {pid_to_node[p] for p in keep_pids}
-
-    papers_rows = []
-    for pid in keep_pids:
-        node = pid_to_node[pid]
-        title, abstract = text[pid]
-        papers_rows.append(
-            {
-                "paper_id": str(pid),
-                "title": title,
-                "abstract": abstract,
-                "subject": raw.label_names[raw.labels[node]],
-                "year": raw.years[node],
-            }
-        )
-    papers_table = pa.Table.from_pylist(papers_rows, schema=_paper_schema())
-
-    cite_table = pa.table(
-        {
-            "src": [
-                str(raw.node2pid[s]) for s, d in raw.edges if s in keep_nodes and d in keep_nodes
-            ],
-            "dst": [
-                str(raw.node2pid[d]) for s, d in raw.edges if s in keep_nodes and d in keep_nodes
-            ],
-        }
-    )
-
-    add_source_idempotent(
-        db, "arxiv_papers", url=_write_parquet(papers_table, "arxiv_papers"), format="parquet"
-    )
-    add_source_idempotent(
-        db, "arxiv_cite_edges",
-        url=_write_parquet(cite_table, "arxiv_cite_edges"), format="parquet",
-    )
-
-    keep_set = set(keep_pids)
-    split_pids = {
-        name: sorted(str(raw.node2pid[i]) for i in idx if raw.node2pid[i] in keep_set)
-        for name, idx in raw.split.items()
-    }
-
-    return OgbnArxiv(
-        papers_source="arxiv_papers",
-        cite_edges_source="arxiv_cite_edges",
-        paper_ids=[str(p) for p in keep_pids],
-        split=split_pids,
-    )
-
-
-def _committed_arxiv_ids(raw: _ArxivRaw, subset: int) -> list[str]:
-    """The committed arxiv subset paper_ids, generating + writing them once.
-
-    On first author-time call (no committed list) the connected subgraph is
-    selected and written to ``data/ids/arxiv.txt`` as the source of truth; every
-    later call (including CI) reads that file.
-    """
-    path = _IDS_DIR / "arxiv.txt"
-    if path.exists():
-        return determinism.committed_ids("arxiv")
-    pids = [str(raw.node2pid[i]) for i in _connected_subset(raw, subset)]
-    _IDS_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(pids) + "\n")
-    return pids
-
-
-def _paper_schema() -> pa.Schema:
-    return pa.schema(
-        [
-            ("paper_id", pa.string()),
-            ("title", pa.string()),
-            ("abstract", pa.string()),
-            ("subject", pa.string()),
-            ("year", pa.int64()),
-        ]
-    )
+if __name__ == "__main__":
+    write_fixtures()

@@ -11,6 +11,7 @@
 //! ([`super::catalog`]); only the compute verbs' shapes are here.
 
 use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::index::SearchMethod;
 use tonic::Status;
 
 use crate::proto::embedding as pb;
@@ -99,6 +100,7 @@ fn result_table_kind_to_proto(kind: ResultTableKind) -> pb::ResultTableKind {
         ResultTableKind::AsofJoin => pb::ResultTableKind::AsofJoin,
         ResultTableKind::TrainingSet => pb::ResultTableKind::TrainingSet,
         ResultTableKind::Statement => pb::ResultTableKind::Statement,
+        ResultTableKind::Lexical => pb::ResultTableKind::Lexical,
         ResultTableKind::Working => pb::ResultTableKind::Working,
     }
 }
@@ -114,6 +116,7 @@ fn result_table_kind_from_proto(kind: i32) -> Result<ResultTableKind, Status> {
         Ok(pb::ResultTableKind::AsofJoin) => Ok(ResultTableKind::AsofJoin),
         Ok(pb::ResultTableKind::TrainingSet) => Ok(ResultTableKind::TrainingSet),
         Ok(pb::ResultTableKind::Statement) => Ok(ResultTableKind::Statement),
+        Ok(pb::ResultTableKind::Lexical) => Ok(ResultTableKind::Lexical),
         Ok(pb::ResultTableKind::Working) => Ok(ResultTableKind::Working),
         Ok(pb::ResultTableKind::Unspecified) | Err(_) => Err(Status::invalid_argument(
             "result table kind must be specified",
@@ -221,6 +224,29 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
     ))
 }
 
+/// A search's `method` on the wire: unset for an approximate search at the
+/// table's own oversample. [`search_method_from_proto`] is the inverse.
+pub fn search_method_to_proto(method: SearchMethod) -> Option<pb::search_request::Method> {
+    match method {
+        SearchMethod::Approximate { oversample: None } => None,
+        SearchMethod::Approximate {
+            oversample: Some(v),
+        } => Some(pb::search_request::Method::Oversample(v as u32)),
+        SearchMethod::Exact => Some(pb::search_request::Method::Exact(pb::ExactSearch {})),
+    }
+}
+
+/// The [`SearchMethod`] a wire `method` names.
+pub fn search_method_from_proto(method: Option<pb::search_request::Method>) -> SearchMethod {
+    match method {
+        None => SearchMethod::default(),
+        Some(pb::search_request::Method::Oversample(v)) => SearchMethod::Approximate {
+            oversample: Some(v as usize),
+        },
+        Some(pb::search_request::Method::Exact(_)) => SearchMethod::Exact,
+    }
+}
+
 #[cfg(test)]
 mod result_table_kind_tests {
     use super::{
@@ -235,36 +261,6 @@ mod result_table_kind_tests {
     /// the generated `pb::ResultTableKind` rather than a restatement of the
     /// list under test.
     const SCAN_LIMIT: i32 = 64;
-
-    /// Every engine [`ResultTableKind`], hand-enumerated and then checked
-    /// complete two ways: [`kind_is_enumerated`] below has no `_` arm (a
-    /// variant added to the engine enum fails to compile until it is listed
-    /// here), and
-    /// `engine_kinds_and_wire_kinds_are_the_same_size` pins this array's
-    /// length against the discriminant scan.
-    const ALL_ENGINE_KINDS: [ResultTableKind; 6] = [
-        ResultTableKind::Model,
-        ResultTableKind::NeighborGraph,
-        ResultTableKind::AsofJoin,
-        ResultTableKind::TrainingSet,
-        ResultTableKind::Statement,
-        ResultTableKind::Working,
-    ];
-
-    /// Compile-time completeness witness for [`ALL_ENGINE_KINDS`]: no `_` arm,
-    /// so a new engine variant reds this function, and each arm names the
-    /// array slot the variant occupies.
-    fn kind_is_enumerated(kind: ResultTableKind) -> bool {
-        let slot = match kind {
-            ResultTableKind::Model => 0,
-            ResultTableKind::NeighborGraph => 1,
-            ResultTableKind::AsofJoin => 2,
-            ResultTableKind::TrainingSet => 3,
-            ResultTableKind::Statement => 4,
-            ResultTableKind::Working => 5,
-        };
-        ALL_ENGINE_KINDS[slot] == kind
-    }
 
     /// The wire enum's value set, derived by scanning discriminants rather
     /// than restating the list: `try_from` accepts exactly the values the
@@ -288,9 +284,10 @@ mod result_table_kind_tests {
         assert_eq!(pb::ResultTableKind::TrainingSet as i32, 4);
         assert_eq!(pb::ResultTableKind::Statement as i32, 5);
         assert_eq!(pb::ResultTableKind::Working as i32, 6);
+        assert_eq!(pb::ResultTableKind::Lexical as i32, 7);
         assert_eq!(
             wire_kind_values(),
-            vec![0, 1, 2, 3, 4, 5, 6],
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
             "the served ResultTableKind values are frozen; adding one is an \
              append to this list, renumbering or removing one is breaking"
         );
@@ -303,8 +300,7 @@ mod result_table_kind_tests {
     #[test]
     fn every_engine_kind_round_trips_through_the_wire_mirror() {
         let mut seen: Vec<i32> = Vec::new();
-        for kind in ALL_ENGINE_KINDS {
-            assert!(kind_is_enumerated(kind), "{kind:?} is not enumerated");
+        for &kind in ResultTableKind::ALL {
             let wire = result_table_kind_to_proto(kind) as i32;
             assert_ne!(
                 wire,
@@ -346,13 +342,13 @@ mod result_table_kind_tests {
         }
     }
 
-    /// The two sides have the same cardinality, so the hand-written
-    /// [`ALL_ENGINE_KINDS`] cannot silently lag a proto that grew a value.
+    /// The two sides have the same cardinality: a proto that grew a value
+    /// has an engine kind to mirror.
     #[test]
     fn engine_kinds_and_wire_kinds_are_the_same_size() {
         let served = wire_kind_values().len() - 1; // less UNSPECIFIED
         assert_eq!(
-            ALL_ENGINE_KINDS.len(),
+            ResultTableKind::ALL.len(),
             served,
             "every served wire kind mirrors exactly one engine kind"
         );

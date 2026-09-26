@@ -195,6 +195,7 @@ fn spec() -> ContextPredictorTrainConfig {
         test_task_fraction: 0.25,
         min_task_count: 4,
         seed: 7,
+        embedding_table: None,
     }
 }
 

@@ -1,0 +1,174 @@
+{
+  "calibration.adaptive_ece": {
+    "tol": 0.05,
+    "value": 0.2091340625335234
+  },
+  "calibration.central_coverage": {
+    "tol": 0.05,
+    "value": 0.8645833333333334
+  },
+  "calibration.crps": {
+    "tol": 0.05,
+    "value": 0.6815583955305503
+  },
+  "calibration.nll": {
+    "tol": 0.1,
+    "value": 1.5871052074793177
+  },
+  "calibration.pit_ks": {
+    "tol": 0.05,
+    "value": 0.642937833329144
+  },
+  "calibration.sharpness": {
+    "tol": 0.2,
+    "value": 3.3167818983315605
+  },
+  "conformal.aps_coverage": {
+    "tol": 0.03,
+    "value": 0.9583333333333334
+  },
+  "conformal.aps_set_size": {
+    "tol": 0.6,
+    "value": 3.0416666666666665
+  },
+  "conformal.cqr_coverage": {
+    "tol": 0.04,
+    "value": 0.9479166666666666
+  },
+  "conformal.cqr_width": {
+    "tol": 0.6,
+    "value": 4.091020380457242
+  },
+  "conformal.interval_coverage": {
+    "tol": 0.04,
+    "value": 0.9375
+  },
+  "conformal.interval_width": {
+    "tol": 0.6,
+    "value": 3.878173828125
+  },
+  "conformal.lac_coverage": {
+    "tol": 0.03,
+    "value": 0.90625
+  },
+  "conformal.lac_set_size": {
+    "tol": 0.6,
+    "value": 1.8229166666666667
+  },
+  "conformal.raps_coverage": {
+    "tol": 0.03,
+    "value": 0.9583333333333334
+  },
+  "conformal.raps_set_size": {
+    "tol": 0.6,
+    "value": 2.875
+  },
+  "conformal.synthetic_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9181147540983607
+  },
+  "conformal.synthetic_shift_corr": {
+    "tol": 0.08,
+    "value": 0.378968396289259
+  },
+  "conformal.synthetic_weighted_coverage": {
+    "tol": 0.03,
+    "value": 0.9323770491803279
+  },
+  "tier01.cite_homophily": {
+    "tol": 1e-09,
+    "value": 0.5370957514267597
+  },
+  "tier01.neighbor_homophily": {
+    "tol": 0.02,
+    "value": 0.43125
+  },
+  "tier01.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.40349999999999975
+  },
+  "tier02.precision_at_10": {
+    "tol": 0.02,
+    "value": 0.426
+  },
+  "tier02.precision_delta": {
+    "tol": 0.02,
+    "value": 0.02249999999999963
+  },
+  "tier03.base_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.4034999999999998
+  },
+  "tier03.declared_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.40499999999999964
+  },
+  "tier03.random_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.4035000000000001
+  },
+  "tier03.similarity_precision_at_10": {
+    "tol": 0.02,
+    "value": 0.4090000000000002
+  },
+  "tier04.classifier_accuracy": {
+    "tol": 0.04,
+    "value": 0.6354166666666666
+  },
+  "tier04.local_marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9583333333333334
+  },
+  "tier04.marginal_coverage": {
+    "tol": 0.03,
+    "value": 0.9583333333333334
+  },
+  "tier04.marginal_set_size": {
+    "tol": 0.6,
+    "value": 3.0416666666666665
+  },
+  "tier04.reg_cal_mean": {
+    "tol": 1.0,
+    "value": 2017.459231517354
+  },
+  "tier04.reg_cal_resid_mag": {
+    "tol": 0.25,
+    "value": 0.7231735479636271
+  },
+  "tier04.reg_interval_coverage": {
+    "tol": 0.04,
+    "value": 0.9375
+  },
+  "tier04.reg_interval_width": {
+    "tol": 0.6,
+    "value": 3.878173828125
+  },
+  "tier04.reg_pred_std": {
+    "tol": 0.5,
+    "value": 0.996896394895851
+  },
+  "tier04.reg_resid_corr": {
+    "tol": 0.2,
+    "value": -0.7951556672932873
+  },
+  "tier04.reg_test_mean": {
+    "tol": 1.0,
+    "value": 2018.0902849833171
+  },
+  "tier04.reg_test_resid_mag": {
+    "tol": 0.25,
+    "value": 1.0451316833496094
+  },
+  "tier04.reg_weighted_coverage": {
+    "tol": 0.04,
+    "value": 0.71875
+  },
+  "tier04.score_shift_corr": {
+    "tol": 0.12,
+    "value": 0.24479706398858486
+  },
+  "tier04.weighting_max_abs_delta": {
+    "tol": 0.01,
+    "value": 0.0
+  }
+}

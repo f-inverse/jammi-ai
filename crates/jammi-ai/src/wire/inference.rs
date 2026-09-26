@@ -1,8 +1,8 @@
 //! `InferenceService` engine-spec conversions: the declared-edge gather and the
 //! served predictive distribution.
 //!
-//! The candle-free `infer_result_to_proto` lives on the wire substrate
-//! ([`jammi_wire`]); what stays here are the `Predict` conversions that touch the
+//! The candle-free result-row encoding (`result_rows_to_proto`) lives on the
+//! wire substrate ([`jammi_wire`]); what stays here are the `Predict` conversions that touch the
 //! engine-side `EdgeGather` / `PredictedDistribution` types, only reachable in a
 //! `local` build.
 //!
@@ -72,7 +72,7 @@ pub fn infer_from_proto(req: pb::InferRequest) -> Result<InferArgs, Status> {
         task: model_task_from_proto(req.task)?,
         columns: req.columns,
         key_column: req.key_column,
-        cache: crate::wire::cache_policy_from_proto(req.cache)?,
+        cache: jammi_wire::cache_policy_from_proto(req.cache)?,
     })
 }
 

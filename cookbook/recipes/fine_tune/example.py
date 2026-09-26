@@ -1,8 +1,9 @@
 """Fine-tune `tiny_bert` with LoRA, then encode a query with the result.
 
+Then fine-tune from a citation graph instead of labelled pairs.
+
 Run with `python cookbook/recipes/fine_tune/example.py`. Exits 0 on
-success. Slow on CPU (~30s) — excluded from the default smoke matrix;
-gated behind `JAMMI_COOKBOOK_SLOW=1` in `tests/cookbook_smoke.py`.
+success; seconds on CPU.
 """
 
 from __future__ import annotations
@@ -11,11 +12,11 @@ import tempfile
 from pathlib import Path
 
 import jammi
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-PAIRS_PATH = FIXTURES / "tiny_pairs.csv"
-BASE_MODEL = f"local:{FIXTURES / 'tiny_bert'}"
+PAIRS_PATH = fixtures.path("tiny_pairs.csv")
+BASE_MODEL = fixtures.model("tiny_bert")
+CITATIONS = fixtures.path("tiny_citation_graph")
 
 
 def main() -> int:
@@ -55,6 +56,26 @@ def main() -> int:
         assert len(query_vec) == 32, (
             f"tiny_bert is 32-dim; got {len(query_vec)}-dim from fine-tuned"
         )
+
+        # 6. Fine-tune from a graph instead of labelled pairs: nodes that cite
+        #    each other are pulled together. Random walks over the citation
+        #    edges sample the positives, the graph's non-neighbours the
+        #    negatives. The nodes and edges are two ordinary sources.
+        db.add_source("papers", url=str(CITATIONS / "nodes.jsonl"), format="jsonl")
+        db.add_source("cites", url=str(CITATIONS / "edges.jsonl"), format="jsonl")
+        graph_job = db.fine_tune_graph(
+            node_source="papers",
+            id_column="id",
+            text_column="text",
+            edge_source="cites",
+            base_model=BASE_MODEL,
+            lora_rank=4,
+            epochs=1,
+            sample_seed=0,
+        )
+        graph_job.wait()
+        print(f"graph-tuned model_id: {graph_job.output_model_id}")
+        assert graph_job.output_model_id.startswith("jammi:fine-tuned:")
 
     print("fine_tune: OK")
     return 0

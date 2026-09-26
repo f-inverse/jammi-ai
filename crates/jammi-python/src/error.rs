@@ -2,9 +2,7 @@ use pyo3::prelude::*;
 use pyo3::PyErr;
 use tonic::{Code, Status};
 
-use jammi_db::catalog::channel_repo::ChannelCatalogError;
 use jammi_db::error::JammiError;
-use jammi_db::store::mutable::MutableTableError;
 
 /// Raise a `jammi.errors` exception class by name, carrying `message`.
 ///
@@ -42,60 +40,28 @@ pub(crate) fn client_error(class: &str, message: String) -> PyErr {
     })
 }
 
-/// Classify a [`JammiError`] onto the `jammi.errors` class name it maps to.
-///
-/// The partition mirrors the server's gRPC status mapping (`map_engine_error`)
-/// so the embedded and remote transports agree on which failures are caller
-/// errors: the variants the server surfaces as `InvalidArgument` become
-/// `InvalidArgument`; a failed training job (`FineTune`) becomes `TrainingError`;
-/// everything else — a transport/runtime/backend fault — becomes `BackendError`.
+/// The `jammi.errors` class an engine error raises in process — the class the
+/// remote client raises for the same failure, so one `except` holds on both
+/// transports. A typed refusal with its own leaf class raises it; every other
+/// error raises the class of the status code the server sends for it
+/// ([`jammi_wire::status_code`], the one classification both transports
+/// share).
 fn jammi_error_class(err: &JammiError) -> &'static str {
     match err {
         JammiError::FineTune(_) => "TrainingError",
         // The end the caller asked for, distinct from a fault — the class the
         // remote client raises for a `cancelled` job (`RemoteJob.wait`).
         JammiError::JobCancelled { .. } => "JobCancelled",
-        JammiError::Config(_)
-        | JammiError::Source { .. }
-        | JammiError::Model { .. }
-        | JammiError::Tenant(_)
-        | JammiError::Schema { .. }
-        | JammiError::Eval(_) => "InvalidArgument",
-        // The mutable-table / channel-catalog kinds carry validation-shaped
-        // variants that are caller errors (`InvalidArgument`); their remaining
-        // variants (NotFound / AlreadyExists / conflict / backend) are not, and
-        // fall through to `BackendError`. Flattened into the outer match so the
-        // caller-error variants are one arm each.
-        JammiError::MutableTable(
-            MutableTableError::InvalidId(_)
-            | MutableTableError::Schema(_)
-            | MutableTableError::MissingPrimaryKey(_)
-            | MutableTableError::ReservedColumn(_)
-            | MutableTableError::NoOrderColumn,
-        ) => "InvalidArgument",
-        JammiError::ChannelCatalog(
-            ChannelCatalogError::InvalidId(_) | ChannelCatalogError::InvalidColumnType(_),
-        ) => "InvalidArgument",
-        // A training set whose projection yields no rows is a degenerate input
-        // the caller must change. The server maps it to `Code::InvalidArgument`
-        // (`jammi_server::grpc::wire::map_engine_error`), which the remote
-        // client raises as `jammi.errors.InvalidArgument`
-        // (`clients/python/jammi/_database.py::_rpc_to_jammi`) — so the
-        // embedded engine raises THAT class, not the `BackendError` the
-        // fall-through below would give it. No leaf class: the remote client
-        // decodes no status detail, so a refinement here would be catchable on
-        // one transport only.
-        JammiError::EmptyTrainingSet { .. } => "InvalidArgument",
-        // The leaf classes `jammi.errors` refines from `InvalidArgument` /
-        // `BackendError` for the typed refusals the embedded engine raises
-        // (each subclasses the class the remote mapper produces for its gRPC
-        // code, so one `except` holds on both transports).
         JammiError::InvalidKey { .. } => "InvalidKey",
+        JammiError::NonUniqueKey { .. } => "NonUniqueKey",
+        JammiError::NoQueryEncoder { .. } => "NoQueryEncoder",
+        JammiError::MissingManifest { .. } => "MissingManifest",
         JammiError::VersionUnavailable { .. } => "VersionUnavailable",
         JammiError::NotRefreshable { .. } => "NotRefreshable",
         JammiError::DefinitionDrift { .. } => "DefinitionDrift",
-        JammiError::NonUniqueKey { .. } => "NonUniqueKey",
-        _ => "BackendError",
+        JammiError::ModelNotFound { .. } => "ModelNotFound",
+        JammiError::ModelReferenced { .. } => "ModelReferenced",
+        other => status_class(jammi_wire::status_code(other)),
     }
 }
 
@@ -139,6 +105,9 @@ pub fn status_to_pyerr(status: Status) -> PyErr {
 fn status_class(code: Code) -> &'static str {
     match code {
         Code::InvalidArgument => "InvalidArgument",
+        Code::NotFound => "NotFound",
+        Code::AlreadyExists => "AlreadyExists",
+        Code::FailedPrecondition => "FailedPrecondition",
         _ => "BackendError",
     }
 }
@@ -151,12 +120,10 @@ mod tests {
     /// `EmptyTrainingSet` is the class the remote transport raises for the same
     /// failure.
     ///
-    /// The remote side of the equality is derived, not restated: the server maps
-    /// this variant to `Code::InvalidArgument`
-    /// (`jammi_server::grpc::wire::map_engine_error`, pinned by that crate's
-    /// `empty_training_set_round_trips_as_its_typed_variant_not_other`), and
-    /// [`status_class`] is this crate's copy of the remote client's
-    /// code → class partition. Were the variant to fall through to
+    /// The remote side of the equality is derived, not restated: the server
+    /// sends this variant as `Code::InvalidArgument`
+    /// ([`jammi_wire::status_code`]), and [`status_class`] is the remote
+    /// client's code → class partition. Were the variant to fall through to
     /// `BackendError`, a caller catching `InvalidArgument` would see the
     /// empty-training-set refusal remotely and miss it embedded.
     #[test]

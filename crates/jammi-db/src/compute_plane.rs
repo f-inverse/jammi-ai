@@ -32,8 +32,8 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{
-    CreateMemoryTable, DdlStatement, Expr, Extension, LogicalPlan, UserDefinedLogicalNode,
-    UserDefinedLogicalNodeCore,
+    CreateMemoryTable, DdlStatement, DmlStatement, Expr, Extension, LogicalPlan,
+    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, WriteOp,
 };
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -250,6 +250,16 @@ pub enum RefusalReason {
         /// The node, as the plan displays it.
         node: String,
     },
+    /// An `UPDATE` or `DELETE` whose rows are chosen by more than a predicate
+    /// over the target table's own columns — a subquery, or a join to
+    /// another relation. A table provider receives a DML statement's
+    /// predicate as filters over its own columns only, so anything beyond
+    /// them would be dropped and the statement would rewrite rows it never
+    /// selected.
+    DmlBeyondTarget {
+        /// The node or expression, as the plan displays it.
+        node: String,
+    },
 }
 
 impl RefusedStatement {
@@ -268,6 +278,10 @@ impl RefusedStatement {
             RefusalReason::NotReplayable { node } => (
                 "a query the engine can render back to SQL, so the table replays".to_string(),
                 format!("a `{node}` node the SQL unparser cannot render"),
+            ),
+            RefusalReason::DmlBeyondTarget { node } => (
+                "an UPDATE / DELETE predicate over the target table's own columns".to_string(),
+                format!("`{node}`: select the keys first, then name them in the predicate"),
             ),
         };
         JammiError::Schema {
@@ -289,8 +303,8 @@ fn statement_name(name: &TableReference) -> std::result::Result<String, RefusalR
 
 impl StatementClass {
     /// Classify `plan`, the logical plan of one statement.
-    pub fn of(plan: LogicalPlan) -> Self {
-        match plan {
+    pub fn of(plan: LogicalPlan) -> DfResult<Self> {
+        Ok(match plan {
             LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmd)) => Self::classify_create(cmd),
             LogicalPlan::Ddl(DdlStatement::DropTable(cmd)) => match statement_name(&cmd.name) {
                 Ok(name) => Self::DropTable {
@@ -302,8 +316,21 @@ impl StatementClass {
                     reason,
                 }),
             },
+            LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
+                Self::classify_rewrite(dml)?
+            }
             other => Self::Inline(other),
-        }
+        })
+    }
+
+    fn classify_rewrite(dml: DmlStatement) -> DfResult<Self> {
+        Ok(match beyond_target(&dml.input, &dml.table_name)? {
+            Some(node) => Self::Refused(RefusedStatement {
+                name: dml.table_name.to_string(),
+                reason: RefusalReason::DmlBeyondTarget { node },
+            }),
+            None => Self::Inline(LogicalPlan::Dml(dml)),
+        })
     }
 
     fn classify_create(cmd: CreateMemoryTable) -> Self {
@@ -366,6 +393,40 @@ impl StatementClass {
             node: Arc::new(node),
         })
     }
+}
+
+/// The first part of a DML statement's `input` that chooses rows by more than
+/// a predicate over `target`'s own columns: a node other than a projection,
+/// a filter, or a scan of `target` (a join, a scan of another relation), or
+/// a subquery expression inside a filter.
+fn beyond_target(input: &LogicalPlan, target: &TableReference) -> DfResult<Option<String>> {
+    let mut culprit = None;
+    input.apply(|node| {
+        let beyond = match node {
+            LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => None,
+            LogicalPlan::TableScan(scan) => {
+                (!scan.table_name.resolved_eq(target)).then(|| node.display().to_string())
+            }
+            LogicalPlan::Filter(filter) => filter
+                .predicate
+                .exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_)
+                    ))
+                })?
+                .then(|| filter.predicate.to_string()),
+            other => Some(other.display().to_string()),
+        };
+        Ok(match beyond {
+            Some(node) => {
+                culprit = Some(node);
+                TreeNodeRecursion::Stop
+            }
+            None => TreeNodeRecursion::Continue,
+        })
+    })?;
+    Ok(culprit)
 }
 
 /// The node of `plan` the unparser cannot render, as the plan displays it:
@@ -707,7 +768,7 @@ mod tests {
 
     /// The `CREATE TABLE … AS` class over `sql`, or the refusal.
     async fn classify(ctx: &SessionContext, sql: &str) -> StatementClass {
-        StatementClass::of(ctx.state().create_logical_plan(sql).await.unwrap())
+        StatementClass::of(ctx.state().create_logical_plan(sql).await.unwrap()).unwrap()
     }
 
     /// Every query shape the class admits records as SQL that re-plans to
@@ -846,6 +907,28 @@ mod tests {
                 Box::new(|s| matches!(s, StatementClass::Inline(_))),
             ),
             (
+                "UPDATE t SET title = upper(title) WHERE id > 1 AND title <> 'b'",
+                Box::new(|s| matches!(s, StatementClass::Inline(_))),
+            ),
+            (
+                "DELETE FROM t WHERE id = 2",
+                Box::new(|s| matches!(s, StatementClass::Inline(_))),
+            ),
+            (
+                "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE title = 'b')",
+                Box::new(|s| {
+                    matches!(s, StatementClass::Refused(r)
+                        if matches!(r.reason, RefusalReason::DmlBeyondTarget { .. }))
+                }),
+            ),
+            (
+                "UPDATE t SET title = 'x' WHERE EXISTS (SELECT 1 FROM t)",
+                Box::new(|s| {
+                    matches!(s, StatementClass::Refused(r)
+                        if matches!(r.reason, RefusalReason::DmlBeyondTarget { .. }))
+                }),
+            ),
+            (
                 "EXPLAIN SELECT id FROM t",
                 Box::new(|s| matches!(s, StatementClass::Inline(_))),
             ),
@@ -860,20 +943,16 @@ mod tests {
         ];
         for (sql, expected) in table {
             let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-            let class = StatementClass::of(plan);
+            let class = StatementClass::of(plan).unwrap();
             assert!(expected(&class), "{sql}");
+            let inline = matches!(class, StatementClass::Inline(_));
             let rooted = matches!(
                 class.into_plan(),
                 LogicalPlan::Extension(Extension { node })
                     if node.as_any().downcast_ref::<StoreStatementNode>().is_some()
             );
             assert_eq!(
-                rooted,
-                !sql.starts_with("SELECT")
-                    && !sql.starts_with("INSERT")
-                    && !sql.starts_with("EXPLAIN")
-                    && !sql.starts_with("CREATE VIEW")
-                    && !sql.starts_with("SET"),
+                rooted, !inline,
                 "{sql}: rooted in the store statement node iff a store statement"
             );
         }

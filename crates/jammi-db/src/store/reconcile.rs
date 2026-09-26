@@ -600,7 +600,7 @@ impl ResultStore {
         //   orphans, at their TRUE listed size, regardless of the object's
         //   own age — a CAS-licensed reap is never grace-gated (see
         //   [`ReconcileReport::orphans`]'s admission routes).
-        // - `Promote { keeps, dir_prefixes }`: the row's FULL current key set
+        // - `Promote { keeps }`: the row's FULL current key set
         //   is PROTECTED — added to `protected`, never credited — so a
         //   promoted-but-not-yet-`ready` row's objects can never fall
         //   through to the general age-gated arm below. Nothing is
@@ -613,10 +613,7 @@ impl ResultStore {
         // - `Untouched`: nothing to account or protect.
         let mut tally = Tally::default();
         let mut promoted_purged: BTreeSet<String> = BTreeSet::new();
-        let mut protected = ReferencedKeys {
-            exact: BTreeSet::new(),
-            dir_prefixes: BTreeSet::new(),
-        };
+        let mut protected: BTreeSet<String> = BTreeSet::new();
         // Looked up by root-relative key, built ONCE from the listing
         // snapshot above — every candidate key an arm credits is looked up
         // here rather than re-scanning the whole `listed` vector.
@@ -647,17 +644,13 @@ impl ResultStore {
                         .await?;
                     tally.credit_reaped(candidates, &listed_sizes);
                 }
-                ExpiredRowOutcome::Promote {
-                    keeps,
-                    dir_prefixes,
-                } => {
+                ExpiredRowOutcome::Promote { keeps } => {
                     // The row's WHOLE current key set is protected wholesale
                     // — a dry-run never runs the rebuild, so it predicts
                     // nothing about which of these keys the rebuild will
                     // purge and not rewrite; see this module's own doc
                     // comment ("a promotion is not a reclaim").
-                    protected.exact.extend(keeps);
-                    protected.dir_prefixes.extend(dir_prefixes);
+                    protected.extend(keeps);
                 }
                 ExpiredRowOutcome::Untouched => {}
             }
@@ -1174,9 +1167,8 @@ impl ResultStore {
         &self,
         ready: &[ResultTableRecord],
         live_building: &[ResultTableRecord],
-    ) -> Result<ReferencedKeys> {
+    ) -> Result<BTreeSet<String>> {
         let mut exact = BTreeSet::new();
-        let mut dir_prefixes = BTreeSet::new();
         // Every LIVE-building version row protects its deterministic
         // `__v{N}*` keys; an expired-lease building version is unreferenced
         // (recovery's version arm reaps it).
@@ -1227,62 +1219,18 @@ impl ResultStore {
                 if let Some(rel) = relative_to(&self.root, &seg_url) {
                     exact.insert(rel);
                 }
-                for kind in [SidecarKind::Ann, SidecarKind::Lexical] {
-                    for ext in sidecar_extensions(kind) {
-                        let Ok(sib) = layout::sidecar_url(&seg_url, ext) else {
-                            continue;
-                        };
-                        let Some(rel) = relative_to(&self.root, &sib) else {
-                            continue;
-                        };
-                        // A directory-shaped sibling (only `tantivy` today)
-                        // is referenced by every key under it, not only a
-                        // key equal to the base name.
-                        if is_directory_sidecar_extension(ext) {
-                            dir_prefixes.insert(format!("{rel}/"));
-                        } else {
-                            exact.insert(rel);
-                        }
+                for ext in sidecar_extensions(SidecarKind::Ann) {
+                    let Ok(sib) = layout::sidecar_url(&seg_url, ext) else {
+                        continue;
+                    };
+                    if let Some(rel) = relative_to(&self.root, &sib) {
+                        exact.insert(rel);
                     }
                 }
             }
         }
-        Ok(ReferencedKeys {
-            exact,
-            dir_prefixes,
-        })
+        Ok(exact)
     }
-}
-
-/// The referenced-object set [`ResultStore::referenced_result_keys`] builds:
-/// exact keys, plus directory-sibling prefixes (each carrying a trailing
-/// `/`) a listed object is referenced through if its own key starts with one.
-///
-/// `pub(super)` (fields included): [`ResultStore::classify_expired_row`]
-/// (`store::mod`) reads both fields directly to build a `Promote` row's
-/// `keeps` payload from its current key set.
-pub(super) struct ReferencedKeys {
-    pub(super) exact: BTreeSet<String>,
-    pub(super) dir_prefixes: BTreeSet<String>,
-}
-
-impl ReferencedKeys {
-    fn contains(&self, rel: &str) -> bool {
-        self.exact.contains(rel)
-            || self
-                .dir_prefixes
-                .iter()
-                .any(|p| rel.starts_with(p.as_str()))
-    }
-}
-
-/// `true` iff `ext` names a sidecar sibling that is a DIRECTORY on disk
-/// (`SidecarKind::Lexical`'s `.tantivy` today — sidecar_layout.rs's own
-/// doc comment names it the one directory-shaped sibling) rather than a
-/// single file, so callers matching a listed object against it must match
-/// by PREFIX (`{base}.{ext}/…`), never by exact equality alone.
-fn is_directory_sidecar_extension(ext: &str) -> bool {
-    ext == "tantivy"
 }
 
 #[cfg(test)]

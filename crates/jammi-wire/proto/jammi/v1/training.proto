@@ -163,7 +163,13 @@ message FineTuneConfig {
   optional uint32 gradient_accumulation_steps = 10;
   optional double validation_fraction = 11;
   optional uint32 early_stopping_patience = 12;
-  optional uint32 warmup_steps = 13;
+  // Linear warmup from 0 to the base learning rate. Unset = a tenth of the run.
+  oneof warmup {
+    // A fixed number of optimizer steps.
+    uint32 warmup_steps = 13;
+    // A fraction of the run's optimizer steps, in [0, 1).
+    double warmup_fraction = 31;
+  }
   LrSchedule lr_schedule = 14;
   EarlyStoppingMetric early_stopping_metric = 15;
   // Layer-name suffixes that receive LoRA adapters. Empty = projection head
@@ -227,14 +233,27 @@ message GraphFineTuneSources {
   string id_column = 2;
   // Column in `node_source` holding the text the encoder embeds.
   string text_column = 3;
-  // Catalog source holding the edges.
-  string edge_source = 4;
-  // Column in `edge_source` holding the edge source endpoint.
-  string src_column = 5;
-  // Column in `edge_source` holding the edge destination endpoint.
-  string dst_column = 6;
-  // Provenance every edge in `edge_source` carries.
+  reserved 4, 5, 6;
+  // The edge relation the walks follow — exactly one arm, as a propagation's.
+  oneof edges {
+    // An engine-produced edge table (a `build_neighbor_graph` output), read
+    // through its `src` / `dst` columns.
+    string edge_graph_table = 8;
+    // A registered edge source and its endpoint columns.
+    GraphEdgeSource edge_source = 9;
+  }
+  // Provenance every edge carries.
   EdgeProvenance provenance = 7;
+}
+
+// A registered source holding a graph fine-tune's edges.
+message GraphEdgeSource {
+  // The registered source id.
+  string source_id = 1;
+  // Column holding the edge's source endpoint.
+  string src_column = 2;
+  // Column holding the edge's destination endpoint.
+  string dst_column = 3;
 }
 
 // node2vec walk + structure-aware negative-sampling knobs. Mirrors the engine's
@@ -331,6 +350,11 @@ message ContextPredictorTrainConfig {
   // Seed for the deterministic train/test task partition and the
   // predictor's initial weights.
   uint64 seed = 16;
+  // The embedding table the contexts are read from — the vector space the
+  // predictor learns in. Unset = the source's current default embedding table,
+  // resolved once when training starts; the resolved table is recorded with
+  // the trained predictor.
+  optional string embedding_table = 17;
 }
 
 // A column-source contrastive / classification / regression fine-tune. Mirrors

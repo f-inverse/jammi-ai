@@ -77,7 +77,7 @@ def main() -> None:
         #    from_offset=0 replays the durable backing table and returns
         #    promptly once caught up, rather than blocking on the live tail.
         delivered = db.subscribe_collect(
-            "jammi.audit.search.v1", from_offset=0, max_batches=1
+            "jammi.audit.search.v1", from_offset=0
         )
         assert delivered.num_rows >= 1, "subscriber receives the audit payload"
         print("audit topic delivered", delivered.num_rows, "row(s)")

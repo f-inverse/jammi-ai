@@ -74,6 +74,7 @@ use tracing::Instrument;
 use crate::pipeline::asof::AsofJoinSpec;
 use crate::pipeline::graph_propagation::PropagateRequest;
 use crate::pipeline::graph_structure::StructureRequest;
+use crate::pipeline::lexical::BuildLexicalIndex;
 use crate::pipeline::neighbor_graph::BuildNeighborGraph;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelTask;
@@ -124,15 +125,15 @@ pub enum ComputeSpec {
         facts: String,
         spec: AsofJoinSpec,
     },
-    /// [`InferenceSession::generate_embeddings`]'s inputs.
-    Embedding {
+    /// [`InferenceSession::build_lexical_index`]'s inputs. Its only input is a
+    /// registered source (`UnpinnedAtInstant`), so it has no cache-opt-in
+    /// surface and carries no `cache` field.
+    LexicalIndex {
         source_id: String,
-        model_id: String,
-        columns: Vec<String>,
-        key_column: String,
-        modality: jammi_wire::request::Modality,
-        cache: CachePolicy,
+        params: BuildLexicalIndex,
     },
+    /// [`InferenceSession::generate_embeddings`]'s inputs.
+    Embedding(jammi_wire::request::EmbeddingRequest),
     /// [`InferenceSession::infer`]'s inputs.
     Infer {
         source_id: String,
@@ -153,13 +154,15 @@ impl ComputeSpec {
     /// for the kinds that take no model.
     pub fn model_source(&self) -> Option<String> {
         match self {
-            ComputeSpec::Embedding { model_id, .. } | ComputeSpec::Infer { model_id, .. } => {
+            ComputeSpec::Embedding(jammi_wire::request::EmbeddingRequest { model_id, .. })
+            | ComputeSpec::Infer { model_id, .. } => {
                 Some(jammi_datafusion::ModelSource::parse(model_id).to_string())
             }
             ComputeSpec::NeighborGraph { .. }
             | ComputeSpec::Propagate { .. }
             | ComputeSpec::GraphStructure { .. }
-            | ComputeSpec::AsofJoin { .. } => None,
+            | ComputeSpec::AsofJoin { .. }
+            | ComputeSpec::LexicalIndex { .. } => None,
         }
     }
 
@@ -170,7 +173,8 @@ impl ComputeSpec {
     pub fn rendezvous_key(&self) -> &str {
         match self {
             ComputeSpec::NeighborGraph { source_id, .. }
-            | ComputeSpec::Embedding { source_id, .. }
+            | ComputeSpec::LexicalIndex { source_id, .. }
+            | ComputeSpec::Embedding(jammi_wire::request::EmbeddingRequest { source_id, .. })
             | ComputeSpec::Infer { source_id, .. } => source_id,
             ComputeSpec::Propagate { request, .. } => &request.source_id,
             ComputeSpec::GraphStructure { request, .. } => &request.source_id,
@@ -189,7 +193,8 @@ impl ComputeSpec {
             ComputeSpec::Propagate { .. } => "propagate",
             ComputeSpec::GraphStructure { .. } => "graph_structure",
             ComputeSpec::AsofJoin { .. } => "asof_join",
-            ComputeSpec::Embedding { .. } => "embedding",
+            ComputeSpec::LexicalIndex { .. } => "lexical_index",
+            ComputeSpec::Embedding(_) => "embedding",
             ComputeSpec::Infer { .. } => "infer",
         }
     }
@@ -197,7 +202,7 @@ impl ComputeSpec {
 
 /// The union of every durable job specification this crate submits: the
 /// three [`TrainingSpec`](crate::fine_tune::spec::TrainingSpec) training
-/// kinds and the six compute kinds in [`ComputeSpec`], flattened into ONE
+/// kinds and the seven compute kinds in [`ComputeSpec`], flattened into ONE
 /// directly-tagged enum — not a wrapper around either of those two types.
 ///
 /// Derived `#[serde(tag = "kind", deny_unknown_fields)]`, over all eight
@@ -298,15 +303,13 @@ pub enum JobSpec {
         facts: String,
         spec: AsofJoinSpec,
     },
-    /// Field-for-field identical to [`ComputeSpec::Embedding`].
-    Embedding {
+    /// Field-for-field identical to [`ComputeSpec::LexicalIndex`].
+    LexicalIndex {
         source_id: String,
-        model_id: String,
-        columns: Vec<String>,
-        key_column: String,
-        modality: jammi_wire::request::Modality,
-        cache: CachePolicy,
+        params: BuildLexicalIndex,
     },
+    /// Field-for-field identical to [`ComputeSpec::Embedding`].
+    Embedding(jammi_wire::request::EmbeddingRequest),
     /// Field-for-field identical to [`ComputeSpec::Infer`].
     Infer {
         source_id: String,
@@ -329,7 +332,8 @@ impl JobSpec {
             JobSpec::Propagate { .. } => "propagate",
             JobSpec::GraphStructure { .. } => "graph_structure",
             JobSpec::AsofJoin { .. } => "asof_join",
-            JobSpec::Embedding { .. } => "embedding",
+            JobSpec::LexicalIndex { .. } => "lexical_index",
+            JobSpec::Embedding(_) => "embedding",
             JobSpec::Infer { .. } => "infer",
         }
     }
@@ -384,13 +388,14 @@ impl JobSpec {
             | JobSpec::Propagate { .. }
             | JobSpec::GraphStructure { .. }
             | JobSpec::AsofJoin { .. }
-            | JobSpec::Embedding { .. }
+            | JobSpec::LexicalIndex { .. }
+            | JobSpec::Embedding(_)
             | JobSpec::Infer { .. } => return None,
         })
     }
 
     /// [`Self::as_training_spec`]'s counterpart: reconstructs the equivalent
-    /// [`ComputeSpec`] when `self` is one of the six compute kinds, `None`
+    /// [`ComputeSpec`] when `self` is one of the seven compute kinds, `None`
     /// for a training kind. The one production reader of a compute-kind
     /// `jobs.spec` row ([`crate::fine_tune::worker::JobWorker::
     /// run_claimed_compute_job`]) decodes `JobSpec` first, then projects
@@ -421,21 +426,11 @@ impl JobSpec {
                 facts: facts.clone(),
                 spec: spec.clone(),
             },
-            JobSpec::Embedding {
-                source_id,
-                model_id,
-                columns,
-                key_column,
-                modality,
-                cache,
-            } => ComputeSpec::Embedding {
+            JobSpec::LexicalIndex { source_id, params } => ComputeSpec::LexicalIndex {
                 source_id: source_id.clone(),
-                model_id: model_id.clone(),
-                columns: columns.clone(),
-                key_column: key_column.clone(),
-                modality: *modality,
-                cache: *cache,
+                params: params.clone(),
             },
+            JobSpec::Embedding(request) => ComputeSpec::Embedding(request.clone()),
             JobSpec::Infer {
                 source_id,
                 model_id,
@@ -465,7 +460,8 @@ impl JobSpec {
     /// column pair).
     fn model_source(&self) -> Option<String> {
         match self {
-            JobSpec::Embedding { model_id, .. } | JobSpec::Infer { model_id, .. } => {
+            JobSpec::Embedding(jammi_wire::request::EmbeddingRequest { model_id, .. })
+            | JobSpec::Infer { model_id, .. } => {
                 Some(jammi_datafusion::ModelSource::parse(model_id).to_string())
             }
             _ => None,
@@ -494,21 +490,10 @@ impl From<ComputeSpec> for JobSpec {
             ComputeSpec::AsofJoin { spine, facts, spec } => {
                 JobSpec::AsofJoin { spine, facts, spec }
             }
-            ComputeSpec::Embedding {
-                source_id,
-                model_id,
-                columns,
-                key_column,
-                modality,
-                cache,
-            } => JobSpec::Embedding {
-                source_id,
-                model_id,
-                columns,
-                key_column,
-                modality,
-                cache,
-            },
+            ComputeSpec::LexicalIndex { source_id, params } => {
+                JobSpec::LexicalIndex { source_id, params }
+            }
+            ComputeSpec::Embedding(request) => JobSpec::Embedding(request),
             ComputeSpec::Infer {
                 source_id,
                 model_id,
@@ -809,54 +794,19 @@ pub async fn execute_compute(
                 cache_outcome: CacheOutcome::Computed,
             })
         }
-        ComputeSpec::Embedding {
-            source_id,
-            model_id,
-            columns,
-            key_column,
-            modality,
-            cache,
-        } => {
-            let (record, outcome) = match modality {
-                jammi_wire::request::Modality::Text => {
-                    session
-                        .generate_text_embeddings(
-                            source_id,
-                            model_id,
-                            columns,
-                            key_column,
-                            *cache,
-                            Some(job_attempt),
-                        )
-                        .await?
-                }
-                jammi_wire::request::Modality::Image => {
-                    let image_column = crate::local_session::single_column(columns, "image")?;
-                    session
-                        .generate_image_embeddings(
-                            source_id,
-                            model_id,
-                            image_column,
-                            key_column,
-                            *cache,
-                            Some(job_attempt),
-                        )
-                        .await?
-                }
-                jammi_wire::request::Modality::Audio => {
-                    let audio_column = crate::local_session::single_column(columns, "audio")?;
-                    session
-                        .generate_audio_embeddings(
-                            source_id,
-                            model_id,
-                            audio_column,
-                            key_column,
-                            *cache,
-                            Some(job_attempt),
-                        )
-                        .await?
-                }
-            };
+        ComputeSpec::LexicalIndex { source_id, params } => {
+            let record = session
+                .build_lexical_index_materialize(source_id, params, Some(job_attempt))
+                .await?;
+            Ok(JobResult::Table {
+                table: record.table_name,
+                cache_outcome: CacheOutcome::Computed,
+            })
+        }
+        ComputeSpec::Embedding(request) => {
+            let (record, outcome) = session
+                .generate_embeddings_materialize(request, Some(job_attempt))
+                .await?;
             Ok(table_result(record, outcome))
         }
         ComputeSpec::Infer {
@@ -1265,6 +1215,44 @@ impl InferenceSession {
             }
         }
     }
+
+    /// Run a compute `spec` through [`Self::run_now`] and return the table it
+    /// produced with its cache outcome. `verb` names the caller in the refusal
+    /// a training result would be.
+    pub(crate) async fn run_now_table(
+        self: &Arc<Self>,
+        verb: &str,
+        spec: ComputeSpec,
+    ) -> Result<(String, CacheOutcome)> {
+        match self.run_now(spec).await? {
+            JobResult::Table {
+                table,
+                cache_outcome,
+            } => Ok((table, cache_outcome)),
+            JobResult::Model { .. } => Err(JammiError::Inference(format!(
+                "{verb}: run_now returned a training JobResult for a compute spec"
+            ))),
+        }
+    }
+
+    /// [`Self::run_now_table`], read back as the produced table's catalog row.
+    pub(crate) async fn run_now_record(
+        self: &Arc<Self>,
+        verb: &str,
+        spec: ComputeSpec,
+    ) -> Result<(ResultTableRecord, CacheOutcome)> {
+        let (table, cache_outcome) = self.run_now_table(verb, spec).await?;
+        let record = self
+            .catalog()
+            .get_result_table(&table)
+            .await?
+            .ok_or_else(|| {
+                JammiError::Catalog(format!(
+                    "{verb}: run_now's own table '{table}' vanished before it could be read back"
+                ))
+            })?;
+        Ok((record, cache_outcome))
+    }
 }
 
 /// Test-only rendezvous inside the compute executor: a test arms a park
@@ -1505,9 +1493,11 @@ mod tests {
                 node_source: "nodes".into(),
                 id_column: "id".into(),
                 text_column: "text".into(),
-                edge_source: "edges".into(),
-                src_column: "src".into(),
-                dst_column: "dst".into(),
+                edges: crate::fine_tune::graph_sampler::GraphEdges::Source {
+                    source: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                },
                 provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
             },
             sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),
@@ -1645,9 +1635,11 @@ mod tests {
                     node_source: "nodes".into(),
                     id_column: "id".into(),
                     text_column: "text".into(),
-                    edge_source: "edges".into(),
-                    src_column: "src".into(),
-                    dst_column: "dst".into(),
+                    edges: crate::fine_tune::graph_sampler::GraphEdges::Source {
+                        source: "edges".into(),
+                        src_column: "src".into(),
+                        dst_column: "dst".into(),
+                    },
                     provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
                 },
                 sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),
@@ -1674,6 +1666,7 @@ mod tests {
                     test_task_fraction: 0.2,
                     min_task_count: 2,
                     seed: 1,
+                    embedding_table: None,
                 },
             },
         ];
@@ -1719,14 +1712,15 @@ mod tests {
                 )
                 .build(),
             },
-            ComputeSpec::Embedding {
+            ComputeSpec::Embedding(jammi_wire::request::EmbeddingRequest {
                 source_id: "s".into(),
                 model_id: "m".into(),
                 columns: vec!["text".into()],
                 key_column: "id".into(),
                 modality: jammi_wire::request::Modality::Text,
+                dimensions: Some(16),
                 cache: CachePolicy::Bypass,
-            },
+            }),
             ComputeSpec::Infer {
                 source_id: "s".into(),
                 model_id: "m".into(),

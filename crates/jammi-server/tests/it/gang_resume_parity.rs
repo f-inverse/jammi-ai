@@ -333,7 +333,7 @@ async fn run_peer_w2_resumed(fleet: &Fleet) -> Vec<u8> {
 /// Returns attempt 2's published rank-0 adapter bytes.
 async fn run_local_w2_resumed(fleet: &Fleet) -> Vec<u8> {
     let configure = |cfg: &mut JammiConfig| {
-        cfg.gpu.device = 0;
+        cfg.gpu.device = Some(0);
         cfg.gpu.devices = Some(vec![0, 1]);
         cfg.worker.local_ranks = 2;
     };
@@ -516,7 +516,7 @@ async fn a_corrupted_epoch_1_checkpoint_fails_attempt_2_loudly_never_a_silent_re
 {
     let fleet = Fleet::new();
     let configure = |cfg: &mut JammiConfig| {
-        cfg.gpu.device = 0;
+        cfg.gpu.device = Some(0);
         cfg.gpu.devices = Some(vec![0, 1]);
         cfg.worker.local_ranks = 2;
     };
@@ -642,7 +642,7 @@ async fn an_attempt_killed_inside_epoch_2s_resume_write_resumes_from_epoch_1_byt
 ) {
     let fleet = Fleet::new();
     let configure = |cfg: &mut JammiConfig| {
-        cfg.gpu.device = 0;
+        cfg.gpu.device = Some(0);
         cfg.gpu.devices = Some(vec![0, 1]);
         cfg.worker.local_ranks = 2;
     };

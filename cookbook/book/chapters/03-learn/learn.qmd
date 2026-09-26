@@ -7,126 +7,137 @@ title: "Tier 03 — Learn"
 import jammi_cookbook
 ```
 
-**Recipe:** `fine_tune_graph` · **Theory:** representation learning on graphs —
-node2vec / contrastive (Stanković et al. 2020, Part III; Hamilton 2017); citation-
-graph contrastive supervision (SPECTER, Cohan et al. 2020); nearest-neighbor-of-
-own-representations (NNCLR, Dwibedi et al. 2021) · **Rail:** measurement
-(declared-edge gain, and two negative controls).
+**Recipe:** `fine_tune_graph` · `eval_compare` · **Theory:** representation
+learning on graphs — node2vec / contrastive (Stanković et al. 2020, Part III;
+Hamilton 2017); citation-graph contrastive supervision (SPECTER, Cohan et al.
+2020); nearest-neighbor-of-own-representations (NNCLR, Dwibedi et al. 2021) ·
+**Rail:** measurement (declared-edge gain, and two negative controls).
 
-Tier 02 *propagated* fixed embeddings; tier 03 **learns** new ones. `fine_tune_graph`
-samples random walks over a graph and fine-tunes the encoder contrastively: papers
-that co-occur on a walk are pulled together, others pushed apart. The graph
-supervises the metric — but *which* graph, and how well the objective is trained,
-both matter to how much it helps; this chapter measures both axes honestly.
+Tier 02 *propagated* fixed embeddings; tier 03 **learns** new ones.
+`fine_tune_graph` samples random walks over a graph and fine-tunes the encoder
+contrastively: papers that co-occur on a walk are pulled together, others
+pushed apart. The graph supervises the metric — but *which* graph matters, and
+this chapter measures that directly by training the identical recipe over
+three graphs:
 
-The keystone ran this on the GPU server with `edge_provenance="declared"`, over the
-declared citation graph:
+- **declared** — the citation graph: who cited whom, a signal external to the
+  encoder;
+- **similarity** — tier 01's k-NN graph over the encoder's own embeddings
+  (`edge_provenance="similarity"`);
+- **random** — uniform random pairs over the same papers: structure-free.
 
-```python
-db.fine_tune_graph(
-    node_source=papers, id_column="paper_id", text_column="abstract",
-    edge_source=cite_edges, src_column="src", dst_column="dst",
-    base_model="answerdotai/ModernBERT-base", edge_provenance="declared",
-    epochs=15,
+```{python}
+import tempfile
+
+import jammi
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+from jammi_cookbook import contracts, datasets, keystone, scale
+
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+base = keystone.embed(db, arxiv, SCALE)
+```
+
+The step, run once per graph:
+
+```{python}
+# | echo: false
+keystone.show(keystone.fine_tune_on_graph)
+```
+
+## The declared graph
+
+```{python}
+declared = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
+    epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
+)
+print("fine-tuned embeddings:", declared)
+```
+
+## The two controls
+
+The similarity graph is the engine's own `build_neighbor_graph` table over the
+base embeddings, which the fine-tune walks directly as `edge_graph_table` — the
+training set then pins that table by its content digest, as any derived table
+pins a result-table input. The random graph has as many edges as the similarity
+graph, drawn uniformly over the same papers, and is registered as a source.
+
+```{python}
+similarity_graph = db.build_neighbor_graph(arxiv.papers, embedding_table=base, k=10, exact=True)
+
+ids = np.array(arxiv.split["train"] + arxiv.split["valid"] + arxiv.split["test"])
+n_edges = db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{similarity_graph}"').to_pylist()[0]["n"]
+rng = np.random.default_rng(0)
+random_path = f"{tempfile.mkdtemp()}/random_edges.parquet"
+pq.write_table(
+    pa.table({"src": rng.choice(ids, n_edges).tolist(), "dst": rng.choice(ids, n_edges).tolist()}),
+    random_path,
+)
+db.add_source("random_edges", url=random_path, format="parquet")
+
+similarity = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_graph_table=similarity_graph, provenance="similarity",
+    epochs=keystone.CONTROL_EPOCHS[SCALE],
+)
+random_graph = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_source="random_edges", provenance="declared",
+    epochs=keystone.CONTROL_EPOCHS[SCALE],
 )
 ```
 
-and committed the resulting checkpoint id. The requested `epochs` is honored
-exactly by the engine. Graph-supervised contrastive fine-tunes in the literature
-(SPECTER trains for tens of epochs) converge slowly — a single epoch under-trains
-the objective and this same recipe turns in a small *negative* gain over the base
-encoder on this subset; 15 epochs is the value-demonstrating point on the curve
-(still rising toward the field's ~20-epoch norm). This chapter reads the cache
-on CPU.
+## The measurement rail: which graph supervises the metric?
+
+One `eval_compare` over all four tables — the base encoder first, so every
+other entry carries its delta against it — on tier 01's same-subject golden.
 
 ```{python}
-from jammi_cookbook import contracts, rails
-
-ft = contracts.load_artifact("arxiv.ft_model")
-print("fine-tuned model id:", ft["model_id"])
-print("edge provenance:    ", ft["edge_provenance"])
-print("base model:         ", ft["base_model"])
-```
-
-## The measurement rail: did the declared graph help?
-
-The honest test of graph supervision is whether the fine-tuned encoder retrieves
-same-subject papers better than the base encoder. The keystone measured recall\@10
-for the declared-edge fine-tune and froze it; the gain over the tier-01 base is the
-learned signal.
-
-```{python}
-base_recall = contracts.golden("arxiv.tier01.recall_at_10").value
-ft_recall = contracts.golden("arxiv.tier03.recall_at_10").value
-gain = contracts.golden("arxiv.tier03.recall_gain_vs_base").value
-
-print(f"recall@10 base encoder:        {base_recall:.3f}")
-print(f"recall@10 declared-edge FT:    {ft_recall:.3f}")
-print(f"Δ (graph-supervised gain):     {gain:+.3f}")
+golden = keystone.subject_golden(db, arxiv)
+compared = db.eval_compare(
+    embedding_tables=[base, declared, similarity, random_graph],
+    source=arxiv.papers, golden_source=golden, k=10,
+)
+arms = ["base", "declared", "similarity", "random"]
+precision, gain = {}, {}
+for arm, entry in zip(arms, compared["per_table"]):
+    precision[arm] = entry["embedding_eval"]["aggregate"]["precision_at_k"]
+    gain[arm] = entry["delta"]["precision_at_k"]["absolute"] if entry["delta"] else 0.0
+    print(f"{arm:<11} precision@10 {precision[arm]:.3f}   Δ vs base {gain[arm]:+.3f}")
 ```
 
 ```{python}
 # | echo: false
-rails.measure("arxiv.tier03.recall_at_10", ft_recall)
-rails.measure("arxiv.tier03.recall_gain_vs_base", gain)
-assert abs((ft_recall - base_recall) - gain) < 1e-6
+for arm in arms:
+    contracts.assert_close(f"arxiv.tier03.{arm}_precision_at_10", precision[arm], tol=0.02)
+if SCALE is scale.Scale.FULL:
+    # The finding, at the scale it is about: random hurts, a self-similarity
+    # bootstrap helps a little, the declared graph helps most.
+    assert gain["random"] < 0 < gain["similarity"] < gain["declared"]
 ```
 
-## Which graph supervises the metric? Two negative controls
+At `full` scale the ordering is **random (harmful) < base < similarity (real,
+partial) < declared (largest)**:
 
-`edge_provenance` distinguishes an edge drawn *independently* of the base
-embedding metric (`"declared"` — who-cited-whom, a signal the embeddings cannot
-reconstruct) from one drawn *by* it (`"similarity"` — the tier-01 k-NN-of-own-
-embeddings graph). The keystone ran the identical recipe over three graphs at a
-matched, cheaper epoch budget, so any recall difference is attributable to the
-graph alone:
+- **declared** — the largest gain: an external signal the encoder did not
+  already have, trained toward convergence;
+- **similarity** — a smaller but real gain. Training against a paper's own
+  nearest neighbours pulls same-subject papers closer through the same
+  homophily mechanism nearest-neighbour contrastive learning exploits (NNCLR,
+  Dwibedi et al. 2021; SciNCL's citation-embedding k-NN augmentation,
+  Ostendorff et al. 2022) — a weak bootstrap, not nothing;
+- **random** — harmful: training against structureless pairs degrades the
+  metric rather than merely failing to improve it.
 
-- **declared** (citation, the tier-03 result above, trained to convergence):
-  the largest gain — an external signal the encoder did not already have.
-- **similarity** (the tier-01 self-k-NN graph, `edge_provenance="similarity"`):
-  a **smaller but real, positive** gain. This is *not* a purely circular no-op:
-  training against a node's own nearest neighbors pulls same-subject papers
-  closer through the same homophily mechanism nearest-neighbor contrastive
-  learning exploits on other modalities (NNCLR, Dwibedi et al. 2021) — the
-  self-similarity graph carries partial signal, not none, echoing SciNCL's
-  citation-embedding k-NN augmentation (Ostendorff et al. 2022).
-- **random** (a null graph of uniform random pairs over the same nodes,
-  `edge_provenance="declared"` since it is external to the metric, just
-  uninformative): **harmful** — a negative gain. Training against structureless
-  pairs degrades the metric rather than merely failing to improve it.
+At `small` scale all three runs are two epochs on a random-weight encoder, so
+their numbers check the pipeline, not the finding; run this chapter at `full`
+scale to see the ordering, measured.
 
 ```{python}
-sim_recall = contracts.golden("arxiv.tier03.control_similarity_recall_at_10").value
-sim_gain = contracts.golden("arxiv.tier03.control_similarity_recall_gain_vs_base").value
-rand_recall = contracts.golden("arxiv.tier03.control_random_recall_at_10").value
-rand_gain = contracts.golden("arxiv.tier03.control_random_recall_gain_vs_base").value
-control_epochs = int(contracts.golden("arxiv.tier03.control_epochs").value)
-
-print(f"recall@10 similarity-graph FT ({control_epochs} epochs): {sim_recall:.3f}   "
-      f"(Δ {sim_gain:+.3f} vs base)")
-print(f"recall@10 random-graph FT ({control_epochs} epochs):     {rand_recall:.3f}   "
-      f"(Δ {rand_gain:+.3f} vs base)")
+db.close()
 ```
-
-```{python}
-# | echo: false
-rails.measure("arxiv.tier03.control_similarity_recall_at_10", sim_recall)
-rails.measure("arxiv.tier03.control_similarity_recall_gain_vs_base", sim_gain)
-rails.measure("arxiv.tier03.control_random_recall_at_10", rand_recall)
-rails.measure("arxiv.tier03.control_random_recall_gain_vs_base", rand_gain)
-# The honest three-way ordering: random graph HURTS, similarity graph gives a real
-# but smaller gain than the declared graph, and the declared graph wins outright.
-assert rand_gain < 0
-assert 0 < sim_gain < gain
-```
-
-The ordering — **random (harmful) < base < similarity (real, partial) <
-declared (largest)** — is the honest circularity finding: a similarity graph is
-a *weak bootstrap*, never a substitute for external supervision, but it is not
-"nothing." Only a declared graph, trained to convergence, delivers the largest
-gain; a random graph actively hurts; the field's literature (SPECTER for
-declared-edge supervision, NNCLR / SciNCL for the partial self-similarity signal)
-predicts exactly this ordering.
 
 ## Bridge note (a signature chapter — deepened in the bridge chapters)
 

@@ -136,6 +136,13 @@ service CatalogService {
   rpc VerifyMaterialization(VerifyMaterializationRequest)
       returns (VerifyMaterializationResponse);
 
+  // The recorded materialization of a result table: what produced it, over
+  // what, and the digests a verifier matches. Read-only. Peer of the
+  // abstraction's `describe_table`. A table with no manifest is the typed
+  // `MissingManifest` refusal. Tenant-scoped: a peer cannot describe a table
+  // it cannot resolve.
+  rpc DescribeTable(DescribeTableRequest) returns (DescribeTableResponse);
+
   // Report whether a `ready` result table is still the output of its recorded
   // definition over its recorded inputs' current state. Read-only sensor;
   // reports a verdict, never acting on one (recompute / accept / alarm is the
@@ -454,6 +461,20 @@ message VerifyMaterializationResponse {
     repeated string unpinned = 1;
   }
   message MissingManifest {}
+}
+
+message DescribeTableRequest {
+  // The result table whose recorded materialization is read.
+  string table = 1;
+}
+
+// A result table's recorded materialization. `manifest_json` is the table's
+// `.materialization.json` sidecar in its own canonical serialization — the
+// form the definition hash folds and the engine's strict manifest reader
+// decodes, versioned by its `manifest_version` field — so every peer reads
+// exactly the record the engine wrote, through one schema.
+message DescribeTableResponse {
+  string manifest_json = 1;
 }
 
 message StalenessRequest {

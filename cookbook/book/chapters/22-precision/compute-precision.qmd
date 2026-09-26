@@ -181,14 +181,14 @@ asserts the `f16` run differs from an `f32` run of the same input while staying
 close by cosine similarity — the same "active but faithful" property this chapter's
 `bf16` measurement returns to below, on real Ampere hardware.)
 
-## `bf16` is refused loud — on this CPU build, by design
+## `bf16` is refused loud on the CPU, by design
 
 `bf16` is a GPU-tier value: its tensor-core kernels are an Ampere (sm_80+)
 innovation, so the candle load boundary admits it only on a CUDA device whose
-compute capability clears that floor. This book's wheel carries no `cuda` feature at
-all, so the very first `bf16` model load — triggered here by the same
-`generate_embeddings` call that just worked at `f16` — must fail loud with a typed
-refusal, never run silently and never fall back to another precision.
+compute capability clears that floor. This chapter pins its engine to the CPU —
+whichever wheel is installed — so the very first `bf16` model load, triggered here
+by the same `generate_embeddings` call that just worked at `f16`, must fail loud
+with a typed refusal, never run silently and never fall back to another precision.
 
 ```{python}
 with open_at_precision("bf16") as db_bf16:
@@ -201,7 +201,7 @@ with open_at_precision("bf16") as db_bf16:
             modality="text",
         )
         raise RuntimeError(
-            "bf16 must be refused on this CPU-only build — it loaded silently instead"
+            "bf16 must be refused on the CPU — it loaded silently instead"
         )
     except jammi.errors.JammiError as exc:
         print(f"caught {type(exc).__name__}: {exc}")
@@ -210,7 +210,7 @@ with open_at_precision("bf16") as db_bf16:
             f"(the engine's JammiError::Model -> InvalidArgument mapping), got {type(exc).__name__}"
         )
         message = str(exc)
-        for token in ("bf16", "compute capability >= 8.0", "Ampere", "no CUDA support"):
+        for token in ("bf16", "compute capability >= 8.0", "Ampere"):
             assert token in message, f"expected {token!r} in the refusal message: {message}"
 
 print("\nbf16 was refused loud, with the typed compute-capability message — "

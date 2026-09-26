@@ -1,5 +1,5 @@
 ---
-title: "The model catalog — referential integrity, measured remote == embedded"
+title: "The model catalog — referential integrity on either transport"
 ---
 
 ```{python}
@@ -7,209 +7,143 @@ title: "The model catalog — referential integrity, measured remote == embedded
 import jammi_cookbook
 ```
 
-**Recipe:** `fine_tune` (the only public registration path) · `list_models` ·
-`describe_model` · `delete_model` ·
-**Theory:** the model catalog as a *referenced store* — a model is a row other
-rows point at [@kleppmann2017ddia], so a hard-delete is *refused* while any
-reference holds, and absence is a *typed* condition, not an ambiguous error ·
-**Rail:** measurement (every delete-matrix cell asserted against a frozen golden)
-+ the cross-transport **parity contract** (`remote == embedded`, the engine swaps
-transports without changing the call).
+**Recipe:** `fine_tune` · `list_models` · `describe_model` · `delete_model` ·
+`prune_jobs` · `[jobs] retention_days` · **Theory:** the model catalog as a
+*referenced store* — a model is a row other rows point at
+[@kleppmann2017ddia], so a hard delete is *refused* while a reference holds, and
+absence is a *typed* condition, not an ambiguous failure · **Rail:** parity (the
+same lifecycle, the same outcomes, in process and against a server).
 
-The engine's model catalog lets you **see** the models it resolves and trains —
-`list_models` and `describe_model` — and **clean them up** — `delete_model`. The
-three verbs are on **both** the embedded `jammi.EmbeddedBackend` and the remote
-`jammi.RemoteDatabase`. This chapter is the engine↔cookbook validator that
-**measures** that surface as a real, asserted property: the
-**referential-integrity matrix** for `delete_model`, validated identical across
-the two transports.
+The engine's model catalog lets you **see** the models it serves and has
+trained — `list_models`, `describe_model` — and **clean them up** —
+`delete_model`. A model enters the catalog by being used: loading one records it,
+and training records both its base and the model it produced. And a model is a
+row other rows point at: the job that trained it names it, so deleting it while
+that job is on record would leave a dangling reference. The engine refuses that
+delete, typed, until the reference is gone.
 
-## What this chapter validates — and the honesty contract
-
-Read the framing plainly:
-
-- **It validates the catalog SURFACE on a CPU/hermetic fixture.** The model is
-  registered the **only public way** — a tiny `fine_tune` (LoRA, `text_embedding`)
-  over a 12-row in-memory `(anchor, positive)` pairs corpus with the engine's
-  public `tiny_modernbert` fixture. Registering a model is a **catalog**
-  operation; the fine-tune trains in seconds on CPU (the candle backend falls
-  back off CUDA), so the whole emit is GPU-free and hermetic. No keystone corpus,
-  no external services.
-- **There is no public `register_model` verb** (introspected against the wheel and
-  the `jammi` client). The only public path that puts a model row in the catalog
-  is **training**: a `fine_tune` registers the base model (path-keyed) at
-  submission and the fine-tuned model (`jammi:fine-tuned:<uuid>`) on completion.
-  Pre-trained models are served by **id** — the resolver loads an HF or local
-  model by reference — so a model enters the catalog by being trained, not by a
-  separate registration step.
-- **Every model in the catalog is trained-and-referenced**, so the
-  delete-unreferenced-succeeds path is simply unreachable here — a *measured
-  property* of the catalog, not a gap. Every model reachable from the surface is
-  born referenced (a fine-tuned model by `training_jobs.output_model_id`; its base
-  by `training_jobs.base_model_id`), so `delete_model` on either is *correctly
-  refused*. The cookbook measures `every_catalog_model_is_referenced = True`: there
-  is no bare unreferenced model in the catalog to delete.
-
-The cache is emitted once by `scripts/build_lifecycle_cache.py`, which runs the
-whole catalog interaction on **both** the embedded engine and a live remote
-`grpc://` `jammi-server`, asserts `remote == embedded` for every observable, and
-freezes the embedded-canonical matrix to `artifacts/lifecycle/`. This chapter
-reads that cache on CPU and asserts every cell against the frozen golden — it
-never re-emits.
-
-## The committed catalog matrix
+This chapter runs the whole lifecycle as one function, against an in-process
+engine and against a live server, and checks that every outcome — including
+every refusal's class — is the same on both.
 
 ```{python}
-from jammi_cookbook import contracts
+import tempfile
+from pathlib import Path
 
-matrix = contracts.load_artifact("lifecycle.matrix")
-record = contracts.load_artifact("lifecycle.lifecycle")
-print("registration path:", record["registration_path"].split(" — ")[0])
-print("transports:", ", ".join(record["transports"]))
+import jammi
+from jammi.errors import ModelNotFound, ModelReferenced
+from jammi.testing import LiveServer
+from jammi_cookbook import fixtures
+
+BASE = fixtures.model("tiny_bert")
+PAIRS = str(fixtures.path("tiny_pairs.csv"))
 ```
 
-### Register → the minimal projection
+## The lifecycle, written once
 
-`fine_tune` registers the model; `describe_model` reads it back as the **minimal
-client-facing projection** — `backend`, `task`, `status` (the per-run UUID
-`model_id` is stripped from the committed form, since it differs across engine
-instances by construction). The same projection both transports return, with no
-server-internal field (e.g. a version/lineage/path bookkeeping field) leaking.
+Train registers two rows: the base model, recorded when the job loads it, and
+the fine-tuned model, written when the job finishes. The finished job is on
+record for `[jobs] retention_days` (30 by default), and until it is pruned it
+references both. So the lifecycle has four outcomes to observe: the listing,
+the refused delete, the absent delete, and — once the job is gone — the delete
+that succeeds.
 
 ```{python}
-registered = matrix["registered"]
-print("registered model projection:", registered)
+def outcome(delete) -> str:
+    """What a delete did: the refusal's class, or that it succeeded."""
+    try:
+        delete()
+        return "deleted"
+    except (ModelReferenced, ModelNotFound) as refused:
+        return type(refused).__name__
 
-# A fresh model reads as `registered`; the public registration path registers TWO
-# rows (the base model + the fine-tuned model).
-assert set(registered) == {"backend", "task", "status"}
-assert "model_id" not in registered
-contracts.assert_close("lifecycle.register.status_registered",
-                       1.0 if registered["status"] == "registered" else 0.0)
 
-n_registered = len(matrix["list_after_register"])
-print(f"list_models after register: {n_registered} rows "
-      f"(base model + fine-tuned model), both registered")
-assert n_registered == 2
+def train_and_refuse(db) -> tuple[str, dict]:
+    db.add_source("pairs", url=PAIRS, format="csv")
+    job = db.fine_tune(
+        source="pairs", base_model=BASE, columns=["text_a", "text_b", "score"],
+        method="lora", task="text_embedding", lora_rank=4, epochs=1,
+    )
+    job.wait()
+    tuned = job.output_model_id
+    return tuned, {
+        "listed": sorted((m["task"], m["status"]) for m in db.list_models()),
+        "described": {k: db.describe_model(tuned)[k] for k in ("task", "status")},
+        "delete_referenced": outcome(lambda: db.delete_model(tuned)),
+        "delete_absent": outcome(lambda: db.delete_model("jammi:fine-tuned:absent")),
+        "delete_absent_if_exists": outcome(
+            lambda: db.delete_model("jammi:fine-tuned:absent", if_exists=True)
+        ),
+    }
+
+
+def prune_and_delete(db, tuned: str) -> dict:
+    db.prune_jobs()
+    return {
+        "jobs_left": len(db.list_jobs()),
+        "delete_unreferenced": outcome(lambda: db.delete_model(tuned)),
+        "described_after": db.describe_model(tuned),
+    }
 ```
 
-### Describe and list → the same shape on both transports
+## In process, then against a server
 
-`list_models` returns one record per model in the catalog; `describe_model` reads
-one back by id (or `None` if it is not in the catalog). Both return the same
-minimal projection, key-for-key, on the embedded engine and the remote server —
-the see-the-catalog half of the surface.
+Retention is a deployment setting: each engine is reopened over the same
+catalog with `retention_days = 0` — a configuration file for the in-process
+engine, the matching environment variable for the server — so the finished job
+is past it and `prune_jobs` removes it.
 
 ```{python}
-for proj in matrix["list_after_register"]:
-    assert set(proj) == {"backend", "task", "status"}
-print("list_models / describe_model projection keys: backend, task, status "
-      "(model_id stripped from the committed form)")
+home = Path(tempfile.mkdtemp())
+config = home / "retention.toml"
+config.write_text("[jobs]\nretention_days = 0\n")
+
+with jammi.connect(f"file://{home / 'embedded'}") as db:
+    tuned, local = train_and_refuse(db)
+with jammi.connect(f"file://{home / 'embedded'}", config=str(config)) as db:
+    local.update(prune_and_delete(db, tuned))
+
+served_dir = home / "served"
+with LiveServer(served_dir) as server, jammi.connect(server.endpoint) as db:
+    tuned, served = train_and_refuse(db)
+with LiveServer(served_dir, env={"JAMMI_JOBS__RETENTION_DAYS": "0"}) as server, \
+        jammi.connect(server.endpoint) as db:
+    served.update(prune_and_delete(db, tuned))
+
+for key in local:
+    print(f"{key:<26} {local[key]!s:<48} same on the server: {local[key] == served[key]}")
 ```
-
-## The referential-integrity matrix for `delete_model`
-
-`delete_model` is how you **clean up** the catalog: it removes the row, so it is
-*refused while any reference still points at the model* — the referential
-guarantee [@kleppmann2017ddia]. The matrix has three exercisable cells; a fourth
-(delete-unreferenced succeeds) is simply unreachable here, because every model in
-the catalog is trained-and-referenced.
-
-### Delete-while-referenced → the typed `ModelReferenced` guard
-
-Every model in the catalog is referenced (the fine-tuned model by
-`training_jobs.output_model_id`; its base by `training_jobs.base_model_id`), so
-`delete_model` on either raises the typed `ModelReferenced` error — embedded as a
-`RuntimeError("Model referenced: … still referenced by training_jobs.<edge>")`,
-remote as a wire `StatusCode.FAILED_PRECONDITION`. The honest cross-transport
-observable is the **normalized error class** `referenced`.
 
 ```{python}
-for cell in ("delete_referenced", "ft_delete_referenced", "base_delete_referenced"):
-    outcome = matrix[cell]
-    assert outcome["raised"] is True and outcome["error_class"] == "referenced", cell
-print("delete-while-referenced → error class 'referenced' "
-      "(both the fine-tuned model and its base; FAILED_PRECONDITION on the wire)")
-contracts.assert_close("lifecycle.delete.referenced_raises", 1.0)
+# | echo: false
+assert local == served
+assert local["delete_referenced"] == "ModelReferenced"
+assert local["delete_absent"] == "ModelNotFound"
+assert local["delete_absent_if_exists"] == "deleted"
+assert local["jobs_left"] == 0 and local["delete_unreferenced"] == "deleted"
+assert local["described_after"] is None
 ```
 
-### The measured property — every catalog model is referenced
+## Reading the outcomes
 
-The headline referential property is that **every model in the catalog is
-referenced**, so a hard-delete is always guarded. This is *also* why the
-delete-unreferenced-succeeds cell is unreachable here: a model enters the catalog
-by being trained, and a trained model is referenced by its training-job row. There
-is no bare unreferenced model in the catalog to delete — a measured property of
-the engine's catalog.
+- **Two rows, both `registered`.** Loading the base model recorded it; the
+  finished job wrote the fine-tuned model. `describe_model` reads one back by
+  id, and `None` once it is gone.
+- **A referenced delete is refused with `ModelReferenced`.** The job that
+  trained the model names it, so the delete would leave that reference
+  dangling. The refusal is a class, not a message to parse — the same class in
+  process and from a server.
+- **An absent delete is `ModelNotFound`,** a condition distinct from a
+  referenced one, and `if_exists=True` makes it a no-op for cleanup code that
+  does not care.
+- **Pruning ends the reference.** With the job past its retention and pruned,
+  nothing points at the model, and the same delete succeeds.
 
-```{python}
-assert matrix["every_catalog_model_is_referenced"] is True
-contracts.assert_close("lifecycle.delete.every_catalog_model_referenced", 1.0)
-print("every catalog model is referenced =",
-      matrix["every_catalog_model_is_referenced"])
-```
+## Bridge note
 
-### Delete-absent → `NotFound`, not invalid-argument
-
-Deleting a model that is not in the catalog is a **typed not-found** condition (the
-`ModelNotFound` error) — *not* an invalid-argument error. The wire status is
-`NOT_FOUND`; embedded it is `RuntimeError("Model not found: …")`. With
-`if_exists=True`, deleting an absent model is a clean **no-op** instead.
-
-```{python}
-strict = matrix["delete_absent_strict"]
-if_exists = matrix["delete_absent_if_exists"]
-assert strict["raised"] is True and strict["error_class"] == "not_found"
-assert if_exists["raised"] is False and if_exists["error_class"] is None
-print("delete-absent (strict)      → error class 'not_found' "
-      "(NOT_FOUND on the wire — the typed ModelNotFound, not INVALID_ARGUMENT)")
-print("delete-absent (if_exists)   → no-op (no raise)")
-contracts.assert_close("lifecycle.delete.absent_strict_not_found", 1.0)
-contracts.assert_close("lifecycle.delete.absent_if_exists_noop", 1.0)
-```
-
-## The cross-transport parity contract — `remote == embedded`
-
-The engine's spine is that the catalog verbs carry the **same call surface and the
-same observable behaviour** on both transports, so a caller swaps
-`connect("file://…")` for `connect("grpc://…")` without changing a single call. The
-emit ran the whole catalog interaction on both and asserted `remote == embedded`
-**live** for every observable: the model projections (UUID excluded) and the
-normalized delete-error class.
-
-The two transports raise different Python exception *types* by construction —
-embedded a `RuntimeError`, the gRPC client a `grpc.RpcError` carrying a
-`StatusCode`. So the honest contract for a typed error is the error **class**,
-derived from each native error (`FAILED_PRECONDITION → referenced`,
-`NOT_FOUND → not_found`). That normalization is what the parity check compares.
-
-```{python}
-parity = record["parity"]
-n = len(parity)
-all_equal = all(p["equal"] for p in parity)
-print(f"remote == embedded: {sum(p['equal'] for p in parity)}/{n} observables agree")
-print("verdict:", record["parity_verdict"])
-assert all_equal and n == 8
-contracts.assert_close("lifecycle.parity.all_observables_equal", 1.0)
-```
-
-## The measured catalog, at a glance
-
-```{python}
-m = record["measured"]
-print("register : status =", m["registered_status"],
-      "| backend =", m["registered_backend"],
-      "| task =", m["registered_task"])
-print("delete   : referenced →", repr(m["delete_referenced_class"]),
-      "| absent(strict) →", repr(m["delete_absent_strict_class"]),
-      "| absent(if_exists) raised =", m["delete_absent_if_exists_raised"])
-print("property : every catalog model referenced =", m["every_catalog_model_is_referenced"])
-```
-
-The model catalog is a real, asserted property: a model registers as `registered`,
-reads back through `describe_model` / `list_models` as the minimal projection, and
-is hard-deletable only when unreferenced — a condition that does not arise in a
-catalog where every model is trained-and-referenced, which the engine refuses with
-a typed `ModelReferenced` guard rather than a silent cascade. Every delete-matrix
-cell holds **identically** across the embedded and remote transports — the
-cross-transport contract, measured.
+> **A catalog is a set of rows that point at each other.** Deleting a model
+> while a job still names it would break the pointer, so the engine refuses it
+> with a typed error [@kleppmann2017ddia]; retention bounds how long a finished
+> job holds its references, and pruning releases them. The outcomes are typed
+> classes, identical on both transports — the property that lets one program
+> manage a catalog in process or on a server without branching on either.

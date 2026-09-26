@@ -20,6 +20,7 @@
 //! Hermetic: the encoder is the local `tiny_bert` cookbook fixture and the
 //! corpus is the bundled `patents.parquet`; no live network, no download.
 
+use jammi_ai::SearchMethod;
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -127,14 +128,15 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
         .expect("add_source");
 
     let remote_table = remote
-        .generate_embeddings(
-            "patents",
-            &model_id,
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: model_id.to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .expect("remote generate_embeddings")
         .0;
@@ -157,6 +159,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("remote encode_query");
@@ -165,6 +168,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("local encode_query");
@@ -188,7 +192,7 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
         embedding_table: None,
         filter: None,
         select,
-        oversample: None,
+        method: SearchMethod::default(),
     };
     let remote_hits = keys_and_scores(
         remote
@@ -233,6 +237,67 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     let _ = server.handle.await;
 }
 
+/// Lexical search over the wire returns the rows a local `Session` returns —
+/// same keys, same BM25 ranks and scores — and names the same failure when the
+/// source has no lexical index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_lexical_search_ranks_like_local() {
+    let server = start_engine_server().await;
+    let remote = remote(&server).await;
+    let local = local(&server);
+    local
+        .add_source("patents", SourceType::File, patents_connection())
+        .await
+        .expect("add_source");
+    let request = || jammi_ai::local_session::LexicalSearchRequest {
+        source_id: "patents".to_string(),
+        text: "quantum networks".to_string(),
+        k: 5,
+        lexical_table: None,
+        filter: Some("year >= 2020".to_string()),
+        select: vec!["id".to_string()],
+    };
+
+    let remote_err = remote.lexical_search(request()).await.unwrap_err();
+    let local_err = local.lexical_search(request()).await.unwrap_err();
+    assert_eq!(remote_err.to_string(), local_err.to_string());
+
+    local
+        .build_lexical_index(
+            "patents",
+            &jammi_ai::local_session::BuildLexicalIndex {
+                columns: vec!["title".to_string(), "abstract".to_string()],
+                key_column: "id".to_string(),
+                analyzer: jammi_ai::local_session::LexicalAnalyzer::English,
+            },
+        )
+        .await
+        .expect("build_lexical_index");
+    let over_the_wire = remote.lexical_search(request()).await.expect("remote");
+    let in_process = local.lexical_search(request()).await.expect("local");
+    let rows = |batches: Vec<RecordBatch>| -> Vec<String> {
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let schema = batch.schema();
+        let columns: Vec<usize> = ["id", "bm25_score", "bm25_rank"]
+            .iter()
+            .map(|name| schema.index_of(name).unwrap())
+            .collect();
+        let formatted =
+            arrow::util::pretty::pretty_format_batches(&[batch.project(&columns).unwrap()])
+                .unwrap();
+        formatted.to_string().lines().map(str::to_string).collect()
+    };
+    let (remote_rows, local_rows) = (rows(over_the_wire), rows(in_process));
+    assert!(
+        local_rows.len() > 4,
+        "the fixture has quantum patents: {local_rows:?}"
+    );
+    assert_eq!(remote_rows, local_rows);
+
+    let _ = server.shutdown.send(());
+    let _ = server.handle.await;
+}
+
 /// `add_source` over the wire, proven interchangeable with a local `Session`. The
 /// remote transport registers the `patents` corpus through
 /// `EmbeddingService.AddSource` (the typed RPC the server and the TS gRPC-web
@@ -260,14 +325,15 @@ async fn remote_add_source_round_trips_like_local() {
     // transport, producing a ready table with rows — proof the registration took
     // effect, not a silent no-op.
     let remote_table = remote
-        .generate_embeddings(
-            "patents",
-            &tiny_bert_model_id(),
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: tiny_bert_model_id().to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .expect("generate_embeddings over the remote-registered source")
         .0;
@@ -350,7 +416,7 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
         embedding_table: None,
         filter: None,
         select: Vec::new(),
-        oversample: None,
+        method: SearchMethod::default(),
     };
 
     let local_err = local
@@ -408,12 +474,12 @@ async fn remote_reconstructs_a_model_error_from_an_inference_failure() {
 
     let (m, i, md) = query();
     let local_err = local
-        .encode_query(&m, i, md)
+        .encode_query(&m, i, md, None)
         .await
         .expect_err("local encode_query on a missing model must fail");
     let (m, i, md) = query();
     let remote_err = remote
-        .encode_query(&m, i, md)
+        .encode_query(&m, i, md, None)
         .await
         .expect_err("remote encode_query on a missing model must fail");
 
@@ -1085,6 +1151,7 @@ async fn front_doors_run_the_same_verb_over_either_transport() {
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("remote encode_query");
@@ -1093,6 +1160,7 @@ async fn front_doors_run_the_same_verb_over_either_transport() {
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("local encode_query");
@@ -1115,6 +1183,7 @@ async fn front_doors_run_the_same_verb_over_either_transport() {
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("embedded encode_query");
@@ -1274,14 +1343,15 @@ async fn remote_refresh_matches_local_identity() {
     let mut tables = Vec::new();
     for _ in 0..2 {
         let (record, _) = local
-            .generate_embeddings(
-                "refresh_src",
-                &model_id,
-                &["text".to_string()],
-                "id",
-                Modality::Text,
-                jammi_db::store::CachePolicy::Bypass,
-            )
+            .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+                source_id: "refresh_src".to_string(),
+                model_id: model_id.to_string(),
+                columns: vec!["text".to_string()],
+                key_column: "id".to_string(),
+                modality: Modality::Text,
+                dimensions: None,
+                cache: jammi_db::store::CachePolicy::Bypass,
+            })
             .await
             .expect("embed");
         tables.push(record);

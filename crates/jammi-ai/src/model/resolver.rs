@@ -126,6 +126,15 @@ impl ModelResolver {
         let model_id = ModelId::from(source);
         let record = match self.catalog.get_model(&model_id.0).await? {
             Some(r) => r,
+            // A trained-output id names a row of this catalog and nothing
+            // else — never a Hub repository to fall back on — so a caller
+            // that cannot see the row (another tenant's model, a deleted
+            // one) is told it does not exist.
+            None if model_id.0.starts_with(FINE_TUNED_ID_PREFIX) => {
+                return Err(JammiError::ModelNotFound {
+                    model_id: model_id.0,
+                })
+            }
             None => return Ok(None),
         };
 
@@ -417,13 +426,34 @@ impl ModelResolver {
     ) -> Result<ResolvedModel> {
         let repo = self.hub.api().model(repo_id.to_string());
 
+        // Fetch the repo listing at most ONCE — for the config and weights
+        // names and for the weights-format plan — never two separate live
+        // `info()` calls that could observe two different snapshots of a
+        // repo being pushed to concurrently. A failed fetch becomes `None`,
+        // not a fatal error here — hf-hub 0.5's `ApiRepo::get` is CACHE-FIRST
+        // and network-free on a hit (sync.rs:758-764) while `ApiRepo::info`
+        // is network-only (sync.rs:860-878), so a warm-cache repo must keep
+        // resolving with no network at all. What `None` means is owned by
+        // the plan's own pure function (`hub_weights_plan`), never decided at
+        // this call site.
+        let listing: Option<Vec<String>> = repo
+            .info()
+            .ok()
+            .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect());
+        // The names come from the same `resolution_order` the local arm
+        // walks, asked of the listing instead of the disk; with no listing,
+        // the frozen order.
+        let (config_names, weights_names) = arch::resolution_order(|name| {
+            listing
+                .as_deref()
+                .is_some_and(|siblings| siblings.iter().any(|s| s == name))
+        });
+
         // NETWORK order, not disk order: a hub repo cannot be stat-ed, so
-        // this stays a `repo.get` chain. The NAMES and their order come from
-        // the shared list, so the hub arm can never look for
-        // a config file the local/catalog arms do not.
+        // this stays a `repo.get` chain.
         let config_path = repo
-            .get(arch::CONFIG_CANDIDATE_NAMES[0])
-            .or_else(|_| repo.get(arch::CONFIG_CANDIDATE_NAMES[1]))
+            .get(config_names[0])
+            .or_else(|_| repo.get(config_names[1]))
             .map_err(|e| JammiError::Model {
                 model_id: source.to_string(),
                 message: format!("Failed to download config: {e}"),
@@ -459,21 +489,6 @@ impl ModelResolver {
             }
         };
 
-        // Fetch the repo listing at most ONCE for the weights-format plan,
-        // never two separate live `info()` calls that could observe two
-        // different snapshots of a repo being pushed to concurrently. A
-        // failed fetch becomes `None`, not a fatal error here — hf-hub 0.5's
-        // `ApiRepo::get` is CACHE-FIRST and network-free on a hit
-        // (sync.rs:758-764) while `ApiRepo::info` is network-only
-        // (sync.rs:860-878), so a warm-cache repo must keep resolving with
-        // no network at all. What `None` means is owned by the plan's own
-        // pure function (`hub_weights_plan`), never decided at this
-        // call site.
-        let listing: Option<Vec<String>> = repo
-            .info()
-            .ok()
-            .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect());
-
         // Precedence FROZEN: safetensors wins, byte-for-byte. The choice
         // between safetensors/gguf/refusal/attempt is made from the repo
         // LISTING (`hub_weights_plan` over `repo.info()`'s siblings)
@@ -497,14 +512,15 @@ impl ModelResolver {
                     // names come straight off the plan arm that decided
                     // this branch, not re-derived from `listing` here.
                     (
-                        self.download_safetensors(&repo, source).map_err(|e| {
-                            annotate_listed_safetensors_download_failure(e, &listed_safetensors)
-                        })?,
+                        self.download_safetensors(&repo, source, &weights_names)
+                            .map_err(|e| {
+                                annotate_listed_safetensors_download_failure(e, &listed_safetensors)
+                            })?,
                         WeightsFormat::Safetensors,
                     )
                 }
                 HubWeightsPlan::SafetensorsOnlyAttempt => (
-                    self.download_safetensors(&repo, source)?,
+                    self.download_safetensors(&repo, source, &weights_names)?,
                     WeightsFormat::Safetensors,
                 ),
                 HubWeightsPlan::Gguf => {
@@ -563,14 +579,14 @@ impl ModelResolver {
         &self,
         repo: &hf_hub::api::sync::ApiRepo,
         source: &ModelSource,
+        weights_names: &[&str],
     ) -> Result<Vec<PathBuf>> {
-        // Try standard naming first, then OpenCLIP naming — the same two
-        // names, in the same order, the local chain walks.
-        if let Ok(path) = repo.get(arch::WEIGHTS_CANDIDATE_NAMES[0]) {
-            return Ok(vec![path]);
-        }
-        if let Ok(path) = repo.get(arch::WEIGHTS_CANDIDATE_NAMES[1]) {
-            return Ok(vec![path]);
+        // The single-file safetensors names, in the order `resolution_order`
+        // gave this repo — the same order the local chain walks.
+        for name in weights_names.iter().filter(|n| n.ends_with(".safetensors")) {
+            if let Ok(path) = repo.get(name) {
+                return Ok(vec![path]);
+            }
         }
         if let Ok(info) = repo.info() {
             let shards: Vec<PathBuf> = info

@@ -53,7 +53,7 @@ use prost::Message;
 
 use ballista_core::serde::BallistaPhysicalExtensionCodec;
 
-use jammi_ai::operator::ann_search_exec::AnnSearchExec;
+use jammi_ai::operator::vector_search_exec::VectorSearchExec;
 use jammi_ai::pipeline::asof::exec::AsofJoinExec;
 use jammi_ai::pipeline::asof::spec::AsofJoinSpec;
 use jammi_ai::pipeline::graph_propagation::hop::{HopFoldExec, HopSpec};
@@ -65,7 +65,7 @@ use jammi_datafusion::InferenceExec;
 use jammi_datafusion::NumberedInputExec;
 use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingRunner};
 use jammi_db::error::JammiError;
-use jammi_db::index::{FiniteQuery, QuerySource};
+use jammi_db::index::{FiniteQuery, QuerySource, SearchMethod};
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
 
@@ -90,7 +90,7 @@ pub const MAGIC: [u8; 4] = [0x07, b'J', b'M', b'B'];
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NodeTag {
     Inference = 0,
-    AnnSearch = 1,
+    VectorSearch = 1,
     AsofJoin = 2,
     KeyCheck = 3,
     Training = 4,
@@ -188,7 +188,7 @@ impl PhysicalExtensionCodec for JammiCodec {
         let session = self.session().map_err(Error::into_df_error)?;
         match tag {
             t if t == NodeTag::Inference as u8 => decode_inference(body, inputs, &session),
-            t if t == NodeTag::AnnSearch as u8 => decode_ann_search(body, &session),
+            t if t == NodeTag::VectorSearch as u8 => decode_vector_search(body, &session),
             t if t == NodeTag::AsofJoin as u8 => decode_asof(body, inputs),
             t if t == NodeTag::KeyCheck as u8 => decode_key_check(body, inputs),
             t if t == NodeTag::Training as u8 => decode_training(body, &self.training),
@@ -228,8 +228,8 @@ impl PhysicalExtensionCodec for JammiCodec {
         if let Some(exec) = node.downcast_ref::<InferenceExec>() {
             return encode_inference(exec, buf);
         }
-        if let Some(exec) = node.downcast_ref::<AnnSearchExec>() {
-            return encode_ann_search(exec, buf);
+        if let Some(exec) = node.downcast_ref::<VectorSearchExec>() {
+            return encode_vector_search(exec, buf);
         }
         if let Some(exec) = node.downcast_ref::<AsofJoinExec>() {
             return encode_asof(exec, buf);
@@ -341,30 +341,38 @@ fn decode_numbered_input(
     .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
-fn encode_ann_search(exec: &AnnSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {
+fn encode_vector_search(exec: &VectorSearchExec, buf: &mut Vec<u8>) -> DfResult<()> {
     let table = exec.table();
-    let msg = pb::AnnSearchExecNode {
+    let msg = pb::VectorSearchExecNode {
         table_name: table.table_name.clone(),
         tenant_id: table.tenant_id.clone(),
         query_vector: exec.query_vector().as_slice().to_vec(),
         k: exec.k() as u64,
-        oversample_override: exec.oversample_override().map(|o| o as u64),
+        method: match exec.method() {
+            SearchMethod::Approximate { oversample: None } => None,
+            SearchMethod::Approximate {
+                oversample: Some(o),
+            } => Some(pb::vector_search_exec_node::Method::Oversample(o as u64)),
+            SearchMethod::Exact => Some(pb::vector_search_exec_node::Method::Exact(
+                pb::ExactSearch {},
+            )),
+        },
         query_stored_table: match exec.query_vector().source() {
             QuerySource::Caller => None,
             QuerySource::Stored { table } => Some(table.clone()),
         },
     };
     buf.extend_from_slice(&MAGIC);
-    buf.push(NodeTag::AnnSearch as u8);
+    buf.push(NodeTag::VectorSearch as u8);
     msg.encode(buf)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())
 }
 
-fn decode_ann_search(
+fn decode_vector_search(
     body: &[u8],
     session: &Arc<InferenceSession>,
 ) -> DfResult<Arc<dyn ExecutionPlan>> {
-    let msg = pb::AnnSearchExecNode::decode(body)
+    let msg = pb::VectorSearchExecNode::decode(body)
         .map_err(|e| Error::Decode(e.to_string()).into_df_error())?;
     // Every typed refusal below boxes the `JammiError` payload directly as
     // `DataFusionError::External`'s inner value (never this crate's own
@@ -435,11 +443,17 @@ fn decode_ann_search(
     let query = query
         .against_authority(width)
         .map_err(|e| typed(e.into()))?;
-    let node = AnnSearchExec::new(
+    let node = VectorSearchExec::new(
         table,
         query,
         msg.k as usize,
-        msg.oversample_override.map(|o| o as usize),
+        match msg.method {
+            None => SearchMethod::default(),
+            Some(pb::vector_search_exec_node::Method::Oversample(o)) => SearchMethod::Approximate {
+                oversample: Some(o as usize),
+            },
+            Some(pb::vector_search_exec_node::Method::Exact(_)) => SearchMethod::Exact,
+        },
         session.result_store(),
         session.context().clone(),
     )

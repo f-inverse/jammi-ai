@@ -31,11 +31,10 @@ os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
 os.environ.setdefault("JAMMI_ENGINE__BATCH_SIZE", "8")
 
 import jammi
+from jammi_cookbook import fixtures
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
-CORPUS_PATH = FIXTURES / "tiny_corpus.parquet"
-MODEL = f"local:{FIXTURES / 'tiny_bert'}"
+CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
+MODEL = fixtures.model("tiny_bert")
 
 
 def main() -> int:

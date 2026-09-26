@@ -941,7 +941,10 @@ async fn one_device_admits_forwards_across_two_inference_execs() {
             compute_precision: jammi_numerics::ComputePrecision::F32,
         };
         let runtime = InferenceRuntime {
-            model: Arc::new(ModelCache::new(resolver, device_config, Arc::new(device))),
+            model: Arc::new(jammi_ai::inference::runtime::TenantScopedModels::capture(
+                Arc::new(ModelCache::new(resolver, device_config, Arc::new(device))),
+                jammi_db::tenant_scope::TenantBinding::unscoped(),
+            )),
             observer: None,
         };
         reset_forward_concurrency_for(source_id);

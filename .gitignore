@@ -54,6 +54,10 @@ packaging/*/jammi_server/bin/jammi-server
 packaging/*/dist/
 packaging/*/build/
 
+# The jammi-cookbook wheel's build outputs.
+cookbook/book/build/
+cookbook/book/dist/
+
 # In-repo cargo target + tmp dirs (CARGO_TARGET_DIR / TMPDIR for local gating)
 .cargo-target/
 .target/
@@ -70,6 +74,7 @@ packaging/*/build/
 CLAUDE.md
 docs/plans/*
 # Maintainer roadmap / journey docs are tracked despite the docs/plans/ rule.
+!docs/plans/40-cookbook/
 !docs/plans/52-maintainer-roadmap/
 !docs/plans/54-python-ecosystem/
 !docs/plans/55-precision-moat/
@@ -87,14 +92,6 @@ docs/IMPLEMENTATION.md
 docs/specs/
 # Artifacts pulled off a GPU pod by `ci/scripts/gpu-dev.sh pull`.
 .gpu-pull/
-
-# The full TRAIN-side pair text `cookbook/book/scripts/derive_heldout_fixture.py
-# --emit-train-pairs` writes (`ci/scripts/perf/finetune_run_ab.sh` generates it
-# when absent). Never committed, for repository size (`cookbook/fixtures/
-# finetune_heldout/README.md`, "Why train text isn't committed"): its identity
-# is checked against the committed `train_ids_sha256.json` by
-# `ci/scripts/perf/verify_train_pairs.py`.
-cookbook/fixtures/finetune_heldout/train_pairs.jsonl
 
 # Local scratch: working notes and throwaway git worktrees.
 /scratchpad/

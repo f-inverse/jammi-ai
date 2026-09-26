@@ -28,7 +28,7 @@ follows from that choice.
 | An inference fan-out the optimizer keeps | `PhysicalOptimizerRule` | `InferenceFanOut` |
 | Fine-tuning as a plan stage | `ExecutionPlan` | `TrainingExec`, bound to a `TrainingRunner` |
 | Durable result tables, and `CREATE TABLE … AS` that writes one | `ExecutionPlan`, `UserDefinedLogicalNodeCore`, `ExtensionPlanner` | `ResultTableSinkExec`, `StoreStatementNode`, `MaterializationPlanner` |
-| Vector search, as-of joins and graph propagation as operators | `ExecutionPlan` | `AnnSearchExec`, `AsofJoinExec`, `InitialStateExec` / `HopFoldExec` / `ReadoutExec` |
+| Vector search, as-of joins and graph propagation as operators | `ExecutionPlan` | `VectorSearchExec`, `AsofJoinExec`, `InitialStateExec` / `HopFoldExec` / `ReadoutExec` |
 | Versioned reads over append-only tables, and mutable companion tables | `TableProvider` | `MaskedTableProvider`, `MutableTableProvider` |
 | SQL functions over model outputs | `TableFunctionImpl`, `ScalarUDFImpl`, `AggregateUDFImpl` | `annotate(…)`, `jammi_content_hash(…)`, `vector_mean` / `vector_sum` / `vector_max` |
 | A memory bound shared fairly by the operators that are using it | `MemoryPool` | `ActiveSpillPool` |
@@ -84,7 +84,9 @@ No Python runs in the serving or training path.
   are decided once, by row cost, and carried as a chunk id the exchange
   hashes on. A plan fanned over one partition or sixteen, in one process or
   across a Ballista cluster, forwards identical chunks and writes identical
-  bytes.
+  bytes ([The Cookbook → Fan-out inference](https://f-inverse.github.io/jammi-ai/cookbook/chapters/26-fanout/fanout.html)
+  builds one table at one, two and four partitions and asserts the artifact
+  digests equal).
 - **Model outputs under a correctness contract.** Every result table
   records what produced it: the producing descriptor and the environment,
   including a typed record of each model's run (local weights with their

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use arrow::datatypes::{DataType, Schema};
 use jammi_db::catalog::eval_repo::{EvalRunRecord, PerQueryEvalRecord};
+use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::status::EvalRunStatus;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::sql::quote_relation;
@@ -48,6 +49,45 @@ impl<'a> EvalRunner<'a> {
             })
     }
 
+    /// The model that encodes queries into `table`'s vector space, read off
+    /// the table's recorded producer: an embedding table's own model, a
+    /// context set's encoder, and — for a propagated table, whose vectors mix
+    /// its input table's vectors in that table's space — its input's encoder,
+    /// walked iteratively down the (acyclic) lineage. A table whose vectors no
+    /// engine encoder produced (structure embeddings, imported vectors) has no
+    /// query encoder, so a text/image/audio golden cannot be run against it:
+    /// the typed [`JammiError::NoQueryEncoder`] naming the producer, never a
+    /// model load of the producer's tag.
+    ///
+    /// Returns the encoder's canonical model id, as `result_tables.model_id`
+    /// and the model catalog store it.
+    async fn query_encoder(&self, table: &ResultTableRecord) -> Result<String> {
+        use jammi_db::store::manifest::ProducingDescriptor as P;
+        let store = self.session.result_store();
+        let mut current = table.clone();
+        loop {
+            match store.base_descriptor(&current).await? {
+                P::Embedding { model_id, .. }
+                | P::EmbeddingDelta { model_id, .. }
+                | P::EmbeddingCompaction { model_id, .. } => return Ok(model_id),
+                P::ContextSet { encoder_id, .. } => return Ok(encoder_id),
+                P::GraphPropagation { source_table, .. } => {
+                    current = self
+                        .session
+                        .catalog()
+                        .resolve_embedding_table(&table.source_id, Some(&source_table))
+                        .await?;
+                }
+                other => {
+                    return Err(JammiError::NoQueryEncoder {
+                        table: table.table_name.clone(),
+                        producer: other.producer().to_string(),
+                    })
+                }
+            }
+        }
+    }
+
     /// Evaluate embedding quality against golden relevance judgments.
     ///
     /// Returns an [`EmbeddingEvalReport`] containing both the aggregate over
@@ -78,13 +118,11 @@ impl<'a> EvalRunner<'a> {
         cohorts: &HashMap<String, BTreeMap<String, String>>,
     ) -> Result<EmbeddingEvalReport> {
         // 1. Resolve embedding table.
-        // result_tables.model_id stores the canonical model name (ModelSource::to_string()).
         let table = self
             .session
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
-        let canonical_model = &table.model_id;
 
         let result_store = self.session.result_store();
 
@@ -125,8 +163,8 @@ impl<'a> EvalRunner<'a> {
         let golden = load_retrieval_golden_from_batches(&batches, has_grades, modality)?;
 
         // 4. For each query: encode → search → compute metrics.
-        let model_source = ModelSource::from_canonical(canonical_model);
-        let encode_id = model_source.to_string();
+        let encoder = self.query_encoder(&table).await?;
+        let encode_id = ModelSource::from_canonical(&encoder).to_string();
         let mut query_metrics = Vec::new();
         // Recall@{1,3,5,10} and the top-1 distance, captured per query so the
         // per-query record carries the multi-cutoff vector J7 re-aggregates.
@@ -149,6 +187,10 @@ impl<'a> EvalRunner<'a> {
                     self.session.encode_audio_query(&encode_id, bytes).await?
                 }
             };
+            // The table's recorded model encodes the query; a table served at
+            // a Matryoshka prefix of that model's width is searched at it.
+            let query_vec =
+                crate::pipeline::embedding::serve_query(&encode_id, query_vec, Some(query_width))?;
 
             // The encoder's output for this query is the query the run
             // supplied — a CALLER's vector, checked against the table's
@@ -223,7 +265,7 @@ impl<'a> EvalRunner<'a> {
         //    historical path), then persist the per-query arrays to
         //    `_jammi_eval_per_query` keyed by the same `eval_run_id`. Per-query
         //    persistence is always-on (spec J9) — no opt-in flag.
-        let model_fk = self.eval_model_fk(canonical_model).await?;
+        let model_fk = self.eval_model_fk(&encoder).await?;
         self.session
             .catalog()
             .record_eval_run(&EvalRunRecord {

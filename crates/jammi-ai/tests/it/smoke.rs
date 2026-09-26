@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Float32Array, ListArray, StringArray};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use tempfile::TempDir;
 
@@ -54,7 +55,13 @@ async fn smoke_full_pipeline() {
 
     // Vector search
     let results = session
-        .search("patents", vec![0.5_f32; 32], 5, None, None)
+        .search(
+            "patents",
+            vec![0.5_f32; 32],
+            5,
+            None,
+            SearchMethod::default(),
+        )
         .await
         .unwrap()
         .run()

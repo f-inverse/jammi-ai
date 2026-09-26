@@ -103,67 +103,11 @@ impl CollectiveSelection {
     }
 }
 
-/// Distance metric for ANN indices.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DistanceMetric {
-    Cosine,
-    L2,
-}
-
-impl fmt::Display for DistanceMetric {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cosine => write!(f, "cosine"),
-            Self::L2 => write!(f, "l2"),
-        }
-    }
-}
-
-impl FromStr for DistanceMetric {
-    type Err = JammiError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "cosine" => Ok(Self::Cosine),
-            "l2" => Ok(Self::L2),
-            other => Err(JammiError::Config(format!(
-                "Unknown distance metric '{other}'. Expected: cosine, l2"
-            ))),
-        }
-    }
-}
-
-/// ANN index type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IndexType {
-    IvfHnswSq,
-}
-
-impl fmt::Display for IndexType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IvfHnswSq => write!(f, "ivf_hnsw_sq"),
-        }
-    }
-}
-
-impl FromStr for IndexType {
-    type Err = JammiError;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "ivf_hnsw_sq" => Ok(Self::IvfHnswSq),
-            other => Err(JammiError::Config(format!(
-                "Unknown index type '{other}'. Expected: ivf_hnsw_sq"
-            ))),
-        }
-    }
-}
-
 /// Log output format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogFormat {
+    #[default]
     Text,
     Json,
 }
@@ -735,9 +679,11 @@ impl EngineConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GpuConfig {
-    /// CUDA device ordinal, and the PRIMARY of [`Self::devices`]. `-1` is the
-    /// CPU. Default: 0.
-    pub device: i32,
+    /// CUDA device ordinal of the PRIMARY device, as configured; `-1` is the
+    /// CPU. Unset, the primary is the first of [`Self::devices`], else
+    /// [`Self::DEFAULT_DEVICE`] — the accelerator (`0`) in a build that carries
+    /// one, the CPU otherwise. Read it through [`Self::primary`].
+    pub device: Option<i32>,
     /// The ordered device list a multi-rank worker places its ranks on: rank
     /// `i` runs on `devices[i]`.
     ///
@@ -784,8 +730,26 @@ impl GpuConfig {
     /// "no CUDA device, run on the host".
     pub const CPU_DEVICE: i32 = -1;
 
+    /// The device an unconfigured deployment runs on: the first accelerator in
+    /// a build that carries one (the `accelerator` feature), the CPU in a
+    /// build that carries none — so a CPU-only build's defaults never request
+    /// a device it cannot have.
+    pub const DEFAULT_DEVICE: i32 = if cfg!(feature = "accelerator") {
+        0
+    } else {
+        Self::CPU_DEVICE
+    };
+
+    /// The primary device: `device` when configured, else the first of
+    /// `devices`, else [`Self::DEFAULT_DEVICE`].
+    pub fn primary(&self) -> i32 {
+        self.device
+            .or_else(|| self.devices.as_ref().and_then(|d| d.first().copied()))
+            .unwrap_or(Self::DEFAULT_DEVICE)
+    }
+
     /// The resolved device list: the configured plural when one was given,
-    /// and otherwise the one-device list `[device]`.
+    /// and otherwise the one-device list `[primary]`.
     ///
     /// This is the ONE reconciliation of the two arities — a caller never
     /// reads [`Self::devices`] directly to decide where to place work, so an
@@ -795,7 +759,7 @@ impl GpuConfig {
     pub fn device_list(&self) -> Vec<i32> {
         match &self.devices {
             Some(devices) => devices.clone(),
-            None => vec![self.device],
+            None => vec![self.primary()],
         }
     }
 
@@ -807,7 +771,7 @@ impl GpuConfig {
     ///
     /// - an explicit `devices = []` — a deployment with nowhere to run, and
     ///   a different statement from omitting the key;
-    /// - a first entry that is not `device` — the plural and the primary
+    /// - a first entry that is not a configured `device` — the plural and the primary
     ///   disagree about which device is rank 0's, and guessing one of them is
     ///   how a "CPU-pinned" session ends up on a GPU.
     ///
@@ -829,11 +793,12 @@ impl GpuConfig {
                         .into(),
                 ));
             }
-            if devices[0] != self.device {
+            if let Some(device) = self.device.filter(|d| *d != devices[0]) {
                 return Err(JammiError::Config(format!(
-                    "[gpu] devices = {:?} disagrees with device = {}: the first entry is rank \
-                     0's device and must equal `device` (set `device = {}` or list it first)",
-                    devices, self.device, devices[0]
+                    "[gpu] devices = {devices:?} disagrees with device = {device}: the first \
+                     entry is rank 0's device and must equal `device` (set `device = {}` or \
+                     list it first)",
+                    devices[0]
                 )));
             }
         }
@@ -1116,11 +1081,8 @@ impl AnnIndexConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// Distance metric for ANN indices. Default: `Cosine`.
-    pub default_distance_metric: DistanceMetric,
-    /// ANN index type. Default: `IvfHnswSq`.
-    pub default_index_type: IndexType,
-    /// Rows between index checkpoint writes. Default: 1000.
+    /// Batches between two progress checkpoints on a building embedding
+    /// table's catalog row; `0` never checkpoints. Default: 1000.
     pub checkpoint_interval: usize,
     /// Rows per ANN segment of a written embedding table: the segments are
     /// consecutive runs of the table's rows at this budget, each built on
@@ -1441,8 +1403,11 @@ impl WorkerConfig {
     ///
     /// - `local_ranks == 0` — a deployment with no rank cannot run anything,
     ///   and `0` is not "unset" (the unset value is the default `1`);
-    /// - `local_ranks > devices` — there is no device for the last rank, and
-    ///   the alternative to refusing is two ranks silently sharing one;
+    /// - `local_ranks > devices` on accelerators — there is no device for the
+    ///   last rank, and the alternative to refusing is two ranks silently
+    ///   sharing one card's memory. The CPU is the one device ranks do share
+    ///   by nature: a deployment whose only device is the CPU runs every rank
+    ///   on it;
     /// - `rank_timeout_secs == 0` — a deadline that has already passed.
     ///
     /// `gpu`'s own domain rules ([`GpuConfig::validate`]) are checked first,
@@ -1458,15 +1423,20 @@ impl WorkerConfig {
                     .into(),
             ));
         }
-        if self.local_ranks as usize > devices.len() {
+        let devices = if devices == [GpuConfig::CPU_DEVICE] {
+            vec![GpuConfig::CPU_DEVICE; self.local_ranks as usize]
+        } else if self.local_ranks as usize > devices.len() {
             return Err(JammiError::Config(format!(
                 "[worker] local_ranks = {} exceeds the {} configured device(s) {:?}: one rank \
-                 per device, so list more in `[gpu] devices` or lower `local_ranks`",
+                 per accelerator, so list more in `[gpu] devices`, lower `local_ranks`, or run \
+                 the ranks on the CPU (`[gpu] device = -1`)",
                 self.local_ranks,
                 devices.len(),
                 devices
             )));
-        }
+        } else {
+            devices
+        };
         if self.rank_timeout_secs == 0 {
             return Err(JammiError::Config(
                 "[worker] rank_timeout_secs must be > 0 (a zero deadline expires before any \
@@ -1489,8 +1459,8 @@ impl WorkerConfig {
 ///
 /// [`WorkerConfig::topology`] is the only constructor, so every instance has
 /// already cleared the bounds: `local_ranks >= 1`, `local_ranks <=
-/// devices.len()`, the devices distinct and placeable, and a non-zero
-/// timeout. The fields are private for the same reason — the bounds hold for
+/// devices.len()`, the accelerators distinct and placeable (the CPU, the one
+/// device ranks share, is listed once per rank), and a non-zero timeout. The fields are private for the same reason — the bounds hold for
 /// the lifetime of the value, not just at the moment it was built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerTopology {
@@ -2517,11 +2487,15 @@ impl BallistaConfig {
 }
 
 /// Tracing/logging configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Log level filter (e.g., `"info"`, `"debug"`, `"warn"`). Default: `"info"`.
-    pub level: String,
+    /// Log filter directive (e.g. `"info"`, `"warn"`, `"jammi_ai=debug"`).
+    /// Unset, the host's own default applies: `info` for `jammi-server`, a
+    /// daemon that logs its operations, and `warn` for an engine embedded in
+    /// another process, which stays quiet unless asked. `RUST_LOG`, when set,
+    /// overrides either.
+    pub level: Option<String>,
     /// Output format. Default: `Text`.
     pub format: LogFormat,
 }
@@ -2763,8 +2737,8 @@ impl Default for EngineConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
-            device: 0,
-            // Unset, NOT `[0]`: a `GpuConfig { device: -1, ..default() }`
+            device: None,
+            // Unset, NOT `[0]`: a `GpuConfig { device: Some(-1), ..default() }`
             // must resolve to the CPU, which it does only while the plural
             // stays absent and `device_list()` derives it from `device`.
             devices: None,
@@ -2864,8 +2838,6 @@ impl InferenceConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            default_distance_metric: DistanceMetric::Cosine,
-            default_index_type: IndexType::IvfHnswSq,
             checkpoint_interval: 1000,
             index_segment_rows: NonZeroUsize::new(4096).expect("a positive segment budget"),
             ann: AnnIndexConfig::default(),
@@ -2908,15 +2880,6 @@ impl Default for ServerConfig {
             peer_advertise: None,
             peer_local_load_bytes: None,
             placement: PlacementMode::default(),
-        }
-    }
-}
-
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: "info".into(),
-            format: LogFormat::Text,
         }
     }
 }

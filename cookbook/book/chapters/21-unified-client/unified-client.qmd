@@ -17,8 +17,7 @@ one behavioural contract, so a program written against the contract runs against
 the leaky-abstraction principle [@spolsky2002leaky] — where the two transports genuinely
 diverge, the seam says so out loud (a typed capability, a finite cap), it does not paper over
 it. · **Rail:** measurement (the shared verb vocabulary, every capability boolean, every
-raised class, and the receive-cap edge asserted against the frozen golden — names and
-booleans exact, not transcribed).
+raised class, and the receive-cap edge, each measured live).
 
 `jammi-ai` (import `jammi`) is the **base**: one lean Python package that speaks to a Jammi engine, local
 or remote. Out of the box it carries the remote arm — `connect("grpc://…")` over the
@@ -47,20 +46,6 @@ identical, and the honest thing is to name where they diverge:
    argument is the *same* class on both sides;
 3. **the remote honest edge** — the one place the remote transport carries a finite bound
    the embedded engine does not, surfaced loudly rather than silently truncated.
-
-```{python}
-from jammi_cookbook import contracts
-
-rec = contracts.load_artifact("unified_client.record")
-inst = rec["install"]
-par = rec["parity"]
-cap = rec["capability"]
-print(f"[embedded] extra pins:     {inst['embedded_extra_pins']}")
-print(f"file:// -> backend:        {inst['file_uri_backend']}  ({inst['file_uri_backend_module']})")
-print(f"grpc:// -> backend:        {inst['grpc_uri_backend']}")
-print(f"shared Session verbs:      {par['verb_count']} — present on both backends: {par['both_complete']}")
-print(f"capability enum (CLOSED):  {cap['enum_values']}")
-```
 
 ## Installing the engine — the `[embedded]` extra
 
@@ -98,9 +83,8 @@ print(f"[embedded] pins:            {embedded_pins}")
 print(f"jammi_native importable:    {native_here}  (the extra is installed)")
 
 assert "embedded" in extras
-assert embedded_pins == inst["embedded_extra_pins"]
-assert any(p.startswith("jammi-ai-native==") for p in embedded_pins), "the extra pins the engine"
-assert native_here is inst["native_importable"] is True
+assert embedded_pins == [f"jammi-ai-native=={md['Version']}"], "the extra pins the lockstep engine"
+assert native_here
 ```
 
 Without the extra, the base client is honest about the absence: a `file://` target raises a
@@ -129,9 +113,9 @@ print(f"connect('file://…') -> {type(embedded).__module__}.{type(embedded).__n
 print(f"connect('grpc://…') -> {type(remote).__module__}.{type(remote).__name__}")
 print(f"both are a Session:  embedded={isinstance(embedded, Session)}  remote={isinstance(remote, Session)}")
 
-assert type(embedded).__name__ == inst["file_uri_backend"] == "EmbeddedBackend"
-assert type(embedded).__module__ == inst["file_uri_backend_module"]  # the base client, direct FFI
-assert type(remote).__name__ == inst["grpc_uri_backend"] == "RemoteDatabase"
+assert type(embedded).__name__ == "EmbeddedBackend"
+assert type(embedded).__module__ == "jammi._embedded"  # the base client, direct FFI
+assert type(remote).__name__ == "RemoteDatabase"
 assert isinstance(embedded, Session) and isinstance(remote, Session)
 ```
 
@@ -158,10 +142,7 @@ print(f"Session Protocol names {len(verbs)} shared verbs")
 print(f"  missing on EmbeddedBackend: {emb_missing or 'none'}")
 print(f"  missing on RemoteDatabase:  {rem_missing or 'none'}")
 
-assert verbs == par["session_protocol_verbs"]
-assert len(verbs) == par["verb_count"]
 assert emb_missing == rem_missing == [], "both backends carry the whole shared vocabulary"
-assert par["both_complete"] is True
 ```
 
 Every shared verb is present on both backends, no drift. A caller writes one program against the
@@ -205,8 +186,8 @@ for c in Capability:
 
 emb_live = {c.value: embedded.supports(c) for c in Capability}
 rem_live = {c.value: remote.supports(c) for c in Capability}
-assert emb_live == cap["embedded_supports"], "embedded capability set drifted from the golden"
-assert rem_live == cap["remote_supports"], "remote capability set drifted from the golden"
+assert {k for k, v in emb_live.items() if v} == {"audit", "ephemeral_session", "preload_model"}
+assert {k for k, v in rem_live.items() if v} == {"session_id"}
 assert all(emb_live[k] != rem_live[k] for k in emb_live), "the two sets must be complementary"
 ```
 
@@ -235,8 +216,8 @@ except NotSupportedOnBackend as exc:
 print(f"embedded.session_id -> {embedded_wrong[0]} (capability: {embedded_wrong[1]})")
 print(f"remote.audit        -> {remote_wrong[0]} (capability: {remote_wrong[1]})")
 
-assert embedded_wrong[1] == cap["embedded_wrong_side"]["capability"]
-assert remote_wrong[1] == cap["remote_wrong_side"]["capability"]
+assert embedded_wrong == ("NotSupportedOnBackend", "session_id")
+assert remote_wrong == ("NotSupportedOnBackend", "audit")
 ```
 
 ## The JammiError taxonomy — one family, two transports
@@ -340,11 +321,10 @@ mapped from gRPC's `RESOURCE_EXHAUSTED`.
 ```{python}
 from jammi._database import MAX_RECEIVE_MESSAGE_LENGTH, _rpc_to_jammi
 
-edge = rec["honest_edge"]
 print(f"remote receive cap (production default): "
       f"{MAX_RECEIVE_MESSAGE_LENGTH:,} bytes = {MAX_RECEIVE_MESSAGE_LENGTH // (1024*1024)} MiB")
 print(f"embedded in-process return:              unbounded (no wire message)")
-assert MAX_RECEIVE_MESSAGE_LENGTH == edge["production_cap_bytes"] == 64 * 1024 * 1024
+assert MAX_RECEIVE_MESSAGE_LENGTH == 64 * 1024 * 1024
 ```
 
 We exercise the mechanism for real. A 64 MiB payload is impractical to move inside the book's
@@ -358,6 +338,8 @@ client mapping turns into `BackendError`; a channel at the production 64 MiB ret
 import concurrent.futures
 
 _ECHO = "/jammi.probe.Echo/Get"
+PAYLOAD_BYTES = 256 * 1024  # the result a server returns
+DEMO_CAP_BYTES = 64 * 1024  # a scaled-down receive cap that refuses it
 
 
 def echo_server(payload):
@@ -385,18 +367,18 @@ def receive_at_cap(port, cap):
         channel.close()
 
 
-payload = b"x" * edge["payload_bytes"]
+payload = b"x" * PAYLOAD_BYTES
 server, port = echo_server(payload)
 try:
     generous_bytes, generous_err = receive_at_cap(port, MAX_RECEIVE_MESSAGE_LENGTH)
-    capped_bytes, capped_err = receive_at_cap(port, edge["demo_cap_bytes"])
+    capped_bytes, capped_err = receive_at_cap(port, DEMO_CAP_BYTES)
 finally:
     server.stop(0)
 
 mapped = _rpc_to_jammi(capped_err)
 print(f"payload:                    {len(payload):,} bytes")
 print(f"channel @ 64 MiB (prod):    returned {generous_bytes:,} bytes  (mirrors embedded)")
-print(f"channel @ {edge['demo_cap_bytes']//1024} KiB (demo cap):  grpc {capped_err.code().name} "
+print(f"channel @ {DEMO_CAP_BYTES // 1024} KiB (demo cap):  grpc {capped_err.code().name} "
       f"-> {type(mapped).__name__}")
 
 assert generous_err is None and generous_bytes == len(payload)
@@ -413,17 +395,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 with tempfile.TemporaryDirectory() as d:
-    table = pa.table({"id": pa.array(range(edge["embedded_returned_rows"]), type=pa.int32())})
+    table = pa.table({"id": pa.array(range(40_000), type=pa.int32())})
     path = f"{d}/big.parquet"
     pq.write_table(table, path)
     embedded.add_source("big", url=path, format="parquet")
     got = embedded.sql("SELECT id FROM big.public.big")
 
 print(f"embedded returned:          {got.num_rows:,} rows = {got.nbytes:,} bytes in-process")
-print(f"  exceeds the {edge['demo_cap_bytes']//1024} KiB remote cap: {got.nbytes > edge['demo_cap_bytes']}")
-assert got.num_rows == edge["embedded_returned_rows"]
-assert got.nbytes == edge["embedded_returned_bytes"]
-assert got.nbytes > edge["demo_cap_bytes"]
+print(f"  exceeds the {DEMO_CAP_BYTES // 1024} KiB remote cap: {got.nbytes > DEMO_CAP_BYTES}")
+assert got.num_rows == 40_000 and got.nbytes == 40_000 * 4
+assert got.nbytes > DEMO_CAP_BYTES
 ```
 
 Both sessions' work is done, so they are closed. A remote session's `close()` releases its
@@ -438,17 +419,14 @@ remote.close()
 ## The verdict
 
 ```{python}
-tax = rec["taxonomy"]
 print("unified client surface — measured:")
-print(f"  capability sets complementary ({len(cap['enum_values'])} capabilities): "
-      f"{cap['complementary']}")
-print(f"  wrong-side capability -> NotSupportedOnBackend:         "
-      f"{cap['embedded_wrong_side']['raised'] == cap['remote_wrong_side']['raised'] == 'NotSupportedOnBackend'}")
-print(f"  bad argument -> same InvalidArgument on both transports: {tax['two_sided_same_class']}")
-print(f"  one except JammiError catches both transports:          {tax['one_except_catches_both']}")
-print(f"  remote receive cap finite (64 MiB) + loud on exceed:    "
-      f"{edge['capped_channel_mapped'] == 'BackendError'}")
-print(f"  embedded returns the same-scale payload unbounded:      {edge['embedded_exceeds_demo_cap']}")
+print(f"  shared Session verbs, present on both transports:      {len(verbs)}")
+print(f"  capability sets complementary ({len(emb_live)} capabilities):       "
+      f"{all(emb_live[k] != rem_live[k] for k in emb_live)}")
+print(f"  bad argument -> same class on both transports:          "
+      f"{type(emb_exc).__name__ == type(rem_exc).__name__ == 'InvalidArgument'}")
+print(f"  remote receive cap finite (64 MiB) + loud on exceed:    {type(mapped).__name__}")
+print(f"  embedded returns the same-scale payload unbounded:      {got.nbytes > DEMO_CAP_BYTES}")
 ```
 
 The substitution the whole book leans on — write once against `Session`, run in-process or

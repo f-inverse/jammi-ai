@@ -1,0 +1,58 @@
+{
+  "base_precision_at_10": {
+    "tol": 0.01,
+    "value": 0.5130000000000001
+  },
+  "cosent.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5180000000000003
+  },
+  "graph.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5244999999999999
+  },
+  "hard_neg.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5090000000000001
+  },
+  "matryoshka.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5194999999999999
+  },
+  "mnrl.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5165
+  },
+  "mnrl_t50.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5199999999999999
+  },
+  "prefix.matryoshka.192": {
+    "tol": 0.03,
+    "value": 0.5199999999999999
+  },
+  "prefix.matryoshka.384": {
+    "tol": 0.03,
+    "value": 0.5340000000000001
+  },
+  "prefix.matryoshka.768": {
+    "tol": 0.03,
+    "value": 0.5194999999999999
+  },
+  "prefix.mnrl.192": {
+    "tol": 0.03,
+    "value": 0.5185000000000004
+  },
+  "prefix.mnrl.384": {
+    "tol": 0.03,
+    "value": 0.531
+  },
+  "prefix.mnrl.768": {
+    "tol": 0.03,
+    "value": 0.5164999999999998
+  },
+  "triplet.precision_at_10": {
+    "tol": 0.03,
+    "value": 0.5314999999999999
+  }
+}

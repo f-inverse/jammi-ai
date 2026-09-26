@@ -5,14 +5,14 @@
 Dense vector search finds rows that *mean* the same thing as your query; lexical
 (BM25) search finds rows that contain the same *words*. Each misses what the
 other catches — dense search fumbles rare identifiers and exact phrases, lexical
-search misses paraphrase. Hybrid retrieval runs both and fuses their rankings,
-and it is the standard production recipe because it reliably beats either alone.
+search misses paraphrase. Hybrid retrieval runs both and fuses their rankings.
 
-Jammi ships two pieces for this:
+Jammi ships the three pieces:
 
-- A **lexical sidecar** (`LexicalIndex`) — a tantivy BM25 inverted index that
-  rides beside a result table's Parquet object, the lexical peer of the USearch
-  ANN sidecar.
+- **`build_lexical_index`** — materialises a source's text as a lexical table,
+  one `(_row_id, text)` row per source row.
+- **`lexical_search`** — ranks a lexical table's rows against a text query by
+  BM25 and hydrates the source's rows, exactly as `search` does for vectors.
 - **Reciprocal-rank fusion** (`rrf_fuse`) — merges any number of ranked lists by
   *rank*, not score.
 
@@ -24,57 +24,117 @@ fused order depends only on *where* a row landed in each list. The default
 
 ## Build a lexical index
 
-A `LexicalIndex` is built over `(row_id, text)` pairs — the `text` is whatever
-text columns of the row you want searchable, joined by the caller. The analyzer
-is configurable; `English` (lowercase + Porter stemming) is the default, and
-`Raw` (lowercase, no stemming) is the escape hatch for text the English stemmer
-would mangle (codes, identifiers, non-English).
+A lexical index is built over a registered source: its `key` column keys each
+row, and its text `columns` are joined in order by a space into the row's text.
+The analyzer decides how that text — and every query — is tokenised:
+`"english"` (lowercase + Porter stemming) is the default, and `"raw"`
+(lowercase, no stemming) is for text a stemmer would mangle (codes, identifiers,
+other languages).
+
+### Python
+
+```python
+db.add_source("patents", url="patents.parquet", format="parquet")
+lexical = db.build_lexical_index("patents", columns=["title", "abstract"], key="id")
+```
+
+### Rust
 
 ```rust,no_run
 # extern crate jammi_ai;
 # extern crate jammi_db;
-# fn ex() -> jammi_db::error::Result<()> {
-use jammi_ai::index::{Analyzer, LexicalIndex};
+# async fn ex(session: &jammi_ai::Session) -> jammi_db::error::Result<()> {
+use jammi_ai::local_session::{BuildLexicalIndex, LexicalAnalyzer};
 
-let rows = vec![
-    ("doc-1", "a method for reducing turbine blade vibration"),
-    ("doc-2", "an apparatus for cooling turbine engine blades"),
-    ("doc-3", "a recipe for baking sourdough bread"),
-];
-
-let lexical = LexicalIndex::build(rows, Analyzer::English)?;
-let hits = lexical.search("turbine engine", 10)?;
-for hit in &hits {
-    println!("{} bm25={:.3} rank={}", hit.row_id, hit.bm25_score, hit.rank);
-}
+let lexical = session
+    .build_lexical_index(
+        "patents",
+        &BuildLexicalIndex {
+            columns: vec!["title".into(), "abstract".into()],
+            key_column: "id".into(),
+            analyzer: LexicalAnalyzer::English,
+        },
+    )
+    .await?;
+# let _ = lexical;
 # Ok(()) }
 ```
 
-Each `LexicalHit` carries the `row_id`, its raw `bm25_score`, and its 0-based
-`rank` — the rank is what fusion consumes.
+The lexical table is the index's data of record: it pins the text as it was
+read, and it carries the same materialization manifest as every other derived
+table, so `describe_table`, `staleness` and `recompute` apply to it unchanged.
+Its inverted index is derived state — rebuilt in memory from the table's rows
+the first time a process searches a version of it, and never stored.
 
-### Lifecycle and scope
+## Search it
 
-The lexical sidecar's lifecycle equals the ANN sidecar's: it is built (and
-rebuilt) with the table. An immutable result table that is rebuilt produces a
-fresh sidecar; for a mutable-table source, re-ingesting the changed rows into a
-new index is the caller's mode. Search applies no row-level filter — isolation
-is table-level, exactly as the ANN `search` path: resolve the table through the
-tenant-scoped catalog and hand the index only that table's rows.
+`lexical_search` takes a text query; its words are the query. Each analysed
+term is one disjunctive clause, so a row matching more of the terms, or rarer
+ones, ranks higher, and no query syntax is interpreted — a colon, a quote or a
+minus sign is text. It returns the `k` best-ranked rows hydrated from the
+source, with the same `filter` / `select` refinements `search` has: with a
+`filter`, the `k` best-ranked rows that satisfy it.
+
+### Python
+
+```python
+hits = db.lexical_search("patents", text="quantum error correction", k=10,
+                         filter="year >= 2021")
+print(hits.select(["id", "title", "bm25_score", "bm25_rank"]).to_pandas())
+```
+
+### Rust
+
+```rust,no_run
+# extern crate jammi_ai;
+# extern crate jammi_db;
+# async fn ex(session: &jammi_ai::Session) -> jammi_db::error::Result<()> {
+use jammi_ai::local_session::LexicalSearchRequest;
+
+let hits = session
+    .lexical_search(LexicalSearchRequest {
+        source_id: "patents".into(),
+        text: "quantum error correction".into(),
+        k: 10,
+        lexical_table: None,
+        filter: Some("year >= 2021".into()),
+        select: Vec::new(),
+    })
+    .await?;
+# let _ = hits;
+# Ok(()) }
+```
+
+Each row carries the built-in `bm25` evidence channel's two columns —
+`bm25_score` (`Float32`, the raw BM25 score) and `bm25_rank` (`Int64`, 0-based)
+— and `retrieved_by == ["bm25"]`, the lexical peer of a dense search's `vector`
+channel and `similarity`. `lexical_table` names which of a source's lexical
+tables to search; unset, the newest.
 
 ## Fuse dense and lexical rankings
 
-`rrf_fuse` takes a slice of ranked lists — each a best-first list of `_row_id`s —
-and returns one fused ranking. The dense list is the ANN `search` result; the
-lexical list is the `LexicalIndex` result. A third list (e.g. a graph-retrieval
-channel) fuses identically, with no special-casing.
+`rrf_fuse` takes ranked lists — each a best-first list of `_row_id`s — and
+returns one fused ranking. The dense list is a `search` result's keys; the
+lexical list is a `lexical_search` result's. A third list (e.g. a
+graph-propagated search) fuses identically, with no special-casing.
+
+### Python
+
+```python
+dense = db.search("patents", query=db.encode_query(model=model, query=q), k=50)
+lexical = db.lexical_search("patents", text=q, k=50)
+fused = db.rrf_fuse([dense.column("_row_id").to_pylist(),
+                     lexical.column("_row_id").to_pylist()])
+```
+
+### Rust
 
 ```rust,no_run
 # extern crate jammi_ai;
 use jammi_ai::query::{rrf_fuse, DEFAULT_K_RRF};
 
 // Best-first row-id lists from each retriever.
-let dense = vec!["doc-2", "doc-1", "doc-5"];   // ANN cosine order
+let dense = vec!["doc-2", "doc-1", "doc-5"];   // cosine order
 let lexical = vec!["doc-1", "doc-2", "doc-9"]; // BM25 order
 
 let fused = rrf_fuse(&[dense, lexical], DEFAULT_K_RRF);
@@ -93,13 +153,9 @@ counts only once, at its best rank.
 ranks (a deep-but-agreed-upon row matters more); smaller values sharpen the
 reward for top-of-list placement. `DEFAULT_K_RRF` (60) is the recommended start.
 
-## Record the evidence
+## Scope
 
-BM25 contributions ride the built-in `bm25` evidence channel, the lexical peer
-of `vector`'s `similarity`. It declares two columns — `bm25_score` (`Float32`)
-and `bm25_rank` (`Int64`) — and a contribution is supplied to `merge_channels`
-exactly as the `vector` channel's is, so a fused result carries both its dense
-and its lexical provenance side by side. See
-[Declare a Custom Provenance Channel](./declare-provenance-channel.md) for the
-contribution mechanics; `bm25` needs no registration — it is seeded with the
-catalog.
+Lexical search applies no row-level filter of its own — isolation is
+table-level, exactly as the ANN `search` path: the lexical table resolves
+through the tenant-scoped catalog, so a tenant searches only the lexical tables
+it built.

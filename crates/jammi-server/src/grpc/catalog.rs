@@ -33,9 +33,9 @@ use jammi_db::trigger::ids::TopicId;
 use jammi_db::trigger::TriggerError;
 use jammi_db::TenantId;
 use jammi_wire::{
-    channel_to_proto, definition_to_proto, derives_from_edge_to_proto, index_segment_to_proto,
-    match_verdict_to_proto, model_to_proto, parse_table_id, source_type_from_proto,
-    staleness_to_proto, topic_to_proto,
+    channel_to_proto, definition_to_proto, derives_from_edge_to_proto, describe_table_to_proto,
+    index_segment_to_proto, match_verdict_to_proto, model_to_proto, parse_table_id,
+    source_type_from_proto, staleness_to_proto, topic_to_proto,
 };
 use tonic::{Request, Response, Status};
 
@@ -413,6 +413,22 @@ impl CatalogService for CatalogServer {
         Ok(Response::new(pb::VerifyMaterializationResponse {
             verdict: Some(match_verdict_to_proto(verdict)),
         }))
+    }
+
+    #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]
+    async fn describe_table(
+        &self,
+        request: Request<pb::DescribeTableRequest>,
+    ) -> Result<Response<pb::DescribeTableResponse>, Status> {
+        let tenant = session_tenant_traced(&request);
+        let session = self.local()?;
+        let table = request.into_inner().table;
+
+        let manifest = scoped(self.engine()?, tenant, || session.describe_table(&table))
+            .await
+            .map_err(map_engine_error)?;
+
+        describe_table_to_proto(&manifest).map(Response::new)
     }
 
     #[tracing::instrument(skip(self, request), fields(tenant_id = tracing::field::Empty))]

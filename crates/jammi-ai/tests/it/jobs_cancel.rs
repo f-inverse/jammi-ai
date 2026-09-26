@@ -254,14 +254,15 @@ async fn run_now_reports_superseded_when_its_row_went_terminal_before_the_finish
     let (session, _dir) = session_with_source(&source).await;
     let park = arm(&source, ParkPoint::BeforeFinish);
 
-    let spec = ComputeSpec::Embedding {
+    let spec = ComputeSpec::Embedding(jammi_ai::local_session::EmbeddingRequest {
         source_id: source.clone(),
         model_id: tiny_bert_model(),
         columns: vec!["abstract".to_string()],
         key_column: "id".to_string(),
         modality: jammi_wire::request::Modality::Text,
         cache: CachePolicy::Bypass,
-    };
+        dimensions: None,
+    });
     let runner = Arc::clone(&session);
     let run = tokio::spawn(async move { runner.run_now(spec).await });
 
@@ -480,7 +481,7 @@ async fn a_claimed_training_jobs_cancel_request_is_honoured_at_the_next_epoch_bo
                         epochs: 20_000,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
@@ -655,7 +656,7 @@ async fn a_dropped_run_claimed_jobs_future_leaves_no_leaked_cancel_watcher_or_ca
                         epochs: 1,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
@@ -843,7 +844,7 @@ async fn a_lease_loss_on_the_owning_worker_lands_the_lease_lost_outcome_never_th
                         epochs: 20_000,
                         batch_size: 8,
                         lora_rank: 4,
-                        warmup_steps: 0,
+                        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                         ..Default::default()
                     },
                     world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,

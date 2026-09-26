@@ -21,6 +21,12 @@ impl PostgresMutableBackend {
 }
 
 impl MutableBackend for PostgresMutableBackend {
+    /// The protocol's limit: a `Bind` message counts its parameters in an
+    /// `Int16`.
+    fn max_bind_params(&self) -> usize {
+        65_535
+    }
+
     fn create_table_ddl(&self, def: &MutableTableDefinition) -> String {
         let mut cols: Vec<String> = def
             .schema
@@ -98,34 +104,6 @@ impl MutableBackend for PostgresMutableBackend {
             quote_ident(def.id.as_str()),
             cols_clause,
             row_clauses.join(", ")
-        )
-    }
-
-    fn update_dml(
-        &self,
-        def: &MutableTableDefinition,
-        set_columns: &[&str],
-        where_predicate: &str,
-    ) -> String {
-        let set_clause: String = set_columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!("{} = ${}", quote_ident(c), i + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "UPDATE {} SET {} WHERE {}",
-            quote_ident(def.id.as_str()),
-            set_clause,
-            where_predicate
-        )
-    }
-
-    fn delete_dml(&self, def: &MutableTableDefinition, where_predicate: &str) -> String {
-        format!(
-            "DELETE FROM {} WHERE {}",
-            quote_ident(def.id.as_str()),
-            where_predicate
         )
     }
 

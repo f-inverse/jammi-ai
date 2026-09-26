@@ -2566,12 +2566,19 @@ fn ordinal_stream(batches: Vec<RecordBatch>) -> datafusion::execution::SendableR
 
 fn graph_descriptor_fixture() -> ProducingDescriptor {
     ProducingDescriptor::graph_training_set(
-        "kb_nodes",
-        "kb_edges",
-        "id",
-        "text",
-        "src",
-        "dst",
+        jammi_db::store::GraphTrainingSources {
+            node_source: "kb_nodes".into(),
+            id_column: "id".into(),
+            text_column: "text".into(),
+            edges: jammi_db::store::EdgeSourceBinding::Registered {
+                source_id: "kb_edges".into(),
+                src_column: "src".into(),
+                dst_column: "dst".into(),
+                type_column: None,
+                weight_column: None,
+                as_of_column: None,
+            },
+        },
         ModelTask::TextEmbedding,
         "pairs",
         jammi_db::store::manifest::GraphSampleFields {

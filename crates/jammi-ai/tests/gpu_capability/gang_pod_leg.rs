@@ -503,7 +503,7 @@ fn gang_pod_config() -> jammi_ai::fine_tune::FineTuneConfig {
         epochs: POD_LEG_EPOCHS,
         batch_size: POD_LEG_PER_RANK_BATCH,
         validation_fraction: 0.0,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         gradient_accumulation_steps: 1,
         lora_rank: 2,
         lora_dropout: 0.0,

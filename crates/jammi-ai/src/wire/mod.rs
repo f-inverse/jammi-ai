@@ -15,7 +15,6 @@
 // response structs (`BuildNeighborGraph` / `PropagateRequest` / `ContextRequest`
 // / `ContextRepresentation`), which live behind the `local` feature — reachable
 // only in an engine build (the server and the embedded SDK).
-mod cache;
 mod catalog;
 mod embedding;
 mod embedding_refresh;
@@ -24,7 +23,6 @@ mod inference;
 mod pipeline;
 mod training;
 
-pub use cache::cache_policy_from_proto;
 pub use catalog::{
     add_channel_columns_from_bytes, add_channel_columns_from_proto,
     create_mutable_table_from_bytes, create_mutable_table_from_proto, register_channel_from_bytes,
@@ -34,8 +32,8 @@ pub use catalog::{
 pub use embedding::{
     encode_query_from_bytes, encode_query_from_proto, generate_embeddings_from_bytes,
     generate_embeddings_from_proto, import_embeddings_from_bytes, import_embeddings_from_proto,
-    search_from_bytes, search_from_proto, EncodeQueryArgs, GenerateEmbeddingsArgs,
-    ImportEmbeddingsArgs,
+    lexical_search_from_bytes, lexical_search_from_proto, search_from_bytes, search_from_proto,
+    EncodeQueryArgs, ImportEmbeddingsArgs,
 };
 pub use embedding_refresh::{
     compact_embeddings_from_bytes, compact_embeddings_from_proto, expire_versions_from_bytes,
@@ -57,10 +55,11 @@ pub use inference::{
 pub use pipeline::{
     asof_join_from_bytes, asof_join_from_proto, assemble_context_from_proto,
     assemble_context_request_from_bytes, assemble_context_request_from_proto,
-    assemble_context_to_proto, build_neighbor_graph_from_bytes, build_neighbor_graph_from_proto,
-    cascade_from_proto, context_source_tag, propagate_request_from_bytes,
-    propagate_request_from_proto, recompute_from_bytes, recompute_from_proto,
-    recompute_report_to_bytes, recompute_report_to_proto, structure_request_from_bytes,
-    structure_request_from_proto, AsofJoinArgs, BuildNeighborGraphArgs, RecomputeArgs,
+    assemble_context_to_proto, build_lexical_index_from_bytes, build_lexical_index_from_proto,
+    build_neighbor_graph_from_bytes, build_neighbor_graph_from_proto, cascade_from_proto,
+    context_source_tag, propagate_request_from_bytes, propagate_request_from_proto,
+    recompute_from_bytes, recompute_from_proto, recompute_report_to_bytes,
+    recompute_report_to_proto, structure_request_from_bytes, structure_request_from_proto,
+    AsofJoinArgs, BuildNeighborGraphArgs, RecomputeArgs,
 };
 pub use training::{training_spec_from_bytes, training_spec_from_proto, training_spec_to_proto};

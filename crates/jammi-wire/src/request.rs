@@ -9,6 +9,7 @@
 use std::num::NonZeroU32;
 
 use jammi_datafusion::ModelTask;
+use jammi_db::index::SearchMethod;
 use jammi_db::store::CachePolicy;
 
 use crate::fine_tune::{FineTuneConfig, FineTuneMethod};
@@ -30,6 +31,53 @@ pub enum Modality {
     Image,
     /// Dense vectors of input audio clips.
     Audio,
+}
+
+impl Modality {
+    /// The embedding task this tower runs.
+    pub fn task(self) -> ModelTask {
+        match self {
+            Self::Text => ModelTask::TextEmbedding,
+            Self::Image => ModelTask::ImageEmbedding,
+            Self::Audio => ModelTask::AudioEmbedding,
+        }
+    }
+
+    /// The tower that runs `task`, when it is an embedding task.
+    pub fn of_task(task: ModelTask) -> Option<Self> {
+        [Self::Text, Self::Image, Self::Audio]
+            .into_iter()
+            .find(|modality| modality.task() == task)
+    }
+}
+
+/// A flattened generate-embeddings request: the source rows and columns to
+/// embed, the model and tower that embed them, the width served, and the
+/// cache policy.
+///
+/// `Serialize`/`Deserialize`: persisted on `jobs.spec` as the payload of
+/// `jammi_ai::jobs::ComputeSpec::Embedding`, so a call submitted through
+/// `InferenceSession::run_now` replays byte-for-byte on a fresh process.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingRequest {
+    /// Source whose rows are embedded.
+    pub source_id: String,
+    /// The encoder: `local:<path>`, a Hub repo id, or a fine-tuned id.
+    pub model_id: String,
+    /// Content columns embedded. The text tower joins them; the image and
+    /// audio towers take exactly one.
+    pub columns: Vec<String>,
+    /// Column whose value keys each embedding row.
+    pub key_column: String,
+    /// Which tower runs over the columns.
+    pub modality: Modality,
+    /// Serve the model's leading `dimensions` coordinates, each vector
+    /// L2-renormalised — a Matryoshka prefix. `None` serves the model's own
+    /// width; a width larger than the model's is refused.
+    pub dimensions: Option<usize>,
+    /// Opt-in memoization.
+    pub cache: CachePolicy,
 }
 
 /// A single query to encode into a vector. Text is encoded by the text tower;
@@ -65,17 +113,33 @@ pub struct SearchRequest {
     /// Which embedding table of the source to search. `None` selects the
     /// source's most-recent ready table; `Some(name)` searches that table.
     pub embedding_table: Option<String>,
-    /// Optional SQL predicate applied to the hydrated results.
+    /// Optional SQL predicate over the hydrated columns: the search returns
+    /// the `k` nearest rows that satisfy it.
     pub filter: Option<String>,
     /// Columns to project. Empty keeps every hydrated column.
     pub select: Vec<String>,
-    /// Per-request override of the table's own stamped retrieve→rescore
-    /// oversample default (market parity with Qdrant's per-query
-    /// oversampling knob). `None` defers to the table's stamped default,
-    /// falling back to the deployment's current oversample default only for
-    /// a pre-migration table with no stamped column. Irrelevant for a `F32`
-    /// table (single-stage, no rescore).
-    pub oversample: Option<usize>,
+    /// Approximate (through the ANN index, with an optional per-request
+    /// oversample) or exact.
+    pub method: SearchMethod,
+}
+
+/// A flattened lexical-search request: [`SearchRequest`]'s peer for a text
+/// query ranked by BM25 over a source's lexical table.
+pub struct LexicalSearchRequest {
+    /// Source whose lexical table is searched.
+    pub source_id: String,
+    /// The query text, analysed into terms by the lexical table's analyzer.
+    pub text: String,
+    /// Number of rows to retrieve.
+    pub k: usize,
+    /// Which lexical table of the source to search. `None` selects the
+    /// source's most-recent ready one.
+    pub lexical_table: Option<String>,
+    /// Optional SQL predicate over the hydrated columns: the search returns
+    /// the `k` best-ranked rows that satisfy it.
+    pub filter: Option<String>,
+    /// Columns to project. Empty keeps every hydrated column.
+    pub select: Vec<String>,
 }
 
 /// A flattened column-source fine-tune submission. Every knob the submit

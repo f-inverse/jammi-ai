@@ -88,7 +88,7 @@ fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
         epochs: 1,
         batch_size: 4,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
         target_modules: vec!["Wqkv".to_string(), "Wo".to_string()],
         backbone_dtype,
@@ -607,7 +607,7 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
             Some(FineTuneConfig {
                 epochs: 1,
                 batch_size: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 // target_modules left empty (the default): the projection-head
                 // arm, which never builds an encoder to probe.
@@ -704,7 +704,7 @@ async fn bert_family_job_reports_flash_decline_honestly() {
                 epochs: 1,
                 batch_size: 4,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 // Non-empty target_modules: the encoder-adapters arm, which
                 // DOES build an encoder and run the acceleration probe (unlike the
@@ -1172,6 +1172,7 @@ async fn context_predictor_job_reports_not_applicable_acceleration() {
         test_task_fraction: 0.5,
         min_task_count: 2,
         seed: 1,
+        embedding_table: None,
     };
 
     let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
@@ -1867,7 +1868,7 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
                 epochs: 1,
                 batch_size: 4,
                 lora_rank: 4,
-                warmup_steps: 0,
+                warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 validation_fraction: 0.0,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,

@@ -170,7 +170,8 @@ use crate::fine_tune::decode::{
     build_training_data_loader, detect_training_format, extract_string_column,
 };
 use crate::fine_tune::graph_sampler::{
-    GraphEdge, GraphFineTuneSources, GraphSampleConfig, GraphSampler, SampledPair, TextNode,
+    GraphEdge, GraphEdges, GraphFineTuneSources, GraphSampleConfig, GraphSampler, SampledPair,
+    TextNode,
 };
 use crate::fine_tune::partition::{PartitionRule, PartitionSpec};
 use crate::fine_tune::role::{LeaseHolder, RunnerRole};
@@ -181,6 +182,7 @@ use crate::fine_tune::FineTuneConfig;
 use crate::jobs::UnsuccessfulEnd;
 use crate::model::backend::DeviceConfig;
 use crate::model::hub::HubSource;
+use crate::pipeline::graph_neighbourhood::EdgeSourceRef;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingJob, TrainingOutcome};
@@ -232,7 +234,7 @@ pub(crate) fn mint_instance_id() -> String {
 /// Every job kind this binary can execute — the vocabulary
 /// `resolve_kinds` validates `[worker] kinds` against at startup.
 /// The three training kinds dispatch through `JobWorker::run_spec`; the
-/// six compute kinds (every embedded synchronous compute verb is one of
+/// seven compute kinds (every embedded synchronous compute verb is one of
 /// [`crate::jobs::ComputeSpec`]'s variants) dispatch through
 /// [`crate::jobs::execute_compute`].
 pub const COMPILED_KINDS: &[&str] = &[
@@ -243,6 +245,7 @@ pub const COMPILED_KINDS: &[&str] = &[
     "propagate",
     "graph_structure",
     "asof_join",
+    "lexical_index",
     "embedding",
     "infer",
 ];
@@ -253,7 +256,13 @@ pub const COMPILED_KINDS: &[&str] = &[
 pub(crate) fn is_compute_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "neighbor_graph" | "propagate" | "graph_structure" | "asof_join" | "embedding" | "infer"
+        "neighbor_graph"
+            | "propagate"
+            | "graph_structure"
+            | "asof_join"
+            | "lexical_index"
+            | "embedding"
+            | "infer"
     )
 }
 
@@ -1572,33 +1581,33 @@ pub(crate) async fn materialize_graph_training_set(
         }
     }
 
-    let edge_table = session.find_table_name(&sources.edge_source).await?;
-    let src_col = quote_ident(&sources.src_column);
-    let dst_col = quote_ident(&sources.dst_column);
+    let (src_name, dst_name) = sources.edges.columns();
+    let edge_relation = match &sources.edges {
+        GraphEdges::Table(table) => jammi_db::store::result_table_relation(table).to_string(),
+        GraphEdges::Source { source, .. } => {
+            source_relation(source, &session.find_table_name(source).await?)
+        }
+    };
+    let src_col = quote_ident(src_name);
+    let dst_col = quote_ident(dst_name);
     let edge_query = format!(
-        "SELECT {src_col}, {dst_col} FROM {} ORDER BY {src_col} ASC NULLS FIRST, {dst_col} ASC NULLS FIRST",
-        source_relation(&sources.edge_source, &edge_table)
+        "SELECT {src_col}, {dst_col} FROM {edge_relation} \
+         ORDER BY {src_col} ASC NULLS FIRST, {dst_col} ASC NULLS FIRST"
     );
     let edge_batches = session.sql(&edge_query).await?;
     let mut edges = Vec::new();
     for batch in &edge_batches {
         let srcs = batch
-            .column_by_name(&sources.src_column)
+            .column_by_name(src_name)
             .and_then(|c| extract_string_column(c.as_ref()))
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "edge src column '{}' is not text",
-                    sources.src_column
-                ))
+                JammiError::FineTune(format!("edge src column '{src_name}' is not text"))
             })?;
         let dsts = batch
-            .column_by_name(&sources.dst_column)
+            .column_by_name(dst_name)
             .and_then(|c| extract_string_column(c.as_ref()))
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "edge dst column '{}' is not text",
-                    sources.dst_column
-                ))
+                JammiError::FineTune(format!("edge dst column '{dst_name}' is not text"))
             })?;
         for (src, dst) in srcs.into_iter().zip(dsts) {
             edges.push(GraphEdge {
@@ -1745,12 +1754,12 @@ pub(crate) async fn materialize_graph_training_set(
         exclude_hops: exclude_hops as u64,
     };
     let descriptor = ProducingDescriptor::graph_training_set(
-        sources.node_source.clone(),
-        sources.edge_source.clone(),
-        sources.id_column.clone(),
-        sources.text_column.clone(),
-        sources.src_column.clone(),
-        sources.dst_column.clone(),
+        jammi_db::store::GraphTrainingSources {
+            node_source: sources.node_source.clone(),
+            id_column: sources.id_column.clone(),
+            text_column: sources.text_column.clone(),
+            edges: sources.edges.binding(),
+        },
         ModelTask::TextEmbedding,
         format_tag,
         sample_fields,
@@ -1769,7 +1778,8 @@ pub(crate) async fn materialize_graph_training_set(
     // have to escape.
     let source_display = format!(
         "graph__node-{}__edge-{}",
-        sources.node_source, sources.edge_source
+        sources.node_source,
+        sources.edges.relation_name()
     );
     let order_columns = vec!["_ordinal".to_string()];
     let spec = TrainingSetSpec {
@@ -3518,9 +3528,20 @@ impl JobWorker {
                         },
                     ) => {
                         let now = chrono::Utc::now().to_rfc3339();
+                        let edge_anchor = match &sources.edges {
+                            GraphEdges::Table(table) => session
+                                .edge_source_anchor(&EdgeSourceRef::NeighborGraph {
+                                    table_name: table.clone(),
+                                })
+                                .await
+                                .map_err(WorkerJobError::from)?,
+                            GraphEdges::Source { source, .. } => {
+                                InputAnchor::unpinned_at_instant(source, now.clone())
+                            }
+                        };
                         let inputs = vec![
-                            InputAnchor::unpinned_at_instant(&sources.node_source, now.clone()),
-                            InputAnchor::unpinned_at_instant(&sources.edge_source, now),
+                            InputAnchor::unpinned_at_instant(&sources.node_source, now),
+                            edge_anchor,
                         ];
                         materialize_graph_training_set(
                             session,
@@ -3913,12 +3934,18 @@ impl JobWorker {
                 )
             }
             RankTopology::Local { world } => {
-                // Rank `r` on `[gpu] devices[r]` (local ranks are threads
-                // pinned to devices); `[worker] local_ranks <=
-                // devices.len()` is enforced at config load and `world <=
-                // local_ranks` by `TopologyDecision::decide`, so every rank
-                // has its own device — restated here rather than assumed.
-                let devices = session.device_config().devices.clone();
+                // Rank `r` on the topology's rank `r` device (local ranks are
+                // threads pinned to devices: each its own accelerator, or all
+                // of them the CPU); `world <= local_ranks` by
+                // `TopologyDecision::decide`, so every rank has a device —
+                // restated here rather than assumed.
+                let config = session.inner_config();
+                let devices = config
+                    .worker
+                    .topology(&config.gpu)
+                    .map_err(WorkerJobError::from)?
+                    .rank_devices()
+                    .to_vec();
                 if (world as usize) > devices.len() {
                     return Err(WorkerJobError::Failed(JammiError::FineTune(format!(
                         "a Local gang of {world} ranks needs {world} configured [gpu] devices; \
@@ -10297,11 +10324,13 @@ mod tests {
                 let graph = TrainingSpec::GraphFineTune {
                     sources: crate::fine_tune::graph_sampler::GraphFineTuneSources {
                         node_source: "n".into(),
-                        edge_source: "e".into(),
                         id_column: "id".into(),
                         text_column: "text".into(),
-                        src_column: "src".into(),
-                        dst_column: "dst".into(),
+                        edges: crate::fine_tune::graph_sampler::GraphEdges::Source {
+                            source: "e".into(),
+                            src_column: "src".into(),
+                            dst_column: "dst".into(),
+                        },
                         provenance: crate::fine_tune::graph_sampler::EdgeProvenance::Declared,
                     },
                     sample_config: crate::fine_tune::graph_sampler::GraphSampleConfig::default(),
@@ -10430,7 +10459,7 @@ mod tests {
     fn worker_devices_is_decided_from_configuration_alone() {
         let mut config = jammi_db::config::JammiConfig {
             gpu: jammi_db::config::GpuConfig {
-                device: -1,
+                device: Some(-1),
                 ..Default::default()
             },
             ..Default::default()
@@ -10445,7 +10474,7 @@ mod tests {
             "{devices:?}"
         );
 
-        config.gpu.device = 0;
+        config.gpu.device = Some(0);
         config.gpu.devices = Some(vec![0, 1]);
         config.worker.local_ranks = 2;
         let devices = worker_devices(&config, ComputeDevice::Cpu);
@@ -11671,7 +11700,7 @@ mod tests {
             epochs: 2,
             batch_size: 2,
             validation_fraction: 0.0,
-            warmup_steps: 0,
+            warmup: crate::fine_tune::Warmup::Steps(0),
             learning_rate: 1e-3,
             lr_schedule: crate::fine_tune::LrSchedule::Constant,
             early_stopping_metric: crate::fine_tune::EarlyStoppingMetric::TrainLoss,

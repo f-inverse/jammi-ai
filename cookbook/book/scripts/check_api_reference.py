@@ -38,14 +38,16 @@ REQUIRED: dict[str, list[str]] = {
     "set_tenant": [],
     "tenant_scope": [],
     "tenant": [],
-    "generate_embeddings": ["source", "model", "columns", "key", "cache"],
-    "encode_query": ["model", "query"],
+    "generate_embeddings": ["source", "model", "columns", "key", "dimensions", "cache"],
+    "encode_query": ["model", "query", "dimensions"],
     "sql": [],
     "rrf_fuse": [],
     # tier 01
-    "build_neighbor_graph": ["k", "exact", "cache"],
+    "build_neighbor_graph": ["k", "exact", "embedding_table", "cache"],
     # tier 02
-    "search": ["query", "k"],
+    "search": ["query", "row_key", "k", "embedding_table", "oversample", "exact"],
+    "build_lexical_index": ["columns", "key", "analyzer"],
+    "lexical_search": ["text", "k", "filter", "select", "lexical_table"],
     "assemble_context": ["query", "k", "edge_source", "edge_direction", "edge_hops"],
     "propagate_embeddings": [
         "embedding_table",
@@ -64,16 +66,17 @@ REQUIRED: dict[str, list[str]] = {
         "source", "base_model", "columns", "method", "task", "embedding_loss",
         "mnrl_temperature", "mine_hard_negatives", "hard_negative_k",
         "hard_negative_exclude_hops", "hard_negative_refresh_every", "matryoshka_dims",
-        "backbone_dtype", "target_modules",
+        "backbone_dtype", "target_modules", "warmup_steps", "warmup_fraction",
     ],
     "fine_tune_graph": [
         "node_source",
         "id_column",
         "text_column",
-        "edge_source",
-        "src_column",
-        "dst_column",
         "base_model",
+        "edge_graph_table",
+        "edge_source",
+        "edge_src_column",
+        "edge_dst_column",
         "edge_provenance",
     ],
     # attach-by-id + the tenant-scoped listing (every job kind): a job handle outlives the
@@ -105,6 +108,7 @@ REQUIRED: dict[str, list[str]] = {
         "tie_break_column",
         "project",
     ],
+    "describe_table": ["table"],
     "verify_materialization": ["expected_definition"],
     "staleness": ["current_definition"],
     "derives_from": [],
@@ -151,7 +155,7 @@ REQUIRED: dict[str, list[str]] = {
     "drop_topic": ["if_exists"],
     "list_topics": [],
     "publish_topic": ["batch"],
-    "subscribe_collect": ["predicate", "from_offset", "max_batches"],
+    "subscribe_collect": ["predicate", "from_offset", "replay_only", "max_batches"],
 }
 
 MODULE_FUNCTIONS = ["connect"]

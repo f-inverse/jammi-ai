@@ -82,7 +82,7 @@ fn shared_config(
         artifact_dir: artifact_dir.to_path_buf(),
         // CPU-only: the lane validates orchestration/durability, not kernels.
         gpu: jammi_db::config::GpuConfig {
-            device: -1,
+            device: Some(-1),
             ..Default::default()
         },
         catalog: CatalogConfig::Postgres {
@@ -856,7 +856,7 @@ fn lane_fine_tune_config(size: JobSize) -> FineTuneConfig {
         epochs: size.epochs(),
         batch_size: 8,
         lora_rank: 4,
-        warmup_steps: 0,
+        warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         ..Default::default()
     }
 }

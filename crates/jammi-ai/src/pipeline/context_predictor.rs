@@ -268,6 +268,13 @@ pub struct ContextPredictorTrainConfig {
     /// predictor's initial weights: a run is a function of the spec and the
     /// rows it reads.
     pub seed: u64,
+    /// The embedding table whose vectors the episodes' contexts are read from
+    /// — the vector space the predictor learns in. `None` is the source's
+    /// current default embedding table, resolved once when training starts.
+    /// Either way the resolved table is recorded with the trained predictor,
+    /// and serving on the training source reads that table, never whichever
+    /// table is newest.
+    pub embedding_table: Option<String>,
 }
 
 impl ContextPredictorTrainConfig {
@@ -488,10 +495,7 @@ impl InferenceSession {
     ) -> Result<SampledEpisodes> {
         spec.validate()?;
 
-        let table = self
-            .catalog()
-            .resolve_embedding_table(source_id, None)
-            .await?;
+        let table = self.context_table(source_id, spec).await?;
         // ONE resolution of the source table's current version: the
         // per-target target vector and member vectors below both read
         // through this pin, never a second, independent resolve of
@@ -672,22 +676,35 @@ impl InferenceSession {
         }
     }
 
+    /// The embedding table a context-predictor training run reads: the spec's
+    /// named table, else the source's current default.
+    async fn context_table(
+        &self,
+        source_id: &str,
+        spec: &ContextPredictorTrainConfig,
+    ) -> Result<ResultTableRecord> {
+        self.catalog()
+            .resolve_embedding_table(source_id, spec.embedding_table.as_deref())
+            .await
+    }
+
     /// The base-model PK a context-predictor job's `model_ref` binds to: the
     /// predictor registers under its own model id, so the FK points at the
     /// SOURCE's embedding model, keeping the row valid. The embedding table
     /// records that model's bare name; a catalog row is registered for it
     /// when absent (an embedding table can be materialised without one) and
     /// its PK (`name::version`) is returned.
-    pub(crate) async fn context_predictor_base_model_pk(&self, source_id: &str) -> Result<String> {
-        let table = self
-            .catalog()
-            .resolve_embedding_table(source_id, None)
-            .await?;
+    pub(crate) async fn context_predictor_base_model_pk(
+        &self,
+        source_id: &str,
+        spec: &ContextPredictorTrainConfig,
+    ) -> Result<String> {
+        let table = self.context_table(source_id, spec).await?;
         let base_model_pk = match self.catalog().get_model(&table.model_id).await? {
             Some(m) => m.catalog_pk,
             None => {
                 self.catalog()
-                    .register_model(RegisterModelParams {
+                    .register_shared_model(RegisterModelParams {
                         model_id: &table.model_id,
                         version: 1,
                         model_type: "embedding",
@@ -746,10 +763,7 @@ impl InferenceSession {
             ));
         }
 
-        let table = self
-            .catalog()
-            .resolve_embedding_table(source_id, None)
-            .await?;
+        let table = self.context_table(source_id, spec).await?;
         let feature_dim = table
             .dimensions()
             .ok_or_else(|| {
@@ -1047,6 +1061,9 @@ impl InferenceSession {
             "head_width": spec.head.head_width(),
             "head": spec.head.to_config_json(),
             "value_column": spec.value_column,
+            // The table the predictor's vector space is — what serving on the
+            // training source reads its context from.
+            "embedding_table": table.table_name,
             // The train-derived target standardiser: persisted so the served
             // predict z-scores its live context with the same transform and
             // de-standardises the head output back to raw outcome units.
@@ -1197,6 +1214,10 @@ pub struct ContextServeOptions {
     /// Optional serving-split predicate scoping the live context (e.g. a
     /// `split <> 'test'` corpus); `None` retrieves over the whole table.
     pub split: Option<String>,
+    /// The serving source's embedding table the context is read from. `None`
+    /// on the training source is the table the predictor trained on; `None` on
+    /// another source is that source's current default embedding table.
+    pub embedding_table: Option<String>,
 }
 
 /// A trained context predictor reloaded for inference: the rebuilt
@@ -1248,6 +1269,27 @@ impl ServedContextPredictor {
 }
 
 impl InferenceSession {
+    /// The embedding table a served predictor reads its context from: the
+    /// named one; else, on the source the predictor trained on, the table it
+    /// trained on; else the serving source's current default.
+    async fn serving_table(
+        &self,
+        source_id: &str,
+        trained_on: &str,
+        named: Option<&str>,
+    ) -> Result<ResultTableRecord> {
+        if named.is_none() {
+            if let Some(trained) = self.catalog().get_result_table(trained_on).await? {
+                if trained.source_id == source_id {
+                    return Ok(trained);
+                }
+            }
+        }
+        self.catalog()
+            .resolve_embedding_table(source_id, named)
+            .await
+    }
+
     /// Reload a trained context predictor for inference: read its catalog config,
     /// rebuild the [`AnyContextPredictor`] the config selects into a fresh
     /// [`VarMap`], and load the persisted safetensors weights into it. The
@@ -1377,9 +1419,15 @@ impl InferenceSession {
                 message: "config missing a 'target_scaler'".into(),
             })?;
 
+        let trained_on = config
+            .get("embedding_table")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| JammiError::Model {
+                model_id: model_id.to_string(),
+                message: "config missing 'embedding_table'".into(),
+            })?;
         let table = self
-            .catalog()
-            .resolve_embedding_table(source_id, None)
+            .serving_table(source_id, trained_on, options.embedding_table.as_deref())
             .await?;
         let serve_dim = table
             .dimensions()
@@ -2316,6 +2364,7 @@ mod tests {
             test_task_fraction: 0.25,
             min_task_count: 2,
             seed: 7,
+            embedding_table: None,
         }
     }
 
@@ -2746,6 +2795,7 @@ mod tests {
         let snapshot = |seed: u64| -> Vec<(String, Vec<f32>)> {
             let spec = ContextPredictorTrainConfig {
                 seed,
+                embedding_table: None,
                 ..high_offset_spec()
             };
             let (varmap, _) = build_context_predictor(&spec, FEATURE_DIM, &device).unwrap();

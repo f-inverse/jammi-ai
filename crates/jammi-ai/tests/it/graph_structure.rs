@@ -21,6 +21,7 @@ use tempfile::TempDir;
 use jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef;
 use jammi_ai::pipeline::graph_structure::{StructureRequest, DEFAULT_STRUCTURE_HOP_CAP};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
@@ -433,7 +434,13 @@ async fn search_by_row_key_ranks_the_node_s_community_and_hydrates_its_source() 
     assert_eq!(table.model_id, "graph_structure");
 
     let batches = session
-        .search_by_id("nodes", "acct-0007", 5, Some(&table.table_name), None)
+        .search_by_id(
+            "nodes",
+            "acct-0007",
+            5,
+            Some(&table.table_name),
+            SearchMethod::default(),
+        )
         .await
         .unwrap()
         .run()
@@ -465,7 +472,13 @@ async fn search_by_row_key_ranks_the_node_s_community_and_hydrates_its_source() 
     // A vector of another width is refused by the index: there is no encoder
     // for this space, and a foreign vector is not a query in it.
     let refused = session
-        .search("nodes", vec![0.1; 7], 5, Some(&table.table_name), None)
+        .search(
+            "nodes",
+            vec![0.1; 7],
+            5,
+            Some(&table.table_name),
+            SearchMethod::default(),
+        )
         .await;
     let refused = match refused {
         Ok(builder) => builder.run().await.err(),

@@ -252,7 +252,8 @@ impl InferenceRunner {
             .bind(&spec.source, spec.task)
             .instrument(started.clone())
             .await?;
-        let adapter = started.in_scope(|| create_adapter(spec.task, model.as_ref()))?;
+        let adapter =
+            started.in_scope(|| create_adapter(spec.task, model.as_ref(), spec.embedding_dim))?;
         drop(started);
         let model_label = spec.source.to_string();
         let ctx = OutputContext {

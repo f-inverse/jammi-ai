@@ -462,8 +462,10 @@ async fn a_placed_task_reports_completion_to_the_advertised_scheduler_and_frees_
     drop(fleet);
 }
 
-/// Standard fleet + a submitted `world_size = 2` gang fine-tune, polled to
-/// `running`. Returns `(fleet, job_id, expected_model, claimant_instance_id)`.
+/// Standard fleet + a submitted `world_size = 2` gang fine-tune, polled until a
+/// placed executor holds it — still `running`, or already `completed` for a
+/// job quicker than the poll. Returns
+/// `(fleet, job_id, expected_model, claimant_instance_id)`.
 async fn submit_and_await_placed_claim(
     backends: &DistributedBackends,
     result_root: &str,
@@ -481,21 +483,24 @@ async fn submit_and_await_placed_claim(
     // id until the executor's `run_placed_attempt` transfers it. A wait that
     // returned on any claimant would catch that pre-transfer state on a
     // slower runner (claimant == lane-1), so the predicate is the transfer
-    // itself; a placement that never transfers
-    // ends here as a timeout with the fleet's diagnostics.
+    // itself; a placement that never transfers ends here as a timeout with
+    // the fleet's diagnostics. A quick job can finish before any poll sees
+    // it `running`, and a completed row keeps its placed claimant, so the
+    // transfer is read off either status.
     let submitter_id = instance_id_of_label(session, fleet.label(0)).await;
     let record = harness::await_job(
         &mut fleet,
         session,
         &job_id,
-        "the job is claimed, running, and transferred to a placed executor",
+        "the job is transferred to a placed executor",
         |r| {
-            r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
-                && r.claimed_by.as_deref().is_some_and(|c| c != submitter_id)
+            let held = r.status == jammi_db::catalog::status::JobStatus::Running.to_string()
+                || r.status == jammi_db::catalog::status::JobStatus::Completed.to_string();
+            held && r.claimed_by.as_deref().is_some_and(|c| c != submitter_id)
         },
     )
     .await;
-    let claimant = record.claimed_by.expect("running job has a claimant");
+    let claimant = record.claimed_by.expect("a placed job has a claimant");
     (fleet, job_id, expected_model, claimant)
 }
 
@@ -2052,14 +2057,15 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
 
     let job = session
         .enqueue(
-            jammi_ai::jobs::JobSpec::Embedding {
+            jammi_ai::jobs::JobSpec::Embedding(jammi_wire::request::EmbeddingRequest {
                 source_id: source_name.clone(),
                 model_id: model.clone(),
                 columns: vec!["text".to_string()],
                 key_column: "id".to_string(),
                 modality: jammi_wire::request::Modality::Text,
+                dimensions: None,
                 cache: jammi_db::store::CachePolicy::Bypass,
-            },
+            }),
             0,
         )
         .await
@@ -2396,14 +2402,15 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
 
     let job = session
         .enqueue(
-            jammi_ai::jobs::JobSpec::Embedding {
+            jammi_ai::jobs::JobSpec::Embedding(jammi_wire::request::EmbeddingRequest {
                 source_id: source_name.clone(),
                 model_id: model.clone(),
                 columns: vec!["text".to_string()],
                 key_column: "id".to_string(),
                 modality: jammi_wire::request::Modality::Text,
+                dimensions: None,
                 cache: jammi_db::store::CachePolicy::Bypass,
-            },
+            }),
             0,
         )
         .await

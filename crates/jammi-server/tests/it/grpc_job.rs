@@ -33,10 +33,11 @@ use jammi_server::grpc::proto::job::submit_job_request::Spec;
 use jammi_server::grpc::proto::job::{
     JobStatusRequest, JobStatusResponse, ListJobsRequest, SubmitJobRequest,
 };
+use jammi_server::grpc::proto::training::graph_fine_tune_sources::Edges;
 use jammi_server::grpc::proto::training::{
     ContextArchitecture, ContextPredictorSpec, ContextPredictorTrainConfig, EdgeProvenance,
-    FineTuneMethod, FineTuneSpec, GaussianObjective, GraphFineTuneSources, GraphFineTuneSpec,
-    GraphSampleConfig, PredictiveHead,
+    FineTuneMethod, FineTuneSpec, GaussianObjective, GraphEdgeSource, GraphFineTuneSources,
+    GraphFineTuneSpec, GraphSampleConfig, PredictiveHead,
 };
 use jammi_test_utils::{cookbook_fixture, fixture_url};
 use tonic::transport::Channel;
@@ -592,6 +593,7 @@ fn predictor_start_request() -> SubmitJobRequest {
                 test_task_fraction: 0.25,
                 min_task_count: 4,
                 seed: 7,
+                embedding_table: None,
             }),
         })),
         // The predictor carries its full budget in `predictor_spec`; no base
@@ -762,9 +764,11 @@ async fn graph_fine_tune_under_a_tenant_scope_completes_over_the_wire() {
                 node_source: "nodes".into(),
                 id_column: "id".into(),
                 text_column: "text".into(),
-                edge_source: "edges".into(),
-                src_column: "src".into(),
-                dst_column: "dst".into(),
+                edges: Some(Edges::EdgeSource(GraphEdgeSource {
+                    source_id: "edges".into(),
+                    src_column: "src".into(),
+                    dst_column: "dst".into(),
+                })),
                 provenance: EdgeProvenance::Declared as i32,
             }),
             sample_config: Some(GraphSampleConfig {

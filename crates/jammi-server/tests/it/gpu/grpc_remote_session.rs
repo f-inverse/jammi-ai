@@ -112,7 +112,7 @@ struct GpuEngineServer {
 async fn start_gpu_engine_server() -> GpuEngineServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = test_config(dir.path());
-    cfg.gpu.device = 0;
+    cfg.gpu.device = Some(0);
     cfg.gpu.require_gpu = true;
 
     // `open` (not `new`) registers the compound-query SQL functions on the
@@ -236,14 +236,15 @@ async fn remote_flight_read_matches_local_readback_bitwise_on_gpu() {
     // ONE compute: the GPU embeds the corpus exactly once, over the remote
     // transport, on the head_dim-64 checkpoint.
     let (table, _outcome) = remote
-        .generate_embeddings(
-            "patents",
-            &model_id,
-            &["abstract".to_string()],
-            "id",
-            Modality::Text,
-            jammi_db::store::CachePolicy::Bypass,
-        )
+        .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
+            source_id: "patents".to_string(),
+            model_id: model_id.to_string(),
+            columns: vec!["abstract".to_string()],
+            key_column: "id".to_string(),
+            modality: Modality::Text,
+            dimensions: None,
+            cache: jammi_db::store::CachePolicy::Bypass,
+        })
         .await
         .expect("remote generate_embeddings on GPU");
     assert!(
@@ -318,6 +319,7 @@ async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated()
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("remote encode_query on GPU");
@@ -326,6 +328,7 @@ async fn encode_query_two_compute_gpu_repeat_determinism_is_recorded_not_gated()
             &model_id,
             QueryInput::Text(query.to_string()),
             Modality::Text,
+            None,
         )
         .await
         .expect("local encode_query on GPU");

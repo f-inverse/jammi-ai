@@ -728,7 +728,7 @@ async fn session_over(
     let config = JammiConfig {
         artifact_dir: artifact_dir.to_path_buf(),
         gpu: GpuConfig {
-            device: shape.gpu_device,
+            device: Some(shape.gpu_device),
             require_gpu: shape.gpu_device >= 0,
             compute_precision: shape.compute_precision,
             ..Default::default()

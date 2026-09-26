@@ -155,5 +155,9 @@ tracing-subscriber.workspace = true
 # multi-line signature). Pinned to the versions `jammi-ai`'s own `syn` /
 # `proc-macro2` dev-deps already resolve in `Cargo.lock`, so this edge adds no
 # new package or version. Test-only: no production code parses Rust source.
+# The Postgres source's quoting is checked against the keyword-string parser its
+# driver connects through. Pinned to the version `datafusion-table-providers`
+# resolves in `Cargo.lock`, so this edge adds no new package or version.
+tokio-postgres = { version = "0.7.18", default-features = false }
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }

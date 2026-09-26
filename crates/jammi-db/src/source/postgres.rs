@@ -51,6 +51,11 @@ pub async fn create_postgres_tables(
 /// same URL. The driver takes no client certificate, so a URI naming one is
 /// refused rather than connected without it. `options` are the driver's own
 /// parameters and override what the URI says.
+///
+/// The driver writes [`INTERPOLATED`] values into a keyword string unquoted
+/// and hands the rest to typed setters, so those values arrive quoted
+/// ([`quoted`]) — a socket directory or database name with a space in it
+/// would otherwise split into a second keyword.
 fn pool_params(
     url: &str,
     options: &HashMap<String, String>,
@@ -64,8 +69,25 @@ fn pool_params(
         .into_iter()
         .chain(from_uri)
         .chain(options.clone())
-        .map(|(key, value)| (key, SecretString::from(value)))
+        .map(|(key, value)| {
+            let value = if INTERPOLATED.contains(&key.as_str()) {
+                quoted(&value)
+            } else {
+                value
+            };
+            (key, SecretString::from(value))
+        })
         .collect())
+}
+
+/// The driver parameters it writes into its keyword connection string as
+/// given; every other parameter reaches the driver's config through a setter.
+const INTERPOLATED: [&str; 4] = ["host", "port", "user", "db"];
+
+/// `value` as a single-quoted keyword-string value, backslash-escaping `\`
+/// and `'` (libpq's keyword/value grammar, which the driver's parser reads).
+fn quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\\', r"\\").replace('\'', r"\'"))
 }
 
 /// The driver's parameter for a libpq keyword.
@@ -112,11 +134,11 @@ mod tests {
         assert_eq!(
             params("postgresql://reader:s%40cret@db.internal:6543/sales"),
             expected(&[
-                ("host", "db.internal"),
-                ("port", "6543"),
-                ("user", "reader"),
+                ("host", "'db.internal'"),
+                ("port", "'6543'"),
+                ("user", "'reader'"),
                 ("pass", "s@cret"),
-                ("db", "sales"),
+                ("db", "'sales'"),
                 ("sslmode", "prefer"),
             ])
         );
@@ -128,9 +150,9 @@ mod tests {
         assert_eq!(
             params("postgresql://postgres:@/postgres?host=/tmp/pgdata"),
             expected(&[
-                ("host", "/tmp/pgdata"),
-                ("user", "postgres"),
-                ("db", "postgres"),
+                ("host", "'/tmp/pgdata'"),
+                ("user", "'postgres'"),
+                ("db", "'postgres'"),
                 ("sslmode", "prefer"),
             ])
         );
@@ -144,6 +166,24 @@ mod tests {
         assert_eq!(got["sslmode"], "verify-full");
         assert_eq!(got["sslrootcert"], "/etc/ssl/ca.pem");
         assert_eq!(got["application_name"], "etl");
+    }
+
+    #[test]
+    fn interpolated_values_reach_the_driver_whole() {
+        // The driver's own keyword string, built as it builds it: each
+        // interpolated value followed by a space.
+        let got = params(r"postgresql://o%27brien:@/my%20db?host=/run/pg%20data%5Cx");
+        let keywords: String = [("host", "host"), ("user", "user"), ("db", "dbname")]
+            .iter()
+            .map(|(param, keyword)| format!("{keyword}={} ", got[*param]))
+            .collect();
+        let config: tokio_postgres::Config = keywords.parse().unwrap();
+        assert_eq!(
+            config.get_hosts(),
+            [tokio_postgres::config::Host::Unix(r"/run/pg data\x".into())]
+        );
+        assert_eq!(config.get_user(), Some("o'brien"));
+        assert_eq!(config.get_dbname(), Some("my db"));
     }
 
     #[test]

@@ -10,14 +10,20 @@ workspace ships every publishable crate at the same
   OpenSSL vendored and zlib linked statically (no runtime libssl/libcrypto/libz). A Postgres source
   URI is read with libpq's meaning — query parameters override the authority, a `host` parameter
   naming a directory is a Unix socket, absent `sslmode` is `prefer` — and a parameter the source
-  cannot pass on is refused; before, every Postgres URI lost its host, user and database. Queries
+  cannot pass on (a client certificate among them) is refused; before, every Postgres URI lost its host, user and database. Queries
   over a database source federate only the sub-plans that call no engine-installed function, so an
   engine function (the embedding content hash among them) runs in the engine over the federated
   rows instead of being sent to the database. **BREAKING** (Python): `add_source(name, *, url,
   format=None, tenant_column=None)` is the one verb on both transports; a `postgres://` /
   `postgresql://` / `mysql://` URL is a database source, anything else a file that needs a format.
-- **Catalog and broker URLs accept libpq's socket form.** `postgresql://user:@/db?host=/dir`
-  (credentials beside an empty host) connects instead of failing with sqlx's `empty host`.
+- **Every Postgres URL is read by one libpq parser.** The catalog, the trigger broker and Postgres
+  sources share one reading of a connection URI (libpq's): the socket form
+  `postgresql://user:@/db?host=/dir` connects instead of failing with sqlx's `empty host`, a query
+  parameter overrides the component it names, an empty value is unset, a host list is refused, and
+  a socket directory or database name may contain a space. **BREAKING:** a catalog or broker URL
+  parameter that is not a libpq keyword the engine reads (`hostaddr`, sqlx's
+  `statement-cache-capacity`) is refused instead of warned about and ignored; a malformed
+  `[broker.postgres] url` is a `Config` error at session open.
 - **Filtered search ranks only the rows the filter admits.** A filtered `search` or lexical search
   evaluates its filter once into the admitted row ids; each index segment scores them exactly when
   few are admitted, otherwise walks HNSW admitting only them (USearch `filtered_search`), instead

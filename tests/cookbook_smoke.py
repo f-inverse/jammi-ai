@@ -57,6 +57,7 @@ RECIPES: tuple[Recipe, ...] = (
     example("trigger_streams"),
     example("eval_embeddings"),
     example("image_search"),
+    example("cross_modal_search"),
     stepwise("image_search", "JAMMI_IMAGE_WORKDIR"),
     example("audio_search"),
     stepwise("audio_search", "JAMMI_AUDIO_WORKDIR"),

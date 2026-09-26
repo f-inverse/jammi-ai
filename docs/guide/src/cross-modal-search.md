@@ -1,5 +1,7 @@
 # Search Text Against Images (Cross-Modal)
 
+> **Runnable companion:** [`cookbook/recipes/cross_modal_search/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/cross_modal_search) indexes an image corpus with a CLIP vision tower, searches it with a text query from the same model's text tower, and checks the ranking against the cosine ranking in the shared space.
+
 OpenCLIP-family models carry both a vision tower and a text tower in the same checkpoint, with both towers projecting into a shared latent space. That means a text query embedded with the text tower lives in the same vector space as image embeddings produced by the vision tower — vector search against an image corpus accepts a text query directly, no separate text encoder, no projection bridge.
 
 This recipe shows the full path: index images with the vision tower, embed a text query with the text tower, run `search()`.

@@ -28,6 +28,7 @@ nothing runs):
 | Build neighbour graphs, propagate, follow lineage | [`recipes/graph_and_lineage/`](./recipes/graph_and_lineage/) |
 | Predict from retrieved context | [`recipes/context_predictor/`](./recipes/context_predictor/) |
 | Search images | [`recipes/image_search/`](./recipes/image_search/) |
+| Search images with a text query (cross-modal) | [`recipes/cross_modal_search/`](./recipes/cross_modal_search/) |
 | Search audio | [`recipes/audio_search/`](./recipes/audio_search/) |
 | Submit, watch and cancel jobs | [`recipes/jobs/`](./recipes/jobs/) |
 | List, describe, preload and delete models | [`recipes/model_catalog/`](./recipes/model_catalog/) |

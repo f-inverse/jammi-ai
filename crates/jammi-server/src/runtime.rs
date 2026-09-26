@@ -303,7 +303,7 @@ impl ReadinessProbe {
 /// Readiness check backed by the engine's catalog backend. Delegates to
 /// [`jammi_db::catalog::Catalog::ping`], which issues a backend-native
 /// reachability probe (no transaction, no lock) and surfaces pool failures
-/// as [`jammi_db::catalog::backend::BackendError::Unavailable`].
+/// as [`jammi_db::BackendError::Unavailable`].
 pub struct CatalogPingProbe {
     session: Arc<InferenceSession>,
 }

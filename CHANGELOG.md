@@ -5,6 +5,12 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A placed search's rescore is verified against the pinned version's segments.** The second
+  phase's `ExactRescoreRequest` names the version the coordinator pinned (`optional int64
+  version = 5`), as `SegmentSearchRequest` does, and the owner verifies every segment named
+  against the set that version serves (`ResultStore::served_segments`) — no longer against every
+  segment the table has ever had. **BREAKING** (Rust API): `jammi_db::index::peer::ExactRescoreRequest`
+  gains `version`.
 - **Logs no longer drop the line that follows a dependency's disabled-level check.** A per-layer
   filter's `enabled()` verdict is parked per thread until the next event consumes it, and a caller
   that asks `enabled()` and emits nothing (sqlx does, on every statement, through the `log` bridge)

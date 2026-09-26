@@ -1,5 +1,7 @@
 # Enrich Results with Joins and Annotations
 
+> **Runnable companion:** [`cookbook/recipes/compound_query/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/compound_query) joins a corpus to an `assignees` table and embeds it with `annotate(...)` in one SQL query, then runs the same SQL against a server over Flight SQL.
+
 Search results can be enriched by joining with other data sources and annotating with additional model inference.
 
 There are two surfaces for this, and they are deliberately different:
@@ -42,7 +44,7 @@ let results = session.search("patents", query, 10, None, SearchMethod::default()
 In Python the compound query is SQL. `search` returns a `pyarrow.Table` directly; to join, run SQL that the engine plans (in-process for the embed wheel, over Flight SQL for a remote engine — same SQL either way):
 
 ```python
-db.add_source("assignees", path="/data/assignees.csv", format="csv")
+db.add_source("assignees", url="file:///data/assignees.csv", format="csv")
 
 results = db.sql("""
     SELECT p.title, a.company_name, a.country

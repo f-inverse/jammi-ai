@@ -73,6 +73,7 @@ RECIPES: tuple[Recipe, ...] = (
     example("context_predictor"),
     example("remote_session"),
     example("flight_sql"),
+    example("compound_query"),
 )
 
 

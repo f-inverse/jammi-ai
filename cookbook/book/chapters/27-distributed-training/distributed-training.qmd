@@ -7,7 +7,9 @@ title: "One job, many ranks — distributed training as a gang"
 import jammi_cookbook
 ```
 
-**Recipe:** `fine_tune(world_size=…)` · `[worker] local_ranks` · **Theory:** data-parallel
+**Recipe:** `fine_tune(world_size=…)` · `[worker] local_ranks` · `[distributed]
+max_world_size` · `[server] peer_bind` / `peer_advertise` · `[ballista]` roles ·
+`list_workers` · **Theory:** data-parallel
 training — each rank computes gradients on its shard of a global batch and the ranks
 sum them, so N ranks take the step one process would take over the whole batch
 [@li2020pytorchddp] · **Rail:** measurement (a gang's training compared with one
@@ -29,7 +31,11 @@ places it:
   `[gpu] devices`, or every rank on the CPU when the CPU is the only device;
 * **across processes**, when a job is wider than one host: the claiming worker becomes
   rank 0 of a *peer* gang and assembles the other ranks from its fleet
-  (`[distributed] max_world_size` bounds how wide).
+  (`[distributed] max_world_size` bounds how wide);
+* **on a compute plane**, when the claimant is a client of a Ballista scheduler: it
+  places the whole training attempt on an executor that holds the ranks.
+
+All three run below, over the same rows, and each is measured against one process.
 
 ```{python}
 import tempfile
@@ -107,6 +113,186 @@ for world_size in (2, 3):
 The loss curves and the adapted model's embeddings agree across rank counts: the gang
 computes one process's step. What the ranks buy is capacity — each holds a third, or a
 half, of the global batch's activations — not a different optimisation.
+
+## A fleet: servers sharing one catalog
+
+A gang wider than one process needs processes that can find each other, and that is
+what a shared catalog is: every `jammi-server` pointed at the same Postgres sees the
+same queued jobs, and each one that runs the claim loop registers itself as a worker
+the others can list. (The SQLite catalog the sections above ran on is one process's
+by contract.) Postgres comes from pip here, and each server is a real process on its
+own ports; a result root on the local disk is shared because the fleet is one host —
+a fleet across hosts roots it in an object store instead.
+
+```{python}
+import socket
+
+import pgserver
+from jammi.testing import LiveServer
+
+postgres = pgserver.get_server(tempfile.mkdtemp(), cleanup_mode="stop")
+
+
+def catalog(name: str) -> str:
+    """A fresh database on the chapter's Postgres: the catalog one fleet shares.
+    pgserver listens on a Unix socket only; the URL names its directory."""
+    postgres.psql(f"CREATE DATABASE {name};")
+    socket_dir = postgres.get_postmaster_info().socket_dir
+    return f"postgres://postgres@localhost/{name}?host={socket_dir}"
+
+
+def free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def member(catalog_url: str, result_root: str, roles: str) -> LiveServer:
+    """A `jammi-server` of the fleet: the shared catalog and result root, the CPU,
+    a short lease, and the `roles` that make this process what it is."""
+    home = Path(tempfile.mkdtemp())
+    (home / "jammi.toml").write_text(f"""
+[gpu]
+device = -1
+
+[catalog.postgres]
+url = "{catalog_url}"
+pool_size = 4
+
+[storage]
+result_root = "{result_root}"
+
+[lease]
+duration_secs = 6
+heartbeat_secs = 2
+{roles}""")
+    return LiveServer(home / "engine", env={"JAMMI_CONFIG": str(home / "jammi.toml")})
+```
+
+## Across processes: a peer gang
+
+Two servers, one rank each (`[worker] local_ranks = 1`), both advertising a gang
+listener (`peer_bind` / `peer_advertise`), and a deployment bound of two ranks
+(`[distributed] max_world_size = 2`). A two-rank job fits neither process alone: the
+server that claims it becomes rank 0 of a *peer* gang and dials the other for rank 1.
+The job is submitted over the wire, like any client's.
+
+```{python}
+peer_catalog = catalog("peer")
+peer_root = Path(tempfile.mkdtemp()).as_uri()
+
+
+def gang_member() -> LiveServer:
+    port = free_port()
+    return member(peer_catalog, peer_root, f"""
+[worker]
+enabled = true
+kinds = ["fine_tune"]
+local_ranks = 1
+idle_poll_secs = 1
+
+[distributed]
+max_world_size = 2
+
+[server]
+peer_bind = "127.0.0.1:{port}"
+peer_advertise = "127.0.0.1:{port}"
+""")
+
+
+with gang_member() as first, gang_member() as second, jammi.connect(first.endpoint) as db:
+    fleet = db.list_workers()
+    db.add_source("pairs", url=PAIRS, format="csv")
+    runs["peer"] = train(db, world_size=2, batch_size=3)
+
+print(f"{len(fleet)} workers on the shared catalog, one rank each")
+curve, vectors = runs["peer"]
+print("peer gang   loss by epoch " + "  ".join(f"{x:.6f}" for x in curve))
+print(f"peer gang vs 1 rank: max |Δ loss| {np.abs(curve - reference_curve).max():.2e}"
+      f"   max |Δ embedding| {np.abs(vectors - reference_vectors).max():.2e}")
+```
+
+```{python}
+# | echo: false
+assert len(fleet) == 2, fleet
+curve, vectors = runs["peer"]
+contracts.assert_close("distributed.peer_w2_max_loss_diff",
+                       float(np.abs(curve - reference_curve).max()), tol=1e-6)
+contracts.assert_close("distributed.peer_w2_max_embedding_diff",
+                       float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
+```
+
+The ranks now live in different processes, and the gradients cross a socket, not
+shared memory, and the step is still one process's.
+
+## Placed on a compute plane: a gang on a Ballista executor
+
+A deployment can separate the servers that claim jobs from the servers that hold the
+devices. One server hosts the compute plane — a Ballista scheduler and an executor
+with two ranks — and claims nothing itself (`kinds = []`). The other claims training
+jobs and is a *client* of that plane (`[ballista.client]`), holding one rank and no
+gang listener. A two-rank job fits nowhere the claimant can reach but the executor, so
+the claimant places the whole training attempt there as one task, and the attempt
+trains in the executor's process.
+
+```{python}
+placed_catalog = catalog("placed")
+placed_root = Path(tempfile.mkdtemp()).as_uri()
+scheduler_port = free_port()
+
+plane = member(placed_catalog, placed_root, f"""
+[worker]
+enabled = true
+kinds = []
+local_ranks = 2
+
+[ballista.scheduler]
+bind = "127.0.0.1:{scheduler_port}"
+advertise_host = "127.0.0.1"
+
+[ballista.executor]
+scheduler_address = "127.0.0.1:{scheduler_port}"
+bind = "127.0.0.1:{free_port()}"
+grpc_bind = "127.0.0.1:{free_port()}"
+advertise_host = "127.0.0.1"
+task_slots = 1
+""")
+claimant = member(placed_catalog, placed_root, f"""
+[worker]
+enabled = true
+kinds = ["fine_tune"]
+local_ranks = 1
+idle_poll_secs = 1
+
+[distributed]
+max_world_size = 2
+
+[ballista.client]
+scheduler_address = "127.0.0.1:{scheduler_port}"
+""")
+
+with plane, claimant, jammi.connect(claimant.endpoint) as db:
+    db.add_source("pairs", url=PAIRS, format="csv")
+    runs["placed"] = train(db, world_size=2, batch_size=3)
+
+curve, vectors = runs["placed"]
+print("placed gang loss by epoch " + "  ".join(f"{x:.6f}" for x in curve))
+print(f"placed gang vs 1 rank: max |Δ loss| {np.abs(curve - reference_curve).max():.2e}"
+      f"   max |Δ embedding| {np.abs(vectors - reference_vectors).max():.2e}")
+```
+
+```{python}
+# | echo: false
+curve, vectors = runs["placed"]
+contracts.assert_close("distributed.placed_w2_max_loss_diff",
+                       float(np.abs(curve - reference_curve).max()), tol=1e-6)
+contracts.assert_close("distributed.placed_w2_max_embedding_diff",
+                       float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
+postgres.cleanup()
+```
+
+Three places a gang ran — one process, two processes dialling each other, and an
+executor the claimant never trains on — and one step computed in each.
 
 ## What a gang refuses
 

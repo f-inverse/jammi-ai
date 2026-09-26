@@ -34,6 +34,12 @@ book = [
 cloud = [
     "moto[server]>=5",
 ]
+# A Postgres the chapters that run a fleet of servers share as their catalog, from
+# pip (`chapters/27-distributed-training/`). Linux x86-64 and macOS only: pgserver
+# ships no Linux aarch64 wheel.
+postgres = [
+    "pgserver>=0.1",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

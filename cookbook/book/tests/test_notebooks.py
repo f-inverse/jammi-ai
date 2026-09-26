@@ -109,14 +109,22 @@ def test_a_chapter_keeps_its_cells_in_order_and_drops_their_options(tree):
 
 
 def test_the_setup_pins_the_release_and_installs_a_server_only_when_needed(tree):
-    served = _text(build.setup_cell("9.9.9", server=True))
-    plain = _text(build.setup_cell("9.9.9", server=False))
+    served = _text(build.setup_cell("9.9.9", server=True, extras=[]))
+    plain = _text(build.setup_cell("9.9.9", server=False, extras=[]))
     assert '"jammi-ai==9.9.9", engine + "==9.9.9"' in plain
     assert (
         f'"jammi-cookbook @ git+https://github.com/{build.GITHUB}@py-v9.9.9'
         '#subdirectory=cookbook/book"'
     ) in plain
     assert 'server + "==9.9.9"' in served and 'server + "' not in plain
+
+
+def test_the_setup_installs_the_extras_the_code_needs():
+    code = "srv = ThreadedMotoServer()\npg = pgserver.get_server(d)\n"
+    assert build.extras_of(code) == ["cloud", "postgres"]
+    assert build.extras_of("print(1)") == []
+    fleet = _text(build.setup_cell("9.9.9", server=True, extras=["postgres"]))
+    assert "jammi-cookbook[postgres] @ git+" in fleet
 
 
 def test_a_recipe_is_its_docstring_its_body_and_a_run_of_main(tree):

@@ -34,7 +34,10 @@
 use jammi_db::config::{LogFormat, LoggingConfig, ObservabilityConfig};
 use jammi_db::error::{JammiError, Result};
 use tracing::level_filters::LevelFilter;
+use tracing::subscriber::Interest;
+use tracing::{span, Event, Metadata, Subscriber};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 /// The log formatter a host installs over `writer`: filtered by `RUST_LOG`
@@ -57,12 +60,75 @@ where
                 .unwrap_or_else(|| host_default.to_string()),
         )
     });
+    let filter = EventsDecidedAtDispatch(filter);
     let layer = tracing_subscriber::fmt::layer()
         .with_writer(writer)
         .with_ansi(ansi);
     match logging.format {
         LogFormat::Json => Box::new(layer.json().with_filter(filter)),
         LogFormat::Text => Box::new(layer.with_filter(filter)),
+    }
+}
+
+/// The log filter as a per-layer [`Filter`] that decides an EVENT only when
+/// the event is dispatched, never in the dispatcher's `enabled()` query.
+///
+/// A per-layer filter's verdict from `enabled()` is parked in a thread-local
+/// map until the next event or span on that thread consumes it, and the
+/// registry answers `enabled() == true` even when every per-layer filter said
+/// no (tracing-subscriber's `FilterMap::any_enabled` counts the 63 unused
+/// filter slots as enabled; tokio-rs/tracing#2519). A caller that asks
+/// `enabled()` and then emits nothing therefore leaves a "disabled" verdict
+/// behind, and the NEXT event on that thread — any event whose callsite is
+/// always-enabled skips `enabled()` and reads the parked verdict — is
+/// silently dropped. sqlx asks exactly that on every statement
+/// (`log::log_enabled!` through the `log` bridge, then a tracing event the
+/// filter never enables), so any log level that lets `sqlx::query`'s level
+/// through the `log` bridge loses the line after a query on that thread.
+///
+/// Answering `true` for events in `enabled()` parks nothing; the real
+/// decision runs in `event_enabled`, which only runs for an event being
+/// dispatched, so its verdict is consumed by that same event. Callsite
+/// interest, span filtering and the level hint stay the wrapped filter's, so
+/// an event its callsite rules out is still never constructed.
+struct EventsDecidedAtDispatch(EnvFilter);
+
+impl<S: Subscriber> Filter<S> for EventsDecidedAtDispatch {
+    fn enabled(&self, meta: &Metadata<'_>, cx: &Context<'_, S>) -> bool {
+        meta.is_event() || Filter::<S>::enabled(&self.0, meta, cx)
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
+        Filter::<S>::enabled(&self.0, event.metadata(), cx)
+            && Filter::<S>::event_enabled(&self.0, event, cx)
+    }
+
+    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
+        Filter::<S>::callsite_enabled(&self.0, meta)
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Filter::<S>::max_level_hint(&self.0)
+    }
+
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_new_span(&self.0, attrs, id, cx)
+    }
+
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, cx: Context<'_, S>) {
+        Filter::<S>::on_record(&self.0, id, values, cx)
+    }
+
+    fn on_enter(&self, id: &span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_enter(&self.0, id, cx)
+    }
+
+    fn on_exit(&self, id: &span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_exit(&self.0, id, cx)
+    }
+
+    fn on_close(&self, id: span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_close(&self.0, id, cx)
     }
 }
 

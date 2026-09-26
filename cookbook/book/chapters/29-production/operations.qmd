@@ -32,7 +32,6 @@ import urllib.error
 import urllib.request
 from concurrent import futures
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import grpc
 import jammi
@@ -51,10 +50,9 @@ ARTIFACTS = work / "artifacts"
 
 
 def catalog_url(postgres) -> str:
-    """The engine's URL for `postgres`, reached over its Unix socket: a named host,
-    with the socket directory in `host` (the libpq empty-host form is refused)."""
-    socket_dir = parse_qs(urlparse(postgres.get_uri()).query)["host"][0]
-    return f"postgresql://postgres@localhost/postgres?host={socket_dir}"
+    """The engine's URL for `postgres`: the libpq URI it hands out, reached over its
+    Unix socket (an empty host, the socket directory in `host`)."""
+    return postgres.get_uri()
 
 
 def configure(postgres, **sections: str) -> Path:

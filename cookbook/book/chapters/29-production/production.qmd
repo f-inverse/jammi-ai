@@ -31,7 +31,6 @@ process, both configured onto the same database.
 import tempfile
 import threading
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 import jammi
 import pgserver
@@ -49,16 +48,15 @@ ARTIFACTS = work / "artifacts"
 
 
 def catalog_url(postgres) -> str:
-    """The engine's URL for `postgres`, reached over its Unix socket: a named host,
-    with the socket directory in `host` (the libpq empty-host form is refused)."""
-    socket_dir = parse_qs(urlparse(postgres.get_uri()).query)["host"][0]
-    return f"postgresql://postgres@localhost/postgres?host={socket_dir}"
+    """The engine's URL for `postgres`: the libpq URI it hands out, reached over its
+    Unix socket (an empty host, the socket directory in `host`)."""
+    return postgres.get_uri()
 ```
 
 ## The configuration: one database, two roles
 
-The catalog stanza names the database — here over its Unix socket, so the URL names a
-host and carries the socket directory in `host`; the broker stanza names no URL of its
+The catalog stanza names the database — here over its Unix socket, in the libpq form
+Postgres hands out (an empty host, the socket directory in `host`); the broker stanza names no URL of its
 own, so it uses the catalog's — one Postgres serves both roles. `idle_poll_secs` bounds how
 long a subscriber waits for a wake-up it might have missed.
 

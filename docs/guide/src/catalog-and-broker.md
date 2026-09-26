@@ -25,11 +25,6 @@ pool_size = 16
 max_lifetime_secs = 1800
 ```
 
-A Postgres reached over a Unix socket still names a host in the URL, with the socket
-directory in the `host` parameter: `postgres://user@localhost/jammi?host=/run/postgresql`.
-libpq's empty-host spelling (`postgres://user@/jammi?host=…`) is refused at load as an
-empty host.
-
 `url` should carry `?sslmode=verify-full` for any connection that leaves a
 trusted network: `sslmode=require` upgrades the connection to TLS but never
 verifies the server's certificate (it defeats a MITM only when the network

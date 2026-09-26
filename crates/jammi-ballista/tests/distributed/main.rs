@@ -2316,6 +2316,123 @@ async fn graph_jobs_on_a_client_run_on_an_executor_and_match_in_process() {
     drop(fleet);
 }
 
+/// Executor rows a killed process left in the shared catalog — `Active`,
+/// heartbeat inside the liveness window, nothing listening at their
+/// address — are bound by the scheduler like live executors, so the
+/// placed job's stages launch against them. Each launch that cannot reach
+/// its executor removes it and resets the tasks bound there, and the job
+/// completes on the fleet's live executors. The stale rows outnumber the
+/// live executors, so every stage of the job binds to some of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_bound_to_stale_executor_rows_relaunches_and_completes() {
+    use jammi_ai::pipeline::graph_neighbourhood::EdgeSourceRef;
+    use jammi_ai::pipeline::graph_structure::StructureRequest;
+    use jammi_db::catalog::compute_repo::ComputeExecutorRecord;
+    use jammi_db::catalog::status::{ComputeExecutorStatus, JobStatus};
+    use jammi_db::store::CachePolicy;
+
+    const TEST: &str = "a_job_bound_to_stale_executor_rows_relaunches_and_completes";
+    let backends = DistributedBackends::from_env();
+    let result_root = backends.unique_result_root(TEST);
+    let (session, dir) = harness::harness_session(&backends, &result_root).await;
+
+    let source_name = harness::unique_source_name("ring_edges");
+    session
+        .add_source(
+            &source_name,
+            SourceType::File,
+            SourceConnection {
+                url: Some(write_ring_edge_source(dir.path(), 400)),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let structure = StructureRequest::new(
+        source_name.clone(),
+        EdgeSourceRef::Registered {
+            source_id: source_name.clone(),
+            src_column: "src".into(),
+            dst_column: "dst".into(),
+            type_column: None,
+            weight_column: None,
+            as_of_column: None,
+        },
+    )
+    .with_dimensions(64)
+    .with_weights([0.0, 1.0, 1.0]);
+
+    let (mut specs, scheduler_port) = standard_fleet_specs();
+    specs.push(client_worker_spec(scheduler_port, &["graph_structure"]));
+    let mut fleet = harness::spawn_fleet(&backends, &result_root, specs);
+    await_fleet_registered(&session, &fleet).await;
+
+    let stale: Vec<String> = (0..6)
+        .map(|i| format!("stale-{i}-{}", jammi_test_utils::unique_suffix()))
+        .collect();
+    for id in &stale {
+        let port = jammi_test_utils::free_port();
+        session
+            .catalog()
+            .upsert_compute_executor(&ComputeExecutorRecord {
+                executor_id: id.clone(),
+                instance_id: id.clone(),
+                host: "127.0.0.1".to_string(),
+                port,
+                grpc_port: port,
+                task_slots: 4,
+                available_slots: 4,
+                status: ComputeExecutorStatus::Active,
+                heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
+                metadata: String::new(),
+                devices: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    let job = session
+        .enqueue(
+            jammi_ai::jobs::JobSpec::GraphStructure {
+                request: structure,
+                cache: CachePolicy::Bypass,
+            },
+            0,
+        )
+        .await
+        .expect("the job enqueues");
+    let record = harness::await_job(
+        &mut fleet,
+        &session,
+        &job.job_id,
+        "the graph job bound to stale executors reaches a terminal status",
+        |r| {
+            r.status == JobStatus::Completed.to_string()
+                || r.status == JobStatus::Failed.to_string()
+        },
+    )
+    .await;
+    assert_eq!(
+        record.status,
+        JobStatus::Completed.to_string(),
+        "the job completes on the live executors: {:?}",
+        record.error
+    );
+    for id in &stale {
+        assert!(
+            session
+                .catalog()
+                .get_compute_executor(id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale executor a launch could not reach leaves the catalog: {id}"
+        );
+    }
+    drop(fleet);
+}
+
 /// An executor killed while it holds a sink's row. The row is the
 /// executor's — `building` under its store's writer id, never handed back
 /// — until its lease expires and a successor's own dispatch reclaims it.

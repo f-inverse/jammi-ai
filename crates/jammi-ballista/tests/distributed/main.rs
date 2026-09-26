@@ -2281,17 +2281,23 @@ async fn graph_jobs_on_a_client_run_on_an_executor_and_match_in_process() {
         let claimant_id = instance_id_of_label(&session, &claimant).await;
         assert_eq!(record.claimed_by.as_deref(), Some(claimant_id.as_str()));
 
+        // The job names the table it produced; a graph derivation runs no
+        // model, so its row records none to look it up by.
+        let jammi_ai::jobs::JobResult::Table { table, .. } =
+            serde_json::from_str::<jammi_ai::jobs::JobResult>(
+                record.result.as_deref().expect("a completed job's result"),
+            )
+            .expect("the result decodes")
+        else {
+            panic!("{model}: a graph job's result is a table");
+        };
         let routed = session
             .catalog()
-            .find_result_tables(&source_name, Some(ModelTask::TextEmbedding), Some(model))
+            .require_result_table(&table)
             .await
-            .unwrap()
-            .into_iter()
-            .find(|t| {
-                t.status == ResultTableStatus::Ready.to_string()
-                    && t.table_name != in_process.table_name
-            })
-            .expect("the job's ready table");
+            .expect("the job's table");
+        assert_eq!(routed.status, ResultTableStatus::Ready.to_string());
+        assert_ne!(routed.table_name, in_process.table_name);
         let (writer, _) = await_sink_writer(&mut fleet, &executors, &routed.table_name).await;
         assert!(
             executors.contains(&writer),

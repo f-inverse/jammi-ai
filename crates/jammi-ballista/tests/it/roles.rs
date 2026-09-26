@@ -515,7 +515,7 @@ async fn stale_round(round: usize) {
     let (shuffle, ctx) = build_shuffle_plan().await;
     let plan: Arc<dyn ExecutionPlan> = Arc::new(
         RepartitionExec::try_new(
-            Arc::clone(&shuffle.children()[0]),
+            Arc::clone(shuffle.children()[0]),
             Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 16),
         )
         .unwrap(),

@@ -1,0 +1,14 @@
+{
+  "audio.change_max_abs_diff": {
+    "tol": 0.0001,
+    "value": 0.1481066793203354
+  },
+  "text.change_max_abs_diff": {
+    "tol": 0.0001,
+    "value": 0.6283555924892426
+  },
+  "vision.change_max_abs_diff": {
+    "tol": 0.0001,
+    "value": 0.27339061722159386
+  }
+}

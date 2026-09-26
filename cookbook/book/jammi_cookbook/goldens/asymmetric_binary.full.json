@@ -1,0 +1,50 @@
+{
+  "anisotropy_ratio": {
+    "tol": 0.01,
+    "value": 0.7493640780448914
+  },
+  "collapsed_dims_mean": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "collapsed_dims_median": {
+    "tol": 0.0,
+    "value": 0.0
+  },
+  "collapsed_dims_zero": {
+    "tol": 0.0,
+    "value": 7.0
+  },
+  "engine_os1_at_10": {
+    "tol": 0.02,
+    "value": 0.629
+  },
+  "engine_rescored_at_10": {
+    "tol": 0.02,
+    "value": 0.9964999999999999
+  },
+  "mean_no_rescore_at_1": {
+    "tol": 0.0,
+    "value": 0.59
+  },
+  "mean_no_rescore_at_10": {
+    "tol": 0.0,
+    "value": 0.6320000000000001
+  },
+  "median_no_rescore_at_1": {
+    "tol": 0.0,
+    "value": 0.57
+  },
+  "median_no_rescore_at_10": {
+    "tol": 0.0,
+    "value": 0.6314999999999997
+  },
+  "zero_no_rescore_at_1": {
+    "tol": 0.0,
+    "value": 0.545
+  },
+  "zero_no_rescore_at_10": {
+    "tol": 0.0,
+    "value": 0.6139999999999999
+  }
+}

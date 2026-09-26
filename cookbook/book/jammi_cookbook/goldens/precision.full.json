@@ -1,0 +1,34 @@
+{
+  "f32_recall_at_10": {
+    "tol": 0.01,
+    "value": 0.9980000000000001
+  },
+  "int8_os1_sweep_recall_at_10": {
+    "tol": 0.02,
+    "value": 0.9235000000000002
+  },
+  "int8_os2_sweep_recall_at_10": {
+    "tol": 0.02,
+    "value": 0.9980000000000001
+  },
+  "int8_os4_recall_at_10": {
+    "tol": 0.01,
+    "value": 0.9980000000000001
+  },
+  "int8_os4_sweep_recall_at_10": {
+    "tol": 0.02,
+    "value": 0.9980000000000001
+  },
+  "int8_os8_sweep_recall_at_10": {
+    "tol": 0.02,
+    "value": 0.9980000000000001
+  },
+  "int8_vs_f32_graph_ratio": {
+    "tol": 0.03,
+    "value": 0.2851161229046338
+  },
+  "override8_on_os1_recall_at_10": {
+    "tol": 0.02,
+    "value": 0.9980000000000001
+  }
+}

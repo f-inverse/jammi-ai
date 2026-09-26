@@ -1301,7 +1301,7 @@ async fn replay_smoke_traffic(flight_addr: std::net::SocketAddr) {
             embedding_table: None,
             filter: None,
             select: Vec::new(),
-            oversample: None,
+            method: None,
         })
         .await
         .expect("search")

@@ -209,7 +209,7 @@ async fn search_via(
             filter: None,
             select: Vec::new(),
             embedding_table: Some(table_name.to_string()),
-            oversample: None,
+            method: None,
         })
         .await?;
     let batches = jammi_wire::result_rows_from_proto(response.into_inner().result)?;

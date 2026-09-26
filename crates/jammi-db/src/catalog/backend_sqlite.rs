@@ -501,7 +501,7 @@ impl CatalogBackend for SqliteBackend {
     /// seam is single-*process*, so a second pool on the same file inside this
     /// process is legal and supported (a session's lease keeper holds one of
     /// its own), and while that pool is live the `-wal` cannot go away. So the
-    /// wait runs only when this close gives up the file's last [`FileClaim`];
+    /// wait runs only when this close gives up the last pool claim on the file;
     /// closing any other pool drains its own connections and returns.
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {

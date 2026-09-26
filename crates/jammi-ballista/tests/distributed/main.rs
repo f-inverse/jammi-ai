@@ -2052,14 +2052,15 @@ async fn embedding_job_on_a_client_routes_its_sink_to_an_executor_and_matches_in
 
     let job = session
         .enqueue(
-            jammi_ai::jobs::JobSpec::Embedding {
+            jammi_ai::jobs::JobSpec::Embedding(jammi_wire::request::EmbeddingRequest {
                 source_id: source_name.clone(),
                 model_id: model.clone(),
                 columns: vec!["text".to_string()],
                 key_column: "id".to_string(),
                 modality: jammi_wire::request::Modality::Text,
+                dimensions: None,
                 cache: jammi_db::store::CachePolicy::Bypass,
-            },
+            }),
             0,
         )
         .await
@@ -2396,14 +2397,15 @@ async fn killed_executor_mid_sink_write_is_reclaimed_and_a_rerun_writes_the_iden
 
     let job = session
         .enqueue(
-            jammi_ai::jobs::JobSpec::Embedding {
+            jammi_ai::jobs::JobSpec::Embedding(jammi_wire::request::EmbeddingRequest {
                 source_id: source_name.clone(),
                 model_id: model.clone(),
                 columns: vec!["text".to_string()],
                 key_column: "id".to_string(),
                 modality: jammi_wire::request::Modality::Text,
+                dimensions: None,
                 cache: jammi_db::store::CachePolicy::Bypass,
-            },
+            }),
             0,
         )
         .await

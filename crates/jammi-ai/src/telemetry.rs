@@ -60,9 +60,9 @@ fn log_filter(logging: &LoggingConfig, host_default: LevelFilter) -> EventsDecid
     }))
 }
 
-/// The log formatter a host installs over `writer`, filtered by
-/// [`log_filter`]; JSON or text per `[logging] format`. `ansi` colours the
-/// output — for a terminal only.
+/// The log formatter a host installs over `writer`, filtered by `RUST_LOG`
+/// when set, else by `[logging] level`, else by `host_default`; JSON or text
+/// per `[logging] format`. `ansi` colours the output — for a terminal only.
 pub fn fmt_layer<W>(
     logging: &LoggingConfig,
     host_default: LevelFilter,
@@ -389,8 +389,10 @@ pub type HostLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 /// The tracing layers a host installs over a [`Registry`]: the log formatter
 /// over `writer` ([`fmt_layer`]) and, when `[observability] otlp_endpoint`
-/// is configured, the OTLP export layer — both filtered by [`log_filter`]. An endpoint this build cannot
-/// honour is refused before anything is built
+/// is configured, the OTLP export layer — both read one filter (`RUST_LOG`,
+/// else `[logging] level`, else `host_default`), so a span the host does not
+/// log is not exported. An endpoint this build cannot honour is refused
+/// before anything is built
 /// ([`refuse_if_endpoint_without_feature`]).
 ///
 /// The export layer's tracer provider is kept alive for the process —

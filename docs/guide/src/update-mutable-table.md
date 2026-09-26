@@ -1,5 +1,7 @@
 # Run Transactional Updates on a Mutable Table
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Feature Store](https://f-inverse.github.io/jammi-ai/cookbook/chapters/12-feature-store/feature-store.html).
+
 Once a mutable companion table is registered (see
 [Register a Mutable Companion Table](./register-mutable-table.md)), you
 change its rows with the same SQL surface that runs your read queries.

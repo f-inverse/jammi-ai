@@ -1,5 +1,7 @@
 # Condition a Prediction on Declared-Edge Context (Bring Your Own Graph)
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Predict & Quantify](https://f-inverse.github.io/jammi-ai/cookbook/chapters/04-predict/predict.html).
+
 [`assemble_context`](./assemble-context.md) builds a target's context set from
 its **embedding-similar** neighbours — `search(target, k)`. That is the right
 neighbourhood when similarity *is* the relationship you want to condition on.

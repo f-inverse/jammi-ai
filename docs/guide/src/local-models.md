@@ -1,5 +1,7 @@
 # Use a Local Model Checkpoint
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Weight Quantization](https://f-inverse.github.io/jammi-ai/cookbook/chapters/22-precision/quantized-weights.html).
+
 Every model-accepting argument in the engine — `generate_embeddings`' `model`,
 fine-tune's `base_model`, `annotate()`'s first argument, the Python `Session`
 API — takes a model reference string. A reference that names a filesystem

@@ -5,6 +5,32 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A Hub download that stops sending fails typed and bounded.** The engine owns the Hugging Face
+  Hub transfer: `HubSource` reads the Hub's `resolve` endpoint with a client whose connect and
+  per-read timeouts are `[models] hub_idle_timeout_secs` (default 60), writing the standard
+  `blobs/`/`snapshots/`/`refs/` cache layout, so a cache `huggingface_hub` populated is a hit and a
+  hit issues no request. A transfer that goes that long without a byte fails as the retryable
+  `JammiError::Unavailable` naming `hf://<repo>/<file>` (gRPC `UNAVAILABLE`; the new
+  `jammi.errors.Unavailable`, a `BackendError`, on both transports), never a wait without end; one
+  that keeps arriving is never cut off. Model resolution is async, so a waiting transfer no longer
+  parks a runtime thread. **BREAKING** (Rust API): `HubSource::api()` is gone — `HubSource::model(repo)`
+  returns a `HubRepo` with async `get(file) -> Option<PathBuf>` and `files()`.
+- **A source declares its tenant column when it is registered, on every surface.**
+  `SourceConnection.tenant_column` crosses the wire (`optional string tenant_column = 3`), and
+  Python's `add_source(..., tenant_column=...)` takes it on both the embedded and remote backends.
+  The declaration is persisted with the source and replayed by every session and replica; a
+  tenant-bound session reads only its own rows and the rows with no tenant, through `sql`,
+  `generate_embeddings` and `search`. Registration refuses a tenant column the source lacks, or one
+  competing with the source's own `tenant_id` column, as a typed `Schema` error
+  (`INVALID_ARGUMENT`). **BREAKING:** `JammiSession::set_source_tenant_column` is removed.
+- **The embedded-engine wheels read and write cloud object storage.** `jammi-python` forwards
+  `jammi-db`'s `storage-s3` / `storage-gcs` / `storage-azure` / `storage-r2` / `storage-cloud`
+  features as `jammi-server` does, and both `jammi-ai-native` and `jammi-ai-native-cu12` build
+  `storage-cloud`: an embedded session registers `s3://` / `gs://` / `azure://` / `r2://` sources
+  and roots its result tables in a bucket through the same `[storage]` config a server reads. The
+  release feature manifest declares both wheels as lanes, gated equal to their `pyproject.toml`.
+  The cookbook's `cloud_storage` recipe runs it against a local S3-compatible server (the
+  cookbook's new `cloud` extra).
 - **A result table records a model and a task only when a model produced its rows.** A derivation
   that runs no model — an as-of join, a lexical index, a neighbor graph, a graph propagation or
   structure encoding, a SQL statement's table, a training set — records no model (`NULL`

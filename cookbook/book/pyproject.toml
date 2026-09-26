@@ -1,5 +1,6 @@
 [project]
-# Ships at the lockstep workspace version, beside `jammi-ai`.
+# Not a published package: a notebook installs it from the release's git tag
+# (`…@py-vX#subdirectory=cookbook/book`), so it carries the lockstep version.
 name = "jammi-cookbook"
 version = "0.49.1"
 description = "The jammi cookbook's library and fixtures — the datasets, encoders, frozen goldens and rails its recipes and chapters run on."
@@ -40,8 +41,8 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["jammi_cookbook"]
 
-# The wheel carries the fixtures the recipes and the `small` scale read, so a fresh
-# install runs every recipe and chapter with no checkout. `_fixtures` links to
+# The install carries the fixtures the recipes and the `small` scale read, so a
+# fresh Colab runtime runs every recipe and chapter with no working checkout. `_fixtures` links to
 # `cookbook/fixtures`, which also holds engine-test and benchmark fixtures the
 # cookbook never reads; only the ones named here ship.
 [tool.setuptools.package-data]

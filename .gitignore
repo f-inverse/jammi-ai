@@ -54,7 +54,7 @@ packaging/*/jammi_server/bin/jammi-server
 packaging/*/dist/
 packaging/*/build/
 
-# The jammi-cookbook wheel's build outputs.
+# Build outputs of a local cookbook install.
 cookbook/book/build/
 cookbook/book/dist/
 

@@ -403,7 +403,6 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "native-cu12-wheel": PromotionRow(
         "pypi-native-cuda.yml", "publish", "gpu-proof", "direct", tag_family="py-v"
     ),
-    "cookbook-wheel": PromotionRow("pypi-cookbook.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
 }
 
 # Local reusable workflows REVIEWED, by direct human inspection, to invoke

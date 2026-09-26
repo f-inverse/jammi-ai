@@ -3,9 +3,11 @@
 
 The Rust crates inherit `[workspace.package] version`; the Python and npm dists
 each state it in their own manifest, and some pin a sibling at it exactly
-(`jammi-ai[embedded]` → `jammi-ai-native==X`, `jammi-cookbook` → `jammi-ai==X`).
-A release bump that misses one publishes a dist whose pin cannot resolve, or
-a notebook whose install line names a release that never shipped. This lists
+(`jammi-ai[embedded]` → `jammi-ai-native==X`). The cookbook is no published
+dist — a notebook installs it from the release's tag — but it carries the same
+version and pins `jammi-ai==X`. A release bump that misses one publishes a dist
+whose pin cannot resolve, or a notebook whose install line names a release that
+never shipped. This lists
 every such site once and fails on any that disagrees with `Cargo.toml`.
 
 Run: `python3 ci/scripts/check_lockstep_versions.py`

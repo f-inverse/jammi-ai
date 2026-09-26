@@ -1,4 +1,5 @@
-"""The published wheel carries every fixture the recipes and chapters read."""
+"""The wheel a notebook's install builds from the release tag carries every
+fixture the recipes and chapters read."""
 
 from __future__ import annotations
 

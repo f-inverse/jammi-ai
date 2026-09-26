@@ -5,6 +5,18 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A placed search serves the table's current version under its mask.** On a table whose segments
+  are placed on peers, the search read every version's segments with no deletion mask — at its own
+  segments, at every owner and at the local-load rung — so a row a refresh re-embedded came back at
+  its superseded vector and a deleted row came back at all, while the in-process search excluded
+  them. `ResultStore::served_segments` is the one definition of what a version serves (the base
+  segments, or the manifest's segments with their versions, and the version's mask); every search
+  entry and every owner resolves through it, and one masked per-segment unit
+  (`ServedIndex::live_hits`) runs wherever a segment is read. The peer `SegmentSearchRequest` carries
+  the pinned `version` (`optional int64 = 8`) and the live-hit `target` (`uint64 = 7`); the
+  coordinator refuses an owner's hit the mask hides as malformed. **BREAKING** (Rust API):
+  `SegmentSource::Local` and `::Remote` carry the segment's version; `PlacedIndex::with_sources`
+  takes `ServedSources`.
 - **A Hub download that stops sending fails typed and bounded.** The engine owns the Hugging Face
   Hub transfer: `HubSource` reads the Hub's `resolve` endpoint with a client whose connect and
   per-read timeouts are `[models] hub_idle_timeout_secs` (default 60), writing the standard

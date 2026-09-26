@@ -243,6 +243,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
             postgres: schema::MIGRATION_045_RESULT_TABLE_PRODUCER_POSTGRES,
         },
     ),
+    (
+        "046_job_ranks",
+        MigrationSql::Same(schema::MIGRATION_046_JOB_RANKS),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

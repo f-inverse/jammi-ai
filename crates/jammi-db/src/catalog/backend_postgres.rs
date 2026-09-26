@@ -262,7 +262,10 @@ mod tests {
             socket_form_with_parameters("postgres://u:p@localhost:5433/db"),
             None
         );
-        assert_eq!(socket_form_with_parameters("postgresql:///db?host=/tmp"), None);
+        assert_eq!(
+            socket_form_with_parameters("postgresql:///db?host=/tmp"),
+            None
+        );
         let opts = pg_connect_options("postgres://u:p@localhost:5433/db").unwrap();
         assert_eq!(opts.get_host(), "localhost");
         assert_eq!(opts.get_port(), 5433);

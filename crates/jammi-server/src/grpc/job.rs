@@ -447,5 +447,7 @@ fn job_summary_from_record(record: JobRecord) -> pb::JobSummary {
         output_model_id: record.output_model_id.unwrap_or_default(),
         created_at: record.created_at,
         error: record.error.unwrap_or_default(),
+        claimed_by: record.claimed_by.unwrap_or_default(),
+        ranks: record.ranks,
     }
 }

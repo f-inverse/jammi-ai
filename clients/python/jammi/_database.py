@@ -249,12 +249,14 @@ def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
     """Project a wire `JobSummary` into the job dict a caller reads.
 
     Every field the message carries and nothing else — the embedded
-    `list_jobs` builds the same seven keys at its FFI boundary from the
-    catalog record, applying the same two conventions this message documents:
+    `list_jobs` builds the same nine keys at its FFI boundary from the
+    catalog record, applying the same conventions this message documents:
     `output_model_id` is the empty string until a training kind completes
-    (always empty for a compute kind), `error` is empty unless it failed.
-    Neither arm maps either onto `None`, so a caller branches on one thing on
-    both transports.
+    (always empty for a compute kind), `error` is empty unless it failed,
+    `claimed_by` is empty while queued, and `ranks` (the instance that ran
+    each rank of the latest training attempt, in rank order) is an empty list
+    for a compute kind and until an attempt records it. No arm maps any of
+    them onto `None`, so a caller branches on one thing on both transports.
     """
     return {
         "job_id": j.job_id,
@@ -264,6 +266,8 @@ def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
         "output_model_id": j.output_model_id,
         "created_at": j.created_at,
         "error": j.error,
+        "claimed_by": j.claimed_by,
+        "ranks": list(j.ranks),
     }
 
 

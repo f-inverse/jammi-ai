@@ -52,6 +52,8 @@ _SUMMARY_KEYS = {
     "output_model_id",
     "created_at",
     "error",
+    "claimed_by",
+    "ranks",
 }
 
 
@@ -178,6 +180,9 @@ def test_list_jobs_carries_the_wire_field_set(
             # queued or not; `error` is empty unless the job failed.
             assert entry["output_model_id"] == f"jammi:fine-tuned:{entry['job_id']}"
             assert entry["error"] == ""
+            # Queued and unclaimed: no claimant, no ranks yet.
+            assert entry["claimed_by"] == ""
+            assert entry["ranks"] == []
     finally:
         db.close()
 

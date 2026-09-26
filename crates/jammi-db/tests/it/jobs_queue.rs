@@ -1461,6 +1461,77 @@ async fn record_acceleration_report_writes_under_a_valid_lease(backend: BackendK
     assert_eq!(unchanged.acceleration_report.as_deref(), Some(report));
 }
 
+/// A training attempt records which instance runs each rank, in rank order,
+/// under its attempt guard; a stale attempt's record is refused, and a new
+/// claim starts the next attempt with none, so the listing never pairs one
+/// attempt's claim with another's ranks. A terminal row keeps its claimant
+/// and its ranks.
+#[test_case(BackendKind::Sqlite ; "sqlite")]
+#[cfg_attr(
+    feature = "live-postgres-tests",
+    test_case(BackendKind::Postgres ; "postgres")
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempt_records_where_its_ranks_run(backend: BackendKind) {
+    let dir = tempdir().unwrap();
+    let (_session, catalog) = queue_session(backend, dir.path()).await;
+    catalog.submit_job(job_params("ranks-1")).await.unwrap();
+    assert!(catalog.get_job("ranks-1").await.unwrap().ranks.is_empty());
+
+    let first = catalog
+        .claim_next("coordinator", KINDS, Duration::from_secs(0))
+        .await
+        .unwrap()
+        .expect("attempt 1 claimed");
+    let gang = vec!["coordinator".to_string(), "member-b".to_string()];
+    assert!(catalog
+        .record_attempt_ranks("ranks-1", "coordinator", first.attempts, &gang)
+        .await
+        .unwrap());
+    let recorded = catalog.get_job("ranks-1").await.unwrap();
+    assert_eq!(recorded.ranks, gang);
+    assert_eq!(recorded.claimed_by.as_deref(), Some("coordinator"));
+
+    catalog
+        .reclaim_expired_jobs(Duration::from_secs(0), 5)
+        .await
+        .unwrap();
+    let second = catalog
+        .claim_next("executor", KINDS, Duration::from_secs(3600))
+        .await
+        .unwrap()
+        .expect("attempt 2 claimed");
+    assert!(
+        catalog.get_job("ranks-1").await.unwrap().ranks.is_empty(),
+        "a new claim starts with no ranks, never the previous attempt's"
+    );
+    assert!(
+        !catalog
+            .record_attempt_ranks("ranks-1", "coordinator", first.attempts, &gang)
+            .await
+            .unwrap(),
+        "the stale attempt's record is refused"
+    );
+    let local = vec!["executor".to_string(); 2];
+    assert!(catalog
+        .record_attempt_ranks("ranks-1", "executor", second.attempts, &local)
+        .await
+        .unwrap());
+    assert!(catalog
+        .finish_job(FinishJobParams {
+            job_id: "ranks-1",
+            instance_id: "executor",
+            attempts: second.attempts,
+            result: "{}",
+        })
+        .await
+        .unwrap());
+    let done = catalog.get_job("ranks-1").await.unwrap();
+    assert_eq!(done.status, "completed");
+    assert_eq!(done.claimed_by.as_deref(), Some("executor"));
+    assert_eq!(done.ranks, local);
+}
+
 /// The mandatory `attempts` guard closes the zombie gap: an instance id can
 /// recur (e.g. a stable `JAMMI_WORKER_ID` across process restarts), so a
 /// reclaimed job re-claimed by an instance carrying the SAME id is

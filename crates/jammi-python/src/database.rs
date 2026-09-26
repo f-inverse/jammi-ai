@@ -404,6 +404,8 @@ impl PyDatabase {
             )?;
             entry.set_item("created_at", &record.created_at)?;
             entry.set_item("error", record.error.as_deref().unwrap_or(""))?;
+            entry.set_item("claimed_by", record.claimed_by.as_deref().unwrap_or(""))?;
+            entry.set_item("ranks", &record.ranks)?;
             list.append(entry)?;
         }
         Ok(list.into_any().unbind())

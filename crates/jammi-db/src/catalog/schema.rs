@@ -2250,3 +2250,11 @@ pub(super) const MIGRATION_045_RESULT_TABLE_PRODUCER_POSTGRES: &str = r#"
 ALTER TABLE result_tables ALTER COLUMN model_id DROP NOT NULL;
 ALTER TABLE result_tables ALTER COLUMN task DROP NOT NULL;
 "#;
+
+/// Migration 046: `jobs.ranks` — the instance that ran each rank of the
+/// latest training attempt, as a JSON array in rank order
+/// (`Catalog::record_attempt_ranks`). `NULL` until an attempt records its
+/// ranks; every claim resets it.
+pub(super) const MIGRATION_046_JOB_RANKS: &str = r#"
+ALTER TABLE jobs ADD COLUMN ranks TEXT;
+"#;

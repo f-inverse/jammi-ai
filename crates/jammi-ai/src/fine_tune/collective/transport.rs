@@ -71,7 +71,16 @@ pub trait DeviceExchange: Send + Sync {
 
     /// End an exchange in flight on this rank and refuse every later one.
     /// Idempotent, and callable from any thread while an exchange is parked.
+    /// The FAULT path's teardown.
     fn abort(&self);
+
+    /// Release this rank's exchange at the gang's healthy end — every rank
+    /// at the same point, since a device exchange spanning processes is torn
+    /// down by its ranks together — bounded by `deadline`; a release that
+    /// does not complete by then falls back to [`Self::abort`] and is
+    /// refused. Closing an exchange already closed is a no-op; closing one
+    /// already aborted is refused.
+    fn close(&self, deadline: Duration) -> Result<()>;
 
     /// The device this rank's buffers live on.
     fn device(&self) -> &Device;
@@ -113,6 +122,15 @@ impl Transport {
     pub(crate) fn abort(&self) {
         if let Self::Device(exchange) = self {
             exchange.abort();
+        }
+    }
+
+    /// Release this rank's exchange at the gang's healthy end
+    /// ([`DeviceExchange::close`]); nothing to release for inline bytes.
+    pub(crate) fn close(&self, deadline: Duration) -> Result<()> {
+        match self {
+            Self::Inline => Ok(()),
+            Self::Device(exchange) => exchange.close(deadline),
         }
     }
 }

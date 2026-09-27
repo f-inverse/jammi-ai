@@ -115,6 +115,8 @@ tracing.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+# `gethostname` for the host an instance lists (`fine_tune::worker::host_name`).
+libc.workspace = true
 chrono.workspace = true
 
 # The residual engine-spec converters (`jammi_ai::wire`, under `local`) encode /
@@ -163,9 +165,6 @@ parquet.workspace = true
 wiremock = "0.6"
 serial_test = "3"
 jammi-test-utils.workspace = true
-# SIGKILL of a spawned worker process in the distributed-validation harness
-# (the kill-9 reclaim / artifact-crash-window properties). Test-only.
-libc.workspace = true
 # Standard-normal quantiles for generating calibrated/ensemble fixtures in the
 # calibration-eval unit tests. Test-only — the engine routes all
 # production calibration math through `jammi-numerics`, never `statrs` directly.

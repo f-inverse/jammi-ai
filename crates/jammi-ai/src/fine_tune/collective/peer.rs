@@ -1997,6 +1997,10 @@ impl Collective for Peer {
         self.world
     }
 
+    fn close(&self, _call: &BlockingCall) -> Result<()> {
+        self.transport.close(self.timeout)
+    }
+
     fn bind_agreement(&self, digest: String) -> Result<()> {
         super::bind_agreement_once(&self.agreement, digest)
     }

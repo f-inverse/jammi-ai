@@ -17,8 +17,9 @@
 //! - `ncclCommAbort` from another thread ends a real NCCL wait against a
 //!   rank that never joins the collective;
 //! - the multi-process join is bounded: two ranks joining the same id form a
-//!   communicator, and a join no peer completes ends at its deadline rather
-//!   than parking.
+//!   communicator that both release together at the healthy end
+//!   (`ncclCommFinalize` then `ncclCommDestroy`), and a join no peer
+//!   completes ends at its deadline rather than parking.
 //!
 //! The training-level proof — a real fine-tune through the worker's
 //! topologies, one host and many — is the product path's, not this file's
@@ -31,6 +32,10 @@
 #[cfg(feature = "cuda")]
 use crate::harness;
 
+/// A result as its shape, dtype and raw little-endian element bytes.
+#[cfg(feature = "cuda")]
+type Bytes = (Vec<usize>, candle_core::DType, Vec<u8>);
+
 /// Every verb at every dtype on one rank of a two-rank gang — an unequal
 /// gather with a zero-row rank, a three-dtype sum, a broadcast from rank 1,
 /// the control word and a barrier — as the exact bytes each result holds.
@@ -38,7 +43,7 @@ use crate::harness;
 fn every_verb(
     local: jammi_ai::fine_tune::collective::Local,
     call: jammi_ai::fine_tune::collective::BlockingCall,
-) -> Vec<(Vec<usize>, candle_core::DType, Vec<u8>)> {
+) -> Vec<Bytes> {
     use candle_core::{DType, Tensor};
     use jammi_ai::fine_tune::collective::Collective;
 
@@ -89,7 +94,7 @@ fn every_verb(
 /// A tensor's shape, dtype and raw little-endian element bytes — equality is
 /// bit-for-bit.
 #[cfg(feature = "cuda")]
-fn bytes(t: &candle_core::Tensor) -> (Vec<usize>, candle_core::DType, Vec<u8>) {
+fn bytes(t: &candle_core::Tensor) -> Bytes {
     use candle_core::DType;
     let flat = t
         .flatten_all()
@@ -125,7 +130,7 @@ fn bytes(t: &candle_core::Tensor) -> (Vec<usize>, candle_core::DType, Vec<u8>) {
 fn run_every_verb(
     kind: jammi_ai::fine_tune::collective::transport::TransportKind,
     devices: &[candle_core::Device],
-) -> Vec<Vec<(Vec<usize>, candle_core::DType, Vec<u8>)>> {
+) -> Vec<Vec<Bytes>> {
     use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang};
     use std::time::Duration;
 
@@ -229,11 +234,12 @@ fn an_abort_ends_a_real_nccl_wait_on_a_rank_that_never_joins() {
 
 /// The multi-process join (`ncclCommInitRankConfig`, non-blocking, polled)
 /// forms a communicator when both ranks join the same id — driven here from
-/// two threads of one process, which NCCL permits — and a join no peer
-/// completes ends at its deadline instead of parking.
+/// two threads of one process, which NCCL permits — that both ranks then
+/// close together; a join no peer completes ends at its deadline instead of
+/// parking.
 #[cfg(feature = "live-gpu-gang-tests")]
 #[test]
-fn a_bounded_join_forms_a_communicator_and_a_join_no_peer_completes_ends_at_its_deadline() {
+fn a_bounded_join_forms_a_communicator_both_ranks_close_and_a_lone_join_ends_at_its_deadline() {
     #[cfg(feature = "cuda")]
     {
         use std::time::{Duration, Instant};
@@ -262,13 +268,21 @@ fn a_bounded_join_forms_a_communicator_and_a_join_no_peer_completes_ends_at_its_
                     let buf = Tensor::from_vec(vec![rank as f32; 3], 3, &device)
                         .and_then(|t| t.to_dtype(DType::F32))
                         .expect("buffer");
-                    BlockingCall::spawn_thread(move |call| exchange.all_gather(&call, &buf))
-                        .join()
-                        .expect("rank thread")
-                        .expect("gather")
-                        .to_device(&candle_core::Device::Cpu)
-                        .and_then(|t| t.to_vec1::<f32>())
-                        .expect("read back")
+                    let gathered = BlockingCall::spawn_thread({
+                        let exchange = std::sync::Arc::clone(&exchange);
+                        move |call| exchange.all_gather(&call, &buf)
+                    })
+                    .join()
+                    .expect("rank thread")
+                    .expect("gather")
+                    .to_device(&candle_core::Device::Cpu)
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .expect("read back");
+                    // The healthy end: both ranks release together.
+                    exchange
+                        .close(Duration::from_secs(60))
+                        .expect("both ranks close the communicator together");
+                    gathered
                 })
             })
             .collect();

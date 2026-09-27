@@ -225,6 +225,30 @@ pub(crate) fn worker_label() -> Option<String> {
     }
 }
 
+/// The machine this process runs on, as the OS names it (`gethostname`) —
+/// the `host` its `instances` row lists, so a gang's ranks name the machines
+/// they ran on. `None` when the OS reports no usable name: the row then
+/// lists no host, which misattributes nothing.
+pub(crate) fn host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes, the length
+    // passed; `gethostname` writes at most that many and never past it.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "gethostname failed; this instance lists no host"
+        );
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..len])
+        .ok()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// Mint this process's `instances`/`jobs.claimed_by` identity: a fresh
 /// UUID, read from nothing in the environment. Called once per session
 /// construction (`InferenceSession::instance_id`).
@@ -6176,6 +6200,7 @@ async fn join_gang_transport(
 /// on every member, and join rank 0 of the communicator on a blocking thread
 /// (the join waits for every member's), bounded by `rank_timeout`.
 async fn bind_gang_transport(
+    job_id: &str,
     collective: jammi_db::config::CollectiveSelection,
     links: &[CoordinatorLink],
     device: &candle_core::Device,
@@ -6186,6 +6211,7 @@ async fn bind_gang_transport(
         && links.iter().all(CoordinatorLink::offers_nccl);
     let kind = TransportKind::select(collective, every_rank_offers_nccl)?;
     tracing::info!(
+        job_id = %job_id,
         topology = "peer",
         world,
         transport = ?kind,
@@ -6529,6 +6555,7 @@ impl JobWorker {
         // device. Bound on every member before round 0; on NCCL every rank
         // then joins the communicator, bounded by the rank timeout.
         let transport = match bind_gang_transport(
+            job_id,
             session.inner_config().worker.collective,
             &links,
             &device,
@@ -9030,7 +9057,12 @@ fn run_fine_tune_blocking(
     }
     let mut training_loop = builder.build()?;
 
-    training_loop.run(call, training_source)
+    let trained = training_loop.run(call, training_source)?;
+    // The gang's healthy end, on every rank at the same point: its round
+    // transport is released together (`Collective::close`). A run that
+    // faulted never reaches here; its transport is aborted instead.
+    training_loop.close_gang(call)?;
+    Ok(trained)
 }
 
 /// Fetch and load the checkpoint a resume of the job restores, if any: the

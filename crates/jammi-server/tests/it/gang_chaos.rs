@@ -536,6 +536,10 @@ impl Collective for ChaosRank {
         self.inner.world()
     }
 
+    fn close(&self, call: &BlockingCall) -> Result<()> {
+        self.inner.close(call)
+    }
+
     fn bind_agreement(&self, digest: String) -> Result<()> {
         self.inner.bind_agreement(digest)
     }

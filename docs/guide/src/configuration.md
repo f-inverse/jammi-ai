@@ -224,9 +224,12 @@ metrics_sample_secs = 5
 # a `Peer` gang whose other ranks are fleet members it assembles and dials.
 local_ranks = 1
 # Which collective a multi-rank worker reduces gradients over. Default:
-# "auto" (the best collective this process can actually reach: NCCL on a
-# CUDA build, the host CPU reduction otherwise). "nccl" on a build without
-# the `cuda` feature is refused at session open. Configuration, not a build
+# "auto" (NCCL when every rank of the gang can join it - a CUDA build and a
+# CUDA device on each rank, and in a fleet a member that offers it - the host
+# CPU reduction otherwise). "nccl" on a build without the `cuda` feature is
+# refused at session open, and a gang with a rank that cannot join NCCL is
+# refused. "cpu" forces the host reduction. Every choice folds in one rank
+# order, so the trained bytes do not depend on it. Configuration, not a build
 # feature.
 collective = "auto"
 # How long a rank waits on its peers at a gang boundary before the wait is a

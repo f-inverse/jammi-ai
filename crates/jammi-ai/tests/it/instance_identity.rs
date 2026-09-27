@@ -51,8 +51,8 @@ async fn await_workers(
 
 /// Two sessions constructed under ONE `JAMMI_WORKER_ID` are two instances:
 /// their ids differ, neither id IS the label, and each process's `workers`
-/// row (once it runs a claim loop) shows the shared label beside its own
-/// id. A stop (graceful) and a drop (abort) each remove the process's
+/// row (once it runs a claim loop) shows the shared label, and the machine
+/// both run on, beside its own id. A stop (graceful) and a drop (abort) each remove the process's
 /// `workers` row, so a stopped claimant is absent from the listing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_sessions_given_one_worker_id_mint_distinct_ids_and_share_the_label() {
@@ -82,9 +82,19 @@ async fn two_sessions_given_one_worker_id_mint_distinct_ids_and_share_the_label(
         Some(LABEL),
         "the label rides the instances row"
     );
+    let machine = rows_a[0]
+        .host
+        .clone()
+        .expect("an instance lists the machine it runs on");
+    assert!(!machine.is_empty(), "a listed host names a machine");
     let rows_b = await_workers(&b, "session b's workers row", |rows| rows.len() == 1).await;
     assert_eq!(rows_b[0].instance_id, b.instance_id());
     assert_eq!(rows_b[0].label.as_deref(), Some(LABEL));
+    assert_eq!(
+        rows_b[0].host.as_deref(),
+        Some(machine.as_str()),
+        "two processes on one machine list the same host"
+    );
 
     worker_a.stop_and_join().await.unwrap();
     assert!(

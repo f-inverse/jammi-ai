@@ -51,6 +51,7 @@ pub(super) struct MemExchange {
     device: Device,
     behaviour: Behaviour,
     calls: AtomicUsize,
+    closes: AtomicUsize,
 }
 
 impl MemExchange {
@@ -72,6 +73,7 @@ impl MemExchange {
                     device: Device::Cpu,
                     behaviour: behaviours[rank],
                     calls: AtomicUsize::new(0),
+                    closes: AtomicUsize::new(0),
                 })
             })
             .collect()
@@ -80,6 +82,11 @@ impl MemExchange {
     /// How many times this rank called the primitive.
     pub(super) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// How many times this rank's exchange was released.
+    pub(super) fn closes(&self) -> usize {
+        self.closes.load(Ordering::SeqCst)
     }
 
     fn aborted(&self) -> JammiError {
@@ -164,6 +171,19 @@ impl DeviceExchange for MemExchange {
             .unwrap_or_else(PoisonError::into_inner);
         state.aborted[self.rank] = true;
         self.gang.signal.notify_all();
+    }
+
+    fn close(&self, _deadline: Duration) -> Result<()> {
+        let state = self
+            .gang
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.aborted[self.rank] {
+            return Err(self.aborted());
+        }
+        self.closes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn device(&self) -> &Device {
@@ -350,8 +370,10 @@ fn a_peer_that_never_joins_the_exchange_ends_at_the_deadline_with_a_typed_timeou
             .as_ref()
             .expect_err("a collective after the fault is refused");
     }
-    // The joining ranks' error names the deadline.
-    assert!(results[..2].iter().any(|(first, _)| first
+    // Some rank's error names the deadline: every rank's watchdog shares
+    // it, and whichever fires first — the stalled rank's included — faults
+    // the gang, so the others see the abort.
+    assert!(results.iter().any(|(first, _)| first
         .as_ref()
         .unwrap_err()
         .to_string()
@@ -420,5 +442,44 @@ fn a_round_whose_tensors_are_all_empty_ends_like_the_inline_round() {
     assert_eq!(device_result[0].0, vec![0, 4]);
     for exchange in &exchanges {
         assert_eq!(exchange.calls(), 0, "an all-empty round moves no byte");
+    }
+}
+
+#[test]
+fn a_healthy_gang_releases_every_ranks_exchange_and_a_faulted_one_refuses_to() {
+    let timeout = Duration::from_secs(30);
+    let exchanges = MemExchange::gang(3, &[Behaviour::Join; 3]);
+    let closed = run(device(&exchanges), timeout, |local, call| {
+        let mut t = vec![ramp(2, 3, local.rank() as f32, DType::F32)];
+        local.all_reduce_sum(&call, &mut t)?;
+        local.close(&call)
+    });
+    for (rank, result) in closed.iter().enumerate() {
+        result
+            .as_ref()
+            .expect("a healthy rank releases its exchange");
+        assert_eq!(
+            exchanges[rank].closes(),
+            1,
+            "rank {rank} releases exactly once"
+        );
+    }
+
+    // A gang whose exchange faulted was aborted; releasing it is refused,
+    // and nothing is released.
+    let exchanges = MemExchange::gang(3, &[Behaviour::Join, Behaviour::Fail, Behaviour::Join]);
+    let closed = run(device(&exchanges), timeout, |local, call| {
+        let mut t = vec![ramp(2, 3, 1.0, DType::F32)];
+        assert!(
+            local.all_reduce_sum(&call, &mut t).is_err(),
+            "the gang faulted"
+        );
+        local.close(&call)
+    });
+    for rank in 0..3 {
+        closed[rank]
+            .as_ref()
+            .expect_err("an aborted exchange is not released as if healthy");
+        assert_eq!(exchanges[rank].closes(), 0);
     }
 }

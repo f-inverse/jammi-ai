@@ -5,6 +5,16 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **Every gang topology reduces over NCCL, and the result does not depend on it.** A collective is
+  a control plane (the in-process rendezvous, or the fleet's two-phase round over `RunRank`) over a
+  transport: inline bytes, or an NCCL device exchange. `[worker] collective` selects the transport
+  for every gang — in one process and across a fleet, where the coordinator binds it on every
+  member (`Admitted.nccl`, `RankControl.bind`) before round 0 — and every transport folds in one
+  rank order, so the trained adapter is the same bytes under either. NCCL communicators join
+  bounded and non-blocking, run on their own streams, abort on a fault, and are released by every
+  rank together at a healthy end (`Collective::close`: finalize, then destroy).
+- **A worker lists the machine it runs on.** `ListWorkers`' `host` carries the process's host name
+  (it was always empty), and a fleet gang's `gang transport selected` log line names its job.
 - **Postgres and MySQL sources ship in every published engine.** `jammi-server` and `jammi-python`
   forward `jammi-db`'s `postgres` / `mysql` features and every release lane builds them, with
   OpenSSL vendored and zlib linked statically (no runtime libssl/libcrypto/libz). A Postgres source

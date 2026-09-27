@@ -681,6 +681,10 @@ impl Collective for Local {
         })
     }
 
+    fn close(&self, _call: &BlockingCall) -> Result<()> {
+        self.shared.transports[self.rank as usize].close(self.shared.timeout)
+    }
+
     fn rank(&self) -> u32 {
         self.rank
     }

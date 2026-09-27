@@ -470,6 +470,14 @@ pub trait Collective: Send + Sync {
     /// Return only once every rank has reached this call.
     fn barrier(&self, call: &BlockingCall) -> Result<()>;
 
+    /// The gang's healthy end: every rank calls it once, after its last
+    /// round, and it releases this rank's round transport. A device
+    /// communicator spanning processes is torn down by its ranks together,
+    /// so this — never a drop — is where a healthy gang lets go of it; a
+    /// rank that faults before reaching it is torn down by the transport's
+    /// abort instead.
+    fn close(&self, call: &BlockingCall) -> Result<()>;
+
     /// This rank's index in `0..world`.
     fn rank(&self) -> u32;
 

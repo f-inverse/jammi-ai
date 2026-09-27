@@ -16,7 +16,7 @@
 //! gang computes, and never calls NCCL with a size another rank did not agree
 //! to (mismatched NCCL counts are undefined behaviour, not an error).
 //!
-//! # Four facts this exchange is shaped by
+//! # Five facts this exchange is shaped by
 //!
 //! **Joining a multi-process gang is bounded.** `ncclCommInitRank` blocks
 //! until every rank has joined, and there is no communicator yet to abort, so
@@ -51,6 +51,14 @@
 //! buffer. So the return value of the sync is not the failure signal —
 //! [`Nccl::is_aborted`] is, and every exchange checks it after synchronizing
 //! and refuses rather than handing back the garbage.
+//!
+//! **A healthy end releases the communicator together.** Across processes,
+//! one rank's teardown (`commFree`) waits on its peers' proxies, so a rank
+//! that tears its communicator down while a peer still holds its own parks
+//! until that peer lets go — and a peer waiting for this rank's report never
+//! will. A gang's healthy end is therefore [`Nccl::close`] on every rank at
+//! the same point: `ncclCommFinalize`, polled to completion under the gang's
+//! deadline, then `ncclCommDestroy`. `ncclCommAbort` is the fault path only.
 //!
 //! **A communicator must never be aborted twice** (the second call
 //! segfaults), and never used after its abort (the handle is freed). The
@@ -101,8 +109,22 @@ const CONFIG_UNDEF_INT: c_int = c_int::MIN;
 /// `NCCL_CONFIG_INITIALIZER`'s magic.
 const CONFIG_MAGIC: u32 = 0xcafe_beef;
 
-/// A raw NCCL communicator; dropping it aborts it (`ncclCommAbort`).
+/// A raw NCCL communicator; dropping it aborts it (`ncclCommAbort`) —
+/// [`Self::destroy`] is the healthy release instead.
 struct RawComm(sys::ncclComm_t);
+
+impl RawComm {
+    /// Destroy a finalized communicator (`ncclCommDestroy`) instead of
+    /// aborting it.
+    fn destroy(self) -> Result<()> {
+        let comm = std::mem::ManuallyDrop::new(self);
+        // SAFETY: a finalized handle, released exactly once — `ManuallyDrop`
+        // keeps `Drop`'s abort from also running on it.
+        unsafe { result::comm_destroy(comm.0) }
+            .map(|_| ())
+            .map_err(|e| nccl_error("ncclCommDestroy", e))
+    }
+}
 
 // SAFETY: the handle is only ever used under `Nccl::comm`'s lock (the module
 // doc's "Threading discipline"); moving it between threads is what NCCL's
@@ -209,6 +231,57 @@ impl Nccl {
         drop(taken);
     }
 
+    /// Release this communicator at the gang's healthy end (the module doc's
+    /// fourth fact): finalize, poll it to completion under `deadline`, then
+    /// destroy. A finalize that has not completed by `deadline` — a peer
+    /// that never closed — aborts the communicator and is refused.
+    pub fn close(&self, deadline: Duration) -> Result<()> {
+        let taken = self
+            .comm
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(comm) = taken else {
+            return self.check_live("close");
+        };
+        // SAFETY: a live handle this call now owns alone.
+        let started = unsafe { sys::ncclCommFinalize(comm.0) };
+        if !matches!(
+            started,
+            sys::ncclResult_t::ncclSuccess | sys::ncclResult_t::ncclInProgress
+        ) {
+            drop(comm);
+            return Err(JammiError::Gpu(format!(
+                "ncclCommFinalize: rank {}: nccl status {started:?}",
+                self.rank
+            )));
+        }
+        let begun = Instant::now();
+        loop {
+            match async_status(&comm) {
+                sys::ncclResult_t::ncclSuccess => return comm.destroy(),
+                sys::ncclResult_t::ncclInProgress if begun.elapsed() < deadline => {
+                    std::thread::sleep(POLL_INTERVAL)
+                }
+                sys::ncclResult_t::ncclInProgress => {
+                    drop(comm);
+                    return Err(JammiError::Gpu(format!(
+                        "ncclCommFinalize: rank {} of {} did not complete within {deadline:?} — \
+                         a peer never closed, so this rank's communicator was aborted",
+                        self.rank, self.world
+                    )));
+                }
+                other => {
+                    drop(comm);
+                    return Err(JammiError::Gpu(format!(
+                        "ncclCommFinalize: rank {}: nccl status {other:?}",
+                        self.rank
+                    )));
+                }
+            }
+        }
+    }
+
     /// Whether [`Self::abort`] has run. This — never a collective's return
     /// value — is the failure signal for a gang whose peer died: an aborted
     /// `synchronize` returns `Ok(())` over a garbage buffer.
@@ -284,6 +357,10 @@ impl DeviceExchange for Nccl {
 
     fn abort(&self) {
         Nccl::abort(self);
+    }
+
+    fn close(&self, deadline: Duration) -> Result<()> {
+        Nccl::close(self, deadline)
     }
 
     fn device(&self) -> &Device {

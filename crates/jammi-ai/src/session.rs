@@ -259,12 +259,13 @@ impl InferenceSession {
 
         let instance_id = crate::fine_tune::worker::mint_instance_id();
         let label = crate::fine_tune::worker::worker_label();
+        let host = crate::fine_tune::worker::host_name();
         let registration = Arc::new(
             jammi_db::catalog::instance::InstanceRegistration::from_config(
                 inner.config(),
                 instance_id.clone(),
                 label.as_deref(),
-                None,
+                host.as_deref(),
             )?,
         );
 

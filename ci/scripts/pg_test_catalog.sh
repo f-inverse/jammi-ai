@@ -14,17 +14,22 @@
 #       Download and verify this host's build into the cache dir
 #       (`JAMMI_PG_CATALOG_DIR`, else `<CARGO_TARGET_DIR or ./target>/pg-test-catalog`);
 #       print its `bin` directory. A second call is a checksum and a print.
-#   pg_test_catalog.sh start [--port PORT] [--data DIR]
+#   pg_test_catalog.sh start [--host HOST] [--port PORT] [--data DIR]
 #       Initialise a cluster in DIR (a fresh temp dir by default), start it in
-#       the background on 127.0.0.1:PORT (default 5433), wait until it accepts
-#       connections, and leave it running. Run as root — a pod's user — the
-#       server runs as the `jammi-pg` system user, created on first use:
-#       Postgres refuses to run as root.
+#       the background on HOST:PORT (default 127.0.0.1:5433), wait until it
+#       accepts connections, and leave it running. A HOST other than loopback
+#       is a catalog other machines share (a multi-host lane's private
+#       network): the cluster then trusts every client that reaches it.
+#       Run as root — a pod's user — the server runs as the `jammi-pg`
+#       system user, created on first use (Postgres refuses to run as root),
+#       and every directory above the server and the cluster gains the
+#       traverse bit (`o+x`, never read) so that user can reach them from
+#       under a private home such as `/root`.
 #   pg_test_catalog.sh stop [--data DIR]
 #       Stop a cluster `start` left running.
-#   pg_test_catalog.sh env [--port PORT]
+#   pg_test_catalog.sh env [--host HOST] [--port PORT]
 #       Print the `JAMMI_TEST_PG_URL=…` line a lane exports.
-#   pg_test_catalog.sh run [--port PORT] -- CMD…
+#   pg_test_catalog.sh run [--host HOST] [--port PORT] -- CMD…
 #       `start`, run CMD with `env` in its environment, `stop`, exit as CMD did.
 set -euo pipefail
 
@@ -73,11 +78,13 @@ fetch() {
   echo "$dir/bin"
 }
 
+HOST="127.0.0.1"
 PORT="5433"
 DATA=""
 parse_opts() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --host) HOST="$2"; shift 2 ;;
       --port) PORT="$2"; shift 2 ;;
       --data) DATA="$2"; shift 2 ;;
       --) shift; break ;;
@@ -85,6 +92,17 @@ parse_opts() {
     esac
   done
   REST=("$@")
+}
+
+# The traverse bit on every ancestor of $1: the system user must reach the
+# server and the cluster wherever the caller keeps them.
+grant_traverse() {
+  local dir
+  dir="$(cd "$1" && pwd)"
+  while [ "$dir" != / ]; do
+    dir="$(dirname "$dir")"
+    chmod o+x "$dir"
+  done
 }
 
 # Run a server command as whoever may: the invoking user, or — as root — the
@@ -103,12 +121,18 @@ start() {
   bin="$(fetch)"
   DATA="${DATA:-$(mktemp -d "${TMPDIR:-/tmp}/pg-test-catalog.XXXXXX")}"
   mkdir -p "$DATA"
-  [ "$(id -u)" != 0 ] || { as_owner true; chown -R "$SYSTEM_USER" "$DATA" "$(dirname "$bin")"; }
+  if [ "$(id -u)" = 0 ]; then
+    as_owner true
+    chown -R "$SYSTEM_USER" "$DATA" "$(dirname "$bin")"
+    grant_traverse "$DATA"
+    grant_traverse "$bin"
+  fi
   as_owner "$bin/initdb" -D "$DATA/cluster" -U "$USER_NAME" --auth=trust --encoding=UTF8 --locale=C >"$DATA/.initdb.log" 2>&1 \
     || { cat "$DATA/.initdb.log" >&2; die "initdb failed"; }
+  [ "$HOST" = "127.0.0.1" ] || echo "host all all 0.0.0.0/0 trust" >> "$DATA/cluster/pg_hba.conf"
   as_owner "$bin/pg_ctl" -D "$DATA/cluster" -l "$DATA/.log" -w -t 60 \
-    -o "-h 127.0.0.1 -p ${PORT} -k $DATA/cluster -c max_connections=400 -c fsync=off" start >/dev/null \
-    || { cat "$DATA/.log" >&2; die "the catalog did not start on 127.0.0.1:${PORT}"; }
+    -o "-h ${HOST} -p ${PORT} -k $DATA/cluster -c max_connections=400 -c fsync=off" start >/dev/null \
+    || { cat "$DATA/.log" >&2; die "the catalog did not start on ${HOST}:${PORT}"; }
   echo "$DATA"
 }
 
@@ -119,7 +143,7 @@ stop() {
 }
 
 env_lines() {
-  printf 'JAMMI_TEST_PG_URL=postgres://%s@127.0.0.1:%s/postgres\n' "$USER_NAME" "$PORT"
+  printf 'JAMMI_TEST_PG_URL=postgres://%s@%s:%s/postgres\n' "$USER_NAME" "$HOST" "$PORT"
 }
 
 run() {
@@ -132,7 +156,7 @@ run() {
   exit "$rc"
 }
 
-[ "$#" -ge 1 ] || die "usage: fetch | start [--port P] [--data D] | stop --data D | env [--port P] | run [--port P] -- CMD…"
+[ "$#" -ge 1 ] || die "usage: fetch | start [--host H] [--port P] [--data D] | stop --data D | env [--host H] [--port P] | run [--host H] [--port P] -- CMD…"
 verb="$1"; shift
 parse_opts "$@"
 case "$verb" in

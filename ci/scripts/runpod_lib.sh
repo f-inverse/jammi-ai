@@ -1400,8 +1400,18 @@ watchdog = ("( sleep %d; "
 # placed ahead of it — `yum install` reaching the network, for instance — can
 # hang and leave the pod running with no deadline, which is the failure this
 # whole mechanism exists to prevent.
+#
+# The image ships sshd; an image without it installs it here, retrying while
+# a fresh host's egress comes up, with yum's own errors in the pod log — a
+# silenced failure left a pod restarting forever on a missing sshd with
+# nothing to say why.
+sshd = ("for try in 1 2 3 4 5 6; do "
+        "[ -x /usr/sbin/sshd ] && break; "
+        "yum install -y -q openssh-server openssh-clients && break; "
+        "echo \"entrypoint: installing openssh-server failed (try $try of 6)\" >&2; "
+        "sleep 10; done; ")
 setup = (watchdog
-         + "yum install -y openssh-server openssh-clients >/dev/null 2>&1; ssh-keygen -A; "
+         + sshd + "ssh-keygen -A; "
          "mkdir -p /root/.ssh; printf \"%s\\n\" \"$PUBLIC_KEY\" > /root/.ssh/authorized_keys; "
          "chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys; "
          "/usr/sbin/sshd -D")

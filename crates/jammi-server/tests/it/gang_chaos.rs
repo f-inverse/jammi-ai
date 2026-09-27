@@ -203,37 +203,53 @@ impl Coordinator {
             .expect("source");
     }
 
-    /// The claim loop's own two steps (`reclaim_expired_jobs`, then
-    /// `claim_next`), polled: a released row is claimable at once, an
-    /// expired one after its lease window, and a cooling row after its
-    /// `next_assembly_after`.
     async fn claim(&self, within: Duration) -> JobRecord {
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            self.session
-                .catalog()
-                .reclaim_expired_jobs(COORDINATOR_LEASE, MAX_ATTEMPTS)
-                .await
-                .expect("reclaim");
-            if let Some(record) = self
-                .session
-                .catalog()
-                .claim_next(self.worker.worker_id(), &["fine_tune"], COORDINATOR_LEASE)
-                .await
-                .expect("claim")
-            {
-                return record;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the job was not claimable within {within:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        claim_within(
+            &self.session,
+            self.worker.worker_id(),
+            COORDINATOR_LEASE,
+            MAX_ATTEMPTS,
+            within,
+        )
+        .await
     }
 
     async fn run(&self, record: JobRecord) {
         self.worker.run_claimed_job(&self.session, record).await;
+    }
+}
+
+/// The claim loop's own two steps (`reclaim_expired_jobs`, then
+/// `claim_next`) for `worker_id`, polled: a released row is claimable at
+/// once, an expired one after its `lease` window, and a cooling row after its
+/// `next_assembly_after`. Panics when nothing was claimable `within`.
+pub(crate) async fn claim_within(
+    session: &Arc<InferenceSession>,
+    worker_id: &str,
+    lease: Duration,
+    max_attempts: u32,
+    within: Duration,
+) -> JobRecord {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        session
+            .catalog()
+            .reclaim_expired_jobs(lease, max_attempts)
+            .await
+            .expect("reclaim");
+        if let Some(record) = session
+            .catalog()
+            .claim_next(worker_id, &["fine_tune"], lease)
+            .await
+            .expect("claim")
+        {
+            return record;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the job was not claimable within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -253,6 +269,15 @@ pub(crate) struct Member {
 
 impl Member {
     pub(crate) async fn start(fleet: &Fleet) -> Self {
+        Self::start_configured(fleet, |_| {}).await
+    }
+
+    /// [`Self::start`] over a config `configure` adjusts first — a member
+    /// pinned to its own device, say.
+    pub(crate) async fn start_configured(
+        fleet: &Fleet,
+        configure: impl FnOnce(&mut JammiConfig),
+    ) -> Self {
         // The port is reserved BEFORE the session exists so the
         // registration can advertise it; the listener moves onto the gang
         // runtime below.
@@ -266,6 +291,7 @@ impl Member {
             RANK_TIMEOUT_SECS,
         );
         cfg.server.peer_advertise = Some(addr.to_string());
+        configure(&mut cfg);
         let session = Arc::new(InferenceSession::new(cfg).await.expect("member"));
         session
             .catalog()

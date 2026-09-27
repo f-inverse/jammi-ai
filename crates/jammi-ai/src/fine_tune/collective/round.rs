@@ -12,7 +12,7 @@
 //! sequence of operations over the same rank-ordered inputs, and the result
 //! bytes are identical across arms and transports on one device kind.
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use jammi_db::error::{JammiError, Result};
 
 use super::{Descriptor, Verb};
@@ -68,6 +68,27 @@ impl Contribution {
             _ => 0,
         }
     }
+
+    /// A tensor verb's contribution rebuilt from the tensors a transport moved
+    /// — a gather's one slice, a sum's tensors in canonical order, or a
+    /// broadcast's root tensor (none off the root). The control verbs carry
+    /// no tensor and never travel by a transport.
+    pub(crate) fn from_tensors(verb: Verb, mut tensors: Vec<Tensor>) -> Result<Self> {
+        let malformed = |count: usize| {
+            JammiError::FineTune(format!(
+                "{verb}: a rebuilt contribution cannot carry {count} tensors"
+            ))
+        };
+        match verb {
+            Verb::AllGather if tensors.len() == 1 => Ok(Self::Gather(tensors.remove(0))),
+            Verb::AllReduceSum => Ok(Self::ReduceSum(tensors)),
+            Verb::Broadcast if tensors.len() <= 1 => Ok(Self::Broadcast(tensors.pop())),
+            Verb::AllGather | Verb::Broadcast => Err(malformed(tensors.len())),
+            Verb::AllReduceMaxFlags | Verb::Barrier => Err(JammiError::FineTune(format!(
+                "{verb}: a control verb's contribution carries no tensor to rebuild"
+            ))),
+        }
+    }
 }
 
 /// A folded round result: the verb's tensors, and the control word.
@@ -75,6 +96,18 @@ impl Contribution {
 pub(crate) struct Folded {
     pub(crate) tensors: Vec<Tensor>,
     pub(crate) flags: u32,
+}
+
+impl Folded {
+    /// The result a device-transport round's coordinator publishes: no
+    /// tensors — the bytes move by the exchange — only the fact that every
+    /// rank's descriptor agreed.
+    pub(crate) fn agreed() -> Self {
+        Self {
+            tensors: Vec::new(),
+            flags: 0,
+        }
+    }
 }
 
 /// The fold, on `device`, in rank order: `Tensor::cat` of the non-empty
@@ -267,4 +300,69 @@ pub(crate) fn apply_broadcast(folded: Folded, t: &mut Tensor, device: &Device) -
         .map_err(|e| JammiError::FineTune(format!("broadcast: to_device: {e}")))?
         .detach();
     Ok(())
+}
+
+/// The shape and dtype one wire tensor decodes to.
+pub(crate) type Shape = (Vec<usize>, DType);
+
+/// The shapes a contribution from `rank` carries under `descriptor` — the
+/// descriptor is agreed before any body is decoded, so this is what the
+/// body MUST decode to.
+pub(crate) fn contribution_shapes(descriptor: &Descriptor, rank: u32) -> Vec<Shape> {
+    match descriptor.verb {
+        Verb::AllGather => {
+            let rows = descriptor
+                .counts
+                .as_ref()
+                .and_then(|counts| counts.get(rank as usize).copied())
+                .unwrap_or(0);
+            gather_shapes(descriptor, rows)
+        }
+        Verb::AllReduceSum => full_shapes(descriptor),
+        Verb::Broadcast => {
+            if descriptor.root == Some(rank) {
+                full_shapes(descriptor)
+            } else {
+                Vec::new()
+            }
+        }
+        Verb::AllReduceMaxFlags | Verb::Barrier => Vec::new(),
+    }
+}
+
+/// The shapes the RESULT of a round under `descriptor` carries.
+pub(crate) fn result_shapes(descriptor: &Descriptor) -> Vec<Shape> {
+    match descriptor.verb {
+        Verb::AllGather => {
+            let total: usize = descriptor
+                .counts
+                .as_ref()
+                .map(|counts| counts.iter().sum())
+                .unwrap_or(0);
+            gather_shapes(descriptor, total)
+        }
+        Verb::AllReduceSum | Verb::Broadcast => full_shapes(descriptor),
+        Verb::AllReduceMaxFlags | Verb::Barrier => Vec::new(),
+    }
+}
+
+fn gather_shapes(descriptor: &Descriptor, rows: usize) -> Vec<Shape> {
+    descriptor
+        .tensors
+        .iter()
+        .map(|s| {
+            let mut dims = Vec::with_capacity(s.dims.len() + 1);
+            dims.push(rows);
+            dims.extend_from_slice(&s.dims);
+            (dims, s.dtype)
+        })
+        .collect()
+}
+
+fn full_shapes(descriptor: &Descriptor) -> Vec<Shape> {
+    descriptor
+        .tensors
+        .iter()
+        .map(|s| (s.dims.clone(), s.dtype))
+        .collect()
 }

@@ -132,17 +132,21 @@ pub mod nccl;
 pub mod noop;
 pub mod peer;
 mod round;
+pub mod transport;
 
 #[cfg(test)]
 mod peer_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod transport_tests;
+#[cfg(test)]
 pub(crate) use tests::witness;
 
 pub use local::{Local, LocalGang};
 pub use noop::Noop;
 pub use peer::{CoordinatorLink, LinkFault, MemberEnd, MemberLink, Peer, RankReadFault};
+pub use transport::{DeviceExchange, Transport};
 
 /// A thread-bound witness that the current thread may block.
 ///

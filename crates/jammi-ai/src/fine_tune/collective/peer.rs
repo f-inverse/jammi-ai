@@ -118,7 +118,8 @@ use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
 use super::local::DEFAULT_RENDEZVOUS_TIMEOUT;
-use super::round::{self, Contribution};
+use super::round::{self, contribution_shapes, result_shapes, Contribution, Shape};
+use super::transport::{self, Transport};
 use super::{
     checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
     Verb,
@@ -729,9 +730,6 @@ struct Body {
     chunk_bytes: usize,
 }
 
-/// The shape and dtype one wire tensor decodes to.
-type Shape = (Vec<usize>, DType);
-
 /// The exact bytes of `t`'s elements as an Arrow column of its dtype.
 fn tensor_to_column(t: &Tensor) -> Result<ArrayRef> {
     let host = t
@@ -915,66 +913,25 @@ fn split_chunks(ipc: &[u8], chunk_bytes: usize) -> Vec<Vec<u8>> {
 
 // ── Contributions ───────────────────────────────────────────────────────────
 
-/// The shapes a contribution from `rank` carries under `descriptor` — the
-/// descriptor is agreed before any body is decoded, so this is what the
-/// body MUST decode to.
-fn contribution_shapes(descriptor: &Descriptor, rank: u32) -> Vec<Shape> {
-    match descriptor.verb {
-        Verb::AllGather => {
-            let rows = descriptor
-                .counts
-                .as_ref()
-                .and_then(|counts| counts.get(rank as usize).copied())
-                .unwrap_or(0);
-            gather_shapes(descriptor, rows)
-        }
-        Verb::AllReduceSum => full_shapes(descriptor),
-        Verb::Broadcast => {
-            if descriptor.root == Some(rank) {
-                full_shapes(descriptor)
-            } else {
-                Vec::new()
-            }
-        }
-        Verb::AllReduceMaxFlags | Verb::Barrier => Vec::new(),
+/// Which round a rank is in: its index, its verb, the descriptor every rank
+/// agreed, and the gang deadline its waits expire at.
+#[derive(Clone, Copy)]
+struct RoundAt<'a> {
+    round: u64,
+    verb: Verb,
+    descriptor: &'a Descriptor,
+    deadline: Instant,
+}
+
+/// The shapes a contribution from `rank` carries IN THE ROUND FRAMES: its
+/// tensors on an inline round, none on a device-transport round (the bytes
+/// move by the exchange once the descriptors agree).
+fn carried_shapes(device_transport: bool, descriptor: &Descriptor, rank: u32) -> Vec<Shape> {
+    if device_transport {
+        Vec::new()
+    } else {
+        contribution_shapes(descriptor, rank)
     }
-}
-
-/// The shapes the RESULT of a round under `descriptor` carries.
-fn result_shapes(descriptor: &Descriptor) -> Vec<Shape> {
-    match descriptor.verb {
-        Verb::AllGather => {
-            let total: usize = descriptor
-                .counts
-                .as_ref()
-                .map(|counts| counts.iter().sum())
-                .unwrap_or(0);
-            gather_shapes(descriptor, total)
-        }
-        Verb::AllReduceSum | Verb::Broadcast => full_shapes(descriptor),
-        Verb::AllReduceMaxFlags | Verb::Barrier => Vec::new(),
-    }
-}
-
-fn gather_shapes(descriptor: &Descriptor, rows: usize) -> Vec<Shape> {
-    descriptor
-        .tensors
-        .iter()
-        .map(|s| {
-            let mut dims = Vec::with_capacity(s.dims.len() + 1);
-            dims.push(rows);
-            dims.extend_from_slice(&s.dims);
-            (dims, s.dtype)
-        })
-        .collect()
-}
-
-fn full_shapes(descriptor: &Descriptor) -> Vec<Shape> {
-    descriptor
-        .tensors
-        .iter()
-        .map(|s| (s.dims.clone(), s.dtype))
-        .collect()
 }
 
 // ── The Peer ────────────────────────────────────────────────────────────────
@@ -1007,6 +964,11 @@ pub struct Peer {
     device: Device,
     timeout: Duration,
     chunk_bytes: usize,
+    /// How this rank's round bytes move: inline in the round frames, or by a
+    /// device exchange once the round is agreed ([`Self::with_transport`]).
+    /// Every rank of a gang holds the same kind — the coordinator decides it
+    /// and binds it on every member before round 0.
+    transport: Transport,
     /// The caller-bound [`Descriptor::agreement`] this rank signs every
     /// round with; unset until [`Self::with_agreement`] or
     /// [`Collective::bind_agreement`] binds one.
@@ -1096,6 +1058,7 @@ impl Peer {
             device,
             timeout: DEFAULT_RENDEZVOUS_TIMEOUT,
             chunk_bytes: chunk_bytes(max_message_bytes)?,
+            transport: Transport::Inline,
             agreement: OnceLock::new(),
             inner: Mutex::new(Inner {
                 endpoint: Endpoint::Coordinator(members),
@@ -1131,6 +1094,7 @@ impl Peer {
             device,
             timeout: DEFAULT_RENDEZVOUS_TIMEOUT,
             chunk_bytes: chunk_bytes(max_message_bytes)?,
+            transport: Transport::Inline,
             agreement: OnceLock::new(),
             inner: Mutex::new(Inner {
                 endpoint: Endpoint::Member(link),
@@ -1150,6 +1114,24 @@ impl Peer {
             ));
         }
         self.timeout = timeout;
+        Ok(self)
+    }
+
+    /// Move this rank's round bytes by `transport` — see
+    /// [`super::transport`]. A device exchange must live on this rank's own
+    /// device.
+    pub fn with_transport(mut self, transport: Transport) -> Result<Self> {
+        if let Transport::Device(exchange) = &transport {
+            if !exchange.device().same_device(&self.device) {
+                return Err(JammiError::FineTune(format!(
+                    "rank {} trains on {:?} but its device exchange is on {:?}",
+                    self.rank,
+                    self.device,
+                    exchange.device()
+                )));
+            }
+        }
+        self.transport = transport;
         Ok(self)
     }
 
@@ -1290,6 +1272,7 @@ impl Peer {
     /// failure permanent.
     fn round<A, T>(
         &self,
+        call: &BlockingCall,
         verb: Verb,
         args: A,
         prepare: impl FnOnce(&A) -> Result<(Descriptor, Contribution)>,
@@ -1331,12 +1314,28 @@ impl Peer {
 
         let deadline = Instant::now() + self.timeout;
         let committed = match endpoint {
-            Endpoint::Coordinator(members) => {
-                self.coordinate(members, round, verb, &descriptor, contribution, deadline)
-            }
-            Endpoint::Member(link) => {
-                self.participate(link, round, verb, &descriptor, contribution, deadline)
-            }
+            Endpoint::Coordinator(members) => self.coordinate(
+                call,
+                members,
+                &RoundAt {
+                    round,
+                    verb,
+                    descriptor: &descriptor,
+                    deadline,
+                },
+                contribution,
+            ),
+            Endpoint::Member(link) => self.participate(
+                call,
+                link,
+                &RoundAt {
+                    round,
+                    verb,
+                    descriptor: &descriptor,
+                    deadline,
+                },
+                contribution,
+            ),
         };
         let result = committed.and_then(|result| apply(args, result));
         if let Err(error) = &result {
@@ -1346,15 +1345,27 @@ impl Peer {
     }
 
     /// The coordinator's round: collect, agree, fold, publish, ACK, commit.
+    ///
+    /// On a device transport the collected contributions carry descriptors
+    /// alone; once they agree, the coordinator publishes the AGREEMENT (a
+    /// result with no tensors), every rank moves its bytes by its device
+    /// exchange and folds them itself, and the ACK / commit that follow are
+    /// the same commit point as inline: a fault before the last ACK applies
+    /// nothing on any rank.
     fn coordinate(
         &self,
+        call: &BlockingCall,
         members: &mut [CoordinatorLink],
-        round: u64,
-        verb: Verb,
-        descriptor: &Descriptor,
+        at: &RoundAt<'_>,
         own: Contribution,
-        deadline: Instant,
     ) -> Result<round::Folded> {
+        let RoundAt {
+            round,
+            verb,
+            descriptor,
+            deadline,
+        } = *at;
+        let exchange = self.transport.device_for(verb);
         let wire_descriptor = descriptor_to_wire(descriptor).map_err(|reason| {
             fault_all(members, round, format!("{verb}: round {round}: {reason}"))
         })?;
@@ -1362,10 +1373,11 @@ impl Peer {
         // Every member's contribution, in rank order, each under a
         // descriptor equal to rank 0's — or no round for anyone.
         let mut contributions: Vec<Contribution> = Vec::with_capacity(members.len() + 1);
-        contributions.push(own);
+        contributions.push(own.clone());
         let collected = members.iter_mut().try_for_each(|link| {
             let rank = link.rank;
-            let bound = reassembly_bound(&contribution_shapes(descriptor, rank))
+            let carried = carried_shapes(exchange.is_some(), descriptor, rank);
+            let bound = reassembly_bound(&carried)
                 .map_err(|reason| format!("{verb}: round {round}: {reason}"))?;
             let (payload, body) = recv_payload(
                 &mut link.link,
@@ -1394,53 +1406,60 @@ impl Peer {
                      so no rank may be handed a result"
                 ));
             }
-            let tensors = decode_tensors(&body, &contribution_shapes(descriptor, rank)).map_err(
-                |reason| format!("{verb}: round {round}: rank {rank}'s contribution: {reason}"),
-            )?;
-            contributions.push(match verb {
-                Verb::AllGather => Contribution::Gather(round::single(tensors)),
-                Verb::AllReduceSum => Contribution::ReduceSum(tensors),
-                Verb::AllReduceMaxFlags => Contribution::MaxFlags(payload.flags),
-                Verb::Broadcast => Contribution::Broadcast(tensors.into_iter().next()),
-                Verb::Barrier => Contribution::Barrier,
-            });
+            let tensors = decode_tensors(&body, &carried).map_err(|reason| {
+                format!("{verb}: round {round}: rank {rank}'s contribution: {reason}")
+            })?;
+            if exchange.is_none() {
+                contributions.push(match verb {
+                    Verb::AllReduceMaxFlags => Contribution::MaxFlags(payload.flags),
+                    Verb::Barrier => Contribution::Barrier,
+                    tensor_verb => Contribution::from_tensors(tensor_verb, tensors)
+                        .map_err(|error| reason_of(&error))?,
+                });
+            }
             Ok(())
         });
         if let Err(reason) = collected {
             return Err(fault_all(members, round, reason));
         }
 
-        // The fold, on this rank's device, in rank order.
-        let folded =
-            round::fold(verb, descriptor, &contributions, &self.device).map_err(|error| {
-                fault_all(
-                    members,
-                    round,
-                    format!("{verb}: round {round}: {}", reason_of(&error)),
-                )
-            })?;
-        let body = Body {
-            ipc: encode_tensors(&folded.tensors.iter().collect::<Vec<_>>())?,
-            flags: folded.flags,
-            chunk_bytes: self.chunk_bytes,
-        };
-        let published = members.iter().try_for_each(|link| {
-            if link
-                .link
-                .send_payload(round, wire_descriptor.clone(), &body)
-            {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{verb}: round {round}: rank {} disconnected while the result was being \
-                     published — no rank applies round {round}",
-                    link.rank
-                ))
+        let folded = match exchange {
+            None => {
+                // The fold, on this rank's device, in rank order.
+                let folded = round::fold(verb, descriptor, &contributions, &self.device).map_err(
+                    |error| {
+                        fault_all(
+                            members,
+                            round,
+                            format!("{verb}: round {round}: {}", reason_of(&error)),
+                        )
+                    },
+                )?;
+                self.publish(members, at, &wire_descriptor, &folded)?;
+                folded
             }
-        });
-        if let Err(reason) = published {
-            return Err(fault_all(members, round, reason));
-        }
+            Some(exchange) => {
+                // The agreement, published; then every rank's bytes by the
+                // device exchange, and this rank's own fold of them.
+                self.publish(members, at, &wire_descriptor, &round::Folded::agreed())?;
+                transport::exchange_contributions(
+                    exchange.as_ref(),
+                    call,
+                    descriptor,
+                    &own,
+                    self.rank,
+                    self.timeout,
+                )
+                .and_then(|all| round::fold(verb, descriptor, &all, &self.device))
+                .map_err(|error| {
+                    fault_all(
+                        members,
+                        round,
+                        format!("{verb}: round {round}: {}", reason_of(&error)),
+                    )
+                })?
+            }
+        };
 
         // Every member's ACK, then the commit point.
         let acked = members.iter_mut().try_for_each(|link| {
@@ -1473,24 +1492,70 @@ impl Peer {
         Ok(folded)
     }
 
+    /// Publish `result` (a fold, or the bare agreement) to every member.
+    fn publish(
+        &self,
+        members: &[CoordinatorLink],
+        at: &RoundAt<'_>,
+        wire_descriptor: &RoundDescriptor,
+        result: &round::Folded,
+    ) -> Result<()> {
+        let RoundAt { round, verb, .. } = *at;
+        let body = Body {
+            ipc: encode_tensors(&result.tensors.iter().collect::<Vec<_>>())?,
+            flags: result.flags,
+            chunk_bytes: self.chunk_bytes,
+        };
+        let published = members.iter().try_for_each(|link| {
+            if link
+                .link
+                .send_payload(round, wire_descriptor.clone(), &body)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{verb}: round {round}: rank {} disconnected while the result was being \
+                     published — no rank applies round {round}",
+                    link.rank
+                ))
+            }
+        });
+        published.map_err(|reason| fault_all(members, round, reason))
+    }
+
     /// A member's round: contribute, wait, hold, ACK, wait, apply.
+    ///
+    /// On a device transport the contribution carries the descriptor alone
+    /// and the coordinator's result is the bare agreement; the member then
+    /// moves its bytes by its device exchange and folds every rank's itself,
+    /// and holds THAT unapplied until the commit.
     fn participate(
         &self,
+        call: &BlockingCall,
         link: &mut MemberLink,
-        round: u64,
-        verb: Verb,
-        descriptor: &Descriptor,
+        at: &RoundAt<'_>,
         own: Contribution,
-        deadline: Instant,
     ) -> Result<round::Folded> {
+        let RoundAt {
+            round,
+            verb,
+            descriptor,
+            deadline,
+        } = *at;
+        let exchange = self.transport.device_for(verb);
         let link = &mut link.0;
-        let wire_descriptor = descriptor_to_wire(descriptor).map_err(|reason| {
-            let reason = format!("{verb}: round {round}: {reason}");
+        let fault = |link: &Link<RankControl, RankEvent>, reason: String| {
             link.send_fault(round, &reason);
             JammiError::FineTune(reason)
-        })?;
+        };
+        let wire_descriptor = descriptor_to_wire(descriptor)
+            .map_err(|reason| fault(link, format!("{verb}: round {round}: {reason}")))?;
+        let carried: Vec<&Tensor> = match exchange {
+            None => own.tensors(),
+            Some(_) => Vec::new(),
+        };
         let body = Body {
-            ipc: encode_tensors(&own.tensors())?,
+            ipc: encode_tensors(&carried)?,
             flags: own.flags(),
             chunk_bytes: self.chunk_bytes,
         };
@@ -1504,12 +1569,12 @@ impl Peer {
         // The coordinator's result: its descriptor must be the one this rank
         // contributed under (defence in depth — the coordinator already
         // refused any disagreement before publishing).
-        let shapes = result_shapes(descriptor);
-        let bound = reassembly_bound(&shapes).map_err(|reason| {
-            let reason = format!("{verb}: round {round}: {reason}");
-            link.send_fault(round, &reason);
-            JammiError::FineTune(reason)
-        })?;
+        let shapes = match exchange {
+            None => result_shapes(descriptor),
+            Some(_) => Vec::new(),
+        };
+        let bound = reassembly_bound(&shapes)
+            .map_err(|reason| fault(link, format!("{verb}: round {round}: {reason}")))?;
         let (payload, body) = recv_payload(
             link,
             round,
@@ -1519,41 +1584,58 @@ impl Peer {
             "the coordinator's result",
             bound,
         )
-        .map_err(|reason| {
-            link.send_fault(round, &reason);
-            JammiError::FineTune(reason)
-        })?;
+        .map_err(|reason| fault(link, reason))?;
         let wire = payload
             .descriptor
             .as_ref()
             .expect("recv_payload refuses a payload without a descriptor");
         let theirs = descriptor_from_wire(wire).map_err(|reason| {
-            let reason = format!(
-                "{verb}: round {round}: the coordinator's round descriptor {wire:?} is refused \
-                 ({reason}) against this rank's {descriptor:?}"
-            );
-            link.send_fault(round, &reason);
-            JammiError::FineTune(reason)
+            fault(
+                link,
+                format!(
+                    "{verb}: round {round}: the coordinator's round descriptor {wire:?} is \
+                     refused ({reason}) against this rank's {descriptor:?}"
+                ),
+            )
         })?;
         if !descriptor.agrees_with(&theirs) {
-            let reason = format!(
-                "{verb}: round {round}: the coordinator published under {theirs:?} but this \
-                 rank {} contributed under {descriptor:?} — refused",
-                self.rank
-            );
-            link.send_fault(round, &reason);
-            return Err(JammiError::FineTune(reason));
+            return Err(fault(
+                link,
+                format!(
+                    "{verb}: round {round}: the coordinator published under {theirs:?} but this \
+                     rank {} contributed under {descriptor:?} — refused",
+                    self.rank
+                ),
+            ));
         }
-        let pending = decode_tensors(&body, &shapes)
-            .map(|tensors| round::Folded {
-                tensors,
-                flags: payload.flags,
-            })
-            .map_err(|reason| {
-                let reason = format!("{verb}: round {round}: the coordinator's result: {reason}");
-                link.send_fault(round, &reason);
-                JammiError::FineTune(reason)
-            })?;
+        let pending = match exchange {
+            None => decode_tensors(&body, &shapes)
+                .map(|tensors| round::Folded {
+                    tensors,
+                    flags: payload.flags,
+                })
+                .map_err(|reason| {
+                    fault(
+                        link,
+                        format!("{verb}: round {round}: the coordinator's result: {reason}"),
+                    )
+                })?,
+            Some(exchange) => transport::exchange_contributions(
+                exchange.as_ref(),
+                call,
+                descriptor,
+                &own,
+                self.rank,
+                self.timeout,
+            )
+            .and_then(|all| round::fold(verb, descriptor, &all, &self.device))
+            .map_err(|error| {
+                fault(
+                    link,
+                    format!("{verb}: round {round}: {}", reason_of(&error)),
+                )
+            })?,
+        };
 
         // Held, unapplied. ACK, then wait for the commit.
         if !link.send(RankEvent {
@@ -1564,10 +1646,8 @@ impl Peer {
                  ACK was sent — nothing applied"
             )));
         }
-        recv_commit(link, round, verb, deadline, self.timeout).map_err(|reason| {
-            link.send_fault(round, &reason);
-            JammiError::FineTune(reason)
-        })?;
+        recv_commit(link, round, verb, deadline, self.timeout)
+            .map_err(|reason| fault(link, reason))?;
         Ok(pending)
     }
 }
@@ -1764,9 +1844,10 @@ fn unexpected(frame: Frame, verb: Verb, round: u64, what: &str) -> String {
 // ── Collective ──────────────────────────────────────────────────────────────
 
 impl Collective for Peer {
-    fn all_gather(&self, _call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
+    fn all_gather(&self, call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         let rank = self.rank as usize;
         self.round(
+            call,
             Verb::AllGather,
             (),
             |()| {
@@ -1785,8 +1866,9 @@ impl Collective for Peer {
         )
     }
 
-    fn all_reduce_sum(&self, _call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
+    fn all_reduce_sum(&self, call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
         self.round(
+            call,
             Verb::AllReduceSum,
             tensors,
             |tensors| {
@@ -1804,8 +1886,9 @@ impl Collective for Peer {
         )
     }
 
-    fn all_reduce_max_flags(&self, _call: &BlockingCall, flags: u32) -> Result<u32> {
+    fn all_reduce_max_flags(&self, call: &BlockingCall, flags: u32) -> Result<u32> {
         self.round(
+            call,
             Verb::AllReduceMaxFlags,
             (),
             |()| {
@@ -1818,8 +1901,9 @@ impl Collective for Peer {
         )
     }
 
-    fn broadcast(&self, _call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
+    fn broadcast(&self, call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
         self.round(
+            call,
             Verb::Broadcast,
             t,
             |t| {
@@ -1838,8 +1922,9 @@ impl Collective for Peer {
         )
     }
 
-    fn barrier(&self, _call: &BlockingCall) -> Result<()> {
+    fn barrier(&self, call: &BlockingCall) -> Result<()> {
         self.round(
+            call,
             Verb::Barrier,
             (),
             |()| {

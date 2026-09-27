@@ -36,6 +36,7 @@ use jammi_db::error::{JammiError, Result};
 use candle_core::{Device, Tensor};
 
 use super::round::{self, Contribution};
+use super::transport::{self, Transport};
 use super::{
     checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
 };
@@ -66,14 +67,14 @@ struct Round {
     /// Rank-indexed contributions of the round being assembled, each tagged
     /// with the [`Self::generation`] it was deposited at and the
     /// [`Descriptor`] `Shared::exchange` compares before publishing.
-    slots: Vec<Option<(u64, Descriptor, Contribution)>>,
+    slots: Vec<Option<(u64, Descriptor, Option<Contribution>)>>,
     /// How many ranks have deposited into `slots`.
     arrived: usize,
     /// The completed round, shared by every rank until all have taken it.
     /// `Some` blocks the NEXT round from starting, which is what keeps a
     /// fast rank from overtaking a slow one by a whole collective. The `u64`
     /// is the generation the contributions were assembled from.
-    published: Option<(u64, Arc<Vec<Contribution>>)>,
+    published: Option<(u64, Arc<Vec<Option<Contribution>>>)>,
     /// How many ranks have taken `published`.
     taken: usize,
 }
@@ -111,6 +112,9 @@ impl Round {
 struct Shared {
     world: usize,
     devices: Vec<Device>,
+    /// Rank `r`'s transport: every rank's is inline, or every rank's is a
+    /// device exchange (`LocalGang::with_transports` refuses a mix).
+    transports: Vec<Transport>,
     timeout: Duration,
     round: Mutex<Round>,
     /// The first failure any rank reported, and the gang's permanent state
@@ -125,15 +129,16 @@ impl Shared {
     /// Deposit this rank's contribution AND its round [`Descriptor`], and
     /// return every rank's contribution, in rank order, once the round
     /// completes — but only once every rank's descriptor for this round is
-    /// equal. On any disagreement no rank is ever handed a result: every
+    /// equal. The contribution is `None` when the round's bytes move by a
+    /// device transport: the rendezvous then agrees the descriptors alone. On any disagreement no rank is ever handed a result: every
     /// rank gets a typed error naming both descriptors, and the fault is
     /// recorded before any rank returns.
     fn exchange(
         &self,
         rank: usize,
         mut descriptor: Descriptor,
-        contribution: Contribution,
-    ) -> Result<Arc<Vec<Contribution>>> {
+        contribution: Option<Contribution>,
+    ) -> Result<Arc<Vec<Option<Contribution>>>> {
         let kind = descriptor.verb.as_str();
         let deadline = Instant::now() + self.timeout;
         let mut round = self.round.lock().unwrap_or_else(PoisonError::into_inner);
@@ -298,6 +303,12 @@ impl Shared {
         self.record(reason.clone());
         round.abandon();
         self.signal.notify_all();
+        // A peer parked inside a device exchange cannot see the condvar: end
+        // its exchange too, so it learns of the fault now, not at the
+        // deadline.
+        for transport in &self.transports {
+            transport.abort();
+        }
         JammiError::FineTune(reason)
     }
 
@@ -387,6 +398,47 @@ impl LocalGang {
     /// deployment whose `[worker] rank_timeout_secs` differs from the
     /// default).
     pub fn with_timeout(devices: Vec<Device>, timeout: Duration) -> Result<Self> {
+        let transports = vec![Transport::Inline; devices.len()];
+        Self::with_transports(devices, transports, timeout)
+    }
+
+    /// [`Self::with_timeout`] over an explicit transport per rank:
+    /// `transports[r]` moves rank `r`'s round bytes. Every rank's is inline,
+    /// or every rank's is a device exchange on that rank's device — a gang
+    /// whose ranks move bytes differently has no common primitive to gather
+    /// through, and is refused.
+    pub fn with_transports(
+        devices: Vec<Device>,
+        transports: Vec<Transport>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        if transports.len() != devices.len() {
+            return Err(JammiError::FineTune(format!(
+                "a local gang of {} ranks was given {} transports — one per rank",
+                devices.len(),
+                transports.len()
+            )));
+        }
+        let device_ranks = transports
+            .iter()
+            .filter(|t| matches!(t, Transport::Device(_)))
+            .count();
+        if device_ranks != 0 && device_ranks != transports.len() {
+            return Err(JammiError::FineTune(format!(
+                "a local gang's transports are all inline or all device exchanges; {device_ranks}                  of {} ranks move bytes by a device exchange",
+                transports.len()
+            )));
+        }
+        for (rank, (device, transport)) in devices.iter().zip(&transports).enumerate() {
+            if let Transport::Device(exchange) = transport {
+                if !exchange.device().same_device(device) {
+                    return Err(JammiError::FineTune(format!(
+                        "rank {rank} trains on {device:?} but its device exchange is on {:?}",
+                        exchange.device()
+                    )));
+                }
+            }
+        }
         if devices.is_empty() {
             return Err(JammiError::FineTune(
                 "a local gang needs at least one device: rank 0's device is the one every \
@@ -406,6 +458,7 @@ impl LocalGang {
             shared: Arc::new(Shared {
                 world,
                 devices,
+                transports,
                 timeout,
                 round: Mutex::new(Round {
                     generation: 0,
@@ -521,22 +574,53 @@ impl Local {
         }
     }
 
-    /// One round: deposit this rank's contribution under `descriptor`, and
-    /// fold every rank's, in rank order, on rank 0's device — the one place
-    /// a reduction's arithmetic happens, so the sum is one fixed sequence of
-    /// additions rather than one per rank.
-    fn round(&self, descriptor: Descriptor, contribution: Contribution) -> Result<round::Folded> {
+    /// One round of `descriptor`'s verb.
+    ///
+    /// Inline: deposit this rank's contribution, and fold every rank's, in
+    /// rank order, on rank 0's device — the one place a reduction's
+    /// arithmetic happens, so the sum is one fixed sequence of additions
+    /// rather than one per rank. Device transport: the rendezvous agrees the
+    /// descriptors alone; the bytes then move by this rank's device exchange
+    /// and every rank runs the same fold on its own device.
+    fn round(
+        &self,
+        call: &BlockingCall,
+        descriptor: Descriptor,
+        contribution: Contribution,
+    ) -> Result<round::Folded> {
         let verb = descriptor.verb;
         let agreed = descriptor.clone();
-        let contributions = self
-            .shared
-            .exchange(self.rank as usize, descriptor, contribution)?;
-        round::fold(verb, &agreed, &contributions, self.reduce_device())
+        let rank = self.rank as usize;
+        match self.shared.transports[rank].device_for(verb) {
+            None => {
+                let deposited = self.shared.exchange(rank, descriptor, Some(contribution))?;
+                let contributions: Vec<Contribution> = deposited
+                    .iter()
+                    .map(|c| {
+                        c.clone()
+                            .expect("an inline round carries every rank's contribution")
+                    })
+                    .collect();
+                round::fold(verb, &agreed, &contributions, self.reduce_device())
+            }
+            Some(exchange) => {
+                self.shared.exchange(rank, descriptor, None)?;
+                let contributions = transport::exchange_contributions(
+                    exchange.as_ref(),
+                    call,
+                    &agreed,
+                    &contribution,
+                    self.rank,
+                    self.shared.timeout,
+                )?;
+                round::fold(verb, &agreed, &contributions, self.device())
+            }
+        }
     }
 }
 
 impl Collective for Local {
-    fn all_gather(&self, _call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
+    fn all_gather(&self, call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         self.guarded("all_gather", || {
             checked_gather_counts(self.rank, self.world(), local, counts)?;
             let contribution = Contribution::Gather(local.clone());
@@ -546,12 +630,12 @@ impl Collective for Local {
                 Some(counts.to_vec()),
                 vec![TensorSignature::of_gather_slice(local)],
             );
-            let folded = self.round(descriptor, contribution)?;
+            let folded = self.round(call, descriptor, contribution)?;
             round::apply_gather(folded, local, counts, self.rank as usize, self.device())
         })
     }
 
-    fn all_reduce_sum(&self, _call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
+    fn all_reduce_sum(&self, call: &BlockingCall, tensors: &mut [Tensor]) -> Result<()> {
         self.guarded("all_reduce_sum", || {
             let contribution = Contribution::ReduceSum(tensors.to_vec());
             let descriptor = self.descriptor(
@@ -560,20 +644,20 @@ impl Collective for Local {
                 None,
                 tensors.iter().map(TensorSignature::of).collect(),
             );
-            let folded = self.round(descriptor, contribution)?;
+            let folded = self.round(call, descriptor, contribution)?;
             round::apply_sum(folded, tensors, self.device())
         })
     }
 
-    fn all_reduce_max_flags(&self, _call: &BlockingCall, flags: u32) -> Result<u32> {
+    fn all_reduce_max_flags(&self, call: &BlockingCall, flags: u32) -> Result<u32> {
         self.guarded("all_reduce_max_flags", || {
             let contribution = Contribution::MaxFlags(flags);
             let descriptor = self.descriptor(&contribution, None, None, Vec::new());
-            Ok(self.round(descriptor, contribution)?.flags)
+            Ok(self.round(call, descriptor, contribution)?.flags)
         })
     }
 
-    fn broadcast(&self, _call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
+    fn broadcast(&self, call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
         self.guarded("broadcast", || {
             checked_root(self.world(), root)?;
             let contribution = Contribution::Broadcast((self.rank == root).then(|| t.clone()));
@@ -583,16 +667,16 @@ impl Collective for Local {
                 None,
                 vec![TensorSignature::of(t)],
             );
-            let folded = self.round(descriptor, contribution)?;
+            let folded = self.round(call, descriptor, contribution)?;
             round::apply_broadcast(folded, t, self.device())
         })
     }
 
-    fn barrier(&self, _call: &BlockingCall) -> Result<()> {
+    fn barrier(&self, call: &BlockingCall) -> Result<()> {
         self.guarded("barrier", || {
             let contribution = Contribution::Barrier;
             let descriptor = self.descriptor(&contribution, None, None, Vec::new());
-            self.round(descriptor, contribution)?;
+            self.round(call, descriptor, contribution)?;
             Ok(())
         })
     }

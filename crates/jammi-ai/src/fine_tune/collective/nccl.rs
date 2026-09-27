@@ -16,7 +16,7 @@
 //! gang computes, and never calls NCCL with a size another rank did not agree
 //! to (mismatched NCCL counts are undefined behaviour, not an error).
 //!
-//! # Three facts this exchange is shaped by
+//! # Four facts this exchange is shaped by
 //!
 //! **Joining a multi-process gang is bounded.** `ncclCommInitRank` blocks
 //! until every rank has joined, and there is no communicator yet to abort, so
@@ -28,8 +28,18 @@
 //! `splitShare`) and says so in its `size`: NCCL starts from its own
 //! `NCCL_CONFIG_INITIALIZER` and copies at most `size` bytes over it, so every
 //! later field keeps its default whatever layout this build's bindings carry.
-//! The single-process gang (`ncclCommInitAll`) has no remote party to wait
-//! for and joins blocking.
+//! The single-process gang joins the same way — one group of such calls, one
+//! per device — so EVERY communicator is non-blocking: a later call never
+//! parks inside NCCL (a peer's absence, or a first collective's connection
+//! setup, is `ncclInProgress`), which is what lets an abort always land.
+//!
+//! **A collective runs on the communicator's own stream.** candle's device
+//! stream is CUDA's per-thread default stream, and a non-blocking
+//! communicator finishes an enqueue on NCCL's own thread, where "per thread"
+//! names a different stream on a different current device. Each
+//! communicator therefore owns a stream created on its device's context; an
+//! exchange synchronizes candle's stream (the input's producer) before
+//! enqueueing, and waits on its own after.
 //!
 //! **A dead peer is not detected, and the abort flag is the failure signal.**
 //! The host side of a collective does not block (it enqueues on the comm's
@@ -114,7 +124,14 @@ pub struct Nccl {
     rank: u32,
     world: u32,
     device: Device,
-    stream: Arc<CudaStream>,
+    /// The stream candle launches this device's kernels on — what produced
+    /// an exchange's input, synchronized before the collective is enqueued.
+    compute: Arc<CudaStream>,
+    /// The communicator's OWN stream, created on this device's context. Never
+    /// candle's: that is the per-thread default stream, and a non-blocking
+    /// communicator finishes an enqueue on NCCL's own thread, where "per
+    /// thread" names a different stream (and a different current device).
+    collective: Arc<CudaStream>,
     /// The communicator, or `None` once [`Self::abort`] has taken and dropped
     /// it. See the module docs: this `Option` is what makes a double abort
     /// unrepresentable, and its lock is what keeps a call off a freed handle.
@@ -138,49 +155,21 @@ impl Nccl {
     }
 
     /// One communicator per device, all in THIS process — the single-process
-    /// multi-GPU gang (`ncclCommInitAll`). Rank `r` is `devices[r]`.
-    ///
-    /// Each communicator runs on the candle device's OWN stream, the stream
-    /// candle launches kernels on, so a collective orders after the kernels
-    /// that produced its input without an extra fence.
-    pub fn single_process(devices: &[Device]) -> Result<Vec<Self>> {
+    /// multi-GPU gang. Rank `r` is `devices[r]`; the join is bounded by
+    /// `deadline` like every other.
+    pub fn single_process(devices: &[Device], deadline: Duration) -> Result<Vec<Self>> {
         if devices.is_empty() {
             return Err(JammiError::Gpu(
                 "an NCCL gang needs at least one device".into(),
             ));
         }
-        let streams = devices
-            .iter()
-            .map(cuda_stream)
-            .collect::<Result<Vec<_>>>()?;
-        let ordinals: Vec<c_int> = streams
-            .iter()
-            .map(|s| s.context().ordinal() as c_int)
-            .collect();
-        let mut comms: Vec<sys::ncclComm_t> = vec![std::ptr::null_mut(); devices.len()];
-        // SAFETY: `comms` and `ordinals` are both `devices.len()` long.
-        unsafe {
-            result::comm_init_all(
-                comms.as_mut_ptr(),
-                devices.len() as c_int,
-                ordinals.as_ptr(),
-            )
-        }
-        .map_err(|e| nccl_error("ncclCommInitAll", e))?;
         let world = devices.len() as u32;
-        Ok(comms
-            .into_iter()
-            .zip(devices.iter().zip(streams))
+        let ranks: Vec<(u32, &Device)> = devices
+            .iter()
             .enumerate()
-            .map(|(rank, (comm, (device, stream)))| Self {
-                rank: rank as u32,
-                world,
-                device: device.clone(),
-                stream,
-                comm: Mutex::new(Some(RawComm(comm))),
-                aborted: AtomicBool::new(false),
-            })
-            .collect())
+            .map(|(rank, device)| (rank as u32, device))
+            .collect();
+        join(&ranks, world, Self::new_id()?, deadline)
     }
 
     /// This process's single rank of a multi-process gang, joined with the
@@ -198,85 +187,8 @@ impl Nccl {
                 "rank {rank} is not a rank of a gang of {world}"
             )));
         }
-        let stream = cuda_stream(device)?;
-        // The join binds the communicator to the CALLING thread's current
-        // device; bind this rank's before calling.
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|e| JammiError::Gpu(format!("ncclCommInitRankConfig: bind device: {e}")))?;
-        let mut internal = [0 as std::ffi::c_char; 128];
-        for (out, b) in internal.iter_mut().zip(id.iter()) {
-            *out = *b as std::ffi::c_char;
-        }
-        let version = result::get_nccl_version().map_err(|e| nccl_error("ncclGetVersion", e))?;
-        // SAFETY: an all-zero config is a valid bit pattern for the struct
-        // (integers and null pointers); every field NCCL reads — through
-        // `size` — is set below.
-        let mut config: sys::ncclConfig_t = unsafe { std::mem::zeroed() };
-        config.size =
-            std::mem::offset_of!(sys::ncclConfig_t, splitShare) + std::mem::size_of::<c_int>();
-        config.magic = CONFIG_MAGIC;
-        config.version = version as u32;
-        config.blocking = 0;
-        config.cgaClusterSize = CONFIG_UNDEF_INT;
-        config.minCTAs = CONFIG_UNDEF_INT;
-        config.maxCTAs = CONFIG_UNDEF_INT;
-        config.netName = std::ptr::null();
-        config.splitShare = CONFIG_UNDEF_INT;
-
-        let mut comm: sys::ncclComm_t = std::ptr::null_mut();
-        // SAFETY: `comm` and `config` outlive the call; the id is 128 bytes.
-        let started = unsafe {
-            sys::ncclCommInitRankConfig(
-                &mut comm,
-                world as c_int,
-                sys::ncclUniqueId { internal },
-                rank as c_int,
-                &mut config,
-            )
-        };
-        match started {
-            sys::ncclResult_t::ncclSuccess | sys::ncclResult_t::ncclInProgress => {}
-            other => {
-                return Err(JammiError::Gpu(format!(
-                    "ncclCommInitRankConfig: rank {rank} of {world}: nccl status {other:?}"
-                )))
-            }
-        }
-        let comm = RawComm(comm);
-        let begun = Instant::now();
-        loop {
-            match async_status(&comm) {
-                sys::ncclResult_t::ncclSuccess => break,
-                sys::ncclResult_t::ncclInProgress => {
-                    if begun.elapsed() >= deadline {
-                        // Dropping the half-built communicator aborts it.
-                        drop(comm);
-                        return Err(JammiError::Gpu(format!(
-                            "ncclCommInitRankConfig: rank {rank} of {world} did not complete \
-                             joining within {deadline:?} — a peer never joined, so this rank's \
-                             half-built communicator was aborted"
-                        )));
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                other => {
-                    drop(comm);
-                    return Err(JammiError::Gpu(format!(
-                        "ncclCommInitRankConfig: rank {rank} of {world}: nccl status {other:?}"
-                    )));
-                }
-            }
-        }
-        Ok(Self {
-            rank,
-            world,
-            device: device.clone(),
-            stream,
-            comm: Mutex::new(Some(comm)),
-            aborted: AtomicBool::new(false),
-        })
+        let mut joined = join(&[(rank, device)], world, id, deadline)?;
+        Ok(joined.remove(0))
     }
 
     /// Abort this communicator, unblocking a rank parked in `synchronize`
@@ -349,7 +261,7 @@ impl Nccl {
     /// abort flag. With the lock RELEASED: a watchdog thread must be able to
     /// take it and [`Self::abort`] to end this wait.
     fn synchronize(&self, op: &str) -> Result<()> {
-        self.stream
+        self.collective
             .synchronize()
             .map_err(|e| JammiError::Gpu(format!("{op}: stream synchronize: {e}")))?;
         self.check_live(op)
@@ -376,6 +288,149 @@ impl DeviceExchange for Nccl {
 
     fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+/// The one way this process joins a communicator: the ranks it holds
+/// (`ranks`, each on its device), of a `world`-rank gang named by `id`.
+///
+/// One NCCL group of non-blocking `ncclCommInitRankConfig` calls — one per
+/// rank held here, each with its device current — then every communicator
+/// polled until it is ready or `deadline` passes, when every one of them is
+/// aborted and the join refused. Non-blocking everywhere: no later call on
+/// these communicators blocks inside NCCL (a peer's absence shows as
+/// `ncclInProgress`, never a parked thread holding the handle's lock), which
+/// is what lets an abort always land.
+fn join(
+    ranks: &[(u32, &Device)],
+    world: u32,
+    id: NcclIdBytes,
+    deadline: Duration,
+) -> Result<Vec<Nccl>> {
+    let mut internal = [0 as std::ffi::c_char; 128];
+    for (out, b) in internal.iter_mut().zip(id.iter()) {
+        *out = *b as std::ffi::c_char;
+    }
+    let version = result::get_nccl_version().map_err(|e| nccl_error("ncclGetVersion", e))?;
+    let streams = ranks
+        .iter()
+        .map(|(_, device)| {
+            let compute = cuda_stream(device)?;
+            let collective = compute
+                .context()
+                .new_stream()
+                .map_err(|e| JammiError::Gpu(format!("an NCCL stream: {e}")))?;
+            Ok((compute, collective))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Read by NCCL during the group: alive until it ends.
+    let mut configs: Vec<sys::ncclConfig_t> =
+        ranks.iter().map(|_| nonblocking_config(version)).collect();
+    let mut comms: Vec<sys::ncclComm_t> = vec![std::ptr::null_mut(); ranks.len()];
+
+    group_status(result::group_start())?;
+    for (((rank, _), (compute, _)), (comm, config)) in ranks
+        .iter()
+        .zip(&streams)
+        .zip(comms.iter_mut().zip(configs.iter_mut()))
+    {
+        // The join binds the communicator to the calling thread's CURRENT
+        // device.
+        compute
+            .context()
+            .bind_to_thread()
+            .map_err(|e| JammiError::Gpu(format!("ncclCommInitRankConfig: bind device: {e}")))?;
+        // SAFETY: `comm` and `config` outlive the group; the id is 128 bytes.
+        let started = unsafe {
+            sys::ncclCommInitRankConfig(
+                comm,
+                world as c_int,
+                sys::ncclUniqueId { internal },
+                *rank as c_int,
+                config,
+            )
+        };
+        if !matches!(
+            started,
+            sys::ncclResult_t::ncclSuccess | sys::ncclResult_t::ncclInProgress
+        ) {
+            return Err(JammiError::Gpu(format!(
+                "ncclCommInitRankConfig: rank {rank} of {world}: nccl status {started:?}"
+            )));
+        }
+    }
+    group_status(result::group_end())?;
+    drop(configs);
+
+    let comms: Vec<RawComm> = comms.into_iter().map(RawComm).collect();
+    let begun = Instant::now();
+    for ((rank, _), comm) in ranks.iter().zip(&comms) {
+        loop {
+            match async_status(comm) {
+                sys::ncclResult_t::ncclSuccess => break,
+                sys::ncclResult_t::ncclInProgress if begun.elapsed() < deadline => {
+                    std::thread::sleep(POLL_INTERVAL)
+                }
+                sys::ncclResult_t::ncclInProgress => {
+                    // Dropping the half-built communicators aborts them.
+                    drop(comms);
+                    return Err(JammiError::Gpu(format!(
+                        "ncclCommInitRankConfig: rank {rank} of {world} did not complete \
+                         joining within {deadline:?} — a peer never joined, so this process's \
+                         half-built communicators were aborted"
+                    )));
+                }
+                other => {
+                    drop(comms);
+                    return Err(JammiError::Gpu(format!(
+                        "ncclCommInitRankConfig: rank {rank} of {world}: nccl status {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(comms
+        .into_iter()
+        .zip(ranks.iter().zip(streams))
+        .map(|(comm, ((rank, device), (compute, collective)))| Nccl {
+            rank: *rank,
+            world,
+            device: (*device).clone(),
+            compute,
+            collective,
+            comm: Mutex::new(Some(comm)),
+            aborted: AtomicBool::new(false),
+        })
+        .collect())
+}
+
+/// A non-blocking communicator config — see the module doc's first fact for
+/// why it names only the fields through `splitShare`.
+fn nonblocking_config(version: c_int) -> sys::ncclConfig_t {
+    // SAFETY: an all-zero config is a valid bit pattern for the struct
+    // (integers and null pointers); every field NCCL reads — through `size` —
+    // is set below.
+    let mut config: sys::ncclConfig_t = unsafe { std::mem::zeroed() };
+    config.size =
+        std::mem::offset_of!(sys::ncclConfig_t, splitShare) + std::mem::size_of::<c_int>();
+    config.magic = CONFIG_MAGIC;
+    config.version = version as u32;
+    config.blocking = 0;
+    config.cgaClusterSize = CONFIG_UNDEF_INT;
+    config.minCTAs = CONFIG_UNDEF_INT;
+    config.maxCTAs = CONFIG_UNDEF_INT;
+    config.netName = std::ptr::null();
+    config.splitShare = CONFIG_UNDEF_INT;
+    config
+}
+
+/// A group call's status: done, or in progress on a non-blocking group (the
+/// communicators' own async status says when it finishes).
+fn group_status(status: std::result::Result<result::NcclStatus, result::NcclError>) -> Result<()> {
+    match status {
+        Ok(_) => Ok(()),
+        Err(e) if e.0 == sys::ncclResult_t::ncclInProgress => Ok(()),
+        Err(e) => Err(nccl_error("ncclGroupStart/End", e)),
     }
 }
 
@@ -443,7 +498,13 @@ impl NcclAllGather<'_> {
         let elements = layout.shape().elem_count();
         let world = self.nccl.world as usize;
         let mut recv = device.alloc_zeros::<T>(elements * world)?;
-        let stream = &self.nccl.stream;
+        // The input — and the output's zeroing — were enqueued on candle's
+        // compute stream; the collective runs on its own.
+        self.nccl
+            .compute
+            .synchronize()
+            .map_err(|e| candle_core::Error::Cuda(format!("compute stream: {e}").into()))?;
+        let stream = &self.nccl.collective;
         self.nccl
             .with_handle("all_gather", |comm| {
                 let (src, _src_record) = send.device_ptr(stream);

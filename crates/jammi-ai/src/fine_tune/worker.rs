@@ -3996,7 +3996,7 @@ impl JobWorker {
                     "gang transport selected"
                 );
                 let transports = kind
-                    .local_transports(&rank_devices)
+                    .local_transports(&rank_devices, rank_timeout)
                     .map_err(WorkerJobError::from)?;
                 let gang = LocalGang::with_transports(rank_devices, transports, rank_timeout)
                     .map_err(WorkerJobError::from)?;

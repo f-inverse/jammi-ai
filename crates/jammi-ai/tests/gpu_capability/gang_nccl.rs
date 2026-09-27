@@ -44,10 +44,15 @@ fn every_verb(
 
     let device = local.device().clone();
     let rank = local.rank();
+    // A zero-row slice is a view of a one-row tensor, cut LAST: CUDA refuses
+    // a zero-length copy and a zero-element kernel launch alike.
     let ramp = |rows: usize, cols: usize, base: f32, dtype: DType| {
-        let data: Vec<f32> = (0..rows * cols).map(|i| base + i as f32 * 0.37).collect();
-        Tensor::from_vec(data, (rows, cols), &device)
+        let data: Vec<f32> = (0..rows.max(1) * cols)
+            .map(|i| base + i as f32 * 0.37)
+            .collect();
+        Tensor::from_vec(data, (rows.max(1), cols), &device)
             .and_then(|t| t.to_dtype(dtype))
+            .and_then(|t| t.narrow(0, 0, rows))
             .expect("tensor")
     };
     let mut out = Vec::new();
@@ -124,7 +129,9 @@ fn run_every_verb(
     use jammi_ai::fine_tune::collective::{BlockingCall, LocalGang};
     use std::time::Duration;
 
-    let transports = kind.local_transports(devices).expect("transports");
+    let transports = kind
+        .local_transports(devices, Duration::from_secs(60))
+        .expect("transports");
     let gang = LocalGang::with_transports(devices.to_vec(), transports, Duration::from_secs(60))
         .expect("gang");
     let handles: Vec<_> = (0..devices.len() as u32)
@@ -184,7 +191,7 @@ fn an_abort_ends_a_real_nccl_wait_on_a_rank_that_never_joins() {
         let slot = harness::serial_cuda_device();
         let devices = [slot.device().clone(), jammi_test_resources::cuda_device(1)];
         let mut transports = TransportKind::Nccl
-            .local_transports(&devices)
+            .local_transports(&devices, Duration::from_secs(60))
             .expect("transports")
             .into_iter();
         let Some(Transport::Device(rank0)) = transports.next() else {

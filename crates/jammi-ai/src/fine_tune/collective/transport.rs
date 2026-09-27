@@ -151,11 +151,16 @@ impl TransportKind {
     }
 
     /// Every rank's transport for an in-process gang on `devices` (rank `r`
-    /// on `devices[r]`).
-    pub fn local_transports(self, devices: &[Device]) -> Result<Vec<Transport>> {
+    /// on `devices[r]`); an NCCL communicator's join is bounded by
+    /// `deadline`.
+    pub fn local_transports(
+        self,
+        devices: &[Device],
+        deadline: Duration,
+    ) -> Result<Vec<Transport>> {
         match self {
             Self::Inline => Ok(vec![Transport::Inline; devices.len()]),
-            Self::Nccl => nccl::single_process(devices),
+            Self::Nccl => nccl::single_process(devices, deadline),
         }
     }
 }
@@ -234,9 +239,9 @@ pub mod nccl {
 
     /// One communicator per device of an in-process gang.
     #[cfg(feature = "cuda")]
-    pub(super) fn single_process(devices: &[Device]) -> Result<Vec<Transport>> {
+    pub(super) fn single_process(devices: &[Device], deadline: Duration) -> Result<Vec<Transport>> {
         Ok(
-            crate::fine_tune::collective::nccl::Nccl::single_process(devices)?
+            crate::fine_tune::collective::nccl::Nccl::single_process(devices, deadline)?
                 .into_iter()
                 .map(|rank| Transport::Device(std::sync::Arc::new(rank)))
                 .collect(),
@@ -245,7 +250,10 @@ pub mod nccl {
 
     /// One communicator per device of an in-process gang.
     #[cfg(not(feature = "cuda"))]
-    pub(super) fn single_process(_devices: &[Device]) -> Result<Vec<Transport>> {
+    pub(super) fn single_process(
+        _devices: &[Device],
+        _deadline: Duration,
+    ) -> Result<Vec<Transport>> {
         Err(no_cuda())
     }
 

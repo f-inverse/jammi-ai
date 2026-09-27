@@ -516,9 +516,13 @@ assert "bf16" in refused["error"], refused["error"]
 # The field set is the wire's, exactly — no arm adds or drops a key.
 SUMMARY_KEYS = {
     "job_id", "kind", "status", "base_model_id", "output_model_id", "created_at", "error",
+    "claimed_by", "ranks",
 }
 for j in jobs:
     assert set(j) == SUMMARY_KEYS, sorted(set(j) ^ SUMMARY_KEYS)
+    # One server ran each job as a single rank: the claimant is that rank's
+    # instance, whether the run completed or was refused.
+    assert j["claimed_by"] != "" and j["ranks"] == [j["claimed_by"]], j
 ```
 
 ```{python}

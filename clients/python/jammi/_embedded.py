@@ -531,9 +531,11 @@ class EmbeddedBackend:
 
         Each entry carries the wire's `JobSummary` field set — ``job_id``,
         ``kind``, ``status``, ``base_model_id``, ``output_model_id``,
-        ``created_at``, ``error`` — with ``output_model_id`` empty until a
-        training kind completes (always empty for a compute kind) and
-        ``error`` empty unless it failed. A listing of :meth:`job` answers
+        ``created_at``, ``error``, ``claimed_by``, ``ranks`` — with
+        ``output_model_id`` stamped at submission (always empty for a compute
+        kind), ``error`` empty unless it failed, ``claimed_by`` the instance
+        holding (or last holding) the claim and ``ranks`` the instance that
+        ran each rank of the latest training attempt. A listing of :meth:`job` answers
         plus the submit-time identity; read :meth:`job(job_id).progress()
         <Job.progress>` for the mid-run progress surface.
         """

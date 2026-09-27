@@ -268,8 +268,8 @@ message JobSummary {
   // The base model a training kind trains from — the catalog's registered
   // model id (PK-keyed). Empty for a compute kind.
   string base_model_id = 4;
-  // The output model id the trained artifact registers under; empty until a
-  // training kind completes, and always empty for a compute kind.
+  // The output model id the trained artifact registers under, stamped at
+  // submission for a training kind; always empty for a compute kind.
   string output_model_id = 5;
   // Job creation time, as recorded by the catalog (UTC text timestamp).
   string created_at = 6;

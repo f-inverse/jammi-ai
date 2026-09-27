@@ -252,8 +252,9 @@ def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
     Every field the message carries and nothing else — the embedded
     `list_jobs` builds the same nine keys at its FFI boundary from the
     catalog record, applying the same conventions this message documents:
-    `output_model_id` is the empty string until a training kind completes
-    (always empty for a compute kind), `error` is empty unless it failed,
+    `output_model_id` is the model a training kind registers under, stamped
+    at submission (always empty for a compute kind), `error` is empty unless
+    it failed,
     `claimed_by` is empty while queued, and `ranks` (the instance that ran
     each rank of the latest training attempt, in rank order) is an empty list
     for a compute kind and until an attempt records it. No arm maps any of
@@ -2887,7 +2888,8 @@ class RemoteDatabase:
         Empty for a compute-kind job — no compute kind ever registers a model.
 
         Note that `list_jobs()`'s `output_model_id` is the SAME field, relayed
-        verbatim by `JobSummary` too — empty until a training kind completes.
+        verbatim by `JobSummary` too — stamped at submission, so the listing
+        and this handle agree at every lifecycle state.
         """
         resp = self._call(
             self._job.JobStatus,
@@ -2906,9 +2908,9 @@ class RemoteDatabase:
 
         Maps to `JobService.ListJobs`; same dict shape per entry as
         the embedded :meth:`jammi.EmbeddedBackend.list_jobs` — the
-        wire's `JobSummary` field set, with ``output_model_id`` empty
-        until a training kind completes (always empty for a compute kind)
-        and ``error`` empty unless it failed. A listing of :meth:`job`
+        wire's `JobSummary` field set, with ``output_model_id`` stamped at
+        submission (always empty for a compute kind), ``error`` empty unless
+        it failed, and ``claimed_by`` / ``ranks`` saying where it ran. A listing of :meth:`job`
         answers plus the submit-time identity; read
         :meth:`job(job_id).progress() <RemoteJob.progress>` for the mid-run
         progress surface.

@@ -372,13 +372,13 @@ impl PyDatabase {
     /// List every job visible to the current tenant, most recent first. Each
     /// entry is a dict carrying the SAME field set the wire's `JobSummary`
     /// carries — `job_id`, `kind`, `status`, `base_model_id`,
-    /// `output_model_id`, `created_at`, `error` — so a caller reads one
+    /// `output_model_id`, `created_at`, `error`, `claimed_by`, `ranks` — so a caller reads one
     /// vocabulary regardless of transport. A listing of `Job.status()`
     /// answers plus the submit-time identity, not a progress surface: read
     /// [`PyJob::progress`] on the individual handle for that.
     ///
-    /// `output_model_id` is the empty string until a training kind completes
-    /// (and always empty for a compute kind) and `error` is empty unless it
+    /// `output_model_id` is stamped at submission for a training kind (and
+    /// always empty for a compute kind) and `error` is empty unless it
     /// failed — the same two conventions `JobService.ListJobs` relays,
     /// reproduced here rather than mapping absence onto `None` on one
     /// transport only.

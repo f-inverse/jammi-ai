@@ -435,9 +435,8 @@ fn job_status_response_from_record(
 
 /// Build a [`pb::JobSummary`] from a job row — the same lifecycle projection
 /// [`job_status_response_from_record`] reads, but relaying `output_model_id`
-/// verbatim (the catalog column, empty until stamped) rather than resolving
-/// it: this listing answers "has the output row landed yet", not "what will
-/// this job's model be called", for every kind.
+/// verbatim rather than resolving it: submission stamps the column for every
+/// training kind, and a compute kind never has one.
 fn job_summary_from_record(record: JobRecord) -> pb::JobSummary {
     pb::JobSummary {
         job_id: record.job_id,

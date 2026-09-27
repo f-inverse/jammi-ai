@@ -267,6 +267,11 @@ on_host() {
 device_lines() {
   cat <<DEVICE
 export CARGO_TERM_COLOR=never CUDA_COMPUTE_CAP=${NATIVE_COMPUTE_CAP}
+# Wrapper off, as on every pod lane (runpod_gpu_prove.sh): a pod's target dir
+# is fresh, so sccache buys nothing, and with it on cc-rs wraps the C
+# compiler too — the vendored OpenSSL's AVX-512 assembly then failed to
+# assemble on a fresh fleet host.
+export CARGO_BUILD_RUSTC_WRAPPER=
 gpu_seen="\$(nvidia-smi --query-gpu=index --format=csv,noheader | grep -c .)"
 [ "\$gpu_seen" = "${RP_GPU_COUNT}" ] || { echo "::error::nvidia-smi reports \$gpu_seen GPU(s), this lane rented ${RP_GPU_COUNT}"; exit 97; }
 cap="\$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '[:space:].')"

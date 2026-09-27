@@ -46,7 +46,10 @@ workspace ships every publishable crate at the same
   federation across Postgres, MariaDB and a file (30), cross-modal and compound-query recipes; every
   guide capability page names the chapter or recipe that runs it (`check_guide_companions.py`).
 - **CI:** `jammi-python`'s Rust tests run in the Python lane; the CUDA CI base image builds in the
-  same workflow as, and from, the CPU base of that run.
+  same workflow as, and from, the CPU base of that run. The CI image carries every guard lane's
+  tools — actionlint, kustomize, kubeconform, cargo-deny, build-graph and the script tests'
+  `tokenizers` — pinned once in `.docker/pinned-tools.sh`, which a bare runner or an older image
+  provides them through; a guard's verdict no longer depends on reaching GitHub or crates.io.
 - **A placed search's rescore is verified against the pinned version's segments.** The second
   phase's `ExactRescoreRequest` names the version the coordinator pinned (`optional int64
   version = 5`), as `SegmentSearchRequest` does, and the owner verifies every segment named

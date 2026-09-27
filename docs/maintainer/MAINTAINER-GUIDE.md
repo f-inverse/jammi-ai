@@ -5656,7 +5656,7 @@ The rich graph is **per-symbol**, lives only under `target/`, and is for interac
 ```
 rustup toolchain install nightly
 rustup component add rust-analyzer --toolchain nightly
-cargo install build-graph --version 0.1.0 --locked   # pin: graph schema is version-coupled
+bash .docker/pinned-tools.sh build-graph            # the dep-dag lane's pin: graph schema is version-coupled
 pip install graphifyy                                 # note the double-y; the import name is `graphify`
 ```
 

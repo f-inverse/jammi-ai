@@ -21,6 +21,7 @@ on:
     branches: [main]
     paths:
       - ".docker/ci.Dockerfile"
+      - ".docker/pinned-tools.sh"
       - ".docker/ci-cuda.Dockerfile"
       - "rust-toolchain.toml"
       - ".github/workflows/_ci-base-image.yml"

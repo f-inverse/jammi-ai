@@ -137,24 +137,13 @@ jobs:
           # image build from the same Dockerfile shares the layer cache.
           cache-scope: cpu-amd64
 
-      - name: Fetch and verify kustomize
+      # This job drives a kind cluster on the runner's own Docker, so it runs
+      # on the bare runner, not in the CI image: it fetches the two tools at
+      # the pins the image carries, checksum-verified.
+      - name: Provide kustomize and kubeconform at their pins
         run: |
-          set -euo pipefail
-          curl -fsSL -o kustomize.tar.gz \
-            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz"
-          echo "029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d  kustomize.tar.gz" | sha256sum -c -
-          tar -xzf kustomize.tar.gz kustomize
-          sudo mv kustomize /usr/local/bin/kustomize
+          sudo bash .docker/pinned-tools.sh kustomize kubeconform
           kustomize version
-
-      - name: Fetch and verify kubeconform
-        run: |
-          set -euo pipefail
-          curl -fsSL -o kubeconform.tar.gz \
-            "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz"
-          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
-          tar -xzf kubeconform.tar.gz kubeconform
-          sudo mv kubeconform /usr/local/bin/kubeconform
           kubeconform -v
 
       - name: Cache kubeconform's downloaded schemas

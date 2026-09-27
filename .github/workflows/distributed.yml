@@ -38,8 +38,9 @@ on:
 
 concurrency:
   # Called from `ci.yml`, `github.workflow` is the caller's, so a merge's run
-  # and the nightly one never share a group; as in `ci.yml`, a run on `main`
-  # is never cancelled — it is the only evidence that commit is green.
+  # and the nightly one never share a group; as in `ci.yml`, a RUNNING run on
+  # `main` is never cancelled, and a waiting one is replaced by the next
+  # merge's, whose verdict covers it.
   group: distributed-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 

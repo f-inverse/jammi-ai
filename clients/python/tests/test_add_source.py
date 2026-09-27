@@ -1,4 +1,9 @@
-"""`RemoteDatabase.add_source`'s `format=` vocabulary — hermetic, no server.
+"""`RemoteDatabase.add_source`'s source kinds and `format=` vocabulary — hermetic,
+no server.
+
+A `postgres://` / `postgresql://` / `mysql://` URL is a database source, sent
+with its wire `SourceKind` and no format, as the engine's
+`SourceDefinition::from_url` (which the embedded arm calls) decides.
 
 `_assembly._FILE_FORMAT` is a HAND-MAINTAINED mirror of the engine's
 `jammi_db::source::FileFormat::from_str` (the embedded backend calls that
@@ -75,5 +80,55 @@ def test_add_source_accepts_jsonl_and_ndjson_and_sends_the_jsonl_wire_value(toke
         assert (
             sent_request.connection.format == catalog_pb2.FileFormat.FILE_FORMAT_JSONL
         )
+    finally:
+        remote.close()
+
+
+def _sent(url, **kwargs):
+    """The `AddSourceRequest` `add_source(url=url, **kwargs)` would send."""
+    remote = jammi.connect("grpc://127.0.0.1:8081")
+    try:
+        with patch.object(remote, "_call", return_value=None) as mock_call:
+            remote.add_source("s", url=url, **kwargs)
+        mock_call.assert_called_once()
+        return mock_call.call_args[0][1]
+    finally:
+        remote.close()
+
+
+@pytest.mark.parametrize(
+    "url, kind",
+    [
+        ("postgres://reader:pw@db.internal:5432/sales", catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES),
+        ("postgresql://postgres:@/postgres?host=/tmp/pg", catalog_pb2.SourceKind.SOURCE_KIND_POSTGRES),
+        ("mysql://reader:pw@127.0.0.1:3306/registry", catalog_pb2.SourceKind.SOURCE_KIND_MYSQL),
+    ],
+)
+def test_a_database_url_is_sent_as_its_database_kind_with_the_url_verbatim(url, kind):
+    sent = _sent(url, tenant_column="org")
+    assert sent.source_kind == kind
+    assert sent.connection.url == url
+    assert sent.connection.format == catalog_pb2.FileFormat.FILE_FORMAT_UNSPECIFIED
+    assert sent.connection.tenant_column == "org"
+
+
+def test_a_file_url_is_sent_as_a_file_in_its_format():
+    sent = _sent("/tmp/x.csv", format="csv")
+    assert sent.source_kind == catalog_pb2.SourceKind.SOURCE_KIND_FILE
+    assert sent.connection.url == "file:///tmp/x.csv"
+    assert sent.connection.format == catalog_pb2.FileFormat.FILE_FORMAT_CSV
+
+
+@pytest.mark.parametrize(
+    "url, format",
+    [("postgres://u@h/d", "parquet"), ("mysql://u@h/d", "csv"), ("/tmp/x.parquet", None)],
+)
+def test_a_database_with_a_format_or_a_file_without_one_is_refused_before_any_i_o(url, format):
+    remote = jammi.connect("grpc://127.0.0.1:8081")
+    try:
+        with patch.object(remote, "_call") as mock_call:
+            with pytest.raises(jammi.InvalidArgument):
+                remote.add_source("s", url=url, format=format)
+        mock_call.assert_not_called()
     finally:
         remote.close()

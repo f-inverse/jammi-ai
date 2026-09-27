@@ -15,7 +15,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
-use datafusion_federation::{FederatedPlanner, FederationOptimizerRule};
+use datafusion_federation::FederatedPlanner;
 
 use crate::audit::{EnvSigningKeyStore, FileSigningKeyStore, SigningKeyStore};
 use crate::catalog::backend::BackendImpl;
@@ -25,6 +25,7 @@ use crate::catalog::Catalog;
 use crate::compute_plane::{ComputePlaneSlot, MaterializationPlanner, StatementClass};
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
+use crate::federation::{EngineFunctions, LocalFunctionFederation};
 use crate::source::mutable::MutableTableRegistry;
 use crate::source::registry::{JammiCatalogList, SourceRegistry};
 use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
@@ -82,6 +83,10 @@ pub struct JammiSession {
     /// derived from `ctx` reads it through its `TaskContext`. Empty until a
     /// role installs a plane; empty forever on a process holding none.
     compute_plane: Arc<ComputePlaneSlot>,
+    /// The functions [`JammiSession::install_functions`] installed, shared
+    /// with the federation rule so no sub-plan calling one is sent to a
+    /// remote source.
+    engine_functions: Arc<EngineFunctions>,
 }
 
 impl JammiSession {
@@ -242,7 +247,11 @@ impl JammiSession {
             .position(|r| r.name() == "scalar_subquery_to_join")
             .map(|pos| pos + 1)
             .unwrap_or(rules.len());
-        rules.insert(insert_pos, Arc::new(FederationOptimizerRule::new()));
+        let engine_functions = Arc::new(EngineFunctions::default());
+        rules.insert(
+            insert_pos,
+            Arc::new(LocalFunctionFederation::new(Arc::clone(&engine_functions))),
+        );
 
         // Tenant-scope analyzer rule injected before existing analyzer rules
         // so the predicate is applied before federation, projection pruning,
@@ -342,6 +351,7 @@ impl JammiSession {
             subscriber,
             signing_key_store,
             compute_plane,
+            engine_functions,
         };
         session.preload_sources().await?;
         session.reload_mutable_tables().await?;
@@ -979,12 +989,22 @@ impl JammiSession {
     /// spec, so it cannot collide under reclaim the way a relation bound
     /// under a per-job token would. That is why functions have this verb
     /// while relations have none outside the store and the source registry.
+    ///
+    /// An installed function exists only in this engine, so a query over a
+    /// federated database source evaluates every call to one here, over the
+    /// rows the database returns.
     pub fn install_functions(&self, functions: impl IntoIterator<Item = QueryFunction>) {
         let ctx = self.ctx.inner();
         for function in functions {
             match function {
-                QueryFunction::Scalar(udf) => ctx.register_udf(udf),
-                QueryFunction::Aggregate(udaf) => ctx.register_udaf(udaf),
+                QueryFunction::Scalar(udf) => {
+                    self.engine_functions.insert(udf.name(), udf.aliases());
+                    ctx.register_udf(udf);
+                }
+                QueryFunction::Aggregate(udaf) => {
+                    self.engine_functions.insert(udaf.name(), udaf.aliases());
+                    ctx.register_udaf(udaf);
+                }
                 QueryFunction::Table { name, function } => ctx.register_udtf(&name, function),
             }
         }
@@ -1388,13 +1408,8 @@ async fn build_broker_from_config(config: &JammiConfig) -> Result<Arc<dyn Trigge
                     }
                 },
             };
-            if !(resolved_url.starts_with("postgres://")
-                || resolved_url.starts_with("postgresql://"))
-            {
-                return Err(JammiError::Config(
-                    "[broker.postgres] url must be a postgres:// (or postgresql://) URL".into(),
-                ));
-            }
+            crate::pg_uri::PgUri::parse(&resolved_url)
+                .map_err(|e| JammiError::Config(format!("[broker.postgres] url: {e}")))?;
             let broker =
                 PostgresBroker::connect(&resolved_url, Duration::from_secs(*idle_poll_secs))
                     .await?;

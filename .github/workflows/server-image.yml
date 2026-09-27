@@ -93,8 +93,8 @@ jobs:
 
   # CPU image, main-branch arm: pushed from the default branch (`latest` +
   # sha) via a `workflow_dispatch` run on `main` only -- this workflow
-  # carries NO `push: branches:` trigger (unlike `image.yml`/
-  # `image-cuda.yml`, which do), so this arm never fires automatically on a
+  # carries NO `push: branches:` trigger (unlike `image.yml`,
+  # which does), so this arm never fires automatically on a
   # mere merge; it is a manual `:latest`/`:sha-...` refresh. This arm is
   # UNGATED: it never promotes a `v*`/semver tag (see `build-and-push`
   # below for that) — the GPU-prove gate applies to a

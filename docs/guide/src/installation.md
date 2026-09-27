@@ -93,23 +93,20 @@ yum install protobuf-compiler gcc gcc-c++ pkg-config
 
 All other native libraries (lzma, zstd, zlib, sqlite) are vendored and compiled from source automatically. These tools are pre-installed in the devcontainer and CI images.
 
-Building `jammi-db` with the `postgres` or `mysql` source feature additionally
-requires OpenSSL's development headers: these features link a native TLS
-stack (`native-tls` -> OpenSSL) rather than `rustls`, and jammi-db does not
-vendor OpenSSL.
+Building `jammi-db` with the `postgres` or `mysql` source feature on Linux also
+compiles OpenSSL from source, which it links statically: OpenSSL's `Configure`
+needs Perl with the `IPC::Cmd` and `Time::Piece` modules. No OpenSSL headers or
+libraries are needed. macOS and Windows use the platform's TLS stack.
 
 ```bash
 # Debian/Ubuntu
-apt-get install libssl-dev
+apt-get install perl make
 
 # RHEL/AlmaLinux
-yum install openssl-devel
-
-# macOS (Homebrew)
-brew install openssl pkg-config
+yum install perl-IPC-Cmd perl-Time-Piece make
 ```
 
-See [Connect to PostgreSQL / MySQL](./external-sources.md#feature-flags).
+See [Connect to PostgreSQL / MySQL](./external-sources.md#what-ships).
 
 ## Python
 
@@ -144,7 +141,6 @@ Jammi has **no mandatory runtime dependencies** beyond the binary itself.
 Optional:
 - **CUDA toolkit + cuDNN** for GPU inference (CPU works out of the box)
 - **HuggingFace Hub access** for downloading models (first run downloads ~90MB for MiniLM, cached thereafter)
-- **PostgreSQL / MySQL client libraries** if using federated database sources
 
 Set `HF_TOKEN` for gated models, or `HF_HOME` to control the cache location —
 both are read as fallbacks when the config's own `[models]` section (see

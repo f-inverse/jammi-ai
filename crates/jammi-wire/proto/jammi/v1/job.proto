@@ -268,12 +268,20 @@ message JobSummary {
   // The base model a training kind trains from — the catalog's registered
   // model id (PK-keyed). Empty for a compute kind.
   string base_model_id = 4;
-  // The output model id the trained artifact registers under; empty until a
-  // training kind completes, and always empty for a compute kind.
+  // The output model id the trained artifact registers under, stamped at
+  // submission for a training kind; always empty for a compute kind.
   string output_model_id = 5;
   // Job creation time, as recorded by the catalog (UTC text timestamp).
   string created_at = 6;
   string error = 7;
+  // The instance holding (or, on a terminal job, last holding) the job's
+  // claim — for a placed training attempt, the executor the claim moved to.
+  // Empty while the job is queued and unclaimed.
+  string claimed_by = 8;
+  // The instance that ran each rank of the latest training attempt, in rank
+  // order (the same id `ListWorkers` reports). Empty for a compute job and
+  // until a training attempt records its ranks.
+  repeated string ranks = 9;
 }
 
 message CancelJobRequest {

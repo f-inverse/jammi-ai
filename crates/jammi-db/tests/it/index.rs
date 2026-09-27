@@ -228,9 +228,16 @@ async fn exact_search_resolves_row_ids_under_default_schema() {
 
     // Query points along the "near" direction; expect "near" ranked first and
     // every row id resolved (not lost to a failed downcast).
-    let results = exact_vector_search(&ctx, table_name, &vq(&[1.0, 0.0, 0.0, 0.0]), 4, None)
-        .await
-        .expect("exact search must resolve _row_id under default schema");
+    let results = exact_vector_search(
+        &ctx,
+        table_name,
+        &vq(&[1.0, 0.0, 0.0, 0.0]),
+        4,
+        None,
+        &jammi_db::index::Admission::Every,
+    )
+    .await
+    .expect("exact search must resolve _row_id under default schema");
 
     assert_eq!(results.len(), n, "every row scored");
     assert_eq!(results[0].0, "near", "nearest neighbour ranked first");
@@ -322,9 +329,16 @@ async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
         );
         assert!(err.to_string().contains("4"), "{err}");
 
-        let err = exact_vector_search(&ctx, "exact_width", &vq(&vec![1.0f32; width]), 4, None)
-            .await
-            .expect_err("a wrong-width query must be refused, not panic");
+        let err = exact_vector_search(
+            &ctx,
+            "exact_width",
+            &vq(&vec![1.0f32; width]),
+            4,
+            None,
+            &jammi_db::index::Admission::Every,
+        )
+        .await
+        .expect_err("a wrong-width query must be refused, not panic");
         assert!(
             matches!(&err, jammi_db::error::JammiError::IncompatibleFormat { artifact, .. } if artifact.contains("exact_width")),
             "width {width}: {err:?}"
@@ -332,17 +346,31 @@ async fn exact_search_refuses_a_wrong_width_query_typed_not_panic() {
     }
     // The catalog width is a CROSS-CHECK against the scan: a disagreement is
     // its own typed, table-named error.
-    let err = exact_vector_search(&ctx, "exact_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 4, Some(5))
-        .await
-        .expect_err("catalog width 5 disagrees with the scan's 4");
+    let err = exact_vector_search(
+        &ctx,
+        "exact_width",
+        &vq(&[1.0, 0.0, 0.0, 0.0]),
+        4,
+        Some(5),
+        &jammi_db::index::Admission::Every,
+    )
+    .await
+    .expect_err("catalog width 5 disagrees with the scan's 4");
     assert!(
         matches!(&err, jammi_db::error::JammiError::IncompatibleFormat { artifact, .. } if artifact.contains("exact_width")),
         "{err:?}"
     );
     // The conforming query still serves.
-    let hits = exact_vector_search(&ctx, "exact_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 4, Some(4))
-        .await
-        .unwrap();
+    let hits = exact_vector_search(
+        &ctx,
+        "exact_width",
+        &vq(&[1.0, 0.0, 0.0, 0.0]),
+        4,
+        Some(4),
+        &jammi_db::index::Admission::Every,
+    )
+    .await
+    .unwrap();
     assert_eq!(hits[0].0, "near");
 }
 
@@ -404,9 +432,16 @@ async fn exact_search_refuses_a_zero_width_scan_column_typed_engine_fault() {
     let ctx = QueryContext::from(ctx);
 
     // Non-empty: 4 components, against the corrupt 0-width scan column.
-    let err = exact_vector_search(&ctx, "zero_width", &vq(&[1.0, 0.0, 0.0, 0.0]), 1, None)
-        .await
-        .expect_err("a zero-width scan column must be refused, never treated as width 0");
+    let err = exact_vector_search(
+        &ctx,
+        "zero_width",
+        &vq(&[1.0, 0.0, 0.0, 0.0]),
+        1,
+        None,
+        &jammi_db::index::Admission::Every,
+    )
+    .await
+    .expect_err("a zero-width scan column must be refused, never treated as width 0");
     match &err {
         jammi_db::error::JammiError::IncompatibleFormat {
             artifact,
@@ -452,9 +487,16 @@ async fn exact_search_refuses_a_corrupt_stored_row_at_the_sink() {
             }
         );
         let ctx = exact_table(dir.path(), &name, &rows).await;
-        let err = exact_vector_search(&ctx, &name, &vq(&[1.0, 0.0, 0.0, 0.0]), 3, None)
-            .await
-            .expect_err("a corrupt stored row must not become a result");
+        let err = exact_vector_search(
+            &ctx,
+            &name,
+            &vq(&[1.0, 0.0, 0.0, 0.0]),
+            3,
+            None,
+            &jammi_db::index::Admission::Every,
+        )
+        .await
+        .expect_err("a corrupt stored row must not become a result");
         match &err {
             jammi_db::error::JammiError::IncompatibleFormat {
                 artifact, found, ..

@@ -1,0 +1,338 @@
+---
+title: "Operating it — backup and restore, health, metrics and traces"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `pg_dump` · `verify_materialization` · `reconcile` · `list_sources` ·
+`/healthz` · `/readyz` · `/metrics` · `[observability] otlp_endpoint` ·
+`InferenceObserver` (Rust) · `jammi.testing.LiveServer` · **Theory:** a backup is a pair of consistent snapshots —
+the catalog and the bytes its rows name — taken in an order that never leaves a row
+without its bytes [@kleppmann2017ddia] · **Rail:** measurement (every restored table
+re-verifies against its recorded materialization; every request the chapter makes is
+counted in the metrics and exported as a span; every inferred row passes the observer
+once).
+
+The deployment of the previous chapter — a Postgres catalog and broker, a server, and
+the result tables its work writes — is what an operator runs. This chapter does the
+operator's two jobs on it, live: **back it up and restore it** into a fresh deployment,
+and **read what it reports about itself** — liveness, readiness, metrics, traces, and,
+inside a process that links the engine, every batch its models produce.
+
+```{python}
+import json
+import shutil
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from concurrent import futures
+from pathlib import Path
+
+import grpc
+import jammi
+import pgserver
+from jammi.testing import LiveServer
+from jammi_cookbook import contracts, fixtures
+from opentelemetry.proto.collector.trace.v1 import trace_service_pb2, trace_service_pb2_grpc
+
+MODEL = fixtures.model("tiny_bert")
+CORPUS = fixtures.url("tiny_corpus.parquet")
+QUERY = "how does quantum computing work?"
+PG_BIN = Path(pgserver.__file__).parent / "pginstall" / "bin"
+
+work = Path(tempfile.mkdtemp())
+ARTIFACTS = work / "artifacts"
+
+
+def catalog_url(postgres) -> str:
+    """The engine's URL for `postgres`: the libpq URI it hands out, reached over its
+    Unix socket (an empty host, the socket directory in `host`)."""
+    return postgres.get_uri()
+
+
+def configure(postgres, **sections: str) -> Path:
+    """A deployment's config: the catalog and broker on `postgres`, plus `sections`."""
+    path = work / f"jammi-{len(list(work.glob('jammi-*.toml')))}.toml"
+    extra = "".join(f"\n[{name}]\n{body}\n" for name, body in sections.items())
+    path.write_text(f"""
+[catalog.postgres]
+url = "{catalog_url(postgres)}"
+
+[broker.postgres]
+idle_poll_secs = 1
+
+[gpu]
+device = -1
+{extra}""")
+    return path
+
+
+def ranked(db) -> list[tuple[str, float]]:
+    query = db.encode_query(model=MODEL, query=QUERY)
+    return [(h["_row_id"], round(h["similarity"], 6))
+            for h in db.search("corpus", query=query, k=5).to_pylist()]
+```
+
+## A deployment with something to lose
+
+A server on a Postgres catalog embeds the corpus and builds a neighbor graph over the
+embeddings — two result tables, each a catalog row naming Parquet under the result
+root.
+
+```{python}
+original = pgserver.get_server(work / "pgdata")
+config = configure(original)
+with LiveServer(ARTIFACTS, env={"JAMMI_CONFIG": str(config)}) as server, \
+        jammi.connect(server.endpoint) as db:
+    db.add_source("corpus", url=CORPUS, format="parquet")
+    embeddings = db.generate_embeddings(
+        source="corpus", model=MODEL, columns=["content"], key="id", modality="text")
+    graph = db.build_neighbor_graph(source="corpus", k=3)
+    before = ranked(db)
+    tables = sorted(t["table_name"] for s in db.list_sources() for t in s["result_tables"])
+print(f"{len(tables)} result tables:", *tables, sep="\n  ")
+```
+
+## Back up: the bytes first, then the catalog
+
+The catalog and the result root are two systems backed up with their own tools —
+`pg_dump` for Postgres, a copy (or a bucket snapshot) for the bytes. The order is the
+rule that keeps them consistent: **storage no later than the catalog**. A catalog row
+is a claim that its bytes exist, so the storage snapshot is taken first and the
+catalog snapshot after it — every row the backup holds then names bytes the backup
+also holds. Postgres serves a dump while the server keeps running; nothing stops.
+
+```{python}
+backup = work / "backup"
+with LiveServer(ARTIFACTS, env={"JAMMI_CONFIG": str(config)}):
+    shutil.copytree(ARTIFACTS / "jammi_db", backup / "jammi_db",
+                    ignore=shutil.ignore_patterns("cache"))
+    dump = subprocess.run(
+        [PG_BIN / "pg_dump", "--no-owner", "--dbname", original.get_uri()],
+        check=True, capture_output=True, text=True).stdout
+(backup / "catalog.sql").write_text(dump)
+objects = sum(1 for p in (backup / "jammi_db").rglob("*") if p.is_file())
+print(f"backed up {objects} result-root objects and a {len(dump):,}-byte catalog dump")
+```
+
+The `cache/` directory is left out: it holds only content-addressed copies the store
+rebuilds on demand, never the sole copy of anything.
+
+## Lose it, then restore into a fresh deployment
+
+The deployment is gone — the database and the result root both. A fresh Postgres takes
+the dump; the result root is put back where the rows say it is. A server opened on the
+restored pair runs its startup recovery, and is then asked two questions: does every
+table still match what was recorded when it was materialized, and does the catalog
+agree with the object store?
+
+```{python}
+original.cleanup()
+shutil.rmtree(work / "pgdata")
+shutil.rmtree(ARTIFACTS)
+
+restored = pgserver.get_server(work / "pgdata-restored")
+subprocess.run([PG_BIN / "psql", "--quiet", "--dbname", restored.get_uri(),
+                "--file", backup / "catalog.sql"], check=True, capture_output=True)
+shutil.copytree(backup / "jammi_db", ARTIFACTS / "jammi_db")
+
+with LiveServer(ARTIFACTS, env={"JAMMI_CONFIG": str(configure(restored))}) as server, \
+        jammi.connect(server.endpoint) as db:
+    verdicts = {t: db.verify_materialization(t)["verdict"] for t in tables}
+    report = db.reconcile(apply=False)
+    after = ranked(db)
+
+for table, verdict in verdicts.items():
+    print(f"  {verdict:<28} {table}")
+print(f"reconcile (dry run): {report['orphan_count']} orphans, "
+      f"{report['rows_failed_count']} rows failed, {report['damaged_count']} damaged")
+print(f"search after the restore returns the same ranking: {after == before}")
+```
+
+```{python}
+# | echo: false
+assert set(verdicts.values()) <= {"match", "match_with_unpinned_inputs"}
+assert report["orphan_count"] == report["rows_failed_count"] == report["damaged_count"] == 0
+assert after == before
+contracts.assert_close("production.restored_tables_verified", len(verdicts))
+```
+
+Each verdict recomputes the table's artifact digest and compares it with the one its
+`.materialization.json` recorded; a table whose inputs were registered sources (never
+pinned to a version) matches with its unpinned inputs named. The dry-run `reconcile`
+mutates nothing — it is the step to read before any `--apply` after a restore whose
+two snapshots were not taken at one instant.
+
+## What the server says about itself
+
+A server exposes a side channel beside its gRPC and Flight SQL surfaces: `/healthz`
+(the process is up), `/readyz` (it can reach its catalog — the load balancer's
+question), and `/metrics` (a Prometheus snapshot). Configured with an OTLP endpoint,
+it also exports a span for every request. The collector here is a few lines of
+Python in this process, receiving over the OTLP protocol any collector speaks.
+
+```{python}
+class Collector(trace_service_pb2_grpc.TraceServiceServicer):
+    """An OTLP trace receiver keeping every span it is sent."""
+
+    def __init__(self) -> None:
+        self.spans: list[dict] = []
+
+    def Export(self, request, context):
+        for resource_spans in request.resource_spans:
+            resource = {a.key: a.value.string_value for a in resource_spans.resource.attributes}
+            for scope in resource_spans.scope_spans:
+                for span in scope.spans:
+                    self.spans.append({
+                        "service": resource.get("service.name"),
+                        "name": span.name,
+                        "attributes": {a.key: a.value.string_value for a in span.attributes},
+                    })
+        return trace_service_pb2.ExportTraceServiceResponse()
+
+
+collector = Collector()
+receiver = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+trace_service_pb2_grpc.add_TraceServiceServicer_to_server(collector, receiver)
+otlp_port = receiver.add_insecure_port("127.0.0.1:0")
+receiver.start()
+
+
+def get(url: str) -> tuple[int, str]:
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as refused:
+        return refused.code, refused.read().decode()
+
+
+def metric(text: str, name: str) -> float:
+    return sum(float(line.split()[-1]) for line in text.splitlines()
+               if line.startswith(name) and not line.startswith("#"))
+```
+
+```{python}
+SEARCHES = 4
+observed = configure(restored, observability=f'otlp_endpoint = "http://127.0.0.1:{otlp_port}"')
+with LiveServer(ARTIFACTS, env={"JAMMI_CONFIG": str(observed)}) as server, \
+        jammi.connect(server.endpoint) as db:
+    side = server.health_endpoint
+    health = get(f"{side}/healthz")
+    ready = get(f"{side}/readyz")
+    before_metrics = get(f"{side}/metrics")[1]
+    for _ in range(SEARCHES):
+        ranked(db)
+    after_metrics = get(f"{side}/metrics")[1]
+
+    # The catalog goes away: the process stays live, and stops being ready.
+    restored.cleanup()
+    unready = get(f"{side}/readyz")
+    still_live = get(f"{side}/healthz")
+    restored = pgserver.get_server(work / "pgdata-restored")
+    deadline = time.time() + 30
+    while (ready_again := get(f"{side}/readyz"))[0] != 200 and time.time() < deadline:
+        time.sleep(0.5)
+# Stopping the server flushes the spans it still holds to the collector.
+receiver.stop(grace=None)
+
+searched = metric(after_metrics, "jammi_search_latency_seconds_count") \
+    - metric(before_metrics, "jammi_search_latency_seconds_count")
+spans = [s for s in collector.spans
+         if s["name"] == "grpc_request"
+         and s["attributes"].get("path") == "/jammi.v1.embedding.EmbeddingService/Search"]
+print(f"/healthz  {health[0]}  {health[1]}")
+print(f"/readyz   {ready[0]}  {ready[1]}")
+print(f"catalog stopped: /readyz {unready[0]} {unready[1]}  ·  /healthz {still_live[0]}")
+print(f"catalog back:    /readyz {ready_again[0]}")
+print(f"/metrics  jammi_search_latency_seconds_count +{searched:.0f} over {SEARCHES} searches")
+print(f"exported  {len(spans)} Search spans, service.name = {spans[0]['service'] if spans else None}")
+```
+
+```{python}
+# | echo: false
+assert health[0] == 200 and json.loads(health[1])["status"] == "ok"
+assert ready[0] == 200 and json.loads(ready[1])["status"] == "ready"
+assert unready[0] == 503 and json.loads(unready[1])["status"] == "not_ready"
+assert still_live[0] == 200
+assert ready_again[0] == 200
+assert searched == SEARCHES
+assert len(spans) == SEARCHES and all(s["service"] == "jammi" for s in spans)
+contracts.assert_close("production.search_spans", len(spans))
+restored.cleanup()
+```
+
+`/healthz` never touches a dependency, so it answers the orchestrator's *should this
+container be restarted?* — and stayed `200` while the catalog was down. `/readyz` pings
+the catalog, so it answers the load balancer's *should traffic come here?* — `503`
+while Postgres was stopped, `200` once it was back, with no restart of the server.
+
+## Watching inference from inside the process
+
+The side channel reports on a server from outside. Inside a process that links the
+engine, an **inference observer** is shown every output batch of every model run, with
+the model that produced it and how long it took — the hook for logging, progress, and
+quality checks. It is a Rust trait: this program implements it, opens an
+`InferenceSession` with it, and embeds the corpus.
+
+```{python}
+import os
+from importlib.metadata import version as dist_version
+
+import pyarrow.parquet as pq
+from jammi_cookbook import programs
+
+VERSION = dist_version("jammi-ai")
+print((programs.program("monitor_inference") / "main.rs").read_text())
+```
+
+It builds against the crates of this release — the workspace when the book renders in
+a checkout, crates.io otherwise — and runs on the embedded default (a SQLite catalog in
+its own artifact directory, from the environment). The first build compiles the
+engine, so it takes minutes.
+
+```{python}
+project = programs.rust_program(work, VERSION, "monitor_inference")
+run = subprocess.run(
+    [programs.cargo(), "run", "-q", "--manifest-path", str(project / "Cargo.toml"),
+     "--", CORPUS, MODEL],
+    capture_output=True, text=True,
+    env=dict(os.environ, JAMMI_ARTIFACT_DIR=str(work / "observed"), JAMMI_GPU__DEVICE="-1"))
+assert run.returncode == 0, run.stderr[-4000:]
+observed = [json.loads(line) for line in run.stdout.splitlines()]
+corpus_rows = pq.read_table(fixtures.path("tiny_corpus.parquet")).num_rows
+print(f"{len(observed)} batches observed, {sum(b['rows'] for b in observed)} rows "
+      f"of {corpus_rows} in the corpus, {sum(b['errors'] for b in observed)} errors")
+for batch in observed:
+    print(" ", batch)
+```
+
+```{python}
+# | echo: false
+assert sum(b["rows"] for b in observed) == corpus_rows
+assert all(b["errors"] == 0 for b in observed)
+assert len({b["model"] for b in observed}) == 1
+assert all(b["latency_ms"] > 0 for b in observed)
+contracts.assert_close("production.observed_rows", sum(b["rows"] for b in observed))
+```
+
+Every row the embedding run produced passed the observer exactly once, in batches, each
+tagged with the one model that ran. The observer costs nothing when none is attached —
+the engine checks for one per batch.
+
+## What this shows
+
+* **A restore is two snapshots in the right order.** Storage first, catalog after, so
+  every restored row names bytes that were restored; every table re-verified against
+  the materialization it recorded, and `reconcile` found nothing to reconcile.
+* **Liveness and readiness are different questions.** One is the process, the other
+  is its dependencies; a catalog outage makes the server unready, not dead.
+* **Every request is measured and traced.** Each search moved the latency histogram's
+  count by one and reached the collector as a span, from a server that needed only an
+  endpoint in its configuration.
+* **Inference is observable from inside.** An observer attached to a session saw every
+  row a model run produced, once, with its model and its latency.

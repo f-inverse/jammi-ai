@@ -1,5 +1,7 @@
 # Distributional Inference: Predict a Distribution, Not a Point
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Regression Fine-Tuning](https://f-inverse.github.io/jammi-ai/cookbook/chapters/15-finetune-regression/finetune-regression.html).
+
 A `ModelTask::Regression` head returns a **predictive distribution** per row —
 a Gaussian `(predicted_mean, predicted_std)` or a set of quantiles — instead of
 a single number. Where [conformal prediction](./conformal-prediction.md) wraps

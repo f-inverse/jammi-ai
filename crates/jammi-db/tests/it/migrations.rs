@@ -65,6 +65,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "043_models_backend_required",
     "044_topics_drop_broker_metadata",
     "045_result_table_producer",
+    "046_job_ranks",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -882,7 +883,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                        '035_instances_peer_addr_result_root', \
                        '036_instances_result_root_identity', \
                        '037_jobs_assembly_failures_next_after', \
-                       '039_canonical_stamps')",
+                       '039_canonical_stamps', '046_job_ranks')",
                     &[],
                 )
                 .await?;

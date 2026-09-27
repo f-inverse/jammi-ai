@@ -1,5 +1,7 @@
 # Monitor Inference
 
+> **Measured companion:** for the long-form, executed-and-measured treatment, see [The Cookbook → Operating It](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/operations.html).
+
 Attach an observer to inspect every output batch during inference. Use this for logging, metrics collection, quality checks, or progress tracking.
 
 ## Attach an observer

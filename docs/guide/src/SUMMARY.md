@@ -11,10 +11,10 @@
 - [Quickstart: Rust](./quickstart-rust.md)
 - [Quickstart: Python](./quickstart-python.md)
 - [Quickstart: CLI](./quickstart-cli.md)
+- [Runnable Recipes](./cookbook-recipes.md)
 
 # How-To Guides
 
-- [Runnable Recipes](./cookbook-recipes.md)
 - [Query Your Data with SQL](./query-data.md)
 - [Generate Embeddings](./generate-embeddings.md)
 - [Use a Local Model Checkpoint](./local-models.md)

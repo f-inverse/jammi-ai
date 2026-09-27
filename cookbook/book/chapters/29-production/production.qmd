@@ -1,0 +1,193 @@
+---
+title: "One Postgres, every process — the catalog and the broker in production"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Recipe:** `[catalog.postgres]` · `[broker.postgres]` · `jammi.testing.LiveServer` ·
+`get_server_info` · `add_source` · `generate_embeddings` · `search` · `register_topic` ·
+`publish_topic` · `subscribe_collect` · **Theory:** one database as the system of record
+every process reads and writes, and an append-only log it replays
+[@kleppmann2017ddia; @kreps2011kafka] · **Rail:** measurement (what one process wrote,
+another reads back row for row; every event one process publishes, another receives).
+
+Every chapter so far ran on the development default: a SQLite catalog file and an
+in-process broker. That default is single-process by construction — one engine owns
+the file. A deployment with more than one process (a server and a batch job, two
+server replicas, a worker fleet) runs its catalog and its broker on **Postgres**
+instead: the catalog's rows (sources, models, result tables, jobs) live in one
+database every process shares, and the broker is Postgres `LISTEN`/`NOTIFY` over the
+topics' own backing tables, which live in that same database. Nothing else changes —
+the same binary, the same verbs; the deployment is configuration.
+
+This chapter runs that deployment in one runtime: a Postgres installed with `pip`
+(`pgserver`), a `jammi-server` process, and an embedded engine in this notebook's own
+process, both configured onto the same database.
+
+```{python}
+import tempfile
+import threading
+from pathlib import Path
+
+import jammi
+import pgserver
+import pyarrow as pa
+from jammi.testing import LiveServer
+from jammi_cookbook import contracts, fixtures
+
+MODEL = fixtures.model("tiny_bert")
+CORPUS = fixtures.url("tiny_corpus.parquet")
+QUERY = "how does quantum computing work?"
+
+work = Path(tempfile.mkdtemp())
+postgres = pgserver.get_server(work / "pgdata")
+ARTIFACTS = work / "artifacts"
+
+
+def catalog_url(postgres) -> str:
+    """The engine's URL for `postgres`: the libpq URI it hands out, reached over its
+    Unix socket (an empty host, the socket directory in `host`)."""
+    return postgres.get_uri()
+```
+
+## The configuration: one database, two roles
+
+The catalog stanza names the database — here over its Unix socket, in the libpq form
+Postgres hands out (an empty host, the socket directory in `host`); the broker stanza names no URL of its
+own, so it uses the catalog's — one Postgres serves both roles. `idle_poll_secs` bounds how
+long a subscriber waits for a wake-up it might have missed.
+
+```{python}
+config = work / "jammi.toml"
+config.write_text(f"""
+[catalog.postgres]
+url = "{catalog_url(postgres)}"
+
+[broker.postgres]
+idle_poll_secs = 1
+
+[gpu]
+device = -1
+""")
+print(config.read_text())
+```
+
+## Two processes, one catalog
+
+The server process registers a source and embeds it. The embedded engine — a different
+process, opened on the same configuration — sees the source, sees the embedding table,
+and searches it: the rows it gets are the rows the server gets.
+
+```{python}
+def ranked(db) -> list[tuple[str, float]]:
+    query = db.encode_query(model=MODEL, query=QUERY)
+    hits = db.search("corpus", query=query, k=5).to_pylist()
+    return [(hit["_row_id"], round(hit["similarity"], 6)) for hit in hits]
+
+
+with LiveServer(ARTIFACTS, env={"JAMMI_CONFIG": str(config)}) as server, \
+        jammi.connect(server.endpoint) as remote:
+    remote.add_source("corpus", url=CORPUS, format="parquet")
+    table = remote.generate_embeddings(
+        source="corpus", model=MODEL, columns=["content"], key="id", modality="text")
+    served = ranked(remote)
+    server_broker = remote.get_server_info()["broker"]
+
+    with jammi.connect(f"file://{ARTIFACTS}", config=str(config)) as local:
+        seen = [t["table_name"] for s in local.list_sources() for t in s["result_tables"]]
+        embedded = ranked(local)
+        local_broker = local.get_server_info()["broker"]
+
+print(f"broker: server={server_broker}, embedded={local_broker}")
+print(f"the embedded engine sees the server's table: {table in seen}")
+for (key, score), (key_e, score_e) in zip(served, embedded):
+    print(f"  {key:>8} {score:.6f}   {key_e:>8} {score_e:.6f}")
+```
+
+```{python}
+# | echo: false
+assert server_broker == local_broker == "postgres"
+assert table in seen
+assert served == embedded
+contracts.assert_close("production.shared_catalog_rows", len(embedded))
+```
+
+The embedded engine did not copy anything and was not told about the table: it read
+the same `result_tables` row from the same database, and the same Parquet the row
+names, from the same result root.
+
+## Events across processes
+
+A topic's backing table is a table in the catalog database, and the Postgres broker
+wakes every subscriber — in any process — when a publish commits. So one process
+publishes and another receives. Here a subscriber in the server process waits for
+three batches while the embedded engine publishes them.
+
+```{python}
+SCHEMA = pa.schema([("op", pa.string()), ("key", pa.string())])
+batches = [
+    pa.table({"op": ["add", "add"], "key": ["a", "b"]}, schema=SCHEMA),
+    pa.table({"op": ["update"], "key": ["a"]}, schema=SCHEMA),
+    pa.table({"op": ["delete", "add"], "key": ["b", "c"]}, schema=SCHEMA),
+]
+
+with LiveServer(ARTIFACTS, env={"JAMMI_CONFIG": str(config)}) as server, \
+        jammi.connect(server.endpoint) as remote:
+    remote.register_topic("changes", schema=SCHEMA)
+    received = {}
+
+    def subscribe() -> None:
+        received["live"] = remote.subscribe_collect(
+            "changes", from_offset=0, replay_only=False, max_batches=len(batches))
+
+    subscriber = threading.Thread(target=subscribe)
+    subscriber.start()
+    with jammi.connect(f"file://{ARTIFACTS}", config=str(config)) as local:
+        offsets = [local.publish_topic("changes", batch=b) for b in batches]
+    subscriber.join(timeout=60)
+    replay = remote.subscribe_collect("changes", from_offset=0)
+
+live = received["live"]
+published = pa.concat_tables(batches)
+print(f"published at offsets {offsets}: {published.num_rows} events")
+print(f"received live in the server process: {live.num_rows} events")
+print(f"replayed from the backing table:     {replay.num_rows} events")
+```
+
+```{python}
+# | echo: false
+assert offsets == [0, 1, 2]
+assert not subscriber.is_alive()
+assert live.select(["op", "key"]).equals(published)
+assert replay.select(["op", "key"]).equals(published)
+contracts.assert_close("production.events_received", live.num_rows)
+```
+
+The live subscriber and the replay agree because they are the same thing: `NOTIFY`
+only says *go look*; what the subscriber delivers comes from replaying the backing
+table from its offset. A subscriber in a process that missed a wake-up — or started
+after the publish — reads the same rows on its next poll.
+
+```{python}
+# | echo: false
+postgres.cleanup()
+```
+
+## What this shows
+
+* **One database is the system of record.** A server and an embedded engine configured
+  onto the same Postgres see one catalog: what one registers or computes, the other
+  reads, with no copy and no coordination beyond the database
+  [@kleppmann2017ddia].
+* **The broker adds no service.** Topics are tables in that database; `LISTEN`/`NOTIFY`
+  is a wake-up, and the log a subscriber reads is the backing table — so delivery across
+  processes is a replay, and a missed wake-up costs latency, never data
+  [@kreps2011kafka].
+* **Deployment is configuration.** Nothing in the program changed between the
+  single-process chapters and this one except the two stanzas above.
+
+The next chapter operates this deployment: backing it up and restoring it, and reading
+what it reports about its own health.

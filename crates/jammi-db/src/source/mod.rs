@@ -1,3 +1,5 @@
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+mod database;
 pub mod file_format;
 pub mod mutable;
 #[cfg(feature = "mysql")]
@@ -187,6 +189,42 @@ impl SourceConnection {
     }
 }
 
+impl SourceDefinition {
+    /// The source `url` names. A `postgres://` / `postgresql://` URL is a
+    /// PostgreSQL database and a `mysql://` URL a MySQL / MariaDB database,
+    /// each connected through the URL as given; any other URL or local path is
+    /// a file read in `format`. A file needs its format; a database has none,
+    /// so one given for it is refused rather than ignored.
+    pub fn from_url(url: &str, format: Option<FileFormat>) -> crate::error::Result<Self> {
+        let database = match url.split_once("://").map(|(scheme, _)| scheme) {
+            Some("postgres" | "postgresql") => Some(SourceType::Postgres),
+            Some("mysql") => Some(SourceType::Mysql),
+            _ => None,
+        };
+        match (database, format) {
+            (Some(source_type), None) => Ok(Self {
+                source_type,
+                connection: SourceConnection {
+                    url: Some(url.to_string()),
+                    ..Default::default()
+                },
+            }),
+            (Some(source_type), Some(format)) => Err(crate::error::JammiError::Config(format!(
+                "a {source_type:?} source is a database, not a file: it takes no format \
+                 (got `{format}`)"
+            ))),
+            (None, Some(format)) => Ok(Self {
+                source_type: SourceType::File,
+                connection: SourceConnection::parse(url, format)?,
+            }),
+            (None, None) => Err(crate::error::JammiError::Config(format!(
+                "`{url}` names a file, which needs a format (parquet, csv, json, jsonl, avro); a \
+                 database source is a `postgres://` or `mysql://` URL"
+            ))),
+        }
+    }
+}
+
 /// Derive a DataFusion table name from a URL by extracting the file stem.
 ///
 /// Handles both Unix forward-slash paths and Windows backslash paths so that
@@ -242,5 +280,33 @@ mod tests {
         assert!(err.contains("csv"));
         assert!(err.contains("json"));
         assert!(err.contains("avro"));
+    }
+
+    #[test]
+    fn a_database_url_names_its_database_and_takes_no_format() {
+        for (url, source_type) in [
+            ("postgres://u@h/d", SourceType::Postgres),
+            ("postgresql://u@h/d", SourceType::Postgres),
+            ("mysql://u@h/d", SourceType::Mysql),
+        ] {
+            let definition = SourceDefinition::from_url(url, None).unwrap();
+            assert_eq!(definition.source_type, source_type);
+            assert_eq!(definition.connection.url.as_deref(), Some(url));
+            assert_eq!(definition.connection.format, None);
+            assert!(SourceDefinition::from_url(url, Some(FileFormat::Parquet)).is_err());
+        }
+    }
+
+    #[test]
+    fn any_other_url_is_a_file_which_needs_its_format() {
+        let definition =
+            SourceDefinition::from_url("/data/corpus.parquet", Some(FileFormat::Parquet)).unwrap();
+        assert_eq!(definition.source_type, SourceType::File);
+        assert_eq!(
+            definition.connection.url.as_deref(),
+            Some("file:///data/corpus.parquet")
+        );
+        assert_eq!(definition.connection.format, Some(FileFormat::Parquet));
+        assert!(SourceDefinition::from_url("/data/corpus.parquet", None).is_err());
     }
 }

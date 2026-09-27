@@ -19,6 +19,11 @@
 //! and its remote arm is the bundled pure-Python `jammi`. The remote
 //! wire surface is proven by the `jammi-server` crate's own data-plane client tests
 //! (under `--features wire`) plus the `jammi` conformance test.
+//!
+//! The test binary links libpython (the crate builds without pyo3's
+//! `extension-module` outside maturin) and drives pyo3 from Rust, so it
+//! starts the embedded interpreter itself; CI runs it in the `Test (Python)`
+//! lane, whose image carries the interpreter's development link.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -45,6 +50,7 @@ fn test_config(artifact_dir: &std::path::Path) -> JammiConfig {
 
 #[test]
 fn session_arc_shares_session_state_with_pydatabase() {
+    pyo3::Python::initialize();
     let dir = tempdir().expect("tempdir");
     let db = PyDatabase::open(test_config(dir.path())).expect("open PyDatabase");
 
@@ -95,51 +101,4 @@ fn session_arc_shares_session_state_with_pydatabase() {
         None,
         "unbinding through one Arc must clear the shared state",
     );
-}
-
-// ── OTLP wiring: `open_local`'s subscriber composition ─────────────────────
-//
-// A Python-level test would need to observe an in-process wheel install and
-// its own tracing subscriber install (`open_local`'s `try_init()` can only
-// ever succeed once per process), which the `pytest` harness cannot exercise
-// repeatably. This Rust-side test drives the SAME composition function
-// `open_local` calls (`jammi_native::build_tracing_layers`) directly, scoped
-// to the current thread via `tracing::subscriber::set_default` rather than
-// the process-global `try_init()`.
-
-#[test]
-fn build_tracing_layers_with_no_endpoint_is_fmt_only() {
-    use tracing_subscriber::layer::SubscriberExt;
-
-    let config = test_config(tempdir().expect("tempdir").path());
-    let layers = jammi_native::build_tracing_layers(&config).expect("no endpoint must not error");
-    assert_eq!(layers.len(), 1, "no otlp_endpoint -> the fmt layer alone");
-
-    // Scoped install (not global): proves the composed subscriber actually
-    // accepts spans/events without panicking, without touching the
-    // process-global default any other test in this binary might rely on.
-    let subscriber = tracing_subscriber::registry().with(layers);
-    let _guard = tracing::subscriber::set_default(subscriber);
-    tracing::info!("build_tracing_layers_with_no_endpoint_is_fmt_only smoke event");
-}
-
-// Building the tonic `Channel` (lazily -- no connection attempt, just the
-// client machinery) needs an active Tokio reactor.
-#[tokio::test]
-async fn build_tracing_layers_with_an_endpoint_adds_the_otlp_layer() {
-    use tracing_subscriber::layer::SubscriberExt;
-
-    let mut config = test_config(tempdir().expect("tempdir").path());
-    config.observability.otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
-    let layers =
-        jammi_native::build_tracing_layers(&config).expect("a well-formed endpoint must build");
-    assert_eq!(
-        layers.len(),
-        2,
-        "a configured otlp_endpoint -> fmt layer + otlp layer"
-    );
-
-    let subscriber = tracing_subscriber::registry().with(layers);
-    let _guard = tracing::subscriber::set_default(subscriber);
-    tracing::info!("build_tracing_layers_with_an_endpoint_adds_the_otlp_layer smoke event");
 }

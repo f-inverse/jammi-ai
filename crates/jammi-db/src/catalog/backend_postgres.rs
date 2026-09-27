@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use super::backend::{
     classify, BackendError, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
@@ -36,7 +36,7 @@ impl PostgresBackend {
         pool_size: u32,
         max_lifetime_secs: Option<u32>,
     ) -> Result<Arc<Self>, BackendError> {
-        let opts: PgConnectOptions = url.parse().map_err(classify)?;
+        let opts = crate::pg_uri::connect_options(url).map_err(classify)?;
         let mut builder = PgPoolOptions::new().max_connections(pool_size);
         if let Some(secs) = max_lifetime_secs {
             builder = builder.max_lifetime(Duration::from_secs(secs as u64));

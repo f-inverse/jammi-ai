@@ -1,5 +1,7 @@
 # Operability
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Operating It](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/operations.html).
+
 How to run a Jammi server in production: what it exposes for observability, how
 it shuts down cleanly, the resource limits it enforces, and how it behaves when
 a dependency fails. Everything below describes the system as it ships today.
@@ -86,8 +88,10 @@ only when stdout is a terminal.
 #### OTLP trace export
 
 Setting `[observability] otlp_endpoint` sends spans to any vendor-neutral OTLP
-collector over gRPC (`opentelemetry-otlp`, tonic transport). Every span from
-this process carries the `service.name` resource attribute (default
+collector over gRPC (`opentelemetry-otlp`, tonic transport). The export layer
+reads the same filter the log formatter does (`logging.level`, or `RUST_LOG`
+when set), so it exports exactly the spans the process logs at that level —
+never a dependency's transport internals below it. Every exported span carries the `service.name` resource attribute (default
 `"jammi"`), and the parent-based ratio sampler keeps `sample_ratio` (default
 `1.0`, i.e. everything) of the traces this process ROOTS — a span whose parent
 was already sampled by the caller is always kept, regardless of the local

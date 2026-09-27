@@ -45,7 +45,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::{distance_is_admissible, validate_query, QuerySource, ValidatedQuery};
+use jammi_db::index::{
+    distance_is_admissible, validate_query, Admission, QuerySource, ValidatedQuery,
+};
 use jammi_db::store::{CacheOutcome, CachePolicy, ResultStore, ResultTableOrigin, ReusedArtifact};
 
 use crate::session::InferenceSession;
@@ -151,9 +153,9 @@ impl NeighborGraphStrategy for IndexAssisted {
         // owns the merge across segments and the exact rescore for a quantized
         // table, so the driver sees one comparable neighbour list regardless of
         // segment count or precision.
-        let raw = self
-            .index
-            .search_final(&node.vector, k + 1, self.oversample)?;
+        let raw =
+            self.index
+                .search_final(&node.vector, k + 1, self.oversample, &Admission::Every)?;
         Ok(drop_self_hit(raw, &node.row_id, k))
     }
 

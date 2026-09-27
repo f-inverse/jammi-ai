@@ -279,6 +279,8 @@ impl CatalogClient {
                 output_model_id: j.output_model_id,
                 created_at: j.created_at,
                 error: j.error,
+                claimed_by: j.claimed_by,
+                ranks: j.ranks,
             })
             .collect())
     }
@@ -898,6 +900,12 @@ pub struct JobSummary {
     pub created_at: String,
     /// The failure message; non-empty exactly when `status` is `"failed"`.
     pub error: String,
+    /// The instance holding (or last holding) the job's claim; empty while
+    /// queued. For a placed training attempt, the executor.
+    pub claimed_by: String,
+    /// The instance that ran each rank of the latest training attempt, in
+    /// rank order; empty for a compute job and until an attempt records it.
+    pub ranks: Vec<String>,
 }
 
 /// One engine process currently running the claim loop, as read by

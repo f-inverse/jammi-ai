@@ -36,7 +36,7 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      job must itself be some OTHER row's promoting job in the SAME workflow
      (e.g. `crates.yml`'s `github-release` chains off `publish`, which is
      itself a `"direct"` row); a `"none"` row is a reviewed, deliberately
-     UNGATED promotion (e.g. `image.yml`/`image-cuda.yml`'s CI base-image
+     UNGATED promotion (e.g. `image.yml`'s CI base-image
      rebuild on every merge to `main`, or `server-image.yml`'s manual
      `:latest` refresh on a `workflow_dispatch` against `main` -- neither is
      ever a release-tag promotion) and must structurally prove it
@@ -119,8 +119,8 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      `+`-bearing filename — the raw parsed scalar's mere PRESENCE, never
      its resolved identity; a job-level `uses:` value that is present but
      not a string is its own finding) is ALSO a promoting job for P6's
-     purposes and must be listed too — e.g. `image.yml`/`image-cuda.yml`'s
-     `build` jobs (each a job-level `uses: ./.github/workflows/_ci-base-
+     purposes and must be listed too — e.g. `image.yml`'s
+     `build`/`build-cuda` jobs (each a job-level `uses: ./.github/workflows/_ci-base-
      image.yml`, which does genuinely push to GHCR) are LISTED rows
      (`gate_kind="none"`, proven structurally unreachable from a tag ref
      per P3's `"none"`-row rule — never reachable via `workflow_dispatch` on a tag
@@ -314,7 +314,7 @@ class PromotionRow:
         SAME workflow (already itself gated, directly or chained) — e.g.
         `crates.yml`'s `github-release` chains off `publish`.
       - `"none"`: a reviewed, deliberately UNGATED promotion (e.g.
-        `image.yml`/`image-cuda.yml`'s CI base-image rebuild on a merge to
+        `image.yml`'s CI base-image rebuilds on a merge to
         `main` — never a release tag promotion). `gate_job` is `None`; P3
         instead asserts the promoting job's `if:` is a PURE top-level
         conjunction carrying the EXACT conjunct `github.ref_type != 'tag'`,
@@ -375,7 +375,7 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "cpu-image-selfcontained": PromotionRow(
         "server-image.yml", "build-and-push-selfcontained", None, "none"
     ),  # manual dispatch-only opt-in image (Cloudflare Containers) -- never a release tag promotion.
-    # ---- image.yml / image-cuda.yml: CI base images. Each `build` job
+    # ---- image.yml: CI base images. Each of `build`/`build-cuda`
     # carries a job-level `uses:` to the LOCAL reusable `_ci-base-image.
     # yml` (whose own `build-and-push` job pushes to GHCR) -- P6's
     # fail-closed job-level `uses:` rule presumes ANY such delegation
@@ -383,11 +383,11 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     # it also happens to be true that the delegate really does push.
     # Both are reviewed UNGATED rows: they publish the
     # toolchain LAYER the release lanes build inside, on a merge to `main`,
-    # never a release tag -- and each `build` job's own `if:` carries
+    # never a release tag -- and each job's own `if:` carries
     # the exact `github.ref_type != 'tag'` conjunct so a workflow_dispatch
     # on a tag ref can never reach them either.
     "ci-image-cpu": PromotionRow("image.yml", "build", None, "none"),
-    "ci-image-cuda": PromotionRow("image-cuda.yml", "build", None, "none"),
+    "ci-image-cuda": PromotionRow("image.yml", "build-cuda", None, "none"),
     # ---- release-binaries.yml's remaining lanes ----
     "cli-binaries": PromotionRow("release-binaries.yml", "promote-binaries", "gpu-proof", "direct"),
     "server-cpu-tarball": PromotionRow("release-binaries.yml", "server-cpu-promote", "gpu-proof", "direct"),

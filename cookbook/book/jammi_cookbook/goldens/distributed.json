@@ -5,7 +5,7 @@
   },
   "local_w2_max_loss_diff": {
     "tol": 1e-06,
-    "value": 0.0
+    "value": 1.9073486301479647e-07
   },
   "local_w3_max_embedding_diff": {
     "tol": 1e-06,
@@ -13,6 +13,22 @@
   },
   "local_w3_max_loss_diff": {
     "tol": 1e-06,
-    "value": 1.9073486345888568e-07
+    "value": 9.536743172944284e-08
+  },
+  "peer_w2_max_embedding_diff": {
+    "tol": 1e-06,
+    "value": 3.725290298461914e-09
+  },
+  "peer_w2_max_loss_diff": {
+    "tol": 1e-06,
+    "value": 1.9073486301479647e-07
+  },
+  "placed_w2_max_embedding_diff": {
+    "tol": 1e-06,
+    "value": 3.725290298461914e-09
+  },
+  "placed_w2_max_loss_diff": {
+    "tol": 1e-06,
+    "value": 1.9073486301479647e-07
   }
 }

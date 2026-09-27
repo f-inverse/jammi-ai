@@ -1,5 +1,7 @@
 # Catalog Backend and Trigger Broker
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/production.html).
+
 Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through
 two fields on `JammiConfig`: `catalog` and `broker`. The dev-laptop default
@@ -30,9 +32,16 @@ path is already trusted), and `sqlx` verifies against the **webpki** root
 store rather than the OS trust store, so a private CA needs its own
 `sslrootcert=` path even on a host that already trusts it system-wide.
 
-The engine hands this URL to the Postgres driver unchanged
-(`backend_postgres.rs::open_with_options`) — but "unchanged" only means the
-driver's own URL parser sees every key you wrote. `sqlx`'s parser
+`url` is a libpq connection URI, read exactly as a Postgres source's URL is
+(see [External Sources](external-sources.md#connection-urls)), and a
+Unix-socket connection takes libpq's form: an empty host and the socket
+directory as the `host` parameter — `postgresql://user:@/jammi?host=/run/postgresql`,
+the form a pip-installed or embedded Postgres hands out. Beyond a source's
+parameters, the catalog and broker take `sslcert` and `sslkey` for a client
+certificate. The same holds for `[broker.postgres] url`.
+
+The engine hands every key you wrote to the Postgres driver (`pg_uri.rs`) —
+but that only means the driver sees those keys. `sqlx`'s parser
 (`PgConnectOptions::parse_from_url`) starts from options already populated
 from the process environment (`PGSSLMODE`, `PGSSLROOTCERT`, and the rest of
 the `PGSSL*`/`PGPASSWORD`/… family) and then overrides *only the keys the

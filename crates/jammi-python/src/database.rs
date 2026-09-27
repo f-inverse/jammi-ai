@@ -17,7 +17,7 @@ use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::error::JammiError;
-use jammi_db::source::{FileFormat, SourceConnection, SourceType};
+use jammi_db::source::{FileFormat, SourceConnection, SourceDefinition};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::{Offset, Predicate};
 
@@ -372,13 +372,13 @@ impl PyDatabase {
     /// List every job visible to the current tenant, most recent first. Each
     /// entry is a dict carrying the SAME field set the wire's `JobSummary`
     /// carries — `job_id`, `kind`, `status`, `base_model_id`,
-    /// `output_model_id`, `created_at`, `error` — so a caller reads one
+    /// `output_model_id`, `created_at`, `error`, `claimed_by`, `ranks` — so a caller reads one
     /// vocabulary regardless of transport. A listing of `Job.status()`
     /// answers plus the submit-time identity, not a progress surface: read
     /// [`PyJob::progress`] on the individual handle for that.
     ///
-    /// `output_model_id` is the empty string until a training kind completes
-    /// (and always empty for a compute kind) and `error` is empty unless it
+    /// `output_model_id` is stamped at submission for a training kind (and
+    /// always empty for a compute kind) and `error` is empty unless it
     /// failed — the same two conventions `JobService.ListJobs` relays,
     /// reproduced here rather than mapping absence onto `None` on one
     /// transport only.
@@ -404,6 +404,8 @@ impl PyDatabase {
             )?;
             entry.set_item("created_at", &record.created_at)?;
             entry.set_item("error", record.error.as_deref().unwrap_or(""))?;
+            entry.set_item("claimed_by", record.claimed_by.as_deref().unwrap_or(""))?;
+            entry.set_item("ranks", &record.ranks)?;
             list.append(entry)?;
         }
         Ok(list.into_any().unbind())
@@ -549,28 +551,32 @@ impl PyDatabase {
         ))
     }
 
-    /// Register a file-shaped data source. `url` accepts a local path
-    /// (parsed into `file://...`) or any storage URL the build was
-    /// compiled with: `s3://bucket/key`, `gs://bucket/key`,
-    /// `azure://container/blob`. `tenant_column` names the column whose value
-    /// is each row's tenant, persisted with the source.
-    #[pyo3(signature = (name, *, url, format, tenant_column=None))]
+    /// Register a data source by the URL that names it
+    /// ([`SourceDefinition::from_url`]): a `postgres://` / `mysql://` URL is a
+    /// database source, federated table by table; anything else is a file
+    /// read in `format` — a local path (parsed into `file://...`) or any
+    /// storage URL the build was compiled with (`s3://`, `gs://`, `azure://`).
+    /// `tenant_column` names the column whose value is each row's tenant,
+    /// persisted with the source.
+    #[pyo3(signature = (name, *, url, format=None, tenant_column=None))]
     fn add_source(
         &self,
         name: &str,
         url: &str,
-        format: &str,
+        format: Option<&str>,
         tenant_column: Option<String>,
     ) -> PyResult<()> {
         self.check_open()?;
-        let file_format = parse_file_format(format)?;
+        let format = format.map(parse_file_format).transpose()?;
+        let definition = SourceDefinition::from_url(url, format).map_err(to_pyerr)?;
         let connection = SourceConnection {
             tenant_column,
-            ..SourceConnection::parse(url, file_format).map_err(to_pyerr)?
+            ..definition.connection
         };
         crate::released(
             &self.runtime,
-            self.session.add_source(name, SourceType::File, connection),
+            self.session
+                .add_source(name, definition.source_type, connection),
         )
         .map_err(to_pyerr)
     }

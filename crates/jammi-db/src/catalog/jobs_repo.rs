@@ -92,7 +92,15 @@ pub struct JobRecord {
     /// its model against. `None` for a training kind.
     pub model_source: Option<String>,
     /// Id of the instance holding the lease, or `None` while queued/unclaimed.
+    /// A terminal row keeps its last holder: for a placed training attempt,
+    /// the executor the claim moved to.
     pub claimed_by: Option<String>,
+    /// The instance that ran each rank of the latest training attempt, in
+    /// rank order, recorded once the attempt's rank set is fixed
+    /// ([`Catalog::record_attempt_ranks`]). Empty for a compute job and until
+    /// a training attempt records its ranks; every claim empties it, so it
+    /// never names an earlier attempt's ranks beside a later attempt's claim.
+    pub ranks: Vec<String>,
     pub attempts: u32,
     /// How many times a claimant handed this job's lease back ON PURPOSE
     /// ([`Catalog::release_job_lease`] / [`Catalog::release_jobs_claimed_by`]
@@ -511,9 +519,26 @@ fn world_size_from_spec_json(spec: &str) -> WorldSizeFact {
     }
 }
 
+/// A `jobs` column an attempt writes for itself under the attempt guard
+/// ([`Catalog::record_acceleration_report`], [`Catalog::record_attempt_ranks`]).
+#[derive(Debug, Clone, Copy)]
+enum AttemptColumn {
+    AccelerationReport,
+    Ranks,
+}
+
+impl AttemptColumn {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AccelerationReport => "acceleration_report",
+            Self::Ranks => "ranks",
+        }
+    }
+}
+
 const SELECT_COLS: &str = "job_id, kind, tenant_id, status, execution, spec, partial_result, \
      result, error, progress_rows_done, progress_rows_total, progress_phase, cancel_requested, \
-     model_ref, output_model_id, model_source, claimed_by, attempts, releases, \
+     model_ref, output_model_id, model_source, claimed_by, ranks, attempts, releases, \
      lease_expires_at, priority, claimable, acceleration_report, \
      training_set_ref, training_set_location, created_at, updated_at";
 
@@ -594,6 +619,16 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
                 })
         })
         .transpose()?;
+    // `NULL` is "no attempt has recorded its ranks": an empty list.
+    let ranks = match row.try_get::<String>("ranks")? {
+        None => Vec::new(),
+        Some(json) => serde_json::from_str::<Vec<String>>(&json).map_err(|e| {
+            super::backend::BackendError::TypeConversion {
+                column: "ranks".to_string(),
+                detail: e.to_string(),
+            }
+        })?,
+    };
     Ok(JobRecord {
         job_id: row.get("job_id")?,
         kind: row.get("kind")?,
@@ -612,6 +647,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<JobRecord, super::backend::Ba
         output_model_id: row.try_get("output_model_id")?,
         model_source: row.try_get("model_source")?,
         claimed_by: row.try_get("claimed_by")?,
+        ranks,
         attempts: row.get::<i32>("attempts")? as u32,
         releases: row.get::<i32>("releases")? as u32,
         lease_expires_at: row.try_get("lease_expires_at")?,
@@ -1434,7 +1470,7 @@ impl Catalog {
         let sql = format!(
             "UPDATE jobs \
              SET status = $1, claimed_by = $2, lease_expires_at = {deadline_expr}, \
-                 attempts = attempts + 1, updated_at = ${updated_at_bind} \
+                 attempts = attempts + 1, ranks = NULL, updated_at = ${updated_at_bind} \
              WHERE job_id = {candidate} AND status = $3 \
              RETURNING {SELECT_COLS}"
         );
@@ -1496,7 +1532,7 @@ impl Catalog {
         let sql = format!(
             "UPDATE jobs \
              SET status = $1, claimed_by = $2, lease_expires_at = {deadline_expr}, \
-                 attempts = attempts + 1, updated_at = ${updated_at_bind} \
+                 attempts = attempts + 1, ranks = NULL, updated_at = ${updated_at_bind} \
              WHERE job_id = ${job_id_bind} AND status = ${queued_bind} \
                AND execution = ${inline_bind} \
              RETURNING {SELECT_COLS}"
@@ -2199,22 +2235,70 @@ impl Catalog {
         attempts: u32,
         report_json: &str,
     ) -> Result<bool> {
+        self.set_under_attempt(
+            job_id,
+            instance_id,
+            attempts,
+            AttemptColumn::AccelerationReport,
+            report_json.to_string(),
+        )
+        .await
+    }
+
+    /// Record the instance that runs each rank of this attempt, in rank
+    /// order — written once the attempt's rank set is fixed (a single rank,
+    /// an in-process gang, or a peer gang the coordinator assembled), under
+    /// the same attempt guard as [`Self::record_acceleration_report`] (see
+    /// there for why the `attempts` pin is mandatory). Read back as
+    /// [`JobRecord::ranks`]. `true` when the write landed; `false` when the
+    /// lease was lost, the job is not running, or `attempts` is stale.
+    pub async fn record_attempt_ranks(
+        &self,
+        job_id: &str,
+        instance_id: &str,
+        attempts: u32,
+        ranks: &[String],
+    ) -> Result<bool> {
+        self.set_under_attempt(
+            job_id,
+            instance_id,
+            attempts,
+            AttemptColumn::Ranks,
+            serde_json::to_string(ranks)?,
+        )
+        .await
+    }
+
+    /// `UPDATE jobs SET <column> = value` under the attempt guard
+    /// (`job_id`, `claimed_by`, `status = 'running'`, `attempts`): the one
+    /// statement every informational per-attempt write shares.
+    async fn set_under_attempt(
+        &self,
+        job_id: &str,
+        instance_id: &str,
+        attempts: u32,
+        column: AttemptColumn,
+        value: String,
+    ) -> Result<bool> {
         let running = JobStatus::Running.to_string();
         let job_id = job_id.to_string();
         let instance_id = instance_id.to_string();
-        let report_json = report_json.to_string();
         let attempts = attempts as i64;
         let now = canonical_stamp_now();
+        let sql = format!(
+            "UPDATE jobs SET {} = $1, updated_at = $2 \
+             WHERE job_id = $3 AND claimed_by = $4 AND status = $5 AND attempts = $6",
+            column.name()
+        );
 
         let updated = self
             .backend()
             .transaction(TxOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE jobs SET acceleration_report = $1, updated_at = $2 \
-                         WHERE job_id = $3 AND claimed_by = $4 AND status = $5 AND attempts = $6",
+                        &sql,
                         &[
-                            SqlValue::TextOwned(report_json),
+                            SqlValue::TextOwned(value),
                             SqlValue::TextOwned(now),
                             SqlValue::TextOwned(job_id),
                             SqlValue::TextOwned(instance_id),

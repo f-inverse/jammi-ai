@@ -1,5 +1,7 @@
 # Generate Image Embeddings
 
+> **Runnable companion:** [`cookbook/recipes/image_search/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/image_search) embeds an image corpus with a vision tower and searches it with an image query.
+
 Generate vector embeddings from images using an OpenCLIP-compatible vision model. Results are persisted to Parquet with sidecar ANN indexes, identical to text embeddings — the same `search()`, evaluation, and SQL tools work on both.
 
 The OpenCLIP family is cross-modal: the vision tower and the text tower in the same checkpoint produce embeddings in a shared latent space, so a text query encoded with the same model can search image embeddings directly. See [Search Text Against Images (Cross-Modal)](./cross-modal-search.md) for the full text-to-image recipe.

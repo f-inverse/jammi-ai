@@ -58,8 +58,20 @@ _QMD_LINK = re.compile(r"\]\(\s*([^)\s#]+)\.qmd(#[^)\s]*)?\s*\)")
 # Lines only an engine started through the client's harness, or a `grpc://`
 # target, needs a server for; the render selector classifies the same way.
 _NEEDS_SERVER = re.compile(r"\bLiveServer\(|connect\(\s*f?[\"']grpc://")
-# Lines only the cookbook's `cloud` extra (a local S3-compatible server) serves.
-_NEEDS_CLOUD = re.compile(r"\bThreadedMotoServer\b")
+# The cookbook extras a notebook installs, by the lines only each one serves:
+# `cloud`, a local S3-compatible server; `postgres`, a pip-installed Postgres a
+# fleet of servers shares as its catalog; `otlp`, the trace protocol an
+# in-process collector receives spans with.
+_EXTRAS = {
+    "cloud": re.compile(r"\bThreadedMotoServer\b"),
+    "postgres": re.compile(r"\bpgserver\b"),
+    "otlp": re.compile(r"\bopentelemetry\.proto\b"),
+}
+
+
+def extras_of(text: str) -> list[str]:
+    """The cookbook extras `text` needs, in `_EXTRAS` order."""
+    return [name for name, needs in _EXTRAS.items() if needs.search(text)]
 
 
 def version() -> str:
@@ -113,10 +125,10 @@ def notebook(cells: list[dict]) -> dict:
     }
 
 
-def setup_cell(release: str, *, server: bool, cloud: bool = False) -> dict:
+def setup_cell(release: str, *, server: bool, extras: list[str]) -> dict:
     """Install the release this notebook was built for, on the engine the
     runtime can run, and choose the scale."""
-    extra = "[cloud]" if cloud else ""
+    extra = f"[{','.join(extras)}]" if extras else ""
     cookbook = (
         f"jammi-cookbook{extra} @ git+https://github.com/{GITHUB}@py-v{release}"
         "#subdirectory=cookbook/book"
@@ -290,12 +302,12 @@ def chapter(qmd: Path, release: str, refs: dict[str, Reference]) -> tuple[Path, 
         cells.append(markdown("## References\n\n" + "\n".join(
             f"- {refs[k].full}" for k in cited)))
 
-    server = bool(_NEEDS_SERVER.search("\n".join(executed)))
-    cloud = bool(_NEEDS_CLOUD.search("\n".join(executed)))
+    run = "\n".join(executed)
+    server = bool(_NEEDS_SERVER.search(run))
     url = colab_url(target, release)
     source = qmd.relative_to(REPO).as_posix()
     return target, notebook([header(title, source, url),
-                             setup_cell(release, server=server, cloud=cloud), *cells])
+                             setup_cell(release, server=server, extras=extras_of(run)), *cells])
 
 
 def recipe(script: Path, release: str) -> tuple[Path, dict]:
@@ -316,9 +328,8 @@ def recipe(script: Path, release: str) -> tuple[Path, dict]:
     url = colab_url(target, release)
     source = script.relative_to(REPO).as_posix()
     server = bool(_NEEDS_SERVER.search(text))
-    cloud = bool(_NEEDS_CLOUD.search(text))
     cells = [header(title.rstrip("."), source, url),
-             setup_cell(release, server=server, cloud=cloud)]
+             setup_cell(release, server=server, extras=extras_of(text))]
     if rest:
         cells.append(markdown(rest))
     cells += [code(body), code("assert main() == 0")]

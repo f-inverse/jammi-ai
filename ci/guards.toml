@@ -59,6 +59,11 @@ run = "python3 ci/scripts/check_cookbook_coverage.py"
 why = "Every public Python surface of jammi is run by a recipe or an executed book-chapter cell, so a verb cannot ship without its runnable example."
 
 [[guard]]
+name = "guide companions"
+run = "python3 ci/scripts/check_guide_companions.py"
+why = "Every How-To and Operations page of the guide names the cookbook chapter or recipe that runs its capability, and that chapter renders or that recipe is smoke-run, so a capability that adds no Python verb still cannot ship without its runnable example."
+
+[[guard]]
 name = "lockstep versions"
 run = "python3 ci/scripts/check_lockstep_versions.py"
 why = "Every Python and npm dist ships at the workspace version and every exact sibling pin names it, so a release never publishes a pin that cannot resolve."
@@ -108,9 +113,9 @@ when = ["cargo-graph"]
 needs = ["cargo-registry"]
 
 [[guard]]
-name = "release postgres/mysql closure"
-run = "python3 ci/scripts/check_release_manifest_pg_mysql_closure.py"
-why = "No release lane's feature closure reaches jammi-db's postgres or mysql features: they link an OpenSSL the release images do not carry."
+name = "database drivers link statically"
+run = "python3 ci/scripts/check_database_drivers_static.py"
+why = "jammi-db's postgres and mysql features, which every release artifact enables, vendor OpenSSL and link zlib statically, so no artifact carries a DT_NEEDED libssl or libz its platform tag does not promise."
 when = ["cargo-graph"]
 needs = ["cargo-registry"]
 

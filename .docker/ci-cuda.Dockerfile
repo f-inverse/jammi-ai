@@ -1,9 +1,9 @@
 # BASE_IMAGE has no default ON PURPOSE, the same fail-closed doctrine
 # ci.Dockerfile's own BASE_IMAGE/RUST_VERSION ARGs are held to: the workflow
-# passes it explicitly (image-cuda.yml's own `base_image_amd64` input,
-# defaulting to `ghcr.io/f-inverse/jammi-ai-ci:latest`).
+# passes it explicitly (image.yml's `build-cuda` job sets `base_image_amd64`
+# to the CPU base index the same run just pushed, `jammi-ai-ci:sha-<sha>`).
 #
-# The CUDA base is amd64-only: image-cuda.yml passes no `platforms`, so this
+# The CUDA base is amd64-only: `build-cuda` passes no `platforms`, so this
 # FROM pins the platform explicitly and an arm64 caller fails loudly at the
 # base-image resolution step instead of silently emulating.
 ARG BASE_IMAGE

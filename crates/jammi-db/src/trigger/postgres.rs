@@ -70,10 +70,11 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use sqlx::postgres::{PgConnectOptions, PgListener, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::pg_uri::connect_options;
 use crate::tenant::TenantId;
 use crate::trigger::broker::{BrokerKind, TriggerBroker};
 use crate::trigger::consumer::ConsumerOffsetSnapshot;
@@ -172,16 +173,9 @@ impl PostgresBroker {
                 "[broker.postgres] idle_poll_secs must be >= 1".to_string(),
             ));
         }
-        if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
-            return Err(TriggerError::Driver(
-                "[broker.postgres] url must be a postgres:// (or postgresql://) URL".to_string(),
-            ));
-        }
-
-        let listener_opts: PgConnectOptions = url
-            .parse()
+        let opts = connect_options(url)
             .map_err(|e| TriggerError::Driver(format!("postgres broker: parse url: {e}")))?;
-        let listener_opts = listener_opts.application_name(LISTENER_APPLICATION_NAME);
+        let listener_opts = opts.clone().application_name(LISTENER_APPLICATION_NAME);
         // A dedicated 1-connection pool, exactly what `PgListener::connect`
         // builds internally — constructed by hand here only so the
         // connection carries a distinguishing `application_name` (used by
@@ -201,10 +195,7 @@ impl PostgresBroker {
             TriggerError::Driver(format!("postgres broker: LISTEN {NOTIFY_CHANNEL}: {e}"))
         })?;
 
-        let notify_opts: PgConnectOptions = url
-            .parse()
-            .map_err(|e| TriggerError::Driver(format!("postgres broker: parse url: {e}")))?;
-        let notify_opts = notify_opts.application_name(NOTIFY_APPLICATION_NAME);
+        let notify_opts = opts.application_name(NOTIFY_APPLICATION_NAME);
         let notify_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_with(notify_opts)

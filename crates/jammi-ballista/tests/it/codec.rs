@@ -489,18 +489,26 @@ async fn vector_search_exec_round_trips() {
     .unwrap();
     let codec = JammiCodec::new(&session);
     let ctx = session.context().task_ctx();
-    for method in [
-        SearchMethod::Approximate {
-            oversample: Some(8),
-        },
-        SearchMethod::Approximate { oversample: None },
-        SearchMethod::Exact,
+    let admitted = jammi_db::index::Admission::rows(["b".to_string(), "d".to_string()]);
+    for (method, admission) in [
+        (
+            SearchMethod::Approximate {
+                oversample: Some(8),
+            },
+            jammi_db::index::Admission::Every,
+        ),
+        (
+            SearchMethod::Approximate { oversample: None },
+            admitted.clone(),
+        ),
+        (SearchMethod::Exact, admitted),
     ] {
         let node = jammi_ai::operator::vector_search_exec::VectorSearchExec::new(
             table.clone(),
             query.clone(),
             5,
             method,
+            admission.clone(),
             session.result_store(),
             session.context().clone(),
         )
@@ -516,6 +524,11 @@ async fn vector_search_exec_round_trips() {
         assert_eq!(decoded.table().table_name, table_name);
         assert_eq!(decoded.k(), 5);
         assert_eq!(decoded.method(), method);
+        assert_eq!(
+            decoded.admission(),
+            &admission,
+            "the admitted rows round-trip"
+        );
         assert_eq!(decoded.query_vector(), &query);
     }
 }
@@ -764,6 +777,7 @@ async fn ann_search_decode_refuses_another_tenants_table_and_a_tenant_free_read_
             k: 5,
             method: None,
             query_stored_table: None,
+            admitted: None,
         };
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC);
@@ -872,6 +886,7 @@ async fn ann_search_decode_checks_width_against_the_catalog_authority_it_holds()
                 k: 5,
                 method: None,
                 query_stored_table,
+                admitted: None,
             };
             let mut buf = Vec::new();
             buf.extend_from_slice(&MAGIC);

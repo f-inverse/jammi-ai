@@ -3849,6 +3849,18 @@ impl JobWorker {
         let output_model_id = crate::fine_tune::training_job::fine_tuned_model_id(job_id);
         let model_source = ModelSource::parse(&common.base_model);
 
+        // The attempt's rank set is fixed here, whatever its topology: record
+        // which instance runs each rank.
+        persist_attempt_ranks(
+            holder,
+            catalog,
+            job_id,
+            &self.worker_id,
+            attempt,
+            &topology.ranks(&self.worker_id),
+        )
+        .await;
+
         // Load the base model under the task being fine-tuned so the right tower
         // (text vs audio) is materialised and `embedding_dim()` reports the
         // shared-latent width the head must match.
@@ -3918,7 +3930,9 @@ impl JobWorker {
             Vec<RunFineTuneParams>,
         ) = match topology {
             RankTopology::Single => (None, session.device_config().clone(), Vec::new()),
-            RankTopology::Peer { world, coordinator } => {
+            RankTopology::Peer {
+                world, coordinator, ..
+            } => {
                 let partition = PartitionSpec::for_gang(
                     0,
                     world as usize,
@@ -5557,8 +5571,29 @@ impl TopologyDecision {
 /// body over the members it dialed, BEFORE the blocking trainer starts.
 enum RankTopology {
     Single,
-    Local { world: u32 },
-    Peer { world: u32, coordinator: Arc<Peer> },
+    Local {
+        world: u32,
+    },
+    Peer {
+        world: u32,
+        coordinator: Arc<Peer>,
+        /// The instance running each of ranks `1..world`, in rank order.
+        members: Vec<String>,
+    },
+}
+
+impl RankTopology {
+    /// The instance running each rank of the attempt, in rank order, when
+    /// this host (`instance`) is rank 0.
+    fn ranks(&self, instance: &str) -> Vec<String> {
+        match self {
+            Self::Single => vec![instance.to_string()],
+            Self::Local { world } => vec![instance.to_string(); *world as usize],
+            Self::Peer { members, .. } => std::iter::once(instance.to_string())
+                .chain(members.iter().cloned())
+                .collect(),
+        }
+    }
 }
 
 /// The training-set identity pair the coordinator writes onto the job row
@@ -6296,6 +6331,10 @@ impl JobWorker {
         let max_message_bytes =
             usize::try_from(session.inner_config().server.limits.max_message_bytes)
                 .unwrap_or(usize::MAX);
+        let members: Vec<String> = assignment
+            .iter()
+            .map(|(_, member)| member.instance_id.clone())
+            .collect();
         let mut links: Vec<CoordinatorLink> = Vec::with_capacity(assignment.len());
         for (rank, member) in &assignment {
             let addr = match catalog
@@ -6370,6 +6409,7 @@ impl JobWorker {
                 RankTopology::Peer {
                     world,
                     coordinator: Arc::clone(&coordinator),
+                    members,
                 },
             )
             .await;
@@ -8336,6 +8376,42 @@ async fn persist_acceleration_report(
                  acceleration report"
             );
         }
+    }
+}
+
+/// Persists the attempt's rank placement via [`Catalog::record_attempt_ranks`],
+/// logging (never propagating) a lease-guard miss or a catalog error — the
+/// same contract as [`persist_acceleration_report`]: the record is a read-only
+/// account of where the attempt runs, never a condition of training, and an
+/// attempt that lost its lease is refused at its terminal write regardless.
+async fn persist_attempt_ranks(
+    holder: LeaseHolder,
+    catalog: &Arc<Catalog>,
+    job_id: &str,
+    worker_id: &str,
+    attempt: u32,
+    ranks: &[String],
+) {
+    match catalog
+        .record_attempt_ranks(job_id, worker_id, attempt, ranks)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            job_id = %job_id,
+            worker_id = %worker_id,
+            attempt,
+            %holder,
+            "record_attempt_ranks's lease guard did not match (lease lost or stale attempt); \
+             continuing without a persisted rank placement"
+        ),
+        Err(e) => tracing::warn!(
+            job_id = %job_id,
+            worker_id = %worker_id,
+            attempt,
+            error = %e,
+            "record_attempt_ranks failed; continuing without a persisted rank placement"
+        ),
     }
 }
 

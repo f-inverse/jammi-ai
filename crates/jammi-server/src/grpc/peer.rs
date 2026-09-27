@@ -20,8 +20,7 @@
 //! - Genuine REQUEST malformation is `INVALID_ARGUMENT`, TERMINAL at the
 //!   coordinator (never a ladder rung): an empty or duplicated segment id in
 //!   the requested set, a duplicated `ExactRescore` row id, a query component
-//!   that is not finite, a `width` or `target` that does not fit `usize`, a
-//!   `target` of `0`, and a
+//!   that is not finite, a `width` that does not fit `usize`, and a
 //!   precision/phase enum whose raw value is `0` (`UNSPECIFIED` — explicitly
 //!   not set).
 //! - A disagreement about the OWNER's OWN DATA — never the coordinator's
@@ -70,7 +69,8 @@ use jammi_db::error::JammiError;
 use jammi_db::index::segment::{rescore, ServedIndex};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{
-    FiniteQuery, QuerySource, QueryValidationError, SegmentId, SegmentSearchPhase, ValidatedQuery,
+    Admission, FiniteQuery, QuerySource, QueryValidationError, SegmentId, SegmentSearchPhase,
+    ValidatedQuery,
 };
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::deletes::DeletionMask;
@@ -397,12 +397,10 @@ impl PeerService for PeerServer {
         let phase = decode_phase(req.phase)?;
         let width = usize::try_from(req.width)
             .map_err(|_| Status::invalid_argument("width does not fit usize"))?;
-        let target = match usize::try_from(req.target) {
-            Ok(0) => return Err(Status::invalid_argument("target is zero")),
-            Ok(target) => target,
-            Err(_) => return Err(Status::invalid_argument("target does not fit usize")),
-        };
         let finite = finite_query(req.query)?;
+        let admission = req
+            .admitted
+            .map_or(Admission::Every, |rows| Admission::rows(rows.row_ids));
         let store = self.session.result_store();
         let (segments, mask) = self.served_of(&store, &req.table_name, req.version).await?;
         verify_membership(&req.table_name, &req.segment_ids, &segments)?;
@@ -418,9 +416,13 @@ impl PeerService for PeerServer {
             |id, (), index, query| {
                 let version = segment(table_name, &segments, id)?.version;
                 ServedIndex::new(SegmentId(id), version, index, &mask)
-                    .live_hits(query, width, target, phase, &|row_id| {
-                        index.get_exact(row_id)
-                    })
+                    .live_hits(
+                        query,
+                        width,
+                        phase,
+                        &|row_id| index.get_exact(row_id),
+                        &admission,
+                    )
                     .map(|unit| SegmentUnit {
                         segment_id: id,
                         hits: hits(unit),

@@ -1,5 +1,7 @@
 # Refresh an Embedding Table Incrementally
 
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Incremental Refresh](https://f-inverse.github.io/jammi-ai/cookbook/chapters/25-incremental-refresh/incremental-refresh.html).
+
 An embedding table produced by `generate_embeddings` is a function of its
 source: `D(S)`. When the source changes, `refresh_embeddings` re-embeds only
 the rows whose content changed and publishes the result as a new **version**
@@ -137,9 +139,10 @@ A reader — `search`, `search_by_id`, every SQL `SELECT`, `read_vectors`,
 `verify_materialization`, `staleness` — resolves the table's
 `current_version` and sees only that version's live rows:
 
-- **ANN.** The version's segments are merged under its mask; a masked
-  candidate is dropped and the search widens until `k` live hits are found,
-  and the exact rescore reads the segment that owns the hit.
+- **ANN.** The version's segments are merged under its mask; each segment
+  is searched admitting only its live rows (the mask is the same admission a
+  search `filter` is), so a masked row never takes one of the `k` places, and
+  the exact rescore reads the segment that owns the hit.
 - **SQL.** The version's fragments are unioned under the mask with `_row_id`
   always projected, so `COUNT(*)`, `SELECT vector` and `LIMIT n` all see live
   rows only.

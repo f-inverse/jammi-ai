@@ -272,9 +272,16 @@ async fn streamed_top_k_is_bit_identical_to_naive_collect() {
     let total = row_ids.len();
     for (q_idx, query) in queries.iter().enumerate() {
         for k in [1_usize, 10, 100, total] {
-            let streamed = exact_vector_search(&ctx, "equivalence", &vq(query), k, None)
-                .await
-                .unwrap();
+            let streamed = exact_vector_search(
+                &ctx,
+                "equivalence",
+                &vq(query),
+                k,
+                None,
+                &jammi_db::index::Admission::Every,
+            )
+            .await
+            .unwrap();
             let reference = naive_top_k(query, &row_ids, &vectors, k);
             assert_bit_identical(&streamed, &reference, &format!("query {q_idx}, k={k}"));
         }
@@ -311,9 +318,16 @@ async fn streamed_search_completes_over_large_corpus() {
     .await;
 
     let query: Vec<f32> = (0..dim).map(|i| (i as f32).cos()).collect();
-    let top10 = exact_vector_search(&ctx, "large", &vq(&query), 10, None)
-        .await
-        .unwrap();
+    let top10 = exact_vector_search(
+        &ctx,
+        "large",
+        &vq(&query),
+        10,
+        None,
+        &jammi_db::index::Admission::Every,
+    )
+    .await
+    .unwrap();
 
     // The streamed result must match the naive full-materialisation reference
     // exactly even at this scale — same correctness contract as the small
@@ -347,9 +361,16 @@ async fn tied_distances_break_on_ascending_row_id() {
     ];
     let ctx = register_embedding_table(dir.path(), "tie_break", dim, &row_ids, &vectors).await;
 
-    let top2 = exact_vector_search(&ctx, "tie_break", &vq(&query), 2, None)
-        .await
-        .unwrap();
+    let top2 = exact_vector_search(
+        &ctx,
+        "tie_break",
+        &vq(&query),
+        2,
+        None,
+        &jammi_db::index::Admission::Every,
+    )
+    .await
+    .unwrap();
 
     // Both tied rows surface, ascending row id breaks the tie: "a" before "b".
     assert_eq!(
@@ -395,9 +416,16 @@ async fn tied_top_k_is_stable_across_repeats_and_input_order() {
 
         // Repeat the call on the same context to prove per-call stability too.
         for _ in 0..3 {
-            let top3 = exact_vector_search(&ctx, &table, &vq(&query), 3, None)
-                .await
-                .unwrap();
+            let top3 = exact_vector_search(
+                &ctx,
+                &table,
+                &vq(&query),
+                3,
+                None,
+                &jammi_db::index::Admission::Every,
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 top3.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
                 expected,

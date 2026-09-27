@@ -1252,6 +1252,126 @@ fn catalog_names(session: &JammiSession) -> Vec<String> {
 }
 
 /// One `COUNT(*)` over `<source>.public.<table>` through `session`.
+/// A Postgres database registered by its URL is a source like any file: its
+/// tables are federated, and one query joins them with a file source.
+#[cfg(feature = "live-postgres-tests")]
+#[tokio::test]
+async fn a_postgres_database_registered_by_its_url_joins_a_file() {
+    use jammi_db::source::SourceDefinition;
+    use sqlx::{Connection, Executor, PgConnection};
+
+    // A database of its own: the shared test database also holds the
+    // catalog, whose tables a source over it would federate too.
+    let server_url = jammi_test_utils::postgres_url();
+    let database = format!("sources_{}", unique_suffix());
+    let mut server = PgConnection::connect(&server_url).await.unwrap();
+    server
+        .execute(format!("CREATE DATABASE \"{database}\"").as_str())
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&server_url).unwrap();
+    url.set_path(&database);
+    let mut db = PgConnection::connect(url.as_str()).await.unwrap();
+    db.execute(
+        "CREATE TABLE ratings (id BIGINT PRIMARY KEY, stars INTEGER NOT NULL); \
+         INSERT INTO ratings VALUES (1, 5), (2, 3), (3, 4);",
+    )
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+
+    let dir = tempdir().unwrap();
+    let session = make_test_session(BackendKind::Sqlite, dir.path()).await;
+    let suffix = unique_suffix();
+    let (patents_id, ratings_id) = (format!("patents_{suffix}"), format!("pg_{suffix}"));
+    session
+        .add_source(
+            &patents_id,
+            SourceType::File,
+            SourceConnection {
+                url: Some(common::fixture_url("patents.parquet")),
+                format: Some(FileFormat::Parquet),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let definition = SourceDefinition::from_url(url.as_str(), None).unwrap();
+    assert_eq!(definition.source_type, SourceType::Postgres);
+    session
+        .add_source(&ratings_id, definition.source_type, definition.connection)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        count_rows(&session, &ratings_id, "ratings").await.unwrap(),
+        3
+    );
+    let count = |sql: String| {
+        let session = &session;
+        async move {
+            let batches = session.sql(&sql).await.unwrap();
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("COUNT(*) is Int64")
+                .value(0)
+        }
+    };
+    let joined = count(format!(
+        "SELECT COUNT(*) FROM {patents_id}.public.patents p \
+         JOIN {ratings_id}.public.ratings r ON p.id = r.id"
+    ))
+    .await;
+    let rated_in_file = count(format!(
+        "SELECT COUNT(*) FROM {patents_id}.public.patents WHERE id IN (1, 2, 3)"
+    ))
+    .await;
+    // A function the session installed exists only in the engine: a query
+    // calling one over the database's rows runs it here, not in Postgres.
+    let doubled = datafusion::logical_expr::create_udf(
+        "doubled_stars",
+        vec![arrow::datatypes::DataType::Int32],
+        arrow::datatypes::DataType::Int32,
+        datafusion::logical_expr::Volatility::Immutable,
+        std::sync::Arc::new(|args: &[datafusion::logical_expr::ColumnarValue]| {
+            let stars = args[0].to_array(1)?;
+            let stars = stars
+                .as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .expect("stars is Int32");
+            Ok(datafusion::logical_expr::ColumnarValue::Array(
+                std::sync::Arc::new(arrow::compute::kernels::numeric::add(stars, stars)?),
+            ))
+        }),
+    );
+    session.install_functions([jammi_db::session::QueryFunction::Scalar(doubled)]);
+    let total = count(format!(
+        "SELECT CAST(SUM(doubled_stars(stars)) AS BIGINT) FROM {ratings_id}.public.ratings"
+    ))
+    .await;
+    assert_eq!(total, 2 * (5 + 3 + 4));
+
+    assert!(rated_in_file > 0, "the fixture holds some of ids 1..3");
+    assert_eq!(
+        joined, rated_in_file,
+        "every rated file row joins its rating"
+    );
+
+    // The source's pool outlives the session's handle to it; end its
+    // connections so the database can go.
+    drop(session);
+    for statement in [
+        format!(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{database}'"
+        ),
+        format!("DROP DATABASE \"{database}\""),
+    ] {
+        server.execute(statement.as_str()).await.unwrap();
+    }
+}
+
 async fn count_rows(
     session: &JammiSession,
     source_id: &str,

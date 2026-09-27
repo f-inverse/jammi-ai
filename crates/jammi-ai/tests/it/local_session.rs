@@ -85,7 +85,7 @@ async fn local_session_matches_engine_for_embed_and_search() {
 
     // Same query straight through the engine builder.
     let via_engine = engine
-        .search("patents", query, 5, None, SearchMethod::default())
+        .search("patents", query, 5, None, SearchMethod::default(), None)
         .await
         .unwrap()
         .run()
@@ -272,7 +272,7 @@ async fn local_session_encode_and_search_by_row_key_match_engine() {
         .await
         .unwrap();
     let via_engine_key = engine
-        .search_by_id("patents", &key, 3, None, SearchMethod::default())
+        .search_by_id("patents", &key, 3, None, SearchMethod::default(), None)
         .await
         .unwrap()
         .run()
@@ -371,7 +371,14 @@ async fn a_filtered_search_returns_the_k_nearest_passing_rows() {
 
     // The truth: every row ranked exactly, then filtered.
     let truth = engine
-        .search("patents", query.clone(), 20, None, SearchMethod::Exact)
+        .search(
+            "patents",
+            query.clone(),
+            20,
+            None,
+            SearchMethod::Exact,
+            None,
+        )
         .await
         .unwrap()
         .filter("year = 2021")
@@ -386,11 +393,44 @@ async fn a_filtered_search_returns_the_k_nearest_passing_rows() {
     // The first ranked breadth alone could not have answered it: the four
     // nearest rows overall are not the four nearest 2021 rows.
     let nearest = engine
-        .search("patents", query, 4, None, SearchMethod::Exact)
+        .search("patents", query.clone(), 4, None, SearchMethod::Exact, None)
         .await
         .unwrap()
         .run()
         .await
         .unwrap();
     assert_ne!(row_ids(&nearest), row_ids(&filtered));
+
+    // A filter selecting one row — the one farthest from the query, which a
+    // search that ranks first and filters after reaches only by ranking every
+    // row — returns exactly that row: the search ranks only what the filter
+    // admits.
+    let every = engine
+        .search(
+            "patents",
+            query.clone(),
+            1_000,
+            None,
+            SearchMethod::Exact,
+            None,
+        )
+        .await
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    let farthest = row_ids(&every).pop().expect("the fixture has rows");
+    let selective = session
+        .search(SearchRequest {
+            source_id: "patents".to_string(),
+            query: SearchQuery::Vector(query),
+            k: 4,
+            embedding_table: None,
+            filter: Some(format!("arrow_cast(id, 'Utf8') = '{farthest}'")),
+            select: Vec::new(),
+            method: SearchMethod::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(row_ids(&selective), vec![farthest]);
 }

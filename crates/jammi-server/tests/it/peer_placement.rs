@@ -50,7 +50,9 @@ use jammi_db::index::peer::{
     SegmentPlacement, SegmentSearchRequest as DomainSegmentSearchRequest, SegmentUnit,
 };
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, VectorIndex};
+use jammi_db::index::{
+    validate_query, Admission, QuerySource, SegmentId, ValidatedQuery, VectorIndex,
+};
 use jammi_db::session::QueryContext;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -397,7 +399,7 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
                 assert!(placed.has_remote(), "segment 1 is B's");
                 assert_eq!(placed.len(), 8);
                 let got = placed
-                    .search_final_placed(&vq(q), k, oversample)
+                    .search_final_placed(&vq(q), k, oversample, &Admission::Every)
                     .await
                     .unwrap();
                 let all_local = store
@@ -405,7 +407,7 @@ async fn placed_search_over_two_instances_equals_all_local_and_brute_force() {
                     .await
                     .unwrap()
                     .unwrap()
-                    .search_final(&vq(q), k, oversample)
+                    .search_final(&vq(q), k, oversample, &Admission::Every)
                     .unwrap();
                 assert_eq!(
                     got, all_local,
@@ -649,7 +651,7 @@ async fn all_remote_placement_refuses_a_caller_fault_before_any_fan_out() {
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&conforming, 3, 4)
+        .search_final_placed(&conforming, 3, 4, &Admission::Every)
         .await
         .expect("a conforming all-remote search serves");
     assert_eq!(hits.len(), 3);
@@ -801,7 +803,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
         // Whatever segment placement says, the refusal must come first.
         placement.set(&record.table_name, 0, vec![owner.clone()]);
         let err = match a
-            .search_by_id(&source_id, "row-1", 1, None, SearchMethod::default())
+            .search_by_id(&source_id, "row-1", 1, None, SearchMethod::default(), None)
             .await
         {
             Err(err) => err,
@@ -823,7 +825,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
         // corrupt artifact (typed, table-named, recovered through the plan
         // boundary), never a top-k over a silently dropped row.
         let err = a
-            .search_by_id(&source_id, "row-0", 1, None, SearchMethod::default())
+            .search_by_id(&source_id, "row-0", 1, None, SearchMethod::default(), None)
             .await
             .expect("an honest stored vector validates as a self-query")
             .run()
@@ -850,6 +852,7 @@ async fn search_by_id_on_a_poisoned_stored_vector_is_a_corrupt_artifact_named_by
             1,
             None,
             SearchMethod::default(),
+            None,
         )
         .await
         .expect("an honest stored vector is a valid self-query")
@@ -890,7 +893,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
         .await
         .unwrap()
         .unwrap()
-        .search_final(&vq(&q), k, oversample)
+        .search_final(&vq(&q), k, oversample, &Admission::Every)
         .unwrap();
     readyz_is_200(&b).await;
 
@@ -902,7 +905,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&vq(&q), k, oversample)
+        .search_final_placed(&vq(&q), k, oversample, &Admission::Every)
         .await
         .unwrap();
     assert_eq!(got, expected, "one retry leaves the bytes unchanged");
@@ -919,7 +922,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&vq(&q), k, oversample)
+        .search_final_placed(&vq(&q), k, oversample, &Admission::Every)
         .await
         .unwrap();
     assert_eq!(got, expected, "the local load leaves the bytes unchanged");
@@ -940,7 +943,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&vq(&q), k, oversample)
+        .search_final_placed(&vq(&q), k, oversample, &Admission::Every)
         .await
         .unwrap_err();
     match &err {
@@ -974,7 +977,7 @@ async fn ladder_retries_then_loads_locally_or_refuses_unavailable() {
         .await
         .unwrap()
         .unwrap()
-        .search_final_placed(&vq(&q), k, oversample)
+        .search_final_placed(&vq(&q), k, oversample, &Admission::Every)
         .await
         .unwrap_err();
     match &err {
@@ -1144,7 +1147,14 @@ async fn force_local_entries_ignore_placement_while_placed_entries_refuse() {
     // Placed half on the SAME store: the context-set entry and the Search leaf
     // both return `Unavailable`.
     let err = store
-        .search_vectors(a.context(), &record, &vq(&e(2)), 2)
+        .search_vectors(
+            a.context(),
+            &record,
+            &vq(&e(2)),
+            2,
+            jammi_db::index::SearchMethod::default(),
+            &Admission::Every,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, JammiError::Unavailable { .. }), "{err:?}");
@@ -1228,7 +1238,7 @@ async fn an_owner_caller_fault_is_terminal_and_classified_from_a_real_status() {
         .unwrap()
         .unwrap();
     let err = placed
-        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 1)
+        .search_final_placed(&vq(&[1.0, 0.0, 0.0, 0.0]), 3, 1, &Admission::Every)
         .await
         .expect_err(
             "a corrupted (empty segment list) request a real owner refuses is a terminal \
@@ -1393,7 +1403,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     )
     .unwrap();
     let err = placed
-        .search_final_placed(&stored_query, 3, 4)
+        .search_final_placed(&stored_query, 3, 4, &Admission::Every)
         .await
         .expect_err(
             "a stored query fanned out to a width-drifted owner must ladder to a named refusal",
@@ -1440,7 +1450,7 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     let counters_before = snapshot(&store);
     let caller_query = vq(&[1.0, 0.0, 0.0, 0.0]);
     let err = placed
-        .search_final_placed(&caller_query, 3, 4)
+        .search_final_placed(&caller_query, 3, 4, &Admission::Every)
         .await
         .expect_err(
             "a caller query fanned out to a width-drifted owner must ladder to a named refusal",
@@ -1824,7 +1834,7 @@ async fn a_placed_search_serves_the_current_version_under_its_mask() {
                 let placed = store.resolve_search_mode(&record).await.unwrap().unwrap();
                 assert!(placed.has_remote(), "segment 0 is B's");
                 let got = placed
-                    .search_final_placed(&vq(q), k, oversample)
+                    .search_final_placed(&vq(q), k, oversample, &Admission::Every)
                     .await
                     .unwrap();
                 let in_process = store
@@ -1832,7 +1842,7 @@ async fn a_placed_search_serves_the_current_version_under_its_mask() {
                     .await
                     .unwrap()
                     .unwrap()
-                    .search_final(&vq(q), k, oversample)
+                    .search_final(&vq(q), k, oversample, &Admission::Every)
                     .unwrap();
                 assert!(
                     got.iter().all(|(id, _)| id != "b"),

@@ -71,7 +71,9 @@ fn masked_row_never_appears_in_search() {
     let mask = Arc::new(DeletionMask::from_entries([("K".to_string(), 0)]));
     let idx = SegmentedIndex::new_masked(vec![(SegmentId(0), 0, s0), (SegmentId(1), 1, s1)], mask)
         .unwrap();
-    let hits = idx.search(&vq(&q), 2).unwrap();
+    let hits = idx
+        .search(&vq(&q), 2, &jammi_db::index::Admission::Every)
+        .unwrap();
     let k = hits
         .iter()
         .find(|(id, _)| id == "K")
@@ -83,7 +85,9 @@ fn masked_row_never_appears_in_search() {
     );
     assert_eq!(hits.iter().filter(|(id, _)| id == "K").count(), 1);
     // Every live row is reachable at k = 3 (a widened fetch past the dead row).
-    let all = idx.search(&vq(&q), 3).unwrap();
+    let all = idx
+        .search(&vq(&q), 3, &jammi_db::index::Admission::Every)
+        .unwrap();
     let mut got = ids(&all);
     got.sort();
     assert_eq!(got, vec!["K", "a", "b"]);
@@ -106,7 +110,9 @@ fn rescore_reads_the_owning_segment() {
     let mask = Arc::new(DeletionMask::from_entries([("K".to_string(), 0)]));
     let idx = SegmentedIndex::new_masked(vec![(SegmentId(0), 0, s0), (SegmentId(1), 1, s1)], mask)
         .unwrap();
-    let hits = idx.search_final(&vq(&q), 1, 4).unwrap();
+    let hits = idx
+        .search_final(&vq(&q), 1, 4, &jammi_db::index::Admission::Every)
+        .unwrap();
     assert_eq!(ids(&hits), vec!["K"]);
     assert!(
         hits[0].1 < 0.01,
@@ -131,7 +137,9 @@ fn empty_mask_is_the_unmasked_merge() {
     .unwrap();
     for (_, q) in &rows {
         assert_eq!(
-            ids(&masked.search(&vq(q), 2).unwrap()),
+            ids(&masked
+                .search(&vq(q), 2, &jammi_db::index::Admission::Every)
+                .unwrap()),
             ids(&lone.search(&vq(q), 2).unwrap())
         );
     }
@@ -579,16 +587,37 @@ async fn masked_ann_merge_over_the_versioned_set() {
         .expect("the segment set loads");
     // r3 was re-embedded: its new vector finds r3 at distance ~0; its old
     // vector never finds r3 at ~0.
-    let hits = index.search_final(&vq(&vec_for("r3", 1)), 1, 4).unwrap();
+    let hits = index
+        .search_final(
+            &vq(&vec_for("r3", 1)),
+            1,
+            4,
+            &jammi_db::index::Admission::Every,
+        )
+        .unwrap();
     assert_eq!(ids(&hits), vec!["r3"]);
     assert!(hits[0].1 < 1e-4);
-    let stale = index.search_final(&vq(&vec_for("r3", 0)), 3, 4).unwrap();
+    let stale = index
+        .search_final(
+            &vq(&vec_for("r3", 0)),
+            3,
+            4,
+            &jammi_db::index::Admission::Every,
+        )
+        .unwrap();
     assert!(
         stale.iter().all(|(id, d)| id != "r3" || *d > 1e-4),
         "the old vector must never return r3 at the old distance: {stale:?}"
     );
     // r12 was deleted: never returned, even when asked for everything.
-    let all = index.search_final(&vq(&vec_for("r12", 0)), 25, 4).unwrap();
+    let all = index
+        .search_final(
+            &vq(&vec_for("r12", 0)),
+            25,
+            4,
+            &jammi_db::index::Admission::Every,
+        )
+        .unwrap();
     assert!(
         all.iter().all(|(id, _)| id != "r12" && id != "r20"),
         "{all:?}"

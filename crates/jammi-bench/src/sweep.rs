@@ -33,7 +33,7 @@ use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::VectorIndex;
-use jammi_db::index::{validate_query, QuerySource};
+use jammi_db::index::{validate_query, Admission, QuerySource};
 
 use crate::corpus;
 use crate::operator_mirror::retrieve_then_rescore;
@@ -128,6 +128,7 @@ pub async fn run(
                 &validate_query(q.to_vec(), dim, QuerySource::Caller)?,
                 max_k,
                 None,
+                &Admission::Every,
             )
             .await?,
         );

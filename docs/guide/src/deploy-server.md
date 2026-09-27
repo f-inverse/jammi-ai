@@ -1,5 +1,7 @@
 # Deploy as a Server
 
+> **Measured companion:** for the long-form, executed-and-measured treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/production.html).
+
 Jammi can run as an Arrow Flight SQL server, making all registered sources and embedding tables queryable from any Arrow-compatible client. Use this when multiple services, BI tools, or non-Rust/Python consumers need to query Jammi's data.
 
 ## The workflow

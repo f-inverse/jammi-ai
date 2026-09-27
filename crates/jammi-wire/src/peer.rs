@@ -205,8 +205,10 @@ impl PeerTransport for GrpcPeerTransport {
             query: req.query.as_slice().to_vec(),
             width: req.width as u64,
             phase: phase_to_proto(req.phase) as i32,
-            target: req.target as u64,
             version: req.version,
+            admitted: req.admission.row_ids().map(|rows| pb::AdmittedRows {
+                row_ids: rows.iter().cloned().collect(),
+            }),
         });
         request.set_timeout(deadline);
         let response: pb::SegmentSearchResponse = bounded(deadline, client.segment_search(request))
@@ -374,9 +376,9 @@ mod tests {
             )
             .unwrap(),
             width: 1,
-            target: 1,
             version: None,
             phase: SegmentSearchPhase::Final,
+            admission: jammi_db::index::Admission::Every,
         };
         let err = transport
             .segment_search(&owner, &req, Duration::from_secs(2))

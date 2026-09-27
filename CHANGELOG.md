@@ -5,6 +5,48 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **Postgres and MySQL sources ship in every published engine.** `jammi-server` and `jammi-python`
+  forward `jammi-db`'s `postgres` / `mysql` features and every release lane builds them, with
+  OpenSSL vendored and zlib linked statically (no runtime libssl/libcrypto/libz). A Postgres source
+  URI is read with libpq's meaning — query parameters override the authority, a `host` parameter
+  naming a directory is a Unix socket, absent `sslmode` is `prefer` — and a parameter the source
+  cannot pass on (a client certificate among them) is refused; before, every Postgres URI lost its host, user and database. Queries
+  over a database source federate only the sub-plans that call no engine-installed function, so an
+  engine function (the embedding content hash among them) runs in the engine over the federated
+  rows instead of being sent to the database. **BREAKING** (Python): `add_source(name, *, url,
+  format=None, tenant_column=None)` is the one verb on both transports; a `postgres://` /
+  `postgresql://` / `mysql://` URL is a database source, anything else a file that needs a format.
+- **Every Postgres URL is read by one libpq parser.** The catalog, the trigger broker and Postgres
+  sources share one reading of a connection URI (libpq's): the socket form
+  `postgresql://user:@/db?host=/dir` connects instead of failing with sqlx's `empty host`, a query
+  parameter overrides the component it names, an empty value is unset, a host list is refused, and
+  a socket directory or database name may contain a space. **BREAKING:** a catalog or broker URL
+  parameter that is not a libpq keyword the engine reads (`hostaddr`, sqlx's
+  `statement-cache-capacity`) is refused instead of warned about and ignored; a malformed
+  `[broker.postgres] url` is a `Config` error at session open.
+- **Filtered search ranks only the rows the filter admits.** A filtered `search` or lexical search
+  evaluates its filter once into the admitted row ids; each index segment scores them exactly when
+  few are admitted, otherwise walks HNSW admitting only them (USearch `filtered_search`), instead
+  of ranking first and widening until `k` rows pass; deleted rows are excluded by the same
+  admission. The admission crosses to peer segment owners (`SegmentSearchRequest.admitted`) and to
+  Ballista executors; the request's `target` (the live-hit count a masked segment widened toward)
+  is gone, its tag reserved.
+- **A job's listing says where it ran.** `JobSummary` gains `claimed_by` and `ranks` (the instance
+  running each rank of a training attempt, persisted by migration 046), on the admin client and both
+  Python transports.
+- **The `jammi` CLI embeds and searches.** `jammi embed` and `jammi search` (query by example,
+  `--filter` / `--select` / `--exact` / `--oversample`) run through one data client; `--tenant`
+  scopes them as it does the catalog verbs.
+- **Traces export only what the host logs.** The OTLP export layer reads the same filter as the
+  formatter (`RUST_LOG`, else `[logging] level`, else the host's default), so transport-internal
+  spans are no longer exported. `jammi-server` and `jammi-python` compose tracing through one
+  `jammi_ai::telemetry::layers`.
+- **Cookbook:** the four-surface program (chapter 28: Python, CLI, Rust, TypeScript return the same
+  rows), peer and placed gangs (27), production operation on a Postgres catalog and broker (29),
+  federation across Postgres, MariaDB and a file (30), cross-modal and compound-query recipes; every
+  guide capability page names the chapter or recipe that runs it (`check_guide_companions.py`).
+- **CI:** `jammi-python`'s Rust tests run in the Python lane; the CUDA CI base image builds in the
+  same workflow as, and from, the CPU base of that run.
 - **A placed search's rescore is verified against the pinned version's segments.** The second
   phase's `ExactRescoreRequest` names the version the coordinator pinned (`optional int64
   version = 5`), as `SegmentSearchRequest` does, and the owner verifies every segment named

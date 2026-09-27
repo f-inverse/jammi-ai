@@ -81,13 +81,18 @@ class LiveServer:
                         for tok in line[len(self.BANNER):].split()
                         if "=" in tok
                     )
-                    announced.put(int(fields["flight"].rsplit(":", 1)[1]))
+                    announced.put(
+                        (
+                            int(fields["flight"].rsplit(":", 1)[1]),
+                            int(fields["health"].rsplit(":", 1)[1]),
+                        )
+                    )
                     reported = True  # announced once; keep draining regardless
 
         self._drain_thread = threading.Thread(target=drain, daemon=True)
         self._drain_thread.start()
         try:
-            self.port = announced.get(timeout=30)
+            self.port, self.health_port = announced.get(timeout=30)
         except queue.Empty:
             self.proc.terminate()
             raise RuntimeError(
@@ -113,6 +118,12 @@ class LiveServer:
     def endpoint(self) -> str:
         """The `grpc://` target of the running server."""
         return f"grpc://127.0.0.1:{self.port}"
+
+    @property
+    def health_endpoint(self) -> str:
+        """The `http://` base of the server's side channel: `/healthz`,
+        `/readyz` and `/metrics`."""
+        return f"http://127.0.0.1:{self.health_port}"
 
     def __exit__(self, *exc) -> None:
         """Stop the child and AWAIT its real exit — the release point itself.

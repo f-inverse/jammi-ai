@@ -33,6 +33,7 @@ from ._assembly import (
     _MODEL_TASK_NAME,
     _RESULT_TABLE_KIND_NAME,
     _SOURCE_KIND_NAME,
+    _database_source_kind,
     _local_source_url,
     build_add_channel_columns_request,
     build_asof_join_request,
@@ -249,12 +250,15 @@ def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
     """Project a wire `JobSummary` into the job dict a caller reads.
 
     Every field the message carries and nothing else — the embedded
-    `list_jobs` builds the same seven keys at its FFI boundary from the
-    catalog record, applying the same two conventions this message documents:
-    `output_model_id` is the empty string until a training kind completes
-    (always empty for a compute kind), `error` is empty unless it failed.
-    Neither arm maps either onto `None`, so a caller branches on one thing on
-    both transports.
+    `list_jobs` builds the same nine keys at its FFI boundary from the
+    catalog record, applying the same conventions this message documents:
+    `output_model_id` is the model a training kind registers under, stamped
+    at submission (always empty for a compute kind), `error` is empty unless
+    it failed,
+    `claimed_by` is empty while queued, and `ranks` (the instance that ran
+    each rank of the latest training attempt, in rank order) is an empty list
+    for a compute kind and until an attempt records it. No arm maps any of
+    them onto `None`, so a caller branches on one thing on both transports.
     """
     return {
         "job_id": j.job_id,
@@ -264,6 +268,8 @@ def _job_summary_to_dict(j: job_pb2.JobSummary) -> Dict[str, Any]:
         "output_model_id": j.output_model_id,
         "created_at": j.created_at,
         "error": j.error,
+        "claimed_by": j.claimed_by,
+        "ranks": list(j.ranks),
     }
 
 
@@ -1243,34 +1249,47 @@ class RemoteDatabase:
     # --- Sources -----------------------------------------------------------------
 
     def add_source(
-        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+        self,
+        name: str,
+        *,
+        url: str,
+        format: Optional[str] = None,
+        tenant_column: Optional[str] = None,
     ) -> None:
-        """Register a file-shaped data source on the remote engine.
+        """Register a data source on the remote engine, by the URL that names it.
 
-        `url` accepts a local path (wrapped into `file://...` server-side) or any
-        storage URL the server was compiled with (`s3://`, `gs://`, `azure://`).
-        `tenant_column` names the column whose value is each row's tenant: a
-        tenant-bound session then reads only its own rows and the rows with no
-        tenant, through every verb that reads the source. Maps to
-        `CatalogService.AddSource`.
+        A `postgres://` / `postgresql://` URL is a PostgreSQL database and a
+        `mysql://` URL a MySQL / MariaDB database, each federated table by
+        table through the connection string as given; they take no `format`.
+        Anything else is a file read in `format`: a local path (wrapped into
+        `file://...`) or any storage URL the server was compiled with (`s3://`,
+        `gs://`, `azure://`). `tenant_column` names the column whose value is
+        each row's tenant: a tenant-bound session then reads only its own rows
+        and the rows with no tenant, through every verb that reads the source.
+        Maps to `CatalogService.AddSource`.
         """
-        try:
-            file_format = _FILE_FORMAT[format]
-        except KeyError:
-            raise InvalidArgument(
-                f"format must be one of {sorted(_FILE_FORMAT)} (got {format!r})"
-            ) from None
+        kind = _database_source_kind(url)
+        if kind is not None:
+            if format is not None:
+                raise InvalidArgument(
+                    f"a database source takes no format (got {format!r} for {url!r})"
+                )
+            connection = catalog_pb2.SourceConnection(url=url, tenant_column=tenant_column)
+        else:
+            try:
+                file_format = _FILE_FORMAT[format]
+            except KeyError:
+                raise InvalidArgument(
+                    f"a file source needs a format, one of {sorted(_FILE_FORMAT)} "
+                    f"(got {format!r}); a database source is a postgres:// or mysql:// URL"
+                ) from None
+            kind = catalog_pb2.SourceKind.SOURCE_KIND_FILE
+            connection = catalog_pb2.SourceConnection(
+                url=_local_source_url(url), format=file_format, tenant_column=tenant_column
+            )
         self._call(
             self._catalog.AddSource,
-            catalog_pb2.AddSourceRequest(
-                source_id=name,
-                source_kind=catalog_pb2.SourceKind.SOURCE_KIND_FILE,
-                connection=catalog_pb2.SourceConnection(
-                    url=_local_source_url(url),
-                    format=file_format,
-                    tenant_column=tenant_column,
-                ),
-            ),
+            catalog_pb2.AddSourceRequest(source_id=name, source_kind=kind, connection=connection),
         )
 
     def list_sources(self) -> List[Dict[str, Any]]:
@@ -1710,8 +1729,8 @@ class RemoteDatabase:
         (query-by-example: the vector stored for that row, resolved inside
         the engine — it never crosses the API); exactly one is given.
         `filter` is an optional SQL predicate over
-        the hydrated columns — the search returns the `k` nearest rows that
-        satisfy it; `select` projects columns (empty keeps every
+        the source's columns — the search ranks only the rows it selects and
+        returns the `k` nearest of them; `select` projects columns (empty keeps every
         hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned
         table); ``None`` searches the most-recent ready table. `oversample`
@@ -2869,7 +2888,8 @@ class RemoteDatabase:
         Empty for a compute-kind job — no compute kind ever registers a model.
 
         Note that `list_jobs()`'s `output_model_id` is the SAME field, relayed
-        verbatim by `JobSummary` too — empty until a training kind completes.
+        verbatim by `JobSummary` too — stamped at submission, so the listing
+        and this handle agree at every lifecycle state.
         """
         resp = self._call(
             self._job.JobStatus,
@@ -2888,9 +2908,9 @@ class RemoteDatabase:
 
         Maps to `JobService.ListJobs`; same dict shape per entry as
         the embedded :meth:`jammi.EmbeddedBackend.list_jobs` — the
-        wire's `JobSummary` field set, with ``output_model_id`` empty
-        until a training kind completes (always empty for a compute kind)
-        and ``error`` empty unless it failed. A listing of :meth:`job`
+        wire's `JobSummary` field set, with ``output_model_id`` stamped at
+        submission (always empty for a compute kind), ``error`` empty unless
+        it failed, and ``claimed_by`` / ``ranks`` saying where it ran. A listing of :meth:`job`
         answers plus the submit-time identity; read
         :meth:`job(job_id).progress() <RemoteJob.progress>` for the mid-run
         progress surface.

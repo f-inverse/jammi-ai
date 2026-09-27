@@ -1334,7 +1334,7 @@ impl BoundServer {
                     None => Ok(()),
                 };
                 session.close().await;
-                crate::telemetry::flush_otlp();
+                jammi_ai::telemetry::flush_otlp();
                 return early.and(health_result).and(peer_result).map(|()| outcome);
             }
         }
@@ -1472,7 +1472,7 @@ impl BoundServer {
         // catalog directory immediately rather than waiting out the process
         // exit.
         session.close().await;
-        crate::telemetry::flush_otlp();
+        jammi_ai::telemetry::flush_otlp();
 
         result.and(health_result).and(peer_result).map(|()| outcome)
     }

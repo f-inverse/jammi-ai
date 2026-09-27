@@ -10,7 +10,7 @@ use futures::TryStreamExt;
 use jammi_numerics::distance::cosine_distance;
 
 use crate::error::{JammiError, Result};
-use crate::index::{distance_is_admissible, ValidatedQuery};
+use crate::index::{distance_is_admissible, Admission, ValidatedQuery};
 use crate::session::QueryContext;
 use crate::store::vectors::extend_with_fixed_size_list_f32;
 
@@ -164,7 +164,8 @@ pub async fn scan_width(ctx: &QueryContext, table_name: &str) -> Result<usize> {
 
 /// Brute-force vector search over a registered Parquet table via DataFusion.
 ///
-/// Computes cosine distance for every row, returns the `k` closest as
+/// Computes cosine distance for every row `admission` admits, returns the
+/// `k` closest as
 /// `(row_id, cosine_distance)` sorted by ascending distance, with ties broken
 /// by ascending `_row_id` so equidistant candidates resolve deterministically
 /// regardless of scan order.
@@ -186,6 +187,7 @@ pub async fn exact_vector_search(
     query: &ValidatedQuery,
     k: usize,
     catalog_dimensions: Option<usize>,
+    admission: &Admission,
 ) -> Result<Vec<(String, f32)>> {
     let df = vector_scan(ctx, table_name).await?;
     let scan_width = scan_schema_width(&df, table_name)?;
@@ -232,6 +234,9 @@ pub async fn exact_vector_search(
         // `extend_with_fixed_size_list_f32` appends exactly one Vec<f32> per
         // row, so the batch's vectors map 1:1 with `row_ids`.
         for (offset, vec) in vectors.iter().enumerate() {
+            if !admission.admits(row_ids.value(offset)) {
+                continue;
+            }
             let dist = cosine_distance(query, vec);
             // The SINK: a non-finite distance here means a corrupt stored
             // row (the query is finite by type). Typed and table-named —

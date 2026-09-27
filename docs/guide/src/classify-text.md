@@ -1,5 +1,7 @@
 # Classify Text
 
+> **Runnable companion:** [`cookbook/recipes/eval_inference/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/eval_inference) runs a text classifier over a registered source and scores it against gold labels.
+
 Run a classification model over text columns to assign labels and confidence scores. Any HuggingFace model with `id2label` in its config works out of the box.
 
 ## Basic usage

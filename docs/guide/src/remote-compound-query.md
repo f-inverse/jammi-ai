@@ -1,5 +1,7 @@
 # Compound Retrieval and Inference over Flight SQL
 
+> **Runnable companion:** [`cookbook/recipes/compound_query/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/compound_query) joins a corpus to an `assignees` table and embeds it with `annotate(...)` in one SQL query, then runs the same SQL against a server over Flight SQL.
+
 `search` is the bounded primitive — nearest-neighbor top-k, returning a table
 directly. **Compound query** — joining sources, filtering, and running a model
 over a relation — is open, caller-shaped composition, so it rides **SQL**. The
@@ -81,7 +83,7 @@ the SQL table function builds):
 use jammi_ai::SearchMethod;
 use jammi_ai::model::ModelTask;
 # async fn ex(session: &Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 10, None, SearchMethod::default()).await?
+let results = session.search("patents", query, 10, None, SearchMethod::default(), None).await?
     .annotate("local:/models/all-MiniLM-L6-v2", ModelTask::TextEmbedding, &["abstract".into()]).await?
     .run().await?;
 # Ok(()) }

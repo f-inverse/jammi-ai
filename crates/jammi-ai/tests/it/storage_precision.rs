@@ -157,7 +157,7 @@ async fn int8_search_with_rescore_matches_exact_f32_baseline() {
     let expected = exact_top_k(&ground_truth, &query, k);
 
     let hits = session
-        .search("patents", query, k, None, SearchMethod::default())
+        .search("patents", query, k, None, SearchMethod::default(), None)
         .await
         .unwrap()
         .run()
@@ -240,7 +240,7 @@ async fn stale_manifest_precision_falls_back_to_exact_search_not_a_crash() {
     let expected = exact_top_k(&ground_truth, &query, k);
 
     let hits = session
-        .search("patents", query, k, None, SearchMethod::default())
+        .search("patents", query, k, None, SearchMethod::default(), None)
         .await
         .unwrap()
         .run()
@@ -330,7 +330,9 @@ async fn per_request_oversample_overrides_table_default() {
         .await
         .unwrap()
         .expect("the Int8 sidecar index must load");
-    let raw_quantized_top_k = index.search(&vq(&query), k).unwrap();
+    let raw_quantized_top_k = index
+        .search(&vq(&query), k, &jammi_db::index::Admission::Every)
+        .unwrap();
     let mut raw_ids: Vec<String> = raw_quantized_top_k
         .iter()
         .map(|(id, _)| id.clone())
@@ -346,6 +348,7 @@ async fn per_request_oversample_overrides_table_default() {
             SearchMethod::Approximate {
                 oversample: Some(1),
             },
+            None,
         )
         .await
         .unwrap()
@@ -412,7 +415,7 @@ async fn table_stamped_oversample_drives_rescore_not_deployment_config() {
     );
 
     let hits = reopened_session
-        .search("patents", query, k, None, SearchMethod::default())
+        .search("patents", query, k, None, SearchMethod::default(), None)
         .await
         .unwrap()
         .run()
@@ -459,7 +462,7 @@ async fn exact_search_returns_the_true_top_k_the_index_misses() {
         let query = query.clone();
         async move {
             let hits = session
-                .search("patents", query, k, None, method)
+                .search("patents", query, k, None, method, None)
                 .await
                 .unwrap()
                 .run()

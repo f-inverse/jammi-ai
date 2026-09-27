@@ -208,7 +208,7 @@ def _local_reusable_caller_yml(
     if_expr: str = "github.ref_type != 'tag'",
     on_block: str = 'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n',
 ) -> str:
-    """The `image.yml`/`image-cuda.yml` shape: a job whose ENTIRE body is a
+    """The `image.yml` job shape: a job whose ENTIRE body is a
     job-level `uses: ./.github/workflows/<target>.yml` call, gated (or not)
     by its own `if:` -- drives the recursive-discovery mechanism (a job that merely delegates to a local reusable which itself pushes is
     still a promoting job)."""
@@ -220,6 +220,28 @@ jobs:
   {caller_job_name}:
     if: {if_expr}
     uses: ./.github/workflows/{target}
+"""
+
+
+# The real-tree `image.yml` shape: two local-reusable callers, the CUDA
+# job `needs:` the CPU job it builds `FROM` -- each tabled by its own row
+# (`ci-image-cpu`, `ci-image-cuda`).
+IMAGE_YML = """\
+name: caller
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.ref_type != 'tag'
+    uses: ./.github/workflows/_ci-base-image.yml
+  build-cuda:
+    needs: build
+    if: github.ref_type != 'tag'
+    uses: ./.github/workflows/_ci-base-image.yml
 """
 
 
@@ -372,8 +394,7 @@ def positive_workflows() -> dict[str, str]:
         "crates.yml": _crates_yml(),
         "npm.yml": _npm_yml(),
         "_ci-base-image.yml": CI_BASE_IMAGE_YML,
-        "image.yml": _local_reusable_caller_yml("build", "_ci-base-image.yml"),
-        "image-cuda.yml": _local_reusable_caller_yml("build", "_ci-base-image.yml"),
+        "image.yml": IMAGE_YML,
         "pypi.yml": _simple_publish_yml(),
         "pypi-client.yml": _simple_publish_yml(),
         "pypi-server.yml": _simple_publish_yml(),
@@ -2409,8 +2430,8 @@ class P6DiscoveryTest(unittest.TestCase):
         self.assertTrue(any("sneak-image" in f for f in findings), findings)
 
     def test_branches_only_workflow_with_a_publishing_primitive_is_still_discovered(self):
-        # A `push: branches:`-only workflow (the real-tree `image.yml`/
-        # `image-cuda.yml` shape) with an UNLISTED publishing primitive
+        # A `push: branches:`-only workflow (the real-tree `image.yml`
+        # shape) with an UNLISTED publishing primitive
         # carries no `tags:` at all. P6 does no trigger filtering: it must
         # be discovered exactly like a tag-triggered one.
         main_pusher = (
@@ -2615,12 +2636,12 @@ class JobLevelAndSequenceCarrierTest(unittest.TestCase):
 class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
     """A job that merely `uses:` a LOCAL reusable workflow
     whose own jobs match a primitive is itself a promoting job too --
-    `_ci-base-image.yml` pushes to GHCR; `image.yml`/`image-cuda.yml`'s
-    `build` jobs (which each `uses:` it) must be discovered."""
+    `_ci-base-image.yml` pushes to GHCR; `image.yml`'s `build`/`build-cuda`
+    jobs (which each `uses:` it) must be discovered."""
 
     def test_real_tree_image_callers_are_tabled_not_double_counted(self):
-        # positive_workflows() already includes _ci-base-image.yml,
-        # image.yml, image-cuda.yml with the real (gated) shape and their
+        # positive_workflows() already includes _ci-base-image.yml and
+        # image.yml with the real (gated, two-job) shape and their
         # PROMOTION_TABLE rows -- confirms the recursion finds the caller,
         # never the reusable itself (which would be a bogus THIRD finding).
         findings = cgo.check_p6_discovery(_positive_texts())
@@ -3127,6 +3148,8 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
             "name: caller\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\n"
             "jobs:\n  build:\n    if: github.ref_type != 'tag'\n"
             "    uses: ./.github/workflows/_does_not_exist_either.yml\n"
+            "  build-cuda:\n    needs: build\n    if: github.ref_type != 'tag'\n"
+            "    uses: ./.github/workflows/_ci-base-image.yml\n"
         )
         findings = cgo.check_p6_discovery(texts)
         mine = [f for f in findings if "image.yml" in f]

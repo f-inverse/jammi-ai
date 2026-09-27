@@ -30,6 +30,7 @@ use datafusion::prelude::{col, lit};
 
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::error::{JammiError, Result};
+use jammi_db::index::{Admission, SearchMethod};
 
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeGather};
 use crate::session::InferenceSession;
@@ -424,7 +425,14 @@ impl InferenceSession {
         )?;
         let neighbours = self
             .result_store()
-            .search_vectors(self.context(), table, &query, fetch_k)
+            .search_vectors(
+                self.context(),
+                table,
+                &query,
+                fetch_k,
+                SearchMethod::default(),
+                &Admission::Every,
+            )
             .await?;
         Ok(neighbours
             .into_iter()

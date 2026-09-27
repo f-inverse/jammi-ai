@@ -825,7 +825,7 @@ async fn the_written_bytes_are_identical_at_every_fan_out() {
                 jammi_db::index::validate_query(vector, width, QuerySource::Caller).unwrap();
             answers.extend(
                 index
-                    .search_final(&query, 10, 1)
+                    .search_final(&query, 10, 1, &jammi_db::index::Admission::Every)
                     .unwrap()
                     .into_iter()
                     .map(|(id, d)| (id, d.to_bits())),

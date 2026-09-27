@@ -1,5 +1,7 @@
 # Embed a Graph's Structure (You Have Only a Graph)
 
+> **Runnable companion:** [`cookbook/recipes/graph_and_lineage/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/graph_and_lineage) embeds a graph's structure with `generate_structure_embeddings` and reads its lineage.
+
 `generate_structure_embeddings` turns an **edge relation alone** into an
 ordinary embedding table. It is for the graph whose nodes carry nothing an
 encoder could read: a transaction graph of account ids, an entity graph of
@@ -112,7 +114,7 @@ let (table, _outcome) = session
 // Query by example: the accounts placed like this one, hydrated from
 // `accounts` through the key column.
 let similar = session
-    .search_by_id("accounts", "acct-0007", 10, Some(&table.table_name), SearchMethod::default())
+    .search_by_id("accounts", "acct-0007", 10, Some(&table.table_name), SearchMethod::default(), None)
     .await?
     .run()
     .await?;

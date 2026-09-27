@@ -12,6 +12,8 @@ _book/
 # A single chapter rendered on its own writes its page beside its source.
 chapters/**/*.html
 chapters/**/*_files/
+# Quarto's executable intermediate, left behind when a render fails.
+chapters/**/*.quarto_ipynb
 
 /.quarto/
 /_freeze/

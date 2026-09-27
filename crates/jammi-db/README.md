@@ -26,14 +26,18 @@ let results = session.sql("SELECT * FROM data.public.data LIMIT 10").await?;
 ## Build requirements
 
 The `postgres` and `mysql` features pull `datafusion-table-providers`'s
-federation drivers, which link a native TLS stack (`native-tls` ->
-OpenSSL) rather than `rustls`, unconditionally at every published
-version. Building either feature requires OpenSSL's development headers
-on the build host (e.g. `libssl-dev`/`openssl-devel`, or the `openssl`
-Homebrew formula plus `OPENSSL_DIR`/`PKG_CONFIG_PATH`). Neither feature
-is enabled by default, and no release lane in this repo enables them
-today (`ci/release-feature-manifest.json` carries no row that reaches
-either — enforced by `ci/scripts/check_release_manifest_pg_mysql_closure.py`).
+federation drivers, which use a native TLS stack (`native-tls`) rather
+than `rustls`. Both features turn on `native-tls`'s `vendored` feature, so
+on Linux OpenSSL is built from source and linked statically, and `mysql`
+links zlib statically: a build host needs a C toolchain and Perl (with the
+`IPC::Cmd` and `Time::Piece` modules OpenSSL's `Configure` uses), not
+OpenSSL's development headers, and the result carries no `libssl`,
+`libcrypto` or `libz` runtime dependency. macOS and Windows use the
+platform TLS stack. Neither feature is on by default; every published
+server binary, image and Python wheel enables both
+(`ci/release-feature-manifest.json`), and
+`ci/scripts/check_database_drivers_static.py` keeps the static linkage a
+checked property of these declarations.
 
 ## Documentation
 

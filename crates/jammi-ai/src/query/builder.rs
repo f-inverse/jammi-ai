@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::Catalog;
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::{FiniteQuery, QuerySource, SearchMethod};
+use jammi_db::index::{Admission, FiniteQuery, SearchMethod};
 use jammi_db::session::QueryContext;
 use jammi_db::sql::source_relation;
 use jammi_db::store::manifest::ProducingDescriptor;
@@ -57,27 +57,30 @@ impl QueryBuilder {
     ///
     /// Creates an ANN search plan, then automatically hydrates results
     /// by joining back to the source table to include all original columns.
-    /// `source` is the query's provenance and decides whose fault a bad one
-    /// is: a caller's vector fails as a schema-class error (`InvalidArgument`
-    /// on the wire); a vector read back from storage (query-by-example) fails
-    /// as a corrupt artifact named by its table. This is the EARLIEST point a
-    /// query can be refused: a non-finite component before any catalog read,
-    /// and the width against the table's authority
+    /// `query`'s provenance decides whose fault a bad one is: a caller's
+    /// vector fails as a schema-class error (`InvalidArgument` on the wire); a
+    /// vector read back from storage (query-by-example) fails as a corrupt
+    /// artifact named by its table. A non-finite component is refused before
+    /// the caller hands the query here (by [`FiniteQuery::new`]); this is the
+    /// EARLIEST point the width is checked: against the table's authority
     /// ([`jammi_db::store::ResultStore::query_width`]) before any plan node
     /// exists — so a query fault never reaches placement, the failure
     /// ladder, or a plan shipped to another process. Everything downstream
     /// holds a [`jammi_db::index::ValidatedQuery`] and checks only its own
     /// artifact's width.
+    ///
+    /// With a `filter`, the search ranks only the source rows the filter
+    /// selects ([`admitted_rows`]): the `k` nearest of those, however few the
+    /// filter selects — never the `k` nearest overall, filtered afterwards.
     pub(crate) async fn new(
         session: Arc<InferenceSession>,
         source_id: &str,
-        query_vec: Vec<f32>,
+        query: FiniteQuery,
         k: usize,
         embedding_table: Option<&str>,
         method: SearchMethod,
-        source: QuerySource,
+        filter: Option<&str>,
     ) -> Result<Self> {
-        let query = FiniteQuery::new(query_vec, source)?;
         let table = session
             .catalog()
             .resolve_embedding_table(source_id, embedding_table)
@@ -85,12 +88,14 @@ impl QueryBuilder {
         let result_store = session.result_store();
         let width = result_store.query_width(session.context(), &table).await?;
         let query_vec = query.against_authority(width)?;
+        let admission = admitted_rows(&session, &table, filter).await?;
 
         let ann = VectorSearchExec::new(
             table.clone(),
             query_vec,
             k,
             method,
+            admission,
             result_store,
             session.context().clone(),
         )?;
@@ -111,13 +116,15 @@ impl QueryBuilder {
     /// version's BM25 index — built from the version's rows the first time
     /// this process searches it — and hydrates the top `k` from the source
     /// like a dense search. Each row carries the `bm25` channel's
-    /// `bm25_score` and 0-based `bm25_rank`.
+    /// `bm25_score` and 0-based `bm25_rank`. With a `filter`, only the source
+    /// rows it selects are ranked, as for a dense search.
     pub(crate) async fn lexical(
         session: Arc<InferenceSession>,
         source_id: &str,
         text: &str,
         k: usize,
         lexical_table: Option<&str>,
+        filter: Option<&str>,
     ) -> Result<Self> {
         let table = session
             .catalog()
@@ -128,7 +135,8 @@ impl QueryBuilder {
             .lexical_indexes()
             .get_or_build(pin.input_anchor(), build_lexical_index(&session, &pin))
             .await?;
-        let hits = index.search(text, k)?;
+        let admission = admitted_rows(&session, pin.record(), filter).await?;
+        let hits = index.search(text, k, &admission)?;
         let plan = lexical_hits_plan(&pin.record().source_id, hits)?;
         Self::ranked(session, pin.record(), plan, Ranking::BM25_RANK, "bm25").await
     }
@@ -473,6 +481,47 @@ async fn extract_channel_contributions(
 
 /// Build a SELECT column list for hydration that casts Utf8View columns to VARCHAR
 /// and adds a `_join_key` column from the key column cast to VARCHAR.
+/// The rows of `table`'s source a search may return: every row with no
+/// `filter`; with one, the rows the filter selects, by the key the search
+/// results carry as `_row_id` (the same `Utf8` cast the hydration join
+/// matches on). Evaluated once, over the source, under the session's tenant
+/// scope — the admission the index then searches within.
+async fn admitted_rows(
+    session: &InferenceSession,
+    table: &ResultTableRecord,
+    filter: Option<&str>,
+) -> Result<Admission> {
+    let Some(filter) = filter else {
+        return Ok(Admission::Every);
+    };
+    let key_col = table
+        .key_column
+        .as_deref()
+        .ok_or_else(|| JammiError::Schema {
+            table: table.table_name.clone(),
+            column: "<key_column>".to_string(),
+            expected: "a recorded key column, which a filter's rows are matched to the search's by"
+                .to_string(),
+            actual: "none".to_string(),
+        })?;
+    let source_table_name = session.find_table_name(&table.source_id).await?;
+    let relation = source_relation(&table.source_id, &source_table_name);
+    let batches = session
+        .context()
+        .sql(&format!(
+            "SELECT arrow_cast(\"{key_col}\", 'Utf8') AS _admitted FROM {relation} WHERE {filter}"
+        ))
+        .await?
+        .collect()
+        .await?;
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let keys = batch.column(0).as_string::<i32>();
+        rows.extend(keys.iter().flatten().map(str::to_string));
+    }
+    Ok(Admission::rows(rows))
+}
+
 async fn build_hydration_select(
     ctx: &QueryContext,
     table_ref: &str,

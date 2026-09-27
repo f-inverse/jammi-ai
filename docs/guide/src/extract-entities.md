@@ -1,5 +1,7 @@
 # Extract Entities (NER)
 
+> **Runnable companion:** [`cookbook/recipes/eval_inference_ner/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/eval_inference_ner) runs an NER model over a registered source and scores the entity spans against gold.
+
 Run a Named Entity Recognition model over text columns to extract person names, organizations, locations, and other entities. Results are returned as JSON arrays of entity spans with character positions and confidence scores.
 
 ## Basic usage

@@ -212,10 +212,16 @@ impl SourceRegistry {
                     resolved_extension,
                 })
             }
+            // The database drivers' connect futures are deep; boxed here, at the
+            // one place a source is built, they add a pointer rather than their
+            // whole layout to every verb that resolves a source (rustc's layout
+            // query depth otherwise overflows in the server's handlers).
             #[cfg(feature = "postgres")]
             SourceType::Postgres => Ok(BuiltSource {
-                tables: crate::source::postgres::create_postgres_tables(source_id, connection)
-                    .await?,
+                tables: Box::pin(crate::source::postgres::create_postgres_tables(
+                    source_id, connection,
+                ))
+                .await?,
                 resolved_extension: None,
             }),
             #[cfg(not(feature = "postgres"))]
@@ -224,7 +230,10 @@ impl SourceRegistry {
             )),
             #[cfg(feature = "mysql")]
             SourceType::Mysql => Ok(BuiltSource {
-                tables: crate::source::mysql::create_mysql_tables(source_id, connection).await?,
+                tables: Box::pin(crate::source::mysql::create_mysql_tables(
+                    source_id, connection,
+                ))
+                .await?,
                 resolved_extension: None,
             }),
             #[cfg(not(feature = "mysql"))]

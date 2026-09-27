@@ -1,5 +1,7 @@
 # Use a Remote Model
 
+> **Runnable companion:** [`cookbook/recipes/remote_model/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/remote_model) embeds and searches with a model served at a remote endpoint.
+
 A model the engine does not run itself can still run through the engine: a
 hosted embeddings API, or an inference server on another machine. The
 deployment declares it once, under `[models.remote.<name>]`, and every verb

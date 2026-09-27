@@ -27,7 +27,7 @@ use crate::index::peer::{
 };
 use crate::index::segment::{merge, over_fetch, rescore, ServedIndex};
 use crate::index::sidecar::SidecarIndex;
-use crate::index::{distance_is_admissible, first_inadmissible_hit, ValidatedQuery};
+use crate::index::{distance_is_admissible, first_inadmissible_hit, Admission, ValidatedQuery};
 use crate::index::{SegmentId, SegmentedIndex, VectorIndex};
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::StorageUrl;
@@ -335,9 +335,10 @@ impl PlacedIndex {
         query: &ValidatedQuery,
         k: usize,
         oversample: usize,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32)>> {
         match &self.inner {
-            Placed::AllLocal(index) => index.search_final(query, k, oversample),
+            Placed::AllLocal(index) => index.search_final(query, k, oversample, admission),
             Placed::Mixed {
                 version,
                 mask,
@@ -350,7 +351,8 @@ impl PlacedIndex {
                     local,
                     remote,
                 };
-                self.search_mixed(&served, query, k, oversample).await
+                self.search_mixed(&served, query, k, oversample, admission)
+                    .await
             }
         }
     }
@@ -361,7 +363,7 @@ impl PlacedIndex {
     /// `N` = local + remote segment count; `candidate_k = max(k, k·oversample)`
     /// for a rescoring precision and `k` for `F32`; `width = over_fetch(candidate_k, N)`.
     /// Remote segments sharing one owner list go in ONE request per phase, in
-    /// parallel across owners; local sources run [`search_unit`] in-process.
+    /// parallel across owners; local sources run [`ServedIndex::live_hits`] in-process.
     ///
     /// - `F32` — one `Final` phase: every source returns its top-`width` exact
     ///   hits; `merge(units, k)`. 1 RTT.
@@ -394,6 +396,7 @@ impl PlacedIndex {
         query: &ValidatedQuery,
         k: usize,
         oversample: usize,
+        admission: &Admission,
     ) -> Result<Vec<(String, f32)>> {
         if k == 0 {
             return Ok(Vec::new());
@@ -420,14 +423,14 @@ impl PlacedIndex {
         // rescored here from now on.
         let mut locally_loaded: Vec<(SegmentId, SidecarIndex)> = Vec::new();
         // One segment's unit, wherever it is read: the served version's
-        // masked search, widening past the rows the mask hides.
+        // search among the rows the caller admits and the mask leaves live.
         let unit = |id: SegmentId, segment_version: i64, index: &SidecarIndex| {
             ServedIndex::new(id, segment_version, index, mask).live_hits(
                 query,
                 width,
-                candidate_k,
                 phase,
                 &|row_id| index.get_exact(row_id),
+                admission,
             )
         };
 
@@ -444,9 +447,9 @@ impl PlacedIndex {
                 storage_precision: precision,
                 query: query.clone(),
                 width,
-                target: candidate_k,
                 version,
                 phase,
+                admission: admission.clone(),
             };
             let req = &req;
             self.call_with_retry(group, |owner| async move {
@@ -761,9 +764,7 @@ enum RungFailure {
 
 /// Reconcile a `SegmentSearch` answer against its request: exactly one unit
 /// per requested segment id, none for an id that was not requested, none
-/// twice; no unit wider than the requested `width` — or, when the served
-/// version's mask hides rows, than the segment's own row count, since the
-/// owner widens past the rows it hides; no hit the mask hides at that
+/// twice; no unit wider than the requested `width`; no hit the mask hides at that
 /// segment's version (an owner serving another version's rows); every distance
 /// ADMISSIBLE ([`distance_is_admissible`] — finite); and no row id twice
 /// ACROSS THE WHOLE ANSWER, not merely within one unit — segments are
@@ -810,14 +811,9 @@ fn reconcile_units(
         let Some(segment) = segments.iter().find(|s| s.segment_id == unit.segment_id) else {
             return Err(malformed());
         };
-        // A segment the mask hides nothing of is searched once at `width`;
-        // one it hides rows of widens, up to its own length.
-        let bound = if mask.is_empty() {
-            req.width
-        } else {
-            req.width.max(segment.row_count)
-        };
-        if unit.hits.len() > bound {
+        // Every segment is searched once at `width`, its hidden rows never
+        // admitted, so no answer is wider.
+        if unit.hits.len() > req.width {
             return Err(malformed());
         }
         if unit
@@ -831,6 +827,14 @@ fn reconcile_units(
             .hits
             .iter()
             .all(|(row_id, _)| rows.insert(row_id.as_str()))
+        {
+            return Err(malformed());
+        }
+        // A row the request did not admit is an answer to another question.
+        if !unit
+            .hits
+            .iter()
+            .all(|(row_id, _)| req.admission.admits(row_id))
         {
             return Err(malformed());
         }
@@ -1055,8 +1059,13 @@ mod tests {
                 assert_eq!(placed.storage_precision(), precision);
                 for q in &[vq(&rows[0].1), vq(&rows[6].1), vq(&rows[11].1)] {
                     for (k, oversample) in [(1usize, 1usize), (3, 4), (5, 32)] {
-                        let want = sync.search_final(q, k, oversample).unwrap();
-                        let got = placed.search_final_placed(q, k, oversample).await.unwrap();
+                        let want = sync
+                            .search_final(q, k, oversample, &crate::index::Admission::Every)
+                            .unwrap();
+                        let got = placed
+                            .search_final_placed(q, k, oversample, &crate::index::Admission::Every)
+                            .await
+                            .unwrap();
                         assert_eq!(
                             got,
                             want,
@@ -1109,7 +1118,10 @@ mod tests {
         );
         // The conforming query serves.
         let ok = entry_query(&placed, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]).unwrap();
-        let hits = placed.search_final_placed(&ok, 1, 1).await.unwrap();
+        let hits = placed
+            .search_final_placed(&ok, 1, 1, &crate::index::Admission::Every)
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, "a");
     }
 
@@ -1134,7 +1146,7 @@ mod tests {
         // segment first: the artifact class, named by the segment, before
         // any owner is dialled.
         let err = placed
-            .search_final_placed(&vq(&[1.0, 0.0, 0.0]), 3, 1)
+            .search_final_placed(&vq(&[1.0, 0.0, 0.0]), 3, 1, &crate::index::Admission::Every)
             .await
             .expect_err("a 3-wide query against an 8-wide resident segment must be refused");
         assert!(
@@ -1511,7 +1523,10 @@ mod tests {
         let owner = fake(SearchAnswer::Conforming, RescoreAnswer::Conforming);
         let (placed, counters, _dir) = mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
         let q = vq(&corpus()[0].1);
-        let hits = placed.search_final_placed(&q, 3, 4).await.unwrap();
+        let hits = placed
+            .search_final_placed(&q, 3, 4, &crate::index::Admission::Every)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 3);
         assert!(
             counters.snapshot().iter().all(|(_, v)| *v == 0),
@@ -1541,7 +1556,7 @@ mod tests {
                 mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
             let q = vq(&corpus()[0].1);
             let err = placed
-                .search_final_placed(&q, 3, 1)
+                .search_final_placed(&q, 3, 1, &crate::index::Admission::Every)
                 .await
                 .expect_err("a non-conforming peer answer must not become a result");
             assert!(
@@ -1576,7 +1591,7 @@ mod tests {
             mixed_with_fake_n_remote(StoragePrecision::F32, Arc::clone(&owner), 2);
         let q = vq(&corpus()[0].1);
         let err = placed
-            .search_final_placed(&q, 3, 1)
+            .search_final_placed(&q, 3, 1, &crate::index::Admission::Every)
             .await
             .expect_err("one row id across two units must not become a result");
         assert!(
@@ -1602,7 +1617,10 @@ mod tests {
         let (placed, counters, _dir) =
             mixed_with_fake_n_remote(StoragePrecision::F32, Arc::clone(&owner), 2);
         let q = vq(&corpus()[0].1);
-        let hits = placed.search_final_placed(&q, 3, 1).await.unwrap();
+        let hits = placed
+            .search_final_placed(&q, 3, 1, &crate::index::Admission::Every)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 3);
         assert!(
             counters.snapshot().iter().all(|(_, v)| *v == 0),
@@ -1626,7 +1644,7 @@ mod tests {
                 mixed_with_fake(StoragePrecision::F32, Arc::clone(&owner));
             let q = vq(&corpus()[0].1);
             let err = placed
-                .search_final_placed(&q, 3, 1)
+                .search_final_placed(&q, 3, 1, &crate::index::Admission::Every)
                 .await
                 .expect_err("a non-finite distance must never reach the merge");
             assert!(
@@ -1640,7 +1658,7 @@ mod tests {
             let (placed, counters, _dir) =
                 mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
             let err = placed
-                .search_final_placed(&q, 3, 4)
+                .search_final_placed(&q, 3, 4, &crate::index::Admission::Every)
                 .await
                 .expect_err("a non-finite rescore distance must never reach the merge");
             assert!(
@@ -1665,7 +1683,7 @@ mod tests {
                 mixed_with_fake(StoragePrecision::Int8, Arc::clone(&owner));
             let q = vq(&corpus()[0].1);
             let err = placed
-                .search_final_placed(&q, 3, 4)
+                .search_final_placed(&q, 3, 4, &crate::index::Admission::Every)
                 .await
                 .expect_err("a non-conforming rescore answer must not become a result");
             assert!(
@@ -1740,7 +1758,10 @@ mod tests {
         assert_eq!(owner.calls.lock().unwrap().0, 0, "no owner was dialled");
         // …and the conforming one fans out.
         let query = entry_query(&placed, &[1.0; 8]).unwrap();
-        let hits = placed.search_final_placed(&query, 3, 1).await.unwrap();
+        let hits = placed
+            .search_final_placed(&query, 3, 1, &crate::index::Admission::Every)
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(owner.calls.lock().unwrap().0, 1);
     }

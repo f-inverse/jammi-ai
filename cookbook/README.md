@@ -28,6 +28,7 @@ nothing runs):
 | Build neighbour graphs, propagate, follow lineage | [`recipes/graph_and_lineage/`](./recipes/graph_and_lineage/) |
 | Predict from retrieved context | [`recipes/context_predictor/`](./recipes/context_predictor/) |
 | Search images | [`recipes/image_search/`](./recipes/image_search/) |
+| Search images with a text query (cross-modal) | [`recipes/cross_modal_search/`](./recipes/cross_modal_search/) |
 | Search audio | [`recipes/audio_search/`](./recipes/audio_search/) |
 | Submit, watch and cancel jobs | [`recipes/jobs/`](./recipes/jobs/) |
 | List, describe, preload and delete models | [`recipes/model_catalog/`](./recipes/model_catalog/) |
@@ -38,6 +39,7 @@ nothing runs):
 | Audit every search a session runs | [`recipes/search_audit/`](./recipes/search_audit/) |
 | Run one program embedded and against a server | [`recipes/remote_session/`](./recipes/remote_session/) |
 | Query a `jammi-server` over Flight SQL | [`recipes/flight_sql/`](./recipes/flight_sql/) |
+| Join sources and run a model inside one SQL query, embedded and over Flight SQL | [`recipes/compound_query/`](./recipes/compound_query/) |
 | Embed and search with a model served at an endpoint | [`recipes/remote_model/`](./recipes/remote_model/) |
 
 Every recipe uses a committed fixture model, so it runs without network

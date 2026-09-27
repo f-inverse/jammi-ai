@@ -279,10 +279,18 @@ class EmbeddedBackend:
     # --- Sources + model lifecycle ---------------------------------------------
 
     def add_source(
-        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+        self,
+        name: str,
+        *,
+        url: str,
+        format: Optional[str] = None,
+        tenant_column: Optional[str] = None,
     ) -> None:
-        """Register a file-shaped data source on the embedded engine.
+        """Register a data source on the embedded engine, by the URL that names it.
 
+        A `postgres://` / `postgresql://` URL is a PostgreSQL database and a
+        `mysql://` URL a MySQL / MariaDB database, federated table by table;
+        they take no `format`. Anything else is a file read in `format`.
         `tenant_column` names the column whose value is each row's tenant: a
         tenant-bound session then reads only its own rows and the rows with no
         tenant, through every verb that reads the source.
@@ -523,9 +531,11 @@ class EmbeddedBackend:
 
         Each entry carries the wire's `JobSummary` field set — ``job_id``,
         ``kind``, ``status``, ``base_model_id``, ``output_model_id``,
-        ``created_at``, ``error`` — with ``output_model_id`` empty until a
-        training kind completes (always empty for a compute kind) and
-        ``error`` empty unless it failed. A listing of :meth:`job` answers
+        ``created_at``, ``error``, ``claimed_by``, ``ranks`` — with
+        ``output_model_id`` stamped at submission (always empty for a compute
+        kind), ``error`` empty unless it failed, ``claimed_by`` the instance
+        holding (or last holding) the claim and ``ranks`` the instance that
+        ran each rank of the latest training attempt. A listing of :meth:`job` answers
         plus the submit-time identity; read :meth:`job(job_id).progress()
         <Job.progress>` for the mid-run progress surface.
         """
@@ -1302,8 +1312,8 @@ class EmbeddedBackend:
         (query-by-example: the vector stored for that row, resolved inside
         the engine — it never crosses the API); exactly one is given.
         `filter` is an optional SQL predicate over
-        the hydrated columns — the search returns the `k` nearest rows that
-        satisfy it; `select` projects columns (empty keeps every
+        the source's columns — the search ranks only the rows it selects and
+        returns the `k` nearest of them; `select` projects columns (empty keeps every
         hydrated column). `embedding_table` names which of the source's
         embedding tables to search (e.g. a raw, propagated, or fine-tuned table);
         ``None`` searches the most-recent ready table. `oversample` overrides,

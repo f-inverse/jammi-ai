@@ -14,7 +14,7 @@ pub use placed::{PlacedIndex, SegmentSource};
 pub use jammi_numerics::query::{
     validate_query, FiniteQuery, QuerySource, QueryValidationError, ValidatedQuery,
 };
-pub use segment::{SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
+pub use segment::{SegmentAdmission, SegmentId, SegmentedIndex, DEFAULT_SEGMENT_OVERFETCH_FACTOR};
 
 use crate::error::Result;
 
@@ -52,6 +52,55 @@ impl Default for SearchMethod {
         Self::Approximate { oversample: None }
     }
 }
+
+/// The rows a search may return: every row, or only the rows a caller's
+/// filter selected, by `_row_id`.
+///
+/// A search returns the nearest ADMITTED rows — the admission is applied
+/// while the index is searched, never to an already-truncated ranking — so a
+/// selective filter costs work in proportion to the rows it admits, not to
+/// the table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Admission {
+    /// Every row.
+    #[default]
+    Every,
+    /// Only these `_row_id`s.
+    Rows(std::sync::Arc<std::collections::HashSet<String>>),
+}
+
+impl Admission {
+    /// Admit exactly `row_ids`.
+    pub fn rows(row_ids: impl IntoIterator<Item = String>) -> Self {
+        Self::Rows(std::sync::Arc::new(row_ids.into_iter().collect()))
+    }
+
+    /// Whether `row_id` may be returned.
+    pub fn admits(&self, row_id: &str) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Rows(rows) => rows.contains(row_id),
+        }
+    }
+
+    /// The admitted row ids, when the admission names them.
+    pub fn row_ids(&self) -> Option<&std::collections::HashSet<String>> {
+        match self {
+            Self::Every => None,
+            Self::Rows(rows) => Some(rows),
+        }
+    }
+}
+
+/// The most admitted rows one segment scores exactly, reading each one's
+/// stored vector; past it, the segment's graph is traversed admitting only
+/// those rows. Planned per segment from the admitted count, as Qdrant's query
+/// planner chooses between a full scan of the filtered points and filterable
+/// HNSW per segment by estimated cardinality against `full_scan_threshold`
+/// (<https://qdrant.tech/documentation/manage-data/indexing/>; its default,
+/// 10 000 KB, is about 10 000 256-d vectors). Below it an exact score is both
+/// cheaper than a traversal that rejects most of what it visits and exact.
+pub const EXACT_ADMISSION_MAX: usize = 10_000;
 
 /// Whether a distance may enter a merge, a rank, or a result.
 ///

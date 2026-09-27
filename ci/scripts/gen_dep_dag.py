@@ -28,22 +28,34 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GRAPH_JSON = REPO_ROOT / "target" / "build-graph" / "graph.json"
 GUIDE = REPO_ROOT / "docs" / "maintainer" / "MAINTAINER-GUIDE.md"
 
 BEGIN_MARKER = "<!-- BEGIN GENERATED: dep-dag -->"
 END_MARKER = "<!-- END GENERATED: dep-dag -->"
 
 
-def refresh_graph() -> None:
-    """Refresh `target/build-graph/graph.json` from the current workspace.
+def graph_json() -> Path:
+    """build-graph writes under cargo's target directory, which
+    `CARGO_TARGET_DIR` or `.cargo/config.toml` may move off `target/`."""
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(json.loads(metadata.stdout)["target_directory"]) / "build-graph" / "graph.json"
+
+
+def refresh_graph(graph: Path) -> None:
+    """Refresh the build graph's `graph.json` from the current workspace.
 
     If the plain (uncompressed) graph already exists, `update` re-extracts it
     from the present `target/` without re-running `cargo build`; otherwise a full
     `build` produces it. Both emit the uncompressed `graph.json` (`--no-compress`)
     so the reader below can parse it directly.
     """
-    subcommand = "update" if GRAPH_JSON.exists() else "build"
+    subcommand = "update" if graph.exists() else "build"
     subprocess.run(
         ["cargo", "build-graph", subcommand, "--no-compress"],
         cwd=REPO_ROOT,
@@ -51,7 +63,7 @@ def refresh_graph() -> None:
     )
 
 
-def render_block() -> str:
+def render_block(graph_path: Path) -> str:
     """Render the deterministic crate-dependency block from the build graph.
 
     Keeps only intra-workspace crate→crate `depends_on` edges (both endpoints
@@ -59,7 +71,7 @@ def render_block() -> str:
     one name-sorted line per crate with a name-sorted dependency list. Crates
     with no intra-workspace dependency render as a bare name.
     """
-    graph = json.loads(GRAPH_JSON.read_text())
+    graph = json.loads(graph_path.read_text())
     nodes = {node["id"]: node for node in graph["nodes"]}
     crate_name = {
         node_id: node["attributes"]["crate"]
@@ -99,8 +111,9 @@ def splice(block: str) -> None:
 
 
 def main() -> int:
-    refresh_graph()
-    splice(render_block())
+    graph = graph_json()
+    refresh_graph(graph)
+    splice(render_block(graph))
     print(f"dep-dag block written to {GUIDE.relative_to(REPO_ROOT)}")
     return 0
 

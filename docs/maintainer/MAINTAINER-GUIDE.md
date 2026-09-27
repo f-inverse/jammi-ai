@@ -70,7 +70,7 @@ jammi-admin -> jammi-datafusion, jammi-db, jammi-wire
 jammi-ai -> jammi-ai, jammi-datafusion, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
 jammi-ballista -> jammi-ai, jammi-datafusion, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-datafusion, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
-jammi-cli -> jammi-admin, jammi-datafusion, jammi-db
+jammi-cli -> jammi-admin, jammi-client, jammi-datafusion, jammi-db, jammi-wire
 jammi-client -> jammi-admin, jammi-datafusion, jammi-db, jammi-wire
 jammi-datafusion -> jammi-datafusion, jammi-numerics
 jammi-db -> jammi-datafusion, jammi-numerics, jammi-test-resources, jammi-test-utils

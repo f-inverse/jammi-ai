@@ -156,6 +156,10 @@ jammi-ai = { workspace = true, features = ["test-hooks"] }
 jammi-client.workspace = true
 jammi-admin.workspace = true
 tempfile = "3"
+# Tests that arm one of `jammi-ai`'s process-global parks (the preload park
+# among them) run one at a time under that park's key: a park is taken by the
+# next matching load in the process, whichever test's server it is.
+serial_test = "3"
 parquet.workspace = true
 # The gRPC integration tests build Arrow IPC payloads and encode raw protos by
 # hand to exercise the wire surface end-to-end; the server's own code reaches

@@ -166,6 +166,7 @@ fn one_epoch_fine_tune() -> jammi_ai::jobs::JobSpec {
 /// `healthz_is_200_during_preload`, and
 /// `preload_entry_with_explicit_task_loads_with_that_task`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(preload_park)]
 async fn readyz_is_503_until_preload_models_are_loaded_then_200() {
     let dir = tempfile::TempDir::new().unwrap();
     let source_key = ModelSource::parse(&tiny_bert()).to_string();
@@ -330,6 +331,7 @@ async fn preload_of_a_bare_id_with_no_models_row_is_a_startup_error() {
 /// ever serving gRPC; the worker's row is deleted and awaited before the
 /// session closes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(preload_park)]
 async fn signal_during_preload_exits_without_serving() {
     for release in [false, true] {
         let dir = tempfile::TempDir::new().unwrap();
@@ -390,6 +392,7 @@ async fn signal_during_preload_exits_without_serving() {
 /// arm never reaches 2e, so the rendezvous never fires even though the
 /// returned outcome reads `Released`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(preload_park)]
 async fn release_signal_during_preload_actually_releases() {
     let dir = tempfile::TempDir::new().unwrap();
     let source_key = ModelSource::parse(&tiny_bert()).to_string();

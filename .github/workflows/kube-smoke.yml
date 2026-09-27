@@ -28,13 +28,13 @@ name: Kubernetes smoke (kind)
 # `workflow_dispatch`ed against its own PR branch before it exists on the
 # default branch, so the pre-merge proof for THIS file is the PR's own
 # `pull_request`-triggered run. The filter is kept after merge too -- a
-# manifest, driver, or Dockerfile change is exactly the class of change this
-# workflow exists to catch, so it keeps running on every PR that touches
-# them, not only on push to main.
+# manifest, driver, Dockerfile or Python-client change is exactly the class of
+# change this workflow exists to catch (the smoke drives the server through
+# that client, so a change to what a verb returns breaks it), so it keeps
+# running on every PR that touches them, not only on push to main.
 #
-# One amd64 leg only, no arm64 matrix: the pinned kustomize and kubeconform
-# release tarballs are linux-amd64-only, and `helm/kind-action`'s own kind
-# binary is amd64 on `ubuntu-latest`; the arm64 build of the server image is
+# One amd64 leg only, no arm64 matrix: `helm/kind-action`'s own kind binary
+# is amd64 on `ubuntu-latest`, and the arm64 build of the server image is
 # already proven by `compose-smoke.yml`'s arm64 leg.
 #
 # Kubernetes has no `depends_on` analogue (unlike `deploy/docker-compose.yml`,
@@ -55,6 +55,7 @@ on:
     paths:
       - deploy/kubernetes/**
       - tests/compose/**
+      - clients/python/**
       - .github/workflows/kube-smoke.yml
       - Dockerfile
 

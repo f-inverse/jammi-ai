@@ -92,13 +92,19 @@ class Ctx:
     sources_before: Any
 
 
+def ranking(hits: Any) -> tuple[list[Any], list[float]]:
+    """A search result's row keys and similarities, in rank order: the
+    hydrated table `search` returns carries each hit's key as `_row_id` and
+    its score as `similarity`."""
+    return hits.column("_row_id").to_pylist(), hits.column("similarity").to_pylist()
+
+
 def durable_after_restart(ctx: Ctx) -> None:
     """Shape B (Compose): the segment bundle lives on a Postgres-backed
     volume, so the exact same search must still answer identically, and the
     index segment list must be unchanged."""
     hits_after = ctx.do_search()
-    hit_keys_after = hits_after.column("key").to_pylist()
-    hit_scores_after = hits_after.column("score").to_pylist()
+    hit_keys_after, hit_scores_after = ranking(hits_after)
     assert hit_keys_after == ctx.hit_keys, (
         f"expected identical keys after restart, before={ctx.hit_keys} after={hit_keys_after}"
     )
@@ -205,8 +211,7 @@ def run(
         return db.search(source="patents", query=vec, k=5)
 
     hits = do_search()
-    hit_keys = hits.column("key").to_pylist()
-    hit_scores = hits.column("score").to_pylist()
+    hit_keys, hit_scores = ranking(hits)
     print("top-5 hits:")
     for key, score in zip(hit_keys, hit_scores):
         print(f"  key={key!r} score={score}")

@@ -2430,7 +2430,9 @@ pub mod preload_test_hooks {
     }
 
     /// Arm one park for the next preload whose source's canonical string
-    /// (`ModelSource`'s `Display`) is `key`. One-shot.
+    /// (`ModelSource`'s `Display`) is `key`. One-shot, and process-wide: the
+    /// next matching preload in the process takes it, whichever session runs
+    /// it, so tests that arm the same key run serially.
     pub fn arm(key: &str, point: ParkPoint) -> ParkHandle {
         let parked = Arc::new(AtomicBool::new(false));
         let parked_notify = Arc::new(Notify::new());

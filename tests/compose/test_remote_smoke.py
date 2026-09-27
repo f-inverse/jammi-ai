@@ -70,10 +70,11 @@ class _FakeHits:
         self._keys = keys
         self._scores = scores
 
+    # The hydrated table `search` returns: `_row_id` and `similarity`.
     def column(self, name):
-        if name == "key":
+        if name == "_row_id":
             return _FakeColumn(self._keys)
-        if name == "score":
+        if name == "similarity":
             return _FakeColumn(self._scores)
         raise KeyError(name)
 

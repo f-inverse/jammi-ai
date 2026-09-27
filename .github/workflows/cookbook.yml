@@ -17,9 +17,9 @@ on:
 
 concurrency:
   group: cookbook-${{ github.ref }}
-  # Same rationale as ci.yml's own concurrency blocks: a PR ref still cancels
-  # its own superseded runs, but a run ON MAIN is evidence a closure can cite
-  # and must be allowed to finish rather than being cancelled by the next merge.
+  # Same trade as ci.yml's concurrency block: a PR ref cancels its own
+  # superseded runs; a RUNNING run on main is never cancelled, and a waiting
+  # one is replaced by the next merge's, whose verdict covers it.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: this lane only reads the checkout; nothing publishes.

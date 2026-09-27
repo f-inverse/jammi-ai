@@ -10,9 +10,14 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   # A PR ref cancels its own superseded runs (rapid pushes to the same PR
-  # should not queue N stale runs). `main` never does: a run on main is the
-  # only evidence that a given commit on main is green, and cancelling it
-  # when the next merge lands leaves that commit with no verdict at all.
+  # should not queue N stale runs). On `main` the RUNNING run is never
+  # cancelled: a main run outlasts the gap between merges, so under
+  # "latest supersedes" a merge streak would cancel every run and leave main
+  # with no verdict at all. A group still holds one PENDING run, though: a
+  # newer merge's run replaces the one waiting, so that waiting commit gets
+  # no run of its own and the next verdict covers it. Every commit was
+  # already green on its own pull request (`ci-summary / assert` gates the
+  # merge).
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # Least privilege: every job here only reads the checkout; nothing publishes.
@@ -425,9 +430,11 @@ jobs:
       # version's schema behavior; an unpinned `cargo install` could silently
       # pick up a newer cargo-deny release that reads the SAME file
       # differently, which is a different risk from the advisory DB's own
-      # deliberate freshness above and is not relaxed by pinning this.
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --version 0.20.2 --locked
+      # deliberate freshness above and is not relaxed by pinning this. The CI
+      # image carries it at its pin (`.docker/pinned-tools.sh`), so this step
+      # is a no-op there; it installs only on an image that predates the pin.
+      - name: Provide cargo-deny at its pin
+        run: bash .docker/pinned-tools.sh cargo-deny
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 
@@ -642,36 +649,27 @@ jobs:
   # is two upstream binaries (kustomize, kubeconform) applied directly;
   # check_no_consumer_names.py does not
   # scan deploy/. A separate job, not a guard in `ci/guards.toml`, because it
-  # needs two fetched binaries and a schema cache, not one hermetic script.
+  # reads the pinned Kubernetes JSON schemas through a cache, not one hermetic
+  # script. The CI image carries kustomize and kubeconform at their pins.
   kube-manifests:
     name: Guard (kubernetes manifests)
     runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Cache the pinned kubernetes-json-schema fetches
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/kubeconform-cache
+          # Under HOME, which the cache action and the step's shell resolve
+          # alike inside the container (`runner.temp` names the host's path).
+          path: ~/.cache/kubeconform
           key: kubeconform-schemas-b582a12a09aa9b5d1edad577a964c504130214fc-1.34.11
 
-      - name: Fetch + verify kustomize v5.8.1
-        run: |
-          set -euo pipefail
-          curl -fsSL -o kustomize.tar.gz \
-            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz"
-          echo "029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d  kustomize.tar.gz" | sha256sum -c -
-          tar -xzf kustomize.tar.gz
-          sudo install -m 0755 kustomize /usr/local/bin/kustomize
-
-      - name: Fetch + verify kubeconform v0.8.0
-        run: |
-          set -euo pipefail
-          curl -fsSL -o kubeconform.tar.gz \
-            "https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz"
-          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
-          tar -xzf kubeconform.tar.gz
-          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+      # A no-op in the CI image; installs only on an image that predates a pin.
+      - name: Provide kustomize and kubeconform at their pins
+        run: bash .docker/pinned-tools.sh kustomize kubeconform
 
       - name: kustomize build | kubeconform --strict (base, shape-d, ci)
         run: |
@@ -681,12 +679,12 @@ jobs:
           # bump that changes the cache key) nothing creates it, and
           # kubeconform v0.8.0 fails hard opening a missing `-cache` folder
           # instead of just skipping the cache.
-          mkdir -p "$RUNNER_TEMP/kubeconform-cache"
+          mkdir -p ~/.cache/kubeconform
           for k in base overlays/shape-d overlays/ci; do
             kustomize build "deploy/kubernetes/$k" | kubeconform --strict --summary \
               --kubernetes-version 1.34.11 \
               -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/b582a12a09aa9b5d1edad577a964c504130214fc/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json" \
-              -cache "$RUNNER_TEMP/kubeconform-cache" \
+              -cache ~/.cache/kubeconform \
               -
           done
 
@@ -739,7 +737,6 @@ jobs:
       # server would find its config where it looks for it.
       - name: Every config mount carries the file its server reads
         run: |
-          python3 -m pip install --quiet pyyaml
           python3 ci/scripts/check_kube_config_mounts.py --self-test
           python3 ci/scripts/check_kube_config_mounts.py
 

@@ -14,7 +14,7 @@ provide = "python3 -m pip install --user --quiet tokenizers"
 
 [need.actionlint]
 probe = "command -v actionlint"
-provide = "bash ci/scripts/install_actionlint.sh"
+provide = "bash .docker/pinned-tools.sh actionlint"
 
 [need.safetensors]
 probe = "python3 -c 'import safetensors'"

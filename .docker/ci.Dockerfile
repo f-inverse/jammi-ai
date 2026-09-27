@@ -58,8 +58,10 @@ RUN yum install -y perl-IPC-Cmd perl-Time-Piece \
 # prerequisite check (`_pyyaml_prerequisite_rc()`) fails loud, by name, the
 # instant a rebuilt image lacks an importable PyYAML -- it is what
 # actually protects the gates, not an assumption about this RUN line.
+# `safetensors` and `tokenizers` are the script tests' Python needs
+# (`ci/needs.toml`), baked for the same reason as the yum needs above.
 RUN python3 -m ensurepip --upgrade \
-    && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors
+    && python3 -m pip install --no-cache-dir 'PyYAML==6.*' safetensors tokenizers
 
 # The system interpreter's development link (`libpython3.12.so`, beside the
 # runtime `libpython3.12.so.1.0`). `jammi-python` built without pyo3's
@@ -166,3 +168,11 @@ RUN . /etc/ci-arch-env \
     && curl -fsSL "https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-${QUARTO_ARCH}.tar.gz" \
         | tar -xz -C /opt \
     && ln -s "/opt/quarto-${QUARTO_VERSION}/bin/quarto" /usr/local/bin/quarto
+
+# The third-party tools the guard lanes run, installed from the one script
+# that pins them (version and per-arch checksum). A bare runner, or an image
+# built before a pin moved, provides them through the same script; here they
+# are baked so a CI run fetches none of them.
+COPY pinned-tools.sh /tmp/pinned-tools.sh
+RUN bash /tmp/pinned-tools.sh actionlint kustomize kubeconform cargo-deny build-graph \
+    && rm -rf /tmp/pinned-tools.sh /usr/local/cargo/registry /usr/local/cargo/git

@@ -5,9 +5,8 @@ name: Dep-DAG freshness
 # context must stay path-filter-free so it never hangs a PR that doesn't touch
 # the DAG's inputs (same reasoning as devcontainer-image.yml).
 # It cannot be folded into ci.yml either: the generator's source of truth is
-# `cargo build-graph` (a third-party crate `cargo install`ed here on every
-# run, not shipped in the CI base image), whose `build` extracts the graph
-# from real `cargo build` artifacts — a full extra workspace-build-shaped cost
+# `cargo build-graph` (a third-party tool the CI image carries at its pin),
+# whose `build` extracts the graph from real `cargo build` artifacts — a full extra workspace-build-shaped cost
 # no ci.yml job carries. So a stale committed DAG block on a PR that dodges
 # the filter surfaces on the next run that touches these paths, not on that
 # PR itself — accepted, and stated here rather than discovered.
@@ -59,19 +58,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # The CI image does not ship cargo-build-graph; install it (pinned, so the
-      # rendered graph matches the committed block). Clear -D warnings for this
-      # step only — it compiles a third-party crate and its deps, where a single
+      # The CI image carries cargo-build-graph at its pin
+      # (`.docker/pinned-tools.sh`, so the rendered graph matches the committed
+      # block); this step is a no-op there and installs it only on an image
+      # that predates the pin. Clear -D warnings for this step only — an
+      # install compiles a third-party crate and its deps, where a single
       # upstream warning would otherwise fail the build. Overriding the SAME
       # per-target var `setup-rust-ci` set (never a bare RUSTFLAGS, which would
       # also silently drop the mold flag `.cargo/config.toml` still supplies for
       # this runner's target — an empty CARGO_TARGET_..._RUSTFLAGS joins with
       # config.toml the same as a non-empty one, contributing nothing extra
       # while leaving mold in place).
-      - name: Install build-graph (the dep-DAG generator's source of truth)
+      - name: Provide build-graph at its pin (the dep-DAG generator's source of truth)
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
-        run: cargo install build-graph --version 0.1.0 --locked
+        run: bash .docker/pinned-tools.sh build-graph
 
       # The maintainer guide's crate-dependency DAG is generated from
       # build-graph (the maintainer-chosen source of truth, extracted from

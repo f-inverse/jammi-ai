@@ -110,23 +110,15 @@ PROVE_SCOPE = frozenset({"ci/scripts/runpod_gpu_prove.sh"})
 
 _PERF_PRODUCER_REASON = "perf producer, not a proof lane"
 EXEMPT_SCOPE: dict[str, str] = {
-    "ci/scripts/runpod_gpu_gang.sh": (
-        "gang pod leg (1 pod x 2 GPU): a DISTRIBUTED-TRAINING correctness surface, not the "
-        "release prove lane's shipped surface. PROVE_SCOPE membership means set-equality "
-        "against `ci/release-feature-manifest.json`'s `prove_lane.crates` declarations, and "
-        "this lane deliberately declares nothing there — it compiles and runs ONE target "
-        "(jammi-ai's `gpu_capability` under the gang name filter) on two devices, which no "
-        "release artifact is built from. Its tuples' off-merge-path residual is carried by "
-        "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own gang section"
-    ),
-    "ci/scripts/runpod_gpu_cluster.sh": (
-        "gang cluster leg (2 pods x 1 GPU on one RunPod cluster): the two-host arm of the "
-        "same distributed-training correctness surface as the pod leg, not the release "
-        "prove lane's shipped surface. It declares nothing in `prove_lane.crates`, compiles "
-        "and runs the same ONE target (jammi-ai's `gpu_capability` under the cluster name "
-        "filter) on each host, and no release artifact is built from it. Its tuples' "
-        "off-merge-path residual is carried by "
-        "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own cluster section"
+    "ci/scripts/runpod_gpu_topology.sh": (
+        "GPU topology lane (two 2-GPU hosts): a DISTRIBUTED-TRAINING correctness surface, not "
+        "the release prove lane's shipped surface. PROVE_SCOPE membership means set-equality "
+        "against `ci/release-feature-manifest.json`'s `prove_lane.crates` declarations, and this "
+        "lane deliberately declares nothing there — it runs jammi-ai's `gpu_capability` and "
+        "jammi-server's `it` targets under the gang name filters, and builds the shipped server "
+        "with the prove lane's own literal cu12-tarball tuple (one allowlist row, two origins). Its "
+        "tuples' off-merge-path residual is carried by "
+        "`ci/scripts/execution_surface_reachability_allowlist.txt`'s own topology section"
     ),
     "ci/scripts/pod_seed_target.sh": (
         "seed cache lane: T1 precedes CUTLASS provisioning, T1/T1b main-only "
@@ -1233,26 +1225,16 @@ def _write_prove_surface_fixture(root: Path, script_body: str, manifest: dict | 
     (root / "ci" / "scripts" / "pod_seed_target.sh").write_text(
         "#!/usr/bin/env bash\ncargo build --release -p jammi-bench --features cuda\n"
     )
-    # The gang pod leg's own two cuda-bearing tuples, shaped like the real
-    # driver's (its `gang-build` compile-check and its `gang-proof` live
-    # run, both inside a remote heredoc, hence the escaped `\$` spellings).
-    (root / "ci" / "scripts" / "runpod_gpu_gang.sh").write_text(
+    # The topology lane's cuda-bearing tuples, shaped like the real driver's
+    # (its `topology-build` compile-checks and its one-host live runs, inside
+    # a remote heredoc, hence the escaped `\$` spellings).
+    (root / "ci" / "scripts" / "runpod_gpu_topology.sh").write_text(
         "#!/usr/bin/env bash\n"
-        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
+        "cargo test -p jammi-ai --features cuda,live-gpu-gang-tests "
         "--test gpu_capability --no-run || grc=\\$?\n"
-        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
-        "--test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 "
-        '2>&1 | tee "\\$gang_log"\n'
-    )
-    # The gang cluster leg's two tuples: the same `--no-run` compile-check and
-    # live run as the pod leg, under the cluster name filter, per host.
-    (root / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text(
-        "#!/usr/bin/env bash\n"
-        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
-        "--test gpu_capability --no-run || grc=\\$?\n"
-        "cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests "
-        "--test gpu_capability ${CLUSTER_TEST_FILTER} -- --nocapture --test-threads=1 "
-        '2>&1 | tee "\\$rank_log"\n'
+        "cargo test -p jammi-ai --features cuda,live-gpu-gang-tests "
+        "--test gpu_capability ${ONE_HOST_DEVICE_FILTER} -- --test-threads=1 "
+        '2>&1 | tee "\\$device_log"\n'
     )
     for perf_name in (
         "finetune_step_ab.sh",

@@ -278,11 +278,8 @@ live-distributed-tests = ["local", "jammi-db/storage-s3"]
 # graph fine-tune learning on the device, bf16 admission, GGUF serving and
 # QLoRA. Needs CUDA device 0; every GPU session pins `require_gpu = true`.
 live-gpu-tests = ["local", "cuda"]
-# The two-rank NCCL gang tests: two CUDA devices on one host.
+# The NCCL transport's device tests: two CUDA devices on one host.
 live-gpu-gang-tests = ["live-gpu-tests"]
-# The two-host NCCL gang test: one rank per host, reading the rank, world,
-# NCCL-id-file and artifact-dir env `ci/scripts/runpod_gpu_cluster.sh` sets on each.
-live-gpu-cluster-tests = ["live-gpu-tests"]
 # CUDA / Metal acceleration of the embedded engine — only meaningful with `local`.
 # `jammi-encoders/cuda` forwards to the encoders' fused kernels;
 # `jammi-lora/cuda` (the fused LoRA epilogue) forwards the same way, through `jammi-lora`'s own
@@ -358,8 +355,8 @@ required-features = ["live-distributed-tests"]
 # The GPU-capability suite. Its own target (not part of the hermetic `it` suite)
 # so it compiles only under `live-gpu-tests` (which enables `cuda`) and needs
 # CUDA device 0: acquiring the device panics naming what is missing, never a
-# silent pass. The gang and two-host tests inside it additionally need
-# `live-gpu-gang-tests` / `live-gpu-cluster-tests`.
+# silent pass. The NCCL transport tests inside it additionally need
+# `live-gpu-gang-tests` (a second device).
 [[test]]
 name = "gpu_capability"
 path = "tests/gpu_capability/main.rs"

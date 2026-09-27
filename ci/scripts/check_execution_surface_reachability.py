@@ -1097,7 +1097,7 @@ def discover_suspicious_lines(repo_root: Path) -> list[str]:
 # KEYS (never the fuller `parse_on_block_or_fail` field shape below, which
 # stays a separate, Rule-1-specific reader over the SAME parsed document) —
 # `check_gpu_prove_once.py`'s P1, P5, P6, P7 and its `--read-on-block` CLI
-# (which `test_gpu_gang_lane.sh`'s G7 shells out to) all import this
+# (which `test_gpu_topology_lane.sh` shells out to) all import this
 # function, never a second, independently-drifting copy. Every value this
 # module derives from a workflow's `on:` block -- the trigger set here, and
 # the per-trigger `branches`/`paths`/... fields `parse_on_block_or_fail`

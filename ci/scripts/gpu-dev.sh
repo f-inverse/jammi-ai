@@ -276,20 +276,12 @@ case "$CMD" in
   reap)
     # shellcheck source=ci/scripts/runpod_lib.sh
     source "$DIR/runpod_lib.sh"
-    # No argument => judge each pod/cluster against the deadline in its own
-    # name. Passing RP_TTL_HOURS here would impose THIS shell's limit on
-    # every pod/cluster. Both object types are ACCOUNT-WIDE and independent
-    # (a cluster is retired by deleting the CLUSTER, never one of its member
-    # pods — rp_sweep's own exclusion logic already keeps the two apart);
-    # this arm reaps both, and — the SAME "could not check must never read
-    # as nothing to clean up" doctrine rp_sweep has always carried — exits
-    # non-zero if EITHER sweep could not enumerate its own object type, even
-    # when the other one succeeded.
-    pod_rc=0 cluster_rc=0
-    rp_sweep "${1:-}" || pod_rc=$?
-    rp_cluster_sweep "${1:-}" || cluster_rc=$?
-    [ "$pod_rc" -eq 0 ] && [ "$cluster_rc" -eq 0 ] && exit 0
-    exit $(( pod_rc != 0 ? pod_rc : cluster_rc ))
+    # No argument => judge each pod against the deadline in its own name.
+    # Passing RP_TTL_HOURS here would impose THIS shell's limit on every pod.
+    # A sweep that could not enumerate the account exits non-zero: "could
+    # not check" must never read as "nothing to clean up".
+    rp_sweep "${1:-}"
+    exit $?
     ;;
 esac
 

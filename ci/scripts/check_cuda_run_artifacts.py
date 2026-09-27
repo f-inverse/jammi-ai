@@ -145,67 +145,24 @@ must carry:
       filename anchors close exactly that escape hatch
       (`check_producer_source_identity_marker`).
 
-  (k) the `gang` ARTIFACT KIND (the RunPod POD and CLUSTER legs' own
-      evidence): an artifact declared `gang` by ANY of
-      three independent anchors — `artifact_kind == "gang"`, a top-level
-      `gang` block, or a committed filename matching
-      `GANG_ARTIFACT_FILENAME_RE` — must FIRST carry `gang.leg`, exactly one
-      of `"pod"`/`"cluster"` (checked before either registry below — a
-      missing or unrecognized leg leaves nothing else checkable, since the
-      two legs owe DIFFERENT payloads). `gang.leg == "pod"` carries every
-      row of `GANG_POD_FIELD_REGISTRY`: `world` (>= 2), `collective`, one per-rank `device` for
-      each of `world` ranks, the same-seed `digests` PAIR (exactly two), the
-      measured `per_step_loss_delta`, the leg's own `verdict` (exactly
-      `pass` or `fail`), and `epsilon` with its `value`, its `derivation`,
-      and the `registered_sha` it was PRE-registered at — a commit that must
-      be an ancestor of HEAD and a STRICT ancestor of the artifact's own
-      EVIDENCE ANCHOR (an ε landing in the same commit as the tree it
-      excuses is not pre-registered). The anchor is `git_sha` when that is
-      an ancestor of HEAD, else `merged_as` when that is present, well-typed
-      and an ancestor of HEAD, else the artifact FAILS naming both — the
-      same order rule (d) itself applies, so a measured tip whose landing
-      commit REWROTE it is still ordered against something real instead of
-      skipping the ε check entirely, while a tip that IS in this history is
-      ordered against itself and no landing commit stamped beside it can
-      loosen that (`_gang_evidence_anchor` carries the full reasoning).
-
-      `gang.leg == "cluster"` (the two-HOST RunPod-cluster leg,
-      `ncclCommInitRank`, never `ncclCommInitAll`) carries every row of
-      `GANG_CLUSTER_FIELD_REGISTRY` instead: `world`, `collective`, `hosts`
-      (exactly 2), `ranks[]` (`rank`/`host`/`device`/`iface` per entry —
-      never merely `device`, since the topology this leg proves spans
-      SEPARATE hosts), `reduced_vector_digest` (a bit-exact digest, equal
-      across both ranks on a `pass` — asserted by the DRIVER before
-      assembly, never re-derived here; this is a bit-exact sum, never
-      conflated with the pod leg's LoRA-shaped same-seed reproducibility
-      PAIR, a different regime this rule does not claim anything about for
-      the cluster leg), `verdict` (the SAME generic check as the pod leg),
-      and `pod_count`/`gpu_count_per_pod`/`ttl_hours` — the shape and
-      deadline the cluster was RENTED at, as measured from the create
-      response. It carries NO `digests`/`per_step_loss_delta`/`epsilon` row
-      at all: those name a training-loss reproducibility bound the cluster
-      leg does not measure.
-
-      A FAILING gang run is REPRESENTABLE: a `fail` is admitted with its deltas and digests as
-      measured, and owes a non-empty `gang.reason` plus a top-level
-      `status` that is not `GREEN`. A `pass` is a CLAIM, so on a `pass` the
-      measured delta must be within ε (an artifact cannot record a run that
-      blew its own tolerance as if it passed) and the same-seed digest PAIR
-      must be EQUAL at `world == 2` — the one regime a spike measured
-      byte-identical. Above that world the pair is recorded, not asserted:
-      the NCCL pin set is untested at world >= 3, and a state defined by
-      missing evidence gets no definite consequence. A new required field
-      lands as a registry row (the same discipline `_TIER_SOURCE_REGISTRY`
-      follows), never an inline literal in a checker.
-
-      WHAT THE ANCHOR RULE ASKS OF A PRODUCER: register ε in its OWN
-      commit, BEFORE the commit that measures with it, on the same branch.
-      A landing that keeps the branch's commits (this repository's merge
-      commits, with no pre-merge rebase) keeps that ε a strict ancestor of
-      `git_sha` afterwards. A squash, or a rebase performed AFTER the
-      measurement, rewrites both commits, and the artifact then fails this
-      rule from the merge onwards — so do not rebase a branch after
-      measuring on it; land it, or re-measure.
+  (k) the `topology` ARTIFACT KIND (the GPU topology lane's evidence): an
+      artifact declared `topology` by ANY of three independent anchors —
+      `artifact_kind == "topology"`, a top-level `topology` block, or a
+      committed filename matching `TOPOLOGY_ARTIFACT_FILENAME_RE` — names
+      the lane's driver as its producer and carries every row of
+      `TOPOLOGY_FIELD_REGISTRY`: the fleet's shape (`hosts` >= 2,
+      `gpus_per_host` >= 2), the one-host cell's passed device and product
+      tests, the one NCCL runtime the fleet ran, the fleet's runs under
+      each transport (the coordinator's selected transport and attempt
+      count; one distinct
+      process per rank, one rank per GPU, spanning every host; the loss
+      curve; the probe embeddings' digest), the single-rank reference, the
+      trainer's registered ε, and the lane's `verdict`/`reasons`. On a
+      `pass` the claims are cross-checked — each gang published on its first
+      attempt, both transports' curves and digests equal, the gang's loss
+      within ε of the single rank; a `fail`
+      is admitted as measured with its reasons and a top-level `status`
+      that is not GREEN.
 
 Rule (d) needs REAL commit history to mean anything: `git merge-base
 --is-ancestor` on a shallow checkout (`actions/checkout`'s default
@@ -959,130 +916,69 @@ def check_oracle_separation(data: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# rule (k) — the `gang` artifact kind (the gpu-gang pod leg's own evidence).
+# rule (k) — the `topology` artifact kind (the GPU topology lane's evidence).
 #
-# A distributed fine-tune run on one 2-GPU pod proves something no
-# single-device artifact can, and it proves it with a DIFFERENT payload: the
-# topology it ran (`world`, the collective, the device each rank held), a
-# digest PAIR from two same-seed runs, the measured per-step loss delta, and
-# the ε that delta is read against. The ε is the part that rots silently, so
-# it is the part this rule is hardest about: it must carry its own
-# derivation AND the commit it was registered at, and that commit must
-# already be history by the time the measured tree existed. An ε chosen
-# after seeing the delta it excuses is not a tolerance, it is a rationalisation.
+# The fine-tune gang on real GPUs at every topology the engine lays a job out
+# as, through the product path, proves something no single-device artifact
+# can, with a payload of its own: which one-host proofs passed, and a
+# multi-host fleet run under each transport — where every rank ran (instance,
+# label, machine), which transport the coordinator selected, the per-epoch
+# loss, the probe embeddings' digest — plus the single-rank reference at the
+# same global batch and the ε the gang's loss is read against.
 #
-# "By the time the measured tree existed" is checked against the artifact's
-# EVIDENCE ANCHOR, not unconditionally against `git_sha`: see
-# `_gang_evidence_anchor`. Guarding the check behind "`git_sha` is an
-# ancestor of HEAD" would skip it entirely for exactly the artifacts whose
-# measured tip was rewritten on landing.
+# The claims are CROSS-FIELD and bind on a `pass`, because a `pass` is a
+# CLAIM: the two transports' curves and embeddings are identical (the
+# transport is invisible in the result), the gang's ranks span every host,
+# one process each, and the gang's loss is within ε of the single rank's. A
+# `fail` is REPRESENTABLE — admitted as measured, with its reasons and a
+# top-level `status` that is not GREEN — because a failing run's own numbers
+# are the evidence that has to survive into the repository.
+#
+# ε is the trainer's pre-registered W-vs-1 bound (`trainer.rs`'s
+# `gather_exactness_w2_matches_w1_within_pre_registered_epsilon`, mirrored by
+# `jammi-server`'s `gpu::topology` tests and `gpu_topology_assemble.py`): an
+# artifact carries the value it was read against, and a value other than the
+# registered one is refused — an ε chosen after seeing the delta it excuses is
+# not a tolerance.
 #
 # LETTER: (k). As with every other letter here, it is comment/self-test-label
 # prose only — no gate, allowlist, or error message parses it.
 #
-# WHY A REGISTRY, NOT AN INLINE LITERAL: this file's own module doc requires
-# a new kind to land as registry ROWS (the same discipline `_TIER_SOURCE_
-# REGISTRY` follows for the v2 identity tuples), so the field set, its
-# validator, and the REASON each field is required all sit in one table a
-# reader can enumerate — and the next required field is a row, never another
-# `if` buried in a checker.
-#
-# A FAILING GANG RUN IS REPRESENTABLE. `gang.verdict` (`pass`/`fail`) is the
-# leg's own call, and it is what every consequence in this rule is
-# conditioned on: a `fail` is ADMITTED with its deltas and digests exactly
-# as measured (with a `gang.reason` naming what failed, and a top-level
-# `status` that is not GREEN), because a non-reproducible run's own numbers
-# are precisely the evidence that has to survive into the repository. The
-# tolerance and reproducibility assertions bind on `pass` only — and there
-# they bind hard, because a `pass` is a CLAIM.
-#
-# WHAT THIS RULE ASSERTS ONLY CONDITIONALLY: digest EQUALITY. On a `pass`
-# it is required at `world == 2` — the regime a spike measured
-# byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD across
-# A100s, with no env pins — and merely RECORDED above that, because nothing
-# has established byte-identity for a reduction whose NCCL pin set is
-# untested at world >= 3. A state defined by missing
-# evidence gets no definite consequence: the gate does not decide the
-# higher-world case in either direction.
+# WHY A REGISTRY, NOT AN INLINE LITERAL: a new required field lands as a
+# registry ROW (the discipline `_TIER_SOURCE_REGISTRY` follows), so the field
+# set, its validator and the REASON it is required sit in one table.
 # --------------------------------------------------------------------------- #
-# A `gang` artifact names WHICH RENTAL LEG produced it. `gang.leg` is a
-# required, closed-set field, checked FIRST, before either registry below:
-# `pod` is a single 2-GPU RunPod POD; `cluster` is the two-HOST RunPod CLUSTER leg's own shape (2 separate
-# hosts over NCCL's `ncclCommInitRank`, never `ncclCommInitAll`) and owes a
-# DIFFERENT payload: `hosts`, per-rank `host`/`iface` (never `digests`/
-# `per_step_loss_delta`/`epsilon` -- the cluster leg proves a bit-exact
-# reduced-vector match, not a training-loss reproducibility bound; the
-# LoRA-shaped byte-identical regime was never measured across two separate
-# HOSTS) plus the shape it was RENTED at (`pod_count`, `gpu_count_per_pod`,
-# `ttl_hours`). Both legs share `world`/`collective`/`verdict` (the SAME
-# generic `_gang_check_verdict` binds on either leg identically) and the
-# three-anchor kind detection below.
-#
-# The cluster registry ALSO asserts, over
-# `ranks[]`: every `host` is DISTINCT across ranks (two ranks on one host is
-# not the two-host bootstrap this leg proves) and neither `host` nor `iface`
-# is the driver's own `unknown` placeholder (the driver's assembler refuses
-# to WRITE an artifact carrying one — see `_rpc_assemble_gang_artifact` — so
-# a committed `unknown` means hand-editing around that refusal); each
-# rank's OWN `reduced_vector_digest` is kept in its own row (never collapsed
-# at assembly) and asserted equal across every rank on a `pass`; `hosts`
-# must equal `pod_count` and `world` must equal `pod_count *
-# gpu_count_per_pod` — both derived from the create response's own measured
-# shape, never a second, independently duplicated literal. `gang.leg` is
-# also bound to `producer.path` (`GANG_LEG_PRODUCER_PATH`): each leg's OWN
-# renting driver is the sole writer of that leg's artifact, so a
-# self-declared leg can never dodge the other leg's (differently-shaped)
-# registry by pointing at a different driver.
-GANG_ARTIFACT_KIND = "gang"
+TOPOLOGY_ARTIFACT_KIND = "topology"
 ARTIFACT_KIND_KEY = "artifact_kind"
-GANG_BLOCK_KEY = "gang"
-GANG_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+TOPOLOGY_BLOCK_KEY = "topology"
+TOPOLOGY_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
-GANG_LEG_POD = "pod"
-GANG_LEG_CLUSTER = "cluster"
-GANG_LEGS = (GANG_LEG_POD, GANG_LEG_CLUSTER)
+# The lane's one driver is the sole writer of this kind.
+TOPOLOGY_PRODUCER_PATH = "ci/scripts/runpod_gpu_topology.sh"
 
-# A self-declared `gang.leg` cannot dodge the OTHER leg's registry by
-# pointing `producer.path` at a different driver -- each leg's OWN renting
-# driver is the sole writer of that leg's artifact, so the two are bound
-# together here, never left as two independently-editable fields. A leg
-# with NO entry here has no registered producer at all -- see
-# `_gang_check_leg_producer_binding`'s own refusal for that shape (fail
-# closed, never a silent pass).
-GANG_LEG_PRODUCER_PATH = {
-    GANG_LEG_POD: "ci/scripts/runpod_gpu_gang.sh",
-    GANG_LEG_CLUSTER: "ci/scripts/runpod_gpu_cluster.sh",
-}
+# Third anchor (rule (j)'s three-anchor shape): a committed artifact whose
+# FILENAME declares the family cannot escape this rule by dropping its kind.
+TOPOLOGY_ARTIFACT_FILENAME_RE = re.compile(r"(?:^|[-_])topology(?:[-_.]|$)")
 
-# The cluster leg proves EXACTLY two hosts -- the plan's own shape; a
-# different host count is a different, unproven regime, not a value this
-# rule tolerates.
-GANG_CLUSTER_HOSTS = 2
+# The multi-host cell proves a fleet of MORE than one host with MORE than one
+# GPU each — fewer is a topology the one-host cell already covers.
+TOPOLOGY_MIN_HOSTS = 2
+TOPOLOGY_MIN_GPUS_PER_HOST = 2
 
-# Third anchor (the same three-anchor shape rule (j) uses): a committed
-# artifact whose FILENAME declares the family cannot escape this rule by
-# dropping its own `artifact_kind` key.
-GANG_ARTIFACT_FILENAME_RE = re.compile(r"(?:^|[-_])gang(?:[-_.]|$)")
+# The trainer's pre-registered W-vs-1 loss bound (see the section comment).
+TOPOLOGY_REGISTERED_EPSILON = 1e-4
 
-# The leg's own call. EXACT strings, closed set: a verdict spelled anything
-# else (`PASS`, `ok`, `failed`) is a FAIL, never coerced — every conditional
-# consequence below reads this field, so a value the gate does not
-# understand must never silently take the lenient branch.
-GANG_VERDICT_PASS = "pass"
-GANG_VERDICT_FAIL = "fail"
-GANG_VERDICTS = (GANG_VERDICT_PASS, GANG_VERDICT_FAIL)
+# The transport each fleet run's coordinator must have selected: the run's
+# key is the `[worker] collective` phase it ran under.
+TOPOLOGY_RUN_TRANSPORTS = {"nccl": "Nccl", "inline": "Inline"}
 
-# The one top-level `status` spelling a `fail` verdict may not carry. The
-# corpus vocabulary is GREEN/RED/RECORD/SUPERSEDED, but `status` itself is
-# free text repo-wide (several pre-schema artifacts carry their own
-# phrasing) — so this rule refuses exactly the one contradiction it can
-# state without inventing a vocabulary: a leg that says it failed cannot
-# also be filed GREEN.
-GANG_GREEN_STATUS = "GREEN"
+TOPOLOGY_VERDICT_PASS = "pass"
+TOPOLOGY_VERDICT_FAIL = "fail"
+TOPOLOGY_VERDICTS = (TOPOLOGY_VERDICT_PASS, TOPOLOGY_VERDICT_FAIL)
 
-# The world size at which a `pass` must show an EQUAL same-seed digest pair.
-# Above it the pair is recorded, not asserted — see the section comment.
-GANG_DIGEST_EQUALITY_WORLD = 2
+# The one top-level `status` a `fail` may not carry (`status` is free text
+# repo-wide; this refuses the one contradiction it can state).
+TOPOLOGY_GREEN_STATUS = "GREEN"
 
 
 def _is_real_number(value) -> bool:
@@ -1093,760 +989,229 @@ def _is_real_number(value) -> bool:
     return value == value and value not in (float("inf"), float("-inf"))
 
 
-def _gang_check_world(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    world = gang.get("world")
-    if isinstance(world, bool) or not isinstance(world, int):
-        return [f"`gang.world` must be an integer rank count, got {world!r}"]
-    if world < 2:
-        return [f"`gang.world` must be >= 2 — a one-rank run is not a gang, got {world}"]
-    return []
+def _is_count(value, minimum: int) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= minimum
 
 
-def _gang_check_collective(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    collective = gang.get("collective")
-    if not isinstance(collective, str) or not collective.strip():
-        return [
-            f"`gang.collective` must be a non-empty string naming the collective the run used, "
-            f"got {collective!r}"
-        ]
-    return []
-
-
-def _gang_check_ranks(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    ranks = gang.get("ranks")
-    if not isinstance(ranks, list) or not ranks:
-        return [f"`gang.ranks` must be a non-empty list, one entry per rank, got {ranks!r}"]
+def _topology_check_shape(topo: dict, _data: dict) -> list[str]:
     failures: list[str] = []
-    world = gang.get("world")
-    if isinstance(world, int) and not isinstance(world, bool) and len(ranks) != world:
+    if not _is_count(topo.get("hosts"), TOPOLOGY_MIN_HOSTS):
         failures.append(
-            f"`gang.ranks` carries {len(ranks)} per-rank `device` entr(y/ies) but `gang.world` is "
-            f"{world} — every rank records the device it held, so the counts must be equal"
+            f"`topology.hosts` must be an integer >= {TOPOLOGY_MIN_HOSTS} — the multi-host cell "
+            f"spans machines, got {topo.get('hosts')!r}"
         )
-    seen: list[int] = []
-    for i, entry in enumerate(ranks):
-        if not isinstance(entry, dict):
-            failures.append(f"`gang.ranks[{i}]` must be an object with `rank` and `device`, got {entry!r}")
-            continue
-        rank = entry.get("rank")
-        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
-            failures.append(f"`gang.ranks[{i}].rank` must be a rank index >= 0, got {rank!r}")
-        else:
-            seen.append(rank)
-        device = entry.get("device")
-        if not isinstance(device, str) or not device.strip():
-            failures.append(
-                f"`gang.ranks[{i}].device` must be a non-empty string naming the device this rank "
-                f"held, got {device!r}"
-            )
-    if len(set(seen)) != len(seen):
-        failures.append(f"`gang.ranks` repeats a rank index ({sorted(seen)}) — each rank appears once")
-    elif isinstance(world, int) and not isinstance(world, bool) and seen and sorted(seen) != list(range(world)):
+    if not _is_count(topo.get("gpus_per_host"), TOPOLOGY_MIN_GPUS_PER_HOST):
         failures.append(
-            f"`gang.ranks` covers rank indices {sorted(seen)}, not 0..{world - 1} — every rank of the "
-            "gang records its own device"
+            f"`topology.gpus_per_host` must be an integer >= {TOPOLOGY_MIN_GPUS_PER_HOST}, got "
+            f"{topo.get('gpus_per_host')!r}"
         )
     return failures
 
 
-def _gang_check_digests(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    digests = gang.get("digests")
-    if not isinstance(digests, list) or len(digests) != 2:
-        return [
-            "`gang.digests` must be the PAIR of same-seed runs the equal-topology reproducibility "
-            f"oracle produces — exactly two entries, got {digests!r}"
-        ]
+def _topology_check_one_host(topo: dict, _data: dict) -> list[str]:
+    one_host = topo.get("one_host")
+    if not isinstance(one_host, dict):
+        return [f"`topology.one_host` must be an object, got {one_host!r}"]
     failures: list[str] = []
-    seeds: list = []
-    values: list[str] = []
-    for i, entry in enumerate(digests):
-        if not isinstance(entry, dict):
-            failures.append(f"`gang.digests[{i}]` must be an object with `seed` and `digest`, got {entry!r}")
-            continue
-        seed = entry.get("seed")
-        if isinstance(seed, bool) or not isinstance(seed, int):
-            failures.append(f"`gang.digests[{i}].seed` must be an integer seed, got {seed!r}")
-        else:
-            seeds.append(seed)
-        digest = entry.get("digest")
-        if not isinstance(digest, str) or not GANG_DIGEST_RE.match(digest):
+    for key in ("device_tests", "product_tests"):
+        tests = one_host.get(key)
+        if not isinstance(tests, list) or not tests or not all(
+            isinstance(t, str) and t.strip() for t in tests
+        ):
             failures.append(
-                f"`gang.digests[{i}].digest` must be a 64-lowercase-hex digest, got {digest!r}"
+                f"`topology.one_host.{key}` must be a non-empty list of the test names that passed, "
+                f"got {tests!r}"
             )
-        else:
-            values.append(digest)
-    if len(seeds) == 2 and seeds[0] != seeds[1]:
+    return failures
+
+
+def _topology_check_nccl_version(topo: dict, _data: dict) -> list[str]:
+    versions = topo.get("nccl_version")
+    if not isinstance(versions, list) or len(versions) != 1 or not isinstance(versions[0], str):
+        return [
+            "`topology.nccl_version` must list exactly the one NCCL runtime every server reported, "
+            f"got {versions!r}"
+        ]
+    return []
+
+
+def _topology_check_run(name: str, run, world, hosts) -> list[str]:
+    where = f"`topology.fleet.{name}`"
+    if not isinstance(run, dict):
+        return [f"{where} must be an object, got {run!r}"]
+    failures: list[str] = []
+    if run.get("transport") != TOPOLOGY_RUN_TRANSPORTS[name]:
         failures.append(
-            f"`gang.digests` records two DIFFERENT seeds ({seeds[0]} and {seeds[1]}) — the pair is two "
-            "runs of the SAME seed; two seeds prove nothing about reproducibility"
+            f"{where}.transport must be {TOPOLOGY_RUN_TRANSPORTS[name]!r} — the transport the "
+            f"coordinator selected under that phase, got {run.get('transport')!r}"
         )
-    # Equality, asserted CONDITIONALLY (see the section comment above): only
-    # on a `pass` verdict, and only in the world size a spike actually
-    # measured byte-identical. A `fail` records its pair as measured — that
-    # is the whole point of admitting a failing run — and a `pass` at a
-    # larger world records it too, because nothing here establishes what
-    # byte-identity should mean for an untested NCCL pin set.
-    world = gang.get("world")
-    if (
-        gang.get("verdict") == GANG_VERDICT_PASS
-        and not isinstance(world, bool)
-        and world == GANG_DIGEST_EQUALITY_WORLD
-        and len(seeds) == 2
-        and seeds[0] == seeds[1]
-        and len(values) == 2
-        and values[0] != values[1]
+    if not _is_count(run.get("attempts"), 1):
+        failures.append(f"{where}.attempts must be an integer >= 1, got {run.get('attempts')!r}")
+    ranks = run.get("ranks")
+    if not isinstance(ranks, list) or not ranks:
+        return failures + [f"{where}.ranks must be a non-empty list, got {ranks!r}"]
+    if _is_count(world, 1) and len(ranks) != world:
+        failures.append(f"{where}.ranks carries {len(ranks)} rank(s) for a world of {world}")
+    instances, machines = [], set()
+    for i, rank in enumerate(ranks):
+        if not isinstance(rank, dict) or not all(
+            isinstance(rank.get(k), str) and rank[k].strip() for k in ("instance", "host")
+        ):
+            failures.append(f"{where}.ranks[{i}] must name its `instance` and `host`, got {rank!r}")
+            continue
+        instances.append(rank["instance"])
+        machines.add(rank["host"])
+    if len(set(instances)) != len(instances):
+        failures.append(f"{where}.ranks repeats an instance — a fleet rank is one process")
+    if _is_count(hosts, 1) and len(machines) != hosts:
+        failures.append(f"{where}.ranks span {len(machines)} host(s), not the fleet's {hosts}")
+    curve = run.get("loss_curve")
+    if not isinstance(curve, list) or not curve or not all(_is_real_number(v) for v in curve):
+        failures.append(f"{where}.loss_curve must be a non-empty list of finite losses, got {curve!r}")
+    if not isinstance(run.get("embeddings_sha256"), str) or not TOPOLOGY_DIGEST_RE.match(
+        run["embeddings_sha256"]
     ):
+        failures.append(f"{where}.embeddings_sha256 must be a 64-lowercase-hex digest")
+    return failures
+
+
+def _topology_check_fleet(topo: dict, _data: dict) -> list[str]:
+    fleet = topo.get("fleet")
+    if not isinstance(fleet, dict):
+        return [f"`topology.fleet` must be an object, got {fleet!r}"]
+    failures: list[str] = []
+    hosts, per_host, world = topo.get("hosts"), topo.get("gpus_per_host"), fleet.get("world_size")
+    if _is_count(hosts, 1) and _is_count(per_host, 1) and world != hosts * per_host:
         failures.append(
-            f"`gang.digests` records a `pass` at `gang.world` {GANG_DIGEST_EQUALITY_WORLD} whose two "
-            f"same-seed runs produced DIFFERENT digests ({values[0]} vs {values[1]}) — a spike "
-            "measured this regime byte-identical, so an unequal pair is a failed run: record it as "
-            f"`gang.verdict` {GANG_VERDICT_FAIL!r} with its own `gang.reason`, never as a pass"
+            f"`topology.fleet.world_size` ({world!r}) must be `hosts` x `gpus_per_host` "
+            f"({hosts * per_host}) — one rank per GPU of the fleet"
+        )
+    for name in TOPOLOGY_RUN_TRANSPORTS:
+        failures.extend(_topology_check_run(name, fleet.get(name), world, hosts))
+    reference = fleet.get("reference")
+    curve = reference.get("loss_curve") if isinstance(reference, dict) else None
+    if not isinstance(curve, list) or not curve or not all(_is_real_number(v) for v in curve):
+        failures.append(
+            f"`topology.fleet.reference.loss_curve` must be the single rank's per-epoch loss, got {curve!r}"
+        )
+    if fleet.get("epsilon") != TOPOLOGY_REGISTERED_EPSILON:
+        failures.append(
+            f"`topology.fleet.epsilon` must be the trainer's registered {TOPOLOGY_REGISTERED_EPSILON} "
+            f"— an ε chosen after the measurement is not a tolerance, got {fleet.get('epsilon')!r}"
+        )
+    delta = fleet.get("max_loss_delta_vs_reference")
+    if not _is_real_number(delta) or delta < 0:
+        failures.append(
+            f"`topology.fleet.max_loss_delta_vs_reference` must be a finite number >= 0, got {delta!r}"
         )
     return failures
 
 
-def _gang_check_delta_series(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    deltas = gang.get("per_step_loss_delta")
-    if not isinstance(deltas, list) or not deltas:
-        return [
-            "`gang.per_step_loss_delta` must be a non-empty list of the MEASURED per-step loss "
-            f"deltas (one per global step), got {deltas!r}"
-        ]
-    bad = [(i, v) for i, v in enumerate(deltas) if not _is_real_number(v)]
-    if bad:
-        i, v = bad[0]
-        return [f"`gang.per_step_loss_delta[{i}]` must be a finite number, got {v!r}"]
-    return []
-
-
-def _gang_check_verdict(gang: dict, data: dict, _repo_root: Path) -> list[str]:
-    """The leg's own pass/fail call, and the two things a `fail` owes a
-    reader. Every other conditional consequence in this rule (the ε
-    tolerance read, the conditional digest-equality assertion) is gated on
-    this field, so an unrecognised value is refused here rather than
-    quietly routed down the lenient branch."""
-    verdict = gang.get("verdict")
-    if verdict not in GANG_VERDICTS:
-        return [
-            f"`gang.verdict` must be exactly one of {list(GANG_VERDICTS)} — the leg's own call about "
-            "the run this artifact records; a run that failed is recorded AS failed, with its "
-            f"numbers as measured, never omitted or filed as a pass, got {verdict!r}"
-        ]
-    if verdict != GANG_VERDICT_FAIL:
-        return []
-    failures: list[str] = []
-    reason = gang.get("reason")
-    if not isinstance(reason, str) or not reason.strip():
-        failures.append(
-            f"`gang.verdict` is {GANG_VERDICT_FAIL!r} but `gang.reason` is missing or blank — a "
-            "recorded failure states WHAT failed (which rank, which collective, which step), or it "
-            f"is an unactionable number, got {reason!r}"
-        )
-    status = data.get("status")
-    if isinstance(status, str) and status.strip().upper() == GANG_GREEN_STATUS:
-        failures.append(
-            f"`gang.verdict` is {GANG_VERDICT_FAIL!r} but the artifact's top-level `status` is "
-            f"{status!r} — a leg that reports its own failure cannot also be filed "
-            f"{GANG_GREEN_STATUS}; the two fields would contradict each other in the corpus"
-        )
-    return failures
-
-
-def _gang_evidence_anchor(data: dict, repo_root: Path) -> tuple[str | None, str | None, list[str]]:
-    """The commit in THIS history that a gang artifact's evidence is anchored
-    at — the thing ε's pre-registration is ordered against.
-
-    Returns `(anchor_field, anchor_sha, failures)`; `anchor_sha is None`
-    means no anchor exists in this history and `failures` carries the one
-    finding that names BOTH candidates.
-
-    The order mirrors `check_ancestry` (rule (d)) — `git_sha` FIRST, then
-    `merged_as` as the RESCUE, each held to `git merge-base --is-ancestor`
-    against HEAD:
-
-      * `git_sha` when 40-hex and an ancestor of HEAD — the ordinary shape,
-        a tip that survived into this history verbatim. It is where the
-        measurement actually happened, so it is the tree ε has to predate;
-        a `merged_as` stamped beside it names a LATER commit, and reading
-        the order against that later commit would admit an ε registered in
-        the measured commit itself. `merged_as` is a rescue for a lost
-        anchor, never a relaxation of a present one.
-      * else `merged_as` when present, 40-hex, and an ancestor of HEAD. A
-        measured branch tip that landed by a commit which REWROTE it (a
-        squash, or a pre-merge rebase) has a `git_sha` that is an ancestor
-        of nothing; `merged_as` is then the only commit whose content is in
-        this history, so it is the only anchor an ordering claim can mean.
-        Concretely: ε is here ordered against the LANDING commit
-        (`merged_as`), never against the (now-unreachable) commit where the
-        measurement itself ran — that commit has no content in this
-        history for anything to be ordered against. On this repo's corpus
-        that is not a corner case: of the 111 cuda-run artifacts carrying a
-        `git_sha`, 7 need this arm.
-      * else neither: a hard FAIL naming both, never a silent skip. Guarding
-        BOTH ε arms behind `_is_ancestor(git_sha, HEAD)` would skip the
-        whole ε pre-registration check for exactly the artifacts that need
-        the `merged_as` rescue — including an ε registered in the landing
-        commit itself.
-
-    ANCESTRY, never "resolvable": whether a rewritten sha is READABLE here
-    is a property of the clone (4 of those 7 exist only as loose objects in
-    one operator's checkout, and not at all in a fresh CI clone), so
-    `git cat-file`-style resolvability would make this gate's verdict
-    depend on who ran it. Ancestry is the same question for every clone
-    with real history — which `run_gate`'s shallow guard already insists on.
-
-    `git_sha_unresolved` is NOT an exemption here: rule (a) lets a reviewed
-    legacy artifact carry a short/malformed ref instead of a `git_sha`, and
-    rule (d) has nothing resolvable to check for it — but an ε is a claim
-    about ORDER IN THIS HISTORY, and an artifact with no anchor in this
-    history cannot make that claim at all. Such an artifact lands as this
-    finding, not as a silent pass.
-
-    Git failures are NOT swallowed: `_run` (see its own definition) does not
-    catch a missing/broken `git`, so a `FileNotFoundError`/`OSError`
-    propagates out of `_is_ancestor` and the gate exits non-zero with the
-    traceback. Fail-closed BY EXIT — never by a `False` that would read as
-    "not an ancestor" and produce a misleading per-artifact finding.
-    """
-    git_sha = data.get("git_sha")
-    merged_as = data.get("merged_as")
-    if isinstance(git_sha, str) and GIT_SHA_RE.match(git_sha) and _is_ancestor(git_sha, repo_root):
-        return "git_sha", git_sha, []
-    if isinstance(merged_as, str) and GIT_SHA_RE.match(merged_as) and _is_ancestor(merged_as, repo_root):
-        return "merged_as", merged_as, []
-    return (
-        None,
-        None,
-        [
-            f"`gang.epsilon` has no commit in this history to be pre-registered AGAINST: neither "
-            f"`git_sha` ({git_sha!r}) nor `merged_as` ({merged_as!r}) is an ancestor of HEAD, so the "
-            "claim 'ε was on record before the measured tree' names no order this checkout can "
-            "establish (a `git_sha_unresolved` artifact is not exempt — it has no anchor either)"
-        ],
-    )
-
-
-def _gang_check_epsilon(gang: dict, data: dict, repo_root: Path) -> list[str]:
-    epsilon = gang.get("epsilon")
-    if not isinstance(epsilon, dict):
-        return [
-            "`gang.epsilon` must be an object carrying the PRE-REGISTERED tolerance: "
-            f"`value`, `derivation`, `registered_sha`, got {epsilon!r}"
-        ]
-    failures: list[str] = []
-    value = epsilon.get("value")
-    if not _is_real_number(value) or value <= 0:
-        failures.append(f"`gang.epsilon.value` must be a finite number > 0, got {value!r}")
-    derivation = epsilon.get("derivation")
-    if not isinstance(derivation, str) or not derivation.strip():
-        failures.append(
-            "`gang.epsilon.derivation` must state HOW this ε was arrived at (the spike that measured "
-            "it, or the max delta over the same-seed baseline runs on this box) — a bare number is "
-            f"not a tolerance, got {derivation!r}"
-        )
-    registered_sha = epsilon.get("registered_sha")
-    if not isinstance(registered_sha, str) or not GIT_SHA_RE.match(registered_sha):
-        failures.append(
-            "`gang.epsilon.registered_sha` must be the 40-hex commit this ε was registered at, "
-            f"got {registered_sha!r}"
-        )
-        return failures
-    # PRE-registered means: already in history when the measured tree existed.
-    # Checked in the strongest form this checkout can actually establish —
-    # ancestry — never inferred from the artifact's own prose.
-    if not _is_ancestor(registered_sha, repo_root):
-        failures.append(
-            f"`gang.epsilon.registered_sha` ({registered_sha}) is not an ancestor of HEAD — an ε whose "
-            "own registration commit is not in this history was never pre-registered here"
-        )
-        return failures
-    anchor_field, anchor, anchor_failures = _gang_evidence_anchor(data, repo_root)
-    if anchor is None:
-        failures.extend(anchor_failures)
-        return failures
-    if registered_sha == anchor:
-        failures.append(
-            f"`gang.epsilon.registered_sha` equals the artifact's own `{anchor_field}` ({anchor}) — the ε "
-            "must be registered BEFORE the tree that was measured, never in the same commit"
-        )
-    elif not _is_ancestor(registered_sha, repo_root, target=anchor):
-        failures.append(
-            f"`gang.epsilon.registered_sha` ({registered_sha}) is not an ancestor of the measured "
-            f"`{anchor_field}` ({anchor}) — this ε was not on record before the run it gates"
-        )
-    return failures
-
-
-# (field key, validator, why this field is required). The registry IS the
-# schema: a new required field lands as a row here, in the same unit that
-# teaches the leg to emit it.
-def _gang_check_leg(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    leg = gang.get("leg")
-    if leg not in GANG_LEGS:
-        return [f"`gang.leg` must be exactly one of {list(GANG_LEGS)} — which rental leg produced this run, got {leg!r}"]
-    return []
-
-
-def _gang_check_hosts(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    hosts = gang.get("hosts")
-    if isinstance(hosts, bool) or not isinstance(hosts, int):
-        return [f"`gang.hosts` must be an integer host count, got {hosts!r}"]
-    if hosts != GANG_CLUSTER_HOSTS:
-        return [
-            f"`gang.hosts` must be exactly {GANG_CLUSTER_HOSTS} — this leg proves a "
-            f"{GANG_CLUSTER_HOSTS}-host cluster only, got {hosts}"
-        ]
-    return []
-
-
-GANG_UNKNOWN_SENTINELS = ("unknown", "")
-
-
-def _gang_check_cluster_ranks(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    """Beyond shape (one row per rank, non-empty fields), this asserts
-    the properties that make a cluster artifact TRUST-WORTHY evidence of a
-    real two-host run: `host` is DISTINCT across ranks (two ranks on one
-    host is not the two-host bootstrap this leg exists to prove), `host`/
-    `iface` are never the driver's own `unknown` placeholder (a committed
-    `unknown` means the schema was hand-edited around the driver's own
-    assembly-time refusal — see `_rpc_assemble_gang_artifact`), and — kept
-    PER RANK, never collapsed into one shared value at assembly — each
-    rank's own `reduced_vector_digest` is asserted equal across ranks on a
-    `pass` verdict HERE, not merely trusted from an already-collapsed
-    top-level field."""
-    ranks = gang.get("ranks")
-    if not isinstance(ranks, list) or not ranks:
-        return [f"`gang.ranks` must be a non-empty list, one entry per rank, got {ranks!r}"]
-    failures: list[str] = []
-    world = gang.get("world")
-    verdict = gang.get("verdict")
-    if isinstance(world, int) and not isinstance(world, bool) and len(ranks) != world:
-        failures.append(
-            f"`gang.ranks` carries {len(ranks)} entries but `gang.world` is {world} — every rank of "
-            "the cluster gang records its own row"
-        )
-    seen: list[int] = []
-    hosts_seen: list[str] = []
-    digests_seen: list[object] = []
-    for i, entry in enumerate(ranks):
-        if not isinstance(entry, dict):
+def _topology_check_verdict(topo: dict, data: dict) -> list[str]:
+    verdict, reasons = topo.get("verdict"), topo.get("reasons")
+    if verdict not in TOPOLOGY_VERDICTS:
+        return [f"`topology.verdict` must be exactly one of {list(TOPOLOGY_VERDICTS)}, got {verdict!r}"]
+    if not isinstance(reasons, list) or not all(isinstance(r, str) and r.strip() for r in reasons):
+        return [f"`topology.reasons` must be a list of non-empty strings, got {reasons!r}"]
+    if verdict == TOPOLOGY_VERDICT_PASS and reasons:
+        return [f"`topology.verdict` is {TOPOLOGY_VERDICT_PASS!r} but `topology.reasons` names failures"]
+    if verdict == TOPOLOGY_VERDICT_FAIL:
+        failures = []
+        if not reasons:
+            failures.append(f"`topology.verdict` is {TOPOLOGY_VERDICT_FAIL!r} with no `topology.reasons`")
+        status = data.get("status")
+        if isinstance(status, str) and status.strip().upper() == TOPOLOGY_GREEN_STATUS:
             failures.append(
-                f"`gang.ranks[{i}]` must be an object with `rank`, `host`, `device`, `iface`, "
-                f"`reduced_vector_digest`, got {entry!r}"
+                f"`topology.verdict` is {TOPOLOGY_VERDICT_FAIL!r} but the top-level `status` is "
+                f"{TOPOLOGY_GREEN_STATUS}"
             )
-            continue
-        rank = entry.get("rank")
-        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
-            failures.append(f"`gang.ranks[{i}].rank` must be a rank index >= 0, got {rank!r}")
-        else:
-            seen.append(rank)
-        for field in ("host", "device", "iface"):
-            v = entry.get(field)
-            if not isinstance(v, str) or not v.strip():
-                failures.append(f"`gang.ranks[{i}].{field}` must be a non-empty string, got {v!r}")
-            elif field in ("host", "iface") and v.strip().lower() in GANG_UNKNOWN_SENTINELS:
-                failures.append(
-                    f"`gang.ranks[{i}].{field}` is {v!r} — the driver's own assembler refuses to "
-                    "assemble when a rank's host or iface is unresolved; a committed `unknown` means "
-                    "this artifact was hand-edited around that refusal"
-                )
-        host_v = entry.get("host")
-        if isinstance(host_v, str) and host_v.strip():
-            hosts_seen.append(host_v.strip())
-        digest_v = entry.get("reduced_vector_digest")
-        if verdict == GANG_VERDICT_PASS:
-            if not isinstance(digest_v, str) or not GANG_DIGEST_RE.match(digest_v):
-                failures.append(
-                    f"`gang.ranks[{i}].reduced_vector_digest` must be a 64-lowercase-hex digest on a "
-                    f"{GANG_VERDICT_PASS!r} verdict — kept PER RANK, asserted equal across ranks below, "
-                    f"got {digest_v!r}"
-                )
-        elif digest_v is not None and not (isinstance(digest_v, str) and GANG_DIGEST_RE.match(digest_v)):
-            failures.append(
-                f"`gang.ranks[{i}].reduced_vector_digest` must be null or a 64-lowercase-hex digest, "
-                f"got {digest_v!r}"
-            )
-        digests_seen.append(digest_v)
-    if len(set(seen)) != len(seen):
-        failures.append(f"`gang.ranks` repeats a rank index ({sorted(seen)}) — each rank appears once")
-    elif isinstance(world, int) and not isinstance(world, bool) and seen and sorted(seen) != list(range(world)):
-        failures.append(
-            f"`gang.ranks` covers rank indices {sorted(seen)}, not 0..{world - 1} — every rank of the "
-            "cluster gang records its own row"
-        )
-    # Compared case-insensitively (and stripped) -- the SAME
-    # normalization the assembler's own `_norm_host` applies before it ever
-    # writes the artifact, so "Host-A" and "host-a" are never read as two
-    # distinct hosts on either side of the producer/checker boundary.
-    hosts_norm = [h.strip().casefold() for h in hosts_seen]
-    if len(hosts_norm) >= 2 and len(set(hosts_norm)) != len(hosts_norm):
-        failures.append(
-            f"`gang.ranks[].host` repeats a host across ranks ({hosts_seen}, compared case-insensitively) "
-            "— a two-host cluster gang with two ranks on the SAME host is not the two-host bootstrap this "
-            "leg exists to prove"
-        )
-    if verdict == GANG_VERDICT_PASS and len(digests_seen) >= 2:
-        valid = [d for d in digests_seen if isinstance(d, str) and GANG_DIGEST_RE.match(d)]
-        if len(valid) == len(digests_seen) and len(set(valid)) != 1:
-            failures.append(
-                f"`gang.ranks[].reduced_vector_digest` disagree across ranks on a {GANG_VERDICT_PASS!r} "
-                f"verdict ({digests_seen!r}) — a pass asserts the SAME reduced vector at every rank"
-            )
-    return failures
-
-
-def _gang_check_cluster_shape(gang: dict) -> list[str]:
-    """CLUSTER LEG ONLY cross-field check: `hosts` must equal
-    `pod_count` (the cluster's own measured member count — the host count
-    this leg proves is not an independent literal), and `world` must equal
-    `pod_count * gpu_count_per_pod` (the rank count derives from the shape
-    the create response measured, never a second, independently duplicated
-    literal). Silent when an input is not yet the right type — the
-    single-field registry checks already reported that."""
-    failures: list[str] = []
-
-    def _int(v: object) -> bool:
-        return isinstance(v, int) and not isinstance(v, bool)
-
-    hosts, pod_count, gpu_count_per_pod, world = (
-        gang.get("hosts"),
-        gang.get("pod_count"),
-        gang.get("gpu_count_per_pod"),
-        gang.get("world"),
-    )
-    if _int(hosts) and _int(pod_count) and hosts != pod_count:
-        failures.append(
-            f"`gang.hosts` ({hosts}) does not equal `gang.pod_count` ({pod_count}) — the host count "
-            "this leg proves is the cluster's own measured member count"
-        )
-    if _int(world) and _int(pod_count) and _int(gpu_count_per_pod) and world != pod_count * gpu_count_per_pod:
-        failures.append(
-            f"`gang.world` ({world}) does not equal `gang.pod_count` x `gang.gpu_count_per_pod` "
-            f"({pod_count} x {gpu_count_per_pod} = {pod_count * gpu_count_per_pod}) — the rank count "
-            "derives from the create response's own shape, never a second literal"
-        )
-    return failures
-
-
-def _gang_check_leg_producer_binding(gang: dict, data: dict, _repo_root: Path) -> list[str]:
-    """`gang.leg` names which rental driver produced this artifact —
-    bound to `producer.path` so a self-declared leg cannot dodge the other
-    leg's (stricter- or differently-shaped) registry by pointing at a
-    different driver, or at no driver at all. A leg with NO
-    `GANG_LEG_PRODUCER_PATH` entry (a THIRD leg added without a row) has no registered producer to bind against at ALL -- that is
-    a REFUSAL, never a silent pass just because there is nothing to compare
-    `producer.path` to; an artifact cannot claim a leg this tree has no
-    producer for."""
-    leg = gang.get("leg")
-    if leg not in GANG_LEG_PRODUCER_PATH:
-        return [
-            f"`gang.leg` == {leg!r} has no registered producer on this tree ({sorted(GANG_LEG_PRODUCER_PATH)} "
-            "are the only legs with a shipped renting driver) — refused; an artifact for this leg cannot be "
-            "accepted until a driver is registered for it"
-        ]
-    expected = GANG_LEG_PRODUCER_PATH[leg]
-    producer = data.get("producer")
-    path = producer.get("path") if isinstance(producer, dict) else None
-    if path != expected:
-        return [
-            f"`gang.leg` == {leg!r} requires `producer.path` == {expected!r} (that leg's own renting "
-            f"driver — the sole writer of its artifact), got {path!r}"
-        ]
+        return failures
     return []
 
 
-def _gang_check_reduced_vector_digest(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    digest = gang.get("reduced_vector_digest")
-    verdict = gang.get("verdict")
-    if verdict == GANG_VERDICT_PASS:
-        if not isinstance(digest, str) or not GANG_DIGEST_RE.match(digest):
-            return [
-                f"`gang.reduced_vector_digest` must be a 64-lowercase-hex digest on a "
-                f"{GANG_VERDICT_PASS!r} verdict (equal across both ranks — asserted BEFORE the driver "
-                f"assembles this artifact), got {digest!r}"
-            ]
-        return []
-    if digest is not None and not (isinstance(digest, str) and GANG_DIGEST_RE.match(digest)):
-        return [f"`gang.reduced_vector_digest` must be null or a 64-lowercase-hex digest, got {digest!r}"]
-    return []
-
-
-def _gang_check_pod_count(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    v = gang.get("pod_count")
-    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-        return [f"`gang.pod_count` must be a positive integer (the create response's own member count), got {v!r}"]
-    return []
-
-
-def _gang_check_gpu_count_per_pod(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    v = gang.get("gpu_count_per_pod")
-    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-        return [
-            f"`gang.gpu_count_per_pod` must be a positive integer (the create response's own shape), got {v!r}"
-        ]
-    return []
-
-
-def _gang_check_ttl_hours(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    v = gang.get("ttl_hours")
-    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-        return [f"`gang.ttl_hours` must be a positive integer (the cluster's own deadline), got {v!r}"]
-    return []
-
-
-# The two-HOST bootstrap can be
-# rented over TWO independent RunPod object types -- an INSTANT CLUSTER
-# (`POST /v2/clusters`, near-zero capacity) or two ORDINARY pods joined by
-# Global Networking (`POST /v2/pods` x2, the default -- ordinary pods
-# provision reliably where clusters do not). `gang.leg` stays `"cluster"`
-# either way (the two-HOST leg is the fact that matters to every OTHER
-# reader of this registry); `gang.transport` is the sub-fact naming WHICH
-# mechanism actually carried it, closed-set, required, so a reader can
-# never mistake a Global-Networking run for an Instant-Cluster one.
-GANG_TRANSPORT_INSTANT_CLUSTER = "instant-cluster"
-GANG_TRANSPORT_GLOBAL_NETWORKING = "global-networking"
-GANG_TRANSPORTS = (GANG_TRANSPORT_INSTANT_CLUSTER, GANG_TRANSPORT_GLOBAL_NETWORKING)
-
-
-def _gang_check_transport(gang: dict, _data: dict, _repo_root: Path) -> list[str]:
-    v = gang.get("transport")
-    if v not in GANG_TRANSPORTS:
-        return [
-            f"`gang.transport` must be exactly one of {list(GANG_TRANSPORTS)} -- which RENTAL MECHANISM "
-            f"actually carried this two-host run, got {v!r}"
-        ]
-    return []
-
-
-# The POD-leg registry.
-GANG_POD_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
-    (
-        "world",
-        _gang_check_world,
-        "the rank count the run actually ran at — every other field is read against it",
-    ),
-    (
-        "collective",
-        _gang_check_collective,
-        "which collective carried the reduction; the same topology over a different collective is a "
-        "different run",
-    ),
-    (
-        "ranks",
-        _gang_check_ranks,
-        "the device each rank held — one entry per rank, so a 'two-GPU' run that silently placed both "
-        "ranks on one device cannot be recorded as a gang",
-    ),
-    (
-        "digests",
-        _gang_check_digests,
-        "the same-seed digest PAIR the equal-topology reproducibility oracle produces. Equality is "
-        f"ASSERTED on a {GANG_VERDICT_PASS!r} verdict at `world` {GANG_DIGEST_EQUALITY_WORLD} (the "
-        "regime a spike measured byte-identical for candle 0.11's LoRA-shaped forward/backward/SGD "
-        "on A100s with no env pins) and merely RECORDED above that world — the NCCL pin set is "
-        "untested at world >= 3, and a state defined by missing evidence gets no "
-        f"definite consequence. A {GANG_VERDICT_FAIL!r} verdict records its pair as measured",
-    ),
-    (
-        "per_step_loss_delta",
-        _gang_check_delta_series,
-        "the MEASURED per-step loss delta — the quantity ε is about; an artifact carrying ε and no "
-        "delta records a tolerance with nothing to tolerate",
-    ),
-    (
-        "epsilon",
-        _gang_check_epsilon,
-        "the pre-registered tolerance, its derivation, and the commit it was registered at — a STRICT "
-        "ancestor of this artifact's evidence anchor (`git_sha` when that is in this history, else "
-        "`merged_as` as the rescue; neither in this history is a FAIL, never a skip — see "
-        "`_gang_evidence_anchor`)",
-    ),
-    (
-        "verdict",
-        _gang_check_verdict,
-        f"the leg's own call, exactly {list(GANG_VERDICTS)}. Without it a FAILING gang run is not "
-        "representable at all: the tolerance and digest-equality assertions would refuse to record "
-        f"the very numbers a non-reproducible run must leave behind. A {GANG_VERDICT_FAIL!r} carries "
-        f"a non-empty `gang.reason` and a top-level `status` that is not {GANG_GREEN_STATUS}",
-    ),
-)
-
-# The CLUSTER-leg registry: world/collective/verdict are shared with
-# the pod leg (the identical `_gang_check_world`/`_gang_check_collective`/
-# `_gang_check_verdict` validators — the SAME property binds on either leg);
-# `hosts`/`ranks`(host+device+iface)/`reduced_vector_digest` are this leg's
-# OWN topology and reproducibility claim; `pod_count`/`gpu_count_per_pod`/
-# `ttl_hours` are the shape it was RENTED at, as measured from the create
-# response. Deliberately NO `digests`/`per_step_loss_delta`/`epsilon` row —
-# those are the pod leg's training-loss reproducibility bound, a regime
-# this leg does not run at all (see the section comment above).
-GANG_CLUSTER_FIELD_REGISTRY: tuple[tuple[str, object, str], ...] = (
-    (
-        "world",
-        _gang_check_world,
-        "the rank count the run actually ran at — every other field is read against it",
-    ),
-    (
-        "collective",
-        _gang_check_collective,
-        "which collective carried the reduction; the same topology over a different collective is a "
-        "different run",
-    ),
-    (
-        "hosts",
-        _gang_check_hosts,
-        f"the host count this leg proves — exactly {GANG_CLUSTER_HOSTS}, the two-HOST bootstrap "
-        "(`ncclCommInitRank`) this leg exists to exercise",
-    ),
-    (
-        "ranks",
-        _gang_check_cluster_ranks,
-        "the host/device/iface each rank held — one entry per rank, so a run that silently collapsed "
-        "both ranks onto one host cannot be recorded as a two-host gang",
-    ),
-    (
-        "reduced_vector_digest",
-        _gang_check_reduced_vector_digest,
-        "the bit-exact reduced-vector digest, equal across both ranks on a pass (asserted by the "
-        "driver BEFORE assembly — never re-derived here) — a bit-exact sum, never conflated with the "
-        "pod leg's LoRA-shaped same-seed reproducibility PAIR",
-    ),
-    (
-        "verdict",
-        _gang_check_verdict,
-        f"the leg's own call, exactly {list(GANG_VERDICTS)}. A {GANG_VERDICT_FAIL!r} carries a "
-        f"non-empty `gang.reason` and a top-level `status` that is not {GANG_GREEN_STATUS}",
-    ),
-    (
-        "pod_count",
-        _gang_check_pod_count,
-        "the cluster's own member count, as measured from the create response",
-    ),
-    (
-        "gpu_count_per_pod",
-        _gang_check_gpu_count_per_pod,
-        "the cluster's own per-pod GPU count, as measured from the create response",
-    ),
-    (
-        "ttl_hours",
-        _gang_check_ttl_hours,
-        "the cluster's own deadline, baked into its entrypoint at create time",
-    ),
-    (
-        "transport",
-        _gang_check_transport,
-        f"which RENTAL MECHANISM carried this two-host run -- exactly one of {list(GANG_TRANSPORTS)} -- so "
-        "a reader never mistakes a Global-Networking run for an Instant-Cluster one",
-    ),
+# key -> (validator, why the field is required).
+TOPOLOGY_FIELD_REGISTRY: tuple = (
+    ("hosts", _topology_check_shape, "the fleet's shape: how many machines, how many GPUs each"),
+    ("gpus_per_host", _topology_check_shape, "the fleet's shape: how many machines, how many GPUs each"),
+    ("one_host", _topology_check_one_host, "the one-host cell's passed tests, device and product"),
+    ("nccl_version", _topology_check_nccl_version, "the NCCL runtime the fleet's communicators ran"),
+    ("fleet", _topology_check_fleet, "the multi-host runs, the reference and ε"),
+    ("verdict", _topology_check_verdict, "the lane's own call; a failing run is representable"),
+    ("reasons", _topology_check_verdict, "what failed, empty on a pass"),
 )
 
 
-def gang_anchors(data: dict, relpath: str) -> list[str]:
-    """Which independent anchor(s) declare this artifact a gang artifact.
-    Three of them (rule (j)'s own shape), so dropping any ONE — renaming the
-    kind key, folding the block away, renaming the file — does not silently
-    return the artifact to the unchecked state."""
+def _topology_check_claims(topo: dict) -> list[str]:
+    """On a `pass`: the transports agree byte for byte and the gang is within
+    ε of the single rank. Only read once the registry validated the parts."""
+    fleet = topo["fleet"]
+    nccl, inline = fleet["nccl"], fleet["inline"]
+    failures: list[str] = [
+        f"`topology.fleet.{name}` records a pass whose gang took {fleet[name]['attempts']} attempts "
+        "— a retry that published hides a hang"
+        for name in TOPOLOGY_RUN_TRANSPORTS
+        if fleet[name]["attempts"] != 1
+    ]
+    if nccl["loss_curve"] != inline["loss_curve"]:
+        failures.append("`topology.fleet` records a pass whose two transports' loss curves differ")
+    if nccl["embeddings_sha256"] != inline["embeddings_sha256"]:
+        failures.append("`topology.fleet` records a pass whose two transports' embeddings differ")
+    if fleet["max_loss_delta_vs_reference"] > fleet["epsilon"]:
+        failures.append(
+            f"`topology.fleet.max_loss_delta_vs_reference` ({fleet['max_loss_delta_vs_reference']}) "
+            f"exceeds ε ({fleet['epsilon']}) on a pass — record it as {TOPOLOGY_VERDICT_FAIL!r}"
+        )
+    return failures
+
+
+def topology_anchors(data: dict, relpath: str) -> list[str]:
+    """Which independent anchor(s) declare this a topology artifact — three,
+    so dropping any ONE does not return it to the unchecked state."""
     anchors: list[str] = []
-    if data.get(ARTIFACT_KIND_KEY) == GANG_ARTIFACT_KIND:
-        anchors.append(f"{ARTIFACT_KIND_KEY} == {GANG_ARTIFACT_KIND!r}")
-    if isinstance(data.get(GANG_BLOCK_KEY), dict):
-        anchors.append(f"a top-level `{GANG_BLOCK_KEY}` block")
-    if GANG_ARTIFACT_FILENAME_RE.search(relpath.rsplit("/", 1)[-1]):
-        anchors.append("the committed filename (GANG_ARTIFACT_FILENAME_RE)")
+    if data.get(ARTIFACT_KIND_KEY) == TOPOLOGY_ARTIFACT_KIND:
+        anchors.append(f"{ARTIFACT_KIND_KEY} == {TOPOLOGY_ARTIFACT_KIND!r}")
+    if isinstance(data.get(TOPOLOGY_BLOCK_KEY), dict):
+        anchors.append(f"a top-level `{TOPOLOGY_BLOCK_KEY}` block")
+    if TOPOLOGY_ARTIFACT_FILENAME_RE.search(relpath.rsplit("/", 1)[-1]):
+        anchors.append("the committed filename (TOPOLOGY_ARTIFACT_FILENAME_RE)")
     return anchors
 
 
-def check_gang_artifact(data: dict, relpath: str, repo_root: Path) -> list[str]:
-    """Rule (k): an artifact declared `gang` by ANY anchor must carry the
-    complete leg-appropriate registry payload. `gang.leg` is checked FIRST —
-    it decides whether `GANG_POD_FIELD_REGISTRY` or
-    `GANG_CLUSTER_FIELD_REGISTRY` applies — and a missing or unrecognized
-    leg stops the check there (nothing else is checkable without knowing
-    which schema applies). An artifact declared by none of the anchors is
-    not a gang artifact and is untouched by this rule."""
-    anchors = gang_anchors(data, relpath)
+def check_topology_artifact(data: dict, relpath: str, _repo_root: Path) -> list[str]:
+    """Rule (k): an artifact declared `topology` by ANY anchor carries the
+    whole registry payload, names the lane's driver as its producer, and —
+    on a `pass` — satisfies the cross-field claims."""
+    anchors = topology_anchors(data, relpath)
     if not anchors:
         return []
-    if data.get(ARTIFACT_KIND_KEY) != GANG_ARTIFACT_KIND:
+    if data.get(ARTIFACT_KIND_KEY) != TOPOLOGY_ARTIFACT_KIND:
         return [
-            f"declared a gang artifact by {anchors[0]} but `{ARTIFACT_KIND_KEY}` is "
-            f"{data.get(ARTIFACT_KIND_KEY)!r} — a gang artifact names its own kind"
+            f"declared a topology artifact by {anchors[0]} but `{ARTIFACT_KIND_KEY}` is "
+            f"{data.get(ARTIFACT_KIND_KEY)!r} — a topology artifact names its own kind"
         ]
-    gang = data.get(GANG_BLOCK_KEY)
-    if not isinstance(gang, dict):
+    topo = data.get(TOPOLOGY_BLOCK_KEY)
+    if not isinstance(topo, dict):
         return [
-            f"`{ARTIFACT_KIND_KEY}` is {GANG_ARTIFACT_KIND!r} but there is no `{GANG_BLOCK_KEY}` "
-            f"object carrying `leg` plus the leg-appropriate rows (pod: "
-            f"{', '.join(f'`{k}`' for k, _v, _w in GANG_POD_FIELD_REGISTRY)}; cluster: "
-            f"{', '.join(f'`{k}`' for k, _v, _w in GANG_CLUSTER_FIELD_REGISTRY)})"
+            f"`{ARTIFACT_KIND_KEY}` is {TOPOLOGY_ARTIFACT_KIND!r} but there is no `{TOPOLOGY_BLOCK_KEY}` "
+            f"object carrying {', '.join(f'`{k}`' for k, _v, _w in TOPOLOGY_FIELD_REGISTRY)}"
         ]
     failures: list[str] = []
-    if "leg" not in gang:
+    producer = data.get("producer")
+    if not isinstance(producer, dict) or producer.get("path") != TOPOLOGY_PRODUCER_PATH:
         failures.append(
-            f"`{GANG_BLOCK_KEY}.leg` is missing — every gang artifact names which rental leg produced "
-            f"it, exactly one of {list(GANG_LEGS)}"
+            f"a topology artifact requires `producer.path` == {TOPOLOGY_PRODUCER_PATH!r} — the "
+            "lane's driver is the sole writer of this kind"
         )
-    else:
-        failures.extend(_gang_check_leg(gang, data, repo_root))
-    leg = gang.get("leg")
-    if leg not in GANG_LEGS:
+    missing = [(k, why) for k, _v, why in TOPOLOGY_FIELD_REGISTRY if k not in topo]
+    failures.extend(f"`{TOPOLOGY_BLOCK_KEY}.{k}` is missing — {why}" for k, why in missing)
+    if missing:
         return failures
-    failures.extend(_gang_check_leg_producer_binding(gang, data, repo_root))
-    registry = GANG_POD_FIELD_REGISTRY if leg == GANG_LEG_POD else GANG_CLUSTER_FIELD_REGISTRY
-    for key, validator, why in registry:
-        if key not in gang:
-            failures.append(f"`{GANG_BLOCK_KEY}.{key}` is missing — {why}")
-            continue
-        failures.extend(validator(gang, data, repo_root))
-    if leg == GANG_LEG_CLUSTER:
-        failures.extend(_gang_check_cluster_shape(gang))
-        return failures
-    if leg != GANG_LEG_POD:
-        return failures
-    # Cross-field (POD LEG ONLY): on a `pass`, the recorded delta is read
-    # against the recorded ε. A committed artifact whose own numbers
-    # contradict its own verdict is a finding here, not a thing a later
-    # reader has to notice by hand. On a `fail` the deltas are admitted
-    # exactly as measured — a run that blew its tolerance is what a `fail`
-    # IS, and refusing to record it would leave the corpus with only the
-    # runs that went well. The cluster leg carries no ε/delta row at all
-    # (see GANG_CLUSTER_FIELD_REGISTRY's own comment), so this block never
-    # runs for it.
-    deltas = gang.get("per_step_loss_delta")
-    epsilon = gang.get("epsilon")
-    if (
-        gang.get("verdict") == GANG_VERDICT_PASS
-        and isinstance(deltas, list)
-        and deltas
-        and all(_is_real_number(v) for v in deltas)
-        and isinstance(epsilon, dict)
-        and _is_real_number(epsilon.get("value"))
-        # Deliberately redundant with `_gang_check_epsilon`'s own `value > 0`
-        # guard (that validator runs unconditionally, above, in the
-        # GANG_POD_FIELD_REGISTRY loop): this cross-field block runs
-        # regardless of whether that validator already appended a failure,
-        # so without this guard a malformed epsilon (0, negative, or
-        # non-numeric) would ALSO produce a nonsensical "worst step exceeds
-        # epsilon.value" finding piled on top of the primary
-        # `gang.epsilon.value must be...` one. Pinned here, not dropped: the
-        # two checks read the same field for two different questions (is
-        # epsilon well-formed vs. does the measured delta respect it) and
-        # this block must not run its own comparison against a value the
-        # other validator already rejected.
-        and epsilon["value"] > 0
-    ):
-        worst = max(abs(v) for v in deltas)
-        # Strict `>`, deliberately: `worst == epsilon.value` is INSIDE the
-        # tolerance (inclusive), never a boundary failure — ε is "within",
-        # not "strictly less than". A fixture at exactly that boundary stays
-        # green (see the self-test's own boundary case).
-        if worst > epsilon["value"]:
-            failures.append(
-                f"`{GANG_BLOCK_KEY}.per_step_loss_delta`'s worst step ({worst}) exceeds "
-                f"`{GANG_BLOCK_KEY}.epsilon.value` ({epsilon['value']}) — this artifact records a run "
-                f"that failed its own pre-registered tolerance as a {GANG_VERDICT_PASS!r}; record it "
-                f"as {GANG_VERDICT_FAIL!r} with its own `{GANG_BLOCK_KEY}.reason`"
-            )
+    part_failures: list[str] = []
+    for validator in dict.fromkeys(v for _k, v, _w in TOPOLOGY_FIELD_REGISTRY):
+        part_failures.extend(validator(topo, data))
+    failures.extend(part_failures)
+    if not part_failures and topo["verdict"] == TOPOLOGY_VERDICT_PASS:
+        failures.extend(_topology_check_claims(topo))
     return failures
 
 
@@ -2505,7 +1870,7 @@ def validate_artifact(
     failures += check_none_allowlist(data, relpath, allowlist)
     failures += check_ancestry(data, repo_root)
     failures += check_oracle_separation(data)
-    failures += check_gang_artifact(data, relpath, repo_root)
+    failures += check_topology_artifact(data, relpath, repo_root)
     return failures
 
 
@@ -2701,13 +2066,13 @@ def self_test() -> int:
         # be tracked (rule (b)) so its own findings never contaminate the
         # marker-specific `expect_hit` needle below.
         (perf_dir / "profile_421_legs.sh").write_text("# stub source-identity-declaring producer\n")
-        # Tracked stand-ins for the two gang-leg renting drivers, so
-        # `_gang_check_leg_producer_binding`'s own path=="the leg's own
-        # driver" assertion has a real, `git ls-files`-tracked file to bind
-        # against (rule (b) — producer.path exists and is tracked).
+        # Tracked stand-ins for the topology lane's driver (rule (k)'s
+        # producer binding) and another paid driver (the binding's RED case),
+        # so rule (b) — producer.path exists and is tracked — never
+        # contaminates rule (k)'s own needles.
         (repo / "ci" / "scripts").mkdir(parents=True, exist_ok=True)
-        (repo / "ci" / "scripts" / "runpod_gpu_gang.sh").write_text("# stub pod-leg gang driver\n")
-        (repo / "ci" / "scripts" / "runpod_gpu_cluster.sh").write_text("# stub cluster-leg gang driver\n")
+        (repo / "ci" / "scripts" / "runpod_gpu_topology.sh").write_text("# stub topology driver\n")
+        (repo / "ci" / "scripts" / "runpod_gpu_prove.sh").write_text("# stub prove driver\n")
 
         # A producer committed at the root and deleted by the next commit:
         # retired, but in this history.
@@ -3160,687 +2525,148 @@ def self_test() -> int:
         ok["producer"]["path"] = "crates/no-rf-crate/tests/cuda_parity.rs"
         expect_clean(ok, "control-superseded.json", "rule (c): a superseded record is not held to its producer")
 
-        # rule (k) — the `gang` artifact kind -----------------------------------
-        # One mutation per DETERMINANT of the kind: each required field
-        # removed, then each malformed in the way that field is actually
-        # gettable wrong, plus the two anchors that must not let an artifact
-        # slip back into the unchecked state, plus the delta-vs-ε
-        # cross-field. Every needle below names the field, so the finding a
-        # producer reads tells it which part of its own payload is wrong.
-        def gang_baseline() -> dict:
+        # rule (k) — the `topology` artifact kind --------------------------------
+        # One mutation per DETERMINANT: each required field removed, each part
+        # malformed the way it is actually gettable wrong, each cross-field
+        # claim broken on a pass (and admitted on a fail), the producer
+        # binding, and each of the three anchors.
+        def topology_baseline() -> dict:
             d = baseline()
-            # A gang artifact measures a tree; its ε was registered EARLIER
-            # (root_sha), which is what makes it pre-registered.
-            d["git_sha"] = second_sha
-            d["artifact_kind"] = "gang"
-            # Producer bound to the pod leg's OWN renting driver — a
-            # self-declared `leg` cannot point at a different (or no)
-            # driver script.
+            d["artifact_kind"] = "topology"
             d["producer"] = {
-                "path": "ci/scripts/runpod_gpu_gang.sh",
+                "path": "ci/scripts/runpod_gpu_topology.sh",
                 "kind": "script",
-                "invocation": "bash ci/scripts/runpod_gpu_gang.sh",
-                "gating": "none",
+                "invocation": "bash ci/scripts/runpod_gpu_topology.sh",
+                "gating": "feature:live-gpu-gang-tests",
             }
-            d["gang"] = {
-                "leg": "pod",
-                "world": 2,
-                "collective": "nccl",
-                "ranks": [
-                    {"rank": 0, "device": "cuda:0 NVIDIA A100-SXM4-80GB"},
-                    {"rank": 1, "device": "cuda:1 NVIDIA A100-SXM4-80GB"},
-                ],
-                "digests": [
-                    {"seed": 7, "digest": "a" * 64},
-                    {"seed": 7, "digest": "a" * 64},
-                ],
-                "per_step_loss_delta": [0.0, 1.0e-7, 2.0e-7],
-                "epsilon": {
-                    "value": 1.0e-6,
-                    "derivation": (
-                        "max |per-step loss delta| over three same-seed baseline runs on this box, "
-                        "registered before the first gating run"
-                    ),
-                    "registered_sha": root_sha,
+
+            def run(transport: str) -> dict:
+                return {
+                    "job_id": f"job-{transport}",
+                    "status": "completed",
+                    "transport": transport,
+                    "attempts": 1,
+                    "ranks": [
+                        {"instance": f"i{r}-{transport}", "label": f"h{r // 2}-gpu{r % 2}", "host": f"pod{r // 2}"}
+                        for r in range(4)
+                    ],
+                    "loss_curve": [0.9, 0.7, 0.6],
+                    "embeddings_sha256": "a" * 64,
+                }
+
+            d["topology"] = {
+                "hosts": 2,
+                "gpus_per_host": 2,
+                "nccl_version": ["2.23.4"],
+                "one_host": {
+                    "device_tests": ["gang_nccl::an_abort_ends_a_real_nccl_wait_on_a_rank_that_never_joins"],
+                    "product_tests": ["gpu::topology::every_gpu_topology_and_transport_publishes_the_same_adapter"],
+                },
+                "fleet": {
+                    "world_size": 4,
+                    "nccl": run("Nccl"),
+                    "inline": run("Inline"),
+                    "reference": {"job_id": "job-ref", "loss_curve": [0.9, 0.7, 0.6]},
+                    "max_loss_delta_vs_reference": 2e-5,
+                    "epsilon": 1e-4,
                 },
                 "verdict": "pass",
+                "reasons": [],
             }
             return d
 
-        def gang_cluster_baseline() -> dict:
-            d = baseline()
-            d["git_sha"] = second_sha
-            d["artifact_kind"] = "gang"
-            # Producer bound to the cluster leg's OWN renting driver.
-            d["producer"] = {
-                "path": "ci/scripts/runpod_gpu_cluster.sh",
-                "kind": "script",
-                "invocation": "bash ci/scripts/runpod_gpu_cluster.sh",
-                "gating": "none",
-            }
-            d["gang"] = {
-                "leg": "cluster",
-                "world": 2,
-                "collective": "nccl",
-                "hosts": 2,
-                "ranks": [
-                    {
-                        "rank": 0,
-                        "host": "runpod-member-0",
-                        "device": "cuda:0",
-                        "iface": "ens1",
-                        "reduced_vector_digest": "b" * 64,
-                    },
-                    {
-                        "rank": 1,
-                        "host": "runpod-member-1",
-                        "device": "cuda:0",
-                        "iface": "ens1",
-                        "reduced_vector_digest": "b" * 64,
-                    },
-                ],
-                "reduced_vector_digest": "b" * 64,
-                "verdict": "pass",
-                "pod_count": 2,
-                "gpu_count_per_pod": 1,
-                "ttl_hours": 1,
-                "transport": "instant-cluster",
-            }
-            return d
+        expect_clean(topology_baseline(), "2026-01-01-topology-a6000.json", "rule (k): complete topology artifact")
+        expect_clean(baseline(), "control-single-device.json", "rule (k): a non-topology artifact is untouched")
 
-        expect_clean(gang_baseline(), "2026-01-01-gang-2xa100.json", "rule (k): complete pod-leg gang artifact")
-        expect_clean(
-            gang_cluster_baseline(),
-            "2026-01-01-gang-cluster-2x1.json",
-            "rule (k): complete cluster-leg gang artifact",
-        )
+        for field in ("hosts", "gpus_per_host", "one_host", "nccl_version", "fleet", "verdict", "reasons"):
+            bad = topology_baseline()
+            del bad["topology"][field]
+            expect_hit(bad, "x.json", f"`topology.{field}` is missing", f"rule (k): missing topology.{field}")
 
-        # A non-gang artifact is untouched by this rule (every artifact
-        # committed before the kind existed stays green).
-        expect_clean(
-            baseline(), "control-single-device.json", "rule (k): non-gang artifact is not gang-checked"
-        )
+        bad = topology_baseline()
+        bad["topology"]["hosts"] = 1
+        expect_hit(bad, "x.json", "`topology.hosts` must be an integer >= 2", "rule (k): one host")
+        bad = topology_baseline()
+        bad["topology"]["gpus_per_host"] = True
+        expect_hit(bad, "x.json", "`topology.gpus_per_host` must be an integer >= 2", "rule (k): bool GPU count")
+        bad = topology_baseline()
+        bad["topology"]["one_host"]["product_tests"] = []
+        expect_hit(bad, "x.json", "`topology.one_host.product_tests` must be a non-empty list", "rule (k): no product tests")
+        bad = topology_baseline()
+        bad["topology"]["nccl_version"] = ["2.23.4", "2.21.5"]
+        expect_hit(bad, "x.json", "`topology.nccl_version` must list exactly the one", "rule (k): mixed NCCL runtimes")
+        bad = topology_baseline()
+        bad["topology"]["fleet"]["world_size"] = 2
+        expect_hit(bad, "x.json", "must be `hosts` x `gpus_per_host`", "rule (k): world is not one rank per GPU")
+        bad = topology_baseline()
+        bad["topology"]["fleet"]["nccl"]["transport"] = "Inline"
+        expect_hit(bad, "x.json", "`topology.fleet.nccl`.transport must be 'Nccl'", "rule (k): nccl run selected inline")
+        bad = topology_baseline()
+        for rank in bad["topology"]["fleet"]["inline"]["ranks"]:
+            rank["host"] = "pod0"
+        expect_hit(bad, "x.json", "ranks span 1 host(s)", "rule (k): a run that never left one host")
+        bad = topology_baseline()
+        bad["topology"]["fleet"]["nccl"]["ranks"][1]["instance"] = "i0-Nccl"
+        expect_hit(bad, "x.json", "repeats an instance", "rule (k): two ranks in one process")
+        bad = topology_baseline()
+        del bad["topology"]["fleet"]["nccl"]["ranks"][2]
+        expect_hit(bad, "x.json", "carries 3 rank(s) for a world of 4", "rule (k): a missing rank")
+        bad = topology_baseline()
+        bad["topology"]["fleet"]["inline"]["embeddings_sha256"] = "nope"
+        expect_hit(bad, "x.json", "embeddings_sha256 must be a 64-lowercase-hex digest", "rule (k): malformed digest")
+        bad = topology_baseline()
+        bad["topology"]["fleet"]["reference"]["loss_curve"] = []
+        expect_hit(bad, "x.json", "`topology.fleet.reference.loss_curve` must be", "rule (k): no reference curve")
+        bad = topology_baseline()
+        bad["topology"]["fleet"]["epsilon"] = 1e-3
+        expect_hit(bad, "x.json", "must be the trainer's registered", "rule (k): a loosened ε")
+        bad = topology_baseline()
+        bad["topology"]["verdict"] = "PASS"
+        expect_hit(bad, "x.json", "`topology.verdict` must be exactly one of", "rule (k): verdict in the wrong case")
+        bad = topology_baseline()
+        bad["topology"]["reasons"] = ["something failed"]
+        expect_hit(bad, "x.json", "but `topology.reasons` names failures", "rule (k): a pass with reasons")
 
-        # `leg` itself: missing, and each unrecognized/legacy value.
-        bad = gang_baseline()
-        del bad["gang"]["leg"]
-        expect_hit(bad, "x.json", "`gang.leg` is missing", "rule (k): missing gang.leg")
-        bad = gang_baseline()
-        bad["gang"]["leg"] = "solo"
-        expect_hit(bad, "x.json", "`gang.leg` must be exactly one of", "rule (k): leg outside the closed set")
-
-        for field in ("world", "collective", "ranks", "digests", "per_step_loss_delta", "epsilon", "verdict"):
-            bad = gang_baseline()
-            del bad["gang"][field]
-            expect_hit(bad, "x.json", f"`gang.{field}` is missing", f"rule (k): pod leg missing gang.{field}")
-
-        # A pod artifact lacking epsilon fails (covered by the loop above;
-        # re-stated standalone as the canonical example).
-        bad = gang_baseline()
-        del bad["gang"]["epsilon"]
-        expect_hit(bad, "x.json", "`gang.epsilon` is missing", "rule (k): a pod artifact lacking epsilon still fails")
-
-        # Cluster leg: missing rows, one per registry entry (a cluster
-        # artifact lacking `hosts` fails by name, and so does every sibling
-        # row).
-        for field in (
-            "world",
-            "collective",
-            "hosts",
-            "ranks",
-            "reduced_vector_digest",
-            "verdict",
-            "pod_count",
-            "gpu_count_per_pod",
-            "ttl_hours",
-            "transport",
+        # The cross-field claims, broken on a pass, admitted on a fail.
+        for mutate, needle, label in (
+            (lambda t: t["fleet"]["inline"].update(loss_curve=[0.9, 0.7, 0.61]), "loss curves differ", "curves"),
+            (lambda t: t["fleet"]["inline"].update(embeddings_sha256="b" * 64), "embeddings differ", "embeddings"),
+            (lambda t: t["fleet"].update(max_loss_delta_vs_reference=2e-4), "exceeds ε", "delta beyond ε"),
+            (lambda t: t["fleet"]["nccl"].update(attempts=2), "took 2 attempts", "retried gang"),
         ):
-            bad = gang_cluster_baseline()
-            del bad["gang"][field]
-            expect_hit(
-                bad, "x.json", f"`gang.{field}` is missing", f"rule (k): cluster leg missing gang.{field}"
-            )
-
-        # `transport` -- closed set, both spellings accepted, anything
-        # else refused.
-        for good_transport in ("instant-cluster", "global-networking"):
-            ok = gang_cluster_baseline()
-            ok["gang"]["transport"] = good_transport
-            expect_clean(ok, "x.json", f"rule (k): transport={good_transport!r} is accepted")
-        bad = gang_cluster_baseline()
-        bad["gang"]["transport"] = "carrier-pigeon"
-        expect_hit(bad, "x.json", "`gang.transport` must be exactly one of", "rule (k): transport outside the closed set")
-        bad = gang_cluster_baseline()
-        bad["gang"]["transport"] = "cluster"
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.transport` must be exactly one of",
-            "rule (k): transport must not be confused with `gang.leg`'s own value",
-        )
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["hosts"] = 3
-        expect_hit(bad, "x.json", "must be exactly 2", "rule (k): cluster hosts != 2")
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"] = [
-            {"rank": 0, "host": "h0", "device": "cuda:0", "iface": "ens1"},
-        ]
-        expect_hit(
-            bad, "x.json", "gang.ranks` carries 1 entries but", "rule (k): cluster ranks count != world"
-        )
-
-        bad = gang_cluster_baseline()
-        del bad["gang"]["ranks"][0]["iface"]
-        expect_hit(bad, "x.json", "`gang.ranks[0].iface` must be a non-empty string", "rule (k): cluster rank missing iface")
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"][1]["rank"] = 0
-        expect_hit(bad, "x.json", "repeats a rank index", "rule (k): cluster ranks repeat an index")
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["reduced_vector_digest"] = None
-        expect_hit(
-            bad,
-            "x.json",
-            "must be a 64-lowercase-hex digest on a 'pass' verdict",
-            "rule (k): cluster pass with no reduced_vector_digest",
-        )
-
-        ok = gang_cluster_baseline()
-        ok["gang"]["verdict"] = "fail"
-        ok["gang"]["reason"] = "rank 1 disagreed with rank 0's reduced vector"
-        ok["gang"]["reduced_vector_digest"] = None
-        ok["status"] = "RED"
-        expect_clean(ok, "control-cluster-fail-no-digest.json", "rule (k): a cluster fail may record no digest at all")
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["pod_count"] = 0
-        expect_hit(bad, "x.json", "`gang.pod_count` must be a positive integer", "rule (k): cluster pod_count 0")
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["gpu_count_per_pod"] = -1
-        expect_hit(
-            bad, "x.json", "`gang.gpu_count_per_pod` must be a positive integer", "rule (k): cluster gpu_count_per_pod negative"
-        )
-
-        bad = gang_cluster_baseline()
-        bad["gang"]["ttl_hours"] = 0
-        expect_hit(bad, "x.json", "`gang.ttl_hours` must be a positive integer", "rule (k): cluster ttl_hours 0")
-
-        # The cluster leg carries NO ε/delta cross-field check at all -- a
-        # cluster artifact with those keys simply present (never required,
-        # never validated) does not trip the pod-only cross-field block.
-        odd = gang_cluster_baseline()
-        odd["gang"]["per_step_loss_delta"] = [999.0]
-        odd["gang"]["epsilon"] = {"value": 1e-9}
-        expect_clean(
-            odd,
-            "control-cluster-extra-pod-fields-ignored.json",
-            "rule (k): cluster leg ignores stray pod-only fields rather than cross-checking them",
-        )
-
-        # the cluster registry's cross-rank properties ------------------------
-        # (i) two ranks on one host FAILS (not the two-host bootstrap this
-        # leg exists to prove).
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"][1]["host"] = bad["gang"]["ranks"][0]["host"]
-        expect_hit(
-            bad,
-            "x.json",
-            "repeats a host across ranks",
-            "rule (k): two ranks on the same host FAILS",
-        )
-
-        # (i-b) two ranks on the SAME host differing only in CASE also FAILS
-        # -- compared case-insensitively (and stripped), the same
-        # normalization the assembler's own `_norm_host` applies before it
-        # ever writes an artifact.
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"][0]["host"] = "Host-A"
-        bad["gang"]["ranks"][1]["host"] = "host-a"
-        expect_hit(
-            bad,
-            "x.json",
-            "repeats a host across ranks",
-            "rule (k): two ranks on the same host differing only in case FAILS",
-        )
-
-        # (ii) an `unknown` host or iface FAILS -- the driver's own
-        # assembler refuses to write one; a committed `unknown` means the
-        # artifact was hand-edited around that refusal.
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"][0]["host"] = "unknown"
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.ranks[0].host` is 'unknown'",
-            "rule (k): an `unknown` host FAILS",
-        )
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"][1]["iface"] = "UNKNOWN"
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.ranks[1].iface` is 'UNKNOWN'",
-            "rule (k): an `unknown` iface FAILS case-insensitively",
-        )
-
-        # (iii) a per-rank digest mismatch on a `pass` FAILS -- kept PER
-        # RANK, never trusted from an already-collapsed top-level value.
-        bad = gang_cluster_baseline()
-        bad["gang"]["ranks"][1]["reduced_vector_digest"] = "c" * 64
-        expect_hit(
-            bad,
-            "x.json",
-            "reduced_vector_digest` disagree across ranks",
-            "rule (k): per-rank digest mismatch on pass FAILS",
-        )
-        bad = gang_cluster_baseline()
-        del bad["gang"]["ranks"][0]["reduced_vector_digest"]
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.ranks[0].reduced_vector_digest` must be a 64-lowercase-hex digest",
-            "rule (k): a pass with a missing per-rank digest FAILS",
-        )
-
-        # (iv) hosts != pod_count, world != pod_count*gpu_count_per_pod.
-        bad = gang_cluster_baseline()
-        bad["gang"]["pod_count"] = 3
-        expect_hit(
-            bad,
-            "x.json",
-            "does not equal `gang.pod_count`",
-            "rule (k): gang.hosts != gang.pod_count FAILS",
-        )
-        bad = gang_cluster_baseline()
-        bad["gang"]["gpu_count_per_pod"] = 2
-        expect_hit(
-            bad,
-            "x.json",
-            "does not equal `gang.pod_count` x `gang.gpu_count_per_pod`",
-            "rule (k): gang.world != pod_count x gpu_count_per_pod FAILS",
-        )
-
-        # (v) leg/producer mismatch FAILS -- a self-declared leg cannot
-        # dodge the other leg's registry by pointing at a different driver.
-        bad = gang_cluster_baseline()
-        bad["producer"] = dict(gang_baseline()["producer"])  # the POD leg's own driver
-        expect_hit(
-            bad,
-            "x.json",
-            "requires `producer.path` == 'ci/scripts/runpod_gpu_cluster.sh'",
-            "rule (k): gang.leg == cluster with the pod leg's producer.path FAILS",
-        )
-        bad = gang_baseline()
-        bad["producer"] = dict(gang_cluster_baseline()["producer"])  # the CLUSTER leg's own driver
-        expect_hit(
-            bad,
-            "x.json",
-            "requires `producer.path` == 'ci/scripts/runpod_gpu_gang.sh'",
-            "rule (k): gang.leg == pod with the cluster leg's producer.path FAILS",
-        )
-
-        bad = gang_baseline()
-        bad["gang"]["world"] = 1
-        expect_hit(bad, "x.json", "`gang.world` must be >= 2", "rule (k): world 1 is not a gang")
-
-        bad = gang_baseline()
-        bad["gang"]["world"] = "2"
-        expect_hit(bad, "x.json", "`gang.world` must be an integer", "rule (k): world as a string")
-
-        bad = gang_baseline()
-        bad["gang"]["collective"] = "   "
-        expect_hit(bad, "x.json", "`gang.collective` must be a non-empty string", "rule (k): blank collective")
-
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}]
-        expect_hit(bad, "x.json", "but `gang.world` is 2", "rule (k): one device for a world of two")
-
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": 1, "device": ""}]
-        expect_hit(bad, "x.json", "`gang.ranks[1].device` must be a non-empty string", "rule (k): empty device")
-
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": 0, "device": "cuda:0"}]
-        expect_hit(bad, "x.json", "repeats a rank index", "rule (k): both entries claim rank 0")
-
-        # The remaining `_gang_check_ranks` arms, one fixture each. Each was
-        # written and left undriven: neutralising the arm kept `--self-test`
-        # green, and three of them would then have ADMITTED the malformed
-        # payload into the corpus.
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = []
-        expect_hit(bad, "x.json", "`gang.ranks` must be a non-empty list", "rule (k): an empty rank list")
-
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, "cuda:1 NVIDIA A100-SXM4-80GB"]
-        expect_hit(bad, "x.json", "`gang.ranks[1]` must be an object", "rule (k): a rank entry that is not an object")
-
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": "zero", "device": "cuda:1"}]
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.ranks[1].rank` must be a rank index >= 0",
-            "rule (k): a rank index spelled as a string",
-        )
-
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 0, "device": "cuda:0"}, {"rank": -1, "device": "cuda:1"}]
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.ranks[1].rank` must be a rank index >= 0",
-            "rule (k): a negative rank index",
-        )
-
-        # Right count, right types, no repeat — and still not the gang's own
-        # ranks: 0 recorded no device. Only the coverage arm catches this.
-        bad = gang_baseline()
-        bad["gang"]["ranks"] = [{"rank": 1, "device": "cuda:0"}, {"rank": 2, "device": "cuda:1"}]
-        expect_hit(
-            bad,
-            "x.json",
-            "covers rank indices [1, 2], not 0..1",
-            "rule (k): two well-formed ranks that are not 0..world-1",
-        )
-
-        bad = gang_baseline()
-        bad["gang"]["digests"] = [{"seed": 7, "digest": "a" * 64}]
-        expect_hit(bad, "x.json", "exactly two entries", "rule (k): a single digest is not a pair")
-
-        bad = gang_baseline()
-        bad["gang"]["digests"] = [
-            {"seed": 7, "digest": "a" * 64},
-            {"seed": 8, "digest": "a" * 64},
-        ]
-        expect_hit(bad, "x.json", "two DIFFERENT seeds", "rule (k): the pair must share one seed")
-
-        bad = gang_baseline()
-        bad["gang"]["digests"] = [{"seed": 7, "digest": "nope"}, {"seed": 7, "digest": "a" * 64}]
-        expect_hit(bad, "x.json", "`gang.digests[0].digest` must be a 64-lowercase-hex", "rule (k): malformed digest")
-
-        bad = gang_baseline()
-        bad["gang"]["digests"] = ["a" * 64, {"seed": 7, "digest": "a" * 64}]
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.digests[0]` must be an object",
-            "rule (k): a digest entry that is not an object",
-        )
-
-        # A non-integer seed is not just a type finding: with `seeds` left
-        # empty, BOTH the same-seed arm and the pass@world-2 equality arm
-        # skip, so an unreadable seed would otherwise buy an artifact its way
-        # out of the digest oracle entirely.
-        bad = gang_baseline()
-        bad["gang"]["digests"] = [{"seed": "a", "digest": "a" * 64}, {"seed": 7, "digest": "b" * 64}]
-        expect_hit(
-            bad,
-            "x.json",
-            "`gang.digests[0].seed` must be an integer seed",
-            "rule (k): a seed that is not an integer",
-        )
-
-        bad = gang_baseline()
-        bad["gang"]["per_step_loss_delta"] = []
-        expect_hit(bad, "x.json", "`gang.per_step_loss_delta` must be a non-empty list", "rule (k): empty delta series")
-
-        bad = gang_baseline()
-        bad["gang"]["per_step_loss_delta"] = [0.0, "1e-7"]
-        expect_hit(bad, "x.json", "`gang.per_step_loss_delta[1]` must be a finite number", "rule (k): non-numeric delta")
-
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = 1.0e-6
-        expect_hit(bad, "x.json", "`gang.epsilon` must be an object", "rule (k): ε as a bare number")
-
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], value=0)
-        expect_hit(bad, "x.json", "`gang.epsilon.value` must be a finite number > 0", "rule (k): ε of zero")
-
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], derivation="")
-        expect_hit(bad, "x.json", "`gang.epsilon.derivation` must state HOW", "rule (k): ε with no derivation")
-
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha="abc1234")
-        expect_hit(bad, "x.json", "`gang.epsilon.registered_sha` must be the 40-hex", "rule (k): short registration sha")
-
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha="b" * 40)
-        expect_hit(bad, "x.json", "is not an ancestor of HEAD", "rule (k): ε registered at an unknown commit")
-
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=second_sha)
-        expect_hit(bad, "x.json", "equals the artifact's own `git_sha`", "rule (k): ε registered in the measured commit")
-
-        # The EVIDENCE ANCHOR (`_gang_evidence_anchor`). One mutation per
-        # arm, over both anchor shapes plus the no-anchor case. Guarding the
-        # ε ordering arms behind "`git_sha` is an ancestor of HEAD" would
-        # SILENTLY ADMIT every case in the `merged_as` block below.
-
-        # (1) merged_as shape: the measured tip was rewritten on landing, so
-        # `git_sha` is an ancestor of nothing and `merged_as` is the anchor.
-        def merged_gang() -> dict:
-            d = gang_baseline()
-            d["git_sha"] = orphan_sha
-            d["merged_as"] = third_sha
-            d["merged_via_pr"] = 4242
-            return d
-
-        ok = merged_gang()
-        ok["gang"]["epsilon"] = dict(ok["gang"]["epsilon"], registered_sha=second_sha)
-        expect_clean(ok, "control-merged-anchor.json", "rule (k): ε strictly before the merged_as anchor")
-
-        bad = merged_gang()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
-        expect_hit(
-            bad,
-            "x.json",
-            "equals the artifact's own `merged_as`",
-            "rule (k): ε registered in the landing commit itself (merged_as anchor)",
-        )
-
-        bad = merged_gang()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=orphan_sha)
-        expect_hit(
-            bad,
-            "x.json",
-            "is not an ancestor of HEAD",
-            "rule (k): ε registered on the rewritten tip, which is in no history here",
-        )
-
-        # (2) ancestor shape: an ε registered AFTER the anchor. `third_sha`
-        # is an ancestor of HEAD (so the HEAD arm passes) but is NOT an
-        # ancestor of `second_sha`, which is the artifact's own anchor.
-        bad = gang_baseline()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
-        expect_hit(
-            bad,
-            "x.json",
-            "is not an ancestor of the measured `git_sha`",
-            "rule (k): ε registered at a commit AFTER the measured tree",
-        )
-
-        # (2b) BOTH anchors are in this history: the measured `git_sha`
-        # survived into HEAD's history AND a `merged_as` was stamped beside
-        # it. The evidence is the tree `git_sha` names — that is where the
-        # measurement happened — so the anchor is `git_sha`, and the later
-        # landing commit must not be allowed to relax the ordering. Trying
-        # `merged_as` FIRST would retarget ε's constraint onto the landing
-        # commit and ADMIT an ε registered in the very commit it measures.
-        def both_anchors_gang() -> dict:
-            d = gang_baseline()  # git_sha == second_sha, itself an ancestor of HEAD
-            d["merged_as"] = third_sha
-            d["merged_via_pr"] = 4243
-            return d
-
-        bad = both_anchors_gang()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=second_sha)
-        expect_hit(
-            bad,
-            "x.json",
-            "equals the artifact's own `git_sha`",
-            "rule (k): ε registered in the measured commit, `merged_as` also in this history",
-        )
-
-        bad = both_anchors_gang()
-        bad["gang"]["epsilon"] = dict(bad["gang"]["epsilon"], registered_sha=third_sha)
-        expect_hit(
-            bad,
-            "x.json",
-            "is not an ancestor of the measured `git_sha`",
-            "rule (k): ε registered AFTER the measured commit, `merged_as` also in this history",
-        )
-
-        ok = both_anchors_gang()
-        ok["gang"]["epsilon"] = dict(ok["gang"]["epsilon"], registered_sha=root_sha)
-        expect_clean(
-            ok,
-            "control-both-anchors.json",
-            "rule (k): ε strictly before the measured `git_sha`, `merged_as` also in this history",
-        )
-
-        # (3) no anchor at all — FAILS naming BOTH candidates, never skipped.
-        bad = gang_baseline()
-        bad["git_sha"] = orphan_sha
-        expect_hit(
-            bad,
-            "x.json",
-            "has no commit in this history to be pre-registered AGAINST",
-            "rule (k): neither git_sha nor merged_as is an ancestor of HEAD",
-        )
-
-        # `git_sha_unresolved` is not an exemption for ε: rule (d) has
-        # nothing resolvable to check for such an artifact, but an ε is a
-        # claim about ORDER IN THIS HISTORY and there is no anchor to order
-        # it against.
-        bad = gang_baseline()
-        del bad["git_sha"]
-        bad["git_sha_unresolved"] = "abc1234"
-        bad["producer"] = {"path": None, "kind": "none", "invocation": None, "gating": "none"}
-        allowlist["legacy-gang.json"] = "synthetic legacy gang fixture"
-        expect_hit(
-            bad,
-            "legacy-gang.json",
-            "has no commit in this history to be pre-registered AGAINST",
-            "rule (k): git_sha_unresolved is not an ε exemption",
-        )
-        del allowlist["legacy-gang.json"]
-
-        bad = gang_baseline()
-        bad["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
-        expect_hit(bad, "x.json", "exceeds", "rule (k): a delta outside the pre-registered ε")
-
-        # The boundary: `worst == epsilon.value` exactly. ε is an INCLUSIVE
-        # tolerance (a run measured AT its pre-registered ceiling is not a
-        # violation of it), so this must stay green -- the strict `>` in
-        # `check_gang_artifact`'s cross-field block is deliberate, not an
-        # off-by-one to fix.
-        ok = gang_baseline()
-        ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-6]
-        expect_clean(ok, "control-gang-epsilon-boundary.json", "rule (k): worst == epsilon.value is inside the tolerance")
-
-        # `gang.verdict`. One mutation per DETERMINANT: the value
-        # itself, each thing a `fail` owes, and each consequence that binds
-        # on `pass` ONLY (so the same payload that FAILS as a pass must be
-        # ADMITTED as a fail — the property is "a failing run is
-        # representable", which an assertion-only gate silently refused).
-        bad = gang_baseline()
-        bad["gang"]["verdict"] = "PASS"
-        expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict in the wrong case")
-
-        bad = gang_baseline()
-        bad["gang"]["verdict"] = "unknown"
-        expect_hit(bad, "x.json", "`gang.verdict` must be exactly one of", "rule (k): verdict outside the closed set")
-
-        # A `pass` at world 2 with an unequal same-seed pair: the spike's
-        # measured byte-identical regime, so this is a failed run recorded as a pass.
-        bad = gang_baseline()
-        bad["gang"]["digests"] = [
-            {"seed": 7, "digest": "a" * 64},
-            {"seed": 7, "digest": "c" * 64},
-        ]
-        expect_hit(
-            bad,
-            "x.json",
-            "same-seed runs produced DIFFERENT digests",
-            "rule (k): a pass at world 2 whose digest pair disagrees",
-        )
-
-        # The SAME unequal pair above world 2 is RECORDED, not asserted —
-        # nothing has measured byte-identity for an untested NCCL pin set.
-        ok = gang_baseline()
-        ok["gang"]["world"] = 4
-        ok["gang"]["ranks"] = [
-            {"rank": i, "device": f"cuda:{i} NVIDIA A100-SXM4-80GB"} for i in range(4)
-        ]
-        ok["gang"]["digests"] = [
-            {"seed": 7, "digest": "a" * 64},
-            {"seed": 7, "digest": "c" * 64},
-        ]
-        expect_clean(ok, "control-gang-world4.json", "rule (k): an unequal pair above world 2 is recorded, not asserted")
-
-        bad = gang_baseline()
-        bad["gang"]["verdict"] = "fail"
-        bad["status"] = "RED"
-        expect_hit(bad, "x.json", "`gang.reason` is missing or blank", "rule (k): a fail with no reason")
-
-        bad = gang_baseline()
-        bad["gang"]["verdict"] = "fail"
-        bad["gang"]["reason"] = "rank 1's all-reduce diverged at global step 3"
-        expect_hit(
-            bad,
-            "x.json",
-            "cannot also be filed GREEN",
-            "rule (k): a fail filed as a GREEN artifact",
-        )
-
-        # The two admissions: the exact payloads that FAIL as a `pass` are
-        # ADMITTED as a `fail`, deltas and digests as measured.
-        ok = gang_baseline()
-        ok["gang"]["verdict"] = "fail"
-        ok["gang"]["reason"] = "worst per-step delta 1e-5 exceeded the pre-registered 1e-6"
-        ok["gang"]["per_step_loss_delta"] = [0.0, 1.0e-5]
-        ok["status"] = "RED"
-        expect_clean(ok, "control-gang-fail-delta.json", "rule (k): a fail records a delta outside ε as measured")
-
-        ok = gang_baseline()
-        ok["gang"]["verdict"] = "fail"
-        ok["gang"]["reason"] = "the same-seed pair did not reproduce"
-        ok["gang"]["digests"] = [
-            {"seed": 7, "digest": "a" * 64},
-            {"seed": 7, "digest": "c" * 64},
-        ]
-        ok["status"] = "RED"
-        expect_clean(ok, "control-gang-fail-digests.json", "rule (k): a fail records an unequal digest pair as measured")
-
-        # Anchors: dropping the `artifact_kind` key does NOT return a gang
-        # artifact to the unchecked state — the `gang` block itself, and the
-        # committed filename, each independently declare the kind.
-        bad = gang_baseline()
+            bad = topology_baseline()
+            mutate(bad["topology"])
+            expect_hit(bad, "x.json", needle, f"rule (k): a pass whose {label} contradict it")
+            ok = topology_baseline()
+            mutate(ok["topology"])
+            ok["topology"]["verdict"] = "fail"
+            ok["topology"]["reasons"] = [f"the {label} disagreed"]
+            ok["status"] = "RED"
+            expect_clean(ok, "control-topology-fail.json", f"rule (k): a fail records its {label} as measured")
+        bad = topology_baseline()
+        bad["topology"]["verdict"] = "fail"
+        expect_hit(bad, "x.json", "with no `topology.reasons`", "rule (k): a fail with no reason")
+        bad = topology_baseline()
+        bad["topology"]["verdict"] = "fail"
+        bad["topology"]["reasons"] = ["the nccl run timed out"]
+        expect_hit(bad, "x.json", "but the top-level `status` is GREEN", "rule (k): a fail filed GREEN")
+
+        bad = topology_baseline()
+        bad["producer"] = dict(bad["producer"], path="ci/scripts/runpod_gpu_prove.sh")
+        expect_hit(bad, "x.json", "requires `producer.path` == 'ci/scripts/runpod_gpu_topology.sh'", "rule (k): another producer")
+
+        # Anchors: dropping any one does not return the artifact to the
+        # unchecked state.
+        bad = topology_baseline()
         del bad["artifact_kind"]
-        expect_hit(bad, "control-block-anchor.json", "a top-level `gang` block", "rule (k): block anchor")
-
-        bad = gang_baseline()
+        expect_hit(bad, "control-block-anchor.json", "a top-level `topology` block", "rule (k): block anchor")
+        bad = topology_baseline()
         del bad["artifact_kind"]
-        del bad["gang"]
-        expect_hit(bad, "2026-01-01-gang-2xa100.json", "the committed filename", "rule (k): filename anchor")
-
-        # The other side of the same door: an artifact that DECLARES the kind
-        # and carries no `gang` block at all owes the whole registry, not a
-        # pass for having nothing to check.
+        del bad["topology"]
+        expect_hit(bad, "2026-01-01-topology-a6000.json", "the committed filename", "rule (k): filename anchor")
         bad = baseline()
-        bad["artifact_kind"] = "gang"
-        expect_hit(
-            bad,
-            "control-kind-without-block.json",
-            "but there is no `gang` object",
-            "rule (k): artifact_kind gang with no gang block",
-        )
+        bad["artifact_kind"] = "topology"
+        expect_hit(bad, "control-kind-without-block.json", "but there is no `topology` object", "rule (k): kind with no block")
 
         # rule (d) — ancestry ---------------------------------------------------
         bad = baseline()
@@ -4485,36 +3311,13 @@ def self_test() -> int:
         "artifact that already carries a non-empty producer.source_sha256 block, or an artifact whose own "
         "basename matches a known profile/frontend SOURCE_IDENTITY_DECLARING_FILENAME_RE family, matched "
         "against the basename only, never an ancestor directory's own name) round out rule (j). "
-        "Rule (k)'s `gang` kind bites on every determinant of its own registry — each GANG_POD_FIELD_"
-        "REGISTRY field missing, world < 2, a device count that disagrees with world, a repeated rank, "
-        "an empty rank list, a rank entry that is not an object, a rank index that is a string or "
-        "negative, two well-formed ranks that are not 0..world-1, a digest entry that is not an "
-        "object, a seed that is not an integer (which would otherwise skip BOTH the same-seed and "
-        "the digest-equality arms), a declared `artifact_kind` with no `gang` block at all, "
-        "a digest pair that is not exactly two same-seed entries, a malformed digest, an empty or "
-        "non-numeric delta series, an ε that is zero / has no derivation / names a short or unknown "
-        "registration commit / was registered in the very commit it measures, and a measured delta "
-        "outside its own pre-registered ε — and each of its three anchors (artifact_kind, the gang "
-        "block, the committed filename) independently pulls an artifact into the rule, while a "
-        "non-gang artifact stays untouched. ε's EVIDENCE ANCHOR is driven arm by arm: an artifact "
-        "whose measured tip was rewritten on landing is ordered against `merged_as` (clean when ε "
-        "precedes it, caught when ε IS it, caught when ε is the rewritten tip), an artifact carrying "
-        "BOTH a `git_sha` in this history and a `merged_as` is ordered against the `git_sha` — the "
-        "tree it measured — so the later landing commit cannot relax it (caught when ε is the "
-        "measured commit, caught when ε is after it, clean when ε precedes it), an ε registered at a "
-        "commit that is an ancestor of HEAD but AFTER the measured tree is caught, and an artifact "
-        "with neither anchor in this history — `git_sha_unresolved` included — is caught by a "
-        "finding naming BOTH candidates, never skipped. `gang.verdict` closes the same "
-        "loop from the other side: the wrong case and an unknown string are refused, a `fail` with "
-        "no reason and a `fail` filed GREEN are caught, a `pass` at world 2 whose same-seed pair "
-        "disagrees is caught while the same pair above world 2 is recorded rather than asserted, "
-        "and the exact delta/digest payloads that FAIL as a pass are ADMITTED as a fail. "
-        "`gang.leg` discriminates the pod registry above from the CLUSTER leg's own "
-        "(hosts == 2, per-rank host/device/iface, a bit-exact reduced_vector_digest, pod_count/"
-        "gpu_count_per_pod/ttl_hours, no ε/delta row at all) -- missing/unrecognized leg, every "
-        "missing cluster row, a wrong host count, a malformed rank, and a pass with no digest are "
-        "each caught by name, and a cluster artifact ignores stray pod-only fields rather than "
-        "cross-checking them."
+        "Rule (k)'s `topology` kind bites on every determinant of its registry — each field missing, a "
+        "one-host fleet, a non-integer GPU count, an empty test list, mixed NCCL runtimes, a world that is "
+        "not one rank per GPU, a run whose coordinator selected the other transport, ranks that never "
+        "left one host / share a process / are missing, a malformed digest, no reference curve, a "
+        "loosened ε, a mis-cased verdict and a pass with reasons — each cross-field claim (a retried gang included) is caught on a "
+        "pass and admitted on a fail, a fail with no reason or filed GREEN is caught, another producer is "
+        "refused, and each of its three anchors independently pulls an artifact into the rule."
     )
     return 0
 

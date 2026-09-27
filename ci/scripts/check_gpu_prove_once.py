@@ -150,8 +150,8 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      — exactly one invoker, no `push:`/`workflow_call:` in that invoker's
      own `on:` block, nothing `uses:` it — restated over the reviewed
      `PAID_POD_LANE_TABLE` registry (driver script -> its one workflow):
-     the prove lane, the gang lane (1 pod x 2 GPU), the perf-A/B lane and
-     the how-well lane. The doctrine was never about one script's name; it
+     the prove lane, the topology lane (two 2-GPU hosts), the perf-A/B
+     lane and the how-well lane. The doctrine was never about one script's name; it
      is about a leg that RENTS HARDWARE, and a lane added without this rule
      would have reproduced P1's own escape shape one file over. A row's
      workflow missing from the tree, an unreadable `on:` block, and zero
@@ -207,17 +207,17 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      gives the workflow scan), so its own suite injects a fifth renting
      driver, or a new deploy wrapper, without touching this tree.
 
-     P7's own RENTING_ROOTS is a REVIEWED LIST (`_rp_deploy_payload`,
-     `_rp_cluster_payload`'s own `rp_cluster_create` — the REST v2 cluster
-     surface's create entrypoint), not a single hard-coded name: the deploy
-     closure is the union of each root's own transitive callers PLUS the
-     roots themselves, so a second renting mechanism (the cluster leg) gets
-     a table row through the exact same derivation the pod leg always has,
+     P7's own RENTING_ROOTS is a REVIEWED LIST (`_rp_deploy_payload`, and
+     `rp_fleet_pod_create` — the REST v2 `POST /v2/pods` create entrypoint
+     the multi-host fleet rents through), not a single hard-coded name: the
+     deploy closure is the union of each root's own transitive callers PLUS
+     the roots themselves, so a second renting mechanism gets a table row
+     through the exact same derivation the GraphQL pod path always has,
      rather than being invisible to P7 the way it would be if the closure
-     seed stayed pinned to the pod-only function. A self-test injects a
-     driver calling ONE of the roots directly and demands a row for it in
-     both directions (the addition never rots the real, already-registered
-     cluster row).
+     seed stayed pinned to one function. A self-test injects a driver
+     calling ONE of the roots directly and demands a row for it in both
+     directions (the addition never rots the real, already-registered
+     fleet row).
 
   P8 (schedule visibility on every paid pod lane). A `schedule:` trigger on
      a `PAID_POD_LANE_TABLE` workflow — or on any OTHER workflow that
@@ -228,8 +228,8 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      allow-list entry's TOKEN must occur verbatim in the workflow's own
      comment-stripped text OR in its `PAID_POD_LANE_TABLE` driver's
      comment-stripped text (`gpu-prove.yml` -> `capability-surface-proof`,
-     found in `runpod_gpu_prove.sh`; `gpu-reap.yml` -> `rp_cluster_sweep`,
-     found in `gpu-dev.sh`'s reap arm) — an unresolvable token is a FAIL,
+     found in `runpod_gpu_prove.sh`; `gpu-reap.yml` -> `rp_sweep`, found in
+     `gpu-dev.sh`'s reap arm) — an unresolvable token is a FAIL,
      exactly like a dead waiver (a listed workflow carrying NO `schedule:`
      at all). The `on:` block is read through the SAME
      `read_top_level_on_block` every other rule in this file uses; an
@@ -739,7 +739,7 @@ def check_promoting_if(expr: str, gate_job: str, tag_family: str | None = None) 
 # level_on_block`/`read_top_level_on_block_from_path` live in
 # `check_execution_surface_reachability.py` (imported above) -- the ONE
 # reader `check_p7_paid_pod_lanes` (push/workflow_call absence), P5, P6, and
-# `test_gpu_gang_lane.sh`'s G7 (schedule absence, via this module's own
+# `test_gpu_topology_lane.sh` (schedule absence, via this module's own
 # `--read-on-block` CLI below) all read the `on:` block through, never a
 # second, independently-drifting copy.
 # --------------------------------------------------------------------------- #
@@ -865,9 +865,10 @@ def check_p1_p2(workflow_texts: dict[str, str]) -> list[str]:
 PAID_POD_LANE_TABLE: dict[str, str] = {
     # The release-gating proof lane (also P1's own subject).
     "ci/scripts/runpod_gpu_prove.sh": "gpu-prove.yml",
-    # The distributed-training gang leg: 1 pod x 2 GPU — the priciest row
-    # here per run, and the only one that rents more than one device.
-    "ci/scripts/runpod_gpu_gang.sh": "gpu-gang.yml",
+    # The fine-tune gang at every topology: a fleet of two 2-GPU pods rented
+    # through `rp_fleet_pod_create` (REST v2) — the priciest row here per
+    # run, and the only one that rents more than one device or host.
+    "ci/scripts/runpod_gpu_topology.sh": "gpu-topology.yml",
     # The within-run GPU perf A/B (two resident clones on one pod).
     "ci/scripts/runpod_gpu_perf_ab.sh": "gpu-perf-ab.yml",
     # The how-well A/B driver.
@@ -880,15 +881,6 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     # actually rents from this site today -- see `test_gpu_dev_lifecycle.sh`
     # for the lifecycle-safety assertions on what `reap` itself may do.
     "ci/scripts/gpu-dev.sh": "gpu-reap.yml",
-    # The distributed-training CLUSTER leg: 2 hosts x 1 GPU on one RunPod
-    # CLUSTER (REST v2) -- a second, independent renting mechanism from the
-    # pod leg's GraphQL `podFindAndDeployOnDemand`, derived into P7's
-    # subject set via RENTING_ROOTS below (never a hard-coded pod-only seed).
-    # `rp_cluster_create` is that ROOT; the driver below calls it, so it is
-    # judged as a derived driver too (both a root and
-    # a driver at once, exactly like `runpod_gpu_gang.sh` calling
-    # `_rp_deploy_payload`/`rp_deploy_live` is already).
-    "ci/scripts/runpod_gpu_cluster.sh": "gpu-cluster.yml",
 }
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +924,7 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
 #     hidden. THIS FILE self-matches the same way
 #     (`derive_renting_drivers(load_script_texts(), closure)`
 #     includes `"ci/scripts/check_gpu_prove_once.py"` on this tree) —
-#     `RENTING_ROOTS` below names `_rp_deploy_payload`/`rp_cluster_create`
+#     `RENTING_ROOTS` below names `_rp_deploy_payload`/`rp_fleet_pod_create`
 #     as Python string literals, and this module's own comment-stripped
 #     text is scanned exactly like any other tracked `ci/scripts/**` file
 #     (it is not `RUNPOD_LIB_REL`, the one path this scan does exclude — see
@@ -989,14 +981,13 @@ RUNPOD_LIB_REL = "ci/scripts/runpod_lib.sh"
 
 # The reviewed renting-root LIST P7's deploy closure is seeded from.
 # `_rp_deploy_payload` builds the GraphQL pod-creation payload;
-# `rp_cluster_create` is the REST v2 cluster surface's own create
-# entrypoint (there is no GraphQL mutation for a cluster at all -- see
-# runpod_lib.sh's own cluster-primitives header) -- a SECOND, independent
-# renting mechanism, not a call path through the first. The closure is each
+# `rp_fleet_pod_create` is the REST v2 `POST /v2/pods` create entrypoint the
+# multi-host fleet rents through (runpod_lib.sh's fleet primitives) -- a
+# SECOND, independent renting mechanism, not a call path through the first. The closure is each
 # root's transitive callers PLUS the roots themselves; a root name that
 # stops existing in runpod_lib.sh is caught the same way an empty closure
 # always was (see `derive_deploy_closure` below).
-RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_cluster_create", "rp_two_host_pod_create")
+RENTING_ROOTS: tuple[str, ...] = ("_rp_deploy_payload", "rp_fleet_pod_create")
 # Retained as an alias: several comments/messages below still read most
 # naturally naming the ORIGINAL (and still first) root; nothing outside
 # this module depends on the name.
@@ -1033,7 +1024,7 @@ def _mentions(text: str, name: str) -> bool:
 def derive_deploy_closure(lib_text: str) -> tuple[frozenset[str], list[str]]:
     """The RENTING CLOSURE: each `RENTING_ROOTS` entry's TRANSITIVE
     CALLERS inside `runpod_lib.sh`, PLUS the roots themselves — a root is
-    something an external driver is known to call DIRECTLY (`rp_cluster_
+    something an external driver is known to call DIRECTLY (`rp_fleet_pod_
     create` has no wrapper the way `_rp_deploy_payload` has `rp_deploy_
     live`/`rp_deploy_arch`), so excluding the roots from the matched set
     would make P7 blind to a driver that calls a root with no wrapper in
@@ -1329,8 +1320,8 @@ PAID_LANE_CRON_ALLOWLIST: dict[str, tuple[str, str]] = {
         "run -- the nightly cron can never silently pass on an empty suite",
     ),
     "gpu-reap.yml": (
-        "rp_cluster_sweep",
-        "gpu-dev.sh's reap arm fails closed (non-zero) when it cannot enumerate pods OR clusters -- "
+        "rp_sweep",
+        "gpu-dev.sh's reap arm fails closed (non-zero) when it cannot enumerate the account's pods -- "
         "the 6-hourly cron never reports 'nothing to reap' from an enumeration it could not make",
     ),
 }
@@ -3209,7 +3200,7 @@ def _cli_read_on_block(path: Path) -> int:
     prints each top-level trigger key on its own line and exits 0, or
     prints the reader's own "cannot read"/"cannot examine" message to
     stderr and exits 1 -- an unreadable path is the same FAIL, never a
-    silent "no key". `test_gpu_gang_lane.sh`'s G7 shells out to this exact
+    silent "no key". `test_gpu_topology_lane.sh` shells out to this exact
     CLI so the bash lane suite and this gate's own P7 arm read the `on:`
     block through one function, never two independently-drifting regexes."""
     keys, err = read_top_level_on_block_from_path(path)

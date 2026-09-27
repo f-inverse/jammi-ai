@@ -4285,7 +4285,7 @@ COMMUNITY|NVIDIA A100 80GB PCIe"
   # ---- D2: RP_GPU_COUNT=2 reaches the payload as the number 2 ------------
   ab_d2="$(ab_run "$AB_LIB" payload 2 | ab_gpu_count)"
   if [ "$ab_d2" = "2" ]; then
-    ok "(ab/gpuCount D2) RP_GPU_COUNT=2 emits gpuCount as the JSON number 2 — the gang leg's 1 pod x 2 GPU shape"
+    ok "(ab/gpuCount D2) RP_GPU_COUNT=2 emits gpuCount as the JSON number 2 — a 2-GPU host's shape"
   else
     bad "(ab/gpuCount D2) expected gpuCount=2 under RP_GPU_COUNT=2, got '${ab_d2}'"
   fi
@@ -4308,10 +4308,10 @@ COMMUNITY|NVIDIA A100 80GB PCIe"
 
   # ---- D5 (set-shaped): which TRACKED files mention RP_GPU_COUNT at all --
   # The reviewed set is exactly runpod_lib.sh (the parameter's own home),
-  # runpod_gpu_gang.sh (the ONE lane that asks for more than one GPU), this
-  # suite, and test_gpu_gang_lane.sh — which READS the gang driver's count
-  # back and asserts 2, because the gang lane's dollar bound is priced at a
-  # rate measured for a 2-GPU pod. An ASSERTER of the value is not a lane
+  # runpod_gpu_topology.sh (the ONE lane that asks for more than one GPU per
+  # host), this suite, and test_gpu_topology_lane.sh — which READS the
+  # topology driver's count back and asserts 2, because that lane's dollar
+  # bound is priced per GPU across two 2-GPU hosts. An ASSERTER of the value is not a lane
   # setting one; anything else appearing here means some OTHER lane started
   # moving its own deploy payload off `gpuCount: 1`.
   ab_mentions="$(cd "$REPO_ROOT" && git ls-files ci/scripts .github/workflows | while IFS= read -r f; do
@@ -4319,13 +4319,13 @@ COMMUNITY|NVIDIA A100 80GB PCIe"
   done | sort)"
   ab_unexpected="$(printf '%s\n' "$ab_mentions" | grep -v '^$' \
     | grep -vx 'ci/scripts/runpod_lib.sh' \
-    | grep -vx 'ci/scripts/runpod_gpu_gang.sh' \
-    | grep -vx 'ci/scripts/test_gpu_gang_lane.sh' \
+    | grep -vx 'ci/scripts/runpod_gpu_topology.sh' \
+    | grep -vx 'ci/scripts/test_gpu_topology_lane.sh' \
     | grep -vx 'ci/scripts/test_pod_substrate.sh' || true)" # tripwire-ok: grep -v with no surviving line legitimately exits 1; the emptiness IS the pass condition, asserted on the next line.
   if grep -qx 'ci/scripts/runpod_lib.sh' <<<"$ab_mentions" && [ -z "$ab_unexpected" ]; then
-    ok "(ab/gpuCount D5) RP_GPU_COUNT is mentioned only by runpod_lib.sh, the gang driver, the gang-lane suite that asserts its value and this suite across every tracked ci/scripts + .github/workflows file — gpu-prove, gpu-perf-ab, gpu-dev and howwell all inherit the default"
+    ok "(ab/gpuCount D5) RP_GPU_COUNT is mentioned only by runpod_lib.sh, the topology driver, the topology-lane suite that asserts its value and this suite across every tracked ci/scripts + .github/workflows file — gpu-prove, gpu-perf-ab, gpu-dev and howwell all inherit the default"
   else
-    bad "(ab/gpuCount D5) unexpected RP_GPU_COUNT site(s) — a lane other than the gang driver is changing its own gpuCount: ${ab_unexpected:-<runpod_lib.sh itself never mentions it>}"
+    bad "(ab/gpuCount D5) unexpected RP_GPU_COUNT site(s) — a lane other than the topology driver is changing its own gpuCount: ${ab_unexpected:-<runpod_lib.sh itself never mentions it>}"
   fi
 
   # ---- revert-RED mutants: one per behavioural determinant above ---------

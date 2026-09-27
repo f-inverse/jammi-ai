@@ -595,336 +595,82 @@ tarball to a read-only object-store bucket, so a NEW pod can rehydrate rather
 than rebuild) is not built: it needs a bucket (`jammi-seed-cache`) and a
 read-only access token, and nothing in this tooling reads or writes that bucket.
 
-## The gang leg — two GPUs in one pod
+## The topology lane — every layout a fine-tune gang can take
 
-`gpu-gang.yml` rents ONE pod holding TWO A100s and runs the distributed
-fine-tune (gang) tests on it, through `ci/scripts/runpod_gpu_gang.sh` and the
-same shared primitive every other lane uses (`ci/scripts/runpod_lib.sh`). It is
-the only lane where a multi-device collective runs on real hardware; every
-other GPU lane rents a single device.
+`gpu-topology.yml` runs the fine-tune gang on real GPUs at every topology the
+engine lays a job out as, under both collective transports, through
+`ci/scripts/runpod_gpu_topology.sh`. It is the only lane where a multi-device
+or multi-host collective runs on real hardware; every other GPU lane rents a
+single device.
 
-**What makes the pod different.** `RP_GPU_COUNT` (default 1 for every other
-lane) is 2 here — the one caller that moves it. At a count above 1
-`rp_deploy_arch` tries the SXM4 candidates before the PCIe ones: a 2-GPU pod
-provisioned on `A100-SXM4-80GB` SECURE while the PCIe pool reported no 2-GPU
-capacity at all. Both pairs stay in the list, so a multi-GPU rental only
-reorders the capacity search, never narrows it.
+**What it rents.** A *fleet* of two ordinary pods, each with two GPUs of one
+type (`RP_GPU_COUNT=2` — the one lane that moves it), created one by one
+through REST v2 (`rp_fleet_pod_create`, `POST /v2/pods`) in ONE data center
+with Global Networking on, so the pods reach each other on a private network.
+The driver reads the pod catalog at `count=2` and the data-center list live,
+walks `TOPOLOGY_GPU_TYPES` (the workflow's `gpu_types` input) in order, and
+takes the first type with co-located Global-Networking capacity at or above
+`TOPOLOGY_MIN_AVAILABILITY` whose secure per-GPU rate is within
+`TOPOLOGY_MAX_GPU_RATE`, printing the rate before it rents. Readiness is
+measured, not trusted: both pods must be `RUNNING`, report a Global-Networking
+ip and a direct ssh endpoint, and sit in the same data center, or the lane
+refuses (97) before building anything. Each host derives its NCCL interface
+from its own route table (`rp_fleet_iface_lines`).
 
-**What it proves.** The gang tests in `jammi-ai`'s `gpu_capability` target,
-selected by the `gang_` name filter the driver owns. A name filter that matches
-zero tests exits 0 with "running 0 tests" — the driver reads that as a
-FAILURE, by name, and equally refuses a run that wrote no artifact. A leg with
-no test is a leg with no proof.
+**What it proves.**
 
-**Triggers.** The `run-gang` PR label and manual dispatch — never a push, never
-`workflow_call`, and no workflow may `uses:` it. The never-in-an-automated-path
-doctrine is `gpu-prove.yml`'s own, and
-`ci/scripts/check_gpu_prove_once.py`'s P7 rule pins it for every renting lane —
-over a driver set *derived* from `runpod_lib.sh`'s deploy closure, with
-`PAID_POD_LANE_TABLE` (driver script -> its one workflow) as the completeness
-assertion over that set. Nothing about a release depends on this lane; the
-release verdict is the prove lane's.
+- *One host* (host 0, both GPUs): `gang_nccl` in `jammi-ai`'s
+  `gpu_capability` — the NCCL transport's device primitive ends every verb with
+  the inline transport's bytes, an abort ends a real NCCL wait, a join is
+  bounded — and `gpu::topology` in `jammi-server`'s `it` — a real fine-tune
+  through the worker at 1 × 1, 1 × 2 in one process and 2 processes × 1, under
+  both transports, publishing one adapter across them all.
+- *Many hosts* (all four GPUs): four `jammi-server` processes, one per GPU,
+  over a shared Postgres catalog and S3-class result root on host 0
+  (`ci/scripts/gpu_topology_host.sh`, over `pg_test_catalog.sh` and
+  `s3_test_store.sh`). `ci/scripts/gpu_topology_fleet.py` submits the same
+  world-4 fine-tune through the Python client twice — the fleet restarted
+  between with `[worker] collective = "nccl"` and `"cpu"` — plus the
+  single-rank reference, and `ci/scripts/gpu_topology_assemble.py` requires
+  the ranks to span both machines one process each, each coordinator to have
+  logged the transport its phase configured, the two runs' losses and probe
+  embeddings to be identical, and the gang to be within the trainer's
+  registered 1e-4 of the single rank.
 
-**Cost bound (human-approved).** Two bounds, each with the mechanism that
-enforces it. The rented pod is not the only thing that bills: `rp_deploy_live`
-walks the `a100` candidate list (4 entries) and terminates a pod that is not
-SSH-reachable within `RP_SSH_WAIT_SECS` before trying the next, so the *search*
-bills too.
+A name filter matching zero tests is a failure by name, never a pass.
 
-- **Terminate-succeeds** — the ordinary path, every `rp_terminate` takes. The
-  driver pins `RP_SSH_WAIT_SECS=300` (half the library default) and the workflow
-  pins `MAX_ATTEMPTS: "1"`, so there is exactly one search; the winning pod then
-  bills to `RP_TTL_HOURS=1`, baked into the pod's own entrypoint so a SIGKILLed
-  runner cannot outlive it. `4 x 300 s x $3.18/h + 1 h x $3.18/h = $4.24` a run.
-- **Sweep-only** — every `rp_terminate` call fails, the case `runpod_lib.sh`'s
-  own header opens with. Nothing is torn down early, each pod bills to its
-  baked-in TTL, and the only remaining enforcers are that TTL and `gpu-reap.yml`'s
-  `rp_sweep`: `(4 + 1) x 1 h x $3.18/h = $15.90`.
+**Triggers.** The `run-topology` PR label and manual dispatch — never a push,
+never `workflow_call`, never a schedule, and no workflow may `uses:` it.
+`ci/scripts/check_gpu_prove_once.py`'s P7/P8 rules pin this for every renting
+lane, over a driver set *derived* from `runpod_lib.sh`'s renting closure
+(`_rp_deploy_payload`, `rp_fleet_pod_create`), with `PAID_POD_LANE_TABLE` as
+the completeness assertion. Nothing about a release depends on this lane.
 
-`$3.18/h` is the rate the SECURE 2-GPU `A100-SXM4-80GB` pod was rented at. The
-COMMUNITY 2-GPU rate is unmeasured — nothing has priced one — so neither figure
-covers a COMMUNITY landing. `ci/scripts/test_gpu_gang_lane.sh` re-derives the
-first bound from the candidate list, the driver's own two values and the
-workflow's `MAX_ATTEMPTS`, and fails if the printed figure and the mechanism
-disagree.
+**Cost bound (human-approved).** `4 GPUs × TOPOLOGY_MAX_GPU_RATE ($4.00) ×
+RP_TTL_HOURS (3)` = **$48.00** a run when the EXIT trap terminates both pods;
+**$144.00** when every terminate fails and each pod bills to its own
+entrypoint deadline plus `gpu-reap.yml`'s 6-hourly sweep. The rate is a
+ceiling the driver refuses above, before any create; the live rate is printed
+(a two-host A100-SXM4-80GB fleet has priced at $1.59/GPU/h, $6.36/h).
+`ci/scripts/test_gpu_topology_lane.sh` re-derives both figures from the
+driver's own defaults and fails when a header disagrees.
 
-Inside the TTL hour, the shared `RP_TIMEOUT` default (50m, owned by
-`runpod_lib.sh` — this lane declares no second one) is what cuts first, with the
-cut group named. Whether a cold `cuda,flash-attn` build plus the gang tests fits
-inside that hour is NOT established — nothing has measured it. A budget cut is
-therefore a cost decision for a human (raise the bound deliberately), never
-something the script raises on its own.
+**Exit codes** (each annotated separately by the workflow): `0` every gating
+group passed; `75` no candidate had co-located capacity within the ceiling;
+`76` the inactivity watchdog killed a hang; `77` a host's `PROVE_SHA` disagreed
+with the expected commit; `97` a host is not the shape asked for; `124` budget
+cut.
 
-**Exit codes** (the workflow annotates each one separately, so a capacity night
-never reads as a code regression):
-
-- `0` — every gating group passed.
-- `75` — no 2-GPU capacity. RED, with no retry: `MAX_ATTEMPTS` is `1`, because a
-  second attempt is a second walk of the candidate list and doubles the search
-  term of the first bound above. A leg with no capacity proved nothing.
-- `76` — the inactivity watchdog killed a hang with a gating group unresolved.
-  A hung collective is exactly what this lane exists to surface.
-- `77` — wrong tree: the pod's own `PROVE_SHA` disagreed with the commit the
-  run expected.
-- `97` — the rented pod is not the device the leg asked for (fewer GPUs than
-  requested, or the wrong compute capability). Refused before anything is
-  built.
-- `124` — budget cut with a gating group unresolved.
-
-**The artifact.** The gang tests write their evidence into
-`JAMMI_GANG_ARTIFACT_DIR` on the pod; the driver pulls that directory back
-before the EXIT trap tears the pod down (the pod is the only place it exists)
-and the workflow uploads it. The pod-leg's own producer is
-`gang_pod_leg_two_ranks_over_nccl_reproduce_and_match_w1`
-(`crates/jammi-ai/tests/gpu_capability/gang_pod_leg.rs`, selected by the
-`gang_` filter like every other test in this suite): it trains a real
-two-rank gang over `Nccl` twice from the same seed (a reproducible adapter
-digest pair) against a W=1 reference at double the per-rank batch (the
-per-epoch training-loss delta), then writes the ONE `gang`-kind artifact
-into that directory itself — nothing else on this tree does. A human
-reviews it and commits it under `crates/jammi-kernels/artifacts/cuda-runs/`,
-where `ci/scripts/check_cuda_run_artifacts.py`'s `gang` kind is its schema
-gate. That schema requires the topology the run actually had (`world`, the
-collective, and one device per rank), the same-seed digest pair, the
-measured per-step loss delta, and the epsilon it is read against — with
-epsilon's own derivation and the commit it was registered at. An epsilon
-chosen after seeing the delta it excuses is not a tolerance, and the gate
-refuses it by name.
-
-**A failing run is representable.** The artifact carries the leg's own
-`verdict`, exactly `pass` or `fail`. A `fail` is *admitted* with its deltas and
-digests as measured — that record is the whole value of a non-reproducible run —
-and owes a `reason` naming what failed plus a top-level `status` that is not
-`GREEN`. A `pass` is a claim, so on a `pass` the worst measured delta must be
-within epsilon, and the same-seed digest pair must be *equal* at `world` 2, the
-one regime a spike measured byte-identical (candle 0.11's LoRA-shaped
-forward/backward/SGD across A100s, no env pins). Above `world` 2 the pair is
-recorded and not asserted: nothing has established what byte-identity should
-mean for a reduction whose NCCL pin set is untested there.
-
-**Where epsilon has to sit in history.** The gate reads the registration commit
-against the artifact's *evidence anchor*: `git_sha` when that is an ancestor of
-`HEAD` — the tree the run actually measured — otherwise `merged_as` as the
-rescue, when the artifact carries one that is an ancestor of `HEAD` (a measured
-tip whose landing commit rewrote it). A `merged_as` stamped beside a `git_sha`
-that is still in this history changes nothing: it names a later commit, and
-ordering against it would admit an epsilon registered in the measured commit
-itself. When `merged_as` IS the anchor, epsilon is ordered against that
-**landing** commit, never against the (now-unreachable) commit where the
-measurement itself ran — the measured tip's own commit has no content left in
-this history to order anything against. The registration commit must be an
-ancestor of `HEAD` and a **strict** ancestor of that anchor; an artifact with
-neither anchor in this history fails, naming both. What that
-asks of whoever runs the leg: commit epsilon on its own, **before** the commit
-you measure with, on the same branch. Landing that branch by a merge commit —
-this repository's own merge style — keeps epsilon a strict ancestor afterwards.
-A squash, or a rebase performed *after* measuring, rewrites both commits and the
-artifact fails from the merge onwards, so do not rebase a measured branch:
-land it, or re-measure.
-
-## The cluster leg — two hosts, one GPU each
-
-**Two transports, one proof.** `RP_TWO_HOST_TRANSPORT` selects which RunPod
-object type carries the two-HOST NCCL bootstrap: `pods` (default) or
-`cluster`. `pods` rents TWO ORDINARY pods (`POST /v2/pods`,
-`rp_two_host_pod_create` — `cloud: SECURE`, `globalNetworking: true`, one
-GPU each), co-located in ONE data center chosen by intersecting the pod
-catalog's own per-data-center availability (`GET /v2/catalog/gpus?
-include=AVAILABILITY&product=POD&count=1&cloud=SECURE`) with the data
-centers RunPod's own `GET /v2/catalog/datacenters` reports `globalNetwork: true`
-for — read LIVE at run time, never a hard-coded list (a snapshot verified
-2026-09-16: CA-MTL-1, CA-MTL-3, EU-CZ-1, EU-FR-1, EU-NL-1, EU-RO-1, EU-SE-1,
-EUR-IS-2, EUR-IS-4, OC-AU-1, US-CA-2, US-GA-2, US-IL-1, US-KS-2, US-NC-1,
-US-TX-3, US-TX-4, US-WA-1). Rank is assigned by CREATION ORDER (the first
-pod created is rank 0, the second rank 1), and each member DERIVES its own
-`NCCL_SOCKET_IFNAME` from its Global-Networking ip at run time
-(the kernel route table, `/proc/net/route`: the interface whose route
-covers that ip by longest prefix — the image ships no `ip` binary) rather
-than the cluster path's `ens1` literal — a member whose route table covers
-no such ip refuses (97) by name, echoing `DERIVED_NCCL_IFACE=` so
-the driver's own post-run proof reads which interface it actually used.
-`cluster` is kept, byte-for-byte what it always was (below) — the SAME
-proof over a different, near-zero-capacity rental mechanism (measured: 8 of
-9 cluster creates refused `Insufficient resources` in one session). Both
-transports assemble the SAME `gang` artifact (`gang.leg` stays `"cluster"`
-either way — the two-HOST leg is the fact that matters downstream);
-`gang.transport` (`instant-cluster` | `global-networking`) is the sub-fact
-naming which mechanism actually carried the run, closed-set and required by
-`check_cuda_run_artifacts.py` rule (k). Cost bound (both parts at the
-measured cluster and catalog rates, `RP_TTL_HOURS=1`): `cluster` bills
-`2 x $1.908/GPU/h = $3.816/h` (`1 h x $3.816/h = $3.82` terminate-succeeds;
-`(1 + 6) h x $3.816/h = $26.71` sweep-only); `pods` bills
-`2 x $1.59/GPU/h = $3.18/h` (`1 h x $3.18/h = $3.18` terminate-succeeds;
-`(1 + 6) h x $3.18/h = $22.26` sweep-only — both pods fall under the
-ORDINARY pod sweep's own name-shape match, so `gpu-reap.yml`'s SAME
-6-hourly cadence is the backstop, no separate sweep primitive for this
-transport).
-
-A CLUSTER is a SEPARATE RunPod object type from a pod: member pods on one
-private overlay network, created and destroyed as a unit — it is retired by
-deleting the CLUSTER, never by terminating one of its member pods. This
-tooling's own `_rp_cluster_payload` requests a FIXED shape, never a
-caller-chosen one: exactly 2 member pods, 1 GPU each (`compute.
-gpuCountPerPod=1`, `compute.podCount=2` — this tooling's own choice, not
-something RunPod's schema demands; there is no parameter for any other
-shape). There is
-no GraphQL surface for it at all; every `rp_cluster_*` primitive in
-`ci/scripts/runpod_lib.sh` goes over RunPod's REST v2 (`_rp_rest`):
-`rp_cluster_create`, `rp_cluster_get`, `rp_cluster_pods` (members with
-`rank`/overlay `ip`/`ssh.direct`), `rp_cluster_delete`, `rp_cluster_list`,
-and `rp_cluster_sweep` (a cluster whose name carries `-ttl<H>` and whose age
-exceeds `H` hours is deleted; one this sweep cannot JUDGE — no usable
-`createdAt`, or a prefixed name with no parseable `-ttl<H>` — is named with
-its by-id remedy (`rp_cluster_delete <id>`) and left alone while the rest
-of the list is still swept, and the sweep exits 1; a failed enumeration is
-`return 1` "could NOT enumerate clusters", never "nothing to reap"). `gpu-dev.sh reap` runs both
-the pod sweep and `rp_cluster_sweep`; the pod sweep excludes every live
-cluster member by id rather than ever calling `podTerminate` on one.
-
-**What it proves.** `gang_nccl_two_hosts_reduce_a_known_vector`
-(`crates/jammi-ai/tests/gpu_capability/gang_nccl.rs`) is the only test body
-that exercises the two-HOST NCCL bootstrap (`ncclCommInitRank`, an
-out-of-band id crossing between hosts); the gang leg above proves a
-two-DEVICE collective inside one pod (`ncclCommInitAll`), which cannot
-exercise this bootstrap at all. Rank 0 mints the 128-byte NCCL id and writes
-it to `$JAMMI_GANG_TWO_HOSTS_ID_FILE`; rank 1 reads it once it is ready
-(rank 0 writes a `.tmp` file then renames, and only after `stat` reports
-exactly 128 bytes). Both ranks then run the SAME assertions the pod leg's
-single-process test runs (rank-ordered sum, unequal-count gather, lockstep
-flags, barrier), over a real cross-host communicator instead of
-`ncclCommInitAll`'s single-process one, and each writes its own
-`rank-<r>.json` report into `$JAMMI_GANG_ARTIFACT_DIR`.
-
-**The driver: `ci/scripts/runpod_gpu_cluster.sh`.** It rents a 2×1 cluster
-of the part `RP_CLUSTER_GPU_TYPE` names (the workflow's `gpu_type` input;
-A100 SXM4 by default, or any sm_80/86/89/90 part the driver's
-`_rpc_compute_cap_for_gpu_type` maps to the compute capability the members
-build for — an unmapped id is refused before anything is rented, and the
-availability floor is the `min_availability` input),
-waits for both members reachable (tracked by DISTINCT rank, never a raw
-count — two rows both reading back as rank 0 must never satisfy readiness),
-ships the id between hosts, pulls both ranks' reports, assembles the one
-committed `gang` artifact (shape MEASURED from the create/get response,
-never a literal), scans every carrier for the id BEFORE anything is
-uploaded, and tears the cluster down on every exit arm — including a
-SIGINT/SIGTERM/SIGHUP cancellation, not only a normal `exit` — via its own
-cleanup trap, which runs the scan FIRST, ahead of its own (bounded) REST
-calls, and destroys a dirty carrier synchronously rather than deferring to
-a session-conditional cleanup. Its own workflow, `.github/workflows/
-gpu-cluster.yml`, is `run-cluster` PR-label or `workflow_dispatch` only —
-never a `schedule:`, and nothing else `uses:` it. As a FALLBACK — before
-the driver's first real run, or if it is ever unavailable — a maintainer
-may still drive the two-host test BY HAND with the primitives above:
-
-1. Read per-data-center availability (`GET /v2/catalog/gpus?include=
-   AVAILABILITY&product=CLUSTER&count=1&cloud=SECURE`) and pick a data
-   center at `MEDIUM` or better — co-placement needs exactly one.
-2. `rp_cluster_create <gpuTypeId> [dataCenterIds]`; poll `rp_cluster_get`/
-   `rp_cluster_pods` until both members are `RUNNING` with a reachable
-   `ssh.direct` (or the overlay-ip fallback through the primary), then
-   probe each member with `ssh … true` until it answers
-   (`rp_wait_sshd`, bounded by `RP_SSH_WAIT_SECS`): a `RUNNING`
-   pod's entrypoint installs sshd after boot, so the endpoint RunPod
-   reports refuses connections for a while first. Both transports run
-   this probe for both members before any remote command.
-3. On BOTH members, concurrently: fetch this tree at the EXACT commit under
-   test (`PROVE_EXPECT_SHA`, by hash — never a branch name, which can move
-   between dispatch and clone) and build the `gpu_capability` test target (only the proof needs the id,
-   so neither build waits on the other; the driver's one watch loop bounds
-   both by log growth within `RP_INACTIVITY` and the T-10m budget).
-4. On the member running rank 0: export `JAMMI_GANG_TWO_HOSTS_RANK=0`,
-   `JAMMI_GANG_TWO_HOSTS_WORLD=2`, `JAMMI_GANG_TWO_HOSTS_ID_FILE=<path>`,
-   `JAMMI_GANG_ARTIFACT_DIR=<path>`, `NCCL_SOCKET_IFNAME=ens1`, and run
-   `cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests
-   --test gpu_capability gang_nccl_two_hosts -- --nocapture
-   --test-threads=1`.
-5. Once rank 0's id file holds exactly 128 bytes, `scp` it to the member
-   running rank 1 (mode 0600; delete the local copy once the id has
-   crossed). Rank 1 runs with the SAME env, `JAMMI_GANG_TWO_HOSTS_RANK=1`, and its
-   script blocks between its build and its proof until that file holds
-   128 bytes — the proof, never the build, waits for the id.
-6. Read both `rank-<r>.json` reports back; `rp_cluster_delete` the cluster
-   when done — do not rely on member self-removal alone (below).
-7. Treat the id as a secret throughout: it must never appear in a
-   terminal scrollback, a committed log, or a comment on this repo.
-
-**Member self-removal is honestly unmeasured.** RunPod's REST v2 surface
-reports member pods with `actions: []`, so even a successful in-pod
-`runpodctl remove pod` self-termination's effect on cluster accounting is
-unconfirmed for a cluster member — the driver's own `_rpc_self_remove_status`
-treats a 404 on the cluster's own GET as "ok" and otherwise falls back to
-its own `rp_cluster_delete` call, from its cleanup trap, on every exit arm.
-The enforcers, in order: (1) the driver's own trap, (2) the cluster's own
-name TTL plus `gpu-reap.yml`'s 6-hourly `rp_cluster_sweep`, (3) a human, via
-the RunPod console. Cost bound, at the MEASURED `$1.908/GPU/h` cluster rate
-(the catalog's own `$1.59` is the POD price, a different rate) and the
-driver's own `RP_TTL_HOURS=1`: the 2×1 shape bills `2 x $1.908/GPU/h =
-$3.816/h`, so (i) terminate-succeeds (the ordinary path): `1 h x $3.816/h =
-$3.82` per run; (ii) sweep-only (the worst path — the trap's own delete call
-fails): `(1 + 6) h x $3.816/h = $26.71`. The lane runs only on the
-`run-cluster` label, <= 1 h billed per run.
-
-**Pre-flight: REST v2 `args` reaches `bash -c`.** The cluster driver relies on
-REST v2's `args` field reaching `bash -c` on `RP_IMAGE` the way the pod
-path's GraphQL `dockerArgs` field does. A real, single-pod REST v2 create
-shows it does: a pod (RTX A4000, SECURE) with `args: "bash -c '...'"` on
-`ghcr.io/f-inverse/jammi-ai-ci-cuda:latest` — the container log printed the
-exact marker that `args` command echoed (`PREFLIGHT-ARGS-OK`), followed by
-`nvidia-smi -L` (`GPU 0: NVIDIA RTX A4000`) and `/sys/class/net` (`bonding_masters
-eth0 lo`); the read-back `Pod.args` on a subsequent GET returned the exact
-text sent. REST v2's `args` reaches `bash -c` exactly as the pod path's
-GraphQL `dockerArgs` does, and the launch-time read-back refusal
-(`_rpc_check_readback`) reads a real field. Still unmeasured, honestly,
-because this was a single ordinary POD, never a cluster: `ens1` as a
-cluster member's own overlay iface (this probe's own pod showed only
-`eth0`/`lo` — no cluster overlay network), member sshd reachability on a
-real cluster, and member self-removal (above).
-
-**The artifact registry.** `ci/scripts/check_cuda_run_artifacts.py`'s `gang`
-kind (rule (k)) discriminates by `gang.leg`: the pod leg's registry is
-unchanged (`world`, `collective`, per-rank `device`, the same-seed digest
-pair, the measured delta, epsilon). The cluster leg's own registry —
-`hosts` (exactly 2), `ranks[]` (`rank`/`host`/`device`/`iface` per entry), a
-`reduced_vector_digest` (a bit-exact digest, equal across both ranks on a
-`pass`; NEVER conflated with the pod leg's LoRA-shaped same-seed
-reproducibility pair, a different regime this leg does not measure), and
-the shape/deadline it was rented at (`pod_count`, `gpu_count_per_pod`,
-`ttl_hours`), with no `digests`/`per_step_loss_delta`/`epsilon` row at all —
-stays on this tree. `GANG_LEG_PRODUCER_PATH` binds `gang.leg ==
-"cluster"` to `producer.path == "ci/scripts/runpod_gpu_cluster.sh"` — THIS
-driver is the sole writer of that leg's artifact, exactly as the pod leg's
-own driver is bound to its own registry, and a leg naming any other path
-(or no registered leg at all) is still refused before any shape is even
-read.
-
-**Schedule visibility (P8).** `ci/scripts/check_gpu_prove_once.py`'s P7 rule
-derives its renting-closure subject set from a REVIEWED ROOT LIST —
-`_rp_deploy_payload` for the pod surface, `rp_cluster_create` for the
-cluster surface — so a second renting mechanism gets a table row through
-the same derivation the pod legs always have the moment a real DRIVER
-calls it. `rp_cluster_create`'s own real caller is `ci/scripts/
-runpod_gpu_cluster.sh`, carrying its own `PAID_POD_LANE_TABLE` row
-(`"gpu-cluster.yml"`) — the root's FIRST real driver, judged by P7 like any
-other. Three OTHER tracked files also word-match the `rp_cluster_create`
-literal and are each independently derived and cleared through the same
-predicate (none is a renting driver and none is exempted for being ours):
-`ci/scripts/test_check_gpu_prove_once.py` (its fixtures spell the literal),
-`ci/scripts/test_runpod_cluster_lib.sh` (the mocks-only primitives
-suite, which genuinely calls it) and `ci/scripts/check_gpu_prove_once.py`
-itself (this very rule's own source names `rp_cluster_create` as a
-`RENTING_ROOTS` string literal, so the gate self-matches its own
-definition — see that file's own disclosure of this, alongside its
-pre-existing `test_check_gpu_prove_once.py` self-match). P8 additionally
-demands that ANY paid pod lane's `schedule:` trigger, if one is ever added,
-is a reviewed `PAID_LANE_CRON_ALLOWLIST` entry naming its own never-vacuous
-arm — `gpu-cluster.yml` carries no `schedule:` at all today, so this leg
-adds nothing to that allowlist. Nothing about a release depends on this
-leg; the release verdict is the prove lane's.
-
-**Known-unmeasured.** This leg proves world 2 only. Whether the NCCL pin set
-(`NCCL_SOCKET_IFNAME=ens1` and friends) that works at world 2 still suffices
-at world >= 3 — a multi-rail/multi-NIC topology a 2-host gang cannot
-exercise — is uncovered here, and stated as such rather than silently assumed.
+**The artifact.** The driver pulls every host's logs and records before
+teardown, and the assembler writes `topology.json` — the `topology` kind
+`ci/scripts/check_cuda_run_artifacts.py`'s rule (k) gates: the fleet's shape,
+the one-host cell's passed tests, the NCCL runtime, each transport's run
+(where every rank ran, the transport the coordinator selected, the loss, the
+embeddings' digest), the reference, ε and the lane's verdict. A failing run is
+representable — admitted with its reasons and a non-GREEN status. A human
+reviews it and commits it under `crates/jammi-kernels/artifacts/cuda-runs/`.
+The NCCL communicator id rides only the gang's own `RunRank` link between the
+servers — never a file, a log line or the artifact.
 
 ## Notes
 

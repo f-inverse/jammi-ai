@@ -3988,6 +3988,13 @@ impl JobWorker {
                     rank_devices.iter().all(can_join_nccl),
                 )
                 .map_err(WorkerJobError::from)?;
+                tracing::info!(
+                    job_id = %job_id,
+                    topology = "local",
+                    world,
+                    transport = ?kind,
+                    "gang transport selected"
+                );
                 let transports = kind
                     .local_transports(&rank_devices)
                     .map_err(WorkerJobError::from)?;
@@ -6164,6 +6171,12 @@ async fn bind_gang_transport(
     let every_rank_offers_nccl = transport::member_offers_nccl(collective, device)
         && links.iter().all(CoordinatorLink::offers_nccl);
     let kind = TransportKind::select(collective, every_rank_offers_nccl)?;
+    tracing::info!(
+        topology = "peer",
+        world,
+        transport = ?kind,
+        "gang transport selected"
+    );
     let bind_all = |bind: Bind| -> std::result::Result<(), JammiError> {
         for link in links {
             if !link.bind(bind.clone()) {

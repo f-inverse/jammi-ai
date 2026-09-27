@@ -73,7 +73,7 @@ impl GangService for MemberService {
         let (events_tx, events_rx) = mpsc::channel::<Result<RankEvent, Status>>(64);
         events_tx
             .send(Ok(RankEvent {
-                event: Some(rank_event::Event::Admitted(Admitted {})),
+                event: Some(rank_event::Event::Admitted(Admitted { nccl: false })),
             }))
             .await
             .map_err(|_| Status::internal("response stream gone"))?;

@@ -107,9 +107,9 @@ use jammi_db::storage::JammiObjectStore;
 use jammi_db::store::manifest::{ArtifactDigest, LeafDigest, LeafKey};
 use jammi_wire::proto::gang::gang_service_client::GangServiceClient;
 use jammi_wire::proto::gang::{
-    outcome, rank_control, rank_event, AbortReason, Assign, Cancel, Counts, Outcome, RankControl,
-    RankEvent, RoundAck, RoundChunk, RoundCommit, RoundDescriptor, RoundFault, RoundPayload,
-    RoundVerb,
+    outcome, rank_control, rank_event, AbortReason, Assign, Bind, Cancel, Counts, Outcome,
+    RankControl, RankEvent, RoundAck, RoundChunk, RoundCommit, RoundDescriptor, RoundFault,
+    RoundPayload, RoundVerb,
 };
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -224,6 +224,31 @@ impl MemberLink {
             outcome: None,
         }))
     }
+
+    /// The coordinator's `Bind` — the first frame after `Admitted`, naming
+    /// the transport every rank of the gang moves its round bytes by —
+    /// waited for until `deadline`. Blocks on the link's runtime, so it is
+    /// called from a blocking thread, as every round is.
+    pub fn recv_bind(&mut self, deadline: Instant) -> Result<Bind> {
+        match self.0.recv(deadline) {
+            Ok(Frame::Bind(bind)) => Ok(bind),
+            Ok(Frame::Session(description)) => Err(JammiError::FineTune(format!(
+                "{description} while waiting for the gang's Bind"
+            ))),
+            Ok(other) => Err(JammiError::FineTune(format!(
+                "{other:?} arrived where the gang's Bind must come first"
+            ))),
+            Err(WaitEnd::Timeout) => Err(JammiError::FineTune(
+                "the coordinator sent no Bind before the gang deadline".into(),
+            )),
+            Err(WaitEnd::Disconnected) => Err(JammiError::FineTune(
+                "the stream to the coordinator closed before its Bind".into(),
+            )),
+            Err(WaitEnd::Transport(reason)) => Err(JammiError::FineTune(format!(
+                "the stream to the coordinator failed before its Bind: {reason}"
+            ))),
+        }
+    }
 }
 
 /// The coordinator's end of one member's admitted `RunRank` stream:
@@ -233,6 +258,9 @@ impl MemberLink {
 pub struct CoordinatorLink {
     rank: u32,
     link: Link<RankEvent, RankControl>,
+    /// Whether the member offered to join an NCCL transport, as its
+    /// `Admitted` stated.
+    offers_nccl: bool,
 }
 
 impl CoordinatorLink {
@@ -252,6 +280,7 @@ impl CoordinatorLink {
                 session_abort: None,
                 outcome: None,
             },
+            offers_nccl: false,
         })
     }
 
@@ -286,10 +315,10 @@ impl CoordinatorLink {
                 JammiError::FineTune(format!("RunRank to rank {rank} was refused: {status}"))
             })?
             .into_inner();
-        match inbound.next().await {
+        let offers_nccl = match inbound.next().await {
             Some(Ok(RankEvent {
-                event: Some(rank_event::Event::Admitted(_)),
-            })) => {}
+                event: Some(rank_event::Event::Admitted(admitted)),
+            })) => admitted.nccl,
             Some(Ok(RankEvent {
                 event: Some(rank_event::Event::Aborted(aborted)),
             })) => {
@@ -313,7 +342,7 @@ impl CoordinatorLink {
                     "RunRank to rank {rank} closed before admission"
                 )));
             }
-        }
+        };
         let inbound = pump(&handle, inbound);
         Ok(Self {
             rank,
@@ -324,6 +353,21 @@ impl CoordinatorLink {
                 session_abort: None,
                 outcome: None,
             },
+            offers_nccl,
+        })
+    }
+
+    /// Whether the member offered to join an NCCL transport in its
+    /// `Admitted`.
+    pub fn offers_nccl(&self) -> bool {
+        self.offers_nccl
+    }
+
+    /// Send the gang's transport to the member — the first frame after
+    /// `Admitted`, before round 0. `false` when the member's stream is gone.
+    pub fn bind(&self, bind: Bind) -> bool {
+        self.link.send(RankControl {
+            control: Some(rank_control::Control::Bind(bind)),
         })
     }
 
@@ -374,6 +418,7 @@ fn abort_reason(raw: i32) -> String {
 /// rather than skipping it.
 #[derive(Debug)]
 enum Frame {
+    Bind(Bind),
     Payload(RoundPayload),
     Chunk(RoundChunk),
     Ack(RoundAck),
@@ -404,6 +449,7 @@ impl Inbound for RankControl {
             Some(rank_control::Control::RoundChunk(chunk)) => Frame::Chunk(chunk),
             Some(rank_control::Control::RoundCommit(commit)) => Frame::Commit(commit),
             Some(rank_control::Control::RoundFault(fault)) => Frame::Fault(fault),
+            Some(rank_control::Control::Bind(bind)) => Frame::Bind(bind),
             Some(rank_control::Control::Assign(_)) => {
                 Frame::Session("a second Assign on an admitted stream".into())
             }

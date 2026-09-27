@@ -51,7 +51,31 @@ message RankControl {
     RoundCommit round_commit = 5;
     // The round is abandoned on every rank; `detail` is the gang's fault.
     RoundFault round_fault = 6;
+    // The transport every rank of this gang moves its round bytes by: the
+    // coordinator's decision, sent to every member once all are admitted
+    // and before round 0 — the first frame after `Admitted`.
+    Bind bind = 7;
   }
+}
+
+// How a gang's round bytes move (`jammi_ai::fine_tune::collective::transport`).
+// The control round — agreement, fault, commit — is the same on either.
+message Bind {
+  oneof transport {
+    // The bytes ride the round frames themselves.
+    InlineTransport inline = 1;
+    // The round frames carry descriptors only; once they agree, the bytes
+    // move by an NCCL all-gather among the ranks.
+    NcclTransport nccl = 2;
+  }
+}
+
+message InlineTransport {}
+
+message NcclTransport {
+  // The communicator id the coordinator minted (`ncclGetUniqueId`, 128
+  // bytes): the capability to join this gang's communicator.
+  bytes id = 1;
 }
 
 // The job coordinates only. No training-set identity (resolved by the
@@ -89,7 +113,12 @@ message RankEvent {
 }
 
 // The rank was admitted: held under re-verification until it ends `Aborted`.
-message Admitted {}
+message Admitted {
+  // This member can move its round bytes by an NCCL transport: a CUDA build,
+  // a CUDA device, and a `[worker] collective` other than "cpu". The
+  // coordinator chooses NCCL for the gang only when every rank can.
+  bool nccl = 1;
+}
 
 // Why a session ended without ever handing control to a rank body. Additive:
 // a later reason joins this set; none already declared is ever renamed or

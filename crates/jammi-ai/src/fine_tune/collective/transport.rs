@@ -55,6 +55,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use candle_core::{DType, Device, Tensor};
+use jammi_db::config::CollectiveSelection;
 use jammi_db::error::{JammiError, Result};
 
 use super::round::{contribution_shapes, Contribution, Shape};
@@ -113,6 +114,146 @@ impl Transport {
         if let Self::Device(exchange) = self {
             exchange.abort();
         }
+    }
+}
+
+/// Which transport a gang moves its round bytes by — decided ONCE per gang,
+/// by [`Self::select`], at every scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// [`Transport::Inline`] on every rank.
+    Inline,
+    /// An NCCL [`DeviceExchange`] on every rank.
+    Nccl,
+}
+
+impl TransportKind {
+    /// The one rule, for an in-process gang and a fleet gang alike:
+    /// `[worker] collective` × whether EVERY rank of the gang can join an
+    /// NCCL transport ([`can_join_nccl`], and a fleet member's own
+    /// `collective` other than `cpu`).
+    ///
+    /// - `cpu` → inline, even where NCCL is reachable.
+    /// - `auto` → NCCL when every rank can join it, inline otherwise.
+    /// - `nccl` → NCCL; a gang with a rank that cannot join it is refused,
+    ///   typed, rather than silently reduced on the host.
+    pub fn select(selection: CollectiveSelection, every_rank_can_join_nccl: bool) -> Result<Self> {
+        match (selection, every_rank_can_join_nccl) {
+            (CollectiveSelection::Cpu, _) | (CollectiveSelection::Auto, false) => Ok(Self::Inline),
+            (CollectiveSelection::Auto | CollectiveSelection::Nccl, true) => Ok(Self::Nccl),
+            (CollectiveSelection::Nccl, false) => Err(JammiError::Config(
+                "[worker] collective = \"nccl\" but a rank of this gang cannot join an NCCL \
+                 transport — every rank needs a CUDA build and a CUDA device, and a fleet \
+                 member's own collective must not be \"cpu\""
+                    .into(),
+            )),
+        }
+    }
+
+    /// Every rank's transport for an in-process gang on `devices` (rank `r`
+    /// on `devices[r]`).
+    pub fn local_transports(self, devices: &[Device]) -> Result<Vec<Transport>> {
+        match self {
+            Self::Inline => Ok(vec![Transport::Inline; devices.len()]),
+            Self::Nccl => nccl::single_process(devices),
+        }
+    }
+}
+
+/// Whether a rank on `device` can join an NCCL transport: a CUDA build and a
+/// CUDA device. Configuration decides whether it WILL
+/// ([`TransportKind::select`]); this is whether it can.
+pub fn can_join_nccl(device: &Device) -> bool {
+    cfg!(feature = "cuda") && device.is_cuda()
+}
+
+/// Whether a fleet member on `device` offers to join an NCCL transport — what
+/// it states in `Admitted`: it can, and its own `[worker] collective` does not
+/// ask for the host reduction.
+pub fn member_offers_nccl(selection: CollectiveSelection, device: &Device) -> bool {
+    selection != CollectiveSelection::Cpu && can_join_nccl(device)
+}
+
+/// The NCCL steps a gang takes to stand its transport up — the one place the
+/// CUDA build boundary is crossed. On a build without CUDA every step is a
+/// typed refusal, and [`TransportKind::select`] never reaches one: no rank of
+/// such a build can join ([`can_join_nccl`]).
+pub mod nccl {
+    use std::time::Duration;
+
+    use candle_core::Device;
+    use jammi_db::error::Result;
+
+    use super::Transport;
+
+    /// Mint a communicator id (the coordinator, before `Bind`).
+    #[cfg(feature = "cuda")]
+    pub fn mint_id() -> Result<Vec<u8>> {
+        Ok(crate::fine_tune::collective::nccl::Nccl::new_id()?.to_vec())
+    }
+
+    /// Mint a communicator id (the coordinator, before `Bind`).
+    #[cfg(not(feature = "cuda"))]
+    pub fn mint_id() -> Result<Vec<u8>> {
+        Err(no_cuda())
+    }
+
+    /// Join rank `rank` of a `world`-rank communicator on `device`, bounded by
+    /// `deadline`.
+    #[cfg(feature = "cuda")]
+    pub fn join(
+        device: &Device,
+        rank: u32,
+        world: u32,
+        id: &[u8],
+        deadline: Duration,
+    ) -> Result<Transport> {
+        use crate::fine_tune::collective::nccl::{Nccl, NcclIdBytes};
+        let id: NcclIdBytes = id.try_into().map_err(|_| {
+            jammi_db::error::JammiError::FineTune(format!(
+                "an NCCL communicator id is 128 bytes; this one is {}",
+                id.len()
+            ))
+        })?;
+        let joined = Nccl::from_rank(device, rank, world, id, deadline)?;
+        Ok(Transport::Device(std::sync::Arc::new(joined)))
+    }
+
+    /// Join rank `rank` of a `world`-rank communicator on `device`, bounded by
+    /// `deadline`.
+    #[cfg(not(feature = "cuda"))]
+    pub fn join(
+        _device: &Device,
+        _rank: u32,
+        _world: u32,
+        _id: &[u8],
+        _deadline: Duration,
+    ) -> Result<Transport> {
+        Err(no_cuda())
+    }
+
+    /// One communicator per device of an in-process gang.
+    #[cfg(feature = "cuda")]
+    pub(super) fn single_process(devices: &[Device]) -> Result<Vec<Transport>> {
+        Ok(
+            crate::fine_tune::collective::nccl::Nccl::single_process(devices)?
+                .into_iter()
+                .map(|rank| Transport::Device(std::sync::Arc::new(rank)))
+                .collect(),
+        )
+    }
+
+    /// One communicator per device of an in-process gang.
+    #[cfg(not(feature = "cuda"))]
+    pub(super) fn single_process(_devices: &[Device]) -> Result<Vec<Transport>> {
+        Err(no_cuda())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn no_cuda() -> jammi_db::error::JammiError {
+        jammi_db::error::JammiError::Config(
+            "an NCCL transport needs a build with the `cuda` feature; this binary has none".into(),
+        )
     }
 }
 

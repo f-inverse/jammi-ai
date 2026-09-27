@@ -625,9 +625,11 @@ async fn reverify(
     }
 }
 
-fn admitted_event() -> RankEvent {
+/// `Admitted`, stating whether this member offers to join an NCCL transport
+/// (`jammi_ai::fine_tune::worker::member_offers_nccl`).
+fn admitted_event(nccl: bool) -> RankEvent {
     RankEvent {
-        event: Some(rank_event::Event::Admitted(Admitted {})),
+        event: Some(rank_event::Event::Admitted(Admitted { nccl })),
     }
 }
 
@@ -757,12 +759,14 @@ impl HeldSession {
                 unreachable!("Assign and Cancel are decided by on_control_frame, never dispatched")
             }
             Some(
-                rank_control::Control::RoundResult(_)
+                rank_control::Control::Bind(_)
+                | rank_control::Control::RoundResult(_)
                 | rank_control::Control::RoundChunk(_)
                 | rank_control::Control::RoundCommit(_)
                 | rank_control::Control::RoundFault(_),
             ) => unreachable!(
-                "every round arm is recognised by RoundInbox::is_round_frame and delivered above"
+                "Bind and every round arm are recognised by RoundInbox::is_round_frame and \
+                 delivered above"
             ),
         }))
     }
@@ -1160,7 +1164,8 @@ impl GangService for GangServer {
             }
             None => (self.offer_member_link(member), None),
         };
-        if events.try_send(Ok(admitted_event())).is_err() {
+        let offers_nccl = jammi_ai::fine_tune::worker::member_offers_nccl(&self.session);
+        if events.try_send(Ok(admitted_event(offers_nccl))).is_err() {
             // A fresh channel with room for four frames cannot refuse the
             // first; stated rather than unwrapped.
             return Err(Status::internal("gang admission: could not emit Admitted"));

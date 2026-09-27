@@ -12,8 +12,9 @@
 # TOPOLOGY_GPU_TYPES type (the workflow's `gpu_types` input, in order) and
 # co-located data center that clears TOPOLOGY_MIN_AVAILABILITY at a secure
 # per-GPU rate — read from the live catalog and printed before anything is
-# rented — within TOPOLOGY_MAX_GPU_RATE; the driver walks them until both
-# hosts land in one place, releasing a first host whose partner cannot. Every type must map to a compute capability
+# rented — within TOPOLOGY_MAX_GPU_RATE; the driver walks them until two
+# ready hosts in one place reach each other over Global Networking (measured,
+# `rp_fleet_routes`), releasing any candidate's hosts that do not. Every type must map to a compute capability
 # (`rp_compute_cap_for_gpu_type`): a type outside sm_80/86/89/90 is refused
 # before renting.
 #
@@ -238,24 +239,39 @@ trap 'cleanup_fleet 129' HUP
 trap 'cleanup_fleet 130' INT
 trap 'cleanup_fleet 143' TERM
 
-# Both hosts in one place, or neither: a first host whose partner cannot be
-# placed there is released before the next candidate is tried.
-while IFS='|' read -r GPU_TYPE GPU_RATE chosen_dc; do
+# Release whatever this candidate rented before the next is tried.
+release_fleet() {
+  local id
+  for id in "$fleet_pod_0" "$fleet_pod_1"; do
+    [ -n "$id" ] || continue
+    rp_terminate "$id" >/dev/null || echo "::warning::terminate ${id} refused -- its TTL and gpu-reap.yml's sweep remain the backstop"
+  done
+  fleet_pod_0=""; fleet_pod_1=""
+}
+
+# A candidate is taken only once both of its hosts exist in one place, are
+# reachable over ssh, and reach EACH OTHER over Global Networking (measured:
+# `rp_fleet_routes`); otherwise both are released and the next is tried. The
+# candidates ride fd 3, so no ssh inside the loop consumes them.
+placed=0
+while IFS='|' read -r GPU_TYPE GPU_RATE chosen_dc <&3; do
   echo "=== ${GPU_TYPE} at \$${GPU_RATE}/GPU/h x ${RP_GPU_COUNT} GPUs x 2 hosts in ${chosen_dc}: $(python3 -c "print(round(float('${GPU_RATE}')*${RP_GPU_COUNT}*2, 2))")/h, TTL ${RP_TTL_HOURS}h ==="
   fleet_pod_0="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 0)" || { fleet_pod_0=""; continue; }
-  fleet_pod_1="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 1)" && break
-  fleet_pod_1=""
-  rp_terminate "$fleet_pod_0" >/dev/null || echo "::warning::terminate ${fleet_pod_0} refused -- its TTL and gpu-reap.yml's sweep remain the backstop"
-  fleet_pod_0=""
-done <<< "$candidates"
-[ -n "$fleet_pod_1" ] || { echo "::error::no candidate placed both hosts in one data center (SUPPLY_CONSTRAINT)"; exit 75; }
+  fleet_pod_1="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 1)" || { fleet_pod_1=""; release_fleet; continue; }
+  echo "=== fleet pods ${fleet_pod_0} (host 0), ${fleet_pod_1} (host 1) ==="
+  ready="$(rp_fleet_wait_ready "$fleet_pod_0" "$fleet_pod_1" "$RP_SSH_WAIT_SECS")" || { release_fleet; continue; }
+  IFS=' ' read -r HOST0 PORT0 HOST1 PORT1 measured_dc GN_IP0 GN_IP1 <<< "$ready"
+  echo "=== both hosts RUNNING in ${measured_dc}; Global-Networking ips ${GN_IP0}, ${GN_IP1} ==="
+  if rp_wait_sshd "$HOST0" "$PORT0" "$RP_SSH_WAIT_SECS" "host 0" \
+     && rp_wait_sshd "$HOST1" "$PORT1" "$RP_SSH_WAIT_SECS" "host 1" \
+     && rp_fleet_routes "$HOST0" "$PORT0" "$HOST1" "$PORT1" "$GN_IP0" "$GN_IP1"; then
+    placed=1
+    break
+  fi
+  release_fleet
+done 3<<< "$candidates"
+[ "$placed" -eq 1 ] || { echo "::error::no candidate gave two ready hosts that reach each other in one data center (SUPPLY_CONSTRAINT)"; exit 75; }
 NATIVE_COMPUTE_CAP="$(rp_compute_cap_for_gpu_type "$GPU_TYPE")"
-echo "=== fleet pods ${fleet_pod_0} (host 0), ${fleet_pod_1} (host 1) ==="
-ready="$(rp_fleet_wait_ready "$fleet_pod_0" "$fleet_pod_1" "$RP_SSH_WAIT_SECS")" || exit $?
-IFS=' ' read -r HOST0 PORT0 HOST1 PORT1 measured_dc GN_IP0 GN_IP1 <<< "$ready"
-echo "=== both hosts RUNNING in ${measured_dc}; Global-Networking ips ${GN_IP0}, ${GN_IP1} ==="
-rp_wait_sshd "$HOST0" "$PORT0" "$RP_SSH_WAIT_SECS" "host 0" || exit 76
-rp_wait_sshd "$HOST1" "$PORT1" "$RP_SSH_WAIT_SECS" "host 1" || exit 76
 
 # One remote script on one host, under the inactivity watchdog. $1=host $2=port.
 on_host() {

@@ -1872,6 +1872,40 @@ export NCCL_SOCKET_IFNAME="\$iface"
 IFACE
 }
 
+# Whether a fleet's hosts reach each other on Global Networking — MEASURED,
+# never trusted from the pods' own report: a data center can list Global
+# Networking, give each pod an ip and a route, resolve `<pod>.runpod.internal`,
+# and still carry no packet between two of its pods. Each host listens on its
+# own Global-Networking ip (`RP_FLEET_ROUTE_PORT`), then each dials the other
+# until it answers or `RP_FLEET_ROUTE_SECS` pass (the network converging after
+# both pods start). $1..$4=host0 port0 host1 port1 (ssh) $5 $6=gn_ip0 gn_ip1.
+# 0 when both directions connect; 97, naming the direction, otherwise.
+RP_FLEET_ROUTE_PORT="${RP_FLEET_ROUTE_PORT:-7999}"
+RP_FLEET_ROUTE_SECS="${RP_FLEET_ROUTE_SECS:-120}"
+rp_fleet_routes() {
+  local h0="$1" p0="$2" h1="$3" p1="$4" g0="$5" g1="$6" own peer host port label
+  for label in 0 1; do
+    if [ "$label" = 0 ]; then host="$h0"; port="$p0"; own="$g0"; else host="$h1"; port="$p1"; own="$g1"; fi
+    ssh "${RP_SSHO[@]}" -p "$port" "root@${host}" "timeout 60 bash -s" <<LISTEN || { echo "::error::host ${label}: could not start its route listener" >&2; return 97; }
+setsid nohup timeout $((RP_FLEET_ROUTE_SECS * 3)) python3 -c 'import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("${own}", ${RP_FLEET_ROUTE_PORT})); s.listen(8)
+while True: s.accept()[0].close()' >/dev/null 2>&1 < /dev/null &
+LISTEN
+  done
+  for label in 0 1; do
+    if [ "$label" = 0 ]; then host="$h0"; port="$p0"; peer="$g1"; else host="$h1"; port="$p1"; peer="$g0"; fi
+    ssh "${RP_SSHO[@]}" -p "$port" "root@${host}" "timeout $((RP_FLEET_ROUTE_SECS + 30)) bash -s" <<REACH || { echo "::error::host ${label} cannot reach ${peer}:${RP_FLEET_ROUTE_PORT} over Global Networking within ${RP_FLEET_ROUTE_SECS}s -- this data center does not route between the two hosts" >&2; return 97; }
+deadline=\$((SECONDS + ${RP_FLEET_ROUTE_SECS}))
+until timeout 5 bash -c "</dev/tcp/${peer}/${RP_FLEET_ROUTE_PORT}" 2>/dev/null; do
+  [ "\$SECONDS" -lt "\$deadline" ] || exit 1
+  sleep 3
+done
+REACH
+  done
+  echo "=== the hosts reach each other over Global Networking (${g0} <-> ${g1}) ==="
+}
+
 # The ONE `-ttl<H>` deadline-NAME parser rp_sweep reads — a `python3` SOURCE
 # FRAGMENT, not a bash function, because the sweep does its age/deadline math
 # in ONE python process over the account's full JSON list (never one

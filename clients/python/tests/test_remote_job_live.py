@@ -45,6 +45,8 @@ _SUMMARY_KEYS = {
     "output_model_id",
     "created_at",
     "error",
+    "claimed_by",
+    "ranks",
 }
 
 
@@ -130,6 +132,9 @@ def test_remote_and_embedded_attach_and_list_agree(tmp_path, monkeypatch, live_s
     # on job_id, never on the run's outcome) — never empty for this kind.
     assert embedded_summary["output_model_id"] == f"jammi:fine-tuned:{job_id}"
     assert embedded_summary["error"] == ""
+    # Queued, never claimed: no claimant and no ranks yet.
+    assert embedded_summary["claimed_by"] == ""
+    assert embedded_summary["ranks"] == []
     assert embedded_report == {"state": "pending"}
 
 

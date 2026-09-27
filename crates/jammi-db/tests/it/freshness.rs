@@ -22,7 +22,7 @@ use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -34,7 +34,7 @@ use jammi_db::store::manifest::{
     ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, ResultStore, StaleReason, Staleness};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin, StaleReason, Staleness};
 use tempfile::tempdir;
 use test_case::test_case;
 
@@ -70,17 +70,19 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
 
 async fn create_building(store: &ResultStore) -> BuildingTable {
     store
-        .create_table(
-            "docs",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "docs",
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }

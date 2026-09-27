@@ -58,6 +58,8 @@ _QMD_LINK = re.compile(r"\]\(\s*([^)\s#]+)\.qmd(#[^)\s]*)?\s*\)")
 # Lines only an engine started through the client's harness, or a `grpc://`
 # target, needs a server for; the render selector classifies the same way.
 _NEEDS_SERVER = re.compile(r"\bLiveServer\(|connect\(\s*f?[\"']grpc://")
+# Lines only the cookbook's `cloud` extra (a local S3-compatible server) serves.
+_NEEDS_CLOUD = re.compile(r"\bThreadedMotoServer\b")
 
 
 def version() -> str:
@@ -111,11 +113,12 @@ def notebook(cells: list[dict]) -> dict:
     }
 
 
-def setup_cell(release: str, *, server: bool) -> dict:
+def setup_cell(release: str, *, server: bool, cloud: bool = False) -> dict:
     """Install the release this notebook was built for, on the engine the
     runtime can run, and choose the scale."""
+    extra = "[cloud]" if cloud else ""
     cookbook = (
-        f"jammi-cookbook @ git+https://github.com/{GITHUB}@py-v{release}"
+        f"jammi-cookbook{extra} @ git+https://github.com/{GITHUB}@py-v{release}"
         "#subdirectory=cookbook/book"
     )
     packages = f'"jammi-ai=={release}", engine + "=={release}", "{cookbook}"'
@@ -288,10 +291,11 @@ def chapter(qmd: Path, release: str, refs: dict[str, Reference]) -> tuple[Path, 
             f"- {refs[k].full}" for k in cited)))
 
     server = bool(_NEEDS_SERVER.search("\n".join(executed)))
+    cloud = bool(_NEEDS_CLOUD.search("\n".join(executed)))
     url = colab_url(target, release)
     source = qmd.relative_to(REPO).as_posix()
-    return target, notebook([header(title, source, url), setup_cell(release, server=server),
-                             *cells])
+    return target, notebook([header(title, source, url),
+                             setup_cell(release, server=server, cloud=cloud), *cells])
 
 
 def recipe(script: Path, release: str) -> tuple[Path, dict]:
@@ -312,7 +316,9 @@ def recipe(script: Path, release: str) -> tuple[Path, dict]:
     url = colab_url(target, release)
     source = script.relative_to(REPO).as_posix()
     server = bool(_NEEDS_SERVER.search(text))
-    cells = [header(title.rstrip("."), source, url), setup_cell(release, server=server)]
+    cloud = bool(_NEEDS_CLOUD.search(text))
+    cells = [header(title.rstrip("."), source, url),
+             setup_cell(release, server=server, cloud=cloud)]
     if rest:
         cells.append(markdown(rest))
     cells += [code(body), code("assert main() == 0")]

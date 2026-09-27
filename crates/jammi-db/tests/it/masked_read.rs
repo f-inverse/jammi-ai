@@ -15,7 +15,7 @@ use arrow::array::{Array, FixedSizeListArray, Float32Array, Int64Array, RecordBa
 use arrow::datatypes::{DataType, Field};
 use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
@@ -25,7 +25,6 @@ use jammi_db::index::VectorIndex;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::deletes::DeletionMask;
-use jammi_db::store::layout;
 use jammi_db::store::manifest::{
     ArtifactDigest, InputAnchor, Materialization, MaterializationEnv, ProducingDescriptor,
 };
@@ -34,6 +33,7 @@ use jammi_db::store::version::{
     DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
 };
 use jammi_db::store::ResultStore;
+use jammi_db::store::{layout, ResultTableOrigin};
 use jammi_test_utils::vq;
 use tempfile::tempdir;
 
@@ -255,17 +255,19 @@ async fn fixture() -> Fixture {
 
     // Base: r0..r19, one segment, through the funnel.
     let building = store
-        .create_table(
-            "docs",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "docs",
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let base_rows: Vec<(String, [f32; 4])> = (0..20)
@@ -603,17 +605,19 @@ async fn never_refreshed_table_has_no_mask_in_its_plan() {
     let store = ResultStore::new(dir.path(), catalog.clone(), AnnIndexConfig::default()).unwrap();
     let ctx = QueryContext::from(SessionContext::new());
     let building = store
-        .create_table(
-            "docs",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "docs",
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let rows_: Vec<(String, [f32; 4])> = (0..3)

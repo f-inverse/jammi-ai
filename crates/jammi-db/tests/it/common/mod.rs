@@ -203,8 +203,15 @@ pub async fn stub_version_manifest(
         definition_hash: DefinitionHash("stub".into()),
         delta: VersionDelta {
             descriptor: ProducingDescriptor::Embedding {
-                model_id: table.model_id.clone(),
-                task: table.task,
+                model_id: table
+                    .producer
+                    .model_id()
+                    .expect("an embedding table names its model")
+                    .to_string(),
+                task: table
+                    .producer
+                    .task()
+                    .expect("an embedding table names its task"),
                 source_id: table.source_id.clone(),
                 columns: Vec::new(),
                 key_column: "_row_id".into(),

@@ -25,23 +25,49 @@ use crate::index::peer::{
     ExactRescoreRequest, PeerAddr, PeerError, PeerFailureCounters, PeerFailureReason,
     PeerTransport, SegmentSearchPhase, SegmentSearchRequest, SegmentUnit, PEER_RPC_DEADLINE,
 };
-use crate::index::segment::{merge, over_fetch, rescore, search_unit};
+use crate::index::segment::{merge, over_fetch, rescore, ServedIndex};
 use crate::index::sidecar::SidecarIndex;
 use crate::index::{distance_is_admissible, first_inadmissible_hit, ValidatedQuery};
 use crate::index::{SegmentId, SegmentedIndex, VectorIndex};
 use crate::storage::index_cache::SegmentIndexCache;
 use crate::storage::StorageUrl;
+use crate::store::deletes::DeletionMask;
+
+/// The segments one version of a placed table serves, and the deletion mask
+/// every one of them is searched under.
+pub struct ServedSources {
+    /// The version served; `None` for a never-refreshed table's base set.
+    pub(crate) version: Option<i64>,
+    pub(crate) mask: Arc<DeletionMask>,
+    pub(crate) segments: Vec<SegmentSource>,
+}
+
+impl ServedSources {
+    /// A never-refreshed table's base set: every segment at version `0`,
+    /// under an empty mask.
+    #[cfg(test)]
+    pub(crate) fn base(segments: Vec<SegmentSource>) -> Self {
+        Self {
+            version: None,
+            mask: Arc::new(DeletionMask::empty()),
+            segments,
+        }
+    }
+}
 
 /// One segment of a placed table: resident here, or owned elsewhere.
 pub enum SegmentSource {
-    /// A segment this process loaded through the segment cache.
-    Local(SegmentId, SidecarIndex),
+    /// A segment this process loaded through the segment cache, with the
+    /// version its rows were produced at.
+    Local(SegmentId, i64, SidecarIndex),
     /// A segment a peer owns. Nothing is loaded here unless the failure
     /// ladder's local-load rung admits it — hence the bundle URL and the
     /// catalog row count ride along.
     Remote {
         /// The segment's catalog id.
         segment_id: SegmentId,
+        /// The version the segment's rows were produced at.
+        version: i64,
         /// The rendezvous-ordered owners: first is the owner, second the one
         /// retry.
         owners: Vec<PeerAddr>,
@@ -56,6 +82,7 @@ pub enum SegmentSource {
 /// A segment a peer owns, as [`Placed::Mixed`] holds it.
 pub(crate) struct RemoteSegment {
     pub(crate) segment_id: SegmentId,
+    pub(crate) version: i64,
     pub(crate) owners: Vec<PeerAddr>,
     pub(crate) row_count: usize,
     pub(crate) index_url: StorageUrl,
@@ -69,9 +96,12 @@ pub(crate) enum Placed {
     /// [`SegmentedIndex`] can be wrapped without a copy — the ONLINE entry
     /// never rebuilds an unmasked set out from under it.
     AllLocal(Arc<SegmentedIndex>),
-    /// At least one segment is owned by a peer.
+    /// At least one segment is owned by a peer: the version served, its
+    /// mask, and each segment with the version its rows were produced at.
     Mixed {
-        local: Vec<(SegmentId, SidecarIndex)>,
+        version: Option<i64>,
+        mask: Arc<DeletionMask>,
+        local: Vec<(SegmentId, i64, SidecarIndex)>,
         remote: Vec<RemoteSegment>,
     },
 }
@@ -111,7 +141,7 @@ impl PlacedIndex {
     /// table with no segments resolves to the exact fallback upstream).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_sources(
-        sources: Vec<SegmentSource>,
+        sources: ServedSources,
         table_name: &str,
         precision: StoragePrecision,
         transport: Arc<dyn PeerTransport>,
@@ -121,6 +151,11 @@ impl PlacedIndex {
         dimensions: Option<std::num::NonZeroUsize>,
         counters: Arc<PeerFailureCounters>,
     ) -> Result<Self> {
+        let ServedSources {
+            version,
+            mask,
+            segments: sources,
+        } = sources;
         if sources.is_empty() {
             return Err(JammiError::Other(
                 "PlacedIndex requires at least one segment".into(),
@@ -134,7 +169,7 @@ impl PlacedIndex {
             let mut remote = Vec::new();
             for source in sources {
                 match source {
-                    SegmentSource::Local(id, index) => {
+                    SegmentSource::Local(id, segment_version, index) => {
                         if index.storage_precision() != precision {
                             return Err(JammiError::Other(format!(
                                 "PlacedIndex: segment {} loaded at {:?} but table '{table_name}' \
@@ -144,31 +179,40 @@ impl PlacedIndex {
                                 index.storage_precision(),
                             )));
                         }
-                        local.push((id, index));
+                        local.push((id, segment_version, index));
                     }
                     SegmentSource::Remote {
                         segment_id,
+                        version: segment_version,
                         owners,
                         row_count,
                         index_url,
                     } => remote.push(RemoteSegment {
                         segment_id,
+                        version: segment_version,
                         owners,
                         row_count,
                         index_url,
                     }),
                 }
             }
-            Placed::Mixed { local, remote }
+            Placed::Mixed {
+                version,
+                mask,
+                local,
+                remote,
+            }
         } else {
             let segments = sources
                 .into_iter()
-                .map(|s| match s {
-                    SegmentSource::Local(id, index) => (id, index),
-                    SegmentSource::Remote { .. } => unreachable!("no remote source"),
+                .filter_map(|s| match s {
+                    SegmentSource::Local(id, segment_version, index) => {
+                        Some((id, segment_version, index))
+                    }
+                    SegmentSource::Remote { .. } => None,
                 })
                 .collect();
-            let index = SegmentedIndex::new(segments)?;
+            let index = SegmentedIndex::new_masked(segments, mask)?;
             if index.storage_precision() != precision {
                 return Err(JammiError::Other(format!(
                     "PlacedIndex: segment set loaded at {:?} but table '{table_name}' is \
@@ -233,8 +277,8 @@ impl PlacedIndex {
     pub fn len(&self) -> usize {
         match &self.inner {
             Placed::AllLocal(index) => index.len(),
-            Placed::Mixed { local, remote } => {
-                local.iter().map(|(_, index)| index.len()).sum::<usize>()
+            Placed::Mixed { local, remote, .. } => {
+                local.iter().map(|(_, _, index)| index.len()).sum::<usize>()
                     + remote.iter().map(|r| r.row_count).sum::<usize>()
             }
         }
@@ -262,7 +306,7 @@ impl PlacedIndex {
     pub fn query_width(&self) -> Result<usize> {
         let resident = match &self.inner {
             Placed::AllLocal(index) => Some(index.dimensions()),
-            Placed::Mixed { local, .. } => local.first().map(|(_, index)| index.dimensions()),
+            Placed::Mixed { local, .. } => local.first().map(|(_, _, index)| index.dimensions()),
         };
         self.dimensions
             .map(std::num::NonZeroUsize::get)
@@ -294,8 +338,19 @@ impl PlacedIndex {
     ) -> Result<Vec<(String, f32)>> {
         match &self.inner {
             Placed::AllLocal(index) => index.search_final(query, k, oversample),
-            Placed::Mixed { local, remote } => {
-                self.search_mixed(local, remote, query, k, oversample).await
+            Placed::Mixed {
+                version,
+                mask,
+                local,
+                remote,
+            } => {
+                let served = MixedSet {
+                    version: *version,
+                    mask,
+                    local,
+                    remote,
+                };
+                self.search_mixed(&served, query, k, oversample).await
             }
         }
     }
@@ -335,8 +390,7 @@ impl PlacedIndex {
     /// a `warn!` and increments its counter.
     async fn search_mixed(
         &self,
-        local: &[(SegmentId, SidecarIndex)],
-        remote: &[RemoteSegment],
+        served: &MixedSet<'_>,
         query: &ValidatedQuery,
         k: usize,
         oversample: usize,
@@ -344,6 +398,12 @@ impl PlacedIndex {
         if k == 0 {
             return Ok(Vec::new());
         }
+        let MixedSet {
+            version,
+            mask,
+            local,
+            remote,
+        } = *served;
         let precision = self.storage_precision;
         let n = local.len() + remote.len();
         let candidate_k = if precision.needs_rescore() {
@@ -359,16 +419,22 @@ impl PlacedIndex {
         // Remote segments this query loaded locally (rung 3): searched and
         // rescored here from now on.
         let mut locally_loaded: Vec<(SegmentId, SidecarIndex)> = Vec::new();
+        // One segment's unit, wherever it is read: the served version's
+        // masked search, widening past the rows the mask hides.
+        let unit = |id: SegmentId, segment_version: i64, index: &SidecarIndex| {
+            ServedIndex::new(id, segment_version, index, mask).live_hits(
+                query,
+                width,
+                candidate_k,
+                phase,
+                &|row_id| index.get_exact(row_id),
+            )
+        };
 
         // ---- Phase 1: per-segment units at `width` ----
         let mut units: Vec<(SegmentId, Vec<(String, f32)>)> = Vec::with_capacity(n);
-        for (id, index) in local {
-            units.push((
-                *id,
-                search_unit(*id, index, query, width, phase, &|row_id| {
-                    index.get_exact(row_id)
-                })?,
-            ));
+        for (id, segment_version, index) in local {
+            units.push((*id, unit(*id, *segment_version, index)?));
         }
         let groups = owner_groups(remote);
         let searches = groups.iter().map(|group| async move {
@@ -378,6 +444,8 @@ impl PlacedIndex {
                 storage_precision: precision,
                 query: query.clone(),
                 width,
+                target: candidate_k,
+                version,
                 phase,
             };
             let req = &req;
@@ -386,7 +454,7 @@ impl PlacedIndex {
                     .transport
                     .segment_search(&owner, req, PEER_RPC_DEADLINE)
                     .await?;
-                reconcile_units(&owner, req, units)
+                reconcile_units(&owner, req, &group.segments, mask, units)
             })
             .await
         });
@@ -403,12 +471,7 @@ impl PlacedIndex {
                     // Rung 3, per segment of the failed group.
                     for seg in &group.segments {
                         let index = self.load_locally(seg, &mut loaded_this_query, last).await?;
-                        units.push((
-                            seg.segment_id,
-                            search_unit(seg.segment_id, &index, query, width, phase, &|row_id| {
-                                index.get_exact(row_id)
-                            })?,
-                        ));
+                        units.push((seg.segment_id, unit(seg.segment_id, seg.version, &index)?));
                         locally_loaded.push((seg.segment_id, index));
                     }
                 }
@@ -435,9 +498,14 @@ impl PlacedIndex {
         let resident = |segment: SegmentId| -> Option<&SidecarIndex> {
             local
                 .iter()
-                .chain(locally_loaded.iter())
-                .find(|(id, _)| *id == segment)
-                .map(|(_, index)| index)
+                .find(|(id, _, _)| *id == segment)
+                .map(|(_, _, index)| index)
+                .or_else(|| {
+                    locally_loaded
+                        .iter()
+                        .find(|(id, _)| *id == segment)
+                        .map(|(_, index)| index)
+                })
         };
         let mut rescored: Vec<(String, f32)> = Vec::with_capacity(candidate_k);
         // Remote survivors, grouped by the owner list of their segment.
@@ -480,6 +548,7 @@ impl PlacedIndex {
                 storage_precision: precision,
                 query: query.clone(),
                 row_ids_by_segment: rows.clone(),
+                version,
             };
             let req = &req;
             self.call_with_retry(group, |owner| async move {
@@ -667,6 +736,16 @@ impl PlacedIndex {
     }
 }
 
+/// A `Mixed` set as one search reads it: the version served, its mask, and
+/// the resident and peer-owned segments.
+#[derive(Clone, Copy)]
+struct MixedSet<'a> {
+    version: Option<i64>,
+    mask: &'a DeletionMask,
+    local: &'a [(SegmentId, i64, SidecarIndex)],
+    remote: &'a [RemoteSegment],
+}
+
 /// The survivors an `ExactRescore` names, grouped by the segment that owns
 /// each.
 type RowIdsBySegment = Vec<(SegmentId, Vec<String>)>;
@@ -682,7 +761,10 @@ enum RungFailure {
 
 /// Reconcile a `SegmentSearch` answer against its request: exactly one unit
 /// per requested segment id, none for an id that was not requested, none
-/// twice; no unit wider than the requested `width`; every distance
+/// twice; no unit wider than the requested `width` — or, when the served
+/// version's mask hides rows, than the segment's own row count, since the
+/// owner widens past the rows it hides; no hit the mask hides at that
+/// segment's version (an owner serving another version's rows); every distance
 /// ADMISSIBLE ([`distance_is_admissible`] — finite); and no row id twice
 /// ACROSS THE WHOLE ANSWER, not merely within one unit — segments are
 /// row-disjoint by the append invariant (`segment.rs`'s module contract), so
@@ -698,13 +780,15 @@ enum RungFailure {
 /// requested segment (the failure the ladder counts, warns and retries),
 /// never a result — an unrequested unit would inject a peer's rows into the
 /// merge, a missing one would silently shrink it. (WHICH rows a segment
-/// holds is the owner's own knowledge; the coordinator has nothing to check
-/// an individual hit's row id against and trusts it as the owner's data —
-/// I-PEER. That the same id is not in two of them is a property of the
-/// answer alone, which is why it IS checked.)
+/// holds is the owner's own knowledge; the coordinator trusts an individual
+/// hit's row id as the owner's data — I-PEER — except where it holds the
+/// fact itself: that the same id is not in two units, and that the version's
+/// mask does not hide it.)
 fn reconcile_units(
     owner: &PeerAddr,
     req: &SegmentSearchRequest,
+    segments: &[&RemoteSegment],
+    mask: &DeletionMask,
     units: Vec<SegmentUnit>,
 ) -> std::result::Result<Vec<SegmentUnit>, PeerError> {
     let malformed = || PeerError {
@@ -723,7 +807,24 @@ fn reconcile_units(
         if !requested.contains(&unit.segment_id) || !seen.insert(unit.segment_id) {
             return Err(malformed());
         }
-        if unit.hits.len() > req.width {
+        let Some(segment) = segments.iter().find(|s| s.segment_id == unit.segment_id) else {
+            return Err(malformed());
+        };
+        // A segment the mask hides nothing of is searched once at `width`;
+        // one it hides rows of widens, up to its own length.
+        let bound = if mask.is_empty() {
+            req.width
+        } else {
+            req.width.max(segment.row_count)
+        };
+        if unit.hits.len() > bound {
+            return Err(malformed());
+        }
+        if unit
+            .hits
+            .iter()
+            .any(|(row_id, _)| mask.is_masked(row_id, segment.version))
+        {
             return Err(malformed());
         }
         if !unit
@@ -903,7 +1004,7 @@ mod tests {
             SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
         );
         PlacedIndex::with_sources(
-            sources,
+            ServedSources::base(sources),
             "t",
             precision,
             Arc::new(NoPeers),
@@ -944,7 +1045,7 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(i, r)| {
-                            SegmentSource::Local(SegmentId(i as i64), segment(r, precision))
+                            SegmentSource::Local(SegmentId(i as i64), 0, segment(r, precision))
                         })
                         .collect(),
                     precision,
@@ -982,10 +1083,11 @@ mod tests {
             SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
         );
         let placed = PlacedIndex::with_sources(
-            vec![SegmentSource::Local(
+            ServedSources::base(vec![SegmentSource::Local(
                 SegmentId(0),
+                0,
                 segment(&rows, StoragePrecision::F32),
-            )],
+            )]),
             "t",
             StoragePrecision::F32,
             Arc::new(NoPeers),
@@ -1066,8 +1168,9 @@ mod tests {
         );
         let counters = Arc::new(PeerFailureCounters::default());
         let sources = vec![
-            SegmentSource::Local(SegmentId(0), segment(left, StoragePrecision::F32)),
+            SegmentSource::Local(SegmentId(0), 0, segment(left, StoragePrecision::F32)),
             SegmentSource::Remote {
+                version: 0,
                 segment_id: SegmentId(1),
                 owners: vec![
                     PeerAddr::parse("127.0.0.1:1").unwrap(),
@@ -1085,7 +1188,7 @@ mod tests {
             },
         ];
         let placed = PlacedIndex::with_sources(
-            sources,
+            ServedSources::base(sources),
             "t",
             StoragePrecision::F32,
             owner,
@@ -1117,7 +1220,7 @@ mod tests {
             SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
         );
         assert!(PlacedIndex::with_sources(
-            Vec::new(),
+            ServedSources::base(Vec::new()),
             "t",
             StoragePrecision::F32,
             Arc::new(NoPeers),
@@ -1140,11 +1243,12 @@ mod tests {
         );
         let build = |with_remote: bool| {
             let mut sources = vec![
-                SegmentSource::Local(SegmentId(0), segment(left, StoragePrecision::F32)),
-                SegmentSource::Local(SegmentId(1), segment(right, StoragePrecision::Int8)),
+                SegmentSource::Local(SegmentId(0), 0, segment(left, StoragePrecision::F32)),
+                SegmentSource::Local(SegmentId(1), 0, segment(right, StoragePrecision::Int8)),
             ];
             if with_remote {
                 sources.push(SegmentSource::Remote {
+                    version: 0,
                     segment_id: SegmentId(2),
                     owners: vec![PeerAddr::parse("127.0.0.1:1").unwrap()],
                     row_count: 1,
@@ -1152,7 +1256,7 @@ mod tests {
                 });
             }
             PlacedIndex::with_sources(
-                sources,
+                ServedSources::base(sources),
                 "t",
                 StoragePrecision::F32,
                 Arc::new(NoPeers),
@@ -1353,9 +1457,14 @@ mod tests {
             SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
         );
         let counters = Arc::new(PeerFailureCounters::default());
-        let mut sources = vec![SegmentSource::Local(SegmentId(0), segment(left, precision))];
+        let mut sources = vec![SegmentSource::Local(
+            SegmentId(0),
+            0,
+            segment(left, precision),
+        )];
         for id in 1..=n_remote {
             sources.push(SegmentSource::Remote {
+                version: 0,
                 segment_id: SegmentId(id),
                 owners: vec![
                     PeerAddr::parse("127.0.0.1:1").unwrap(),
@@ -1373,7 +1482,7 @@ mod tests {
             });
         }
         let placed = PlacedIndex::with_sources(
-            sources,
+            ServedSources::base(sources),
             "t",
             precision,
             fake,
@@ -1586,6 +1695,7 @@ mod tests {
             SegmentIndexCache::new(StorageRegistry::new(), dir.path().join("index")).unwrap(),
         );
         let remote = || SegmentSource::Remote {
+            version: 0,
             segment_id: SegmentId(1),
             owners: vec![PeerAddr::parse("127.0.0.1:1").unwrap()],
             row_count: 6,
@@ -1600,7 +1710,7 @@ mod tests {
         };
         let build = |dimensions: Option<std::num::NonZeroUsize>| {
             PlacedIndex::with_sources(
-                vec![remote()],
+                ServedSources::base(vec![remote()]),
                 "t",
                 StoragePrecision::F32,
                 Arc::clone(&owner) as Arc<dyn PeerTransport>,

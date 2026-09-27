@@ -10,6 +10,7 @@
 //! and what a consumer assembles from the result is the consumer's concern.
 
 use arrow_schema::{DataType, SchemaRef};
+use jammi_db::error::JammiError;
 
 /// One side's column roles for the as-of match.
 ///
@@ -349,11 +350,55 @@ pub enum AsofError {
     /// A group held duplicate facts at the matched instant and no tie-break
     /// column was given.
     #[error(
-        "ambiguous match: group has duplicate facts at the matched instant and \
+        "ambiguous match: group has duplicate facts at instant {instant} and \
          no tie-break column was given"
     )]
-    AmbiguousMatch,
+    AmbiguousMatch {
+        /// The duplicated instant, as the temporal key's integer tick.
+        instant: i128,
+    },
     /// A DataFusion / Arrow execution error surfaced through the operator.
     #[error(transparent)]
     DataFusion(#[from] datafusion::error::DataFusionError),
+}
+
+/// The engine error an as-of refusal is: a spec that does not fit the
+/// relations is a typed `Schema` refusal naming the column; a tie with no
+/// tie-break column is [`JammiError::AmbiguousAsofMatch`]; an execution
+/// fault keeps DataFusion's own classification.
+impl From<AsofError> for JammiError {
+    fn from(error: AsofError) -> Self {
+        let schema = |column: String, expected: &str, actual: String| JammiError::Schema {
+            table: "asof_join".to_string(),
+            column,
+            expected: expected.to_string(),
+            actual,
+        };
+        match error {
+            AsofError::UnorderedTimeKey { column, found } => schema(
+                column,
+                "a totally ordered temporal key: a timestamp, date or integer",
+                found,
+            ),
+            AsofError::MissingByKey { column, side } => schema(
+                column,
+                "a column of the relation",
+                format!("no such column on the {side} side"),
+            ),
+            AsofError::TimeKeyTypeMismatch { left, right } => schema(
+                "<time>".to_string(),
+                "spine and facts temporal keys of one type",
+                format!("{left} vs {right}"),
+            ),
+            AsofError::NearestRequiresNumeric { column, found } => schema(
+                column,
+                "a numeric temporal key for the `nearest` direction",
+                found,
+            ),
+            AsofError::AmbiguousMatch { instant } => JammiError::AmbiguousAsofMatch {
+                instant: instant.to_string(),
+            },
+            AsofError::DataFusion(e) => JammiError::from(e),
+        }
+    }
 }

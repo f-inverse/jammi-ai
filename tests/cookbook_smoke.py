@@ -53,6 +53,7 @@ def stepwise(name: str, workdir_env: str) -> Recipe:
 RECIPES: tuple[Recipe, ...] = (
     Recipe("quickstart", (COOKBOOK / "quickstart" / "quickstart.py",)),
     example("mutable_tables"),
+    example("cloud_storage"),
     example("trigger_streams"),
     example("eval_embeddings"),
     example("image_search"),

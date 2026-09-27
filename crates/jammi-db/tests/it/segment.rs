@@ -12,7 +12,8 @@ use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendImpl, BackendKind};
 use jammi_db::catalog::result_repo::{
-    CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, ResultTableRecord, TenantArm,
+    CreateResultTableParams, Owner, Producer, ResultTableCas, ResultTableKind, ResultTableRecord,
+    TenantArm,
 };
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::Catalog;
@@ -21,7 +22,7 @@ use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, VectorIndex};
 use jammi_db::session::QueryContext;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_numerics::distance::cosine_distance;
 
 use crate::common;
@@ -58,17 +59,19 @@ fn store(dir: &std::path::Path, catalog: Arc<Catalog>, precision: StoragePrecisi
 /// lease-owned row every segment append is a CAS against).
 async fn building_table(store: &ResultStore) -> BuildingTable {
     store
-        .create_table(
-            "src",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }
@@ -304,17 +307,19 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = store(dir.path(), catalog, StoragePrecision::F32);
     let table = store
-        .create_table(
-            "src",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            None, // no catalog width on record
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: None,
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -369,17 +374,19 @@ async fn a_width_fault_names_the_artifact_it_was_found_against() {
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
     let store = store(dir.path(), catalog, StoragePrecision::F32);
     let table = store
-        .create_table(
-            "src",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4), // catalog width ON record — the failure precondition
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
 
@@ -482,8 +489,10 @@ async fn seed_result_table(session: &jammi_db::session::JammiSession, table: &st
             lease: None,
             table_name: table,
             source_id: "seg_src",
-            model_id: "seg_model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "seg_model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/seg.parquet",

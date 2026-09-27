@@ -210,10 +210,12 @@ async fn an_onnx_export_beside_safetensors_changes_nothing_a_resolve_loads() {
 #[tokio::test]
 async fn tokenizer_encode_batch_produces_padded_output() {
     let hf_api = live_hub_source();
-    let repo = hf_api
-        .api()
-        .model("sentence-transformers/all-MiniLM-L6-v2".into());
-    let tokenizer_path = repo.get("tokenizer.json").unwrap();
+    let tokenizer_path = hf_api
+        .model("sentence-transformers/all-MiniLM-L6-v2")
+        .get("tokenizer.json")
+        .await
+        .unwrap()
+        .unwrap();
 
     let tokenizer = TokenizerWrapper::from_file(&tokenizer_path).unwrap();
 
@@ -246,10 +248,12 @@ async fn tokenizer_encode_batch_produces_padded_output() {
 #[tokio::test]
 async fn tokenizer_encode_batch_with_truncation() {
     let hf_api = live_hub_source();
-    let repo = hf_api
-        .api()
-        .model("sentence-transformers/all-MiniLM-L6-v2".into());
-    let tokenizer_path = repo.get("tokenizer.json").unwrap();
+    let tokenizer_path = hf_api
+        .model("sentence-transformers/all-MiniLM-L6-v2")
+        .get("tokenizer.json")
+        .await
+        .unwrap()
+        .unwrap();
 
     let tokenizer = TokenizerWrapper::from_file(&tokenizer_path).unwrap();
 

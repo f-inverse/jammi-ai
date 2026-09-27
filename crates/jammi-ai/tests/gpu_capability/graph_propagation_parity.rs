@@ -150,7 +150,7 @@ async fn graph_session(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id: "nodes",
-                model_id: "synthetic-embed",
+                model_id: Some("synthetic-embed"),
                 derived_from: None,
                 dimensions: DIM,
                 key_column: Some("_row_id"),

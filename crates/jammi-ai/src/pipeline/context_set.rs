@@ -952,7 +952,7 @@ impl InferenceSession {
                 self.context(),
                 jammi_db::store::EmbeddingTableSpec {
                     source_id,
-                    model_id: "jammi:context-set",
+                    model_id: None,
                     // A pooled context set is keyed by *target* keys and pools
                     // each target's neighbours from the source's raw rows —
                     // there is no single source result table the whole batch

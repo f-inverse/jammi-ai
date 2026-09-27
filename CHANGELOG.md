@@ -5,6 +5,93 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A placed search's rescore is verified against the pinned version's segments.** The second
+  phase's `ExactRescoreRequest` names the version the coordinator pinned (`optional int64
+  version = 5`), as `SegmentSearchRequest` does, and the owner verifies every segment named
+  against the set that version serves (`ResultStore::served_segments`) — no longer against every
+  segment the table has ever had. **BREAKING** (Rust API): `jammi_db::index::peer::ExactRescoreRequest`
+  gains `version`.
+- **Logs no longer drop the line that follows a dependency's disabled-level check.** A per-layer
+  filter's `enabled()` verdict is parked per thread until the next event consumes it, and a caller
+  that asks `enabled()` and emits nothing (sqlx does, on every statement, through the `log` bridge)
+  left a "disabled" verdict that silently dropped the next always-enabled event on that thread
+  (tokio-rs/tracing#2519). The server's and the embedded engine's log layer now decide an event
+  only when it is dispatched. The distributed lane's intermittent placed-gang timeout was this: a
+  log line the test awaited went missing after the job had completed.
+- **A placed search serves the table's current version under its mask.** On a table whose segments
+  are placed on peers, the search read every version's segments with no deletion mask — at its own
+  segments, at every owner and at the local-load rung — so a row a refresh re-embedded came back at
+  its superseded vector and a deleted row came back at all, while the in-process search excluded
+  them. `ResultStore::served_segments` is the one definition of what a version serves (the base
+  segments, or the manifest's segments with their versions, and the version's mask); every search
+  entry and every owner resolves through it, and one masked per-segment unit
+  (`ServedIndex::live_hits`) runs wherever a segment is read. The peer `SegmentSearchRequest` carries
+  the pinned `version` (`optional int64 = 8`) and the live-hit `target` (`uint64 = 7`); the
+  coordinator refuses an owner's hit the mask hides as malformed. **BREAKING** (Rust API):
+  `SegmentSource::Local` and `::Remote` carry the segment's version; `PlacedIndex::with_sources`
+  takes `ServedSources`.
+- **A Hub download that stops sending fails typed and bounded.** The engine owns the Hugging Face
+  Hub transfer: `HubSource` reads the Hub's `resolve` endpoint with a client whose connect and
+  per-read timeouts are `[models] hub_idle_timeout_secs` (default 60), writing the standard
+  `blobs/`/`snapshots/`/`refs/` cache layout, so a cache `huggingface_hub` populated is a hit and a
+  hit issues no request. A transfer that goes that long without a byte fails as the retryable
+  `JammiError::Unavailable` naming `hf://<repo>/<file>` (gRPC `UNAVAILABLE`; the new
+  `jammi.errors.Unavailable`, a `BackendError`, on both transports), never a wait without end; one
+  that keeps arriving is never cut off. Model resolution is async, so a waiting transfer no longer
+  parks a runtime thread. **BREAKING** (Rust API): `HubSource::api()` is gone — `HubSource::model(repo)`
+  returns a `HubRepo` with async `get(file) -> Option<PathBuf>` and `files()`.
+- **A source declares its tenant column when it is registered, on every surface.**
+  `SourceConnection.tenant_column` crosses the wire (`optional string tenant_column = 3`), and
+  Python's `add_source(..., tenant_column=...)` takes it on both the embedded and remote backends.
+  The declaration is persisted with the source and replayed by every session and replica; a
+  tenant-bound session reads only its own rows and the rows with no tenant, through `sql`,
+  `generate_embeddings` and `search`. Registration refuses a tenant column the source lacks, or one
+  competing with the source's own `tenant_id` column, as a typed `Schema` error
+  (`INVALID_ARGUMENT`). **BREAKING:** `JammiSession::set_source_tenant_column` is removed.
+- **The embedded-engine wheels read and write cloud object storage.** `jammi-python` forwards
+  `jammi-db`'s `storage-s3` / `storage-gcs` / `storage-azure` / `storage-r2` / `storage-cloud`
+  features as `jammi-server` does, and both `jammi-ai-native` and `jammi-ai-native-cu12` build
+  `storage-cloud`: an embedded session registers `s3://` / `gs://` / `azure://` / `r2://` sources
+  and roots its result tables in a bucket through the same `[storage]` config a server reads. The
+  release feature manifest declares both wheels as lanes, gated equal to their `pyproject.toml`.
+  The cookbook's `cloud_storage` recipe runs it against a local S3-compatible server (the
+  cookbook's new `cloud` extra).
+- **A result table records a model and a task only when a model produced its rows.** A derivation
+  that runs no model — an as-of join, a lexical index, a neighbor graph, a graph propagation or
+  structure encoding, a SQL statement's table, a training set — records no model (`NULL`
+  `model_id`) and, unless its rows are a model task's output shape (a propagated embedding is still
+  a text embedding), no task, instead of a sentinel. Its name is `{source}__{kind}__{stamp}`. A
+  result table's origin is typed as `Producer::{Model, Derivation}`; `ResultStore::create_table`
+  takes a `ResultTableOrigin`. Migration 045 drops the two `NOT NULL`s; the embedding Parquet
+  schema's `_model_id` is nullable; the wire `ResultTable`'s `model_id` and `task` are `optional`.
+  A context predictor trained over an embedding no model produced has no base model
+  (`jobs.model_ref` NULL) rather than a registered sentinel model. **BREAKING** for the Rust API
+  (`ResultTableRecord::producer`, `ResultTableOrigin`, `EmbeddingTableSpec::model_id:
+  Option<&str>`).
+- **An as-of join's refusals are typed.** Duplicate facts at a matched instant with no
+  `tie_break_column` is `JammiError::AmbiguousAsofMatch` (`INVALID_ARGUMENT`, naming the instant
+  and the argument); a spec that does not fit the relations is a `Schema` refusal. A dropped
+  building handle whose row the sink already failed no longer warns.
+- **A missing catalog row is one typed not-found: `JammiError::NotFound(Missing)`.** A source, a
+  model, a job, a named result table, and a source's ready embedding table or lexical index that a
+  search resolves when it names none: each is `NotFound` (gRPC `NOT_FOUND`) carrying which row is
+  missing, and the ready-index case names the verb that builds it (`generate_embeddings`,
+  `build_lexical_index`). Python raises `NoReadyIndex` (a `NotFound`) for the ready-index case on both
+  transports, `ModelNotFound` for a model, and `NotFound` otherwise. **BREAKING:**
+  `JammiError::SourceNotFound` / `ModelNotFound` become `NotFound(Missing::Source | Missing::Model)`;
+  the wire's `model_not_found` (18) and `source_not_found` (42) are replaced by `not_found` (49,
+  `NotFoundError`), and the old tags and names are reserved. Naming a table of another kind for
+  `lexical_search` is a typed `Schema` refusal (`INVALID_ARGUMENT`), not a catalog fault.
+- **A mutable table's `UPDATE` / `DELETE` chooses its rows with any predicate a query can use.**
+  A subquery (`DELETE … WHERE key IN (SELECT …)`, `EXISTS`), an `UPDATE … FROM` join, and a
+  `LIMIT` now select exactly the rows they name: the statement's own plan runs as a query, and the
+  table rewrites the rows it yields in one serializable transaction (`RowRewriteNode`). The
+  transaction re-reads the selected rows and refuses the statement, writing nothing, when another
+  writer changed one in between (`MutableTableError::WriteConflict`, gRPC `ABORTED`); an
+  `UPDATE … FROM` whose join gives one row two different new values is refused as
+  `MutableTableError::AmbiguousUpdate` (`INVALID_ARGUMENT`). `EXPLAIN` of an `UPDATE` / `DELETE`
+  explains this plan rather than running the write. Such a predicate on any other table provider
+  stays refused (`RefusalReason::DmlBeyondTarget`).
 - **Postgres is the production trigger broker; the NATS JetStream driver is gone.** The Postgres
   broker's `LISTEN`/`NOTIFY` wake-ups over the topic's backing table (the authoritative log) give
   replayable cross-replica delivery on the database a shared deployment already runs, so the second

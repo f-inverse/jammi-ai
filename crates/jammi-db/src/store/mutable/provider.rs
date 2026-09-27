@@ -1,37 +1,44 @@
 //! `TableProvider` implementation for mutable companion tables.
 //!
-//! The provider supports `scan` (full-table reads) and `insert_into` (DataFusion DML through
-//! [`MutableTableSink`]). Predicate pushdown, projection, and limit are translated to backend SQL
-//! when straightforward; otherwise DataFusion's planner handles them above the scan node.
+//! The provider supports `scan` (full-table reads), `insert_into` (DataFusion DML through
+//! [`MutableTableSink`]) and `truncate`. Predicate pushdown, projection, and limit are translated
+//! to backend SQL when straightforward; otherwise DataFusion's planner handles them above the scan
+//! node. An `UPDATE` / `DELETE` plans to [`super::rewrite::RowRewriteNode`], which hands the rows
+//! the statement selected to `MutableTableProvider::rewrite_rows`.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array,
     Int64Array, Int8Array, LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow::compute::filter_record_batch;
+use arrow::compute::{concat_batches, filter_record_batch, take_record_batch};
+use arrow::row::{Row as ValueRow, RowConverter, Rows, SortField};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::DFSchema;
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::utils::conjunction;
-use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
-use crate::catalog::backend::{BackendError, Row, Transaction, TxOptions};
+use crate::catalog::backend::{BackendError, Row, SqlValue, Transaction, TxOptions};
+use crate::error::JammiError;
 
-use super::definition::MutableTableDefinition;
-use super::sink::{execution, primary_key_of, replace_rows, KeyConflict, MutableTableSink};
-use super::{owned_rows, visible_rows, MutableBackend};
+use super::definition::{MutableTableDefinition, MutableTableError};
+use super::sink::{
+    execution, key_params, primary_key_of, replace_rows, row_chunks, KeyConflict, MutableTableSink,
+};
+use super::{keys_predicate, owned_rows, visible_rows, MutableBackend};
 
 /// `TableProvider` for one mutable companion table.
 pub struct MutableTableProvider {
@@ -90,7 +97,17 @@ impl MutableTableProvider {
                 },
                 move |tx| {
                     Box::pin(async move {
-                        select_rows(tx, backend.as_ref(), &def, visible.as_deref(), limit).await
+                        let columns = select_rows(
+                            tx,
+                            backend.as_ref(),
+                            &def,
+                            &[],
+                            visible.as_deref(),
+                            &[],
+                            limit,
+                        )
+                        .await?;
+                        RecordBatch::try_new(Arc::clone(&def.schema), columns).map_err(execution)
                     })
                 },
             )
@@ -98,61 +115,69 @@ impl MutableTableProvider {
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 
-    /// Rewrite the session-owned rows `filters` selects, in one transaction:
-    /// read them, then [`replace_rows`] them with `rewrite` applied — the
-    /// rows' new values when `rewrite` is `Some`, nothing (a delete) when it
-    /// is `None`. The read happens inside the write transaction, so the rows
-    /// rewritten are exactly the rows the predicate matched. Returns the
-    /// number of rows matched.
-    async fn rewrite(
+    /// Rewrite the rows an `UPDATE` / `DELETE` selected, in one serializable
+    /// transaction: `old` is each selected row as the statement read it, and
+    /// `new`, for an `UPDATE`, the row it becomes (row for row); a `DELETE`
+    /// writes nothing in their place.
+    ///
+    /// The statement read its rows before this transaction opened, so the
+    /// transaction first re-reads the rows at the selected keys: a row
+    /// another writer changed or removed in between fails the statement
+    /// with [`MutableTableError::WriteConflict`] before anything is written,
+    /// rather than overwriting that writer's change. A selected row the
+    /// session reads but does not own (a global row, for a tenant-bound
+    /// session) is left in place. Returns the number of rows rewritten.
+    pub(crate) async fn rewrite_rows(
         &self,
-        state: &dyn Session,
-        filters: &[Expr],
-        rewrite: Option<&[(String, Expr)]>,
-    ) -> Result<u64, DataFusionError> {
-        let schema = DFSchema::try_from(Arc::clone(&self.def.schema))?;
-        let props = state.execution_props();
-        let predicate = conjunction(filters.iter().cloned())
-            .map(|e| create_physical_expr(&e, &schema, props))
-            .transpose()?;
-        let assignments = rewrite
-            .map(|assignments| {
-                assignments
-                    .iter()
-                    .map(|(column, e)| {
-                        Ok((
-                            self.def.schema.index_of(column)?,
-                            create_physical_expr(e, &schema, props)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, DataFusionError>>()
-            })
-            .transpose()?;
-
+        old: RecordBatch,
+        new: Option<RecordBatch>,
+    ) -> Result<u64, JammiError> {
+        let (old, new) = distinct_rows(&self.def, old, new)?;
         let def = Arc::clone(&self.def);
         let backend = Arc::clone(&self.backend);
         let tenant = self.tenant.current_tenant();
-        self.backend
+        let settled = self
+            .backend
             .catalog_backend()
-            .transaction(TxOptions::default(), move |tx| {
+            .serializable(move |tx| {
+                let (def, backend) = (Arc::clone(&def), Arc::clone(&backend));
+                let (old, new) = (old.clone(), new.clone());
                 Box::pin(async move {
                     tx.set_tenant(tenant);
                     tx.assert_tenant_matches(tenant, def.id.as_str())?;
-                    let owned = owned_rows(tenant);
-                    let rows = select_rows(tx, backend.as_ref(), &def, Some(&owned), None).await?;
-                    let matched = matching(&rows, predicate.as_ref()).map_err(execution)?;
-                    let keys = primary_key_of(&def, &matched)?;
-                    let written = match &assignments {
-                        Some(assignments) => assign(&matched, assignments).map_err(execution)?,
+                    let keys = primary_key_of(&def, &old)?;
+                    let current = visible_at_keys(tx, backend.as_ref(), &def, &keys).await?;
+                    let owned = match unchanged(&def, &old, &current).map_err(execution)? {
+                        Unchanged::Owned(owned) => owned,
+                        Unchanged::Conflict(rows) => return Ok(Settled::Conflict(rows)),
+                    };
+                    let keys = filter_record_batch(&keys, &owned).map_err(execution)?;
+                    let written = match &new {
+                        Some(new) => filter_record_batch(new, &owned).map_err(execution)?,
                         None => RecordBatch::new_empty(Arc::clone(&def.schema)),
                     };
                     replace_rows(tx, backend.as_ref(), &def, Some(&keys), &written).await?;
-                    Ok(matched.num_rows() as u64)
+                    Ok(Settled::Rewrote(keys.num_rows() as u64))
                 })
             })
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+            .await?;
+        match settled {
+            Settled::Rewrote(rows) => Ok(rows),
+            Settled::Conflict(rows) => Err(MutableTableError::WriteConflict {
+                table: self.def.id.clone(),
+                rows,
+            }
+            .into()),
+        }
     }
+}
+
+/// How a rewrite's transaction settled.
+enum Settled {
+    /// It rewrote this many rows.
+    Rewrote(u64),
+    /// This many selected rows had changed; it wrote nothing.
+    Conflict(u64),
 }
 
 #[async_trait]
@@ -193,66 +218,75 @@ impl TableProvider for MutableTableProvider {
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let deleted = self.rewrite(state, &filters, None).await?;
-        affected(state, deleted).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let updated = self.rewrite(state, &filters, Some(&assignments)).await?;
-        affected(state, updated).await
-    }
-
     async fn truncate(
         &self,
         state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        self.delete_from(state, Vec::new()).await
+        let def = Arc::clone(&self.def);
+        let backend = Arc::clone(&self.backend);
+        let tenant = self.tenant.current_tenant();
+        let deleted = self
+            .backend
+            .catalog_backend()
+            .transaction(TxOptions::default(), move |tx| {
+                Box::pin(async move {
+                    tx.set_tenant(tenant);
+                    tx.assert_tenant_matches(tenant, def.id.as_str())?;
+                    tx.execute(&backend.delete_dml(&def, &owned_rows(tenant)), &[])
+                        .await
+                })
+            })
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        affected(state, deleted).await
     }
 }
 
-/// The single-row `count` plan a DML statement answers with — the shape
+/// The single-row `count` a DML statement answers with — the shape
 /// DataFusion's own `DataSinkExec` and `MemTable` DML return.
+pub(crate) fn count_batch(rows: u64) -> Result<RecordBatch, DataFusionError> {
+    Ok(RecordBatch::try_from_iter_with_nullable(vec![(
+        "count",
+        Arc::new(UInt64Array::from(vec![rows])) as ArrayRef,
+        false,
+    )])?)
+}
+
+/// [`count_batch`] as a plan.
 async fn affected(
     state: &dyn Session,
     rows: u64,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    let batch = RecordBatch::try_from_iter_with_nullable(vec![(
-        "count",
-        Arc::new(UInt64Array::from(vec![rows])) as ArrayRef,
-        false,
-    )])?;
+    let batch = count_batch(rows)?;
     MemTable::try_new(batch.schema(), vec![vec![batch]])?
         .scan(state, None, &[], None)
         .await
 }
 
-/// Every row of `def` that `predicate` selects, read inside `tx`.
+/// Every row of `def` that `predicate` selects, `params` bound, read inside
+/// `tx`: the table's columns, then each of `extra` (a column the table's
+/// schema does not declare, such as the tenant slot).
 async fn select_rows(
     tx: &mut Transaction<'_>,
     backend: &dyn MutableBackend,
     def: &MutableTableDefinition,
+    extra: &[(String, DataType)],
     predicate: Option<&str>,
+    params: &[SqlValue<'_>],
     limit: Option<usize>,
-) -> Result<RecordBatch, BackendError> {
+) -> Result<Vec<ArrayRef>, BackendError> {
     let columns: Vec<(String, DataType)> = def
         .schema
         .fields()
         .iter()
         .map(|f| (f.name().clone(), f.data_type().clone()))
+        .chain(extra.iter().cloned())
         .collect();
     let names: Vec<&str> = columns.iter().map(|(name, _)| name.as_str()).collect();
     let sql = backend.scan_dml(def, &names, predicate, limit);
-    let rows = tx.query(&sql, &[], |row| decode_row(row, &columns)).await?;
+    let rows = tx
+        .query(&sql, params, |row| decode_row(row, &columns))
+        .await?;
     // Transpose Vec<Row> → Vec<Column>
     let mut transposed: Vec<Vec<DecodedValue>> = (0..columns.len())
         .map(|_| Vec::with_capacity(rows.len()))
@@ -262,40 +296,145 @@ async fn select_rows(
             transposed[i].push(v);
         }
     }
-    let arrays = build_arrays(&columns, transposed).map_err(execution)?;
-    RecordBatch::try_new(Arc::clone(&def.schema), arrays).map_err(execution)
+    build_arrays(&columns, transposed).map_err(execution)
 }
 
-/// The rows of `rows` that `predicate` selects; every row when there is no
-/// predicate. A `NULL` verdict does not select (SQL three-valued logic), which
-/// is how `filter_record_batch` reads a null mask slot.
-fn matching(
-    rows: &RecordBatch,
-    predicate: Option<&Arc<dyn PhysicalExpr>>,
-) -> Result<RecordBatch, DataFusionError> {
-    let Some(predicate) = predicate else {
-        return Ok(rows.clone());
-    };
-    let verdict = predicate.evaluate(rows)?.into_array(rows.num_rows())?;
-    let verdict = verdict
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| {
-            DataFusionError::Plan("a DML predicate must evaluate to a boolean".into())
-        })?;
-    Ok(filter_record_batch(rows, verdict)?)
-}
-
-/// `rows` with each assigned column replaced by its expression's value.
-fn assign(
-    rows: &RecordBatch,
-    assignments: &[(usize, Arc<dyn PhysicalExpr>)],
-) -> Result<RecordBatch, DataFusionError> {
-    let mut columns = rows.columns().to_vec();
-    for (index, expr) in assignments {
-        columns[*index] = expr.evaluate(rows)?.into_array(rows.num_rows())?;
+/// The rows of `def` at the primary keys in `keys` that the transaction's
+/// tenant reads, each with whether it owns the row (a tenant reads the
+/// global rows too, but owns only its own).
+async fn visible_at_keys(
+    tx: &mut Transaction<'_>,
+    backend: &dyn MutableBackend,
+    def: &MutableTableDefinition,
+    keys: &RecordBatch,
+) -> Result<(RecordBatch, BooleanArray), BackendError> {
+    let tenant_slot = [("tenant_id".to_string(), DataType::Utf8)];
+    let visible = visible_rows(tx.tenant());
+    let tenant_bound = tx.tenant().is_some();
+    let mut rows = Vec::new();
+    let mut owned = Vec::new();
+    for chunk in row_chunks(keys, keys.num_columns(), backend) {
+        let predicate = format!("{} AND {visible}", keys_predicate(def, chunk.num_rows()));
+        let mut columns = select_rows(
+            tx,
+            backend,
+            def,
+            &tenant_slot,
+            Some(&predicate),
+            &key_params(&chunk)?,
+            None,
+        )
+        .await?;
+        let row_tenant = columns.pop().expect("the tenant slot was selected");
+        // Every visible row is the session's own or global; a tenant-bound
+        // session owns the tenanted ones, an unbound session the global ones.
+        owned.extend((0..row_tenant.len()).map(|i| Some(row_tenant.is_valid(i) == tenant_bound)));
+        rows.push(RecordBatch::try_new(Arc::clone(&def.schema), columns).map_err(execution)?);
     }
-    Ok(RecordBatch::try_new(rows.schema(), columns)?)
+    let rows = concat_batches(&def.schema, &rows).map_err(execution)?;
+    Ok((rows, BooleanArray::from(owned)))
+}
+
+/// `old` and `new` with each selected row once. A join can select one row
+/// several times; the copies must agree on the row's new value, or the
+/// `UPDATE` is ambiguous.
+fn distinct_rows(
+    def: &MutableTableDefinition,
+    old: RecordBatch,
+    new: Option<RecordBatch>,
+) -> Result<(RecordBatch, Option<RecordBatch>), JammiError> {
+    let keys = primary_key_of(def, &old)?;
+    let keys = row_values(&keys).map_err(execution)?;
+    let values = row_values(new.as_ref().unwrap_or(&old)).map_err(execution)?;
+    let mut first: HashMap<ValueRow<'_>, usize> = HashMap::with_capacity(keys.num_rows());
+    let mut kept = Vec::with_capacity(keys.num_rows());
+    for i in 0..keys.num_rows() {
+        match first.entry(keys.row(i)) {
+            Entry::Vacant(slot) => {
+                slot.insert(i);
+                kept.push(i as u64);
+            }
+            Entry::Occupied(seen) if values.row(*seen.get()) == values.row(i) => {}
+            Entry::Occupied(_) => {
+                return Err(MutableTableError::AmbiguousUpdate {
+                    table: def.id.clone(),
+                    key: key_display(&primary_key_of(def, &old)?.slice(i, 1)),
+                }
+                .into())
+            }
+        }
+    }
+    if kept.len() == keys.num_rows() {
+        return Ok((old, new));
+    }
+    let kept = UInt64Array::from(kept);
+    let take = |rows: &RecordBatch| take_record_batch(rows, &kept).map_err(execution);
+    Ok((take(&old)?, new.as_ref().map(take).transpose()?))
+}
+
+/// Whether the rows the statement read (`old`) are the rows the transaction
+/// reads now (`current`, with which of them the session owns).
+enum Unchanged {
+    /// All are; the mask marks, row for row of `old`, the ones the session
+    /// owns.
+    Owned(BooleanArray),
+    /// This many had changed or gone.
+    Conflict(u64),
+}
+
+fn unchanged(
+    def: &MutableTableDefinition,
+    old: &RecordBatch,
+    (current, current_owned): &(RecordBatch, BooleanArray),
+) -> Result<Unchanged, BackendError> {
+    let current_keys = row_values(&primary_key_of(def, current)?).map_err(execution)?;
+    let current_rows = row_values(current).map_err(execution)?;
+    let now: HashMap<ValueRow<'_>, (ValueRow<'_>, bool)> = (0..current.num_rows())
+        .map(|i| {
+            let owned = current_owned.value(i);
+            (current_keys.row(i), (current_rows.row(i), owned))
+        })
+        .collect();
+    let old_keys = row_values(&primary_key_of(def, old)?).map_err(execution)?;
+    let old_rows = row_values(old).map_err(execution)?;
+    let seen: Vec<Option<bool>> = (0..old.num_rows())
+        .map(|i| match now.get(&old_keys.row(i)) {
+            Some((row, owned)) if *row == old_rows.row(i) => Some(*owned),
+            _ => None,
+        })
+        .collect();
+    let changed = seen.iter().filter(|s| s.is_none()).count() as u64;
+    Ok(match changed {
+        0 => Unchanged::Owned(seen.into_iter().collect()),
+        changed => Unchanged::Conflict(changed),
+    })
+}
+
+/// `rows` in the row format, where two rows compare equal exactly when every
+/// value does (nulls equal nulls, as a key or a stored value does).
+fn row_values(rows: &RecordBatch) -> Result<Rows, arrow::error::ArrowError> {
+    let converter = RowConverter::new(
+        rows.schema()
+            .fields()
+            .iter()
+            .map(|f| SortField::new(f.data_type().clone()))
+            .collect(),
+    )?;
+    converter.convert_columns(rows.columns())
+}
+
+/// A one-row key batch as `(v1, v2, …)`.
+fn key_display(key: &RecordBatch) -> String {
+    let values = key
+        .columns()
+        .iter()
+        .map(|column| {
+            ArrayFormatter::try_new(column.as_ref(), &FormatOptions::default())
+                .map(|f| f.value(0).to_string())
+                .unwrap_or_else(|e| e.to_string())
+        })
+        .collect::<Vec<_>>();
+    format!("({})", values.join(", "))
 }
 
 /// One column value read from a backend row, after **width-faithful**

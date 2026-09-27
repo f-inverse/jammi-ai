@@ -42,7 +42,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::config::{AnnIndexConfig, ServerConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::peer::{
@@ -51,14 +51,19 @@ use jammi_db::index::peer::{
 };
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{validate_query, QuerySource, SegmentId, ValidatedQuery, VectorIndex};
+use jammi_db::session::QueryContext;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
+use jammi_db::store::deletes::DeletionMask;
 use jammi_db::store::manifest::{
-    ComputeDevice, ComputePrecision, ContentDigest, LocalRun, Materialization, MaterializationEnv,
-    ModelIdentity, ModelRun, ProducingDescriptor,
+    ArtifactDigest, ComputeDevice, ComputePrecision, ContentDigest, InputAnchor, LocalRun,
+    Materialization, MaterializationEnv, ModelIdentity, ModelRun, ProducingDescriptor,
 };
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::version::{
+    DeletesRef, FragmentRef, SegmentRef, VersionDelta, VersionManifest,
+};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_db::TenantId;
 use jammi_numerics::distance::cosine_distance;
 use jammi_server::grpc::proto::embedding::embedding_service_client::EmbeddingServiceClient;
@@ -67,6 +72,8 @@ use jammi_server::grpc::proto::embedding::{QueryVector, SearchRequest as WireSea
 use jammi_server::grpc::wire::map_engine_error;
 use jammi_test_utils::vq;
 use jammi_wire::peer::GrpcPeerTransport;
+use jammi_wire::proto::peer as pb;
+use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
 use jammi_wire::request::{SearchQuery, SearchRequest};
 use parquet::arrow::ArrowWriter;
 use std::time::Duration;
@@ -199,17 +206,19 @@ async fn two_segment_table(
     dimensions: Option<i32>,
 ) -> (BuildingTable, ResultTableRecord) {
     let table = store
-        .create_table(
+        .create_table(ResultTableOrigin {
             source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
             dimensions,
-            Some("_row_id"),
-            None,
-            None,
-        )
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let precision = table.storage_precision();
@@ -701,17 +710,19 @@ async fn ready_table_with_poisoned_row(
     .unwrap();
     let store = a.result_store();
     let building = store
-        .create_table(
+        .create_table(ResultTableOrigin {
             source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(4),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let schema = embedding_table_schema(4);
@@ -1319,17 +1330,19 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
     // coordinator has no local index to catch before fan-out (that check
     // only exists in the all-remote shape).
     let table = store
-        .create_table(
-            "src_o3_drift",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "src_o3_drift",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let precision = table.storage_precision();
@@ -1457,6 +1470,384 @@ async fn stored_width_drift_answered_by_an_owner_ladders_to_a_named_refusal() {
 
     table.abort().await.unwrap();
     a.close().await;
+    let _ = b.shutdown.send(());
+    let _ = b.handle.await;
+}
+
+// ---------------------------------------------------------------------------
+// A versioned table: the placed search serves the current version, masked
+// ---------------------------------------------------------------------------
+
+/// `a` re-embedded by version 1: its new vector, far from its old one.
+const A_REEMBEDDED: [f32; 4] = [0.0, 0.0, 0.1, 1.0];
+
+/// The embedding-table batch `rows` are written as.
+fn embedding_batch(rows: &[(&str, [f32; 4])]) -> RecordBatch {
+    let n = rows.len();
+    let item = Arc::new(Field::new("item", DataType::Float32, false));
+    let flat: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+    let vectors =
+        FixedSizeListArray::try_new(item, 4, Arc::new(Float32Array::from(flat)), None).unwrap();
+    RecordBatch::try_new(
+        embedding_table_schema(4),
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|(k, _)| *k))),
+            Arc::new(StringArray::from_iter_values((0..n).map(|_| "docs"))),
+            Arc::new(StringArray::from_iter_values((0..n).map(|_| "model"))),
+            Arc::new(vectors),
+            jammi_db::store::content_hash::null_hash_column(n),
+        ],
+    )
+    .unwrap()
+}
+
+/// Write `rows` as the Parquet object at `url`; its row count and digest.
+async fn write_fragment(
+    store: &ResultStore,
+    url: &StorageUrl,
+    rows: &[(&str, [f32; 4])],
+) -> (usize, ArtifactDigest) {
+    let batch = embedding_batch(rows);
+    let mut writer = store.open_writer(url, batch.schema()).await.unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    let written = writer.close().await.unwrap();
+    let handle = store.open_parquet(url).unwrap();
+    let bytes = handle
+        .get_bytes(&handle.data_path().unwrap())
+        .await
+        .unwrap();
+    (written, ArtifactDigest::of_bytes(&bytes))
+}
+
+/// A version's manifest over `table`, from the parts that vary per version.
+struct VersionParts {
+    version: i64,
+    parent: Option<i64>,
+    fragments: Vec<FragmentRef>,
+    segments: Vec<SegmentRef>,
+    deletes: Option<DeletesRef>,
+    identity: String,
+    live_rows: usize,
+    masked_rows: usize,
+}
+
+fn version_manifest(
+    table: &str,
+    definition_hash: &jammi_db::store::manifest::DefinitionHash,
+    descriptor: &ProducingDescriptor,
+    source_id: &str,
+    parts: VersionParts,
+) -> VersionManifest {
+    VersionManifest {
+        version_format: jammi_db::store::version::VERSION_FORMAT,
+        table: table.into(),
+        version: parts.version,
+        parent: parts.parent,
+        definition_hash: definition_hash.clone(),
+        delta: VersionDelta {
+            descriptor: descriptor.clone(),
+            input_anchors: vec![InputAnchor::unpinned_at_instant(
+                source_id,
+                "1970-01-01T00:00:00Z",
+            )],
+        },
+        fragments: parts.fragments,
+        segments: parts.segments,
+        deletes: parts.deletes,
+        live_rows: parts.live_rows,
+        masked_rows: parts.masked_rows,
+        identity: parts.identity,
+        produced_by: "test".into(),
+        produced_at: "1970-01-01T00:00:00Z".into(),
+        engine_version: "0".into(),
+    }
+}
+
+/// A two-version table built through the store primitives a refresh uses.
+/// Version 0 is `ROWS` (`a`, `b`, `c`, `d`) as segment 0. Version 1
+/// re-embeds `a` at [`A_REEMBEDDED`] as segment 1 and deletes `b`: its mask
+/// hides `a` and `b` in every segment stamped at version 0.
+async fn versioned_table(store: &ResultStore, source_id: &str) -> ResultTableRecord {
+    let descriptor = ProducingDescriptor::Embedding {
+        model_id: "model".into(),
+        task: ModelTask::TextEmbedding,
+        source_id: source_id.into(),
+        columns: vec!["body".into()],
+        key_column: "_row_id".into(),
+        dimensions: 4,
+    };
+    let building = store
+        .create_table(ResultTableOrigin {
+            source_id,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
+        .await
+        .unwrap();
+    let precision = building.storage_precision();
+    let parquet_url = building.parquet_url().clone();
+    let (rows, _) = write_fragment(store, &parquet_url, &ROWS).await;
+    building
+        .append_segment(&built_index(&ROWS, precision))
+        .await
+        .unwrap();
+    let env = MaterializationEnv::without_models();
+    let record = building
+        .finish(
+            &QueryContext::from(datafusion::prelude::SessionContext::new()),
+            rows,
+            Materialization::new(
+                &descriptor,
+                &env,
+                vec![InputAnchor::unpinned_at_instant(
+                    source_id,
+                    "1970-01-01T00:00:00Z",
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+    let table = record.table_name.clone();
+    let base = store
+        .read_materialization_manifest(&parquet_url)
+        .await
+        .unwrap()
+        .unwrap();
+    let definition_hash = base.definition_hash.clone();
+    let base_identity = base.artifact.as_str().to_string();
+
+    let base_fragment = FragmentRef {
+        url: parquet_url.as_str().into(),
+        version: 0,
+        rows: ROWS.len(),
+        digest: base.artifact.clone(),
+    };
+    let v0 = version_manifest(
+        &table,
+        &definition_hash,
+        &descriptor,
+        source_id,
+        VersionParts {
+            version: 0,
+            parent: None,
+            fragments: vec![base_fragment.clone()],
+            segments: vec![SegmentRef {
+                segment_id: 0,
+                version: 0,
+            }],
+            deletes: None,
+            identity: base_identity.clone(),
+            live_rows: ROWS.len(),
+            masked_rows: 0,
+        },
+    );
+    let v0_url = store
+        .write_version_manifest(&parquet_url, &v0)
+        .await
+        .unwrap();
+    store
+        .catalog()
+        .publish_base_version(&table, 0, v0_url.as_str(), &base_identity, ROWS.len())
+        .await
+        .unwrap();
+
+    let pinned = store
+        .catalog()
+        .get_result_table(&table)
+        .await
+        .unwrap()
+        .unwrap();
+    let pin = store.pin_current_version(pinned).await.unwrap();
+    let mut v1 = store.allocate_version(&pin).await.unwrap();
+    let reembedded = [("a", A_REEMBEDDED)];
+    let (v1_rows, v1_digest) =
+        write_fragment(store, &v1.fragment_url().unwrap(), &reembedded).await;
+    let segment = v1
+        .append_segment(&built_index(&reembedded, precision))
+        .await
+        .unwrap();
+    let mut mask = DeletionMask::empty();
+    mask.raise("a".into(), 0);
+    mask.raise("b".into(), 0);
+    let deletes_url = v1.deletes_url().unwrap();
+    let (entries, deletes_digest) = mask
+        .write(&store.open_parquet(&deletes_url).unwrap())
+        .await
+        .unwrap();
+    let deletes = DeletesRef {
+        url: deletes_url.as_str().into(),
+        entries,
+        digest: deletes_digest,
+    };
+    let fragments = vec![
+        base_fragment,
+        FragmentRef {
+            url: v1.fragment_url().unwrap().as_str().into(),
+            version: 1,
+            rows: v1_rows,
+            digest: v1_digest,
+        },
+    ];
+    let identity = VersionManifest::compute_identity(
+        &base_identity,
+        &definition_hash,
+        &descriptor,
+        &fragments,
+        Some(&deletes),
+    )
+    .unwrap();
+    let live = ROWS.len() - 1;
+    let v1_manifest = version_manifest(
+        &table,
+        &definition_hash,
+        &descriptor,
+        source_id,
+        VersionParts {
+            version: 1,
+            parent: Some(0),
+            fragments,
+            segments: vec![
+                SegmentRef {
+                    segment_id: 0,
+                    version: 0,
+                },
+                SegmentRef {
+                    segment_id: segment.0,
+                    version: 1,
+                },
+            ],
+            deletes: Some(deletes),
+            identity: identity.clone(),
+            live_rows: live,
+            masked_rows: 2,
+        },
+    );
+    store
+        .write_version_manifest(&parquet_url, &v1_manifest)
+        .await
+        .unwrap();
+    v1.publish(&identity, live, 2, "[]").await.unwrap();
+    store
+        .catalog()
+        .get_result_table(&table)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// An `ExactRescore` names the version its coordinator pinned, and the owner
+/// rescores only segments that version serves — the same set a
+/// `SegmentSearch` of that version is verified against, never every segment
+/// the table has ever had. Segment 1 exists only from version 1 on: named
+/// under the base set it is refused as own-data, named under version 1 it is
+/// rescored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_rescore_is_verified_against_the_pinned_versions_segments() {
+    let b = start_engine_server_with_peer_bind().await;
+    let store = b.engine.result_store();
+    let record = versioned_table(&store, "rescore_versioned").await;
+    let mut client = PeerServiceClient::new(channel(b.peer_addr).await);
+    let rescore = |version: Option<i64>| pb::ExactRescoreRequest {
+        table_name: record.table_name.clone(),
+        storage_precision: pb::StoragePrecision::F32 as i32,
+        query: A_REEMBEDDED.to_vec(),
+        row_ids_by_segment: vec![pb::SegmentRowIds {
+            segment_id: 1,
+            row_ids: vec!["a".into()],
+        }],
+        version,
+    };
+
+    let refused = client
+        .exact_rescore(rescore(None))
+        .await
+        .expect_err("the base set serves no segment 1");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+
+    let served = client
+        .exact_rescore(rescore(Some(1)))
+        .await
+        .expect("version 1 serves segment 1")
+        .into_inner();
+    assert_eq!(served.hits.len(), 1);
+    assert_eq!(served.hits[0].row_id, "a");
+    assert!(
+        served.hits[0].distance.abs() < 1e-6,
+        "`a`'s version-1 vector is the query: {:?}",
+        served.hits[0]
+    );
+
+    let _ = b.shutdown.send(());
+    let _ = b.handle.await;
+}
+
+/// A versioned table whose superseded segment is placed on a peer: the placed
+/// search serves exactly the rows of the version the table is at, as the
+/// in-process search does. The owner of segment 0 holds `a`'s old vector and
+/// the deleted `b`; neither may come back, at any precision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_placed_search_serves_the_current_version_under_its_mask() {
+    let b = start_engine_server_with_peer_bind().await;
+    let dir = dir_of(&b);
+    let owner = PeerAddr::parse(&b.peer_addr.to_string()).unwrap();
+    let queries: [[f32; 4]; 4] = [ROWS[0].1, ROWS[1].1, A_REEMBEDDED, [0.5, 0.5, 0.0, 0.0]];
+
+    for precision in [
+        StoragePrecision::F32,
+        StoragePrecision::Int8,
+        StoragePrecision::Binary,
+    ] {
+        let placement = TestPlacement::default();
+        let a = open_a(&dir, precision, None, placement.clone()).await;
+        let store = a.result_store();
+        let record = versioned_table(&store, &format!("versioned_{precision:?}")).await;
+        assert_eq!(
+            store
+                .pin_current_version(record.clone())
+                .await
+                .unwrap()
+                .version(),
+            Some(1)
+        );
+        placement.set(&record.table_name, 0, vec![owner.clone()]);
+
+        for q in &queries {
+            for (k, oversample) in [(1usize, 1usize), (2, 4), (4, 32)] {
+                let placed = store.resolve_search_mode(&record).await.unwrap().unwrap();
+                assert!(placed.has_remote(), "segment 0 is B's");
+                let got = placed
+                    .search_final_placed(&vq(q), k, oversample)
+                    .await
+                    .unwrap();
+                let in_process = store
+                    .resolve_search_mode_local(&record)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .search_final(&vq(q), k, oversample)
+                    .unwrap();
+                assert!(
+                    got.iter().all(|(id, _)| id != "b"),
+                    "{precision:?} {q:?} k={k}: the deleted row came back: {got:?}"
+                );
+                assert_eq!(
+                    got, in_process,
+                    "{precision:?} {q:?} k={k} oversample={oversample}: the placed search \
+                     must serve the in-process search's rows and distances"
+                );
+            }
+        }
+        a.close().await;
+    }
+    readyz_is_200(&b).await;
     let _ = b.shutdown.send(());
     let _ = b.handle.await;
 }

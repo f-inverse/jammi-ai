@@ -31,7 +31,7 @@ use jammi_ai::{
     Jammi, Modality, PerQueryAudit, QueryInput, SearchQuery, SearchRequest, Session, Target,
 };
 use jammi_client::DataClient;
-use jammi_db::error::JammiError;
+use jammi_db::error::{IndexKind, JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::{DeliveredBatch, Predicate, TopicDefinition, TopicId, TriggerError};
 use jammi_db::AuditError;
@@ -145,11 +145,11 @@ async fn remote_round_trips_embeddings_and_search_like_local() {
     assert!(remote_table.row_count > 0, "patents corpus embeds rows");
     assert!(remote_table.dimensions().is_some(), "dimensions recorded");
     assert_eq!(remote_table.source_id, "patents");
-    // The remote arm reconstructs `task` from the requested modality (the wire
-    // omits it as server-internal bookkeeping); it must match the tower.
+    // The wire carries the producer; the remote record's task must match the
+    // tower.
     assert_eq!(
-        remote_table.task,
-        jammi_datafusion::ModelTask::TextEmbedding
+        remote_table.producer.task(),
+        Some(jammi_datafusion::ModelTask::TextEmbedding)
     );
 
     // encode_query parity: identical query, identical model → identical vector.
@@ -391,11 +391,10 @@ async fn remote_add_source_round_trips_like_local() {
 }
 
 /// THE error-parity proof. A search against a source that has no ready
-/// embedding table fails inside the engine with `JammiError::Catalog`. The
-/// remote transport must reconstruct that *exact* variant from the typed wire
-/// detail — not just report `invalid_argument`. A heuristic reverse-map from
-/// the gRPC code could not distinguish `Catalog` from `Source` / `Config` /
-/// `Eval` / `Tenant`, all of which the server maps onto `invalid_argument`.
+/// embedding table fails inside the engine with the typed not-found naming
+/// the source and the index kind. The remote transport must reconstruct that
+/// *exact* variant from the typed wire detail — not just report `not_found`,
+/// which a source, a model, a job or a named table missing would also be.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_reconstructs_the_exact_error_variant_local_returns() {
     let server = start_engine_server().await;
@@ -403,7 +402,7 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
     let local = local(&server);
 
     // Register the corpus but never generate embeddings: a search-by-row-key
-    // then fails resolving the (absent) embedding table — `JammiError::Catalog`.
+    // then fails resolving the (absent) embedding table.
     local
         .add_source("patents", SourceType::File, patents_connection())
         .await
@@ -429,19 +428,21 @@ async fn remote_reconstructs_the_exact_error_variant_local_returns() {
         .expect_err("remote search must fail");
 
     // Same variant AND same payload — faithful reconstruction, not a category.
-    assert!(
-        matches!(local_err, JammiError::Catalog(_)),
-        "local search on a source with no embedding table is a Catalog error, got {local_err:?}"
-    );
+    let expected = Missing::ReadyIndex {
+        source_id: "patents".to_string(),
+        index: IndexKind::Embedding,
+    };
     match (&local_err, &remote_err) {
-        (JammiError::Catalog(local_msg), JammiError::Catalog(remote_msg)) => {
-            assert_eq!(
-                local_msg, remote_msg,
-                "the remote transport carries the same Catalog message the engine produced"
-            );
+        (JammiError::NotFound(local_missing), JammiError::NotFound(remote_missing)) => {
+            assert_eq!(local_missing, &expected);
+            assert_eq!(remote_missing, &expected);
         }
-        other => panic!("remote did not reconstruct the Catalog variant: {other:?}"),
+        other => panic!("both transports raise the typed not-found: {other:?}"),
     }
+    assert!(
+        remote_err.to_string().contains("generate_embeddings"),
+        "the refusal names the verb that builds the index: {remote_err}"
+    );
 
     let _ = server.shutdown.send(());
     let _ = server.handle.await;

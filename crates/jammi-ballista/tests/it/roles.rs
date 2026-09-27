@@ -444,3 +444,105 @@ async fn the_plane_admits_a_placed_attempt_on_a_live_peer_of_its_kind_only() {
     catalog.remove_compute_executor(&live_id).await.ok();
     scheduler.stop().await;
 }
+
+/// Executor rows a killed process left behind — `Active`, heartbeat inside
+/// the liveness window, nothing listening at their address — are bound by
+/// the scheduler exactly like live executors, so a plan's tasks launch
+/// against several of them at once. Each failed launch removes its
+/// executor and resets the tasks bound there; the reset tasks relaunch on
+/// the live executor and the plan completes with the in-process rows. The
+/// stale rows outnumber the live one, so every stage binds to some of them
+/// and several launches fail concurrently. Two runtime workers and several
+/// rounds, so the concurrent launch failures, removals and resets contend
+/// for the runtime and for the job's graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plan_bound_to_stale_executor_rows_relaunches_and_completes() {
+    for round in 0..8 {
+        stale_round(round).await;
+    }
+}
+
+/// One round: a fresh scheduler and live executor, twelve stale rows, a
+/// sixteen-partition shuffle plan submitted and awaited.
+async fn stale_round(round: usize) {
+    let session = session().await;
+    let catalog = Arc::clone(session.catalog_arc());
+    let scheduler = host_scheduler(&session, &scheduler_on("127.0.0.1:0"))
+        .await
+        .expect("scheduler role hosts");
+    let executor = host_executor(
+        &session,
+        &BallistaExecutorConfig {
+            scheduler_address: format!("127.0.0.1:{}", scheduler.addr.port()),
+            bind: "127.0.0.1:0".to_string(),
+            grpc_bind: "127.0.0.1:0".to_string(),
+            advertise_host: Some("127.0.0.1".to_string()),
+            work_dir: None,
+            task_slots: 2,
+        },
+    )
+    .await
+    .expect("executor role hosts and registers");
+
+    // A port nothing listens on: bound, then released.
+    let refused_port = || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let stale: Vec<String> = (0..12)
+        .map(|i| format!("stale-{round}-{i}-{}", jammi_test_utils::unique_suffix()))
+        .collect();
+    for id in &stale {
+        let port = refused_port();
+        catalog
+            .upsert_compute_executor(&ComputeExecutorRecord {
+                executor_id: id.clone(),
+                instance_id: id.clone(),
+                host: "127.0.0.1".to_string(),
+                port,
+                grpc_port: port,
+                task_slots: 4,
+                available_slots: 4,
+                status: jammi_db::catalog::status::ComputeExecutorStatus::Active,
+                heartbeat_at: jammi_db::catalog::lease::canonical_stamp_now(),
+                metadata: String::new(),
+                devices: vec![],
+            })
+            .await
+            .unwrap();
+    }
+
+    let (shuffle, ctx) = build_shuffle_plan().await;
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        RepartitionExec::try_new(
+            Arc::clone(shuffle.children()[0]),
+            Partitioning::Hash(vec![Arc::new(Column::new("id", 0))], 16),
+        )
+        .unwrap(),
+    );
+    let expected = physical_plan::collect(plan.clone(), ctx.task_ctx())
+        .await
+        .expect("in-process collect");
+    let scheduler_url = format!("http://127.0.0.1:{}", scheduler.addr.port());
+    let placed = async {
+        let stream = submit_physical_plan(&session, &scheduler_url, plan)
+            .await
+            .expect("submit_physical_plan succeeds");
+        datafusion::physical_plan::common::collect(stream).await
+    };
+    let actual = tokio::time::timeout(Duration::from_secs(60), placed)
+        .await
+        .expect("the plan completes once its tasks leave the stale executors")
+        .expect("the placed plan succeeds");
+    let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    assert_eq!(rows(&actual), rows(&expected));
+
+    for id in &stale {
+        assert!(
+            catalog.get_compute_executor(id).await.unwrap().is_none(),
+            "a stale executor a launch could not reach leaves the catalog: {id}"
+        );
+    }
+    executor.stop().await;
+    scheduler.stop().await;
+}

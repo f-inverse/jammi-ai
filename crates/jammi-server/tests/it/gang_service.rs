@@ -47,6 +47,7 @@
 //! test cases (the holder-contention rows that manufacture a holder through
 //! `HostAdmission::hold_for_test` are `test-hooks` only as well).
 
+use jammi_db::catalog::result_repo::Producer;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -300,7 +301,7 @@ async fn materialize_ready_table_for_tenant(
                     &ctx,
                     EmbeddingTableSpec {
                         source_id: &source_id_owned,
-                        model_id: "rt-base",
+                        model_id: Some("rt-base"),
                         derived_from: None,
                         dimensions: 4,
                         key_column: None,
@@ -474,8 +475,10 @@ fn null_tenant_row(table: &str) -> jammi_db::catalog::result_repo::CreateResultT
     CreateResultTableParams {
         table_name: table,
         source_id: "src",
-        model_id: "rt-base",
-        task: ModelTask::TextEmbedding,
+        producer: Producer::Model {
+            model_id: "rt-base".to_string(),
+            task: ModelTask::TextEmbedding,
+        },
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "file:///tmp/does-not-exist.parquet",

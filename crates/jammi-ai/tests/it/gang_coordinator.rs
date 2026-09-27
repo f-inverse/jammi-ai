@@ -596,8 +596,8 @@ async fn a_cpu_host_runs_a_two_rank_gang_on_the_cpu_and_publishes_the_gangs_byte
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never_met_by_the_successor(
 ) {
-    use jammi_db::catalog::result_repo::ResultTableKind;
-    use jammi_db::store::TRAINING_SET_MODEL_ID;
+    use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
+    use jammi_db::store::ResultTableOrigin;
 
     let (session, _dir) = coordinating_session(|_| {}).await;
     let worker = JobWorker::new(&session).unwrap();
@@ -606,17 +606,18 @@ async fn a_live_building_training_set_row_left_by_a_crashed_coordinator_is_never
     // task, held under a live, renewing lease.
     let orphan = session
         .result_store()
-        .create_table(
-            "pairs",
-            ModelTask::TextEmbedding,
-            ResultTableKind::TrainingSet,
-            None,
-            TRAINING_SET_MODEL_ID,
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "pairs",
+            producer: Producer::Derivation {
+                task: Some(ModelTask::TextEmbedding),
+            },
+            kind: ResultTableKind::TrainingSet,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .expect("the orphan's building row");
     let orphan_name = orphan.table_name().to_string();

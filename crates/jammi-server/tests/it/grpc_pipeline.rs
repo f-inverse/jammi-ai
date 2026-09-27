@@ -74,6 +74,7 @@ where
             connection: Some(SourceConnection {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await

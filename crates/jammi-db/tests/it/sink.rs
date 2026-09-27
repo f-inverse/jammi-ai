@@ -11,7 +11,7 @@ use arrow::datatypes::DataType;
 use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::session::QueryContext;
@@ -22,7 +22,8 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::sink::ProducingEnvironment;
 use jammi_db::store::{
-    BuildingTable, ResultStore, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind,
+    BuildingTable, ResultStore, ResultTableOrigin, ResultTableSinkSpec, SinkKind, SinkLease,
+    SinkLeaseKind,
 };
 use jammi_numerics::ComputePrecision;
 use tempfile::tempdir;
@@ -32,17 +33,19 @@ use crate::common::{fresh_catalog, memory_scan as scan, store_over, titled_rows 
 
 async fn building(store: &ResultStore, source: &str) -> BuildingTable {
     store
-        .create_table(
-            source,
-            ModelTask::TextEmbedding,
-            ResultTableKind::AsofJoin,
-            None,
-            "rows",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: source,
+            producer: Producer::Model {
+                model_id: "rows".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::AsofJoin,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }

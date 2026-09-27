@@ -134,7 +134,6 @@ pub struct Emit<'a> {
     /// The block width `d`.
     pub dimensions: usize,
     pub source_id: &'a str,
-    pub model_id: &'a str,
 }
 
 const SRC: &str = "_src";
@@ -443,7 +442,6 @@ pub fn emit_plan(
                 readout,
                 dimensions: emit.dimensions,
                 source_id: emit.source_id.to_string(),
-                model_id: emit.model_id.to_string(),
             },
         )
         .map_err(plan_error("readout"))?,
@@ -667,7 +665,6 @@ mod tests {
             Emit {
                 dimensions: DIMENSIONS,
                 source_id: "edges",
-                model_id: "graph_structure",
             },
         )?;
         let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())

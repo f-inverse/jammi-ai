@@ -14,6 +14,7 @@
 //! pre-contract table (honest `MissingManifest`). The SIGKILL crash-injection
 //! peer lives in `materialization_crash_recovery.rs` (feature `test-hooks`).
 
+use jammi_db::error::{IndexKind, JammiError, Missing};
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray};
@@ -21,7 +22,7 @@ use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableName;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
@@ -33,8 +34,8 @@ use jammi_db::store::manifest::{
 };
 use jammi_db::store::schema::embedding_table_schema;
 use jammi_db::store::{
-    BuildingTable, CacheOutcome, PinnedSource, ResultStore, ReusedArtifact, StaleReason, Staleness,
-    TrainingSetInput, TrainingSetSpec,
+    BuildingTable, CacheOutcome, PinnedSource, ResultStore, ResultTableOrigin, ReusedArtifact,
+    StaleReason, Staleness, TrainingSetInput, TrainingSetSpec,
 };
 use tempfile::tempdir;
 use test_case::test_case;
@@ -54,17 +55,19 @@ async fn create_building(store: &ResultStore) -> BuildingTable {
 
 async fn create_building_for(store: &ResultStore, source_id: &str) -> BuildingTable {
     store
-        .create_table(
+        .create_table(ResultTableOrigin {
             source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "test-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+            producer: Producer::Model {
+                model_id: "test-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }
@@ -2207,7 +2210,13 @@ async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: Bac
         .await
         .unwrap()
         .expect("the producer promoted a catalog row");
-    assert_eq!(ts_record.task, ModelTask::TextEmbedding);
+    assert_eq!(
+        ts_record.producer,
+        Producer::Derivation {
+            task: Some(ModelTask::TextEmbedding)
+        },
+        "a training set runs no model; its rows are read as the spec's task"
+    );
 
     // With ONLY the training set present, the source has no embedding table.
     let err = catalog
@@ -2215,7 +2224,13 @@ async fn a_training_set_never_resolves_as_a_sources_embedding_table(backend: Bac
         .await
         .expect_err("a training set must not resolve as an embedding table");
     assert!(
-        err.to_string().contains("No ready embedding table"),
+        matches!(
+            &err,
+            JammiError::NotFound(Missing::ReadyIndex {
+                index: IndexKind::Embedding,
+                ..
+            })
+        ),
         "{err}"
     );
 
@@ -2255,17 +2270,19 @@ async fn materializing_never_touches_a_live_building_row(backend: BackendKind) {
     // hold HERE is that a second materialization neither deletes it, promotes
     // it, nor writes over it.
     let abandoned = store
-        .create_table(
-            &source,
-            ModelTask::TextEmbedding,
-            ResultTableKind::TrainingSet,
-            None,
-            "training-set",
-            None,
-            None,
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: &source,
+            producer: Producer::Model {
+                model_id: "training-set".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::TrainingSet,
+            derived_from: None,
+            dimensions: None,
+            key_column: None,
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let abandoned_name = abandoned.table_name().to_string();

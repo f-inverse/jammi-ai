@@ -2,10 +2,10 @@ use crate::common;
 
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
-use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::{
     session::JammiSession,
     source::{FileFormat, SourceConnection, SourceType},
@@ -271,8 +271,10 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
         .create_result_table(CreateResultTableParams {
             table_name: &ready_name,
             source_id: &source_id,
-            model_id: "busy-model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "busy-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: &ready_url,
@@ -302,8 +304,10 @@ async fn remove_source_refuses_and_touches_nothing_with_a_live_building_table(
         .create_result_table(CreateResultTableParams {
             table_name: &building_name,
             source_id: &source_id,
-            model_id: "busy-model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "busy-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: &building_url,
@@ -1270,8 +1274,8 @@ async fn count_rows(
 
 fn assert_source_not_found(err: &JammiError, source_id: &str) {
     assert!(
-        matches!(err, JammiError::SourceNotFound { source_id: s } if s == source_id),
-        "expected SourceNotFound for '{source_id}', got {err:?}"
+        matches!(err, JammiError::NotFound(Missing::Source { source_id: s }) if s == source_id),
+        "expected a source NotFound for '{source_id}', got {err:?}"
     );
     assert!(
         err.to_string().contains(source_id),

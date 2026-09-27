@@ -40,7 +40,7 @@ use jammi_db::catalog::model_repo::ModelDescriptor;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::source_repo::SourceDescriptor;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::Result;
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::manifest::{DefinitionHash, MatchVerdict, MaterializationManifest};
 use jammi_db::store::mutable::{MutableTableDefinition, MutableTableId};
@@ -235,7 +235,7 @@ impl Session {
 
     /// Hard-delete a model row, removing it — so it is refused while any
     /// reference still points at the model, surfacing
-    /// [`JammiError::ModelReferenced`].
+    /// [`JammiError::ModelReferenced`](jammi_db::error::JammiError::ModelReferenced).
     /// When `version` is `None` the latest version is targeted. A tenant may
     /// delete only a model it owns. When `if_exists` is set, deleting an absent
     /// model is a success no-op; otherwise it is reported as absent.
@@ -530,7 +530,7 @@ impl Session {
     /// artifact digest, the producing descriptor, the environment (engine
     /// version, device, and every invoked model's run), the input anchors,
     /// and who produced it when. Read-only. A table that carries no manifest
-    /// is the typed [`JammiError::MissingManifest`] refusal, never an empty
+    /// is the typed [`JammiError::MissingManifest`](jammi_db::error::JammiError::MissingManifest) refusal, never an empty
     /// description.
     ///
     /// Tenant-scoped: the table is resolved through the tenant-filtered
@@ -542,11 +542,7 @@ impl Session {
 
     /// Resolve a result table by name under this session's tenant binding.
     async fn result_table(&self, table: &str) -> Result<ResultTableRecord> {
-        self.engine
-            .catalog()
-            .get_result_table(table)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{table}' not found")))
+        self.engine.catalog().require_result_table(table).await
     }
 
     /// Recompute a materialised result table's artifact digest and check it
@@ -639,7 +635,7 @@ impl Session {
     /// through the unmodified materialization funnel with
     /// [`CachePolicy::Bypass`](jammi_db::store::CachePolicy::Bypass) (a recompute
     /// always recomputes). A table with no recorded descriptor is the
-    /// typed [`JammiError::NotRecomputable`] — a loud refusal, never a re-run
+    /// typed [`JammiError::NotRecomputable`](jammi_db::error::JammiError::NotRecomputable) — a loud refusal, never a re-run
     /// guessed from columns.
     ///
     /// [`Cascade::ReportOnly`] (default) recomputes the named table only and

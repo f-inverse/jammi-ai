@@ -16,7 +16,9 @@ from jammi.errors import (
     InvalidArgument,
     ModelNotFound,
     ModelReferenced,
+    NoReadyIndex,
     NotFound,
+    Unavailable,
 )
 
 
@@ -46,12 +48,20 @@ def _with_detail(code, detail: error_pb2.JammiErrorDetail) -> _FailedCall:
 
 def test_a_typed_detail_raises_its_leaf_class() -> None:
     referenced = error_pb2.JammiErrorDetail(model_referenced=error_pb2.ModelReferencedError())
-    missing = error_pb2.JammiErrorDetail(model_not_found=error_pb2.ModelNotFoundError())
+    missing = error_pb2.JammiErrorDetail(not_found=error_pb2.NotFoundError(model_id="m"))
+    no_index = error_pb2.JammiErrorDetail(
+        not_found=error_pb2.NotFoundError(
+            ready_index=error_pb2.ReadyIndexMissing(source_id="patents", index="embedding")
+        )
+    )
+    no_table = error_pb2.JammiErrorDetail(not_found=error_pb2.NotFoundError(result_table="t"))
 
     raised = _rpc_to_jammi(_with_detail(grpc.StatusCode.FAILED_PRECONDITION, referenced))
     assert isinstance(raised, ModelReferenced) and isinstance(raised, FailedPrecondition)
     assert raised.code == grpc.StatusCode.FAILED_PRECONDITION
     assert isinstance(_rpc_to_jammi(_with_detail(grpc.StatusCode.NOT_FOUND, missing)), ModelNotFound)
+    assert isinstance(_rpc_to_jammi(_with_detail(grpc.StatusCode.NOT_FOUND, no_index)), NoReadyIndex)
+    assert type(_rpc_to_jammi(_with_detail(grpc.StatusCode.NOT_FOUND, no_table))) is NotFound
 
 
 def test_without_a_detail_the_code_decides() -> None:
@@ -61,6 +71,10 @@ def test_without_a_detail_the_code_decides() -> None:
         _rpc_to_jammi(_FailedCall(grpc.StatusCode.FAILED_PRECONDITION, "m")), FailedPrecondition
     )
     assert type(_rpc_to_jammi(_FailedCall(grpc.StatusCode.INTERNAL, "m"))) is BackendError
+    # A stalled Hub download (and any other unreachable resource) is the
+    # retryable refinement of BackendError.
+    stalled = _rpc_to_jammi(_FailedCall(grpc.StatusCode.UNAVAILABLE, "m"))
+    assert type(stalled) is Unavailable and isinstance(stalled, BackendError)
     assert isinstance(
         _rpc_to_jammi(_FailedCall(grpc.StatusCode.INVALID_ARGUMENT, "m")), InvalidArgument
     )

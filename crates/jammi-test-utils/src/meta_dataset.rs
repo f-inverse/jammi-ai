@@ -123,7 +123,7 @@ pub async fn materialize_embeddings(
             ctx,
             jammi_db::store::EmbeddingTableSpec {
                 source_id,
-                model_id: EMBEDDING_MODEL_ID,
+                model_id: Some(EMBEDDING_MODEL_ID),
                 derived_from: None,
                 dimensions: FEATURE_DIM,
                 key_column: Some("_row_id"),

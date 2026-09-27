@@ -32,7 +32,7 @@ use std::sync::Arc;
 use jammi_admin::CatalogClient;
 use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
-use jammi_db::catalog::result_repo::{CreateResultTableParams, ResultTableKind};
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 use jammi_test_utils::{cookbook_fixture, fixture};
@@ -80,7 +80,7 @@ type TableShape = (
     String,
     usize,
     Option<i32>,
-    jammi_datafusion::ModelTask,
+    jammi_db::catalog::result_repo::Producer,
     ResultTableKind,
     Option<String>,
     Option<String>,
@@ -97,7 +97,7 @@ fn descriptor_shape(d: &SourceDescriptor) -> DescriptorShape {
                 t.status.clone(),
                 t.row_count,
                 t.dimensions_raw(),
-                t.task,
+                t.producer.clone(),
                 t.kind,
                 t.derived_from.clone(),
                 t.key_column.clone(),
@@ -202,7 +202,10 @@ async fn remote_list_and_describe_sources_like_local() {
     assert_eq!(rt.status, "ready");
     assert_eq!(rt.row_count, table.row_count);
     assert_eq!(rt.dimensions_raw(), table.dimensions_raw());
-    assert_eq!(rt.task, jammi_datafusion::ModelTask::TextEmbedding);
+    assert_eq!(
+        rt.producer.task(),
+        Some(jammi_datafusion::ModelTask::TextEmbedding)
+    );
     assert_eq!(rt.kind, ResultTableKind::Model);
     assert_eq!(rt.derived_from, None);
 
@@ -287,8 +290,10 @@ async fn remote_describe_source_carries_a_training_set_kind_like_local() {
             lease: None,
             table_name: "patents_training_set",
             source_id: "patents",
-            model_id: "trainer",
-            task: jammi_datafusion::ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "trainer".to_string(),
+                task: jammi_datafusion::ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::TrainingSet,
             derived_from: None,
             parquet_path: "file:///tmp/patents_training_set.parquet",

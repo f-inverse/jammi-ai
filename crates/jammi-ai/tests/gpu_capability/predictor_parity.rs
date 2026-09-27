@@ -142,7 +142,7 @@ async fn meta_session(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id: "fns",
-                model_id: "synthetic-embed",
+                model_id: Some("synthetic-embed"),
                 derived_from: None,
                 dimensions: FEATURE_DIM,
                 key_column: Some("_row_id"),

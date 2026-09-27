@@ -676,7 +676,15 @@ hub_endpoint = "https://huggingface.co"
 hub_cache_dir = "/var/cache/jammi"
 hub_token = { file = "/run/secrets/hf-token" }
 offline = false
+hub_idle_timeout_secs = 60
 ```
+
+`hub_idle_timeout_secs` (default 60) bounds how long a Hub transfer may go
+without receiving a byte — to connect, to answer, or mid-download. It bounds
+silence, not duration: a large weights file that keeps arriving is never cut
+off. A transfer that stalls fails as the retryable `Unavailable` naming the
+repo and the file (gRPC `UNAVAILABLE`; `jammi.errors.Unavailable` in Python),
+never a wait without end. `0` is refused at load.
 
 `offline = true` refuses every Hub network fetch: a model loads only from a
 `local:` reference or an already-resolved catalog row (a warm, on-disk Hub

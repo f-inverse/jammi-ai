@@ -26,7 +26,9 @@ use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{
     FinishJobParams, FinishJobWithModelParams, SubmitJobParams, WorkerState,
 };
-use jammi_db::catalog::result_repo::{CreateResultTableParams, JobAttempt, ResultTableKind};
+use jammi_db::catalog::result_repo::{
+    CreateResultTableParams, JobAttempt, Producer, ResultTableKind,
+};
 use jammi_db::catalog::status::{JobExecution, JobStatus};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::StoragePrecision;
@@ -1966,8 +1968,10 @@ fn result_table_params<'a>(
     CreateResultTableParams {
         table_name,
         source_id: "src",
-        model_id: "q-base",
-        task: ModelTask::TextEmbedding,
+        producer: Producer::Model {
+            model_id: "q-base".to_string(),
+            task: ModelTask::TextEmbedding,
+        },
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "file:///tmp/rt.parquet",

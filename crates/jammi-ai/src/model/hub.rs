@@ -1,14 +1,26 @@
 //! The one place `[models]` (`jammi_db::config::ModelsConfig`) turns into a
 //! live Hugging Face Hub client.
 //!
-//! No call site builds its own `Api` off `ApiBuilder::new()`/`Cache::default()`:
-//! that path reads `HF_HOME` inconsistently, never reads `HF_TOKEN` at all
-//! (hf-hub 0.5 does not), and `Cache::default()` panics outright when `HOME`
-//! is unset (`dirs::home_dir().expect(..)`, hf-hub `lib.rs:202-209`).
-//! `HubSource` is built exactly ONCE
-//! per session, at the `jammi-ai` choke point
-//! (`crate::session::InferenceSession::wrap`), and every call site downstream
-//! (the resolver, the fine-tune worker) shares that one client.
+//! `HubSource` is built exactly ONCE per session, at the `jammi-ai` choke
+//! point (`crate::session::InferenceSession::wrap`), and every call site
+//! downstream (the resolver, the fine-tune worker) shares that one client.
+//!
+//! # The transfer is this module's own
+//!
+//! `hf_hub` supplies the on-disk cache layout (`hf_hub::Cache`: `blobs/`,
+//! `snapshots/`, `refs/`), and nothing else: its clients build their HTTP
+//! agents with no timeouts and expose no knob to set one (hf-hub 0.5
+//! `api/sync.rs` `ApiBuilder::build`, `api/tokio.rs` likewise), so a server
+//! or middlebox that stops sending without closing the connection would
+//! block a fetch forever. `HubSource` owns the transfer instead — the
+//! Hub's `resolve` endpoint, read with a client whose connect and per-read
+//! timeouts are `[models] hub_idle_timeout_secs` — and writes the same
+//! layout, so a warm cache is shared with any other `hf_hub` reader and a
+//! cache hit issues no request at all. A transfer that goes that long
+//! without a byte fails as a retryable
+//! [`jammi_db::error::JammiError::Unavailable`] naming the repo and the
+//! file; one that keeps making progress is never cut off. The fetch is
+//! async, so a waiting transfer holds no thread: dropping it cancels it.
 //!
 //! # Precedence
 //!
@@ -30,7 +42,7 @@
 //! **Endpoint:**
 //! 1. `[models] hub_endpoint`
 //! 2. the `HF_ENDPOINT` environment variable
-//! 3. hf-hub's own default (`https://huggingface.co`)
+//! 3. the Hub's own endpoint, `https://huggingface.co`
 //!
 //! **Token** (only set on the client when one resolves — an absent token
 //! means no `Authorization` header, exactly like an anonymous
@@ -90,8 +102,8 @@
 //!    it can only ever push an edge case TOWARD offline, never away from it
 //!    — see
 //!    <https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhuboffline>;
-//!    hf-hub, the Rust crate this module wraps, does not read either
-//!    variable at all — see this module's private `resolve_offline`/
+//!    hf-hub, the Rust crate whose cache layout this module writes, does not
+//!    read either variable at all — see this module's private `resolve_offline`/
 //!    `is_hf_hub_offline_truthy`)
 //! 3. `false`
 //!
@@ -158,16 +170,15 @@
 //! by construction). Production passes `&|k: &str| std::env::var(k).ok()`; a
 //! test passes a placeholder map.
 //!
-//! The client is always built with `ApiBuilder::from_cache(..)`, never
-//! `ApiBuilder::from_env()`/`ApiBuilder::new()` — both of those re-derive the
-//! cache root from `Cache::from_env()`/`Cache::default()` a second time,
-//! independently of the precedence above, and `Cache::default()` panics when
-//! no home directory resolves.
+//! The cache is always `hf_hub::Cache::new` over the root resolved above,
+//! never `Cache::from_env()`/`Cache::default()` — those re-derive the root
+//! a second time, independently of the precedence above, and
+//! `Cache::default()` panics when no home directory resolves.
 //!
 //! # The `offline` promise is Hub-only
 //!
 //! `ModelsConfig::offline` refuses every *Hub network* fetch — every call
-//! site that reaches `self.api()` checks it first. That is two call sites,
+//! site that reaches `HubSource::model` checks it first. That is two call sites,
 //! both after their own catalog lookup and both refusing by name when no
 //! catalog row resolved the model (a warm Hub cache directory with no
 //! catalog row is still a miss: the catalog, not the on-disk cache, is
@@ -179,33 +190,59 @@
 //! already-trained model: that path always reads the adapter bundle
 //! through the artifact store (object storage), never the Hub, offline or
 //! not.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use hf_hub::api::sync::{Api, ApiBuilder};
-use hf_hub::Cache;
+use hf_hub::{Cache, CacheRepo, Repo};
 use jammi_db::config::ModelsConfig;
 use jammi_db::error::{JammiError, Result};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_RANGE, LOCATION, RANGE};
+use reqwest::{redirect, Client, RequestBuilder, Response, StatusCode, Url};
+use tokio::io::AsyncWriteExt;
+
+/// The Hub's own endpoint, used when neither `[models] hub_endpoint` nor
+/// `HF_ENDPOINT` names another.
+const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
+
+/// How long a Hub transfer may go without receiving a byte when `[models]
+/// hub_idle_timeout_secs` is unset. It bounds silence, not duration: a
+/// multi-gigabyte weights file that keeps arriving is never cut off, while a
+/// connection that stops sending fails within this interval.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many relative redirects a metadata probe follows (the Hub answers a
+/// renamed repo with one) before it refuses the chain as a loop.
+const MAX_RELATIVE_REDIRECTS: usize = 10;
 
 /// A Hugging Face Hub client built once from `[models]`, shared by every
 /// jammi-ai call site that talks to the Hub. See the module docs for the
-/// precedence chain and the `offline` promise.
+/// precedence chain, the `offline` promise, and why the transfer is this
+/// module's own.
 ///
-/// `Debug` is hand-written, NOT derived: `hf_hub::api::sync::Api`'s own
-/// (derived) `Debug` walks down into its header map, which holds the
-/// resolved bearer token as a plaintext `Authorization` header value once
+/// `Debug` is hand-written, NOT derived: each client's default headers hold
+/// the resolved bearer token as an `Authorization` value once
 /// [`HubSource::from_config`] has set one — the same class of leak
 /// `jammi_db::config::secret::Secret` exists to prevent everywhere else in
 /// this config. A `{:?}` of a `HubSource` must never reach it.
 #[derive(Clone)]
 pub struct HubSource {
-    api: Api,
+    cache: Cache,
+    endpoint: String,
+    /// Follows redirects: a file body, which the Hub hands to its CDN.
+    client: Client,
+    /// Follows none: the metadata probe reads the commit and etag headers
+    /// off the Hub's own answer, before a redirect to the CDN drops them.
+    probe: Client,
+    idle: Duration,
     offline: bool,
 }
 
 impl std::fmt::Debug for HubSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubSource")
-            .field("api", &"<redacted: may hold a Hub bearer token>")
+            .field("endpoint", &self.endpoint)
+            .field("client", &"<redacted: may hold a Hub bearer token>")
+            .field("idle", &self.idle)
             .field("offline", &self.offline)
             .finish()
     }
@@ -228,37 +265,352 @@ impl HubSource {
         env: &impl Fn(&str) -> Option<String>,
     ) -> Result<Self> {
         let env: &dyn Fn(&str) -> Option<String> = env;
-        let root = resolve_root(config, env)?;
-        let cache = Cache::new(root);
-
-        let mut builder = ApiBuilder::from_cache(cache.clone());
-        if let Some(endpoint) = resolve_endpoint(config, env) {
-            builder = builder.with_endpoint(endpoint);
-        }
-        if let Some(token) = resolve_token(config, env)? {
-            builder = builder.with_token(Some(token));
-        }
-
-        let api = builder
-            .build()
-            .map_err(|e| JammiError::Config(format!("Hugging Face Hub client init failed: {e}")))?;
-
+        let cache = Cache::new(resolve_root(config, env)?);
+        let endpoint = resolve_endpoint(config, env)
+            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let token = resolve_token(config, env)?;
+        let idle = config
+            .hub_idle_timeout_secs
+            .map_or(DEFAULT_IDLE_TIMEOUT, Duration::from_secs);
         Ok(Self {
-            api,
+            cache,
+            endpoint,
+            client: build_client(token.as_deref(), idle, redirect::Policy::default())?,
+            probe: build_client(token.as_deref(), idle, redirect::Policy::none())?,
+            idle,
             offline: resolve_offline(config, env),
         })
-    }
-
-    /// The underlying blocking Hub client every resolver/worker call site
-    /// shares.
-    pub fn api(&self) -> &Api {
-        &self.api
     }
 
     /// Whether `[models] offline` is set — see the module docs' "offline
     /// promise is Hub-only" section for exactly what this refuses.
     pub fn offline(&self) -> bool {
         self.offline
+    }
+
+    /// The model repository `repo_id` (`owner/name`) at its `main` revision.
+    pub fn model(&self, repo_id: &str) -> HubRepo<'_> {
+        HubRepo {
+            hub: self,
+            repo: Repo::model(repo_id.to_string()),
+        }
+    }
+}
+
+/// A client whose every request carries `token` as a bearer token (when one
+/// resolved) and fails after `idle` without progress: to connect, and on
+/// each read — reqwest resets its read timeout after every successful read,
+/// so it bounds silence, never a transfer that keeps arriving
+/// (<https://docs.rs/reqwest/0.12/reqwest/struct.ClientBuilder.html#method.read_timeout>).
+/// reqwest drops the `Authorization` header on a redirect to another host,
+/// so the token never reaches the CDN a file body is served from.
+fn build_client(
+    token: Option<&str>,
+    idle: Duration,
+    redirects: redirect::Policy,
+) -> Result<Client> {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = token {
+        let mut bearer = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| {
+            JammiError::Config(format!(
+                "the Hugging Face Hub token is not a valid header: {e}"
+            ))
+        })?;
+        bearer.set_sensitive(true);
+        headers.insert(AUTHORIZATION, bearer);
+    }
+    Client::builder()
+        .default_headers(headers)
+        .user_agent(concat!("jammi/", env!("CARGO_PKG_VERSION")))
+        .redirect(redirects)
+        .connect_timeout(idle)
+        .read_timeout(idle)
+        .build()
+        .map_err(|e| JammiError::Config(format!("Hugging Face Hub client init failed: {e}")))
+}
+
+/// One Hub repository, read through its [`HubSource`]: its files into the
+/// shared on-disk cache, and its listing.
+pub struct HubRepo<'a> {
+    hub: &'a HubSource,
+    repo: Repo,
+}
+
+/// What a file's metadata probe learnt: the commit the revision resolves
+/// to, the blob's etag (its cache key), and its size in bytes.
+struct FileMetadata {
+    commit: String,
+    etag: String,
+    size: u64,
+}
+
+/// The repo listing's shape: every file the repo holds, by its path.
+#[derive(serde::Deserialize)]
+struct Listing {
+    siblings: Vec<Sibling>,
+}
+
+#[derive(serde::Deserialize)]
+struct Sibling {
+    rfilename: String,
+}
+
+impl HubRepo<'_> {
+    /// The local path of `filename`: straight from the cache when it is
+    /// there (no request at all), else downloaded into it. `Ok(None)` when
+    /// the Hub has no such file; a Hub that cannot be reached, or stops
+    /// sending, is [`JammiError::Unavailable`] naming the repo and the file.
+    pub async fn get(&self, filename: &str) -> Result<Option<PathBuf>> {
+        match self.cache().get(filename) {
+            Some(path) => Ok(Some(path)),
+            None => self.download(filename).await,
+        }
+    }
+
+    /// Every file the repo holds, by its path in the repo.
+    pub async fn files(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/{}", self.hub.endpoint, self.repo.api_url());
+        let response = self.send(self.hub.client.get(&url), "<listing>").await?;
+        let response = self.expect_success(response, "<listing>")?;
+        let listing: Listing = response
+            .json()
+            .await
+            .map_err(|e| self.unreachable("<listing>", &e))?;
+        Ok(listing.siblings.into_iter().map(|s| s.rfilename).collect())
+    }
+
+    fn cache(&self) -> CacheRepo {
+        self.hub.cache.repo(self.repo.clone())
+    }
+
+    /// Download `filename` into the cache layout `hf_hub::Cache` reads —
+    /// the body under `blobs/<etag>`, a relative symlink to it under
+    /// `snapshots/<commit>/<filename>`, and `refs/<revision>` naming the
+    /// commit — so a file this client fetched is a cache hit for any other
+    /// reader of the same cache, and the reverse.
+    async fn download(&self, filename: &str) -> Result<Option<PathBuf>> {
+        let url = format!(
+            "{}/{}/resolve/{}/{}",
+            self.hub.endpoint,
+            self.repo.url(),
+            self.repo.url_revision(),
+            filename
+        );
+        let Some(metadata) = self.metadata(&url, filename).await? else {
+            return Ok(None);
+        };
+        let cache = self.cache();
+        let blob = cache.blob_path(&metadata.etag);
+        if let Some(blobs) = blob.parent() {
+            tokio::fs::create_dir_all(blobs).await?;
+        }
+        if !tokio::fs::try_exists(&blob).await? {
+            self.fetch(&url, filename, &blob, metadata.size).await?;
+        }
+        let mut pointer = cache.pointer_path(&metadata.commit);
+        pointer.push(filename);
+        if let Some(snapshot) = pointer.parent() {
+            tokio::fs::create_dir_all(snapshot).await?;
+        }
+        link_pointer(&metadata.etag, &pointer, filename)?;
+        cache.create_ref(&metadata.commit)?;
+        Ok(Some(pointer))
+    }
+
+    /// Probe `url` for the file's commit, etag and size without its body: a
+    /// one-byte range, following only relative redirects (a renamed repo),
+    /// so the commit and etag headers come off the Hub's own answer. An
+    /// absolute redirect hands the body to the CDN, whose one-byte answer
+    /// carries the size. `Ok(None)` is the Hub saying there is no such file.
+    async fn metadata(&self, url: &str, filename: &str) -> Result<Option<FileMetadata>> {
+        let mut url = Url::parse(url).map_err(|e| self.malformed(filename, e))?;
+        let mut hops = 0;
+        let response = loop {
+            let response = self
+                .send(
+                    self.hub.probe.get(url.clone()).header(RANGE, "bytes=0-0"),
+                    filename,
+                )
+                .await?;
+            let next = match location(&response) {
+                Some(next) if response.status().is_redirection() && Url::parse(next).is_err() => {
+                    next.to_string()
+                }
+                _ => break response,
+            };
+            hops += 1;
+            if hops > MAX_RELATIVE_REDIRECTS {
+                return Err(self.unavailable(
+                    filename,
+                    format!("more than {MAX_RELATIVE_REDIRECTS} relative redirects"),
+                ));
+            }
+            url = url.join(&next).map_err(|e| self.malformed(filename, e))?;
+        };
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let commit = header(&response, "x-repo-commit")
+            .ok_or_else(|| self.missing(filename, "x-repo-commit"))?;
+        let etag = header(&response, "x-linked-etag")
+            .or_else(|| header(&response, "etag"))
+            .ok_or_else(|| self.missing(filename, "etag"))?
+            .replace('"', "");
+        let sized = if response.status().is_redirection() {
+            let cdn = location(&response).ok_or_else(|| self.missing(filename, "location"))?;
+            self.send(
+                self.hub.client.get(cdn).header(RANGE, "bytes=0-0"),
+                filename,
+            )
+            .await?
+        } else {
+            response
+        };
+        let sized = self.expect_success(sized, filename)?;
+        let size = header(&sized, CONTENT_RANGE.as_str())
+            .and_then(|range| range.rsplit('/').next().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| self.missing(filename, "content-range"))?;
+        Ok(Some(FileMetadata { commit, etag, size }))
+    }
+
+    /// Stream `url`'s body into `blob`, through a partial file renamed into
+    /// place only once all `size` bytes arrived, so a reader never sees a
+    /// torn blob. A partial file left by a failed transfer is removed.
+    async fn fetch(&self, url: &str, filename: &str, blob: &Path, size: u64) -> Result<()> {
+        let partial = blob.with_extension(format!("{}.part", uuid::Uuid::new_v4().simple()));
+        let fetched = self.write_body(url, filename, &partial, size).await;
+        match fetched {
+            Ok(()) => Ok(tokio::fs::rename(&partial, blob).await?),
+            Err(failed) => {
+                if let Err(e) = tokio::fs::remove_file(&partial).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(path = %partial.display(), error = %e, "Hub: a failed transfer's partial file was not removed");
+                    }
+                }
+                Err(failed)
+            }
+        }
+    }
+
+    async fn write_body(&self, url: &str, filename: &str, partial: &Path, size: u64) -> Result<()> {
+        let response = self.send(self.hub.client.get(url), filename).await?;
+        let mut response = self.expect_success(response, filename)?;
+        let mut file = tokio::fs::File::create(partial).await?;
+        let mut written: u64 = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| self.unreachable(filename, &e))?
+        {
+            file.write_all(&chunk).await?;
+            written += chunk.len() as u64;
+        }
+        file.flush().await?;
+        if written == size {
+            Ok(())
+        } else {
+            Err(self.unavailable(
+                filename,
+                format!("the transfer ended after {written} of {size} bytes"),
+            ))
+        }
+    }
+
+    async fn send(&self, request: RequestBuilder, filename: &str) -> Result<Response> {
+        request
+            .send()
+            .await
+            .map_err(|e| self.unreachable(filename, &e))
+    }
+
+    /// `response` when it succeeded; otherwise the refusal it is. A server
+    /// fault or rate limit is retryable [`JammiError::Unavailable`]; any
+    /// other answer (a gated repo refusing the token, a malformed request)
+    /// is a [`JammiError::Model`] naming the file.
+    fn expect_success(&self, response: Response, filename: &str) -> Result<Response> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let reason = format!("the Hub answered {status}");
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            Err(self.unavailable(filename, reason))
+        } else {
+            Err(JammiError::Model {
+                model_id: self.repo_id(),
+                message: format!("{filename}: {reason}"),
+            })
+        }
+    }
+
+    /// A transfer that could not be made or stopped making progress.
+    fn unreachable(&self, filename: &str, error: &reqwest::Error) -> JammiError {
+        let reason = if error.is_timeout() {
+            format!(
+                "no progress for {}s (`[models] hub_idle_timeout_secs`): the transfer stalled",
+                self.hub.idle.as_secs()
+            )
+        } else {
+            error.to_string()
+        };
+        self.unavailable(filename, reason)
+    }
+
+    fn unavailable(&self, filename: &str, reason: String) -> JammiError {
+        JammiError::Unavailable {
+            resource: format!("hf://{}/{filename}", self.repo_id()),
+            reason,
+        }
+    }
+
+    fn missing(&self, filename: &str, header: &str) -> JammiError {
+        JammiError::Model {
+            model_id: self.repo_id(),
+            message: format!("{filename}: the Hub's answer carries no `{header}` header"),
+        }
+    }
+
+    fn malformed(&self, filename: &str, error: impl std::fmt::Display) -> JammiError {
+        JammiError::Model {
+            model_id: self.repo_id(),
+            message: format!("{filename}: not a valid Hub URL: {error}"),
+        }
+    }
+
+    fn repo_id(&self) -> String {
+        self.repo.url()
+    }
+}
+
+/// The `Location` a redirect names, when it is readable.
+fn location(response: &Response) -> Option<&str> {
+    response.headers().get(LOCATION)?.to_str().ok()
+}
+
+/// A header's value, when present and readable.
+fn header(response: &Response, name: &str) -> Option<String> {
+    Some(response.headers().get(name)?.to_str().ok()?.to_string())
+}
+
+/// Point `pointer` (`snapshots/<commit>/<filename>`) at `blob`
+/// (`blobs/<etag>`) by a relative symlink, as `hf_hub` does, so the cache
+/// stays valid when its root moves (the engine builds for Unix targets
+/// only). Another writer having linked it first is the same outcome.
+fn link_pointer(etag: &str, pointer: &Path, filename: &str) -> Result<()> {
+    if pointer.exists() {
+        return Ok(());
+    }
+    // Up out of the file's own subdirectories and `snapshots/<commit>`, to
+    // the repo directory `blobs/` sits in.
+    let depth = Path::new(filename).components().count() + 1;
+    let mut target: PathBuf = std::iter::repeat_n("..", depth).collect();
+    target.push("blobs");
+    target.push(etag);
+    match std::os::unix::fs::symlink(&target, pointer) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -321,9 +673,8 @@ fn resolve_root_with(
 }
 
 /// Resolve the endpoint per the module docs' precedence: `hub_endpoint` >
-/// `HF_ENDPOINT` (non-empty) > `None` (hf-hub's own default,
-/// `https://huggingface.co`, applies when the builder is never told
-/// otherwise).
+/// `HF_ENDPOINT` (non-empty) > `None` (the Hub's own endpoint,
+/// [`DEFAULT_ENDPOINT`], applies).
 fn resolve_endpoint(config: &ModelsConfig, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     config
         .hub_endpoint
@@ -474,8 +825,8 @@ fn env_nonempty(env: &dyn Fn(&str) -> Option<String>, key: &str) -> Option<Strin
 ///
 /// This mirrors `huggingface_hub`'s own `HF_HUB_OFFLINE`/
 /// `TRANSFORMERS_OFFLINE` truthy convention (see the module docs' "Offline"
-/// precedence for the citation); hf-hub 0.5, the Rust crate `HubSource`
-/// wraps, does not read either variable at all, so this crate reads and
+/// precedence for the citation); hf-hub 0.5, whose cache layout `HubSource`
+/// writes, does not read either variable at all, so this crate reads and
 /// parses them directly rather than leaving them silently ignored.
 fn is_hf_hub_offline_truthy(value: &str) -> bool {
     let trimmed = value.trim();

@@ -75,3 +75,12 @@ extension-module = ["pyo3/extension-module"]
 cuda = ["jammi-ai/cuda"]
 metal = ["jammi-ai/metal"]
 flash-attn = ["jammi-ai/flash-attn"]
+# The cloud object-storage drivers, by-name passthroughs to `jammi-db`'s — the
+# same surface `jammi-server` forwards, so an embedded engine reads sources
+# from and writes result tables to `s3://` / `gs://` / `azure://` / `r2://`
+# as a server does. Both native wheels build `storage-cloud`.
+storage-s3 = ["jammi-db/storage-s3"]
+storage-gcs = ["jammi-db/storage-gcs"]
+storage-azure = ["jammi-db/storage-azure"]
+storage-r2 = ["jammi-db/storage-r2"]
+storage-cloud = ["jammi-db/storage-cloud"]

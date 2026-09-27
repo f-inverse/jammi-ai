@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
-use jammi_db::catalog::result_repo::ResultTableRecord;
+use jammi_db::catalog::result_repo::{Producer, ResultTableRecord};
 use jammi_db::config::JammiConfig;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::SearchMethod;
 use jammi_db::session::{JammiSession, QueryContext, QueryFunction};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::sql::{quote_ident, source_relation};
-use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore};
+use jammi_db::store::{ArtifactStore, PinnedSource, ResultStore, ResultTableOrigin};
 
 use crate::eval::runner::EvalRunner;
 use crate::fine_tune::spec::{TrainingCommon, TrainingSpec};
@@ -90,8 +90,9 @@ pub struct InferenceSession {
 /// The model-side links a training kind's `jobs` row is submitted with —
 /// see [`InferenceSession::training_job_links`].
 pub(crate) struct TrainingJobLinks {
-    /// `jobs.model_ref`: the base model's catalog PK.
-    pub(crate) model_ref: String,
+    /// `jobs.model_ref`: the base model's catalog PK; `None` for a context
+    /// predictor over an embedding table no model produced.
+    pub(crate) model_ref: Option<String>,
     /// `jobs.output_model_id`: the NAME the finished model registers under.
     pub(crate) output_model_id: String,
 }
@@ -327,8 +328,7 @@ impl InferenceSession {
         // The Hub choke point: `[models]` -> `HubSource`, exactly
         // once per session. Every downstream Hub call (the resolver's
         // HuggingFace arm, the fine-tune worker's HF fallback) shares this
-        // one client rather than each re-deriving its own from
-        // `hf_hub::api::sync::Api::new()`/`ApiBuilder::from_env()`. Process
+        // one client rather than each re-deriving its own. Process
         // env is read HERE (the `HF_HOME`/`HF_ENDPOINT`/`HF_TOKEN`
         // fallbacks) — never inside `JammiConfig::load_from`, which stays
         // process-env-free.
@@ -1684,17 +1684,19 @@ impl InferenceSession {
         // the caller as that variant).
         let mut building = self
             .result_store
-            .create_table(
+            .create_table(ResultTableOrigin {
                 source_id,
-                task,
-                jammi_db::catalog::result_repo::ResultTableKind::Model,
-                None,
-                &source.to_string(),
-                None,
-                None,
-                None,
+                producer: Producer::Model {
+                    model_id: source.to_string(),
+                    task,
+                },
+                kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
+                derived_from: None,
+                dimensions: None,
+                key_column: None,
+                text_columns: None,
                 job_attempt,
-            )
+            })
             .await?;
         let summary = self
             .result_store
@@ -1774,7 +1776,7 @@ impl InferenceSession {
     /// The first table a source serves, resolved through the catalog's
     /// `sources` row ([`JammiSession::source_table_names`]) — a source
     /// registered on any replica resolves here, and a missing one is
-    /// [`JammiError::SourceNotFound`].
+    /// [`JammiError::NotFound`].
     pub(crate) async fn find_table_name(&self, source_id: &str) -> Result<String> {
         self.inner
             .source_table_names(source_id)
@@ -2093,7 +2095,7 @@ impl InferenceSession {
             self.inner.catalog(),
             &admitted,
             &job_id,
-            &links.model_ref,
+            links.model_ref.as_deref(),
             &links.output_model_id,
             0,
             idempotency_key,
@@ -2130,7 +2132,8 @@ impl InferenceSession {
     /// [`Self::train_context_predictor`]) and the generic
     /// [`Self::enqueue`] alike — so a row cannot be linked differently
     /// depending on which door it came through. `model_ref` is the base
-    /// model's catalog PK (the row is registered first when absent);
+    /// model's catalog PK (the row is registered first when absent), when
+    /// there is a base model;
     /// `output_model_id` is the NAME the finish CAS mints the output under
     /// (`fine_tuned_model_id(job_id)` for the two LoRA kinds, the spec's
     /// own `model_id` for a context predictor).
@@ -2141,15 +2144,16 @@ impl InferenceSession {
     ) -> Result<TrainingJobLinks> {
         match spec {
             TrainingSpec::FineTune { task, common, .. } => Ok(TrainingJobLinks {
-                model_ref: self.ensure_base_model_pk(&common.base_model, *task).await?,
+                model_ref: Some(self.ensure_base_model_pk(&common.base_model, *task).await?),
                 output_model_id: fine_tuned_model_id(job_id),
             }),
             // A graph fine-tune trains a text-embedding metric over the node
             // source's text; the edges only supervise the pairing.
             TrainingSpec::GraphFineTune { common, .. } => Ok(TrainingJobLinks {
-                model_ref: self
-                    .ensure_base_model_pk(&common.base_model, ModelTask::TextEmbedding)
-                    .await?,
+                model_ref: Some(
+                    self.ensure_base_model_pk(&common.base_model, ModelTask::TextEmbedding)
+                        .await?,
+                ),
                 output_model_id: fine_tuned_model_id(job_id),
             }),
             TrainingSpec::ContextPredictor {

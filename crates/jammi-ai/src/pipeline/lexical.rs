@@ -7,20 +7,15 @@
 //! ([`crate::index::LexicalIndexes`]), so the table alone pins what a search
 //! ranks: the text as it was read, under the analyzer the descriptor records.
 
-use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::{JobAttempt, ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{JobAttempt, Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::index::LexicalAnalyzer;
 use jammi_db::sql::{quote_ident, source_relation};
 use jammi_db::store::manifest::{InputAnchor, Materialization, ProducingDescriptor};
-use jammi_db::store::SinkKind;
+use jammi_db::store::{ResultTableOrigin, SinkKind};
 use serde::{Deserialize, Serialize};
 
 use crate::session::InferenceSession;
-
-/// The `model_id` a lexical table records: it runs no model, and the column is
-/// NOT NULL, so a fixed marker names the derivation kind.
-const LEXICAL_MODEL_ID: &str = "lexical";
 
 /// What a lexical index is built from: a source's text columns, keyed by one
 /// of its columns, tokenised by an analyzer.
@@ -81,22 +76,19 @@ pub async fn run(
         .await
         .map_err(JammiError::from)?;
 
-    // `task` is NOT NULL on every result table; a lexical table runs no model,
-    // and its kind keeps it out of embedding resolution.
     let columns = params.columns.join(",");
     let mut building = session
         .result_store()
-        .create_table(
+        .create_table(ResultTableOrigin {
             source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Lexical,
-            None,
-            LEXICAL_MODEL_ID,
-            None,
-            Some(&params.key_column),
-            Some(&columns),
+            producer: Producer::Derivation { task: None },
+            kind: ResultTableKind::Lexical,
+            derived_from: None,
+            dimensions: None,
+            key_column: Some(&params.key_column),
+            text_columns: Some(&columns),
             job_attempt,
-        )
+        })
         .await?;
     let summary = session
         .result_store()

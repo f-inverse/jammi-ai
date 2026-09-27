@@ -82,10 +82,17 @@ message SegmentSearchRequest {
   StoragePrecision storage_precision = 3;
   // The query vector.
   repeated float query = 4;
-  // The per-segment fetch width.
+  // The per-segment fetch width a segment's search starts from.
   uint64 width = 5;
   // Which stage of the protocol this search is.
   SegmentSearchPhase phase = 6;
+  // How many live hits each segment's search widens toward while the
+  // version's deletion mask hides rows of it.
+  uint64 target = 7;
+  // The table version the coordinator pinned: the owner serves that
+  // version's segment set under its deletion mask. Unset for a
+  // never-refreshed table's base set.
+  optional int64 version = 8;
 }
 
 message SegmentSearchResponse {
@@ -103,6 +110,10 @@ message ExactRescoreRequest {
   StoragePrecision storage_precision = 2;
   repeated float query = 3;
   repeated SegmentRowIds row_ids_by_segment = 4;
+  // The table version the coordinator pinned, as `SegmentSearchRequest`
+  // names it: every segment named must be one that version serves. Unset
+  // for a never-refreshed table's base set.
+  optional int64 version = 5;
 }
 
 message ExactRescoreResponse {

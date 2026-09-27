@@ -161,6 +161,7 @@ async fn generate_and_encode_audio_modality_over_the_wire() {
             connection: Some(SourceConnection {
                 url: format!("file://{}", parquet_path.display()),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await
@@ -234,6 +235,7 @@ async fn generate_and_encode_text_modality_over_the_wire() {
             connection: Some(SourceConnection {
                 url: patents_url(),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await
@@ -307,6 +309,7 @@ async fn embed_corpus(
             connection: Some(SourceConnection {
                 url: format!("file://{}", parquet_path.display()),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await
@@ -597,6 +600,7 @@ async fn catalog_service_rejects_unspecified_source_kind() {
             connection: Some(SourceConnection {
                 url: "file:///tmp/whatever.parquet".into(),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await
@@ -691,6 +695,7 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
             connection: Some(SourceConnection {
                 url: format!("file://{}", source_parquet.display()),
                 format: FileFormat::Parquet as i32,
+                tenant_column: None,
             }),
         })
         .await
@@ -715,7 +720,8 @@ async fn import_embeddings_registers_a_ready_searchable_table_over_the_wire() {
     assert_eq!(table.status, "ready", "imported table must be ready");
     assert_eq!(table.source_id, "docs");
     assert_eq!(
-        table.model_id, "import-model",
+        table.model_id.as_deref(),
+        Some("import-model"),
         "model id recorded canonical"
     );
     assert_eq!(

@@ -24,13 +24,13 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::config::AnnIndexConfig;
 use jammi_db::session::JammiSession;
 use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ProducingDescriptor};
 use jammi_db::store::mutable::test_hook::MATERIALIZATION_CHECKPOINT_ENV;
 use jammi_db::store::schema::embedding_table_schema;
-use jammi_db::store::ResultStore;
+use jammi_db::store::{ResultStore, ResultTableOrigin};
 
 use crate::common;
 
@@ -65,17 +65,19 @@ async fn child_workload() {
     .with_lease_intervals(short_lease());
 
     let info = store
-        .create_table(
-            TABLE_SOURCE,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "crash-model",
-            Some(DIMS as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: TABLE_SOURCE,
+            producer: Producer::Model {
+                model_id: "crash-model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIMS as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
 

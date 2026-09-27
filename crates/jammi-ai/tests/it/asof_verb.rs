@@ -14,7 +14,8 @@ use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_ai::pipeline::asof::{AsofJoinSpecBuilder, AsofKey, Boundary, MatchDirection, TieBreak};
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
+use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
@@ -151,6 +152,16 @@ async fn asof_join_writes_a_ready_result_table_with_manifest() {
         "the result table is published ready"
     );
     assert_eq!(record.kind, ResultTableKind::AsofJoin);
+    assert_eq!(
+        record.producer,
+        Producer::Derivation { task: None },
+        "an as-of join runs no model, and its rows are no model task's"
+    );
+    assert!(
+        record.table_name.starts_with("trades__asof_join__"),
+        "the kind names the table: {}",
+        record.table_name
+    );
     assert_eq!(record.row_count, 2, "the spine is fully preserved");
 
     // trade 1 (exec 25) → bid 200; trade 2 (exec 5, before any quote) → null.
@@ -282,13 +293,64 @@ async fn ambiguous_duplicate_facts_fail_loud_through_the_verb() {
     register_parquet(&session, &dir, "trades", &spine).await;
     register_parquet(&session, &dir, "quotes", &facts).await;
 
+    let logs = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
     let err = session
         .asof_join("trades", "quotes", &default_spec())
         .await
         .unwrap_err();
-    let msg = err.to_string();
+    match &err {
+        JammiError::AmbiguousAsofMatch { instant } => assert_eq!(instant, "20"),
+        other => panic!("a tie with no tie-break column is AmbiguousAsofMatch, got {other:?}"),
+    }
+    assert!(err.to_string().contains("tie_break_column"), "{err}");
+
+    // The sink failed the building row; the dropped handle's guard finds it
+    // failed and says so at DEBUG, never warning about a row already where
+    // it would put it.
+    for _ in 0..200 {
+        if logs.text().contains("row failed") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let text = logs.text();
+    assert!(text.contains("row failed"), "the drop guard ran: {text}");
     assert!(
-        msg.contains("ambiguous"),
-        "a duplicate at the matched instant with TieBreak::Error must fail loud; got: {msg}"
+        !text.contains("WARN"),
+        "no warning for an already-failed row: {text}"
     );
+}
+
+/// A `tracing` writer into a shared buffer.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for LogBuffer {
+    type Writer = LogBuffer;
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
 }

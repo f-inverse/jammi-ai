@@ -9,6 +9,7 @@ open the notebooks as tagged at `py-v0.49.1`.
 | Notebook | Colab |
 |---|---|
 | [Audio-to-audio search over a tiny synthetic corpus with a CLAP model](recipes/audio_search.ipynb) | [Open](https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.49.1/cookbook/notebooks/recipes/audio_search.ipynb) |
+| [Read a source from S3 and write result tables to S3, from the embedded engine](recipes/cloud_storage.ipynb) | [Open](https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.49.1/cookbook/notebooks/recipes/cloud_storage.ipynb) |
 | [Predict a row's outcome from the rows most like it — an in-context predictor](recipes/context_predictor.ipynb) | [Open](https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.49.1/cookbook/notebooks/recipes/context_predictor.ipynb) |
 | [Measure recall@k / nDCG of a vector index against a golden relevance set](recipes/eval_embeddings.ipynb) | [Open](https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.49.1/cookbook/notebooks/recipes/eval_embeddings.ipynb) |
 | [Measure classification accuracy / F1 against gold labels](recipes/eval_inference.ipynb) | [Open](https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.49.1/cookbook/notebooks/recipes/eval_inference.ipynb) |

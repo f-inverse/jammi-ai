@@ -20,10 +20,12 @@
 # the bare `jammi-server` crate as published to crates.io, built with no
 # `--features` at all) and over `--all-features` (which covers every OTHER
 # shipped family — the CPU PyPI wheel, the CPU tarball, the CPU container
-# image and all three CUDA lanes, every one of which builds `storage-cloud`;
-# see `.github/workflows/pypi-server.yml`,
-# `release-binaries.yml`, `Dockerfile` and `ci/release-feature-manifest.json`
-# — plus jammi-db's `postgres`/`mysql` backends). A copyleft license, a git
+# image, all three CUDA lanes and both embedded-engine wheels
+# (`jammi-ai-native`, `jammi-ai-native-cu12`), every one of which builds
+# `storage-cloud`; see `.github/workflows/pypi-server.yml`,
+# `release-binaries.yml`, `Dockerfile`, `packaging/native*/pyproject.toml`
+# and `ci/release-feature-manifest.json` — plus jammi-db's `postgres`/`mysql`
+# backends). A copyleft license, a git
 # source, a second engine line or an advisory hiding behind an optional
 # feature is caught by the second run; the default-only run cannot see it.
 # `crates/jammi-db/tests/it/shipped_feature_exposure.rs` derives and gates the
@@ -84,8 +86,8 @@ ignore = [
     # HOSTILE XML document. Reached only via `object_store`'s aws/gcp/azure
     # backends, i.e. jammi-db's `storage-s3`/`storage-gcs`/`storage-azure`/
     # `storage-r2` features, where the XML parsed is an object-store API
-    # response, gated by jammi-server's `storage-cloud` feature. The two
-    # EXPOSURE lines below are GENERATED and gated:
+    # response, gated by jammi-server's and jammi-python's `storage-cloud`
+    # feature. The two EXPOSURE lines below are GENERATED and gated:
     # `crates/jammi-db/tests/it/shipped_feature_exposure.rs` asserts them
     # byte-equal to every shipped family whose cargo_features carries
     # `storage-cloud` today — a shipped family gaining the feature reds that
@@ -93,8 +95,8 @@ ignore = [
     # reds the same way (never silently over- or under-stated). Any
     # deployment of a listed family whose object-store endpoint is
     # attacker-controlled (or MITM'd) can be driven to CPU/memory exhaustion.
-    # EXPOSURE[RUSTSEC-2026-0194] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image
-    # EXPOSURE[RUSTSEC-2026-0195] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image
+    # EXPOSURE[RUSTSEC-2026-0194] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image, native-cpu-wheel, native-cu12-wheel
+    # EXPOSURE[RUSTSEC-2026-0195] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image, native-cpu-wheel, native-cu12-wheel
     # NO UPSTREAM FIX REACHABLE: the patched line is
     # quick-xml >= 0.41, which requires object_store >= 0.14.1, which requires
     # leaving the DataFusion 54 line (datafusion 54.1 pins object_store

@@ -372,3 +372,10 @@ required-features = ["live-gpu-tests"]
 name = "metal_quantized_gpu"
 path = "tests/metal_quantized_gpu.rs"
 required-features = ["live-metal-tests"]
+
+# The log formatter under a process-global subscriber: a standalone binary
+# because the global dispatcher's callsite-interest cache is the behaviour
+# under test, and a global subscriber installs once per process.
+[[test]]
+name = "telemetry_dispatch"
+path = "tests/telemetry_dispatch.rs"

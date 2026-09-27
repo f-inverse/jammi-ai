@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::PyErr;
 use tonic::{Code, Status};
 
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 
 /// Raise a `jammi.errors` exception class by name, carrying `message`.
 ///
@@ -59,7 +59,8 @@ fn jammi_error_class(err: &JammiError) -> &'static str {
         JammiError::VersionUnavailable { .. } => "VersionUnavailable",
         JammiError::NotRefreshable { .. } => "NotRefreshable",
         JammiError::DefinitionDrift { .. } => "DefinitionDrift",
-        JammiError::ModelNotFound { .. } => "ModelNotFound",
+        JammiError::NotFound(Missing::Model { .. }) => "ModelNotFound",
+        JammiError::NotFound(Missing::ReadyIndex { .. }) => "NoReadyIndex",
         JammiError::ModelReferenced { .. } => "ModelReferenced",
         other => status_class(jammi_wire::status_code(other)),
     }
@@ -108,6 +109,7 @@ fn status_class(code: Code) -> &'static str {
         Code::NotFound => "NotFound",
         Code::AlreadyExists => "AlreadyExists",
         Code::FailedPrecondition => "FailedPrecondition",
+        Code::Unavailable => "Unavailable",
         _ => "BackendError",
     }
 }
@@ -137,6 +139,21 @@ mod tests {
             "the embedded class for an empty training set must equal the class \
              the remote client raises for the INVALID_ARGUMENT the server sends",
         );
+    }
+
+    /// Embedded ⇄ remote parity for the retryable condition: a stalled Hub
+    /// download (`Unavailable`) raises the class the remote client raises for
+    /// the `UNAVAILABLE` the server sends, so one `except Unavailable` retries
+    /// on both transports.
+    #[test]
+    fn a_stalled_download_raises_the_class_the_remote_transport_raises() {
+        let err = JammiError::Unavailable {
+            resource: "hf://acme/model/model.safetensors".to_string(),
+            reason: "no progress for 60s: the transfer stalled".to_string(),
+        };
+        assert_eq!(jammi_wire::status_code(&err), Code::Unavailable);
+        assert_eq!(jammi_error_class(&err), status_class(Code::Unavailable));
+        assert_eq!(jammi_error_class(&err), "Unavailable");
     }
 
     /// The residual bucket is still the residual bucket: a fault that is not a

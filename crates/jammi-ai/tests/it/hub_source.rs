@@ -1,11 +1,8 @@
 //! `[models]` -> [`HubSource`] — the shared Hugging Face Hub client every
-//! jammi-ai call site builds through, instead of each independently reaching
-//! for `hf_hub::api::sync::Api::new()`/`ApiBuilder::from_env()`.
-//!
-//! A bare `Api::new()` never reads `HF_TOKEN` (hf-hub 0.5 does not), applies
-//! `HF_HOME`/`HF_ENDPOINT` differently at each call site, and panics
-//! outright (`Cache::default()`'s `dirs::home_dir().expect(..)`) when `HOME`
-//! is unset; these tests pin that every tier goes through one `HubSource`.
+//! jammi-ai call site builds through: every precedence tier (cache root,
+//! endpoint, token, offline) reaches the wire through one `HubSource`, a warm
+//! cache issues no request, and a transfer that stops sending fails typed
+//! and bounded instead of waiting forever.
 
 use std::sync::Arc;
 
@@ -33,19 +30,20 @@ const BODY: &[u8] = b"{\"hidden_size\":4,\"model_type\":\"bert\"}";
 const MINIMAL_SAFETENSORS: &[u8] = &[2, 0, 0, 0, 0, 0, 0, 0, b'{', b'}'];
 
 /// Mount ONE mock matching every `GET` to `{repo_id}/resolve/main/{filename}`
-/// — hf-hub 0.5's sync API issues exactly two such requests per fresh
-/// download (`Api::metadata`'s `Range: bytes=0-0` HEAD-shaped probe, then the
-/// real `Range: bytes=0-` body fetch — see `hf_hub::api::sync::Api::metadata`/
-/// `download_from`), both against the identical URL, so one mock serves
-/// both. Every header hf-hub's `metadata()` requires is present: `etag`,
-/// `x-repo-commit`, and `content-range` (whose `/`-suffix it parses as the
-/// file size).
+/// — `HubRepo::get` issues exactly two such requests per fresh download (the
+/// `Range: bytes=0-0` metadata probe, then the body fetch), both against the
+/// identical URL, so one mock serves both. Every header the probe requires
+/// is present: `etag`, `x-repo-commit`, and `content-range` (whose
+/// `/`-suffix is the file size).
 async fn mount_repo_file(server: &MockServer, repo_id: &str, filename: &str, body: &'static [u8]) {
+    // An etag names a file's content — the cache stores each blob under it —
+    // so two different files never share one.
+    let etag = format!("\"etag-{}\"", filename.replace('/', "-"));
     Mock::given(method("GET"))
         .and(path(format!("/{repo_id}/resolve/main/{filename}")))
         .respond_with(
             ResponseTemplate::new(200)
-                .insert_header("etag", "\"hub-source-etag\"")
+                .insert_header("etag", etag.as_str())
                 .insert_header("x-repo-commit", "hubsourcecommit")
                 .insert_header("content-range", format!("bytes 0-0/{}", body.len()))
                 .set_body_bytes(body),
@@ -75,16 +73,12 @@ async fn config_token_reaches_the_mock_and_file_lands_under_root_hub() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: Some(SecretSource::Inline("tok".into())),
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let hub = HubSource::from_config(&config, &|_: &str| None).unwrap();
 
-    let downloaded = tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    let downloaded = hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     assert!(
         downloaded.starts_with(root.path().join("hub")),
@@ -124,17 +118,13 @@ async fn hf_home_env_drives_the_cache_root_end_to_end() {
         hub_cache_dir: None,
         hub_token: None,
         offline: None,
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let env = move |k: &str| (k == "HF_HOME").then(|| hf_home_path.to_str().unwrap().to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    let downloaded = tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    let downloaded = hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     assert!(
         downloaded.starts_with(hf_home.path().join("hub")),
@@ -160,17 +150,13 @@ async fn warm_cache_across_a_second_hub_source_issues_no_requests() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: None,
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
 
     // Cold cache: the first HubSource genuinely downloads.
     let first = HubSource::from_config(&config, &|_: &str| None).unwrap();
-    tokio::task::spawn_blocking({
-        let hub = first.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    first.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
     let requests_after_first = server.received_requests().await.unwrap().len();
     assert!(
         requests_after_first > 0,
@@ -181,12 +167,7 @@ async fn warm_cache_across_a_second_hub_source_issues_no_requests() {
     // SAME hub_cache_dir — models a process restart with the cache directory
     // mounted from a persistent volume.
     let second = HubSource::from_config(&config, &|_: &str| None).unwrap();
-    let downloaded_again = tokio::task::spawn_blocking({
-        let hub = second.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    let downloaded_again = second.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
     assert_eq!(std::fs::read(&downloaded_again).unwrap(), BODY);
 
     let requests_after_second = server.received_requests().await.unwrap().len();
@@ -437,6 +418,7 @@ async fn hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended(
         hub_cache_dir: None,
         hub_token: None,
         offline: None,
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let env = move |k: &str| {
@@ -444,12 +426,7 @@ async fn hf_hub_cache_env_drives_the_cache_root_directly_no_hub_subdir_appended(
     };
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    let downloaded = tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    let downloaded = hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     let expected_repo_dir = hf_hub_cache
         .path()
@@ -500,6 +477,7 @@ async fn config_offline_false_wins_over_hf_hub_offline_env() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let env = |k: &str| (k == "HF_HUB_OFFLINE").then(|| "1".to_string());
@@ -544,17 +522,13 @@ async fn env_token_used_when_config_token_absent() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let env = |k: &str| (k == "HF_TOKEN").then(|| "env-tok".to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.is_empty());
@@ -581,16 +555,12 @@ async fn no_token_no_authorization_header() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let hub = HubSource::from_config(&config, &|_: &str| None).unwrap();
 
-    tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.is_empty());
@@ -624,6 +594,7 @@ async fn hf_home_token_file_used_with_hf_hub_cache_set_file_lands_under_hf_hub_c
         hub_cache_dir: None,
         hub_token: None,
         offline: None,
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let hf_home_path = hf_home.path().to_str().unwrap().to_string();
@@ -635,12 +606,7 @@ async fn hf_home_token_file_used_with_hf_hub_cache_set_file_lands_under_hf_hub_c
     };
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    let downloaded = tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    let downloaded = hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     assert!(
         downloaded.starts_with(hf_hub_cache.path()),
@@ -677,6 +643,7 @@ async fn empty_hf_token_falls_through_to_home_token_file() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let hf_home_path = hf_home.path().to_str().unwrap().to_string();
@@ -687,12 +654,7 @@ async fn empty_hf_token_falls_through_to_home_token_file() {
     };
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.is_empty());
@@ -728,6 +690,7 @@ async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let hf_home_path = hf_home.path().to_str().unwrap().to_string();
@@ -739,12 +702,7 @@ async fn hf_token_path_env_used_when_hf_home_has_no_token_file() {
     };
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.is_empty(), "the mock never received a request");
@@ -774,17 +732,13 @@ async fn legacy_hugging_face_hub_token_env_used_when_hf_token_absent() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let env = |k: &str| (k == "HUGGING_FACE_HUB_TOKEN").then(|| "legacy-tok".to_string());
     let hub = HubSource::from_config(&config, &env).unwrap();
 
-    tokio::task::spawn_blocking({
-        let hub = hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    hub.model(REPO_ID).get(FILENAME).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.is_empty(), "the mock never received a request");
@@ -915,15 +869,16 @@ async fn offline_warm_cache_without_catalog_row_still_refuses() {
         hub_cache_dir: Some(root.path().to_path_buf()),
         hub_token: None,
         offline: Some(false),
+        hub_idle_timeout_secs: None,
         remote: Default::default(),
     };
     let online_hub = HubSource::from_config(&online_config, &|_: &str| None).unwrap();
-    tokio::task::spawn_blocking({
-        let hub = online_hub.clone();
-        move || hub.api().model(REPO_ID.to_string()).get(FILENAME).unwrap()
-    })
-    .await
-    .unwrap();
+    online_hub
+        .model(REPO_ID)
+        .get(FILENAME)
+        .await
+        .unwrap()
+        .unwrap();
 
     let offline_config = ModelsConfig {
         offline: Some(true),
@@ -960,4 +915,166 @@ fn offline_test_models_config() -> ModelsConfig {
         hub_cache_dir: Some(tempfile::tempdir().unwrap().keep()),
         ..Default::default()
     }
+}
+
+// --- A stalled transfer fails typed and bounded, never waits forever ---
+
+/// Where a stalled Hub endpoint stops sending.
+#[derive(Clone, Copy)]
+enum Stall {
+    /// It accepts the request and never answers.
+    BeforeAnswer,
+    /// It answers the metadata probe, then sends the body's headers and a
+    /// few bytes of it, and nothing more — the connection stays open.
+    MidBody,
+}
+
+/// A Hub stand-in that stops sending as `stall` says and never closes the
+/// connection — the shape a server or middlebox that goes silent takes.
+/// Returns its endpoint and the task serving it (aborted when dropped).
+async fn stalled_hub(stall: Stall) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let serving = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let mut request = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        request.push(byte[0]);
+                    }
+                    let probe = String::from_utf8_lossy(&request)
+                        .to_ascii_lowercase()
+                        .contains("range: bytes=0-0");
+                    match (stall, probe) {
+                        (Stall::MidBody, true) => {
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 206 Partial Content\r\nx-repo-commit: stalledcommit\r\n\
+                                      etag: \"stalled-etag\"\r\ncontent-range: bytes 0-0/1000\r\n\
+                                      content-length: 1\r\n\r\nx",
+                                )
+                                .await
+                                .unwrap();
+                        }
+                        (Stall::MidBody, false) => {
+                            socket
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\nfirst")
+                                .await
+                                .unwrap();
+                            std::future::pending::<()>().await;
+                        }
+                        (Stall::BeforeAnswer, _) => std::future::pending::<()>().await,
+                    }
+                }
+            });
+        }
+    });
+    (endpoint, serving)
+}
+
+/// A `HubSource` over `endpoint` with a one-second idle timeout and a fresh
+/// cache root.
+fn one_second_hub(endpoint: String) -> (HubSource, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let config = ModelsConfig {
+        hub_endpoint: Some(endpoint),
+        hub_cache_dir: Some(root.path().to_path_buf()),
+        hub_idle_timeout_secs: Some(1),
+        ..Default::default()
+    };
+    (
+        HubSource::from_config(&config, &|_: &str| None).unwrap(),
+        root,
+    )
+}
+
+/// `err` is the retryable `Unavailable` naming `repo/file` as a stall.
+fn assert_stalled(err: JammiError, repo: &str, file: &str) {
+    match err {
+        JammiError::Unavailable { resource, reason } => {
+            assert_eq!(resource, format!("hf://{repo}/{file}"));
+            assert!(
+                reason.contains("stalled"),
+                "the reason names the stall: {reason}"
+            );
+        }
+        other => panic!("expected the retryable Unavailable, got {other:?}"),
+    }
+}
+
+/// A transfer that stops mid-body fails within a bounded time as the typed,
+/// retryable `Unavailable` naming the repo and the file — the incident this
+/// guards against was a verb blocked for hours on exactly this — and leaves
+/// no partial file or blob in the cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_that_stops_mid_body_fails_typed_within_the_idle_timeout() {
+    let (endpoint, serving) = stalled_hub(Stall::MidBody).await;
+    let (hub, root) = one_second_hub(endpoint);
+
+    let started = std::time::Instant::now();
+    let err = hub
+        .model("acme/stalled-model")
+        .get("model.safetensors")
+        .await
+        .unwrap_err();
+    let waited = started.elapsed();
+    serving.abort();
+
+    assert_stalled(err, "acme/stalled-model", "model.safetensors");
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "a one-second idle timeout bounds the wait, got {waited:?}"
+    );
+    let blobs = root.path().join("hub/models--acme--stalled-model/blobs");
+    let left: Vec<_> = std::fs::read_dir(&blobs)
+        .map(|entries| entries.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "no partial file or blob is left: {left:?}");
+}
+
+/// A Hub that accepts the request and never answers fails the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hub_that_never_answers_fails_typed_within_the_idle_timeout() {
+    let (endpoint, serving) = stalled_hub(Stall::BeforeAnswer).await;
+    let (hub, _root) = one_second_hub(endpoint);
+
+    let err = hub
+        .model("acme/silent-model")
+        .get("config.json")
+        .await
+        .unwrap_err();
+    serving.abort();
+    assert_stalled(err, "acme/silent-model", "config.json");
+}
+
+/// Through the verb path the incident took: a model resolution whose Hub
+/// stops mid-transfer returns the typed stall, rather than never returning.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_resolution_over_a_stalled_hub_returns_the_stall() {
+    let (endpoint, serving) = stalled_hub(Stall::MidBody).await;
+    let (hub, _root) = one_second_hub(endpoint);
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
+    let resolver = ModelResolver::new(catalog, crate::common::test_artifact_store(), hub).unwrap();
+
+    let err = match resolver
+        .resolve(
+            &ModelSource::hf("acme/stalled-model"),
+            ModelTask::TextEmbedding,
+        )
+        .await
+    {
+        Ok(_) => panic!("a stalled Hub cannot resolve a model"),
+        Err(e) => e,
+    };
+    serving.abort();
+    assert_stalled(err, "acme/stalled-model", "config.json");
 }

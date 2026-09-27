@@ -32,8 +32,8 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{
-    CreateMemoryTable, DdlStatement, DmlStatement, Expr, Extension, LogicalPlan,
-    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, WriteOp,
+    CreateMemoryTable, DdlStatement, DmlStatement, Expr, ExprSchemable, Extension, LogicalPlan,
+    Projection, TableScan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore, WriteOp,
 };
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -43,12 +43,17 @@ use datafusion::physical_plan::{
 };
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
+use datafusion::sql::parser::Statement as DfStatement;
+use datafusion::sql::sqlparser::ast::{
+    AssignmentTarget, Statement as SqlStatement, TableFactor, Update, UpdateTableFromKind,
+};
 use datafusion::sql::unparser::plan_to_sql;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
 
 use crate::error::{JammiError, Result};
 use crate::session::QueryContext;
+use crate::store::mutable::rewrite::RowRewriteNode;
 use crate::store::statement::CreateTableAs;
 use crate::store::ResultStore;
 use jammi_datafusion::ComputeDeviceKind;
@@ -200,10 +205,18 @@ impl ComputePlaneSlot {
 ///   is named by one identifier. So is a query the unparser cannot render
 ///   back to SQL (a `WITH RECURSIVE` query, a `VALUES` list), naming the
 ///   node: a definition that cannot replay is never recorded.
+/// - `UPDATE` / `DELETE` of a mutable companion table is a
+///   [`Self::RewriteRows`]: the statement's own plan — whatever it joins,
+///   filters or limits — selects the rows, and the table rewrites exactly
+///   those, on this process's catalog backend
+///   ([`RowRewriteNode`]). On any other table the statement is the table
+///   provider's own, which receives only filters over the table's columns:
+///   one choosing its rows by more than that is [`Self::Refused`].
 /// - Everything else is [`Self::Inline`], running where it was issued: a
-///   query's rows stream to the caller as they are produced; `INSERT`,
-///   `UPDATE` and `DELETE` write a mutable companion table on this
-///   process's catalog backend from the statement's own rows; `COPY … TO`
+///   query's rows stream to the caller as they are produced; `INSERT`
+///   writes a mutable companion table on this process's catalog backend
+///   from the statement's own rows; `EXPLAIN` explains the statement as
+///   classified here; `COPY … TO`
 ///   writes a file through this process's own store registry; the
 ///   remaining DDL, `SET`, `EXPLAIN` and transaction statements compute
 ///   nothing.
@@ -222,6 +235,8 @@ pub enum StatementClass {
         /// `IF EXISTS`: an absent table is not an error.
         if_exists: bool,
     },
+    /// `UPDATE` / `DELETE` of a mutable table's selected rows.
+    RewriteRows(RowRewriteNode),
     /// A statement the store refuses, typed at planning.
     Refused(RefusedStatement),
     /// Any other statement, as it was planned.
@@ -250,12 +265,12 @@ pub enum RefusalReason {
         /// The node, as the plan displays it.
         node: String,
     },
-    /// An `UPDATE` or `DELETE` whose rows are chosen by more than a predicate
-    /// over the target table's own columns — a subquery, or a join to
-    /// another relation. A table provider receives a DML statement's
-    /// predicate as filters over its own columns only, so anything beyond
-    /// them would be dropped and the statement would rewrite rows it never
-    /// selected.
+    /// An `UPDATE` or `DELETE` of a table other than a mutable table whose
+    /// rows are chosen by more than a predicate over the target table's own
+    /// columns — a subquery, or a join to another relation. Such a table's
+    /// provider receives a DML statement's predicate as filters over its own
+    /// columns only, so anything beyond them would be dropped and the
+    /// statement would rewrite rows it never selected.
     DmlBeyondTarget {
         /// The node or expression, as the plan displays it.
         node: String,
@@ -302,6 +317,30 @@ fn statement_name(name: &TableReference) -> std::result::Result<String, RefusalR
 }
 
 impl StatementClass {
+    /// Plan and classify the one statement `sql` holds under `state`.
+    ///
+    /// DataFusion's SQL planner refuses `UPDATE … FROM`; this plans it into
+    /// the shape DataFusion gives every other `UPDATE` (see
+    /// `plan_update_from`), so the class of an `UPDATE` does not depend on
+    /// whether its rows come from a join.
+    pub async fn plan(state: &SessionState, sql: &str) -> DfResult<Self> {
+        let dialect = state.config().options().sql_parser.dialect;
+        let plan = match state.sql_to_statement(sql, &dialect)? {
+            DfStatement::Statement(statement) => match *statement {
+                SqlStatement::Update(update) if update.from.is_some() => {
+                    plan_update_from(state, update).await?
+                }
+                statement => {
+                    state
+                        .statement_to_plan(DfStatement::Statement(Box::new(statement)))
+                        .await?
+                }
+            },
+            statement => state.statement_to_plan(statement).await?,
+        };
+        Self::of(plan)
+    }
+
     /// Classify `plan`, the logical plan of one statement.
     pub fn of(plan: LogicalPlan) -> DfResult<Self> {
         Ok(match plan {
@@ -317,13 +356,28 @@ impl StatementClass {
                 }),
             },
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
-                Self::classify_rewrite(dml)?
+                match RowRewriteNode::of(dml)? {
+                    Ok(rewrite) => Self::RewriteRows(rewrite),
+                    Err(dml) => Self::classify_provider_dml(dml)?,
+                }
+            }
+            LogicalPlan::Explain(mut explain) => {
+                explain.plan = Arc::new(Self::of(Arc::unwrap_or_clone(explain.plan))?.into_plan());
+                Self::Inline(LogicalPlan::Explain(explain))
+            }
+            LogicalPlan::Analyze(mut analyze) => {
+                analyze.input =
+                    Arc::new(Self::of(Arc::unwrap_or_clone(analyze.input))?.into_plan());
+                Self::Inline(LogicalPlan::Analyze(analyze))
             }
             other => Self::Inline(other),
         })
     }
 
-    fn classify_rewrite(dml: DmlStatement) -> DfResult<Self> {
+    /// An `UPDATE` / `DELETE` the target's provider runs from filters over
+    /// its own columns, or the refusal when the statement chooses rows by
+    /// more than that.
+    fn classify_provider_dml(dml: DmlStatement) -> DfResult<Self> {
         Ok(match beyond_target(&dml.input, &dml.table_name)? {
             Some(node) => Self::Refused(RefusedStatement {
                 name: dml.table_name.to_string(),
@@ -371,11 +425,12 @@ impl StatementClass {
 
     /// The plan the engine executes: a store statement's node
     /// ([`StoreStatementNode`]), planned into [`StoreStatementExec`] by
-    /// [`MaterializationPlanner`] and run when the frame is collected; an
-    /// inline statement unchanged.
+    /// [`MaterializationPlanner`] and run when the frame is collected; a
+    /// rewrite's [`RowRewriteNode`]; an inline statement unchanged.
     pub fn into_plan(self) -> LogicalPlan {
         let node = match self {
             Self::Inline(plan) => return plan,
+            Self::RewriteRows(rewrite) => return rewrite.into_plan(),
             Self::CreateTableAs { statement, input } => StoreStatementNode {
                 statement: StoreStatement::CreateTableAs(statement),
                 input: vec![input],
@@ -392,6 +447,130 @@ impl StatementClass {
         LogicalPlan::Extension(Extension {
             node: Arc::new(node),
         })
+    }
+}
+
+/// The plan of `UPDATE <target> SET … FROM <relations> [WHERE …]`, in the
+/// shape DataFusion plans an `UPDATE` without `FROM`: a `Dml` over a
+/// projection of each target column's new value — its assignment cast to the
+/// column's type, or the column as read — over the target joined to the
+/// `FROM` relations and filtered by the predicate. The target is the join's
+/// leftmost relation, so its columns as read are the first under the
+/// projection ([`RowRewriteNode`] reads them there).
+async fn plan_update_from(state: &SessionState, update: Update) -> DfResult<LogicalPlan> {
+    if update.returning.is_some()
+        || update.output.is_some()
+        || update.or.is_some()
+        || update.limit.is_some()
+        || !update.order_by.is_empty()
+    {
+        return Err(DataFusionError::NotImplemented(
+            "UPDATE … FROM takes only SET, FROM and WHERE".into(),
+        ));
+    }
+    let target = match &update.table.relation {
+        TableFactor::Table { name, alias, .. } => alias
+            .as_ref()
+            .map_or_else(|| name.to_string(), |alias| alias.name.to_string()),
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "UPDATE names a table, not `{other}`"
+            )))
+        }
+    };
+    let relations = match update.from {
+        Some(UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from)) => from,
+        None => Vec::new(),
+    };
+    let selected = format!(
+        "SELECT {target}.* FROM {}{}",
+        std::iter::once(&update.table)
+            .chain(&relations)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        update
+            .selection
+            .as_ref()
+            .map_or_else(String::new, |p| format!(" WHERE {p}"))
+    );
+    let LogicalPlan::Projection(read) = state.create_logical_plan(&selected).await? else {
+        return Err(DataFusionError::Internal(format!(
+            "`{selected}` plans to a projection"
+        )));
+    };
+    let source = read.input;
+    let target_scan = leftmost_scan(&source).ok_or_else(|| {
+        DataFusionError::Internal(format!("`{selected}` scans its target leftmost"))
+    })?;
+    let normalize = state
+        .config()
+        .options()
+        .sql_parser
+        .enable_ident_normalization;
+    let mut assigned = update
+        .assignments
+        .into_iter()
+        .map(|assignment| {
+            let AssignmentTarget::ColumnName(column) = assignment.target else {
+                return Err(DataFusionError::NotImplemented(
+                    "UPDATE assigns one column at a time, not a tuple".into(),
+                ));
+            };
+            let column = column
+                .0
+                .last()
+                .and_then(|part| part.as_ident())
+                .map(|ident| match ident.quote_style {
+                    None if normalize => ident.value.to_lowercase(),
+                    _ => ident.value.clone(),
+                })
+                .ok_or_else(|| DataFusionError::Plan(format!("`{column}` names no column")))?;
+            let value =
+                state.create_logical_expr(&assignment.value.to_string(), source.schema())?;
+            Ok((column, value))
+        })
+        .collect::<DfResult<std::collections::HashMap<_, _>>>()?;
+    let columns = target_scan.source.schema();
+    let values = read
+        .expr
+        .into_iter()
+        .zip(columns.fields().iter())
+        .map(|(as_read, field)| {
+            let value = match assigned.remove(field.name()) {
+                Some(value) => value.cast_to(field.data_type(), source.schema())?,
+                None => as_read,
+            };
+            Ok(value.alias(field.name()))
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    if let Some(column) = assigned.into_keys().next() {
+        return Err(DataFusionError::Plan(format!(
+            "UPDATE assigns `{column}`, which `{}` does not have",
+            target_scan.table_name
+        )));
+    }
+    Ok(LogicalPlan::Dml(DmlStatement::new(
+        target_scan.table_name.clone(),
+        Arc::clone(&target_scan.source),
+        WriteOp::Update,
+        Arc::new(LogicalPlan::Projection(Projection::try_new(
+            values, source,
+        )?)),
+    )))
+}
+
+/// The table scan a plan of `SELECT … FROM <target>, …` reads its target
+/// from: the leftmost relation under the filters and joins.
+fn leftmost_scan(mut plan: &LogicalPlan) -> Option<&TableScan> {
+    loop {
+        plan = match plan {
+            LogicalPlan::Filter(filter) => &filter.input,
+            LogicalPlan::Join(join) => &join.left,
+            LogicalPlan::SubqueryAlias(alias) => &alias.input,
+            LogicalPlan::TableScan(scan) => return Some(scan),
+            _ => return None,
+        };
     }
 }
 
@@ -768,7 +947,7 @@ mod tests {
 
     /// The `CREATE TABLE … AS` class over `sql`, or the refusal.
     async fn classify(ctx: &SessionContext, sql: &str) -> StatementClass {
-        StatementClass::of(ctx.state().create_logical_plan(sql).await.unwrap()).unwrap()
+        StatementClass::plan(&ctx.state(), sql).await.unwrap()
     }
 
     /// Every query shape the class admits records as SQL that re-plans to
@@ -861,7 +1040,9 @@ mod tests {
     }
 
     /// Which class every statement shape the SQL surface takes falls in:
-    /// the store statements, the refusals, and everything else inline.
+    /// the store statements, the refusals, and everything else inline. The
+    /// table here is not a mutable table, so an `UPDATE` / `DELETE` choosing
+    /// rows beyond its own columns is refused.
     #[tokio::test]
     async fn the_class_table_names_the_store_statements_and_the_refusals() {
         let ctx = context();
@@ -922,6 +1103,13 @@ mod tests {
                 }),
             ),
             (
+                "UPDATE t SET title = o.title FROM t AS o WHERE t.id = o.id + 1",
+                Box::new(|s| {
+                    matches!(s, StatementClass::Refused(r)
+                        if matches!(r.reason, RefusalReason::DmlBeyondTarget { .. }))
+                }),
+            ),
+            (
                 "UPDATE t SET title = 'x' WHERE EXISTS (SELECT 1 FROM t)",
                 Box::new(|s| {
                     matches!(s, StatementClass::Refused(r)
@@ -942,8 +1130,7 @@ mod tests {
             ),
         ];
         for (sql, expected) in table {
-            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-            let class = StatementClass::of(plan).unwrap();
+            let class = StatementClass::plan(&ctx.state(), sql).await.unwrap();
             assert!(expected(&class), "{sql}");
             let inline = matches!(class, StatementClass::Inline(_));
             let rooted = matches!(

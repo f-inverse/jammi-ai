@@ -121,7 +121,7 @@ def report(findings: list[Finding]) -> int:
     print("sqlite-isms: FAIL", file=sys.stderr)
     for f in findings:
         print(
-            f"  {f.file}:{f.line_no}: {f.backend} token `{f.token.name}` — {f.line}",
+            f"  {f.file}:{f.line_no}: {f.token.backend} token `{f.token.name}` — {f.line}",
             file=sys.stderr,
         )
     print(

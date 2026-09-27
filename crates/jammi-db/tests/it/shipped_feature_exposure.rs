@@ -1,16 +1,17 @@
-//! The set of cargo features a shipped `jammi-server` artifact carries is DERIVED here and
+//! The set of cargo features a shipped artifact carries is DERIVED here and
 //! gated against `deny.toml`, never hand-maintained as prose that drifts from the release
 //! lanes. Four rounds of this exact unit blocked on the same class: a hand-written sentence
 //! in `deny.toml` naming "the release image and the CUDA lanes" as the features-exposed set,
 //! silently understating it every time a lane was added or a literal `--features` list moved.
 //!
-//! All SIX shipped `jammi-server` artifact families (the CUDA tarball, wheel and
-//! image, and the CPU tarball, wheel and image) live under `ci/release-feature-
-//! manifest.json`'s `lanes` object — a CPU family carries no `capabilities` block
+//! All EIGHT shipped artifact families live under `ci/release-feature-manifest.json`'s
+//! `lanes` object: the six `jammi-server` families (the CUDA tarball, wheel and image, and the
+//! CPU tarball, wheel and image) and the two embedded-engine wheels `jammi-python` builds
+//! (`jammi-ai-native`, `jammi-ai-native-cu12`). A CPU family carries no `capabilities` block
 //! (`check_release_manifest.py` enforces that block is required iff a lane's own
 //! `cargo_features` names `cuda`/`flash-attn`, forbidden otherwise), but its `cargo_features`
-//! sits in exactly the same place as a CUDA lane's. This test derives all six families' feature
-//! lists from the manifest ALONE — no second, hand-duplicated per-family feature list here.
+//! sits in exactly the same place as a CUDA lane's. This test derives every family's feature
+//! list from the manifest ALONE — no second, hand-duplicated per-family feature list here.
 //!
 //! This lives as an it-test rather than a `ci/scripts/check_*.py` gate for the same reason
 //! `bans_names_resolve.rs` does: gate scripts are a human-amend-only surface
@@ -18,15 +19,19 @@
 //! `cargo test --workspace` lane already runs this binary on every PR.
 //!
 //! What this test asserts, all fail-closed (never a silent skip):
-//!   1. Every one of the six shipped families is present under the manifest's `lanes` object
+//!   1. Every one of the eight shipped families is present under the manifest's `lanes` object
 //!      (a deleted/renamed family is a FINDING here).
-//!   2. `deny.toml` carries a GENERATED, marker-delimited exposure line for every advisory whose
+//!   2. A native wheel's `pyproject.toml` `[tool.maturin] features`, beyond
+//!      `extension-module` (how maturin links the module, not a capability), equal its lane's
+//!      `cargo_features`: maturin builds from the pyproject, so the manifest's declaration is
+//!      checked against the build input rather than trusted.
+//!   3. `deny.toml` carries a GENERATED, marker-delimited exposure line for every advisory whose
 //!      reason names a cargo-gated feature, byte-equal to what today's manifest data computes.
 //!      `exposure = [...]` as a structured key inside `[[advisories.ignore]]` is not an option:
 //!      measured on cargo-deny 0.20.2, it is `error[unexpected-keys]` and rejects the WHOLE
 //!      config. This test never parses `deny.toml`'s prose — it generates the expected line and
 //!      checks the file contains that exact line, byte for byte.
-//!   3. The Dockerfile's two `ARG CARGO_FEATURES` declarations (the CPU and CUDA builder
+//!   4. The Dockerfile's two `ARG CARGO_FEATURES` declarations (the CPU and CUDA builder
 //!      stages) carry NO default, and each builder stage's own `RUN` instruction carries the
 //!      `${CARGO_FEATURES:?...}` required-argument guard — a literal line scan (the Dockerfile
 //!      is not YAML or JSON, so there is no real structured parser for it in this crate's
@@ -68,8 +73,8 @@ fn read_to_string(path: &Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The six shipped `jammi-server` artifact families, in the order the exposure
-// line lists them. All six live under the manifest's `lanes` key --
+// The eight shipped artifact families, in the order the exposure line lists
+// them. All eight live under the manifest's `lanes` key --
 // this is a list of NAMES only, never a second copy of any family's feature
 // list (that stays exclusively in ci/release-feature-manifest.json).
 // ---------------------------------------------------------------------------
@@ -81,7 +86,19 @@ const FAMILY_ORDER: &[&str] = &[
     "cu12-tarball",
     "cu12-wheel",
     "cu12-image",
+    "native-cpu-wheel",
+    "native-cu12-wheel",
 ];
+
+/// The native wheels: each family built by maturin, and the `pyproject.toml` it builds from.
+const NATIVE_WHEELS: &[(&str, &str)] = &[
+    ("native-cpu-wheel", "packaging/native/pyproject.toml"),
+    ("native-cu12-wheel", "packaging/native-cu12/pyproject.toml"),
+];
+
+/// The feature maturin links every native wheel's module with; how it builds, not what it
+/// ships.
+const MODULE_LINKAGE_FEATURE: &str = "extension-module";
 
 /// Every advisory this test derives an exposure line for, and the single cargo feature that
 /// gates the code path the advisory is in. Lives here (not in `ci/release-feature-
@@ -123,8 +140,8 @@ fn manifest_lane_features(manifest: &serde_json::Value, lane: &str) -> Vec<Strin
         .collect()
 }
 
-/// Every family (of the six) that carries `feature`, in `FAMILY_ORDER` -- driven ENTIRELY by
-/// the manifest (all six families, CPU and CUDA alike, live under `lanes`).
+/// Every family (of the eight) that carries `feature`, in `FAMILY_ORDER` -- driven ENTIRELY by
+/// the manifest (every family, CPU and CUDA alike, lives under `lanes`).
 fn families_carrying(
     feature: &str,
     features_by_family: &BTreeMap<&str, Vec<String>>,
@@ -158,7 +175,7 @@ fn every_shipped_family_is_present_in_the_manifest() {
     assert!(
         missing.is_empty(),
         "ci/release-feature-manifest.json's `lanes` is missing shipped famil{}: {:?} -- all \
-         six shipped families (CPU and CUDA alike) must live under `lanes`",
+         eight shipped families (CPU and CUDA alike) must live under `lanes`",
         if missing.len() == 1 { "y" } else { "ies" },
         missing
     );
@@ -217,11 +234,65 @@ fn generated_exposure_line_lists_every_family_carrying_the_gated_feature() {
             "cu12-tarball",
             "cu12-wheel",
             "cu12-image",
+            "native-cpu-wheel",
+            "native-cu12-wheel",
         ]
     );
     assert_eq!(
         generated_exposure_line("RUSTSEC-TEST-0000", &families),
-        "# EXPOSURE[RUSTSEC-TEST-0000] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, cu12-wheel, cu12-image"
+        "# EXPOSURE[RUSTSEC-TEST-0000] = cpu-wheel, cpu-tarball, cpu-image, cu12-tarball, \
+         cu12-wheel, cu12-image, native-cpu-wheel, native-cu12-wheel"
+    );
+}
+
+/// A native wheel's shipped features, as its `pyproject.toml` builds it: the `[tool.maturin]
+/// features` list without the module-linkage feature, sorted.
+fn pyproject_shipped_features(pyproject: &str) -> Vec<String> {
+    let table: toml::Table = pyproject
+        .parse()
+        .unwrap_or_else(|e| panic!("pyproject does not parse as TOML: {e}"));
+    let mut features: Vec<String> = table
+        .get("tool")
+        .and_then(|t| t.get("maturin"))
+        .and_then(|m| m.get("features"))
+        .and_then(|f| f.as_array())
+        .unwrap_or_else(|| panic!("pyproject has no [tool.maturin] features array"))
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| panic!("[tool.maturin] features has a non-string entry"))
+                .to_string()
+        })
+        .filter(|f| f != MODULE_LINKAGE_FEATURE)
+        .collect();
+    features.sort();
+    features
+}
+
+#[test]
+fn every_native_wheel_builds_the_features_its_lane_declares() {
+    let root = workspace_root();
+    let manifest = manifest_json(&root);
+    for (family, pyproject) in NATIVE_WHEELS {
+        let mut declared = manifest_lane_features(&manifest, family);
+        declared.sort();
+        let built = pyproject_shipped_features(&read_to_string(&root.join(pyproject)));
+        assert_eq!(
+            built, declared,
+            "{pyproject} builds {built:?} beyond `{MODULE_LINKAGE_FEATURE}`, but the manifest's \
+             `{family}` lane declares {declared:?} -- the wheel ships what its pyproject builds, \
+             so the two move in one change"
+        );
+    }
+}
+
+#[test]
+fn pyproject_shipped_features_drops_only_the_module_linkage_feature() {
+    let pyproject =
+        "[tool.maturin]\nfeatures = [\"extension-module\", \"storage-cloud\", \"cuda\"]\n";
+    assert_eq!(
+        pyproject_shipped_features(pyproject),
+        vec!["cuda".to_string(), "storage-cloud".to_string()]
     );
 }
 

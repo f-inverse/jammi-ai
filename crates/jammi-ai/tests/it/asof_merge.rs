@@ -300,7 +300,10 @@ fn duplicate_facts_with_error_tiebreak_fail_loud() {
         TieBreak::Error,
     )
     .unwrap_err();
-    assert!(matches!(err, AsofError::AmbiguousMatch), "got {err:?}");
+    assert!(
+        matches!(err, AsofError::AmbiguousMatch { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]

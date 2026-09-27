@@ -17,8 +17,9 @@
 
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{SqlValue, TxOptions};
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::config::{PlacementMode, StoragePrecision};
+use jammi_db::store::ResultTableOrigin;
 
 use crate::common::grpc::{peer_bind_config, start_engine_server_from_config};
 use crate::peer_service::{built_index, ROWS};
@@ -79,17 +80,19 @@ async fn ring_empty_fallback_is_registered_and_scraped_on_metrics() {
     // table with zero segments).
     let store = server.engine.result_store();
     let table = store
-        .create_table(
-            "rendezvous-ring-empty",
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "rendezvous-ring-empty",
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap();
     assert_eq!(

@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::{JammiError, Missing, Result};
 use jammi_db::storage::StorageError;
 use jammi_db::store::ArtifactStore;
 
 use super::arch;
 use super::backend::gguf::estimate_gguf_residency;
 use super::backend::safetensors_residency::estimate_safetensors_residency;
-use super::hub::HubSource;
+use super::hub::{HubRepo, HubSource};
 use super::{ModelId, ResolvedModel, TokenizerSource, WeightsFormat};
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
@@ -111,7 +111,7 @@ impl ModelResolver {
                         ),
                     });
                 }
-                self.resolve_hf_hub(repo_id, source, task)
+                self.resolve_hf_hub(repo_id, source, task).await
             }
         }
     }
@@ -131,9 +131,9 @@ impl ModelResolver {
             // that cannot see the row (another tenant's model, a deleted
             // one) is told it does not exist.
             None if model_id.0.starts_with(FINE_TUNED_ID_PREFIX) => {
-                return Err(JammiError::ModelNotFound {
+                return Err(JammiError::NotFound(Missing::Model {
                     model_id: model_id.0,
-                })
+                }))
             }
             None => return Ok(None),
         };
@@ -418,28 +418,25 @@ impl ModelResolver {
         })
     }
 
-    fn resolve_hf_hub(
+    async fn resolve_hf_hub(
         &self,
         repo_id: &str,
         source: &ModelSource,
         task: ModelTask,
     ) -> Result<ResolvedModel> {
-        let repo = self.hub.api().model(repo_id.to_string());
+        let repo = self.hub.model(repo_id);
 
         // Fetch the repo listing at most ONCE — for the config and weights
-        // names and for the weights-format plan — never two separate live
-        // `info()` calls that could observe two different snapshots of a
-        // repo being pushed to concurrently. A failed fetch becomes `None`,
-        // not a fatal error here — hf-hub 0.5's `ApiRepo::get` is CACHE-FIRST
-        // and network-free on a hit (sync.rs:758-764) while `ApiRepo::info`
-        // is network-only (sync.rs:860-878), so a warm-cache repo must keep
-        // resolving with no network at all. What `None` means is owned by
-        // the plan's own pure function (`hub_weights_plan`), never decided at
-        // this call site.
-        let listing: Option<Vec<String>> = repo
-            .info()
-            .ok()
-            .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect());
+        // names, for the weights-format plan, and for the sharded-weights
+        // fallback — never two separate live listings that could observe two
+        // different snapshots of a repo being pushed to concurrently. A failed
+        // fetch becomes `None`, not a fatal error here — `HubRepo::get` is
+        // CACHE-FIRST and network-free on a hit while the listing is
+        // network-only, so a warm-cache repo must keep resolving with no
+        // network at all (a failed listing costs at most one idle timeout). What
+        // `None` means is owned by the plan's own pure function
+        // (`hub_weights_plan`), never decided at this call site.
+        let listing: Option<Vec<String>> = repo.files().await.ok();
         // The names come from the same `resolution_order` the local arm
         // walks, asked of the listing instead of the disk; with no listing,
         // the frozen order.
@@ -450,14 +447,18 @@ impl ModelResolver {
         });
 
         // NETWORK order, not disk order: a hub repo cannot be stat-ed, so
-        // this stays a `repo.get` chain.
-        let config_path = repo
-            .get(config_names[0])
-            .or_else(|_| repo.get(config_names[1]))
-            .map_err(|e| JammiError::Model {
-                model_id: source.to_string(),
-                message: format!("Failed to download config: {e}"),
-            })?;
+        // this stays a `repo.get` chain. A name the repo does not hold moves
+        // to the next; a Hub that cannot be reached, or stops sending, fails
+        // the resolution typed — never read as "the repo has no config".
+        let config_path =
+            first_present(&repo, &config_names)
+                .await?
+                .ok_or_else(|| JammiError::Model {
+                    model_id: source.to_string(),
+                    message: format!(
+                        "Failed to download config: the repo holds none of {config_names:?}"
+                    ),
+                })?;
         let config: serde_json::Value =
             serde_json::from_reader(std::fs::File::open(&config_path)?)?;
 
@@ -466,7 +467,7 @@ impl ModelResolver {
         // an error — only audio models read it downstream.
         let preprocessor_config: Option<serde_json::Value> = repo
             .get("preprocessor_config.json")
-            .ok()
+            .await?
             .and_then(|p| std::fs::File::open(p).ok())
             .and_then(|f| serde_json::from_reader(f).ok());
 
@@ -476,9 +477,12 @@ impl ModelResolver {
         // downloaded, it must be readable and parseable JSON — a corrupt
         // pooling declaration must never collapse into the same "absent"
         // case that drives the mean fallback.
-        let pooling_config: Option<serde_json::Value> = match repo.get("1_Pooling/config.json") {
-            Err(_) => None,
-            Ok(downloaded_path) => {
+        let pooling_config: Option<serde_json::Value> = match repo
+            .get("1_Pooling/config.json")
+            .await?
+        {
+            None => None,
+            Some(downloaded_path) => {
                 let file = std::fs::File::open(&downloaded_path)?;
                 Some(
                     serde_json::from_reader(file).map_err(|e| JammiError::Model {
@@ -491,11 +495,11 @@ impl ModelResolver {
 
         // Precedence FROZEN: safetensors wins, byte-for-byte. The choice
         // between safetensors/gguf/refusal/attempt is made from the repo
-        // LISTING (`hub_weights_plan` over `repo.info()`'s siblings)
+        // LISTING (`hub_weights_plan` over `repo.files()`)
         // alone, never from a download outcome — a transient download
         // failure on a repo that lists BOTH formats must propagate as the
         // failure it is, not silently substitute the other weight format
-        // (a confidently wrong model). `repo.info()` failing outright is NOT
+        // (a confidently wrong model). `repo.files()` failing outright is NOT
         // itself a typed error: a missing listing is the
         // `SafetensorsOnlyAttempt` arm below — the safetensors-only path,
         // never a guessed gguf format and never the listing-failure or
@@ -512,7 +516,8 @@ impl ModelResolver {
                     // names come straight off the plan arm that decided
                     // this branch, not re-derived from `listing` here.
                     (
-                        self.download_safetensors(&repo, source, &weights_names)
+                        download_safetensors(&repo, source, &weights_names, listing.as_deref())
+                            .await
                             .map_err(|e| {
                                 annotate_listed_safetensors_download_failure(e, &listed_safetensors)
                             })?,
@@ -520,16 +525,19 @@ impl ModelResolver {
                     )
                 }
                 HubWeightsPlan::SafetensorsOnlyAttempt => (
-                    self.download_safetensors(&repo, source, &weights_names)?,
+                    download_safetensors(&repo, source, &weights_names, listing.as_deref()).await?,
                     WeightsFormat::Safetensors,
                 ),
                 HubWeightsPlan::Gguf => {
-                    let p = repo
-                        .get(GGUF_WEIGHTS_FILENAME)
-                        .map_err(|e| JammiError::Model {
+                    let p = repo.get(GGUF_WEIGHTS_FILENAME).await?.ok_or_else(|| {
+                        JammiError::Model {
                             model_id: source.to_string(),
-                            message: format!("Failed to download {GGUF_WEIGHTS_FILENAME}: {e}"),
-                        })?;
+                            message: format!(
+                                "Failed to download {GGUF_WEIGHTS_FILENAME}: the repo lists it \
+                                 but the Hub has no such file"
+                            ),
+                        }
+                    })?;
                     (vec![p], WeightsFormat::Gguf)
                 }
                 HubWeightsPlan::NonCanonicalGguf(others) => {
@@ -546,15 +554,13 @@ impl ModelResolver {
         // Prefer the HF-converted tokenizer.json if it exists; otherwise
         // fall back to the OpenCLIP native vocab file for stock OpenCLIP
         // repos that ship `bpe_simple_vocab_16e6.txt.gz` instead.
-        let tokenizer = repo
-            .get("tokenizer.json")
-            .ok()
-            .map(TokenizerSource::HuggingFaceJson)
-            .or_else(|| {
-                repo.get("bpe_simple_vocab_16e6.txt.gz")
-                    .ok()
-                    .map(TokenizerSource::OpenClipBpe)
-            });
+        let tokenizer = match repo.get("tokenizer.json").await? {
+            Some(path) => Some(TokenizerSource::HuggingFaceJson(path)),
+            None => repo
+                .get("bpe_simple_vocab_16e6.txt.gz")
+                .await?
+                .map(TokenizerSource::OpenClipBpe),
+        };
 
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
@@ -574,36 +580,54 @@ impl ModelResolver {
             estimated_memory,
         })
     }
+}
 
-    fn download_safetensors(
-        &self,
-        repo: &hf_hub::api::sync::ApiRepo,
-        source: &ModelSource,
-        weights_names: &[&str],
-    ) -> Result<Vec<PathBuf>> {
-        // The single-file safetensors names, in the order `resolution_order`
-        // gave this repo — the same order the local chain walks.
-        for name in weights_names.iter().filter(|n| n.ends_with(".safetensors")) {
-            if let Ok(path) = repo.get(name) {
-                return Ok(vec![path]);
-            }
+/// The local path of the first of `names` the repo holds; `Ok(None)` when
+/// it holds none. A Hub that cannot be reached is an error, not a miss.
+async fn first_present(repo: &HubRepo<'_>, names: &[&str]) -> Result<Option<PathBuf>> {
+    for name in names {
+        if let Some(path) = repo.get(name).await? {
+            return Ok(Some(path));
         }
-        if let Ok(info) = repo.info() {
-            let shards: Vec<PathBuf> = info
-                .siblings
-                .iter()
-                .filter(|s| s.rfilename.ends_with(".safetensors"))
-                .filter_map(|s| repo.get(&s.rfilename).ok())
-                .collect();
-            if !shards.is_empty() {
-                return Ok(shards);
-            }
-        }
-        Err(JammiError::Model {
+    }
+    Ok(None)
+}
+
+/// The safetensors weights of a Hub repo: the first single-file name, in the
+/// order `resolution_order` gave (the same order the local chain walks), else
+/// every `.safetensors` shard the repo's `listing` names.
+async fn download_safetensors(
+    repo: &HubRepo<'_>,
+    source: &ModelSource,
+    weights_names: &[&str],
+    listing: Option<&[String]>,
+) -> Result<Vec<PathBuf>> {
+    let single: Vec<&str> = weights_names
+        .iter()
+        .copied()
+        .filter(|n| n.ends_with(".safetensors"))
+        .collect();
+    if let Some(path) = first_present(repo, &single).await? {
+        return Ok(vec![path]);
+    }
+    // No listing names no shards.
+    let listed: Vec<&str> = listing
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|name| name.ends_with(".safetensors"))
+        .collect();
+    let mut shards = Vec::with_capacity(listed.len());
+    for name in listed {
+        shards.extend(repo.get(name).await?);
+    }
+    if shards.is_empty() {
+        return Err(JammiError::Model {
             model_id: source.to_string(),
             message: "No safetensors weights found".into(),
-        })
+        });
     }
+    Ok(shards)
 }
 
 /// The weights file a load reads from a local directory, and its storage
@@ -707,10 +731,9 @@ fn decide_hub_weights_format(siblings: &[String], canonical_gguf: &str) -> HubWe
 /// weight format to load, including the case the repo LISTING itself is
 /// unavailable — a strict superset of [`HubWeightsDecision`]'s four
 /// listing-present arms plus a fifth. `None` listing here means
-/// `repo.info()` itself failed, which hf-hub 0.5 makes a perfectly ordinary
-/// outcome: `ApiRepo::get` is CACHE-FIRST and network-free on a hit
-/// (sync.rs:758-764), while `ApiRepo::info` is network-only
-/// (sync.rs:860-878) — so a warm-cache safetensors-only repo must keep
+/// `HubRepo::files` itself failed, a perfectly ordinary outcome:
+/// `HubRepo::get` is CACHE-FIRST and network-free on a hit, while the
+/// listing is network-only — so a warm-cache safetensors-only repo must keep
 /// resolving offline. `hub_weights_plan` is the single pure function that owns this
 /// decision; every arm below is unit-tested without a live repo.
 #[derive(Debug, PartialEq, Eq)]
@@ -730,7 +753,7 @@ enum HubWeightsPlan {
     NonCanonicalGguf(Vec<String>),
     /// Listing available, no safetensors and no `*.gguf` sibling at all.
     Neither,
-    /// Listing UNAVAILABLE (`repo.info()` failed). Never decide gguf and
+    /// Listing UNAVAILABLE (`HubRepo::files` failed). Never decide gguf and
     /// never emit the listing-failure or rename-refusal error from a failed
     /// listing: attempt the cache-first safetensors download and propagate
     /// whatever error THAT returns.
@@ -738,7 +761,7 @@ enum HubWeightsPlan {
 }
 
 /// Decide the Hub-path weights plan from an OPTIONAL repo
-/// listing. `None` means the listing itself is unavailable (`repo.info()`
+/// listing. `None` means the listing itself is unavailable (`HubRepo::files`
 /// failed) — NOT "no siblings"; `Some(&[])`/a listing with no weight
 /// siblings is the ordinary `Neither` arm. Pure and independent of
 /// `hf_hub`/network types, so every one of the five arms is unit-testable
@@ -976,7 +999,7 @@ mod tests {
     }
 
     /// Plan arm 5: `None` — the listing itself is unavailable
-    /// (`repo.info()` failed, e.g. no network against a warm cache-first
+    /// (`HubRepo::files` failed, e.g. no network against a warm cache-first
     /// hit) — must NEVER decide gguf and must NEVER return a listing-failure
     /// or rename-refusal error; it is `SafetensorsOnlyAttempt`. A failed
     /// listing turned into a hard error would break a warm-cache

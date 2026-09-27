@@ -9,6 +9,7 @@
 pub mod definition;
 pub mod postgres;
 pub mod provider;
+pub mod rewrite;
 pub mod sink;
 pub mod sqlite;
 #[cfg(feature = "test-hooks")]
@@ -50,30 +51,10 @@ pub trait MutableBackend: Send + Sync {
     /// `n_rows * (columns.len() + 1)` (the +1 is the implicit `tenant_id`).
     fn insert_dml(&self, def: &MutableTableDefinition, columns: &[&str], n_rows: usize) -> String;
 
-    /// `DELETE` of the rows whose primary key is one of `n_keys` key tuples,
-    /// restricted to the rows `owned` selects. The key tuples bind as
-    /// `$1 … $(n_keys * primary_key.len())`, row-major. The row-value `IN`
-    /// renders identically on SQLite (3.15+) and Postgres.
-    fn delete_keys_dml(&self, def: &MutableTableDefinition, n_keys: usize, owned: &str) -> String {
-        let width = def.primary_key.len();
-        let key = def
-            .primary_key
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let tuples = (0..n_keys)
-            .map(|r| {
-                let slots = (1..=width)
-                    .map(|i| format!("${}", r * width + i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("({slots})")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+    /// `DELETE` of the rows `predicate` selects.
+    fn delete_dml(&self, def: &MutableTableDefinition, predicate: &str) -> String {
         format!(
-            "DELETE FROM {} WHERE ({key}) IN ({tuples}) AND {owned}",
+            "DELETE FROM {} WHERE {predicate}",
             quote_ident(def.id.as_str())
         )
     }
@@ -89,6 +70,30 @@ pub trait MutableBackend: Send + Sync {
 
     /// The matching catalog backend (used to open transactions).
     fn catalog_backend(&self) -> &BackendImpl;
+}
+
+/// The rows whose primary key is one of `n_keys` key tuples, the tuples bound
+/// as `$1 … $(n_keys * primary_key.len())`, row-major. The row-value `IN`
+/// renders identically on SQLite (3.15+) and Postgres.
+pub(crate) fn keys_predicate(def: &MutableTableDefinition, n_keys: usize) -> String {
+    let width = def.primary_key.len();
+    let key = def
+        .primary_key
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tuples = (0..n_keys)
+        .map(|r| {
+            let slots = (1..=width)
+                .map(|i| format!("${}", r * width + i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({slots})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({key}) IN ({tuples})")
 }
 
 /// The rows a session reads: its own and the global (`tenant_id IS NULL`)

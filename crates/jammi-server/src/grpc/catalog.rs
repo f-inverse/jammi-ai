@@ -321,7 +321,7 @@ impl CatalogService for CatalogServer {
 
         // A model outside the caller's scope (absent without `if_exists`, or a
         // GLOBAL model a tenant session cannot delete) surfaces as
-        // `JammiError::ModelNotFound` — a NotFound at the wire. A still-referenced
+        // `JammiError::NotFound` — a NotFound at the wire. A still-referenced
         // model surfaces as `JammiError::ModelReferenced`, which `map_engine_error`
         // renders as `FailedPrecondition`. Every fault keeps its faithful
         // `map_engine_error` mapping.

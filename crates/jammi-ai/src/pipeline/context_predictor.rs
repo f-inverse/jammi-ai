@@ -646,7 +646,7 @@ impl InferenceSession {
             self.catalog(),
             &admitted,
             &job_id,
-            &links.model_ref,
+            links.model_ref.as_deref(),
             &links.output_model_id,
             0,
             idempotency_key,
@@ -690,44 +690,38 @@ impl InferenceSession {
 
     /// The base-model PK a context-predictor job's `model_ref` binds to: the
     /// predictor registers under its own model id, so the FK points at the
-    /// SOURCE's embedding model, keeping the row valid. The embedding table
-    /// records that model's bare name; a catalog row is registered for it
-    /// when absent (an embedding table can be materialised without one) and
-    /// its PK (`name::version`) is returned.
+    /// model that produced the SOURCE's embedding table, keeping the row
+    /// valid. A catalog row is registered for it when absent (an embedding
+    /// table can be materialised without one) and its PK (`name::version`)
+    /// is returned. `None` when no model produced the table (a propagated
+    /// embedding): the predictor has no base model.
     pub(crate) async fn context_predictor_base_model_pk(
         &self,
         source_id: &str,
         spec: &ContextPredictorTrainConfig,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         let table = self.context_table(source_id, spec).await?;
-        let base_model_pk = match self.catalog().get_model(&table.model_id).await? {
-            Some(m) => m.catalog_pk,
-            None => {
-                self.catalog()
-                    .register_shared_model(RegisterModelParams {
-                        model_id: &table.model_id,
-                        version: 1,
-                        model_type: "embedding",
-                        backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
-                        task: ModelTask::TextEmbedding,
-                        base_model_id: None,
-                        external_location: None,
-                        config_json: None,
-                    })
-                    .await?;
-                self.catalog()
-                    .get_model(&table.model_id)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                            "Base model '{}' not registered in catalog",
-                            table.model_id
-                        ))
-                    })?
-                    .catalog_pk
-            }
+        let Some(model_id) = table.producer.model_id() else {
+            return Ok(None);
         };
-        Ok(base_model_pk)
+        if self.catalog().get_model(model_id).await?.is_none() {
+            self.catalog()
+                .register_shared_model(RegisterModelParams {
+                    model_id,
+                    version: 1,
+                    model_type: "embedding",
+                    backend: jammi_db::catalog::model_repo::ModelBackendKind::Candle,
+                    task: ModelTask::TextEmbedding,
+                    base_model_id: None,
+                    external_location: None,
+                    config_json: None,
+                })
+                .await?;
+        }
+        let registered = self.catalog().get_model(model_id).await?.ok_or_else(|| {
+            JammiError::FineTune(format!("Base model '{model_id}' not registered in catalog"))
+        })?;
+        Ok(Some(registered.catalog_pk))
     }
 
     /// Run an in-context-predictor meta-training to completion: sample the
@@ -1078,7 +1072,7 @@ impl InferenceSession {
                 version: 1,
                 model_type: "context-predictor",
                 task: ModelTask::Regression,
-                base_model_id: Some(table.model_id.clone()),
+                base_model_id: table.producer.model_id().map(str::to_string),
                 config_json: Some(config_json),
             },
             metrics: Some(serde_json::to_string(metrics)?),

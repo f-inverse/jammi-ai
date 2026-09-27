@@ -48,21 +48,18 @@ use jammi_db::store::manifest::{ArtifactDigest, ProducingDescriptor};
 
 use crate::common;
 
-/// Golden output Parquet artifact digest (SHA-256 hex). Re-captured on the
-/// merged tree: BOTH inputs to these bytes moved independently. This branch
-/// added a fifth column to the embedding schema (`_row_id, _source_id,
-/// _model_id, vector, _content_hash` — NULL on an imported table, which embeds
-/// no source row), and `main` moved the writer to the `parquet` 58 line. So
-/// neither side's constant is correct here and this value is measured on the
-/// merge, not carried from either parent.
+/// Golden output Parquet artifact digest (SHA-256 hex): the written bytes
+/// of the embedding schema (`_row_id, _source_id, _model_id, vector,
+/// _content_hash`, the last two nullable) under the workspace's `parquet`
+/// writer. A change to that schema or to the writer moves it, and it is
+/// re-measured then.
 ///
-/// What did NOT move, and is the reason an artifact-digest change is safe to
-/// accept: [`GOLDEN_CONTENT_DIGEST`] below is folded from the normalized
+/// [`GOLDEN_CONTENT_DIGEST`] below is folded from the normalized
 /// `(key, vector)` rows as they are handed to the writer, never from a decode
-/// of the written artifact, so it is invariant to both the encoder line and
-/// the schema's null column. This test asserts it on every run.
+/// of the written artifact, so it is invariant to both; it is the digest that
+/// proves the rows themselves did not move.
 const GOLDEN_ARTIFACT_DIGEST: &str =
-    "57219fe5253e751d6627cb15c4688fe97f2099f99487cbf0e79c2aa2417dd222";
+    "0566da80e77c3b8baebacb15819a71213426d0da18c5976917b952c5aed0aee1";
 
 /// Golden content digest (SHA-256 hex) of the fixture's normalized
 /// `(_row_id, vector)` rows, captured the same way as

@@ -11,7 +11,7 @@ use arrow::array::{Array, Int64Array};
 use jammi_ai::jobs::{execute_compute, ComputeSpec, JobResult};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::result_repo::JobAttempt;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 
@@ -85,8 +85,8 @@ async fn count_patents(session: &InferenceSession) -> Result<i64, JammiError> {
 
 fn assert_source_not_found(err: &JammiError, source_id: &str) {
     assert!(
-        matches!(err, JammiError::SourceNotFound { source_id: s } if s == source_id),
-        "expected SourceNotFound for '{source_id}', got {err:?}"
+        matches!(err, JammiError::NotFound(Missing::Source { source_id: s }) if s == source_id),
+        "expected a source NotFound for '{source_id}', got {err:?}"
     );
     assert!(
         err.to_string().contains(source_id),

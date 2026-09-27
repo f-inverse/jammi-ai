@@ -137,8 +137,8 @@ pub const DEFAULT_STRUCTURE_SEED: u64 = 0;
 /// (`λ₂ᵏ` has decayed) while still costing a full shuffle of the graph.
 pub const DEFAULT_STRUCTURE_HOP_CAP: usize = 8;
 
-/// The model-id provenance recorded on a structure table.
-const STRUCTURE_MODEL_ID: &str = "graph_structure";
+/// The kernel a structure encoding's descriptor names.
+const STRUCTURE_KERNEL_ID: &str = "graph_structure";
 
 /// A graph-structure encoding: which edge relation, read how, into what.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -323,7 +323,7 @@ impl InferenceSession {
 
         let descriptor = ProducingDescriptor::GraphStructure {
             edge_source: request.edge_source.to_binding(),
-            kernel_id: STRUCTURE_MODEL_ID.to_string(),
+            kernel_id: STRUCTURE_KERNEL_ID.to_string(),
             direction: propagation_direction(request.direction),
             weighting: propagation_weighting(request.weighting),
             seed: request.seed,
@@ -353,7 +353,6 @@ impl InferenceSession {
                 FeatureSource::StructuralSeed(seed),
                 PropagationTable {
                     source_id: &request.source_id,
-                    model_id: STRUCTURE_MODEL_ID,
                     derived_from: None,
                     key_column: request.key_column.as_deref(),
                     descriptor: &descriptor,

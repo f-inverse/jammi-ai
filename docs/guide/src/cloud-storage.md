@@ -1,10 +1,12 @@
 # Store Sources and Results in Cloud Object Storage
 
+> **Runnable companion:** [`cookbook/recipes/cloud_storage/`](https://github.com/f-inverse/jammi-ai/tree/main/cookbook/recipes/cloud_storage) reads a source from and writes result tables to an S3 bucket from the embedded Python engine, against a local S3-compatible server, and checks the rows against a local-disk run.
+
 Jammi treats local disk, S3, GCS, Azure Blob, and Cloudflare R2 as interchangeable backends. Any place the engine accepts a local file path it also accepts a storage URL — `file://`, `s3://`, `gs://`, `azure://`, or `r2://` — including registered file-shaped sources and the result-table Parquet that embedding and inference jobs write.
 
 ## Build with the cloud features you need
 
-The default build ships only `file://` and the in-memory test driver. Cloud schemes are opt-in per provider so a deployment that only uses S3 does not pull in the GCS and Azure SDK chains:
+The released `jammi-server` binaries, wheels and images and both embedded-engine Python wheels (`jammi-ai-native`, `jammi-ai-native-cu12`) carry all four cloud drivers (`storage-cloud`; `ci/release-feature-manifest.json` declares each artifact's features). A crate built from source ships only `file://` and the in-memory test driver by default; cloud schemes are opt-in per provider so a build that only uses S3 does not pull in the GCS and Azure SDK chains:
 
 | Feature | Schemes it enables |
 |---------|--------------------|
@@ -18,6 +20,8 @@ The default build ships only `file://` and the in-memory test driver. Cloud sche
 [dependencies]
 jammi-db = { version = "0.5", features = ["storage-s3", "storage-gcs"] }
 ```
+
+`jammi-server` and `jammi-python` (the embedded engine's crate) forward the same five features by name.
 
 Live integration tests live behind matching `live-s3-tests`, `live-gcs-tests`, `live-azure-tests` features so the hermetic `cargo test` lane never reaches the network.
 
@@ -66,7 +70,13 @@ db.add_source("papers", url="s3://benchmarks/snapshots/2026/papers.parquet", for
 db.sql("SELECT id, title FROM papers.public.papers LIMIT 10")
 ```
 
-The Python binding accepts the same URL forms as the Rust API; per-source cloud credentials are read from process environment.
+The embedded engine accepts the same URL forms as the Rust API and reads the driver's credentials from the environment (`AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, the `AZURE_*` chain) or the SDK's credential chain. To put the session's result tables in a bucket too, give it a config file with a `[storage]` section (see [Config-driven result storage](#config-driven-result-storage)):
+
+```python
+db = jammi.connect("file:///var/lib/jammi", config="/etc/jammi/jammi.toml")
+```
+
+The local directory keeps the catalog; the result tables' Parquet and index segments go to `result_root`.
 
 ### CLI
 

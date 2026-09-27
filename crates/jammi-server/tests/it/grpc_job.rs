@@ -83,6 +83,7 @@ async fn add_training_source(
         connection: Some(SourceConnection {
             url: training_url(),
             format: FileFormat::Csv as i32,
+            tenant_column: None,
         }),
     };
     match session {
@@ -541,7 +542,7 @@ async fn seed_predictor_dataset_under_tenant_a(server: &EngineServer) {
                     server.engine.context(),
                     jammi_db::store::EmbeddingTableSpec {
                         source_id: "fns",
-                        model_id: "synthetic-embed",
+                        model_id: Some("synthetic-embed"),
                         derived_from: None,
                         dimensions: FEATURE_DIM,
                         key_column: Some("_row_id"),

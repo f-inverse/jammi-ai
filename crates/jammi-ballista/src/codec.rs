@@ -64,7 +64,7 @@ use jammi_datafusion::inference::key_check::KeyCheckExec;
 use jammi_datafusion::InferenceExec;
 use jammi_datafusion::NumberedInputExec;
 use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingRunner};
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::index::{FiniteQuery, QuerySource, SearchMethod};
 use jammi_db::store::{ResultTableSinkExec, ResultTableSinkSpec};
 use jammi_db::TenantId;
@@ -417,10 +417,9 @@ fn decode_vector_search(
     )
     .map_err(typed_lookup)?
     .ok_or_else(|| {
-        typed(JammiError::Other(format!(
-            "result table '{}' not found",
-            msg.table_name
-        )))
+        typed(JammiError::NotFound(Missing::ResultTable {
+            table: msg.table_name.clone(),
+        }))
     })?;
     // A decoded query is a fresh entry on THIS process: it is re-validated
     // with the provenance it was encoded with, against the same authority

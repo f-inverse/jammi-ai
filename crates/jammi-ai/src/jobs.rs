@@ -1041,7 +1041,7 @@ impl InferenceSession {
                     self.catalog(),
                     &admitted,
                     &job_id,
-                    &links.model_ref,
+                    links.model_ref.as_deref(),
                     &links.output_model_id,
                     priority,
                     None,
@@ -1376,6 +1376,7 @@ mod tests {
     use super::*;
     use crate::pipeline::graph_neighbourhood::EdgeDirection;
     use crate::pipeline::graph_propagation::{PropagationOutput, PropagationWeighting};
+    use jammi_db::error::Missing;
 
     /// `JobSpec`/`ComputeSpec` round-trip through JSON byte-identically to how
     /// they will be persisted on `jobs.spec` and read back by a worker on a
@@ -1894,9 +1895,9 @@ mod tests {
             executor_id: "executor-1".into(),
             job_id: "7bY2".into(),
         };
-        let refused = JammiError::SourceNotFound {
+        let refused = JammiError::NotFound(Missing::Source {
             source_id: "patents".into(),
-        };
+        });
         for execution in [JobExecution::Queued, JobExecution::Inline] {
             assert_eq!(
                 UnsuccessfulEnd::of(&cancelled, execution),

@@ -239,6 +239,31 @@ pub enum MutableTableError {
     AlreadyExists(MutableTableId),
     #[error("table has no order_column declared; required by scan_after")]
     NoOrderColumn,
+    /// Rows an `UPDATE` / `DELETE` selected were changed or removed by
+    /// another writer between the statement's read and its write. Nothing
+    /// was written; re-running the statement selects against the new rows.
+    #[error(
+        "mutable table {table}: {rows} selected row(s) changed before the write; nothing was \
+         written, re-run the statement"
+    )]
+    WriteConflict {
+        /// The table the statement wrote.
+        table: MutableTableId,
+        /// How many selected rows had changed.
+        rows: u64,
+    },
+    /// An `UPDATE` selected one row more than once (a join matching it
+    /// several times) with different new values, so the row has no one
+    /// new value.
+    #[error(
+        "mutable table {table}: the UPDATE gives the row at key {key} more than one new value"
+    )]
+    AmbiguousUpdate {
+        /// The table the statement wrote.
+        table: MutableTableId,
+        /// The row's primary key, as displayed.
+        key: String,
+    },
     #[error("backend: {0}")]
     Backend(#[from] BackendError),
 }

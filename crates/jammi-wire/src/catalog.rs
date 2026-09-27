@@ -72,9 +72,9 @@ pub fn source_type_to_proto(source_type: SourceType) -> pb::SourceKind {
     }
 }
 
-/// Build the engine's [`SourceConnection`] from the proto message. Only the URL
-/// and format are carried on the wire; cloud credentials are server-side, so
-/// the rest comes from `Default`.
+/// Build the engine's [`SourceConnection`] from the proto message. The URL,
+/// format and tenant column are carried on the wire; cloud credentials are
+/// server-side, so the rest comes from `Default`.
 impl TryFrom<pb::SourceConnection> for SourceConnection {
     type Error = Status;
 
@@ -87,6 +87,7 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
         Ok(SourceConnection {
             url,
             format: file_format_from_proto(conn.format)?,
+            tenant_column: conn.tenant_column,
             ..Default::default()
         })
     }
@@ -94,8 +95,8 @@ impl TryFrom<pb::SourceConnection> for SourceConnection {
 
 /// Encode the engine's [`SourceConnection`] into the proto message for an
 /// `AddSource` request — the inverse of the decode above, for the
-/// the remote client send side. Only the URL + format cross the wire
-/// (matching what the decode reads back): cloud credentials, file-extension
+/// the remote client send side. The URL, format and tenant column cross the
+/// wire (matching what the decode reads back): cloud credentials, file-extension
 /// overrides, and driver options are server-side and have no wire field, so the
 /// send side does not carry them. A `None` URL encodes as the empty string the
 /// decode reads back as `None`; an unset format encodes as
@@ -105,6 +106,7 @@ impl From<SourceConnection> for pb::SourceConnection {
         pb::SourceConnection {
             url: conn.url.unwrap_or_default(),
             format: file_format_to_proto(conn.format) as i32,
+            tenant_column: conn.tenant_column,
         }
     }
 }
@@ -657,6 +659,26 @@ mod tests {
         assert_eq!(encoded, pb::FileFormat::Unspecified);
         let decoded = file_format_from_proto(encoded as i32).unwrap();
         assert_eq!(decoded, None);
+    }
+
+    /// A source's tenant column crosses the wire both ways, set and unset —
+    /// the declaration a remote `add_source` makes is the one the engine
+    /// persists.
+    #[test]
+    fn a_source_connection_round_trips_its_tenant_column() {
+        for tenant_column in [Some("workspace".to_string()), None] {
+            let connection = SourceConnection {
+                url: Some("file:///data/notes.parquet".into()),
+                format: Some(FileFormat::Parquet),
+                tenant_column: tenant_column.clone(),
+                ..Default::default()
+            };
+            let decoded = SourceConnection::try_from(pb::SourceConnection::from(connection))
+                .expect("a well-formed connection decodes");
+            assert_eq!(decoded.tenant_column, tenant_column);
+            assert_eq!(decoded.url.as_deref(), Some("file:///data/notes.parquet"));
+            assert_eq!(decoded.format, Some(FileFormat::Parquet));
+        }
     }
 
     /// An out-of-range `i32` (no compiled `FileFormat` variant claims it) is

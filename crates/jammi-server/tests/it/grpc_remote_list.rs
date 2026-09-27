@@ -27,7 +27,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::channel_repo::{ChannelColumn, ChannelColumnType, ChannelSpec};
 use jammi_db::catalog::model_repo::RegisterModelParams;
 use jammi_db::catalog::result_repo::{
-    CreateResultTableParams, Owner, ResultTableCas, ResultTableKind, TenantArm,
+    CreateResultTableParams, Owner, Producer, ResultTableCas, ResultTableKind, TenantArm,
 };
 use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
@@ -305,8 +305,10 @@ async fn seed_segmented_table(server: &EngineServer, table: &str, segments: &[(i
             lease: None,
             table_name: table,
             source_id: "seg_src",
-            model_id: "seg_model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "seg_model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Model,
             derived_from: None,
             parquet_path: "file:///tmp/seg.parquet",
@@ -476,8 +478,10 @@ async fn remote_list_index_segments_denies_a_peer_tenants_table() {
                     lease: None,
                     table_name: "a_owned_rt",
                     source_id: "seg_src",
-                    model_id: "seg_model",
-                    task: ModelTask::TextEmbedding,
+                    producer: Producer::Model {
+                        model_id: "seg_model".to_string(),
+                        task: ModelTask::TextEmbedding,
+                    },
                     kind: ResultTableKind::Model,
                     derived_from: None,
                     parquet_path: "file:///tmp/seg.parquet",

@@ -29,6 +29,11 @@ book = [
     "nbclient>=0.9",
     "ipykernel>=6.29",
 ]
+# An S3-compatible server the cloud-storage recipe runs against, so it needs
+# no cloud account (`recipes/cloud_storage/`).
+cloud = [
+    "moto[server]>=5",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

@@ -31,6 +31,7 @@ use crate::source::schema_provider::{JammiSchemaProvider, PublicSchemaCatalog};
 use crate::source::{SourceConnection, SourceDefinition, SourceType};
 use crate::storage::{StorageRegistry, StorageUrl};
 use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
+use crate::store::mutable::rewrite::RowRewritePlanner;
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
 use crate::tenant::{TenantContext, TenantId};
@@ -49,10 +50,6 @@ pub struct JammiSession {
     catalog: Arc<Catalog>,
     config: Arc<JammiConfig>,
     tenant: TenantBinding,
-    /// Shared with the `TenantScopeAnalyzerRule` so callers can register
-    /// per-source tenant columns at `add_source` time (for federated sources
-    /// whose tenant discriminator has a non-`tenant_id` name).
-    source_tenant_columns: Arc<SourceTenantColumns>,
     /// Process-wide cache of `object_store` drivers keyed by (scheme, bucket).
     /// Used to register `s3://` / `gs://` / `azure://` URLs with both the
     /// engine's own writers and DataFusion's `ListingTable` reader.
@@ -335,7 +332,6 @@ impl JammiSession {
             catalog,
             config,
             tenant: tenant_binding,
-            source_tenant_columns,
             storage_registry,
             sources,
             mutable,
@@ -497,14 +493,6 @@ impl JammiSession {
         TenantBinding::admin_scope(f(scope)).await
     }
 
-    /// Register a tenant-discriminator column for a federated source. The
-    /// `TenantScopeAnalyzerRule` consults this lookup when a `TableScan`'s
-    /// schema does *not* itself declare a `tenant_id` column — i.e., when
-    /// the user's source carries the discriminator under a different name.
-    pub fn set_source_tenant_column(&self, source: &str, column: Option<String>) {
-        self.source_tenant_columns.set(source, column);
-    }
-
     /// Build providers for every source persisted in the catalog, up front.
     ///
     /// Resolution reads through to the catalog on its own (see
@@ -550,6 +538,30 @@ impl JammiSession {
         };
         let built = self.sources.build(source_id, &definition).await?;
 
+        // A declared tenant column is what every tenant's scan of the source
+        // is filtered by, so it must be a column of every table the source
+        // serves, and the only discriminator there: a table's own `tenant_id`
+        // column scopes it first. Refused here, before anything is persisted,
+        // rather than silently ignored or failed at a tenant's first query.
+        if let Some(column) = &definition.connection.tenant_column {
+            for (table, provider) in &built.tables {
+                let schema = provider.schema();
+                let actual = if schema.index_of(column).is_err() {
+                    "no such column"
+                } else if column != "tenant_id" && schema.index_of("tenant_id").is_ok() {
+                    "the table's own `tenant_id` column already scopes it"
+                } else {
+                    continue;
+                };
+                return Err(JammiError::Schema {
+                    table: format!("{source_id}.public.{table}"),
+                    column: column.clone(),
+                    expected: "the one tenant column of every table of the source".into(),
+                    actual: actual.into(),
+                });
+            }
+        }
+
         // Registration is the ONLY adaptive moment for a `FileFormat::JsonLines`
         // source with no explicit `file_extension` override: pin whichever
         // extension (`.jsonl` or `.ndjson`) actually won here into the
@@ -583,7 +595,7 @@ impl JammiSession {
     /// The table names a source serves, in discovery order — resolved
     /// through the catalog's `sources` row like every SQL reference to the
     /// source is, so a source registered on another replica resolves here
-    /// and a source removed there is [`JammiError::SourceNotFound`] here.
+    /// and a source removed there is [`JammiError::NotFound`] here.
     pub async fn source_table_names(&self, source_id: &str) -> Result<Vec<String>> {
         Ok(self.sources.resolve(source_id).await?.table_names())
     }
@@ -1089,10 +1101,8 @@ impl QueryContext {
     /// TABLE … AS`, a `SET`) has executed when this returns, as
     /// `SessionContext::sql` has it.
     pub async fn sql(&self, sql: &str) -> DfResult<DataFrame> {
-        let plan = self.0.state().create_logical_plan(sql).await?;
-        self.0
-            .execute_logical_plan(StatementClass::of(plan)?.into_plan())
-            .await
+        let class = StatementClass::plan(&self.0.state(), sql).await?;
+        self.0.execute_logical_plan(class.into_plan()).await
     }
 
     /// A [`DataFrame`] scanning the table `table_ref` resolves to.
@@ -1265,8 +1275,9 @@ pub enum QueryFunction {
 
 /// The session's physical planner: DataFusion's default planner with the
 /// federation extension planner (a federated sub-plan pushed to its
-/// source) and [`MaterializationPlanner`] (a statement's materialization
-/// rooted in the node that decides where it runs).
+/// source), [`MaterializationPlanner`] (a statement's materialization
+/// rooted in the node that decides where it runs) and [`RowRewritePlanner`]
+/// (an `UPDATE` / `DELETE` of a mutable table's selected rows).
 #[derive(Debug)]
 struct JammiQueryPlanner;
 
@@ -1280,6 +1291,7 @@ impl QueryPlanner for JammiQueryPlanner {
         DefaultPhysicalPlanner::with_extension_planners(vec![
             Arc::new(FederatedPlanner::new()),
             Arc::new(MaterializationPlanner),
+            Arc::new(RowRewritePlanner),
         ])
         .create_physical_plan(logical_plan, session_state)
         .await

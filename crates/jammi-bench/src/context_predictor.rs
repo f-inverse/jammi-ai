@@ -367,7 +367,7 @@ async fn register_dataset(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id,
-                model_id: EMBED_MODEL_ID,
+                model_id: Some(EMBED_MODEL_ID),
                 derived_from: None,
                 dimensions: FEATURE_DIM,
                 key_column: Some("_row_id"),

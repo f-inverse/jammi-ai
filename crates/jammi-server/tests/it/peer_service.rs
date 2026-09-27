@@ -23,13 +23,13 @@
 //! path an embedded table takes, without a model load.
 
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::ResultTableKind;
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::segment::{rescore, search_unit};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{SegmentSearchPhase, VectorIndex};
 use jammi_db::storage::StorageUrl;
-use jammi_db::store::{BuildingTable, ResultStore};
+use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_test_utils::vq;
 use jammi_wire::proto::peer::peer_service_client::PeerServiceClient;
 use jammi_wire::proto::peer::{
@@ -56,17 +56,19 @@ pub fn built_index(rows: &[(&str, [f32; 4])], precision: StoragePrecision) -> Si
 /// handle (the lease-owned row every segment append is a CAS against).
 pub async fn building_table(store: &ResultStore, source_id: &str) -> BuildingTable {
     store
-        .create_table(
+        .create_table(ResultTableOrigin {
             source_id,
-            ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "model",
-            Some(4),
-            Some("_row_id"),
-            None,
-            None,
-        )
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(4),
+            key_column: Some("_row_id"),
+            text_columns: None,
+            job_attempt: None,
+        })
         .await
         .unwrap()
 }
@@ -162,6 +164,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -184,6 +188,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -206,6 +212,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::Int8 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -221,6 +229,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: 0,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -238,6 +248,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: 99,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -250,6 +262,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: 99,
         })
         .await
@@ -265,6 +279,8 @@ async fn segment_search_over_peer_bind_equals_in_process_search_unit() {
             storage_precision: pb::StoragePrecision::F32 as i32,
             query: q.to_vec(),
             width: 3,
+            target: 3,
+            version: None,
             phase: pb::SegmentSearchPhase::Final as i32,
         })
         .await
@@ -333,6 +349,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
                 segment_id: 0,
                 row_ids: vec!["d".into(), "a".into(), "b".into()],
             }],
+            version: None,
         })
         .await
         .expect("ExactRescore over peer_bind")
@@ -349,6 +366,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
                 segment_id: 0,
                 row_ids: vec!["a".into(), "ghost".into()],
             }],
+            version: None,
         })
         .await
         .expect_err("a row id the segment does not index is own-data, not a caller fault");
@@ -368,6 +386,7 @@ async fn exact_rescore_over_peer_bind_equals_in_process_rescore() {
                 segment_id: 3,
                 row_ids: vec!["a".into()],
             }],
+            version: None,
         })
         .await
         .expect_err("segment 3 is not a segment of the table");
@@ -412,6 +431,8 @@ async fn owner_refuses_non_conforming_requests() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         width: 3,
+        target: 3,
+        version: None,
         phase: pb::SegmentSearchPhase::Approximate as i32,
     };
     let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {
@@ -419,6 +440,7 @@ async fn owner_refuses_non_conforming_requests() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         row_ids_by_segment: groups,
+        version: None,
     };
     let rows = |ids: &[&str]| SegmentRowIds {
         segment_id: 0,
@@ -571,6 +593,8 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         width: 3,
+        target: 3,
+        version: None,
         phase: pb::SegmentSearchPhase::Approximate as i32,
     };
     let rescore_req = |query: Vec<f32>, groups: Vec<SegmentRowIds>| ExactRescoreRequest {
@@ -578,6 +602,7 @@ async fn owner_refuses_non_conforming_requests_with_invalid_argument() {
         storage_precision: pb::StoragePrecision::Int8 as i32,
         query,
         row_ids_by_segment: groups,
+        version: None,
     };
     let rows = |ids: &[&str]| SegmentRowIds {
         segment_id: 0,

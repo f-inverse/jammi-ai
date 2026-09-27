@@ -11,7 +11,7 @@ use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, Stri
 use arrow::datatypes::{DataType, Field};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
-use jammi_db::catalog::result_repo::CreateResultTableParams;
+use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer};
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 use jammi_db::store::schema::embedding_table_schema;
@@ -73,8 +73,10 @@ async fn inference_session_read_vectors_forwards_to_jammi_session() {
             lease: None,
             table_name,
             source_id: "src",
-            model_id: "model",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "model".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: jammi_db::catalog::result_repo::ResultTableKind::Model,
             derived_from: None,
             parquet_path: url.as_str(),

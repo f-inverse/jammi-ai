@@ -10,7 +10,7 @@ use crate::catalog::lease::{lease_deadline_expr, lease_expired_clause};
 use crate::catalog::status::ResultTableStatus;
 use crate::catalog::Catalog;
 use crate::config::StoragePrecision;
-use crate::error::{JammiError, Result};
+use crate::error::{IndexKind, JammiError, Missing, Result};
 use crate::tenant::TenantId;
 use crate::tenant_scope::TenantBinding;
 use jammi_datafusion::ModelTask;
@@ -115,14 +115,76 @@ impl ResultTableKind {
     }
 }
 
+/// What produced a result table's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Producer {
+    /// A model ran over the source: its canonical id and the task it ran.
+    Model {
+        /// The model's canonical id.
+        model_id: String,
+        /// The task the model ran.
+        task: ModelTask,
+    },
+    /// A derivation that runs no model; the table's kind names which.
+    /// `task` is the model task whose output shape the rows have, when they
+    /// have one — a propagated embedding is still a text embedding; an
+    /// as-of join's or a lexical index's rows are no task's.
+    Derivation {
+        /// The task the rows' shape belongs to, if any.
+        task: Option<ModelTask>,
+    },
+}
+
+impl Producer {
+    /// The producing model's canonical id, when a model ran.
+    pub fn model_id(&self) -> Option<&str> {
+        match self {
+            Self::Model { model_id, .. } => Some(model_id),
+            Self::Derivation { .. } => None,
+        }
+    }
+
+    /// The model task the rows are the output shape of, when they are one.
+    pub fn task(&self) -> Option<ModelTask> {
+        match self {
+            Self::Model { task, .. } => Some(*task),
+            Self::Derivation { task } => *task,
+        }
+    }
+
+    /// The producer a row's `model_id` and `task` columns record; `None`
+    /// for a model without a task, which no writer records.
+    pub fn from_columns(model_id: Option<String>, task: Option<ModelTask>) -> Option<Self> {
+        match (model_id, task) {
+            (Some(model_id), Some(task)) => Some(Self::Model { model_id, task }),
+            (None, task) => Some(Self::Derivation { task }),
+            (Some(_), None) => None,
+        }
+    }
+}
+
+/// A producer serializes as the row's two columns, `model_id` and `task`,
+/// each `null` when the producer has none.
+impl serde::Serialize for Producer {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut columns = serializer.serialize_struct("Producer", 2)?;
+        columns.serialize_field("model_id", &self.model_id())?;
+        columns.serialize_field("task", &self.task())?;
+        columns.end()
+    }
+}
+
 /// Parameters for creating a new result table entry.
 /// `status` defaults to `'building'` via SQL DEFAULT — not passed here.
 #[derive(Debug)]
 pub struct CreateResultTableParams<'a> {
     pub table_name: &'a str,
     pub source_id: &'a str,
-    pub model_id: &'a str,
-    pub task: ModelTask,
+    pub producer: Producer,
     pub kind: ResultTableKind,
     pub derived_from: Option<&'a str>,
     pub parquet_path: &'a str,
@@ -234,8 +296,8 @@ impl ResultTableName {
 pub struct ResultTableRecord {
     pub table_name: String,
     pub source_id: String,
-    pub model_id: String,
-    pub task: ModelTask,
+    #[serde(flatten)]
+    pub producer: Producer,
     pub kind: ResultTableKind,
     pub derived_from: Option<String>,
     pub parquet_path: String,
@@ -371,8 +433,7 @@ impl ResultTableRecord {
     pub fn from_wire_projection(
         table_name: String,
         source_id: String,
-        model_id: String,
-        task: ModelTask,
+        producer: Producer,
         kind: ResultTableKind,
         derived_from: Option<String>,
         dimensions_raw: i32,
@@ -383,8 +444,7 @@ impl ResultTableRecord {
         Self {
             table_name,
             source_id,
-            model_id,
-            task,
+            producer,
             kind,
             derived_from,
             parquet_path: String::new(),
@@ -411,10 +471,19 @@ impl ResultTableRecord {
 }
 
 fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendError> {
-    let task_raw: String = row.get("task")?;
-    let task = ModelTask::parse(&task_raw).map_err(|e| BackendError::TypeConversion {
-        column: "task".into(),
-        detail: e.to_string(),
+    let task = row
+        .try_get::<String>("task")?
+        .map(|raw| ModelTask::parse(&raw))
+        .transpose()
+        .map_err(|e| BackendError::TypeConversion {
+            column: "task".into(),
+            detail: e.to_string(),
+        })?;
+    let producer = Producer::from_columns(row.try_get("model_id")?, task).ok_or_else(|| {
+        BackendError::TypeConversion {
+            column: "task".into(),
+            detail: "a row naming a model records the task it ran".into(),
+        }
     })?;
     let kind_raw: String = row.get("kind")?;
     let kind =
@@ -434,8 +503,7 @@ fn parse_row(row: &Row<'_>) -> std::result::Result<ResultTableRecord, BackendErr
     Ok(ResultTableRecord {
         table_name: row.get("table_name")?,
         source_id: row.get("source_id")?,
-        model_id: row.get("model_id")?,
-        task,
+        producer,
         kind,
         derived_from: row.try_get("derived_from")?,
         parquet_path: row.get("parquet_path")?,
@@ -877,8 +945,8 @@ impl Catalog {
     pub async fn create_result_table(&self, p: CreateResultTableParams<'_>) -> Result<()> {
         let table_name = p.table_name.to_string();
         let source_id = p.source_id.to_string();
-        let model_id = p.model_id.to_string();
-        let task = p.task.as_str();
+        let model_id = p.producer.model_id().map(str::to_string);
+        let task = p.producer.task().map(|t| t.as_str());
         let kind = p.kind.as_db_str();
         let derived_from = p.derived_from.map(str::to_string);
         let parquet_path = p.parquet_path.to_string();
@@ -911,8 +979,8 @@ impl Catalog {
                     let mut params: Vec<SqlValue<'static>> = vec![
                         SqlValue::TextOwned(table_name),
                         SqlValue::TextOwned(source_id),
-                        SqlValue::TextOwned(model_id),
-                        SqlValue::Text(task),
+                        SqlValue::from(model_id),
+                        SqlValue::from(task),
                         SqlValue::Text(kind),
                         SqlValue::from(derived_from),
                         SqlValue::TextOwned(parquet_path),
@@ -1703,6 +1771,16 @@ impl Catalog {
             .await?)
     }
 
+    /// [`Self::get_result_table`], with an absent row the typed
+    /// [`JammiError::NotFound`]: for a verb whose caller named the table.
+    pub async fn require_result_table(&self, name: &str) -> Result<ResultTableRecord> {
+        self.get_result_table(name).await?.ok_or_else(|| {
+            JammiError::NotFound(Missing::ResultTable {
+                table: name.to_string(),
+            })
+        })
+    }
+
     /// Fetch a single result table by name. Tenant-filtered; inside a
     /// [`crate::session::JammiSession::with_admin_scope`] closure the tenant
     /// predicate is dropped and the row resolves by its primary key alone
@@ -2113,10 +2191,7 @@ impl Catalog {
         table_name: Option<&str>,
     ) -> Result<ResultTableRecord> {
         if let Some(name) = table_name {
-            return self
-                .get_result_table(name)
-                .await?
-                .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")));
+            return self.require_result_table(name).await;
         }
 
         // Derive the embedding-task list from `ModelTask::ALL` so that
@@ -2139,7 +2214,10 @@ impl Catalog {
         self.newest_ready_table(source_id, ResultTableKind::Model, &embedding_tasks)
             .await?
             .ok_or_else(|| {
-                JammiError::Catalog(format!("No ready embedding table for source '{source_id}'"))
+                JammiError::NotFound(Missing::ReadyIndex {
+                    source_id: source_id.to_string(),
+                    index: IndexKind::Embedding,
+                })
             })
     }
 
@@ -2156,18 +2234,20 @@ impl Catalog {
                 .newest_ready_table(source_id, ResultTableKind::Lexical, &[])
                 .await?
                 .ok_or_else(|| {
-                    JammiError::Catalog(format!("No ready lexical index for source '{source_id}'"))
+                    JammiError::NotFound(Missing::ReadyIndex {
+                        source_id: source_id.to_string(),
+                        index: IndexKind::Lexical,
+                    })
                 });
         };
-        let table = self
-            .get_result_table(name)
-            .await?
-            .ok_or_else(|| JammiError::Catalog(format!("Result table '{name}' not found")))?;
+        let table = self.require_result_table(name).await?;
         if table.kind != ResultTableKind::Lexical {
-            return Err(JammiError::Catalog(format!(
-                "Result table '{name}' is a {} table, not a lexical index",
-                table.kind.as_db_str()
-            )));
+            return Err(JammiError::Schema {
+                table: name.to_string(),
+                column: "<kind>".to_string(),
+                expected: "a lexical index".to_string(),
+                actual: format!("a {} table", table.kind.as_db_str()),
+            });
         }
         Ok(table)
     }

@@ -236,6 +236,13 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "044_topics_drop_broker_metadata",
         MigrationSql::Same(schema::MIGRATION_044_TOPICS_DROP_BROKER_METADATA),
     ),
+    (
+        "045_result_table_producer",
+        MigrationSql::PerBackend {
+            sqlite: schema::MIGRATION_045_RESULT_TABLE_PRODUCER_SQLITE,
+            postgres: schema::MIGRATION_045_RESULT_TABLE_PRODUCER_POSTGRES,
+        },
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

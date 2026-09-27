@@ -26,11 +26,11 @@ use jammi_ai::pipeline::neighbor_graph::BuildNeighborGraph;
 use jammi_ai::pipeline::recompute::Cascade;
 use jammi_ai::session::InferenceSession;
 use jammi_ai::Session;
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::JammiError;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{ArtifactDigest, InputAnchor, Materialization};
-use jammi_db::store::{CachePolicy, EmbeddingTableSpec};
+use jammi_db::store::{CachePolicy, EmbeddingTableSpec, ResultTableOrigin};
 use tempfile::TempDir;
 
 use crate::common;
@@ -77,7 +77,7 @@ async fn session_with_synthetic_embeddings() -> (Arc<InferenceSession>, TempDir,
             session.context(),
             EmbeddingTableSpec {
                 source_id: "points",
-                model_id: "synthetic-embed",
+                model_id: Some("synthetic-embed"),
                 derived_from: None,
                 dimensions: DIM,
                 key_column: Some("_row_id"),
@@ -743,17 +743,19 @@ async fn a_pre_contract_table_is_not_recomputable() {
     // `BuildingTable::finish` (the only path that writes a sidecar).
     let store = session.result_store();
     let info = store
-        .create_table(
-            "points",
-            jammi_datafusion::ModelTask::TextEmbedding,
-            ResultTableKind::Model,
-            None,
-            "pre-contract",
-            Some(DIM as i32),
-            Some("_row_id"),
-            Some("body"),
-            None,
-        )
+        .create_table(ResultTableOrigin {
+            source_id: "points",
+            producer: Producer::Model {
+                model_id: "pre-contract".to_string(),
+                task: jammi_datafusion::ModelTask::TextEmbedding,
+            },
+            kind: ResultTableKind::Model,
+            derived_from: None,
+            dimensions: Some(DIM as i32),
+            key_column: Some("_row_id"),
+            text_columns: Some("body"),
+            job_attempt: None,
+        })
         .await
         .unwrap();
     let schema = jammi_db::store::schema::embedding_table_schema(DIM);

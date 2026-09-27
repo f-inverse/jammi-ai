@@ -2620,6 +2620,7 @@ fn http_url(key: &str, value: &str) -> Result<url::Url> {
 /// hub_cache_dir = "/var/cache/jammi"
 /// hub_token = { file = "/run/secrets/hf-token" }
 /// offline = false
+/// hub_idle_timeout_secs = 60
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2675,14 +2676,29 @@ pub struct ModelsConfig {
     /// (`huggingface_hub`'s own `ENV_VARS_TRUE_VALUES`: `"1"`, `"on"`,
     /// `"yes"`, `"true"`, case-insensitively).
     pub offline: Option<bool>,
+    /// How long a Hub transfer may go without receiving a byte — to
+    /// connect, to answer, or mid-body — before it fails as a retryable
+    /// `Unavailable` naming the repo and the file. A transfer that keeps
+    /// making progress is never cut off, however large the file. `None` →
+    /// `jammi-ai`'s `model::hub::DEFAULT_IDLE_TIMEOUT`; `0` is refused at
+    /// load (it would fail every transfer).
+    pub hub_idle_timeout_secs: Option<u64>,
     /// Models served at remote endpoints, by the name a plan references them
     /// under (`remote:<name>`). See [`RemoteModelConfig`].
     pub remote: BTreeMap<String, RemoteModelConfig>,
 }
 
 impl ModelsConfig {
-    /// Refuse a remote model declaration no request could be built from.
+    /// Refuse a remote model declaration no request could be built from,
+    /// and a zero Hub idle timeout.
     pub fn validate(&self) -> Result<()> {
+        if self.hub_idle_timeout_secs == Some(0) {
+            return Err(JammiError::Config(
+                "[models] hub_idle_timeout_secs must be positive: a zero idle timeout fails \
+                 every Hub transfer"
+                    .into(),
+            ));
+        }
         self.remote
             .iter()
             .try_for_each(|(name, model)| model.validate(name))

@@ -205,6 +205,14 @@ class NotFound(BackendError):
     """
 
 
+class Unavailable(BackendError):
+    """What the call needs could not be reached right now — a Hugging Face
+    Hub download that stalled or could not connect, a peer that holds a
+    segment. The same call may succeed later: this is the condition to retry
+    on. ``UNAVAILABLE`` on the remote transport.
+    """
+
+
 class AlreadyExists(BackendError):
     """The thing being created exists already — a channel id, a mutable table,
     a column declared twice. ``ALREADY_EXISTS`` on the remote transport.
@@ -243,6 +251,14 @@ class DefinitionDrift(FailedPrecondition):
 class ModelNotFound(NotFound):
     """No model with this id is in the catalog. Refines :class:`NotFound`;
     ``delete_model(if_exists=True)`` is the no-op form.
+    """
+
+
+class NoReadyIndex(NotFound):
+    """A search named no table, and the source has no ready index of the kind
+    it searches: ``search`` needs an embedding table (``generate_embeddings``
+    builds one), ``lexical_search`` a lexical index (``build_lexical_index``).
+    Refines :class:`NotFound`.
     """
 
 

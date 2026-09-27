@@ -87,7 +87,7 @@ async fn close_copy_reopen_preserves_rows() {
             &ctx,
             EmbeddingTableSpec {
                 source_id: "docs",
-                model_id: "backup-model",
+                model_id: Some("backup-model"),
                 derived_from: None,
                 dimensions: DIMS,
                 key_column: Some("_row_id"),

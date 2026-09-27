@@ -87,6 +87,7 @@ from .errors import (
     JammiError,
     MissingManifest,
     ModelNotFound,
+    NoReadyIndex,
     NotFound,
     ModelReferenced,
     NoQueryEncoder,
@@ -95,6 +96,7 @@ from .errors import (
     NotSupportedOnBackend,
     JobCancelled,
     TrainingError,
+    Unavailable,
     VersionUnavailable,
 )
 from ._generated.jammi.v1 import catalog_pb2, catalog_pb2_grpc, error_pb2
@@ -131,7 +133,8 @@ _DETAIL_CLASS = {
     "not_refreshable": NotRefreshable,
     "definition_drift": DefinitionDrift,
     "version_unavailable": VersionUnavailable,
-    "model_not_found": ModelNotFound,
+    "not_found.model_id": ModelNotFound,
+    "not_found.ready_index": NoReadyIndex,
     "model_referenced": ModelReferenced,
 }
 
@@ -141,6 +144,7 @@ _CODE_CLASS = {
     grpc.StatusCode.INVALID_ARGUMENT: InvalidArgument,
     grpc.StatusCode.UNIMPLEMENTED: NotSupportedOnBackend,
     grpc.StatusCode.NOT_FOUND: NotFound,
+    grpc.StatusCode.UNAVAILABLE: Unavailable,
     grpc.StatusCode.ALREADY_EXISTS: AlreadyExists,
     grpc.StatusCode.FAILED_PRECONDITION: FailedPrecondition,
 }
@@ -149,7 +153,9 @@ _CODE_CLASS = {
 def _error_detail(exc: grpc.RpcError) -> Optional[str]:
     """The typed engine detail a server attached to a failed call — the
     `JammiErrorDetail` variant packed in the `grpc-status-details-bin`
-    trailer's `google.rpc.Status` envelope — or None when it carries none."""
+    trailer's `google.rpc.Status` envelope, as `variant` or, for a variant that
+    names a case of its own (`not_found`), `variant.case` — or None when it
+    carries none."""
     trailers = exc.trailing_metadata() if hasattr(exc, "trailing_metadata") else None
     for key, value in trailers or ():
         if key != "grpc-status-details-bin":
@@ -157,7 +163,10 @@ def _error_detail(exc: grpc.RpcError) -> Optional[str]:
         for packed in error_pb2.RpcStatus.FromString(value).details:
             detail = error_pb2.JammiErrorDetail()
             if packed.Unpack(detail):
-                return detail.WhichOneof("variant")
+                variant = detail.WhichOneof("variant")
+                if variant == "not_found":
+                    return f"not_found.{detail.not_found.WhichOneof('missing')}"
+                return variant
     return None
 
 
@@ -177,9 +186,9 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
       did not mount.
     * ``NOT_FOUND`` / ``ALREADY_EXISTS`` / ``FAILED_PRECONDITION`` →
       :class:`NotFound` / :class:`AlreadyExists` / :class:`FailedPrecondition`.
+    * ``UNAVAILABLE`` → :class:`Unavailable` — retryable.
     * everything else (``RESOURCE_EXHAUSTED`` — the receive-cap edge —,
-      ``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, ``INTERNAL``, …) →
-      :class:`BackendError`.
+      ``DEADLINE_EXCEEDED``, ``INTERNAL``, …) → :class:`BackendError`.
 
     The originating grpc ``StatusCode`` rides on the mapped exception's ``code``
     attribute so the few call-sites that branch on ``NOT_FOUND`` (``describe_*``
@@ -199,8 +208,8 @@ def _rpc_to_jammi(exc: grpc.RpcError) -> JammiError:
 def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
     """Project a wire `ResultTable` into the embed wheel's result-table dict.
 
-    `key_column` and `derived_from` round-trip as `None` when the engine did
-    not record one — the same shape the embedded `Option<String>` serialises
+    `model_id`, `key_column` and `derived_from` round-trip as `None` when the
+    engine did not record one (a derivation runs no model) — the same shape the embedded `Option<String>` serialises
     to — and `kind` is spelled the same string the embedded `ResultTableKind`
     serialises to, so a derived (neighbor-graph / as-of-join) table's
     provenance reads identically regardless of transport. `RESULT_TABLE_KIND_
@@ -211,7 +220,7 @@ def _result_table_to_dict(rt: embedding_pb2.ResultTable) -> Dict[str, Any]:
     return {
         "table_name": rt.table_name,
         "source_id": rt.source_id,
-        "model_id": rt.model_id,
+        "model_id": rt.model_id if rt.HasField("model_id") else None,
         "dimensions": rt.dimensions,
         "row_count": rt.row_count,
         "status": rt.status,
@@ -1233,12 +1242,17 @@ class RemoteDatabase:
 
     # --- Sources -----------------------------------------------------------------
 
-    def add_source(self, name: str, *, url: str, format: str) -> None:
+    def add_source(
+        self, name: str, *, url: str, format: str, tenant_column: Optional[str] = None
+    ) -> None:
         """Register a file-shaped data source on the remote engine.
 
         `url` accepts a local path (wrapped into `file://...` server-side) or any
         storage URL the server was compiled with (`s3://`, `gs://`, `azure://`).
-        Maps to `CatalogService.AddSource`.
+        `tenant_column` names the column whose value is each row's tenant: a
+        tenant-bound session then reads only its own rows and the rows with no
+        tenant, through every verb that reads the source. Maps to
+        `CatalogService.AddSource`.
         """
         try:
             file_format = _FILE_FORMAT[format]
@@ -1254,6 +1268,7 @@ class RemoteDatabase:
                 connection=catalog_pb2.SourceConnection(
                     url=_local_source_url(url),
                     format=file_format,
+                    tenant_column=tenant_column,
                 ),
             ),
         )

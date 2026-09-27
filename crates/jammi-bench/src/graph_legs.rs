@@ -369,7 +369,7 @@ pub(crate) async fn materialize_features(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id: &sources.nodes,
-                model_id: INPUT_MODEL_ID,
+                model_id: Some(INPUT_MODEL_ID),
                 derived_from: None,
                 dimensions: dim,
                 key_column: Some("_row_id"),

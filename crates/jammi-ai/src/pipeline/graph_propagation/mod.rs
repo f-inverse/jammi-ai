@@ -111,11 +111,11 @@ use std::sync::Arc;
 
 use datafusion::prelude::DataFrame;
 
-use jammi_db::catalog::result_repo::{ResultTableKind, ResultTableRecord};
+use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::error::{JammiError, Result};
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{InputAnchor, MaterializationEnv, ProducingDescriptor};
-use jammi_db::store::{CacheOutcome, CachePolicy, SinkKind};
+use jammi_db::store::{CacheOutcome, CachePolicy, ResultTableOrigin, SinkKind};
 
 use crate::pipeline::graph_neighbourhood::{EdgeDirection, EdgeSourceRef, DEFAULT_HOP_CAP};
 use crate::session::InferenceSession;
@@ -275,10 +275,8 @@ impl PropagateRequest {
     }
 }
 
-/// The model-id provenance recorded on a propagated embedding table. Short and
-/// fixed (the source embedding table is recorded separately in `derived_from`),
-/// so the generated table name stays a sane length.
-const PROPAGATE_MODEL_ID: &str = "graph_propagate";
+/// The kernel a propagation's descriptor names.
+const PROPAGATE_KERNEL_ID: &str = "graph_propagate";
 
 /// Refuse a teleport probability outside `[0, 1]` — `α·X⁽⁰⁾ + (1−α)·ÂX` is a
 /// convex mix, and a NaN would poison every row.
@@ -291,12 +289,6 @@ pub(crate) fn check_alpha(alpha: f64) -> Result<()> {
         )))
     }
 }
-
-/// The model-id provenance recorded on a propagation's adjacency snapshot.
-const ADJACENCY_MODEL_ID: &str = "graph_adjacency";
-
-/// The model-id provenance recorded on a hop's state.
-const STATE_MODEL_ID: &str = "graph_state";
 
 /// A relation a propagation wrote for its own reading — its adjacency
 /// snapshot, a hop's state — as the `building` table that holds it and the
@@ -365,7 +357,6 @@ pub(crate) struct PropagationShape<'a> {
 /// The table a propagation lands as, and the contract it is recorded under.
 pub(crate) struct PropagationTable<'a> {
     pub source_id: &'a str,
-    pub model_id: &'a str,
     pub derived_from: Option<&'a str>,
     pub key_column: Option<&'a str>,
     pub descriptor: &'a ProducingDescriptor,
@@ -467,7 +458,7 @@ impl InferenceSession {
         let descriptor = ProducingDescriptor::GraphPropagation {
             source_table: table.table_name.clone(),
             edge_source: request.edge_source.to_binding(),
-            kernel_id: PROPAGATE_MODEL_ID.to_string(),
+            kernel_id: PROPAGATE_KERNEL_ID.to_string(),
             direction: propagation_direction(request.direction),
             hops,
             alpha_bits: request.alpha.to_bits(),
@@ -507,7 +498,6 @@ impl InferenceSession {
                 FeatureSource::Table(Box::new(features)),
                 PropagationTable {
                     source_id: &request.source_id,
-                    model_id: PROPAGATE_MODEL_ID,
                     derived_from: Some(table.table_name.as_str()),
                     // Every output row is keyed by a `_row_id` read verbatim
                     // off the source table, so the output's keys came from
@@ -611,24 +601,22 @@ impl InferenceSession {
         self: &Arc<Self>,
         ctx: &QueryContext,
         source_id: &str,
-        model_id: &str,
         plan: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
         order: Option<Vec<datafusion::logical_expr::SortExpr>>,
     ) -> Result<WorkingTable> {
         let schema = plan.schema();
         let mut building = self
             .result_store()
-            .create_table(
+            .create_table(ResultTableOrigin {
                 source_id,
-                jammi_datafusion::ModelTask::TextEmbedding,
-                ResultTableKind::Working,
-                None,
-                model_id,
-                None,
-                None,
-                None,
-                None,
-            )
+                producer: Producer::Derivation { task: None },
+                kind: ResultTableKind::Working,
+                derived_from: None,
+                dimensions: None,
+                key_column: None,
+                text_columns: None,
+                job_attempt: None,
+            })
             .await?;
         self.result_store()
             .write_result_table(&mut building, SinkKind::Rows, plan, ctx.task_ctx())
@@ -656,14 +644,8 @@ impl InferenceSession {
             .create_physical_plan()
             .await
             .map_err(|e| JammiError::Other(format!("graph propagation: adjacency plan: {e}")))?;
-        self.write_working_table(
-            ctx,
-            source_id,
-            ADJACENCY_MODEL_ID,
-            plan,
-            Some(adjacency_order()),
-        )
-        .await
+        self.write_working_table(ctx, source_id, plan, Some(adjacency_order()))
+            .await
     }
 
     /// Run the hops over `snapshot` one stage at a time ([`hop_plan`]) —
@@ -695,7 +677,7 @@ impl InferenceSession {
         for block in 1..shape.hops {
             let state = hop_plan(ctx, input, &stage(Some(block))).await?;
             let written = self
-                .write_working_table(ctx, table.source_id, STATE_MODEL_ID, state, None)
+                .write_working_table(ctx, table.source_id, state, None)
                 .await?;
             if let Some(previous) = held.replace(written) {
                 previous.reclaim().await;
@@ -714,7 +696,6 @@ impl InferenceSession {
             Emit {
                 dimensions: shape.dimensions,
                 source_id: table.source_id,
-                model_id: table.model_id,
             },
         )?;
 
@@ -722,17 +703,18 @@ impl InferenceSession {
         // Drop (a best-effort `building -> failed` CAS).
         let mut building = self
             .result_store()
-            .create_table(
-                table.source_id,
-                jammi_datafusion::ModelTask::TextEmbedding,
-                ResultTableKind::Model,
-                table.derived_from,
-                table.model_id,
-                Some(out_dim as i32),
-                table.key_column,
-                None,
+            .create_table(ResultTableOrigin {
+                source_id: table.source_id,
+                producer: Producer::Derivation {
+                    task: Some(jammi_datafusion::ModelTask::TextEmbedding),
+                },
+                kind: ResultTableKind::Model,
+                derived_from: table.derived_from,
+                dimensions: Some(out_dim as i32),
+                key_column: table.key_column,
+                text_columns: None,
                 job_attempt,
-            )
+            })
             .await?;
         let embedding = &self.inner_config().embedding;
         let summary = self
@@ -756,7 +738,7 @@ impl InferenceSession {
             return Err(JammiError::Config(format!(
                 "{}: the graph has no node to embed — the edge relation and the node set it is \
                  read against share no key",
-                table.model_id
+                table.source_id
             )));
         }
         building
@@ -790,15 +772,7 @@ impl InferenceSession {
     ) -> Result<InputAnchor> {
         match edge_source {
             EdgeSourceRef::NeighborGraph { table_name } => {
-                let record = self
-                    .catalog()
-                    .get_result_table(table_name)
-                    .await?
-                    .ok_or_else(|| {
-                        JammiError::Catalog(format!(
-                            "propagate: edge relation '{table_name}' not found in the catalog"
-                        ))
-                    })?;
+                let record = self.catalog().require_result_table(table_name).await?;
                 Ok(self
                     .result_store()
                     .pin_current_version(record)

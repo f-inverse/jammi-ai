@@ -83,7 +83,7 @@ async fn generate_embeddings_produces_complete_result() {
 
     // Metadata tracked
     assert_eq!(record.source_id, "patents");
-    assert_eq!(record.task, ModelTask::TextEmbedding);
+    assert_eq!(record.producer.task(), Some(ModelTask::TextEmbedding));
     assert!(record.key_column.as_deref() == Some("id"));
     assert!(record.text_columns.as_deref() == Some("abstract"));
 

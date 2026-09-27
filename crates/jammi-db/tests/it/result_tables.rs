@@ -15,7 +15,7 @@ use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::SubmitJobParams;
 use jammi_db::catalog::lease_keeper::LeaseTarget;
 use jammi_db::catalog::result_repo::{
-    CreateResultTableParams, JobAttempt, ResultTableCas, ResultTableKind,
+    CreateResultTableParams, JobAttempt, Producer, ResultTableCas, ResultTableKind,
 };
 use jammi_db::catalog::status::{JobExecution, JobStatus};
 use jammi_db::catalog::Catalog;
@@ -47,8 +47,10 @@ fn building_row<'a>(
     CreateResultTableParams {
         table_name: table,
         source_id: "src",
-        model_id: BASE_MODEL_ID,
-        task: ModelTask::TextEmbedding,
+        producer: Producer::Model {
+            model_id: BASE_MODEL_ID.to_string(),
+            task: ModelTask::TextEmbedding,
+        },
         kind: ResultTableKind::Model,
         derived_from: None,
         parquet_path: "file:///tmp/rt.parquet",

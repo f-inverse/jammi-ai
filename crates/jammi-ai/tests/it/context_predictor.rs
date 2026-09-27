@@ -456,7 +456,7 @@ async fn session_with_origin_keyed_propagated_table(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
                 source_id: "papers",
-                model_id: "synthetic-embed",
+                model_id: Some("synthetic-embed"),
                 derived_from: None,
                 dimensions: FEATURE_DIM,
                 key_column: Some("paper_id"),

@@ -142,21 +142,20 @@ When a paper is withdrawn, two things change: the papers it cited each lose one
 citation (`UPDATE`), and its own feature row goes (`DELETE`). We withdraw the
 test-era paper that cites the most others.
 
-An `UPDATE` or `DELETE` chooses its rows by a predicate over the table's own
-columns; the engine refuses one that reaches into another relation (a subquery
-or a join), because it could not honour it. So we first read the keys the
-withdrawal touches, then name them.
+An `UPDATE` or `DELETE` chooses its rows with any predicate a query could use,
+including a subquery over another relation: the statement's own plan selects
+the rows, and the table rewrites exactly those, in one transaction. The papers
+the withdrawn one cited are a subquery over the citation graph.
 
 ```{python}
 withdrawn = db.sql(
     f"SELECT c.src FROM {CITES} c JOIN {PAPERS} p ON c.src = p.paper_id "
     f"WHERE p.year >= {TEST_ERA} GROUP BY c.src ORDER BY COUNT(*) DESC, c.src LIMIT 1"
 ).column("src")[0].as_py()
-cited = db.sql(f"SELECT DISTINCT dst FROM {CITES} WHERE src = '{withdrawn}'").column("dst")
-keys = ", ".join(f"'{k}'" for k in cited.to_pylist())
 
 decremented = count(
-    f"UPDATE {FEATURES} SET in_degree = in_degree - 1 WHERE paper_id IN ({keys})"
+    f"UPDATE {FEATURES} SET in_degree = in_degree - 1 "
+    f"WHERE paper_id IN (SELECT dst FROM {CITES} WHERE src = '{withdrawn}')"
 )
 deleted = count(f"DELETE FROM {FEATURES} WHERE paper_id = '{withdrawn}'")
 survivors = f"c.src <> '{withdrawn}' AND c.dst <> '{withdrawn}'"

@@ -163,6 +163,109 @@ pub fn search_unit(
     }
 }
 
+/// One segment as a search of a table's version reads it: its index, the
+/// version its rows were produced at, and the mask of the version being
+/// served. A hit `K` is live unless the mask hides it at this segment's
+/// version (`mask[K] >= version`).
+///
+/// The one per-segment unit every search runs — in process, as a placed
+/// coordinator's local source, as a segment owner, and at the ladder's local
+/// load — so each serves the same rows at the same widths.
+pub struct ServedIndex<'a> {
+    id: SegmentId,
+    version: i64,
+    index: &'a SidecarIndex,
+    mask: &'a DeletionMask,
+    /// `|{K : mask[K] >= version ∧ index contains K}|` — how many of this
+    /// segment's rows the mask hides, which sizes the widened fetch.
+    dead: usize,
+}
+
+impl<'a> ServedIndex<'a> {
+    /// `index`, segment `id` produced at `version`, read under `mask`.
+    pub fn new(
+        id: SegmentId,
+        version: i64,
+        index: &'a SidecarIndex,
+        mask: &'a DeletionMask,
+    ) -> Self {
+        let dead = hidden_rows(mask, version, index);
+        Self {
+            id,
+            version,
+            index,
+            mask,
+            dead,
+        }
+    }
+
+    /// The segment's live hits toward a global top-`target`, starting from
+    /// `base_width`: its own search, every hit the mask hides dropped. While
+    /// the segment hides rows, the width is scaled by `1 / (1 - dead / len)`
+    /// (capped at the segment's length) and doubled until `target` live hits
+    /// survive or the whole segment has been asked for; a segment hiding
+    /// nothing is searched exactly once at `base_width`. A
+    /// [`SegmentSearchPhase::Final`] phase on a precision that
+    /// [`needs_rescore`](StoragePrecision::needs_rescore) rescores the live
+    /// hits through `exact`.
+    pub fn live_hits(
+        &self,
+        query: &ValidatedQuery,
+        base_width: usize,
+        target: usize,
+        phase: SegmentSearchPhase,
+        exact: &ExactLookup<'_>,
+    ) -> Result<Vec<(String, f32)>> {
+        let len = self.index.len();
+        let mut width = if self.dead > 0 && len > self.dead {
+            let live_fraction = 1.0 - (self.dead as f32 / len as f32);
+            let scaled = (base_width as f32 / live_fraction).ceil() as usize;
+            scaled.max(base_width).min(len)
+        } else if self.dead > 0 {
+            len
+        } else {
+            base_width
+        };
+        let live = loop {
+            // The candidate phase, never rescored here: the width guard and
+            // the admissibility check apply, and these raw distances are the
+            // merge's sort key.
+            let live: Vec<(String, f32)> = search_unit(
+                self.id,
+                self.index,
+                query,
+                width,
+                SegmentSearchPhase::Approximate,
+                exact,
+            )?
+            .into_iter()
+            .filter(|(key, _)| !self.mask.is_masked(key, self.version))
+            .collect();
+            if self.dead == 0 || live.len() >= target || width >= len {
+                break live;
+            }
+            width = (width * 2).min(len);
+        };
+        if phase == SegmentSearchPhase::Final && self.index.storage_precision().needs_rescore() {
+            rescore(self.id, live, exact, query)
+        } else {
+            Ok(live)
+        }
+    }
+
+    /// Whether the mask hides `key` in this segment.
+    pub fn hides(&self, key: &str) -> bool {
+        self.mask.is_masked(key, self.version)
+    }
+}
+
+/// How many of `index`'s rows `mask` hides at `version`.
+fn hidden_rows(mask: &DeletionMask, version: i64, index: &SidecarIndex) -> usize {
+    mask.entries()
+        .filter(|(key, horizon)| *horizon >= version && index.contains(key))
+        .count()
+}
+
 /// Every distance a LOCAL kernel produces must be admissible
 /// ([`distance_is_admissible`]). A violation here is a broken index — a
 /// non-finite component in a stored vector, or a backend that stopped
@@ -317,7 +420,7 @@ impl SegmentedIndex {
             JammiError::Other("SegmentedIndex requires at least one segment".into())
         })?;
         let storage_precision = first.storage_precision();
-        let dead = Self::count_dead(&mask, first_version, &first);
+        let dead = hidden_rows(&mask, first_version, &first);
         let mut out = vec![Segment {
             id: first_id,
             version: first_version,
@@ -334,7 +437,7 @@ impl SegmentedIndex {
                     storage_precision
                 )));
             }
-            let dead = Self::count_dead(&mask, version, &index);
+            let dead = hidden_rows(&mask, version, &index);
             out.push(Segment {
                 id,
                 version,
@@ -347,12 +450,6 @@ impl SegmentedIndex {
             storage_precision,
             mask,
         })
-    }
-
-    fn count_dead(mask: &DeletionMask, version: i64, index: &SidecarIndex) -> usize {
-        mask.entries()
-            .filter(|(k, h)| *h >= version && index.contains(k))
-            .count()
     }
 
     /// The precision every segment in this set was built and loaded at.
@@ -393,52 +490,32 @@ impl SegmentedIndex {
     }
 
     /// Per segment: the live candidates for a global top-`m` — the segment's
-    /// own search at the over-fetch width, masked; when the segment has dead
-    /// rows the width is scaled by `1 / (1 - dead / len)`, capped at the
-    /// segment's length, and doubled until `m` live hits survive or the whole
-    /// segment has been asked for. A segment with no dead rows is searched
-    /// exactly once at today's width.
+    /// [`ServedIndex::live_hits`] from the over-fetch width, each carrying the
+    /// segment that owns it.
     fn live_candidates(
         &self,
         seg: &Segment,
         query: &ValidatedQuery,
         m: usize,
     ) -> Result<Vec<(String, f32, SegmentId)>> {
-        let len = seg.index.len();
-        let base = over_fetch(m, self.segments.len());
-        let mut w = if seg.dead > 0 && len > seg.dead {
-            let live_fraction = 1.0 - (seg.dead as f32 / len as f32);
-            let scaled = (base as f32 / live_fraction).ceil() as usize;
-            scaled.max(base).min(len)
-        } else if seg.dead > 0 {
-            len
-        } else {
-            base
+        let served = ServedIndex {
+            id: seg.id,
+            version: seg.version,
+            index: &seg.index,
+            mask: &self.mask,
+            dead: seg.dead,
         };
-        loop {
-            // Through `search_unit` at the CANDIDATE phase (never rescored
-            // here — today's behaviour exactly), so the width guard and the
-            // admissibility check apply to the masked/versioned path too:
-            // these raw per-segment distances are the merge's sort key, and
-            // for `F32` they are also the final answer.
-            let hits = search_unit(
-                seg.id,
-                &seg.index,
+        Ok(served
+            .live_hits(
                 query,
-                w,
+                over_fetch(m, self.segments.len()),
+                m,
                 SegmentSearchPhase::Approximate,
                 &|row_id| seg.index.get_exact(row_id),
-            )?;
-            let live: Vec<(String, f32, SegmentId)> = hits
-                .into_iter()
-                .filter(|(k, _)| !self.mask.is_masked(k, seg.version))
-                .map(|(k, d)| (k, d, seg.id))
-                .collect();
-            if seg.dead == 0 || live.len() >= m || w >= len {
-                return Ok(live);
-            }
-            w = (w * 2).min(len);
-        }
+            )?
+            .into_iter()
+            .map(|(key, distance)| (key, distance, seg.id))
+            .collect())
     }
 
     /// The RAW candidate merge primitive: search each segment (masked), order

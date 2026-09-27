@@ -9,6 +9,7 @@
 //! bipartite graph and a declared isolated node for the operator's
 //! invariants.
 
+use jammi_datafusion::ModelTask;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_ai::SearchMethod;
 use jammi_db::catalog::result_repo::ResultTableRecord;
 use jammi_db::config::JammiConfig;
-use jammi_db::error::JammiError;
+use jammi_db::error::{JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
 
@@ -431,7 +432,13 @@ async fn search_by_row_key_ranks_the_node_s_community_and_hydrates_its_source() 
     let (session, _dir) = graph_session(&edges, &community, 2).await;
     let table = encode(&session, &request()).await;
     assert_eq!(table.key_column.as_deref(), Some("account"));
-    assert_eq!(table.model_id, "graph_structure");
+    assert_eq!(
+        table.producer,
+        Producer::Derivation {
+            task: Some(ModelTask::TextEmbedding)
+        },
+        "a structure encoding runs no model; its rows are text embeddings"
+    );
 
     let batches = session
         .search_by_id(
@@ -550,7 +557,7 @@ async fn invalid_requests_are_typed_refusals() {
     ))
     .await;
     assert!(
-        matches!(err, JammiError::SourceNotFound { .. }),
+        matches!(err, JammiError::NotFound(Missing::Source { .. })),
         "an unknown edge source: {err}"
     );
 }
@@ -574,7 +581,7 @@ async fn an_empty_graph_is_a_typed_refusal() {
 // ─── The adjacency snapshot ──────────────────────────────────────────────────
 
 use jammi_ai::jobs::compute_test_hooks::{self, ParkPoint};
-use jammi_db::catalog::result_repo::{ResultTableCas, ResultTableKind};
+use jammi_db::catalog::result_repo::{Producer, ResultTableCas, ResultTableKind};
 use jammi_db::catalog::status::ResultTableStatus;
 
 /// Register the session's `edges.parquet` again under `source` — a name one

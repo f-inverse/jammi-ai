@@ -15,7 +15,7 @@ use datafusion::prelude::SessionContext;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::{
-    CreateResultTableParams, ResultTableCas, ResultTableKind, ResultTableRecord,
+    CreateResultTableParams, Producer, ResultTableCas, ResultTableKind, ResultTableRecord,
 };
 use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::config::StoragePrecision;
@@ -279,8 +279,10 @@ async fn building_row(
         .create_result_table(CreateResultTableParams {
             table_name,
             source_id: "docs",
-            model_id: "statement",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "statement".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Statement,
             derived_from: None,
             parquet_path: &parquet_path,
@@ -374,8 +376,10 @@ async fn a_replacement_abandoned_before_its_swap_is_reaped_and_the_table_stays(
         .create_result_table(CreateResultTableParams {
             table_name: &staging,
             source_id: "docs",
-            model_id: "statement",
-            task: ModelTask::TextEmbedding,
+            producer: Producer::Model {
+                model_id: "statement".to_string(),
+                task: ModelTask::TextEmbedding,
+            },
             kind: ResultTableKind::Statement,
             derived_from: None,
             parquet_path: staging_url.as_str(),

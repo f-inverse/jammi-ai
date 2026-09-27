@@ -67,6 +67,41 @@ A `DELETE` with no `WHERE` clause empties the table. Row-level cascades
 are the backend's job (the foreign-key declarations on the storage
 table); the engine does not model cascades above the backend.
 
+## Choose rows with a subquery or a join
+
+The predicate of an `UPDATE` or `DELETE` is any predicate a query could
+use, including a subquery over another relation, and an `UPDATE … FROM`
+takes its new values from a join. Here a `discontinued` table lists the
+items to retire, and a `price_changes` table carries each item's new tier:
+
+```sql
+DELETE FROM mutable.public.item_dimensions
+ WHERE item_id IN (SELECT item_id FROM mutable.public.discontinued);
+```
+
+```sql
+UPDATE mutable.public.item_dimensions AS d
+   SET price_tier = c.new_tier
+  FROM mutable.public.price_changes AS c
+ WHERE d.item_id = c.item_id AND d.valid_to IS NULL;
+```
+
+The statement's own plan selects the rows — with whatever it joins or
+filters — and the table rewrites exactly those, in one transaction.
+`count` is the number of rows rewritten. When a join matches one row
+several times, the matches must agree on its new value; if they disagree
+the `UPDATE` is refused (`MutableTableError::AmbiguousUpdate`, naming the
+row's key) and nothing is written.
+
+## Concurrent writers
+
+A statement reads the rows it selects before its write transaction opens.
+The transaction checks that each of those rows is still as it was read; if
+another writer changed or removed one in between, the statement fails
+with `MutableTableError::WriteConflict` (gRPC `ABORTED`), writes nothing,
+and leaves the other writer's change in place. Re-run the statement: it
+selects against the rows as they are now.
+
 ## Tenancy
 
 A session bound to a tenant reads its own rows and the global

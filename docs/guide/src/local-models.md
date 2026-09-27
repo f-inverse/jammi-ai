@@ -115,7 +115,14 @@ hub_endpoint = "https://huggingface.co"
 hub_cache_dir = "/var/cache/jammi"
 hub_token = { file = "/run/secrets/hf-token" }
 offline = false
+hub_idle_timeout_secs = 60
 ```
+
+A download that goes `hub_idle_timeout_secs` without a byte fails as the
+retryable `Unavailable` naming the repo and the file; one that keeps arriving
+is never cut off, however large. Files land in the standard Hugging Face
+cache layout, so a cache `huggingface_hub` populated is a hit here, and the
+reverse.
 
 Every field is also settable through the standard `JAMMI_MODELS__HUB_*` /
 `JAMMI_MODELS__OFFLINE` env-override layer (e.g. `JAMMI_MODELS__HUB_CACHE_DIR`,

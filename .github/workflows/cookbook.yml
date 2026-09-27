@@ -49,11 +49,12 @@ jobs:
           build-server: "true"
 
       # The recipes resolve their fixtures through the `jammi_cookbook`
-      # package, as a fresh install (a Colab runtime) does.
+      # package, as a fresh install (a Colab runtime) does; the `cloud` extra
+      # is the local S3-compatible server the cloud-storage recipe reads.
       - name: Install the cookbook package
         run: |
           . .venv/bin/activate
-          pip install -e cookbook/book
+          pip install -e 'cookbook/book[cloud]'
 
       - name: Run every recipe
         run: |

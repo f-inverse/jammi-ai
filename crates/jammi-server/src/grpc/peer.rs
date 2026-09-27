@@ -8,21 +8,27 @@
 //! The owner is deliberately tenant-free (invariant I-PEER): the request
 //! carries no tenant, and this handler reads no `result_tables` row. Tenant
 //! scope was enforced by the COORDINATOR, which resolved the table through its
-//! own tenant-scoped catalog read before fanning out. What the owner enforces,
+//! own tenant-scoped catalog read before fanning out. A `SegmentSearch` and
+//! an `ExactRescore` both name the table version the coordinator pinned; the
+//! owner resolves that version's segment set (and, for a search, its
+//! deletion mask) from the table name alone
+//! ([`jammi_db::store::ResultStore::served_segments`]), so it serves exactly
+//! the rows the coordinator's version does. What the owner enforces,
 //! at its input edge, splits on WHOSE fault a refusal is — never on how it
 //! looks at a glance:
 //!
 //! - Genuine REQUEST malformation is `INVALID_ARGUMENT`, TERMINAL at the
 //!   coordinator (never a ladder rung): an empty or duplicated segment id in
 //!   the requested set, a duplicated `ExactRescore` row id, a query component
-//!   that is not finite, a `width` that does not fit `usize`, and a
+//!   that is not finite, a `width` or `target` that does not fit `usize`, a
+//!   `target` of `0`, and a
 //!   precision/phase enum whose raw value is `0` (`UNSPECIFIED` — explicitly
 //!   not set).
 //! - A disagreement about the OWNER's OWN DATA — never the coordinator's
 //!   fault — is `FAILED_PRECONDITION`, which LADDERS (a retry, then a local
-//!   load): a requested segment id absent from this owner's own segment list
-//!   (its `list_index_segments` read can race a concurrent
-//!   `purge_segments`/append); the bundle's stamped precision not matching
+//!   load): a requested segment id absent from the set this owner resolves
+//!   for the named version (its catalog read can race a concurrent
+//!   `purge_segments`/append), or a version this owner cannot resolve; the bundle's stamped precision not matching
 //!   the requested one (the segment cache's strict load); the query's width
 //!   not matching a loaded segment's own width (see "The wire query" below);
 //!   an `ExactRescore` row id this owner's segment does not index
@@ -45,9 +51,10 @@
 //! any later one — is this owner's segment drifting from that authority:
 //! own-data, `FAILED_PRECONDITION`, never the caller's fault.
 //!
-//! It then runs the same pure kernels a single node runs
-//! ([`jammi_db::index::segment::search_unit`] / [`rescore`]) per segment and
-//! returns `(row_id, distance)` units — ids and distances, never vectors. A
+//! It then runs the same per-segment unit a single node runs
+//! ([`jammi_db::index::segment::ServedIndex::live_hits`] — the served
+//! version's masked search — and [`rescore`]) per segment and returns
+//! `(row_id, distance)` units — ids and distances, never vectors. A
 //! torn bundle (a candidate with no exact vector) is `DATA_LOSS`.
 //!
 //! Segments are loaded per RPC exactly as a coordinator loads per query —
@@ -58,15 +65,15 @@
 use std::sync::Arc;
 
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::config::StoragePrecision;
 use jammi_db::error::JammiError;
-use jammi_db::index::segment::{rescore, search_unit};
+use jammi_db::index::segment::{rescore, ServedIndex};
 use jammi_db::index::sidecar::SidecarIndex;
 use jammi_db::index::{
     FiniteQuery, QuerySource, QueryValidationError, SegmentId, SegmentSearchPhase, ValidatedQuery,
 };
 use jammi_db::storage::StorageUrl;
+use jammi_db::store::deletes::DeletionMask;
 use jammi_db::store::ResultStore;
 use jammi_wire::peer::{phase_from_proto, precision_from_proto, ProtoEnumDecode};
 use tonic::{Request, Response, Status};
@@ -89,18 +96,35 @@ impl PeerServer {
         Self { session }
     }
 
-    /// The catalog's segment list for `table_name` — the set every requested
-    /// id must be a member of. No tenant filter: see the module docs (I-PEER).
-    async fn segments_of(
+    /// The segments `version` of `table_name` serves and their mask — the
+    /// set every `SegmentSearch` and `ExactRescore` segment id must be a
+    /// member of. No tenant filter: see the module docs (I-PEER). A version
+    /// this owner cannot resolve is own-data (`FAILED_PRECONDITION`, ladders).
+    async fn served_of(
         &self,
         store: &ResultStore,
         table_name: &str,
-    ) -> Result<Vec<IndexSegment>, Status> {
-        store
-            .catalog()
-            .list_index_segments(table_name)
+        version: Option<i64>,
+    ) -> Result<(Vec<OwnedSegment>, std::sync::Arc<DeletionMask>), Status> {
+        let served = store
+            .served_segments(table_name, version)
             .await
-            .map_err(map_engine_error)
+            .map_err(|e| match e {
+                JammiError::VersionUnavailable { .. } => {
+                    Status::failed_precondition(format!("table '{table_name}': {e}"))
+                }
+                other => map_engine_error(other),
+            })?;
+        let segments = served
+            .segments
+            .into_iter()
+            .map(|seg| OwnedSegment {
+                id: seg.segment_id.0,
+                version: seg.version,
+                index_url: seg.index_url,
+            })
+            .collect();
+        Ok((segments, served.mask))
     }
 
     /// Load segment `id` of `table_name` through the segment cache at the
@@ -110,19 +134,17 @@ impl PeerServer {
     async fn load(
         store: &ResultStore,
         table_name: &str,
-        segment: &IndexSegment,
+        segment: &OwnedSegment,
         precision: StoragePrecision,
     ) -> Result<SidecarIndex, Status> {
-        let url = StorageUrl::parse(&segment.index_path)
-            .map_err(|e| map_engine_error(JammiError::from(e)))?;
         store
             .segment_cache()
-            .load_segment(&url, store.ann_config(), precision)
+            .load_segment(&segment.index_url, store.ann_config(), precision)
             .await
             .map_err(|e| match e {
                 JammiError::IncompatibleFormat { .. } => Status::failed_precondition(format!(
                     "segment {}/{}: {e}",
-                    table_name, segment.segment_id
+                    table_name, segment.id
                 )),
                 other => map_engine_error(other),
             })
@@ -136,7 +158,7 @@ impl PeerServer {
     async fn over_segments<P, T>(
         store: &ResultStore,
         table_name: &str,
-        segments: &[IndexSegment],
+        segments: &[OwnedSegment],
         precision: StoragePrecision,
         query: FiniteQuery,
         requested: Vec<(i64, P)>,
@@ -171,6 +193,14 @@ impl PeerServer {
     }
 }
 
+/// A segment this owner serves: its id, the version its rows were produced
+/// at, and its bundle.
+struct OwnedSegment {
+    id: i64,
+    version: i64,
+    index_url: StorageUrl,
+}
+
 /// A request that names no segment — request malformation,
 /// `INVALID_ARGUMENT`.
 fn none_named(table_name: &str) -> Status {
@@ -179,15 +209,15 @@ fn none_named(table_name: &str) -> Status {
 
 /// Every requested id must be named once and at least one must be named
 /// (request malformation, `INVALID_ARGUMENT`); each named id must ALSO be in
-/// this owner's own segment list — own-data, `FAILED_PRECONDITION`, since the
-/// owner's `list_index_segments` read can race a concurrent
-/// `purge_segments`/append and disagree with the coordinator's. The first
+/// the set the pinned version serves at this owner — own-data,
+/// `FAILED_PRECONDITION`, since the owner's read of that set can race a
+/// concurrent `purge_segments`/append and disagree with the coordinator's. The first
 /// violation refuses the WHOLE request (a unit-less or partial answer would
 /// be a silent shrink at the coordinator).
 fn verify_membership(
     table_name: &str,
     requested: &[i64],
-    segments: &[IndexSegment],
+    segments: &[OwnedSegment],
 ) -> Result<(), Status> {
     if requested.is_empty() {
         return Err(none_named(table_name));
@@ -199,7 +229,7 @@ fn verify_membership(
                 "segment {id} of table '{table_name}' is named more than once"
             )));
         }
-        if !segments.iter().any(|s| s.segment_id == *id) {
+        if !segments.iter().any(|s| s.id == *id) {
             return Err(Status::failed_precondition(format!(
                 "segment {id} is not a segment of table '{table_name}'"
             )));
@@ -298,10 +328,10 @@ fn verify_row_ids(
 /// [`verify_membership`]'s — never a panic.
 fn segment<'a>(
     table_name: &str,
-    segments: &'a [IndexSegment],
+    segments: &'a [OwnedSegment],
     id: i64,
-) -> Result<&'a IndexSegment, Status> {
-    segments.iter().find(|s| s.segment_id == id).ok_or_else(|| {
+) -> Result<&'a OwnedSegment, Status> {
+    segments.iter().find(|s| s.id == id).ok_or_else(|| {
         Status::failed_precondition(format!(
             "segment {id} is not a segment of table '{table_name}'"
         ))
@@ -367,9 +397,14 @@ impl PeerService for PeerServer {
         let phase = decode_phase(req.phase)?;
         let width = usize::try_from(req.width)
             .map_err(|_| Status::invalid_argument("width does not fit usize"))?;
+        let target = match usize::try_from(req.target) {
+            Ok(0) => return Err(Status::invalid_argument("target is zero")),
+            Ok(target) => target,
+            Err(_) => return Err(Status::invalid_argument("target does not fit usize")),
+        };
         let finite = finite_query(req.query)?;
         let store = self.session.result_store();
-        let segments = self.segments_of(&store, &req.table_name).await?;
+        let (segments, mask) = self.served_of(&store, &req.table_name, req.version).await?;
         verify_membership(&req.table_name, &req.segment_ids, &segments)?;
         let table_name = req.table_name.as_str();
         let requested = req.segment_ids.iter().map(|id| (*id, ())).collect();
@@ -381,14 +416,16 @@ impl PeerService for PeerServer {
             finite,
             requested,
             |id, (), index, query| {
-                search_unit(SegmentId(id), index, query, width, phase, &|row_id| {
-                    index.get_exact(row_id)
-                })
-                .map(|unit| SegmentUnit {
-                    segment_id: id,
-                    hits: hits(unit),
-                })
-                .map_err(|e| torn(table_name, id, e))
+                let version = segment(table_name, &segments, id)?.version;
+                ServedIndex::new(SegmentId(id), version, index, &mask)
+                    .live_hits(query, width, target, phase, &|row_id| {
+                        index.get_exact(row_id)
+                    })
+                    .map(|unit| SegmentUnit {
+                        segment_id: id,
+                        hits: hits(unit),
+                    })
+                    .map_err(|e| torn(table_name, id, e))
             },
         )
         .await?;
@@ -404,7 +441,12 @@ impl PeerService for PeerServer {
         let precision = decode_precision(req.storage_precision)?;
         let finite = finite_query(req.query)?;
         let store = self.session.result_store();
-        let segments = self.segments_of(&store, &req.table_name).await?;
+        // The candidates came from phase 1's masked search; a rescore needs
+        // only the set they must belong to.
+        let segments = self
+            .served_of(&store, &req.table_name, req.version)
+            .await?
+            .0;
         let requested: Vec<i64> = req
             .row_ids_by_segment
             .iter()

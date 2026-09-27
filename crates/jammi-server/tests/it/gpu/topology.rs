@@ -82,7 +82,9 @@ async fn host(
 ) -> Arc<InferenceSession> {
     let mut cfg = fleet.host_config(dir.path(), LEASE, HEARTBEAT, RANK_TIMEOUT_SECS);
     configure(&mut cfg);
-    let session = Arc::new(InferenceSession::new(cfg).await.expect("host"));
+    // Boxed: an engine, a submission and a claimed run are each a large
+    // future, and the test's root future lives on its thread's stack.
+    let session = Arc::new(Box::pin(InferenceSession::new(cfg)).await.expect("host"));
     if dials_members {
         assert!(session
             .host_admission()
@@ -109,7 +111,9 @@ async fn add_pairs(session: &Arc<InferenceSession>, fleet: &Fleet) {
 /// Submit `spec` on `session`, claim it as `session`'s worker, run it to its
 /// end, and read back what it left.
 async fn train(session: &Arc<InferenceSession>, spec: TrainingSpec) -> Trained {
-    let job = session.run_training_spec(spec).await.expect("submit");
+    let job = Box::pin(session.run_training_spec(spec))
+        .await
+        .expect("submit");
     let worker = JobWorker::new(session).expect("worker");
     let record = claim_within(
         session,
@@ -119,7 +123,7 @@ async fn train(session: &Arc<InferenceSession>, spec: TrainingSpec) -> Trained {
         Duration::from_secs(60),
     )
     .await;
-    worker.run_claimed_job(session, record).await;
+    Box::pin(worker.run_claimed_job(session, record)).await;
     let record = session.catalog().get_job(&job.job_id).await.expect("row");
     assert_eq!(
         record.status, "completed",
@@ -135,6 +139,7 @@ async fn train(session: &Arc<InferenceSession>, spec: TrainingSpec) -> Trained {
     else {
         panic!("a fine-tune's result is a model with metrics");
     };
+    let metrics: serde_json::Value = serde_json::from_str(&metrics).expect("metrics json");
     let loss_curve = metrics["train_loss_curve"]
         .as_array()
         .expect("a loss curve")
@@ -150,8 +155,39 @@ async fn train(session: &Arc<InferenceSession>, spec: TrainingSpec) -> Trained {
     }
 }
 
+/// The two-rank job (`two_rank_spec`) at `per_rank_batch` rows per rank.
+fn two_rank_spec_at(per_rank_batch: usize) -> TrainingSpec {
+    let TrainingSpec::FineTune {
+        source,
+        columns,
+        method,
+        task,
+        mut common,
+    } = two_rank_spec()
+    else {
+        unreachable!("two_rank_spec is a fine-tune")
+    };
+    common.config.batch_size = per_rank_batch;
+    TrainingSpec::FineTune {
+        source,
+        columns,
+        method,
+        task,
+        common,
+    }
+}
+
 /// The two-rank job at `topology` under `collective`.
 async fn two_ranks(topology: Topology, collective: CollectiveSelection) -> Trained {
+    two_ranks_at(topology, collective, 2).await
+}
+
+/// [`two_ranks`] at `per_rank_batch` rows per rank.
+async fn two_ranks_at(
+    topology: Topology,
+    collective: CollectiveSelection,
+    per_rank_batch: usize,
+) -> Trained {
     let fleet = Fleet::new();
     let dir = TempDir::new().expect("host dir");
     match topology {
@@ -164,7 +200,7 @@ async fn two_ranks(topology: Topology, collective: CollectiveSelection) -> Train
             })
             .await;
             add_pairs(&session, &fleet).await;
-            train(&session, two_rank_spec()).await
+            train(&session, two_rank_spec_at(per_rank_batch)).await
         }
         Topology::Fleet => {
             let coordinator = host(&fleet, &dir, true, |cfg| {
@@ -179,7 +215,7 @@ async fn two_ranks(topology: Topology, collective: CollectiveSelection) -> Train
                 cfg.worker.collective = collective;
             })
             .await;
-            let mut trained = train(&coordinator, two_rank_spec()).await;
+            let mut trained = train(&coordinator, two_rank_spec_at(per_rank_batch)).await;
             trained
                 .instances
                 .push(member.session.instance_id().to_string());
@@ -280,4 +316,17 @@ async fn an_nccl_gang_is_deterministic_and_trains_to_the_single_rank_loss() {
              {single} within {W2_VS_W1_LOSS_EPSILON}"
         );
     }
+}
+
+/// A remainder batch on device: eight rows at three per rank (a global batch
+/// of six) leave a last step of two rows — rank 0 takes both, rank 1 NONE.
+/// A zero-row rank is a normal case of the partition rule; on CUDA it must
+/// train, under either transport and either topology, to the same adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_remainder_step_with_a_zero_row_rank_trains_on_device() {
+    let in_process_inline = two_ranks_at(Topology::InProcess, CollectiveSelection::Cpu, 3).await;
+    let in_process_nccl = two_ranks_at(Topology::InProcess, CollectiveSelection::Nccl, 3).await;
+    let fleet_nccl = two_ranks_at(Topology::Fleet, CollectiveSelection::Nccl, 3).await;
+    assert!(in_process_nccl.adapter == in_process_inline.adapter);
+    assert!(fleet_nccl.adapter == in_process_inline.adapter);
 }

@@ -400,3 +400,25 @@ fn a_local_gang_refuses_mixed_transports_and_a_transport_count_that_is_not_the_w
         .expect_err("one transport per rank");
     assert!(error.to_string().contains("one per rank"));
 }
+
+/// A round where EVERY rank's tensors of a dtype are empty — the gather of a
+/// step no rank holds rows for — still hands every rank a tensor of its
+/// agreed shape, with the inline transport's bytes, and moves nothing.
+#[test]
+fn a_round_whose_tensors_are_all_empty_ends_like_the_inline_round() {
+    let program = |local: Local, call: BlockingCall| {
+        let empty = ramp(1, 4, local.rank() as f32, DType::F32)
+            .narrow(0, 0, 0)
+            .expect("empty");
+        let gathered = local.all_gather(&call, &empty, &[0, 0]).expect("gather");
+        bytes(&gathered)
+    };
+    let inline_result = run(inline(2), Duration::from_secs(30), program);
+    let exchanges = MemExchange::gang(2, &[Behaviour::Join; 2]);
+    let device_result = run(device(&exchanges), Duration::from_secs(30), program);
+    assert_eq!(inline_result, device_result);
+    assert_eq!(device_result[0].0, vec![0, 4]);
+    for exchange in &exchanges {
+        assert_eq!(exchange.calls(), 0, "an all-empty round moves no byte");
+    }
+}

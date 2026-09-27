@@ -365,10 +365,16 @@ impl CoordinatorLink {
 
     /// Send the gang's transport to the member — the first frame after
     /// `Admitted`, before round 0. `false` when the member's stream is gone.
-    pub fn bind(&self, bind: Bind) -> bool {
-        self.link.send(RankControl {
-            control: Some(rank_control::Control::Bind(bind)),
-        })
+    /// Async: the coordinator binds from its assembly, on the runtime, before
+    /// any round's blocking thread exists.
+    pub async fn bind(&self, bind: Bind) -> bool {
+        self.link
+            .outbound
+            .send(RankControl {
+                control: Some(rank_control::Control::Bind(bind)),
+            })
+            .await
+            .is_ok()
     }
 
     /// The member this link reaches.

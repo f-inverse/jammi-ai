@@ -6124,6 +6124,20 @@ pub fn member_offers_nccl(session: &InferenceSession) -> bool {
     }
 }
 
+/// Send `bind` on every admitted member's link; the first link whose member
+/// is gone is a typed refusal.
+async fn bind_all(links: &[CoordinatorLink], bind: Bind) -> std::result::Result<(), JammiError> {
+    for link in links {
+        if !link.bind(bind.clone()).await {
+            return Err(JammiError::FineTune(format!(
+                "rank {}'s stream ended before the gang's Bind reached it",
+                link.rank()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// A fleet member's side of its gang's transport: read the coordinator's
 /// `Bind` (the first frame after `Admitted`) and stand it up — nothing more
 /// for inline; for NCCL, join this rank of the communicator the coordinator
@@ -6177,29 +6191,26 @@ async fn bind_gang_transport(
         transport = ?kind,
         "gang transport selected"
     );
-    let bind_all = |bind: Bind| -> std::result::Result<(), JammiError> {
-        for link in links {
-            if !link.bind(bind.clone()) {
-                return Err(JammiError::FineTune(format!(
-                    "rank {}'s stream ended before the gang's Bind reached it",
-                    link.rank()
-                )));
-            }
-        }
-        Ok(())
-    };
     match kind {
         TransportKind::Inline => {
-            bind_all(Bind {
-                transport: Some(bind::Transport::Inline(InlineTransport {})),
-            })?;
+            bind_all(
+                links,
+                Bind {
+                    transport: Some(bind::Transport::Inline(InlineTransport {})),
+                },
+            )
+            .await?;
             Ok(Transport::Inline)
         }
         TransportKind::Nccl => {
             let id = transport::nccl::mint_id()?;
-            bind_all(Bind {
-                transport: Some(bind::Transport::Nccl(NcclTransport { id: id.clone() })),
-            })?;
+            bind_all(
+                links,
+                Bind {
+                    transport: Some(bind::Transport::Nccl(NcclTransport { id: id.clone() })),
+                },
+            )
+            .await?;
             let device = device.clone();
             tokio::task::spawn_blocking(move || {
                 transport::nccl::join(&device, 0, world, &id, rank_timeout)

@@ -312,6 +312,24 @@ pub(crate) fn exchange_contributions(
             .collect();
         let len = counts.iter().copied().max().unwrap_or(0);
         if len == 0 {
+            // Every rank's tensors of this dtype are empty: no byte moves,
+            // but every slot still holds a tensor of its agreed shape — a
+            // zero-element VIEW, since a device refuses a zero-length
+            // allocation or kernel launch.
+            let seed = Tensor::zeros(1, dtype, exchange.device())
+                .map_err(|e| JammiError::FineTune(format!("{verb}: an empty slot: {e}")))?;
+            for (peer, rank_shapes) in shapes.iter().enumerate() {
+                for (index, (dims, d)) in rank_shapes.iter().enumerate() {
+                    if *d != dtype {
+                        continue;
+                    }
+                    let empty = seed
+                        .narrow(0, 0, 0)
+                        .and_then(|t| t.reshape(dims.as_slice()))
+                        .map_err(|e| JammiError::FineTune(format!("{verb}: an empty slot: {e}")))?;
+                    per_rank[peer][index] = Some(empty);
+                }
+            }
             continue;
         }
         let packed = pack(

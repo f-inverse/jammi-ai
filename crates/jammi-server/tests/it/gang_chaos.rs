@@ -292,7 +292,7 @@ impl Member {
         );
         cfg.server.peer_advertise = Some(addr.to_string());
         configure(&mut cfg);
-        let session = Arc::new(InferenceSession::new(cfg).await.expect("member"));
+        let session = Arc::new(Box::pin(InferenceSession::new(cfg)).await.expect("member"));
         session
             .catalog()
             .upsert_worker(

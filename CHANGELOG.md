@@ -11,7 +11,7 @@ workspace ships every publishable crate at the same
   for every gang — in one process and across a fleet, where the coordinator binds it on every
   member (`Admitted.nccl`, `RankControl.bind`) before round 0 — and every transport folds in one
   rank order, so the trained adapter is the same bytes under either. NCCL communicators join
-  bounded and non-blocking, run on their own streams, abort on a fault, and are released by every
+  bounded, non-blocking and already connected, run on their own streams, abort on a fault, and are released by every
   rank together at a healthy end (`Collective::close`: finalize, then destroy).
 - **A worker lists the machine it runs on.** `ListWorkers`' `host` carries the process's host name
   (it was always empty), and a fleet gang's `gang transport selected` log line names its job.

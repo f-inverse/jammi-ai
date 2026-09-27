@@ -29,9 +29,18 @@
 //! `NCCL_CONFIG_INITIALIZER` and copies at most `size` bytes over it, so every
 //! later field keeps its default whatever layout this build's bindings carry.
 //! The single-process gang joins the same way — one group of such calls, one
-//! per device — so EVERY communicator is non-blocking: a later call never
-//! parks inside NCCL (a peer's absence, or a first collective's connection
-//! setup, is `ncclInProgress`), which is what lets an abort always land.
+//! per device — so EVERY communicator is non-blocking. NCCL defers the peers'
+//! connections to a communicator's first collective, and an enqueue that
+//! finds them pending WAITS for that setup inside NCCL, holding whatever lock
+//! guards the handle — where an abort could not land. So a join is not done
+//! until the communicator is connected: it runs one one-element gather, under
+//! the same deadline, while no other thread can see the handles yet. After
+//! it, an enqueue never waits on a connection, which is what lets an abort
+//! always land. Communicators made in one NCCL group share that group's
+//! job, and the next call on EACH of them completes it (`pthread_join`,
+//! unguarded): rank threads doing so at once double-join it. So the joining
+//! thread completes the shared job itself — one call per communicator, in
+//! turn — before any communicator reaches its rank's thread.
 //!
 //! **A collective runs on the communicator's own stream.** candle's device
 //! stream is CUDA's per-thread default stream, and a non-blocking
@@ -441,6 +450,7 @@ fn join(
 
     let comms: Vec<RawComm> = comms.into_iter().map(RawComm).collect();
     let begun = Instant::now();
+    let deadline_at = begun + deadline;
     for ((rank, _), comm) in ranks.iter().zip(&comms) {
         loop {
             match async_status(comm) {
@@ -466,6 +476,12 @@ fn join(
             }
         }
     }
+    if let Err(e) = connect(ranks, world, &streams, &comms, deadline_at) {
+        // Dropping the unconnected communicators aborts them; no other
+        // thread holds them.
+        drop(comms);
+        return Err(e);
+    }
     Ok(comms
         .into_iter()
         .zip(ranks.iter().zip(streams))
@@ -479,6 +495,107 @@ fn join(
             aborted: AtomicBool::new(false),
         })
         .collect())
+}
+
+/// Connect freshly joined communicators (the module doc's first fact): one
+/// grouped one-element gather on every communicator this process holds, its
+/// enqueue settled and its completion awaited by polling — both bounded by
+/// `deadline_at`, so a peer that never connects ends the join rather than
+/// parking it.
+fn connect(
+    ranks: &[(u32, &Device)],
+    world: u32,
+    streams: &[(Arc<CudaStream>, Arc<CudaStream>)],
+    comms: &[RawComm],
+    deadline_at: Instant,
+) -> Result<()> {
+    let refuse = |what: &str| {
+        JammiError::Gpu(format!(
+            "an NCCL communicator of {world} did not {what} before the join deadline — a peer \
+             never connected"
+        ))
+    };
+    let mut buffers = streams
+        .iter()
+        .map(|(_, collective)| {
+            Ok((
+                collective.alloc_zeros::<f32>(1)?,
+                collective.alloc_zeros::<f32>(world as usize)?,
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, candle_core::cuda::cudarc::driver::DriverError>>()
+        .map_err(|e| JammiError::Gpu(format!("the connecting gather's buffers: {e}")))?;
+
+    group_status(result::group_start())?;
+    for (((rank, _), (_, collective)), (comm, (send, recv))) in ranks
+        .iter()
+        .zip(streams)
+        .zip(comms.iter().zip(buffers.iter_mut()))
+    {
+        collective
+            .context()
+            .bind_to_thread()
+            .map_err(|e| JammiError::Gpu(format!("connect: bind device: {e}")))?;
+        let (src, _src_record) = send.device_ptr(collective);
+        let (dst, _dst_record) = recv.device_ptr_mut(collective);
+        // SAFETY: `src` holds one f32 and `dst` `world` of them on this
+        // rank's device; the handle is live and unshared; the stream is the
+        // one both buffers are ordered on.
+        let enqueued = unsafe {
+            result::all_gather(
+                src as _,
+                dst as _,
+                1,
+                <f32 as NcclType>::as_nccl_type(),
+                comm.0,
+                collective.cu_stream() as _,
+            )
+        };
+        match enqueued {
+            Ok(_) => {}
+            Err(e) if e.0 == sys::ncclResult_t::ncclInProgress => {}
+            Err(e) => {
+                return Err(JammiError::Gpu(format!(
+                    "connect: rank {rank}: nccl status {:?}",
+                    e.0
+                )))
+            }
+        }
+    }
+    group_status(result::group_end())?;
+
+    for comm in comms {
+        loop {
+            match async_status(comm) {
+                sys::ncclResult_t::ncclSuccess => break,
+                sys::ncclResult_t::ncclInProgress if Instant::now() < deadline_at => {
+                    std::thread::sleep(POLL_INTERVAL)
+                }
+                sys::ncclResult_t::ncclInProgress => return Err(refuse("connect")),
+                other => return Err(JammiError::Gpu(format!("connect: nccl status {other:?}"))),
+            }
+        }
+    }
+    // The grouped gather's shared job, completed here, in turn, so no two
+    // rank threads ever complete it at once (the module doc's first fact).
+    for comm in comms {
+        // SAFETY: a live, unshared handle; `ncclCommCount` only reads it,
+        // completing its linked group job first.
+        unsafe { result::comm_count(comm.0) }
+            .map_err(|e| nccl_error("connect: complete the group's job", e))?;
+    }
+    for (_, collective) in streams {
+        let done = collective
+            .record_event(None)
+            .map_err(|e| JammiError::Gpu(format!("connect: record: {e}")))?;
+        while !done.is_complete() {
+            if Instant::now() >= deadline_at {
+                return Err(refuse("complete its connecting gather"));
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+    Ok(())
 }
 
 /// A non-blocking communicator config — see the module doc's first fact for

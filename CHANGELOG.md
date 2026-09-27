@@ -50,6 +50,13 @@ workspace ships every publishable crate at the same
   tools — actionlint, kustomize, kubeconform, cargo-deny, build-graph and the script tests'
   `tokenizers` — pinned once in `.docker/pinned-tools.sh`, which a bare runner or an older image
   provides them through; a guard's verdict no longer depends on reaching GitHub or crates.io.
+  The Compose and Kubernetes smokes read the hydrated search result (`_row_id`, `similarity`).
+- **`train-scale`'s memory control is sized for the fused LoRA site.** The fused
+  `LowRankResidualLinear` keeps one row-sized tensor per application where the eager composition
+  kept four to five, so single-pass growth over the sweep fell from about 1.2 GiB to 350 MiB and the
+  control's 512 MiB floors failed every night. The sweep now runs its own depth (128, the throughput
+  lane keeps 24 and its baseline), and both floors are half the growth the retention model predicts
+  (960 MiB; about 906 measured). The report records each lane's depth (`report_schema_version` 3).
 - **A placed search's rescore is verified against the pinned version's segments.** The second
   phase's `ExactRescoreRequest` names the version the coordinator pinned (`optional int64
   version = 5`), as `SegmentSearchRequest` does, and the owner verifies every segment named

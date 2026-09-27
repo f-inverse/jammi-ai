@@ -91,8 +91,8 @@ fn assert_provenance_shape(provenance: &serde_json::Value) {
     );
     assert_eq!(
         provenance["report_schema_version"].as_u64(),
-        Some(2),
-        "report_schema_version must be 2; provenance={provenance}"
+        Some(3),
+        "report_schema_version must be 3; provenance={provenance}"
     );
 }
 

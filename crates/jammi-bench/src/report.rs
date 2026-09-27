@@ -151,7 +151,7 @@ pub struct Provenance {
     /// compiled with — see [`build_features`]'s own doc for why these are
     /// cross-crate `const`s, never `CARGO_FEATURE_*`.
     pub build_features: Vec<&'static str>,
-    /// The `Report` JSON shape version: `2`.
+    /// The `Report` JSON shape version: `3`.
     pub report_schema_version: u32,
 }
 
@@ -165,7 +165,7 @@ impl Provenance {
             target: env!("JAMMI_BUILD_TARGET"),
             profile: env!("JAMMI_BUILD_PROFILE"),
             build_features: build_features(),
-            report_schema_version: 2,
+            report_schema_version: 3,
         }
     }
 }
@@ -611,6 +611,9 @@ pub struct TrainingTier {
     /// run at — the encoder activation per row scales with it, so it travels
     /// with the numbers.
     pub hidden_size: usize,
+    /// How many times the projection head is applied per row in the throughput
+    /// lane's "encoder" — the depth the committed rate baseline was measured at.
+    pub throughput_depth: usize,
     /// The pair count the throughput was measured at (the largest in the OOM
     /// sweep, where the per-second rate is most stable).
     pub throughput_pairs: usize,
@@ -670,6 +673,10 @@ pub struct OomControl {
     /// How peak RSS was sampled — the same whole-process high-water source the
     /// binding tier uses.
     pub rss_source: RssSource,
+    /// How many times the projection head is applied per row in the swept
+    /// "encoder" — the per-row activation the single-pass graph retains scales
+    /// with it.
+    pub depth: usize,
     /// One entry per pair count, ascending in `pairs`.
     pub points: Vec<OomPoint>,
     /// The verdict over `points`: GradCache RSS flat, single-pass RSS grows.

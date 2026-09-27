@@ -66,12 +66,27 @@ use crate::rss::{active_source, proc_peak_rss_mib};
 const HIDDEN_SIZE: usize = 768;
 
 /// How many times the projection head is re-applied per row to form the
-/// "encoder". A real encoder is many layers deep; stacking the engine's own
-/// LoRA head this many times makes each row's retained activation graph
-/// `depth · O(d)`, so the single-pass path's `O(n · depth · d)` footprint is the
-/// unmistakable term the bounded path removes — without inventing a non-engine
-/// layer.
-const ENCODER_DEPTH: usize = 24;
+/// "encoder" the throughput lane times. The committed same-box rate baseline
+/// (`baselines/training.json`) is measured at this depth, so it moves only with
+/// a re-measured baseline.
+const THROUGHPUT_DEPTH: usize = 24;
+
+/// How many times the projection head is re-applied per row to form the
+/// "encoder" the OOM control sweeps. Sized from [`RETAINED_ROWS_PER_SITE`] so
+/// the activation graph is the unmistakable growth term: the modelled
+/// separation ([`MODELED_SEPARATION_MIB`], 960 MiB) is several times the
+/// GradCache path's own reps-plus-similarity growth (about 210 MiB across the
+/// sweep, measured).
+const MEMORY_DEPTH: usize = 128;
+
+/// The row-sized tensors one application of the projection head keeps alive
+/// for the backward, per row. The site runs as one fused
+/// `LowRankResidualLinear` op whose tape holds 5 nodes, of which only the op's
+/// own output is row-sized (`A.t()` and the packed `ab` are weight-sized; see
+/// `jammi_lora::lora_linear`'s dispatch snapshot doc). The eager composition a
+/// site falls back to outside the fused domain keeps four to five; this probe's
+/// site is always inside it.
+const RETAINED_ROWS_PER_SITE: usize = 1;
 
 /// GradCache chunk size (rows re-encoded with their graph alive at once). Small
 /// relative to the largest pair count so the bounded path's `O(chunk · depth ·
@@ -115,19 +130,29 @@ const POSITIVE_SEED: u64 = 0x0FED_CBA9_8765_4321;
 // growth floor. Both halves observed live across the ascending pair counts —
 // never asserted against a remembered cliff count.
 
+/// The activation-graph growth GradCache removes across the sweep, by the
+/// retention model: every row added between the smallest and largest pair count
+/// (an anchor and a positive per pair) keeps `MEMORY_DEPTH ·
+/// RETAINED_ROWS_PER_SITE` f32 vectors of width `HIDDEN_SIZE` alive in the
+/// single-pass graph, and none past its chunk in GradCache's.
+const MODELED_SEPARATION_MIB: f64 = {
+    let rows_added = 2 * (OOM_PAIR_COUNTS[OOM_PAIR_COUNTS.len() - 1] - OOM_PAIR_COUNTS[0]);
+    let bytes = rows_added * MEMORY_DEPTH * RETAINED_ROWS_PER_SITE * HIDDEN_SIZE * 4;
+    bytes as f64 / (1024.0 * 1024.0)
+};
+
 /// The single-pass peak-RSS delta between the smallest and largest pair count
-/// must exceed this to count as "grows with n". Set well below the activation
-/// growth the `n · depth · d` model predicts so the floor is a clear lower
-/// bound, not a tight fit.
-const SINGLE_PASS_GROWTH_FLOOR_MIB: f64 = 512.0;
+/// must exceed this to count as "grows with n": half the modelled separation, a
+/// clear lower bound rather than a tight fit (the single-pass delta carries the
+/// separation plus the similarity growth both paths share).
+const SINGLE_PASS_GROWTH_FLOOR_MIB: f64 = MODELED_SEPARATION_MIB / 2.0;
 
 /// The single-pass delta must exceed the GradCache delta by at least this margin
 /// for the activation-graph removal to count as the *dominant* growth term. This
-/// is the load-bearing separation: it is the extra memory GradCache's chunked
-/// re-encode keeps off the resident set, which by the `O(n · depth · d)` model
-/// is the bulk of the single-pass footprint. Set below the modelled separation
-/// so it is a clear lower bound, not a tight fit.
-const ACTIVATION_GRAPH_SEPARATION_FLOOR_MIB: f64 = 512.0;
+/// is the load-bearing separation: the memory GradCache's chunked re-encode
+/// keeps off the resident set. Half the modelled separation, so it is a clear
+/// lower bound, not a tight fit.
+const ACTIVATION_GRAPH_SEPARATION_FLOOR_MIB: f64 = MODELED_SEPARATION_MIB / 2.0;
 
 /// Which backward path a `train-measure-once` child exercises.
 ///
@@ -167,8 +192,9 @@ impl BackwardPath {
 }
 
 /// The encoder shape one run trains at: the hidden width and the number of times
-/// the projection head is re-applied per row. The full-fidelity proof uses
-/// [`Shape::FULL`]; the hermetic cargo-test gate uses a small shape so the same
+/// the projection head is re-applied per row. The `train-scale` subcommand times
+/// at [`Shape::THROUGHPUT`] and sweeps memory at [`Shape::MEMORY`]; the hermetic
+/// cargo-test gate uses a small shape so the same
 /// code path runs fast enough for CI. Threading the shape through one struct
 /// keeps the subcommand and the gate on one set of train/encode functions.
 #[derive(Debug, Clone, Copy)]
@@ -180,12 +206,18 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// The full-fidelity proof shape: the realistic encoder width and depth that
-    /// make the single-pass activation graph the dominant, unmistakable growth
-    /// term. Driven by the `train-scale` subcommand.
-    pub const FULL: Shape = Shape {
+    /// The shape the throughput lane times, and the committed rate baseline was
+    /// measured at. Driven by the `train-scale` subcommand.
+    pub const THROUGHPUT: Shape = Shape {
         hidden: HIDDEN_SIZE,
-        depth: ENCODER_DEPTH,
+        depth: THROUGHPUT_DEPTH,
+    };
+    /// The shape the OOM control sweeps: deep enough that the single-pass
+    /// activation graph is the dominant, unmistakable growth term. Driven by the
+    /// `train-scale` subcommand's `train-measure-once` children.
+    pub const MEMORY: Shape = Shape {
+        hidden: HIDDEN_SIZE,
+        depth: MEMORY_DEPTH,
     };
 
     /// A small shape the hermetic cargo-test gate runs the bounded and unbounded
@@ -391,7 +423,7 @@ fn to_jammi_err(e: Box<dyn std::error::Error>) -> jammi_db::error::JammiError {
 /// only this path's working set at this pair count — the contamination a single
 /// in-process measurement would suffer is structurally avoided.
 pub fn measure_once(path: BackwardPath, pairs: usize) -> Result<f64, Box<dyn std::error::Error>> {
-    let shape = Shape::FULL;
+    let shape = Shape::MEMORY;
     let (head, vars) = fresh_head(shape)?;
     let anchors = synthetic_embeddings(pairs, shape, ANCHOR_SEED)?;
     let positives = synthetic_embeddings(pairs, shape, POSITIVE_SEED)?;
@@ -458,7 +490,7 @@ async fn spawn_measure(
 /// the in-process timing avoids the child-spawn overhead skewing a per-second
 /// rate. Returns `(pairs_per_s, wall_ms)`.
 fn measure_throughput(pairs: usize) -> Result<(f64, f64), Box<dyn std::error::Error>> {
-    let shape = Shape::FULL;
+    let shape = Shape::THROUGHPUT;
     let (head, vars) = fresh_head(shape)?;
     let anchors = synthetic_embeddings(pairs, shape, ANCHOR_SEED)?;
     let positives = synthetic_embeddings(pairs, shape, POSITIVE_SEED)?;
@@ -540,6 +572,7 @@ pub async fn run_oom_control() -> Result<OomControl, Box<dyn std::error::Error>>
 
     Ok(OomControl {
         rss_source: active_source(),
+        depth: MEMORY_DEPTH,
         points,
         assertion: OomAssertion {
             passed,
@@ -623,6 +656,7 @@ pub fn build_tier(throughput: Throughput, baseline: Baseline, oom: OomControl) -
     );
     TrainingTier {
         hidden_size: HIDDEN_SIZE,
+        throughput_depth: THROUGHPUT_DEPTH,
         throughput_pairs: throughput.pairs,
         pairs_per_s: crate::report::Measurement::measured(throughput.pairs_per_s, "pairs_per_s"),
         epoch_wall_ms: crate::report::Measurement::measured(throughput.wall_ms, "ms"),

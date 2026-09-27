@@ -118,6 +118,7 @@ use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
 use super::local::DEFAULT_RENDEZVOUS_TIMEOUT;
+use super::round::{self, Contribution};
 use super::{
     checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
     Verb,
@@ -914,33 +915,6 @@ fn split_chunks(ipc: &[u8], chunk_bytes: usize) -> Vec<Vec<u8>> {
 
 // ── Contributions ───────────────────────────────────────────────────────────
 
-/// What one rank contributes to one round, on the host.
-enum Contribution {
-    Gather(Tensor),
-    ReduceSum(Vec<Tensor>),
-    MaxFlags(u32),
-    Broadcast(Option<Tensor>),
-    Barrier,
-}
-
-impl Contribution {
-    fn tensors(&self) -> Vec<&Tensor> {
-        match self {
-            Self::Gather(t) => vec![t],
-            Self::ReduceSum(ts) => ts.iter().collect(),
-            Self::MaxFlags(_) | Self::Barrier => Vec::new(),
-            Self::Broadcast(t) => t.iter().collect(),
-        }
-    }
-
-    fn flags(&self) -> u32 {
-        match self {
-            Self::MaxFlags(flags) => *flags,
-            _ => 0,
-        }
-    }
-}
-
 /// The shapes a contribution from `rank` carries under `descriptor` — the
 /// descriptor is agreed before any body is decoded, so this is what the
 /// body MUST decode to.
@@ -1001,12 +975,6 @@ fn full_shapes(descriptor: &Descriptor) -> Vec<Shape> {
         .iter()
         .map(|s| (s.dims.clone(), s.dtype))
         .collect()
-}
-
-/// A decoded round result, held UNAPPLIED on the host until the commit.
-struct Pending {
-    tensors: Vec<Tensor>,
-    flags: u32,
 }
 
 // ── The Peer ────────────────────────────────────────────────────────────────
@@ -1325,7 +1293,7 @@ impl Peer {
         verb: Verb,
         args: A,
         prepare: impl FnOnce(&A) -> Result<(Descriptor, Contribution)>,
-        apply: impl FnOnce(A, Pending) -> Result<T>,
+        apply: impl FnOnce(A, round::Folded) -> Result<T>,
     ) -> Result<T> {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(reason) = &inner.fault {
@@ -1386,7 +1354,7 @@ impl Peer {
         descriptor: &Descriptor,
         own: Contribution,
         deadline: Instant,
-    ) -> Result<Pending> {
+    ) -> Result<round::Folded> {
         let wire_descriptor = descriptor_to_wire(descriptor).map_err(|reason| {
             fault_all(members, round, format!("{verb}: round {round}: {reason}"))
         })?;
@@ -1430,7 +1398,7 @@ impl Peer {
                 |reason| format!("{verb}: round {round}: rank {rank}'s contribution: {reason}"),
             )?;
             contributions.push(match verb {
-                Verb::AllGather => Contribution::Gather(single(tensors)),
+                Verb::AllGather => Contribution::Gather(round::single(tensors)),
                 Verb::AllReduceSum => Contribution::ReduceSum(tensors),
                 Verb::AllReduceMaxFlags => Contribution::MaxFlags(payload.flags),
                 Verb::Broadcast => Contribution::Broadcast(tensors.into_iter().next()),
@@ -1443,9 +1411,8 @@ impl Peer {
         }
 
         // The fold, on this rank's device, in rank order.
-        let folded = self
-            .fold(verb, descriptor, &contributions)
-            .map_err(|error| {
+        let folded =
+            round::fold(verb, descriptor, &contributions, &self.device).map_err(|error| {
                 fault_all(
                     members,
                     round,
@@ -1515,7 +1482,7 @@ impl Peer {
         descriptor: &Descriptor,
         own: Contribution,
         deadline: Instant,
-    ) -> Result<Pending> {
+    ) -> Result<round::Folded> {
         let link = &mut link.0;
         let wire_descriptor = descriptor_to_wire(descriptor).map_err(|reason| {
             let reason = format!("{verb}: round {round}: {reason}");
@@ -1578,7 +1545,7 @@ impl Peer {
             return Err(JammiError::FineTune(reason));
         }
         let pending = decode_tensors(&body, &shapes)
-            .map(|tensors| Pending {
+            .map(|tensors| round::Folded {
                 tensors,
                 flags: payload.flags,
             })
@@ -1603,122 +1570,6 @@ impl Peer {
         })?;
         Ok(pending)
     }
-
-    /// The fold, on this rank's device, in rank order — the same operation
-    /// sequence [`Local`](super::Local) runs on rank 0's device.
-    fn fold(
-        &self,
-        verb: Verb,
-        descriptor: &Descriptor,
-        contributions: &[Contribution],
-    ) -> Result<Pending> {
-        match verb {
-            Verb::AllGather => {
-                let mut slices = Vec::with_capacity(contributions.len());
-                for contribution in contributions {
-                    let Contribution::Gather(tensor) = contribution else {
-                        unreachable!("every contribution of a round carries the round's verb");
-                    };
-                    if tensor.dims().first().copied().unwrap_or(0) == 0 {
-                        continue;
-                    }
-                    slices.push(tensor.to_device(&self.device).map_err(|e| {
-                        JammiError::FineTune(format!("all_gather: to_device: {e}"))
-                    })?);
-                }
-                let gathered = if slices.is_empty() {
-                    // Every rank contributed zero rows: rank 0's own (empty)
-                    // tensor already carries the trailing shape and dtype.
-                    let Contribution::Gather(own) = &contributions[0] else {
-                        unreachable!("rank 0's contribution carries the round's verb");
-                    };
-                    own.clone()
-                } else if slices.len() == 1 {
-                    slices.into_iter().next().expect("length checked")
-                } else {
-                    Tensor::cat(&slices, 0)
-                        .map_err(|e| JammiError::FineTune(format!("all_gather: cat: {e}")))?
-                };
-                Ok(Pending {
-                    tensors: vec![gathered],
-                    flags: 0,
-                })
-            }
-            Verb::AllReduceSum => {
-                let count = descriptor.tensors.len();
-                let mut sums = Vec::with_capacity(count);
-                for index in 0..count {
-                    let mut sum: Option<Tensor> = None;
-                    for (peer, contribution) in contributions.iter().enumerate() {
-                        let Contribution::ReduceSum(tensors) = contribution else {
-                            unreachable!("every contribution of a round carries the round's verb");
-                        };
-                        let term = tensors[index].to_device(&self.device).map_err(|e| {
-                            JammiError::FineTune(format!("all_reduce_sum: to_device: {e}"))
-                        })?;
-                        sum = Some(match sum {
-                            None => term,
-                            Some(acc) => acc.add(&term).map_err(|e| {
-                                JammiError::FineTune(format!(
-                                    "all_reduce_sum: adding rank {peer}'s tensor {index}: {e}"
-                                ))
-                            })?,
-                        });
-                    }
-                    sums.push(sum.expect("a gang has at least one rank"));
-                }
-                Ok(Pending {
-                    tensors: sums,
-                    flags: 0,
-                })
-            }
-            Verb::AllReduceMaxFlags => {
-                let mut max = 0u32;
-                for contribution in contributions {
-                    let Contribution::MaxFlags(flags) = contribution else {
-                        unreachable!("every contribution of a round carries the round's verb");
-                    };
-                    max = max.max(*flags);
-                }
-                Ok(Pending {
-                    tensors: Vec::new(),
-                    flags: max,
-                })
-            }
-            Verb::Broadcast => {
-                let root = descriptor
-                    .root
-                    .expect("a broadcast descriptor names its root")
-                    as usize;
-                let Contribution::Broadcast(from_root) = &contributions[root] else {
-                    unreachable!("every contribution of a round carries the round's verb");
-                };
-                let from_root = from_root
-                    .as_ref()
-                    .ok_or_else(|| {
-                        JammiError::FineTune(format!(
-                            "broadcast: rank {root} is the agreed root but sent no tensor"
-                        ))
-                    })?
-                    .to_device(&self.device)
-                    .map_err(|e| JammiError::FineTune(format!("broadcast: to_device: {e}")))?;
-                Ok(Pending {
-                    tensors: vec![from_root],
-                    flags: 0,
-                })
-            }
-            Verb::Barrier => Ok(Pending {
-                tensors: Vec::new(),
-                flags: 0,
-            }),
-        }
-    }
-}
-
-fn single(mut tensors: Vec<Tensor>) -> Tensor {
-    tensors
-        .pop()
-        .expect("a one-signature contribution decodes to exactly one tensor")
 }
 
 /// The chunk payload size under a listener cap.
@@ -1930,51 +1781,7 @@ impl Collective for Peer {
                     Contribution::Gather(local.clone()),
                 ))
             },
-            |(), result| {
-                let total: usize = counts.iter().sum();
-                let own_rows = counts[rank];
-                let rows_before: usize = counts[..rank].iter().sum();
-                let gathered = single(result.tensors)
-                    .to_device(&self.device)
-                    .map_err(|e| JammiError::FineTune(format!("all_gather: to_device: {e}")))?;
-                let rows = gathered.dims().first().copied().unwrap_or(0);
-                if rows != total {
-                    return Err(JammiError::FineTune(format!(
-                        "all_gather: gathered {rows} rows where the counts sum to {total}"
-                    )));
-                }
-                // Only this rank's own slot carries a gradient: the remote
-                // slots are the published values, detached; the caller's own
-                // `local` is spliced back in at its rank's rows, byte-equal
-                // to what the coordinator folded there.
-                if own_rows == 0 {
-                    return Ok(gathered.detach());
-                }
-                if rows == own_rows {
-                    return Ok(local.clone());
-                }
-                let mut parts = Vec::with_capacity(3);
-                if rows_before > 0 {
-                    parts.push(
-                        gathered
-                            .narrow(0, 0, rows_before)
-                            .map_err(|e| JammiError::FineTune(format!("all_gather: narrow: {e}")))?
-                            .detach(),
-                    );
-                }
-                parts.push(local.clone());
-                let after = rows - rows_before - own_rows;
-                if after > 0 {
-                    parts.push(
-                        gathered
-                            .narrow(0, rows_before + own_rows, after)
-                            .map_err(|e| JammiError::FineTune(format!("all_gather: narrow: {e}")))?
-                            .detach(),
-                    );
-                }
-                Tensor::cat(&parts, 0)
-                    .map_err(|e| JammiError::FineTune(format!("all_gather: cat: {e}")))
-            },
+            |(), result| round::apply_gather(result, local, counts, rank, &self.device),
         )
     }
 
@@ -1993,14 +1800,7 @@ impl Collective for Peer {
                     Contribution::ReduceSum(tensors.to_vec()),
                 ))
             },
-            |tensors, result| {
-                for (slot, sum) in tensors.iter_mut().zip(result.tensors) {
-                    *slot = sum.to_device(&self.device).map_err(|e| {
-                        JammiError::FineTune(format!("all_reduce_sum: to_device: {e}"))
-                    })?;
-                }
-                Ok(())
-            },
+            |tensors, result| round::apply_sum(result, tensors, &self.device),
         )
     }
 
@@ -2034,13 +1834,7 @@ impl Collective for Peer {
                     Contribution::Broadcast((self.rank == root).then(|| Tensor::clone(t))),
                 ))
             },
-            |t, result| {
-                *t = single(result.tensors)
-                    .to_device(&self.device)
-                    .map_err(|e| JammiError::FineTune(format!("broadcast: to_device: {e}")))?
-                    .detach();
-                Ok(())
-            },
+            |t, result| round::apply_broadcast(result, t, &self.device),
         )
     }
 

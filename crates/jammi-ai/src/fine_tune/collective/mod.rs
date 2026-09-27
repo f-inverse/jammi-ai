@@ -131,6 +131,7 @@ pub mod local;
 pub mod nccl;
 pub mod noop;
 pub mod peer;
+mod round;
 
 #[cfg(test)]
 mod peer_tests;

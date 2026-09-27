@@ -28,7 +28,6 @@
 //!   contribution and be handed `Ok`, and the two ranks would leave one round
 //!   with opposite verdicts.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -36,9 +35,9 @@ use jammi_db::error::{JammiError, Result};
 
 use candle_core::{Device, Tensor};
 
+use super::round::{self, Contribution};
 use super::{
     checked_gather_counts, checked_root, BlockingCall, Collective, Descriptor, TensorSignature,
-    Verb,
 };
 
 /// How long a rank waits at a rendezvous before the round is declared failed.
@@ -49,37 +48,6 @@ use super::{
 /// in-process gang whose peer thread panicked, exited early, or took a
 /// different branch would otherwise park forever.
 pub const DEFAULT_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// What one rank contributes to one round of one collective.
-#[derive(Clone, Debug)]
-enum Contribution {
-    /// [`Collective::all_gather`]: this rank's slice.
-    Gather(Tensor),
-    /// [`Collective::all_reduce_sum`]: this rank's tensors, canonical order.
-    ReduceSum(Vec<Tensor>),
-    /// [`Collective::all_reduce_max_flags`]: this rank's control word.
-    MaxFlags(u32),
-    /// [`Collective::broadcast`]: the root's tensor; `None` off the root.
-    Broadcast(Option<Tensor>),
-    /// [`Collective::barrier`]: no payload.
-    Barrier,
-}
-
-impl Contribution {
-    /// The operation — this is [`Descriptor::verb`], so a round in which the
-    /// ranks are executing DIFFERENT collectives is caught by the same
-    /// descriptor-agreement check as every other disagreement, rather than
-    /// by a check of its own.
-    fn kind(&self) -> Verb {
-        match self {
-            Self::Gather(_) => Verb::AllGather,
-            Self::ReduceSum(_) => Verb::AllReduceSum,
-            Self::MaxFlags(_) => Verb::AllReduceMaxFlags,
-            Self::Broadcast(_) => Verb::Broadcast,
-            Self::Barrier => Verb::Barrier,
-        }
-    }
-}
 
 /// One rendezvous round.
 #[derive(Debug)]
@@ -512,7 +480,7 @@ impl Local {
         Descriptor {
             // Stamped by `Shared::exchange` under the round's lock.
             round: 0,
-            verb: contribution.kind(),
+            verb: contribution.verb(),
             world: self.shared.world,
             root,
             counts,
@@ -552,12 +520,25 @@ impl Local {
             }
         }
     }
+
+    /// One round: deposit this rank's contribution under `descriptor`, and
+    /// fold every rank's, in rank order, on rank 0's device — the one place
+    /// a reduction's arithmetic happens, so the sum is one fixed sequence of
+    /// additions rather than one per rank.
+    fn round(&self, descriptor: Descriptor, contribution: Contribution) -> Result<round::Folded> {
+        let verb = descriptor.verb;
+        let agreed = descriptor.clone();
+        let contributions = self
+            .shared
+            .exchange(self.rank as usize, descriptor, contribution)?;
+        round::fold(verb, &agreed, &contributions, self.reduce_device())
+    }
 }
 
 impl Collective for Local {
     fn all_gather(&self, _call: &BlockingCall, local: &Tensor, counts: &[usize]) -> Result<Tensor> {
         self.guarded("all_gather", || {
-            let total = checked_gather_counts(self.rank, self.world(), local, counts)?;
+            checked_gather_counts(self.rank, self.world(), local, counts)?;
             let contribution = Contribution::Gather(local.clone());
             let descriptor = self.descriptor(
                 &contribution,
@@ -565,57 +546,8 @@ impl Collective for Local {
                 Some(counts.to_vec()),
                 vec![TensorSignature::of_gather_slice(local)],
             );
-            let contributions =
-                self.shared
-                    .exchange(self.rank as usize, descriptor, contribution)?;
-
-            // Rank order, this rank's device, and only this rank's own slot
-            // attached to the graph: the remote slots are values, not a path a
-            // gradient can take to a peer's parameters. Every peer's row count
-            // is already known to equal `counts[peer]` — the descriptor
-            // agreement `exchange` just proved makes every rank's `counts`
-            // vector identical, and each rank checked its OWN row count
-            // against its own `counts` entry before depositing.
-            let mut slices: VecDeque<Tensor> = VecDeque::with_capacity(contributions.len());
-            for (peer, contribution) in contributions.iter().enumerate() {
-                let Contribution::Gather(tensor) = contribution else {
-                    unreachable!("exchange checked every contribution's kind");
-                };
-                let rows = tensor.dims().first().copied().unwrap_or(0);
-                if rows == 0 {
-                    continue;
-                }
-                let slice = if peer == self.rank as usize {
-                    tensor.clone()
-                } else {
-                    tensor
-                        .to_device(self.device())
-                        .map_err(|e| JammiError::FineTune(format!("all_gather: to_device: {e}")))?
-                        .detach()
-                };
-                slices.push_back(slice);
-            }
-
-            if slices.is_empty() {
-                // Every rank contributed zero rows: the gather is this rank's own
-                // (empty) tensor, which already carries the trailing shape and
-                // dtype the caller expects.
-                return Ok(local.clone());
-            }
-            let slices: Vec<Tensor> = slices.into();
-            let gathered = if slices.len() == 1 {
-                slices.into_iter().next().expect("length checked")
-            } else {
-                Tensor::cat(&slices, 0)
-                    .map_err(|e| JammiError::FineTune(format!("all_gather: cat: {e}")))?
-            };
-            let rows = gathered.dims().first().copied().unwrap_or(0);
-            if rows != total {
-                return Err(JammiError::FineTune(format!(
-                    "all_gather: gathered {rows} rows where the counts sum to {total}"
-                )));
-            }
-            Ok(gathered)
+            let folded = self.round(descriptor, contribution)?;
+            round::apply_gather(folded, local, counts, self.rank as usize, self.device())
         })
     }
 
@@ -628,41 +560,8 @@ impl Collective for Local {
                 None,
                 tensors.iter().map(TensorSignature::of).collect(),
             );
-            let contributions =
-                self.shared
-                    .exchange(self.rank as usize, descriptor, contribution)?;
-
-            // Every peer's tensor count and each tensor's shape and dtype are
-            // already known to match this rank's own — that agreement is what
-            // `exchange` just proved, symmetrically, before publishing.
-            for (index, slot) in tensors.iter_mut().enumerate() {
-                // The fold runs on rank 0's device, in rank order, so the sum is
-                // one fixed sequence of additions rather than one per rank.
-                let mut sum: Option<Tensor> = None;
-                for (peer, contribution) in contributions.iter().enumerate() {
-                    let Contribution::ReduceSum(peer_tensors) = contribution else {
-                        unreachable!("exchange checked every contribution's kind");
-                    };
-                    let term = peer_tensors[index]
-                        .to_device(self.reduce_device())
-                        .map_err(|e| {
-                            JammiError::FineTune(format!("all_reduce_sum: to_device: {e}"))
-                        })?;
-                    sum = Some(match sum {
-                        None => term,
-                        Some(acc) => acc.add(&term).map_err(|e| {
-                            JammiError::FineTune(format!(
-                                "all_reduce_sum: adding rank {peer}'s tensor {index}: {e}"
-                            ))
-                        })?,
-                    });
-                }
-                let sum = sum.expect("a gang has at least one rank");
-                *slot = sum
-                    .to_device(self.device())
-                    .map_err(|e| JammiError::FineTune(format!("all_reduce_sum: to_device: {e}")))?;
-            }
-            Ok(())
+            let folded = self.round(descriptor, contribution)?;
+            round::apply_sum(folded, tensors, self.device())
         })
     }
 
@@ -670,46 +569,22 @@ impl Collective for Local {
         self.guarded("all_reduce_max_flags", || {
             let contribution = Contribution::MaxFlags(flags);
             let descriptor = self.descriptor(&contribution, None, None, Vec::new());
-            let contributions =
-                self.shared
-                    .exchange(self.rank as usize, descriptor, contribution)?;
-            let mut max = 0u32;
-            for contribution in contributions.iter() {
-                let Contribution::MaxFlags(peer_flags) = contribution else {
-                    unreachable!("exchange checked every contribution's kind");
-                };
-                max = max.max(*peer_flags);
-            }
-            Ok(max)
+            Ok(self.round(descriptor, contribution)?.flags)
         })
     }
 
     fn broadcast(&self, _call: &BlockingCall, t: &mut Tensor, root: u32) -> Result<()> {
         self.guarded("broadcast", || {
-            let root_index = checked_root(self.world(), root)?;
-            let descriptor_tensor = TensorSignature::of(t);
-            let payload = (self.rank == root).then(|| t.clone());
-            let contribution = Contribution::Broadcast(payload);
-            let descriptor =
-                self.descriptor(&contribution, Some(root), None, vec![descriptor_tensor]);
-            let contributions =
-                self.shared
-                    .exchange(self.rank as usize, descriptor, contribution)?;
-            let Contribution::Broadcast(from_root) = &contributions[root_index] else {
-                unreachable!("exchange checked every contribution's kind");
-            };
-            // `exchange` only publishes once every rank's descriptor agrees,
-            // including `root`: the rank at `root_index` is the one every
-            // rank named as root, and it is the only one whose payload is
-            // `Some`, so a disagreeing root can never leave `None` here.
-            let from_root = from_root
-                .as_ref()
-                .expect("the agreed root's slot in a published round always carries a payload");
-            *t = from_root
-                .to_device(self.device())
-                .map_err(|e| JammiError::FineTune(format!("broadcast: to_device: {e}")))?
-                .detach();
-            Ok(())
+            checked_root(self.world(), root)?;
+            let contribution = Contribution::Broadcast((self.rank == root).then(|| t.clone()));
+            let descriptor = self.descriptor(
+                &contribution,
+                Some(root),
+                None,
+                vec![TensorSignature::of(t)],
+            );
+            let folded = self.round(descriptor, contribution)?;
+            round::apply_broadcast(folded, t, self.device())
         })
     }
 
@@ -717,8 +592,7 @@ impl Collective for Local {
         self.guarded("barrier", || {
             let contribution = Contribution::Barrier;
             let descriptor = self.descriptor(&contribution, None, None, Vec::new());
-            self.shared
-                .exchange(self.rank as usize, descriptor, contribution)?;
+            self.round(descriptor, contribution)?;
             Ok(())
         })
     }
@@ -971,12 +845,13 @@ mod rendezvous_state_tests {
 /// The three tests below instead peek at the round directly: park a rank
 /// mid-collective (a second rank that never arrives), read back the
 /// [`Descriptor`] it deposited, and assert `.verb` is the constructor's own
-/// [`Contribution::kind`] — this is sensitive to the exact
+/// [`Contribution::verb`] — this is sensitive to the exact
 /// `verb: "barrier"` mutation regardless of `counts`/`root`, because it
 /// never depends on a peer's descriptor agreeing or disagreeing at all.
 #[cfg(test)]
 mod constructor_verb_tests {
     use super::*;
+    use crate::fine_tune::collective::Verb;
 
     #[test]
     fn all_gather_deposits_a_descriptor_whose_verb_is_all_gather() {
@@ -1085,6 +960,7 @@ mod descriptor_tests {
     use candle_core::DType;
 
     use super::*;
+    use crate::fine_tune::collective::Verb;
 
     fn gather_descriptor(counts: Vec<usize>) -> Descriptor {
         Descriptor {

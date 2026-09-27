@@ -607,11 +607,15 @@ single device.
 type (`RP_GPU_COUNT=2` — the one lane that moves it), created one by one
 through REST v2 (`rp_fleet_pod_create`, `POST /v2/pods`) in ONE data center
 with Global Networking on, so the pods reach each other on a private network.
-The driver reads the pod catalog at `count=2` and the data-center list live,
-walks `TOPOLOGY_GPU_TYPES` (the workflow's `gpu_types` input) in order, and
-takes the first type with co-located Global-Networking capacity at or above
-`TOPOLOGY_MIN_AVAILABILITY` whose secure per-GPU rate is within
-`TOPOLOGY_MAX_GPU_RATE`, printing the rate before it rents. Readiness is
+The driver reads the pod catalog at `count=2` and the data-center list live
+and lists every candidate — each `TOPOLOGY_GPU_TYPES` type (the workflow's
+`gpu_types` input, in order) in each co-located Global-Networking data center
+at or above `TOPOLOGY_MIN_AVAILABILITY`, at a secure per-GPU rate within
+`TOPOLOGY_MAX_GPU_RATE` — then walks them, printing each rate before it rents,
+until both hosts land in one place. An availability level is not a slot
+count: a data center reporting `LOW` may hold one 2-GPU pod, so a first host
+whose partner cannot be placed beside it is released before the next
+candidate is tried. Readiness is
 measured, not trusted: both pods must be `RUNNING`, report a Global-Networking
 ip and a direct ssh endpoint, and sit in the same data center, or the lane
 refuses (97) before building anything. Each host derives its NCCL interface

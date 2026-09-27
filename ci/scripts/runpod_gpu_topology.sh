@@ -8,11 +8,12 @@
 #
 # WHAT IT RENTS: a FLEET of two ordinary pods (`rp_fleet_pod_create`), each
 # with `RP_GPU_COUNT=2` GPUs of ONE type, co-located in ONE data center and
-# joined by RunPod's Global Networking. The GPU type is the first of
-# TOPOLOGY_GPU_TYPES (the workflow's `gpu_types` input) whose co-located data
-# centers clear TOPOLOGY_MIN_AVAILABILITY, and whose secure per-GPU rate — read
-# from the live catalog and printed before anything is rented — does not exceed
-# TOPOLOGY_MAX_GPU_RATE. Every type must map to a compute capability
+# joined by RunPod's Global Networking. The candidates are every
+# TOPOLOGY_GPU_TYPES type (the workflow's `gpu_types` input, in order) and
+# co-located data center that clears TOPOLOGY_MIN_AVAILABILITY at a secure
+# per-GPU rate — read from the live catalog and printed before anything is
+# rented — within TOPOLOGY_MAX_GPU_RATE; the driver walks them until both
+# hosts land in one place, releasing a first host whose partner cannot. Every type must map to a compute capability
 # (`rp_compute_cap_for_gpu_type`): a type outside sm_80/86/89/90 is refused
 # before renting.
 #
@@ -154,12 +155,17 @@ rp_topology_verdict() {
   return "$rc"
 }
 
-# The first candidate type whose co-located data centers clear the floor and
-# whose rate clears the ceiling. $1=pod catalog body (availability at
-# count=RP_GPU_COUNT) $2=Global-Networking data centers (space-separated).
-# Prints `<gpuTypeId>|<rate>|<data centers>`; rc 75 when none qualifies.
-rp_topology_pick_type() {
-  local catalog="$1" gn_dcs="$2" type dcs rate co
+# Every place this lane may rent its fleet, in preference order: one line
+# `<gpuTypeId>|<rate>|<dataCenterId>` per candidate type (TOPOLOGY_GPU_TYPES
+# order) and co-located Global-Networking data center (sorted) where the type
+# clears TOPOLOGY_MIN_AVAILABILITY at RP_GPU_COUNT and its secure per-GPU rate
+# clears TOPOLOGY_MAX_GPU_RATE — only TOPOLOGY_DATA_CENTER when one is named.
+# An availability level is not a slot count (LOW may hold one 2-GPU pod), so
+# the driver walks these until both hosts land in one place. $1=pod catalog
+# body $2=Global-Networking data centers (space-separated). rc 75 when none
+# qualifies; 2 when a candidate type maps to no compute capability.
+rp_topology_candidates() {
+  local catalog="$1" gn_dcs="$2" type dcs rate co dc found=0
   local IFS_SAVE="$IFS"
   IFS='|'
   # shellcheck disable=SC2086
@@ -174,6 +180,7 @@ rp_topology_pick_type() {
     dcs="$(printf '%s' "$catalog" | rp_fleet_pick_data_centers "$type" "$TOPOLOGY_MIN_AVAILABILITY")"
     case "$dcs" in PARSE_ERROR*) echo "::error::${dcs}" >&2; return 75 ;; esac
     co="$(rp_fleet_intersect "$dcs" "$gn_dcs")"
+    [ -z "$TOPOLOGY_DATA_CENTER" ] || co="$(rp_fleet_intersect "$co" "$TOPOLOGY_DATA_CENTER")"
     [ -n "$co" ] || { echo "no co-located capacity for ${type}" >&2; continue; }
     rate="$(printf '%s' "$catalog" | python3 -c '
 import json, sys
@@ -184,13 +191,16 @@ p = (e.get("price") or {}).get("secure")
 print("" if p is None else p)
 ' "$type")"
     [ -n "$rate" ] || { echo "no secure rate listed for ${type}" >&2; continue; }
-    if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$rate" "$TOPOLOGY_MAX_GPU_RATE"; then
-      printf '%s|%s|%s\n' "$type" "$rate" "$co"
-      return 0
+    if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$rate" "$TOPOLOGY_MAX_GPU_RATE"; then
+      echo "${type} at \$${rate}/GPU/h exceeds the \$${TOPOLOGY_MAX_GPU_RATE} ceiling" >&2
+      continue
     fi
-    echo "${type} at \$${rate}/GPU/h exceeds the \$${TOPOLOGY_MAX_GPU_RATE} ceiling" >&2
+    for dc in $co; do
+      printf '%s|%s|%s\n' "$type" "$rate" "$dc"
+      found=1
+    done
   done
-  return 75
+  [ "$found" -eq 1 ] || return 75
 }
 
 # Everything below runs only when this file is EXECUTED, never when it is
@@ -210,11 +220,7 @@ gn_status="$(printf '%s\n' "$gn_resp" | head -n1)"
 [ "$gn_status" = "200" ] || { echo "::error::datacenters read failed (status ${gn_status})"; exit 75; }
 gn_dcs="$(printf '%s\n' "$gn_resp" | tail -n +2 | rp_fleet_global_network_datacenters)"
 case "$gn_dcs" in PARSE_ERROR*) echo "::error::${gn_dcs}"; exit 75 ;; esac
-picked="$(rp_topology_pick_type "$avail_body" "$gn_dcs")" || exit $?
-IFS='|' read -r GPU_TYPE GPU_RATE co_dcs <<< "$picked"
-chosen_dc="$(rp_fleet_choose_data_center "$co_dcs" "$TOPOLOGY_DATA_CENTER")" || exit 75
-NATIVE_COMPUTE_CAP="$(rp_compute_cap_for_gpu_type "$GPU_TYPE")"
-echo "=== ${GPU_TYPE} (sm_${NATIVE_COMPUTE_CAP}) at \$${GPU_RATE}/GPU/h x ${RP_GPU_COUNT} GPUs x 2 hosts in ${chosen_dc}: $(python3 -c "print(round(float('${GPU_RATE}')*${RP_GPU_COUNT}*2, 2))")/h, TTL ${RP_TTL_HOURS}h ==="
+candidates="$(rp_topology_candidates "$avail_body" "$gn_dcs")" || exit $?
 
 fleet_pod_0=""; fleet_pod_1=""
 cleanup_fleet() {
@@ -230,8 +236,18 @@ trap 'cleanup_fleet 129' HUP
 trap 'cleanup_fleet 130' INT
 trap 'cleanup_fleet 143' TERM
 
-fleet_pod_0="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 0)" || exit 75
-fleet_pod_1="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 1)" || exit 75
+# Both hosts in one place, or neither: a first host whose partner cannot be
+# placed there is released before the next candidate is tried.
+while IFS='|' read -r GPU_TYPE GPU_RATE chosen_dc; do
+  echo "=== ${GPU_TYPE} at \$${GPU_RATE}/GPU/h x ${RP_GPU_COUNT} GPUs x 2 hosts in ${chosen_dc}: $(python3 -c "print(round(float('${GPU_RATE}')*${RP_GPU_COUNT}*2, 2))")/h, TTL ${RP_TTL_HOURS}h ==="
+  fleet_pod_0="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 0)" || { fleet_pod_0=""; continue; }
+  fleet_pod_1="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 1)" && break
+  fleet_pod_1=""
+  rp_terminate "$fleet_pod_0" >/dev/null || echo "::warning::terminate ${fleet_pod_0} refused -- its TTL and gpu-reap.yml's sweep remain the backstop"
+  fleet_pod_0=""
+done <<< "$candidates"
+[ -n "$fleet_pod_1" ] || { echo "::error::no candidate placed both hosts in one data center (SUPPLY_CONSTRAINT)"; exit 75; }
+NATIVE_COMPUTE_CAP="$(rp_compute_cap_for_gpu_type "$GPU_TYPE")"
 echo "=== fleet pods ${fleet_pod_0} (host 0), ${fleet_pod_1} (host 1) ==="
 ready="$(rp_fleet_wait_ready "$fleet_pod_0" "$fleet_pod_1" "$RP_SSH_WAIT_SECS")" || exit $?
 IFS=' ' read -r HOST0 PORT0 HOST1 PORT1 measured_dc GN_IP0 GN_IP1 <<< "$ready"

@@ -17,11 +17,12 @@
 #       whose final line has no newline.
 #   T2  every `PROVE_GROUP_RC name=` the driver writes literally names a
 #       declared gating group, and every declared group is written.
-#   T3  `rp_topology_pick_type` over a catalog fixture: the first candidate
-#       with co-located Global-Networking capacity within the rate ceiling
-#       wins; a candidate above the ceiling or without co-located capacity
-#       is passed over; none qualifying is 75; a candidate with no compute
-#       capability is refused (2) before anything is rented.
+#   T3  `rp_topology_candidates` over a catalog fixture: every co-located
+#       Global-Networking data center of every type within the rate ceiling,
+#       in preference order; a type above the ceiling or without co-located
+#       capacity is passed over; a named data center narrows the list; none
+#       qualifying is 75; a type with no compute capability is refused (2)
+#       before anything is rented.
 #   T4  the cost bound is what the MECHANISM produces: both figures printed
 #       in the driver's header and in `gpu-topology.yml` are re-derived from
 #       the driver's own defaults (hosts x RP_GPU_COUNT x
@@ -103,13 +104,16 @@ check "T2 the written groups are exactly the declared gating groups" '[ "$declar
 CATALOG='{"gpus":[
  {"id":"NVIDIA A40","price":{"secure":0.4},"dataCenters":[{"id":"DC-NOGN","availability":"HIGH"}]},
  {"id":"NVIDIA H100 NVL","price":{"secure":9.0},"dataCenters":[{"id":"DC-A","availability":"HIGH"}]},
- {"id":"NVIDIA RTX A6000","price":{"secure":0.53},"dataCenters":[{"id":"DC-A","availability":"LOW"},{"id":"DC-B","availability":"NONE"}]}
+ {"id":"NVIDIA RTX A6000","price":{"secure":0.53},"dataCenters":[{"id":"DC-A","availability":"LOW"},{"id":"DC-B","availability":"NONE"},{"id":"DC-C","availability":"HIGH"}]},
+ {"id":"NVIDIA A100-SXM4-80GB","price":{"secure":1.59},"dataCenters":[{"id":"DC-C","availability":"LOW"}]}
 ]}'
-pick() { # $1=candidate types; prints "<rc>|<stdout>"
-  in_driver "TOPOLOGY_GPU_TYPES='$1'; out=\"\$(rp_topology_pick_type '$CATALOG' 'DC-A DC-B' 2>/dev/null)\"; echo \"\$?|\$out\""
+pick() { # $1=candidate types [$2=named data center]; prints "<rc>|<stdout, one line>"
+  in_driver "TOPOLOGY_GPU_TYPES='$1'; TOPOLOGY_DATA_CENTER='${2:-}'; out=\"\$(rp_topology_candidates '$CATALOG' 'DC-A DC-B DC-C' 2>/dev/null)\"; echo \"\$?|\$(echo \"\$out\" | tr '\n' ' ')\""
 }
-got="$(pick 'NVIDIA A40|NVIDIA H100 NVL|NVIDIA RTX A6000')"
-check "T3 the first co-located type within the ceiling wins" '[ "$got" = "0|NVIDIA RTX A6000|0.53|DC-A" ]'
+got="$(pick 'NVIDIA A40|NVIDIA H100 NVL|NVIDIA RTX A6000|NVIDIA A100-SXM4-80GB')"
+check "T3 every co-located place within the ceiling, in preference order" '[ "$got" = "0|NVIDIA RTX A6000|0.53|DC-A NVIDIA RTX A6000|0.53|DC-C NVIDIA A100-SXM4-80GB|1.59|DC-C " ]'
+got="$(pick 'NVIDIA RTX A6000|NVIDIA A100-SXM4-80GB' DC-C)"
+check "T3 a named data center narrows the candidates" '[ "$got" = "0|NVIDIA RTX A6000|0.53|DC-C NVIDIA A100-SXM4-80GB|1.59|DC-C " ]'
 got="$(pick 'NVIDIA A40|NVIDIA H100 NVL')"
 check "T3 no qualifying type is 75" '[ "${got%%|*}" = 75 ]'
 got="$(pick 'NVIDIA B200|NVIDIA RTX A6000')"

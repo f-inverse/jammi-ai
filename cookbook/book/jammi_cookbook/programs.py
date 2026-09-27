@@ -11,7 +11,7 @@ which it did:
 * in a working checkout (the book renders from one), a surface is built from
   the checkout's own sources — the Rust program against the workspace crates,
   the TypeScript program against ``clients/typescript``, the CLI from
-  ``target/release`` — so the chapter measures the code beside it;
+  ``jammi-cli`` — so the chapter measures the code beside it;
 * anywhere else (a fresh Colab runtime), from what that release published —
   the crates on crates.io, the client on npm, the ``jammi`` binary on the
   GitHub release — installing a missing toolchain (Rust, Node) the way a user
@@ -20,6 +20,7 @@ which it did:
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -63,11 +64,15 @@ def _fetch(url: str, dest: Path) -> Path:
 
 
 def cli(version: str) -> str:
-    """The ``jammi`` binary: the one on ``PATH`` (a checkout's ``target/release``),
-    else the release tarball for this platform."""
-    found = shutil.which("jammi")
-    if found:
-        return found
+    """The ``jammi`` binary: built from a checkout's ``jammi-cli``, else the
+    release tarball for this platform."""
+    root = checkout()
+    if root is not None:
+        _run([cargo(), "build", "--release", "-q", "-p", "jammi-cli", "--bin", "jammi"], cwd=root)
+        metadata = json.loads(
+            _run([cargo(), "metadata", "--format-version", "1", "--no-deps"], cwd=root)
+        )
+        return str(Path(metadata["target_directory"]) / "release" / "jammi")
     triple = {
         ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
         ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",

@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Search: the rows nearest the vector stored for `row_key`.
     let hits = session
-        .search_by_id("corpus", &row_key, 3, None, SearchMethod::default())
+        .search_by_id("corpus", &row_key, 3, None, SearchMethod::default(), None)
         .await?
         .select(&["id".to_string(), "similarity".to_string()])?
         .run()

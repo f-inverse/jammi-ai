@@ -114,7 +114,7 @@ let (table, _outcome) = session
 // Query by example: the accounts placed like this one, hydrated from
 // `accounts` through the key column.
 let similar = session
-    .search_by_id("accounts", "acct-0007", 10, Some(&table.table_name), SearchMethod::default())
+    .search_by_id("accounts", "acct-0007", 10, Some(&table.table_name), SearchMethod::default(), None)
     .await?
     .run()
     .await?;

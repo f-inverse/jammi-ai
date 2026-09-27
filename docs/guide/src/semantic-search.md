@@ -27,7 +27,7 @@ let query = session.encode_text_query(
 ).await?;
 
 // Search — returns top 10 results through the table's ANN index
-let results = session.search("patents", query, 10, None, SearchMethod::default()).await?
+let results = session.search("patents", query, 10, None, SearchMethod::default(), None).await?
     .run().await?;
 # Ok(()) }
 ```
@@ -79,7 +79,7 @@ step composes over the `k` rows the search ranked, as every builder step does.
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::index::SearchMethod;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-session.search("patents", query, 20, None, SearchMethod::default()).await?
+session.search("patents", query, 20, None, SearchMethod::default(), None).await?
     .filter("year > 2020")?
     .sort("similarity", true)?  // descending
     .limit(5)
@@ -113,7 +113,7 @@ function for inference. In Rust the same operations compose on the fluent builde
 # use jammi_ai::session::InferenceSession;
 # use jammi_db::index::SearchMethod;
 # async fn ex(session: &std::sync::Arc<InferenceSession>, query: Vec<f32>) -> jammi_db::error::Result<()> {
-let results = session.search("patents", query, 100, None, SearchMethod::default()).await?
+let results = session.search("patents", query, 100, None, SearchMethod::default(), None).await?
     .filter("year > 2020")?
     .sort("similarity", true)?
     .limit(10)

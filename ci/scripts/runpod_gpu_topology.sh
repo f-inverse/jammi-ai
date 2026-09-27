@@ -24,12 +24,12 @@
 #   entrypoint watchdog, `_rp_entrypoint_setup`, so a SIGKILLed runner still
 #   bills no longer than the TTL):
 #     (i) terminate-succeeds: the EXIT trap terminates both pods:
-#           4 x TOPOLOGY_MAX_GPU_RATE x RP_TTL_HOURS = 4 x $4.00 x 3 h = $48.00
+#           4 x TOPOLOGY_MAX_GPU_RATE x RP_TTL_HOURS = 4 x $4.00 x 4 h = $64.00
 #           (the ceiling; the driver prints the live rate it rents at)
 #     (ii) sweep-only (every terminate fails): each pod bills to its TTL, then
 #          gpu-reap.yml's 6-hourly `rp_sweep` (both pods carry the ordinary pod
 #          name shape) is the backstop:
-#           4 x TOPOLOGY_MAX_GPU_RATE x (RP_TTL_HOURS + 6) = 4 x $4.00 x 9 h = $144.00
+#           4 x TOPOLOGY_MAX_GPU_RATE x (RP_TTL_HOURS + 6) = 4 x $4.00 x 10 h = $160.00
 #   `ci/scripts/test_gpu_topology_lane.sh` re-derives both figures from this
 #   script's own defaults and fails when this header and the mechanism
 #   disagree.
@@ -79,11 +79,13 @@ set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The pods' own hard deadline == this lane's approved ceiling term. An explicit
 # RP_TTL_HOURS from the caller always wins, so raising it is a visible act.
-RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
+RP_TTL_HOURS="${RP_TTL_HOURS:-4}"
 # Two GPUs per fleet host: host 0 runs the one-host cell on both, and the
 # fleet runs one server per GPU.
 export RP_GPU_COUNT="${RP_GPU_COUNT:-2}"
-export RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-600}"
+# A cold host pulls the multi-GB CI image before sshd starts: the fleet's
+# readiness window is generous, and inside the TTL.
+export RP_SSH_WAIT_SECS="${RP_SSH_WAIT_SECS:-1200}"
 # The remote budget per phase: a cold CUDA build of the server and both test
 # targets is the long one.
 export RP_TIMEOUT="${RP_TIMEOUT:-7200}"

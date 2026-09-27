@@ -1817,7 +1817,7 @@ rp_fleet_wait_ready() {
     sleep 5
   done
   if [ "$ready0" -ne 1 ] || [ "$ready1" -ne 1 ]; then
-    echo "::error::not every fleet pod reached RUNNING with Global Networking enabled and a direct ssh endpoint within ${wait_secs}s (rank 0 ready: ${ready0}, rank 1 ready: ${ready1})" >&2
+    echo "::error::not every fleet pod reached RUNNING with Global Networking enabled and a direct ssh endpoint within ${wait_secs}s (rank 0 ready: ${ready0}, rank 1 ready: ${ready1}); last readback (<pod> <host> <status> <dc> <gn> <gn_ip> <ssh_host> <ssh_port>): ${readback:-<none>}" >&2
     return 97
   fi
   if [ "$dc0" != "$dc1" ]; then

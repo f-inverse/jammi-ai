@@ -651,8 +651,8 @@ lane, over a driver set *derived* from `runpod_lib.sh`'s renting closure
 the completeness assertion. Nothing about a release depends on this lane.
 
 **Cost bound (human-approved).** `4 GPUs × TOPOLOGY_MAX_GPU_RATE ($4.00) ×
-RP_TTL_HOURS (3)` = **$48.00** a run when the EXIT trap terminates both pods;
-**$144.00** when every terminate fails and each pod bills to its own
+RP_TTL_HOURS (4)` = **$64.00** a run when the EXIT trap terminates both pods;
+**$160.00** when every terminate fails and each pod bills to its own
 entrypoint deadline plus `gpu-reap.yml`'s 6-hourly sweep. The rate is a
 ceiling the driver refuses above, before any create; the live rate is printed
 (a two-host A100-SXM4-80GB fleet has priced at $1.59/GPU/h, $6.36/h).

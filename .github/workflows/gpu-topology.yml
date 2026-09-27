@@ -13,12 +13,12 @@ name: GPU topology (RunPod)
 # fails when this header and the mechanism disagree):
 #
 #   2 hosts x 2 GPUs x TOPOLOGY_MAX_GPU_RATE ($4.00/GPU/h, refused above it
-#   before any create) x RP_TTL_HOURS (3 h, baked into each pod's own
-#   entrypoint):
-#     (i) terminate-succeeds: 4 x $4.00 x 3 h = $48.00 per run (ceiling; the
+#   before any create) x RP_TTL_HOURS (4 h, baked into each pod's own
+#   entrypoint, above this job's own budget so a pod never dies mid-run):
+#     (i) terminate-succeeds: 4 x $4.00 x 4 h = $64.00 per run (ceiling; the
 #         driver prints the live catalog rate it rents at).
 #     (ii) sweep-only (every terminate fails): each pod bills to its TTL,
-#          then gpu-reap.yml's 6-hourly sweep: 4 x $4.00 x (3 + 6) h = $144.00.
+#          then gpu-reap.yml's 6-hourly sweep: 4 x $4.00 x (4 + 6) h = $160.00.
 #
 # Off the merge path, and never in an automated workflow's critical path: it
 # fires on the `run-topology` PR label (opt-in per PR) and manual dispatch —
@@ -60,10 +60,11 @@ jobs:
       group: gpu-topology-${{ github.ref }}
       cancel-in-progress: false
     # Above the driver's own budget, so a job-timeout kill (another trap
-    # bypass) never fires first: two ready-waits (2 x RP_SSH_WAIT_SECS = 20m)
-    # + host 0's session (RP_TIMEOUT, 120m) + host 1 and both fleet phases
-    # (~30m) + 10m runner overhead = 180m.
-    timeout-minutes: 180
+    # bypass) never fires first: the fleet's readiness window
+    # (RP_SSH_WAIT_SECS, 20m) + host 0's session (RP_TIMEOUT, 120m) + host 1
+    # and both fleet phases (~30m) + 20m for the candidate walk and runner
+    # overhead = 190m, inside the pods' 4h TTL.
+    timeout-minutes: 190
     steps:
       - uses: actions/checkout@v4
 

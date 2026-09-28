@@ -46,3 +46,27 @@ fn hold_reductions_to_compute_type(device: &Device) -> Result<()> {
     .result()
     .w()
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "live-gpu-tests")]
+    mod gpu {
+        use crate::device::open_cuda;
+        use candle_core::cuda_backend::cudarc::cublas::sys;
+
+        #[test]
+        fn open_cuda_leaves_the_cublas_handle_disallowing_reduced_precision_reduction() {
+            let device = open_cuda(0).expect("this test needs CUDA device 0");
+            let blas = device.as_cuda_device().unwrap().cublas_handle();
+            let mut mode = sys::cublasMath_t::CUBLAS_DEFAULT_MATH;
+            // SAFETY: reads the math mode of candle's live handle for this
+            // device into a local.
+            let status = unsafe { sys::cublasGetMathMode(*blas.handle(), &mut mode) };
+            assert_eq!(status, sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS);
+            assert_eq!(
+                mode,
+                sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION
+            );
+        }
+    }
+}

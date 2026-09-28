@@ -102,17 +102,10 @@ pub(crate) fn gencode_sm(entry: &str) -> &str {
 /// machine; `check_toolkit_floor` (below) is the sibling pure function that
 /// turns the parsed pair into a pass/fail-with-remedy verdict.
 ///
-/// `#[allow(dead_code)]`: this function's only call site is inside
-/// `build_flash_attn`, which is `#[cfg(feature = "flash-attn")]`-gated —
-/// under this crate's DEFAULT feature set (no `cuda`/`flash-attn`), that
-/// call site does not exist, so the build script binary itself never
-/// reaches this function and rustc's own dead-code lint is right that it
-/// is unreachable FROM THAT BINARY. It is reachable from two OTHER,
-/// legitimate places: `build_flash_attn` under `--features flash-attn`
-/// (the real production path), and `tests/build_rs_unit.rs`'s `#[path]`
-/// seam (every feature configuration) — the allow documents that this is
-/// an intentional cross-cfg surface, not dead code left behind.
-#[allow(dead_code)]
+/// Compiled where it is called: into the flash build (`build_flash_attn`),
+/// and into `tests/build_rs_unit.rs`'s `#[path]` seam (`test`). Every
+/// flash-only helper below is gated the same way.
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
     // Tokenized on whitespace/commas and matched against the WHOLE token
     // `"release"`, never a bare substring search
@@ -144,11 +137,7 @@ pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
 /// sm_90 (Hopper) only since CUDA 11.8 (October 2022), the release NVIDIA
 /// shipped to add both, per its release notes. So BOTH `sm_89` and `sm_90`
 /// bind this crate's combined 11.8 floor.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability (only `build_flash_attn`, feature-gated, and the
-/// `tests/build_rs_unit.rs` seam call this under the default feature set).
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn check_toolkit_floor(
     detected: (u32, u32),
     floor: (u32, u32),
@@ -173,11 +162,7 @@ pub(crate) fn check_toolkit_floor(
 /// `JAMMI_FLASH_MEASURE_RSS` opts in, absent everywhere else — see
 /// `build_flash_attn`'s own comment for why this is opt-in, not
 /// autodetected). Pure, unit-tested against a literal fixture line.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability (only `build_flash_attn`, feature-gated, and the
-/// `tests/build_rs_unit.rs` seam call this under the default feature set).
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn parse_max_rss_kb(gnu_time_stderr: &str) -> Option<u64> {
     for line in gnu_time_stderr.lines() {
         if let Some(rest) = line
@@ -193,13 +178,13 @@ pub(crate) fn parse_max_rss_kb(gnu_time_stderr: &str) -> Option<u64> {
 /// Peak memory of one nvcc front-end thread compiling one FlashAttention TU
 /// for one architecture: ~2.9 GB measured on an A100 for the bf16 TUs,
 /// rounded up.
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) const NVCC_FRONT_END_BYTES: u64 = 3 << 30;
 
 /// How the flash build spreads nvcc over a machine: how many TUs compile at
 /// once, and the `--threads` each gets.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) struct NvccConcurrency {
     pub(crate) processes: usize,
     pub(crate) threads: u32,
@@ -211,10 +196,7 @@ pub(crate) struct NvccConcurrency {
 /// one thread. `--threads` parallelizes a TU's per-architecture steps, so it
 /// never exceeds `arches`. Unknown memory bounds by cores alone. Pure,
 /// unit-tested.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability.
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn nvcc_concurrency(
     cores: usize,
     memory_bytes: Option<u64>,
@@ -233,7 +215,7 @@ pub(crate) fn nvcc_concurrency(
 /// `memory.max`, else v1 `memory.limit_in_bytes`) and `/proc/meminfo`'s
 /// `MemAvailable`, whichever can be read. A container's `/proc/meminfo`
 /// reports the host, so the cgroup limit is what binds inside one.
-#[allow(dead_code)]
+#[cfg(feature = "flash-attn")]
 fn available_memory_bytes() -> Option<u64> {
     let read = |path: &str| std::fs::read_to_string(path).ok();
     let cgroup = read("/sys/fs/cgroup/memory.max")
@@ -245,19 +227,13 @@ fn available_memory_bytes() -> Option<u64> {
 
 /// A cgroup memory limit file's value in bytes; `None` for `max` (no limit)
 /// or anything unparseable. Pure, unit-tested.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability.
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
     contents.trim().parse().ok()
 }
 
 /// `/proc/meminfo`'s `MemAvailable` in bytes. Pure, unit-tested.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability.
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
     meminfo.lines().find_map(|line| {
         let kb = line

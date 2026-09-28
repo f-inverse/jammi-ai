@@ -94,6 +94,11 @@ run = "bash ci/scripts/check_no_piped_grep_q.sh"
 why = "No bash test reads a match as no match: none pipes into grep -q, whose early exit SIGPIPEs the writer and, under pipefail, flips the pipeline's status."
 
 [[guard]]
+name = "CUDA devices open through open_cuda"
+run = "bash ci/scripts/check_cuda_device_open.sh"
+why = "Every CUDA device holds cuBLAS reductions to the compute type: none is opened except by jammi_kernels::device::open_cuda, and the GPU prove's cards would not notice one that was."
+
+[[guard]]
 name = "GPU parity matrix"
 run = "python3 ci/scripts/check_gpu_parity_matrix.py"
 why = "Every shipped (architecture × verb) cell is covered by a GPU parity test, structurally excluded, or named as pending."

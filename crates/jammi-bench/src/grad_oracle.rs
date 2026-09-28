@@ -121,7 +121,7 @@ pub(crate) fn triplet_blocks(
 /// Run the oracle and return its leg. No optimizer step — see this
 /// module's doc for why a gradient-direction comparison does not need one.
 pub fn run(params: &GradOracleParams) -> Result<Leg<TrainStepPayload>, Box<dyn std::error::Error>> {
-    let device = crate::finetune_step::device(params.cuda_device)?;
+    let device = crate::finetune_step::open_device(params.cuda_device)?;
     let device_label = match params.cuda_device {
         Some(o) => format!("cuda:{o}"),
         None => "cpu".to_string(),

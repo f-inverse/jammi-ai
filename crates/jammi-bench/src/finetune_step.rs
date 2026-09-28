@@ -357,7 +357,7 @@ fn build_fixture(
     ),
     Box<dyn std::error::Error>,
 > {
-    let device = device(params.cuda_device)?;
+    let device = open_device(params.cuda_device)?;
 
     let config_raw = std::fs::read_to_string(params.model_dir.join("config.json"))?;
     let config: jammi_encoders::ModernBertConfig = serde_json::from_str(&config_raw)?;
@@ -923,7 +923,7 @@ fn run_with(
 /// The device a producer computes on: CUDA device `ordinal` opened as the
 /// engine opens it ([`jammi_kernels::device::open_cuda`]), or the CPU. Every
 /// producer here opens its device through this one function.
-pub(crate) fn device(cuda_device: Option<usize>) -> candle_core::Result<Device> {
+pub(crate) fn open_device(cuda_device: Option<usize>) -> candle_core::Result<Device> {
     cuda_device.map_or(Ok(Device::Cpu), jammi_kernels::device::open_cuda)
 }
 

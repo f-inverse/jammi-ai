@@ -1,0 +1,118 @@
+measure_gpu_floors_print_only on NVIDIA GeForce RTX 4090 (sm89), driver 570.195.03, tree 9c699873 (release/v0.50.0: every CUDA device opened by jammi_kernels::device::open_cuda, cuBLAS reduced-precision reduction disallowed); the same card at 37a1b59c, before that change, reproduced the RTX 6000 Ada numbers bit for bit (row 4 alone_vs_batch=1.6891605126899245e-3)
+measure_gpu_floors_print_only: HEADER compute_capability=8.9 device_name=NVIDIA GeForce RTX 4090 jammi_encoders_version=0.50.0
+measure_gpu_floors_print_only: composition=0 row_slot=0 len=3 alone_vs_truth=3.378781015956159e-3 batch_vs_truth=3.378781015956159e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=1 len=7 alone_vs_truth=3.975313697127402e-3 batch_vs_truth=3.975313697127402e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=2 len=11 alone_vs_truth=3.618402910452925e-3 batch_vs_truth=3.618402910452925e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=3 len=15 alone_vs_truth=4.086485968078355e-3 batch_vs_truth=4.086485968078355e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=4 len=19 alone_vs_truth=4.432713953583847e-3 batch_vs_truth=4.432713953583847e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=5 len=23 alone_vs_truth=3.0065721142729343e-3 batch_vs_truth=3.0065721142729343e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=6 len=27 alone_vs_truth=3.7875035425207967e-3 batch_vs_truth=3.7875035425207967e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=7 len=31 alone_vs_truth=3.984351738719032e-3 batch_vs_truth=3.984351738719032e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=8 len=35 alone_vs_truth=3.007914837219449e-3 batch_vs_truth=3.007914837219449e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=9 len=39 alone_vs_truth=3.8508543432925865e-3 batch_vs_truth=3.8508543432925865e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=10 len=43 alone_vs_truth=3.8272638597405834e-3 batch_vs_truth=3.8272638597405834e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=11 len=47 alone_vs_truth=3.4549981404675668e-3 batch_vs_truth=3.4549981404675668e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=12 len=51 alone_vs_truth=3.277843470569808e-3 batch_vs_truth=3.277843470569808e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=13 len=55 alone_vs_truth=3.6234141420952793e-3 batch_vs_truth=3.6234141420952793e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=14 len=59 alone_vs_truth=3.661301453146733e-3 batch_vs_truth=3.661301453146733e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 row_slot=15 len=63 alone_vs_truth=3.524261918822073e-3 batch_vs_truth=3.524261918822073e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 MAX OVER 16 ROWS: max_alone_vs_truth=4.432713953583847e-3 max_batch_vs_truth=4.432713953583847e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=0 RED_CONTROL row_length_off_by_one ratio=6.906906271873527e-2
+measure_gpu_floors_print_only: composition=0 RED_CONTROL window_radius_off_by_one row_slot=15 len=63 ratio=1.021712720137889e-3
+measure_gpu_floors_print_only: composition=1 row_slot=0 len=3 alone_vs_truth=3.378781015956159e-3 batch_vs_truth=3.378781015956159e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=1 len=7 alone_vs_truth=3.975313697127402e-3 batch_vs_truth=3.975313697127402e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=2 len=11 alone_vs_truth=3.618402910452925e-3 batch_vs_truth=3.618402910452925e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=3 len=15 alone_vs_truth=4.086485968078355e-3 batch_vs_truth=4.086485968078355e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=4 len=19 alone_vs_truth=4.432713953583847e-3 batch_vs_truth=4.432713953583847e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=5 len=23 alone_vs_truth=3.0065721142729343e-3 batch_vs_truth=3.0065721142729343e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=6 len=27 alone_vs_truth=3.7875035425207967e-3 batch_vs_truth=3.7875035425207967e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 row_slot=7 len=31 alone_vs_truth=3.984351738719032e-3 batch_vs_truth=3.984351738719032e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 MAX OVER 8 ROWS: max_alone_vs_truth=4.432713953583847e-3 max_batch_vs_truth=4.432713953583847e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=1 RED_CONTROL row_length_off_by_one ratio=6.906906271873527e-2
+measure_gpu_floors_print_only: composition=1 RED_CONTROL window_radius_off_by_one row_slot=7 len=31 ratio=2.588562795987303e-4
+measure_gpu_floors_print_only: composition=2 row_slot=0 len=35 alone_vs_truth=3.007914837219449e-3 batch_vs_truth=3.007914837219449e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=1 len=39 alone_vs_truth=3.8508543432925865e-3 batch_vs_truth=3.8508543432925865e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=2 len=43 alone_vs_truth=3.8272638597405834e-3 batch_vs_truth=3.8272638597405834e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=3 len=47 alone_vs_truth=3.4549981404675668e-3 batch_vs_truth=3.4549981404675668e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=4 len=51 alone_vs_truth=3.277843470569808e-3 batch_vs_truth=3.277843470569808e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=5 len=55 alone_vs_truth=3.6234141420952793e-3 batch_vs_truth=3.6234141420952793e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=6 len=59 alone_vs_truth=3.661301453146733e-3 batch_vs_truth=3.661301453146733e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 row_slot=7 len=63 alone_vs_truth=3.524261918822073e-3 batch_vs_truth=3.524261918822073e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 MAX OVER 8 ROWS: max_alone_vs_truth=3.8508543432925865e-3 max_batch_vs_truth=3.8508543432925865e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=2 RED_CONTROL row_length_off_by_one ratio=7.178715922811329e-3
+measure_gpu_floors_print_only: composition=2 RED_CONTROL window_radius_off_by_one row_slot=7 len=63 ratio=1.021712720137889e-3
+measure_gpu_floors_print_only: composition=3 row_slot=0 len=3 alone_vs_truth=3.378781015956159e-3 batch_vs_truth=3.378781015956159e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=1 len=11 alone_vs_truth=3.618402910452925e-3 batch_vs_truth=3.618402910452925e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=2 len=19 alone_vs_truth=4.432713953583847e-3 batch_vs_truth=4.432713953583847e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=3 len=27 alone_vs_truth=3.7875035425207967e-3 batch_vs_truth=3.7875035425207967e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=4 len=35 alone_vs_truth=3.007914837219449e-3 batch_vs_truth=3.007914837219449e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=5 len=43 alone_vs_truth=3.8272638597405834e-3 batch_vs_truth=3.8272638597405834e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=6 len=51 alone_vs_truth=3.277843470569808e-3 batch_vs_truth=3.277843470569808e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 row_slot=7 len=59 alone_vs_truth=3.661301453146733e-3 batch_vs_truth=3.661301453146733e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 MAX OVER 8 ROWS: max_alone_vs_truth=4.432713953583847e-3 max_batch_vs_truth=4.432713953583847e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=3 RED_CONTROL row_length_off_by_one ratio=6.906906271873527e-2
+measure_gpu_floors_print_only: composition=3 RED_CONTROL window_radius_off_by_one row_slot=7 len=59 ratio=3.719704460674682e-3
+measure_gpu_floors_print_only: composition=4 row_slot=0 len=7 alone_vs_truth=3.975313697127402e-3 batch_vs_truth=3.975313697127402e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=1 len=15 alone_vs_truth=4.086485968078355e-3 batch_vs_truth=4.086485968078355e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=2 len=23 alone_vs_truth=3.0065721142729343e-3 batch_vs_truth=3.0065721142729343e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=3 len=31 alone_vs_truth=3.984351738719032e-3 batch_vs_truth=3.984351738719032e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=4 len=39 alone_vs_truth=3.8508543432925865e-3 batch_vs_truth=3.8508543432925865e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=5 len=47 alone_vs_truth=3.4549981404675668e-3 batch_vs_truth=3.4549981404675668e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=6 len=55 alone_vs_truth=3.6234141420952793e-3 batch_vs_truth=3.6234141420952793e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 row_slot=7 len=63 alone_vs_truth=3.524261918822073e-3 batch_vs_truth=3.524261918822073e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 MAX OVER 8 ROWS: max_alone_vs_truth=4.086485968078355e-3 max_batch_vs_truth=4.086485968078355e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=4 RED_CONTROL row_length_off_by_one ratio=4.34992627243606e-2
+measure_gpu_floors_print_only: composition=4 RED_CONTROL window_radius_off_by_one row_slot=7 len=63 ratio=1.021712720137889e-3
+measure_gpu_floors_print_only: composition=5 row_slot=0 len=63 alone_vs_truth=3.524261918822073e-3 batch_vs_truth=3.524261918822073e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=1 len=59 alone_vs_truth=3.661301453146733e-3 batch_vs_truth=3.661301453146733e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=2 len=55 alone_vs_truth=3.6234141420952793e-3 batch_vs_truth=3.6234141420952793e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=3 len=51 alone_vs_truth=3.277843470569808e-3 batch_vs_truth=3.277843470569808e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=4 len=47 alone_vs_truth=3.4549981404675668e-3 batch_vs_truth=3.4549981404675668e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=5 len=43 alone_vs_truth=3.8272638597405834e-3 batch_vs_truth=3.8272638597405834e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=6 len=39 alone_vs_truth=3.8508543432925865e-3 batch_vs_truth=3.8508543432925865e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=7 len=35 alone_vs_truth=3.007914837219449e-3 batch_vs_truth=3.007914837219449e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=8 len=31 alone_vs_truth=3.984351738719032e-3 batch_vs_truth=3.984351738719032e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=9 len=27 alone_vs_truth=3.7875035425207967e-3 batch_vs_truth=3.7875035425207967e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=10 len=23 alone_vs_truth=3.0065721142729343e-3 batch_vs_truth=3.0065721142729343e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=11 len=19 alone_vs_truth=4.432713953583847e-3 batch_vs_truth=4.432713953583847e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=12 len=15 alone_vs_truth=4.086485968078355e-3 batch_vs_truth=4.086485968078355e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=13 len=11 alone_vs_truth=3.618402910452925e-3 batch_vs_truth=3.618402910452925e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=14 len=7 alone_vs_truth=3.975313697127402e-3 batch_vs_truth=3.975313697127402e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 row_slot=15 len=3 alone_vs_truth=3.378781015956159e-3 batch_vs_truth=3.378781015956159e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 MAX OVER 16 ROWS: max_alone_vs_truth=4.432713953583847e-3 max_batch_vs_truth=4.432713953583847e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=5 RED_CONTROL row_length_off_by_one ratio=4.689253336265635e-3
+measure_gpu_floors_print_only: composition=5 RED_CONTROL window_radius_off_by_one row_slot=0 len=63 ratio=1.021712720137889e-3
+measure_gpu_floors_print_only: composition=6 row_slot=0 len=3 alone_vs_truth=3.378781015956159e-3 batch_vs_truth=3.378781015956159e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=1 len=7 alone_vs_truth=3.975313697127402e-3 batch_vs_truth=3.975313697127402e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=2 len=11 alone_vs_truth=3.618402910452925e-3 batch_vs_truth=3.618402910452925e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=3 len=15 alone_vs_truth=4.086485968078355e-3 batch_vs_truth=4.086485968078355e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=4 len=19 alone_vs_truth=4.432713953583847e-3 batch_vs_truth=4.432713953583847e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=5 len=23 alone_vs_truth=3.0065721142729343e-3 batch_vs_truth=3.0065721142729343e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=6 len=27 alone_vs_truth=3.7875035425207967e-3 batch_vs_truth=3.7875035425207967e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=7 len=31 alone_vs_truth=3.984351738719032e-3 batch_vs_truth=3.984351738719032e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=8 len=35 alone_vs_truth=3.007914837219449e-3 batch_vs_truth=3.007914837219449e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=9 len=39 alone_vs_truth=3.8508543432925865e-3 batch_vs_truth=3.8508543432925865e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=10 len=43 alone_vs_truth=3.8272638597405834e-3 batch_vs_truth=3.8272638597405834e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 row_slot=11 len=47 alone_vs_truth=3.4549981404675668e-3 batch_vs_truth=3.4549981404675668e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 MAX OVER 12 ROWS: max_alone_vs_truth=4.432713953583847e-3 max_batch_vs_truth=4.432713953583847e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=6 RED_CONTROL row_length_off_by_one ratio=6.906906271873527e-2
+measure_gpu_floors_print_only: composition=6 RED_CONTROL window_radius_off_by_one row_slot=11 len=47 ratio=1.5192634542873572e-3
+measure_gpu_floors_print_only: composition=7 row_slot=0 len=19 alone_vs_truth=4.432713953583847e-3 batch_vs_truth=4.432713953583847e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=1 len=23 alone_vs_truth=3.0065721142729343e-3 batch_vs_truth=3.0065721142729343e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=2 len=27 alone_vs_truth=3.7875035425207967e-3 batch_vs_truth=3.7875035425207967e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=3 len=31 alone_vs_truth=3.984351738719032e-3 batch_vs_truth=3.984351738719032e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=4 len=35 alone_vs_truth=3.007914837219449e-3 batch_vs_truth=3.007914837219449e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=5 len=39 alone_vs_truth=3.8508543432925865e-3 batch_vs_truth=3.8508543432925865e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=6 len=43 alone_vs_truth=3.8272638597405834e-3 batch_vs_truth=3.8272638597405834e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=7 len=47 alone_vs_truth=3.4549981404675668e-3 batch_vs_truth=3.4549981404675668e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=8 len=51 alone_vs_truth=3.277843470569808e-3 batch_vs_truth=3.277843470569808e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=9 len=55 alone_vs_truth=3.6234141420952793e-3 batch_vs_truth=3.6234141420952793e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=10 len=59 alone_vs_truth=3.661301453146733e-3 batch_vs_truth=3.661301453146733e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 row_slot=11 len=63 alone_vs_truth=3.524261918822073e-3 batch_vs_truth=3.524261918822073e-3 alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 MAX OVER 12 ROWS: max_alone_vs_truth=4.432713953583847e-3 max_batch_vs_truth=4.432713953583847e-3 max_alone_vs_batch=0e0
+measure_gpu_floors_print_only: composition=7 RED_CONTROL row_length_off_by_one ratio=9.667840325796461e-3
+measure_gpu_floors_print_only: composition=7 RED_CONTROL window_radius_off_by_one row_slot=11 len=63 ratio=1.021712720137889e-3
+measure_gpu_floors_print_only: OVERALL OVER 8 COMPOSITIONS / 88 ROW-MEASUREMENTS: alone_vs_truth mean=3.657296114319822e-3 max=4.432713953583847e-3 | batch_vs_truth mean=3.657296114319822e-3 max=4.432713953583847e-3 | alone_vs_batch mean=0e0 max=0e0 (these bound GPU_TRUTH_DRIFT_BOUND [alone_vs_truth/batch_vs_truth] and gpu_composition_floor [alone_vs_batch] respectively)
+measure_gpu_floors_print_only: OVERALL row_length_off_by_one control OVER 8 COMPOSITIONS: mean=4.266391539802189e-2 max=6.906906271873527e-2
+measure_gpu_floors_print_only: OVERALL window_radius_off_by_one control OVER 8 COMPOSITIONS: mean=1.3257984744062768e-3 max=3.719704460674682e-3
+measure_gpu_floors_print_only: measurement complete -- these numbers are the derivation input for gpu_composition_floor's EXACT_ARCH_COMPOSITION_FLOOR and GPU_TRUTH_DRIFT_BOUND; folding them into those constants (with safety-margin arithmetic documented there) is a separate change, not this test -- this test asserts finiteness only and gates nothing

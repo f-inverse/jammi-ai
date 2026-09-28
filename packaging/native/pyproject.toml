@@ -49,6 +49,9 @@ manifest-path = "../../crates/jammi-python/Cargo.toml"
 # places the built `.so` beside `python/jammi_native/__init__.py` (which
 # re-exports the engine surface).
 module-name = "jammi_native"
+# The symbol table is stripped, as the server binaries are: a wheel ships the
+# engine, not its debug symbols, and the CUDA wheel must fit PyPI's per-file limit.
+strip = true
 # The `jammi_native` re-export shim lives HERE, under this dist's own
 # `python/` source root. `python-source` must resolve at or below the project
 # dir: maturin copies the `module-name` package's Python files from a local

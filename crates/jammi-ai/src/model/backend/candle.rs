@@ -3730,7 +3730,7 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 /// The test-side acquisition, `jammi_test_resources::metal_device`, catches
 /// the same panic the same way.
 ///
-/// `ctor` need not be `UnwindSafe` itself — `Device::new_cuda` /
+/// `ctor` need not be `UnwindSafe` itself — `jammi_kernels::device::open_cuda` /
 /// `Device::new_metal` capture nothing and trivially are, but requiring the
 /// bound would leak into every call site including test-injected closures.
 /// `AssertUnwindSafe` is sound here for the same no-shared-mutable-state
@@ -3781,7 +3781,7 @@ fn acquire_accelerator_device(
 ///   than silently serving on CPU.
 ///
 /// Device acquisition goes through [`acquire_accelerator_device`], which
-/// wraps `Device::new_cuda` / `Device::new_metal` in `catch_unwind`: a
+/// wraps `jammi_kernels::device::open_cuda` / `Device::new_metal` in `catch_unwind`: a
 /// PANICKING acquisition (measured on real `macos-14` hosts — see that
 /// function's doc) is folded into the SAME unavailable outcome as a returned
 /// `Err`, so both of the arms above are reachable no matter which failure
@@ -3794,9 +3794,11 @@ pub(crate) fn select_device(config: &DeviceConfig) -> Result<Device> {
     }
     #[cfg(feature = "cuda")]
     {
-        if let Some(dev) =
-            acquire_accelerator_device("cuda", config.gpu_device as usize, Device::new_cuda)
-        {
+        if let Some(dev) = acquire_accelerator_device(
+            "cuda",
+            config.gpu_device as usize,
+            jammi_kernels::device::open_cuda,
+        ) {
             // Fail fast on a driver too old to JIT this build's PTX, rather than
             // letting the first model load surface a raw
             // `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` from deep in candle.
@@ -3868,7 +3870,7 @@ fn cuda_driver_cuda_version() -> Result<i32> {
     use candle_core::cuda::cudarc::driver::sys;
     let mut version: core::ffi::c_int = 0;
     // SAFETY: `cuDriverGetVersion` writes a single `int` through the pointer and
-    // reads nothing else; the driver is present because `Device::new_cuda` just
+    // reads nothing else; the driver is present because opening the device just
     // succeeded. cudarc is linked (`dynamic-linking`), so the symbol resolves.
     let status = unsafe { sys::cuDriverGetVersion(&mut version) };
     if status != sys::CUresult::CUDA_SUCCESS {
@@ -3939,7 +3941,7 @@ fn cuda_compute_capability(dev: &Device) -> Result<(i32, i32)> {
 /// It calls [`select_device`] directly rather than re-deriving device
 /// identity from `config`, so it inherits [`select_device`]'s panic-safe
 /// acquisition ([`acquire_accelerator_device`]) for free: a host on which
-/// `Device::new_metal`/`Device::new_cuda` panics resolves here the same way
+/// opening a Metal or CUDA device panics resolves here the same way
 /// it resolves in `select_device` — CPU (via the `_` arm below), never a
 /// propagated panic — with no separate handling needed at this call site.
 pub(crate) fn effective_compute_device(config: &DeviceConfig) -> ComputeDevice {

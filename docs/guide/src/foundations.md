@@ -61,6 +61,9 @@ tensor library. Jammi extends it through candle's own `CustomOp` seam:
 - **`jammi-kernels`:** fused CUDA kernels (attention, layer norm, GELU,
   AdamW, LoRA residuals). Each has a CPU reference arm, with candle's
   eager composition as the fallback.
+  It also opens every CUDA device, with cuBLAS held to the `f32` compute
+  type candle asks for: whichever way a card's cuBLAS splits a `bf16`
+  matmul, the partial sums are added in `f32` and rounded once.
 - **`jammi-lora`:** low-rank adapters.
 - **`jammi-encoders`:** the encoder towers.
 

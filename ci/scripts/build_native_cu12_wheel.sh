@@ -20,6 +20,15 @@ rm -rf dist
 maturin build --release --out dist --compatibility manylinux_2_28 --auditwheel skip
 
 wheel="$(ls dist/jammi_ai_native_cu12-*.whl)"
+# PyPI refuses a file over the project's upload limit (100 MiB unless PyPI
+# raises it for the project); a wheel that outgrows it fails here, on the PR,
+# not at the tag's publish.
+pypi_file_limit=$((100 * 1024 * 1024))
+size="$(stat -c %s "$wheel")"
+if [ "$size" -gt "$pypi_file_limit" ]; then
+  echo "::error::$wheel is $size bytes, over PyPI's per-file limit of $pypi_file_limit" >&2
+  exit 1
+fi
 work="$(mktemp -d)"
 python3 -m zipfile -e "$wheel" "$work"
 so="$(find "$work" -name '*.so' -print -quit)"

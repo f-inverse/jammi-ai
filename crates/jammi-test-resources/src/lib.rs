@@ -113,14 +113,15 @@ pub fn child_test_stdout(cmd: &mut std::process::Command) -> String {
     stdout
 }
 
-/// CUDA device `ordinal`.
+/// CUDA device `ordinal`, opened as the engine opens it
+/// ([`jammi_kernels::device::open_cuda`]).
 ///
 /// # Panics
 /// When the device cannot be opened — including in a build without candle's
 /// CUDA backend.
 #[cfg(feature = "candle")]
 pub fn cuda_device(ordinal: usize) -> candle_core::Device {
-    candle_core::Device::new_cuda(ordinal)
+    jammi_kernels::device::open_cuda(ordinal)
         .unwrap_or_else(|e| panic!("this test needs CUDA device {ordinal}: {e}"))
 }
 

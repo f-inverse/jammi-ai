@@ -1842,10 +1842,7 @@ impl RunContext {
         params: &FinetuneRunParams,
         train_rows: Vec<IdTriplet>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let device = match params.cuda_device {
-            Some(ordinal) => Device::new_cuda(ordinal)?,
-            None => Device::Cpu,
-        };
+        let device = crate::finetune_step::open_device(params.cuda_device)?;
         let gpu_device = params.cuda_device.map(|o| o as i32).unwrap_or(-1);
         let device_config = DeviceConfig {
             gpu_device,

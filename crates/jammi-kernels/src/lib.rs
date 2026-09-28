@@ -19,9 +19,11 @@
 //! see `ops`'s module doc). [`admission`] is the runtime scaffolding — a CUDA
 //! compute-capability probe, per-op dispatch counters, a log-once WARN, and
 //! a `Strict` mode — every fused op's call site uses to decide
-//! fused-vs-eager and make that decision observable.
+//! fused-vs-eager and make that decision observable. [`device`] opens a CUDA
+//! device with the cuBLAS numerics every computation on it assumes.
 
 pub mod admission;
+pub mod device;
 pub mod error;
 /// f16 oracle scaffolds: the shared BEHAVIORAL boundary-contract helpers
 /// (saturation at `F16_MAX`/`-F16_MAX`, underflow-to-zero, non-finite

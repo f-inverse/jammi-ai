@@ -80,7 +80,7 @@ jammi-lora -> jammi-kernels, jammi-numerics, jammi-test-resources
 jammi-numerics
 jammi-python -> jammi-ai, jammi-datafusion, jammi-db, jammi-wire
 jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-datafusion, jammi-db, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
-jammi-test-resources
+jammi-test-resources -> jammi-kernels
 jammi-test-utils -> jammi-datafusion, jammi-db, jammi-test-resources
 jammi-wire -> jammi-datafusion, jammi-db, jammi-lora, jammi-numerics
 symbol-index
@@ -557,6 +557,7 @@ maintainer's, with the invariant each seam implementation holds.
 | Ballista `ExecutionEngine` | `JammiExecutionEngine` | `crates/jammi-ballista/src/engine.rs` | Wraps the default engine; refuses a stage whose required device kind is not this executor's |
 | Ballista `ClusterState`/`JobState` | `CatalogClusterState`, `CatalogJobState` | `crates/jammi-ballista/src/cluster.rs` | Catalog rows are every scheduler's view of the fleet; execution graphs are never persisted, and a lost executor fails its jobs to Jammi's reclaim |
 | candle `CustomOp1/2/3` | the fused kernels | `crates/jammi-kernels/src/ops/` | Every kernel has a CPU reference arm; candle's eager composition is the fallback |
+| candle `CudaDevice::cublas_handle` | `open_cuda` | `crates/jammi-kernels/src/device.rs` | Every CUDA device holds cuBLAS reductions to the compute type (`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`), so a split-K GEMM adds its partial sums in `f32` and rounds once, as an unsplit one does, whatever the card's heuristic picks; the `CUDA devices open through open_cuda` guard refuses any other way of opening one |
 
 Two rules hold across every row:
 

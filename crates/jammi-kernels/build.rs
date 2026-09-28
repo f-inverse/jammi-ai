@@ -102,17 +102,10 @@ pub(crate) fn gencode_sm(entry: &str) -> &str {
 /// machine; `check_toolkit_floor` (below) is the sibling pure function that
 /// turns the parsed pair into a pass/fail-with-remedy verdict.
 ///
-/// `#[allow(dead_code)]`: this function's only call site is inside
-/// `build_flash_attn`, which is `#[cfg(feature = "flash-attn")]`-gated —
-/// under this crate's DEFAULT feature set (no `cuda`/`flash-attn`), that
-/// call site does not exist, so the build script binary itself never
-/// reaches this function and rustc's own dead-code lint is right that it
-/// is unreachable FROM THAT BINARY. It is reachable from two OTHER,
-/// legitimate places: `build_flash_attn` under `--features flash-attn`
-/// (the real production path), and `tests/build_rs_unit.rs`'s `#[path]`
-/// seam (every feature configuration) — the allow documents that this is
-/// an intentional cross-cfg surface, not dead code left behind.
-#[allow(dead_code)]
+/// Compiled where it is called: into the flash build (`build_flash_attn`),
+/// and into `tests/build_rs_unit.rs`'s `#[path]` seam (`test`). Every
+/// flash-only helper below is gated the same way.
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
     // Tokenized on whitespace/commas and matched against the WHOLE token
     // `"release"`, never a bare substring search
@@ -144,11 +137,7 @@ pub(crate) fn parse_nvcc_release(version_stdout: &str) -> Option<(u32, u32)> {
 /// sm_90 (Hopper) only since CUDA 11.8 (October 2022), the release NVIDIA
 /// shipped to add both, per its release notes. So BOTH `sm_89` and `sm_90`
 /// bind this crate's combined 11.8 floor.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability (only `build_flash_attn`, feature-gated, and the
-/// `tests/build_rs_unit.rs` seam call this under the default feature set).
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn check_toolkit_floor(
     detected: (u32, u32),
     floor: (u32, u32),
@@ -173,11 +162,7 @@ pub(crate) fn check_toolkit_floor(
 /// `JAMMI_FLASH_MEASURE_RSS` opts in, absent everywhere else — see
 /// `build_flash_attn`'s own comment for why this is opt-in, not
 /// autodetected). Pure, unit-tested against a literal fixture line.
-///
-/// `#[allow(dead_code)]`: see [`parse_nvcc_release`]'s doc — same cross-cfg
-/// reachability (only `build_flash_attn`, feature-gated, and the
-/// `tests/build_rs_unit.rs` seam call this under the default feature set).
-#[allow(dead_code)]
+#[cfg(any(feature = "flash-attn", test))]
 pub(crate) fn parse_max_rss_kb(gnu_time_stderr: &str) -> Option<u64> {
     for line in gnu_time_stderr.lines() {
         if let Some(rest) = line
@@ -188,6 +173,94 @@ pub(crate) fn parse_max_rss_kb(gnu_time_stderr: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Peak memory of one nvcc front-end thread compiling one FlashAttention TU
+/// for one architecture: ~2.9 GB measured on an A100 for the bf16 TUs,
+/// rounded up.
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) const NVCC_FRONT_END_BYTES: u64 = 3 << 30;
+
+/// How the flash build spreads nvcc over a machine: how many TUs compile at
+/// once, and the `--threads` each gets.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) struct NvccConcurrency {
+    pub(crate) processes: usize,
+    pub(crate) threads: u32,
+}
+
+/// Sizes the flash build's nvcc concurrency from the machine: the
+/// simultaneous front-end count (`processes * threads`) stays within both
+/// `cores` and `memory_bytes / NVCC_FRONT_END_BYTES`, never below one TU with
+/// one thread. `--threads` parallelizes a TU's per-architecture steps, so it
+/// never exceeds `arches`. Unknown memory bounds by cores alone. Pure,
+/// unit-tested.
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) fn nvcc_concurrency(
+    cores: usize,
+    memory_bytes: Option<u64>,
+    tus: usize,
+    arches: usize,
+) -> NvccConcurrency {
+    let by_memory =
+        memory_bytes.map_or(usize::MAX, |bytes| (bytes / NVCC_FRONT_END_BYTES) as usize);
+    let budget = cores.min(by_memory).max(1);
+    let processes = tus.min(budget).max(1);
+    let threads = (budget / processes).clamp(1, arches.max(1)) as u32;
+    NvccConcurrency { processes, threads }
+}
+
+/// The memory this build may still use: the smaller of its cgroup's headroom
+/// (the limit less current usage: v2 `memory.max` and `memory.current`, else
+/// v1 `memory.limit_in_bytes` and `memory.usage_in_bytes`) and
+/// `/proc/meminfo`'s `MemAvailable`, whichever can be read. A container's
+/// `/proc/meminfo` reports the host, so the cgroup is what binds inside one,
+/// and the rest of the cargo build is already counted in its usage.
+#[cfg(feature = "flash-attn")]
+fn available_memory_bytes() -> Option<u64> {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    let cgroup = [
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(limit, usage)| Some((read(limit)?, read(usage)?)))
+    .and_then(|(limit, usage)| cgroup_headroom(&limit, &usage));
+    let meminfo = read("/proc/meminfo").and_then(|s| parse_meminfo_available(&s));
+    cgroup.into_iter().chain(meminfo).min()
+}
+
+/// The memory a cgroup still grants, in bytes, from its limit and usage
+/// files: `None` when the limit is `max` (none) or either is unparseable.
+/// Pure, unit-tested.
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) fn cgroup_headroom(limit: &str, usage: &str) -> Option<u64> {
+    let limit = parse_cgroup_memory_limit(limit)?;
+    let usage: u64 = usage.trim().parse().ok()?;
+    Some(limit.saturating_sub(usage))
+}
+
+/// A cgroup memory limit file's value in bytes; `None` for `max` (no limit)
+/// or anything unparseable. Pure, unit-tested.
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
+    contents.trim().parse().ok()
+}
+
+/// `/proc/meminfo`'s `MemAvailable` in bytes. Pure, unit-tested.
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) fn parse_meminfo_available(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let kb = line
+            .strip_prefix("MemAvailable:")?
+            .trim()
+            .strip_suffix("kB")?;
+        kb.trim().parse::<u64>().ok().map(|kb| kb * 1024)
+    })
 }
 
 /// Every FILE (recursively) under `dir`, sorted for a deterministic
@@ -484,11 +557,11 @@ fn build_cuda() {
 ///   simultaneous nvcc front-ends, each with its own footprint (~2.9 GB per
 ///   TU-arch-thread measured on an A100 for the bf16 TUs); a flat `N = 4`
 ///   OOMs the 16 GB `ubuntu-latest` CI runner this crate's
-///   flash-attn-compile lane uses. `N` defaults to
-///   `available_parallelism() / tus.len()`, bounding TOTAL front-end
-///   concurrency to roughly the machine's own core count;
-///   `$NVCC_THREADS`, when set (`> 0`), overrides this entirely — a
-///   caller who has measured their own machine's headroom keeps
+///   flash-attn-compile lane uses. How many TUs compile at once and `N`
+///   come from [`nvcc_concurrency`], which bounds TOTAL front-end
+///   concurrency by the machine's cores AND its available memory;
+///   `$NVCC_THREADS`, when set (`> 0`), overrides `N` and runs every TU at
+///   once — a caller who has measured their own machine's headroom keeps
 ///   full control.
 /// - `--expt-relaxed-constexpr --expt-extended-lambda`
 /// - `--use_fast_math` — THE ONE-TU DIVERGENCE from this crate's
@@ -669,25 +742,32 @@ fn build_flash_attn() {
     // flash_validated_arches()` read can never drift apart — one array, two
     // readers.
     //
-    // `nvcc_threads` bounds TOTAL front-end concurrency (see `--threads`'s
-    // own doc comment above — a wall-time flag, not a memory mitigation):
-    // this build spawns `tus.len()` nvcc processes CONCURRENTLY, and
-    // `--threads N` further parallelizes EACH one internally, so the real
-    // simultaneous front-end count is `tus.len() * N`. Defaulting `N` to
-    // `available_parallelism() / tus.len()` keeps that PRODUCT close to
-    // the machine's own core count rather than a flat multiple of it; a
-    // flat `N` regardless of cores/RAM OOMs the CI runner. `.max(1)`: even a
-    // single-core machine still gets ONE thread per TU, never zero.
-    // `$NVCC_THREADS`, when explicitly set to a positive integer, still
-    // overrides this unconditionally.
+    // The simultaneous front-end count is (TUs compiling at once) x
+    // `--threads`; [`nvcc_concurrency`] sizes both from the cores and the
+    // memory this build can use. `$NVCC_THREADS`, when explicitly set to a
+    // positive integer, overrides `--threads` and compiles every TU at once.
     let cpu_parallelism = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
-    let nvcc_threads: u32 = env::var("NVCC_THREADS")
+    let NvccConcurrency {
+        processes: nvcc_processes,
+        threads: nvcc_threads,
+    } = match env::var("NVCC_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| (cpu_parallelism / tus.len()).max(1) as u32);
+        .filter(|&n: &u32| n > 0)
+    {
+        Some(threads) => NvccConcurrency {
+            processes: tus.len(),
+            threads,
+        },
+        None => nvcc_concurrency(
+            cpu_parallelism,
+            available_memory_bytes(),
+            tus.len(),
+            GENCODE_ARCHES.len(),
+        ),
+    };
     let common_flags: Vec<String> = ["-O3".to_string(), "-std=c++17".to_string()]
         .into_iter()
         .chain(["--threads".to_string(), nvcc_threads.to_string()])
@@ -725,7 +805,7 @@ fn build_flash_attn() {
         ])
         .collect();
 
-    // ---- Compile every TU in `tus` concurrently (they are independent;
+    // ---- Compile the TUs in `tus`, `nvcc_processes` at a time (they are independent;
     // on an A100, single-arch, the bf16 bwd TU alone takes ~70 s, the bf16
     // fwd ~45 s, the wrapper ~5 s; each extra gencode adds wall — see
     // `VENDORED.md`'s build-times table).
@@ -741,8 +821,8 @@ fn build_flash_attn() {
     // constraint on the host is close to the SUM of all `tus.len()` peaks,
     // not any one child's own max, and a per-child sampler has no way to see
     // that. This instrumentation is DIAGNOSTIC ONLY; the aggregate-memory
-    // safety mechanism is the `nvcc_threads` bound above (total front-end
-    // concurrency tracks the machine's own core count).
+    // safety mechanism is [`nvcc_concurrency`] above (total front-end
+    // concurrency tracks the machine's cores and its available memory).
     //
     // FAIL-OPEN, but only in ONE direction: when `JAMMI_FLASH_MEASURE_RSS`
     // is EXPLICITLY set, a missing `/usr/bin/time` is a LOUD BUILD ERROR
@@ -775,55 +855,67 @@ fn build_flash_attn() {
         );
     }
     let started = Instant::now();
-    let handles: Vec<_> = tus
-        .iter()
-        .map(|(stem, cu)| {
-            let nvcc = nvcc.clone();
-            let flags = common_flags.clone();
-            let obj = out_dir.join(format!("{stem}.o"));
-            let cu = cu.clone();
-            let stem = stem.to_string();
-            std::thread::spawn(move || {
-                let t0 = Instant::now();
-                let mut cmd = if measure_rss {
-                    let mut c = Command::new("/usr/bin/time");
-                    c.arg("-v").arg(&nvcc);
-                    c
-                } else {
-                    Command::new(&nvcc)
-                };
-                let output = cmd
-                    .args(&flags)
-                    .arg("-c")
-                    .arg(&cu)
-                    .arg("-o")
-                    .arg(&obj)
-                    .output()
-                    .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", nvcc.display()));
-                let secs = t0.elapsed().as_secs_f64();
-                if !output.status.success() {
-                    panic!(
-                        "nvcc failed on {} ({}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                        cu.display(),
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let peak_rss_kb = if measure_rss {
-                    parse_max_rss_kb(&stderr)
-                } else {
-                    None
-                };
-                (stem, obj, secs, stderr, peak_rss_kb)
+    let compile = |stem: &str, cu: &Path| {
+        let obj = out_dir.join(format!("{stem}.o"));
+        let t0 = Instant::now();
+        let mut cmd = if measure_rss {
+            let mut c = Command::new("/usr/bin/time");
+            c.arg("-v").arg(&nvcc);
+            c
+        } else {
+            Command::new(&nvcc)
+        };
+        let output = cmd
+            .args(&common_flags)
+            .arg("-c")
+            .arg(cu)
+            .arg("-o")
+            .arg(&obj)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", nvcc.display()));
+        let secs = t0.elapsed().as_secs_f64();
+        if !output.status.success() {
+            panic!(
+                "nvcc failed on {} ({}):\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                cu.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let peak_rss_kb = if measure_rss {
+            parse_max_rss_kb(&stderr)
+        } else {
+            None
+        };
+        (stem.to_string(), obj, secs, stderr, peak_rss_kb)
+    };
+    // `nvcc_processes` workers take the next TU until none is left; results
+    // are put back in `tus` order so the archive's member order never
+    // depends on which TU finished first.
+    let next_tu = std::sync::atomic::AtomicUsize::new(0);
+    let mut compiled: Vec<_> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..nvcc_processes)
+            .map(|_| {
+                scope.spawn(|| {
+                    std::iter::from_fn(|| {
+                        let i = next_tu.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tus.get(i).map(|(stem, cu)| (i, compile(stem, cu)))
+                    })
+                    .collect::<Vec<_>>()
+                })
             })
-        })
-        .collect();
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("nvcc worker thread panicked"))
+            .collect()
+    });
+    compiled.sort_by_key(|(i, _)| *i);
     let mut objs = Vec::new();
     let mut timing = String::new();
-    for h in handles {
-        let (stem, obj, secs, stderr, peak_rss_kb) = h.join().expect("nvcc worker thread panicked");
+    for (_, (stem, obj, secs, stderr, peak_rss_kb)) in compiled {
         timing.push_str(&format!("{stem}: {secs:.1} s\n"));
         // Unconditional stderr print — a build
         // script's own stderr is ALWAYS forwarded by Cargo to the
@@ -848,11 +940,12 @@ fn build_flash_attn() {
     }
     let wall_s = started.elapsed().as_secs_f64();
     eprintln!(
-        "jammi-kernels flash-attn: wall ({} TUs concurrent, --threads {nvcc_threads}) = {wall_s:.1}s",
+        "jammi-kernels flash-attn: wall ({} TUs, {nvcc_processes} at a time, --threads \
+         {nvcc_threads}) = {wall_s:.1}s",
         tus.len(),
     );
     timing.push_str(&format!(
-        "wall ({} TUs concurrent, --threads {nvcc_threads}): {wall_s:.1} s\n",
+        "wall ({} TUs, {nvcc_processes} at a time, --threads {nvcc_threads}): {wall_s:.1} s\n",
         tus.len(),
     ));
     std::fs::write(out_dir.join("jammi_flash_build_times.txt"), &timing)

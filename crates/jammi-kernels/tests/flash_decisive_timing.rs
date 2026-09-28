@@ -75,7 +75,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle_core::backend::BackendDevice;
-use candle_core::{CudaDevice, Device};
+use candle_core::CudaDevice;
 use half::bf16;
 use jammi_kernels::flash::{
     flash_varlen_bwd, flash_varlen_bwd_into, flash_varlen_fwd, flash_varlen_fwd_into, BwdBuffers,
@@ -88,14 +88,6 @@ const ITERS: usize = 200;
 const RUNS: usize = 2;
 /// Steady-state tolerance: `|median - mean| / mean` must not exceed this.
 const STEADY_STATE_REL_TOL: f64 = 0.05;
-
-fn cuda_device() -> CudaDevice {
-    Device::new_cuda(0)
-        .expect("flash_decisive_timing requires an exclusive CUDA device")
-        .as_cuda_device()
-        .unwrap()
-        .clone()
-}
 
 /// Deterministic-but-spread bf16 fill in `[-18, 18]` (production
 /// amplitude) — a fixed irrational-multiplier fractional sequence, not an
@@ -528,7 +520,7 @@ fn one_full_run(dev: &CudaDevice) -> Vec<String> {
 #[test]
 #[ignore]
 fn decisive_timing_measurement() {
-    let dev = cuda_device();
+    let dev = jammi_test_resources::cuda_backend(0);
     let (major, minor) = dev.cuda_stream().context().compute_capability().unwrap();
     let sha = resolve_sha();
     let sm_name = require_env("JAMMI_TIMING_BOX_NAME");

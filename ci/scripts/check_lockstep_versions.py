@@ -53,6 +53,10 @@ def sites() -> dict[str, str | None]:
             _toml("packaging/server-cu12/pyproject.toml")["project"]["version"],
         "clients/typescript/package.json version":
             json.loads((ROOT / "clients/typescript/package.json").read_text())["version"],
+        "clients/typescript/package-lock.json version":
+            json.loads((ROOT / "clients/typescript/package-lock.json").read_text())["version"],
+        "clients/typescript/package-lock.json root package version":
+            json.loads((ROOT / "clients/typescript/package-lock.json").read_text())["packages"][""]["version"],
     }
 
 

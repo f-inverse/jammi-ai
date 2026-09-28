@@ -41,7 +41,9 @@
 mod build_script;
 
 use build_script::{
-    check_toolkit_floor, gencode_sm, parse_max_rss_kb, parse_nvcc_release, GENCODE_ARCHES,
+    check_toolkit_floor, gencode_sm, nvcc_concurrency, parse_cgroup_memory_limit, parse_max_rss_kb,
+    parse_meminfo_available, parse_nvcc_release, NvccConcurrency, GENCODE_ARCHES,
+    NVCC_FRONT_END_BYTES,
 };
 
 /// Pins the REAL `build.rs::GENCODE_ARCHES` constant's four entries
@@ -154,4 +156,66 @@ fn parse_max_rss_kb_returns_none_without_the_gnu_v_line() {
         None
     );
     assert_eq!(parse_max_rss_kb(""), None);
+}
+
+/// The flash build's five TUs over the four shipped architectures.
+const FLASH_TUS: usize = 5;
+const GIB: u64 = 1 << 30;
+
+#[test]
+fn nvcc_concurrency_fits_a_many_core_host_with_little_memory() {
+    // A community RTX 3090 host OOM-killed cicc when concurrency followed the
+    // cores alone (5 TUs x 4 threads at ~2.9 GB each); 31 GiB affords ten
+    // front-ends.
+    let c = nvcc_concurrency(24, Some(31 * GIB), FLASH_TUS, GENCODE_ARCHES.len());
+    assert_eq!(
+        c,
+        NvccConcurrency {
+            processes: 5,
+            threads: 2
+        }
+    );
+    assert!(c.processes as u64 * u64::from(c.threads) * NVCC_FRONT_END_BYTES <= 31 * GIB);
+}
+
+#[test]
+fn nvcc_concurrency_follows_the_cores_when_memory_is_ample_or_unknown() {
+    let ample = NvccConcurrency {
+        processes: 5,
+        threads: 4,
+    };
+    assert_eq!(nvcc_concurrency(64, Some(512 * GIB), FLASH_TUS, 4), ample);
+    assert_eq!(nvcc_concurrency(64, None, FLASH_TUS, 4), ample);
+    // The 16 GB, 4-core CI runner: four TUs at a time, one thread each.
+    assert_eq!(
+        nvcc_concurrency(4, Some(16 * GIB), FLASH_TUS, 4),
+        NvccConcurrency {
+            processes: 4,
+            threads: 1
+        }
+    );
+}
+
+#[test]
+fn nvcc_concurrency_never_drops_below_one_tu_with_one_thread() {
+    let one = NvccConcurrency {
+        processes: 1,
+        threads: 1,
+    };
+    assert_eq!(nvcc_concurrency(8, Some(2 * GIB), FLASH_TUS, 4), one);
+    assert_eq!(nvcc_concurrency(0, Some(0), FLASH_TUS, 4), one);
+}
+
+#[test]
+fn parse_meminfo_available_reads_the_kilobyte_line() {
+    let meminfo = "MemTotal:       65842044 kB\nMemFree:         1203456 kB\n\
+                   MemAvailable:   32505856 kB\nBuffers:          123456 kB\n";
+    assert_eq!(parse_meminfo_available(meminfo), Some(32_505_856 * 1024));
+    assert_eq!(parse_meminfo_available("MemTotal: 1 kB\n"), None);
+}
+
+#[test]
+fn parse_cgroup_memory_limit_reads_bytes_and_treats_max_as_unlimited() {
+    assert_eq!(parse_cgroup_memory_limit("34359738368\n"), Some(32 * GIB));
+    assert_eq!(parse_cgroup_memory_limit("max\n"), None);
 }

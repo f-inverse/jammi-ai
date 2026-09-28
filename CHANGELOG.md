@@ -5,6 +5,12 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A row embeds the same alone and in a batch on every measured GPU.** cuBLAS's default math mode
+  let a split-K GEMM round its partial sums to `bf16` before summing, and whether a GEMM splits is a
+  per-card choice by shape: on an RTX 4090 or RTX 6000 Ada a row longer than 16 tokens embedded alone
+  differed from the same row in a padded batch by up to `4.6e-3` (relative L1), while an L40S or L4
+  stayed exact. Every CUDA device the engine opens now disallows reduced-precision reduction
+  (`jammi_kernels::device::open_cuda`), and those cards are bit-identical to the L40S.
 - **The engine wheels ship stripped.** `jammi-ai-native` and `jammi-ai-native-cu12` drop their
   symbol tables, as the server binaries already did, which puts the CUDA wheel under PyPI's
   100 MiB per-file limit (111 MB unstripped). Its build fails on the PR when it outgrows that limit,

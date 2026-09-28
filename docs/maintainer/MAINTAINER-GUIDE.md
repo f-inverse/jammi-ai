@@ -80,7 +80,7 @@ jammi-lora -> jammi-kernels, jammi-numerics, jammi-test-resources
 jammi-numerics
 jammi-python -> jammi-ai, jammi-datafusion, jammi-db, jammi-wire
 jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-datafusion, jammi-db, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
-jammi-test-resources
+jammi-test-resources -> jammi-kernels
 jammi-test-utils -> jammi-datafusion, jammi-db, jammi-test-resources
 jammi-wire -> jammi-datafusion, jammi-db, jammi-lora, jammi-numerics
 symbol-index

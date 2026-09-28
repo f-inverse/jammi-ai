@@ -90,7 +90,7 @@ use jammi_db::store::artifact::artifact_test_hooks;
 use jammi_server::grpc::gang_rounds::GangDialer;
 use tempfile::TempDir;
 
-use crate::gang_chaos::{Fleet, Member};
+use crate::gang_chaos::{claim_within, Fleet, Member};
 use crate::gang_coordinator::{
     gang_config, pairs_loader, published_adapter_bytes, reference_rank0_adapter_bytes, row,
     two_rank_spec, write_pairs_csv, Row,
@@ -179,36 +179,8 @@ impl KillableHost {
         }
     }
 
-    /// The claim loop's own two steps (`reclaim_expired_jobs`, then
-    /// `claim_next`), polled on a lease-expiry cadence — the SAME shape
-    /// `gang_chaos::Coordinator::claim` already uses (reclaim-then-claim,
-    /// gated on the row's own lease, never a fixed wall-clock guess at an
-    /// unrelated event); reproduced here rather than shared because
-    /// `Coordinator` and `KillableHost` close over different lease/attempt
-    /// constants.
     async fn claim(&self, within: Duration) -> JobRecord {
-        let deadline = tokio::time::Instant::now() + within;
-        loop {
-            self.session
-                .catalog()
-                .reclaim_expired_jobs(LEASE, MAX_ATTEMPTS)
-                .await
-                .expect("reclaim");
-            if let Some(record) = self
-                .session
-                .catalog()
-                .claim_next(&self.worker_id, &["fine_tune"], LEASE)
-                .await
-                .expect("claim")
-            {
-                return record;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the job was not claimable within {within:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        claim_within(&self.session, &self.worker_id, LEASE, MAX_ATTEMPTS, within).await
     }
 
     /// Spawn `run_claimed_job` ON this host's own runtime — killable via

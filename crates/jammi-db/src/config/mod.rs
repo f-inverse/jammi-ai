@@ -50,18 +50,18 @@ use layers::Node;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectiveSelection {
-    /// Pick the best collective this process can actually reach: NCCL on a
-    /// CUDA build with enough visible devices, the host reduction
-    /// otherwise. Degrades rather than refuses. Default.
+    /// NCCL when every rank of the gang can join it — a CUDA build and a
+    /// CUDA device on each rank, and in a fleet a member that offers it —
+    /// the host reduction otherwise. Degrades rather than refuses. Default.
     #[default]
     Auto,
-    /// Require NCCL. A build without CUDA refuses to open rather than
-    /// silently reducing on the host at a fraction of the throughput the
-    /// deployment asked for.
+    /// Require NCCL. A build without CUDA refuses to open, and a gang with a
+    /// rank that cannot join NCCL is refused, rather than silently reducing
+    /// on the host at a fraction of the throughput the deployment asked for.
     Nccl,
     /// Require the host reduction, even where NCCL is available — the
-    /// deterministic, device-free path a hermetic run and a debugging
-    /// session want.
+    /// device-free path a hermetic run and a debugging session want. Every
+    /// transport folds in one rank order, so the result is the same bytes.
     Cpu,
 }
 

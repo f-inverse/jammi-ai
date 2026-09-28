@@ -53,6 +53,10 @@ impl Collective for Noop {
         Ok(())
     }
 
+    fn close(&self, _call: &BlockingCall) -> Result<()> {
+        Ok(())
+    }
+
     fn rank(&self) -> u32 {
         0
     }

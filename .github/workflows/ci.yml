@@ -348,8 +348,8 @@ jobs:
           cargo clippy -p jammi-encoders --all-targets --features live-gpu-tests -- -D warnings
           cargo clippy -p jammi-lora --all-targets --features live-gpu-tests -- -D warnings
           cargo clippy -p jammi-bench --all-targets --features live-gpu-tests,flash-attn -- -D warnings
-          cargo clippy -p jammi-ai --all-targets --features live-gpu-tests,live-gpu-gang-tests,live-gpu-cluster-tests -- -D warnings
-          cargo clippy -p jammi-server --tests --features live-gpu-tests -- -D warnings
+          cargo clippy -p jammi-ai --all-targets --features live-gpu-tests,live-gpu-gang-tests -- -D warnings
+          cargo clippy -p jammi-server --tests --features live-gpu-tests,live-gpu-gang-tests -- -D warnings
 
   # Lints the Metal-gated surfaces. It cannot run them: a GitHub-hosted macos-14
   # runner cannot construct a candle Metal device (`Device::new_metal(0)` panics

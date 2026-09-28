@@ -647,6 +647,11 @@ impl RankContext {
         self.collective.barrier(call)
     }
 
+    /// [`Collective::close`], routed through this ONE seam.
+    pub fn close(&self, call: &BlockingCall) -> Result<()> {
+        self.collective.close(call)
+    }
+
     /// A stable digest of the CANONICAL `trainable_vars` name order this
     /// gang's reduce must agree on (the same order [`super::optimizer::
     /// sorted_trainable_vars`] produces, threaded through
@@ -1221,6 +1226,12 @@ pub fn tokenize_and_bucket(
 }
 
 impl TrainingLoop {
+    /// The gang's healthy end ([`RankContext::close`]): the caller that owns
+    /// the gang's lifetime calls it once, after the last [`Self::run`].
+    pub fn close_gang(&self, call: &BlockingCall) -> Result<()> {
+        self.rank_ctx.close(call)
+    }
+
     /// Run the training loop. Returns the path to the saved adapter.
     ///
     /// Dual-path:

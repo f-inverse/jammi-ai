@@ -308,6 +308,8 @@ message WorkerSummary {
   // `JAMMI_WORKER_ID`, non-unique — an operator-chosen label, empty when
   // unset.
   string label = 2;
+  // The machine the process runs on, as its OS names it; empty when the OS
+  // reports none.
   string host = 3;
   // The `[worker] kinds` configuration this process claims: `"all"` or a
   // comma-joined kind list.

@@ -100,6 +100,12 @@ flash-attn = ["jammi-ai/flash-attn"]
 # Compiles the served GPU proofs (`tests/it/grpc_*_gpu.rs`): a gRPC server
 # whose engine is pinned to CUDA device 0.
 live-gpu-tests = ["cuda", "jammi-ai/live-gpu-tests"]
+# Compiles the served topology proofs that need TWO CUDA devices and NCCL
+# (`tests/it/gpu/topology.rs`): every gang topology one host can form, under
+# each transport, through the product path.
+# The fleet harness they run on (`gang_chaos`, `gang_coordinator`) is the
+# test-hooks one.
+live-gpu-gang-tests = ["live-gpu-tests", "test-hooks", "jammi-ai/live-gpu-gang-tests"]
 # Compiles the tests that need a live Postgres at JAMMI_TEST_PG_URL.
 live-postgres-tests = []
 # Cloud object-store backends for source reads / result-table storage, forwarded

@@ -18,6 +18,8 @@ use tokio::runtime::{Handle, Runtime};
 use tokio::sync::mpsc;
 
 use super::peer::{verify_leaves, CoordinatorLink, LinkFault, MemberLink, Peer, RankReadFault};
+use super::transport::{DeviceExchange, Transport};
+use super::transport_tests::{Behaviour, MemExchange};
 use super::{BlockingCall, Collective, Local, LocalGang};
 
 // ── Wiring ──────────────────────────────────────────────────────────────────
@@ -82,7 +84,26 @@ fn build_gang(
     world: u32,
     cap: usize,
     timeout: Duration,
+    taps: Taps,
+) -> (Arc<Peer>, Vec<Arc<Peer>>) {
+    build_gang_over(
+        rt,
+        world,
+        cap,
+        timeout,
+        taps,
+        vec![Transport::Inline; world as usize],
+    )
+}
+
+/// [`build_gang`] over an explicit transport per rank.
+fn build_gang_over(
+    rt: &Runtime,
+    world: u32,
+    cap: usize,
+    timeout: Duration,
     mut taps: Taps,
+    transports: Vec<Transport>,
 ) -> (Arc<Peer>, Vec<Arc<Peer>>) {
     let _guard = rt.enter();
     let handle = rt.handle();
@@ -113,14 +134,18 @@ fn build_gang(
             Peer::member(rank, world, link, Device::Cpu, cap)
                 .expect("member")
                 .with_timeout(timeout)
-                .expect("timeout"),
+                .expect("timeout")
+                .with_transport(transports[rank as usize].clone())
+                .expect("transport"),
         ));
     }
     let coordinator = Arc::new(
         Peer::coordinator(member_links, Device::Cpu, cap)
             .expect("coordinator")
             .with_timeout(timeout)
-            .expect("timeout"),
+            .expect("timeout")
+            .with_transport(transports[0].clone())
+            .expect("transport"),
     );
     (coordinator, members)
 }
@@ -269,6 +294,111 @@ fn peer_fold_over_the_wire_equals_local_fold_byte_for_byte_at_f32_f16_bf16() {
     // its own input, a gather is longer than a slice).
     assert_ne!(over_peer[0][3], raw_bits(&matrix(2, 3, 0.5)));
     assert_eq!(over_peer[0][0].len(), 4 * 3, "counts [1, 0, 3] × 3 columns");
+}
+
+/// The device transport under the SAME control plane: the rounds agree
+/// over the wire with descriptors alone, the bytes move by the exchange, and
+/// every rank folds them itself — ending every verb, at every dtype, with
+/// the inline gang's bits.
+#[test]
+fn a_device_transport_peer_gang_ends_every_verb_with_the_inline_bits() {
+    let rt = runtime();
+    let (coordinator, members) =
+        build_gang(&rt, 3, 1 << 20, Duration::from_secs(20), Taps::default());
+    let inline = run_ranks(&coordinator, &members, |peer, call| {
+        every_verb_at_every_dtype(peer, &call)
+    });
+    let exchanges = MemExchange::gang(3, &[Behaviour::Join; 3]);
+    let (coordinator, members) = build_gang_over(
+        &rt,
+        3,
+        1 << 20,
+        Duration::from_secs(20),
+        Taps::default(),
+        device_transports(&exchanges),
+    );
+    let device = run_ranks(&coordinator, &members, |peer, call| {
+        every_verb_at_every_dtype(peer, &call)
+    });
+    assert_eq!(inline, device);
+    for exchange in &exchanges {
+        assert!(
+            exchange.calls() > 0,
+            "the tensor verbs must have moved by the device exchange"
+        );
+    }
+}
+
+/// A disagreeing round is refused over the wire before any rank reaches its
+/// device exchange: no rank's bytes move under a descriptor another rank did
+/// not agree to.
+#[test]
+fn a_device_transport_peer_round_is_agreed_before_any_byte_moves() {
+    let rt = runtime();
+    let exchanges = MemExchange::gang(3, &[Behaviour::Join; 3]);
+    let (coordinator, members) = build_gang_over(
+        &rt,
+        3,
+        1 << 20,
+        Duration::from_secs(20),
+        Taps::default(),
+        device_transports(&exchanges),
+    );
+    let results = run_ranks(&coordinator, &members, |peer, call| {
+        let mut t = matrix(2, 2, 1.0);
+        // Every rank names itself root: the descriptors disagree.
+        peer.broadcast(&call, &mut t, peer.rank())
+    });
+    for (rank, result) in results.iter().enumerate() {
+        result
+            .as_ref()
+            .expect_err(&format!("rank {rank}: the round must be refused"));
+    }
+    for exchange in &exchanges {
+        assert_eq!(exchange.calls(), 0, "no byte may move before agreement");
+    }
+}
+
+/// A member whose exchange never completes ends the round at the gang
+/// deadline on every rank, with nothing applied: the ACK the coordinator
+/// waits for never comes, so it never commits.
+#[test]
+fn a_stalled_device_exchange_ends_every_peer_rank_at_the_deadline_unapplied() {
+    let rt = runtime();
+    let timeout = Duration::from_millis(500);
+    let exchanges = MemExchange::gang(3, &[Behaviour::Join, Behaviour::Join, Behaviour::Stall]);
+    let (coordinator, members) = build_gang_over(
+        &rt,
+        3,
+        1 << 20,
+        timeout,
+        Taps::default(),
+        device_transports(&exchanges),
+    );
+    let started = Instant::now();
+    let results = run_ranks(&coordinator, &members, |peer, call| {
+        let original = matrix(2, 3, peer.rank() as f32);
+        let mut tensors = vec![original.clone()];
+        let outcome = peer.all_reduce_sum(&call, &mut tensors);
+        (outcome, raw_bits(&tensors[0]) == raw_bits(&original))
+    });
+    assert!(started.elapsed() < timeout * 20, "{:?}", started.elapsed());
+    for (rank, (outcome, untouched)) in results.iter().enumerate() {
+        outcome
+            .as_ref()
+            .expect_err(&format!("rank {rank}: the round cannot complete"));
+        assert!(
+            untouched,
+            "rank {rank} applied a round that never committed"
+        );
+    }
+}
+
+fn device_transports(exchanges: &[Arc<MemExchange>]) -> Vec<Transport> {
+    exchanges
+        .iter()
+        .map(|x| Transport::Device(Arc::clone(x) as Arc<dyn DeviceExchange>))
+        .collect()
 }
 
 /// Two runs of the same Peer gang over the same inputs produce the same

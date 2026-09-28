@@ -163,6 +163,7 @@ use jammi_db::store::{ArtifactStore, CachePolicy, TrainingSetInput, TrainingSetS
 use jammi_db::tenant::TenantId;
 use tokio::sync::watch;
 
+use crate::fine_tune::collective::transport::{self, can_join_nccl, Transport, TransportKind};
 use crate::fine_tune::collective::{
     BlockingCall, Collective, CoordinatorLink, LocalGang, MemberEnd, MemberLink, Peer,
 };
@@ -186,7 +187,7 @@ use crate::pipeline::graph_neighbourhood::EdgeSourceRef;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingJob, TrainingOutcome};
-use jammi_wire::proto::gang::{AbortReason, Assign};
+use jammi_wire::proto::gang::{bind, AbortReason, Assign, Bind, InlineTransport, NcclTransport};
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
 // one lease primitive every leased row shares), the idle poll via `[worker]`
@@ -222,6 +223,30 @@ pub(crate) fn worker_label() -> Option<String> {
         Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
         _ => None,
     }
+}
+
+/// The machine this process runs on, as the OS names it (`gethostname`) —
+/// the `host` its `instances` row lists, so a gang's ranks name the machines
+/// they ran on. `None` when the OS reports no usable name: the row then
+/// lists no host, which misattributes nothing.
+pub(crate) fn host_name() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of `buf.len()` bytes, the length
+    // passed; `gethostname` writes at most that many and never past it.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            "gethostname failed; this instance lists no host"
+        );
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..len])
+        .ok()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// Mint this process's `instances`/`jobs.claimed_by` identity: a fresh
@@ -3980,7 +4005,24 @@ impl JobWorker {
                     );
                     rank_device_configs.push(device_config);
                 }
-                let gang = LocalGang::with_timeout(rank_devices, rank_timeout)
+                // The transport, by the one rule (`TransportKind::select`):
+                // configuration × whether every rank's device can join NCCL.
+                let kind = TransportKind::select(
+                    config.worker.collective,
+                    rank_devices.iter().all(can_join_nccl),
+                )
+                .map_err(WorkerJobError::from)?;
+                tracing::info!(
+                    job_id = %job_id,
+                    topology = "local",
+                    world,
+                    transport = ?kind,
+                    "gang transport selected"
+                );
+                let transports = kind
+                    .local_transports(&rank_devices, rank_timeout)
+                    .map_err(WorkerJobError::from)?;
+                let gang = LocalGang::with_transports(rank_devices, transports, rank_timeout)
                     .map_err(WorkerJobError::from)?;
                 let context_for = |rank: u32| -> std::result::Result<RankContext, WorkerJobError> {
                     let local = gang.rank(rank).map_err(WorkerJobError::from)?;
@@ -5639,7 +5681,10 @@ pub(crate) enum CoordinatorEnd {
         detail: String,
     },
     /// The coordinator's own `Peer` could not be built over the admitted
-    /// links (a message cap below the codec's floor, no device).
+    /// links (a message cap below the codec's floor, no device), or the
+    /// gang's transport could not be stood up (a rank that cannot join the
+    /// NCCL the configuration requires, a communicator that did not form
+    /// within the rank timeout).
     PeerRefused(String),
     /// The cancel flag was set before dispatch or tripped mid-run (a cancel
     /// request, or the lease lost).
@@ -6089,6 +6134,119 @@ async fn bind_recorded_training_set(
     Ok((table, manifest))
 }
 
+/// Whether this process, as a fleet member, offers to join an NCCL transport
+/// — what its `Admitted` states: its own `[worker] collective` is not `cpu`,
+/// this is a CUDA build, and its primary device is a CUDA device. A host
+/// whose device cannot even be selected offers nothing (its rank body
+/// refuses on the same selection).
+pub fn member_offers_nccl(session: &InferenceSession) -> bool {
+    match crate::model::backend::candle::select_device(session.device_config()) {
+        Ok(device) => {
+            transport::member_offers_nccl(session.inner_config().worker.collective, &device)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Send `bind` on every admitted member's link; the first link whose member
+/// is gone is a typed refusal.
+async fn bind_all(links: &[CoordinatorLink], bind: Bind) -> std::result::Result<(), JammiError> {
+    for link in links {
+        if !link.bind(bind.clone()).await {
+            return Err(JammiError::FineTune(format!(
+                "rank {}'s stream ended before the gang's Bind reached it",
+                link.rank()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A fleet member's side of its gang's transport: read the coordinator's
+/// `Bind` (the first frame after `Admitted`) and stand it up — nothing more
+/// for inline; for NCCL, join this rank of the communicator the coordinator
+/// minted, bounded by `rank_timeout`. On a blocking thread: the link blocks
+/// on its runtime, and the join waits for every rank's.
+async fn join_gang_transport(
+    mut link: MemberLink,
+    device: &candle_core::Device,
+    rank: u32,
+    world: u32,
+    rank_timeout: Duration,
+) -> std::result::Result<(MemberLink, Transport), JammiError> {
+    let device = device.clone();
+    tokio::task::spawn_blocking(move || {
+        let bind = link.recv_bind(std::time::Instant::now() + rank_timeout)?;
+        let transport = match bind.transport {
+            Some(bind::Transport::Inline(_)) => Transport::Inline,
+            Some(bind::Transport::Nccl(nccl)) => {
+                transport::nccl::join(&device, rank, world, &nccl.id, rank_timeout)?
+            }
+            None => {
+                return Err(JammiError::FineTune(
+                    "the coordinator's Bind names no transport".into(),
+                ))
+            }
+        };
+        Ok((link, transport))
+    })
+    .await
+    .map_err(|e| JammiError::FineTune(format!("binding the gang's transport: {e}")))?
+}
+
+/// Decide a fleet gang's transport (`TransportKind::select`), send it to
+/// every admitted member as `Bind`, and stand this coordinator's side of it
+/// up: nothing more for inline; for NCCL, mint the communicator id, bind it
+/// on every member, and join rank 0 of the communicator on a blocking thread
+/// (the join waits for every member's), bounded by `rank_timeout`.
+async fn bind_gang_transport(
+    job_id: &str,
+    collective: jammi_db::config::CollectiveSelection,
+    links: &[CoordinatorLink],
+    device: &candle_core::Device,
+    world: u32,
+    rank_timeout: Duration,
+) -> std::result::Result<Transport, JammiError> {
+    let every_rank_offers_nccl = transport::member_offers_nccl(collective, device)
+        && links.iter().all(CoordinatorLink::offers_nccl);
+    let kind = TransportKind::select(collective, every_rank_offers_nccl)?;
+    tracing::info!(
+        job_id = %job_id,
+        topology = "peer",
+        world,
+        transport = ?kind,
+        "gang transport selected"
+    );
+    match kind {
+        TransportKind::Inline => {
+            bind_all(
+                links,
+                Bind {
+                    transport: Some(bind::Transport::Inline(InlineTransport {})),
+                },
+            )
+            .await?;
+            Ok(Transport::Inline)
+        }
+        TransportKind::Nccl => {
+            let id = transport::nccl::mint_id()?;
+            bind_all(
+                links,
+                Bind {
+                    transport: Some(bind::Transport::Nccl(NcclTransport { id: id.clone() })),
+                },
+            )
+            .await?;
+            let device = device.clone();
+            tokio::task::spawn_blocking(move || {
+                transport::nccl::join(&device, 0, world, &id, rank_timeout)
+            })
+            .await
+            .map_err(|e| JammiError::FineTune(format!("joining the gang's NCCL: {e}")))?
+        }
+    }
+}
+
 /// End every admitted member session in `links` cooperatively (one
 /// `Cancel` each) — the stream close for an attempt that ends before its
 /// `Peer` exists.
@@ -6390,8 +6548,31 @@ impl JobWorker {
             }
         };
         let rank_timeout = Duration::from_secs(session.inner_config().worker.rank_timeout_secs);
+
+        // (7) The gang's transport, by the one rule (`TransportKind::select`):
+        // this coordinator's `[worker] collective` × whether EVERY rank
+        // offered NCCL — each member in its `Admitted`, this rank by its own
+        // device. Bound on every member before round 0; on NCCL every rank
+        // then joins the communicator, bounded by the rank timeout.
+        let transport = match bind_gang_transport(
+            job_id,
+            session.inner_config().worker.collective,
+            &links,
+            &device,
+            world,
+            rank_timeout,
+        )
+        .await
+        {
+            Ok(transport) => transport,
+            Err(e) => {
+                cancel_links(&links);
+                return (CoordinatorEnd::PeerRefused(e.to_string()), None);
+            }
+        };
         let coordinator = match Peer::coordinator(links, device, max_message_bytes)
             .and_then(|peer| peer.with_timeout(rank_timeout))
+            .and_then(|peer| peer.with_transport(transport))
         {
             Ok(peer) => Arc::new(peer),
             Err(e) => return (CoordinatorEnd::PeerRefused(e.to_string()), None),
@@ -6681,6 +6862,21 @@ async fn member_rank_body(
     };
     let catalog = Arc::new(session.catalog().pinned_to_tenant(tenant));
 
+    // The gang's transport comes first: the coordinator binds it on every
+    // member right after admission and, on NCCL, is already joining the
+    // communicator — so this rank joins now, before its own preparation,
+    // and the join's deadline is not spent on a model load.
+    let device = match crate::model::backend::candle::select_device(session.device_config()) {
+        Ok(device) => device,
+        Err(e) => return failed(e.to_string()),
+    };
+    let rank_timeout = Duration::from_secs(session.inner_config().worker.rank_timeout_secs);
+    let (link, transport) =
+        match join_gang_transport(link, &device, rank, world, rank_timeout).await {
+            Ok(bound) => bound,
+            Err(e) => return failed(e.to_string()),
+        };
+
     // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc), then
     // project to `TrainingSpec` — see the loop-claimer training path's own
     // comment for why.
@@ -6770,15 +6966,11 @@ async fn member_rank_body(
     drop(guard);
 
     let device_config = session.device_config().clone();
-    let device = match crate::model::backend::candle::select_device(&device_config) {
-        Ok(device) => device,
-        Err(e) => return failed(e.to_string()),
-    };
     let max_message_bytes = usize::try_from(session.inner_config().server.limits.max_message_bytes)
         .unwrap_or(usize::MAX);
-    let rank_timeout = Duration::from_secs(session.inner_config().worker.rank_timeout_secs);
     let peer = match Peer::member(rank, world, link, device, max_message_bytes)
         .and_then(|peer| peer.with_timeout(rank_timeout))
+        .and_then(|peer| peer.with_transport(transport))
     {
         Ok(peer) => peer,
         Err(e) => return failed(e.to_string()),
@@ -8865,7 +9057,12 @@ fn run_fine_tune_blocking(
     }
     let mut training_loop = builder.build()?;
 
-    training_loop.run(call, training_source)
+    let trained = training_loop.run(call, training_source)?;
+    // The gang's healthy end, on every rank at the same point: its round
+    // transport is released together (`Collective::close`). A run that
+    // faulted never reaches here; its transport is aborted instead.
+    training_loop.close_gang(call)?;
+    Ok(trained)
 }
 
 /// Fetch and load the checkpoint a resume of the job restores, if any: the

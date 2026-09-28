@@ -167,7 +167,7 @@ impl GangService for HoldLoopShaped {
         let (events, stream) = mpsc::channel::<Result<RankEvent, Status>>(64);
         events
             .send(Ok(RankEvent {
-                event: Some(rank_event::Event::Admitted(Admitted {})),
+                event: Some(rank_event::Event::Admitted(Admitted { nccl: false })),
             }))
             .await
             .map_err(|_| Status::internal("stream gone"))?;

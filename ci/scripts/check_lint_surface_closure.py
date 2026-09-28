@@ -815,7 +815,7 @@ def find_unprotected_lanes(
 #: wrong reason.
 _MOVED_STEP_TUPLE = (
     "cargo clippy -p jammi-ai --all-targets "
-    "--features live-gpu-tests,live-gpu-gang-tests,live-gpu-cluster-tests -- -D warnings"
+    "--features live-gpu-tests,live-gpu-gang-tests -- -D warnings"
 )
 _SYNTHETIC_JOB = """
   moved-clippy-lane:

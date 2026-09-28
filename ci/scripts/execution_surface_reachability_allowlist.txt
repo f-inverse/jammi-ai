@@ -64,8 +64,8 @@ cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (p
 # own set-equality rule) — a shell-variable `--features` value would be
 # invisible to this gate's registry. Same off-merge-path residual as the
 # LIVE suites section below — see the HONEST RESIDUAL note above. ---
-cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,mysql,postgres,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, written as a literal tuple rather than a manifest-read shell variable.
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, written as a literal tuple. ci/scripts/runpod_gpu_gang.sh's own `gang-build` group and ci/scripts/runpod_gpu_cluster.sh's own `cluster-build` group both carry the SAME tuple verbatim (each compiles the same test binary before running its own filter over it) — one row, three origins, all off the merge path for the same reason.
+cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,mysql,postgres,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, written as a literal tuple rather than a manifest-read shell variable. ci/scripts/runpod_gpu_topology.sh's `topology-build` group builds the SAME shipped server verbatim for its fleet — one row, two origins, both off the merge path for the same reason.
+cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, written as a literal tuple.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture 2>&1)"	runpod_gpu_prove.sh's capability-surface-proof group — the RAGGED normalization of a `cap_out="$(JAMMI_KERNELS_STRICT=1 cargo test ... 2>&1)"` command-substitution line: the extractor's env-assignment stripper consumes `cap_out="$(JAMMI_KERNELS_STRICT=1 ` as its fallback (non-quoted) branch (the surrounding `"..."` never closes before end-of-line with trailing content, so the quoted branch cannot match) and the trailing `2>&1)"` is NOT stripped by anything else — this exact ragged string, not the "obvious" clean reading, is what the registry actually holds.
 
 # --- ci/scripts/runpod_gpu_prove.sh's own LIVE suites (distinct from the
@@ -131,39 +131,26 @@ cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-a
 # clones (base, rebuilt, revised), never invoked from a merge-path workflow. ---
 cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$clone/Cargo.toml"	gpu_inference_ab.sh's own per-side build leg (`build_side`, `CARGO_TARGET_DIR="$target" run_cmd cargo build ...`) -- operator-run on a rented pod, invoked from no merge-path workflow.
 
-# --- ci/scripts/runpod_gpu_gang.sh — the gpu-gang POD leg.
-# One pod, two A100s, the distributed fine-tune (gang) tests in jammi-ai's
-# `gpu_capability` target. Its `gang-build` compile-check tuple is
-# byte-identical to the prove lane's own and is covered by that row above
-# (one row, two origins); the LIVE run below is this script's only tuple of
-# its own. Same off-merge-path residual as every row above, on a narrower
-# fact: the tuple needs TWO real A100s in one box, which no hermetic runner
+# --- ci/scripts/runpod_gpu_topology.sh — the GPU topology lane.
+# A fleet of two RunPod pods, two GPUs each, co-located and joined by Global
+# Networking: the fine-tune gang at every topology (one host with one GPU,
+# one host with two in one process and as two processes, two hosts with two
+# each) under the inline and NCCL transports. Its one-host cell runs the two
+# tuples below on host 0's two devices; its multi-host cell runs the shipped
+# server (covered by the prove lane's own build row above). Same
+# off-merge-path residual as every row above, on a narrower fact: the tuples
+# need two real CUDA devices in one box and NCCL, which no hermetic runner
 # has and no single-GPU lane can stand in for. Its one invoker is
-# `.github/workflows/gpu-gang.yml` (the `run-gang` PR label and manual
-# dispatch — deliberately no `push:`/`workflow_call:`
-# trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s
-# paid-pod-lane rule pins that `on:` block by name, exactly as its P1 pins
-# the prove lane's). ---
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-gang-tests --test gpu_capability ${GANG_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$gang_log"	runpod_gpu_gang.sh's `gang-proof` group — the live two-rank gang run on one 2-GPU pod (the RAGGED normalization of a `... | tee "$gang_log"` line inside the remote heredoc, so the registry holds the escaped `\$gang_log` spelling, not the "obvious" reading). Needs two real A100s in one box; the group refuses a zero-test filter match and a run that wrote no artifact, so this row never waives a vacuous pass.
+# `.github/workflows/gpu-topology.yml` (the `run-topology` PR label and
+# manual dispatch — deliberately no `push:`/`workflow_call:`/`schedule:`
+# trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s P7/P8
+# rules pin that `on:` block by name). Each live group refuses a zero-test
+# filter match, so no row here waives a vacuous pass. ---
+cargo test -p jammi-ai --features cuda,live-gpu-gang-tests --test gpu_capability --no-run	runpod_gpu_topology.sh's `topology-build` group — compiles the NCCL transport's device tests ahead of the `one-host-device` run; ci.yml's CUDA clippy lane lints the same surface.
+cargo test -p jammi-server --features cuda,live-gpu-gang-tests --test it --no-run	runpod_gpu_topology.sh's `topology-build` group — compiles the served topology tests ahead of the `one-host-product` run; ci.yml's CUDA clippy lane lints the same surface.
+cargo test -p jammi-ai --features cuda,live-gpu-gang-tests --test gpu_capability ${ONE_HOST_DEVICE_FILTER} -- --test-threads=1 2>&1 | tee "\$device_log"	runpod_gpu_topology.sh's `one-host-device` group — the NCCL transport's device tests on host 0's two GPUs (the RAGGED normalization of a `... | tee "$device_log"` line inside the remote heredoc, so the registry holds the escaped `\$device_log` spelling).
+cargo test -p jammi-server --features cuda,live-gpu-gang-tests --test it -- ${ONE_HOST_PRODUCT_FILTER} --test-threads=1 2>&1 | tee "\$product_log"	runpod_gpu_topology.sh's `one-host-product` group — every one-host topology and transport through the product path on host 0's two GPUs (the same RAGGED `\$product_log` spelling).
 
-# --- ci/scripts/runpod_gpu_cluster.sh — the gpu-cluster TWO-HOST leg.
-# Two RunPod PODS on one RunPod CLUSTER, one A100 each, joined over the
-# cluster's own private overlay network — the two-host NCCL bootstrap
-# (`ncclCommInitRank`) the pod leg above cannot exercise at all. Its
-# `cluster-build` compile-check tuple is byte-identical to the prove/gang
-# lanes' own `--no-run` tuple and is covered by that row above (one row,
-# three origins); the LIVE run below is this script's only tuple of its
-# own. Same off-merge-path residual as every row above, on a narrower fact:
-# the tuple needs TWO SEPARATE hosts each holding a real A100, which no
-# hermetic runner has and no single-pod lane can stand in for. Its one
-# invoker is `.github/workflows/gpu-cluster.yml` (the `run-cluster` PR
-# label and manual dispatch — deliberately no `push:`/`workflow_call:`/
-# `schedule:` trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s
-# P7/P8 rules pin that `on:` block by name). ---
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests --test gpu_capability ${CLUSTER_TEST_FILTER} -- --nocapture --test-threads=1 2>&1 | tee "\$rank_log"	runpod_gpu_cluster.sh's `cluster-proof` group — the live two-HOST NCCL run, one rank per host (the RAGGED normalization of a `... | tee "$rank_log"` line inside the per-rank remote heredoc, so the registry holds the escaped `\$rank_log` spelling, not the "obvious" reading). Needs two real A100s on two SEPARATE hosts; F13's shared zero-test tripwire refuses a zero-test filter match, and the driver refuses a run that wrote no artifact, so this row never waives a vacuous pass.
-
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-gang-tests --test gpu_capability --no-run	runpod_gpu_gang.sh's build of the gang suite on the 2-GPU pod, ahead of its `gang-proof` run; ci.yml's `flash-attn-compile` job lints the same surface.
-cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-cluster-tests --test gpu_capability --no-run	runpod_gpu_cluster.sh's per-host build of the cluster suite, ahead of its `cluster-proof` run; ci.yml's `flash-attn-compile` job lints the same surface.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --lib -- gpu:: --test-threads=1 2>&1 | tee /tmp/gpu_tests.log	runpod_gpu_prove.sh runs its lib's GPU tests (the `gpu` modules), on CUDA device 0; ci.yml's flash-attn-compile job lints the same surface.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability -- --nocapture --test-threads=1 --skip capability_surface 2>&1 | tee /tmp/gpu_tests.log	runpod_gpu_prove.sh runs the gpu_capability suite apart from capability_surface, on CUDA device 0; ci.yml's flash-attn-compile job lints the same surface.
 cargo test -p jammi-bench --features cuda,flash-attn,live-gpu-tests --test finetune_step_padded_cuda -- --test-threads=1 2>&1 | tee /tmp/gpu_tests.log	runpod_gpu_prove.sh runs the padded fine-tune step on CUDA device 0; ci.yml's flash-attn-compile job lints the same surface.

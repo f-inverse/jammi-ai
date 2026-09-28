@@ -64,14 +64,16 @@ impl RoundInbox {
         drop(self.frames);
     }
 
-    /// `true` for a frame the round protocol owns — one of the `round_*`
-    /// arms. Every other arm (`Assign`, `Cancel`) is the session's, decided
-    /// by the hold loop itself and never delivered here.
+    /// `true` for a frame the round protocol owns — the gang's `Bind` (its
+    /// first frame, naming the transport) and the `round_*` arms. Every other
+    /// arm (`Assign`, `Cancel`) is the session's, decided by the hold loop
+    /// itself and never delivered here.
     pub fn is_round_frame(frame: &RankControl) -> bool {
         matches!(
             frame.control,
             Some(
-                rank_control::Control::RoundResult(_)
+                rank_control::Control::Bind(_)
+                    | rank_control::Control::RoundResult(_)
                     | rank_control::Control::RoundChunk(_)
                     | rank_control::Control::RoundCommit(_)
                     | rank_control::Control::RoundFault(_)

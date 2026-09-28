@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "git_sha": "4655ccc0e2024aba58680813a721c39aa408002a",
+  "box": "NVIDIA H100 NVL, 2 hosts x 2 GPUs in US-KS-2, Global Networking",
+  "producer": {
+    "path": "ci/scripts/runpod_gpu_topology.sh",
+    "kind": "script",
+    "invocation": "bash ci/scripts/runpod_gpu_topology.sh",
+    "gating": "feature:live-gpu-gang-tests"
+  },
+  "status": "GREEN",
+  "artifact_kind": "topology",
+  "topology": {
+    "hosts": 2,
+    "gpus_per_host": 2,
+    "devices_host0": [
+      {
+        "index": "0",
+        "name": "NVIDIA H100 NVL",
+        "compute_cap": "9.0",
+        "driver_version": "580.159.04"
+      },
+      {
+        "index": "1",
+        "name": "NVIDIA H100 NVL",
+        "compute_cap": "9.0",
+        "driver_version": "580.159.04"
+      }
+    ],
+    "nccl_version": [
+      "2.23.4+cuda12.6"
+    ],
+    "one_host": {
+      "device_tests": [
+        "gang_nccl::a_bounded_join_forms_a_communicator_both_ranks_close_and_a_lone_join_ends_at_its_deadline",
+        "gang_nccl::an_abort_ends_a_real_nccl_wait_on_a_rank_that_never_joins",
+        "gang_nccl::an_nccl_gang_ends_every_verb_with_the_inline_gangs_bytes_on_two_devices"
+      ],
+      "product_tests": [
+        "gpu::topology::a_remainder_step_with_a_zero_row_rank_trains_on_device",
+        "gpu::topology::an_nccl_gang_is_deterministic_and_trains_to_the_single_rank_loss",
+        "gpu::topology::every_gpu_topology_and_transport_publishes_the_same_adapter"
+      ]
+    },
+    "fleet": {
+      "world_size": 4,
+      "nccl": {
+        "job_id": "2813233d-999c-4014-b316-1d90754398d8",
+        "status": "completed",
+        "transport": "Nccl",
+        "attempts": 1,
+        "ranks": [
+          {
+            "instance": "799df910-f0c3-4445-97ac-73ddc0d1ee50",
+            "label": "h1-gpu0",
+            "host": "b0e93cb996ec"
+          },
+          {
+            "instance": "050ff4a3-26bc-4653-a2ea-8e44b333ee1b",
+            "label": "h0-gpu1",
+            "host": "57923d4e1b19"
+          },
+          {
+            "instance": "9c0a7773-4571-462f-b3f5-a4242ec20817",
+            "label": "h1-gpu1",
+            "host": "b0e93cb996ec"
+          },
+          {
+            "instance": "dcd2b828-8ce8-4531-bd80-76f90720a650",
+            "label": "h0-gpu0",
+            "host": "57923d4e1b19"
+          }
+        ],
+        "loss_curve": [
+          2.3439207077026367,
+          2.3422672748565674,
+          2.3414419889450073
+        ],
+        "embeddings_sha256": "431cdd49a1d1f57e1a76abb153e23009e7f733666185090acc8a2604c63926af"
+      },
+      "inline": {
+        "job_id": "4f026bcb-764c-41d6-a46f-1c34bf9310a8",
+        "status": "completed",
+        "transport": "Inline",
+        "attempts": 1,
+        "ranks": [
+          {
+            "instance": "0eeec823-cd1a-473a-af58-fa29f35f1fac",
+            "label": "h1-gpu1",
+            "host": "b0e93cb996ec"
+          },
+          {
+            "instance": "108599af-6886-4ce5-b229-6c173ec3b0d1",
+            "label": "h0-gpu0",
+            "host": "57923d4e1b19"
+          },
+          {
+            "instance": "5358fbcb-b094-4d13-b159-1f504cbaf544",
+            "label": "h0-gpu1",
+            "host": "57923d4e1b19"
+          },
+          {
+            "instance": "b7e34ba0-a010-405c-96bb-b8b648748268",
+            "label": "h1-gpu0",
+            "host": "b0e93cb996ec"
+          }
+        ],
+        "loss_curve": [
+          2.3439207077026367,
+          2.3422672748565674,
+          2.3414419889450073
+        ],
+        "embeddings_sha256": "431cdd49a1d1f57e1a76abb153e23009e7f733666185090acc8a2604c63926af"
+      },
+      "reference": {
+        "job_id": "b95bbd5c-8bce-4920-baa1-3f2a4c6a3478",
+        "loss_curve": [
+          2.3439207077026367,
+          2.3422672748565674,
+          2.3414419889450073
+        ],
+        "embeddings_sha256": "71326b2f2115fe6129d1852c4b21c29b4c11faefa30f1a5904230a8434e5f390"
+      },
+      "max_loss_delta_vs_reference": 0.0,
+      "epsilon": 0.0001
+    },
+    "verdict": "pass",
+    "reasons": []
+  }
+}

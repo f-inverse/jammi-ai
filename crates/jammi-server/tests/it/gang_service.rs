@@ -82,6 +82,26 @@ pub(crate) fn assign_frame_full(
     }
 }
 
+/// The coordinator's `Bind` naming the inline transport — the first frame a
+/// body-bearing member reads after `Admitted`, before its body prepares.
+fn bind_inline_frame() -> RankControl {
+    use jammi_wire::proto::gang::{bind, rank_control, Bind, InlineTransport};
+    RankControl {
+        control: Some(rank_control::Control::Bind(Bind {
+            transport: Some(bind::Transport::Inline(InlineTransport {})),
+        })),
+    }
+}
+
+/// Play the coordinator's side of the transport: bind the inline transport
+/// on an admitted, body-bearing member.
+pub(crate) async fn bind_inline(rank: &mut OpenRank) {
+    rank.outbound
+        .send(bind_inline_frame())
+        .await
+        .expect("the admitted stream takes the coordinator's Bind");
+}
+
 fn cancel_frame() -> RankControl {
     use jammi_wire::proto::gang::{rank_control, Cancel};
     RankControl {
@@ -801,6 +821,7 @@ async fn admitted_world_two(
         .await
         .expect("a pair that resolves and verifies for the job's own tenant admits");
     expect_admitted(&mut rank).await;
+    bind_inline(&mut rank).await;
     (rank, attempt, before, ready)
 }
 
@@ -2928,6 +2949,7 @@ async fn run_rank_body_refuses_a_partition_whose_leaf_does_not_verify_as_store_u
     .await
     .expect("admission reads the sidecar, not the bytes: admitted");
     expect_admitted(&mut rank).await;
+    bind_inline(&mut rank).await;
     expect_aborted(
         &mut rank,
         AbortReason::StoreUnavailable,

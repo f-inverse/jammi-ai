@@ -1,15 +1,18 @@
 //! The collective: what a gang of training ranks does at a step boundary.
 //!
-//! One trait, one implementation per transport, selected by CONFIGURATION —
-//! `[worker] collective` and `[worker] local_ranks`, never a cargo feature. The
-//! trainer holds a `&dyn Collective` and is never `cfg`-forked: a single-rank
-//! run holds a [`Noop`], a multi-rank run on one host holds a [`Local`], a
-//! multi-host run holds a [`Peer`] (rank 0 in the coordinator's process, every
-//! other rank on the far end of one admitted `RunRank` stream), and — on a
-//! CUDA build, where the `nccl` submodule exists — an `nccl::Nccl`; the
-//! trainer's own code is the same code in every case. (A link rather than a
-//! code span would resolve only on a CUDA build, and fail the docs lane on
-//! every other.)
+//! One trait, and a collective is a CONTROL PLANE over a TRANSPORT, both
+//! selected by CONFIGURATION — `[worker] local_ranks` and `[worker]
+//! collective`, never a cargo feature. The trainer holds a `&dyn Collective`
+//! and is never `cfg`-forked: a single-rank run holds a [`Noop`], a
+//! multi-rank run on one host holds a [`Local`], a multi-host run holds a
+//! [`Peer`] (rank 0 in the coordinator's process, every other rank on the far
+//! end of one admitted `RunRank` stream). The control plane (`Local`'s
+//! rendezvous, `Peer`'s two-phase round) owns a round's agreement, fault,
+//! commit and deadline; the [`Transport`] owns only how the contributions'
+//! bytes move — inline in the round, or by a [`DeviceExchange`] (NCCL, on a
+//! CUDA build) once the round is agreed — see [`transport`]. Every arm and
+//! every transport folds through the one `round` arithmetic, so the
+//! trainer's own code is the same code in every case and so are the bytes.
 //!
 //! # The blocking-call witness
 //!
@@ -25,10 +28,10 @@
 //! or stored anywhere a worker thread could reach it. The witness lives on
 //! the TRAIT, not on `Peer` alone, because the trainer holds a `&dyn
 //! Collective` and never names `Peer`: a guarantee on `Peer`'s inherent
-//! methods would be invisible at the one call site that matters. [`Noop`],
-//! [`Local`] and `Nccl` accept the witness and ignore it — one ignored
-//! parameter each is the whole cost of a discipline that is compile-checked
-//! on every arm.
+//! methods would be invisible at the one call site that matters. [`Noop`]
+//! accepts the witness and ignores it; [`Local`] hands it to its device
+//! exchange, which blocks in the device library's wait — so the discipline
+//! is compile-checked on every arm and every transport.
 //!
 //! # The five operations
 //!
@@ -105,19 +108,11 @@
 //! ACK observed by the coordinator) is the one state a later fault cannot
 //! retract.
 //!
-//! The `Nccl` arm has none of that. NCCL exchanges the buffers a collective
-//! names and nothing else: there is no counts exchange (by design — see
-//! above), so a peer's counts, its tensor-list length and its idea of the
-//! root are not observable to this rank, and a gang whose ranks disagree
-//! about any of them produces a wrong result or a hang rather than a typed
-//! error. The failure signal for that arm is the watchdog abort — a peer
-//! that never answers leaves this rank in `synchronize`, another thread
-//! calls `nccl::Nccl::abort`, and the abort FLAG (never the collective's
-//! return value, which is `Ok` over a garbage buffer) is what says the
-//! attempt failed. A gang is kept in agreement upstream of the collective,
-//! by every rank deriving its counts from the same partition rule and
-//! walking the same canonical trainable-variable order, and not by this
-//! seam.
+//! A device transport keeps all of that: the round is agreed by the control
+//! plane BEFORE any rank calls the device primitive, a device exchange's
+//! failure is recorded as the gang's fault and aborts every exchange the
+//! control plane can reach, and on `Peer` the bytes move and are folded
+//! between the agreement and the ACK, so the commit point is unchanged.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -131,17 +126,22 @@ pub mod local;
 pub mod nccl;
 pub mod noop;
 pub mod peer;
+mod round;
+pub mod transport;
 
 #[cfg(test)]
 mod peer_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod transport_tests;
+#[cfg(test)]
 pub(crate) use tests::witness;
 
 pub use local::{Local, LocalGang};
 pub use noop::Noop;
 pub use peer::{CoordinatorLink, LinkFault, MemberEnd, MemberLink, Peer, RankReadFault};
+pub use transport::{DeviceExchange, Transport};
 
 /// A thread-bound witness that the current thread may block.
 ///
@@ -425,9 +425,8 @@ impl Descriptor {
 /// The gang's collective operations, as the trainer sees them.
 ///
 /// `Send + Sync` because the trainer runs on a blocking thread and holds the
-/// implementation behind an `Arc`; the CUDA arm carries the single-thread
-/// discipline NCCL requires in its own documentation rather than in the
-/// trait's bounds. Every verb takes a [`BlockingCall`] — see the module doc.
+/// implementation behind an `Arc`. Every verb takes a [`BlockingCall`] — see
+/// the module doc.
 pub trait Collective: Send + Sync {
     /// Concatenate every rank's slice of this step's batch along dim 0, in
     /// RANK ORDER, and return the identical tensor on every rank.
@@ -471,6 +470,14 @@ pub trait Collective: Send + Sync {
     /// Return only once every rank has reached this call.
     fn barrier(&self, call: &BlockingCall) -> Result<()>;
 
+    /// The gang's healthy end: every rank calls it once, after its last
+    /// round, and it releases this rank's round transport. A device
+    /// communicator spanning processes is torn down by its ranks together,
+    /// so this — never a drop — is where a healthy gang lets go of it; a
+    /// rank that faults before reaching it is torn down by the transport's
+    /// abort instead.
+    fn close(&self, call: &BlockingCall) -> Result<()>;
+
     /// This rank's index in `0..world`.
     fn rank(&self) -> u32;
 
@@ -485,8 +492,7 @@ pub trait Collective: Send + Sync {
     /// than a wrong fold. Binding the SAME digest again is a no-op; a
     /// DIFFERENT digest on a rank already bound is a typed error (a rank
     /// has exactly one layout per run). [`Noop`] has no peer to disagree
-    /// with and `Nccl` carries no descriptor at all (the module doc's last
-    /// paragraph): both accept and ignore it.
+    /// with and accepts and ignores it.
     fn bind_agreement(&self, digest: String) -> Result<()>;
 }
 
@@ -515,7 +521,7 @@ pub(crate) fn bind_agreement_once(
 }
 
 /// Check `counts` against the gang's shape and the caller's own tensor —
-/// shared by every implementation (`Noop`, `Local`, `Peer`, `Nccl`) so ONE
+/// shared by every implementation (`Noop`, `Local`, `Peer`) so ONE
 /// seam decides what a well-formed gather request is; no arm carries a
 /// scalar check of its own.
 ///
@@ -552,10 +558,9 @@ pub(crate) fn checked_gather_counts(
     // already guarantees `rank < world` before a `Collective` value exists at
     // all — `Noop` hardcodes rank 0 of world 1, `LocalGang::rank` refuses a
     // rank outside the gang before handing out a `Local`, `Peer::member`
-    // refuses the same before handing out a `Peer`, and `Nccl::from_rank`
-    // before handing out an `Nccl`. So `counts.get(rank as usize)` returning
-    // `None` here is unreachable
-    // through any of the four arms today; it is still a typed error rather
+    // refuses the same before handing out a `Peer`. So `counts.get(rank as
+    // usize)` returning `None` here is unreachable through any of the three
+    // arms; it is still a typed error rather
     // than an index panic, for defense in depth, and no second refusal site
     // for `world == 0` / `rank >= world` is added anywhere else in this
     // module — the length check above and this one are the only two.

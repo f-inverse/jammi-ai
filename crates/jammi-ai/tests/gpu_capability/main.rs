@@ -63,8 +63,8 @@
 //! `cargo test` lane never builds it. Under that feature the host is declared
 //! to have CUDA device 0: a test acquires it through
 //! `jammi_test_resources::cuda_device` (or `harness::serial_cuda_device`),
-//! which panics naming the missing device. The two-device and two-host gang
-//! legs compile only under `live-gpu-gang-tests` / `live-gpu-cluster-tests`.
+//! which panics naming the missing device. The two-device NCCL transport
+//! tests compile only under `live-gpu-gang-tests`.
 //! The GPU sessions pin `require_gpu = true`, so a parity test that reached
 //! `select_device` *must* have run on the GPU — a host without one fails at
 //! session construction rather than silently degrading to CPU and faking
@@ -85,7 +85,6 @@ mod clip_text_embeddings_parity;
 mod embeddings_parity;
 mod fine_tune_learns;
 mod gang_nccl;
-mod gang_pod_leg;
 mod gguf_quantized_gpu;
 mod graph_finetune_learns;
 mod graph_propagation_parity;

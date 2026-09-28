@@ -23,7 +23,10 @@ RUN yum install -y sqlite-libs \
 # `[need.*]` tables). The guard runner provides a missing need at run time, so
 # an image built before a need was declared still works; baking them here
 # keeps a CI run off the package mirrors.
-RUN yum install -y jq openssh-clients rsync tmux util-linux perl-Digest-SHA glibc-langpack-en \
+# `openssh-server`: a RunPod GPU pod runs this image and is reached over ssh
+# (`runpod_lib.sh`'s entrypoint starts sshd), so the daemon ships here rather
+# than being fetched from a mirror on every pod start.
+RUN yum install -y jq openssh-clients openssh-server rsync tmux util-linux perl-Digest-SHA glibc-langpack-en \
     && yum clean all
 
 # The Perl modules OpenSSL's `Configure` needs to build OpenSSL from source —

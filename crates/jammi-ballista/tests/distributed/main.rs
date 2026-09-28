@@ -537,6 +537,12 @@ async fn placed_gang_completes_on_a_registered_executor_other_than_the_submitter
         |r| r.status == jammi_db::catalog::status::JobStatus::Completed.to_string(),
     )
     .await;
+    if record.attempts != 1 || record.releases != 0 {
+        fleet.dump_diagnostics(&format!(
+            "job {job_id} completed after {} attempt(s) and {} release(s)",
+            record.attempts, record.releases
+        ));
+    }
     assert_eq!(record.claimed_by.as_deref(), Some(claimant.as_str()));
     assert_eq!(
         record.attempts, 1,

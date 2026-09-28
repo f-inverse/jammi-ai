@@ -9,6 +9,11 @@ arch, full stdout lines extracted verbatim per pod:
 - `gpu-floors-h100.txt` — NVIDIA H100 80GB HBM3 (sm90), pod gufh54wmqox1rw
 - `gpu-floors-l40s.txt` — NVIDIA L40S (sm89), pod kccwbawx92pou1
 - `gpu-floors-a40.txt`  — NVIDIA A40 (sm86), pod qlc5z76zh98v6c
+- `gpu-floors-rtx6000ada.txt` — NVIDIA RTX 6000 Ada Generation (sm89), measured 2026-09-28 at `37a1b59c`
+  after the nightly prove's sm_89 leg first landed on this card: `alone_vs_batch` max `4.569318750356236e-3`
+  (rows of length <= 15 exact, longer rows not), window-radius control `1.23e-3`..`1.71e-3` BELOW that
+  noise, row-length control's weakest composition `5.21e-3` below floor*5 -- neither red control has
+  power at that noise. Which operation diverges is not yet identified.
 
 These files are the producer citations for `EXACT_ARCH_COMPOSITION_FLOOR`,
 `SM89_COMPOSITION_FLOOR`, `GPU_TRUTH_DRIFT_BOUND`, and the per-arch red-control

@@ -15,7 +15,7 @@
 //!   once they agree, every rank's tensors move by one device primitive,
 //!   [`DeviceExchange::all_gather`], and EVERY rank folds the rank-ordered
 //!   contributions on its own device through the one fold
-//!   ([`super::round::fold`]), so the result bytes are the ones the inline
+//!   (`round::fold`), so the result bytes are the ones the inline
 //!   transport produces.
 //!
 //! Agreement first is what makes a device transport safe: a device
@@ -31,7 +31,7 @@
 //!
 //! The primitive is the smallest a device library must supply: every rank
 //! passes one 1-D buffer of the same length and dtype, and gets the
-//! rank-ordered concatenation back. [`exchange_contributions`] packs a
+//! rank-ordered concatenation back. `exchange_contributions` packs a
 //! contribution's tensors into one buffer per dtype (in the agreed
 //! descriptor's tensor order), zero-pads it to the longest rank's buffer
 //! (a gather's ranks contribute different row counts; a broadcast's non-root
@@ -65,7 +65,7 @@ use super::{BlockingCall, Descriptor, Verb};
 pub trait DeviceExchange: Send + Sync {
     /// The rank-ordered concatenation of every rank's `buf`, on this rank's
     /// device. Every rank passes a 1-D tensor of the same length and dtype —
-    /// [`exchange_contributions`]'s packing guarantees it — and gets back
+    /// `exchange_contributions`'s packing guarantees it — and gets back
     /// `world × len` elements.
     fn all_gather(&self, call: &BlockingCall, buf: &Tensor) -> Result<Tensor>;
 

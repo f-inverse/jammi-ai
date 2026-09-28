@@ -11,7 +11,7 @@
 //! commit and deadline; the [`Transport`] owns only how the contributions'
 //! bytes move — inline in the round, or by a [`DeviceExchange`] (NCCL, on a
 //! CUDA build) once the round is agreed — see [`transport`]. Every arm and
-//! every transport folds through the one [`round`] arithmetic, so the
+//! every transport folds through the one `round` arithmetic, so the
 //! trainer's own code is the same code in every case and so are the bytes.
 //!
 //! # The blocking-call witness

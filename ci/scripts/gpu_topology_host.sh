@@ -7,8 +7,13 @@
 #   gpu_topology_host.sh infra <infra-ip> <dir>
 #       On the first host: start one Postgres catalog per phase
 #       (`pg_test_catalog.sh`, `nccl` on 5433 and `cpu` on 5434) and the
-#       S3-class store (`s3_test_store.sh`) on <infra-ip>, and build the
-#       Python client into <dir>/venv.
+#       S3-class store (`s3_test_store.sh`) on <infra-ip>, serve this host's
+#       <dir>/jammi-server to the fleet over HTTP on <infra-ip>:7300, and build
+#       the Python client into <dir>/venv.
+#   gpu_topology_host.sh fetch <infra-ip> <dir> <sha256>
+#       On every other host: fetch the first host's server binary into
+#       <dir>/jammi-server over the private network, refused unless its
+#       sha256 is <sha256>.
 #   gpu_topology_host.sh servers <host> <ip> <infra-ip> <collective> <dir> <gpus>
 #       Start <gpus> servers on this host (server g on GPU g, flight port
 #       7000+g, health 7100+g, gang listener <ip>:7200+g) over the catalog
@@ -23,6 +28,7 @@ set -euo pipefail
 die() { echo "gpu_topology_host.sh: $*" >&2; exit 1; }
 
 S3_PORT=9000
+DIST_PORT=7300
 FLIGHT_BASE=7000
 HEALTH_BASE=7100
 PEER_BASE=7200
@@ -46,11 +52,26 @@ infra() {
       --data "$dir/pg-${phase}" >/dev/null
   done
   bash ci/scripts/s3_test_store.sh start --addr "${ip}:${S3_PORT}" --data "$dir/s3" >/dev/null
+  mkdir -p "$dir/dist"
+  ln -f "$dir/jammi-server" "$dir/dist/jammi-server"
+  setsid nohup python3 -m http.server "$DIST_PORT" --bind "$ip" --directory "$dir/dist" \
+    > "$dir/dist.log" 2>&1 < /dev/null &
   python3 -m venv "$dir/venv"
   "$dir/venv/bin/pip" install -q --upgrade pip
   "$dir/venv/bin/pip" install -q -e 'clients/python[dev]'
   ( . "$dir/venv/bin/activate" && make -C clients/python generate >/dev/null )
   echo "catalogs postgres://jammi@${ip}:{$(pg_port nccl),$(pg_port cpu)}/postgres; store http://${ip}:${S3_PORT}"
+}
+
+fetch() {
+  local infra_ip="$1" dir="$2" sha="$3" got
+  mkdir -p "$dir"
+  curl -fsS --retry 5 --retry-connrefused -o "$dir/jammi-server" "http://${infra_ip}:${DIST_PORT}/jammi-server" \
+    || die "could not fetch the server from ${infra_ip}:${DIST_PORT}"
+  got="$(sha256sum "$dir/jammi-server" | awk '{print $1}')"
+  [ "$got" = "$sha" ] || die "the fetched server's sha256 ${got} is not the first host's ${sha}"
+  chmod 0755 "$dir/jammi-server"
+  echo "fetched the server (${sha})"
 }
 
 server_toml() {
@@ -126,10 +147,11 @@ stop() {
   done
 }
 
-[ "$#" -ge 1 ] || die "usage: infra IP DIR | servers HOST IP INFRA_IP COLLECTIVE DIR GPUS | stop DIR COLLECTIVE"
+[ "$#" -ge 1 ] || die "usage: infra IP DIR | fetch INFRA_IP DIR SHA256 | servers HOST IP INFRA_IP COLLECTIVE DIR GPUS | stop DIR COLLECTIVE"
 verb="$1"; shift
 case "$verb" in
   infra) [ "$#" -eq 2 ] || die "infra IP DIR"; infra "$@" ;;
+  fetch) [ "$#" -eq 3 ] || die "fetch INFRA_IP DIR SHA256"; fetch "$@" ;;
   servers) [ "$#" -eq 6 ] || die "servers HOST IP INFRA_IP COLLECTIVE DIR GPUS"; servers "$@" ;;
   stop) [ "$#" -eq 2 ] || die "stop DIR COLLECTIVE"; stop "$@" ;;
   *) die "unknown verb '$verb'" ;;

@@ -331,6 +331,7 @@ cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-a
 cargo test -p jammi-ai --features cuda,live-gpu-gang-tests --test gpu_capability --no-run || grc=\$?
 cargo test -p jammi-server --features cuda,live-gpu-gang-tests --test it --no-run || grc=\$?
 [ "\$grc" -ne 0 ] || cp "\${CARGO_TARGET_DIR:-\$PWD/target}/release/jammi-server" ${TOPOLOGY_REMOTE_DIR}/jammi-server || grc=\$?
+[ "\$grc" -ne 0 ] || echo "SERVER_SHA256=\$(sha256sum ${TOPOLOGY_REMOTE_DIR}/jammi-server | awk '{print \$1}')"
 [ "\$grc" -ne 0 ] && rc=\$grc
 echo "PROVE_GROUP_RC name=topology-build rc=\${grc}"
 echo "::endgroup::"
@@ -367,25 +368,23 @@ rp_topology_verdict "${PIPESTATUS[0]}" "$HOST0_LOG" "${HOST0_GROUPS[@]}"
 rc=$?
 
 # ── host 1: the checkout, and host 0's server binary ────────────────────────
+# Host 1 fetches the server host 0 built over the private network (which the
+# rental measured routes), checked against the sha256 host 0 reported — never
+# relayed through this runner.
+if [ "$rc" -eq 0 ]; then
+  server_sha="$(sed -n 's/^SERVER_SHA256=\([0-9a-f]\{64\}\)$/\1/p' "$HOST0_LOG" | tail -1)"
+  [ -n "$server_sha" ] || { echo "::error::host 0 reported no SERVER_SHA256"; rc=1; }
+fi
 if [ "$rc" -eq 0 ]; then
   HOST1_LOG="$(mktemp)"
   on_host "$HOST1" "$PORT1" <<REMOTE | tee "$HOST1_LOG"
 $(device_lines)
 ${REMOTE_CHECKOUT_LINES}
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
-$(group_lines fleet-checkout "mkdir -p ${TOPOLOGY_REMOTE_DIR}")
+$(group_lines fleet-checkout "${HOST_SCRIPT} fetch ${GN_IP0} ${TOPOLOGY_REMOTE_DIR} ${server_sha}")
 REMOTE
   rp_topology_verdict "${PIPESTATUS[0]}" "$HOST1_LOG" "${HOST1_GROUPS[@]}"
   rc=$?
-fi
-if [ "$rc" -eq 0 ]; then
-  relay="$(mktemp -d)"
-  if ! scp "${RP_SSHO[@]}" -P "$PORT0" "root@${HOST0}:${TOPOLOGY_REMOTE_DIR}/jammi-server" "$relay/" \
-     || ! scp "${RP_SSHO[@]}" -P "$PORT1" "$relay/jammi-server" "root@${HOST1}:${TOPOLOGY_REMOTE_DIR}/jammi-server"; then
-    echo "::error::could not relay host 0's jammi-server to host 1"
-    rc=1
-  fi
-  rm -rf "$relay"
 fi
 
 # ── the fleet, once per transport ───────────────────────────────────────────
@@ -416,6 +415,7 @@ grc=${start_rc}
   --world-size $((RP_GPU_COUNT * 2)) --per-rank-batch 2 --expect-hosts 2 ${reference} \\
   > ${TOPOLOGY_REMOTE_DIR}/fleet-${phase}.json || grc=\$?
 cat ${TOPOLOGY_REMOTE_DIR}/fleet-${phase}.json 2>/dev/null | head -c 4000
+echo
 ${HOST_SCRIPT} stop ${TOPOLOGY_REMOTE_DIR} ${phase}
 echo "PROVE_GROUP_RC name=${group} rc=\${grc}"
 echo "::endgroup::"

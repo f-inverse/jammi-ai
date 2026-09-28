@@ -49,6 +49,9 @@ Repository = "https://github.com/f-inverse/jammi-ai"
 # The same crate and module as `jammi-ai-native`; only the features differ.
 manifest-path = "../../crates/jammi-python/Cargo.toml"
 module-name = "jammi_native"
+# The symbol table is stripped, as the server binaries are: a wheel ships the
+# engine, not its debug symbols, and the CUDA wheel must fit PyPI's per-file limit.
+strip = true
 # `python/jammi_native/__init__.py` links to the CPU dist's re-export shim, so
 # the two wheels ship one module surface.
 python-source = "python"

@@ -211,18 +211,37 @@ pub(crate) fn nvcc_concurrency(
     NvccConcurrency { processes, threads }
 }
 
-/// The memory this build may use: the smaller of the cgroup's limit (v2
-/// `memory.max`, else v1 `memory.limit_in_bytes`) and `/proc/meminfo`'s
-/// `MemAvailable`, whichever can be read. A container's `/proc/meminfo`
-/// reports the host, so the cgroup limit is what binds inside one.
+/// The memory this build may still use: the smaller of its cgroup's headroom
+/// (the limit less current usage: v2 `memory.max` and `memory.current`, else
+/// v1 `memory.limit_in_bytes` and `memory.usage_in_bytes`) and
+/// `/proc/meminfo`'s `MemAvailable`, whichever can be read. A container's
+/// `/proc/meminfo` reports the host, so the cgroup is what binds inside one,
+/// and the rest of the cargo build is already counted in its usage.
 #[cfg(feature = "flash-attn")]
 fn available_memory_bytes() -> Option<u64> {
     let read = |path: &str| std::fs::read_to_string(path).ok();
-    let cgroup = read("/sys/fs/cgroup/memory.max")
-        .or_else(|| read("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
-        .and_then(|s| parse_cgroup_memory_limit(&s));
+    let cgroup = [
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(limit, usage)| Some((read(limit)?, read(usage)?)))
+    .and_then(|(limit, usage)| cgroup_headroom(&limit, &usage));
     let meminfo = read("/proc/meminfo").and_then(|s| parse_meminfo_available(&s));
     cgroup.into_iter().chain(meminfo).min()
+}
+
+/// The memory a cgroup still grants, in bytes, from its limit and usage
+/// files: `None` when the limit is `max` (none) or either is unparseable.
+/// Pure, unit-tested.
+#[cfg(any(feature = "flash-attn", test))]
+pub(crate) fn cgroup_headroom(limit: &str, usage: &str) -> Option<u64> {
+    let limit = parse_cgroup_memory_limit(limit)?;
+    let usage: u64 = usage.trim().parse().ok()?;
+    Some(limit.saturating_sub(usage))
 }
 
 /// A cgroup memory limit file's value in bytes; `None` for `max` (no limit)

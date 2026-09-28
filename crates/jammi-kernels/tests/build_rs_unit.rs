@@ -41,8 +41,8 @@
 mod build_script;
 
 use build_script::{
-    check_toolkit_floor, gencode_sm, nvcc_concurrency, parse_cgroup_memory_limit, parse_max_rss_kb,
-    parse_meminfo_available, parse_nvcc_release, NvccConcurrency, GENCODE_ARCHES,
+    cgroup_headroom, check_toolkit_floor, gencode_sm, nvcc_concurrency, parse_cgroup_memory_limit,
+    parse_max_rss_kb, parse_meminfo_available, parse_nvcc_release, NvccConcurrency, GENCODE_ARCHES,
     NVCC_FRONT_END_BYTES,
 };
 
@@ -218,4 +218,14 @@ fn parse_meminfo_available_reads_the_kilobyte_line() {
 fn parse_cgroup_memory_limit_reads_bytes_and_treats_max_as_unlimited() {
     assert_eq!(parse_cgroup_memory_limit("34359738368\n"), Some(32 * GIB));
     assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+}
+
+#[test]
+fn cgroup_headroom_is_the_limit_less_what_the_cgroup_already_uses() {
+    assert_eq!(
+        cgroup_headroom("34359738368\n", "8589934592\n"),
+        Some(24 * GIB)
+    );
+    assert_eq!(cgroup_headroom("8589934592\n", "9663676416\n"), Some(0));
+    assert_eq!(cgroup_headroom("max\n", "8589934592\n"), None);
 }

@@ -5,6 +5,10 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The engine wheels ship stripped.** `jammi-ai-native` and `jammi-ai-native-cu12` drop their
+  symbol tables, as the server binaries already did, which puts the CUDA wheel under PyPI's
+  100 MiB per-file limit (111 MB unstripped). Its build fails on the PR when it outgrows that limit,
+  instead of at the tag's upload.
 - **Every gang topology reduces over NCCL, and the result does not depend on it.** A collective is
   a control plane (the in-process rendezvous, or the fleet's two-phase round over `RunRank`) over a
   transport: inline bytes, or an NCCL device exchange. `[worker] collective` selects the transport

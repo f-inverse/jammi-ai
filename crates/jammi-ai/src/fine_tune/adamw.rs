@@ -764,7 +764,7 @@ mod admission_predicate {
     #[cfg(feature = "cuda")]
     fn grad_on_a_different_device_is_refused_with_the_exact_reason() {
         let dev_cpu = Device::Cpu;
-        let dev_cuda = Device::new_cuda(0).expect("a CUDA device must be available on this leg");
+        let dev_cuda = jammi_test_resources::cuda_device(0);
         let (theta, m, v, _) = valid_quad();
         let g = Tensor::zeros((2, 3), DType::F32, &dev_cuda).unwrap();
         let _ = &dev_cpu;
@@ -777,7 +777,7 @@ mod admission_predicate {
     #[test]
     #[cfg(feature = "cuda")]
     fn second_moment_on_a_different_device_is_refused_with_the_exact_reason() {
-        let dev_cuda = Device::new_cuda(0).expect("a CUDA device must be available on this leg");
+        let dev_cuda = jammi_test_resources::cuda_device(0);
         let (theta, m, _, g) = valid_quad();
         let v = Tensor::zeros((2, 3), DType::F32, &dev_cuda).unwrap();
         assert_eq!(
@@ -789,7 +789,7 @@ mod admission_predicate {
     #[test]
     #[cfg(feature = "cuda")]
     fn first_moment_on_a_different_device_is_refused_with_the_exact_reason() {
-        let dev_cuda = Device::new_cuda(0).expect("a CUDA device must be available on this leg");
+        let dev_cuda = jammi_test_resources::cuda_device(0);
         let (theta, _, v, g) = valid_quad();
         let m = Tensor::zeros((2, 3), DType::F32, &dev_cuda).unwrap();
         assert_eq!(

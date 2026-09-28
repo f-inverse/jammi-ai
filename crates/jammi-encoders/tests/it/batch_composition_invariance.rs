@@ -26,17 +26,35 @@
 //! helpers rather than reaching into `src/modernbert.rs`'s private
 //! `fold_order_bound`/`FOLD_ORDER_*_ULP`.
 //!
-//! **Per reachable arm, not per fused kernel.** `attention_block_fused`/
-//! `attention_block_flash` dispatch ONLY under `self.training == true`
-//! (`ModernBertAttention::forward`) -- the encode/serving surface this
-//! oracle exercises never reaches them, so there is no forced-arm encode
-//! A/B (`ForcedFlash` stays private) and no dispatch-counter assertion here
-//! (fused arms are training-only by design). "Per reachable arm" therefore
-//! means the two device/dtype paths encode/serving actually uses: eager
-//! `f32` on CPU (this file's CPU-hermetic legs) and eager `bf16` on CUDA
-//! (per-item `#[cfg(feature = "live-gpu-tests")]` legs acquiring device 0
-//! through `jammi_test_resources::cuda_device`, which panics naming the
-//! missing device).
+//! **Per reachable arm, not per fused kernel.** The legs run the production
+//! dispatch, never a forced arm (`ForcedFlash` stays private): eager `f32`
+//! on CPU (this file's CPU-hermetic legs), and on CUDA `bf16` the flash
+//! cascade `ModernBert::forward_hidden_inner` decides once per forward --
+//! the dense flash arm for a row encoded alone, the unpad/repad transport
+//! into the varlen flash arm for a padded batch (per-item
+//! `#[cfg(feature = "live-gpu-tests")]` legs acquiring device 0 through
+//! `jammi_test_resources::cuda_device`, which opens it as the engine does
+//! and panics naming the missing device). Both flash arms attend each row
+//! over its own length, which is what makes the CUDA composition exact.
+//! The eager `bf16` arm the cascade falls back to is NOT exact: it attends
+//! a padded row over the batch's padded length, so its softmax and
+//! attention-times-value reductions run over a different length than the
+//! lone row's. With `attention_block_flash` disabled it drifts by
+//! `1.03e-3` on an L40S and an L4, and by `6.8e-5` on an RTX 4090 (row 4,
+//! length 19; rows of length <= 15 stay exact).
+//!
+//! **cuBLAS reductions are held to the compute type.** The flash arms'
+//! exactness also needs every linear layer's GEMM to round once. candle asks
+//! for an `f32` compute type, but cuBLAS's default math mode lets a split-K
+//! kernel round its partial sums to `bf16` first, and whether it splits is a
+//! per-card choice by shape: on an RTX 4090 and an RTX 6000 Ada a `[m, 32]
+//! x [32, 64]` product splits K sixteen ways from `m = 17` and not at all at
+//! `m = 528`, so a row longer than 16 came out differently alone than in a
+//! batch (`alone_vs_batch` up to `4.57e-3`) while an L40S or L4, which never
+//! split those shapes, stayed exact. `jammi_kernels::device::open_cuda`
+//! disallows that reduced-precision reduction on every device the engine
+//! opens; with it the RTX 4090 is exact on every measured composition and
+//! bit-identical to the L40S.
 //!
 //! **Anchored to f32 truth.** The CPU legs run the encoder entirely in
 //! `f32` (candle's CPU backend has no `bf16` GEMM arm at all) -- there is no `bf16` rounding noise to

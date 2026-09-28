@@ -36,25 +36,24 @@
 //! `jammi_test_resources::cuda_device`, which opens it as the engine does
 //! and panics naming the missing device). Both flash arms attend each row
 //! over its own length, which is what makes the CUDA composition exact.
-//! The eager `bf16` arm the cascade falls back to is NOT exact: it attends
-//! a padded row over the batch's padded length, so its softmax and
-//! attention-times-value reductions run over a different length than the
-//! lone row's. With `attention_block_flash` disabled it drifts by
-//! `1.03e-3` on an L40S and an L4, and by `6.8e-5` on an RTX 4090 (row 4,
-//! length 19; rows of length <= 15 stay exact).
+//! The eager `bf16` arm the cascade falls back to attends a padded row over
+//! the batch's padded length, so its attention GEMMs run at a different
+//! shape than the lone row's; it is exact on an L40S and off by `6.8e-5`
+//! (one row of the gating composition) on an RTX 4090 and an RTX 6000 Ada.
+//! No leg here runs it -- it is the fallback, not the dispatch.
 //!
-//! **cuBLAS reductions are held to the compute type.** The flash arms'
-//! exactness also needs every linear layer's GEMM to round once. candle asks
-//! for an `f32` compute type, but cuBLAS's default math mode lets a split-K
-//! kernel round its partial sums to `bf16` first, and whether it splits is a
-//! per-card choice by shape: on an RTX 4090 and an RTX 6000 Ada a `[m, 32]
-//! x [32, 64]` product splits K sixteen ways from `m = 17` and not at all at
-//! `m = 528`, so a row longer than 16 came out differently alone than in a
-//! batch (`alone_vs_batch` up to `4.57e-3`) while an L40S or L4, which never
-//! split those shapes, stayed exact. `jammi_kernels::device::open_cuda`
-//! disallows that reduced-precision reduction on every device the engine
-//! opens; with it the RTX 4090 is exact on every measured composition and
-//! bit-identical to the L40S.
+//! **cuBLAS reductions are held to the compute type.** Exactness also needs
+//! every GEMM to round once. candle asks for an `f32` compute type, but
+//! cuBLAS's default math mode lets a split-K kernel round its partial sums
+//! to `bf16` first, and whether it splits is a per-card choice by shape: on
+//! an RTX 4090 and an RTX 6000 Ada a `[m, 32] x [32, 64]` product splits K
+//! sixteen ways from `m = 17` and not at all at `m = 528`, so a row longer
+//! than 16 came out differently alone than in a batch (`alone_vs_batch` up
+//! to `4.57e-3`), while an L40S or L4, which never split those shapes,
+//! stayed exact. `jammi_kernels::device::open_cuda` disallows that
+//! reduced-precision reduction on every device the engine opens; with it
+//! the RTX 4090 is exact on all 8 measured compositions and bit-identical
+//! to the L40S.
 //!
 //! **Anchored to f32 truth.** The CPU legs run the encoder entirely in
 //! `f32` (candle's CPU backend has no `bf16` GEMM arm at all) -- there is no `bf16` rounding noise to
@@ -625,17 +624,22 @@ mod gpu {
     /// | h100 sm90 (9,0)      | `0e0`                     | `0e0` (EXACT)               |
     /// | a40  sm86 (8,6)      | `0e0`                     | `0e0` (EXACT)               |
     /// | l40s sm89 (8,9)      | `0e0`                     | `0e0` (EXACT)               |
+    /// | rtx 4090 sm89 (8,9)  | `0e0`                     | `0e0` (EXACT)               |
+    ///
+    /// The RTX 4090 row is measured with cuBLAS's reduced-precision reduction
+    /// disallowed (`jammi_kernels::device::open_cuda`); without it the RTX 4090
+    /// and the RTX 6000 Ada measure `alone_vs_batch` max `4.569318750356236e-3`.
     ///
     /// **Exact-arches class (sm80/sm86/sm89/sm90, [`EXACT_ARCH_COMPOSITION_FLOOR`]).**
-    /// 352 row-measurements (4 arches x 88 each) came back EXACTLY `0.0`,
+    /// 440 row-measurements (5 SKUs over the 4 arches, 88 each) came back EXACTLY `0.0`,
     /// zero flakiness -- the same bit-exact-zero this file's own module doc
     /// predicts from `MASKED_LOGIT` underflow (a pad weight's contribution to
     /// the value-weighted sum is `0.0 * finite == 0.0` exactly). The floor is
     /// set to `1e-5`: the weakest red control separation measured on this
-    /// class (the window-radius control's own min, `7.508231757090548e-4`)
-    /// clears the ASSERTED THRESHOLD (`floor * RED_CONTROL_SEPARATION_MULTIPLE`
-    /// = `1e-5 * 5.0 = 5e-5`), never the bare floor, by `~15.0x`
-    /// (`7.508231757090548e-4 / 5e-5 ~= 15.0x`), and the floor is infinitely
+    /// class (the window-radius control on the RTX 4090's composition 1,
+    /// `2.588562795987303e-4`) clears the ASSERTED THRESHOLD
+    /// (`floor * RED_CONTROL_SEPARATION_MULTIPLE` = `1e-5 * 5.0 = 5e-5`),
+    /// never the bare floor, by `~5.2x`, and the floor is infinitely
     /// above the measured `0.0` -- a `0.0` floor itself would admit no float
     /// slop at all, including benign FMA/ordering differences on a future,
     /// architecturally-identical but as-yet-unmeasured exact-arch SKU.
@@ -674,15 +678,18 @@ mod gpu {
     /// lookup keys SOLELY on driver-probed compute capability
     /// (`ComputeCapability::new(major, minor)`), a coarser key than the
     /// repository's own per-`(arch, build)` determinism rule used
-    /// elsewhere. Only ONE SKU per capability class is measured -- a100 sm80
-    /// `(8,0)`, h100 sm90 `(9,0)`, a40 sm86 `(8,6)`, l40s sm89 `(8,9)`, per
-    /// `docs/plans/62-embedding-surface/measurements/README.md` -- so an
-    /// unmeasured SKU that merely REPORTS the same capability (e.g. a
-    /// different sm89 card) inherits its whole class's floor without ever
-    /// having been measured itself. This is a stated residual, not a silent
-    /// gap: capability is a coarser key than the repo's `(arch, build)`
-    /// determinism unit, and closing it needs per-SKU measurement or a
-    /// documented argument that capability alone suffices.
+    /// elsewhere. sm89 is measured on three SKUs -- the L40S, the RTX 4090
+    /// and the RTX 6000 Ada -- and sm80, sm86 and sm90 on one each (a100,
+    /// a40, h100), per `docs/plans/62-embedding-surface/measurements/README.md`,
+    /// so an unmeasured SKU that merely REPORTS one of those capabilities
+    /// inherits its class's floor without having been measured itself. The
+    /// residual has fired once: the RTX 4090 and RTX 6000 Ada broke the sm89
+    /// floor because cuBLAS split their GEMMs differently from the L40S's
+    /// (see the module doc), and the answer was the math mode
+    /// `jammi_kernels::device::open_cuda` sets, which made them bit-identical
+    /// to the L40S, not a per-SKU floor. Closing the residual for good needs
+    /// per-SKU measurement or a documented argument that capability alone
+    /// suffices.
     fn gpu_composition_floor(device: &Device) -> f64 {
         use jammi_kernels::admission::{probe_cuda_compute_capability, ComputeCapability};
         match probe_cuda_compute_capability(device) {

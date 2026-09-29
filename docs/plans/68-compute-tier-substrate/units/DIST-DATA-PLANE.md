@@ -286,10 +286,23 @@ for the tier it adds. K = 1 is reported, not judged.
 
 **Fail** removes `crates/jammi-ballista`, the `[ballista]` roles and the `ComputePlane` seam;
 splitting one plan across hosts is revisited on `datafusion-distributed` (D4, #613) when a
-workload needs it. **Pass** keeps the plane for result-table materializations, with every section
-jammi runs under a job's execution-graph lock made unable to suspend (#682: Ballista's
-`TaskManager::executor_lost` awaits that lock while holding its active-job cache, which every task
-launch reads synchronously).
+workload needs it. **Pass** keeps the plane for result-table materializations.
+
+**Amended 2026-09-29, before any leg of the test ran: the plane is removed whatever the test
+shows, and the test decides #613.** Weighed beside the measurement, the plane's cost is an upstream
+coupling the engine cannot extend its way out of: Ballista's seams are too thin, so jammi carries
+parallel implementations of Ballista's own internals — its task binder (`bind_task_round_robin` is
+`pub(crate)`; Ballista `main` has since reshaped that seam from slots to vcores), its cluster and
+job state, its role hosting — and works around its hazards (retries forced off, a typed-error
+envelope over a text-only failure path, #682's lock order). It holds the workspace's DataFusion
+line (#613). For an engine whose story is ML inside DataFusion, the substrate that splits one plan
+across hosts should itself be DataFusion-shaped: `datafusion-distributed` (D4) is a library, with
+no scheduler process, carrying custom nodes through a `PhysicalExtensionCodec` and exposing
+per-task routing where device placement attaches. The test still answers the capability's own
+question, largely independent of substrate — how far one materialization's forwards parallelize
+across hosts — so its verdicts are committed as #613's evidence: a pass by the bar above justifies
+splitting plans on `datafusion-distributed` once the workspace is on DataFusion 55; a fail closes
+that half of #613.
 
 ---
 

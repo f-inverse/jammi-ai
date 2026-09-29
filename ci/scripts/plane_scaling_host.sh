@@ -75,7 +75,11 @@ build() {
   python3 -m venv "$dir/hf"
   "$dir/hf/bin/pip" install -q huggingface_hub
   "$dir/hf/bin/python3" ci/scripts/perf/checkpoint_files.py --fetch "$MODEL_REPO" "$MODEL_DIR"
-  tar -C "$(dirname "$MODEL_DIR")" -cf "$dir/dist/model.tar" "$(basename "$MODEL_DIR")"
+  # The repo snapshot carries ONNX exports and the download cache beside the
+  # checkpoint; the candle loader reads neither, so neither crosses the fleet.
+  tar -C "$(dirname "$MODEL_DIR")" --exclude="$(basename "$MODEL_DIR")/onnx" \
+    --exclude="$(basename "$MODEL_DIR")/.cache" -cf "$dir/dist/model.tar" "$(basename "$MODEL_DIR")"
+  echo "MODEL_TAR_BYTES=$(stat -c %s "$dir/dist/model.tar")"
   echo "SERVER_SHA256=$(sha "$dir/dist/jammi-server")"
   echo "BENCH_SHA256=$(sha "$dir/dist/jammi-bench")"
   echo "MODEL_SHA256=$(sha "$dir/dist/model.tar")"

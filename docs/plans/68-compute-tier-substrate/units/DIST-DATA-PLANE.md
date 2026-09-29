@@ -226,6 +226,67 @@ refuses a peer answer that repeats a row id across units (§5.3).
 **D14 — Ray / Ray Serve: recorded, not proposed.** Python-side collectives and serving are a second
 runtime beside the one binary.
 
+**D15 — The Ballista plane keeps its place only on a measured, pre-registered claim (2026-09-29).**
+D2 made Ballista "the compute/training plane". Evaluated against what the plane uniquely provides:
+
+- *Training* gains nothing from it. A placed attempt runs on another host of the claimant's own
+  device kind while the claimant idles; the jobs table's claim (`[worker] kinds`) already routes an
+  attempt to the host that trains it, and plan 67's gang assembly places its ranks. The placed
+  training rung never produced a leg (#624), and the path carried #624 and #695. Training comes off
+  the plane; plan 67 §9 records it.
+- *Disaggregation* (a CPU query tier sending model work to GPU hosts) is D1's jobs fleet already.
+- *Splitting one materialization across hosts* is the one capability nothing else in the engine
+  provides: an embedding job is whole-table on one worker (D1). The plane measured 1.61× the
+  in-process cost on ONE executor (`ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane`:
+  a fixed cost worth 49 units of work, ×1.086 per row); across hosts it was never measured.
+
+So the plane stays only if splitting one materialization across hosts pays. The test, fixed before
+any leg of it runs:
+
+- **Workload.** The `encode` ladder's embed serve (`jammi-bench encode-step --task embed`),
+  ModernBERT-large at f32, `[inference] batch_size = 32`, `batch_tokens = 16384`, fan-out
+  `partitions = 8` on every rung, units of 16,384 and 65,536 rows, 32 serves per rung per take,
+  takes `r1` and `r2`.
+- **Hosts.** Five pods of one GPU model, one GPU each, co-located in one data center on Global
+  Networking: a control host (Postgres catalog, S3-class store, the `shape-d` scheduler and query
+  tier) and four compute hosts. The fleet runs the committed `shape-d` role configs
+  (`deploy/kubernetes/overlays/shape-d/`), overridden only in addresses, storage endpoint and the
+  workload's `[inference]` settings above; compute `task_slots = 1`.
+- **Fleet sizes.** K ∈ {1, 2, 4} live compute executors, each leg recording the live executors it
+  served against.
+- **Legs.** The edges `plan-partitioned → placed → shape-d` for each K, the `placed` session on a
+  compute host over backends of its own (no fleet executor visible to it), and the direct pair
+  `plan-partitioned`/`shape-d` interleaved in one process on the control host, filed under
+  `direct/`.
+- **Judge.** `jammi-bench ladder encode <legs_K> --from plan-partitioned --to shape-d`, one verdict
+  per K, committed under `ci/artifacts/parity-ladder-runs/`. The product of the edge costs must
+  agree with the direct pair (the ladder's telescoping check); a refused verdict is a finding about
+  the measurement, repaired and re-run, and decides nothing.
+
+**Pass** iff, for K = 2 and K = 4 alike:
+
+1. every edge and the direct pair show equal outcome digests on every unit;
+2. the verdict is not refused;
+3. the composed per-row speedup, `1 / (per_work_ratio(plan-partitioned → placed) ×
+   per_work_ratio(placed → shape-d))`, is at least **1.7 at K = 2** and **3.0 at K = 4** —
+   85 % and 75 % parallel efficiency on a stage that is embarrassingly parallel, so any shortfall
+   is the plane's own cost;
+4. the direct pair's end-to-end speedup, read at the conservative end of its interval
+   (`1 / cost.interval.upper`), is at least **1.4 at K = 2** and **2.2 at K = 4** — most of (3)
+   realized on a serve a single GPU finishes in tens of seconds.
+
+The bar is set against the alternative the engine already has: K GPUs running K whole-table jobs
+from the jobs fleet scale throughput by K with no scheduler tier, so the plane's value is the
+latency of ONE table, and a cluster that does not cut that latency by these factors does not pay
+for the tier it adds. K = 1 is reported, not judged.
+
+**Fail** removes `crates/jammi-ballista`, the `[ballista]` roles and the `ComputePlane` seam;
+splitting one plan across hosts is revisited on `datafusion-distributed` (D4, #613) when a
+workload needs it. **Pass** keeps the plane for result-table materializations, with every section
+jammi runs under a job's execution-graph lock made unable to suspend (#682: Ballista's
+`TaskManager::executor_lost` awaits that lock while holding its active-job cache, which every task
+launch reads synchronously).
+
 ---
 
 ## 2. The candidates

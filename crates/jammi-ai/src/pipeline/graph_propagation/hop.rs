@@ -5,7 +5,7 @@
 //! `(g, n, w)` on `n`, so each row is one neighbour's vector for one group —
 //! the node's own among them; then each group's rows folded into one vector.
 //! The join, the shuffle and the sort are stock operators, so a hop
-//! partitions, spills and is placed like any other plan. This operator is
+//! partitions and spills like any other plan. This operator is
 //! the fold.
 //!
 //! # Why the fold is an operator and not an aggregate

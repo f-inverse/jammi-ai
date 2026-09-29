@@ -586,7 +586,7 @@ fn a_reference_that_established_no_learning_effect_is_refused_as_insensitive() {
 
 const PLAN: &str = "plan";
 const PARTITIONED: &str = "plan-partitioned";
-const PLACED: &str = "placed";
+const DIRECT: &str = "direct";
 
 fn encode_leg(rung: &str, work: u64, take: &str, series: Vec<f64>, fields: Value) -> Leg {
     let base = json!({
@@ -1079,14 +1079,14 @@ fn host_memory_that_grows_with_the_training_set_breaks_the_streaming_rung() {
 
 // ── telescoping ────────────────────────────────────────────────────────────
 
-fn ladder_of_three(placed: f64) -> (Vec<EdgeVerdict>, LegSet) {
+fn ladder_of_three(partitioned: f64) -> (Vec<EdgeVerdict>, LegSet) {
     let legs = set([
-        encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
-        encode_leg(PARTITIONED, 16, "r1", steady(1.05), json!({})),
-        encode_leg(PLACED, 16, "r1", steady(placed), json!({})),
+        encode_leg(DIRECT, 16, "r1", steady(1.0), json!({})),
+        encode_leg(PLAN, 16, "r1", steady(1.05), json!({})),
+        encode_leg(PARTITIONED, 16, "r1", steady(partitioned), json!({})),
     ]);
     let ladder = committed_ladder(Workload::Encode);
-    let span = ladder.span(Some(PLAN), Some(PLACED)).unwrap();
+    let span = ladder.span(Some(DIRECT), Some(PARTITIONED)).unwrap();
     let edges = span
         .iter()
         .map(|e| {
@@ -1105,12 +1105,12 @@ fn ladder_of_three(placed: f64) -> (Vec<EdgeVerdict>, LegSet) {
 #[test]
 fn a_product_that_contradicts_the_direct_ratio_is_refused() {
     let ladder = committed_ladder(Workload::Encode);
-    let span = ladder.span(Some(PLAN), Some(PLACED)).unwrap();
+    let span = ladder.span(Some(DIRECT), Some(PARTITIONED)).unwrap();
     let (edges, _) = ladder_of_three(1.10);
-    let direct = |placed: f64| {
+    let direct = |partitioned: f64| {
         set([
-            encode_leg(PLAN, 16, "r1", steady(1.0), json!({})),
-            encode_leg(PLACED, 16, "r1", steady(placed), json!({})),
+            encode_leg(DIRECT, 16, "r1", steady(1.0), json!({})),
+            encode_leg(PARTITIONED, 16, "r1", steady(partitioned), json!({})),
         ])
     };
     let agreed = telescoping(&edges, &span, &direct(1.10)).unwrap().unwrap();
@@ -1758,7 +1758,7 @@ fn encode_fields(work: u64, seconds: f64) -> Value {
 #[test]
 fn the_subcommand_reads_a_directory_and_refuses_what_it_cannot_place() {
     let dir = tempfile::tempdir().unwrap();
-    for rung in [PLAN, PARTITIONED, PLACED] {
+    for rung in [DIRECT, PLAN, PARTITIONED] {
         write_leg(
             dir.path(),
             Workload::Encode,
@@ -1767,8 +1767,8 @@ fn the_subcommand_reads_a_directory_and_refuses_what_it_cannot_place() {
         );
     }
     let mut span = args(Workload::Encode, dir.path());
-    span.from = Some(PLAN.into());
-    span.to = Some(PLACED.into());
+    span.from = Some(DIRECT.into());
+    span.to = Some(PARTITIONED.into());
     let verdict = run_ladder(&span).unwrap();
     assert_eq!(
         (verdict.status, verdict.edges.len()),
@@ -1827,8 +1827,6 @@ fn a_rung_in_the_span_with_no_legs_is_a_missing_leg() {
 }
 
 // ── revision edges: one rung, two builds ───────────────────────────────────
-
-const DIRECT: &str = "direct";
 
 /// The four legs of a revision session at one size — base and revised, two
 /// repeats each — and, with `rebuilt`, the A/A twin of the base.

@@ -140,9 +140,9 @@ Where a capability is better bought than built, the engine extends the
 library at the seam it already exposes for exactly that — its own
 extension points, never a fork and never a vendored copy — and keeps the
 retry/actuator/ownership discipline (attempts, terminal writes, who is
-allowed to write a row) on jammi's own side of that seam. Three examples,
+allowed to write a row) on jammi's own side of that seam. Two examples,
 one pattern (the full map, seam by seam, is
-[Built on DataFusion and Ballista](./foundations.md)):
+[Built on DataFusion](./foundations.md)):
 
 - **Fused CUDA kernels extend candle**, never replace it: a jammi kernel is
   a candle `CustomOp` with a CPU reference arm and an optional fused CUDA
@@ -158,18 +158,6 @@ one pattern (the full map, seam by seam, is
   pair and depends on no engine, so a DataFusion user who wants a model
   stage takes the crate and brings their own model cache; jammi's engine
   is one such consumer.
-- **The Ballista compute plane extends Ballista**, never forks it: a codec
-  (`PhysicalExtensionCodec`), an execution engine wrapper, and a custom task
-  distribution policy are all extension points Ballista ships for exactly
-  this — a scheduler/executor role hosts them inside the SAME
-  `jammi-server` binary, on jammi's own shutdown (never Ballista's own
-  process-level `start_server`/`start_executor_process`, which install
-  their own signal handlers). Every operator the codec does not know still
-  crosses the wire through Ballista's own codec unchanged, so extending the
-  plan surface never touches Ballista's own node set. Retries stay off on
-  the Ballista side entirely (`task_max_failures = stage_max_failures =
-  0`) — a task fault surfaces to jammi's own `attempts`/reclaim accounting,
-  never a second, competing retry loop.
 
 ## Positioning
 

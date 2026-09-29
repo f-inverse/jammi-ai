@@ -432,10 +432,6 @@ pub struct OssServer {
     /// `[server] peer_bind`: the internal peer listener's address, `Some`
     /// iff this replica is a segment owner. `None` = no third listener.
     peer_addr: Option<SocketAddr>,
-    /// `[ballista]`: which Ballista compute-plane roles this process holds,
-    /// if any. Unset = a process that holds no Ballista role and binds no
-    /// Ballista listener.
-    ballista: jammi_db::config::BallistaConfig,
     session: Arc<InferenceSession>,
     session_store: SessionStore,
     metrics: Arc<MetricsRegistry>,
@@ -455,15 +451,6 @@ impl OssServer {
         config
             .server
             .validate()
-            .map_err(|e| ServerError::Config(e.to_string()))?;
-        // Cross-section: `BallistaConfig::validate` needs both `config.
-        // ballista` and `config.server` at once (the six-address collision
-        // rule), so it takes the whole `&JammiConfig` rather than being a
-        // method on `self` — the second call site
-        // `MembershipConfig::validate` also has, for the same
-        // "struct-literal config skips `load_from`" reason
-        // (`jammi_db::config::BallistaConfig::validate`'s own doc).
-        jammi_db::config::BallistaConfig::validate(&config)
             .map_err(|e| ServerError::Config(e.to_string()))?;
         // Reject lease timing that violates the heartbeat margin, or a
         // worker poll that is a busy-loop, at construction — before the
@@ -490,7 +477,6 @@ impl OssServer {
         // that names an unknown tier or one whose feature is compiled out is a
         // startup error, not a silent degrade.
         let tiers = TierSet::from_config(&config.server.services)?;
-        let ballista = config.ballista.clone();
 
         // `open` (not `new`) registers the `annotate` query UDTF on the engine's
         // DataFusion context — the Flight SQL surface needs it. It already returns
@@ -529,7 +515,6 @@ impl OssServer {
             flight_addr,
             health_addr,
             peer_addr,
-            ballista,
             session,
             session_store,
             metrics,
@@ -650,36 +635,6 @@ impl OssServer {
             Some((listener, _, _)) => Some(listener.local_addr()?),
             None => None,
         };
-        // `[ballista]`: the Ballista compute-plane roles, beside the peer
-        // listener above. The scheduler role hosts the catalog-backed
-        // cluster under `DevicePlacement` — there is no knob.
-        let scheduler = match self.ballista.scheduler.as_ref() {
-            Some(cfg) => Some(
-                jammi_ballista::roles::host_scheduler(&self.session, cfg)
-                    .await
-                    .map_err(|e| ServerError::Config(e.to_string()))?,
-            ),
-            None => None,
-        };
-        let executor = match &self.ballista.executor {
-            Some(cfg) => Some(
-                jammi_ballista::roles::host_executor(&self.session, cfg)
-                    .await
-                    .map_err(|e| ServerError::Config(e.to_string()))?,
-            ),
-            None => None,
-        };
-        // The client role dials, binds nothing and stops nothing: it is the
-        // seams it installs on the session, so nothing is held.
-        if let Some(cfg) = &self.ballista.client {
-            let client = jammi_ballista::roles::host_client(&self.session, cfg)
-                .map_err(|e| ServerError::Config(e.to_string()))?;
-            tracing::info!(
-                scheduler = client.scheduler_url(),
-                "[ballista.client]: claimed training attempts and materializations are submitted to the \
-                 compute plane"
-            );
-        }
         // Cloned before `build_grpc_chain`/`assemble_grpc_chain` consume
         // `self` — `AssembledChain`/`BoundChain` hold their own `Arc` clones
         // internally (captured by the mounted services), but neither type
@@ -713,8 +668,6 @@ impl OssServer {
             health_router,
             peer,
             peer_addr,
-            scheduler,
-            executor,
             session,
             worker,
             readiness,
@@ -802,12 +755,6 @@ pub struct BoundServer {
     peer: Option<(TcpListener, tonic::service::Routes, Arc<MetricsRegistry>)>,
     /// The ACTUAL peer listener address (the real port for a `:0` request).
     peer_addr: Option<SocketAddr>,
-    /// The hosted Ballista scheduler role, `Some` iff `[ballista.scheduler]`
-    /// was set.
-    scheduler: Option<jammi_ballista::roles::SchedulerRole>,
-    /// The hosted Ballista executor role, `Some` iff `[ballista.executor]`
-    /// was set.
-    executor: Option<jammi_ballista::roles::ExecutorRole>,
     /// The engine session, kept alive past [`OssServer::bind`] so
     /// [`Self::serve_with_signals`] can release its catalog connections
     /// (including the lease keeper's own) once the serve loop has fully
@@ -1033,19 +980,6 @@ impl BoundServer {
         self.peer_addr
     }
 
-    /// The ACTUAL address the Ballista scheduler is bound to — `Some` iff
-    /// `[ballista.scheduler]` was set (the real port for a `:0`
-    /// request).
-    pub fn scheduler_addr(&self) -> Option<SocketAddr> {
-        self.scheduler.as_ref().map(|s| s.addr)
-    }
-
-    /// The ACTUAL (flight, grpc) addresses the Ballista executor is bound
-    /// to — `Some` iff `[ballista.executor]` was set.
-    pub fn executor_addrs(&self) -> Option<(SocketAddr, SocketAddr)> {
-        self.executor.as_ref().map(|e| (e.flight_addr, e.grpc_addr))
-    }
-
     /// `test-hooks` only: a cheaply cloneable handle onto the `GangServer`
     /// mounted on the internal peer listener's own
     /// refusal-reason state — `None` when `[server] peer_bind` is unset. A
@@ -1117,8 +1051,6 @@ impl BoundServer {
             health_router,
             peer,
             peer_addr,
-            scheduler,
-            executor,
             session,
             worker,
             readiness,
@@ -1231,13 +1163,6 @@ impl BoundServer {
                     // `StopOutcome`, never `worker.is_some()` — that
                     // would read `true` even when the join itself errored
                     // or found nothing left to join.
-                    // `[ballista]`: the executor stops admitting tasks the
-                    // same instant (`Terminating` to the scheduler), before
-                    // the in-flight worker job is joined — the drain below
-                    // still waits for the executor's own in-flight task.
-                    if let Some(e) = executor.as_ref() {
-                        e.begin_drain().await;
-                    }
                     let worker_joined = match worker.as_ref() {
                         Some(w) => match w.stop_and_join().await {
                             Ok(jammi_ai::fine_tune::worker::StopOutcome::Joined) => true,
@@ -1301,21 +1226,6 @@ impl BoundServer {
                 // covered by anything in this suite is UNMEASURED — a grep
                 // for a test that panics either task found none — and is
                 // left that way rather than asserted.
-                //
-                // `[ballista]`: same fold as the main tail's — nothing
-                // established either role stopped before the session closed
-                // otherwise (the same divergence class the peer listener
-                // comment above names).
-                if let Some(executor) = executor {
-                    if matches!(outcome, ShutdownOutcome::Drained { .. }) {
-                        executor.drain().await;
-                    } else {
-                        executor.stop().await;
-                    }
-                }
-                if let Some(scheduler) = scheduler {
-                    scheduler.stop().await;
-                }
                 let _ = health_stop_tx.send(());
                 let health_result = match health_task.await {
                     Ok(r) => r,
@@ -1357,7 +1267,6 @@ impl BoundServer {
             // The gated join half: nothing here runs until DRAIN is
             // signalled, so the worker is never stopped at t = 0.
             let session_ref = Arc::clone(&session);
-            let executor_ref = executor.as_ref();
             let gated_join = async move {
                 let _ = drain_gate.wait_for(|v| *v).await;
                 readiness_ref.begin_drain();
@@ -1365,13 +1274,6 @@ impl BoundServer {
                 // without a worker (`EmbeddedWorker::begin_drain` flips the
                 // same session-owned phase; this call is idempotent).
                 session_ref.host_admission().begin_drain();
-                // `[ballista]`: the executor reports `Terminating` the same
-                // instant, so the scheduler stops binding new tasks here
-                // while the worker below drains; the executor's own drain
-                // (after this join) still waits for its in-flight task.
-                if let Some(e) = executor_ref {
-                    e.begin_drain().await;
-                }
                 match worker_ref {
                     Some(w) => {
                         w.begin_drain().await;
@@ -1426,23 +1328,6 @@ impl BoundServer {
                 (Ok(()), outcome)
             }
         };
-
-        // `[ballista]`: DRAIN waits for the executor's own in-flight tasks
-        // before stopping it (never tear down a running placed attempt, the same reason the worker guard
-        // above is drained rather than dropped); RELEASE stops it
-        // immediately, the same "sever, don't wait" shape RELEASE gives the
-        // gRPC surface. The scheduler role always stops AFTER the
-        // executor's own drain/stop completes.
-        if let Some(executor) = executor {
-            if matches!(outcome, ShutdownOutcome::Drained { .. }) {
-                executor.drain().await;
-            } else {
-                executor.stop().await;
-            }
-        }
-        if let Some(scheduler) = scheduler {
-            scheduler.stop().await;
-        }
 
         // The tail both arms share: stop the health side-channel, release
         // the catalog (the keeper's own connection included — a

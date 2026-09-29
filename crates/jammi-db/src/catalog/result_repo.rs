@@ -1397,34 +1397,6 @@ impl Catalog {
         }
     }
 
-    /// The result-table sink's hand-off: move the `building` row `cas` names
-    /// (an [`Owner::Writer`] CAS — the holder handing it off) to
-    /// `to_writer_id` under a fresh `lease` FROM THE CATALOG'S OWN CLOCK,
-    /// the same SET the recovery claim stamps. The row must be `building`
-    /// under `cas`'s writer with a lease that is PRESENT (a released lease
-    /// cannot be handed off, exactly as [`Self::renew_lease`] never re-arms
-    /// one); a miss is the classified typed error — a second launch of the
-    /// same placed sink, whose first launch already moved the row, reads
-    /// [`JammiError::LeaseLost`]. A transfer from a writer to itself is a
-    /// renewal.
-    pub async fn transfer_building_lease(
-        &self,
-        cas: &ResultTableCas,
-        to_writer_id: &str,
-        lease: Duration,
-    ) -> Result<()> {
-        let kind = self.backend().backend_kind();
-        let mut params = vec![SqlValue::TextOwned(to_writer_id.to_string())];
-        let expr = lease_deadline_expr(kind, lease, &mut params);
-        let guarded = cas.clone().with_lease_present();
-        self.building_row_cas(
-            &guarded,
-            &format!("writer_id = $1, lease_expires_at = {expr}"),
-            params,
-        )
-        .await
-    }
-
     /// Remove the terminal (`ready` or `failed`) row `name` under the
     /// binding in force — the catalog half of dropping a result table —
     /// returning the row removed with what its segment and version rows

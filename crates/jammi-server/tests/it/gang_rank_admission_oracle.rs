@@ -313,21 +313,6 @@ fn only_the_gang_resolution_site_calls_get_result_table_for_tenant() {
         "crates/jammi-db/src/catalog/result_repo.rs", // the definition itself
         "crates/jammi-server/src/grpc/gang.rs",       // the ONE production caller
         "crates/jammi-db/tests/it/result_tables.rs",  // jammi-db's own strict-predicate tests
-        // The SECOND production caller, reviewed: `JammiCodec`'s `VectorSearchExec`
-        // decode rebuilds the operator on a Ballista executor from the table
-        // name AND the tenant the SUBMITTER's own session carried onto the
-        // wire — a read pinned to the carried tenant, never to the decoding
-        // process's ambient tenant (a scheduler/executor process has none),
-        // over the internal Ballista listeners, which are the peer listener's
-        // trust class (every client of them is a jammi role, I-PEER).
-        "crates/jammi-ballista/src/codec.rs",
-        // The THIRD production caller, reviewed: `ResultStore::adopt_placed_sink`
-        // rebuilds a result-table sink that arrived on a Ballista executor
-        // and checks that the row it names is one this catalog holds — a
-        // read pinned to the tenant the SUBMITTER's spec carried onto the
-        // wire (the row's own), never to the decoding process's ambient
-        // tenant, over the same internal listeners as the codec's read.
-        "crates/jammi-db/src/store/sink.rs",
     ]
     .into_iter()
     .collect();

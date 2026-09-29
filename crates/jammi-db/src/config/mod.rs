@@ -218,10 +218,6 @@ pub struct JammiConfig {
     pub cache: CacheConfig,
     /// HTTP and Arrow Flight server bind addresses.
     pub server: ServerConfig,
-    /// Whether this process hosts a Ballista scheduler and/or executor
-    /// role for the distributed compute plane. Default: neither role
-    /// (today's process, byte-for-byte). See [`BallistaConfig`].
-    pub ballista: BallistaConfig,
     /// Tracing/logging configuration.
     pub logging: LoggingConfig,
     /// Vendor-neutral OTLP trace export: collector endpoint, request headers,
@@ -2087,7 +2083,7 @@ impl<'de> Deserialize<'de> for PreloadEntry {
     }
 }
 
-/// Two of the six `[server]`/`[ballista]` fixed listener addresses collide
+/// Two of the three `[server]` fixed listener addresses collide
 /// iff their ports are equal and non-zero AND (their hosts are equal, OR
 /// either host is UNSPECIFIED — `0.0.0.0` / `[::]` binds every local
 /// interface, so it always overlaps a host-specific bind on the same port,
@@ -2095,11 +2091,8 @@ impl<'de> Deserialize<'de> for PreloadEntry {
 /// `[::]`, overlap each other on a dual-stack listener the same way). An
 /// ephemeral (`:0`) address never collides with anything — the kernel
 /// assigns each bind a distinct free port, so two `:0` addresses (even the
-/// identical host) are never a collision. The ONE definition
-/// [`ServerConfig::validate`]'s three-way check and [`BallistaConfig::validate`]'s
-/// six-way check both apply, so the two call sites can never diverge on what
-/// "collide" means.
-pub(crate) fn addresses_collide(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
+/// identical host) are never a collision.
+fn addresses_collide(a: std::net::SocketAddr, b: std::net::SocketAddr) -> bool {
     a.port() != 0
         && a.port() == b.port()
         && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
@@ -2154,334 +2147,6 @@ impl ServerConfig {
             ));
         }
         self.limits.validate()?;
-        Ok(())
-    }
-}
-
-/// `[ballista]`: which of the three compute-plane roles this process holds
-/// — a scheduler, an executor, a client — in any combination. Unset (the
-/// default) means none (roles are config, never a cargo feature). A
-/// scheduler and an executor on one process is the single-node cluster; a
-/// client is a process whose batch statements run on the cluster.
-///
-/// # TOML
-///
-/// ```toml
-/// [ballista.scheduler]
-/// bind = "0.0.0.0:50050"                    # Some = host a scheduler
-/// advertise_host = "10.0.4.7"               # default: the bind host
-///
-/// [ballista.executor]
-/// scheduler_address = "10.0.4.7:50050"      # Some = host an executor
-/// bind = "0.0.0.0:50051"                    # shuffle (Arrow Flight) listener
-/// grpc_bind = "0.0.0.0:50052"               # task (gRPC) listener
-/// advertise_host = "10.0.4.8"               # default: the bind host
-/// work_dir = "/var/lib/jammi/shuffle"       # default: a fresh temp dir
-/// task_slots = 1                            # >= 1
-///
-/// [ballista.client]
-/// scheduler_address = "10.0.4.7:50050"      # Some = a client of that scheduler
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BallistaConfig {
-    /// This process hosts a Ballista scheduler iff `Some`. `None` (the
-    /// default) means no scheduler role.
-    pub scheduler: Option<BallistaSchedulerConfig>,
-    /// This process hosts a Ballista executor iff `Some`. `None` (the
-    /// default) means no executor role.
-    pub executor: Option<BallistaExecutorConfig>,
-    /// This process is a client of a Ballista scheduler iff `Some`: a
-    /// statement whose plan is a materialization runs on that scheduler's
-    /// executors. `None` (the default) means every statement runs in this
-    /// process.
-    pub client: Option<BallistaClientConfig>,
-}
-
-/// `[ballista.client]`: the scheduler a client-role process submits its
-/// materializations to. Named explicitly even on a process that hosts the
-/// scheduler itself: hosting a scheduler makes a process the cluster's
-/// binder, which says nothing about where that process's own statements
-/// run — the two are separate roles, held separately.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BallistaClientConfig {
-    /// The scheduler this client submits to: `host:port` (a `SocketAddr`,
-    /// or a DNS name and port — the Kubernetes case). Required: the unset
-    /// default (empty) is refused by [`BallistaConfig::validate`].
-    pub scheduler_address: String,
-    /// The device kind this client places its models' plans onto — a
-    /// deployment fact, not this process's hardware: a CPU query tier
-    /// placing onto a GPU compute tier names `"cuda"`. Unset, a plan
-    /// requires the kind of this process's own compute device. A plan no
-    /// live executor holds runs in this process whatever it names, and its
-    /// table records the device it ran on.
-    pub device_kind: Option<jammi_datafusion::ComputeDeviceKind>,
-}
-
-/// `[ballista.scheduler]`: a scheduler role's listener and the host
-/// executors dial it back at.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BallistaSchedulerConfig {
-    /// This scheduler's gRPC listener. Default: `"0.0.0.0:50050"`.
-    pub bind: String,
-    /// The host executors dial to report a placed task's status back to
-    /// this scheduler — stamped, with `bind`'s port, into every task it
-    /// places. `None` (the default) means the `bind` host.
-    pub advertise_host: Option<String>,
-}
-
-impl Default for BallistaSchedulerConfig {
-    fn default() -> Self {
-        Self {
-            bind: "0.0.0.0:50050".into(),
-            advertise_host: None,
-        }
-    }
-}
-
-impl BallistaSchedulerConfig {
-    /// The host an executor dials to reach this scheduler: see
-    /// `advertised_host`.
-    pub fn advertised_host(&self) -> Result<String> {
-        advertised_host(
-            "ballista.scheduler",
-            &self.bind,
-            self.advertise_host.as_deref(),
-        )
-    }
-}
-
-/// The host a peer dials to reach the listener a role binds at `bind`:
-/// `advertise_host` when set, otherwise `bind`'s own host. A bind on an
-/// unspecified host (`0.0.0.0`/`::`) accepts on every interface but names
-/// none — it unwraps to a real address only on the *dialling* peer's side
-/// of a connection this process accepted, never on this process's own —
-/// so such a bind must advertise a host or it is refused, naming `table`'s
-/// keys. One rule for both roles: the scheduler's name rides in every task
-/// it places (the executor's status-report target) and the executor's in
-/// its registration (the scheduler's task-push target).
-fn advertised_host(table: &str, bind: &str, advertise_host: Option<&str>) -> Result<String> {
-    let addr: std::net::SocketAddr = bind
-        .parse()
-        .map_err(|e| JammiError::Config(format!("Invalid {table}.bind address '{bind}': {e}")))?;
-    match advertise_host {
-        Some(host) => Ok(host.to_string()),
-        None if addr.ip().is_unspecified() => Err(JammiError::Config(format!(
-            "{table}.advertise_host must be set when {table}.bind '{bind}' has an \
-             unspecified host (0.0.0.0/::)"
-        ))),
-        None => Ok(addr.ip().to_string()),
-    }
-}
-
-/// `[ballista.executor]`: an executor role's listeners, the scheduler it
-/// registers with, and its task-slot capacity.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BallistaExecutorConfig {
-    /// The scheduler this executor registers with and takes tasks from:
-    /// `host:port` (a `SocketAddr`, or a DNS name and port — the
-    /// Kubernetes case). Required: the unset default (empty) is refused by
-    /// [`BallistaConfig::validate`].
-    pub scheduler_address: String,
-    /// This executor's Arrow Flight (shuffle) listener. Default:
-    /// `"0.0.0.0:50051"`.
-    pub bind: String,
-    /// This executor's gRPC (task) listener. Default: `"0.0.0.0:50052"`.
-    pub grpc_bind: String,
-    /// The host other executors and the scheduler dial to reach this
-    /// executor. `None` (the default) means the `bind` host.
-    pub advertise_host: Option<String>,
-    /// Local directory Ballista's shuffle writer stages files under.
-    /// `None` (the default) means a fresh temporary directory per process
-    /// (no object-store shuffle in v1).
-    pub work_dir: Option<PathBuf>,
-    /// Concurrent task slots this executor offers the scheduler. Must be
-    /// `>= 1`. Default: 1.
-    pub task_slots: u32,
-}
-
-impl Default for BallistaExecutorConfig {
-    fn default() -> Self {
-        Self {
-            scheduler_address: String::new(),
-            bind: "0.0.0.0:50051".into(),
-            grpc_bind: "0.0.0.0:50052".into(),
-            advertise_host: None,
-            work_dir: None,
-            task_slots: 1,
-        }
-    }
-}
-
-impl BallistaExecutorConfig {
-    /// The host the scheduler (and other executors) dial to reach this
-    /// executor: see `advertised_host`.
-    pub fn advertised_host(&self) -> Result<String> {
-        advertised_host(
-            "ballista.executor",
-            &self.bind,
-            self.advertise_host.as_deref(),
-        )
-    }
-}
-
-impl BallistaConfig {
-    /// Whether this process hosts a Ballista scheduler role.
-    pub fn hosts_scheduler(&self) -> bool {
-        self.scheduler.is_some()
-    }
-
-    /// Whether this process hosts a Ballista executor role.
-    pub fn hosts_executor(&self) -> bool {
-        self.executor.is_some()
-    }
-
-    /// Whether this process is a client of a Ballista scheduler.
-    pub fn hosts_client(&self) -> bool {
-        self.client.is_some()
-    }
-
-    /// Validate `config`'s `[ballista]` section: a CROSS-SECTION check, the
-    /// same shape as
-    /// [`crate::catalog::instance::MembershipConfig::validate`] — ONE
-    /// `&JammiConfig` in, never `self` plus a separately-threaded
-    /// `&ServerConfig` (a second read into the same config), because the
-    /// six-address collision rule below needs both `config.ballista` and
-    /// `config.server` at once. Every configured bind address parses;
-    /// `executor.scheduler_address` and `client.scheduler_address` each
-    /// parse as a validated `host:port` DIAL target
-    /// ([`crate::catalog::instance::PeerAddr`] — hostnames are the
-    /// Kubernetes case, so this is never restricted to a `SocketAddr`, and
-    /// a `:0` scheduler address is refused the same way `PeerAddr` refuses
-    /// one for any dial target; a dial target binds nothing, so the client
-    /// role joins no collision check); a FIXED-port collision among
-    /// `scheduler.bind`, `executor.bind`, `executor.grpc_bind`,
-    /// `server.health_listen`, `server.flight_listen`, `server.peer_bind`
-    /// is refused naming BOTH keys (an ephemeral `:0` never collides — each
-    /// resolves to a distinct kernel-assigned port, the same rule
-    /// [`ServerConfig::validate`] applies to its own three listeners);
-    /// `executor.task_slots == 0` and `executor.work_dir = Some("")` are
-    /// refused.
-    ///
-    /// Called by [`JammiConfig::load_from`]. [`ServerConfig::validate`]
-    /// stays the owner of its OWN three addresses' domain validity and is
-    /// called from `jammi_server::runtime::OssServer::new`, never from
-    /// `load_from` — so a `JammiConfig` built by struct literal (or by
-    /// `parse_from` alone) and handed straight to `OssServer::new`, the way
-    /// most `jammi-server` integration tests do, never runs THIS function
-    /// either. Hosting the roles this section describes is `OssServer::
-    /// new`'s own job, so that constructor also calls
-    /// `BallistaConfig::validate(&config)` right after
-    /// `config.server.validate()` — the same second-call-site shape
-    /// [`crate::catalog::instance::MembershipConfig::validate`] has at
-    /// `InstanceRegistration::from_config`, for the same "struct-literal
-    /// config skips load_from" reason.
-    pub fn validate(config: &JammiConfig) -> Result<()> {
-        use std::net::SocketAddr;
-
-        let ballista = &config.ballista;
-        let server = &config.server;
-
-        // Every currently-configured FIXED listener this section and
-        // `server` own, named, so a collision names both keys. `server`'s
-        // own three are re-parsed here rather than threaded through as
-        // already-parsed `SocketAddr`s; an unparseable one is
-        // `ServerConfig::validate`'s own refusal, not this function's, so
-        // it is silently skipped here (`.ok()`) — leaving the other
-        // listeners checked against each other exactly as if it were
-        // absent, never a spurious ballista-side error about a server key
-        // this function does not own.
-        let mut fixed: Vec<(&'static str, SocketAddr)> = Vec::new();
-
-        if let Some(scheduler) = &ballista.scheduler {
-            let addr: SocketAddr = scheduler.bind.parse().map_err(|e| {
-                JammiError::Config(format!(
-                    "Invalid ballista.scheduler.bind address '{}': {e}",
-                    scheduler.bind
-                ))
-            })?;
-            fixed.push(("ballista.scheduler.bind", addr));
-            // An executor reports every placed task's status back to the
-            // scheduler's advertised name; an unspecified bind host must
-            // therefore advertise one.
-            scheduler.advertised_host()?;
-        }
-
-        if let Some(executor) = &ballista.executor {
-            let bind: SocketAddr = executor.bind.parse().map_err(|e| {
-                JammiError::Config(format!(
-                    "Invalid ballista.executor.bind address '{}': {e}",
-                    executor.bind
-                ))
-            })?;
-            fixed.push(("ballista.executor.bind", bind));
-
-            let grpc_bind: SocketAddr = executor.grpc_bind.parse().map_err(|e| {
-                JammiError::Config(format!(
-                    "Invalid ballista.executor.grpc_bind address '{}': {e}",
-                    executor.grpc_bind
-                ))
-            })?;
-            fixed.push(("ballista.executor.grpc_bind", grpc_bind));
-
-            crate::catalog::instance::PeerAddr::parse(&executor.scheduler_address).map_err(
-                |e| JammiError::Config(format!("Invalid ballista.executor.scheduler_address: {e}")),
-            )?;
-
-            if executor.task_slots == 0 {
-                return Err(JammiError::Config(
-                    "ballista.executor.task_slots must be >= 1".into(),
-                ));
-            }
-
-            if let Some(dir) = &executor.work_dir {
-                if dir.as_os_str().is_empty() {
-                    return Err(JammiError::Config(
-                        "ballista.executor.work_dir must not be empty when set".into(),
-                    ));
-                }
-            }
-
-            // The scheduler dials the executor's flight/task ports back
-            // (registration + task push); an unspecified `bind` host must
-            // therefore advertise one.
-            executor.advertised_host()?;
-        }
-
-        if let Some(client) = &ballista.client {
-            crate::catalog::instance::PeerAddr::parse(&client.scheduler_address).map_err(|e| {
-                JammiError::Config(format!("Invalid ballista.client.scheduler_address: {e}"))
-            })?;
-        }
-
-        if let Ok(addr) = server.health_listen.parse::<SocketAddr>() {
-            fixed.push(("server.health_listen", addr));
-        }
-        if let Ok(addr) = server.flight_listen.parse::<SocketAddr>() {
-            fixed.push(("server.flight_listen", addr));
-        }
-        if let Some(raw) = &server.peer_bind {
-            if let Ok(addr) = raw.parse::<SocketAddr>() {
-                fixed.push(("server.peer_bind", addr));
-            }
-        }
-
-        for i in 0..fixed.len() {
-            for j in (i + 1)..fixed.len() {
-                let (name_a, addr_a) = fixed[i];
-                let (name_b, addr_b) = fixed[j];
-                if addresses_collide(addr_a, addr_b) {
-                    return Err(JammiError::Config(format!(
-                        "{name_a} ({addr_a}) and {name_b} ({addr_b}) must not bind colliding \
-                         addresses (equal ports on equal, or either unspecified, hosts)"
-                    )));
-                }
-            }
-        }
-
         Ok(())
     }
 }
@@ -2728,7 +2393,6 @@ impl Default for JammiConfig {
             jobs: JobsConfig::default(),
             cache: CacheConfig::default(),
             server: ServerConfig::default(),
-            ballista: BallistaConfig::default(),
             logging: LoggingConfig::default(),
             observability: ObservabilityConfig::default(),
             catalog: CatalogConfig::default(),
@@ -3087,14 +2751,6 @@ impl JammiConfig {
         // zero timeout) at load time, naming the offending key, rather than
         // at server startup deep inside `OssServer::new`.
         config.server.limits.validate()?;
-        // Reject an out-of-domain `[ballista]` knob (an unparseable bind, a
-        // fixed-port collision with itself or with `[server]`'s three
-        // listeners, a zero `task_slots`, an empty `work_dir`) at load
-        // time, naming the offending key. `BallistaConfig::validate` is a
-        // cross-section check (its own doc names the SECOND call site
-        // `OssServer::new` must also make, for a struct-literal config that
-        // skips `load_from` entirely).
-        BallistaConfig::validate(&config)?;
         // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
         // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)
         // `otlp_endpoint`) at load time, naming the offending key, rather

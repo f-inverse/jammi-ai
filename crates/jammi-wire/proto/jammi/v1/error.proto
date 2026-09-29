@@ -115,24 +115,6 @@ message JammiErrorDetail {
     // to grow past the session's `[engine] memory_limit`-bounded pool.
     // Maps to `RESOURCE_EXHAUSTED`.
     ResourcesExhaustedError resources_exhausted = 41;
-    // `JammiError::DeviceKindUnheld { required, held }` — a plan requiring
-    // a device kind reached a holder (the compute plane before submission,
-    // one executor at stage creation) that lists none of it. Maps to
-    // `FAILED_PRECONDITION`: the plan is well-formed, the plane's device
-    // inventory is what must change.
-    DeviceKindUnheldError device_kind_unheld = 43;
-    // `JammiError::PlacedAttemptFanOut { job_id, partitions }` — a placed
-    // training attempt's stage planned at more than one partition, refused
-    // by the executor before it ran. An engine invariant; maps to `INTERNAL`.
-    PlacedAttemptFanOutError placed_attempt_fan_out = 44;
-    // `JammiError::Unheld(Unheld)` — the compute plane cannot hold a plan
-    // right now. Maps to `FailedPrecondition`.
-    UnheldError unheld = 45;
-    // `JammiError::ExecutorLost { executor_id, job_id }` — the compute plane
-    // lost the executor holding a placed job's task. Maps to `UNAVAILABLE`:
-    // the attempt is spent and its successor runs on the executors that
-    // remain; nothing about the plan or its caller must change.
-    ExecutorLostError executor_lost = 46;
     // `JammiError::MissingManifest { table }` — a read of a result table's
     // recorded materialization found no sidecar. The absent-resource
     // convention `VersionUnavailable` follows: maps to `NOT_FOUND`.
@@ -158,8 +140,9 @@ message JammiErrorDetail {
   // `JammiError::Other` carrying the enclosing `Status`'s message verbatim --
   // the peer keeps the fault's text even though it cannot keep the fault's
   // specific shape, never a fabricated empty string.
-  reserved 15, 18, 42;
-  reserved "model_retired", "model_not_found", "source_not_found";
+  reserved 15, 18, 42, 43, 44, 45, 46;
+  reserved "model_retired", "model_not_found", "source_not_found", "device_kind_unheld",
+    "placed_attempt_fan_out", "unheld", "executor_lost";
 }
 
 // `JammiError::RowGone { table }`. A building-row compare-and-set matched no
@@ -425,53 +408,6 @@ message AmbiguousAsofMatchError {
 message ReadyIndexMissing {
   string source_id = 1;
   string index = 2;
-}
-
-// `JammiError::DeviceKindUnheld { required, held }`. `required` is the kind
-// the plan's own `InferenceExec`/`TrainingExec` stamps and `held` every
-// kind the holder lists, each as its `ComputeDeviceKind::wire_str` token (`cpu`,
-// `cuda`, `metal`). Maps to `FailedPrecondition`.
-message DeviceKindUnheldError {
-  string required = 1;
-  repeated string held = 2;
-}
-
-// `JammiError::PlacedAttemptFanOut { job_id, partitions }`. The placed
-// attempt's own training job id and the partition count the stage was
-// planned at. Maps to `Internal`.
-message PlacedAttemptFanOutError {
-  string job_id = 1;
-  uint64 partitions = 2;
-}
-
-// `JammiError::Unheld(Unheld)`: why the compute plane cannot hold a plan
-// right now — one of `Unheld`'s reasons. Maps to `FailedPrecondition`.
-message UnheldError {
-  oneof reason {
-    NoLiveExecutorReason no_live_executor = 1;
-    // `Unheld::NoExecutorOfKind { required, held }`: `DeviceKindUnheldError`'s
-    // own fields.
-    DeviceKindUnheldError no_executor_of_kind = 2;
-    OnlyTheSubmitterReason only_the_submitter = 3;
-    // `Unheld::NotEncodable { detail }`.
-    StringError not_encodable = 4;
-  }
-}
-
-// `Unheld::NoLiveExecutor`: no field.
-message NoLiveExecutorReason {}
-
-// `JammiError::ExecutorLost { executor_id, job_id }`: the executor the plane
-// expired and the plane's own id for the placed plan whose task it held.
-// Maps to `Unavailable`.
-message ExecutorLostError {
-  string executor_id = 1;
-  string job_id = 2;
-}
-
-// `Unheld::OnlyTheSubmitter { submitter }`.
-message OnlyTheSubmitterReason {
-  string submitter = 1;
 }
 
 // `JammiError::MutableTable(MutableTableError)`. The inner taxonomy is

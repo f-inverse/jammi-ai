@@ -21,8 +21,7 @@ use jammi_wire::request::EmbeddingRequest;
 /// definition hash folds (backend, precision, content digest, quantization,
 /// device). Described once per producer call, never loaded — the base embed
 /// and every refresh build their descriptor + environment from this one
-/// place, and a plan placed elsewhere leaves this process holding no
-/// weights.
+/// place.
 pub(crate) struct EmbeddingDefinition {
     pub(crate) model_source: ModelSource,
     pub(crate) embedding_dim: usize,
@@ -126,7 +125,6 @@ pub async fn build_embedding_plan(
         embedding_dim: Some(embedding_dim),
         regression_form: None,
         passthrough: vec![jammi_db::store::schema::CONTENT_HASH_COLUMN.to_string()],
-        device_kind: session.required_device_kind(),
         partitions: inference.fan_out()?,
     };
     let plan = plan_inference(
@@ -253,9 +251,8 @@ impl<'a> EmbeddingPipeline<'a> {
             .instrument(tracing::debug_span!("embed.create_table"))
             .await?;
 
-        // Build the plan through the one plan-building site: in-process here and a Ballista
-        // submitter both call `build_embedding_plan`, so both build byte-identical
-        // plans by construction.
+        // Build the plan through the one plan-building site,
+        // `build_embedding_plan`, which every embedding producer calls.
         let inference_exec = build_embedding_plan(
             self.session,
             source_id,
@@ -268,7 +265,7 @@ impl<'a> EmbeddingPipeline<'a> {
         .instrument(tracing::debug_span!("embed.plan"))
         .await?;
 
-        // Write through the sink, where the compute plane says: the ok rows
+        // Write through the sink: the ok rows
         // in the embedding schema, the segments built at the table's own
         // precision (`create_table` just stamped today's deployment default
         // on the row, so the same knobs apply here), a checkpoint every

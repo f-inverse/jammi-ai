@@ -17,21 +17,18 @@ knobs.
   (`replicas: 3`), a `Service`, and a `ConfigMap` carrying `jammi.toml`'s
   non-secret knobs. Every replica runs `[worker] enabled = false` — it
   accepts every job submission but claims none.
-- **`overlays/shape-d/`** — the query tier with the Ballista client role
-  (`jammi-query.toml` replaces the base ConfigMap: `[ballista.client]`
-  pointed at `jammi-server-scheduler:50050`, so a batch statement the tier
-  receives runs on the compute tier) plus the compute tier: a GPU-scheduled `StatefulSet`
-  (`jammi-server-compute`, `replicas: 2`) behind a headless `Service`
-  (`clusterIP: None`), running the `cu12` image with `[worker] enabled =
-  true` claiming the training job kinds and `nvidia.com/gpu: 2` per pod
-  (one device per `[worker] local_ranks`), PLUS a single-replica CPU
-  scheduler `Deployment` (`jammi-server-scheduler`) behind a plain
-  `Service`. Each `jammi-server-compute` pod's `peer_advertise` is its own
-  stable DNS name under the headless Service
+- **`overlays/shape-d/`** — the base query tier plus the compute tier: a
+  GPU-scheduled `StatefulSet` (`jammi-server-compute`, `replicas: 2`)
+  behind a headless `Service` (`clusterIP: None`), running the `cu12` image
+  with `[worker] enabled = true` claiming every job kind and
+  `nvidia.com/gpu: 2` per pod (one device per `[worker] local_ranks`). The
+  query tier accepts every job submission and claims none; the compute
+  pods claim them, so work that should reach a GPU is submitted as a job.
+  Each `jammi-server-compute` pod's `peer_advertise` is its own stable DNS
+  name under the headless Service
   (`<pod>.jammi-server-compute.<namespace>.svc.cluster.local`), so a rank's
   peer identity survives a pod restart — the property a plain `Deployment`
-  cannot hold; the same name is its Ballista `advertise_host`, since each
-  pod also registers as a Ballista executor with `jammi-server-scheduler`.
+  cannot hold.
   This overlay admits single-pod gangs (`W ≤ 2`, `Local` on one pod's two
   devices); a cross-pod `Peer` gang of world `W` needs `W > local_ranks`,
   `max_world_size ≥ W` on the submit edge (`base/jammi.toml`; the key is
@@ -139,16 +136,7 @@ ordinal AT OR ABOVE it to the old spec, useful for a canary rollout of the
 highest ordinal alone. `podManagementPolicy: Parallel` governs SCALE
 up/down only (replicas created or deleted without waiting on a sibling); it
 does not change a `RollingUpdate`'s own strictly-ordered, one-at-a-time
-replacement. The single-replica `jammi-server-scheduler` `Deployment`
-claims no job and runs no task, so it has nothing to drain: `maxSurge: 25%`
-rounds up to 1 (the Deployment default), so a fresh scheduler pod starts
-before the old one stops, and the two briefly serve the SAME
-`[ballista.scheduler]`-hosted role behind the same Service (executor
-registrations and slot counts are read from the shared catalog, never a
-scheduler-local cache that a rollout could split). A plan in flight on the
-old scheduler when it stops fails at its submitter, whose own path re-runs
-it — a materialization in the replica that received it, a training attempt
-through the lease reclaim. Caps a DRAIN cannot cross: kubelet graceful
+replacement. Caps a DRAIN cannot cross: kubelet graceful
 node shutdown is off by default (0 s); AWS Spot gives a 2-minute
 interruption notice; GCP Spot ≤ 30 s. On spot capacity use RELEASE instead
 — the job is claimable at once and no attempt burns:
@@ -182,52 +170,6 @@ bring that container back; signal the process from the host (`kill -INT` on
 process samples it from the catalog every `[worker] metrics_sample_secs`) is
 the HPA/KEDA signal for the compute tier; `jammi_worker_jobs_in_flight` says
 whether a replica is busy.
-
-## Compute plane
-
-Three roles under `[ballista]` (`docs/guide/src/configuration.md`). The
-query tier (`jammi-server`, `[worker] enabled = false`) is a CLIENT of the
-scheduler: a `CREATE TABLE … AS` over Flight SQL or a materialization a
-verb builds runs its plan on the compute tier when a live executor holds
-every device kind it requires, in the replica otherwise; a `SELECT` never
-leaves the replica.
-
-A claimed training attempt — `fine_tune`, `graph_fine_tune` or
-`context_predictor`, of any world size — is submitted the same way when its
-claimant holds the client role: as one Ballista task, bound to an executor
-other than the claimant that lists the claimant's OWN device kind, and
-trained in the claimant's process when no live executor does
-(byte-identical either way, which is why the kind must match). That rule
-decides who claims here: the query tier and the scheduler are CPU pods and
-the executors list `cuda`, so an attempt claimed on either would train
-there. The compute pods claim the training kinds, and nothing else does:
-
-- **`jammi-server-scheduler`** (a single-replica CPU `Deployment`):
-  `[ballista.scheduler]` set (advertised as its Service name, so an
-  executor's task-status report dials the Service, never the pod's `0.0.0.0`
-  bind), `[worker] enabled = false`, no `[ballista.executor]`, no
-  `[ballista.client]`. It binds submitted tasks to executors; it claims no
-  job, runs no task and submits nothing of its own.
-- **`jammi-server-compute`** (the GPU `StatefulSet`): `[worker] enabled =
-  true` claiming `["fine_tune", "graph_fine_tune", "context_predictor"]`,
-  and `[ballista.executor]` pointed at `jammi-server-scheduler`'s Service.
-  Each pod trains the jobs it claims in-process under its own `[worker]
-  local_ranks` topology, and runs the tasks the scheduler binds to it. A
-  placed training attempt and the pod's own claim take the same job slot,
-  and run the same body.
-
-DRAIN on a `jammi-server-compute` pod stops Ballista task admission at once
-— the executor reports `Terminating` to the scheduler the instant DRAIN
-begins, before the pod's in-flight worker job is joined, a terminating
-executor is never bound, and a training attempt the pod is still dialled
-with inside its grace is refused before any claim transfer — but WAITS for any in-flight
-placed task to finish before the pod itself stops — the same "finish what's
-running, refuse what's new" shape DRAIN already gives an in-process claim.
-RELEASE tears the executor down immediately regardless of an in-flight
-placed task: the scheduler's own `ExecutorLost` handling and jammi's
-`transfer_claim` guard (never Ballista's own task retry, which is pinned at
-zero — `task_max_failures = 0`) are what put the job back in front of a
-successor.
 
 ## Image pin advice
 

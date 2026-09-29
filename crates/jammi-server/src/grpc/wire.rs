@@ -282,25 +282,6 @@ mod tests {
         ));
     }
 
-    /// The plane's loss of a placed job's executor reaches a remote caller
-    /// as `Unavailable` — a peer that went away, retried by the job's
-    /// successor — and reconstructs as its typed variant naming the
-    /// executor and the placed job, never `FailedPrecondition` (nothing the
-    /// caller could fix) and never a fold into `Other`.
-    #[test]
-    fn executor_lost_is_unavailable_and_round_trips_typed() {
-        let lost = map_engine_error(JammiError::ExecutorLost {
-            executor_id: "executor-1".into(),
-            job_id: "7bY2".into(),
-        });
-        assert_eq!(lost.code(), Code::Unavailable);
-        assert!(matches!(
-            error_from_status(&lost),
-            JammiError::ExecutorLost { executor_id, job_id }
-                if executor_id == "executor-1" && job_id == "7bY2"
-        ));
-    }
-
     /// The empty-training-set refusal must reach a remote caller as the
     /// refusal it is. An empty
     /// training set is raised by the producer before any row or byte exists;

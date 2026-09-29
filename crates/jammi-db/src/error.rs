@@ -506,82 +506,9 @@ pub enum JammiError {
         detail: String,
     },
 
-    /// A plan that requires a device kind reached a holder with none of it:
-    /// the compute plane before submission (no live registered executor
-    /// lists the kind — `held` is every kind the live executors list) or one
-    /// executor at stage creation (its own device is another kind — `held`
-    /// is that one kind — a stage bound past the scheduler's KIND MATCH).
-    /// The plan is never silently run on another kind. The plan itself is
-    /// well-formed; what must change is the plane's device inventory, so
-    /// this maps to gRPC `FailedPrecondition`.
-    #[error(
-        "device kind {} is unheld: the plan requires it, the holder lists [{}]",
-        required.wire_str(),
-        wire_kinds(held)
-    )]
-    DeviceKindUnheld {
-        /// The kind the plan's own `InferenceExec`/`TrainingExec` stamps.
-        required: jammi_datafusion::ComputeDeviceKind,
-        /// The kinds the holder lists, distinct and in wire order.
-        held: Vec<jammi_datafusion::ComputeDeviceKind>,
-    },
-
-    /// A stage whose plan carries a placed training attempt was planned at
-    /// more than one partition: one attempt is one task, never a fan-out of
-    /// its body. Refused by the executor before the stage runs. An engine
-    /// invariant — the submitter's plan, or the scheduler's planning of it
-    /// — never a caller condition, so this maps to gRPC `Internal`.
-    #[error(
-        "placed attempt of job `{job_id}` was planned at {partitions} partitions; a placed \
-         attempt's stage is one partition"
-    )]
-    PlacedAttemptFanOut {
-        /// The placed attempt's own training job id.
-        job_id: String,
-        /// The partition count the stage was planned at.
-        partitions: u64,
-    },
-
     /// Catch-all for errors that don't fit another variant.
-    /// The compute plane cannot hold a plan a caller required it to hold —
-    /// a claimed training attempt's one task — right now: no live executor, none of the
-    /// kind the plan requires, only the plan's own submitter, or a plan the
-    /// wire cannot carry. A runtime state of the plane, never a fault in
-    /// the plan or its caller; a materialization runs in-process on the
-    /// same refusal and never raises it.
-    #[error("compute plane: {0}")]
-    Unheld(crate::compute_plane::Unheld),
-
-    /// The compute plane lost the executor holding a placed job's task:
-    /// its scheduler expired `executor_id` — a heartbeat that stopped, a
-    /// launch it could not deliver — while `job_id`, the plane's own id
-    /// for the placed plan, had a task running on it. Raised by the
-    /// plane's scheduler at the loss and delivered to the submitter as the
-    /// placed job's failure, so the submitter learns of it when the plane
-    /// does, never from a relaunch. An attempt ended this way is spent and
-    /// left for its job's successor; nothing about the plan or its caller
-    /// must change, so this maps to gRPC `Unavailable` — the code a peer
-    /// that went away carries — never `FailedPrecondition`.
-    #[error("compute plane: executor `{executor_id}` holding placed job `{job_id}` was lost")]
-    ExecutorLost {
-        /// The executor the plane expired.
-        executor_id: String,
-        /// The plane's own id for the placed plan.
-        job_id: String,
-    },
-
     #[error("{0}")]
     Other(String),
-}
-
-/// `kinds` as their wire tokens, comma-separated — the `Display` of every
-/// error that lists a device inventory.
-fn wire_kinds(kinds: &[jammi_datafusion::ComputeDeviceKind]) -> String {
-    kinds
-        .iter()
-        .map(|k| k.wire_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// The catalog row a [`JammiError::NotFound`] names.
@@ -793,8 +720,7 @@ impl From<datafusion::error::DataFusionError> for JammiError {
 
 /// A `jammi-datafusion` operator's error as this crate's: the null-key
 /// refusal keeps its typed shape, a runtime failure that was one of ours is
-/// restored from its source chain, a training job reaching a process that
-/// runs none is a fine-tune refusal, and the rest is an inference error
+/// restored from its source chain, and the rest is an inference error
 /// naming the cause.
 fn operator_error(e: &jammi_datafusion::Error) -> JammiError {
     use jammi_datafusion::Error as Operator;
@@ -806,11 +732,7 @@ fn operator_error(e: &jammi_datafusion::Error) -> JammiError {
         Operator::Runtime(source) => source_chain(source.as_ref())
             .find_map(|err| err.downcast_ref::<JammiError>().cloned())
             .unwrap_or_else(|| JammiError::Inference(e.to_string())),
-        Operator::NoTrainingRunner => JammiError::FineTune(e.to_string()),
-        Operator::Inference(_)
-        | Operator::UnknownTask(_)
-        | Operator::UnknownDeviceKind(_)
-        | Operator::Decode(_) => JammiError::Inference(e.to_string()),
+        Operator::Inference(_) | Operator::UnknownTask(_) => JammiError::Inference(e.to_string()),
     }
 }
 

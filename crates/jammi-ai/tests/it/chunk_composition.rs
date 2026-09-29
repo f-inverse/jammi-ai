@@ -21,7 +21,6 @@ use jammi_ai::model::LoadedModel;
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::inference::chunk::ChunkAssembler;
 use jammi_datafusion::inference::runner::test_hooks;
-use jammi_datafusion::ComputeDeviceKind;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_datafusion::{plan_inference, InferenceSpec};
@@ -104,7 +103,6 @@ fn spec(source_id: &str, partitions: usize) -> InferenceSpec {
         embedding_dim: Some(32),
         regression_form: None,
         passthrough: Vec::new(),
-        device_kind: ComputeDeviceKind::Cpu,
         partitions: NonZeroUsize::new(partitions).unwrap(),
     }
 }

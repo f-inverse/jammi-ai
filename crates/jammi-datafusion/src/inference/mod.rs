@@ -5,8 +5,7 @@
 //! below every exchange ([`numbered`]); each chunk is prepared on the
 //! host, admitted against its device and forwarded ([`runner`]); the
 //! output carries the task's columns behind a common prefix ([`schema`],
-//! [`adapter`]); and the plan is placeable on another process through its
-//! wire form ([`wire`]) and the runtime that process binds ([`runtime`]).
+//! [`adapter`]); and it binds its model through [`runtime`].
 
 pub mod adapter;
 pub mod chunk;
@@ -21,4 +20,3 @@ pub mod runner;
 pub mod runtime;
 pub mod schema;
 pub mod spec;
-pub mod wire;

@@ -27,7 +27,6 @@ use tempfile::TempDir;
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::inference::chunk::CHUNK_COLUMN;
 use jammi_datafusion::inference::schema::{build_output_schema, ORDINAL_COLUMN};
-use jammi_datafusion::ComputeDeviceKind;
 use jammi_datafusion::ModelSource;
 use jammi_datafusion::ModelTask;
 use jammi_datafusion::{plan_inference, InferenceExec, InferenceSpec};
@@ -157,7 +156,6 @@ fn spec(partitions: usize) -> InferenceSpec {
         embedding_dim: Some(32),
         regression_form: None,
         passthrough: Vec::new(),
-        device_kind: ComputeDeviceKind::Cpu,
         partitions: NonZeroUsize::new(partitions).unwrap(),
     }
 }

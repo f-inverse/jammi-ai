@@ -55,12 +55,10 @@ futures.workspace = true
 libc.workspace = true
 tempfile = "3"
 chrono.workspace = true
-# The rungs above `streamed` stand up the compute plane: a fleet of
-# `jammi-server` processes on Postgres and an S3-class store, the in-process
-# roles a placed encode is hosted by, and the public client a shape-d job is
-# submitted through. Optional, behind `plane`, so the default build stays the
-# in-process instrument.
-jammi-ballista = { workspace = true, optional = true }
+# The `shape-d` rungs stand up a fleet of `jammi-server` processes on
+# Postgres and an S3-class store, and submit through its public client.
+# Optional, behind `fleet`, so the default build stays the in-process
+# instrument.
 jammi-test-utils = { workspace = true, optional = true }
 jammi-client = { workspace = true, optional = true }
 jammi-admin = { workspace = true, optional = true }
@@ -95,12 +93,10 @@ flash-attn = ["jammi-ai/flash-attn"]
 # Compiles the tests that need CUDA device 0: the padded-transport legs, which
 # run this binary on the device and read its report.
 live-gpu-tests = ["cuda"]
-# The `placed` and `shape-d` rungs of every workload: the compute plane's
-# roles hosted in this process, and fleets of `jammi-server` processes on
-# Postgres and an S3-class store (`crate::plane`).
-plane = [
+# The `shape-d` rungs: fleets of `jammi-server` processes on Postgres and an
+# S3-class store (`crate::fleet`).
+fleet = [
     "dep:bytes",
-    "dep:jammi-ballista",
     "dep:jammi-test-utils",
     "dep:jammi-client",
     "dep:jammi-admin",
@@ -108,11 +104,11 @@ plane = [
     "dep:tonic",
     "jammi-db/storage-s3",
 ]
-# The distributed lane's own tests: the `placed` and `shape-d` legs of the
-# train-run and encode workloads on a fleet this process spawns, against
-# the Postgres and S3-class store the lane provides (`JAMMI_TEST_PG_URL`,
+# The distributed lane's own tests: the `shape-d` legs of the train-run and
+# predictor-train-run workloads on a fleet this process spawns, against the
+# Postgres and S3-class store the lane provides (`JAMMI_TEST_PG_URL`,
 # `JAMMI_TEST_S3_*`).
-live-distributed-tests = ["plane"]
+live-distributed-tests = ["fleet"]
 
 [dev-dependencies]
 jammi-test-resources.workspace = true

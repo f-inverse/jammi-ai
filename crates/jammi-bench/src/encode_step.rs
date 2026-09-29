@@ -86,9 +86,7 @@ use sha2::{Digest, Sha256};
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 use crate::finetune_step::sha256_and_len;
-use crate::leg::{Facts, Leg, Measured, Provenance, RanOn};
-#[cfg(feature = "plane")]
-use crate::plane::encode_host::{InProcessRoles, PlacementLog, ShapeDHost};
+use crate::leg::{Facts, Leg, Measured, Provenance};
 use crate::report::{EncodePayload, Measurement, Report, SinkPhaseSeries, Tiers};
 use crate::rss::peak_rss_measurement;
 use crate::timing::{nearest_rank, per_second, CostFit, ServeStats};
@@ -135,14 +133,6 @@ pub enum Rung {
     Direct,
     Plan,
     PlanPartitioned,
-    /// The `plan-partitioned` serve with the compute plane's three roles
-    /// hosted in this process: the sink is placed on the executor
-    /// (`crate::plane::encode_host`, the `plane` feature's).
-    Placed,
-    /// The same serve made through the deployed topology's query tier and
-    /// placed on its compute processes (`crate::plane::encode_host`), the
-    /// fleet placed with this leg's inference shape.
-    ShapeD,
 }
 
 impl Rung {
@@ -151,26 +141,17 @@ impl Rung {
             Rung::Direct => "direct",
             Rung::Plan => "plan",
             Rung::PlanPartitioned => "plan-partitioned",
-            Rung::Placed => "placed",
-            Rung::ShapeD => "shape-d",
         }
     }
 
-    /// The `[inference] partitions` the rung's plan is cut into — by this
-    /// process's session, or by the fleet's query tier placed with it;
-    /// `None` for the rung that builds no plan. Every rung above
-    /// `plan-partitioned` keeps its fan-out, so each edge adds one layer.
+    /// The `[inference] partitions` the rung's plan is cut into; `None` for
+    /// the rung that builds no plan.
     fn partitions(self, partitioned: usize) -> Option<usize> {
         match self {
             Rung::Direct => None,
             Rung::Plan => Some(1),
-            Rung::PlanPartitioned | Rung::Placed | Rung::ShapeD => Some(partitioned),
+            Rung::PlanPartitioned => Some(partitioned),
         }
-    }
-
-    /// Whether the rung's serve leaves the session that plans it.
-    fn on_plane(self) -> bool {
-        matches!(self, Rung::Placed | Rung::ShapeD)
     }
 }
 
@@ -217,8 +198,6 @@ pub struct EncodeStepParams {
     /// (`<rung>__rows<N>__r<take>.json`, a unit's first take with its vectors
     /// beside it); `None` writes none and only summarises.
     pub legs_dir: Option<PathBuf>,
-    /// Where the `placed` and `shape-d` rungs run ([`crate::plane`]).
-    pub plane: crate::plane::PlaneParams,
 }
 
 impl EncodeStepParams {
@@ -264,21 +243,6 @@ impl EncodeStepParams {
         distinct.dedup();
         if distinct.len() != self.rungs.len() {
             return Err(format!("a leg session serves each rung once: {:?}", self.rungs).into());
-        }
-        if self.task == Task::Infer && self.rungs.iter().any(|r| r.on_plane()) {
-            return Err(
-                "the infer task's rows return to the caller and commit no table, so no sink \
-                 of it is placed: placed and shape-d are embed rungs"
-                    .into(),
-            );
-        }
-        if cfg!(not(feature = "plane")) && self.rungs.iter().any(|r| r.on_plane()) {
-            return Err(format!(
-                "the placed and shape-d rungs need the compute plane ({} were given): build \
-                 jammi-bench with --features plane",
-                self.plane.summary()
-            )
-            .into());
         }
         Ok(())
     }
@@ -745,12 +709,6 @@ async fn session_over(
     Ok(session)
 }
 
-/// A plane host's error as this producer's.
-#[cfg(feature = "plane")]
-fn plane_err(e: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {
-    e
-}
-
 /// The corpus parquet at `corpus`, as the file source every rung registers.
 fn corpus_connection(corpus: &Path) -> Result<SourceConnection, Box<dyn std::error::Error>> {
     Ok(SourceConnection {
@@ -872,17 +830,15 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhaseLayer {
 }
 
 /// What this process observes of its own serves: the sink's phases per
-/// table, and the placement lines a placed rung is proven by.
+/// table.
 #[derive(Clone)]
 struct Observed {
     ledger: PhaseLedger,
-    #[cfg(feature = "plane")]
-    placement: PlacementLog,
 }
 
 /// The process's observer, installed with the process's ONE tracing
 /// subscriber on first use: the phase ledger's layer under its one-target
-/// filter, the placement log beside it, and the engine's events to stderr
+/// filter, and the engine's events to stderr
 /// under `RUST_LOG` (the trainer's per-epoch and validation walls among
 /// them), so stdout stays the report's alone. Each layer carries its own
 /// filter — a layer's `enabled` is the whole subscriber's, and one layer's
@@ -895,8 +851,6 @@ fn observed() -> Result<Observed, Box<dyn std::error::Error>> {
         .get_or_init(|| {
             let observed = Observed {
                 ledger: PhaseLedger::default(),
-                #[cfg(feature = "plane")]
-                placement: PlacementLog::default(),
             };
             let phases = PhaseLayer(Arc::clone(&observed.ledger)).with_filter(
                 tracing_subscriber::filter::filter_fn(|metadata| {
@@ -907,32 +861,12 @@ fn observed() -> Result<Observed, Box<dyn std::error::Error>> {
                 .with_writer(std::io::stderr)
                 .with_filter(tracing_subscriber::EnvFilter::from_default_env());
             let subscriber = tracing_subscriber::registry().with(stderr).with(phases);
-            #[cfg(feature = "plane")]
-            let subscriber = subscriber.with(observed.placement.clone().with_filter(
-                tracing_subscriber::filter::filter_fn(|metadata| {
-                    *metadata.level() <= tracing::Level::INFO
-                }),
-            ));
             tracing::subscriber::set_global_default(subscriber)
                 .map(|()| observed)
                 .map_err(|e| format!("the tracing subscriber could not be installed: {e}"))
         })
         .clone()
         .map_err(Into::into)
-}
-
-/// The plane under one rung's session.
-enum Plane {
-    /// No plane: the serve runs where it was planned.
-    None,
-    /// The three roles hosted in this process; the serve is placed on the
-    /// executor among them.
-    #[cfg(feature = "plane")]
-    InProcess(Box<InProcessRoles>),
-    /// The deployed topology's fleet; the serve is made through its query
-    /// tier.
-    #[cfg(feature = "plane")]
-    Fleet(Box<ShapeDHost>),
 }
 
 /// Install the process's tracing subscriber — see [`observed`]. `main`
@@ -966,8 +900,6 @@ struct RungSession {
     session: Arc<InferenceSession>,
     model: Arc<LoadedModel>,
     model_load_ms: f64,
-    /// The plane under the session, on a rung whose serve leaves it.
-    plane: Plane,
     _artifacts: tempfile::TempDir,
 }
 
@@ -988,9 +920,9 @@ impl RungSession {
     async fn serve(
         &mut self,
         unit: &Unit<'_>,
-    ) -> Result<(f64, Option<[f64; 6]>, Artifact, Option<RanOn>), Box<dyn std::error::Error>> {
+    ) -> Result<(f64, Option<[f64; 6]>, Artifact), Box<dyn std::error::Error>> {
         let start = Instant::now();
-        let (wall_s, phases, artifact, ran_on) = match (self.rung, unit.task) {
+        let (wall_s, phases, artifact) = match (self.rung, unit.task) {
             (Rung::Direct, task) => {
                 // The forwards are the plan's chunks, in its forward order;
                 // the artifact is scattered back to row order, as a table
@@ -1040,29 +972,9 @@ impl RungSession {
                     Task::Embed => Artifact::Vectors { flat, dim },
                     Task::Infer => Artifact::Scores(scores),
                 };
-                (start.elapsed().as_secs_f64(), None, artifact, None)
-            }
-            #[cfg(feature = "plane")]
-            (Rung::ShapeD, Task::Embed) => {
-                let Plane::Fleet(host) = &mut self.plane else {
-                    return Err("the shape-d rung's session has no fleet under it".into());
-                };
-                let (table_name, wall_s) = host
-                    .serve(unit.model_id, TEXT_COLUMN, KEY_COLUMN)
-                    .await
-                    .map_err(plane_err)?;
-                let vectors = host.vectors(&table_name).await.map_err(plane_err)?;
-                let ran_on = host.prove(&table_name).await.map_err(plane_err)?;
-                let dim = vectors.first().map_or(0, Vec::len);
-                let flat = vectors.into_iter().flatten().collect();
-                (wall_s, None, Artifact::Vectors { flat, dim }, Some(ran_on))
+                (start.elapsed().as_secs_f64(), None, artifact)
             }
             (_, Task::Embed) => {
-                #[cfg(feature = "plane")]
-                let mark = match &self.plane {
-                    Plane::InProcess(roles) => roles.mark(),
-                    _ => Default::default(),
-                };
                 let (table, _) = self
                     .session
                     .generate_text_embeddings(
@@ -1090,19 +1002,9 @@ impl RungSession {
                     .pin_current_version(table)
                     .await?;
                 let vectors = self.session.read_vectors(&pin).await?;
-                let ran_on = match &self.plane {
-                    #[cfg(feature = "plane")]
-                    Plane::InProcess(roles) => Some(roles.prove(mark).map_err(plane_err)?),
-                    _ => None,
-                };
                 let dim = vectors.first().map_or(0, Vec::len);
                 let flat = vectors.into_iter().flatten().collect();
-                (
-                    wall_s,
-                    Some(phases),
-                    Artifact::Vectors { flat, dim },
-                    ran_on,
-                )
+                (wall_s, Some(phases), Artifact::Vectors { flat, dim })
             }
             (_, Task::Infer) => {
                 let (batches, _) = self
@@ -1134,7 +1036,7 @@ impl RungSession {
                 }
                 keyed.sort();
                 let scores = keyed.into_iter().map(|(_, scores)| scores).collect();
-                (wall_s, None, Artifact::Scores(scores), None)
+                (wall_s, None, Artifact::Scores(scores))
             }
         };
         if artifact.rows() != unit.texts.len() {
@@ -1146,15 +1048,7 @@ impl RungSession {
             )
             .into());
         }
-        Ok((wall_s, phases, artifact, ran_on))
-    }
-
-    /// Stop what the rung's plane started.
-    async fn stop(self) {
-        #[cfg(feature = "plane")]
-        if let Plane::InProcess(roles) = self.plane {
-            roles.stop().await;
-        }
+        Ok((wall_s, phases, artifact))
     }
 }
 
@@ -1166,8 +1060,6 @@ struct Served {
     phases: Vec<[f64; 6]>,
     first_digest: Option<String>,
     last: Option<Artifact>,
-    /// Where the last serve ran, on a rung whose serve leaves the session.
-    ran_on: Option<RanOn>,
 }
 
 /// Measure one leg session in THIS process: every rung of `params.rungs` over
@@ -1210,55 +1102,18 @@ pub async fn measure_legs(
     for &rung in &params.rungs {
         let partitions = rung.partitions(params.partitions);
         let artifacts = tempfile::tempdir()?;
-        let (session, plane) = match rung {
-            #[cfg(feature = "plane")]
-            Rung::ShapeD => {
-                let host = ShapeDHost::stand_up(
-                    &params.plane,
-                    &corpus_path,
-                    corpus_connection(&corpus_path)?,
-                    params.gpu_device,
-                    jammi_test_utils::fleet::ShapeDInference {
-                        partitions: partitions.unwrap_or(params.partitions),
-                        batch_size: params.batch_size,
-                        batch_tokens: params.batch_tokens,
-                        compute_precision: params.compute_precision,
-                    },
-                    &format!(
-                        "encode-{}",
-                        leg_stem(rung.as_str(), row_count, take, params.rungs.len() == 1)
-                    ),
-                )
-                .await
-                .map_err(plane_err)?;
-                let session = Arc::clone(host.session());
-                (session, Plane::Fleet(Box::new(host)))
-            }
-            _ => {
-                let session = session_over(
-                    &corpus_path,
-                    artifacts.path(),
-                    SessionShape {
-                        gpu_device: params.gpu_device,
-                        batch_size: params.batch_size,
-                        batch_tokens: params.batch_tokens,
-                        partitions: partitions.unwrap_or(1),
-                        compute_precision: params.compute_precision,
-                    },
-                )
-                .await?;
-                let plane = match rung {
-                    #[cfg(feature = "plane")]
-                    Rung::Placed => Plane::InProcess(Box::new(
-                        InProcessRoles::host(&session, observed.placement.clone())
-                            .await
-                            .map_err(plane_err)?,
-                    )),
-                    _ => Plane::None,
-                };
-                (session, plane)
-            }
-        };
+        let session = session_over(
+            &corpus_path,
+            artifacts.path(),
+            SessionShape {
+                gpu_device: params.gpu_device,
+                batch_size: params.batch_size,
+                batch_tokens: params.batch_tokens,
+                partitions: partitions.unwrap_or(1),
+                compute_precision: params.compute_precision,
+            },
+        )
+        .await?;
         let load = Instant::now();
         let guard = session
             .model_cache()
@@ -1270,7 +1125,6 @@ pub async fn measure_legs(
             model: Arc::clone(&guard.model),
             model_load_ms: load.elapsed().as_secs_f64() * 1_000.0,
             session,
-            plane,
             _artifacts: artifacts,
         });
     }
@@ -1279,8 +1133,7 @@ pub async fn measure_legs(
     // and ladder under the session's budget — what the `direct` rung
     // forwards and what the token accounting is read from.
     // The model handle is cloned out of the first session, not borrowed from
-    // it: the serves below take each session mutably (a rung whose serve
-    // leaves this process drives its plane through it).
+    // it: the serves below take each session mutably.
     let loaded = Arc::clone(&sessions.first().ok_or("a leg session has a rung")?.model);
     let max_sequence_length = loaded
         .max_sequence_length()
@@ -1311,13 +1164,12 @@ pub async fn measure_legs(
             order.reverse();
         }
         for slot in order {
-            let (wall_s, phases, artifact, ran_on) = sessions[slot].serve(&unit).await?;
+            let (wall_s, phases, artifact) = sessions[slot].serve(&unit).await?;
             let into = &mut served[slot];
             into.iter_wall_s.push(wall_s);
             into.phases.extend(phases);
             into.first_digest.get_or_insert_with(|| artifact.digest());
             into.last = Some(artifact);
-            into.ran_on = ran_on;
         }
     }
 
@@ -1426,7 +1278,7 @@ pub async fn measure_legs(
             attention_arm: attention_arm(&session.model.kernel_admission()).to_string(),
             kernels_disabled_requested,
             mutant: Default::default(),
-            ran_on: served.ran_on,
+            ran_on: None,
         };
         let measured = Measured {
             iter_wall_s: Some(served.iter_wall_s),
@@ -1449,9 +1301,6 @@ pub async fn measure_legs(
         // Identity completeness, enforced on every real leg.
         leg.to_value();
         legs.push(leg);
-    }
-    for session in sessions {
-        session.stop().await;
     }
     Ok(legs)
 }
@@ -1662,7 +1511,6 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                     child.arg(flag).arg(dir);
                 }
             }
-            child.args(params.plane.child_args());
             let (output, peak_vram) =
                 run_sampled(&mut child, device_memory_probe(params.cuda_ordinal()))?;
             if !output.status.success() {
@@ -1708,7 +1556,6 @@ mod tests {
             gpu_device: CPU_HERMETIC_DEVICE,
             exchange_dir: None,
             legs_dir: None,
-            plane: Default::default(),
         }
     }
 

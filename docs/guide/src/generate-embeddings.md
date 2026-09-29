@@ -125,7 +125,7 @@ The sidecar files are disposable — deleting them falls back to brute-force exa
 
 Failed rows (null or empty text) are excluded — only successfully embedded rows appear in the output. Rows are written in key order — by key on its own type, ties broken by `_content_hash` — so a lookup, a join or a merge by `_row_id` reads the row groups that hold its keys and no others. The model forwards them in a different order: by token count, so rows that share a forward are nearly equal in length; the forward chunks are cut from that order under the chunk budget (`inference.batch_size` rows, `inference.batch_tokens` padded tokens), and the rows are put back in key order before they are written. The table's bytes are identical across `engine.execution_threads`, across `inference.partitions`, and between an in-process run and the same plan run on a cluster.
 
-The ANN index is a set of segments: consecutive runs of the table's rows, `embedding.index_segment_rows` each (default 4096), each built on its own thread as its rows are written and searched together — a smaller budget builds sooner and wider, a larger one gives a query fewer graphs to search. The segment layout is a function of the rows and that budget alone, so it too is identical across partition counts and executors; `compact_embeddings` rewrites a refreshed table's segments at the same budget.
+The ANN index is a set of segments: consecutive runs of the table's rows, `embedding.index_segment_rows` each (default 4096), each built on its own thread as its rows are written and searched together — a smaller budget builds sooner and wider, a larger one gives a query fewer graphs to search. The segment layout is a function of the rows and that budget alone, so it too is identical across partition counts; `compact_embeddings` rewrites a refreshed table's segments at the same budget.
 
 A `NULL` in the **key** column is not a per-row failure: the whole call is refused with the typed `InvalidKey { column, null_count }` before the model runs (the null count is exact; zero rows are embedded and nothing is written). Every row needs a key.
 
@@ -383,7 +383,7 @@ The reduced size is sticky for the remainder of the stream.
 
 ## Parallel and distributed inference
 
-`inference.partitions = N` runs the model over `N` partitions of one plan. The input is costed, ordered, numbered and chunked once, the chunks are spread over the partitions by a hash exchange on the chunk number, and a merge restores the row order — all stock DataFusion operators, so the same plan runs as `N` threads of one process or, submitted to a Ballista cluster, as `N` tasks across its executors. Output is byte-identical at every `N`.
+`inference.partitions = N` runs the model over `N` partitions of one plan. The input is costed, ordered, numbered and chunked once, the chunks are spread over the partitions by a hash exchange on the chunk number, and a merge restores the row order — all stock DataFusion operators, so the plan runs as `N` threads of one process. Output is byte-identical at every `N`.
 
 ## Crash recovery
 

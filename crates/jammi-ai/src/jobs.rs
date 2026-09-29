@@ -36,10 +36,9 @@
 //! **Cancellation.** `Catalog::cancel_request` ends a job no worker has
 //! claimed at once (`queued -> cancelled`) and flags a running one
 //! (`jobs.cancel_requested`), which its executor ends `cancelled` through the
-//! lease-guarded `Catalog::cancel_job`. `UnsuccessfulEnd` decides `failed`,
-//! `cancelled` or left-for-reclaim (a placed attempt whose executor the
-//! compute plane lost: spent, re-offered to a successor) from the
-//! executor's typed error — one rule for every job kind.
+//! lease-guarded `Catalog::cancel_job`. `UnsuccessfulEnd` decides `failed`
+//! or `cancelled` from the executor's typed error — one rule for every job
+//! kind.
 //! The COMPUTE executor observes the flag at three checkpoint boundaries — after
 //! the claim ([`crate::session::InferenceSession::run_now`],
 //! `JobWorker::run_claimed_compute_job`) and before dispatch
@@ -849,54 +848,30 @@ pub async fn check_cancel(catalog: &Catalog, job_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// The line a claimant logs, once, as its attempt ends with the plane's
-/// loss of the executor holding it and is left for a successor. Carries
-/// `job_id`, `attempt` and `error` (the typed loss) as fields.
-pub const EXECUTOR_LOST_ATTEMPT_LOG: &str =
-    "attempt lost with its executor; left for reclaim, an attempt spent";
-
 /// How a claimed job ends without its result, decided by [`Self::of`]
-/// from the typed error — one rule for every job kind: asked not to run,
-/// lost with its executor, or could not run.
+/// from the typed error — one rule for every job kind: asked not to run, or
+/// could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnsuccessfulEnd {
     /// Terminal `failed`, the error's message on the row.
     Failed(String),
     /// Terminal `cancelled`: the caller asked for this end.
     Cancelled,
-    /// Not terminal: the compute plane lost the executor holding the
-    /// attempt's placed task ([`JammiError::ExecutorLost`], carried here
-    /// as its message). The attempt is spent and the row is left `running`
-    /// for the lease reclaim, which re-offers it to a successor claim
-    /// while the reclaim cap admits (`Catalog::reclaim_expired_jobs`) —
-    /// the end a gang's mid-run fault takes, `attempts + 1` at the
-    /// successor's claim and `releases` untouched.
-    LeftForReclaim(String),
 }
 
 impl UnsuccessfulEnd {
-    /// The end `error` decides for a job run under `execution`: a
-    /// [`JammiError::JobCancelled`] is `Cancelled`, never a failure; the
-    /// plane's [`JammiError::ExecutorLost`] leaves a queued job for its
-    /// successor, and is terminal for an inline one — an inline row has no
-    /// successor (`Catalog::reclaim_expired_jobs` has no requeue arm for
-    /// it) and nothing else would ever end it; everything else is
-    /// `Failed`.
-    pub(crate) fn of(error: &JammiError, execution: JobExecution) -> Self {
-        match (error, execution) {
-            (JammiError::JobCancelled { .. }, _) => Self::Cancelled,
-            (JammiError::ExecutorLost { .. }, JobExecution::Queued) => {
-                Self::LeftForReclaim(error.to_string())
-            }
-            (other, _) => Self::Failed(other.to_string()),
+    /// The end `error` decides: a [`JammiError::JobCancelled`] is
+    /// `Cancelled`, never a failure; everything else is `Failed`.
+    pub(crate) fn of(error: &JammiError) -> Self {
+        match error {
+            JammiError::JobCancelled { .. } => Self::Cancelled,
+            other => Self::Failed(other.to_string()),
         }
     }
 
     /// Settle this end on the row: the lease-guarded terminal write for a
     /// terminal end (`false` when the attempt guard misses — the caller no
-    /// longer owns the job), nothing for one left for reclaim, whose next
-    /// write is the reclaim's own once this attempt's hold stops renewing
-    /// the lease.
+    /// longer owns the job).
     pub(crate) async fn record(
         &self,
         catalog: &Catalog,
@@ -907,7 +882,6 @@ impl UnsuccessfulEnd {
         match self {
             Self::Failed(error) => catalog.fail_job(job_id, instance_id, attempts, error).await,
             Self::Cancelled => catalog.cancel_job(job_id, instance_id, attempts).await,
-            Self::LeftForReclaim(_) => Ok(true),
         }
     }
 }
@@ -1191,7 +1165,7 @@ impl InferenceSession {
                 // the benign race (a peer somehow holds this attempt's
                 // lease already) and stays a debug log; a genuine catalog
                 // `Err` is surfaced at error level so it is never silent.
-                match UnsuccessfulEnd::of(&e, JobExecution::Inline)
+                match UnsuccessfulEnd::of(&e)
                     .record(self.catalog(), &job_id, &instance_id, claimed.attempts)
                     .await
                 {
@@ -1882,39 +1856,19 @@ mod tests {
     }
 
     /// The one rule every job kind's unsuccessful end follows: a cancel is
-    /// `cancelled` under either execution mode; the plane's loss of the
-    /// attempt's executor leaves a queued job for its successor and is
-    /// terminal for an inline one, which has no successor; every other
-    /// error is terminal with its message.
+    /// `cancelled`; every other error is terminal with its message.
     #[test]
-    fn an_unsuccessful_end_is_decided_by_the_typed_error_and_the_execution_mode() {
+    fn an_unsuccessful_end_is_decided_by_the_typed_error() {
         let cancelled = JammiError::JobCancelled {
             job_id: "job-1".into(),
-        };
-        let lost = JammiError::ExecutorLost {
-            executor_id: "executor-1".into(),
-            job_id: "7bY2".into(),
         };
         let refused = JammiError::NotFound(Missing::Source {
             source_id: "patents".into(),
         });
-        for execution in [JobExecution::Queued, JobExecution::Inline] {
-            assert_eq!(
-                UnsuccessfulEnd::of(&cancelled, execution),
-                UnsuccessfulEnd::Cancelled
-            );
-            assert_eq!(
-                UnsuccessfulEnd::of(&refused, execution),
-                UnsuccessfulEnd::Failed(refused.to_string())
-            );
-        }
+        assert_eq!(UnsuccessfulEnd::of(&cancelled), UnsuccessfulEnd::Cancelled);
         assert_eq!(
-            UnsuccessfulEnd::of(&lost, JobExecution::Queued),
-            UnsuccessfulEnd::LeftForReclaim(lost.to_string())
-        );
-        assert_eq!(
-            UnsuccessfulEnd::of(&lost, JobExecution::Inline),
-            UnsuccessfulEnd::Failed(lost.to_string())
+            UnsuccessfulEnd::of(&refused),
+            UnsuccessfulEnd::Failed(refused.to_string())
         );
     }
 }

@@ -234,152 +234,63 @@ the state a fresh pod recovers.
 
 ## Shape D — disaggregated
 
-**Artifact:** the query tier above (Shape C's Deployment) with the Ballista
-CLIENT role added (`overlays/shape-d/jammi-query.toml`: `[ballista.client]`
-pointed at the scheduler's Service), plus a GPU-scheduled `StatefulSet`
-compute tier and a single-replica CPU scheduler Deployment, both running
-the SAME image family, scheduled separately. The query tier is CPU and the
-compute tier GPU, so its client role names the kind it places onto
-(`device_kind = "cuda"`): a model's plan requires the compute tier's
-device, not the replica's. A result-table
-materialization the query tier receives — a `CREATE TABLE … AS` over
-Flight SQL, an embedding, inference, refresh, as-of join or training set a
-verb builds — runs whole on the compute tier's executors when a live one
-holds every device kind it requires: the compute and the write, as one
-plan rooted in the result-table sink, so the table's bytes are written on
-the executor under the row's lease and only a summary crosses back — the
-row counts, the index segments, and the environment that produced them;
-the query-tier replica finishes the catalog side, recording that
-environment. The replica plans against the model's description — its
-output width, its regression head's form and the identity the
-environment records, read from the model's files and configuration —
-and never holds the weights: the executor that runs the plan materializes
-them, from the same description, so what the replica planned against
-and what the executor recorded cannot disagree. It runs in the query-tier replica otherwise, and its table
-records the replica's CPU. An executor the scheduler expires mid-task (its
-heartbeat stopped — Ballista's `executor_timeout_seconds`, 180 s, swept
-every `expire_dead_executor_interval_seconds`, 15 s) fails every placed
-job bound to it at the loss, typed `ExecutorLost` naming the executor and
-the plane's job: the claimant's attempt is spent and its row left for the
-lease reclaim, and a successor claim runs the job anew on the executors
-that remain — the reattempt a gang's mid-run fault takes, bounded by the
-attempts cap; no stage is ever relaunched. The table is catalogued state: a `result_tables` row
-and bytes under the shared result root, read on every replica as
-`"jammi.<name>"`. A `SELECT` or a `search` never leaves the replica that
-received it.
+**Artifact:** the query tier above (Shape C's Deployment, its config
+unchanged) plus a GPU-scheduled `StatefulSet` compute tier, both running the
+SAME image family, scheduled separately. The two tiers share one catalog
+and one result root; the jobs queue is the only way work crosses between
+them.
 
 Running jobs is not a service tier (see [Service
 tiers](./deploy-server.md#service-tiers)): whether a process *claims and
 executes* the jobs it accepted is `[worker] enabled`. Every query-tier
-replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) —
-it still mounts `core`/`event`/`eval` and accepts every submission — and
-the scheduler Deployment claims nothing either; the compute StatefulSet's
-pods run `[worker] enabled = true` (`JAMMI_WORKER__ENABLED=true`) claiming
-`["fine_tune", "graph_fine_tune", "context_predictor"]`, so only they run
-the job worker's claim loop against the shared catalog. `[server] services
-= []` on both compute-tier roles — a pure compute/scheduler node serves no
-query-tier gRPC.
+replica runs `[worker] enabled = false` (`JAMMI_WORKER__ENABLED=false`) — it
+still mounts `core`/`event`/`eval` and accepts every submission — and the
+compute StatefulSet's pods run `[worker] enabled = true`
+(`JAMMI_WORKER__ENABLED=true`) with `kinds = "all"`, so only they run the
+job worker's claim loop against the shared catalog. `[server] services = []`
+on the compute tier — a pure compute node serves no query-tier gRPC.
 
-**Three roles, one config knob.** Whether a process hosts a Ballista
-scheduler, hosts an executor, or is a client of a scheduler (in any
-combination) is `[ballista]` (`scheduler` / `executor` / `client`, see
-[Configuration](./configuration.md)) — a process with no role runs exactly
-as it always has:
-
-- **The scheduler** is ONE dedicated single-replica `Deployment`
-  (`jammi-server-scheduler`): `[ballista.scheduler]` set (bound on the pod,
-  advertised as its Service name), no `[ballista.executor]`, no
-  `[ballista.client]`, `[worker] enabled = false`, CPU image. It binds the
-  tasks clients submit to the registered executors; it claims no job, runs
-  no task and submits nothing of its own.
-- **The compute tier's `StatefulSet` pods** (`jammi-server-compute`) each
-  host a Ballista EXECUTOR (`[ballista.executor]` pointed at the
-  scheduler's Service) alongside their own claim loop: a pod trains the
-  jobs it claims in-process, and runs the tasks the scheduler binds to it.
-
-**A training attempt is placed like any other submission.** A process that
-holds the client role and claims a training job — a `fine_tune`, a
-`graph_fine_tune` or a `context_predictor`, of any `world_size` — submits
-the attempt as ONE Ballista task before anything about how it runs is
-decided: where an attempt runs is a property of the attempt, and how many
-ranks share it is the spec's own `world_size`, which a kind that has none
-simply does not carry. The task names only the job, the attempt, its
-submitter and the device kind it requires; the executor it lands on takes
-the claim over and re-derives the whole run from the job's row, exactly as
-a reclaiming worker would, so it trains the same bytes the claimant would
-have. Three rules bind it, the same for every kind:
-
-- **Kind match.** The required kind is the claimant's OWN device kind, and
-  the task binds only to a live executor listing that exact kind (CPU is a
-  kind too). When no live executor can hold it — none registered, none of
-  the kind, or the only one is the claimant's own — the attempt trains in
-  the claimant's process, logged as such, never parked.
-- **Never the submitter.** A claimant's host holds its job slot for the
-  whole await, so its own executor is never bound its own attempt: a lone
-  process placing its own claim would deadlock against itself. While it
-  waits it runs no compute, and can still serve a `RunRank` session.
-- **One launch.** The executor takes the row's claim over at launch, at the
-  same attempt count; a task re-offered after that transfer is never bound
-  again. An executor lost mid-attempt fails the task typed
-  (`ExecutorLost`), the row's lease expires, and a successor claim runs the
-  job anew.
-
-Only the process that ends up running the job's body — the placed
-executor, or the claimant itself — decides `Single`/`Local`/`Peer` for a
-fine-tune, from its OWN `[worker] local_ranks`: this overlay admits
-single-pod gangs (`W ≤ 2`, `Local` on one pod's two devices); a cross-pod
-`Peer` gang of world `W` needs `W > local_ranks`, `max_world_size ≥ W` on
-the submit edge (`base/jammi.toml` — the key is read only where jobs are
-enqueued), and at least `W` compute pods able to hold a rank (the
-coordinator's included).
-
-Kind match is what decides who claims in this overlay. The query tier and
-the scheduler are CPU pods and the executors list `cuda`, so a training
-attempt claimed on either would train there; the compute pods claim the
-training kinds and train them on their devices. A fleet whose claimant and
-executors share a device kind — a CPU fleet, or a GPU claimant among GPU
-executors — can instead leave every executor claiming nothing (`[worker]
-kinds = []`) and have one client-role process claim and place every
-attempt.
+**Work runs where it is claimed.** A job submitted to the query tier — a
+fine-tune, a graph fine-tune, a context predictor, an embedding, inference,
+propagation or as-of join — is claimed by a compute pod through the shared
+catalog and runs on that pod's devices; its result table lands under the
+shared result root and is read on every replica as `"jammi.<name>"`. A
+statement the query tier runs inline — a `SELECT`, a `search`, a `CREATE
+TABLE … AS` — runs in the replica that received it, on that replica's own
+device, and its table records that device. Work meant for the GPUs is
+therefore submitted as a job. Which pods claim what is `[worker] kinds`, and
+the claimant decides `Single`/`Local`/`Peer` for a fine-tune from its own
+`[worker] local_ranks`: this overlay admits single-pod gangs (`W ≤ 2`,
+`Local` on one pod's two devices); a cross-pod `Peer` gang of world `W`
+needs `W > local_ranks`, `max_world_size ≥ W` on the submit edge
+(`base/jammi.toml` — the key is read only where jobs are enqueued), and at
+least `W` compute pods able to hold a rank (the coordinator's included),
+which the claimant assembles over their gang listeners.
 
 Each `jammi-server-compute` pod's `peer_advertise` is its own stable DNS
 name under the headless Service
 (`<pod>.jammi-server-compute.<namespace>.svc.cluster.local`,
 `publishNotReadyAddresses: true` so a rank can dial a sibling that is still
 warming), the property a plain `Deployment`'s churning pod names cannot
-hold; its Ballista `advertise_host` is the SAME per-pod name, since the
-scheduler must dial the executor back on the identical stable address.
+hold.
 
-The compute pods carry `terminationGracePeriodSeconds: 600` (the
-scheduler runs no job and no task; its grace is the 30 s default)
-— SIGTERM drains (the in-flight training job finishes, every epoch bundle
-lands) and SIGKILL follows the grace; SIGINT, or `jammi-server release` from
-a `preStop` hook, RELEASES — on a CONFIRMED release (exit 0), the job's
-lease is handed back at once and any other replica claims it within one
-idle poll at no attempt cost; a DEGRADED release (exit 3) does not cost an
-attempt universally, and its per-lease outcome depends on which determinant
-degraded (see the RELEASE breakdown in `deploy/kubernetes/README.md` and
-`deploy-server.md` below — never assume the CONFIRMED cost here for a
-degraded exit). The grace must cover one epoch's wall time; on spot
-capacity use RELEASE. DRAIN on an executor pod additionally stops Ballista
-task admission at once — the executor reports `Terminating` to the scheduler
-the instant DRAIN begins, before the in-flight worker job is joined, and a
-terminating executor is never bound; a training attempt the pod is still
-dialled with inside its grace is refused before any claim transfer — but
-waits for any in-flight placed task before the process itself stops — only
-RELEASE tears the executor down immediately. The operative rule, the
-rollout arithmetic and both `preStop` recipes are in
+The compute pods carry `terminationGracePeriodSeconds: 600` — SIGTERM
+drains (the in-flight job finishes, every epoch bundle lands) and SIGKILL
+follows the grace; SIGINT, or `jammi-server release` from a `preStop` hook,
+RELEASES — on a CONFIRMED release (exit 0), the job's lease is handed back
+at once and any other replica claims it within one idle poll at no attempt
+cost; a DEGRADED release (exit 3) does not cost an attempt universally, and
+its per-lease outcome depends on which determinant degraded (see the
+RELEASE breakdown in `deploy/kubernetes/README.md` and `deploy-server.md`
+below — never assume the CONFIRMED cost here for a degraded exit). The grace
+must cover one epoch's wall time; on spot capacity use RELEASE. The
+operative rule, the rollout arithmetic and both `preStop` recipes are in
 `deploy/kubernetes/README.md` ("Shutdown: DRAIN and RELEASE"); the modes
 themselves are in [Shutdown](./deploy-server.md#shutdown-drain-and-release).
 
-The compute tier is a `StatefulSet` — each rank's peer address (and
-Ballista `advertise_host`) must stay stable across a pod restart, which a
-Deployment's churning pod names cannot hold. This overlay is validated by
-`kubeconform` only — CI has no GPU node.
-
-```toml
-{{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-query.toml}}
-```
+The compute tier is a `StatefulSet` — each rank's peer address must stay
+stable across a pod restart, which a Deployment's churning pod names cannot
+hold. This overlay is validated by `kubeconform` only — CI has no GPU node.
 
 ```yaml
 {{#include ../../../deploy/kubernetes/overlays/shape-d/statefulset-compute.yaml}}
@@ -391,18 +302,6 @@ Deployment's churning pod names cannot hold. This overlay is validated by
 
 ```toml
 {{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-compute.toml}}
-```
-
-```yaml
-{{#include ../../../deploy/kubernetes/overlays/shape-d/deployment-scheduler.yaml}}
-```
-
-```yaml
-{{#include ../../../deploy/kubernetes/overlays/shape-d/service-scheduler.yaml}}
-```
-
-```toml
-{{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-scheduler.toml}}
 ```
 
 Both `:latest` tags are re-pointed by every `v*` release tag (never by a

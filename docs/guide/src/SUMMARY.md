@@ -3,7 +3,7 @@
 [Introduction](./introduction.md)
 [Design Philosophy](./philosophy.md)
 [Engineering Principles](./engineering.md)
-[Built on DataFusion and Ballista](./foundations.md)
+[Built on DataFusion](./foundations.md)
 
 # Getting Started
 

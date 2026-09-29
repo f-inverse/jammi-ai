@@ -5,6 +5,30 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **Jammi no longer runs on Ballista; work reaches a GPU host as a claimed job.** The Ballista
+  compute plane placed a result-table materialization, and a claimed training attempt, on a
+  scheduler's executors. It carried a parallel implementation of what the engine already does —
+  the catalog held a second fleet (executors, slots, job rows) beside the workers, the sink took
+  its row's lease across processes and back, every failure crossed as an envelope string — and
+  it coupled the engine to Ballista's scheduler internals. #695 (a placed attempt refused by its
+  own executor's claim probe and then run twice) came from that path, and #682 traces, by reading
+  the code, to Ballista's executor-loss path holding a map guard across an await a graph-lock
+  holder was waiting on. The jobs queue already routes work to the host that runs it (`[worker]
+  kinds`), gang assembly places a training run's ranks, and fan-out is DataFusion partitioning
+  in one process, so the plane is removed rather than repaired. A measured scaling test of
+  splitting one plan across hosts (DIST-DATA-PLANE D15) informs #613, where plan splitting is
+  revisited on a library that keeps no scheduler of its own. **BREAKING**: the `jammi-ballista`
+  crate, the `[ballista]` config section, `jammi_db::compute_plane` (`ComputePlane`,
+  `ComputePlaneSlot`, `Unheld`; the statement classifier moved to `jammi_db::store::statement`),
+  `ResultTableSinkExec`, `ResultTableSinkSpec`, `SinkLease`, `ResultStore::adopt_placed_sink`,
+  `Catalog::transfer_building_lease`/`transfer_building_version_lease`/`transfer_claim`,
+  `catalog::compute_repo`, `ComputeExecutorStatus`, `JammiError::DeviceKindUnheld`/
+  `ExecutorLost`/`PlacedAttemptFanOut`, `jammi_wire::TaskErrorEnvelope`,
+  `InferenceSpec::device_kind`, `InferenceSession::required_device_kind`/`compute_plane`,
+  `jammi_datafusion::inference::wire` and `jammi_datafusion::training` are gone; the error-wire
+  tags 43–46 are reserved, and migration 047 drops `compute_executors` and `compute_jobs`. The
+  Shape D overlay is the base query tier plus a compute `StatefulSet` whose workers claim every
+  job kind, with no scheduler; a statement the query tier runs inline runs on that replica.
 - **A row embeds the same alone and in a batch on every measured GPU.** cuBLAS's default math mode
   let a split-K GEMM round its partial sums to `bf16` before summing, and whether a GEMM splits is a
   per-card choice by shape: on an RTX 4090 or RTX 6000 Ada a row longer than 16 tokens embedded alone

@@ -8,8 +8,8 @@ import jammi_cookbook
 ```
 
 **Recipe:** `fine_tune(world_size=…)` · `[worker] local_ranks` · `[distributed]
-max_world_size` · `[server] peer_bind` / `peer_advertise` · `[ballista]` roles ·
-`list_workers` · **Theory:** data-parallel
+max_world_size` · `[server] peer_bind` / `peer_advertise` · `list_workers` ·
+**Theory:** data-parallel
 training — each rank computes gradients on its shard of a global batch and the ranks
 sum them, so N ranks take the step one process would take over the whole batch
 [@li2020pytorchddp] · **Rail:** measurement (a gang's training compared with one
@@ -31,11 +31,9 @@ places it:
   `[gpu] devices`, or every rank on the CPU when the CPU is the only device;
 * **across processes**, when a job is wider than one host: the claiming worker becomes
   rank 0 of a *peer* gang and assembles the other ranks from its fleet
-  (`[distributed] max_world_size` bounds how wide);
-* **on a compute plane**, when the claimant is a client of a Ballista scheduler: it
-  places the whole training attempt on an executor that holds the ranks.
+  (`[distributed] max_world_size` bounds how wide).
 
-All three run below, over the same rows, and each is measured against one process.
+Both run below, over the same rows, and each is measured against one process.
 
 ```{python}
 import tempfile
@@ -239,89 +237,12 @@ contracts.assert_close("distributed.peer_w2_max_loss_diff",
                        float(np.abs(curve - reference_curve).max()), tol=1e-6)
 contracts.assert_close("distributed.peer_w2_max_embedding_diff",
                        float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
-```
-
-The ranks now live in different processes, and the gradients cross a socket, not
-shared memory, and the step is still one process's.
-
-## Placed on a compute plane: a gang on a Ballista executor
-
-A deployment can separate the servers that claim jobs from the servers that hold the
-devices. One server hosts the compute plane — a Ballista scheduler and an executor
-with two ranks — and claims nothing itself (`kinds = []`). The other claims training
-jobs and is a *client* of that plane (`[ballista.client]`), holding one rank and no
-gang listener. A two-rank job fits nowhere the claimant can reach but the executor, so
-the claimant places the whole training attempt there as one task, and the attempt
-trains in the executor's process.
-
-```{python}
-placed_catalog = catalog("placed")
-placed_root = Path(tempfile.mkdtemp()).as_uri()
-scheduler_port = free_port()
-
-plane = member(placed_catalog, placed_root, label="plane", roles=f"""
-[worker]
-enabled = true
-kinds = []
-local_ranks = 2
-
-[ballista.scheduler]
-bind = "127.0.0.1:{scheduler_port}"
-advertise_host = "127.0.0.1"
-
-[ballista.executor]
-scheduler_address = "127.0.0.1:{scheduler_port}"
-bind = "127.0.0.1:{free_port()}"
-grpc_bind = "127.0.0.1:{free_port()}"
-advertise_host = "127.0.0.1"
-task_slots = 1
-""")
-claimant = member(placed_catalog, placed_root, label="claimant", roles=f"""
-[worker]
-enabled = true
-kinds = ["fine_tune"]
-local_ranks = 1
-idle_poll_secs = 1
-
-[distributed]
-max_world_size = 2
-
-[ballista.client]
-scheduler_address = "127.0.0.1:{scheduler_port}"
-""")
-
-with plane, claimant, jammi.connect(claimant.endpoint) as db:
-    db.add_source("pairs", url=PAIRS, format="csv")
-    runs["placed"] = train(db, world_size=2, batch_size=3)
-    (placed_job,) = db.list_jobs()
-    placed_fleet = workers(db)
-
-placed_label_of = {instance: label for label, instance in placed_fleet.items()}
-print("the job's ranks ran on: "
-      + ", ".join(f"rank {r} → {placed_label_of.get(i, i)}"
-                  for r, i in enumerate(placed_job["ranks"])))
-curve, vectors = runs["placed"]
-print("placed gang loss by epoch " + "  ".join(f"{x:.6f}" for x in curve))
-print(f"placed gang vs 1 rank: max |Δ loss| {np.abs(curve - reference_curve).max():.2e}"
-      f"   max |Δ embedding| {np.abs(vectors - reference_vectors).max():.2e}")
-```
-
-```{python}
-# | echo: false
-# The attempt ran on the plane's executor, never the claimant: both ranks there,
-# and the claim moved there with it.
-assert placed_job["ranks"] == [placed_fleet["plane"]] * 2, (placed_job, placed_fleet)
-assert placed_job["claimed_by"] == placed_fleet["plane"] != placed_fleet["claimant"], placed_job
-curve, vectors = runs["placed"]
-contracts.assert_close("distributed.placed_w2_max_loss_diff",
-                       float(np.abs(curve - reference_curve).max()), tol=1e-6)
-contracts.assert_close("distributed.placed_w2_max_embedding_diff",
-                       float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
 postgres.cleanup()
 ```
 
-Three places a gang ran — one process, two processes dialling each other, and an
-executor the claimant never trains on — and one step computed in each.
+The ranks now live in different processes, and the gradients cross a socket, not
+shared memory, and the step is still one process's: two places a gang ran — one
+process, and two processes dialling each other — and one step computed in each.
 
 ## What a gang refuses
 

@@ -2,13 +2,11 @@ use std::num::NonZeroUsize;
 
 use jammi_numerics::ChunkBudget;
 
-use crate::device::ComputeDeviceKind;
 use crate::inference::adapter::DistributionForm;
 use crate::source::ModelSource;
 use crate::task::ModelTask;
 
-/// What an [`InferenceExec`](crate::InferenceExec) computes: plain data,
-/// and everything about the node that crosses a process boundary.
+/// What an [`InferenceExec`](crate::InferenceExec) computes: plain data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceSpec {
     /// The model to run.
@@ -29,10 +27,6 @@ pub struct InferenceSpec {
     pub regression_form: Option<DistributionForm>,
     /// Input columns copied verbatim to the end of every output batch.
     pub passthrough: Vec<String>,
-    /// The device kind this node must run on. A submitter placing the plan
-    /// onto a kind other than its own names that kind here; nothing
-    /// downstream rewrites it.
-    pub device_kind: ComputeDeviceKind,
     /// The fan-out: how many partitions forward chunks concurrently.
     pub partitions: NonZeroUsize,
 }

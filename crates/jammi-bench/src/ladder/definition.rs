@@ -827,18 +827,11 @@ fn train_run_ladder(budgets: &Budgets) -> Ladder {
                 EdgeRules::of(budgets, w, "resident", "streamed").engine_layer(false),
             ),
             (
-                fused("placed"),
-                Difference::Layer {
-                    name: "the same job as a gang on an executor",
-                },
-                EdgeRules::of(budgets, w, "streamed", "placed").engine_layer(false),
-            ),
-            (
                 fused("shape-d"),
                 Difference::Layer {
-                    name: "the deployed topology: the job through the query tier, on a compute process",
+                    name: "the deployed topology: the job through the query tier, claimed by a compute process",
                 },
-                EdgeRules::of(budgets, w, "placed", "shape-d").engine_layer(false),
+                EdgeRules::of(budgets, w, "streamed", "shape-d").engine_layer(false),
             ),
         ],
     }
@@ -893,18 +886,6 @@ fn encode_ladder(budgets: &Budgets) -> Ladder {
                 Rung::new("plan-partitioned", vec![]),
                 layer("the same plan, N partitions"),
                 exact("plan", "plan-partitioned"),
-            ),
-            (
-                Rung::new("placed", vec![]),
-                layer("the same plan, its sink placed on an executor this process hosts"),
-                exact("plan-partitioned", "placed"),
-            ),
-            (
-                Rung::new("shape-d", vec![]),
-                layer(
-                    "the deployed topology: the serve through the query tier, on the compute tier",
-                ),
-                exact("placed", "shape-d"),
             ),
         ],
     }
@@ -973,26 +954,19 @@ fn propagate_ladder(budgets: &Budgets) -> Ladder {
                 ),
             ),
         ],
-        exact: vec![
-            (
-                Rung::new("plan-partitioned", vec![]),
-                layer("the same plan, N partitions"),
-                EdgeRules::of(budgets, w, "plan", "plan-partitioned").engine_layer(true),
-            ),
-            (
-                Rung::new("placed", vec![]),
-                layer("the same plan on a Ballista executor"),
-                EdgeRules::of(budgets, w, "plan-partitioned", "placed").engine_layer(true),
-            ),
-        ],
+        exact: vec![(
+            Rung::new("plan-partitioned", vec![]),
+            layer("the same plan, N partitions"),
+            EdgeRules::of(budgets, w, "plan", "plan-partitioned").engine_layer(true),
+        )],
     }
 }
 
-/// `torch` → `plan` → `plan-partitioned` → `placed`: the reference is an
-/// exact evaluation of the engine's own operator — the lazy walk over the
+/// `torch` → `plan` → `plan-partitioned`: the reference is an exact
+/// evaluation of the engine's own operator — the lazy walk over the
 /// self-loop-augmented graph from the engine's seed rows, each block
 /// normalised then weighed — so the edge to `plan` is row agreement, and the
-/// rungs above are the same plan at more partitions and on an executor.
+/// rung above is the same plan at more partitions.
 fn structure_ladder(budgets: &Budgets) -> Ladder {
     let w = Workload::Structure;
     let layer = |name| Difference::Layer { name };
@@ -1013,18 +987,11 @@ fn structure_ladder(budgets: &Budgets) -> Ladder {
                 false,
             ),
         )],
-        exact: vec![
-            (
-                Rung::new("plan-partitioned", vec![]),
-                layer("the same plan, N partitions"),
-                EdgeRules::of(budgets, w, "plan", "plan-partitioned").engine_layer(true),
-            ),
-            (
-                Rung::new("placed", vec![]),
-                layer("the same plan on a Ballista executor"),
-                EdgeRules::of(budgets, w, "plan-partitioned", "placed").engine_layer(true),
-            ),
-        ],
+        exact: vec![(
+            Rung::new("plan-partitioned", vec![]),
+            layer("the same plan, N partitions"),
+            EdgeRules::of(budgets, w, "plan", "plan-partitioned").engine_layer(true),
+        )],
     }
 }
 
@@ -1048,18 +1015,18 @@ fn predictor_train_run_ladder(budgets: &Budgets) -> Ladder {
         )],
         exact: vec![
             (
-                Rung::new("placed", learns.clone()),
+                Rung::new("job", learns.clone()),
                 Difference::Layer {
-                    name: "the same training as a job, placed on an executor",
+                    name: "the same training as a job, claimed by this process's worker",
                 },
-                EdgeRules::of(budgets, w, "in-process", "placed").engine_layer(false),
+                EdgeRules::of(budgets, w, "in-process", "job").engine_layer(false),
             ),
             (
                 Rung::new("shape-d", learns),
                 Difference::Layer {
-                    name: "the deployed topology: the job claimed by a compute process",
+                    name: "the deployed topology: the job through the query tier, claimed by a compute process",
                 },
-                EdgeRules::of(budgets, w, "placed", "shape-d").engine_layer(false),
+                EdgeRules::of(budgets, w, "job", "shape-d").engine_layer(false),
             ),
         ],
     }
@@ -1141,7 +1108,7 @@ mod tests {
         let span = ladder.span(Some("torch"), Some("resident")).unwrap();
         assert_eq!(span.len(), 1);
         assert_eq!(span[0].name(), "torch -> resident");
-        assert_eq!(ladder.span(None, None).unwrap().len(), 4);
+        assert_eq!(ladder.span(None, None).unwrap().len(), 3);
         assert!(matches!(
             ladder.span(Some("nope"), None),
             Err(Refusal::UnknownRung { .. })
@@ -1155,7 +1122,7 @@ mod tests {
     #[test]
     fn ladders_are_as_long_as_their_workload_needs() {
         let lengths: Vec<usize> = ladders().map(|l| l.rungs().count()).collect();
-        assert_eq!(lengths, [6, 2, 5, 2, 5, 4, 4]);
+        assert_eq!(lengths, [4, 2, 4, 2, 4, 3, 4]);
     }
 
     #[test]

@@ -36,10 +36,7 @@ pub use manifest::{
 };
 pub use reconcile::{ReconcileOptions, ReconcileReport};
 pub use result_schema::ResultTableSchemaProvider;
-pub use sink::{
-    ResultTableSinkExec, ResultTableSinkSpec, SinkKind, SinkLease, SinkLeaseKind, SinkSummary,
-    SINK_PHASES_TARGET, SINK_WRITE_LOG,
-};
+pub use sink::{SinkKind, SinkSummary, SINK_PHASES_TARGET};
 pub use statement::CreateTableAs;
 pub use version::VersionManifest;
 
@@ -1831,8 +1828,7 @@ impl ResultStore {
     }
 
     /// Install the environment this process produces a sink's bytes in.
-    /// Write-once, like the compute plane: `false` when one is already
-    /// installed, which is kept.
+    /// Write-once: `false` when one is already installed, which is kept.
     pub fn install_producing_environment(
         &self,
         environment: Arc<dyn sink::ProducingEnvironment>,
@@ -1965,32 +1961,11 @@ impl ResultStore {
     /// ever registers through the store need not call it; a session installs it
     /// eagerly so the provider is present even before the first table lands.
     pub fn install_result_schema(&self, ctx: &QueryContext) -> Result<()> {
-        // A session that resolves result tables must also be able to READ
-        // the bytes they point at. A query builds each table's provider and
-        // binds this root's driver on the way (`build_result_table_provider`),
-        // but a process that only EXECUTES — a compute-plane executor handed
-        // a placed stage that scans a result table — builds no provider of
-        // its own, and DataFusion would resolve the scan's cloud URL against
-        // a runtime that has never heard of it. Bound here, once, where the
-        // session takes the store on.
-        // A root the registry cannot drive yet — a cloud scheme with no
-        // credentials configured for it — is not an error at install time:
-        // a session that never reads a result table needs no driver, and
-        // the query path builds the provider and reports the failure where
-        // the read actually happens.
-        if let Ok(driver) = self.registry.driver_for(&self.root, None) {
-            crate::storage::read_view::register_read_view(
-                &ctx.inner().runtime_env(),
-                &self.root,
-                driver,
-            )?;
-        }
-        // The store rides in the session's config as an extension, beside
-        // the compute-plane slot: a statement planned under this session
-        // (`CREATE TABLE … AS`, `DROP TABLE`) reaches the store through the
-        // planner's `SessionState` alone, a context derived from the
-        // session's carries it too, and the schema provider resolves a
-        // name it does not hold through it. Installed once: the provider's
+        // The store rides in the session's config as an extension: a
+        // statement planned under this session (`CREATE TABLE … AS`, `DROP
+        // TABLE`) reaches the store through the planner's `SessionState`
+        // alone, a context derived from the session's carries it too, and
+        // the schema provider resolves a name it does not hold through it. Installed once: the provider's
         // reference is weak, so the extension is what keeps it alive.
         let installed = ctx.copied_config().get_extension::<ResultStore>();
         let store = installed.unwrap_or_else(|| {
@@ -5217,8 +5192,8 @@ impl ResultStore {
         {
             Ok(summary) => summary,
             Err(JammiError::EmptyTrainingSet { source_query }) => {
-                // The sink failed the row under its own writer and deleted
-                // the empty object; the row itself is retired here, so an
+                // The sink aborted the row and deleted the empty object;
+                // the row itself is retired here, so an
                 // empty training set leaves no row in any status and no
                 // bytes — never a 0-row table a run trains on in silence.
                 let name = building.table_name().to_string();
@@ -5313,9 +5288,7 @@ impl ResultStore {
     /// executing at more than one output partition would silently commit
     /// only partition 0's rows, never every row in order — an engine
     /// invariant breach, surfaced as a typed error rather than a panic in a
-    /// producer. Where the plan runs is the sink's decision: a `Batches`
-    /// plan carries this process's own stream, which no wire can carry, so
-    /// the plane declines it and it runs here.
+    /// producer.
     async fn plan_training_set_rows(
         &self,
         ctx: &QueryContext,

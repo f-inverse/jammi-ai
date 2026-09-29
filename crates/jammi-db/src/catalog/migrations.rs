@@ -247,6 +247,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "046_job_ranks",
         MigrationSql::Same(schema::MIGRATION_046_JOB_RANKS),
     ),
+    (
+        "047_drop_compute_cluster_state",
+        MigrationSql::Same(schema::MIGRATION_047_DROP_COMPUTE_CLUSTER_STATE),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

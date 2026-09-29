@@ -15,6 +15,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use jammi_ai::pipeline::asof::{AsofJoinSpecBuilder, AsofKey, Boundary, MatchDirection, TieBreak};
 use jammi_ai::session::InferenceSession;
 use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
+use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use parquet::arrow::ArrowWriter;
@@ -311,21 +312,22 @@ async fn ambiguous_duplicate_facts_fail_loud_through_the_verb() {
     }
     assert!(err.to_string().contains("tie_break_column"), "{err}");
 
-    // The sink failed the building row; the dropped handle's guard finds it
-    // failed and says so at DEBUG, never warning about a row already where
-    // it would put it.
-    for _ in 0..200 {
-        if logs.text().contains("row failed") {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // The write aborted its row in place: it is `failed`, nothing is left
+    // `building`, and the caller's dropped handle has nothing left to do.
+    let failed = session
+        .catalog()
+        .list_result_tables_by_status(ResultTableStatus::Failed)
+        .await
+        .unwrap();
+    assert_eq!(failed.len(), 1, "the refused as-of join's row is failed");
+    assert!(session
+        .catalog()
+        .list_result_tables_by_status(ResultTableStatus::Building)
+        .await
+        .unwrap()
+        .is_empty());
     let text = logs.text();
-    assert!(text.contains("row failed"), "the drop guard ran: {text}");
-    assert!(
-        !text.contains("WARN"),
-        "no warning for an already-failed row: {text}"
-    );
+    assert!(!text.contains("WARN"), "no warning for the aborted row: {text}");
 }
 
 /// A `tracing` writer into a shared buffer.

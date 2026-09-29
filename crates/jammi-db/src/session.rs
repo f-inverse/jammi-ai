@@ -22,7 +22,6 @@ use crate::catalog::backend::BackendImpl;
 use crate::catalog::segment_repo::IndexSegment;
 use crate::catalog::topic_repo::TopicRepo;
 use crate::catalog::Catalog;
-use crate::compute_plane::{ComputePlaneSlot, MaterializationPlanner, StatementClass};
 use crate::config::{BrokerConfig, CatalogConfig, JammiConfig, SigningKeyConfig};
 use crate::error::{JammiError, Result};
 use crate::federation::{EngineFunctions, LocalFunctionFederation};
@@ -35,6 +34,7 @@ use crate::store::mutable::definition::{MutableTableDefinition, MutableTableId};
 use crate::store::mutable::rewrite::RowRewritePlanner;
 use crate::store::mutable::sqlite::SqliteMutableBackend;
 use crate::store::mutable::MutableBackend;
+use crate::store::statement::{MaterializationPlanner, StatementClass};
 use crate::tenant::{TenantContext, TenantId};
 use crate::tenant_scope::{SourceTenantColumns, TenantBinding, TenantScopeAnalyzerRule};
 use crate::trigger::{InMemoryBroker, PostgresBroker, Publisher, Subscriber, TriggerBroker};
@@ -77,12 +77,6 @@ pub struct JammiSession {
     /// [`JammiSession::with_signing_key_store`], so the sign path routes through
     /// a caller-chosen store.
     signing_key_store: Arc<dyn SigningKeyStore>,
-    /// The compute plane a materialization's plan is submitted to when this
-    /// process holds the client role — the same slot `ctx`'s session config
-    /// carries as an extension, so a plan executing under any context
-    /// derived from `ctx` reads it through its `TaskContext`. Empty until a
-    /// role installs a plane; empty forever on a process holding none.
-    compute_plane: Arc<ComputePlaneSlot>,
     /// The functions [`JammiSession::install_functions`] installed, shared
     /// with the federation rule so no sub-plan calling one is sent to a
     /// remote source.
@@ -203,11 +197,9 @@ impl JammiSession {
         trigger_broker: Arc<dyn TriggerBroker>,
         signing_key_store: Arc<dyn SigningKeyStore>,
     ) -> Result<Self> {
-        let compute_plane = Arc::new(ComputePlaneSlot::default());
         let session_config = SessionConfig::new()
             .with_target_partitions(config.engine.execution_threads.get())
-            .with_batch_size(config.engine.batch_size)
-            .with_extension(Arc::clone(&compute_plane));
+            .with_batch_size(config.engine.batch_size);
 
         // `[engine] memory_limit` becomes THIS session's memory pool — the
         // ONE knob every consumer (a training-set stream's reservation, an
@@ -350,7 +342,6 @@ impl JammiSession {
             publisher,
             subscriber,
             signing_key_store,
-            compute_plane,
             engine_functions,
         };
         session.preload_sources().await?;
@@ -954,13 +945,6 @@ impl JammiSession {
     /// unbinds a name; see [`QueryContext`].
     pub fn context(&self) -> &QueryContext {
         &self.ctx
-    }
-
-    /// The slot a compute-plane role installs this process's
-    /// [`crate::compute_plane::ComputePlane`] into. Every plan this session
-    /// executes for a materialization reads it.
-    pub fn compute_plane(&self) -> &Arc<ComputePlaneSlot> {
-        &self.compute_plane
     }
 
     /// Append `rule` to this session's physical optimizer, after every rule

@@ -73,9 +73,8 @@ pub fn canonical_stamp_now() -> String {
 
 /// `at`, rendered in [`LEASE_TS_FORMAT`] — the formatter behind
 /// [`canonical_stamp_now`] and [`lease_deadline`], for a writer whose
-/// instant is not the application clock's `now`: a heartbeat row that
-/// records the whole-second instant its scheduler's sweep compares
-/// (`jammi-ballista`'s cluster state), a deadline computed from a lease.
+/// instant is not the application clock's `now`: a deadline computed from a
+/// lease.
 /// Every stamp this crate's TEXT timestamp columns carry is one of these
 /// three calls, so the catalog never grows a second timestamp shape.
 pub fn canonical_stamp(at: chrono::DateTime<chrono::Utc>) -> String {
@@ -196,35 +195,6 @@ pub fn lease_expired_clause(
         BackendKind::Sqlite => {
             params.push(SqlValue::TextOwned(canonical_stamp_now()));
             format!("({col} IS NULL OR {col} < ${})", params.len())
-        }
-    }
-}
-
-/// The SQL fragment that is true for a LIVE (non-expired, non-absent)
-/// lease — the exact complement of [`lease_expired_clause`], `col IS NOT
-/// NULL AND col > now` rather than that function's `col IS NULL OR col <
-/// now`, on the SAME backend clock. `Catalog::transfer_claim`'s hand-off
-/// predicate needs THIS positive polarity, never
-/// [`lease_expired_clause`]'s: a RELEASE ([`super::jobs_repo::Catalog::
-/// release_job_lease`]) sets `lease_expires_at = NULL`, and a transfer of a
-/// released claim must FAIL — `lease_expired_clause`'s own `col IS NULL OR
-/// …` shape reads a NULL lease as "expired" (true), which is the right
-/// answer for a reclaim sweep deciding whether to requeue a job but the
-/// WRONG answer for a hand-off deciding whether a live claim exists to
-/// transfer; negating `lease_expired_clause` as a whole would still leave
-/// the boundary at exactly `now` ambiguous between the two functions'
-/// independent per-backend expressions, so this is its own, explicitly
-/// authored predicate rather than `format!("NOT {}", lease_expired_clause(..))`.
-pub fn lease_live_clause(
-    col: &str,
-    kind: BackendKind,
-    params: &mut Vec<SqlValue<'static>>,
-) -> String {
-    match kind {
-        BackendKind::Postgres => format!("({col} IS NOT NULL AND {col}::timestamptz > now())"),
-        BackendKind::Sqlite => {
-            params.push(SqlValue::TextOwned(canonical_stamp_now()));
-            format!("({col} IS NOT NULL AND {col} > ${})", params.len())
         }
     }
 }

@@ -1,29 +1,20 @@
-//! A fleet of `jammi-server` processes on one host: rendered role configs,
-//! spawned binaries, captured logs, and the diagnostics a failure prints.
-//! The distributed lanes and the ladder's `placed`/`shape-d` legs launch
-//! their fleets through this one facility, so a fleet a test proves against
-//! is the fleet a leg measures.
+//! A fleet of `jammi-server` processes on one host: spawned binaries,
+//! captured logs, and the diagnostics a failure prints. The ladder's
+//! `shape-d` legs launch their fleets through this facility.
 //!
-//! A process is either [`ProcConfig::Rendered`] — a config this module
-//! writes from a [`BallistaRole`] and a [`WorkerRole`], the ad-hoc fleets
-//! the lanes build to isolate one mechanism — or [`ProcConfig::ShapeD`]: one
-//! of the deployed topology's committed role configs
-//! (`deploy/kubernetes/overlays/shape-d/jammi-<role>.toml`), run as
-//! written, with the values that differ per box — catalog, store, devices,
-//! listeners, the scheduler's address — layered over it through the
-//! `JAMMI_<PATH>` environment exactly as the deployment layers them
-//! ([`ShapeDRole::env`]). A process on another host is started the same
-//! way with the same variables, so a fleet across hosts is the same fleet.
+//! Every process runs one of the deployed topology's committed role configs
+//! ([`ShapeDRole::config_path`]) as written, with
+//! the values that differ per box — catalog, store, devices, listeners —
+//! layered over it through the `JAMMI_<PATH>` environment exactly as the
+//! deployment layers them ([`ShapeDRole::env`]). A process on another host
+//! is started the same way with the same variables, so a fleet across hosts
+//! is the same fleet.
 
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-
-use jammi_datafusion::ComputeDeviceKind;
-use jammi_numerics::ComputePrecision;
 
 use crate::DistributedBackends;
 
@@ -31,8 +22,7 @@ const LEASE_SECS: u64 = 3;
 const HEARTBEAT_SECS: u64 = 1;
 const IDLE_POLL_SECS: u64 = 1;
 const RANK_TIMEOUT_SECS: u64 = 10;
-/// `[distributed] max_world_size` every rendered process carries; the jobs
-/// the lanes submit use `world_size = 2`.
+/// `[distributed] max_world_size` an observer of a fleet carries.
 pub const MAX_WORLD_SIZE: u32 = 3;
 
 /// The audit master key every spawned process is given.
@@ -62,98 +52,40 @@ pub fn jammi_server_binary() -> PathBuf {
     bin
 }
 
-/// This process's Ballista roles, if any: `SchedulerAndExecutor` renders
-/// `[ballista.scheduler]`, `[ballista.executor]` and `[ballista.client]`
-/// (the process names itself, so the training attempts it claims are
-/// placed); `SchedulerAndClient` renders `[ballista.scheduler]` and
-/// `[ballista.client]` (a claimant that places every attempt and hosts no
-/// executor, so none ever trains on it while a live executor can hold it);
-/// `Scheduler` renders `[ballista.scheduler]` only (a scheduler that runs
-/// no task itself, so no placed task ever lands on the process the plane
-/// lives in); `Executor` renders `[ballista.executor]` only (pointed at
-/// `scheduler_port`); `Client` renders `[ballista.client]` only (a query
-/// tier whose materializations go to the scheduler at `scheduler_port`);
-/// `None` renders no `[ballista]` section at all (the plain, unplaced
-/// comparison fleet).
-#[derive(Clone, Copy, Debug)]
-pub enum BallistaRole {
-    SchedulerAndExecutor { scheduler_port: u16 },
-    SchedulerAndClient { scheduler_port: u16 },
-    Scheduler { scheduler_port: u16 },
-    Executor { scheduler_port: u16 },
-    Client { scheduler_port: u16 },
-    None,
-}
-
-impl BallistaRole {
-    /// Whether a process of this role registers a `compute_executors` row:
-    /// the roles that render `[ballista.executor]`. A client-role process
-    /// submits and hosts no executor; an unplaced one has no plane at all.
-    pub fn hosts_executor(self) -> bool {
-        matches!(
-            self,
-            BallistaRole::SchedulerAndExecutor { .. } | BallistaRole::Executor { .. }
-        )
-    }
-}
-
-/// This process's `[worker]` shape.
-#[derive(Clone, Copy, Debug)]
-pub struct WorkerRole {
-    pub enabled: bool,
-    /// `None` = `kinds = "all"`; `Some(ks)` = exactly `ks` — `Some(&[])` is a
-    /// fleet member that claims nothing.
-    pub kinds: Option<&'static [&'static str]>,
-    pub idle_poll_secs: u64,
-}
-
-impl Default for WorkerRole {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            kinds: None,
-            idle_poll_secs: IDLE_POLL_SECS,
-        }
-    }
-}
-
-/// The deployed topology's three roles, by the committed config each runs.
+/// The deployed topology's two roles, by the committed config each runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShapeDRole {
-    /// `jammi-scheduler.toml`: the one Ballista scheduler; claims nothing,
-    /// runs no task.
-    Scheduler,
-    /// `jammi-query.toml`: the query tier, a Ballista client; the surface a
-    /// job is submitted through; claims nothing.
+    /// The base query tier's `jammi.toml`: the surface a job is submitted
+    /// through; claims nothing.
     Query,
-    /// `jammi-compute.toml`: an executor beside a worker that claims every
-    /// training kind and trains it on this process's devices.
+    /// `jammi-compute.toml`: a worker that claims every job kind and runs it
+    /// on this process's devices.
     Compute,
 }
 
 impl ShapeDRole {
     pub fn as_str(self) -> &'static str {
         match self {
-            ShapeDRole::Scheduler => "scheduler",
             ShapeDRole::Query => "query",
             ShapeDRole::Compute => "compute",
         }
     }
 
-    /// The committed config this role runs, under the repository root.
+    /// The committed config this role runs, under the repository root: the
+    /// base query tier's, or the Shape D overlay's compute tier's.
     pub fn config_path(self, repo_root: &Path) -> PathBuf {
-        repo_root
-            .join("deploy/kubernetes/overlays/shape-d")
-            .join(format!("jammi-{}.toml", self.as_str()))
+        let kube = repo_root.join("deploy/kubernetes");
+        match self {
+            ShapeDRole::Query => kube.join("base/jammi.toml"),
+            ShapeDRole::Compute => kube.join("overlays/shape-d/jammi-compute.toml"),
+        }
     }
 
     /// The `JAMMI_<PATH>` variables that place this role on one box: the
     /// backends every role shares and the listeners and addresses that
     /// differ per process — the same layer the deployment's Secret and
     /// downward-API `env` provide, so the committed file is run as written.
-    /// Every role of one fleet is placed with the same `compute_device`:
-    /// the compute role trains on it, and the query role names its kind as
-    /// the kind a model's plan is placed onto.
+    /// The compute role runs its jobs on `compute_device`.
     pub fn env(self, place: &ShapeDPlace<'_>) -> Vec<(String, String)> {
         let b = place.backends;
         let mut env = vec![
@@ -200,46 +132,9 @@ impl ShapeDRole {
             ),
         ];
         match self {
-            // The scheduler and query roles compute nothing: no device.
-            ShapeDRole::Scheduler => env.extend([
-                ("JAMMI_GPU__DEVICE".to_string(), "-1".to_string()),
-                (
-                    "JAMMI_BALLISTA__SCHEDULER__BIND".to_string(),
-                    format!("0.0.0.0:{}", place.ports.scheduler),
-                ),
-                (
-                    "JAMMI_BALLISTA__SCHEDULER__ADVERTISE_HOST".to_string(),
-                    place.advertise_host.to_string(),
-                ),
-            ]),
-            ShapeDRole::Query => env.extend([
-                ("JAMMI_GPU__DEVICE".to_string(), "-1".to_string()),
-                (
-                    "JAMMI_BALLISTA__CLIENT__SCHEDULER_ADDRESS".to_string(),
-                    place.scheduler_address.to_string(),
-                ),
-                (
-                    "JAMMI_BALLISTA__CLIENT__DEVICE_KIND".to_string(),
-                    place.compute_kind().wire_str().to_string(),
-                ),
-            ]),
+            // The query role computes nothing: no device.
+            ShapeDRole::Query => env.push(("JAMMI_GPU__DEVICE".to_string(), "-1".to_string())),
             ShapeDRole::Compute => env.extend([
-                (
-                    "JAMMI_BALLISTA__EXECUTOR__SCHEDULER_ADDRESS".to_string(),
-                    place.scheduler_address.to_string(),
-                ),
-                (
-                    "JAMMI_BALLISTA__EXECUTOR__BIND".to_string(),
-                    format!("{}:{}", place.bind_host, place.ports.exec_bind),
-                ),
-                (
-                    "JAMMI_BALLISTA__EXECUTOR__GRPC_BIND".to_string(),
-                    format!("{}:{}", place.bind_host, place.ports.exec_grpc),
-                ),
-                (
-                    "JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST".to_string(),
-                    place.advertise_host.to_string(),
-                ),
                 (
                     "JAMMI_SERVER__PEER_BIND".to_string(),
                     format!("{}:{}", place.bind_host, place.ports.peer),
@@ -267,49 +162,7 @@ impl ShapeDRole {
                 ),
             ]),
         }
-        // The two roles that plan and forward a model serve under the
-        // fleet's inference shape; the scheduler neither plans nor forwards.
-        if let (ShapeDRole::Query | ShapeDRole::Compute, Some(inference)) = (self, place.inference)
-        {
-            env.extend(inference.env());
-        }
         env
-    }
-}
-
-/// The inference shape a fleet's planning and forwarding roles serve under:
-/// the fan-out a plan is cut into, the chunk budget its forwards are cut
-/// by, and the precision they run at. A leg that compares a fleet against a
-/// session of this process places the fleet with the session's own shape,
-/// so the edge between them differs in the topology alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShapeDInference {
-    pub partitions: usize,
-    pub batch_size: usize,
-    pub batch_tokens: usize,
-    pub compute_precision: ComputePrecision,
-}
-
-impl ShapeDInference {
-    fn env(self) -> [(String, String); 4] {
-        [
-            (
-                "JAMMI_INFERENCE__PARTITIONS".to_string(),
-                self.partitions.to_string(),
-            ),
-            (
-                "JAMMI_INFERENCE__BATCH_SIZE".to_string(),
-                self.batch_size.to_string(),
-            ),
-            (
-                "JAMMI_INFERENCE__BATCH_TOKENS".to_string(),
-                self.batch_tokens.to_string(),
-            ),
-            (
-                "JAMMI_GPU__COMPUTE_PRECISION".to_string(),
-                self.compute_precision.to_string(),
-            ),
-        ]
     }
 }
 
@@ -324,26 +177,10 @@ pub struct ShapeDPlace<'a> {
     pub bind_host: &'a str,
     /// The name other processes dial this one by.
     pub advertise_host: &'a str,
-    /// `host:port` of the fleet's scheduler.
-    pub scheduler_address: &'a str,
     pub ports: Ports,
-    /// The CUDA ordinal the fleet's compute tier trains on, or `-1` for the
-    /// CPU — one fact of the fleet, the same for every role placed in it.
+    /// The CUDA ordinal the fleet's compute tier runs on, or `-1` for the
+    /// CPU — one fact of the fleet.
     pub compute_device: i32,
-    /// The inference shape the fleet serves under, likewise one fact of the
-    /// fleet; `None` runs the committed configs' own `[inference]`.
-    pub inference: Option<ShapeDInference>,
-}
-
-impl ShapeDPlace<'_> {
-    /// The device kind the fleet's compute tier holds.
-    pub fn compute_kind(&self) -> ComputeDeviceKind {
-        if self.compute_device < 0 {
-            ComputeDeviceKind::Cpu
-        } else {
-            ComputeDeviceKind::Cuda
-        }
-    }
 }
 
 /// One process's listener ports.
@@ -352,96 +189,37 @@ pub struct Ports {
     pub flight: u16,
     pub health: u16,
     pub peer: u16,
-    /// Meaningful on a scheduler-hosting process.
-    pub scheduler: u16,
-    /// Meaningful on an executor-hosting process.
-    pub exec_bind: u16,
-    pub exec_grpc: u16,
 }
 
 impl Ports {
-    /// Six free loopback ports.
+    /// Three free loopback ports.
     pub fn fresh() -> Self {
         Self {
             flight: crate::free_port(),
             health: crate::free_port(),
             peer: crate::free_port(),
-            scheduler: crate::free_port(),
-            exec_bind: crate::free_port(),
-            exec_grpc: crate::free_port(),
         }
     }
 }
 
-/// How one process is configured.
-#[derive(Clone, Copy, Debug)]
-pub enum ProcConfig {
-    /// A config rendered from the two roles, on `device` (a CUDA ordinal,
-    /// or `-1` for CPU).
-    Rendered {
-        ballista: BallistaRole,
-        worker: WorkerRole,
-        device: i32,
-    },
-    /// The deployed topology's committed config for `role`, layered over
-    /// through the environment; `scheduler_port` is the fleet's scheduler,
-    /// `compute_device` the ordinal the fleet's compute tier trains on,
-    /// `inference` the shape it serves under.
-    ShapeD {
-        role: ShapeDRole,
-        scheduler_port: u16,
-        compute_device: i32,
-        inference: Option<ShapeDInference>,
-    },
-}
-
-/// One process's full listener/role spec.
+/// One process's listeners and role.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcSpec {
     pub ports: Ports,
-    pub config: ProcConfig,
+    pub role: ShapeDRole,
+    /// The CUDA ordinal the fleet's compute tier runs on, or `-1`.
+    pub compute_device: i32,
 }
 
 impl ProcSpec {
-    /// A rendered process on fresh ports, on CPU.
-    pub fn fresh(ballista: BallistaRole, worker: WorkerRole) -> Self {
-        Self::fresh_on(ballista, worker, -1)
-    }
-
-    /// A rendered process on fresh ports, on `device` (a CUDA ordinal, or
-    /// `-1` for CPU).
-    pub fn fresh_on(ballista: BallistaRole, worker: WorkerRole, device: i32) -> Self {
+    /// A shape-d role on fresh ports; `compute_device` is the fleet's
+    /// compute tier's CUDA ordinal (or `-1`), the same for every role of the
+    /// fleet.
+    pub fn shape_d(role: ShapeDRole, compute_device: i32) -> Self {
         Self {
             ports: Ports::fresh(),
-            config: ProcConfig::Rendered {
-                ballista,
-                worker,
-                device,
-            },
-        }
-    }
-
-    /// A shape-d role on fresh ports. `scheduler_port` is the fleet's one
-    /// scheduler port: the scheduler role binds it, every other role dials
-    /// it; `compute_device` is the fleet's compute tier's CUDA ordinal (or
-    /// `-1`) and `inference` its inference shape, the same for every role of
-    /// the fleet.
-    pub fn shape_d(
-        role: ShapeDRole,
-        scheduler_port: u16,
-        compute_device: i32,
-        inference: Option<ShapeDInference>,
-    ) -> Self {
-        let mut ports = Ports::fresh();
-        ports.scheduler = scheduler_port;
-        Self {
-            ports,
-            config: ProcConfig::ShapeD {
-                role,
-                scheduler_port,
-                compute_device,
-                inference,
-            },
+            role,
+            compute_device,
         }
     }
 
@@ -449,136 +227,10 @@ impl ProcSpec {
         self.ports.flight
     }
 
-    /// Whether this process hosts an executor.
-    pub fn hosts_executor(&self) -> bool {
-        match self.config {
-            ProcConfig::Rendered { ballista, .. } => ballista.hosts_executor(),
-            ProcConfig::ShapeD { role, .. } => role == ShapeDRole::Compute,
-        }
-    }
-
     /// Whether this process runs a `[worker]`.
     pub fn worker_enabled(&self) -> bool {
-        match self.config {
-            ProcConfig::Rendered { worker, .. } => worker.enabled,
-            ProcConfig::ShapeD { role, .. } => role == ShapeDRole::Compute,
-        }
+        self.role == ShapeDRole::Compute
     }
-}
-
-fn render_toml(
-    backends: &DistributedBackends,
-    result_root: &str,
-    artifact_dir: &str,
-    ports: Ports,
-    ballista: BallistaRole,
-    worker: WorkerRole,
-    device: i32,
-) -> String {
-    let allow_http = backends.allows_http();
-    let kinds = match worker.kinds {
-        Some(kinds) => format!(
-            "kinds = [{}]",
-            kinds
-                .iter()
-                .map(|k| format!("\"{k}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        None => "kinds = \"all\"".to_string(),
-    };
-    let mut out = format!(
-        r#"
-artifact_dir = "{artifact_dir}"
-
-[gpu]
-device = {device}
-
-[catalog.postgres]
-url = "{pg_url}"
-pool_size = 8
-
-[storage]
-result_root = "{result_root}"
-
-[storage.cloud.s3]
-region = "{region}"
-endpoint = "{s3_endpoint}"
-allow_http = {allow_http}
-
-[lease]
-duration_secs = {LEASE_SECS}
-heartbeat_secs = {HEARTBEAT_SECS}
-
-[worker]
-enabled = {enabled}
-{kinds}
-idle_poll_secs = {idle_poll_secs}
-local_ranks = 1
-rank_timeout_secs = {RANK_TIMEOUT_SECS}
-
-[distributed]
-max_world_size = {MAX_WORLD_SIZE}
-
-[server]
-flight_listen = "127.0.0.1:{flight_port}"
-health_listen = "127.0.0.1:{health_port}"
-peer_bind = "127.0.0.1:{peer_port}"
-peer_advertise = "127.0.0.1:{peer_port}"
-services = []
-"#,
-        pg_url = backends.pg_url,
-        region = backends.region,
-        s3_endpoint = backends.s3_endpoint,
-        enabled = worker.enabled,
-        idle_poll_secs = worker.idle_poll_secs,
-        flight_port = ports.flight,
-        health_port = ports.health,
-        peer_port = ports.peer,
-    );
-
-    // A scheduler is bound the way a deployment binds it (every interface)
-    // and advertised by a dialable host, so every placed task's status
-    // report exercises the advertised name.
-    let scheduler_section = |scheduler_port: u16| {
-        format!(
-            "\n[ballista.scheduler]\nbind = \"0.0.0.0:{scheduler_port}\"\n\
-             advertise_host = \"127.0.0.1\"\n"
-        )
-    };
-    let client_section = |scheduler_port: u16| {
-        format!("\n[ballista.client]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n")
-    };
-    let executor_section = |scheduler_port: u16| {
-        format!(
-            "\n[ballista.executor]\nscheduler_address = \"127.0.0.1:{scheduler_port}\"\n\
-             bind = \"127.0.0.1:{}\"\ngrpc_bind = \"127.0.0.1:{}\"\n\
-             advertise_host = \"127.0.0.1\"\ntask_slots = 1\n",
-            ports.exec_bind, ports.exec_grpc,
-        )
-    };
-    match ballista {
-        BallistaRole::None => {}
-        BallistaRole::Scheduler { scheduler_port } => {
-            out.push_str(&scheduler_section(scheduler_port));
-        }
-        BallistaRole::SchedulerAndClient { scheduler_port } => {
-            out.push_str(&scheduler_section(scheduler_port));
-            out.push_str(&client_section(scheduler_port));
-        }
-        BallistaRole::SchedulerAndExecutor { scheduler_port } => {
-            out.push_str(&scheduler_section(scheduler_port));
-            out.push_str(&executor_section(scheduler_port));
-            out.push_str(&client_section(scheduler_port));
-        }
-        BallistaRole::Executor { scheduler_port } => {
-            out.push_str(&executor_section(scheduler_port));
-        }
-        BallistaRole::Client { scheduler_port } => {
-            out.push_str(&client_section(scheduler_port));
-        }
-    }
-    out
 }
 
 /// One spawned `jammi-server` process and the scratch dir backing its
@@ -596,10 +248,7 @@ pub struct WorkerProc {
 
 /// A fleet of processes on this host.
 pub struct Fleet {
-    exe: PathBuf,
-    repo_root: PathBuf,
     workers: Vec<WorkerProc>,
-    run_id: String,
 }
 
 impl Fleet {
@@ -633,38 +282,11 @@ impl Fleet {
                 )
             })
             .collect();
-        Self {
-            exe: exe.to_path_buf(),
-            repo_root: repo_root.to_path_buf(),
-            workers,
-            run_id,
-        }
+        Self { workers }
     }
 
     pub fn worker_labels(&self) -> Vec<&str> {
         self.workers.iter().map(|w| w.label.as_str()).collect()
-    }
-
-    /// The labels of the members whose role hosts an executor, in spawn
-    /// order — the set that registers with the compute plane. Every one of
-    /// them runs a `[worker]`: a member is known to the shared catalog by
-    /// its label only through its `workers` row, so an executor whose
-    /// worker is disabled has an executor registration no test can tie
-    /// back to it — refused here, never a 60 s timeout.
-    pub fn executor_labels(&self) -> Vec<&str> {
-        self.workers
-            .iter()
-            .filter(|w| w.spec.hosts_executor())
-            .inspect(|w| {
-                assert!(
-                    w.spec.worker_enabled(),
-                    "executor-hosting member {} runs no worker: its label resolves to no \
-                     instance id; give it a worker of a kind the test never enqueues",
-                    w.label
-                )
-            })
-            .map(|w| w.label.as_str())
-            .collect()
     }
 
     /// The `i`-th spawned worker's label (0-indexed), in spawn order.
@@ -690,87 +312,10 @@ impl Fleet {
             .unwrap_or_else(|| panic!("no worker labelled {label:?}"))
     }
 
-    /// Spawn ONE more process into this already-running fleet, labelled
-    /// with the SAME run id (`lane-{run_id}-{n}`, `n` continuing the
-    /// existing sequence) — a LATE-joining process, added only after the
-    /// earlier processes' own claim/placement race has already resolved,
-    /// so it plays no part in that race. Returns the new process's own
-    /// index (for [`Fleet::label`]).
-    pub fn spawn_more(
-        &mut self,
-        backends: &DistributedBackends,
-        result_root: &str,
-        spec: ProcSpec,
-    ) -> usize {
-        let idx = self.workers.len();
-        let label = format!("lane-{}-{}", self.run_id, idx + 1);
-        self.workers.push(spawn_one(
-            &self.exe,
-            &self.repo_root,
-            backends,
-            result_root,
-            &label,
-            spec,
-        ));
-        idx
-    }
-
     /// The captured stdout+stderr log of the worker labelled `label`, read
     /// fresh (the process may still be writing it).
     pub fn log_contents(&self, label: &str) -> String {
         std::fs::read_to_string(&self.worker(label).log_path).unwrap_or_default()
-    }
-
-    pub fn kill9(&mut self, label: &str) -> bool {
-        let Some(w) = self.workers.iter_mut().find(|w| w.label == label) else {
-            return false;
-        };
-        sigkill(&mut w.child);
-        true
-    }
-
-    /// Spawn a REPLACEMENT process at the SAME index, with the SAME spec
-    /// (same ports — a fixed `scheduler.bind` rebinds once the killed
-    /// process's listener is released). The replacement is a freshly-minted
-    /// instance (a new `instances` row): `InferenceSession::instance_id` is
-    /// minted at session construction, never externally supplied, so a
-    /// killed-then-respawned process cannot keep the OLD instance id — a
-    /// scheduler-restart test needs only the OTHER executors' registrations
-    /// and the job status rows to survive, which the shared catalog carries
-    /// regardless of the replacement's own identity.
-    pub fn respawn(&mut self, backends: &DistributedBackends, result_root: &str, label: &str) {
-        let idx = self
-            .workers
-            .iter()
-            .position(|w| w.label == label)
-            .unwrap_or_else(|| panic!("no worker labelled {label:?} to respawn"));
-        let spec = self.workers[idx].spec;
-        // The old listener may take a moment to release after SIGKILL.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                spawn_one(
-                    &self.exe,
-                    &self.repo_root,
-                    backends,
-                    result_root,
-                    label,
-                    spec,
-                )
-            }));
-            match probe {
-                Ok(w) => {
-                    self.workers[idx] = w;
-                    return;
-                }
-                Err(e) => {
-                    if Instant::now() >= deadline {
-                        std::panic::resume_unwind(e);
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        }
     }
 
     /// The first member that has exited other than by SIGKILL, with its
@@ -841,57 +386,29 @@ fn spawn_one(
     let artifact_dir = scratch.path().join("artifacts");
     std::fs::create_dir_all(&artifact_dir).expect("worker artifact_dir");
 
-    let (config_path, env, effective_config) = match spec.config {
-        ProcConfig::Rendered {
-            ballista,
-            worker,
-            device,
-        } => {
-            let config_toml = render_toml(
-                backends,
-                result_root,
-                artifact_dir.to_str().expect("utf8 artifact_dir"),
-                spec.ports,
-                ballista,
-                worker,
-                device,
-            );
-            let config_path = scratch.path().join("jammi.toml");
-            std::fs::write(&config_path, &config_toml).expect("write worker config");
-            (config_path, Vec::new(), config_toml)
-        }
-        ProcConfig::ShapeD {
-            role,
-            scheduler_port,
-            compute_device,
-            inference,
-        } => {
-            let config_path = role.config_path(repo_root);
-            assert!(
-                config_path.is_file(),
-                "the shape-d {} role's committed config is not at {}",
-                role.as_str(),
-                config_path.display()
-            );
-            let scheduler_address = format!("127.0.0.1:{scheduler_port}");
-            let env = role.env(&ShapeDPlace {
-                backends,
-                result_root,
-                artifact_dir: &artifact_dir,
-                bind_host: "127.0.0.1",
-                advertise_host: "127.0.0.1",
-                scheduler_address: &scheduler_address,
-                ports: spec.ports,
-                compute_device,
-                inference,
-            });
-            let effective = std::iter::once(format!("--config {}", config_path.display()))
-                .chain(env.iter().map(|(k, v)| format!("{k}={v}")))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (config_path, env, effective)
-        }
-    };
+    let config_path = spec.role.config_path(repo_root);
+    assert!(
+        config_path.is_file(),
+        "the shape-d {} role's committed config is not at {}",
+        spec.role.as_str(),
+        config_path.display()
+    );
+    let env = spec.role.env(&ShapeDPlace {
+        backends,
+        result_root,
+        artifact_dir: &artifact_dir,
+        bind_host: "127.0.0.1",
+        advertise_host: "127.0.0.1",
+        ports: spec.ports,
+        compute_device: spec.compute_device,
+    });
+    let effective_config = std::iter::once(format!("--config {}", config_path.display()))
+        .chain(env.iter().map(|(k, v)| format!("{k}={v}")))
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
 
     let log_path = scratch.path().join("worker.log");
     let log = std::fs::File::create(&log_path).expect("worker log file");
@@ -950,17 +467,12 @@ mod tests {
             artifact_dir,
             bind_host: "0.0.0.0",
             advertise_host: "compute-0.fleet",
-            scheduler_address: "scheduler.fleet:50050",
             ports: Ports {
                 flight: 8815,
                 health: 8080,
                 peer: 9000,
-                scheduler: 50050,
-                exec_bind: 50051,
-                exec_grpc: 50052,
             },
             compute_device: 1,
-            inference: None,
         }
     }
 
@@ -968,17 +480,16 @@ mod tests {
         env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
-    /// Every role dials the one scheduler by its address; the roles that
-    /// compute nothing carry no device, and the compute role carries the
-    /// device it trains on and the listeners it advertises.
+    /// Both roles share the fleet's backends; the query role carries no
+    /// device, and the compute role carries the device it runs on and the
+    /// peer listener it advertises.
     #[test]
     fn shape_d_roles_layer_the_box_over_the_committed_config() {
         let backends = backends();
         let dir = Path::new("/var/lib/jammi");
-        let scheduler = ShapeDRole::Scheduler.env(&place(&backends, dir));
         let query = ShapeDRole::Query.env(&place(&backends, dir));
         let compute = ShapeDRole::Compute.env(&place(&backends, dir));
-        for env in [&scheduler, &query, &compute] {
+        for env in [&query, &compute] {
             assert_eq!(
                 value(env, "JAMMI_CATALOG__POSTGRES__URL"),
                 Some("postgres://u:p@db:5432/jammi")
@@ -992,29 +503,8 @@ mod tests {
                 Some("true")
             );
         }
-        assert_eq!(
-            value(&scheduler, "JAMMI_BALLISTA__SCHEDULER__BIND"),
-            Some("0.0.0.0:50050")
-        );
-        assert_eq!(value(&scheduler, "JAMMI_GPU__DEVICE"), Some("-1"));
-        assert_eq!(
-            value(&query, "JAMMI_BALLISTA__CLIENT__SCHEDULER_ADDRESS"),
-            Some("scheduler.fleet:50050")
-        );
         assert_eq!(value(&query, "JAMMI_GPU__DEVICE"), Some("-1"));
-        assert_eq!(
-            value(&query, "JAMMI_BALLISTA__CLIENT__DEVICE_KIND"),
-            Some("cuda"),
-            "the query tier places a model's plan onto the compute tier's kind"
-        );
-        assert_eq!(
-            value(&compute, "JAMMI_BALLISTA__EXECUTOR__SCHEDULER_ADDRESS"),
-            Some("scheduler.fleet:50050")
-        );
-        assert_eq!(
-            value(&compute, "JAMMI_BALLISTA__EXECUTOR__ADVERTISE_HOST"),
-            Some("compute-0.fleet")
-        );
+        assert!(value(&query, "JAMMI_SERVER__PEER_BIND").is_none());
         assert_eq!(
             value(&compute, "JAMMI_SERVER__PEER_ADVERTISE"),
             Some("compute-0.fleet:9000")
@@ -1022,79 +512,15 @@ mod tests {
         assert_eq!(value(&compute, "JAMMI_GPU__DEVICE"), Some("1"));
         assert_eq!(value(&compute, "JAMMI_GPU__DEVICES"), Some("[1]"));
         assert_eq!(value(&compute, "JAMMI_WORKER__LOCAL_RANKS"), Some("1"));
-        assert!(value(&scheduler, "JAMMI_BALLISTA__EXECUTOR__BIND").is_none());
-        assert!(value(&query, "JAMMI_BALLISTA__SCHEDULER__BIND").is_none());
-    }
-
-    /// A fleet whose compute tier trains on the CPU has a query tier that
-    /// places a model's plan onto the CPU: the committed query config names
-    /// the deployment's CUDA tier, and the box it runs on is layered over it.
-    #[test]
-    fn a_cpu_fleets_query_tier_names_the_cpu() {
-        let backends = backends();
-        let cpu_fleet = ShapeDPlace {
-            compute_device: -1,
-            ..place(&backends, Path::new("/var/lib/jammi"))
-        };
-        let query = ShapeDRole::Query.env(&cpu_fleet);
-        assert_eq!(
-            value(&query, "JAMMI_BALLISTA__CLIENT__DEVICE_KIND"),
-            Some("cpu")
-        );
-        let compute = ShapeDRole::Compute.env(&cpu_fleet);
-        assert_eq!(value(&compute, "JAMMI_GPU__DEVICE"), Some("-1"));
-    }
-
-    /// A fleet placed with an inference shape serves under it on the two
-    /// roles that plan and forward; the scheduler, which does neither,
-    /// carries none of it; and a fleet placed without one overrides nothing,
-    /// running the committed files' own `[inference]`.
-    #[test]
-    fn a_fleets_inference_shape_reaches_the_roles_that_plan_and_forward() {
-        let backends = backends();
-        let shaped = ShapeDPlace {
-            inference: Some(ShapeDInference {
-                partitions: 8,
-                batch_size: 32,
-                batch_tokens: 16384,
-                compute_precision: ComputePrecision::F32,
-            }),
-            ..place(&backends, Path::new("/var/lib/jammi"))
-        };
-        for role in [ShapeDRole::Query, ShapeDRole::Compute] {
-            let env = role.env(&shaped);
-            assert_eq!(value(&env, "JAMMI_INFERENCE__PARTITIONS"), Some("8"));
-            assert_eq!(value(&env, "JAMMI_INFERENCE__BATCH_SIZE"), Some("32"));
-            assert_eq!(value(&env, "JAMMI_INFERENCE__BATCH_TOKENS"), Some("16384"));
-            assert_eq!(value(&env, "JAMMI_GPU__COMPUTE_PRECISION"), Some("f32"));
-        }
-        let scheduler = ShapeDRole::Scheduler.env(&shaped);
-        assert!(value(&scheduler, "JAMMI_INFERENCE__PARTITIONS").is_none());
-        let unshaped = place(&backends, Path::new("/var/lib/jammi"));
-        for role in [
-            ShapeDRole::Scheduler,
-            ShapeDRole::Query,
-            ShapeDRole::Compute,
-        ] {
-            let env = role.env(&unshaped);
-            assert!(env
-                .iter()
-                .all(|(key, _)| !key.starts_with("JAMMI_INFERENCE__")));
-        }
     }
 
     /// The config each role runs is the deployment's own file.
     #[test]
     fn shape_d_roles_run_the_committed_configs() {
         let root = crate::workspace_root();
-        for role in [
-            ShapeDRole::Scheduler,
-            ShapeDRole::Query,
-            ShapeDRole::Compute,
-        ] {
+        for role in [ShapeDRole::Query, ShapeDRole::Compute] {
             let path = role.config_path(&root);
             assert!(path.is_file(), "{} is missing", path.display());
-            assert!(path.ends_with(format!("shape-d/jammi-{}.toml", role.as_str())));
         }
     }
 }

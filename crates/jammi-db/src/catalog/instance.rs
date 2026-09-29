@@ -382,14 +382,8 @@ fn canonical_local_root(root: &str, path: &str) -> Result<String> {
 /// policy reads it as an exact-match token) and its ORDINAL within that
 /// kind (rank 0's device is ordinal 0, etc. — never a global, cross-kind
 /// index). Serialized as JSON `{kind, ordinal}` — no other field (there is
-/// no source for a `memory_bytes`). The ONE shape both `devices` columns
-/// (migration 038) carry a `Vec` of: `workers.devices`
-/// ([`WorkerFacts::devices`], the `[worker]` process's own inventory,
-/// carried for `ListWorkers` only) and `compute_executors.devices`
-/// (`super::compute_repo::ComputeExecutorRecord::devices`, the compute
-/// executor's OWN registration fact and the placement join's sole
-/// authority) — so a device claim reads identically wherever it is
-/// registered.
+/// no source for a `memory_bytes`). `workers.devices` (migration 038,
+/// [`WorkerFacts::devices`]) carries a `Vec` of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceFact {
     /// The device kind.
@@ -398,13 +392,13 @@ pub struct DeviceFact {
     pub ordinal: u32,
 }
 
-/// Decode a `devices` JSON column (`workers.devices` /
-/// `compute_executors.devices`) into its device list. Non-`NULL` text that
+/// Decode a `devices` JSON column (`workers.devices`) into its device
+/// list. Non-`NULL` text that
 /// does not parse as `[{kind, ordinal}]` is a ROW FACT on both backends,
 /// never a read FAULT — the same shape as
 /// `jobs.lease_expires_at` ([`super::lease::LeaseFact`]): the read that
 /// found the row still succeeds, with an EMPTY device list AND a
-/// `tracing::warn!` naming `row_label` (the executor/instance id) — never a
+/// `tracing::warn!` naming `row_label` (the instance id) — never a
 /// silent `unwrap_or_default()`, which would make the identical failure
 /// invisible instead of an observable, attributed row fact.
 pub fn decode_devices_json(raw: &str, row_label: &str) -> Vec<DeviceFact> {
@@ -444,11 +438,7 @@ pub struct WorkerFacts {
     /// This `[worker]` process's own device inventory —
     /// `workers.devices`, a `ListWorkers` MIRROR only (read back verbatim on
     /// `jammi.v1.job.WorkerSummary.devices`, field 8 —
-    /// `crates/jammi-wire/proto/jammi/v1/job.proto`; never the placement
-    /// join's authority: `compute_executors.devices`,
-    /// `super::compute_repo::ComputeExecutorRecord::devices`, is that,
-    /// since a compute-executor process and a `[worker]` process may be
-    /// different processes with different device visibility).
+    /// `crates/jammi-wire/proto/jammi/v1/job.proto`).
     pub devices: Vec<DeviceFact>,
 }
 

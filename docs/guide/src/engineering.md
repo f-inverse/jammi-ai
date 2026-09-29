@@ -184,7 +184,7 @@ alone and removed when it exits:
 
 ```bash
 ci/dev.sh --with pg cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
-ci/dev.sh --with pg,s3 cargo test -p jammi-ballista --features live-distributed-tests --test distributed -- --test-threads=1
+ci/dev.sh --with pg,s3 cargo test -p jammi-ai --features live-distributed-tests --test distributed -- --test-threads=1
 ci/dev.sh --gc          # remove whatever earlier runs left behind, keeping the build caches
 ```
 

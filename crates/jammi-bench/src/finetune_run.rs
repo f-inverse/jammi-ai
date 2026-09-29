@@ -9,8 +9,8 @@
 //! [`Rung`] names how the same job reaches the trainer: `resident` drives
 //! `TrainingLoopBuilder` over in-memory rows; `streamed` submits the job
 //! through the session and lets an embedded worker materialise its training
-//! set, stream the rows back and publish the adapter; `placed` and `shape-d`
-//! run that job on other processes (`crate::plane`). Adjacent rungs differ
+//! set, stream the rows back and publish the adapter; `shape-d` runs that
+//! job on other processes (`crate::fleet`). Adjacent rungs differ
 //! by one layer and must publish a byte-identical adapter, so every rung
 //! trains the SAME run:
 //!
@@ -649,8 +649,8 @@ pub struct FinetuneRunParams {
     /// Which rung of the ladder this leg is — how the run reaches the
     /// trainer ([`Rung`]). Provenance on the emitted tier, never identity.
     pub rung: Rung,
-    /// Where a rung above `streamed` runs (`crate::plane`).
-    pub plane: crate::plane::PlaneParams,
+    /// Where a rung above `streamed` runs (`crate::fleet`).
+    pub fleet: crate::fleet::FleetParams,
     /// CUDA ordinal, or `None` for CPU (the CPU-hermetic smoke path).
     pub cuda_device: Option<usize>,
     /// Scratch directory this run's catalog sqlite file, artifact store, and
@@ -1646,12 +1646,9 @@ pub enum Rung {
     /// materialised, the rows streamed back through the training-set table's
     /// scan, the adapter published through the artifact store.
     Streamed,
-    /// The same job, claimed by one process and placed on a Ballista
-    /// executor in another.
-    Placed,
-    /// The same job on the deployed topology's role configs: a scheduler, a
-    /// query tier the job is submitted through over the public surface, and
-    /// compute processes that claim and train it.
+    /// The same job on the deployed topology's role configs: a query tier
+    /// the job is submitted through over the public surface, and compute
+    /// processes that claim and train it.
     ShapeD,
 }
 
@@ -1660,7 +1657,6 @@ impl Rung {
         match self {
             Rung::Resident => "resident",
             Rung::Streamed => "streamed",
-            Rung::Placed => "placed",
             Rung::ShapeD => "shape-d",
         }
     }
@@ -1672,10 +1668,9 @@ impl std::str::FromStr for Rung {
         match s {
             "resident" => Ok(Rung::Resident),
             "streamed" => Ok(Rung::Streamed),
-            "placed" => Ok(Rung::Placed),
             "shape-d" => Ok(Rung::ShapeD),
             other => Err(format!(
-                "unknown --rung {other:?}; expected resident, streamed, placed, or shape-d"
+                "unknown --rung {other:?}; expected resident, streamed, or shape-d"
             )),
         }
     }
@@ -2300,7 +2295,7 @@ pub fn run(
     let trained = match params.rung {
         Rung::Resident => train_resident(call, params, &ctx, &train_rows)?,
         Rung::Streamed => train_streamed(params, &ctx)?,
-        Rung::Placed | Rung::ShapeD => crate::plane::train_run::train_on_fleet(params, &ctx)?,
+        Rung::ShapeD => crate::fleet::train_run::train_on_fleet(params, &ctx)?,
     };
     if trained.epoch_bundles.len() != params.epochs {
         return Err(format!(
@@ -3055,7 +3050,7 @@ mod tests {
             max_seq_length: 16,
             expect_dense: false,
             rung: Rung::Resident,
-            plane: crate::plane::PlaneParams::default(),
+            fleet: crate::fleet::FleetParams::default(),
             cuda_device: None,
             work_dir,
             mutant_id: None,

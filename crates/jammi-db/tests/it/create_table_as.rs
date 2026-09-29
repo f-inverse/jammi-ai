@@ -1,23 +1,16 @@
 //! `CREATE TABLE … AS` issued to the session is a result table — a
 //! `result_tables` row, bytes under the store's root, read on every session
-//! bound to the catalog as `"jammi.<name>"` — written through the sink where
-//! the installed compute plane says; `DROP TABLE` is the store's drop of it;
-//! `CREATE TABLE` without a query, or over a query the engine could not
-//! replay, is refused typed; a `SELECT` on the same session never reaches
-//! the plane.
+//! bound to the catalog as `"jammi.<name>"` — written through the sink;
+//! `DROP TABLE` is the store's drop of it; `CREATE TABLE` without a query,
+//! or over a query the engine could not replay, is refused typed.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::{execute_stream, ExecutionPlan};
-use futures::future::BoxFuture;
 use jammi_db::catalog::backend::BackendKind;
 use jammi_db::catalog::result_repo::ResultTableKind;
 use jammi_db::catalog::status::ResultTableStatus;
-use jammi_db::compute_plane::{ComputePlane, Unheld};
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::error::{JammiError, Result};
+use jammi_db::error::JammiError;
 use jammi_db::session::JammiSession;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -25,35 +18,8 @@ use jammi_db::store::ResultStore;
 
 use crate::common;
 
-/// A plane that runs every plan it is handed under its own bare context —
-/// the way an executor runs a plan under its own session, where the sink
-/// arrives placed and writes — and counts them.
-struct CountingPlane {
-    submitted: AtomicUsize,
-}
-
-impl ComputePlane for CountingPlane {
-    fn unheld(&self, _plan: &Arc<dyn ExecutionPlan>) -> BoxFuture<'static, Result<Option<Unheld>>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn place(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
-        self.submitted.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async move {
-            let ctx = datafusion::prelude::SessionContext::new();
-            Ok(execute_stream(plan, ctx.task_ctx())?)
-        })
-    }
-}
-
-/// A session over `patents` with a result store installed and the counting
-/// plane as its compute plane.
-async fn session_with_store(
-    dir: &std::path::Path,
-) -> (JammiSession, ResultStore, Arc<CountingPlane>, String) {
+/// A session over `patents` with a result store installed.
+async fn session_with_store(dir: &std::path::Path) -> (JammiSession, ResultStore, String) {
     let session = jammi_test_utils::make_test_session(BackendKind::Sqlite, dir).await;
     let store = ResultStore::new(
         dir,
@@ -62,10 +28,6 @@ async fn session_with_store(
     )
     .unwrap();
     store.install_result_schema(session.context()).unwrap();
-    let plane = Arc::new(CountingPlane {
-        submitted: AtomicUsize::new(0),
-    });
-    assert!(session.compute_plane().install(plane.clone()));
     let patents = format!("patents_{}", jammi_test_utils::unique_suffix());
     session
         .add_source(
@@ -79,13 +41,13 @@ async fn session_with_store(
         )
         .await
         .unwrap();
-    (session, store, plane, patents)
+    (session, store, patents)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_create_table_as_is_a_result_table_written_on_the_plane_and_a_select_never_is() {
+async fn a_create_table_as_is_a_result_table_the_store_drops() {
     let dir = tempfile::tempdir().unwrap();
-    let (session, store, plane, patents) = session_with_store(dir.path()).await;
+    let (session, store, patents) = session_with_store(dir.path()).await;
 
     let expected = session
         .sql(&format!(
@@ -93,11 +55,6 @@ async fn a_create_table_as_is_a_result_table_written_on_the_plane_and_a_select_n
         ))
         .await
         .unwrap();
-    assert_eq!(
-        plane.submitted.load(Ordering::SeqCst),
-        0,
-        "a SELECT serves its rows inline"
-    );
 
     let created = session
         .sql(&format!(
@@ -109,11 +66,6 @@ async fn a_create_table_as_is_a_result_table_written_on_the_plane_and_a_select_n
     assert!(
         created.iter().all(|b| b.num_rows() == 0),
         "a CREATE TABLE AS returns no rows"
-    );
-    assert_eq!(
-        plane.submitted.load(Ordering::SeqCst),
-        1,
-        "the CREATE TABLE AS submitted its sink once"
     );
 
     // The table is catalogued state: a `ready` `result_tables` row of the
@@ -131,7 +83,10 @@ async fn a_create_table_as_is_a_result_table_written_on_the_plane_and_a_select_n
         expected.iter().map(|b| b.num_rows()).sum::<usize>()
     );
     let url = StorageUrl::parse(&record.parquet_path).unwrap();
-    assert!(store.holds_url(&url), "{url} lies under the store's root");
+    assert!(
+        url.as_str().starts_with(store.root().as_str()),
+        "{url} lies under the store's root"
+    );
     let handle = store.open_parquet(&url).unwrap();
     assert!(handle.exists(&handle.data_path().unwrap()).await.unwrap());
 
@@ -139,7 +94,6 @@ async fn a_create_table_as_is_a_result_table_written_on_the_plane_and_a_select_n
         .sql("SELECT id, title FROM \"jammi.recent\" ORDER BY id")
         .await
         .unwrap();
-    assert_eq!(plane.submitted.load(Ordering::SeqCst), 1);
     let concat = |batches: &[arrow::array::RecordBatch]| {
         arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap()
     };
@@ -172,7 +126,7 @@ async fn a_create_table_as_is_a_result_table_written_on_the_plane_and_a_select_n
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_create_table_without_a_query_is_refused_typed() {
     let dir = tempfile::tempdir().unwrap();
-    let (session, _store, plane, _patents) = session_with_store(dir.path()).await;
+    let (session, _store, _patents) = session_with_store(dir.path()).await;
     let err = session
         .sql("CREATE TABLE empty_rows (id BIGINT, title VARCHAR)")
         .await
@@ -187,7 +141,6 @@ async fn a_create_table_without_a_query_is_refused_typed() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(plane.submitted.load(Ordering::SeqCst), 0);
 }
 
 /// A `CREATE TABLE … AS` over a query the unparser cannot render back to
@@ -197,7 +150,7 @@ async fn a_create_table_without_a_query_is_refused_typed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
     let dir = tempfile::tempdir().unwrap();
-    let (session, _store, plane, patents) = session_with_store(dir.path()).await;
+    let (session, _store, patents) = session_with_store(dir.path()).await;
     let err = session
         .sql(&format!(
             "CREATE TABLE lineage AS WITH RECURSIVE cited AS \
@@ -218,7 +171,6 @@ async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
         .await
         .unwrap()
         .is_none());
-    assert_eq!(plane.submitted.load(Ordering::SeqCst), 0);
 }
 
 /// The `(id, title)` rows of `"jammi.<name>"`, by id, and the `ready`
@@ -259,7 +211,7 @@ async fn object_exists(store: &ResultStore, url: &StorageUrl) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_refused_at_planning_leaves_the_old_table_readable() {
     let dir = tempfile::tempdir().unwrap();
-    let (session, _store, plane, patents) = session_with_store(dir.path()).await;
+    let (session, _store, patents) = session_with_store(dir.path()).await;
     session
         .sql(&format!(
             "CREATE TABLE recent AS SELECT id, title FROM {patents}.public.patents \
@@ -268,7 +220,6 @@ async fn a_replacement_refused_at_planning_leaves_the_old_table_readable() {
         .await
         .unwrap();
     let (before, url) = rows_and_url(&session, "recent").await;
-    assert_eq!(plane.submitted.load(Ordering::SeqCst), 1);
 
     session
         .sql(&format!(
@@ -294,11 +245,6 @@ async fn a_replacement_refused_at_planning_leaves_the_old_table_readable() {
     let (after, url_after) = rows_and_url(&session, "recent").await;
     assert_eq!(concat(&after), concat(&before), "the old rows serve");
     assert_eq!(url_after, url, "the old row, untouched");
-    assert_eq!(
-        plane.submitted.load(Ordering::SeqCst),
-        1,
-        "nothing was submitted"
-    );
 }
 
 /// A `CREATE OR REPLACE TABLE … AS` whose input refuses mid-write — the
@@ -308,7 +254,7 @@ async fn a_replacement_refused_at_planning_leaves_the_old_table_readable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_that_refuses_mid_write_leaves_the_old_table_and_reclaims_its_artifact() {
     let dir = tempfile::tempdir().unwrap();
-    let (session, store, plane, patents) = session_with_store(dir.path()).await;
+    let (session, store, patents) = session_with_store(dir.path()).await;
     session
         .sql(&format!(
             "CREATE TABLE recent AS SELECT id, title FROM {patents}.public.patents \
@@ -325,11 +271,6 @@ async fn a_replacement_that_refuses_mid_write_leaves_the_old_table_and_reclaims_
         ))
         .await
         .expect_err("no title casts to an integer");
-    assert_eq!(
-        plane.submitted.load(Ordering::SeqCst),
-        2,
-        "the replacement's sink was submitted and failed there"
-    );
 
     let (after, url_after) = rows_and_url(&session, "recent").await;
     assert_eq!(concat(&after), concat(&before), "the old rows serve");
@@ -363,7 +304,7 @@ async fn a_replacement_that_refuses_mid_write_leaves_the_old_table_and_reclaims_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_that_completes_serves_the_new_rows_and_the_old_bytes_are_gone() {
     let dir = tempfile::tempdir().unwrap();
-    let (session, store, plane, patents) = session_with_store(dir.path()).await;
+    let (session, store, patents) = session_with_store(dir.path()).await;
     // A second session over the same catalog, bound to the old table
     // before the swap.
     let reader = store_over_session(dir.path(), &session).await;
@@ -390,7 +331,6 @@ async fn a_replacement_that_completes_serves_the_new_rows_and_the_old_bytes_are_
         ))
         .await
         .unwrap();
-    assert_eq!(plane.submitted.load(Ordering::SeqCst), 2);
 
     let (after, new_url) = rows_and_url(&session, "recent").await;
     assert_eq!(concat(&after), concat(&expected), "the new rows serve here");
@@ -422,7 +362,7 @@ async fn a_reader_that_opened_the_old_table_before_the_swap_finishes_its_read() 
     use futures::StreamExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let (session, _store, _plane, patents) = session_with_store(dir.path()).await;
+    let (session, _store, patents) = session_with_store(dir.path()).await;
     session
         .sql(&format!(
             "CREATE TABLE recent AS SELECT id, title FROM {patents}.public.patents ORDER BY id"

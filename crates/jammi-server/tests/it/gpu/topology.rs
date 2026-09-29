@@ -8,8 +8,8 @@
 //! - **1 × 2, one process** — `[worker] local_ranks = 2` over devices 0 and 1
 //!   (`TopologyDecision::Local`, an in-process gang).
 //! - **2 processes × 1** — a coordinator on device 0 dials a fleet member on
-//!   device 1 over the real `GangService` (`TopologyDecision::Peer`, the
-//!   compute plane's gang), the same program a two-machine gang runs.
+//!   device 1 over the real `GangService` (`TopologyDecision::Peer`, a
+//!   fleet's gang), the same program a two-machine gang runs.
 //!
 //! Each multi-rank topology runs under `[worker] collective = "cpu"` (the
 //! inline transport) and `"nccl"` (the NCCL device transport). The claims:

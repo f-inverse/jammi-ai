@@ -741,10 +741,7 @@ impl InferenceSession {
     }
 
     /// The shared catalog handle behind an `Arc` — the form a [`TrainingJob`]
-    /// handle clones to poll its job after the submitting call returns, and
-    /// the form `jammi-ballista`'s `CatalogClusterState`/`CatalogJobState`/
-    /// `DevicePlacement` need to hold
-    /// their own long-lived handle rather than borrowing this session's.
+    /// handle clones to poll its job after the submitting call returns.
     pub fn catalog_arc(&self) -> &Arc<jammi_db::catalog::Catalog> {
         self.inner.catalog()
     }
@@ -991,25 +988,6 @@ impl InferenceSession {
         self.inner.context()
     }
 
-    /// The compute-plane slot, forwarded from
-    /// [`JammiSession::compute_plane`]: where a compute-plane role installs
-    /// the plane this process's materializations are submitted to.
-    pub fn compute_plane(&self) -> &Arc<jammi_db::compute_plane::ComputePlaneSlot> {
-        self.inner.compute_plane()
-    }
-
-    /// The device kind a plan this session builds requires of whoever holds
-    /// it: the kind the installed compute plane places onto when the
-    /// deployment names one, this session's own otherwise. A plan's
-    /// admission is the only reader — where the plan actually runs, and so
-    /// what its table records, is the holder's own device.
-    pub fn required_device_kind(&self) -> jammi_datafusion::ComputeDeviceKind {
-        self.compute_plane()
-            .plane()
-            .and_then(|plane| plane.device_kind())
-            .unwrap_or_else(|| self.compute_device().kind())
-    }
-
     /// Access the engine configuration.
     pub fn inner_config(&self) -> &jammi_db::config::JammiConfig {
         self.inner.config()
@@ -1170,7 +1148,6 @@ impl InferenceSession {
             embedding_dim: Some(description.embedding_dim()),
             regression_form: description.regression_form().cloned(),
             passthrough: Vec::new(),
-            device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
         };
         let plan = plan_inference(input, RowOrder::Arrival, spec, self.inference_runtime())?;
@@ -1674,7 +1651,6 @@ impl InferenceSession {
             embedding_dim: Some(description.embedding_dim()),
             regression_form: description.regression_form().cloned(),
             passthrough: Vec::new(),
-            device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
         };
         let inference_exec = plan_inference(
@@ -1690,9 +1666,8 @@ impl InferenceSession {
         // An inference always creates its (possibly empty) result table — a
         // zero-row scan is a real, queryable artifact too, never a case the
         // producer silently skips materializing. Every row the plan
-        // produces is written through the sink where the compute plane says
-        // (a typed refusal raised inside the plan, placed or not, reaches
-        // the caller as that variant).
+        // produces is written through the sink (a typed refusal raised
+        // inside the plan reaches the caller as that variant).
         let mut building = self
             .result_store
             .create_table(ResultTableOrigin {

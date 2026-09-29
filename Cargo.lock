@@ -599,99 +599,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ballista-core"
-version = "54.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7064c1552c4cbd90336a6a3111cb2a6dc9810f6464ca941ddf6d4776f976c868"
-dependencies = [
- "arrow-flight",
- "async-trait",
- "chrono",
- "datafusion",
- "datafusion-proto",
- "datafusion-proto-common",
- "futures",
- "itertools 0.15.0",
- "log",
- "md-5 0.11.0",
- "parking_lot",
- "prost",
- "prost-types",
- "rand 0.10.2",
- "rustc_version",
- "serde",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tonic-prost",
- "tonic-prost-build",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "ballista-executor"
-version = "54.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a82eca4900634624e18434dfaa97490e8609736816abfa205b04fba5ef01e30"
-dependencies = [
- "arrow",
- "arrow-flight",
- "async-trait",
- "ballista-core",
- "bytesize",
- "dashmap",
- "datafusion",
- "datafusion-proto",
- "futures",
- "libc",
- "log",
- "lru 0.18.4",
- "memory-stats",
- "parking_lot",
- "serde",
- "sysinfo",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "uuid",
-]
-
-[[package]]
-name = "ballista-scheduler"
-version = "54.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b9f769d5e09fa5d6d87efa951d063cc389e2ac5dc5020cfc2db6d1bf846c869"
-dependencies = [
- "arrow-flight",
- "async-trait",
- "axum",
- "ballista-core",
- "dashmap",
- "datafusion",
- "datafusion-proto",
- "futures",
- "http",
- "insta",
- "itertools 0.15.0",
- "log",
- "object_store",
- "parking_lot",
- "prost",
- "prost-types",
- "rand 0.10.2",
- "serde",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower-http 0.7.1",
- "uuid",
-]
-
-[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1024,12 +931,6 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
-
-[[package]]
-name = "bytesize"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7354288c522e7e980fafd2075d63d1285794c3a6a16cdd492f189ea406e5f18b"
 
 [[package]]
 name = "bzip2"
@@ -2447,44 +2348,6 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "datafusion-proto"
-version = "54.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67791dcfacd142a9d95f8f73c2a161094cc936d231d80c235f5017dacf24e84e"
-dependencies = [
- "arrow",
- "chrono",
- "datafusion-catalog",
- "datafusion-catalog-listing",
- "datafusion-common",
- "datafusion-datasource",
- "datafusion-datasource-arrow",
- "datafusion-datasource-csv",
- "datafusion-datasource-json",
- "datafusion-datasource-parquet",
- "datafusion-execution",
- "datafusion-expr",
- "datafusion-functions-table",
- "datafusion-physical-expr",
- "datafusion-physical-expr-common",
- "datafusion-physical-plan",
- "datafusion-proto-common",
- "object_store",
- "prost",
-]
-
-[[package]]
-name = "datafusion-proto-common"
-version = "54.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8cd9e80d637891645d074db0f6c650b591117367247deb313fdfb78dff559cb"
-dependencies = [
- "arrow",
- "datafusion-common",
- "prost",
 ]
 
 [[package]]
@@ -4330,18 +4193,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "insta"
-version = "1.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
-dependencies = [
- "console",
- "once_cell",
- "similar",
- "tempfile",
-]
-
-[[package]]
 name = "integer-encoding"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4498,45 +4349,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jammi-ballista"
-version = "0.50.0"
-dependencies = [
- "arrow",
- "arrow-flight",
- "arrow-schema",
- "async-trait",
- "ballista-core",
- "ballista-executor",
- "ballista-scheduler",
- "chrono",
- "datafusion",
- "datafusion-proto",
- "futures",
- "jammi-ai",
- "jammi-datafusion",
- "jammi-db",
- "jammi-numerics",
- "jammi-test-utils",
- "jammi-wire",
- "libc",
- "parquet",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "jammi-bench"
 version = "0.50.0"
 dependencies = [
@@ -4551,7 +4363,6 @@ dependencies = [
  "hex",
  "jammi-admin",
  "jammi-ai",
- "jammi-ballista",
  "jammi-client",
  "jammi-datafusion",
  "jammi-db",
@@ -4621,18 +4432,14 @@ version = "0.50.0"
 dependencies = [
  "arrow",
  "async-trait",
- "chrono",
  "datafusion",
  "futures",
  "jammi-datafusion",
  "jammi-numerics",
- "prost",
- "protoc-bin-vendored",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "tonic-prost-build",
  "tracing",
 ]
 
@@ -4795,7 +4602,6 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum",
- "ballista-core",
  "bytes",
  "candle-core",
  "candle-nn",
@@ -4809,7 +4615,6 @@ dependencies = [
  "http-body",
  "jammi-admin",
  "jammi-ai",
- "jammi-ballista",
  "jammi-client",
  "jammi-datafusion",
  "jammi-db",
@@ -4857,9 +4662,7 @@ dependencies = [
  "arrow",
  "arrow-flight",
  "futures",
- "jammi-datafusion",
  "jammi-db",
- "jammi-numerics",
  "jammi-test-resources",
  "libc",
  "parquet",
@@ -4878,7 +4681,6 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "chrono",
- "hex",
  "jammi-datafusion",
  "jammi-db",
  "jammi-lora",
@@ -5377,16 +5179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memory-stats"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "metal"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5694,15 +5486,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61807f77802ff30975e01f4f071c8ba10c022052f98b3294119f3e615d13e5be"
 
 [[package]]
-name = "ntapi"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
-dependencies = [
- "winapi",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5889,16 +5672,6 @@ dependencies = [
  "block2",
  "libc",
  "objc2",
- "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-io-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
-dependencies = [
- "libc",
  "objc2-core-foundation",
 ]
 
@@ -7283,7 +7056,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http 0.6.8",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -7915,12 +7688,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "similar"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "siphasher"
@@ -8556,20 +8323,6 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "walkdir",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows",
 ]
 
 [[package]]
@@ -9330,21 +9083,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tower-http"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
-dependencies = [
- "bitflags 2.11.0",
- "bytes",
- "http",
- "percent-encoding",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
-]
-
-[[package]]
 name = "tower-layer"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10097,27 +9835,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
-name = "windows"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
-dependencies = [
- "windows-collections",
- "windows-core",
- "windows-future",
- "windows-numerics",
-]
-
-[[package]]
-name = "windows-collections"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
-dependencies = [
- "windows-core",
-]
-
-[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10128,17 +9845,6 @@ dependencies = [
  "windows-link",
  "windows-result",
  "windows-strings",
-]
-
-[[package]]
-name = "windows-future"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
-dependencies = [
- "windows-core",
- "windows-link",
- "windows-threading",
 ]
 
 [[package]]
@@ -10168,16 +9874,6 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
-
-[[package]]
-name = "windows-numerics"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
-dependencies = [
- "windows-core",
- "windows-link",
-]
 
 [[package]]
 name = "windows-registry"
@@ -10273,15 +9969,6 @@ dependencies = [
  "windows_x86_64_gnu 0.52.6",
  "windows_x86_64_gnullvm 0.52.6",
  "windows_x86_64_msvc 0.52.6",
-]
-
-[[package]]
-name = "windows-threading"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
-dependencies = [
- "windows-link",
 ]
 
 [[package]]

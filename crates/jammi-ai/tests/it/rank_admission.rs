@@ -824,7 +824,7 @@ fn scan_submit_source(file: &str, text: &str) -> Vec<SubmitCallSite> {
 /// universe [`every_submit_job_call_in_production_code_is_the_seam_or_a_reviewed_non_training_site`]
 /// checks against its allow-list. `Catalog::submit_job`/`submit_job_deduped`
 /// and `SubmitJobParams` are `pub`, so a caller anywhere cargo compiles is
-/// in scope (`jammi-server`, `jammi-ballista` and `jammi-bench` hold
+/// in scope (`jammi-server` and `jammi-bench` hold
 /// `Catalog` handles today, and `jammi-bench` has an example target); a
 /// universe narrower than that would let a hand-built training-kind
 /// submit pass unseen. The file list comes from `git ls-files`, never a

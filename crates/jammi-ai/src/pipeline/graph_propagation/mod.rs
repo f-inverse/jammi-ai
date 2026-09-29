@@ -68,8 +68,7 @@
 //! hops, the readout — written through the same embedding sink every
 //! embedding producer uses. Its joins, shuffles and sorts are stock operators
 //! that hold pool reservations and spill, so the graph is bounded by the
-//! spill disk and `[engine] memory_limit` is honoured; and the sink places
-//! the plan on the compute plane when one can hold it.
+//! spill disk and `[engine] memory_limit` is honoured.
 //!
 //! # Determinism
 //!
@@ -594,9 +593,7 @@ impl InferenceSession {
     /// ([`WorkingTable`]'s `reclaim` and `Drop` are the one abort); and a
     /// propagation whose process is gone stops renewing the lease, after
     /// which the recovery sweep reclaims the row as it does any dead
-    /// writer's. It is written through the sink, so it lands in the shared
-    /// store wherever the compute plane runs the write, and a placed reader
-    /// finds it there.
+    /// writer's. It is written through the sink.
     async fn write_working_table(
         self: &Arc<Self>,
         ctx: &QueryContext,
@@ -651,8 +648,7 @@ impl InferenceSession {
     /// Run the hops over `snapshot` one stage at a time ([`hop_plan`]) —
     /// each stage's state a working table the next reads, reclaimed once
     /// read — and land the last through the embedding sink as `table`: a
-    /// `kind=Model` embedding table written where the compute plane says and
-    /// finished under the caller's contract. Refuses a propagation that has
+    /// `kind=Model` embedding table finished under the caller's contract. Refuses a propagation that has
     /// no node to write.
     async fn land_propagation(
         self: &Arc<Self>,

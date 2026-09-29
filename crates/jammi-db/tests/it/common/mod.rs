@@ -36,11 +36,10 @@ pub async fn catalog_on(kind: BackendKind) -> (tempfile::TempDir, Arc<Catalog>) 
     (dir, Arc::clone(session.catalog()))
 }
 
-/// Empty the job queue, the worker/instance registries, the compute plane's
-/// executor and job rows, and the model-artifact state. The Postgres lane
-/// runs every test against one shared database, so a test that counts or
-/// claims jobs must start from an empty queue, a test that lists executors
-/// must see only its own, and a test that probes for a reusable artifact must
+/// Empty the job queue, the worker/instance registries, and the
+/// model-artifact state. The Postgres lane runs every test against one
+/// shared database, so a test that counts or claims jobs must start from an
+/// empty queue, and a test that probes for a reusable artifact must
 /// start with none published — a definition another test published under the
 /// same hash is a legitimate hit. On SQLite (a fresh catalog per test) it is a
 /// no-op kept for one code path.
@@ -58,8 +57,6 @@ pub async fn reset_shared_catalog(catalog: &Catalog) {
                 tx.execute("DELETE FROM model_artifacts", &[]).await?;
                 tx.execute("DELETE FROM workers", &[]).await?;
                 tx.execute("DELETE FROM instances", &[]).await?;
-                tx.execute("DELETE FROM compute_jobs", &[]).await?;
-                tx.execute("DELETE FROM compute_executors", &[]).await?;
                 Ok(())
             })
         })

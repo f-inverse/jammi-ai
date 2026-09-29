@@ -14,11 +14,10 @@
 //! state the one before wrote and writing its own; the first builds block
 //! `0` inline and the last reads out inline. It is the iterative form of the
 //! recurrence, and it is that on purpose: a plan nesting `K` hops is `K`
-//! times as deep, and every walker of a plan — DataFusion's optimizer, the
-//! wire encoder and decoder that carry it to the compute plane, the plane's
-//! own stage planner — recurses over that depth on a worker thread's fixed
-//! stack. One hop per plan keeps the depth constant in `K`, the pool's floor
-//! one hop's, and places each hop on its own.
+//! times as deep, and every walker of a plan — DataFusion's optimizer and
+//! physical planner among them — recurses over that depth on a worker
+//! thread's fixed stack. One hop per plan keeps the depth constant in `K`
+//! and the pool's floor one hop's.
 //!
 //! Everything relational — the adjacency, the join, the shuffle, the sorts —
 //! is planned by DataFusion, under an
@@ -283,8 +282,7 @@ pub fn adjacency_relation(read: EdgeRead, features: &FeatureSource) -> Result<Da
 }
 
 /// One hop's plan, producing hop state — the one plan-building site: the
-/// two propagating verbs and anything that must carry the same plan (the
-/// compute plane's codec) build it here, so they hold the same nodes by
+/// two propagating verbs build it here, so they hold the same nodes by
 /// construction. Read through `ctx`, a [`QueryContext::out_of_core`] context.
 pub async fn hop_plan(
     ctx: &QueryContext,

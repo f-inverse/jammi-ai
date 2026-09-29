@@ -1,7 +1,7 @@
-# Built on DataFusion and Ballista
+# Built on DataFusion
 
-Jammi is a DataFusion engine that deploys as a Ballista cluster. Everything
-it adds sits on an extension point those projects ship for that purpose: no
+Jammi is a DataFusion engine. Everything it adds sits on an extension point
+DataFusion and candle ship for that purpose: no
 fork, no vendored copy, no patch carried against upstream. This page maps
 what Jammi adds, the seam each addition uses, and what that buys you. The
 [Design Philosophy](./philosophy.md#extending-third-party-libraries-at-their-seams)
@@ -15,10 +15,9 @@ back. The engine can't see the model, so it can't place the model's work,
 bound its memory, or say what produced its output.
 
 In Jammi, a model run is a node of the physical plan, like a sort or a
-join. `InferenceExec` embeds, classifies or scores a relation's rows, and
-`TrainingExec` runs a claimed fine-tuning job. The optimizer, the scheduler
-and the materialization contract all see these nodes. Everything below
-follows from that choice.
+join. `InferenceExec` embeds, classifies or scores a relation's rows. The
+optimizer, the memory pool and the materialization contract all see that
+node. Everything below follows from that choice.
 
 ## What rides on DataFusion
 
@@ -26,8 +25,7 @@ follows from that choice.
 |---|---|---|
 | Inference as a plan stage: rows numbered, costed, cut into forward chunks, admitted to a device and forwarded | `ExecutionPlan` | `InferenceExec`, `NumberedInputExec`, `RowCostExec`, `KeyCheckExec` (`jammi-datafusion`) |
 | An inference fan-out the optimizer keeps | `PhysicalOptimizerRule` | `InferenceFanOut` |
-| Fine-tuning as a plan stage | `ExecutionPlan` | `TrainingExec`, bound to a `TrainingRunner` |
-| Durable result tables, and `CREATE TABLE … AS` that writes one | `ExecutionPlan`, `UserDefinedLogicalNodeCore`, `ExtensionPlanner` | `ResultTableSinkExec`, `StoreStatementNode`, `MaterializationPlanner` |
+| Durable result tables, and `CREATE TABLE … AS` that writes one | `UserDefinedLogicalNodeCore`, `ExtensionPlanner`, `ExecutionPlan` | `StoreStatementNode`, `MaterializationPlanner`, `StoreStatementExec` |
 | Vector search, as-of joins and graph propagation as operators | `ExecutionPlan` | `VectorSearchExec`, `AsofJoinExec`, `InitialStateExec` / `HopFoldExec` / `ReadoutExec` |
 | Versioned reads over append-only tables, and mutable companion tables | `TableProvider` | `MaskedTableProvider`, `MutableTableProvider` |
 | SQL functions over model outputs | `TableFunctionImpl`, `ScalarUDFImpl`, `AggregateUDFImpl` | `annotate(…)`, `jammi_content_hash(…)`, `vector_mean` / `vector_sum` / `vector_max` |
@@ -37,21 +35,6 @@ follows from that choice.
 model through one pair of traits, `ModelRuntime` and `BoundModel`. A
 DataFusion user who wants a model stage in their own engine can take the
 crate and bring their own model cache; Jammi's engine is one such consumer.
-
-## What rides on Ballista
-
-| Jammi adds | Ballista seam | Jammi type |
-|---|---|---|
-| Jammi's operators crossing the scheduler/executor boundary, and every other node crossing through Ballista's own codec unchanged | `PhysicalExtensionCodec` | `JammiCodec` (`jammi-ballista`) |
-| Placement by device kind: a stage runs only on an executor that registered the device its plan requires | `TaskDistributionPolicy::Custom` | `DevicePlacement` |
-| A per-stage device check before a stage runs, refusing typed rather than running on the wrong device | `ExecutionEngine` (wrapping Ballista's default) | `JammiExecutionEngine` |
-| Cluster and job state in the catalog, so every scheduler sees one fleet | `ClusterState`, `JobState` | `CatalogClusterState`, `CatalogJobState` |
-
-The scheduler, executor and client roles run inside the same
-`jammi-server` binary, chosen by the `[ballista]` configuration section.
-Ballista's own retries are off (`task_max_failures = stage_max_failures =
-0`): a task fault reaches Jammi's own attempt and reclaim accounting, so
-there's one retry discipline, not two competing ones.
 
 ## What rides on candle
 
@@ -71,9 +54,7 @@ No Python runs in the serving or training path.
 
 ## What this buys you
 
-- **The planner sees the model.** Device placement is a property of the
-  plan (`DevicePlacement` reads the kind an `InferenceExec` or
-  `TrainingExec` declares). A model's residency is admitted against its
+- **The planner sees the model.** A model's residency is admitted against its
   device's `[gpu] memory_limit` budget, and a forward against the device's
   forward slots; host-side operators share the session's memory pool. A
   forward the device refuses for memory is retried at half the rows, and
@@ -85,9 +66,8 @@ No Python runs in the serving or training path.
   ([Use a Remote Model](./remote-models.md)).
 - **Identical bytes at any fan-out.** The rows a model forwards together
   are decided once, by row cost, and carried as a chunk id the exchange
-  hashes on. A plan fanned over one partition or sixteen, in one process or
-  across a Ballista cluster, forwards identical chunks and writes identical
-  bytes ([The Cookbook → Fan-out inference](https://f-inverse.github.io/jammi-ai/cookbook/chapters/26-fanout/fanout.html)
+  hashes on. A plan fanned over one partition or sixteen forwards identical
+  chunks and writes identical bytes ([The Cookbook → Fan-out inference](https://f-inverse.github.io/jammi-ai/cookbook/chapters/26-fanout/fanout.html)
   builds one table at one, two and four partitions and asserts the artifact
   digests equal).
 - **Model outputs under a correctness contract.** Every result table
@@ -99,10 +79,13 @@ No Python runs in the serving or training path.
   ([The Materialization Contract](./materialization-contract.md); the book's
   recompute chapter, `cookbook/book/chapters/20-recompute/`, runs a
   recompute over unmoved inputs and asserts it byte-identical).
-- **Training on the same plane as queries.** A fine-tuning job is placed,
-  admitted and recorded by the same machinery as an embedding plan.
-- **One binary, every topology.** Embedded, single server and Ballista
-  cluster are configuration, not forks
+- **Training as a durable job.** A fine-tuning job is admitted, claimed
+  under a lease and recorded like any other job; its training set is a
+  result table under the same materialization contract, and the engine
+  assembles its ranks as one gang
+  ([Fine-Tuning](./fine-tuning.md)).
+- **One binary, every topology.** Embedded, a single server, and a fleet of
+  servers claiming jobs from one catalog are configuration, not forks
   ([Reference Topologies](./reference-topologies.md)).
 
 ## What is measured, and what is not yet
@@ -122,13 +105,12 @@ engine commit `168c71dc`) established:
   medians; the training step alone takes 0.885×.
 - **Space:** 0.516× the device memory and 0.805× the host memory of the same
   PyTorch run.
-- **The plane:** an embedding plan fanned over four partitions costs 0.95× the
-  single plan, and 1.61× on a Ballista executor. A streamed training job
-  costs 1.0007× the resident one.
+- **Fan-out:** an embedding plan fanned over four partitions costs 0.95× the
+  single plan. A streamed training job costs 1.0007× the resident one.
 
 That session also recorded ladders it couldn't judge: graph propagation,
 graph sampling, the context predictor and the structure encoder were
-INVALID, and the placed training rung was refused. Those workloads carry no
+INVALID. Those workloads carry no
 claim until a committed verdict judges them. A verdict states the commit it
 measured, so a number here holds for that commit, not necessarily for
 today's head.

@@ -275,8 +275,7 @@ message JobSummary {
   string created_at = 6;
   string error = 7;
   // The instance holding (or, on a terminal job, last holding) the job's
-  // claim — for a placed training attempt, the executor the claim moved to.
-  // Empty while the job is queued and unclaimed.
+  // claim. Empty while the job is queued and unclaimed.
   string claimed_by = 8;
   // The instance that ran each rank of the latest training attempt, in rank
   // order (the same id `ListWorkers` reports). Empty for a compute job and

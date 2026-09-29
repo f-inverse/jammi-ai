@@ -5,7 +5,7 @@
 `JAMMI_CONFIG`, then `./jammi.toml`, then `/etc/jammi/jammi.toml`. A manifest
 that mounts a ConfigMap at `/etc/jammi` under any other key renders, validates
 and deploys — and the pod then runs on defaults, with its topology role
-(scheduler, executor, worker) silently unset. For each kustomization under
+(its `[worker]` kinds and listeners) silently unset. For each kustomization under
 `deploy/kubernetes`, this renders the manifests and requires, for every
 container that mounts a ConfigMap at `/etc/jammi`, that the ConfigMap carries
 a `jammi.toml` key — unless the container names its config file itself through

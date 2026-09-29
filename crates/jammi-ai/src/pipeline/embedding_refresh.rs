@@ -923,7 +923,7 @@ impl InferenceSession {
 
     /// Step 7: infer `keys` (an in-memory build side joined onto the source
     /// scan) through the one ordered plan shape into the version's fragment +
-    /// segment, written through the sink where the compute plane says.
+    /// segment, written through the sink.
     /// Returns the fragment reference and its segment id (`None` when zero
     /// rows were realized — the empty object is deleted), plus the realized
     /// keys, read back off the fragment the sink wrote (the same bytes its
@@ -988,7 +988,6 @@ impl InferenceSession {
             embedding_dim: Some(params.dimensions),
             regression_form: None,
             passthrough: vec![CONTENT_HASH_COLUMN.to_string()],
-            device_kind: self.required_device_kind(),
             partitions: inference.fan_out()?,
         };
         let inference_exec = plan_inference(

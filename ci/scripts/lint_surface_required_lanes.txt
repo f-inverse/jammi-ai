@@ -33,7 +33,6 @@ jammi-db        unprivileged-tests,live-postgres-tests  all-targets
 jammi-db        live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests  all-targets
 jammi-server    unprivileged-tests,live-postgres-tests  all-targets
 jammi-server    live-gpu-tests,live-gpu-gang-tests      tests
-jammi-ballista  live-postgres-tests                     tests
 jammi-bench     live-distributed-tests                  tests
 jammi-kernels   live-gpu-tests,flash-attn               all-targets
 jammi-kernels   live-metal-tests                        lib

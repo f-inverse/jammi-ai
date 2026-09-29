@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use jammi_db::catalog::backend::{BackendError, BackendImpl, CatalogBackend, TxOptions};
 use jammi_db::catalog::backend_sqlite::SqliteBackend;
-use jammi_db::catalog::status::ComputeExecutorStatus;
 use jammi_db::catalog::Catalog;
 use tempfile::tempdir;
 use tokio::sync::Barrier;
@@ -66,6 +65,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "044_topics_drop_broker_metadata",
     "045_result_table_producer",
     "046_job_ranks",
+    "047_drop_compute_cluster_state",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {
@@ -856,14 +856,11 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // table the current `SELECT_COLS` cannot read — the
                 // manufactured state is pre-029, so the ledger must say so
                 // for everything from 029 onwards that alters
-                // `jobs`/`instances`/`workers`. 038 is deliberately left
-                // applied despite also `ALTER TABLE workers ADD COLUMN
-                // devices`: it bundles that ALTER with two `CREATE TABLE`s
-                // (`compute_executors`, `compute_jobs`) this test never
-                // drops, and those are non-idempotent — replaying 038 would
-                // fail on "table already exists". The reopened `workers`
-                // table below is missing `devices` as a result, which this
-                // test's `jobs`-only assertions never observe. `039` DOES
+                // `jobs`/`instances`/`workers`. 038 (`ALTER TABLE workers ADD
+                // COLUMN devices` beside two `CREATE TABLE`s) replays too, and
+                // so does 047, which drops those two tables again: 039's
+                // triggers name one of them, so the as-of-037 state this test
+                // manufactures is only coherent with both rewound. `039` DOES
                 // join this list (replay-idempotence): its `jobs`/
                 // `instances` triggers were dropped along with the tables
                 // above (`DROP TABLE` drops a table's own triggers in
@@ -871,7 +868,7 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                 // reopened `jobs`/`instances` would carry NO schema-edge
                 // stamp domain at all. Replaying it is safe for the tables
                 // this test does NOT drop (`result_tables`, `models`,
-                // `compute_executors`, `applied_migrations`): their triggers
+                // `applied_migrations`): their triggers
                 // survive intact, `CREATE TRIGGER IF NOT EXISTS` makes
                 // reinstalling them a no-op, and the data-rewrite `UPDATE`s
                 // are naturally idempotent (their `WHERE` excludes
@@ -883,7 +880,8 @@ async fn migration_029_copies_training_jobs_rows_into_jobs_as_queued() {
                        '035_instances_peer_addr_result_root', \
                        '036_instances_result_root_identity', \
                        '037_jobs_assembly_failures_next_after', \
-                       '039_canonical_stamps', '046_job_ranks')",
+                       '038_compute_cluster_state', '039_canonical_stamps', \
+                       '046_job_ranks', '047_drop_compute_cluster_state')",
                     &[],
                 )
                 .await?;
@@ -2648,15 +2646,16 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
 /// AFTER BOTH `035_instances_peer_addr_result_root` (its
 /// `compute_executors.instance_id` join target) and
 /// `037_jobs_assembly_failures_next_after` (relative position, never
-/// `.last()`), creates `compute_executors`/`compute_jobs`, and adds
-/// `workers.devices` (`NOT NULL DEFAULT '[]'`) on both backends.
+/// `.last()`), and adds `workers.devices` (`NOT NULL DEFAULT '[]'`) on both
+/// backends; the two tables it creates, `compute_executors`/`compute_jobs`,
+/// are gone once `047_drop_compute_cluster_state` has run.
 #[test_case::test_case(jammi_db::catalog::backend::BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
     test_case::test_case(jammi_db::catalog::backend::BackendKind::Postgres ; "postgres")
 )]
 #[tokio::test]
-async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
+async fn migration_038_adds_worker_devices_and_047_drops_its_compute_tables(
     kind: jammi_db::catalog::backend::BackendKind,
 ) {
     use jammi_db::catalog::backend::{BackendKind, SqlValue};
@@ -2692,9 +2691,13 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
             )
         }
     };
+    assert!(
+        position("047_drop_compute_cluster_state") > position("039_canonical_stamps"),
+        "the drop must follow 039, whose triggers and constraints it takes with the table"
+    );
     backend.migrate().await.unwrap();
 
-    // Both new tables exist.
+    // Neither compute table survives 047.
     for table in ["compute_executors", "compute_jobs"] {
         let exists: bool = backend
             .transaction(
@@ -2733,108 +2736,8 @@ async fn migration_038_is_ordered_after_035_and_037_and_creates_compute_tables(
             )
             .await
             .unwrap();
-        assert!(exists, "'{table}' must exist after migration 038");
+        assert!(!exists, "'{table}' must be dropped by migration 047");
     }
-
-    // `compute_executors.devices` is a NOT NULL column -- the placement
-    // policy's own device authority, distinct
-    // from `workers.devices` below.
-    let columns: Vec<(String, bool)> = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                Box::pin(async move {
-                    match kind {
-                        BackendKind::Sqlite => {
-                            tx.query(
-                                "SELECT name, \"notnull\" FROM pragma_table_info('compute_executors') \
-                                 WHERE name = 'devices'",
-                                &[],
-                                |row| {
-                                    let name: String = row.get("name")?;
-                                    let notnull: i32 = row.get("notnull")?;
-                                    Ok((name, notnull == 1))
-                                },
-                            )
-                            .await
-                        }
-                        BackendKind::Postgres => {
-                            tx.query(
-                                "SELECT column_name, is_nullable FROM information_schema.columns \
-                                 WHERE table_name = 'compute_executors' AND column_name = 'devices'",
-                                &[],
-                                |row| {
-                                    let name: String = row.get("column_name")?;
-                                    let nullable: String = row.get("is_nullable")?;
-                                    Ok((name, nullable == "NO"))
-                                },
-                            )
-                            .await
-                        }
-                    }
-                })
-            },
-        )
-        .await
-        .unwrap();
-    assert!(
-        columns
-            .iter()
-            .any(|(c, notnull)| c == "devices" && *notnull),
-        "compute_executors.devices must be a NOT NULL column; got {columns:?}"
-    );
-
-    // The default is `'[]'` for a freshly registered executor row --
-    // inserting with `devices` unnamed must not fail and must read back
-    // the documented default.
-    let executor_id = format!("mig038_executor_{}", jammi_test_utils::unique_suffix());
-    backend
-        .transaction(TxOptions::default(), |tx| {
-            let executor_id = executor_id.clone();
-            Box::pin(async move {
-                tx.execute(
-                    "INSERT INTO compute_executors \
-                     (executor_id, instance_id, host, port, grpc_port, task_slots, \
-                      available_slots, status, heartbeat_at, metadata) \
-                     VALUES ($1, 'inst-1', 'localhost', 50051, 50052, 1, 1, $2, '2026-01-01T00:00:00.000000Z', '{}')",
-                    &[
-                        SqlValue::TextOwned(executor_id.clone()),
-                        SqlValue::TextOwned(ComputeExecutorStatus::Active.to_string()),
-                    ],
-                )
-                .await
-            })
-        })
-        .await
-        .expect("a compute_executors row naming no `devices` must be a valid insert");
-    let devices: String = backend
-        .transaction(
-            TxOptions {
-                read_only: true,
-                ..Default::default()
-            },
-            |tx| {
-                let executor_id = executor_id.clone();
-                Box::pin(async move {
-                    tx.query_opt(
-                        "SELECT devices FROM compute_executors WHERE executor_id = $1",
-                        &[SqlValue::TextOwned(executor_id)],
-                        |row| row.get::<String>("devices"),
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        .unwrap()
-        .expect("the inserted row must be readable");
-    assert_eq!(
-        devices, "[]",
-        "compute_executors.devices defaults to the empty JSON array"
-    );
 
     // `workers.devices` is a NOT NULL column.
     let columns: Vec<(String, bool)> = backend
@@ -2950,7 +2853,6 @@ const CANONICAL_STAMP_COLUMNS: &[(&str, &str)] = &[
     ("result_tables", "lease_expires_at"),
     ("result_tables", "created_at"),
     ("result_table_versions", "lease_expires_at"),
-    ("compute_executors", "heartbeat_at"),
     ("models", "created_at"),
     ("models", "updated_at"),
     ("applied_migrations", "applied_at"),
@@ -2980,8 +2882,8 @@ fn every_column_stale_before_clause_accepts_is_schema_enforced() {
 /// `.last()` — it names `compute_executors`, which `038` creates), and the
 /// enforcement set a freshly migrated catalog carries — on SQLite, a
 /// `BEFORE INSERT` AND a `BEFORE UPDATE OF <col>` trigger per
-/// [`CANONICAL_STAMP_COLUMNS`] entry (28 triggers); on Postgres, one
-/// `sdchk__<table>__<column>` `CHECK` constraint per entry (14 constraints)
+/// [`CANONICAL_STAMP_COLUMNS`] entry (26 triggers); on Postgres, one
+/// `sdchk__<table>__<column>` `CHECK` constraint per entry (13 constraints)
 /// — equals exactly that set. A future migration that rebuilds one of these
 /// tables (SQLite's create-new/copy/drop/rename dance, migration 012's own
 /// shape) without reinstalling its two triggers would silently drop
@@ -3105,7 +3007,7 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
 
 /// The rewrite's fail-closed behaviour is an OUTCOME property,
 /// not a mechanism — a refused re-application of `039_canonical_stamps`
-/// must leave the ledger at 038, the offending row's own value untouched,
+/// must leave the ledger short of 039, the offending row's own value untouched,
 /// AND install NEITHER the trigger nor the `CHECK` for the column it could
 /// not normalise (a `RAISE(ABORT)`/cast fault rolls back only its own
 /// statement; fail-closed holds because the migration RUNNER's one
@@ -3167,8 +3069,15 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
                     ],
                 )
                 .await?;
+                // Rewound to the as-of-037 state 039 first ran against: 038's
+                // column and the tables 047 dropped come back when 038
+                // replays ahead of 039, in the runner's one transaction.
+                tx.execute("ALTER TABLE workers DROP COLUMN devices", &[])
+                    .await?;
                 tx.execute(
-                    "DELETE FROM applied_migrations WHERE name = '039_canonical_stamps'",
+                    "DELETE FROM applied_migrations WHERE name IN ( \
+                       '038_compute_cluster_state', '039_canonical_stamps', \
+                       '047_drop_compute_cluster_state')",
                     &[],
                 )
                 .await
@@ -3189,7 +3098,7 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
         "the refusal must be the typed domain-violation class, got {err:?}"
     );
 
-    // Outcome, not mechanism: the ledger stays at 038 for this migration,
+    // Outcome, not mechanism: the ledger does not record this migration,
     let ledger: Vec<String> = backend
         .transaction(
             TxOptions {

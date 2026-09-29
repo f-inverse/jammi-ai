@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GPU topology lane: the fine-tune gang on real GPUs at EVERY topology the
 # engine lays a job out as — the one place the collective's NCCL transport and
-# the compute plane's multi-host gang run on real hardware before release.
+# the fleet's multi-host gang run on real hardware before release.
 # Shared rent/run/teardown lives in runpod_lib.sh (its fleet primitives); this
 # driver shares the prove lane's shapes (group markers, the verdict function,
 # the rc contract) rather than a dialect of its own.

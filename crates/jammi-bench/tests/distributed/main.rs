@@ -1,12 +1,10 @@
 //! The ladder's rungs above the in-process ones, on a fleet this process
 //! spawns against the lane's Postgres and S3-class store: every train-run
-//! rung — `resident`, `streamed`, `placed`, one-host `shape-d` — publishes
-//! the SAME adapter digest on the tiny fixture; every encode rung — `plan`,
-//! `placed`, one-host `shape-d` — the SAME vectors digest; a placed
-//! propagation the SAME vectors as the plan; and every predictor-train-run
-//! rung — `in-process`, `placed`, one-host `shape-d` — the SAME predictions
-//! and final weights. Each leg records where its work ran, and a leg above
-//! the in-process rungs ran on a process that was not the submitter.
+//! rung — `resident`, `streamed`, one-host `shape-d` — publishes the SAME
+//! adapter digest on the tiny fixture, and every predictor-train-run rung —
+//! `in-process`, `job`, one-host `shape-d` — the SAME predictions and final
+//! weights. Each leg records where its work ran, and a `shape-d` leg ran on
+//! a compute process, never the query tier it was submitted through.
 //!
 //! Needs the `jammi-server` binary built with `storage-s3` into this
 //! target dir (`jammi_test_utils::fleet::jammi_server_binary`) and the
@@ -130,7 +128,7 @@ fn every_train_run_rung_publishes_the_same_adapter() {
     write_triplets_jsonl(fixtures.path(), "heldout.jsonl", 2, 100);
     write_heldout_ids(fixtures.path(), 2, 100);
 
-    let rungs = ["resident", "streamed", "placed", "shape-d"];
+    let rungs = ["resident", "streamed", "shape-d"];
     let mut legs = Vec::new();
     for rung in rungs {
         let work_dir = tempfile::tempdir().expect("work dir");
@@ -143,12 +141,11 @@ fn every_train_run_rung_publishes_the_same_adapter() {
     for (rung, leg) in &legs {
         eprintln!(
             "{rung}: outcome_digest={} held_out={} ran_on={} stations={{claim_latency_s: {}, \
-             placement_s: {}, materialization_s: {}, publish_s: {}}}",
+             materialization_s: {}, publish_s: {}}}",
             leg["outcome_digest"],
             leg["held_out_example_mean"],
             leg["ran_on"],
             leg["claim_latency_s"],
-            leg["placement_s"],
             leg["materialization_s"],
             leg["publish_s"],
         );
@@ -191,29 +188,18 @@ fn every_train_run_rung_publishes_the_same_adapter() {
     assert_eq!(role(&legs[1].1), "worker");
     assert_eq!(
         role(&legs[2].1),
-        "executor",
-        "a placed leg trained on the executor"
-    );
-    assert_eq!(
-        role(&legs[3].1),
         "compute",
         "a shape-d leg trained on a compute process"
     );
-    for (rung, leg) in &legs[2..] {
-        let evidence = leg["ran_on"]["evidence"].as_array().expect("evidence");
-        assert!(
-            evidence.len() >= 2,
-            "the {rung} leg carries the lines that prove where it ran: {evidence:?}"
-        );
-        assert!(leg["placement_s"].is_number(), "{rung} times its placement");
-        assert!(leg["claim_latency_s"].is_number());
-        assert!(leg["materialization_s"].is_number());
-        assert!(leg["publish_s"].is_number());
-    }
+    let shape_d = &legs[2].1;
+    let evidence = shape_d["ran_on"]["evidence"].as_array().expect("evidence");
     assert!(
-        legs[2].1["placement_s"].as_f64().unwrap() > 0.0,
-        "a placed attempt begins on the executor after its claim"
+        evidence.len() >= 2,
+        "the shape-d leg carries the lines that prove where it ran: {evidence:?}"
     );
+    assert!(shape_d["claim_latency_s"].is_number());
+    assert!(shape_d["materialization_s"].is_number());
+    assert!(shape_d["publish_s"].is_number());
 }
 
 /// One `jammi-bench` subcommand, on the fleet the lane's server binary
@@ -251,144 +237,10 @@ fn filed_leg(legs_dir: &Path, stem: &str, tier: &str) -> serde_json::Value {
     report["tiers"][tier].clone()
 }
 
-/// The encode rungs served interleaved in one session — the session every
-/// rung's outcome is filed from, each rung's leg beside its vectors.
-#[test]
-fn every_encode_rung_serves_the_same_vectors() {
-    let legs_dir = tempfile::tempdir().expect("legs dir");
-    let rungs = ["plan", "placed", "shape-d"];
-    bench(
-        &[
-            "encode-step",
-            "--rung",
-            "plan",
-            "--rung",
-            "placed",
-            "--rung",
-            "shape-d",
-            "--rows",
-            "8",
-            "--take",
-            "1",
-            "--seed",
-            "3",
-            "--iters",
-            "2",
-        ],
-        legs_dir.path(),
-    );
-    let legs: Vec<(&str, serde_json::Value)> = rungs
-        .iter()
-        .map(|&rung| {
-            (
-                rung,
-                filed_leg(
-                    legs_dir.path(),
-                    &format!("{rung}__rows8__r1"),
-                    "encode_step",
-                ),
-            )
-        })
-        .collect();
-    for (rung, leg) in &legs {
-        eprintln!(
-            "{rung}: outcome_digest={} ran_on={} iter_wall_s={}",
-            leg["outcome_digest"], leg["ran_on"], leg["iter_wall_s"]
-        );
-    }
-    let digests: Vec<&str> = legs
-        .iter()
-        .map(|(_, leg)| leg["outcome_digest"].as_str().expect("outcome digest"))
-        .collect();
-    assert!(
-        digests.iter().all(|d| *d == digests[0]),
-        "every encode rung must serve the same vectors: {digests:?}"
-    );
-    assert!(
-        legs[0].1["ran_on"].is_null(),
-        "a plan leg never left its process"
-    );
-    assert_eq!(legs[1].1["ran_on"]["role"], "executor");
-    assert_eq!(legs[2].1["ran_on"]["role"], "compute");
-    for (rung, leg) in &legs[1..] {
-        assert!(
-            leg["ran_on"]["evidence"]
-                .as_array()
-                .is_some_and(|e| e.len() >= 2),
-            "the {rung} leg carries the lines that prove where it ran: {}",
-            leg["ran_on"]
-        );
-    }
-    assert_eq!(legs[0].1["vector_dim"], legs[2].1["vector_dim"]);
-}
-
-/// The placed propagation's sink is written by the executor, and the
-/// vectors it writes are the plan's bytes.
-#[test]
-fn a_placed_propagation_matches_the_plan() {
-    let legs_dir = tempfile::tempdir().expect("legs dir");
-    let files: Vec<String> = serde_json::from_slice(&bench(
-        &[
-            "propagate",
-            "--nodes",
-            "32",
-            "--rung",
-            "plan,placed",
-            "--take",
-            "1",
-            "--iterations",
-            "2",
-        ],
-        legs_dir.path(),
-    ))
-    .expect("propagate prints its leg files");
-    let stem = |rung: &str| {
-        files
-            .iter()
-            .find_map(|f| f.strip_prefix(&format!("{rung}__"))?.strip_suffix(".json"))
-            .map(|unit_take| format!("{rung}__{unit_take}"))
-            .unwrap_or_else(|| panic!("no {rung} leg among {files:?}"))
-    };
-    let plan = filed_leg(legs_dir.path(), &stem("plan"), "propagate");
-    let placed = filed_leg(legs_dir.path(), &stem("placed"), "propagate");
-    eprintln!(
-        "plan: outcome_digest={} iter_wall_s={}\nplaced: outcome_digest={} iter_wall_s={} \
-         ran_on={}",
-        plan["outcome_digest"],
-        plan["iter_wall_s"],
-        placed["outcome_digest"],
-        placed["iter_wall_s"],
-        placed["ran_on"]
-    );
-    assert_eq!(
-        placed["outcome_digest"], plan["outcome_digest"],
-        "the placed propagation writes the plan's bytes"
-    );
-    assert_eq!(placed["unit"], plan["unit"]);
-    assert_eq!(placed["rung"], "placed");
-    assert!(
-        plan["ran_on"].is_null(),
-        "a plan leg never left its process"
-    );
-    assert_eq!(
-        placed["ran_on"]["role"], "executor",
-        "the placed sink was written by the executor: {}",
-        placed["ran_on"]
-    );
-    assert!(
-        placed["ran_on"]["evidence"]
-            .as_array()
-            .is_some_and(|e| e.len() >= 3),
-        "the placement line, the binding and the sink write: {}",
-        placed["ran_on"]
-    );
-    assert_eq!(placed["iter_wall_s"].as_array().map(Vec::len), Some(2));
-}
-
-/// The predictor a placed job and a shape-d job publish is the one the
-/// in-process fit trains: the same predictions, the same final weights, the
-/// same learning curve — trained on an executor and on a compute process,
-/// never on the submitter.
+/// The predictor a job and a shape-d job publish is the one the in-process
+/// fit trains: the same predictions, the same final weights, the same
+/// learning curve — the shape-d job trained on a compute process, never on
+/// the query tier it was submitted through.
 #[test]
 fn every_predictor_train_run_rung_publishes_the_same_predictor() {
     let legs_dir = tempfile::tempdir().expect("legs dir");
@@ -396,7 +248,7 @@ fn every_predictor_train_run_rung_publishes_the_same_predictor() {
         &[
             "predictor-train-run",
             "--rung",
-            "in-process,placed,shape-d",
+            "in-process,job,shape-d",
             "--seeds",
             "7",
             "--epochs",
@@ -406,7 +258,7 @@ fn every_predictor_train_run_rung_publishes_the_same_predictor() {
         ],
         legs_dir.path(),
     );
-    let rungs = ["in-process", "placed", "shape-d"];
+    let rungs = ["in-process", "job", "shape-d"];
     let legs: Vec<(&str, serde_json::Value)> = rungs
         .iter()
         .map(|&rung| {
@@ -435,13 +287,12 @@ fn every_predictor_train_run_rung_publishes_the_same_predictor() {
     for (rung, leg) in &legs {
         eprintln!(
             "{rung}: outcome_digest={} final_weights={} held_out={} ran_on={} stations={{\
-             claim_latency_s: {}, placement_s: {}, publish_s: {}}}",
+             claim_latency_s: {}, publish_s: {}}}",
             leg["outcome_digest"],
             leg["final_weights"]["sha256"],
             leg["held_out_example_mean"],
             leg["ran_on"],
             leg["claim_latency_s"],
-            leg["placement_s"],
             leg["publish_s"],
         );
         assert_eq!(leg["rung"], *rung);
@@ -462,7 +313,7 @@ fn every_predictor_train_run_rung_publishes_the_same_predictor() {
         "an in-process leg never left its process"
     );
     assert_eq!(
-        legs[1].1["ran_on"]["role"], "executor",
+        legs[1].1["ran_on"]["role"], "worker",
         "{}",
         legs[1].1["ran_on"]
     );
@@ -471,20 +322,15 @@ fn every_predictor_train_run_rung_publishes_the_same_predictor() {
         "{}",
         legs[2].1["ran_on"]
     );
+    assert!(
+        legs[2].1["ran_on"]["evidence"]
+            .as_array()
+            .is_some_and(|e| !e.is_empty()),
+        "the shape-d leg carries what proves where it ran: {}",
+        legs[2].1["ran_on"]
+    );
     for (rung, leg) in &legs[1..] {
-        assert!(
-            leg["ran_on"]["evidence"]
-                .as_array()
-                .is_some_and(|e| !e.is_empty()),
-            "the {rung} leg carries what proves where it ran: {}",
-            leg["ran_on"]
-        );
         assert!(leg["claim_latency_s"].is_number(), "{rung} times its claim");
-        assert!(leg["placement_s"].is_number(), "{rung} times its placement");
         assert!(leg["publish_s"].is_number(), "{rung} times its publish");
     }
-    assert!(
-        legs[1].1["placement_s"].as_f64().unwrap() > 0.0,
-        "a placed attempt begins on the executor after its claim"
-    );
 }

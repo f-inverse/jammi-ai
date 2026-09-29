@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 use jammi_datafusion::ComputeDeviceKind;
+use jammi_numerics::ComputePrecision;
 
 use crate::DistributedBackends;
 
@@ -266,7 +267,49 @@ impl ShapeDRole {
                 ),
             ]),
         }
+        // The two roles that plan and forward a model serve under the
+        // fleet's inference shape; the scheduler neither plans nor forwards.
+        if let (ShapeDRole::Query | ShapeDRole::Compute, Some(inference)) = (self, place.inference)
+        {
+            env.extend(inference.env());
+        }
         env
+    }
+}
+
+/// The inference shape a fleet's planning and forwarding roles serve under:
+/// the fan-out a plan is cut into, the chunk budget its forwards are cut
+/// by, and the precision they run at. A leg that compares a fleet against a
+/// session of this process places the fleet with the session's own shape,
+/// so the edge between them differs in the topology alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeDInference {
+    pub partitions: usize,
+    pub batch_size: usize,
+    pub batch_tokens: usize,
+    pub compute_precision: ComputePrecision,
+}
+
+impl ShapeDInference {
+    fn env(self) -> [(String, String); 4] {
+        [
+            (
+                "JAMMI_INFERENCE__PARTITIONS".to_string(),
+                self.partitions.to_string(),
+            ),
+            (
+                "JAMMI_INFERENCE__BATCH_SIZE".to_string(),
+                self.batch_size.to_string(),
+            ),
+            (
+                "JAMMI_INFERENCE__BATCH_TOKENS".to_string(),
+                self.batch_tokens.to_string(),
+            ),
+            (
+                "JAMMI_GPU__COMPUTE_PRECISION".to_string(),
+                self.compute_precision.to_string(),
+            ),
+        ]
     }
 }
 
@@ -287,6 +330,9 @@ pub struct ShapeDPlace<'a> {
     /// The CUDA ordinal the fleet's compute tier trains on, or `-1` for the
     /// CPU — one fact of the fleet, the same for every role placed in it.
     pub compute_device: i32,
+    /// The inference shape the fleet serves under, likewise one fact of the
+    /// fleet; `None` runs the committed configs' own `[inference]`.
+    pub inference: Option<ShapeDInference>,
 }
 
 impl ShapeDPlace<'_> {
@@ -339,11 +385,13 @@ pub enum ProcConfig {
     },
     /// The deployed topology's committed config for `role`, layered over
     /// through the environment; `scheduler_port` is the fleet's scheduler,
-    /// `compute_device` the ordinal the fleet's compute tier trains on.
+    /// `compute_device` the ordinal the fleet's compute tier trains on,
+    /// `inference` the shape it serves under.
     ShapeD {
         role: ShapeDRole,
         scheduler_port: u16,
         compute_device: i32,
+        inference: Option<ShapeDInference>,
     },
 }
 
@@ -376,8 +424,14 @@ impl ProcSpec {
     /// A shape-d role on fresh ports. `scheduler_port` is the fleet's one
     /// scheduler port: the scheduler role binds it, every other role dials
     /// it; `compute_device` is the fleet's compute tier's CUDA ordinal (or
-    /// `-1`), the same for every role of the fleet.
-    pub fn shape_d(role: ShapeDRole, scheduler_port: u16, compute_device: i32) -> Self {
+    /// `-1`) and `inference` its inference shape, the same for every role of
+    /// the fleet.
+    pub fn shape_d(
+        role: ShapeDRole,
+        scheduler_port: u16,
+        compute_device: i32,
+        inference: Option<ShapeDInference>,
+    ) -> Self {
         let mut ports = Ports::fresh();
         ports.scheduler = scheduler_port;
         Self {
@@ -386,6 +440,7 @@ impl ProcSpec {
                 role,
                 scheduler_port,
                 compute_device,
+                inference,
             },
         }
     }
@@ -809,6 +864,7 @@ fn spawn_one(
             role,
             scheduler_port,
             compute_device,
+            inference,
         } => {
             let config_path = role.config_path(repo_root);
             assert!(
@@ -827,6 +883,7 @@ fn spawn_one(
                 scheduler_address: &scheduler_address,
                 ports: spec.ports,
                 compute_device,
+                inference,
             });
             let effective = std::iter::once(format!("--config {}", config_path.display()))
                 .chain(env.iter().map(|(k, v)| format!("{k}={v}")))
@@ -903,6 +960,7 @@ mod tests {
                 exec_grpc: 50052,
             },
             compute_device: 1,
+            inference: None,
         }
     }
 
@@ -985,6 +1043,44 @@ mod tests {
         );
         let compute = ShapeDRole::Compute.env(&cpu_fleet);
         assert_eq!(value(&compute, "JAMMI_GPU__DEVICE"), Some("-1"));
+    }
+
+    /// A fleet placed with an inference shape serves under it on the two
+    /// roles that plan and forward; the scheduler, which does neither,
+    /// carries none of it; and a fleet placed without one overrides nothing,
+    /// running the committed files' own `[inference]`.
+    #[test]
+    fn a_fleets_inference_shape_reaches_the_roles_that_plan_and_forward() {
+        let backends = backends();
+        let shaped = ShapeDPlace {
+            inference: Some(ShapeDInference {
+                partitions: 8,
+                batch_size: 32,
+                batch_tokens: 16384,
+                compute_precision: ComputePrecision::F32,
+            }),
+            ..place(&backends, Path::new("/var/lib/jammi"))
+        };
+        for role in [ShapeDRole::Query, ShapeDRole::Compute] {
+            let env = role.env(&shaped);
+            assert_eq!(value(&env, "JAMMI_INFERENCE__PARTITIONS"), Some("8"));
+            assert_eq!(value(&env, "JAMMI_INFERENCE__BATCH_SIZE"), Some("32"));
+            assert_eq!(value(&env, "JAMMI_INFERENCE__BATCH_TOKENS"), Some("16384"));
+            assert_eq!(value(&env, "JAMMI_GPU__COMPUTE_PRECISION"), Some("f32"));
+        }
+        let scheduler = ShapeDRole::Scheduler.env(&shaped);
+        assert!(value(&scheduler, "JAMMI_INFERENCE__PARTITIONS").is_none());
+        let unshaped = place(&backends, Path::new("/var/lib/jammi"));
+        for role in [
+            ShapeDRole::Scheduler,
+            ShapeDRole::Query,
+            ShapeDRole::Compute,
+        ] {
+            let env = role.env(&unshaped);
+            assert!(env
+                .iter()
+                .all(|(key, _)| !key.starts_with("JAMMI_INFERENCE__")));
+        }
     }
 
     /// The config each role runs is the deployment's own file.

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 jammi-datafusion.workspace = true
+jammi-numerics.workspace = true
 jammi-db = { workspace = true, features = ["test-hooks"] }
 jammi-test-resources.workspace = true
 libc.workspace = true

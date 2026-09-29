@@ -22,19 +22,14 @@ pub struct PlaneParams {
     /// The repository checkout whose committed shape-d role configs a
     /// spawned shape-d fleet runs; this workspace when unset.
     pub repo_root: Option<PathBuf>,
-    /// For a joined fleet: the URL every member reads the leg's rows from
-    /// (a JSONL of the training rows, a parquet of the corpus), already put
-    /// where the fleet's hosts can read it. A spawned fleet reads a file
-    /// under the work dir.
-    pub source_url: Option<String>,
 }
 
 impl PlaneParams {
     /// What was given, for a refusal that names it.
     pub fn summary(&self) -> String {
         format!(
-            "--server-bin {:?}, --query-addr {:?}, --repo-root {:?}, --source-url {:?}",
-            self.server_bin, self.query_addr, self.repo_root, self.source_url
+            "--server-bin {:?}, --query-addr {:?}, --repo-root {:?}",
+            self.server_bin, self.query_addr, self.repo_root
         )
     }
 
@@ -44,10 +39,7 @@ impl PlaneParams {
             ("--server-bin", &self.server_bin),
             ("--repo-root", &self.repo_root),
         ];
-        let values = [
-            ("--query-addr", &self.query_addr),
-            ("--source-url", &self.source_url),
-        ];
+        let values = [("--query-addr", &self.query_addr)];
         paths
             .into_iter()
             .filter_map(|(flag, path)| path.as_ref().map(|p| [flag.into(), p.into()]))
@@ -97,11 +89,6 @@ pub struct PlaneArgs {
     /// this workspace when omitted.
     #[arg(long)]
     repo_root: Option<PathBuf>,
-    /// With `--query-addr`: the URL the fleet's members read the leg's rows
-    /// from (the training rows as JSONL with `anchor`/`positive`/`negative`
-    /// columns; the corpus as parquet), already put where they can read it.
-    #[arg(long)]
-    source_url: Option<String>,
 }
 
 impl From<PlaneArgs> for PlaneParams {
@@ -110,7 +97,6 @@ impl From<PlaneArgs> for PlaneParams {
             server_bin: args.server_bin,
             query_addr: args.query_addr,
             repo_root: args.repo_root,
-            source_url: args.source_url,
         }
     }
 }

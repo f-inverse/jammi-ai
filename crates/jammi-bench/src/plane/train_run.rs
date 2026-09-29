@@ -39,13 +39,14 @@ pub fn train_on_fleet(
     })
 }
 
-/// The training rows as a file source every member on this host reads.
-fn local_training_source(
+/// The training rows as a JSONL source, put in `fleet`'s shared store.
+async fn training_source(
+    fleet: &RunningFleet,
     ctx: &RunContext,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let path = ctx.work_dir.join("training_source.jsonl");
     write_training_source(&ctx.train_rows, &path)?;
-    Ok(RunningFleet::local_url(&path))
+    fleet.publish_input(&path).await
 }
 
 fn training_spec(params: &FinetuneRunParams, ctx: &RunContext, source: &str) -> TrainingSpec {
@@ -92,7 +93,7 @@ async fn train_placed(
     let device = params.cuda_device.map_or(-1, |o| o as i32);
     let leg = format!("train-run-placed-seed{}", params.seed);
     let mut fleet = RunningFleet::spawn_placed(&params.plane, &leg, device, &["fine_tune"]).await?;
-    let source_url = local_training_source(ctx)?;
+    let source_url = training_source(&fleet, ctx).await?;
     let source = register_source(&fleet.session, &source_url).await?;
     let job = fleet
         .session
@@ -117,12 +118,9 @@ async fn train_shape_d(
     let leg = format!("train-run-shape-d-seed{}", params.seed);
     let mut fleet = match &params.plane.query_addr {
         Some(query_addr) => RunningFleet::join_shape_d(query_addr, &leg).await?,
-        None => RunningFleet::spawn_shape_d(&params.plane, &leg, device).await?,
+        None => RunningFleet::spawn_shape_d(&params.plane, &leg, device, None).await?,
     };
-    let source_url = match &params.plane.source_url {
-        Some(url) => url.clone(),
-        None => local_training_source(ctx)?,
-    };
+    let source_url = training_source(&fleet, ctx).await?;
     let query_addr = fleet
         .query_addr
         .clone()

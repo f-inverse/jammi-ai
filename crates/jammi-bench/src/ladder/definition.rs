@@ -896,13 +896,13 @@ fn encode_ladder(budgets: &Budgets) -> Ladder {
             ),
             (
                 Rung::new("placed", vec![]),
-                layer("the same plan on a Ballista executor"),
+                layer("the same plan, its sink placed on an executor this process hosts"),
                 exact("plan-partitioned", "placed"),
             ),
             (
                 Rung::new("shape-d", vec![]),
                 layer(
-                    "the deployed topology: the serve through the query tier, on a compute process",
+                    "the deployed topology: the serve through the query tier, on the compute tier",
                 ),
                 exact("placed", "shape-d"),
             ),

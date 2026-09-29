@@ -4541,6 +4541,7 @@ name = "jammi-bench"
 version = "0.50.0"
 dependencies = [
  "arrow",
+ "bytes",
  "candle-core",
  "candle-nn",
  "chrono",
@@ -4858,6 +4859,7 @@ dependencies = [
  "futures",
  "jammi-datafusion",
  "jammi-db",
+ "jammi-numerics",
  "jammi-test-resources",
  "libc",
  "parquet",

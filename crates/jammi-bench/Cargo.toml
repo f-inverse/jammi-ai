@@ -66,6 +66,8 @@ jammi-client = { workspace = true, optional = true }
 jammi-admin = { workspace = true, optional = true }
 jammi-wire = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
+# A leg puts its inputs in a fleet's shared store (`JammiObjectStore::put_bytes`).
+bytes = { version = "1", optional = true }
 # The grad-oracle tier's base-checkpoint CONTENT identity (sha256 of
 # config.json / model.safetensors, replacing the un-comparable `model_dir`
 # path string — see `grad_oracle.rs`'s module doc's determinant table).
@@ -97,6 +99,7 @@ live-gpu-tests = ["cuda"]
 # roles hosted in this process, and fleets of `jammi-server` processes on
 # Postgres and an S3-class store (`crate::plane`).
 plane = [
+    "dep:bytes",
     "dep:jammi-ballista",
     "dep:jammi-test-utils",
     "dep:jammi-client",

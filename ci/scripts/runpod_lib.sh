@@ -1741,33 +1741,78 @@ print(" ".join(sorted(a & b)))
 ' "$a" "$b"
 }
 
-# The fleet's readback parser over TWO `GET /v2/pods/{id}` bodies, one per
-# host. $1=host 0's raw Pod body $2=host 1's raw Pod body. Prints ONE line per
-# host (the second field is the host's index): `<podId> <rank> <status> <dataCenterId>
+# Every place a fleet may be rented, in preference order: one line
+# `<gpuTypeId>|<rate>|<dataCenterId>` per candidate type (in `types` order)
+# and co-located Global-Networking data center (sorted) where the type
+# clears `min_availability` at RP_GPU_COUNT and its secure per-GPU rate
+# clears `max_rate` — only `data_center` when one is named. An availability
+# level is not a slot count (LOW may hold one pod), so a driver walks these
+# until its whole fleet lands in one place. $1=pod catalog body $2=Global-
+# Networking data centers (space-separated) $3=candidate types (`|`-
+# separated) $4=min availability $5=max per-GPU rate $6=data center or "".
+# rc 75 when none qualifies; 2 when a candidate type maps to no compute
+# capability.
+rp_fleet_candidates() {
+  local catalog="$1" gn_dcs="$2" types="$3" min_availability="$4" max_rate="$5" data_center="${6:-}" \
+        type dcs rate co dc found=0
+  local IFS_SAVE="$IFS"
+  IFS='|'
+  # shellcheck disable=SC2086
+  set -- $types
+  IFS="$IFS_SAVE"
+  for type in "$@"; do
+    [ -n "$type" ] || continue
+    rp_compute_cap_for_gpu_type "$type" >/dev/null || {
+      echo "::error::candidate GPU type '${type}' maps to no compute capability (sm_80/86/89/90) -- refused" >&2
+      return 2
+    }
+    dcs="$(printf '%s' "$catalog" | rp_fleet_pick_data_centers "$type" "$min_availability")"
+    case "$dcs" in PARSE_ERROR*) echo "::error::${dcs}" >&2; return 75 ;; esac
+    co="$(rp_fleet_intersect "$dcs" "$gn_dcs")"
+    [ -z "$data_center" ] || co="$(rp_fleet_intersect "$co" "$data_center")"
+    [ -n "$co" ] || { echo "no co-located capacity for ${type}" >&2; continue; }
+    rate="$(printf '%s' "$catalog" | python3 -c '
+import json, sys
+t = sys.argv[1]
+d = json.load(sys.stdin)
+e = next((g for g in d.get("gpus", []) if g.get("id") == t), {})
+p = (e.get("price") or {}).get("secure")
+print("" if p is None else p)
+' "$type")"
+    [ -n "$rate" ] || { echo "no secure rate listed for ${type}" >&2; continue; }
+    if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$rate" "$max_rate"; then
+      echo "${type} at \$${rate}/GPU/h exceeds the \$${max_rate} ceiling" >&2
+      continue
+    fi
+    for dc in $co; do
+      printf '%s|%s|%s\n' "$type" "$rate" "$dc"
+      found=1
+    done
+  done
+  [ "$found" -eq 1 ] || return 75
+}
+
+# The fleet's readback parser over one `GET /v2/pods/{id}` body per host,
+# in host order ($1 is host 0's). Prints ONE line per host (the second field
+# is the host's index): `<podId> <index> <status> <dataCenterId>
 # <gn_enabled 0|1> <gn_ip_or_dash> <ssh_host_or_dash> <ssh_port_or_dash>`.
-# Returns 0 when BOTH bodies parse (even when a pod is not yet RUNNING or
-# not yet GN-enabled — the caller's own poll loop reads the per-rank
-# fields); 2 when EITHER body could not be read as the documented `Pod`
+# Returns 0 when EVERY body parses (even when a pod is not yet RUNNING or
+# not yet GN-enabled — the caller's own poll loop reads the per-host
+# fields); 2 when ANY body could not be read as the documented `Pod`
 # object shape at all.
 rp_fleet_pods_readback() {
-  local body0="${1:?rp_fleet_pods_readback needs rank 0 own Pod body}" \
-        body1="${2:?rp_fleet_pods_readback needs rank 1 own Pod body}"
+  [ "$#" -ge 1 ] || { echo "PARSE_ERROR: rp_fleet_pods_readback needs one Pod body per host"; return 2; }
   python3 -c '
 import json, sys
 
-def parse(body, rank):
+for index, body in enumerate(sys.argv[1:]):
     try:
         d = json.loads(body)
     except Exception as e:
-        return None, "PARSE_ERROR: could not parse rank %d Pod body: %s" % (rank, e)
+        print("PARSE_ERROR: could not parse host %d Pod body: %s" % (index, e))
+        sys.exit(2)
     if not isinstance(d, dict):
-        return None, "PARSE_ERROR: rank %d Pod body is not an object" % rank
-    return d, None
-
-for rank, body in ((0, sys.argv[1]), (1, sys.argv[2])):
-    d, err = parse(body, rank)
-    if err:
-        print(err)
+        print("PARSE_ERROR: host %d Pod body is not an object" % index)
         sys.exit(2)
     pid = d.get("id") or "?"
     status = d.get("desiredStatus") or d.get("status") or "?"
@@ -1780,61 +1825,60 @@ for rank, body in ((0, sys.argv[1]), (1, sys.argv[2])):
     shost = ssh_direct.get("host") or "-"
     sport = ssh_direct.get("port")
     sport = str(sport) if sport is not None else "-"
-    print("%s %d %s %s %s %s %s %s" % (pid, rank, status, dc, gn_enabled, gn_ip, shost, sport))
-' "$body0" "$body1"
+    print("%s %d %s %s %s %s %s %s" % (pid, index, status, dc, gn_enabled, gn_ip, shost, sport))
+' "$@"
 }
 
-# The fleet's reachability wait over TWO independently polled pods. Refuses
-# (97) BEFORE
-# any build starts when: either pod never reaches RUNNING within the
-# window, either pod never reports `globalNetworking.enabled` with a GN ip,
-# the two pods' OWN `dataCenterId` disagree (co-placement did not actually
-# happen — measured, never trusted from the create-time request alone), or
-# either pod carries no `ssh.direct` (`scp`/`rsync` need a direct endpoint on
-# BOTH hosts). $1=rank 0 pod id $2=rank 1 pod id
-# $3=RP_SSH_WAIT_SECS. On success prints ONE line: `<host0> <port0> <host1>
-# <port1> <dataCenterId> <gn_ip0> <gn_ip1>` and returns 0. On any refusal,
+# The fleet's reachability wait over its independently polled pods, in host
+# order. Refuses (97) BEFORE any build starts when: a pod never reaches
+# RUNNING within the window, a pod never reports `globalNetworking.enabled`
+# with a GN ip, the pods' OWN `dataCenterId`s disagree (co-placement did
+# not actually happen — measured, never trusted from the create-time
+# request alone), or a pod carries no `ssh.direct` (`scp`/`rsync` need a
+# direct endpoint on every host). $1=RP_SSH_WAIT_SECS $2..=pod ids. On
+# success prints the data center on the first line, then ONE line per host
+# in order: `<ssh_host> <ssh_port> <gn_ip>`, and returns 0. On any refusal,
 # prints nothing to stdout, names the reason on stderr, returns 97.
 rp_fleet_wait_ready() {
-  local pod0_id="${1:?rp_fleet_wait_ready needs rank 0 pod id}" \
-        pod1_id="${2:?rp_fleet_wait_ready needs rank 1 pod id}" \
-        wait_secs="${3:?rp_fleet_wait_ready needs RP_SSH_WAIT_SECS}"
-  local deadline=$(( SECONDS + wait_secs ))
-  local body0 body1 readback readback_rc
-  local host0="" port0="" host1="" port1="" dc0="" dc1="" gn_ip0="" gn_ip1=""
-  local ready0=0 ready1=0
+  local wait_secs="${1:?rp_fleet_wait_ready needs RP_SSH_WAIT_SECS}"; shift
+  [ "$#" -ge 1 ] || { echo "::error::rp_fleet_wait_ready needs at least one pod id" >&2; return 97; }
+  local -a pods=("$@") bodies=() ready_lines=()
+  local deadline=$(( SECONDS + wait_secs )) readback="" id body ready _pid index status dc gn_en gn_ip shost sport
   while [ "$SECONDS" -lt "$deadline" ]; do
-    body0="$(rp_pod_get "$pod0_id" 2>/dev/null)"
-    body1="$(rp_pod_get "$pod1_id" 2>/dev/null)"
-    if [ -n "$body0" ] && [ -n "$body1" ]; then
-      readback="$(rp_fleet_pods_readback "$body0" "$body1")"
-      readback_rc=$?
-      if [ "$readback_rc" -eq 0 ]; then
-        ready0=0; ready1=0
-        while IFS=' ' read -r _pid rank status dc gn_en gn_ip shost sport; do
-          [ -n "$rank" ] || continue
-          if [ "$status" = "RUNNING" ] && [ "$gn_en" = "1" ] && [ "$gn_ip" != "-" ] && [ "$shost" != "-" ]; then
-            if [ "$rank" = "0" ]; then
-              ready0=1; host0="$shost"; port0="$sport"; dc0="$dc"; gn_ip0="$gn_ip"
-            else
-              ready1=1; host1="$shost"; port1="$sport"; dc1="$dc"; gn_ip1="$gn_ip"
-            fi
-          fi
-        done <<< "$readback"
-        [ "$ready0" -eq 1 ] && [ "$ready1" -eq 1 ] && break
-      fi
+    bodies=()
+    for id in "${pods[@]}"; do
+      body="$(rp_pod_get "$id" 2>/dev/null)"
+      [ -n "$body" ] || break
+      bodies+=("$body")
+    done
+    if [ "${#bodies[@]}" -ne "${#pods[@]}" ] || ! readback="$(rp_fleet_pods_readback "${bodies[@]}")"; then
+      sleep 5
+      continue
     fi
+    ready_lines=()
+    while IFS=' ' read -r _pid index status dc gn_en gn_ip shost sport; do
+      [ -n "$index" ] || continue
+      if [ "$status" = "RUNNING" ] && [ "$gn_en" = "1" ] && [ "$gn_ip" != "-" ] && [ "$shost" != "-" ]; then
+        ready_lines+=("${dc} ${shost} ${sport} ${gn_ip}")
+      fi
+    done <<< "$readback"
+    [ "${#ready_lines[@]}" -eq "${#pods[@]}" ] && break
     sleep 5
   done
-  if [ "$ready0" -ne 1 ] || [ "$ready1" -ne 1 ]; then
-    echo "::error::not every fleet pod reached RUNNING with Global Networking enabled and a direct ssh endpoint within ${wait_secs}s (rank 0 ready: ${ready0}, rank 1 ready: ${ready1}); last readback (<pod> <host> <status> <dc> <gn> <gn_ip> <ssh_host> <ssh_port>): ${readback:-<none>}" >&2
+  if [ "${#ready_lines[@]}" -ne "${#pods[@]}" ]; then
+    echo "::error::${#ready_lines[@]} of ${#pods[@]} fleet pods reached RUNNING with Global Networking enabled and a direct ssh endpoint within ${wait_secs}s; last readback (<pod> <host> <status> <dc> <gn> <gn_ip> <ssh_host> <ssh_port>): ${readback:-<none>}" >&2
     return 97
   fi
-  if [ "$dc0" != "$dc1" ]; then
-    echo "::error::the two pods landed in DIFFERENT data centers (rank 0: ${dc0}, rank 1: ${dc1}) -- co-placement failed; refusing before any build starts" >&2
+  local dcs
+  dcs="$(printf '%s\n' "${ready_lines[@]}" | awk '{print $1}' | sort -u)"
+  if [ "$(printf '%s\n' "$dcs" | grep -c .)" -ne 1 ]; then
+    echo "::error::the fleet's pods landed in DIFFERENT data centers ($(printf '%s' "$dcs" | tr '\n' ' ')) -- co-placement failed; refusing before any build starts" >&2
     return 97
   fi
-  printf '%s %s %s %s %s %s %s\n' "$host0" "$port0" "$host1" "$port1" "$dc0" "$gn_ip0" "$gn_ip1"
+  printf '%s\n' "$dcs"
+  for ready in "${ready_lines[@]}"; do
+    printf '%s\n' "${ready#* }"
+  done
   return 0
 }
 
@@ -1876,34 +1920,41 @@ IFACE
 # never trusted from the pods' own report: a data center can list Global
 # Networking, give each pod an ip and a route, resolve `<pod>.runpod.internal`,
 # and still carry no packet between two of its pods. Each host listens on its
-# own Global-Networking ip (`RP_FLEET_ROUTE_PORT`), then each dials the other
-# until it answers or `RP_FLEET_ROUTE_SECS` pass (the network converging after
-# both pods start). $1..$4=host0 port0 host1 port1 (ssh) $5 $6=gn_ip0 gn_ip1.
-# 0 when both directions connect; 97, naming the direction, otherwise.
+# own Global-Networking ip (`RP_FLEET_ROUTE_PORT`), then each dials every
+# other until it answers or `RP_FLEET_ROUTE_SECS` pass (the network
+# converging after the pods start). Args: one `<ssh_host> <ssh_port> <gn_ip>`
+# triple per host, in host order. 0 when every ordered pair connects; 97,
+# naming the pair, otherwise.
 RP_FLEET_ROUTE_PORT="${RP_FLEET_ROUTE_PORT:-7999}"
 RP_FLEET_ROUTE_SECS="${RP_FLEET_ROUTE_SECS:-120}"
 rp_fleet_routes() {
-  local h0="$1" p0="$2" h1="$3" p1="$4" g0="$5" g1="$6" own peer host port label
-  for label in 0 1; do
-    if [ "$label" = 0 ]; then host="$h0"; port="$p0"; own="$g0"; else host="$h1"; port="$p1"; own="$g1"; fi
-    ssh "${RP_SSHO[@]}" -p "$port" "root@${host}" "timeout 60 bash -s" <<LISTEN || { echo "::error::host ${label}: could not start its route listener" >&2; return 97; }
+  [ "$#" -ge 6 ] && [ $(( $# % 3 )) -eq 0 ] \
+    || { echo "::error::rp_fleet_routes needs a <ssh_host> <ssh_port> <gn_ip> triple for each of at least two hosts" >&2; return 97; }
+  local -a hosts=() ports=() ips=()
+  while [ "$#" -gt 0 ]; do hosts+=("$1"); ports+=("$2"); ips+=("$3"); shift 3; done
+  local i j peers
+  for i in "${!hosts[@]}"; do
+    ssh "${RP_SSHO[@]}" -p "${ports[$i]}" "root@${hosts[$i]}" "timeout 60 bash -s" <<LISTEN || { echo "::error::host ${i}: could not start its route listener" >&2; return 97; }
 setsid nohup timeout $((RP_FLEET_ROUTE_SECS * 3)) python3 -c 'import socket
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("${own}", ${RP_FLEET_ROUTE_PORT})); s.listen(8)
+s.bind(("${ips[$i]}", ${RP_FLEET_ROUTE_PORT})); s.listen(8)
 while True: s.accept()[0].close()' >/dev/null 2>&1 < /dev/null &
 LISTEN
   done
-  for label in 0 1; do
-    if [ "$label" = 0 ]; then host="$h0"; port="$p0"; peer="$g1"; else host="$h1"; port="$p1"; peer="$g0"; fi
-    ssh "${RP_SSHO[@]}" -p "$port" "root@${host}" "timeout $((RP_FLEET_ROUTE_SECS + 30)) bash -s" <<REACH || { echo "::error::host ${label} cannot reach ${peer}:${RP_FLEET_ROUTE_PORT} over Global Networking within ${RP_FLEET_ROUTE_SECS}s -- this data center does not route between the two hosts" >&2; return 97; }
+  for i in "${!hosts[@]}"; do
+    peers=""
+    for j in "${!ips[@]}"; do [ "$i" = "$j" ] || peers="${peers} ${ips[$j]}"; done
+    ssh "${RP_SSHO[@]}" -p "${ports[$i]}" "root@${hosts[$i]}" "timeout $((RP_FLEET_ROUTE_SECS + 30)) bash -s" <<REACH || { echo "::error::host ${i} (${ips[$i]}) cannot reach every other host on ${RP_FLEET_ROUTE_PORT} over Global Networking within ${RP_FLEET_ROUTE_SECS}s -- this data center does not route between the fleet's hosts" >&2; return 97; }
 deadline=\$((SECONDS + ${RP_FLEET_ROUTE_SECS}))
-until timeout 5 bash -c "</dev/tcp/${peer}/${RP_FLEET_ROUTE_PORT}" 2>/dev/null; do
-  [ "\$SECONDS" -lt "\$deadline" ] || exit 1
-  sleep 3
+for peer in${peers}; do
+  until timeout 5 bash -c "</dev/tcp/\${peer}/${RP_FLEET_ROUTE_PORT}" 2>/dev/null; do
+    [ "\$SECONDS" -lt "\$deadline" ] || { echo "no route to \${peer}" >&2; exit 1; }
+    sleep 3
+  done
 done
 REACH
   done
-  echo "=== the hosts reach each other over Global Networking (${g0} <-> ${g1}) ==="
+  echo "=== the fleet's ${#hosts[@]} hosts reach each other over Global Networking (${ips[*]}) ==="
 }
 
 # The ONE `-ttl<H>` deadline-NAME parser rp_sweep reads — a `python3` SOURCE

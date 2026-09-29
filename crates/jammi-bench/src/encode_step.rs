@@ -135,12 +135,13 @@ pub enum Rung {
     Direct,
     Plan,
     PlanPartitioned,
-    /// The `plan` serve with the compute plane's three roles hosted in
-    /// this process: the sink is placed on the executor
+    /// The `plan-partitioned` serve with the compute plane's three roles
+    /// hosted in this process: the sink is placed on the executor
     /// (`crate::plane::encode_host`, the `plane` feature's).
     Placed,
-    /// The serve made through the deployed topology's query tier and
-    /// placed on a compute process (`crate::plane::encode_host`).
+    /// The same serve made through the deployed topology's query tier and
+    /// placed on its compute processes (`crate::plane::encode_host`), the
+    /// fleet placed with this leg's inference shape.
     ShapeD,
 }
 
@@ -155,15 +156,15 @@ impl Rung {
         }
     }
 
-    /// The `[inference] partitions` the rung's session plans with; `None` for
-    /// the rung that builds no plan.
+    /// The `[inference] partitions` the rung's plan is cut into — by this
+    /// process's session, or by the fleet's query tier placed with it;
+    /// `None` for the rung that builds no plan. Every rung above
+    /// `plan-partitioned` keeps its fan-out, so each edge adds one layer.
     fn partitions(self, partitioned: usize) -> Option<usize> {
         match self {
             Rung::Direct => None,
-            Rung::Plan | Rung::Placed => Some(1),
-            Rung::PlanPartitioned => Some(partitioned),
-            // The query tier's plan; its partition count is that process's.
-            Rung::ShapeD => None,
+            Rung::Plan => Some(1),
+            Rung::PlanPartitioned | Rung::Placed | Rung::ShapeD => Some(partitioned),
         }
     }
 
@@ -196,7 +197,7 @@ pub struct EncodeStepParams {
     /// `[inference] batch_tokens` — the padded-token cap of a forward chunk,
     /// on every rung.
     pub batch_tokens: usize,
-    /// `[inference] partitions` of the `plan-partitioned` rung.
+    /// `[inference] partitions` of every rung above `plan`.
     pub partitions: usize,
     /// `[gpu] compute_precision` — the precision the model loads at unless its
     /// own `config.json` declares one. What it RESOLVED to is what a leg
@@ -1217,6 +1218,12 @@ pub async fn measure_legs(
                     &corpus_path,
                     corpus_connection(&corpus_path)?,
                     params.gpu_device,
+                    jammi_test_utils::fleet::ShapeDInference {
+                        partitions: partitions.unwrap_or(params.partitions),
+                        batch_size: params.batch_size,
+                        batch_tokens: params.batch_tokens,
+                        compute_precision: params.compute_precision,
+                    },
                     &format!(
                         "encode-{}",
                         leg_stem(rung.as_str(), row_count, take, params.rungs.len() == 1)

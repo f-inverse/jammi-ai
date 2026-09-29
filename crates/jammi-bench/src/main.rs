@@ -348,6 +348,18 @@ struct FleetEnvArgs {
     exec_bind_port: u16,
     #[arg(long, default_value_t = 50052)]
     exec_grpc_port: u16,
+    /// The fleet's inference fan-out (`[inference] partitions`). With
+    /// `--batch-size`, `--batch-tokens` and `--compute-precision`, the
+    /// inference shape the query and compute roles serve under; without
+    /// them, the committed configs' own.
+    #[arg(long, requires_all = ["batch_size", "batch_tokens", "compute_precision"])]
+    partitions: Option<usize>,
+    #[arg(long, requires = "partitions")]
+    batch_size: Option<usize>,
+    #[arg(long, requires = "partitions")]
+    batch_tokens: Option<usize>,
+    #[arg(long, requires = "partitions")]
+    compute_precision: Option<jammi_numerics::ComputePrecision>,
 }
 
 #[derive(Subcommand)]
@@ -2410,7 +2422,7 @@ async fn run_encode_leg(
 
 #[cfg(feature = "plane")]
 fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
-    use jammi_test_utils::fleet::{Ports, ShapeDPlace, ShapeDRole};
+    use jammi_test_utils::fleet::{Ports, ShapeDInference, ShapeDPlace, ShapeDRole};
     let role = match args.role.as_str() {
         "scheduler" => ShapeDRole::Scheduler,
         "query" => ShapeDRole::Query,
@@ -2437,6 +2449,22 @@ fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
             exec_grpc: args.exec_grpc_port,
         },
         compute_device: args.device.map_or(-1, |o| o as i32),
+        inference: match (
+            args.partitions,
+            args.batch_size,
+            args.batch_tokens,
+            args.compute_precision,
+        ) {
+            (Some(partitions), Some(batch_size), Some(batch_tokens), Some(compute_precision)) => {
+                Some(ShapeDInference {
+                    partitions,
+                    batch_size,
+                    batch_tokens,
+                    compute_precision,
+                })
+            }
+            _ => None,
+        },
     });
     println!(
         "# jammi-server --config deploy/kubernetes/overlays/shape-d/jammi-{}.toml",

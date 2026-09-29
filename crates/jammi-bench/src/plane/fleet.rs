@@ -17,9 +17,10 @@ use jammi_db::config::{
     CatalogConfig, DistributedConfig, GpuConfig, JammiConfig, LeaseConfig, StorageConfig,
     WorkerConfig,
 };
+use jammi_db::storage::{JammiObjectStore, StorageUrl};
 use jammi_db::store::SINK_WRITE_LOG;
 use jammi_test_utils::fleet::{
-    BallistaRole, Fleet, ProcSpec, ShapeDRole, WorkerRole, MAX_WORLD_SIZE,
+    BallistaRole, Fleet, ProcSpec, ShapeDInference, ShapeDRole, WorkerRole, MAX_WORLD_SIZE,
 };
 use jammi_test_utils::DistributedBackends;
 
@@ -130,19 +131,21 @@ impl RunningFleet {
 
     /// The `shape-d` fleet on this host: the deployed topology's three role
     /// configs, one compute process on `device`, whose kind the query tier
-    /// names.
+    /// names, the fleet placed with `inference` (the committed configs' own
+    /// when `None`).
     pub async fn spawn_shape_d(
         plane: &PlaneParams,
         leg: &str,
         device: i32,
+        inference: Option<ShapeDInference>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let backends = Self::backends();
         let result_root = backends.unique_result_root(leg);
         let scheduler_port = jammi_test_utils::free_port();
         let specs = vec![
-            ProcSpec::shape_d(ShapeDRole::Scheduler, scheduler_port, device),
-            ProcSpec::shape_d(ShapeDRole::Query, scheduler_port, device),
-            ProcSpec::shape_d(ShapeDRole::Compute, scheduler_port, device),
+            ProcSpec::shape_d(ShapeDRole::Scheduler, scheduler_port, device, inference),
+            ProcSpec::shape_d(ShapeDRole::Query, scheduler_port, device, inference),
+            ProcSpec::shape_d(ShapeDRole::Compute, scheduler_port, device, inference),
         ];
         let query_addr = format!("127.0.0.1:{}", specs[1].flight_port());
         let roles = [
@@ -590,9 +593,32 @@ impl RunningFleet {
         Ok(ran_on)
     }
 
-    /// A `file://` URL every member on this host can read, under `dir`.
-    pub fn local_url(path: &Path) -> String {
-        format!("file://{}", path.display())
+    /// Put the file at `local` in the fleet's shared store, under this
+    /// leg's result root, and return the URL every member registers it
+    /// from — the one route a leg's input takes to a fleet, on whichever
+    /// hosts its members run.
+    pub async fn publish_input(
+        &self,
+        local: &Path,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let storage = &self.session.inner_config().storage;
+        let root = storage
+            .result_root
+            .as_deref()
+            .ok_or("the fleet's observer session has no result root")?;
+        let name = local
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{} names no file", local.display()))?;
+        let url = format!("{}/inputs/{name}", root.trim_end_matches('/'));
+        let store = JammiObjectStore::open(&StorageUrl::parse(&url)?, storage.cloud.as_ref())?;
+        store
+            .put_bytes(
+                &store.data_path()?,
+                bytes::Bytes::from(std::fs::read(local)?),
+            )
+            .await?;
+        Ok(url)
     }
 }
 

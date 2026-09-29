@@ -29,6 +29,7 @@ use jammi_ballista::roles::{
 use jammi_db::config::{BallistaClientConfig, BallistaExecutorConfig, BallistaSchedulerConfig};
 use jammi_db::source::{SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
+use jammi_test_utils::fleet::ShapeDInference;
 use jammi_wire::request::Modality;
 
 use crate::leg::RanOn;
@@ -230,11 +231,12 @@ impl ShapeDHost {
         corpus: &Path,
         corpus_connection: SourceConnection,
         gpu_device: i32,
+        inference: ShapeDInference,
         leg: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let fleet = match &plane.query_addr {
             Some(query_addr) => RunningFleet::join_shape_d(query_addr, leg).await?,
-            None => RunningFleet::spawn_shape_d(plane, leg, gpu_device).await?,
+            None => RunningFleet::spawn_shape_d(plane, leg, gpu_device, Some(inference)).await?,
         };
         let query_addr = fleet
             .query_addr
@@ -244,11 +246,7 @@ impl ShapeDHost {
         let admin = jammi_admin::CatalogClient::connect(endpoint.clone()).await?;
         let source = format!("corpus_{}", crate::capture::unique_suffix());
         let mut connection = corpus_connection;
-        if let Some(url) = &plane.source_url {
-            connection.url = Some(url.clone());
-        } else if connection.url.is_none() {
-            connection.url = Some(RunningFleet::local_url(corpus));
-        }
+        connection.url = Some(fleet.publish_input(corpus).await?);
         admin
             .add_source(&source, SourceType::File, connection)
             .await?;
@@ -309,17 +307,36 @@ impl ShapeDHost {
     /// Where the serve that committed `table_name` ran: a compute
     /// process, proven by the query tier's placement line, the scheduler's
     /// binding and the compute process's sink write.
+    /// The compute tier the serve was bound across — every executor the
+    /// catalog held live when it ended, with the device kinds it registered
+    /// — is part of the proof: a fleet's size is what its legs are compared
+    /// at.
     pub async fn prove(
         &mut self,
         table_name: &str,
     ) -> Result<RanOn, Box<dyn std::error::Error + Send + Sync>> {
-        self.fleet
+        let mut ran_on = self
+            .fleet
             .placed_sink_ran_on(
                 table_name,
                 MemberRole::Query,
                 MemberRole::Scheduler,
                 MemberRole::Compute,
             )
-            .await
+            .await?;
+        let live = jammi_ballista::cluster::live_executors(self.fleet.session.catalog()).await?;
+        let tier: Vec<String> = live
+            .iter()
+            .map(|executor| {
+                let kinds: Vec<&str> = executor.devices.iter().map(|d| d.kind.as_str()).collect();
+                format!("{} [{}]", executor.executor_id, kinds.join(","))
+            })
+            .collect();
+        ran_on.evidence.push(format!(
+            "compute tier: {} live executors: {}",
+            tier.len(),
+            tier.join("; ")
+        ));
+        Ok(ran_on)
     }
 }

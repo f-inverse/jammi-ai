@@ -259,8 +259,9 @@ async fn dataset_session(
     let dir = tempfile::tempdir()?;
     let session = local_session(dir.path()).await?;
     let parquet = dir.path().join("source.parquet");
-    register_dataset(&session, &parquet, None, SOURCE_ID, rows).await?;
-    Ok((session, dir))
+    let host = Host::InProcess { session };
+    register_dataset(&host, &parquet, SOURCE_ID, rows).await?;
+    Ok((Arc::clone(host.session()), dir))
 }
 
 /// The config key under which a trained context predictor records the embedding
@@ -293,16 +294,15 @@ async fn local_session(
     Ok(session)
 }
 
-/// Stand the synthetic meta-dataset up in `session` as `source_id`: write the
-/// source parquet (`_row_id`, `task`, `y`) at `parquet`, register it — at
-/// `url` when one is given, else at the file itself — and materialise the
+/// Stand the synthetic meta-dataset up in `host`'s session as `source_id`:
+/// write the source parquet (`_row_id`, `task`, `y`) at `parquet`, register
+/// it at the URL `host` serves its inputs from, and materialise the
 /// embedding table whose `vector` is each row's feature `x`, through the
 /// engine's own embedding-table writer, the same setup the engine's
 /// context-predictor suite uses.
 async fn register_dataset(
-    session: &Arc<InferenceSession>,
+    host: &Host,
     parquet: &Path,
-    url: Option<&str>,
     source_id: &str,
     rows: &[Row],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -332,12 +332,13 @@ async fn register_dataset(
     let mut writer = ObjectParquetWriter::open(&handle, Arc::clone(&schema)).await?;
     writer.write_batch(&batch).await?;
     writer.close().await?;
+    let session = host.session();
     session
         .add_source(
             source_id,
             SourceType::File,
             SourceConnection {
-                url: Some(url.map_or_else(|| format!("file://{path}"), str::to_string)),
+                url: Some(host.input_url(parquet).await?),
                 format: Some(FileFormat::Parquet),
                 ..Default::default()
             },
@@ -613,14 +614,7 @@ pub async fn run_leg(
     let mut host = Host::stand_up(params, artifacts.path()).await?;
     let source = host.source_id();
     config.model_id = host.model_id();
-    register_dataset(
-        host.session(),
-        &input_dir.join(SOURCE_FILE),
-        host.source_url(),
-        &source,
-        &rows,
-    )
-    .await?;
+    register_dataset(&host, &input_dir.join(SOURCE_FILE), &source, &rows).await?;
     let sampled = host
         .session()
         .sample_context_episodes(&source, &config)
@@ -753,8 +747,6 @@ enum Host {
     Fleet {
         fleet: crate::plane::fleet::RunningFleet,
         rung: Rung,
-        /// A joined fleet's `--source-url`.
-        source_url: Option<String>,
         suffix: String,
     },
 }
@@ -783,13 +775,12 @@ impl Host {
                             .await
                     }
                     (_, Some(query_addr)) => RunningFleet::join_shape_d(query_addr, &leg).await,
-                    (_, None) => RunningFleet::spawn_shape_d(&params.plane, &leg, -1).await,
+                    (_, None) => RunningFleet::spawn_shape_d(&params.plane, &leg, -1, None).await,
                 }
                 .map_err(|e| e.to_string())?;
                 Ok(Host::Fleet {
                     fleet,
                     rung: params.rung,
-                    source_url: params.plane.source_url.clone(),
                     suffix: crate::capture::unique_suffix(),
                 })
             }
@@ -827,13 +818,20 @@ impl Host {
         }
     }
 
-    /// The URL the meta-dataset is registered at instead of its file: a
-    /// joined fleet's `--source-url`.
-    fn source_url(&self) -> Option<&str> {
+    /// The URL the leg's input file at `local` is registered from: the file
+    /// itself in this process; on a fleet, its copy in the fleet's shared
+    /// store.
+    async fn input_url(&self, local: &Path) -> Result<String, Box<dyn std::error::Error>> {
         match self {
-            Host::InProcess { .. } => None,
+            Host::InProcess { .. } => Ok(format!(
+                "file://{}",
+                local.to_str().ok_or("input path is not valid UTF-8")?
+            )),
             #[cfg(feature = "plane")]
-            Host::Fleet { source_url, .. } => source_url.as_deref(),
+            Host::Fleet { fleet, .. } => Ok(fleet
+                .publish_input(local)
+                .await
+                .map_err(|e| e.to_string())?),
         }
     }
 

@@ -51,7 +51,9 @@ GIT_REPO="${GIT_REPO:-https://github.com/f-inverse/jammi-ai.git}"
 GIT_REF="${GIT_REF:?GIT_REF names the pushed branch the hosts check out}"
 REMOTE_CHECKOUT_LINES="$(rp_remote_checkout_lines "${GIT_REF}" "${GIT_REPO}")"
 
-SCALING_GPU_TYPES="${SCALING_GPU_TYPES:-NVIDIA A100-SXM4-80GB|NVIDIA A100 80GB PCIe|NVIDIA H100 80GB HBM3|NVIDIA L40S|NVIDIA RTX A6000}"
+# D15 pre-registered A100 hosts: another card changes compute against the
+# network, the very ratio the test measures, so no other type is a candidate.
+SCALING_GPU_TYPES="${SCALING_GPU_TYPES:-NVIDIA A100-SXM4-80GB|NVIDIA A100 80GB PCIe}"
 SCALING_MIN_AVAILABILITY="${SCALING_MIN_AVAILABILITY:-LOW}"
 SCALING_MAX_GPU_RATE="${SCALING_MAX_GPU_RATE:-4.00}"
 SCALING_DATA_CENTER="${SCALING_DATA_CENTER:-}"

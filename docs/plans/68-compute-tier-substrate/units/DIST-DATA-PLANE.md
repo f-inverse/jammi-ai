@@ -28,7 +28,8 @@ see `DELTA-INCREMENTAL-EMBEDDING.md`). A fan-in "publish when every shard is ter
 orchestration; the engine has no job dependencies, and orchestration belongs to the consumer's
 runtime.
 
-**D2 — Ballista (S2) is not the retrieval data plane; it is the compute/training plane.** Principle:
+**D2 — Ballista (S2) is not the retrieval data plane; it is the compute plane for materializations
+(training came off it, and its own place is D15's measured claim).** Principle:
 topology is configuration, and the actuator rule (D5). What is true of Ballista 54.1.0:
 
 - *No accelerator resource dimension, no affinity.* `ExecutorSpecification` is `{ task_slots }` and
@@ -57,8 +58,8 @@ memory-only" (above).
 
 Ballista IS jammi's compute-plane dependency: `crates/jammi-ballista` encodes jammi's physical
 operators across the scheduler/executor boundary (`codec::JammiCodec`), adapts per-stage execution,
-hosts the scheduler, executor and client roles from `[ballista]` configuration, and is what a placed
-training attempt runs on and what a client-role process's result-table materializations run on: a
+hosts the scheduler, executor and client roles from `[ballista]` configuration, and is what a
+client-role process's result-table materializations run on: a
 `CREATE TABLE … AS`, an embedding, inference, refresh, as-of join or training-set build roots in
 `jammi_db::store::ResultTableSinkExec` and submits the whole plan — compute and write — when a live
 executor can hold it; the sink writes the table's bytes on the executor under the row's lease
@@ -245,8 +246,11 @@ any leg of it runs:
 
 - **Workload.** The `encode` ladder's embed serve (`jammi-bench encode-step --task embed`),
   ModernBERT-large at f32, `[inference] batch_size = 32`, `batch_tokens = 16384`, fan-out
-  `partitions = 8` on every rung, units of 16,384 and 65,536 rows, 32 serves per rung per take,
-  takes `r1` and `r2`.
+  `partitions = 8` on every rung, units of 16,384, 32,768 and 65,536 rows, 32 serves per rung per
+  take, takes `r1` and `r2`. (Amended 2026-09-29, before any leg of the test ran: the test was first
+  registered at two units, but the ladder fits a rung's `fixed + per_work · rows` line only over
+  three or more — two points always lie on a line, so their residual tests nothing — and condition
+  3 below reads that fit. A CPU rehearsal of the whole chain found it.)
 - **Hosts.** Five pods of one GPU model, one GPU each, co-located in one data center on Global
   Networking: a control host (Postgres catalog, S3-class store, the `shape-d` scheduler and query
   tier) and four compute hosts. The fleet runs the committed `shape-d` role configs

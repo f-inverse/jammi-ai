@@ -95,8 +95,15 @@ fetch() {
   mkdir -p "$dir/dist"
   for name in jammi-server jammi-bench model.tar; do
     case "$name" in jammi-server) want="$server_sha" ;; jammi-bench) want="$bench_sha" ;; *) want="$model_sha" ;; esac
-    curl -fsS --retry 5 --retry-connrefused -o "$dir/dist/$name" "http://${infra_ip}:${DIST_PORT}/${name}" \
-      || die "could not fetch ${name} from ${infra_ip}:${DIST_PORT}"
+    # A silent transfer outlives the driver's inactivity watchdog, so the
+    # bytes landed are reported every minute until it ends.
+    curl -fsS --retry 5 --retry-connrefused -o "$dir/dist/$name" "http://${infra_ip}:${DIST_PORT}/${name}" &
+    local pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 60
+      echo "fetching ${name}: $(stat -c %s "$dir/dist/$name" 2>/dev/null || echo 0) bytes at $(date -u +%T)"
+    done
+    wait "$pid" || die "could not fetch ${name} from ${infra_ip}:${DIST_PORT}"
     [ "$(sha "$dir/dist/$name")" = "$want" ] || die "the fetched ${name}'s sha256 is not host 0's ${want}"
   done
   chmod 0755 "$dir/dist/jammi-server" "$dir/dist/jammi-bench"

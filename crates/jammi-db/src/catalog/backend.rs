@@ -6,11 +6,10 @@
 //!
 //! Transactions are closure-passing: the caller hands a closure to
 //! [`CatalogBackend::transaction`]; the backend opens a transaction in its own
-//! dialect ([`CatalogBackend::begin`]), and one operator
-//! ([`OpenTransaction::run`]) invokes the closure with a
-//! `&mut Transaction<'_>`, commits on `Ok(_)` and rolls back on `Err(_)`. The
-//! `Transaction<'_>` lifetime is bound to the closure's stack frame so it
-//! cannot leak.
+//! dialect ([`CatalogBackend::begin`]), and one operator, the same for every
+//! backend, invokes the closure with a `&mut Transaction<'_>`, commits on
+//! `Ok(_)` and rolls back on `Err(_)`. The `Transaction<'_>` lifetime is bound
+//! to the closure's stack frame so it cannot leak.
 //!
 //! Parameter binding flows through the engine-owned [`SqlValue`] enum: every
 //! call site assembles `&[SqlValue<'_>]` and the backend impl translates to
@@ -37,7 +36,7 @@ use crate::tenant::TenantId;
 pub trait CatalogBackend: Send + Sync {
     /// Open a transaction at `opts`, in this backend's dialect: its `BEGIN`
     /// mode, isolation level and read-only flag. What the transaction then
-    /// does, and how it ends, is [`OpenTransaction::run`]'s.
+    /// does, and how it ends, is [`Self::transaction`]'s.
     ///
     /// An implementation may spawn a detached task internally: the SQLite
     /// backend opens its uncancellable `BEGIN` on `tokio::spawn(...).await`. So
@@ -124,8 +123,8 @@ pub enum BackendImpl {
 
 impl BackendImpl {
     /// Run `f` inside one backend transaction: the concrete backend's
-    /// [`CatalogBackend::begin`], then [`OpenTransaction::run`]. Same contract
-    /// as [`CatalogBackend::transaction`].
+    /// [`CatalogBackend::begin`], then the operator every backend shares. Same
+    /// contract as [`CatalogBackend::transaction`].
     pub fn transaction<'a, F, R>(
         &'a self,
         opts: TxOptions,

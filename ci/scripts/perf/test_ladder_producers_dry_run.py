@@ -82,6 +82,11 @@ class EncodeRevisionProducer(unittest.TestCase):
                 "direct@base__rows256__r2",
             ],
         )
+        # Each session is the repeat its leg is named for, and none is filed
+        # as a run alone: a side has no shared session its repeats come from.
+        takes = re.findall(r"^--- direct@\S+__(r\d): .* --take (\d) ", out, flags=re.M)
+        self.assertEqual(takes, [("r1", "1")] * 3 + [("r2", "2")] * 3)
+        self.assertNotIn("--alone", out)
         self.assertIn("ladder encode", out)
         self.assertIn("--revision direct", out)
         self.assertEqual(out.count("cargo build --release -p jammi-bench"), 3)

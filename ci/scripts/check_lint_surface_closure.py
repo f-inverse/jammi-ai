@@ -109,9 +109,8 @@ That last clause is a determinant of its own, and it is the one a
 trigger-only notion of "merge path" misses. A workflow can qualify under
 Rule 1a and still never see the PR that breaks the lint: `image.yml`
 is `push:`-to-main-only (no `pull_request` trigger at all), and
-`pypi-server-cuda.yml`'s `pull_request` trigger is filtered to
-`packaging/server-cu12/**`, `crates/jammi-server/**` and the two wheel
-workflow files. The jammi-ai live-gpu lane moved into either would satisfy
+`server-image.yml`'s `pull_request` trigger is filtered to the `Dockerfile`,
+its own file and the release manifest. The jammi-ai live-gpu lane moved into either would satisfy
 its row while a PR editing only
 `crates/jammi-ai/**` ran neither, which is the fail-open this row exists to
 prevent. So a row is credited only by a lane whose HOSTING workflow carries
@@ -136,8 +135,8 @@ corpus every real row must read SATISFIED. It runs the host-workflow
 mutations end-to-end as well, through the real workflow parser: a copy of
 `.github/workflows/` with that step's `run:` line MOVED out of `ci.yml`
 into a synthetic job in `image.yml` (push-to-main + `paths:`), and the
-same move into `pypi-server-cuda.yml` (a `pull_request` whose `paths:` do
-not list `crates/jammi-ai/**`), must each read UNSATISFIED, while the
+same move into `server-image.yml` (a `pull_request` whose `paths:` list no
+crate), must each read UNSATISFIED, while the
 same copy with nothing moved reads SATISFIED — so the mutation's verdict
 cannot be an artefact of copying the workflows.
 
@@ -1004,8 +1003,8 @@ def self_test() -> int:
     for host, why in (
         ("image.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
         (
-            "pypi-server-cuda.yml",
-            "a workflow whose `pull_request` `paths:` do not list `crates/jammi-ai/**`",
+            "server-image.yml",
+            "a workflow whose `pull_request` `paths:` list no crate",
         ),
     ):
         moved = _corpus_with_step_moved(exec_mod, host, True)
@@ -1023,40 +1022,38 @@ def self_test() -> int:
             "never runs on a PR touching the crate"
         )
 
-    # ... and the same predicate must still SAY YES where the host genuinely
-    # does run on the crate: `pypi-server-cuda.yml`'s `paths:` DO list
-    # `crates/jammi-server/**`. Without this arm, "not ci.yml" would pass for
-    # the rule.
-    pypi_origin = LaneOrigin(
-        workflow="pypi-server-cuda.yml",
-        pr_lanes=workflow_pr_lanes(
-            exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / "pypi-server-cuda.yml"
-        ),
-    )
-    assert len(pypi_origin.pr_lanes) == 1 and pypi_origin.pr_lanes[0].paths, (
-        "self-test FAILED: pypi-server-cuda.yml no longer carries a paths-filtered "
+    # ... and the same predicate must still SAY YES where a host other than
+    # ci.yml genuinely does run on the crate: `pypi-server.yml`'s `paths:`
+    # list `crates/**`. Without this arm, "not ci.yml" would pass for the
+    # rule.
+    def origin_of(workflow: str) -> LaneOrigin:
+        return LaneOrigin(
+            workflow=workflow,
+            pr_lanes=workflow_pr_lanes(exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / workflow),
+        )
+
+    def probe_in(origin: LaneOrigin):
+        probe = parse_clippy_lane("cargo clippy -p jammi-server --tests -- -D warnings", origin=origin)
+        assert probe is not None
+        return probe
+
+    filtered_origin = origin_of("server-image.yml")
+    assert len(filtered_origin.pr_lanes) == 1 and filtered_origin.pr_lanes[0].paths, (
+        "self-test FAILED: server-image.yml no longer carries a paths-filtered "
         "`pull_request` trigger, so the control above tests something else now"
     )
-    image_origin = LaneOrigin(
-        workflow="image.yml",
-        pr_lanes=workflow_pr_lanes(
-            exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / "image.yml"
-        ),
-    )
-    assert image_origin.pr_lanes == (), (
+    assert origin_of("image.yml").pr_lanes == (), (
         "self-test FAILED: image.yml now has a `pull_request`-to-main trigger, so the "
         "push-only control above tests something else now"
     )
-    host_probe = parse_clippy_lane(
-        "cargo clippy -p jammi-server --tests -- -D warnings", origin=pypi_origin
-    )
-    assert host_probe is not None
-    assert not lane_runs_on_pr_touching_crate(exec_mod, host_probe, "jammi-ai", crate_dirs), (
-        "self-test FAILED: pypi-server-cuda.yml's paths were read as admitting crates/jammi-ai/**"
-    )
-    assert lane_runs_on_pr_touching_crate(exec_mod, host_probe, "jammi-server", crate_dirs), (
-        "self-test FAILED (over-strict): pypi-server-cuda.yml's `paths:` DO list "
-        "`crates/jammi-server/**`, so a lane hosted there must be credited for a jammi-server row"
+    assert not lane_runs_on_pr_touching_crate(
+        exec_mod, probe_in(filtered_origin), "jammi-ai", crate_dirs
+    ), "self-test FAILED: server-image.yml's paths were read as admitting crates/jammi-ai/**"
+    assert lane_runs_on_pr_touching_crate(
+        exec_mod, probe_in(origin_of("pypi-server.yml")), "jammi-server", crate_dirs
+    ), (
+        "self-test FAILED (over-strict): pypi-server.yml's `paths:` list `crates/**`, so a "
+        "lane hosted there must be credited for a jammi-server row"
     )
 
     # Negative control on the feature axis: a row naming a feature no lane

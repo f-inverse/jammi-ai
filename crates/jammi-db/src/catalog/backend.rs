@@ -5,10 +5,11 @@
 //! one trait, one [`Transaction`], one [`BackendError`] taxonomy.
 //!
 //! Transactions are closure-passing: the caller hands a closure to
-//! [`CatalogBackend::transaction`]; the backend opens a transaction, invokes
-//! the closure with a `&mut Transaction<'_>`, commits on `Ok(_)`, rolls back
-//! on `Err(_)`. The `Transaction<'_>` lifetime is bound to the closure's
-//! stack frame so it cannot leak.
+//! [`CatalogBackend::transaction`]; the backend opens a transaction in its own
+//! dialect ([`CatalogBackend::begin`]), and one operator, the same for every
+//! backend, invokes the closure with a `&mut Transaction<'_>`, commits on
+//! `Ok(_)` and rolls back on `Err(_)`. The `Transaction<'_>` lifetime is bound
+//! to the closure's stack frame so it cannot leak.
 //!
 //! Parameter binding flows through the engine-owned [`SqlValue`] enum: every
 //! call site assembles `&[SqlValue<'_>]` and the backend impl translates to
@@ -33,8 +34,9 @@ use crate::tenant::TenantId;
 /// still serves as the contract for generic helpers (e.g. the catalog's
 /// migration runner) and for backend implementations to honor.
 pub trait CatalogBackend: Send + Sync {
-    /// Run `f` inside one backend transaction. Commits on `Ok(_)`, rolls back
-    /// on `Err(_)`. The `&mut Transaction<'_>` cannot escape `f`.
+    /// Open a transaction at `opts`, in this backend's dialect: its `BEGIN`
+    /// mode, isolation level and read-only flag. What the transaction then
+    /// does, and how it ends, is [`Self::transaction`]'s.
     ///
     /// An implementation may spawn a detached task internally: the SQLite
     /// backend opens its uncancellable `BEGIN` on `tokio::spawn(...).await`. So
@@ -43,6 +45,14 @@ pub trait CatalogBackend: Send + Sync {
     /// runtime worker thread, which would pin the worker on the join handle
     /// while the spawned begin starves. Awaiting it normally (multi- or
     /// single-thread runtime) is fine.
+    fn begin(
+        &self,
+        opts: TxOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenTransaction, BackendError>> + Send + '_>>;
+
+    /// Run `f` inside one backend transaction. Commits on `Ok(_)`, rolls back
+    /// on `Err(_)`. The `&mut Transaction<'_>` cannot escape `f`. Carries
+    /// [`Self::begin`]'s runtime constraint.
     fn transaction<'a, F, R>(
         &'a self,
         opts: TxOptions,
@@ -55,7 +65,10 @@ pub trait CatalogBackend: Send + Sync {
                 -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'tx>>
             + Send
             + 'a,
-        R: Send + 'a;
+        R: Send + 'a,
+    {
+        Box::pin(async move { self.begin(opts).await?.run(f).await })
+    }
 
     /// Apply pending migrations to bring the catalog to the latest schema.
     /// Idempotent.
@@ -109,9 +122,9 @@ pub enum BackendImpl {
 }
 
 impl BackendImpl {
-    /// Run `f` inside one backend transaction. Dispatches to the concrete
-    /// backend's `transaction` method. Same contract as
-    /// [`CatalogBackend::transaction`].
+    /// Run `f` inside one backend transaction: the concrete backend's
+    /// [`CatalogBackend::begin`], then the operator every backend shares. Same
+    /// contract as [`CatalogBackend::transaction`].
     pub fn transaction<'a, F, R>(
         &'a self,
         opts: TxOptions,
@@ -126,11 +139,14 @@ impl BackendImpl {
             + 'a,
         R: Send + 'a,
     {
-        let transaction = match self {
-            BackendImpl::Sqlite(b) => b.transaction(opts, f),
-            BackendImpl::Postgres(b) => b.transaction(opts, f),
+        let begin = match self {
+            BackendImpl::Sqlite(b) => b.begin(opts),
+            BackendImpl::Postgres(b) => b.begin(opts),
         };
-        Box::pin(transaction.instrument(tracing::debug_span!("catalog.transaction")))
+        Box::pin(
+            async move { begin.await?.run(f).await }
+                .instrument(tracing::debug_span!("catalog.transaction")),
+        )
     }
 
     /// Run `f` in a `Serializable` read-write transaction, re-running it when
@@ -372,9 +388,96 @@ fn serializable_backoff(tries: usize, rng: &mut impl rand::Rng) -> std::time::Du
     std::time::Duration::from_millis(rng.gen_range(0..=ceiling))
 }
 
+/// A transaction a backend has begun and nothing has settled yet: it owns the
+/// connection a [`Transaction`] borrows. Dropped unsettled — a cancelled
+/// caller — it rolls back through the driver's own guard.
+pub struct OpenTransaction {
+    inner: OpenInner,
+}
+
+enum OpenInner {
+    Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
+    Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
+}
+
+impl OpenTransaction {
+    pub(crate) fn sqlite(tx: sqlx::Transaction<'static, sqlx::Sqlite>) -> Self {
+        Self {
+            inner: OpenInner::Sqlite(tx),
+        }
+    }
+
+    pub(crate) fn postgres(tx: sqlx::Transaction<'static, sqlx::Postgres>) -> Self {
+        Self {
+            inner: OpenInner::Postgres(tx),
+        }
+    }
+
+    /// Run `f` on this transaction and settle it: commit on `Ok(_)`, roll
+    /// back on `Err(_)` and return `f`'s error.
+    pub(crate) async fn run<F, R>(mut self, f: F) -> Result<R, BackendError>
+    where
+        F: for<'tx> FnOnce(
+                &'tx mut Transaction<'tx>,
+            )
+                -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'tx>>
+            + Send,
+        R: Send,
+    {
+        // The higher-ranked bound on `f` borrows the handle for the handle's
+        // whole lifetime, so it is scoped to end before `self` moves into the
+        // commit or the rollback.
+        let outcome = {
+            let mut handle = self.handle();
+            f(&mut handle).await
+        };
+        match outcome {
+            Ok(value) => {
+                self.commit().await?;
+                Ok(value)
+            }
+            Err(err) => {
+                // `f`'s error is the operation's; a rollback that fails as
+                // well is reported beside it, never in its place.
+                if let Err(rollback) = self.rollback().await {
+                    tracing::warn!(
+                        error = %rollback,
+                        cause = %err,
+                        "rolling back a failed catalog transaction failed"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn handle(&mut self) -> Transaction<'_> {
+        match &mut self.inner {
+            OpenInner::Sqlite(tx) => Transaction::new_sqlite(tx),
+            OpenInner::Postgres(tx) => Transaction::new_postgres(tx),
+        }
+    }
+
+    async fn commit(self) -> Result<(), BackendError> {
+        match self.inner {
+            OpenInner::Sqlite(tx) => tx.commit().await,
+            OpenInner::Postgres(tx) => tx.commit().await,
+        }
+        .map_err(classify)
+    }
+
+    async fn rollback(self) -> Result<(), BackendError> {
+        match self.inner {
+            OpenInner::Sqlite(tx) => tx.rollback().await,
+            OpenInner::Postgres(tx) => tx.rollback().await,
+        }
+        .map_err(classify)
+    }
+}
+
 /// Lifetime-scoped transactional handle handed to a [`CatalogBackend::transaction`]
 /// closure. Holds a borrowed reference to the backend's connection (the
-/// transaction itself is owned by the backend's `transaction` method).
+/// transaction itself is owned by the [`OpenTransaction`] that lends it).
 pub struct Transaction<'tx> {
     pub(crate) inner: TxInner<'tx>,
     tenant: Option<TenantId>,

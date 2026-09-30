@@ -25,7 +25,7 @@
 #                                       (default .gpu-pull/gpu-perf-ab)
 set -uo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$DIR/.." && pwd)"
+REPO_ROOT="$(cd "$DIR/../.." && pwd)"
 RP_TTL_HOURS="${RP_TTL_HOURS:-3}"
 # Three clones and three release build trees beside the checkout.
 RP_DISK_GB="${RP_DISK_GB:-90}"

@@ -297,6 +297,15 @@ approx = "0.5"
 test-case = "3.3"
 libc = "0.2"
 
+# One codegen unit per crate. A crate split into several units compiles a
+# private copy of every inlinable function into each unit that calls it, and
+# the derived `Clone`/`Hash`/`PartialEq`/drop code over the SQL syntax tree that
+# every plan type embeds is large: at the default sixteen units those copies
+# are over a third of the server binary, and the CUDA server wheel does not
+# fit PyPI's per-file limit (`ci/scripts/assert_wheel_size.sh`).
+[profile.release]
+codegen-units = 1
+
 [profile.dev]
 debug = "line-tables-only"
 

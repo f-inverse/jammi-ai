@@ -205,6 +205,11 @@ jobs:
           # requires so pip installs it only on a compatible host.
           python -m wheel tags --platform-tag ${{ inputs.platform_tag }} --remove dist/*.whl
 
+      # PyPI refuses a file over its per-file limit at the tag's publish;
+      # the wheel that outgrew it fails here instead, on the PR that grew it.
+      - name: Assert the wheel fits PyPI's per-file limit
+        run: bash ci/scripts/assert_wheel_size.sh ${{ inputs.package_dir }}/dist/*.whl
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_prefix }}-dist

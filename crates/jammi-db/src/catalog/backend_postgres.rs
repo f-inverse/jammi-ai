@@ -8,7 +8,7 @@ use std::time::Duration;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use super::backend::{
-    classify, BackendError, BackendKind, CatalogBackend, IsolationLevel, Transaction, TxOptions,
+    classify, BackendError, BackendKind, CatalogBackend, IsolationLevel, OpenTransaction, TxOptions,
 };
 
 /// Postgres-backed catalog. Wraps `sqlx::PgPool`.
@@ -63,20 +63,10 @@ impl PostgresBackend {
 }
 
 impl CatalogBackend for PostgresBackend {
-    fn transaction<'a, F, R>(
-        &'a self,
+    fn begin(
+        &self,
         opts: TxOptions,
-        f: F,
-    ) -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'a>>
-    where
-        F: for<'tx> FnOnce(
-                &'tx mut Transaction<'tx>,
-            )
-                -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'tx>>
-            + Send
-            + 'a,
-        R: Send + 'a,
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<OpenTransaction, BackendError>> + Send + '_>> {
         Box::pin(async move {
             let mut tx = self.pool.begin().await.map_err(classify)?;
 
@@ -96,25 +86,7 @@ impl CatalogBackend for PostgresBackend {
                     .await
                     .map_err(classify)?;
             }
-
-            // Scope wrapper so its borrow of `tx` ends before we move `tx`
-            // into commit/rollback. The HRTB on `f` borrows wrapper for its
-            // entire lifetime, so wrapper must drop before tx moves.
-            let outcome = {
-                let mut wrapper = Transaction::new_postgres(&mut tx);
-                f(&mut wrapper).await
-            };
-
-            match outcome {
-                Ok(value) => {
-                    tx.commit().await.map_err(classify)?;
-                    Ok(value)
-                }
-                Err(err) => {
-                    let _ = tx.rollback().await;
-                    Err(err)
-                }
-            }
+            Ok(OpenTransaction::postgres(tx))
         })
     }
 

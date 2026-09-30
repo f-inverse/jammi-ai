@@ -121,22 +121,26 @@ case $? in
 esac
 
 # One leg: `direct@<side>__<unit>__<take>.json`; the unit is the corpus size
-# served. `encode-step` files its leg as `direct__rows256__r1.json` in the
+# served. A side is a build of its own, so its session is its rung's repeat:
+# `encode-step --take <n>` files it as `direct__rows256__r<n>.json` in the
 # side's own legs directory, and the leg is refiled under the side tag the
 # revision edge reads.
 run_leg() { # $1=side $2=take
   local bin="$WORK_DIR/target-$1/release/jammi-bench"
   local leg="$RAW_DIR/direct@$1__rows256__$2"
   local side_legs="$RAW_DIR/side-$1-$2"
-  printf -- '--- %s: %q encode-step --cuda %s --rung direct --rows 256 --legs-dir %q\n' "$(basename "$leg")" "$bin" "$GPU_INFERENCE_AB_CUDA" "$side_legs"
+  local -a cmd=("$bin" encode-step --cuda "$GPU_INFERENCE_AB_CUDA" --rung direct --rows 256 --take "${2#r}" --legs-dir "$side_legs")
+  printf -- '--- %s:' "$(basename "$leg")"
+  printf ' %q' "${cmd[@]}"
+  printf '\n'
   if [ "$GPU_INFERENCE_AB_DRY_RUN" = "1" ]; then
     return 0
   fi
   local rc=0
-  "$bin" encode-step --cuda "$GPU_INFERENCE_AB_CUDA" --rung direct --rows 256 --legs-dir "$side_legs" > "$leg.stdout" 2> "$leg.stderr" || rc=$?
+  "${cmd[@]}" > "$leg.stdout" 2> "$leg.stderr" || rc=$?
   echo "$rc" > "$leg.exit"
-  if [ "$rc" -eq 0 ] && [ -f "$side_legs/direct__rows256__r1.json" ]; then
-    mv "$side_legs/direct__rows256__r1.json" "$leg.json"
+  if [ "$rc" -eq 0 ] && [ -f "$side_legs/direct__rows256__$2.json" ]; then
+    mv "$side_legs/direct__rows256__$2.json" "$leg.json"
   else
     echo "::warning::$(basename "$leg") FAILED (exit ${rc}) -- recorded; the ladder refuses the unit." >&2
     tail -n 5 "$leg.stderr" 2>/dev/null || true

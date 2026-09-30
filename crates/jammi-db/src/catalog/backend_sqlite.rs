@@ -103,7 +103,9 @@ use sqlx::sqlite::{
 };
 use sqlx::ConnectOptions;
 
-use super::backend::{classify, BackendError, BackendKind, CatalogBackend, Transaction, TxOptions};
+use super::backend::{
+    classify, BackendError, BackendKind, CatalogBackend, OpenTransaction, TxOptions,
+};
 
 /// Diagnostic escape hatch naming the SQLite VFS the catalog pool opens with.
 ///
@@ -362,7 +364,7 @@ impl SqliteBackend {
 }
 
 impl CatalogBackend for SqliteBackend {
-    /// Open a transaction and run `f` within it.
+    /// Open a transaction in SQLite's dialect.
     ///
     /// **Invariant: this future must be driven by a live tokio runtime — never
     /// blocked on from a runtime worker thread.** The uncancellable `BEGIN`
@@ -375,23 +377,14 @@ impl CatalogBackend for SqliteBackend {
     /// worker — that pins the worker on the join handle and the spawned begin
     /// never gets polled. The Postgres backend does not spawn and carries no
     /// such constraint.
-    fn transaction<'a, F, R>(
-        &'a self,
+    fn begin(
+        &self,
         opts: TxOptions,
-        f: F,
-    ) -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'a>>
-    where
-        F: for<'tx> FnOnce(
-                &'tx mut Transaction<'tx>,
-            )
-                -> Pin<Box<dyn Future<Output = Result<R, BackendError>> + Send + 'tx>>
-            + Send
-            + 'a,
-        R: Send + 'a,
-    {
+    ) -> Pin<Box<dyn Future<Output = Result<OpenTransaction, BackendError>> + Send + '_>> {
         Box::pin(async move {
             // SQLite has no SET TRANSACTION ISOLATION LEVEL; isolation is fixed
-            // by the journal mode (WAL gives snapshot reads). The write/read
+            // by the journal mode (WAL gives snapshot reads), so
+            // `opts.isolation` selects nothing here. The write/read
             // distinction is carried entirely by the BEGIN mode, which `sqlx`'s
             // default `Pool::begin` (always DEFERRED) cannot express — so we
             // open the transaction through `Pool::begin_with`, which runs our
@@ -411,7 +404,6 @@ impl CatalogBackend for SqliteBackend {
             } else {
                 "BEGIN IMMEDIATE"
             };
-            let _ = (opts.isolation, opts.read_only);
 
             // The BEGIN itself must be uncancellable. `Pool::begin_with` issues
             // the `BEGIN` statement and only then constructs the sqlx
@@ -429,31 +421,13 @@ impl CatalogBackend for SqliteBackend {
             // `Transaction`, and that `Transaction` then drops through its own
             // guard — rolling back and returning the connection clean.
             let pool = self.pool.clone();
-            let mut tx = tokio::spawn(async move { pool.begin_with(begin).await })
+            let tx = tokio::spawn(async move { pool.begin_with(begin).await })
                 .await
                 .map_err(|join| {
                     BackendError::Unavailable(format!("transaction begin task failed: {join}"))
                 })?
                 .map_err(classify)?;
-
-            // Scope wrapper so its borrow of `tx` ends before we move `tx`
-            // into commit/rollback. The HRTB on `f` borrows wrapper for its
-            // entire lifetime, so wrapper must drop before tx moves.
-            let outcome = {
-                let mut wrapper = Transaction::new_sqlite(&mut tx);
-                f(&mut wrapper).await
-            };
-
-            match outcome {
-                Ok(value) => {
-                    tx.commit().await.map_err(classify)?;
-                    Ok(value)
-                }
-                Err(err) => {
-                    let _ = tx.rollback().await;
-                    Err(err)
-                }
-            }
+            Ok(OpenTransaction::sqlite(tx))
         })
     }
 

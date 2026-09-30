@@ -539,7 +539,8 @@ enum Command {
     /// take) is measured in a child process under the device-memory sampler;
     /// more than one `--rung` is served interleaved in that child. Emits one
     /// leg per rung per unit per take (`--legs-dir`, the ladder's leg
-    /// contract) and prints a summary. Every number is RECORDED; the
+    /// contract: a repeat, or with `--alone` the one rung's run alone) and
+    /// prints a summary. Every number is RECORDED; the
     /// comparison is `jammi-bench ladder encode`'s.
     EncodeStep {
         /// What the rows are served for.
@@ -594,6 +595,11 @@ enum Command {
         /// a unit's first take with its vectors beside it.
         #[arg(long)]
         legs_dir: Option<std::path::PathBuf>,
+        /// File the one `--rung` as its runs alone (`a<take>`), the legs its
+        /// memory is read from, when its repeats are measured in a session
+        /// shared with other rungs.
+        #[arg(long)]
+        alone: bool,
     },
     /// Run a command under the device-memory sampler — the one external
     /// instrument every rung's leg, including a PyTorch reference's, reads
@@ -642,6 +648,8 @@ enum Command {
         exchange_dir: Option<std::path::PathBuf>,
         #[arg(long)]
         legs_dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        alone: bool,
     },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
@@ -951,6 +959,7 @@ async fn main() -> std::process::ExitCode {
             iters,
             exchange_dir,
             legs_dir,
+            alone,
         } => run_encode_step(encode_step::EncodeStepParams {
             task,
             rungs,
@@ -966,6 +975,7 @@ async fn main() -> std::process::ExitCode {
             gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
             exchange_dir,
             legs_dir,
+            alone,
         }),
         Command::SampleDevice { cuda, command } => run_sample_device(cuda, &command),
         Command::EncodeLeg {
@@ -983,6 +993,7 @@ async fn main() -> std::process::ExitCode {
             iters,
             exchange_dir,
             legs_dir,
+            alone,
         } => {
             run_encode_leg(
                 encode_step::EncodeStepParams {
@@ -1001,6 +1012,7 @@ async fn main() -> std::process::ExitCode {
                         .map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
                     exchange_dir,
                     legs_dir,
+                    alone,
                 },
                 rows,
                 take,

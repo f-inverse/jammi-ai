@@ -638,9 +638,11 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
 
 - **`CatalogBackend`** — `crates/jammi-db/src/catalog/backend.rs` (the
   `CatalogBackend` trait). The backend-agnostic transactional surface
-  (`transaction`/`migrate`/`ping`/`backend_kind`). **Closure-passing transactions**:
+  (`begin`/`transaction`/`migrate`/`ping`/`backend_kind`). **Closure-passing transactions**:
   commit on `Ok`, rollback on `Err`; the `&mut Transaction` cannot escape the
-  closure. **Not dyn-compatible** (generic method) → backends live behind the
+  closure. A backend implements only its dialect's `begin`; running the closure
+  and settling the transaction is one operator, `OpenTransaction::run`, for
+  every backend. **Not dyn-compatible** (generic method) → backends live behind the
   `BackendImpl` enum (`crates/jammi-db/src/catalog/backend.rs`), not `Arc<dyn …>`.
   Parameter type `SqlValue<'v>` (`crates/jammi-db/src/catalog/backend.rs`), read
   trait `FromSqlValue` (`crates/jammi-db/src/catalog/backend.rs`). **Invariant:

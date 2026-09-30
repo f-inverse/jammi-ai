@@ -5,6 +5,15 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+
+## [0.51.0] - 2026-09-30
+
+The engine drops its Ballista compute plane: work reaches a GPU host as a
+claimed job, and fan-out is DataFusion partitioning in one process. Release
+binaries build as one codegen unit per crate, which brings the CUDA server
+wheel under PyPI's per-file limit, so `jammi-server-cu12` ships again and the
+cookbook's server notebooks install on a GPU runtime.
+
 - **Jammi no longer runs on Ballista; work reaches a GPU host as a claimed job.** The Ballista
   compute plane placed a result-table materialization, and a claimed training attempt, on a
   scheduler's executors. It carried a parallel implementation of what the engine already does —
@@ -29,16 +38,6 @@ workspace ships every publishable crate at the same
   tags 43–46 are reserved, and migration 047 drops `compute_executors` and `compute_jobs`. The
   Shape D overlay is the base query tier plus a compute `StatefulSet` whose workers claim every
   job kind, with no scheduler; a statement the query tier runs inline runs on that replica.
-- **A row embeds the same alone and in a batch on every measured GPU.** cuBLAS's default math mode
-  let a split-K GEMM round its partial sums to `bf16` before summing, and whether a GEMM splits is a
-  per-card choice by shape: on an RTX 4090 or RTX 6000 Ada a row longer than 16 tokens embedded alone
-  differed from the same row in a padded batch by up to `4.6e-3` (relative L1), while an L40S or L4
-  stayed exact. Every CUDA device the engine opens now disallows reduced-precision reduction
-  (`jammi_kernels::device::open_cuda`), and those cards are bit-identical to the L40S.
-- **The engine wheels ship stripped.** `jammi-ai-native` and `jammi-ai-native-cu12` drop their
-  symbol tables, as the server binaries already did, which puts the CUDA wheel under PyPI's
-  100 MiB per-file limit (111 MB unstripped). Its build fails on the PR when it outgrows that limit,
-  instead of at the tag's upload.
 - **Release binaries are a third smaller, and every wheel is held to PyPI's per-file limit.**
   PyPI refused `jammi-server-cu12` 0.50.0 (112 MiB against its 100 MiB limit). The weight was
   repeated code, not more code: at Cargo's default sixteen codegen units each unit carries its own
@@ -65,6 +64,25 @@ workspace ships every publishable crate at the same
   CLI): `--alone` declares the run alone, and `encode_ab.sh` passes it; without it a session's legs
   are `r<take>`, the first carrying its vectors. The pod wrapper also resolves the repository root
   correctly, so the workflow uploads the verdict it pulls.
+
+## [0.50.0] - 2026-09-28
+
+The cookbook becomes reachable from a Colab link: the notebooks install this
+release, and the CUDA engine ships as `jammi-ai-native-cu12`. A row embeds the
+same alone and in a batch on every measured GPU, and every gang topology
+reduces over NCCL. `jammi-server-cu12` did not ship at this version; PyPI
+refused its wheel as over the per-file limit.
+
+- **A row embeds the same alone and in a batch on every measured GPU.** cuBLAS's default math mode
+  let a split-K GEMM round its partial sums to `bf16` before summing, and whether a GEMM splits is a
+  per-card choice by shape: on an RTX 4090 or RTX 6000 Ada a row longer than 16 tokens embedded alone
+  differed from the same row in a padded batch by up to `4.6e-3` (relative L1), while an L40S or L4
+  stayed exact. Every CUDA device the engine opens now disallows reduced-precision reduction
+  (`jammi_kernels::device::open_cuda`), and those cards are bit-identical to the L40S.
+- **The engine wheels ship stripped.** `jammi-ai-native` and `jammi-ai-native-cu12` drop their
+  symbol tables, as the server binaries already did, which puts the CUDA wheel under PyPI's
+  100 MiB per-file limit (111 MB unstripped). Its build fails on the PR when it outgrows that limit,
+  instead of at the tag's upload.
 - **Every gang topology reduces over NCCL, and the result does not depend on it.** A collective is
   a control plane (the in-process rendezvous, or the fleet's two-phase round over `RunRank`) over a
   transport: inline bytes, or an NCCL device exchange. `[worker] collective` selects the transport
@@ -1802,7 +1820,6 @@ workspace ships every publishable crate at the same
   is layered on top. `compose-smoke.yml` gains a native
   `ubuntu-24.04-arm` leg (its own within-leg parity assertions only, no cross-arch byte
   comparison).
-
 - **The Ballista compute plane: a training job can run on ANY registered
   compute host, not only the one that claimed it (#500).** A new
   publishable, lockstep crate, `jammi-ballista`, extends Apache DataFusion

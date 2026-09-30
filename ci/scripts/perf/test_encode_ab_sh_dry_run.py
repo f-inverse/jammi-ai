@@ -81,8 +81,9 @@ class DryRunTests(unittest.TestCase):
         self.assertIn("--compute-precision bf16", interleaved)
         self.assertIn(f"--legs-dir {self.out.name}/legs-plan ", interleaved)
         self.assertIn(f"--exchange-dir {self.out.name}/exchange ", interleaved)
+        self.assertNotIn("--alone", interleaved)
         for label, rung in (("jammi-direct", "direct"), ("jammi-plan", "plan"), ("jammi-plan-partitioned", "plan-partitioned")):
-            self.assertTrue(legs[label].endswith(f"--rung {rung} "), legs[label])
+            self.assertTrue(legs[label].endswith(f"--alone --rung {rung} "), legs[label])
             # Alone, in the same legs directory: filed as `a<take>`, read for space.
             self.assertIn(f"--legs-dir {self.out.name}/legs-plan ", legs[label])
         for command in legs.values():

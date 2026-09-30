@@ -198,6 +198,11 @@ pub struct EncodeStepParams {
     /// (`<rung>__rows<N>__r<take>.json`, a unit's first take with its vectors
     /// beside it); `None` writes none and only summarises.
     pub legs_dir: Option<PathBuf>,
+    /// File the one rung's legs as runs alone (`a<take>`): the caller measures
+    /// the rung's repeats in sessions it shares with other rungs, and this
+    /// session is where its memory is read. Without it a session's legs are
+    /// repeats, whether it serves several rungs or one.
+    pub alone: bool,
 }
 
 impl EncodeStepParams {
@@ -235,6 +240,14 @@ impl EncodeStepParams {
                 "the plan-partitioned rung needs --partitions of at least 2, not {} — at 1 it \
                  is the plan rung",
                 self.partitions
+            )
+            .into());
+        }
+        if self.alone && self.rungs.len() != 1 {
+            return Err(format!(
+                "--alone files one rung's runs alone, and this session serves {}: {:?}",
+                self.rungs.len(),
+                self.rungs
             )
             .into());
         }
@@ -1187,7 +1200,7 @@ pub async fn measure_legs(
     sorted_tokens.sort_by(|a, b| a.total_cmp(b));
 
     let session_rungs: Vec<String> = params.rungs.iter().map(|r| r.as_str().into()).collect();
-    let solo = sessions.len() == 1;
+    let own_process = sessions.len() == 1;
     let mut legs = Vec::with_capacity(sessions.len());
     for (session, served) in sessions.iter().zip(served) {
         let stats = ServeStats::of(&served.iter_wall_s).ok_or("a leg measured no serve")?;
@@ -1206,10 +1219,10 @@ pub async fn measure_legs(
         // The outcome is read off the first repeat's vectors; a run alone
         // carries its rung's memory and nothing the outcome pairs.
         let vectors = match (&artifact, &params.legs_dir, take) {
-            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) if !solo => {
+            (Artifact::Vectors { flat, dim }, Some(legs_dir), 1) if !params.alone => {
                 let name = format!(
                     "{}.vectors.f32",
-                    leg_stem(session.rung.as_str(), row_count, take, solo)
+                    leg_stem(session.rung.as_str(), row_count, take, params.alone)
                 );
                 std::fs::create_dir_all(legs_dir)?;
                 let bytes: Vec<u8> = flat.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1284,7 +1297,7 @@ pub async fn measure_legs(
             iter_wall_s: Some(served.iter_wall_s),
             work: Some(row_count as f64),
             // A shared process's high-water mark belongs to no one rung.
-            peak_rss_bytes: if solo {
+            peak_rss_bytes: if own_process {
                 peak_rss_measurement()
             } else {
                 Measurement::not_yet_measured("bytes")
@@ -1305,9 +1318,9 @@ pub async fn measure_legs(
     Ok(legs)
 }
 
-/// A leg's file stem by the ladder's contract: a repeat when its session
-/// interleaves several rungs — the legs an edge's speed pairs — and a run
-/// alone when it serves one, the leg its rung's memory is read from.
+/// A leg's file stem by the ladder's contract: a repeat — the legs an edge's
+/// speed pairs — unless the caller declared the session a rung's run alone,
+/// the leg its memory is read from beside repeats that shared a process.
 fn leg_stem(rung: &str, row_count: usize, take: usize, alone: bool) -> String {
     let take = u32::try_from(take).expect("a take count fits u32");
     crate::capture::leg_stem(
@@ -1480,7 +1493,7 @@ fn fit_rungs(rungs: &[Rung], rows: &[usize], legs: &[LegSummary]) -> Vec<RungFit
 /// summarised.
 pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error::Error>> {
     params.validate()?;
-    let solo = params.rungs.len() == 1;
+    let own_process = params.rungs.len() == 1;
     let mut legs = Vec::new();
     for &row_count in &params.rows {
         for &take in &params.takes {
@@ -1498,6 +1511,9 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
                 .args(["--iters", &params.iters.to_string()]);
             for rung in &params.rungs {
                 child.args(["--rung", rung.as_str()]);
+            }
+            if params.alone {
+                child.arg("--alone");
             }
             if let Some(ordinal) = params.cuda_ordinal() {
                 child.args(["--cuda", &ordinal.to_string()]);
@@ -1522,13 +1538,13 @@ pub fn run(params: &EncodeStepParams) -> Result<EncodeSweep, Box<dyn std::error:
             }
             let mut reports: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
             for report in &mut reports {
-                if solo {
+                if own_process {
                     // One rung had the process, so what the sampler read
                     // around it is that rung's.
                     report["tiers"]["encode_step"]["peak_vram_bytes"] =
                         serde_json::to_value(&peak_vram)?;
                 }
-                legs.push(file_leg(params.legs_dir.as_deref(), report, solo)?);
+                legs.push(file_leg(params.legs_dir.as_deref(), report, params.alone)?);
             }
         }
     }
@@ -1556,6 +1572,7 @@ mod tests {
             gpu_device: CPU_HERMETIC_DEVICE,
             exchange_dir: None,
             legs_dir: None,
+            alone: false,
         }
     }
 
@@ -1934,24 +1951,50 @@ mod tests {
             .join("model.safetensors")
             .exists());
 
-        // A session serving one rung alone is filed as that run alone: the
-        // leg its memory is read from, carrying no outcome vectors.
+        // A session declared one rung's run alone is filed as that: the leg
+        // its memory is read from, carrying no outcome vectors.
         let alone = EncodeStepParams {
             rungs: vec![Rung::Direct],
             rows: vec![16],
             takes: vec![1],
+            alone: true,
             ..params
         };
         for report in leg_reports(measure_legs(&alone, 16, 1).await.expect("leg session")) {
             let report = serde_json::to_value(&report).expect("serialize");
-            file_leg(alone.legs_dir.as_deref(), &report, true).expect("file");
+            file_leg(alone.legs_dir.as_deref(), &report, alone.alone).expect("file");
         }
-        let solo = read("direct__rows16__a1.json");
-        assert!(solo["tiers"]["encode_step"]["vectors_file"].is_null());
+        let run_alone = read("direct__rows16__a1.json");
+        let run_alone = &run_alone["tiers"]["encode_step"];
+        assert!(run_alone["vectors_file"].is_null());
+        assert!(run_alone["peak_rss_bytes"]["value"].is_number());
         assert!(!legs_dir
             .path()
             .join("direct__rows16__a1.vectors.f32")
             .exists());
+
+        // The same one-rung session undeclared is its rung's repeat — what a
+        // comparison of two builds pairs: it carries the outcome as any first
+        // repeat does, and its own process's memory.
+        let repeat_dir = tempfile::tempdir().expect("tempdir");
+        let repeat = EncodeStepParams {
+            alone: false,
+            legs_dir: Some(repeat_dir.path().to_path_buf()),
+            ..alone
+        };
+        for report in leg_reports(measure_legs(&repeat, 16, 1).await.expect("leg session")) {
+            let report = serde_json::to_value(&report).expect("serialize");
+            file_leg(repeat.legs_dir.as_deref(), &report, repeat.alone).expect("file");
+        }
+        let own: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(repeat_dir.path().join("direct__rows16__r1.json"))
+                .expect("the repeat's leg"),
+        )
+        .expect("json");
+        let own = &own["tiers"]["encode_step"];
+        assert_eq!(own["vectors_file"], "direct__rows16__r1.vectors.f32");
+        assert!(own["peak_rss_bytes"]["value"].is_number());
+        assert_eq!(own["outcome_digest"], leg["outcome_digest"]);
     }
 
     /// A run that could measure nothing, or whose rungs make no sense, is
@@ -1982,6 +2025,11 @@ mod tests {
             EncodeStepParams {
                 rungs: vec![Rung::PlanPartitioned],
                 partitions: 1,
+                ..test_params()
+            },
+            EncodeStepParams {
+                rungs: vec![Rung::Direct, Rung::Plan],
+                alone: true,
                 ..test_params()
             },
         ] {

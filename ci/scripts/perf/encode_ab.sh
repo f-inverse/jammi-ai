@@ -13,8 +13,8 @@
 #   jammi          `jammi-bench encode-step --rung direct --rung plan --rung
 #                  plan-partitioned`: the three engine rungs INTERLEAVED in one
 #                  process per unit (the legs an edge's speed is read from),
-#                  then each rung again ALONE (`--rung <one>`, filed as
-#                  `a<take>` beside the interleaved `r<take>` legs: the legs
+#                  then each rung again ALONE (`--alone --rung <one>`, filed
+#                  as `a<take>` beside the interleaved `r<take>` legs: the legs
 #                  its space is read from, a shared process's high-water marks
 #                  belonging to no one rung).
 #   torch-plan     `torch_encode.py --order plan --attn eager`: the reference
@@ -192,9 +192,9 @@ run_legs() {
   return 0
 }
 
-# run_jammi_legs LABEL LEGS_DIR RUNG...
+# run_jammi_legs LABEL LEGS_DIR repeats|alone RUNG...
 run_jammi_legs() {
-  local label="$1" legs_dir="$2"; shift 2
+  local label="$1" legs_dir="$2" takes="$3"; shift 3
   local -a cmd=("$BIN" encode-step --task embed
     --rows "$ENCODE_AB_ROWS"
     --partitions "$ENCODE_AB_PARTITIONS"
@@ -203,6 +203,7 @@ run_jammi_legs() {
     --iters "$ENCODE_AB_ITERS"
     --exchange-dir "$EXCHANGE_DIR" --legs-dir "$legs_dir")
   [ -n "$ENCODE_AB_TAKE" ] && cmd+=(--take "$ENCODE_AB_TAKE")
+  [ "$takes" = alone ] && cmd+=(--alone)
   local rung
   for rung in "$@"; do cmd+=(--rung "$rung"); done
   # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
@@ -231,11 +232,11 @@ run_torch_legs() {
 
 # The palindrome over the arms. The interleaved jammi run is first so its
 # exchange directory exists for every torch leg; the solo runs close it.
-run_jammi_legs jammi-interleaved "$LEGS_PLAN" "${RUNGS[@]}"
+run_jammi_legs jammi-interleaved "$LEGS_PLAN" repeats "${RUNGS[@]}"
 run_torch_legs torch-plan "$LEGS_PLAN" plan eager
 run_torch_legs torch-sorted "$LEGS_SORTED" length-sorted sdpa
 for rung in "${RUNGS[@]}"; do
-  run_jammi_legs "jammi-$rung" "$LEGS_PLAN" "$rung"
+  run_jammi_legs "jammi-$rung" "$LEGS_PLAN" alone "$rung"
 done
 
 # The sorted comparison sees the same engine legs beside the other torch order.

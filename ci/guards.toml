@@ -142,6 +142,12 @@ run = "python3 ci/scripts/check_workflow_feature_literals.py"
 why = "A release workflow takes jammi-server's cargo features from the release manifest and spells none itself."
 
 [[guard]]
+name = "wheel gates"
+run = "python3 ci/scripts/check_wheel_gates.py"
+why = "Every workflow that publishes to PyPI builds its wheel, and checks it against PyPI's per-file limit, on the pull request that changes what the wheel is built from."
+needs = ["pyyaml"]
+
+[[guard]]
 name = "cu12 tarball fixture"
 run = "python3 ci/scripts/check_bundle_fixture.py"
 why = "The committed cu12 loader report is the real build's, never a provisional stand-in."

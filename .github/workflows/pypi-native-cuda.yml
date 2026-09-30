@@ -18,8 +18,9 @@ on:
   push:
     tags: ["py-v*"]
   workflow_dispatch:
-  # PR gate: build-only (no publish) on every input compiled into the wheel,
-  # so a wheel that stops building, or outgrows PyPI's per-file limit
+  # PR gate: build-only (no publish) on every input compiled into the wheel
+  # (`ci/scripts/check_wheel_gates.py` holds the list), so a wheel that stops
+  # building, or outgrows PyPI's per-file limit
   # (`ci/scripts/assert_wheel_size.sh`), fails on the PR that caused it.
   pull_request:
     paths:

@@ -21,6 +21,15 @@ on:
   # A branch dispatch is a build-only dry run — the same recovery semantics
   # as the lockstep `pypi.yml` / `_pypi-server.yml` lanes.
   workflow_dispatch:
+  # PR gate: build-only (no publish) when what the wheel is built from
+  # changes — the client package and the protos its stubs are generated from —
+  # so a wheel that stops building fails on the PR that caused it.
+  pull_request:
+    paths:
+      - "clients/python/**"
+      - "crates/jammi-wire/proto/**"
+      - ".github/workflows/pypi-client.yml"
+      - "ci/scripts/assert_wheel_size.sh"
 
 # Serialize per ref, never cancel: a publish in flight must finish (PyPI
 # uploads are not resumable), matching the other release lanes.
@@ -64,6 +73,9 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build --wheel --outdir dist
+
+      - name: Assert the wheel fits PyPI's per-file limit
+        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
 
       - uses: actions/upload-artifact@v4
         with:

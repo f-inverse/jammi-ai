@@ -4,9 +4,8 @@
 # larger file with `400 File too large` at the tag's publish, after the other
 # wheels of the same lockstep release are already up; this fails the wheel's
 # own build instead, on the PR that grew it. One script holds the limit, so
-# every lane that builds a PyPI wheel — the server wheels
-# (`_pypi-server.yml`), the native engine wheels (`pypi.yml`) and the CUDA
-# native wheel (`build_native_cu12_wheel.sh`) — checks the same number.
+# every workflow that publishes a wheel checks the same number
+# (`ci/scripts/check_wheel_gates.py` holds that each one does).
 #
 # The size is read with `wc -c`, which the Linux and the macOS wheel legs
 # both have (`stat`'s size flag differs between them).
@@ -83,10 +82,9 @@ _self_test() {
   _expect "exactly-the-limit-fits" 0 "$rc"
   rc=0; _fits $((PYPI_FILE_LIMIT + 1)) "$PYPI_FILE_LIMIT" || rc=$?
   _expect "one-byte-over-refused" 1 "$rc"
-  # The size PyPI refused: decimal megabytes read as under "100", but the
-  # limit is in MiB and the file is over it.
-  rc=0; _fits 117582007 "$PYPI_FILE_LIMIT" || rc=$?
-  _expect "the-refused-wheel-refused" 1 "$rc"
+  # The limit is 100 MiB, not 100 MB: a file between the two fits.
+  rc=0; _fits 104000000 "$PYPI_FILE_LIMIT" || rc=$?
+  _expect "over-100-megabytes-under-100-mebibytes-fits" 0 "$rc"
 
   printf '%0100d' 0 > "$work/fits.whl"
   printf '%0101d' 0 > "$work/over.whl"

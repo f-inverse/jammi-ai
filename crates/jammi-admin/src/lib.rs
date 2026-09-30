@@ -901,7 +901,7 @@ pub struct JobSummary {
     /// The failure message; non-empty exactly when `status` is `"failed"`.
     pub error: String,
     /// The instance holding (or last holding) the job's claim; empty while
-    /// queued. For a placed training attempt, the executor.
+    /// queued.
     pub claimed_by: String,
     /// The instance that ran each rank of the latest training attempt, in
     /// rank order; empty for a compute job and until an attempt records it.

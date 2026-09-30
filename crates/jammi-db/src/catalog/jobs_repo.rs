@@ -45,7 +45,7 @@ use super::instance::{
 };
 use super::lease::{
     canonical_stamp_now, instance_liveness_margin, lease_deadline_expr, lease_expired_clause,
-    lease_live_clause, stale_before_clause, CanonicalStampColumn,
+    stale_before_clause, CanonicalStampColumn,
 };
 use super::status::{ArtifactState, JobExecution, JobStatus};
 use super::Catalog;
@@ -92,8 +92,7 @@ pub struct JobRecord {
     /// its model against. `None` for a training kind.
     pub model_source: Option<String>,
     /// Id of the instance holding the lease, or `None` while queued/unclaimed.
-    /// A terminal row keeps its last holder: for a placed training attempt,
-    /// the executor the claim moved to.
+    /// A terminal row keeps its last holder.
     pub claimed_by: Option<String>,
     /// The instance that ran each rank of the latest training attempt, in
     /// rank order, recorded once the attempt's rank set is fixed
@@ -1060,9 +1059,7 @@ pub struct WorkerRecord {
     /// This worker's device inventory, as `Catalog::upsert_worker` wrote
     /// it. A `ListWorkers` MIRROR only (mapped verbatim onto
     /// `jammi.v1.job.WorkerSummary.devices`, field 8, an additive field on
-    /// the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`)
-    /// — never the placement policy's authority; see
-    /// `super::compute_repo::ComputeExecutorRecord::devices`'s doc. A
+    /// the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`). A
     /// malformed stored value decodes to an empty list with a
     /// `tracing::warn!` naming `instance_id` (a row fact, not a fault; see
     /// [`super::instance::decode_devices_json`]), never a read fault.
@@ -1580,77 +1577,6 @@ impl Catalog {
             "UPDATE jobs SET lease_expires_at = {deadline_expr}, updated_at = $2 \
              WHERE job_id = $3 AND status = $4 AND claimed_by = $5 AND attempts = $6 \
                AND lease_expires_at IS NOT NULL"
-        );
-        let updated = self
-            .backend()
-            .transaction(TxOptions::default(), |tx| {
-                Box::pin(async move { tx.execute(&sql, &params).await })
-            })
-            .await?;
-        Ok(updated == 1)
-    }
-
-    /// The placed-attempt hand-off: move `job_id`'s claim from `from_instance` to `to_instance` —
-    /// `claimed_by = $to`, a fresh `lease` deadline, `updated_at` — WITHOUT
-    /// touching `attempts` or `releases` (zero net attempts: this is a
-    /// hand-off, never a re-claim). `Ok(false)` when the guard misses:
-    ///
-    /// - `claimed_by != from_instance` — a stale runner (a superseded
-    ///   attempt, or a SECOND launch of the same task, Ballista's own
-    ///   reset-on-`ExecutorLost`) cannot transfer a claim it does not hold;
-    ///   this is also the bind-time re-launch guard's second half (the
-    ///   first half is the placement policy refusing to bind a task whose
-    ///   row is already `claimed_by` an executor);
-    /// - `attempts` does not match — a stale runner of an OLDER attempt
-    ///   cannot transfer a claim a newer attempt already moved past;
-    /// - `status != 'running'` — a terminal or queued row has no claim to
-    ///   hand off;
-    /// - the lease is not LIVE — [`lease_live_clause`], a POSITIVE
-    ///   comparison (`lease_expires_at IS NOT NULL AND lease_expires_at >
-    ///   now`), never [`lease_expired_clause`]'s `IS NULL OR …` shape: a
-    ///   RELEASE ([`Self::release_job_lease`]) sets `lease_expires_at =
-    ///   NULL`, and that NULL must make a transfer FAIL, the opposite of
-    ///   what `lease_expired_clause`'s own `OR` would read a NULL as for a
-    ///   RECLAIM sweep's purposes. See [`lease_live_clause`]'s doc for why
-    ///   this is its own predicate, not `NOT lease_expired_clause(..)`.
-    pub async fn transfer_claim(
-        &self,
-        job_id: &str,
-        from_instance: &str,
-        to_instance: &str,
-        attempts: u32,
-        lease: Duration,
-    ) -> Result<bool> {
-        let running = JobStatus::Running.to_string();
-        let job_id = job_id.to_string();
-        let from_instance = from_instance.to_string();
-        let to_instance = to_instance.to_string();
-        let attempts = attempts as i64;
-        let now = canonical_stamp_now();
-        let kind = self.backend().backend_kind();
-
-        let mut params: Vec<SqlValue<'static>> = Vec::new();
-        params.push(SqlValue::TextOwned(to_instance));
-        let to_bind = params.len();
-        let deadline_expr = lease_deadline_expr(kind, lease, &mut params);
-        params.push(SqlValue::TextOwned(now));
-        let updated_at_bind = params.len();
-        params.push(SqlValue::TextOwned(job_id));
-        let job_id_bind = params.len();
-        params.push(SqlValue::TextOwned(from_instance));
-        let from_bind = params.len();
-        params.push(SqlValue::Int(attempts));
-        let attempts_bind = params.len();
-        params.push(SqlValue::TextOwned(running));
-        let status_bind = params.len();
-        let live_clause = lease_live_clause("lease_expires_at", kind, &mut params);
-
-        let sql = format!(
-            "UPDATE jobs SET claimed_by = ${to_bind}, lease_expires_at = {deadline_expr}, \
-                 updated_at = ${updated_at_bind} \
-             WHERE job_id = ${job_id_bind} AND claimed_by = ${from_bind} \
-               AND attempts = ${attempts_bind} AND status = ${status_bind} \
-               AND {live_clause}"
         );
         let updated = self
             .backend()

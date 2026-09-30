@@ -28,7 +28,8 @@ see `DELTA-INCREMENTAL-EMBEDDING.md`). A fan-in "publish when every shard is ter
 orchestration; the engine has no job dependencies, and orchestration belongs to the consumer's
 runtime.
 
-**D2 — Ballista (S2) is not the retrieval data plane; it is the compute/training plane.** Principle:
+**D2 — Ballista (S2) is not the retrieval data plane, nor any plane: the engine carries no
+Ballista (D15).** Principle:
 topology is configuration, and the actuator rule (D5). What is true of Ballista 54.1.0:
 
 - *No accelerator resource dimension, no affinity.* `ExecutorSpecification` is `{ task_slots }` and
@@ -57,8 +58,8 @@ memory-only" (above).
 
 Ballista IS jammi's compute-plane dependency: `crates/jammi-ballista` encodes jammi's physical
 operators across the scheduler/executor boundary (`codec::JammiCodec`), adapts per-stage execution,
-hosts the scheduler, executor and client roles from `[ballista]` configuration, and is what a placed
-training attempt runs on and what a client-role process's result-table materializations run on: a
+hosts the scheduler, executor and client roles from `[ballista]` configuration, and is what a
+client-role process's result-table materializations run on: a
 `CREATE TABLE … AS`, an embedding, inference, refresh, as-of join or training-set build roots in
 `jammi_db::store::ResultTableSinkExec` and submits the whole plan — compute and write — when a live
 executor can hold it; the sink writes the table's bytes on the executor under the row's lease
@@ -225,6 +226,107 @@ refuses a peer answer that repeats a row id across units (§5.3).
 
 **D14 — Ray / Ray Serve: recorded, not proposed.** Python-side collectives and serving are a second
 runtime beside the one binary.
+
+**D15 — The Ballista plane keeps its place only on a measured, pre-registered claim (2026-09-29).**
+D2 made Ballista "the compute/training plane". Evaluated against what the plane uniquely provides:
+
+- *Training* gains nothing from it. A placed attempt runs on another host of the claimant's own
+  device kind while the claimant idles; the jobs table's claim (`[worker] kinds`) already routes an
+  attempt to the host that trains it, and plan 67's gang assembly places its ranks. The placed
+  training rung never produced a leg (#624), and the path carried #624 and #695. Training comes off
+  the plane; plan 67 §9 records it.
+- *Disaggregation* (a CPU query tier sending model work to GPU hosts) is D1's jobs fleet already.
+- *Splitting one materialization across hosts* is the one capability nothing else in the engine
+  provides: an embedding job is whole-table on one worker (D1). The plane measured 1.61× the
+  in-process cost on ONE executor (`ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane`:
+  a fixed cost worth 49 units of work, ×1.086 per row); across hosts it was never measured.
+
+So the plane stays only if splitting one materialization across hosts pays. The test, fixed before
+any leg of it runs:
+
+- **Workload.** The `encode` ladder's embed serve (`jammi-bench encode-step --task embed`),
+  ModernBERT-large at f32, `[inference] batch_size = 32`, `batch_tokens = 16384`, fan-out
+  `partitions = 8` on every rung, units of 16,384, 32,768 and 65,536 rows, 32 serves per rung per
+  take, takes `r1` and `r2`. (Amended 2026-09-29, before any leg of the test ran: the test was first
+  registered at two units, but the ladder fits a rung's `fixed + per_work · rows` line only over
+  three or more — two points always lie on a line, so their residual tests nothing — and condition
+  3 below reads that fit. A CPU rehearsal of the whole chain found it.)
+- **Hosts.** Five pods of one GPU model, one GPU each, co-located in one data center on Global
+  Networking: a control host (Postgres catalog, S3-class store, the `shape-d` scheduler and query
+  tier) and four compute hosts. The fleet runs the committed `shape-d` role configs
+  (`deploy/kubernetes/overlays/shape-d/`), overridden only in addresses, storage endpoint and the
+  workload's `[inference]` settings above; compute `task_slots = 1`.
+- **Fleet sizes.** K ∈ {1, 2, 4} live compute executors, each leg recording the live executors it
+  served against.
+- **Legs.** The edges `plan-partitioned → placed → shape-d` for each K, the `placed` session on a
+  compute host over backends of its own (no fleet executor visible to it), and the direct pair
+  `plan-partitioned`/`shape-d` interleaved in one process on the control host, filed under
+  `direct/`.
+- **Judge.** `jammi-bench ladder encode <legs_K> --from plan-partitioned --to shape-d`, one verdict
+  per K, committed under `ci/artifacts/parity-ladder-runs/`. The product of the edge costs must
+  agree with the direct pair (the ladder's telescoping check); a refused verdict is a finding about
+  the measurement, repaired and re-run, and decides nothing.
+
+**Pass** iff, for K = 2 and K = 4 alike:
+
+1. every edge and the direct pair show equal outcome digests on every unit;
+2. the verdict is not refused;
+3. the composed per-row speedup, `1 / (per_work_ratio(plan-partitioned → placed) ×
+   per_work_ratio(placed → shape-d))`, is at least **1.7 at K = 2** and **3.0 at K = 4** —
+   85 % and 75 % parallel efficiency on a stage that is embarrassingly parallel, so any shortfall
+   is the plane's own cost;
+4. the direct pair's end-to-end speedup, read at the conservative end of its interval
+   (`1 / cost.interval.upper`), is at least **1.4 at K = 2** and **2.2 at K = 4** — most of (3)
+   realized on a serve a single GPU finishes in tens of seconds.
+
+The bar is set against the alternative the engine already has: K GPUs running K whole-table jobs
+from the jobs fleet scale throughput by K with no scheduler tier, so the plane's value is the
+latency of ONE table, and a cluster that does not cut that latency by these factors does not pay
+for the tier it adds. K = 1 is reported, not judged.
+
+**Fail** removes `crates/jammi-ballista`, the `[ballista]` roles and the `ComputePlane` seam;
+splitting one plan across hosts is revisited on `datafusion-distributed` (D4, #613) when a
+workload needs it. **Pass** keeps the plane for result-table materializations.
+
+**Amended 2026-09-29, before any leg of the test ran: the plane is removed whatever the test
+shows, and the test decides #613.** Weighed beside the measurement, the plane's cost is an upstream
+coupling the engine cannot extend its way out of: Ballista's seams are too thin, so jammi carries
+parallel implementations of Ballista's own internals — its task binder (`bind_task_round_robin` is
+`pub(crate)`; Ballista `main` has since reshaped that seam from slots to vcores), its cluster and
+job state, its role hosting — and works around its hazards (retries forced off, a typed-error
+envelope over a text-only failure path, #682's lock order). It holds the workspace's DataFusion
+line (#613). For an engine whose story is ML inside DataFusion, the substrate that splits one plan
+across hosts should itself be DataFusion-shaped: `datafusion-distributed` (D4) is a library, with
+no scheduler process, carrying custom nodes through a `PhysicalExtensionCodec` and exposing
+per-task routing where device placement attaches. The test still answers the capability's own
+question, largely independent of substrate — how far one materialization's forwards parallelize
+across hosts — so its verdicts are committed as #613's evidence: a pass by the bar above justifies
+splitting plans on `datafusion-distributed` once the workspace is on DataFusion 55; a fail closes
+that half of #613.
+
+**Amended 2026-09-30, before any leg of the test was filed: units of 4,096, 8,192 and 16,384
+rows.** The first fleet to run the protocol served K = 1's 16,384-row unit at about 52 s a
+`shape-d` serve (the executor runs the plan's eight tasks one after another at about 5 s each, then
+the sink writes for about 12 s). At that rate one take of K = 1 over the registered units is about
+six hours and the six blocks over a day — past the driver's three-hour block and the pods'
+ten-hour life, so the run could never finish. It was stopped with no leg filed; the only
+observation made is those K = 1 serve walls, no K = 2 or K = 4 serve ran, and nothing the pass
+conditions read was seen. The units shrink fourfold and stay three, so the shape fit still has its
+residual; the serves stay at 32, the ladder's minimum run; the largest unit is still a serve one
+GPU finishes in tens of seconds, the regime condition 4 is written for; every condition and bar
+is unchanged.
+
+**Withdrawn 2026-09-30, unrun: the test decides nothing the engine needs now.** With the plane
+removed whatever it showed, the test's only reader was #613. It would have measured Ballista's
+overhead and a plane the same change deletes — tasks run one after another on a one-slot
+executor, a sink writing through the object store — while #613's question is the overhead of
+`datafusion-distributed`, a substrate with no scheduler and a different exchange. What carries
+across substrates is known without it: an embedding's forwards split trivially across hosts. No
+workload needs one table cut across GPUs today; K GPUs already serve K whole-table jobs from the
+jobs fleet (D1). So splitting one plan across hosts is measured on `datafusion-distributed` when a
+workload asks for it, under a protocol timed on the target hardware before it is registered —
+this one was timed only by a CPU rehearsal, and on A100s its registered units could not finish
+within a pod's life. `crates/jammi-ballista` and every surface that existed for it are removed.
 
 ---
 

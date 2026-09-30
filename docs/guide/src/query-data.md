@@ -94,10 +94,7 @@ SELECT id, title FROM "jammi.recent" ORDER BY id;
 DROP TABLE recent;
 ```
 
-The query runs where the compute plane says (see `[ballista.client]` in
-[Configuration](./configuration.md)): on a process holding the client role, the whole
-materialization — the query and the write — runs on an executor, and the submitting process
-finishes the catalog row. `IF NOT EXISTS` leaves an existing table as it is; a name already
+The query and the write run in the process that received the statement. `IF NOT EXISTS` leaves an existing table as it is; a name already
 taken is refused otherwise.
 
 `CREATE OR REPLACE TABLE <name> AS <query>` never loses the table it replaces. The new rows are
@@ -107,7 +104,7 @@ old row and moves the new one onto the name; only then are the old bytes reclaim
 resolves the old table or the new one, never none: a replica whose binding of the name predates
 the swap rebinds at its next resolution, and a read already in flight finishes over the bytes it
 opened. A failure anywhere before that transaction — the query refused at planning, the input
-refusing mid-write, the compute plane declining — leaves the old table exactly as it was and
+refusing mid-write — leaves the old table exactly as it was and
 discards the replacement's row and bytes. A process that dies mid-replacement leaves the same:
 recovery reaps a replacement nobody is driving and never publishes it. `OR REPLACE` on a name
 nothing is under is a plain `CREATE`.

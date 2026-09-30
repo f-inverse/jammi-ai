@@ -797,6 +797,27 @@ placement policy (§9), never by a fork or an upstream request.
 
 ## 9. The Ballista extension
 
+**Decision, 2026-09-29: training is not placed on the plane.** What follows describes a placed
+attempt as one task (`PlacedAttemptExec`, later `TrainingExec` over a `TrainingRunner`) and its
+hand-off. It was removed. Placing an attempt moved it to another host of the claimant's own device
+kind while the claimant idled; the jobs table's claim (`[worker] kinds`) already routes an attempt
+to the host that trains it, and §4's gang assembly places its ranks. The placed rung never
+produced a leg (#624), and the path carried #624 and #695 (a placed attempt refused while its
+executor's own claim loop was mid-probe, then run again as attempt 2 after the reclaim). The
+Hydrogen analogy of §1 was examined as barrier-mode gangs on Ballista — an all-or-nothing
+W-partition stage, which Ballista's bind round (it offers every live executor's slots at once) can
+carry — and rejected on merit: the collective's transport, its bootstrap and its admission stay
+`RunRank` either way, so Ballista would replace only member discovery, at the cost of a second
+gang-placement path or of Ballista as a hard dependency of multi-host training. Whether the plane
+keeps its place for materializations was to be put to a measurement, plan 68's
+`DIST-DATA-PLANE.md` D15, withdrawn unrun once the plane was removed regardless.
+
+**Decision, 2026-09-29: the plane is removed.** `jammi-ballista` and everything that existed only
+for it — the `ComputePlane` seam, the sink's cross-process lease, the catalog's second fleet of
+executor and job rows, the error envelope, the `[ballista]` roles and Shape D's scheduler — are
+deleted, whatever D15 shows: the plane was a parallel implementation of what the jobs fleet does,
+coupled to Ballista's scheduler internals (#682). This section is history.
+
 **Discipline.** `jammi-kernels` extends candle at the seam candle exposes (`CustomOp1/2/3`), keeps
 one call path, vendors verbatim at a pinned version only where no seam exists, and believes
 nothing before its oracles pass. `jammi-ballista` follows the same discipline: extend at the seams

@@ -174,7 +174,7 @@ pub fn vector_rows_digest(rows: &[VectorRow]) -> String {
 /// A suffix no earlier run of this process or another produced: the clock's
 /// nanoseconds, in hex — what a name registered in a fleet's catalog, shared
 /// across runs, is made unique by.
-#[cfg(feature = "plane")]
+#[cfg(feature = "fleet")]
 pub fn unique_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     format!(

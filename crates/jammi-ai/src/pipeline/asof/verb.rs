@@ -72,8 +72,7 @@ pub async fn run(
         })
         .await?;
 
-    // Every row the join produces, written through the sink where the
-    // compute plane says.
+    // Every row the join produces, written through the sink.
     let summary = session
         .result_store()
         .write_result_table(

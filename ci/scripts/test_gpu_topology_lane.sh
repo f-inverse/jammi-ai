@@ -17,7 +17,8 @@
 #       whose final line has no newline.
 #   T2  every `PROVE_GROUP_RC name=` the driver writes literally names a
 #       declared gating group, and every declared group is written.
-#   T3  `rp_topology_candidates` over a catalog fixture: every co-located
+#   T3  `rp_fleet_candidates` over the lane's own knobs and a catalog
+#       fixture: every co-located
 #       Global-Networking data center of every type within the rate ceiling,
 #       in preference order; a type above the ceiling or without co-located
 #       capacity is passed over; a named data center narrows the list; none
@@ -108,7 +109,7 @@ CATALOG='{"gpus":[
  {"id":"NVIDIA A100-SXM4-80GB","price":{"secure":1.59},"dataCenters":[{"id":"DC-C","availability":"LOW"}]}
 ]}'
 pick() { # $1=candidate types [$2=named data center]; prints "<rc>|<stdout, one line>"
-  in_driver "TOPOLOGY_GPU_TYPES='$1'; TOPOLOGY_DATA_CENTER='${2:-}'; out=\"\$(rp_topology_candidates '$CATALOG' 'DC-A DC-B DC-C' 2>/dev/null)\"; echo \"\$?|\$(echo \"\$out\" | tr '\n' ' ')\""
+  in_driver "out=\"\$(rp_fleet_candidates '$CATALOG' 'DC-A DC-B DC-C' '$1' \"\$TOPOLOGY_MIN_AVAILABILITY\" \"\$TOPOLOGY_MAX_GPU_RATE\" '${2:-}' 2>/dev/null)\"; echo \"\$?|\$(echo \"\$out\" | tr '\n' ' ')\""
 }
 got="$(pick 'NVIDIA A40|NVIDIA H100 NVL|NVIDIA RTX A6000|NVIDIA A100-SXM4-80GB')"
 check "T3 every co-located place within the ceiling, in preference order" '[ "$got" = "0|NVIDIA RTX A6000|0.53|DC-A NVIDIA RTX A6000|0.53|DC-C NVIDIA A100-SXM4-80GB|1.59|DC-C " ]'

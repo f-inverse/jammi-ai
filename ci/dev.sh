@@ -6,7 +6,7 @@
 #   ci/dev.sh cargo test -p jammi-db
 #   ci/dev.sh cargo clippy --workspace --all-targets
 #   ci/dev.sh --with pg cargo test -p jammi-db --features live-postgres-tests --test it
-#   ci/dev.sh --with pg,s3 cargo test -p jammi-ballista --features live-distributed-tests --test distributed
+#   ci/dev.sh --with pg,s3 cargo test -p jammi-ai --features live-distributed-tests --test distributed
 #   ci/dev.sh --scratch rebase cargo test --workspace     # a target volume that dies with the command
 #   ci/dev.sh --gc                                        # remove what earlier runs left behind
 #

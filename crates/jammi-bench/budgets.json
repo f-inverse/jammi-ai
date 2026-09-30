@@ -22,27 +22,6 @@
       "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
     },
     {
-      "workload": "encode",
-      "edge": "plan-partitioned -> placed",
-      "rule": "fixed_cost",
-      "bound": 49.026,
-      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
-    },
-    {
-      "workload": "encode",
-      "edge": "plan-partitioned -> placed",
-      "rule": "overhead_budget",
-      "bound": 1.645,
-      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
-    },
-    {
-      "workload": "encode",
-      "edge": "plan-partitioned -> placed",
-      "rule": "per_work_cost",
-      "bound": 1.086,
-      "measured_from": "ci/artifacts/parity-ladder-runs/2026-09-23-a100-parity/encode-plane/ladder_verdict.json"
-    },
-    {
       "workload": "train-run",
       "edge": "torch -> resident",
       "rule": "device_memory_ratio",

@@ -102,7 +102,7 @@ pub struct MutantStamp {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RanOn {
     /// The instance that held the work when it finished: `claimed_by` on a
-    /// job, the executor a placed task was bound to, this process otherwise.
+    /// job, this process otherwise.
     pub instance_id: String,
     /// The fleet member's label and host, when the instance registered as a
     /// worker; a process with no worker row carries neither.
@@ -111,11 +111,10 @@ pub struct RanOn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// The role the instance filled — `bench`, `session`, `worker`,
-    /// `submitter`, `executor`, `scheduler`, `query`, `compute` — as the
-    /// rung's topology names it.
+    /// `query`, `compute` — as the rung's topology names it.
     pub role: String,
-    /// The lines and rows that prove it: a scheduler's task binding, a
-    /// submitter's hand-off, a sink's write, the claim's transfer.
+    /// The lines and rows that prove it: the catalog's claim, the claimant's
+    /// own log line.
     #[serde(default)]
     pub evidence: Vec<String>,
 }
@@ -141,12 +140,8 @@ pub struct Stations {
     /// Submit to claim: how long the queued job waited for a claimant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_latency_s: Option<f64>,
-    /// Claim to the attempt beginning where it runs — zero when the
-    /// claimant runs it, the placement round-trip when it is placed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placement_s: Option<f64>,
-    /// The attempt beginning to its training source bound: the training-set
-    /// table materialised and its stream opened.
+    /// The claim to its training source bound: the training-set table
+    /// materialised and its stream opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialization_s: Option<f64>,
     /// The trainer's last write to the artifact published and attested.
@@ -156,9 +151,8 @@ pub struct Stations {
 
 impl Stations {
     /// The stations of a job whose attempt `timeline` the worker recorded:
-    /// from `submitted_at` to the claim, the claim to the attempt beginning,
-    /// the beginning to the training source bound, and the run's
-    /// `completed_at` to the publish.
+    /// from `submitted_at` to the claim, the claim to the training source
+    /// bound, and the run's `completed_at` to the publish.
     pub fn of(
         timeline: &Timeline,
         submitted_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -169,10 +163,9 @@ impl Stations {
         };
         Self {
             claim_latency_s: submitted_at.map(|s| seconds(s, timeline.claimed_at)),
-            placement_s: Some(seconds(timeline.claimed_at, timeline.began_at)),
             materialization_s: timeline
                 .source_bound_at
-                .map(|bound| seconds(timeline.began_at, bound)),
+                .map(|bound| seconds(timeline.claimed_at, bound)),
             publish_s: Some(seconds(completed_at, timeline.published_at)),
         }
     }
@@ -183,7 +176,6 @@ impl Stations {
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct Timeline {
     pub claimed_at: chrono::DateTime<chrono::Utc>,
-    pub began_at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub source_bound_at: Option<chrono::DateTime<chrono::Utc>>,
     pub published_at: chrono::DateTime<chrono::Utc>,

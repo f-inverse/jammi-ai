@@ -1,10 +1,9 @@
 //! The `structure` workload's engine rungs over the synthetic graph
 //! `graph_legs` builds: `generate_structure_embeddings` — an embedding table
-//! from the edge relation alone — at `plan`, `plan-partitioned` and
-//! `placed`, each leg filed with the unit's inputs the PyTorch rung reads:
-//! the edge list and the engine's own seed rows, so the reference starts from
-//! the bytes the engine starts from and what remains between them is the
-//! operator.
+//! from the edge relation alone — at `plan` and `plan-partitioned`, each leg
+//! filed with the unit's inputs the PyTorch rung reads: the edge list and
+//! the engine's own seed rows, so the reference starts from the bytes the
+//! engine starts from and what remains between them is the operator.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -17,20 +16,18 @@ use jammi_ai::pipeline::graph_structure::{
     StructureRequest, DEFAULT_STRUCTURE_BETA, DEFAULT_STRUCTURE_DIMENSIONS, DEFAULT_STRUCTURE_SEED,
     DEFAULT_STRUCTURE_SPARSITY, DEFAULT_STRUCTURE_WEIGHTS,
 };
-use jammi_db::catalog::result_repo::ResultTableRecord;
 
 use crate::capture::{
     cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, vector_rows_digest,
     write_jsonl, write_vector_rows, Takes,
 };
 use crate::graph_legs::{
-    add_graph_sources, augmented_degrees, build_edges, build_nodes, read_sorted_vectors,
-    EngineRung, GraphHost, GraphShape, GraphSources, KeyedRows, DEFAULT_SHAPE, EDGES_FILE,
-    INPUT_DIR, X0_STEM,
+    add_graph_sources, augmented_degrees, build_edges, build_nodes, local_session,
+    read_sorted_vectors, EngineRung, GraphShape, KeyedRows, DEFAULT_SHAPE, EDGES_FILE,
+    EDGES_SOURCE, INPUT_DIR, NODES_SOURCE, X0_STEM,
 };
 use crate::ladder::leg::Take;
-use crate::leg::{Facts, Leg, Measured, Measurement, Payload, Provenance};
-use crate::plane::{PlaneArgs, PlaneParams};
+use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
 use crate::report::{Nullable, Tiers};
 
 /// The encoding one `structure` leg is asked to run: one graph size on one
@@ -61,8 +58,6 @@ pub struct StructureLegParams {
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
-    /// Where the `placed` rung runs.
-    pub plane: PlaneParams,
 }
 
 /// The `structure` leg's payload: what two legs must agree on, and what this
@@ -150,11 +145,11 @@ fn seed_rows(
         .collect())
 }
 
-fn build_request(params: &StructureLegParams, sources: &GraphSources) -> StructureRequest {
+fn build_request(params: &StructureLegParams) -> StructureRequest {
     StructureRequest::new(
-        sources.nodes.clone(),
+        NODES_SOURCE,
         EdgeSourceRef::Registered {
-            source_id: sources.edges.clone(),
+            source_id: EDGES_SOURCE.into(),
             src_column: "src".into(),
             dst_column: "dst".into(),
             type_column: None,
@@ -168,32 +163,6 @@ fn build_request(params: &StructureLegParams, sources: &GraphSources) -> Structu
     .with_beta(params.beta)
     .with_sparsity(params.sparsity)
     .with_seed(params.seed)
-}
-
-/// One encoding of `request` on `host`: the table it committed.
-async fn encode(
-    host: &mut GraphHost,
-    request: &StructureRequest,
-) -> Result<ResultTableRecord, Box<dyn std::error::Error>> {
-    match host {
-        GraphHost::InProcess { session, .. } => {
-            let (table, _) = session
-                .generate_structure_embeddings(request, jammi_db::store::CachePolicy::Bypass)
-                .await?;
-            Ok(table)
-        }
-        #[cfg(feature = "plane")]
-        GraphHost::Placed { .. } => {
-            host.run_placed(
-                jammi_ai::jobs::JobSpec::GraphStructure {
-                    request: request.clone(),
-                    cache: jammi_db::store::CachePolicy::Bypass,
-                },
-                "structure encoding",
-            )
-            .await
-        }
-    }
 }
 
 /// Run one `structure` leg and file it: write the unit's inputs (the edge list
@@ -223,19 +192,10 @@ pub async fn run_leg(
     )?;
 
     let dir = tempfile::tempdir()?;
-    let mut host = GraphHost::stand_up(
-        params.rung,
-        params.partitions,
-        &params.plane,
-        "structure",
-        &format!("structure-nodes{}-r{}", params.nodes, params.take),
-        &["graph_structure"],
-        dir.path(),
-    )
-    .await?;
-    let sources = host.sources().clone();
-    add_graph_sources(host.session(), dir.path(), &sources, &nodes, &edges).await?;
-    let request = build_request(params, &sources);
+    let session =
+        local_session(dir.path(), params.rung.target_partitions(params.partitions)).await?;
+    add_graph_sources(&session, dir.path(), &nodes, &edges).await?;
+    let request = build_request(params);
     let hops = request.hops()?;
 
     // Each iteration's wall in run order, and the last one's table.
@@ -243,15 +203,16 @@ pub async fn run_leg(
     let mut last = None;
     for _ in 0..params.iterations {
         let start = Instant::now();
-        let table = encode(&mut host, &request).await?;
+        let (table, _) = session
+            .generate_structure_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
+            .await?;
         iter_wall_s.push(start.elapsed().as_secs_f64());
         last = Some(table);
     }
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
     let table = last.ok_or("a structure leg needs at least one iteration")?;
-    let rows = read_sorted_vectors(host.session(), &table).await?;
-    let ran_on = host.ran_on(&table.table_name).await?;
+    let rows = read_sorted_vectors(&session, &table).await?;
     let vectors = write_vector_rows(&params.legs_dir, &stem, &rows)?;
 
     let payload = StructurePayload {
@@ -285,11 +246,7 @@ pub async fn run_leg(
         vector_dim: Some(vectors.dim),
         ..Default::default()
     };
-    let provenance = Provenance {
-        ran_on,
-        ..cpu_provenance()
-    };
-    let leg = Leg::new(payload, provenance, measured, Facts::default());
+    let leg = Leg::new(payload, cpu_provenance(), measured, Facts::default());
     let report = leg_report("structure", leg.clone(), |leg| Tiers {
         structure: Some(leg),
         ..Default::default()
@@ -308,9 +265,7 @@ pub struct StructureArgs {
     /// `target_partitions` of the `plan-partitioned` rung.
     #[arg(long, default_value_t = 4)]
     partitions: usize,
-    /// The rungs to run: `plan`, `plan-partitioned`, `placed`; the first two
-    /// by default. `placed` needs `--features plane`, the plane's backends
-    /// in the environment and `--server-bin`.
+    /// The rungs to run: `plan`, `plan-partitioned`; both by default.
     #[arg(long = "rung", value_enum, value_delimiter = ',', default_values = ["plan", "plan-partitioned"])]
     rungs: Vec<EngineRung>,
     /// The embedding width.
@@ -336,8 +291,6 @@ pub struct StructureArgs {
     iterations: usize,
     #[command(flatten)]
     takes: Takes,
-    #[command(flatten)]
-    plane: PlaneArgs,
 }
 
 impl StructureArgs {
@@ -355,7 +308,6 @@ impl StructureArgs {
             legs_dir: self.legs_dir.clone(),
             iterations: self.iterations,
             take,
-            plane: self.plane.clone().into(),
         }
     }
 
@@ -406,7 +358,6 @@ impl StructureArgs {
                         .into_iter()
                         .flat_map(|(flag, value)| [flag.into(), value.into()]),
                 )
-                .chain(PlaneParams::from(self.plane.clone()).child_args())
                 .collect()
             },
         )
@@ -453,7 +404,6 @@ mod tests {
             legs_dir: legs_dir.to_path_buf(),
             iterations: 1,
             take: 1,
-            plane: PlaneParams::default(),
         })
         .await
         .expect("structure leg runs")

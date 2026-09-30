@@ -23,8 +23,7 @@
 //!    `JammiObjectStore::new` only ACCEPTS a driver a caller already built
 //!    (route 3); nothing returns one to caller code.
 //! 2. **Open.** `JammiSession::context()` (`pub`, re-exposed by `jammi-ai`'s
-//!    `InferenceSession::context()`, and held by `jammi-ballista`'s executor
-//!    wiring) hands out the live `SessionContext`, whose default `RuntimeEnv`
+//!    `InferenceSession::context()`) hands out the live `SessionContext`, whose default `RuntimeEnv`
 //!    pre-registers a `LocalFileSystem` rooted at `/` for `file://`, so
 //!    `context().runtime_env().object_store(url)` yields a writable store. A
 //!    registry-level wrapper cannot close this route: DataFusion's

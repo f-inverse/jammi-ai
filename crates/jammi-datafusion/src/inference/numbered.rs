@@ -517,7 +517,6 @@ mod tests {
     use futures::StreamExt;
     use jammi_numerics::ChunkBudget;
 
-    use crate::device::ComputeDeviceKind;
     use crate::error::Error;
     use crate::inference::runtime::stub::{self, StubModel};
     use crate::source::ModelSource;
@@ -574,7 +573,6 @@ mod tests {
             embedding_dim: Some(1),
             regression_form: None,
             passthrough: Vec::new(),
-            device_kind: ComputeDeviceKind::Cpu,
             partitions: NonZeroUsize::MIN,
         }
     }

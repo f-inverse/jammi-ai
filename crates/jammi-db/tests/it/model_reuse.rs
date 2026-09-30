@@ -32,7 +32,7 @@ use test_case::test_case;
 
 use crate::common::{
     adapter_files, backdate_artifact, bundle_dir, files_in, queue_session, running_fine_tune_job,
-    store_over, BASE_MODEL_ID,
+    store_over, BASE_MODEL_ID, FINE_TUNE_KIND,
 };
 
 const WORKER: &str = "reuse-worker";
@@ -385,10 +385,10 @@ async fn a_miss_writes_nothing(backend: BackendKind) {
     assert_untouched("a staged artifact").await;
 }
 
-/// A hit whose attempt guard misses — the lease moved to a successor —
-/// writes nothing: no job status, no `models` row, no second reference. The
-/// published artifact and its bytes are untouched, and the successor's own
-/// reuse then attaches.
+/// A hit whose attempt guard misses — the holder RELEASEd its lease and a
+/// successor claimed the job again — writes nothing: no job status, no
+/// `models` row, no second reference. The published artifact and its bytes
+/// are untouched, and the successor's own reuse then attaches.
 #[test_case(BackendKind::Sqlite ; "sqlite")]
 #[cfg_attr(
     feature = "live-postgres-tests",
@@ -405,17 +405,32 @@ async fn a_lost_lease_hit_writes_nothing_and_leaves_the_bytes_intact(backend: Ba
     let bundle_before = files_in(&bundle_dir(&artifact));
 
     let (job_id, stale_attempt) = running_fine_tune_job(&catalog, WORKER, None).await;
-    let moved = catalog
-        .transfer_claim(
-            &job_id,
-            WORKER,
-            "successor",
-            stale_attempt,
-            Duration::from_secs(3600),
-        )
+    assert!(
+        catalog
+            .release_job_lease(&job_id, WORKER, stale_attempt)
+            .await
+            .unwrap(),
+        "the holder hands its lease back"
+    );
+    // A released row stays `running` with no lease; the reclaim requeues it.
+    assert_eq!(
+        catalog
+            .reclaim_expired_jobs(Duration::from_secs(3600), 5)
+            .await
+            .unwrap(),
+        1,
+        "the released job is requeued"
+    );
+    let successor_attempt = catalog
+        .claim_next("successor", &[FINE_TUNE_KIND], Duration::from_secs(3600))
         .await
-        .unwrap();
-    assert!(moved, "the lease moves to the successor");
+        .unwrap()
+        .expect("the released job is claimable")
+        .attempts;
+    assert!(
+        successor_attempt > stale_attempt,
+        "the successor's claim is a new attempt"
+    );
 
     assert_eq!(
         reuse(&catalog, &job_id, stale_attempt, &definition).await,
@@ -440,7 +455,7 @@ async fn a_lost_lease_hit_writes_nothing_and_leaves_the_bytes_intact(backend: Ba
         .finish_job_reusing_artifact(FinishJobReusingArtifactParams {
             job_id: &job_id,
             instance_id: "successor",
-            attempts: stale_attempt,
+            attempts: successor_attempt,
             definition_hash: &definition.hash(),
             inputs: &definition.anchors,
             output: model_row(&name),

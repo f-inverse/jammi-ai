@@ -19,8 +19,9 @@ built, and what is deliberately not.
    checkpoint give restart.
 4. **Not** the SGD step or gradient exchange as DataFusion operators or aggregates.
 
-Distributor-agnosticism is shown by `jammi-ballista`, a workspace crate that extends Ballista
-at the seams it exposes and executes the engine's operators unchanged.
+A multi-host run is placed by the jobs fleet and gang assembly (§4), with no distributed
+scheduler under the engine; the Ballista compute plane that once carried materializations was
+removed (`DESIGN.md` §9).
 
 ## What is built
 
@@ -33,8 +34,7 @@ at the seams it exposes and executes the engine's operators unchanged.
 | Membership from the catalog (`peer_advertise`, root identity), host admission, the attempt fence, the two-phase round protocol, the assembly-outcome table, released-versus-failed settlement, the per-attempt watchdog | `DESIGN.md` §4 |
 | Partitioned attestation inventory (per-row-group leaf digests) | `crates/jammi-db/src/store/manifest.rs` |
 | Partitioned inference: one plan shape in one process and across a cluster | `crates/jammi-ai/src/operator/inference_exec.rs`, `numbered_input_exec.rs` |
-| The Ballista compute plane: codecs, execution engine, catalog-backed cluster and job state, device placement, a gang as one placed task | `crates/jammi-ballista/` |
-| The `shape-d` Kubernetes topology: scheduler `Deployment`, compute `StatefulSet` with a headless service | `deploy/kubernetes/overlays/shape-d/` |
+| The `shape-d` Kubernetes topology: the base query tier and a compute `StatefulSet` with a headless service | `deploy/kubernetes/overlays/shape-d/` |
 
 Hardware proof runs in three legs (`DESIGN.md` §10): the CPU collective hermetically in CI; a
 single-node two-GPU gang on a rented pod; a two-host gang over a private network. Their
@@ -50,9 +50,5 @@ plane like every other); hard-negative mining and gradient caching at `world_siz
 
 Blocked on upstream releases and tracked in one place
 ([#613](https://github.com/f-inverse/jammi-ai/issues/613)): moving the workspace to the
-DataFusion 55 line, and distributed SQL through `datafusion-distributed`. Ballista's executor
-specification has no accelerator dimension; `jammi-ballista` carries device inventory in the
-engine's own catalog (`compute_executors.devices`) and places device-bound tasks with its own
-distribution policy — an extension at the seam Ballista exposes, the way `jammi-kernels`
-extends candle, never a fork or an upstream request. Two unrelated backlog items are parked,
+DataFusion 55 line, and distributed SQL through `datafusion-distributed`. Two unrelated backlog items are parked,
 not pending: Metal/f16 acceleration (#445) and a Kafka-protocol trigger broker (#478).

@@ -50,7 +50,6 @@ mod parallel_train;
 mod partitioned_inference;
 mod peer_gang;
 mod pipeline;
-mod placed_attempt;
 mod pooling_config;
 mod rank_admission;
 mod read_vectors;

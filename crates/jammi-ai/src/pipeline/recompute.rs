@@ -59,7 +59,7 @@
 //! A statement's replay is the one arm whose output keeps the original's
 //! name: the query is re-issued as `CREATE OR REPLACE TABLE <name> AS
 //! <query>` through the session's statement entry, so it routes — class,
-//! sink, compute plane, tenant — exactly as the statement did. See
+//! sink, tenant — exactly as the statement did. See
 //! `recompute_statement`.
 
 use std::collections::{HashMap, HashSet};
@@ -538,8 +538,7 @@ impl InferenceSession {
     /// TABLE <name> AS <query>` through the session's one statement entry
     /// ([`jammi_db::session::QueryContext::sql`]), so the replay routes
     /// exactly as the statement did: classified at its root, rooted in the
-    /// sink, written where the compute plane says, under the tenant in
-    /// force. The query is re-planned under today's catalog, so it reads
+    /// sink, written under the tenant in force. The query is re-planned under today's catalog, so it reads
     /// every scanned relation's CURRENT rows; the table keeps its name —
     /// `OR REPLACE` builds the new rows beside the old table and moves the
     /// name in one catalog transaction once they are complete, so a replay

@@ -30,10 +30,7 @@ only the wire and pulls no ML stack, versus the embedded engine (`jammi-ai` + it
 default `local` feature) that compiles candle / hf-hub / tokenizers / symphonia.
 Below the engine sit the leaf crates `jammi-numerics` (pure math), `jammi-db`
 (catalog/storage/SQL/index), `jammi-lora` (LoRA primitives), and `jammi-encoders`
-(candle transformers). Above it sits `jammi-ballista` — the Ballista compute
-plane, publishable and lockstep with the rest of the workspace, no cargo
-feature — which depends on `jammi-ai`/`jammi-db`/`jammi-wire` and which
-`jammi-server` depends on unconditionally; above THAT sits `jammi-server`
+(candle transformers). Above it sits `jammi-server`
 (serves the wire over the engine) and `jammi-python` (a local-only PyO3
 cdylib whose remote arm is the bundled pure-Python client).
 
@@ -68,7 +65,6 @@ edges, by design — not a discrepancy.
 ```
 jammi-admin -> jammi-datafusion, jammi-db, jammi-wire
 jammi-ai -> jammi-ai, jammi-datafusion, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
-jammi-ballista -> jammi-ai, jammi-datafusion, jammi-db, jammi-numerics, jammi-test-utils, jammi-wire
 jammi-bench -> jammi-ai, jammi-datafusion, jammi-db, jammi-encoders, jammi-kernels, jammi-lora, jammi-numerics, jammi-test-resources
 jammi-cli -> jammi-admin, jammi-client, jammi-datafusion, jammi-db, jammi-wire
 jammi-client -> jammi-admin, jammi-datafusion, jammi-db, jammi-wire
@@ -79,9 +75,9 @@ jammi-kernels -> jammi-test-resources
 jammi-lora -> jammi-kernels, jammi-numerics, jammi-test-resources
 jammi-numerics
 jammi-python -> jammi-ai, jammi-datafusion, jammi-db, jammi-wire
-jammi-server -> jammi-admin, jammi-ai, jammi-ballista, jammi-client, jammi-datafusion, jammi-db, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
+jammi-server -> jammi-admin, jammi-ai, jammi-client, jammi-datafusion, jammi-db, jammi-numerics, jammi-test-resources, jammi-test-utils, jammi-wire
 jammi-test-resources -> jammi-kernels
-jammi-test-utils -> jammi-datafusion, jammi-db, jammi-test-resources
+jammi-test-utils -> jammi-db, jammi-test-resources
 jammi-wire -> jammi-datafusion, jammi-db, jammi-lora, jammi-numerics
 symbol-index
 ```
@@ -111,9 +107,7 @@ jammi-ai ──► jammi-db, jammi-numerics, jammi-lora, jammi-wire,   [EMBEDDED
              jammi-encoders(opt, `local`), jammi-kernels(opt, `cuda`),
              candle(opt, `local`)
    ▲
-jammi-ballista ──► jammi-ai, jammi-db, jammi-wire        [BALLISTA COMPUTE PLANE — codec, roles, client]
-   ▲
-jammi-server ──► jammi-wire, jammi-ai, jammi-ballista, jammi-db, jammi-numerics  [serves the wire over the engine]
+jammi-server ──► jammi-wire, jammi-ai, jammi-db, jammi-numerics  [serves the wire over the engine]
    │
 jammi-python ──► jammi-ai, jammi-db, jammi-lora                  [LOCAL-ONLY PyO3 cdylib]
 
@@ -123,14 +117,14 @@ jammi-encoders ──► jammi-numerics, jammi-kernels, jammi-lora(features=["ca
 The publish topological order (the canonical DAG statement,
 `.github/workflows/crates.yml`, the publish-order list) is:
 `jammi-numerics → jammi-db → jammi-kernels → jammi-lora → jammi-encoders →
-jammi-wire → jammi-admin → jammi-client → jammi-ai → jammi-ballista → jammi-server → jammi-cli`.
+jammi-wire → jammi-admin → jammi-client → jammi-ai → jammi-server → jammi-cli`.
 `jammi-kernels` sits before `jammi-lora`, not after: `jammi-lora`'s default
 feature set (`default = ["candle"]`, `crates/jammi-lora/Cargo.toml`) enables
 the optional `jammi-kernels` dependency, so `cargo publish -p jammi-lora`
 (no explicit feature flags in the publish step) needs `jammi-kernels` already
 resolvable on crates.io.
 
-Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
+Workspace membership (`Cargo.toml`, `[workspace] members`): 17 members;
 `default-members` excludes `jammi-python` (PyO3 cdylib, built by maturin) and
 `jammi-test-utils`. `jammi-bench` *is* a default member.
 
@@ -153,23 +147,11 @@ Workspace membership (`Cargo.toml`, `[workspace] members`): 15 members;
   (`crates/jammi-cli/src/main.rs`, the crate imports). CI enforces this [§6].
 - **`jammi-server` depends on `jammi-ai` (engine) AND `jammi-wire`**: it mounts
   service impls over the shared engine.
-- **`jammi-ballista` depends on `jammi-ai`/`jammi-db`/`jammi-wire`, never the
-  reverse.** The seams it plugs into — `jammi-db`'s `ComputePlane`
-  (`crates/jammi-db/src/compute_plane.rs`, the one submit client, installed
-  by the client role) and `jammi-datafusion`'s `TrainingRunner`
-  (`crates/jammi-datafusion/src/training/exec.rs`, implemented by the
-  executor role over `JobWorker::run_placed_attempt` and bound by that
-  role's codec to every `TrainingExec` it decodes) — are never called from
-  their own crates' dependency graphs. `jammi-server` depends on `jammi-ballista` unconditionally
-  (no cargo feature): roles are `[ballista]` config, decided at runtime
-  [§2.8f].
-- **`jammi-bench` depends on `jammi-ballista`, `jammi-test-utils`, `jammi-client`
-  and `jammi-admin` only behind its `plane` feature** (`crates/jammi-bench/
-  Cargo.toml`): the ladder's `placed` and `shape-d` rungs host the plane's roles
-  in the bench process (`crate::plane::encode_host`) and spawn or join fleets of
-  `jammi-server` processes (`jammi_test_utils::fleet`, the ONE facility the
-  distributed lane launches its fleets through), submitting a shape-d job over
-  the public client as a user would. The default bench build carries none of
+- **`jammi-bench` depends on `jammi-test-utils`, `jammi-client` and
+  `jammi-admin` only behind its `fleet` feature** (`crates/jammi-bench/
+  Cargo.toml`): the ladder's `shape-d` rungs spawn or join fleets of
+  `jammi-server` processes (`jammi_test_utils::fleet`), submitting a shape-d
+  job over the public client as a user would. The default bench build carries none of
   it; the edges point from the measurement consumer into the engine, never
   back, as every bench edge does.
 - **`jammi-python` depends on `jammi-ai`, `jammi-db`, `jammi-lora`** — no
@@ -534,7 +516,7 @@ retrieval surfaces:
 
 ---
 
-### 1.5 The foundation seams — where Jammi plugs into DataFusion, Ballista and candle
+### 1.5 The foundation seams — where Jammi plugs into DataFusion and candle
 
 Every capability Jammi adds to a foundation sits on an extension point that
 foundation ships for it: no fork, no vendored copy, no upstream patch. The
@@ -546,25 +528,19 @@ maintainer's, with the invariant each seam implementation holds.
 | DataFusion `ExecutionPlan` | `InferenceExec` | `crates/jammi-datafusion/src/inference/exec.rs` | Binds to a model only through `ModelRuntime`/`BoundModel`; a forward is admitted by its device before it runs |
 | DataFusion `ExecutionPlan` | `NumberedInputExec`, `RowCostExec`, `KeyCheckExec` | `crates/jammi-datafusion/src/inference/{numbered,row_cost,key_check}.rs` | Chunks are cut once, by row cost, and carried as `_chunk`; null keys are refused before any forward |
 | DataFusion `PhysicalOptimizerRule` | `InferenceFanOut` | `crates/jammi-datafusion/src/inference/exec.rs` | Restores the node's own declared fan-out after `EnforceDistribution`; the exchange hashes on `_chunk`, so bytes are identical at every width |
-| DataFusion `ExecutionPlan` | `TrainingExec` | `crates/jammi-datafusion/src/training/exec.rs` | A claimed training job as one task, run by the `TrainingRunner` it was bound to |
-| DataFusion `ExecutionPlan` + `ExtensionPlanner` + `UserDefinedLogicalNodeCore` | `ResultTableSinkExec`, `MaterializationPlanner`, `StoreStatementNode` | `crates/jammi-db/src/store/sink.rs`, `crates/jammi-db/src/compute_plane.rs` | Every result table, `CREATE TABLE … AS` included, roots in the one sink; `BuildingTable::finish` is the sole building→ready transition |
+| DataFusion `ExecutionPlan` + `ExtensionPlanner` + `UserDefinedLogicalNodeCore` | `StoreStatementExec`, `MaterializationPlanner`, `StoreStatementNode` | `crates/jammi-db/src/store/statement.rs`, `crates/jammi-db/src/store/sink.rs` | Every result table, `CREATE TABLE … AS` included, is written through the one sink (`ResultStore::write_result_table`); `BuildingTable::finish` is the sole building→ready transition |
 | DataFusion `ExecutionPlan` | `VectorSearchExec`, `AsofJoinExec`, `InitialStateExec`/`HopFoldExec`/`ReadoutExec` | `crates/jammi-ai/src/operator/`, `crates/jammi-ai/src/pipeline/{asof,graph_propagation}/` | Out-of-core under the session pool; graph hops walk with an explicit work stack |
 | DataFusion `TableProvider` | `MaskedTableProvider`, `MutableTableProvider` | `crates/jammi-db/src/store/masked_provider.rs`, `crates/jammi-db/src/store/mutable/provider.rs` | A versioned read resolves one version; mutable tables expose CRUD through DML only |
 | DataFusion UDF/UDAF/UDTF | `annotate`, `jammi_content_hash`, `vector_{mean,sum,max}` | `crates/jammi-ai/src/query/` | Pure functions of their inputs |
 | DataFusion `MemoryPool` | `ActiveSpillPool` | `crates/jammi-db/src/memory_pool.rs` | A spilling consumer is held to an equal share among the consumers actually holding memory |
-| Ballista `PhysicalExtensionCodec` | `JammiCodec` | `crates/jammi-ballista/src/codec.rs` | Writes a magic prefix no prost message can start with; every other node crosses through Ballista's codec unchanged |
-| Ballista `TaskDistributionPolicy::Custom` | `DevicePlacement` | `crates/jammi-ballista/src/placement.rs` | A stage binds only to an executor that registered the device kind its plan requires (the one `required_device_kind` predicate) |
-| Ballista `ExecutionEngine` | `JammiExecutionEngine` | `crates/jammi-ballista/src/engine.rs` | Wraps the default engine; refuses a stage whose required device kind is not this executor's |
-| Ballista `ClusterState`/`JobState` | `CatalogClusterState`, `CatalogJobState` | `crates/jammi-ballista/src/cluster.rs` | Catalog rows are every scheduler's view of the fleet; execution graphs are never persisted, and a lost executor fails its jobs to Jammi's reclaim |
 | candle `CustomOp1/2/3` | the fused kernels | `crates/jammi-kernels/src/ops/` | Every kernel has a CPU reference arm; candle's eager composition is the fallback |
 | candle `CudaDevice::cublas_handle` | `open_cuda` | `crates/jammi-kernels/src/device.rs` | Every CUDA device holds cuBLAS reductions to the compute type (`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`), so a split-K GEMM adds its partial sums in `f32` and rounds once, as an unsplit one does, whatever the card's heuristic picks; the `CUDA devices open through open_cuda` guard refuses any other way of opening one |
 
 Two rules hold across every row:
 
 - **Ownership stays on Jammi's side.** Attempts, retries, terminal writes and
-  who may write a row are Jammi's discipline. The foundation's own retry
-  loops are off (Ballista's `task_max_failures = stage_max_failures = 0`,
-  `crates/jammi-ballista/src/roles.rs`).
+  who may write a row are Jammi's discipline, never a foundation's own
+  retry loop.
 - **A new capability starts from a seam.** When the foundation ships no
   extension point for what a change needs, that is a design fork to resolve
   (`docs/guide/src/engineering.md`, "Deciding at a fork"). Forking or
@@ -657,12 +633,6 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   `RegressionLoss`, `ClassificationLoss`, `LrSchedule`, `FineTuneMethod`,
   `HardNegativeConfig` — re-exported at `jammi_ai::fine_tune::*` so a client builds a
   training request without candle.
-- **`jammi.ballista.v1` is a SEPARATE package, not part of the frozen
-  `jammi.v1.*` surface** [§1.3] — it crosses a Ballista scheduler/executor
-  boundary inside one cluster's own processes, never a client/server wire a
-  foreign consumer decodes, so `jammi-ballista` (the crate that speaks
-  Ballista's wire) owns its shape outright, compiled by its own `build.rs`
-  [§2.8f].
 
 ### 2.3 Storage, catalog & SQL (`jammi-db`)
 
@@ -697,40 +667,19 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   that may hold the file. Migration `027_result_table_lease`
   adds `result_tables.writer_id` / `lease_expires_at` + `idx_result_tables_lease`
   for the lease module below.
-- **Migration `038_compute_cluster_state`** (`schema.rs`; ordered after BOTH
-  `035_instances_peer_addr_result_root` and
-  `037_jobs_assembly_failures_next_after`, asserted on both backends by
-  `tests/it/migrations.rs::migration_038_is_ordered_after_035_and_037_and_creates_compute_tables`)
-  — the catalog-backed cluster state `jammi-ballista`'s scheduler role reads/
-  writes [§2.8f]: distributor-neutral, no `ballista` in any
-  identifier. `compute_executors` (`executor_id` PK, `instance_id`,
-  `host`/`port`/`grpc_port`, `task_slots`/`available_slots`, `status`,
-  `heartbeat_at`, `metadata`, and **`devices`** — JSON `[{kind, ordinal}]`,
-  the executor's OWN registration fact and the placement join's ONLY
-  authority: `Catalog::list_compute_executor_devices` reads THIS column
-  directly, never `workers.devices` and never a join on `instance_id`, since
-  an executor process and a `[worker]` process are different roles that may
-  see different device sets); `compute_jobs` (`job_id` PK, `owner`,
-  `status`, `queued_at`, `updated_at` — ownership/status only, since the
-  execution GRAPH itself has no serialisation in Ballista 54.1); `ALTER
-  TABLE workers ADD COLUMN devices` — a `ListWorkers` MIRROR only, surfaced
-  as `WorkerSummary.devices` (field 8, `repeated DeviceFact {kind,
-  ordinal}`, additive to the frozen RPC surface), never the placement
-  join's authority.
-  `compute_repo.rs` (generic CRUD, no distributor vocabulary):
-  `upsert_compute_executor`, `list_compute_executors`,
-  `record_compute_heartbeat`, `remove_compute_executor`,
-  `adjust_compute_slots`/`bind_compute_slots` (the placement policy's slot
-  CAS), `put_compute_job`/`get_compute_job`/`list_compute_jobs`/
-  `delete_compute_job`, `list_compute_executor_devices`.
+- **Migration `038_compute_cluster_state`** (`schema.rs`) — `ALTER TABLE workers ADD
+  COLUMN devices`, the worker's device inventory surfaced as `WorkerSummary.devices`
+  (field 8, `repeated DeviceFact {kind, ordinal}`); the two tables it also created,
+  `compute_executors` and `compute_jobs`, are dropped by
+  **`047_drop_compute_cluster_state`** (asserted by
+  `tests/it/migrations.rs::migration_038_adds_worker_devices_and_047_drops_its_compute_tables`).
 - **Migration `039_canonical_stamps`** (`schema.rs`; `catalog::lease`'s
   `CANONICAL_STAMP` — `YYYY-MM-DDTHH:MM:SS.ffffffZ`, UTC, exactly six
   fraction digits) — the ONE catalog stamp shape, enforced at the schema
   edge on both backends for `jobs.{lease_expires_at, next_assembly_after,
   updated_at, created_at}`, `instances.{last_seen_at, started_at}`,
   `result_tables.{lease_expires_at, created_at}`,
-  `result_table_versions.lease_expires_at`, `compute_executors.heartbeat_at`,
-  `models.{created_at, updated_at}`, `applied_migrations.applied_at`.
+  `result_table_versions.lease_expires_at`, `models.{created_at, updated_at}`, `applied_migrations.applied_at`.
   SQLite: a `BEFORE INSERT`/`BEFORE UPDATE OF <col>` trigger per column
   (shape only — SQLite has no calendar parser); Postgres: `CHECK` per column
   (shape AND `::timestamptz` cast validity), named
@@ -2248,8 +2197,8 @@ Per-variant subtleties:
   model)` — `latest_ready_table_for`.
 - **`Statement`** is the one arm whose output keeps the original's name: `recompute_statement`
   re-issues `CREATE OR REPLACE TABLE <name> AS <query>` through the session's statement entry
-  (`QueryContext::sql` → `StatementClass` → the sink node), so the replay routes — class, sink,
-  compute plane, tenant — exactly as the statement did; the re-planned query reads every
+  (`QueryContext::sql` → `StatementClass` → the sink), so the replay routes — class, sink,
+  tenant — exactly as the statement did; the re-planned query reads every
   scanned relation's current rows and `create_table_as` records fresh unpinned anchors on
   them. `create_table_as` carries no cache dial, so the outcome is unconditionally `Computed`.
 - **`AsofJoin`** rebuilds the spec via `AsofJoinSpecBuilder` and reports
@@ -4240,169 +4189,6 @@ disagreement naming both digests on every rank, never a wrong fold
 accept and ignore it; `Local` and `Peer` bind once (the same digest again
 is a no-op, a different one a typed error).
 
-### 2.8f `jammi-ballista` — the Ballista compute plane
-
-`jammi-ballista` sits between the
-engine (`jammi-ai`/`jammi-db`/`jammi-wire`) and `jammi-server`
-(`crates/jammi-ballista/src/lib.rs`'s crate doc): publishable, lockstep
-with the rest of the workspace, no cargo feature — a process's role is
-`[ballista]` config (§2.1 above), decided at runtime by `jammi-server`.
-
-- **`JammiCodec`** (`codec.rs`, `PhysicalExtensionCodec`) — encodes
-  `VectorSearchExec`/`AsofJoinExec`/`KeyCheckExec` as prost
-  messages of a package it compiles itself, `jammi.ballista.v1`, and frames
-  `InferenceExec`/`NumberedInputExec` and `TrainingExec` in the wire forms
-  `jammi-datafusion` owns (`jammi_datafusion::inference::wire`, package
-  `jammi.inference.v1`; `jammi_datafusion::training::wire`, package
-  `jammi.training.v1`) under the same
-  magic and tag
-  (`build.rs`) — **not** part of the frozen `jammi.v1.*` surface [§1.3]:
-  this package crosses a scheduler/executor boundary INSIDE one cluster's
-  own processes, never a client/server wire a foreign consumer decodes, so
-  the crate that speaks Ballista's wire owns its shape outright, with none
-  of the frozen surface's cross-release compatibility obligations. Every
-  buffer this codec writes starts with a 4-byte magic (`codec.rs`'s module
-  doc: an illegal prost tag byte, so it can never alias a buffer Ballista's
-  own codec wrote); an unmagicked buffer delegates whole to
-  `BallistaPhysicalExtensionCodec` — the ONLY way Ballista's own nodes
-  cross the wire. Decode rebuilds each operator through its public
-  constructor against the DECODING process's own `InferenceSession` (a
-  `Weak` reference).
-- **`JammiExecutionEngine`** (`engine.rs`) wraps Ballista's
-  `DefaultExecutionEngine` and adds two duties before delegating: a stage
-  containing a `TrainingExec` must be single-partition (one attempt is one
-  task, never a multi-partition fan-out); a stage whose required device kind (an
-  `InferenceExec`'s or a `TrainingExec`'s stamped `device_kind`) differs from this executor's own
-  `InferenceSession::compute_device()` is refused typed (device
-  pinning), never silently run on the wrong device.
-- **Roles** (`roles.rs`): `host_scheduler`/`host_executor` build a
-  `SchedulerRole`/`ExecutorRole` served on jammi's own shutdown — never
-  Ballista's own `start_server`/`start_executor_process`, which install
-  their own `ctrl_c` handlers and would race the server's two-mode
-  shutdown. `host_scheduler` takes a `BallistaCluster`/
-  `TaskDistributionPolicy` pair as parameters ONLY so an in-memory cluster
-  + a bare policy stay reachable as a test fixture — `jammi-server`'s own
-  hosting always passes `BallistaCluster::new(CatalogClusterState,
-  CatalogJobState)` and `TaskDistributionPolicy::Custom(DevicePlacement)`;
-  there is no knob, the catalog-backed pair is the shipped scheduler,
-  never the in-memory one. The client role installs the session's
-  `jammi_db::compute_plane::ComputePlane` over `client.rs`; the executor
-  role's codec runs training (`JammiCodec::running_training`) and the role
-  writes this process's own device
-  claim to its `compute_executors` row right after registering.
-- **Client** (`client.rs`) — the one submit client, the two verbs the
-  client role's `ComputePlane` makes: `unheld`, the admission — a pure
-  predicate (`unheld_by`) over the plan's own requirements
-  (`engine::plan_requirements`: the device KIND a node is stamped with,
-  `InferenceExec::device_kind` or `TrainingJob::device_kind`, "cpu" is a
-  kind too; and a gang's own submitter as the executor it must not land
-  on) and the LIVE inventory, refusing typed BEFORE submitting when no
-  live registered executor can hold the plan, reading the same catalog
-  `DevicePlacement` reads from and applying the same liveness predicate
-  the binder applies (`cluster::executor_is_live`:
-  `Active` status and a `heartbeat_at` within `executor_liveness_window()`,
-  derived at run time from Ballista's own default executor timeout — a row a SIGKILLed executor left
-  behind stops admitting plans after the window, a `Terminating` one at
-  once) — `JammiExecutionEngine`'s own device-pinning refusal above
-  is the second line, never a silent mis-run; and `place`, the submission
-  itself. A placed task's failure
-  arrives as the string Ballista copied from hop to hop; when it carries
-  the `jammi_wire::TaskErrorEnvelope` the engine wrote, this seam hands
-  the caller the typed `JammiError` back (`restore_task_error`, applied to
-  the job's terminal failure and to the stream), a stale or malformed
-  envelope as the typed `IncompatibleFormat` refusal, and a foreign
-  failure as the string it is.
-- **`CatalogClusterState`/`CatalogJobState`** (`cluster.rs`) — the
-  catalog-backed `ballista_scheduler::cluster::{ClusterState, JobState}`
-  over `jammi_db::catalog::compute_repo`'s generic, distributor-neutral CRUD
-  [§2.3]. Execution graphs are never persisted (Ballista 54.1 has no
-  graph serialisation): a scheduler restart keeps executor registrations
-  and job STATUS rows, but an in-flight job is re-run through jammi's own
-  reclaim, never revived by Ballista.
-- **`DevicePlacement`** (`placement.rs`, `TaskDistributionPolicy::Custom`)
-  — round-robin over executor slots with three refinements: never binds a
-  `TrainingExec` stage to the executor equal to its own `submitter` (deadlock
-  avoidance); a stage binds only to an executor whose OWN registered
-  devices list its `PlacedAttempt.device_kind`/`InferenceExec::
-  device_kind()` (a CPU-stamped stage binds a CPU executor, never only a
-  GPU refinement); a `TrainingExec` stage whose job row is already
-  `claimed_by` a DIFFERENT executor is never bound at all (the bind-time
-  half of the re-launch guard, §2.8g below).
-
-### 2.8g The placed training attempt — `transfer_claim` and the hand-off arms
-
-Under Ballista placement a claimed training attempt of ANY kind — a
-`fine_tune` of any world size, a `graph_fine_tune`, a `context_predictor` —
-runs as ONE task, `TrainingExec` over a `TrainingJob { job_id, attempt,
-submitter, device_kind, claimed_at }` (`crates/jammi-datafusion/src/training/`), placed
-by the scheduler on an executor of the claimant's device kind other than the
-submitter. Where an attempt runs is a property of the attempt; how many ranks
-share it is the spec's `world_size`, which the job does not carry —
-the executor re-derives the run, its kind and its topology from the job's
-row. The claimant submits the task
-through the session's `ComputePlane` (installed by the client role) — the
-same seam a materialization's plan goes through, the attempt's admission
-being the plan's own requirements — and the executor runs it through the
-`TrainingRunner` its codec bound the decoded node to (the executor role's,
-over `JobWorker::run_placed_attempt`); every other process's codec binds
-`NoTrainingRunner`, a typed refusal — `jammi-ai` never depends on
-`jammi-ballista`.
-
-**The submitting host's holder.** `Holder` (`worker.rs`) gains
-`Awaiting { job_id, attempt }` beside `Free`/`ClaimProbe`/`JobRun`/`Rank`
-(`worker.rs`): a claimant that is submitting its attempt (the move precedes the submit) or is
-awaiting its stream runs no compute for that attempt, so it can still serve
-a `RunRank` session for some OTHER attempt — `HostAdmission::
-try_hold_rank` admits out of `Awaiting` exactly as it does out of `Free`; a
-two-host fleet could not otherwise assemble a `Peer` gang if its only
-free-looking host were the one awaiting its own placement result.
-`probe_claim` still refuses `Awaiting`, exactly like `JobRun`.
-
-`submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs`) submits the descriptor and awaits the
-stream; its exit arms are total — `submit_placed` (`crates/jammi-ai/src/fine_tune/worker.rs`) documents them: the stream ends
-with at least one batch → `WorkerJobError::HandedOff` (the executor owns
-the attempt now: no terminal write, no release); the stream ends in an
-error or with no batch → re-read the row — `claimed_by` still this
-instance → `Abandoned` (left `running` for reclaim, an attempt spent at the
-successor's claim); `claimed_by` moved → `HandedOff` (the executor's own
-lease expiry requeues it, never this instance's).
-
-`transfer_claim` (`crates/jammi-db/src/catalog/jobs_repo.rs`) is the hand-off: an `UPDATE` guarded by FOUR conjuncts —
-`claimed_by = $from` (a stale runner, or a SECOND launch of the same task
-via Ballista's own reset-on-`ExecutorLost`, cannot transfer a claim it does
-not hold — the re-launch guard's second half, `DevicePlacement`'s bind-time
-refusal above being the first); `attempts = $attempts` (an older attempt
-cannot transfer past a newer one); `status = 'running'`; the lease is LIVE
-(`lease_live_clause`, a POSITIVE `IS NOT NULL AND ... > now`, never the
-`OR`-shaped `lease_expired_clause` a RECLAIM sweep uses — a RELEASE's `NULL`
-must FAIL a transfer, the opposite of how a reclaim sweep reads that same
-`NULL`). `attempts`/`releases` are untouched by design: a hand-off is zero
-net attempts, never a re-claim.
-
-`run_placed_attempt` (`crates/jammi-ai/src/fine_tune/worker.rs`, called from the
-executor role's `TrainingRunner`) — (i) takes this host's job slot
-through `HostAdmission::probe_claim` (a host already holding a rank, a
-loop-claimed job, or another placement refuses typed BEFORE any row write,
-); (ii) `transfer_claim`s the row from the descriptor's submitter to
-this instance at the SAME `attempts`; (iii) runs `run_claimed_job_under`
-VERBATIM under the holder `lease_holder_for` derives on THIS host — the SAME
-body the attempt's claimant would run for the row's kind — so the published
-bytes are the in-process run's (a context predictor's initial weights are a
-function of the spec's seed, `pipeline/seeded_init.rs`, which is what makes
-that hold for a kind with no seeded LoRA init); (iv) maps the
-body's `AttemptEnd` to `PlacedOutcome`
-(`Trained`/`Reused`; `Failed` is a typed `Err` carrying the attempt's own
-error, which the row already records and which reaches the submitter as the
-task's error through `jammi_wire::TaskErrorEnvelope`; `LeftForReclaim` is a
-typed `Err` too, so the Ballista task itself ends in error and Ballista's
-own `task_max_failures = 0` never re-runs it — jammi's own reclaim, from a
-future claim, is the only path back). The writer table (`worker.rs`'s module doc, "Runner roles and the
-job-row writers") states this as two more rows: the SUBMITTER after
-`HandedOff` writes NOTHING (the row and its lease-keeper registration are
-the placed executor's now); the EXECUTOR running `run_placed_attempt` writes
-as the holder derived on its own host — the same body as every
-`LeaseHolder`-gated site above it [§2.8e].
-
 ### 2.9 Numerics (`jammi-numerics`)
 
 - **`NumericsError` / `Result`** — `crates/jammi-numerics/src/error.rs`. The only
@@ -4500,22 +4286,18 @@ as the holder derived on its own host — the same body as every
    `update_result_table_status(Ready, rows)` (stamps `completed_at`).
 
 (The `EmbeddingPipeline` path, `crates/jammi-ai/src/pipeline/embedding.rs`, is the
-production driver. It creates the row, then writes through the ONE node every result-table
-producer roots in — `jammi_db::store::ResultTableSinkExec` (`crates/jammi-db/src/store/sink.rs`),
-via `ResultStore::write_result_table` — over the inference plan: the sink filters OK rows into
-the embedding schema, hands their vectors to a `SegmentBuilder` (segments of
-`embedding.index_segment_rows` consecutive rows, each built on its own thread in row order),
-checkpoints the row every `checkpoint_interval` batches, appends the built segments in order,
-and reports one summary batch (`input_rows`, `rows`, `segment_ids`); the pipeline then `finish`es
-the row with the manifest. Where the sink runs is decided when it is polled: under a session
-carrying a `ComputePlane` that holds the plan it submits itself whole and the executor writes
-the bytes under the row's lease — `SinkLease::take` transfers the row from the submitter's
-writer id to the executor's by CAS, `hand_back` returns it, `fail` retires it under the
-executor's own id — and the submitter takes a fresh keeper hold (`BuildingTable::rehold`) when
-the summary returns; otherwise it writes in-process under the same lifecycle. The same node,
-with `SinkKind::Rows`, is what `infer`, `asof_join` and `CREATE TABLE … AS` write through;
-`SinkKind::TrainingSet` is the training-set producer's; a refresh writes its version fragment
-through `ResultStore::write_version_fragment` under the version row's lease.)
+production driver. It creates the row, then writes through the ONE sink every result-table
+producer writes through — `ResultStore::write_result_table` (`crates/jammi-db/src/store/sink.rs`)
+— over the inference plan: the sink filters OK rows into the embedding schema, hands their
+vectors to a `SegmentBuilder` (segments of `embedding.index_segment_rows` consecutive rows,
+each built on its own thread in row order), checkpoints the row every `checkpoint_interval`
+batches, appends the built segments in order, and reports a `SinkSummary` (`input_rows`,
+`rows`, `segments`, the producing environment); the pipeline then `finish`es the row with the
+manifest. The write borrows the caller's `BuildingTable` and, on any failure, aborts it in
+place — the row fails under the caller's writer and the bytes the write put under it are
+deleted. With `SinkKind::Rows` the same sink is what `infer`, `asof_join` and `CREATE TABLE …
+AS` write through; `SinkKind::TrainingSet` is the training-set producer's; a refresh writes its
+version fragment through `ResultStore::write_version_fragment` under the version row's lease.)
 
 ### 3.4 annotate(...) — model inference as a SQL relation
 

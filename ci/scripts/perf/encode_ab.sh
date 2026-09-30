@@ -65,12 +65,7 @@
 #                           venv). 0: they stop at the Parquet file, and their
 #                           legs say so.
 #   ENCODE_AB_RUNGS         the engine rungs, comma-separated (default
-#                           `direct,plan,plan-partitioned`); the plane's
-#                           `placed` and `shape-d` join them when named —
-#                           built with the plane, over the pinned Postgres
-#                           catalog and S3-class store (`pg_test_catalog.sh`,
-#                           `s3_test_store.sh`) this run starts, with a
-#                           `jammi-server` fleet built beside the bench.
+#                           `direct,plan,plan-partitioned`).
 #   ENCODE_AB_ITERS         serves per rung, every one timed and filed (default
 #                           64; even — the rungs are interleaved — and at least
 #                           the ladder's minimum run, 32: the ladder cuts each
@@ -100,12 +95,10 @@ ENCODE_AB_TORCH_ANN_INDEX="${ENCODE_AB_TORCH_ANN_INDEX:-1}"
 ENCODE_AB_ITERS="${ENCODE_AB_ITERS:-64}"
 ENCODE_AB_RUNGS="${ENCODE_AB_RUNGS:-direct,plan,plan-partitioned}"
 IFS=',' read -r -a RUNGS <<< "$ENCODE_AB_RUNGS"
-FLEET=0
 for rung in "${RUNGS[@]}"; do
   case "$rung" in
     direct|plan|plan-partitioned) ;;
-    placed|shape-d) FLEET=1 ;;
-    *) echo "::error::ENCODE_AB_RUNGS names '$rung'; the engine rungs are direct, plan, plan-partitioned, placed, shape-d." >&2; exit 2 ;;
+    *) echo "::error::ENCODE_AB_RUNGS names '$rung'; the engine rungs are direct, plan, plan-partitioned." >&2; exit 2 ;;
   esac
 done
 ENCODE_AB_CUDA_ORDINAL="${ENCODE_AB_CUDA_ORDINAL:-}"
@@ -139,37 +132,16 @@ run_cmd() {
 }
 
 # A CUDA ordinal pulls in the engine's CUDA backend — without it `--cuda`
-# has no device to select; a plane rung pulls in the plane, and the fleet
-# its jobs run on is built with the same kernels and the S3 driver. Each
-# shape is its own literal invocation: the feature-closure and reachability
-# guards read these lines as written.
-SERVER_BIN="$TARGET_DIR/release/jammi-server"
+# has no device to select. Each shape is its own literal invocation: the
+# feature-closure and reachability guards read these lines as written.
 if [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
-  case "${ENCODE_AB_CUDA_ORDINAL:+cuda}:$FLEET" in
-    cuda:1)
-      run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn,plane --manifest-path "$REPO_ROOT/Cargo.toml" \
-        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
-      run_cmd cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
-        || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; } ;;
-    cuda:0)
-      run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
-        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; } ;;
-    :1)
-      run_cmd cargo build --release -p jammi-bench --features plane --manifest-path "$REPO_ROOT/Cargo.toml" \
-        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
-      run_cmd cargo build --release -p jammi-server --bin jammi-server --features storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
-        || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; } ;;
-    :0)
-      run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
-        || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; } ;;
-  esac
-fi
-
-# A plane rung's catalog and store: the pinned Postgres and S3-class store,
-# started for this run and stopped with it.
-if [ "$FLEET" = 1 ] && [ "$ENCODE_AB_DRY_RUN" != "1" ]; then
-  source "$DIR/plane_backends.sh"
-  plane_backends_up "$OUT_DIR/plane"
+  if [ -n "$ENCODE_AB_CUDA_ORDINAL" ]; then
+    run_cmd cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+  else
+    run_cmd cargo build --release -p jammi-bench --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench failed" >&2; exit 1; }
+  fi
 fi
 
 # --- provenance cross-check, same shape as
@@ -233,7 +205,6 @@ run_jammi_legs() {
   [ -n "$ENCODE_AB_TAKE" ] && cmd+=(--take "$ENCODE_AB_TAKE")
   local rung
   for rung in "$@"; do cmd+=(--rung "$rung"); done
-  [ "$FLEET" = 1 ] && cmd+=(--server-bin "$SERVER_BIN")
   # `--model-dir`/`--cuda` are OMITTED entirely when unset, so the hermetic
   # default (the compiled-in fixture on `Device::Cpu`) is the flagless run.
   [ -n "$ENCODE_AB_MODEL_DIR" ] && cmd+=(--model-dir "$ENCODE_AB_MODEL_DIR")

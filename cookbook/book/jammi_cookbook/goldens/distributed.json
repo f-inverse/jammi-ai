@@ -22,13 +22,5 @@
   "peer_w2_max_loss_diff": {
     "tol": 1e-06,
     "value": 1.9073486301479647e-07
-  },
-  "placed_w2_max_embedding_diff": {
-    "tol": 1e-06,
-    "value": 3.725290298461914e-09
-  },
-  "placed_w2_max_loss_diff": {
-    "tol": 1e-06,
-    "value": 1.9073486301479647e-07
   }
 }

@@ -94,10 +94,10 @@ class CpuLaddersDryRun(unittest.TestCase):
         self.assertIn("graph-fixture --nodes-per 64 --out", done.stdout)
         self.assertRegex(done.stdout, r"ladder graph-sample \S+ --from torch --to sampler --out \S+ --law-dir \S+/legs/law")
 
-    def test_the_planes_rungs_run_on_the_fleet_and_the_verdict_spans_them(self):
-        done = run(CPU_AB_WORKLOAD="predictor-train-run", CPU_AB_UNITS="1", CPU_AB_RUNGS="in-process,placed,shape-d")
+    def test_the_job_rungs_run_where_they_are_named_and_the_verdict_spans_them(self):
+        done = run(CPU_AB_WORKLOAD="predictor-train-run", CPU_AB_UNITS="1", CPU_AB_RUNGS="in-process,job,shape-d")
         commands = dict(re.findall(r"^--- (\S+): (.*)$", done.stdout, flags=re.M))
-        self.assertIn("--server-bin", commands["placed__1__r1"])
+        self.assertNotIn("--server-bin", commands["job__1__r1"])
         self.assertIn("--server-bin", commands["shape-d__1__r2"])
         self.assertNotIn("--server-bin", commands["in-process__1__r1"])
         self.assertRegex(done.stdout, r"ladder predictor-train-run \S+ --from torch --to shape-d ")

@@ -1,6 +1,5 @@
 mod api_freeze;
 mod audit_master_key;
-mod ballista_roles;
 mod common;
 mod composability_seam;
 mod flight_annotate;

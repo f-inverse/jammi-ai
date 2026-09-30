@@ -1,7 +1,7 @@
 # 69 — The parity ladder
 
 How the engine shows that a workload run through its whole stack — candle kernels, the trainer,
-a DataFusion plan, a Ballista placement — is as fast, as small, and learns as well as the same
+a DataFusion plan, the jobs fleet — is as fast, as small, and learns as well as the same
 workload in PyTorch, and how much each layer of the stack costs.
 
 ## The problem with a single comparison
@@ -20,13 +20,13 @@ differ by exactly one layer. A ladder has as many rungs as its workload has laye
 
 | workload | artifact | rungs, in order |
 |---|---|---|
-| `encode` | one vector per key | `torch` → `direct` (the loaded model called on the same texts, no plan) → `plan` (DataFusion, 1 partition) → `plan-partitioned` (N partitions) → `placed` (the same plan on a Ballista executor) → `shape-d` (the deployed topology: the serve through the query tier, on a compute process) |
+| `encode` | one vector per key | `torch` → `direct` (the loaded model called on the same texts, no plan) → `plan` (DataFusion, 1 partition) → `plan-partitioned` (N partitions) |
 | `train-step` | one optimizer step's cost over a synthetic batch, swept over shapes; on the `torch` edge, gradient agreement at shared weights | `torch` → `reference` (the engine on the training reference arm: the flash cascade and the fused AdamW step off) → `fused` |
-| `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident` (the trainer over in-memory rows) → `streamed` (the job path: training-set table, streaming loader) → `placed` (the same job as a gang on an executor) → `shape-d` (the deployed topology) |
+| `train-run` | an adapter and a held-out loss trajectory, from a pair table | `torch` → `resident` (the trainer over in-memory rows) → `streamed` (the job path: training-set table, streaming loader) → `shape-d` (the deployed topology: the job claimed by a compute process) |
 | `graph-sample` | a pair table, from random walks over a graph | `torch` (PyTorch Geometric's node2vec walk sampler) → `sampler` (the engine's graph sampler) |
-| `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` → `placed` |
-| `structure` | one structure vector per node, from the edge relation alone | `torch` (an exact evaluation of the engine's operator from the engine's own seed rows: the lazy walk, each block normalised then weighed) → `plan` (the engine's encoding, 1 partition) → `plan-partitioned` → `placed` |
-| `predictor-train-run` | a context predictor's weights and a held-out loss trajectory | `torch` → `in-process` → `placed` (the same training as a job, placed on an executor) → `shape-d` (the deployed topology: the job claimed by a compute process) |
+| `propagate` | one propagated vector per node | `torch` (exact propagation by sparse matrix product) → `torch-geometric` (PyG's propagation layer: the practical bar) → `plan` (the engine's propagation, 1 partition) → `plan-partitioned` |
+| `structure` | one structure vector per node, from the edge relation alone | `torch` (an exact evaluation of the engine's operator from the engine's own seed rows: the lazy walk, each block normalised then weighed) → `plan` (the engine's encoding, 1 partition) → `plan-partitioned` |
+| `predictor-train-run` | a context predictor's weights and a held-out loss trajectory | `torch` → `in-process` → `job` (the same training as a job in this process) → `shape-d` (the deployed topology: the job claimed by a compute process) |
 
 A **composite workload is cut at its committed intermediate artifact**, so each ladder compares
 one thing. Graph-supervised fine-tuning is `graph-sample` ∘ `train-run`: its training half is the
@@ -317,7 +317,7 @@ law, gradient structure, and a revision's own in-session noise band.
 
 | where | what runs | verdict |
 |---|---|---|
-| every change (hermetic, CPU) | exact edges over the tiny fixtures: outcome digests equal across `direct`/`resident` … `placed` (`--axes outcome`); the kernel-arm derivation on the tiny BERT and ModernBERT fixtures; the committed campaigns and sweeps as oracles | hard |
+| every change (hermetic, CPU) | exact edges over the tiny fixtures: outcome digests equal across `direct`/`resident` … `plan-partitioned` (`--axes outcome`); the kernel-arm derivation on the tiny BERT and ModernBERT fixtures; the committed campaigns and sweeps as oracles | hard |
 | nightly (hosted CPU) | exact-edge overhead ratios, fixed and per-work. Both legs of a ratio run interleaved in one process on one box, so the box's speed cancels and no absolute rate is committed | evidence until measured |
 | on demand (one GPU, one session) | the full ladder including the `torch` rung, at the shapes the performance guide reports (`ci/scripts/perf/finetune_step_ab.sh` for `train-step`); the torch edge of `train-run` with its control and mutant columns (`finetune_run_ab.sh`); the `encode` revision edge of this checkout against its merge-base with a rebuilt base as the A/A null (`gpu_inference_ab.sh`) | the `torch` edges' outcome rules are hard, their speed and space bars evidence until measured; the revision edge's band is hard; committed as an artifact |
 

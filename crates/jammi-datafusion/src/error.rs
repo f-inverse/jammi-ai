@@ -29,20 +29,9 @@ pub enum Error {
          audio_embedding, classification, ner, regression"
     )]
     UnknownTask(String),
-    /// A device-kind spelling no [`ComputeDeviceKind`](crate::ComputeDeviceKind) has.
-    #[error("unknown device kind '{0}'; expected one of: cpu, cuda, metal")]
-    UnknownDeviceKind(String),
-    /// A wire buffer failed to decode (truncated, malformed, or naming a
-    /// value no field admits).
-    #[error("malformed jammi-datafusion operator buffer: {0}")]
-    Decode(String),
-    /// A training job reached a process that runs none: it binds
-    /// [`NoTrainingRunner`](crate::NoTrainingRunner).
-    #[error("this process runs no training job: it hosts no executor")]
-    NoTrainingRunner,
     /// A runtime's own failure — a model runtime binding a model, costing or
-    /// preparing rows, admitting or running a forward, or a training runner
-    /// running a job — carried as the runtime raised it, so a consumer that
+    /// preparing rows, admitting or running a forward — carried as the
+    /// runtime raised it, so a consumer that
     /// knows the runtime's error type finds it in the source chain.
     #[error(transparent)]
     Runtime(Box<dyn std::error::Error + Send + Sync + 'static>),

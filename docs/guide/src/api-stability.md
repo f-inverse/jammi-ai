@@ -143,8 +143,8 @@ across the published surface, which is what the terminal-0.x bar requires.
 
 ## Published-crate Rust APIs
 
-Thirteen workspace crates lack `publish = false` and are therefore published
-Rust crates: `jammi-admin`, `jammi-ai`, `jammi-ballista`, `jammi-cli`,
+Twelve workspace crates lack `publish = false` and are therefore published
+Rust crates: `jammi-admin`, `jammi-ai`, `jammi-cli`,
 `jammi-client`, `jammi-db`, `jammi-encoders`, `jammi-datafusion`,
 `jammi-kernels`, `jammi-lora`, `jammi-numerics`, `jammi-server`, and
 `jammi-wire`. Their public items (types, functions, trait

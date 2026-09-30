@@ -133,8 +133,7 @@ preload tests use.
 ### 2.3 DRAIN (first SIGTERM)
 
 1. The gated join half wakes on `drain_rx`: `readiness.begin_drain()` (`/readyz` 503 `"draining"`),
-   `HostAdmission::begin_drain()` (held gang ranks end `Drain`), a Ballista executor role stops
-   admitting tasks, then `EmbeddedWorker::begin_drain()` = phase `Draining` + stop requested +
+   `HostAdmission::begin_drain()` (held gang ranks end `Drain`), then `EmbeddedWorker::begin_drain()` = phase `Draining` + stop requested +
    best-effort `workers.state = 'draining'`. The health side-channel and the peer listener are not
    signalled.
 2. The same `drain_rx` feeds tonic's `serve_with_incoming_shutdown` — listener closed, in-flight

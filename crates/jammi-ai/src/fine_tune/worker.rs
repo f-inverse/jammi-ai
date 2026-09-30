@@ -112,15 +112,13 @@
 //! | 4 | `run_claimed_job_under` — `Failed` (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 5 | `fail_before_finalize` — `publish_and_finalize` giving up before its finalize: the final bundle could not be staged, its materialization attestation could not be written or summarised, or the job result could not be serialised (`record_failed`) | `LoopClaimer`, `Coordinator` |
 //! | 6 | `publish_and_finalize` — the finalize (`finish_job_with_model`) | `LoopClaimer`, `Coordinator` |
-//! | 7 | `run_claimed_compute_job` — an unparseable execution mode or undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
+//! | 7 | `run_claimed_compute_job` — an undeserialisable compute spec (`record_failed`) | `LoopClaimer` |
 //! | 8 | `run_claimed_compute_job` — a cancel observed at the post-claim checkpoint (`record_unsuccessful_end`) | `LoopClaimer` |
 //! | 9 | `run_claimed_compute_job` — partial-result serialisation failure (`record_failed`) | `LoopClaimer` |
 //! | 10 | `run_claimed_compute_job` — result serialisation failure (`record_failed`) | `LoopClaimer` |
-//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_unsuccessful_end`: terminal, or nothing when the plane lost the attempt's executor and the row is left for a successor) | `LoopClaimer` |
+//! | 11 | `run_claimed_compute_job` — `execute_compute` failure (`record_unsuccessful_end`) | `LoopClaimer` |
 //! | 12 | the acceleration report: `compute_and_persist_acceleration_report` (a `Rank` computes and discards) → `persist_acceleration_report`; `mark_acceleration_not_applicable`; `mark_acceleration_undetermined` | `LoopClaimer`, `Coordinator` |
 //! | 13 | `JobWorker::coordinate` — `record_assembly_outcome`, `release_job_lease` | `Coordinator` |
-//! | 14 | placed hand-off: the SUBMITTER, after `WorkerJobError::HandedOff` | writes NOTHING — the row and its lease keeper registration are the placed executor's now |
-//! | 15 | placed hand-off: the EXECUTOR, running [`JobWorker::run_placed_attempt`] | writes as the holder [`lease_holder_for`] derives on ITS host (`run_claimed_job_under(.., placed = true)` is the SAME body as every training row above) |
 //!
 //! `finish_job` (the compute arm's CAS) is reachable only from
 //! `run_claimed_compute_job`, a `LoopClaimer` by construction. The trainer's
@@ -142,7 +140,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::ExecutionPlan;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::artifact_repo::{MaterializationSummary, ReclaimDecision, StagedArtifact};
 use jammi_db::catalog::instance::{
@@ -152,7 +149,6 @@ use jammi_db::catalog::jobs_repo::{AssemblyOutcome, TrainingSetAssembly, WorkerS
 use jammi_db::catalog::lease_keeper::{HoldRelease, LeaseHold, LeaseKeeper, LeaseTarget};
 use jammi_db::catalog::model_repo::ModelLocation;
 use jammi_db::catalog::Catalog;
-use jammi_db::compute_plane::ComputePlane;
 use jammi_db::config::WorkerIntervals;
 use jammi_db::error::{JammiError, Result};
 use jammi_db::sql::{quote_ident, source_relation};
@@ -186,7 +182,6 @@ use crate::model::hub::HubSource;
 use crate::pipeline::graph_neighbourhood::EdgeSourceRef;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
-use jammi_datafusion::{NoTrainingRunner, TrainingExec, TrainingJob, TrainingOutcome};
 use jammi_wire::proto::gang::{bind, AbortReason, Assign, Bind, InlineTransport, NcclTransport};
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
@@ -344,16 +339,6 @@ pub enum Holder {
     ClaimProbe,
     /// A loop-claimed job runs under a registered lease hold.
     JobRun,
-    /// A loop-claimed attempt is submitting itself through the session's
-    /// installed compute plane, or awaiting its stream: this host runs no
-    /// compute for `(job_id, attempt)` while it waits, so it can still
-    /// serve a `RunRank` session for some OTHER attempt —
-    /// [`HostAdmission::try_hold_rank`] admits out of this state exactly as
-    /// it does out of `Free` — a two-host fleet could not otherwise
-    /// assemble if its only free-looking host were the one awaiting a
-    /// placement result. [`HostAdmission::probe_claim`] still refuses it,
-    /// exactly like `JobRun`.
-    Awaiting { job_id: String, attempt: u32 },
     /// An admitted gang rank is held for `(job_id, attempt)`.
     Rank { job_id: String, attempt: u32 },
 }
@@ -513,48 +498,6 @@ impl HostAdmission {
         self.dialer.get().cloned()
     }
 
-    /// `JobRun → Awaiting{job_id, attempt}` — the claim loop's own attempt
-    /// is about to submit its training stage (the move precedes the submit)
-    /// and then awaits its stream: this host runs no compute for the
-    /// attempt meanwhile, so it can still serve a `RunRank` session
-    /// ([`Self::try_hold_rank`]'s `Awaiting` arm admits exactly as `Free`
-    /// does) — a two-host fleet could not otherwise assemble if its only
-    /// free-looking host were the one busy awaiting a placement result. A
-    /// refused (`Err(the holder the CAS saw)`) unless the holder is exactly `JobRun` — a direct
-    /// `run_claimed_job`/an inline `run_now` (no [`ClaimGuard`]) or a slot
-    /// already superseded never observes this transition. No corresponding
-    /// "end awaiting" call is needed: the loop's own [`ClaimGuard`], still
-    /// held across the whole submit-and-await, resets `Awaiting` to `Free`
-    /// on drop exactly as it resets `ClaimProbe`/`JobRun`.
-    pub(crate) fn begin_awaiting_placement(
-        &self,
-        job_id: &str,
-        attempt: u32,
-    ) -> std::result::Result<(), Holder> {
-        let mut found: Option<Holder> = None;
-        let moved = self.holder.send_if_modified(|h| {
-            if *h == Holder::JobRun {
-                *h = Holder::Awaiting {
-                    job_id: job_id.to_string(),
-                    attempt,
-                };
-                true
-            } else {
-                found = Some(h.clone());
-                false
-            }
-        });
-        if moved {
-            Ok(())
-        } else {
-            // The holder the CAS saw, in the SAME critical section — the
-            // caller decides on that value, never on a second read.
-            Err(found.expect(
-                "send_if_modified runs its closure exactly once; a refusal recorded the holder",
-            ))
-        }
-    }
-
     /// This process's registration — the ONE carrier its `instances` row
     /// (and, once a claim loop runs, its `workers` row) is written from.
     pub fn registry(&self) -> &Arc<InstanceRegistration> {
@@ -599,10 +542,10 @@ impl HostAdmission {
     /// generation.
     ///
     /// The phase flip runs strictly BEFORE the epoch bump — LOAD-BEARING,
-    /// not incidental: `run_placed_attempt`'s own doc and `WorkerShared::
-    /// for_single_run`'s (the two-catch lattice over a birth-epoch snapshot
-    /// taken before `probe_claim()`) both depend on "the bump is visible ⇒
-    /// the flip already happened", which only holds in THIS order. Swapping
+    /// not incidental: the claim loop's two catches (`WorkerShared::
+    /// admits_claim` over the loop's birth epoch, then `probe_claim()`'s
+    /// phase check) depend on "the bump is visible ⇒ the flip already
+    /// happened", which only holds in THIS order. Swapping
     /// the two statements admits a gang on a releasing host: a birth-epoch
     /// snapshot taken inside the (relocated) window between the bump
     /// and the flip already contains the bump, so `released_since_birth`
@@ -666,13 +609,9 @@ impl HostAdmission {
     /// the iteration it covers (the claim finding nothing, the run
     /// returning, a panic, the loop future being aborted).
     pub fn probe_claim(self: &Arc<Self>) -> Option<ClaimGuard> {
-        // A host that has begun a DRAIN or RELEASE admits nothing new — the
-        // claim loop's own gate stops it claiming, and the placed-attempt
-        // runner (`JobWorker::run_placed_attempt`, dialled by the executor)
-        // is refused here the same way, so an attempt bound to this host inside
-        // its termination grace is never started on a process about to
-        // exit ("finish what's running, refuse what's new" holds for every
-        // entry, not only the loop's).
+        // A host that has begun a DRAIN or RELEASE admits nothing new: the
+        // loop never starts a claim on a process about to exit ("finish
+        // what's running, refuse what's new").
         if *self.phase.borrow() != WorkerPhase::Running {
             return None;
         }
@@ -722,20 +661,6 @@ impl HostAdmission {
         let mut busy: Option<HolderBusy> = None;
         self.holder.send_if_modified(|h| match h {
             Holder::Free => {
-                *h = Holder::Rank {
-                    job_id: job_id.to_string(),
-                    attempt,
-                };
-                true
-            }
-            // A host awaiting its OWN placed attempt's stream runs no
-            // compute meanwhile, so it can still serve a rank of some
-            // OTHER attempt — admitted exactly like `Free`.
-            // The awaited attempt's own eventual `ClaimGuard::drop` no
-            // longer finds `Awaiting` in the cell in this case and is a
-            // no-op, leaving this rank's hold untouched — the same rule a
-            // superseded `Rank`'s elder guard already follows.
-            Holder::Awaiting { .. } => {
                 *h = Holder::Rank {
                     job_id: job_id.to_string(),
                     attempt,
@@ -837,10 +762,7 @@ pub struct ClaimGuard {
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
         self.admission.holder.send_if_modified(|h| {
-            if matches!(
-                h,
-                Holder::ClaimProbe | Holder::JobRun | Holder::Awaiting { .. }
-            ) {
+            if matches!(h, Holder::ClaimProbe | Holder::JobRun) {
                 *h = Holder::Free;
                 true
             } else {
@@ -999,40 +921,14 @@ impl WorkerShared {
     }
 
     /// Fresh shared state for ONE claimed-job run OUTSIDE the claim-loop
-    /// slot — `JobWorker::run_claimed_job`'s and `run_placed_attempt`'s shared
-    /// shape (`worker.rs`'s single private constructor for it, rather than
-    /// each caller inlining its own `Self::new`): the hold sites read the
-    /// session's phase/epoch, and — holding no claim probe — leave the
-    /// session's holder exactly as they found it, sitting beside the loop's
-    /// slot the way an inline `run_now` does.
-    ///
-    /// `birth_epoch` is THIS run's true birth snapshot — the caller's own
-    /// job, not this function's: `run_claimed_job` has no earlier commit
-    /// event to align to (its record is already claimed when it is called),
-    /// so it reads `admission.release_epoch()` live, right before this call,
-    /// matching what a bare `phase()` read would have observed before
-    /// `WorkerShared` carried a birth snapshot at all. `run_placed_attempt`
-    /// instead reads the epoch BEFORE its own `HostAdmission::probe_claim()`
-    /// call and carries that value all the way here — every byte of work
-    /// after the snapshot (`probe_claim()` itself, `Catalog::transfer_claim`,
-    /// `Catalog::get_job`) must be covered by the SAME birth snapshot any
-    /// RELEASE landing during them has to race: because `HostAdmission::
-    /// begin_release` flips the phase strictly BEFORE it bumps the epoch, a
-    /// snapshot whose epoch bump is already visible implies the flip already
-    /// happened too, so `probe_claim()`'s own phase check — run immediately
-    /// after the snapshot — refuses it typed directly; a snapshot whose
-    /// epoch bump is NOT yet visible carries no such guarantee about the
-    /// phase (the flip may land at any point after the snapshot, including
-    /// inside `probe_claim()`'s own check), so that case relies instead on
-    /// `released_since_birth` downstream once the bump does become visible.
-    /// No RELEASE lands in the gap between the two catches. The epoch must
-    /// be read BEFORE `probe_claim()`, not after it: `probe_claim` commits on
-    /// the phase read alone and `begin_release` bumps the epoch after
-    /// flipping the phase, so a read after `probe_claim()` could snapshot an
-    /// already-bumped epoch, compare the post-release epoch against itself,
-    /// read `false`, and dispatch the gang on a releasing host. The
-    /// flip-before-bump ORDER this relies on is pinned in
-    /// `HostAdmission::begin_release`'s own doc.
+    /// slot — `JobWorker::run_claimed_job`'s shape (`worker.rs`'s single
+    /// private constructor for it, rather than the caller inlining its own
+    /// `Self::new`): the hold sites read the session's phase/epoch, and —
+    /// holding no claim probe — leave the session's holder exactly as they
+    /// found it, sitting beside the loop's slot the way an inline `run_now`
+    /// does. `birth_epoch` is the caller's own live read of
+    /// `admission.release_epoch()`, taken right before this call: its record
+    /// is already claimed, so there is no earlier commit event to align to.
     fn for_single_run(
         admission: &Arc<HostAdmission>,
         worker_id: String,
@@ -1309,36 +1205,6 @@ pub(crate) async fn release_sweep(
         }
     };
     ReleaseSweep { jobs, building }
-}
-
-/// Whether `plane` holds `plan`, a claimant's own attempt, right now: the
-/// plane and the plan to submit when it does; `None` — the claim runs in
-/// this process, never a submission with nowhere to land — when the plane
-/// refuses it (logged with the plane's reason) or the plane's own
-/// inventory read faults (logged: a catalog fault is not "no peer", but
-/// the in-process run is still correct). Decided before anything about how
-/// the attempt runs, from the claimant's cluster view.
-async fn placement_of(
-    plane: &Arc<dyn ComputePlane>,
-    plan: Arc<dyn ExecutionPlan>,
-) -> Option<(Arc<dyn ComputePlane>, Arc<dyn ExecutionPlan>)> {
-    match plane.unheld(&plan).await {
-        Ok(None) => Some((Arc::clone(plane), plan)),
-        Ok(Some(why)) => {
-            tracing::info!(
-                reason = %why,
-                "the claimed attempt runs in this process: the compute plane cannot hold it"
-            );
-            None
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "the compute plane's inventory read failed; the claimed attempt runs in this process"
-            );
-            None
-        }
-    }
 }
 
 /// This host's compute devices, in rank order — the `workers.devices`
@@ -2128,8 +1994,7 @@ impl JobWorker {
                     // the run re-upgrades the Weak through the `Arc` it captures.
                     // The probe guard lives across the run: `ClaimProbe → JobRun`
                     // at the hold site, `→ Free` here when the run returns.
-                    self.run_claimed_job_under(&session, record, &shared, AttemptOrigin::Claimed)
-                        .await;
+                    self.run_claimed_job_under(&session, record, &shared).await;
                     drop(claim);
                 }
                 None => {
@@ -2263,28 +2128,20 @@ impl JobWorker {
             self.worker_id.clone(),
             self.admission.release_epoch(),
         );
-        self.run_claimed_job_under(session, record, &shared, AttemptOrigin::Claimed)
-            .await;
+        self.run_claimed_job_under(session, record, &shared).await;
     }
 
     /// [`Self::run_claimed_job`] under the loop's [`WorkerShared`]: the two
     /// hold sites register through [`register_job_hold_or_release`] against
     /// `shared`'s phase and account the job in `shared.in_flight`.
-    ///
-    /// `placed = true` is the ONE recursion guard: a run [`Self::run_placed_attempt`] is
-    /// already running on THIS process never re-checks the placement
-    /// seam, whatever plane this process itself has installed —
-    /// every OTHER caller (the claim loop, [`Self::run_claimed_job`]) passes
-    /// `false`.
     async fn run_claimed_job_under(
         &self,
         session: &Arc<InferenceSession>,
         record: jammi_db::catalog::jobs_repo::JobRecord,
         shared: &Arc<WorkerShared>,
-        origin: AttemptOrigin,
-    ) -> AttemptEnd {
+    ) {
         let job_id = record.job_id.clone();
-        let timeline = AttemptTimeline::begin(&job_id, record.attempts, origin);
+        let timeline = AttemptTimeline::begin(&job_id, record.attempts);
         // The attempt counter makes the artifact prefix unique per (job, worker,
         // attempt): a reclaimed job re-runs under a higher `attempts`, so its
         // new attempt writes to a fresh prefix and never overwrites the prior
@@ -2293,13 +2150,9 @@ impl JobWorker {
         let catalog = Arc::new(session.catalog().pinned_to_tenant(record.tenant_id));
 
         if is_compute_kind(&record.kind) {
-            // Unreachable for `placed`: a training stage only ever names a
-            // training attempt (the placement check below is the only
-            // producer of one) — a compute kind never reaches
-            // `run_placed_attempt`.
             self.run_claimed_compute_job(session, &catalog, shared, &record)
                 .await;
-            return AttemptEnd::LeftForReclaim;
+            return;
         }
 
         // `crate::jobs::JobSpec` is the one type every persisted `jobs.spec`
@@ -2334,12 +2187,10 @@ impl JobWorker {
                     &job_id,
                     &self.worker_id,
                     attempt,
-                    reason.clone(),
+                    reason,
                 )
                 .await;
-                return AttemptEnd::Failed {
-                    error: JammiError::FineTune(reason),
-                };
+                return;
             }
         };
         let Some(spec) = job_spec.as_training_spec() else {
@@ -2367,12 +2218,10 @@ impl JobWorker {
                 &job_id,
                 &self.worker_id,
                 attempt,
-                reason.clone(),
+                reason,
             )
             .await;
-            return AttemptEnd::Failed {
-                error: JammiError::FineTune(reason),
-            };
+            return;
         };
         // Who this attempt runs as — derived ONCE from the spec and this
         // host's `[worker] local_ranks` (the module doc's writer table), and
@@ -2390,7 +2239,7 @@ impl JobWorker {
         let Some(hold) =
             register_job_hold_or_release(session, &catalog, shared, &job_id, attempt, holder).await
         else {
-            return AttemptEnd::LeftForReclaim;
+            return;
         };
         let cancel = hold.lost_flag();
 
@@ -2458,77 +2307,38 @@ impl JobWorker {
             _ => None,
         };
 
-        // Where this attempt runs is decided BEFORE anything about how it
-        // runs, and for every training kind alike: placement is a property
-        // of the attempt, the rank count a property of the spec the executor
-        // reads off the row. Nothing but the attempt's coordinates travels,
-        // so no materialization/loader work happens here for a placed
-        // attempt — it happens once, on whichever process actually trains.
-        //
-        // The attempt as the one task the compute plane would hold — built
-        // once here, so the admission and the submission read the same
-        // plan. The required kind is the one every plan this session builds
-        // requires (`required_device_kind`), never re-derived from "a GPU
-        // exists somewhere": `DevicePlacement` and the plane's admission
-        // bind/refuse on this exact kind, and the executor's engine refuses
-        // a stage of any other. An attempt that is itself placed never
-        // consults the plane: it is already where it runs. The stage binds
-        // no runner here — this process submits it and runs none of it; the
-        // executor that decodes it binds its own.
-        let placement = match session.compute_plane().plane() {
-            Some(plane) if origin == AttemptOrigin::Claimed => {
-                let plan: Arc<dyn ExecutionPlan> = Arc::new(TrainingExec::new(
-                    TrainingJob {
-                        job_id: job_id.clone(),
-                        attempt,
-                        submitter: session.instance_id().to_string(),
-                        device_kind: session.required_device_kind(),
-                        claimed_at: timeline.claimed_at,
-                    },
-                    Arc::new(NoTrainingRunner),
-                ));
-                placement_of(&plane, plan).await
-            }
-            _ => None,
-        };
-
-        let outcome = if let Some((plane, plan)) = placement {
-            self.submit_placed(session, &catalog, &job_id, attempt, plane, plan)
-                .await
-        } else {
-            match record.tenant_id {
-                Some(tenant) => {
-                    let recorded_pair = recorded_pair.clone();
-                    session
-                        .with_tenant_scoped(tenant, |_scope| {
-                            self.run_spec(
-                                session,
-                                &catalog,
-                                &job_id,
-                                spec,
-                                &cancel,
-                                attempt,
-                                recorded_pair,
-                                holder,
-                                &timeline,
-                            )
-                        })
-                        .await
-                }
-                None => {
-                    self.run_spec(
-                        session,
-                        &catalog,
-                        &job_id,
-                        spec,
-                        &cancel,
-                        attempt,
-                        recorded_pair,
-                        holder,
-                        &timeline,
-                    )
+        let outcome = match record.tenant_id {
+            Some(tenant) => {
+                let recorded_pair = recorded_pair.clone();
+                session
+                    .with_tenant_scoped(tenant, |_scope| {
+                        self.run_spec(
+                            session,
+                            &catalog,
+                            &job_id,
+                            spec,
+                            &cancel,
+                            attempt,
+                            recorded_pair,
+                            holder,
+                            &timeline,
+                        )
+                    })
                     .await
-                }
+            }
+            None => {
+                self.run_spec(
+                    session,
+                    &catalog,
+                    &job_id,
+                    spec,
+                    &cancel,
+                    attempt,
+                    recorded_pair,
+                    holder,
+                    &timeline,
+                )
+                .await
             }
         };
 
@@ -2549,7 +2359,7 @@ impl JobWorker {
         // the hold is dropped only once the terminal write has returned.
         drop(cancel_watcher);
 
-        let end = match outcome {
+        match outcome {
             Ok(AttemptOutput::Reused(reused)) => {
                 // The job is already `completed` (the reuse probe's own
                 // transaction wrote the terminal row, the output model's
@@ -2565,46 +2375,10 @@ impl JobWorker {
                 reclaim_unpublished_artifacts(&store, &catalog, &job_id, &self.worker_id, attempt)
                     .await;
                 delete_retired_checkpoints(&store, &catalog, &job_id, reused.finalized).await;
-                AttemptEnd::Reused
             }
             Ok(AttemptOutput::Trained(artifact)) => {
-                // Computed BEFORE the artifact's directory is handed to
-                // `publish_and_finalize` (which consumes it) — the SAME
-                // bytes a member/an in-process `Peer` rank digests, so
-                // a placed run's `TrainingOutcome::Trained` carries an
-                // identical digest without a second row read.
-                let digest = artifact_files_digest(artifact.dir.path());
-                match self
-                    .publish_and_finalize(holder, session, &catalog, *artifact, &timeline)
-                    .await
-                {
-                    PublishOutcome::Completed => match digest {
-                        Ok(artifact_digest) => AttemptEnd::Published { artifact_digest },
-                        Err(e) => {
-                            // The publish itself already read every file in
-                            // the SAME directory successfully (it just
-                            // committed `completed`) — a digest re-read
-                            // failing here is an I/O fault in the narrow
-                            // window between those two reads, not a
-                            // training/publish failure; the row IS
-                            // genuinely `completed`. UNCOVERED: no fixture
-                            // manufactures this race.
-                            tracing::error!(
-                                job_id = %job_id, worker = %self.worker_id, error = %e,
-                                "completed job's artifact digest could not be re-read"
-                            );
-                            AttemptEnd::Failed {
-                                error: JammiError::FineTune(format!(
-                                    "artifact published but its digest could not be re-read: {e}"
-                                )),
-                            }
-                        }
-                    },
-                    PublishOutcome::Failed(reason) => AttemptEnd::Failed {
-                        error: JammiError::FineTune(reason),
-                    },
-                    PublishOutcome::LeftForReclaim => AttemptEnd::LeftForReclaim,
-                }
+                self.publish_and_finalize(holder, session, &catalog, *artifact, &timeline)
+                    .await;
             }
             Err(WorkerJobError::Cancelled) => {
                 // No `TrainedArtifact` was ever built on this path (the run
@@ -2639,23 +2413,16 @@ impl JobWorker {
                         UnsuccessfulEnd::Cancelled,
                     )
                     .await;
-                    AttemptEnd::Failed {
-                        error: JammiError::JobCancelled {
-                            job_id: job_id.clone(),
-                        },
-                    }
                 } else {
                     // Lease lost: leave the job `running` for reclaim to
                     // re-queue. Do not record a terminal status — a
                     // different worker now owns, or will own, this job.
                     tracing::warn!(job_id = %job_id, worker = %self.worker_id, "training cancelled (lease lost); left for reclaim");
-                    AttemptEnd::LeftForReclaim
                 }
             }
             Err(WorkerJobError::Abandoned(why)) => {
-                // Either the coordinator body already recorded the attempt's
-                // assembly outcome and settled the lease, or the attempt's
-                // placement faulted before its claim moved; nothing terminal
+                // The coordinator body already recorded the attempt's
+                // assembly outcome and settled the lease; nothing terminal
                 // is written here — the row is `running` for reclaim (the
                 // fleet's only requeue path). Any epoch checkpoint a run wrote before a
                 // mid-run fault is swept exactly as on the cancelled arm.
@@ -2668,19 +2435,6 @@ impl JobWorker {
                     attempt,
                 )
                 .await;
-                AttemptEnd::LeftForReclaim
-            }
-            Err(WorkerJobError::HandedOff) => {
-                // The placed hand-off: this process wrote NOTHING under
-                // its own worker id for this attempt (the placement check
-                // runs before any materialization/training starts), so
-                // there is nothing here to sweep — the row, and its lease
-                // keeper registration, are the executor's now.
-                tracing::info!(
-                    job_id = %job_id, worker = %self.worker_id,
-                    "attempt handed off to a placed executor"
-                );
-                AttemptEnd::LeftForReclaim
             }
             Err(WorkerJobError::Failed(error))
                 if hold.lost() && !cancel_requested_seen.load(Ordering::SeqCst) =>
@@ -2702,7 +2456,6 @@ impl JobWorker {
                     attempt,
                 )
                 .await;
-                AttemptEnd::LeftForReclaim
             }
             Err(WorkerJobError::Failed(error)) => {
                 tracing::error!(job_id = %job_id, error = %error, "training job failed");
@@ -2726,324 +2479,9 @@ impl JobWorker {
                     attempt,
                 )
                 .await;
-                AttemptEnd::Failed { error }
             }
-        };
+        }
         drop(hold);
-        end
-    }
-
-    /// Submit this attempt — `plan`, its one `TrainingExec` task, already
-    /// admitted by `plane` — through the session's compute plane and await
-    /// its stream, instead of running it in-process. The submitter's exit
-    /// arms are total (this function's only return values):
-    ///
-    /// - the stream ends with AT LEAST ONE batch → [`WorkerJobError::
-    ///   HandedOff`] (the executor owns the attempt from here: no terminal
-    ///   write, no release);
-    /// - the stream ends in an error, or ends with no batch and no error
-    ///   (the submission itself never reached a running task) → re-read the
-    ///   row: `claimed_by` is STILL this instance (the transfer never
-    ///   happened, or the executor refused before the CAS) →
-    ///   [`WorkerJobError::Abandoned`] (left `running` for reclaim, an
-    ///   attempt spent at the successor's claim);
-    ///   `claimed_by` moved → [`WorkerJobError::HandedOff`] (the executor
-    ///   owns the attempt; if it died, its own lease expiry requeues it,
-    ///   never this instance's).
-    ///
-    /// This host's holder moves `JobRun → Awaiting{job_id, attempt}` BEFORE
-    /// the descriptor is submitted — a CAS from exactly `JobRun`; on its
-    /// refusal a `Free` holder (a direct `run_claimed_job` with no
-    /// `ClaimGuard`, which admits ranks already) still submits, any other
-    /// holder ends this call typed with nothing submitted
-    /// (`HostAdmission::begin_awaiting_placement`;
-    /// an in-process scheduler can bind the task and the placed executor can
-    /// dial this host's `RunRank` before `submit()` returns): the host runs no compute while it waits, so it can
-    /// still serve a `RunRank` session — a two-host fleet could not
-    /// otherwise assemble if its only free-looking host were the one
-    /// awaiting its own placement result.
-    async fn submit_placed(
-        &self,
-        session: &Arc<InferenceSession>,
-        catalog: &Arc<Catalog>,
-        job_id: &str,
-        attempt: u32,
-        plane: Arc<dyn ComputePlane>,
-        plan: Arc<dyn ExecutionPlan>,
-    ) -> std::result::Result<AttemptOutput, WorkerJobError> {
-        #[cfg(feature = "test-hooks")]
-        training_test_hooks::note_placed(job_id, attempt);
-        // JobRun -> Awaiting BEFORE the plan crosses the wire, never after
-        // `submit()` resolves: when the submitter's own host ALSO hosts the
-        // scheduler role (`roles::host_scheduler`'s in-process case,
-        // exercised end-to-end by `crates/jammi-ballista/tests/distributed`),
-        // the scheduler's own binder can dispatch the task and the placed
-        // executor can dial this host's RunRank BEFORE `submitter.submit`'s
-        // async call returns to this line, since the round-trip and the
-        // scheduler's background bind loop share the same process/runtime.
-        // Moving the holder after the submit would leave it `JobRun`, and
-        // `admit_rank`'s busy arm would refuse every such dial.
-        if let Err(holder) = session
-            .host_admission()
-            .begin_awaiting_placement(job_id, attempt)
-        {
-            // The move is a CAS from exactly `JobRun` (the claim loop's
-            // hold, `register_job_hold_or_release` -> `job_running`). Its
-            // refusal has two readings: a `Free` holder is a direct
-            // `run_claimed_job` with no `ClaimGuard` (the documented
-            // no-op arm — `Free` admits every `RunRank` dial already, so
-            // a placed gang can assemble and the submit proceeds); ANY other
-            // holder (a rank held, a probe in flight, an `Awaiting` for
-            // another job) would leave this host refusing every dial while
-            // a placed gang assembles, so the descriptor is refused BEFORE the
-            // submit, typed — the row is still this instance's claim and is
-            // left for reclaim.
-            if holder != Holder::Free {
-                return Err(self
-                    .placed_submit_end(
-                        catalog,
-                        job_id,
-                        JammiError::FineTune(format!(
-                            "submit_placed: this host's job slot is neither JobRun nor Free \
-                             (holder {holder:?}); the descriptor was not submitted"
-                        )),
-                    )
-                    .await);
-            }
-        }
-        let mut stream = match plane.place(plan).await {
-            Ok(stream) => stream,
-            Err(e) => return Err(self.placed_submit_end(catalog, job_id, e).await),
-        };
-        use futures::StreamExt;
-        let mut saw_batch = false;
-        let mut end_err: Option<JammiError> = None;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(_batch) => saw_batch = true,
-                Err(e) => {
-                    end_err = Some(e.into());
-                    break;
-                }
-            }
-        }
-        if saw_batch {
-            // The ONE `tracing::info!` line this crate grants
-            // `crates/jammi-ballista`'s distributed lane: a process-visible,
-            // stdout-captured line naming the job/attempt on the placed
-            // submitter's `HandedOff` arm, so a spawned worker's captured
-            // log (never the in-process `training_test_hooks` recorder,
-            // which a multi-process harness cannot read) can confirm this
-            // process ran `run_placed_attempt`/`submit_placed` and handed off.
-            tracing::info!(
-                job_id,
-                attempt,
-                "run_placed_attempt: submitter HandedOff after the placed \
-                 attempt's stream completed"
-            );
-            return Err(WorkerJobError::HandedOff);
-        }
-        let e = end_err.unwrap_or_else(|| {
-            JammiError::FineTune(
-                "the placed attempt's stream ended with no batch and no error".into(),
-            )
-        });
-        Err(self.placed_submit_end(catalog, job_id, e).await)
-    }
-
-    /// Re-read the row after a submission fault (before any batch arrived):
-    /// still this instance's claim → [`WorkerJobError::Abandoned`]; moved
-    /// (or the re-read itself faults) → [`WorkerJobError::HandedOff`] — see
-    /// [`Self::submit_placed`]'s doc.
-    async fn placed_submit_end(
-        &self,
-        catalog: &Arc<Catalog>,
-        job_id: &str,
-        e: JammiError,
-    ) -> WorkerJobError {
-        let still_mine = matches!(
-            catalog.get_job(job_id).await,
-            Ok(record) if record.claimed_by.as_deref() == Some(self.worker_id.as_str())
-        );
-        let end = if still_mine {
-            WorkerJobError::Abandoned(format!("placement failed before transfer: {e}"))
-        } else {
-            // The executor owns the row and has already recorded this
-            // attempt's end; the typed error it handed back as the task's
-            // own is named here so the submitter's log carries the same
-            // failure the row does.
-            tracing::warn!(
-                job_id,
-                error = %e,
-                "submit_placed: the placed attempt failed after its transfer; the executor \
-                 recorded it"
-            );
-            WorkerJobError::HandedOff
-        };
-        #[cfg(feature = "test-hooks")]
-        training_test_hooks::note_placed_submit_end(
-            job_id,
-            matches!(end, WorkerJobError::Abandoned(_)),
-        );
-        end
-    }
-
-    /// Run a placed training attempt's body on THIS process — the body of
-    /// the executor role's [`jammi_datafusion::TrainingRunner`], which a
-    /// `TrainingExec` decoded on that executor is bound to. Reuses
-    /// `Self::run_claimed_job_under`
-    /// VERBATIM (`placed = true`, the recursion guard) — the SAME body the
-    /// attempt's claimant would run for the row's kind (a context
-    /// predictor's episodic loop; a fine-tune's topology decision from THIS
-    /// host's `[worker] local_ranks`, a `Peer` gang's assembly → dispatch →
-    /// rounds included), then publish → finalize — so the published bytes
-    /// are the in-process run's. An ASSOCIATED function, not a method: the
-    /// caller (the executor role, `crates/jammi-ballista`) holds only the
-    /// session, never a `JobWorker`.
-    ///
-    /// (i) snapshots `HostAdmission::release_epoch` as this run's
-    /// `WorkerShared` birth BEFORE taking this host's job slot through
-    /// [`HostAdmission::probe_claim`] (`Free → ClaimProbe`; a host already
-    /// holding a rank, a loop-claimed job, or another placement's
-    /// probe/await refuses typed BEFORE any row write) — a two-catch
-    /// lattice with no gap between the catches: because `HostAdmission::
-    /// begin_release` orders the phase flip strictly BEFORE the epoch
-    /// bump, a snapshot whose epoch bump IS already visible implies the
-    /// flip already happened too, so `probe_claim`'s own phase check —
-    /// run immediately after the snapshot — refuses it typed directly; a
-    /// snapshot whose epoch bump is NOT yet visible carries no such
-    /// guarantee (the flip can still land at any point up to and including
-    /// inside `probe_claim`'s own check), so that case is instead caught
-    /// downstream by the epoch compare (`WorkerShared::released_since_birth`)
-    /// once the bump does become visible — covering `probe_claim()` itself
-    /// and every byte of (ii)/(iii) below — see `WorkerShared::
-    /// for_single_run`'s own doc for the prior (windowed) shape this
-    /// replaced;
-    /// (ii) [`Catalog::transfer_claim`] moves `claimed_by` from
-    /// `descriptor.submitter` to this instance at the SAME `attempts`,
-    /// arming a fresh lease (`false` — the transfer never happened, a
-    /// stale runner, or a second launch of an already-transferred attempt
-    /// — is a typed refusal, the slot released, no row write); (iii)
-    /// re-reads the row (`Catalog::get_job`) and runs
-    /// `Self::run_claimed_job_under` — which registers THIS process's own
-    /// [`LeaseKeeper`] hold (`register_job_hold_or_release`, the SAME verb
-    /// the claim loop uses after `claim_next`) and flips the claim guard's
-    /// `ClaimProbe → JobRun` (`HostAdmission::job_running`) itself, so
-    /// nothing here duplicates that registration; (iv) maps the body's
-    /// `AttemptEnd` to [`TrainingOutcome`] (`Published` → `Trained`;
-    /// `Reused` → `Reused`; `Failed` → `Err` carrying the attempt's own
-    /// typed error, which the row already records and which reaches the
-    /// submitter as the task's error; `LeftForReclaim` → a typed `Err` too,
-    /// so the Ballista task itself ends in error and Ballista never re-runs
-    /// it: the scheduler is configured with `task_max_failures = 0`,
-    /// because a re-run would be a second attempt of the same claim, whose
-    /// lease identity the first attempt still holds; jammi's own reclaim,
-    /// from a FUTURE claim, is the only path back); (v) releases the slot on
-    /// every exit arm (the claim guard's own `Drop`).
-    pub async fn run_placed_attempt(
-        session: &Arc<InferenceSession>,
-        descriptor: TrainingJob,
-    ) -> Result<TrainingOutcome> {
-        let admission = session.host_admission();
-        // The birth snapshot for this run's `WorkerShared`, read BEFORE
-        // `probe_claim()` itself — see this function's own doc, point (i),
-        // and `WorkerShared::for_single_run` for the lattice argument (a
-        // RELEASE lands either before this read, and is then caught by
-        // `probe_claim`'s own phase check below, or after it, and is then
-        // caught downstream by the epoch compare — no gap between the two).
-        let claim_epoch = admission.release_epoch();
-        #[cfg(feature = "test-hooks")]
-        loop_test_hooks::maybe_park(
-            &descriptor.job_id,
-            loop_test_hooks::ParkPoint::PlacedAttemptBeforeProbeClaim,
-        )
-        .await;
-        let Some(claim) = admission.probe_claim() else {
-            let phase = *admission.phase_receiver().borrow();
-            return Err(JammiError::FineTune(if phase == WorkerPhase::Running {
-                "run_placed_attempt: this host's job slot is busy (a rank is held, a loop-claimed \
-                 job already runs, or another placement is in flight)"
-                    .into()
-            } else {
-                format!(
-                    "run_placed_attempt: this host has begun a {phase:?} and admits no new \
-                     attempt (refuse what's new); the row is left with its submitter"
-                )
-            }));
-        };
-        #[cfg(feature = "test-hooks")]
-        loop_test_hooks::maybe_park(
-            &descriptor.job_id,
-            loop_test_hooks::ParkPoint::PlacedAttemptBeforeTransfer,
-        )
-        .await;
-        let catalog = session.catalog();
-        let lease = session.inner_config().lease.intervals()?.lease();
-        let worker = JobWorker::new(session)?;
-        let transferred = catalog
-            .transfer_claim(
-                &descriptor.job_id,
-                &descriptor.submitter,
-                worker.worker_id(),
-                descriptor.attempt,
-                lease,
-            )
-            .await;
-        let transferred = match transferred {
-            Ok(t) => t,
-            Err(e) => {
-                drop(claim);
-                return Err(e);
-            }
-        };
-        if !transferred {
-            drop(claim);
-            return Err(JammiError::FineTune(format!(
-                "run_placed_attempt: the transfer for job '{}' attempt {} did not land (already \
-                 transferred, a stale attempt, or the row moved)",
-                descriptor.job_id, descriptor.attempt
-            )));
-        }
-        // `get_job` is tenant-SCOPED (a caller-facing read); the claim it
-        // stands in for here is the unscoped kind every claim-loop read is
-        // (the module doc: "the catalog used for reclaim/claim is
-        // unscoped — a worker serves every tenant's queue") — admin scope
-        // for this ONE re-read, exactly as a claim's own row read would see
-        // it regardless of tenant.
-        let record = match session
-            .with_admin_scope(|_scope| catalog.get_job(&descriptor.job_id))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                drop(claim);
-                return Err(e);
-            }
-        };
-        let shared = WorkerShared::for_single_run(admission, worker.worker_id.clone(), claim_epoch);
-        let end = worker
-            .run_claimed_job_under(
-                session,
-                record,
-                &shared,
-                AttemptOrigin::Placed {
-                    claimed_at: descriptor.claimed_at,
-                },
-            )
-            .await;
-        drop(claim);
-        match end {
-            AttemptEnd::Published { artifact_digest } => {
-                Ok(TrainingOutcome::Trained { artifact_digest })
-            }
-            AttemptEnd::Reused => Ok(TrainingOutcome::Reused),
-            AttemptEnd::Failed { error } => Err(error),
-            AttemptEnd::LeftForReclaim => Err(JammiError::FineTune(format!(
-                "run_placed_attempt: job '{}' attempt {} left running for reclaim (no terminal \
-                 write)",
-                descriptor.job_id, descriptor.attempt
-            ))),
-        }
     }
 
     /// Stage a trained artifact in the object store and run the single
@@ -3083,7 +2521,7 @@ impl JobWorker {
         catalog: &Arc<Catalog>,
         artifact: TrainedArtifact,
         timeline: &AttemptTimeline,
-    ) -> PublishOutcome {
+    ) {
         let (job_id, attempt) = (timeline.job_id.as_str(), timeline.attempt);
         #[cfg(feature = "test-hooks")]
         loop_test_hooks::maybe_park(job_id, loop_test_hooks::ParkPoint::BeforePublish).await;
@@ -3211,7 +2649,6 @@ impl JobWorker {
         match finished {
             Ok(Some(finalized)) => {
                 delete_retired_checkpoints(&store, catalog, job_id, finalized).await;
-                PublishOutcome::Completed
             }
             Ok(None) => {
                 // Lost the lease before finalizing: the transaction wrote
@@ -3223,11 +2660,9 @@ impl JobWorker {
                     %holder,
                     "lost lease before finalize; not finalizing (left for reclaim)"
                 );
-                PublishOutcome::LeftForReclaim
             }
             Err(e) => {
                 tracing::error!(job_id = %job_id, %holder, error = %e, "finish_job_with_model failed");
-                PublishOutcome::LeftForReclaim
             }
         }
     }
@@ -3242,18 +2677,9 @@ impl JobWorker {
         job_id: &str,
         attempt: u32,
         reason: String,
-    ) -> PublishOutcome {
+    ) {
         reclaim_unpublished_artifacts(store, catalog, job_id, &self.worker_id, attempt).await;
-        record_failed(
-            holder,
-            catalog,
-            job_id,
-            &self.worker_id,
-            attempt,
-            reason.clone(),
-        )
-        .await;
-        PublishOutcome::Failed(reason)
+        record_failed(holder, catalog, job_id, &self.worker_id, attempt, reason).await;
     }
 
     /// Run a claimed compute-kind job (`neighbor_graph`/`propagate`/
@@ -3263,8 +2689,7 @@ impl JobWorker {
     /// says to does this register the job's lease with the session's keeper
     /// (no heartbeat task) and dispatch through
     /// [`crate::jobs::execute_compute`] — then settles the attempt's end
-    /// on the row: the single lease-guarded terminal write, or nothing
-    /// when the typed error leaves the job for a successor
+    /// on the row: the single lease-guarded terminal write
     /// ([`UnsuccessfulEnd::of`]). A worker that lost its lease during the
     /// compute does not finalize (`finish_job`/`fail_job` match zero rows);
     /// the job is left for [`Catalog::reclaim_expired_jobs`].
@@ -3277,21 +2702,6 @@ impl JobWorker {
     ) {
         let job_id = record.job_id.as_str();
         let attempt = record.attempts;
-        let execution: jammi_db::catalog::status::JobExecution = match record.execution.parse() {
-            Ok(execution) => execution,
-            Err(e) => {
-                record_failed(
-                    LeaseHolder::LoopClaimer,
-                    catalog,
-                    job_id,
-                    &self.worker_id,
-                    attempt,
-                    format!("compute claim path: {e}"),
-                )
-                .await;
-                return;
-            }
-        };
         // Decode the one persisted type (`crate::jobs::JobSpec`'s own doc),
         // then project to `ComputeSpec` — see the loop-claimer training path
         // above for why, and `JobSpec::as_compute_spec`'s doc.
@@ -3340,7 +2750,7 @@ impl JobWorker {
                 job_id,
                 &self.worker_id,
                 attempt,
-                UnsuccessfulEnd::of(&e, execution),
+                UnsuccessfulEnd::of(&e),
             )
             .await;
             return;
@@ -3467,7 +2877,7 @@ impl JobWorker {
                     job_id,
                     &self.worker_id,
                     attempt,
-                    UnsuccessfulEnd::of(&e, execution),
+                    UnsuccessfulEnd::of(&e),
                 )
                 .await;
             }
@@ -4902,23 +4312,10 @@ pub mod loop_test_hooks {
         /// and before the hold is registered — the claim→hold prologue, on
         /// both the fine-tune and the compute path.
         BeforeHold,
-        /// Inside `JobWorker::run_placed_attempt`, immediately after this
-        /// run's `WorkerShared` birth release-epoch is read and before
-        /// `HostAdmission::probe_claim` itself runs — the window a RELEASE
-        /// landing between the epoch snapshot and `probe_claim`'s own phase
-        /// check must still be caught in, by `probe_claim` refusing typed
-        /// (the epoch read precedes `probe_claim()`, never follows it).
-        PlacedAttemptBeforeProbeClaim,
-        /// Inside `JobWorker::run_placed_attempt`, immediately after
-        /// `HostAdmission::probe_claim` succeeds, before
-        /// `Catalog::transfer_claim`/`Catalog::get_job` — the two catalog
-        /// round trips a RELEASE landing during them must still be caught
-        /// across.
-        PlacedAttemptBeforeTransfer,
         /// Inside `HostAdmission::begin_release`, between the phase flip
         /// (→ `Releasing`) and the release-epoch bump — pins the load-
-        /// bearing order the two-catch lattice in `run_placed_attempt`'s own
-        /// doc and `WorkerShared::for_single_run`'s depends on: while
+        /// bearing order the claim loop's two catches depend on
+        /// (`HostAdmission::begin_release`'s own doc): while
         /// parked here the phase is already `Releasing` (a concurrent
         /// `probe_claim` refuses) but the epoch is not yet bumped (a
         /// concurrent birth-epoch snapshot would not yet contain it).
@@ -6625,17 +6022,6 @@ impl JobWorker {
             // coordinator body's own classification); folded, not
             // wildcarded, so the match stays total.
             Err(WorkerJobError::Abandoned(why)) => (CoordinatorEnd::TrainingFailed(why), None),
-            // `train_fine_tune` never produces this arm either — `HandedOff`
-            // is `submit_placed`'s own classification, reached ONLY from
-            // `run_claimed_job_under`'s placement check, before topology is
-            // ever decided (a `Peer` rank's own `train_fine_tune` call never
-            // reaches it). Folded, not wildcarded, so the match stays total.
-            Err(WorkerJobError::HandedOff) => (
-                CoordinatorEnd::TrainingFailed(
-                    "unreachable: HandedOff surfaced from train_fine_tune".into(),
-                ),
-                None,
-            ),
             Err(WorkerJobError::Failed(error)) => {
                 if let Some((rank, raw)) = coordinator.member_aborts().into_iter().next() {
                     let reason = AbortReason::try_from(raw).unwrap_or(AbortReason::Unspecified);
@@ -7234,44 +6620,6 @@ async fn settle_reclaim(
     }
 }
 
-/// What [`JobWorker::publish_and_finalize`] did — the ONE fact
-/// [`JobWorker::run_claimed_job_under`] needs to derive its own
-/// [`AttemptEnd`] without re-deriving it from a second row read.
-enum PublishOutcome {
-    /// The finalize CAS committed `completed`.
-    Completed,
-    /// A terminal `failed` was already recorded (by this function), with
-    /// this reason.
-    Failed(String),
-    /// No terminal write: the finalize CAS lost the race (this instance's
-    /// lease was gone by the time it ran) — left `running` for reclaim.
-    LeftForReclaim,
-}
-
-/// What one attempt of [`JobWorker::run_claimed_job_under`] ended as — the
-/// fact [`JobWorker::run_placed_attempt`] maps onto
-/// [`TrainingOutcome`] without a second row read.
-/// `run_claimed_job`/the claim loop discard it; both already observe every
-/// row write this type merely reports.
-enum AttemptEnd {
-    /// The attempt published `completed`; this is the artifact's own digest
-    /// (`artifact_files_digest`, computed over the SAME directory
-    /// `publish_and_finalize` just uploaded from).
-    Published { artifact_digest: String },
-    /// The attempt completed by reusing a published artifact: no bytes of
-    /// its own, so no digest of its own.
-    Reused,
-    /// A terminal unsuccessful status (`failed`, or `cancelled` for an
-    /// honoured cancel) was recorded; `error` is the typed failure whose
-    /// message ([`failed_job_message`]) the row carries — a placed attempt
-    /// hands it to its submitter as the task's own error.
-    Failed { error: JammiError },
-    /// No terminal write: left `running` for reclaim (a lease loss, a
-    /// finalize race lost, a mid-run gang abandon, or a hand-off to a
-    /// placed executor).
-    LeftForReclaim,
-}
-
 /// The terminal classification of a worker's run of one job.
 enum WorkerJobError {
     /// The lease was lost mid-training; the job is left `running` for reclaim.
@@ -7287,23 +6635,9 @@ enum WorkerJobError {
     /// split ([`lease_settlement`]) — handed back (`release_job_lease`) or
     /// left to expire — either way the row stays `running` for reclaim (the
     /// fleet's only requeue path) and the next attempt
-    /// re-assembles once its cooldown passes. A placed attempt of any kind
-    /// whose submission faulted BEFORE its claim moved ends the same way
-    /// ([`JobWorker::submit_placed`]): the row is still this instance's,
-    /// nothing ran, and reclaim requeues it. The string is the reason, for
+    /// re-assembles once its cooldown passes. The string is the reason, for
     /// the log.
     Abandoned(String),
-    /// The claim moved to a placed executor mid-attempt: the submitter's stream ended with at least
-    /// one batch, or ended in error/emptily AFTER `Catalog::transfer_claim`
-    /// already moved `claimed_by` off this instance. NO terminal write, NO
-    /// release — the row is another process's now, and this process's
-    /// lease keeper registration for the attempt is already dropped by the
-    /// time this arm is reached (the same `drop(hold); drop(cancel_watcher);`
-    /// every other end goes through) — a heartbeat from this stale holder
-    /// can never resurrect the lease (`Catalog::heartbeat_job` keys on
-    /// `claimed_by`, proven by
-    /// `crates/jammi-ai/tests/it/placed_attempt.rs::the_submitters_heartbeat_after_hand_off_never_resurrects_the_executors_lease`).
-    HandedOff,
 }
 
 /// Render a terminal training failure's message for `record_failed` to
@@ -8203,61 +7537,6 @@ pub mod training_test_hooks {
             .collect()
     }
 
-    fn placed_submissions() -> &'static Mutex<Vec<(String, u32)>> {
-        static SLOTS: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
-        SLOTS.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
-    /// Recorded by [`super::JobWorker::submit_placed`] the instant a claim
-    /// takes the `Placed` arm — the oracle that a claim with a submitter
-    /// installed took `Placed`, not [`super::JobWorker::coordinate`].
-    pub(super) fn note_placed(job_id: &str, attempt: u32) {
-        placed_submissions()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((job_id.to_string(), attempt));
-    }
-
-    /// Every attempt of `job_id` that took the `Placed` arm, oldest first.
-    pub fn placed_attempts_for(job_id: &str) -> Vec<u32> {
-        placed_submissions()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(id, _)| id == job_id)
-            .map(|(_, attempt)| *attempt)
-            .collect()
-    }
-
-    fn placed_submit_ends() -> &'static Mutex<Vec<(String, bool)>> {
-        static SLOTS: OnceLock<Mutex<Vec<(String, bool)>>> = OnceLock::new();
-        SLOTS.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
-    /// Recorded by [`super::JobWorker::placed_submit_end`]: whether the row
-    /// was STILL this instance's (`Abandoned`) or had already moved
-    /// (`HandedOff`) at the re-read — the oracle that the two arms are
-    /// distinguished by the row's OWN `claimed_by`, never guessed.
-    pub(super) fn note_placed_submit_end(job_id: &str, still_mine: bool) {
-        placed_submit_ends()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push((job_id.to_string(), still_mine));
-    }
-
-    /// Every `placed_submit_end` classification recorded for `job_id`, oldest
-    /// first: `true` = `Abandoned` (still this instance's claim), `false` =
-    /// `HandedOff` (the row had already moved).
-    pub fn placed_submit_ends_for(job_id: &str) -> Vec<bool> {
-        placed_submit_ends()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|(id, _)| id == job_id)
-            .map(|(_, still_mine)| *still_mine)
-            .collect()
-    }
-
     /// One armed pause, keyed by the job whose `train_fine_tune` call it is
     /// for.
     struct ArmedPause {
@@ -8477,10 +7756,9 @@ async fn record_failed(
 
 /// [`record_failed`]'s general form: settle a job that ended without its
 /// result — the lease-guarded terminal write, as `failed` or as
-/// `cancelled`, or nothing for an attempt left for reclaim. A call site
-/// whose error can be a [`JammiError::JobCancelled`] or the plane's
-/// [`JammiError::ExecutorLost`] passes `UnsuccessfulEnd::of(&error, …)`,
-/// so the typed error decides the end.
+/// `cancelled`. A call site whose error can be a
+/// [`JammiError::JobCancelled`] passes `UnsuccessfulEnd::of(&error)`, so the
+/// typed error decides the end.
 async fn record_unsuccessful_end(
     holder: LeaseHolder,
     catalog: &Arc<Catalog>,
@@ -8489,17 +7767,6 @@ async fn record_unsuccessful_end(
     attempt: u32,
     end: UnsuccessfulEnd,
 ) {
-    if let UnsuccessfulEnd::LeftForReclaim(lost) = &end {
-        tracing::warn!(
-            job_id,
-            worker = %worker_id,
-            attempt,
-            %holder,
-            error = %lost,
-            "{}",
-            crate::jobs::EXECUTOR_LOST_ATTEMPT_LOG
-        );
-    }
     match end.record(catalog, job_id, worker_id, attempt).await {
         Ok(true) => {}
         Ok(false) => {
@@ -8692,35 +7959,18 @@ async fn mark_acceleration_undetermined(
     .await;
 }
 
-/// How an attempt reached the process that runs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttemptOrigin {
-    /// This process's own claim.
-    Claimed,
-    /// Placed here by the claimant, which claimed it at `claimed_at` (its
-    /// clock).
-    Placed {
-        claimed_at: chrono::DateTime<chrono::Utc>,
-    },
-}
-
 /// One attempt — which job, which attempt — and when it passed each of
 /// its stations, folded into the job's terminal metrics as `timeline` so a
-/// reader of the metrics can split the job's wall into claim, placement,
-/// source binding, training and publish wherever the attempt ran. The
-/// trainer's own `started_at`/`completed_at` sit between `source_bound_at`
-/// and `published_at`.
-///
-/// Every instant is UTC on the clock of the process that stamped it:
-/// `claimed_at` the claimant's, the rest the running process's. They are one
-/// clock unless the attempt was placed on another host, where a difference
-/// across the two carries those hosts' clock offset.
+/// reader of the metrics can split the job's wall into claim, source
+/// binding, training and publish. The trainer's own
+/// `started_at`/`completed_at` sit between `source_bound_at` and
+/// `published_at`. Every instant is UTC on the clock of the process that
+/// claimed and runs the attempt.
 #[derive(Debug)]
 struct AttemptTimeline {
     job_id: String,
     attempt: u32,
     claimed_at: chrono::DateTime<chrono::Utc>,
-    began_at: chrono::DateTime<chrono::Utc>,
     source_bound_at: std::sync::OnceLock<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -8729,24 +7979,18 @@ struct AttemptTimeline {
 #[derive(Debug, serde::Serialize)]
 struct PublishedTimeline {
     claimed_at: chrono::DateTime<chrono::Utc>,
-    began_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_bound_at: Option<chrono::DateTime<chrono::Utc>>,
     published_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl AttemptTimeline {
-    /// `attempt` of `job_id` begins in this process, now.
-    fn begin(job_id: &str, attempt: u32, origin: AttemptOrigin) -> Self {
-        let began_at = chrono::Utc::now();
+    /// `attempt` of `job_id`, claimed by this process, begins now.
+    fn begin(job_id: &str, attempt: u32) -> Self {
         Self {
             job_id: job_id.to_string(),
             attempt,
-            claimed_at: match origin {
-                AttemptOrigin::Claimed => began_at,
-                AttemptOrigin::Placed { claimed_at } => claimed_at,
-            },
-            began_at,
+            claimed_at: chrono::Utc::now(),
             source_bound_at: std::sync::OnceLock::new(),
         }
     }
@@ -8762,7 +8006,6 @@ impl AttemptTimeline {
     fn published(&self) -> PublishedTimeline {
         PublishedTimeline {
             claimed_at: self.claimed_at,
-            began_at: self.began_at,
             source_bound_at: self.source_bound_at.get().copied(),
             published_at: chrono::Utc::now(),
         }
@@ -12910,15 +12153,10 @@ mod tests {
     }
 
     /// Pins `begin_release`'s two statements in order: the phase flip lands
-    /// strictly before the epoch bump. The two-catch lattice
-    /// `run_placed_attempt`'s own doc and `WorkerShared::for_single_run`'s
-    /// depend on ("a snapshot whose epoch bump is already visible implies
-    /// the flip already happened too") only holds in that order, and the
-    /// lattice's end-to-end test (`placed_attempt::
-    /// release_landing_between_the_epoch_read_and_probe_claim_is_still_
-    /// refused`) cannot falsify the ORDER because its own RELEASE runs to
-    /// full completion (both statements) inside one park, never observing
-    /// the gap between them.
+    /// strictly before the epoch bump. The claim loop's two catches depend
+    /// on it ("a snapshot whose epoch bump is already visible implies the
+    /// flip already happened too"), and only a test that parks inside the
+    /// gap between the two statements can falsify the ORDER.
     ///
     /// This test parks a live `begin_release` call between its two
     /// statements and reads BOTH sides of the window directly: while
@@ -12966,9 +12204,9 @@ mod tests {
             birth_epoch,
             "the epoch must not be bumped yet while parked between the flip and the bump"
         );
-        // A concurrent `probe_claim` — exactly `run_placed_attempt`'s own
-        // check, racing this window — must refuse on the phase alone, with
-        // no epoch compare available to it at all.
+        // A concurrent `probe_claim` — exactly the claim loop's own check,
+        // racing this window — must refuse on the phase alone, with no epoch
+        // compare available to it at all.
         assert!(
             admission.probe_claim().is_none(),
             "probe_claim must refuse on the phase read alone while the epoch is still unbumped"
@@ -12984,83 +12222,6 @@ mod tests {
             admission.release_epoch(),
             birth_epoch + 1,
             "the bump lands once begin_release resumes"
-        );
-    }
-
-    /// `Awaiting` (the state a
-    /// claim's own `submit_placed` puts the holder in BEFORE it submits —
-    /// the move precedes the submit) admits a `RunRank` session EXACTLY like `Free`
-    /// (a two-host fleet could not otherwise assemble if its only
-    /// free-looking host were the one awaiting its own placement result)
-    /// and refuses a second claim EXACTLY like `JobRun`; once the claim's
-    /// own guard drops with no rank having taken the cell over, the host is
-    /// `Free` again. Mutation: `probe_claim`'s admitting predicate widened
-    /// to `matches!(h, Holder::Free | Holder::Awaiting { .. })` (admitting
-    /// a SECOND claim while awaiting) reds this test's second assertion.
-    #[test]
-    fn awaiting_admits_a_rank_and_refuses_a_second_claim_and_frees_when_the_claim_ends() {
-        let cell = cell();
-        let claim = cell.probe_claim().expect("Free admits the claim's probe");
-        // `register_job_hold_or_release`'s own transition, mimicked
-        // directly (it needs a live catalog/session to call for real).
-        cell.job_running();
-        assert_eq!(cell.holder(), Holder::JobRun);
-        assert_eq!(
-            cell.begin_awaiting_placement("job-a", 1),
-            Ok(()),
-            "JobRun -> Awaiting"
-        );
-        assert_eq!(
-            cell.begin_awaiting_placement("job-a", 1),
-            Err(Holder::Awaiting {
-                job_id: "job-a".into(),
-                attempt: 1
-            }),
-            "the move is a CAS from exactly JobRun: from Awaiting it refuses with the \
-             holder it SAW (one critical section, never a second read); `submit_placed` \
-             submits on that refusal only for Free, and ends typed for any other holder"
-        );
-        assert_eq!(
-            cell.holder(),
-            Holder::Awaiting {
-                job_id: "job-a".into(),
-                attempt: 1
-            }
-        );
-        assert!(
-            cell.probe_claim().is_none(),
-            "Awaiting refuses a second claim exactly like JobRun"
-        );
-
-        // A RunRank admission on the submitter's host succeeds.
-        let rank = cell
-            .try_hold_rank("job-b", 7)
-            .expect("Awaiting admits a rank exactly like Free");
-        assert_eq!(
-            cell.holder(),
-            Holder::Rank {
-                job_id: "job-b".into(),
-                attempt: 7
-            }
-        );
-        drop(rank);
-        assert_eq!(cell.holder(), Holder::Free);
-        // The original claim's own guard, dropped after a rank already
-        // took the cell over, is a no-op (the cell no longer names
-        // `Awaiting`) — never resurrects a hold that already ended.
-        drop(claim);
-        assert_eq!(cell.holder(), Holder::Free);
-
-        // The plain case: no rank ever takes the cell — the claim's own
-        // guard alone returns the host to `Free` once the await ends.
-        let claim2 = cell.probe_claim().expect("Free admits the claim's probe");
-        cell.job_running();
-        assert_eq!(cell.begin_awaiting_placement("job-c", 1), Ok(()));
-        drop(claim2);
-        assert_eq!(
-            cell.holder(),
-            Holder::Free,
-            "the claim guard resets Awaiting to Free exactly as it resets JobRun"
         );
     }
 }

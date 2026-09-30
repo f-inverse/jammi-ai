@@ -61,6 +61,7 @@ mod eval;
 mod finetune_run;
 mod finetune_step;
 mod fixture;
+mod fleet;
 mod grad_oracle;
 mod graph_legs;
 mod graph_sample;
@@ -68,7 +69,6 @@ mod kernel_arm;
 mod ladder;
 mod leg;
 mod operator_mirror;
-mod plane;
 mod propagate;
 mod rate_gate;
 mod recall;
@@ -83,7 +83,7 @@ mod train_scale;
 mod vram;
 
 use clap::{Parser, Subcommand};
-use plane::PlaneArgs;
+use fleet::FleetArgs;
 
 use std::path::PathBuf;
 
@@ -299,21 +299,20 @@ struct FinetuneRunArgs {
     mutant_patch_sha256: Option<String>,
     /// Which rung of the train-run ladder this leg is: `resident` (the
     /// trainer over in-memory rows), `streamed` (the job path in this
-    /// process), `placed` (the job placed on a Ballista executor in another
     /// process) or `shape-d` (the deployed topology's role configs). The
-    /// rungs above `streamed` need `--features plane` and the plane's
+    /// rung above `streamed` needs `--features fleet` and the fleet's
     /// backends (`JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`,
     /// `JAMMI_TEST_S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
     #[arg(long, default_value = "resident")]
     rung: String,
     #[command(flatten)]
-    plane: PlaneArgs,
+    fleet: FleetArgs,
 }
 
 /// `fleet-env`'s flags.
 #[derive(clap::Args)]
 struct FleetEnvArgs {
-    /// `scheduler`, `query` or `compute`.
+    /// `query` or `compute`.
     #[arg(long)]
     role: String,
     /// The store root every member shares (`s3://bucket/prefix`).
@@ -328,12 +327,8 @@ struct FleetEnvArgs {
     /// The name other hosts dial this process by.
     #[arg(long)]
     advertise_host: String,
-    /// `host:port` of the fleet's scheduler.
-    #[arg(long)]
-    scheduler_address: String,
-    /// The CUDA ordinal the fleet's compute tier trains on; the CPU when
-    /// omitted. The same value places every role of one fleet: the compute
-    /// role trains on it, the query role names its kind.
+    /// The CUDA ordinal the fleet's compute tier runs on; the CPU when
+    /// omitted.
     #[arg(long)]
     device: Option<usize>,
     #[arg(long, default_value_t = 8815)]
@@ -342,12 +337,6 @@ struct FleetEnvArgs {
     health_port: u16,
     #[arg(long, default_value_t = 9000)]
     peer_port: u16,
-    #[arg(long, default_value_t = 50050)]
-    scheduler_port: u16,
-    #[arg(long, default_value_t = 50051)]
-    exec_bind_port: u16,
-    #[arg(long, default_value_t = 50052)]
-    exec_grpc_port: u16,
 }
 
 #[derive(Subcommand)]
@@ -605,8 +594,6 @@ enum Command {
         /// a unit's first take with its vectors beside it.
         #[arg(long)]
         legs_dir: Option<std::path::PathBuf>,
-        #[command(flatten)]
-        plane: PlaneArgs,
     },
     /// Run a command under the device-memory sampler — the one external
     /// instrument every rung's leg, including a PyTorch reference's, reads
@@ -655,8 +642,6 @@ enum Command {
         exchange_dir: Option<std::path::PathBuf>,
         #[arg(long)]
         legs_dir: Option<std::path::PathBuf>,
-        #[command(flatten)]
-        plane: PlaneArgs,
     },
     /// The encoder fine-tune step tier: time one real LoRA training step —
     /// three encoder forwards live on the tape at once, a cosine-margin triplet
@@ -748,12 +733,10 @@ enum Command {
     /// own fix for the identical lint (see that variant's doc).
     FinetuneRun(Box<FinetuneRunArgs>),
     /// The environment that places one shape-d role on one box, as
-    /// `KEY=VALUE` lines: the committed role config
-    /// (`deploy/kubernetes/overlays/shape-d/jammi-<role>.toml`) is run as
-    /// written with these layered over it, exactly as a one-host shape-d
+    /// `KEY=VALUE` lines: the committed role config is run as written with these layered over it, exactly as a one-host shape-d
     /// fleet layers them — so a fleet across hosts is the same fleet. The
     /// backends come from `JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`,
-    /// `JAMMI_TEST_S3_BUCKET`, `AWS_*`. Needs `--features plane`.
+    /// `JAMMI_TEST_S3_BUCKET`, `AWS_*`. Needs `--features fleet`.
     FleetEnv(Box<FleetEnvArgs>),
     /// The jammi-vs-torch learning oracle: one forward+backward at
     /// identical LoRA weights (never an optimizer step), emitted as a
@@ -859,26 +842,26 @@ enum Command {
     /// reads — so a resident fine-tune, the graph job and a PyTorch trainer all
     /// train on byte-identical input.
     GraphPairs(graph_sample::GraphPairsArgs),
-    /// The `propagate` workload's engine rungs, `plan` (one partition),
-    /// `plan-partitioned` (`--partitions`) and `placed` (the same request as
-    /// a job on a fleet, its sink placed on an executor process):
+    /// The `propagate` workload's engine rungs, `plan` (one partition) and
+    /// `plan-partitioned` (`--partitions`):
     /// `propagate_embeddings` over the synthetic graph at each `--nodes`
     /// size, one leg and one process per point under `--legs-dir` — the warm
     /// per-iteration series, the peak resident set, the digest of the
     /// key-sorted propagated vectors and the vectors themselves — beside the
-    /// unit's input files the PyTorch rungs read; a placed leg records where
-    /// its sink ran. The comparison is `jammi-bench ladder propagate`'s.
+    /// unit's input files the PyTorch rungs read. The comparison is
+    /// `jammi-bench ladder propagate`'s.
     Propagate(propagate::PropagateArgs),
-    /// The `structure` workload's engine rungs, `plan`, `plan-partitioned`
-    /// and `placed`: `generate_structure_embeddings` — an embedding table
+    /// The `structure` workload's engine rungs, `plan` and
+    /// `plan-partitioned`: `generate_structure_embeddings` — an embedding table
     /// from the edge relation alone — over the synthetic graph at each
     /// `--nodes` size, one leg and one process per point under `--legs-dir`,
     /// beside the unit's edge list and the engine's own seed rows, which the
     /// PyTorch rung starts from. The comparison is `jammi-bench ladder
     /// structure`'s.
     Structure(structure::StructureArgs),
-    /// The `predictor-train-run` workload's engine rungs — `in-process`, and
-    /// `placed` and `shape-d` (the same training as a job on a fleet) — for
+    /// The `predictor-train-run` workload's engine rungs — `in-process`,
+    /// `job` (the same training as a job in this process) and `shape-d` (as a
+    /// job on a fleet) — for
     /// the family member `--arch` names (`Cnp`, `AttnCnp`, `Tnp`): at each
     /// `--seeds` seed, sample the committed meta-dataset into episodes, write
     /// them and the seeded initial weights (the files a PyTorch twin loads),
@@ -968,7 +951,6 @@ async fn main() -> std::process::ExitCode {
             iters,
             exchange_dir,
             legs_dir,
-            plane,
         } => run_encode_step(encode_step::EncodeStepParams {
             task,
             rungs,
@@ -984,7 +966,6 @@ async fn main() -> std::process::ExitCode {
             gpu_device: cuda.map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
             exchange_dir,
             legs_dir,
-            plane: plane.into(),
         }),
         Command::SampleDevice { cuda, command } => run_sample_device(cuda, &command),
         Command::EncodeLeg {
@@ -1002,7 +983,6 @@ async fn main() -> std::process::ExitCode {
             iters,
             exchange_dir,
             legs_dir,
-            plane,
         } => {
             run_encode_leg(
                 encode_step::EncodeStepParams {
@@ -1021,7 +1001,6 @@ async fn main() -> std::process::ExitCode {
                         .map_or(encode_step::CPU_HERMETIC_DEVICE, |ordinal| ordinal as i32),
                     exchange_dir,
                     legs_dir,
-                    plane: plane.into(),
                 },
                 rows,
                 take,
@@ -1152,7 +1131,7 @@ async fn main() -> std::process::ExitCode {
                 mutant_base_sha,
                 mutant_patch_sha256,
                 rung,
-                plane,
+                fleet,
             } = *args;
             let rung = match rung.parse::<finetune_run::Rung>() {
                 Ok(r) => r,
@@ -1375,7 +1354,7 @@ async fn main() -> std::process::ExitCode {
                 max_seq_length,
                 expect_dense,
                 rung,
-                plane: plane.into(),
+                fleet: fleet.into(),
                 cuda_device: cuda,
                 work_dir,
                 mutant_id,
@@ -2408,15 +2387,14 @@ async fn run_encode_leg(
     }
 }
 
-#[cfg(feature = "plane")]
+#[cfg(feature = "fleet")]
 fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
     use jammi_test_utils::fleet::{Ports, ShapeDPlace, ShapeDRole};
     let role = match args.role.as_str() {
-        "scheduler" => ShapeDRole::Scheduler,
         "query" => ShapeDRole::Query,
         "compute" => ShapeDRole::Compute,
         other => {
-            eprintln!("fleet-env: unknown --role {other:?}; expected scheduler, query, or compute");
+            eprintln!("fleet-env: unknown --role {other:?}; expected query or compute");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -2427,20 +2405,16 @@ fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
         artifact_dir: &args.artifact_dir,
         bind_host: &args.bind_host,
         advertise_host: &args.advertise_host,
-        scheduler_address: &args.scheduler_address,
         ports: Ports {
             flight: args.flight_port,
             health: args.health_port,
             peer: args.peer_port,
-            scheduler: args.scheduler_port,
-            exec_bind: args.exec_bind_port,
-            exec_grpc: args.exec_grpc_port,
         },
         compute_device: args.device.map_or(-1, |o| o as i32),
     });
     println!(
-        "# jammi-server --config deploy/kubernetes/overlays/shape-d/jammi-{}.toml",
-        role.as_str()
+        "# jammi-server --config {}",
+        role.config_path(std::path::Path::new("")).display()
     );
     for (key, value) in env {
         println!("{key}={value}");
@@ -2448,11 +2422,11 @@ fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-#[cfg(not(feature = "plane"))]
+#[cfg(not(feature = "fleet"))]
 fn run_fleet_env(args: FleetEnvArgs) -> std::process::ExitCode {
     eprintln!(
-        "fleet-env: the {} role's environment is rendered by the compute plane's fleet facility: \
-         build jammi-bench with --features plane",
+        "fleet-env: the {} role's environment is rendered by the fleet facility: build \
+         jammi-bench with --features fleet",
         args.role
     );
     std::process::ExitCode::FAILURE

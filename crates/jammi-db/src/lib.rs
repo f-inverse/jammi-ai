@@ -9,7 +9,6 @@
 pub mod audit;
 pub mod cache;
 pub mod catalog;
-pub mod compute_plane;
 pub mod config;
 pub mod ephemeral;
 pub mod error;

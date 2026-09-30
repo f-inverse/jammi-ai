@@ -54,7 +54,6 @@ jobs:
           cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings
           cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
           cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
-          cargo clippy -p jammi-ballista --tests --features live-distributed-tests,live-postgres-tests -- -D warnings
           cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
 
       # jammi-db's `postgres` / `mysql` features compile `source/postgres.rs`
@@ -615,7 +614,6 @@ jobs:
           cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
           cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1
           cargo test -p jammi-server --features live-postgres-tests --test it -- --test-threads=1
-          cargo test -p jammi-ballista --features live-postgres-tests --test it -- --test-threads=1
 
   # The repository's guards (`ci/guards.toml`), run by the one runner a local
   # check uses too: `ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main`.
@@ -894,7 +892,7 @@ jobs:
         run: python3 ci/scripts/check_no_consumer_names.py
 
   # The multi-process lanes over Postgres and the S3-class store: the claim,
-  # chaos, compute-plane and ladder-rung legs `distributed.yml` defines.
+  # chaos and ladder-rung legs `distributed.yml` defines.
   distributed:
     uses: ./.github/workflows/distributed.yml
 

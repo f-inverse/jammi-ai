@@ -487,7 +487,6 @@ mod tests {
     use jammi_numerics::ChunkBudget;
 
     use super::*;
-    use crate::device::ComputeDeviceKind;
     use crate::inference::adapter::EmbeddingAdapter;
     use crate::inference::chunk::CHUNK_COLUMN;
     use crate::inference::runtime::stub::{self, ones, StubModel};
@@ -825,7 +824,6 @@ mod tests {
             embedding_dim: Some(1),
             regression_form: None,
             passthrough: Vec::new(),
-            device_kind: ComputeDeviceKind::Cpu,
             partitions: NonZeroUsize::new(4).unwrap(),
         };
         let input_schema = Arc::new(Schema::new(vec![

@@ -142,13 +142,8 @@ print(f"one definition across every fan-out → {one_definition}")
 - **Verification is width-independent.** `verify_materialization` recomputes
   an artifact digest; a verifier running a different fan-out than the
   producer still gets a `match`.
-- **Scaling out is a configuration change.** The same holds when the plan's
-  partitions run as tasks of a Ballista cluster. The chunk ids travel with
-  the rows through the shuffle, so a cluster writes what one process writes.
-  The engine's distributed tests prove that leg; this chapter proves the
-  in-process one.
 
 The mechanism lives in `crates/jammi-datafusion/src/inference/` (`numbered.rs`
 numbers and cuts; `exec.rs` holds `InferenceExec` and `InferenceFanOut`). The
-guide's *Built on DataFusion and Ballista* page maps it among the engine's
+guide's *Built on DataFusion* page maps it among the engine's
 other extensions of DataFusion.

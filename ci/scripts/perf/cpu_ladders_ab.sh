@@ -20,10 +20,10 @@
 #   graph-sample         sampler                       torch (PyG's node2vec walker)
 #   predictor-train-run  in-process                    torch
 #
-# The plane's rungs join when named: `placed` for the three graph workloads,
-# `placed` and `shape-d` for the predictor. They build the bench with the
-# plane and a `jammi-server` fleet beside it, over the pinned Postgres catalog
-# and S3-class store this run starts (`plane_backends.sh`).
+# The predictor's job rungs join when named: `job` in this process, and
+# `shape-d`, which builds the bench with the fleet and a `jammi-server` beside
+# it, over the pinned Postgres catalog and S3-class store this run starts
+# (`fleet_backends.sh`).
 #
 # The predictor twin trains with the knobs the engine's leg of the same seed
 # states (architecture, epochs, learning rate, clip, heads, layers), so the
@@ -57,13 +57,13 @@ REFERENCE="$REPO_ROOT/crates/jammi-bench/reference"
 case "$CPU_AB_WORKLOAD" in
   propagate|structure)
     DEFAULT_UNITS="2048,8192,32768"; DEFAULT_RUNGS="plan,plan-partitioned"
-    LADDER_RUNGS=(plan plan-partitioned placed) ;;
+    LADDER_RUNGS=(plan plan-partitioned) ;;
   graph-sample)
     DEFAULT_UNITS="64,256,1024"; DEFAULT_RUNGS="sampler"
     LADDER_RUNGS=(sampler) ;;
   predictor-train-run)
     DEFAULT_UNITS="$(seq -s, 1 12)"; DEFAULT_RUNGS="in-process"
-    LADDER_RUNGS=(in-process placed shape-d) ;;
+    LADDER_RUNGS=(in-process job shape-d) ;;
   *)
     echo "::error::CPU_AB_WORKLOAD must be propagate, structure, graph-sample or predictor-train-run (got '$CPU_AB_WORKLOAD')." >&2
     exit 2 ;;
@@ -77,7 +77,7 @@ FLEET=0
 for rung in "${RUNGS[@]}"; do
   [[ " ${LADDER_RUNGS[*]} " == *" $rung "* ]] \
     || { echo "::error::CPU_AB_RUNGS names '$rung'; the $CPU_AB_WORKLOAD engine rungs are ${LADDER_RUNGS[*]}." >&2; exit 2; }
-  case "$rung" in placed|shape-d) FLEET=1 ;; esac
+  if [ "$rung" = shape-d ]; then FLEET=1; fi
 done
 TOP_RUNG="${RUNGS[${#RUNGS[@]}-1]}"
 
@@ -110,8 +110,8 @@ if [ "$CPU_AB_DRY_RUN" != "1" ]; then
     || { echo "::error::CPU_AB_CPUS is set but taskset is not on PATH." >&2; exit 1; }
   # Each shape is its own literal invocation, as the guards read it.
   if [ "$FLEET" = 1 ]; then
-    run_cmd cargo build --release -p jammi-bench --features plane --manifest-path "$REPO_ROOT/Cargo.toml" \
-      || { echo "::error::cargo build -p jammi-bench --features plane failed" >&2; exit 1; }
+    run_cmd cargo build --release -p jammi-bench --features fleet --manifest-path "$REPO_ROOT/Cargo.toml" \
+      || { echo "::error::cargo build -p jammi-bench --features fleet failed" >&2; exit 1; }
     run_cmd cargo build --release -p jammi-server --bin jammi-server --features storage-s3 --manifest-path "$REPO_ROOT/Cargo.toml" \
       || { echo "::error::cargo build -p jammi-server failed" >&2; exit 1; }
   else
@@ -128,8 +128,8 @@ if [ "$CPU_AB_DRY_RUN" != "1" ]; then
     exit 1
   fi
   if [ "$FLEET" = 1 ]; then
-    source "$DIR/plane_backends.sh"
-    plane_backends_up "$OUT_DIR/plane"
+    source "$DIR/fleet_backends.sh"
+    fleet_backends_up "$OUT_DIR/fleet"
   fi
 fi
 
@@ -180,7 +180,7 @@ engine_leg() { # $1=point $2=rung $3=take
     graph-sample) cmd+=(--graph "$(graph_dir "$point")") ;;
     predictor-train-run) cmd+=(--seeds "$point" --rung "$rung") ;;
   esac
-  case "$rung" in placed|shape-d) cmd+=(--server-bin "$SERVER_BIN") ;; esac
+  if [ "$rung" = shape-d ]; then cmd+=(--server-bin "$SERVER_BIN"); fi
   run_leg "$label" "${cmd[@]}"
   LAST_LABEL="$label"
 }

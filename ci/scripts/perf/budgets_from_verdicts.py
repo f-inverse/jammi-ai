@@ -24,10 +24,17 @@ Every bound is rounded outward to three decimals, so a re-run that lands on the
 measurement itself passes. A rule a verdict did not measure gets no entry, and
 stays `UNBUDGETED`.
 
+`--check` holds every committed entry to the bound its named artifact
+derives for that `(workload, edge, rule)`: an edited bound, a moved artifact,
+or an entry its artifact does not measure reds. An entry may be retired — an
+edge whose rung no longer means what that artifact measured is held to
+nothing rather than to a stale bound, and reads `UNBUDGETED` until a new
+verdict budgets it — but never invented or edited.
+
 Usage:
     budgets_from_verdicts.py --out crates/jammi-bench/budgets.json ARTIFACT.json...
     budgets_from_verdicts.py --check crates/jammi-bench/budgets.json [ARTIFACT.json...]
-        (with no artifacts named, the table's own `measured_from` entries are the sources)
+        (every committed entry against its own `measured_from` artifact)
     budgets_from_verdicts.py --self-test
 
 Artifact paths are given relative to the repository root, and are recorded that
@@ -116,7 +123,35 @@ def derive(repo_root: Path, artifacts: list[str]) -> dict:
 
 
 def render(table: dict) -> str:
+    table = {"budgets": sorted(table["budgets"], key=lambda e: (e["workload"], e["edge"], e["rule"]))}
     return json.dumps(table, indent=2) + "\n"
+
+
+def check(repo_root: Path, table: dict) -> list[str]:
+    """Every committed entry against the bound its own artifact derives."""
+    derived: dict[str, dict] = {}
+    findings: list[str] = []
+    for e in table["budgets"]:
+        source = e["measured_from"]
+        if source not in derived:
+            path = repo_root / source
+            if not path.is_file():
+                findings.append(f"{e['workload']} {e['edge']} {e['rule']}: its artifact {source} is not in the tree")
+                derived[source] = {}
+                continue
+            derived[source] = {
+                (d["workload"], d["edge"], d["rule"]): d["bound"]
+                for d in entries_of(json.loads(path.read_text()), source)
+            }
+        key = (e["workload"], e["edge"], e["rule"])
+        if key not in derived[source]:
+            if (repo_root / source).is_file():
+                findings.append(f"{' '.join(key)}: {source} measures no such bound")
+        elif derived[source][key] != e["bound"]:
+            findings.append(
+                f"{' '.join(key)}: committed {e['bound']}, but {source} derives {derived[source][key]}"
+            )
+    return findings
 
 
 def self_test() -> int:
@@ -143,7 +178,10 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "v.json").write_text(json.dumps(verdict))
-        got = derive(root, ["v.json"])["budgets"]
+        return self_test_over(root, derive(root, ["v.json"])["budgets"])
+
+
+def self_test_over(root: Path, got: list[dict]) -> int:
     want = [
         ("encode", "direct -> plan", "device_memory_ratio", 0.99),
         ("encode", "direct -> plan", "fixed_cost", 12.34),
@@ -158,7 +196,24 @@ def self_test() -> int:
         print("self-test FAILED\n want:", want, "\n have:", have, file=sys.stderr)
         return 1
     assert all(e["measured_from"] == "v.json" for e in got)
-    print("budgets_from_verdicts self-test: OK — every rule kind derives its bound, rounded outward, sorted")
+    retired = {"budgets": [e for e in got if e["edge"] != "direct -> plan"]}
+    edited = {"budgets": [dict(got[0], bound=got[0]["bound"] + 0.001)] + got[1:]}
+    invented = {"budgets": got + [dict(got[0], rule="time_to_quality")]}
+    cases = [
+        ("the derivation itself", {"budgets": got}, 0),
+        ("a retired edge", retired, 0),
+        ("an edited bound", edited, 1),
+        ("an invented entry", invented, 1),
+    ]
+    for label, table, want_findings in cases:
+        findings = check(root, table)
+        if len(findings) != want_findings:
+            print(f"self-test FAILED: {label}: {findings}", file=sys.stderr)
+            return 1
+    print(
+        "budgets_from_verdicts self-test: OK — every rule kind derives its bound, rounded outward, "
+        "sorted; a retired edge passes the check, an edited or invented entry does not"
+    )
     return 0
 
 
@@ -181,15 +236,15 @@ def main(argv: list[str]) -> int:
         return 0
     if args.check:
         committed = Path(args.check).read_text()
-        if not args.artifacts:
-            # The table names its own sources: re-derive from exactly those.
-            artifacts = sorted({e["measured_from"] for e in json.loads(committed)["budgets"]})
-            table = derive(Path(args.repo_root), artifacts)
-            args.artifacts = artifacts
-        if committed != render(table):
-            print(f"::error::{args.check} does not equal its derivation from the named artifacts — regenerate with --out", file=sys.stderr)
+        findings = check(Path(args.repo_root), json.loads(committed))
+        if committed != render(json.loads(committed)):
+            findings.append(f"{args.check} is not in canonical form — regenerate with --out")
+        for finding in findings:
+            print(f"::error::{finding}", file=sys.stderr)
+        if findings:
             return 1
-        print(f"budgets: {args.check} follows its {len(args.artifacts)} artifact(s)")
+        sources = {e["measured_from"] for e in json.loads(committed)["budgets"]}
+        print(f"budgets: {args.check} follows its {len(sources)} artifact(s)")
         return 0
     print(render(table), end="")
     return 0

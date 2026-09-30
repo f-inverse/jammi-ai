@@ -1,6 +1,5 @@
 //! The fleets a leg runs on: spawned on this host from a `jammi-server`
-//! binary through `jammi_test_utils::fleet` — the same facility the
-//! distributed lane spawns its fleets through — or joined where it already
+//! binary through `jammi_test_utils::fleet`, or joined where it already
 //! runs across hosts. Every fleet shares one Postgres catalog and one
 //! S3-class store, which this process reads as an observer (a session with
 //! no worker) to find who claimed a job, what it published, and where.
@@ -10,31 +9,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jammi_ai::session::InferenceSession;
-use jammi_ballista::placement::BOUND_TASK_LOG;
-use jammi_db::catalog::jobs_repo::{JobRecord, WorkerRecord};
+use jammi_db::catalog::jobs_repo::JobRecord;
 use jammi_db::catalog::status::JobStatus;
 use jammi_db::config::{
     CatalogConfig, DistributedConfig, GpuConfig, JammiConfig, LeaseConfig, StorageConfig,
     WorkerConfig,
 };
-use jammi_db::store::SINK_WRITE_LOG;
-use jammi_test_utils::fleet::{
-    BallistaRole, Fleet, ProcSpec, ShapeDRole, WorkerRole, MAX_WORLD_SIZE,
-};
+use jammi_db::storage::{JammiObjectStore, StorageUrl};
+use jammi_test_utils::fleet::{Fleet, ProcSpec, ShapeDRole, MAX_WORLD_SIZE};
 use jammi_test_utils::DistributedBackends;
 
-use super::PlaneParams;
+use super::FleetParams;
 use crate::leg::RanOn;
 
 /// A fleet member's role, as the leg names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberRole {
-    /// `placed`: the claimant that hosts the scheduler and the client role,
-    /// places every attempt and hosts no executor.
-    Submitter,
-    /// `placed`: the executor a placed attempt runs on.
-    Executor,
-    Scheduler,
     Query,
     Compute,
 }
@@ -42,9 +32,6 @@ pub enum MemberRole {
 impl MemberRole {
     pub fn as_str(self) -> &'static str {
         match self {
-            MemberRole::Submitter => "submitter",
-            MemberRole::Executor => "executor",
-            MemberRole::Scheduler => "scheduler",
             MemberRole::Query => "query",
             MemberRole::Compute => "compute",
         }
@@ -74,14 +61,6 @@ pub struct RunningFleet {
 pub const TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The line the submitter writes when a claimed attempt is handed off to
-/// the executor it was placed on.
-pub const HANDED_OFF_LOG: &str = "run_placed_attempt: submitter HandedOff";
-/// The line a sink writes when it places its materialization on the compute
-/// plane, and the one it writes when the plane cannot hold it.
-pub const SINK_PLACED_LOG: &str = "materialization placed on the compute plane";
-pub const SINK_LOCAL_LOG: &str = "materialization runs in this process";
-
 impl RunningFleet {
     /// The backends every fleet shares, from the environment
     /// (`JAMMI_TEST_PG_URL`, `JAMMI_TEST_S3_ENDPOINT`, `JAMMI_TEST_S3_BUCKET`,
@@ -90,68 +69,23 @@ impl RunningFleet {
         DistributedBackends::from_env()
     }
 
-    /// The `placed` fleet: a submitter that claims jobs of `kinds` and
-    /// places them, and one executor that holds what is placed and claims
-    /// nothing of its own. Both on `device` (the executor's CUDA ordinal,
-    /// or `-1`): an attempt is placed only on an executor of its claimant's
-    /// device kind.
-    pub async fn spawn_placed(
-        plane: &PlaneParams,
-        leg: &str,
-        device: i32,
-        kinds: &'static [&'static str],
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let backends = Self::backends();
-        let result_root = backends.unique_result_root(leg);
-        let scheduler_port = jammi_test_utils::free_port();
-        let specs = vec![
-            ProcSpec::fresh_on(
-                BallistaRole::SchedulerAndClient { scheduler_port },
-                WorkerRole {
-                    enabled: true,
-                    kinds: Some(kinds),
-                    idle_poll_secs: 1,
-                },
-                device,
-            ),
-            ProcSpec::fresh_on(
-                BallistaRole::Executor { scheduler_port },
-                WorkerRole {
-                    enabled: true,
-                    kinds: Some(&[]),
-                    idle_poll_secs: 1,
-                },
-                device,
-            ),
-        ];
-        let roles = [MemberRole::Submitter, MemberRole::Executor];
-        Self::spawn(plane, backends, result_root, specs, &roles, None).await
-    }
-
-    /// The `shape-d` fleet on this host: the deployed topology's three role
-    /// configs, one compute process on `device`, whose kind the query tier
-    /// names.
+    /// The `shape-d` fleet on this host: the deployed topology's two role
+    /// configs, one compute process on `device`.
     pub async fn spawn_shape_d(
-        plane: &PlaneParams,
+        fleet: &FleetParams,
         leg: &str,
         device: i32,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let backends = Self::backends();
         let result_root = backends.unique_result_root(leg);
-        let scheduler_port = jammi_test_utils::free_port();
         let specs = vec![
-            ProcSpec::shape_d(ShapeDRole::Scheduler, scheduler_port, device),
-            ProcSpec::shape_d(ShapeDRole::Query, scheduler_port, device),
-            ProcSpec::shape_d(ShapeDRole::Compute, scheduler_port, device),
+            ProcSpec::shape_d(ShapeDRole::Query, device),
+            ProcSpec::shape_d(ShapeDRole::Compute, device),
         ];
-        let query_addr = format!("127.0.0.1:{}", specs[1].flight_port());
-        let roles = [
-            MemberRole::Scheduler,
-            MemberRole::Query,
-            MemberRole::Compute,
-        ];
+        let query_addr = format!("127.0.0.1:{}", specs[0].flight_port());
+        let roles = [MemberRole::Query, MemberRole::Compute];
         Self::spawn(
-            plane,
+            fleet,
             backends,
             result_root,
             specs,
@@ -196,24 +130,24 @@ impl RunningFleet {
     }
 
     async fn spawn(
-        plane: &PlaneParams,
+        fleet: &FleetParams,
         backends: DistributedBackends,
         result_root: String,
         specs: Vec<ProcSpec>,
         roles: &[MemberRole],
         query_addr: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let exe = plane.server_bin.clone().ok_or_else(|| {
+        let exe = fleet.server_bin.clone().ok_or_else(|| {
             format!(
                 "this rung spawns a fleet on this host: pass --server-bin <jammi-server> ({} \
                  were given)",
-                plane.summary()
+                fleet.summary()
             )
         })?;
         if !exe.is_file() {
             return Err(format!("--server-bin {} is not a file", exe.display()).into());
         }
-        let repo_root = plane
+        let repo_root = fleet
             .repo_root
             .clone()
             .unwrap_or_else(jammi_test_utils::workspace_root);
@@ -235,24 +169,6 @@ impl RunningFleet {
         };
         running.await_workers_registered().await?;
         Ok(running)
-    }
-
-    pub fn member(&self, role: MemberRole) -> Option<&Member> {
-        self.members.iter().find(|m| m.role == role)
-    }
-
-    /// The worker row of `label`, once it exists.
-    pub async fn worker_of_label(
-        &self,
-        label: &str,
-    ) -> Result<WorkerRecord, Box<dyn std::error::Error + Send + Sync>> {
-        self.session
-            .catalog()
-            .list_workers()
-            .await?
-            .into_iter()
-            .find(|w| w.label.as_deref() == Some(label))
-            .ok_or_else(|| format!("no worker row for label {label:?}").into())
     }
 
     /// Every spawned member that runs a worker has its `workers` row —
@@ -323,29 +239,6 @@ impl RunningFleet {
         }
     }
 
-    /// The first line of `label`'s log containing `needle`, polling until
-    /// it lands (a line a member writes after the catalog fact already
-    /// awaited is never a single read).
-    pub async fn await_log_line(
-        &mut self,
-        label: &str,
-        needle: &str,
-        what: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let deadline = Instant::now() + TERMINAL_TIMEOUT;
-        loop {
-            if let Some(line) = self.log_line(label, needle) {
-                return Ok(line);
-            }
-            self.check_alive(what)?;
-            if Instant::now() >= deadline {
-                self.diagnostics(&format!("timed out awaiting the log line: {what}"));
-                return Err(format!("{label}'s log never showed: {what}").into());
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-    }
-
     /// The first line of `label`'s log containing `needle`, if any yet.
     /// `None` for a joined fleet, whose logs are not this process's to read.
     pub fn log_line(&self, label: &str, needle: &str) -> Option<String> {
@@ -355,11 +248,6 @@ impl RunningFleet {
             .lines()
             .find(|line| line.contains(needle))
             .map(str::to_string)
-    }
-
-    /// Whether the logs are this process's to read.
-    pub fn has_logs(&self) -> bool {
-        self.fleet.is_some()
     }
 
     fn check_alive(&mut self, what: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -423,16 +311,6 @@ impl RunningFleet {
         })
     }
 
-    /// The label of the member in `role`.
-    fn label_of(
-        &self,
-        role: MemberRole,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.member(role)
-            .map(|m| m.label.clone())
-            .ok_or_else(|| format!("the fleet has no {} process", role.as_str()).into())
-    }
-
     /// The completed job `job_id`, or the reason it is not.
     pub async fn await_completed(
         &mut self,
@@ -465,32 +343,9 @@ impl RunningFleet {
         Ok(ran_on)
     }
 
-    /// Where a training job placed by the submitter ran: the job completed,
-    /// its claim transferred to the executor (never the submitter), proven
-    /// by the submitter's hand-off line and the scheduler's binding.
-    pub async fn placed_training_ran_on(
-        &mut self,
-        job_id: &str,
-    ) -> Result<(JobRecord, RanOn), Box<dyn std::error::Error + Send + Sync>> {
-        let record = self
-            .await_completed(job_id, "the placed job completes")
-            .await?;
-        let mut ran_on = self.claim_ran_on(&record, &[MemberRole::Submitter]).await?;
-        let submitter = self.label_of(MemberRole::Submitter)?;
-        ran_on.evidence.push(
-            self.await_log_line(&submitter, HANDED_OFF_LOG, "the submitter's hand-off line")
-                .await?,
-        );
-        ran_on.evidence.push(
-            self.await_log_line(&submitter, BOUND_TASK_LOG, "the scheduler's task binding")
-                .await?,
-        );
-        Ok((record, ran_on))
-    }
-
     /// Where a training job on the shape-d fleet ran: the job completed,
-    /// claimed by a compute process, never the query tier or the scheduler
-    /// — the catalog's claim, and that process's own line on the job where
+    /// claimed by a compute process, never the query tier — the catalog's
+    /// claim, and that process's own line on the job where
     /// it wrote one and the logs are this process's to read.
     pub async fn shape_d_training_ran_on(
         &mut self,
@@ -499,9 +354,7 @@ impl RunningFleet {
         let record = self
             .await_completed(job_id, "the shape-d job completes")
             .await?;
-        let mut ran_on = self
-            .claim_ran_on(&record, &[MemberRole::Query, MemberRole::Scheduler])
-            .await?;
+        let mut ran_on = self.claim_ran_on(&record, &[MemberRole::Query]).await?;
         if let Some(line) = ran_on
             .label
             .as_deref()
@@ -512,87 +365,32 @@ impl RunningFleet {
         Ok((record, ran_on))
     }
 
-    /// Where the sink that committed `table_name` ran: the member in
-    /// `writer`, proven by `placer`'s placement line, `scheduler`'s binding
-    /// and the writer's own sink write — refused when the placer ran the
-    /// materialization itself. On a joined fleet, whose logs are not this
-    /// process's, the writer's identity alone.
-    pub async fn placed_sink_ran_on(
-        &mut self,
-        table_name: &str,
-        placer: MemberRole,
-        scheduler: MemberRole,
-        writer: MemberRole,
-    ) -> Result<RanOn, Box<dyn std::error::Error + Send + Sync>> {
-        let writer_label = self.label_of(writer)?;
-        let worker = self.worker_of_label(&writer_label).await.ok();
-        let mut ran_on = RanOn {
-            instance_id: worker
-                .as_ref()
-                .map(|w| w.instance_id.clone())
-                .unwrap_or_else(|| writer_label.clone()),
-            label: Some(writer_label.clone()),
-            host: worker.and_then(|w| w.host),
-            role: writer.as_str().to_string(),
-            evidence: Vec::new(),
-        };
-        if !self.has_logs() {
-            return Ok(ran_on);
-        }
-        let placer_label = self.label_of(placer)?;
-        let scheduler_label = self.label_of(scheduler)?;
-        if let Some(local) = self.log_line(&placer_label, SINK_LOCAL_LOG) {
-            return Err(format!(
-                "the {} process ran the materialization itself, so this serve was not placed: \
-                 {local}",
-                placer.as_str()
+    /// Put the file at `local` in the fleet's shared store, under this
+    /// leg's result root, and return the URL every member registers it
+    /// from — the one route a leg's input takes to a fleet, on whichever
+    /// hosts its members run.
+    pub async fn publish_input(
+        &self,
+        local: &Path,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let storage = &self.session.inner_config().storage;
+        let root = storage
+            .result_root
+            .as_deref()
+            .ok_or("the fleet's observer session has no result root")?;
+        let name = local
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{} names no file", local.display()))?;
+        let url = format!("{}/inputs/{name}", root.trim_end_matches('/'));
+        let store = JammiObjectStore::open(&StorageUrl::parse(&url)?, storage.cloud.as_ref())?;
+        store
+            .put_bytes(
+                &store.data_path()?,
+                bytes::Bytes::from(std::fs::read(local)?),
             )
-            .into());
-        }
-        ran_on.evidence.push(
-            self.await_log_line(
-                &placer_label,
-                SINK_PLACED_LOG,
-                "the placer's placement line",
-            )
-            .await?,
-        );
-        ran_on.evidence.push(
-            self.await_log_line(
-                &scheduler_label,
-                BOUND_TASK_LOG,
-                "the scheduler binding the sink's task",
-            )
-            .await?,
-        );
-        let write = self
-            .await_log_line(&writer_label, SINK_WRITE_LOG, "the writer's sink write")
             .await?;
-        if !write.contains(table_name) {
-            let own = self.log_line(&writer_label, table_name).ok_or_else(|| {
-                format!(
-                    "the {} process wrote a table, but never {table_name}: {write}",
-                    writer.as_str()
-                )
-            })?;
-            ran_on.evidence.push(own);
-        }
-        ran_on.evidence.push(write);
-        if let Some(line) = self.log_line(&placer_label, SINK_WRITE_LOG) {
-            if line.contains(table_name) {
-                return Err(format!(
-                    "the {} process wrote {table_name} itself: {line}",
-                    placer.as_str()
-                )
-                .into());
-            }
-        }
-        Ok(ran_on)
-    }
-
-    /// A `file://` URL every member on this host can read, under `dir`.
-    pub fn local_url(path: &Path) -> String {
-        format!("file://{}", path.display())
+        Ok(url)
     }
 }
 

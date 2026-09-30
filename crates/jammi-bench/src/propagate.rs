@@ -1,6 +1,6 @@
 //! The `propagate` workload's engine rungs over the synthetic graph
-//! `graph_legs` builds: `plan`, `plan-partitioned` and `placed`, each leg
-//! filed with the unit's inputs the PyTorch rungs read.
+//! `graph_legs` builds: `plan` and `plan-partitioned`, each leg filed with
+//! the unit's inputs the PyTorch rungs read.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,20 +13,18 @@ use jammi_ai::pipeline::graph_propagation::{
     PropagateRequest, PropagationOutput, PropagationWeighting,
 };
 use jammi_ai::session::InferenceSession;
-use jammi_db::catalog::result_repo::ResultTableRecord;
 
 use crate::capture::{
     cpu_provenance, file_leg, leg_report, leg_stem, legs_per_point, vector_rows_digest,
     write_jsonl, write_vector_rows, Takes,
 };
 use crate::graph_legs::{
-    add_graph_sources, build_edges, build_features, build_nodes, materialize_features,
-    read_sorted_vectors, EngineRung, GraphHost, GraphShape, GraphSources, DEFAULT_SHAPE,
-    EDGES_FILE, INPUT_DIR, INPUT_MODEL_ID, X0_STEM,
+    add_graph_sources, build_edges, build_features, build_nodes, local_session,
+    materialize_features, read_sorted_vectors, EngineRung, GraphShape, DEFAULT_SHAPE, EDGES_FILE,
+    EDGES_SOURCE, INPUT_DIR, INPUT_MODEL_ID, NODES_SOURCE, X0_STEM,
 };
 use crate::ladder::leg::Take;
-use crate::leg::{Facts, Leg, Measured, Measurement, Payload, Provenance};
-use crate::plane::{PlaneArgs, PlaneParams};
+use crate::leg::{Facts, Leg, Measured, Measurement, Payload};
 use crate::report::{Nullable, Tiers};
 
 /// Build the propagation request over the registered synthetic graph, pinned to
@@ -34,21 +32,20 @@ use crate::report::{Nullable, Tiers};
 /// read undirected so the symmetric `Â` is meaningful.
 async fn build_request(
     session: &Arc<InferenceSession>,
-    sources: &GraphSources,
     hops: usize,
     alpha: f64,
 ) -> Result<PropagateRequest, Box<dyn std::error::Error>> {
     let source_table = session
         .catalog()
-        .find_result_tables(&sources.nodes, None, Some(INPUT_MODEL_ID))
+        .find_result_tables(NODES_SOURCE, None, Some(INPUT_MODEL_ID))
         .await?
         .into_iter()
         .next()
         .ok_or("the synthetic source embedding table is missing")?;
     Ok(PropagateRequest::new(
-        sources.nodes.clone(),
+        NODES_SOURCE,
         EdgeSourceRef::Registered {
-            source_id: sources.edges.clone(),
+            source_id: EDGES_SOURCE.into(),
             src_column: "src".into(),
             dst_column: "dst".into(),
             type_column: None,
@@ -62,32 +59,6 @@ async fn build_request(
     .with_output(PropagationOutput::Final)
     .with_hops(hops)
     .with_alpha(alpha))
-}
-
-/// One propagation of `request` on `host`: the table it committed.
-async fn propagate(
-    host: &mut GraphHost,
-    request: &PropagateRequest,
-) -> Result<ResultTableRecord, Box<dyn std::error::Error>> {
-    match host {
-        GraphHost::InProcess { session, .. } => {
-            let (table, _) = session
-                .propagate_embeddings(request, jammi_db::store::CachePolicy::Bypass)
-                .await?;
-            Ok(table)
-        }
-        #[cfg(feature = "plane")]
-        GraphHost::Placed { .. } => {
-            host.run_placed(
-                jammi_ai::jobs::JobSpec::Propagate {
-                    request: request.clone(),
-                    cache: jammi_db::store::CachePolicy::Bypass,
-                },
-                "propagation",
-            )
-            .await
-        }
-    }
 }
 
 /// The propagation one `propagate` leg is asked to run: one graph size on one
@@ -113,8 +84,6 @@ pub struct PropagateLegParams {
     pub iterations: usize,
     /// The measured repeat this leg is filed as.
     pub take: usize,
-    /// Where the `placed` rung runs.
-    pub plane: PlaneParams,
 }
 
 /// The `propagate` leg's payload: what two legs must agree on, and what this
@@ -201,35 +170,27 @@ pub async fn run_leg(
     )?;
 
     let dir = tempfile::tempdir()?;
-    let mut host = GraphHost::stand_up(
-        params.rung,
-        params.partitions,
-        &params.plane,
-        "propagate",
-        &format!("propagate-nodes{}-r{}", params.nodes, params.take),
-        &["propagate"],
-        dir.path(),
-    )
-    .await?;
-    let sources = host.sources().clone();
-    add_graph_sources(host.session(), dir.path(), &sources, &nodes, &edges).await?;
-    materialize_features(host.session(), &sources, &nodes, shape.dim).await?;
-    let request = build_request(host.session(), &sources, params.hops, params.alpha).await?;
+    let session =
+        local_session(dir.path(), params.rung.target_partitions(params.partitions)).await?;
+    add_graph_sources(&session, dir.path(), &nodes, &edges).await?;
+    materialize_features(&session, &nodes, shape.dim).await?;
+    let request = build_request(&session, params.hops, params.alpha).await?;
 
     // Each iteration's wall in run order, and the last one's table.
     let mut iter_wall_s = Vec::with_capacity(params.iterations);
     let mut last = None;
     for _ in 0..params.iterations {
         let start = Instant::now();
-        let table = propagate(&mut host, &request).await?;
+        let (table, _) = session
+            .propagate_embeddings(&request, jammi_db::store::CachePolicy::Bypass)
+            .await?;
         iter_wall_s.push(start.elapsed().as_secs_f64());
         last = Some(table);
     }
     let peak_rss_bytes = crate::rss::peak_rss_measurement();
 
     let table = last.ok_or("a propagate leg needs at least one iteration")?;
-    let rows = read_sorted_vectors(host.session(), &table).await?;
-    let ran_on = host.ran_on(&table.table_name).await?;
+    let rows = read_sorted_vectors(&session, &table).await?;
     let vectors = write_vector_rows(&params.legs_dir, &stem, &rows)?;
     let hops = request.effective_hops();
 
@@ -262,11 +223,7 @@ pub async fn run_leg(
         vector_dim: Some(vectors.dim),
         ..Default::default()
     };
-    let provenance = Provenance {
-        ran_on,
-        ..cpu_provenance()
-    };
-    let leg = Leg::new(payload, provenance, measured, Facts::default());
+    let leg = Leg::new(payload, cpu_provenance(), measured, Facts::default());
     let report = leg_report("propagate", leg.clone(), |leg| Tiers {
         propagate: Some(leg),
         ..Default::default()
@@ -285,9 +242,7 @@ pub struct PropagateArgs {
     /// `target_partitions` of the `plan-partitioned` rung.
     #[arg(long, default_value_t = 4)]
     partitions: usize,
-    /// The rungs to run: `plan`, `plan-partitioned`, `placed`; the first two
-    /// by default. `placed` needs `--features plane`, the plane's backends
-    /// in the environment and `--server-bin`.
+    /// The rungs to run: `plan`, `plan-partitioned`; both by default.
     #[arg(long = "rung", value_enum, value_delimiter = ',', default_values = ["plan", "plan-partitioned"])]
     rungs: Vec<EngineRung>,
     #[arg(long, default_value_t = jammi_ai::pipeline::graph_propagation::DEFAULT_PROPAGATE_HOPS)]
@@ -304,8 +259,6 @@ pub struct PropagateArgs {
     iterations: usize,
     #[command(flatten)]
     takes: Takes,
-    #[command(flatten)]
-    plane: PlaneArgs,
 }
 
 impl PropagateArgs {
@@ -320,7 +273,6 @@ impl PropagateArgs {
             legs_dir: self.legs_dir.clone(),
             iterations: self.iterations,
             take,
-            plane: self.plane.clone().into(),
         }
     }
 
@@ -362,7 +314,6 @@ impl PropagateArgs {
                         .into_iter()
                         .flat_map(|(flag, value)| [flag.into(), value.into()]),
                 )
-                .chain(PlaneParams::from(self.plane.clone()).child_args())
                 .collect()
             },
         )
@@ -407,7 +358,6 @@ mod tests {
             legs_dir: legs_dir.to_path_buf(),
             iterations: 1,
             take: 1,
-            plane: PlaneParams::default(),
         })
         .await
         .expect("propagate leg runs")

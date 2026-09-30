@@ -123,34 +123,14 @@ impl BuildingTable {
         table
     }
 
-    /// Hold the row open for renewal under this writer — a fresh
-    /// [`LeaseHold`] replacing any earlier one. Taken at adoption, and again
-    /// by the submitter of a placed sink when the row comes back from its
-    /// loan: while another process held the row under its own writer id the
-    /// keeper's renewals under this one matched nothing and the earlier hold
-    /// read lost, which the returned row is not.
-    pub fn rehold(&mut self) {
+    /// Hold the row open for renewal under this writer.
+    fn rehold(&mut self) {
         self.hold = self.store.lease_keeper().map(|keeper| {
             keeper.hold(LeaseTarget::ResultTable {
                 table: self.table_name.clone(),
                 writer_id: self.writer_id.clone(),
             })
         });
-    }
-
-    /// Hand the row to `to_writer_id` — the sink's return of a loaned row
-    /// to its submitter: the transfer CAS under this writer, then
-    /// [`Self::detach`] (no further renewal, no transition on drop). A
-    /// miss is the classified typed error and the handle is detached all
-    /// the same: the row is no longer this writer's to act on.
-    pub(crate) async fn hand_back(self, to_writer_id: &str) -> Result<()> {
-        let cas = self.cas();
-        let catalog = Arc::clone(self.store.catalog());
-        let lease = self.store.lease_intervals().lease();
-        self.detach();
-        catalog
-            .transfer_building_lease(&cas, to_writer_id, lease)
-            .await
     }
 
     /// The table's catalog name (the `result_tables` primary key).
@@ -372,6 +352,13 @@ impl BuildingTable {
     /// way — only the byte cleanup is incomplete, left for `reconcile` to
     /// retry.
     pub async fn abort(mut self) -> Result<()> {
+        self.abort_in_place().await
+    }
+
+    /// [`Self::abort`] through a borrow — the write that failed under the
+    /// caller's handle aborts it; the handle is done, so its drop is a
+    /// no-op.
+    pub(crate) async fn abort_in_place(&mut self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
         self.release_hold();
         let cas = self.cas();

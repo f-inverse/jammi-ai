@@ -10,7 +10,7 @@ same path on every host (the checkout's `training_triplets.csv`, read as its
 registered source.
 
 It submits the job at `--world-size` ranks (a gang wider than any one process,
-so the claiming server coordinates and dials the rest over the compute plane),
+so the claiming server coordinates and dials the rest over the gang service),
 waits for it, and records, as JSON on stdout:
 
 - the job's status, `claimed_by` and `ranks` (the instance that ran each rank),

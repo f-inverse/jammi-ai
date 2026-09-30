@@ -5,22 +5,11 @@ resources:
   - ../../base
   - statefulset-compute.yaml
   - service-compute-headless.yaml
-  - deployment-scheduler.yaml
-  - service-scheduler.yaml
 
 configMapGenerator:
-  # The base query tier's ConfigMap, replaced: Shape D's query tier is the
-  # base's config with the Ballista client role added.
-  - name: jammi-server-config
-    behavior: replace
-    files:
-      - jammi.toml=jammi-query.toml
   - name: jammi-compute-config
     files:
       - jammi.toml=jammi-compute.toml
-  - name: jammi-scheduler-config
-    files:
-      - jammi.toml=jammi-scheduler.toml
 
 generatorOptions:
   disableNameSuffixHash: true

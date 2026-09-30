@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GPU topology lane: the fine-tune gang on real GPUs at EVERY topology the
 # engine lays a job out as — the one place the collective's NCCL transport and
-# the compute plane's multi-host gang run on real hardware before release.
+# the fleet's multi-host gang run on real hardware before release.
 # Shared rent/run/teardown lives in runpod_lib.sh (its fleet primitives); this
 # driver shares the prove lane's shapes (group markers, the verdict function,
 # the rc contract) rather than a dialect of its own.
@@ -158,54 +158,6 @@ rp_topology_verdict() {
   return "$rc"
 }
 
-# Every place this lane may rent its fleet, in preference order: one line
-# `<gpuTypeId>|<rate>|<dataCenterId>` per candidate type (TOPOLOGY_GPU_TYPES
-# order) and co-located Global-Networking data center (sorted) where the type
-# clears TOPOLOGY_MIN_AVAILABILITY at RP_GPU_COUNT and its secure per-GPU rate
-# clears TOPOLOGY_MAX_GPU_RATE — only TOPOLOGY_DATA_CENTER when one is named.
-# An availability level is not a slot count (LOW may hold one 2-GPU pod), so
-# the driver walks these until both hosts land in one place. $1=pod catalog
-# body $2=Global-Networking data centers (space-separated). rc 75 when none
-# qualifies; 2 when a candidate type maps to no compute capability.
-rp_topology_candidates() {
-  local catalog="$1" gn_dcs="$2" type dcs rate co dc found=0
-  local IFS_SAVE="$IFS"
-  IFS='|'
-  # shellcheck disable=SC2086
-  set -- $TOPOLOGY_GPU_TYPES
-  IFS="$IFS_SAVE"
-  for type in "$@"; do
-    [ -n "$type" ] || continue
-    rp_compute_cap_for_gpu_type "$type" >/dev/null || {
-      echo "::error::candidate GPU type '${type}' maps to no compute capability (sm_80/86/89/90) -- refused" >&2
-      return 2
-    }
-    dcs="$(printf '%s' "$catalog" | rp_fleet_pick_data_centers "$type" "$TOPOLOGY_MIN_AVAILABILITY")"
-    case "$dcs" in PARSE_ERROR*) echo "::error::${dcs}" >&2; return 75 ;; esac
-    co="$(rp_fleet_intersect "$dcs" "$gn_dcs")"
-    [ -z "$TOPOLOGY_DATA_CENTER" ] || co="$(rp_fleet_intersect "$co" "$TOPOLOGY_DATA_CENTER")"
-    [ -n "$co" ] || { echo "no co-located capacity for ${type}" >&2; continue; }
-    rate="$(printf '%s' "$catalog" | python3 -c '
-import json, sys
-t = sys.argv[1]
-d = json.load(sys.stdin)
-e = next((g for g in d.get("gpus", []) if g.get("id") == t), {})
-p = (e.get("price") or {}).get("secure")
-print("" if p is None else p)
-' "$type")"
-    [ -n "$rate" ] || { echo "no secure rate listed for ${type}" >&2; continue; }
-    if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$rate" "$TOPOLOGY_MAX_GPU_RATE"; then
-      echo "${type} at \$${rate}/GPU/h exceeds the \$${TOPOLOGY_MAX_GPU_RATE} ceiling" >&2
-      continue
-    fi
-    for dc in $co; do
-      printf '%s|%s|%s\n' "$type" "$rate" "$dc"
-      found=1
-    done
-  done
-  [ "$found" -eq 1 ] || return 75
-}
-
 # Everything below runs only when this file is EXECUTED, never when it is
 # `source`d (so a fixture reaches the pure functions above without renting).
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -223,7 +175,7 @@ gn_status="$(printf '%s\n' "$gn_resp" | head -n1)"
 [ "$gn_status" = "200" ] || { echo "::error::datacenters read failed (status ${gn_status})"; exit 75; }
 gn_dcs="$(printf '%s\n' "$gn_resp" | tail -n +2 | rp_fleet_global_network_datacenters)"
 case "$gn_dcs" in PARSE_ERROR*) echo "::error::${gn_dcs}"; exit 75 ;; esac
-candidates="$(rp_topology_candidates "$avail_body" "$gn_dcs")" || exit $?
+candidates="$(rp_fleet_candidates "$avail_body" "$gn_dcs" "$TOPOLOGY_GPU_TYPES" "$TOPOLOGY_MIN_AVAILABILITY" "$TOPOLOGY_MAX_GPU_RATE" "$TOPOLOGY_DATA_CENTER")" || exit $?
 
 fleet_pod_0=""; fleet_pod_1=""
 cleanup_fleet() {
@@ -259,12 +211,12 @@ while IFS='|' read -r GPU_TYPE GPU_RATE chosen_dc <&3; do
   fleet_pod_0="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 0)" || { fleet_pod_0=""; continue; }
   fleet_pod_1="$(rp_fleet_pod_create "$GPU_TYPE" "$chosen_dc" 1)" || { fleet_pod_1=""; release_fleet; continue; }
   echo "=== fleet pods ${fleet_pod_0} (host 0), ${fleet_pod_1} (host 1) ==="
-  ready="$(rp_fleet_wait_ready "$fleet_pod_0" "$fleet_pod_1" "$RP_SSH_WAIT_SECS")" || { release_fleet; continue; }
-  IFS=' ' read -r HOST0 PORT0 HOST1 PORT1 measured_dc GN_IP0 GN_IP1 <<< "$ready"
+  ready="$(rp_fleet_wait_ready "$RP_SSH_WAIT_SECS" "$fleet_pod_0" "$fleet_pod_1")" || { release_fleet; continue; }
+  { read -r measured_dc; read -r HOST0 PORT0 GN_IP0; read -r HOST1 PORT1 GN_IP1; } <<< "$ready"
   echo "=== both hosts RUNNING in ${measured_dc}; Global-Networking ips ${GN_IP0}, ${GN_IP1} ==="
   if rp_wait_sshd "$HOST0" "$PORT0" "$RP_SSH_WAIT_SECS" "host 0" \
      && rp_wait_sshd "$HOST1" "$PORT1" "$RP_SSH_WAIT_SECS" "host 1" \
-     && rp_fleet_routes "$HOST0" "$PORT0" "$HOST1" "$PORT1" "$GN_IP0" "$GN_IP1"; then
+     && rp_fleet_routes "$HOST0" "$PORT0" "$GN_IP0" "$HOST1" "$PORT1" "$GN_IP1"; then
     placed=1
     break
   fi

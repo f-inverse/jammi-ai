@@ -1253,68 +1253,12 @@ ALTER TABLE jobs ADD COLUMN assembly_failures INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN next_assembly_after TEXT;
 "#;
 
-/// Migration 038 — `compute_cluster_state` — the catalog-backed cluster state a Ballista
-/// scheduler role reads/writes through `catalog::compute_repo`, and
-/// `workers.devices` — a per-worker device MIRROR, informational only, for
-/// `ListWorkers`. DISTRIBUTOR-NEUTRAL: no `ballista` in any
-/// identifier here, so the tables carry no distributor vocabulary into the
-/// engine's own catalog.
-///
-/// * `compute_executors` — one row per registered compute executor:
-///   `executor_id` (PK, the distributor's own executor identity — opaque to
-///   this crate), `instance_id` (FK-shaped, not enforced — carried for
-///   display/correlation only; see `devices` below for why it is NOT the
-///   placement join key), `host`/`port`/`grpc_port` (the executor's two
-///   listeners), `task_slots` (total capacity) and `available_slots`
-///   (capacity not currently bound — `available_slots <= task_slots`
-///   always, enforced by
-///   `compute_repo::Catalog::adjust_compute_slots`/`bind_compute_slots`,
-///   never by a schema `CHECK`, since a batch adjustment's intermediate
-///   per-row state during its one transaction is not itself required to
-///   satisfy the bound, only the committed result), `status` (the
-///   executor's lifecycle state, `status::ComputeExecutorStatus`, which
-///   the heartbeat write only ever moves forward), `heartbeat_at` (last
-///   liveness signal, `TEXT` in the same lease-timestamp family other
-///   catalog clocks use), `metadata` (free-form `TEXT`, e.g. the
-///   distributor's own JSON executor description — never parsed by this
-///   crate), and **`devices`** — the JSON `[{kind, ordinal}]`
-///   (`instance.rs::DeviceFact`) THIS EXECUTOR itself registers with,
-///   written by `compute_repo::Catalog::upsert_compute_executor` from
-///   `ComputeExecutorRecord.devices`. This is the executor's OWN
-///   registration fact and the placement join's ONLY authority —
-///   `catalog::compute_repo::Catalog::list_compute_executor_devices` reads
-///   THIS column directly, never `workers.devices` and never a join on
-///   `instance_id`: an executor process and a `[worker]` process are
-///   different roles that may run in different containers with different
-///   device visibility, so the executor's own device claim, not another
-///   table's, is what a placement decision must trust. `NOT NULL DEFAULT
-///   '[]'` so an executor registered before this column existed (or one
-///   that never names a device) reads back an empty list, never `NULL`.
-/// * `compute_jobs` — one row per submitted compute job: `job_id` (PK,
-///   opaque), `owner`, `status`, `queued_at`, `updated_at`. The execution
-///   GRAPH itself has no serialisation in Ballista 54.1, so
-///   it is deliberately NOT a column here — a scheduler restart keeps this
-///   row's status but never revives the in-flight graph; jammi's own
-///   reclaim re-runs the job, never Ballista's.
-/// * `workers.devices` — the JSON `[{kind, ordinal}]` device inventory
-///   `catalog::jobs_repo::Catalog::upsert_worker` writes from
-///   `WorkerFacts.devices`; `NOT NULL DEFAULT '[]'` so every pre-existing
-///   row (and every row a caller that still passes `&[]` writes) reads back
-///   an empty device list rather than `NULL` — the same "additive column,
-///   zero behaviour change for a row this migration does not itself write"
-///   shape as 034's/037's own `ADD COLUMN ... DEFAULT`. This column is a
-///   `ListWorkers` mirror ONLY, read back verbatim on
-///   `jammi.v1.job.WorkerSummary.devices` (field 8, an additive field on
-///   the frozen RPC surface — `crates/jammi-wire/proto/jammi/v1/job.proto`)
-///   — `compute_executors.devices` above is the placement policy's sole
-///   authority, never this one, because a `[worker]` row and a
-///   compute-executor row describe potentially different processes.
-///
-/// Ordered after BOTH `035_instances_peer_addr_result_root` (the `instances`/
-/// `workers` membership columns) and `037_jobs_assembly_failures_next_after`
-/// (the `jobs` assembly columns) — asserted by
-/// `tests/it/migrations.rs::migration_038_is_ordered_after_035_and_037_and_creates_compute_tables`
-/// on both backends by relative position, never `.last()`.
+/// Migration 038 — `compute_executors` and `compute_jobs` (dropped again by
+/// migration 047), and `workers.devices` — the JSON `[{kind, ordinal}]`
+/// device inventory `catalog::jobs_repo::Catalog::upsert_worker` writes from
+/// `WorkerFacts.devices`, read back verbatim on
+/// `jammi.v1.job.WorkerSummary.devices`. `NOT NULL DEFAULT '[]'` so every
+/// pre-existing row reads back an empty device list rather than `NULL`.
 pub(super) const MIGRATION_038_COMPUTE_CLUSTER_STATE: &str = r#"
 CREATE TABLE compute_executors (
     executor_id     TEXT PRIMARY KEY,
@@ -1370,9 +1314,8 @@ ALTER TABLE workers ADD COLUMN devices TEXT NOT NULL DEFAULT '[]';
 /// edge like any other non-canonical value, so a raw `INSERT` that omits
 /// the column fails loudly (`<table>.<column>: not a canonical stamp`) and
 /// every writer — the crate's own and any test fixture — stamps explicitly.
-/// `compute_jobs.{queued_at, updated_at}`'s `queued_at` is a decimal epoch
-/// counter (`jammi-ballista/src/cluster.rs`), not this shape, at all — out
-/// of the universe entirely, a different domain. Every remaining `*_at`
+/// `compute_jobs.queued_at` is a decimal epoch counter, not this shape at
+/// all — out of the universe entirely, a different domain. Every remaining `*_at`
 /// column (`sources`, `eval_runs`, `evidence_channels`,
 /// `evidence_channel_columns`, `mutable_tables`, `topics`, `index_segments`,
 /// `result_table_versions.created_at`/`completed_at`,
@@ -2257,4 +2200,12 @@ ALTER TABLE result_tables ALTER COLUMN task DROP NOT NULL;
 /// ranks; every claim resets it.
 pub(super) const MIGRATION_046_JOB_RANKS: &str = r#"
 ALTER TABLE jobs ADD COLUMN ranks TEXT;
+"#;
+
+/// Migration 047: the compute executor and compute job tables (038) are
+/// dropped — no role reads or writes them. Dropping a table takes its 039
+/// stamp triggers (SQLite) and CHECK constraint (Postgres) with it.
+pub(super) const MIGRATION_047_DROP_COMPUTE_CLUSTER_STATE: &str = r#"
+DROP TABLE compute_executors;
+DROP TABLE compute_jobs;
 "#;

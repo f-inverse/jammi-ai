@@ -219,5 +219,5 @@ run as a working table in the result store, and every hop reads the snapshot.
 An edge source that changes while a propagation runs cannot give hops that
 disagree. A hop is one plan; its state is handed to the next hop as another
 working table, reclaimed once read, and the snapshot when the run ends,
-however it ends. The last hop's plan is written through the embedding sink, so it is placed on the
-compute plane when one can hold it, exactly as `generate_embeddings` is.
+however it ends. The last hop's plan is written through the embedding sink, exactly as
+`generate_embeddings` writes its table.

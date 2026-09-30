@@ -96,11 +96,8 @@ impl BuildingVersion {
         version
     }
 
-    /// Hold the version row open for renewal under this writer — a fresh
-    /// [`LeaseHold`] replacing any earlier one; see
-    /// [`crate::store::BuildingTable::rehold`] for when a submitter takes
-    /// one again.
-    pub fn rehold(&mut self) {
+    /// Hold the version row open for renewal under this writer.
+    fn rehold(&mut self) {
         self.hold = self.store.lease_keeper().map(|keeper| {
             keeper.hold(LeaseTarget::ResultTableVersion {
                 table: self.table_name.clone(),
@@ -108,18 +105,6 @@ impl BuildingVersion {
                 writer_id: self.writer_id.clone(),
             })
         });
-    }
-
-    /// Hand the version row to `to_writer_id` and detach — the version twin
-    /// of [`crate::store::BuildingTable::hand_back`].
-    pub(crate) async fn hand_back(self, to_writer_id: &str) -> Result<()> {
-        let cas = self.cas();
-        let catalog = Arc::clone(self.store.catalog());
-        let lease = self.store.lease_intervals().lease();
-        self.detach();
-        catalog
-            .transfer_building_version_lease(&cas, to_writer_id, lease)
-            .await
     }
 
     /// The table's catalog name.
@@ -261,6 +246,13 @@ impl BuildingVersion {
     /// nothing. The base Parquet, its manifest and base segments are never
     /// touched.
     pub async fn abort(mut self) -> Result<()> {
+        self.abort_in_place().await
+    }
+
+    /// [`Self::abort`] through a borrow — the write that failed under the
+    /// caller's handle aborts it; the handle is done, so its drop is a
+    /// no-op.
+    pub(crate) async fn abort_in_place(&mut self) -> Result<()> {
         self.done.store(true, Ordering::SeqCst);
         self.release_hold();
         let cas = self.cas();

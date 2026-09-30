@@ -1,10 +1,8 @@
 //! The synthetic graph every graph workload's engine legs run over, and where
 //! they run it: the planted-class graph and its features, the sources it is
 //! registered under, a hermetic session at a partition count, the read of a
-//! materialised table's rows in key order, and a host — this process, or a
-//! fleet a request is submitted into as a job with its sink placed on an
-//! executor. `propagate` and `structure` build on this and differ only in the
-//! verb they run and the leg they file.
+//! materialised table's rows in key order. `propagate` and `structure` build
+//! on this and differ only in the verb they run and the leg they file.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -18,11 +16,10 @@ use jammi_db::config::{GpuConfig, JammiConfig};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
 
-use crate::leg::RanOn;
-use crate::plane::PlaneParams;
-
-const NODES_SOURCE: &str = "nodes";
-const EDGES_SOURCE: &str = "edges";
+/// The source the synthetic nodes are registered under.
+pub(crate) const NODES_SOURCE: &str = "nodes";
+/// The source the synthetic edges are registered under.
+pub(crate) const EDGES_SOURCE: &str = "edges";
 /// The model id the synthetic input embedding table is materialised under.
 pub const INPUT_MODEL_ID: &str = "synthetic-embed";
 const FEATURE_SEED: u64 = 0x00C0_FFEE_0001;
@@ -219,32 +216,6 @@ async fn write_parquet(
     Ok(format!("file://{}", path.to_str().unwrap()))
 }
 
-/// The names the synthetic graph is registered under: the constants in a
-/// session of this leg's own, suffixed in a fleet's shared catalog.
-#[derive(Debug, Clone)]
-pub(crate) struct GraphSources {
-    pub(crate) nodes: String,
-    pub(crate) edges: String,
-}
-
-impl GraphSources {
-    pub(crate) fn own() -> Self {
-        Self {
-            nodes: NODES_SOURCE.to_string(),
-            edges: EDGES_SOURCE.to_string(),
-        }
-    }
-
-    #[cfg(feature = "plane")]
-    pub(crate) fn unique() -> Self {
-        let suffix = crate::capture::unique_suffix();
-        Self {
-            nodes: format!("{NODES_SOURCE}_{suffix}"),
-            edges: format!("{EDGES_SOURCE}_{suffix}"),
-        }
-    }
-}
-
 /// A hermetic `Device::Cpu` session of this leg's own, over a tempdir.
 /// `target_partitions` is the DataFusion execution-thread count: the
 /// determinism test varies it to exercise the byte-identical-across-partitions
@@ -276,7 +247,6 @@ pub(crate) async fn local_session(
 pub(crate) async fn add_graph_sources(
     session: &Arc<InferenceSession>,
     dir: &std::path::Path,
-    sources: &GraphSources,
     nodes: &[Node],
     edges: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -298,7 +268,7 @@ pub(crate) async fn add_graph_sources(
     let node_url = write_parquet(dir, "nodes.parquet", node_schema, node_batch).await?;
     session
         .add_source(
-            &sources.nodes,
+            NODES_SOURCE,
             SourceType::File,
             SourceConnection {
                 url: Some(node_url),
@@ -326,7 +296,7 @@ pub(crate) async fn add_graph_sources(
     let edge_url = write_parquet(dir, "edges.parquet", edge_schema, edge_batch).await?;
     session
         .add_source(
-            &sources.edges,
+            EDGES_SOURCE,
             SourceType::File,
             SourceConnection {
                 url: Some(edge_url),
@@ -342,14 +312,13 @@ pub(crate) async fn add_graph_sources(
 /// keyed by `_row_id` — the `X⁽⁰⁾` a propagation reads.
 pub(crate) async fn materialize_features(
     session: &Arc<InferenceSession>,
-    sources: &GraphSources,
     nodes: &[Node],
     dim: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let features = build_features(nodes, dim);
     let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
         encoder_id: INPUT_MODEL_ID.to_string(),
-        source_id: sources.nodes.clone(),
+        source_id: NODES_SOURCE.to_string(),
         embedding_table: None,
         candidate_source: jammi_db::store::manifest::ContextCandidateSource::Ann { k: 5 },
         value_columns: Vec::new(),
@@ -360,7 +329,7 @@ pub(crate) async fn materialize_features(
     };
     let env = jammi_db::store::manifest::MaterializationEnv::without_models();
     let inputs = vec![jammi_db::store::manifest::InputAnchor::unpinned_at_instant(
-        &sources.nodes,
+        NODES_SOURCE,
         "1970-01-01T00:00:00Z",
     )];
     session
@@ -368,7 +337,7 @@ pub(crate) async fn materialize_features(
         .materialize_embedding_table(
             session.context(),
             jammi_db::store::EmbeddingTableSpec {
-                source_id: &sources.nodes,
+                source_id: NODES_SOURCE,
                 model_id: Some(INPUT_MODEL_ID),
                 derived_from: None,
                 dimensions: dim,
@@ -448,13 +417,11 @@ pub(crate) async fn read_sorted_vectors(
 }
 
 /// The rung an engine leg claims: the verb in this process at one partition,
-/// the same plan at `--partitions`, or the same request as a job on a fleet,
-/// claimed by the submitter process and its sink placed on an executor.
+/// or the same plan at `--partitions`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum EngineRung {
     Plan,
     PlanPartitioned,
-    Placed,
 }
 
 impl EngineRung {
@@ -462,7 +429,6 @@ impl EngineRung {
         match self {
             EngineRung::Plan => "plan",
             EngineRung::PlanPartitioned => "plan-partitioned",
-            EngineRung::Placed => "placed",
         }
     }
 
@@ -470,142 +436,8 @@ impl EngineRung {
     /// `partitioned` is the `plan-partitioned` rung's.
     pub fn target_partitions(self, partitioned: usize) -> usize {
         match self {
-            EngineRung::Plan | EngineRung::Placed => 1,
+            EngineRung::Plan => 1,
             EngineRung::PlanPartitioned => partitioned,
         }
-    }
-}
-
-/// Where a leg's verb runs: a session of this process's own, or a fleet the
-/// request is submitted into as a job.
-pub(crate) enum GraphHost {
-    InProcess {
-        session: Arc<InferenceSession>,
-        sources: GraphSources,
-    },
-    #[cfg(feature = "plane")]
-    Placed {
-        fleet: crate::plane::fleet::RunningFleet,
-        sources: GraphSources,
-    },
-}
-
-impl GraphHost {
-    /// Stand the host up for `rung`: a hermetic session at the rung's
-    /// partition count, or a fleet whose compute claims `job_kinds`, labelled
-    /// `label`.
-    pub(crate) async fn stand_up(
-        rung: EngineRung,
-        partitions: usize,
-        plane: &PlaneParams,
-        workload: &str,
-        label: &str,
-        job_kinds: &'static [&'static str],
-        artifact_dir: &std::path::Path,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        match rung {
-            EngineRung::Plan | EngineRung::PlanPartitioned => Ok(GraphHost::InProcess {
-                session: local_session(artifact_dir, rung.target_partitions(partitions)).await?,
-                sources: GraphSources::own(),
-            }),
-            #[cfg(feature = "plane")]
-            EngineRung::Placed => {
-                let _ = workload;
-                let fleet =
-                    crate::plane::fleet::RunningFleet::spawn_placed(plane, label, -1, job_kinds)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                Ok(GraphHost::Placed {
-                    fleet,
-                    sources: GraphSources::unique(),
-                })
-            }
-            #[cfg(not(feature = "plane"))]
-            EngineRung::Placed => {
-                let _ = (label, job_kinds);
-                Err(plane.refusal(workload, EngineRung::Placed.as_str()))
-            }
-        }
-    }
-
-    pub(crate) fn session(&self) -> &Arc<InferenceSession> {
-        match self {
-            GraphHost::InProcess { session, .. } => session,
-            #[cfg(feature = "plane")]
-            GraphHost::Placed { fleet, .. } => &fleet.session,
-        }
-    }
-
-    pub(crate) fn sources(&self) -> &GraphSources {
-        match self {
-            GraphHost::InProcess { sources, .. } => sources,
-            #[cfg(feature = "plane")]
-            GraphHost::Placed { sources, .. } => sources,
-        }
-    }
-
-    /// Run `spec` as a job on the fleet and return the table it committed;
-    /// an in-process host has no fleet to submit to.
-    #[cfg(feature = "plane")]
-    pub(crate) async fn run_placed(
-        &mut self,
-        spec: jammi_ai::jobs::JobSpec,
-        what: &str,
-    ) -> Result<ResultTableRecord, Box<dyn std::error::Error>> {
-        let GraphHost::Placed { fleet, .. } = self else {
-            return Err(format!("{what}: an in-process host runs no placed job").into());
-        };
-        let job = fleet.session.enqueue(spec, 0).await?;
-        let record = fleet
-            .await_completed(&job.job_id, &format!("the placed {what} completes"))
-            .await
-            .map_err(|e| e.to_string())?;
-        let result = record
-            .result
-            .as_deref()
-            .ok_or_else(|| format!("the completed {what} job carries no result"))?;
-        let jammi_ai::jobs::JobResult::Table { table, .. } = serde_json::from_str(result)? else {
-            return Err(format!("the {what} job's result is not a table").into());
-        };
-        fleet
-            .session
-            .catalog()
-            .get_result_table(&table)
-            .await?
-            .ok_or_else(|| format!("the {what} table {table} is not in the catalog").into())
-    }
-
-    /// Where the sink that committed `table_name` ran, when it left this
-    /// process.
-    #[cfg(feature = "plane")]
-    pub(crate) async fn ran_on(
-        &mut self,
-        table_name: &str,
-    ) -> Result<Option<RanOn>, Box<dyn std::error::Error>> {
-        match self {
-            GraphHost::InProcess { .. } => Ok(None),
-            GraphHost::Placed { fleet, .. } => {
-                use crate::plane::fleet::MemberRole;
-                fleet
-                    .placed_sink_ran_on(
-                        table_name,
-                        MemberRole::Submitter,
-                        MemberRole::Submitter,
-                        MemberRole::Executor,
-                    )
-                    .await
-                    .map(Some)
-                    .map_err(|e| e.to_string().into())
-            }
-        }
-    }
-
-    /// Without the plane, no sink leaves this process.
-    #[cfg(not(feature = "plane"))]
-    pub(crate) async fn ran_on(
-        &mut self,
-        _table_name: &str,
-    ) -> Result<Option<RanOn>, Box<dyn std::error::Error>> {
-        Ok(None)
     }
 }

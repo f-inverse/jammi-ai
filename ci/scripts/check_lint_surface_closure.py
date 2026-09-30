@@ -109,8 +109,8 @@ That last clause is a determinant of its own, and it is the one a
 trigger-only notion of "merge path" misses. A workflow can qualify under
 Rule 1a and still never see the PR that breaks the lint: `image.yml`
 is `push:`-to-main-only (no `pull_request` trigger at all), and
-`pypi-server-cuda.yml`'s `pull_request` trigger is filtered to
-`packaging/server-cu12/**`, `crates/jammi-server/**` and the two wheel
+`pypi-server.yml`'s `pull_request` trigger is filtered to
+`packaging/server-cpu/**`, `crates/jammi-server/**` and the two wheel
 workflow files. The jammi-ai live-gpu lane moved into either would satisfy
 its row while a PR editing only
 `crates/jammi-ai/**` ran neither, which is the fail-open this row exists to
@@ -136,7 +136,7 @@ corpus every real row must read SATISFIED. It runs the host-workflow
 mutations end-to-end as well, through the real workflow parser: a copy of
 `.github/workflows/` with that step's `run:` line MOVED out of `ci.yml`
 into a synthetic job in `image.yml` (push-to-main + `paths:`), and the
-same move into `pypi-server-cuda.yml` (a `pull_request` whose `paths:` do
+same move into `pypi-server.yml` (a `pull_request` whose `paths:` do
 not list `crates/jammi-ai/**`), must each read UNSATISFIED, while the
 same copy with nothing moved reads SATISFIED — so the mutation's verdict
 cannot be an artefact of copying the workflows.
@@ -1004,7 +1004,7 @@ def self_test() -> int:
     for host, why in (
         ("image.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
         (
-            "pypi-server-cuda.yml",
+            "pypi-server.yml",
             "a workflow whose `pull_request` `paths:` do not list `crates/jammi-ai/**`",
         ),
     ):
@@ -1024,17 +1024,17 @@ def self_test() -> int:
         )
 
     # ... and the same predicate must still SAY YES where the host genuinely
-    # does run on the crate: `pypi-server-cuda.yml`'s `paths:` DO list
+    # does run on the crate: `pypi-server.yml`'s `paths:` DO list
     # `crates/jammi-server/**`. Without this arm, "not ci.yml" would pass for
     # the rule.
     pypi_origin = LaneOrigin(
-        workflow="pypi-server-cuda.yml",
+        workflow="pypi-server.yml",
         pr_lanes=workflow_pr_lanes(
-            exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / "pypi-server-cuda.yml"
+            exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / "pypi-server.yml"
         ),
     )
     assert len(pypi_origin.pr_lanes) == 1 and pypi_origin.pr_lanes[0].paths, (
-        "self-test FAILED: pypi-server-cuda.yml no longer carries a paths-filtered "
+        "self-test FAILED: pypi-server.yml no longer carries a paths-filtered "
         "`pull_request` trigger, so the control above tests something else now"
     )
     image_origin = LaneOrigin(
@@ -1052,10 +1052,10 @@ def self_test() -> int:
     )
     assert host_probe is not None
     assert not lane_runs_on_pr_touching_crate(exec_mod, host_probe, "jammi-ai", crate_dirs), (
-        "self-test FAILED: pypi-server-cuda.yml's paths were read as admitting crates/jammi-ai/**"
+        "self-test FAILED: pypi-server.yml's paths were read as admitting crates/jammi-ai/**"
     )
     assert lane_runs_on_pr_touching_crate(exec_mod, host_probe, "jammi-server", crate_dirs), (
-        "self-test FAILED (over-strict): pypi-server-cuda.yml's `paths:` DO list "
+        "self-test FAILED (over-strict): pypi-server.yml's `paths:` DO list "
         "`crates/jammi-server/**`, so a lane hosted there must be credited for a jammi-server row"
     )
 

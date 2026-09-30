@@ -121,9 +121,11 @@ case $? in
 esac
 
 # One leg: `direct@<side>__<unit>__<take>.json`; the unit is the corpus size
-# served. `encode-step` files its leg as `direct__rows256__r1.json` in the
-# side's own legs directory, and the leg is refiled under the side tag the
-# revision edge reads.
+# served. A session that serves one rung files its legs as runs alone
+# (`direct__rows256__a1.json`) in the side's own legs directory. A side is a
+# build of its own, so its sessions are the edge's repeats: the first is
+# refiled as the repeat this call is, under the side tag the revision edge
+# reads.
 run_leg() { # $1=side $2=take
   local bin="$WORK_DIR/target-$1/release/jammi-bench"
   local leg="$RAW_DIR/direct@$1__rows256__$2"
@@ -135,8 +137,8 @@ run_leg() { # $1=side $2=take
   local rc=0
   "$bin" encode-step --cuda "$GPU_INFERENCE_AB_CUDA" --rung direct --rows 256 --legs-dir "$side_legs" > "$leg.stdout" 2> "$leg.stderr" || rc=$?
   echo "$rc" > "$leg.exit"
-  if [ "$rc" -eq 0 ] && [ -f "$side_legs/direct__rows256__r1.json" ]; then
-    mv "$side_legs/direct__rows256__r1.json" "$leg.json"
+  if [ "$rc" -eq 0 ] && [ -f "$side_legs/direct__rows256__a1.json" ]; then
+    mv "$side_legs/direct__rows256__a1.json" "$leg.json"
   else
     echo "::warning::$(basename "$leg") FAILED (exit ${rc}) -- recorded; the ladder refuses the unit." >&2
     tail -n 5 "$leg.stderr" 2>/dev/null || true

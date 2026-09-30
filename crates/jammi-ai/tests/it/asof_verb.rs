@@ -327,7 +327,10 @@ async fn ambiguous_duplicate_facts_fail_loud_through_the_verb() {
         .unwrap()
         .is_empty());
     let text = logs.text();
-    assert!(!text.contains("WARN"), "no warning for the aborted row: {text}");
+    assert!(
+        !text.contains("WARN"),
+        "no warning for the aborted row: {text}"
+    );
 }
 
 /// A `tracing` writer into a shared buffer.

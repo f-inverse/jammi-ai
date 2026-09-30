@@ -114,6 +114,9 @@ jobs:
       - name: Assert the wheel's .so ELF machine matches matrix.arch
         run: bash ../../ci/scripts/assert_elf_machine.sh "${{ steps.glibc-floor.outputs.so_path }}" ${{ matrix.arch }}
 
+      - name: Assert the wheel fits PyPI's per-file limit
+        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
+
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-native-linux-${{ matrix.arch }}
@@ -184,6 +187,9 @@ jobs:
             exit 1
           fi
           bash ../../ci/scripts/assert_elf_machine.sh "$so" ${{ matrix.assert_arch }}
+
+      - name: Assert the wheel fits PyPI's per-file limit
+        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
 
       - uses: actions/upload-artifact@v4
         with:

@@ -18,12 +18,20 @@ on:
   push:
     tags: ["py-v*"]
   workflow_dispatch:
+  # PR gate: build-only (no publish) on every input compiled into the wheel,
+  # so a wheel that stops building, or outgrows PyPI's per-file limit
+  # (`ci/scripts/assert_wheel_size.sh`), fails on the PR that caused it.
   pull_request:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".cargo/**"
+      - "rust-toolchain.toml"
       - "packaging/native-cu12/**"
       - "packaging/native/python/**"
-      - "crates/jammi-python/**"
       - "ci/scripts/build_native_cu12_wheel.sh"
+      - "ci/scripts/assert_wheel_size.sh"
       - ".github/workflows/pypi-native-cuda.yml"
 
 # Serialize per ref, never cancel: a publish in flight must finish (PyPI

@@ -39,6 +39,18 @@ workspace ships every publishable crate at the same
   symbol tables, as the server binaries already did, which puts the CUDA wheel under PyPI's
   100 MiB per-file limit (111 MB unstripped). Its build fails on the PR when it outgrows that limit,
   instead of at the tag's upload.
+- **Release binaries are a third smaller, and every wheel is held to PyPI's per-file limit.**
+  PyPI refused `jammi-server-cu12` 0.50.0 (112 MiB against its 100 MiB limit). The weight was
+  repeated code, not more code: at Cargo's default sixteen codegen units each unit carries its own
+  copy of every inlinable function it calls, and the derived code over the SQL syntax tree that
+  plan types embed was compiled over a hundred times. The release profile now builds each crate as
+  one codegen unit (`codegen-units = 1`): the stripped CPU server goes from 216 MiB to 130 MiB and
+  its wheel from 79 MiB to 51 MiB (aarch64), with the measured CPU workloads no slower. LTO
+  removed nothing further and fat LTO peaked at 28 GiB in one process; `opt-level = "s"` halved the
+  wheel again but cost about a tenth of training throughput, so neither is used. Every wheel build
+  — both servers, both engine wheels — now checks its size with `ci/scripts/assert_wheel_size.sh`,
+  and the CUDA wheels, the largest of each package, rebuild on any PR that changes what is compiled
+  into them.
 - **Every gang topology reduces over NCCL, and the result does not depend on it.** A collective is
   a control plane (the in-process rendezvous, or the fleet's two-phase round over `RunRank`) over a
   transport: inline bytes, or an NCCL device exchange. `[worker] collective` selects the transport

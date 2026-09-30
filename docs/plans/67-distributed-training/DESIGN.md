@@ -809,15 +809,14 @@ W-partition stage, which Ballista's bind round (it offers every live executor's 
 carry — and rejected on merit: the collective's transport, its bootstrap and its admission stay
 `RunRank` either way, so Ballista would replace only member discovery, at the cost of a second
 gang-placement path or of Ballista as a hard dependency of multi-host training. Whether the plane
-keeps its place for materializations was put to a measurement, plan 68's
-`DIST-DATA-PLANE.md` D15.
+keeps its place for materializations was to be put to a measurement, plan 68's
+`DIST-DATA-PLANE.md` D15, withdrawn unrun once the plane was removed regardless.
 
 **Decision, 2026-09-29: the plane is removed.** `jammi-ballista` and everything that existed only
 for it — the `ComputePlane` seam, the sink's cross-process lease, the catalog's second fleet of
 executor and job rows, the error envelope, the `[ballista]` roles and Shape D's scheduler — are
 deleted, whatever D15 shows: the plane was a parallel implementation of what the jobs fleet does,
-coupled to Ballista's scheduler internals (#682). D15 decides #613 instead. This section is
-history.
+coupled to Ballista's scheduler internals (#682). This section is history.
 
 **Discipline.** `jammi-kernels` extends candle at the seam candle exposes (`CustomOp1/2/3`), keeps
 one call path, vendors verbatim at a pinned version only where no seam exists, and believes

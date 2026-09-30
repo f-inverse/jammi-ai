@@ -15,9 +15,9 @@ workspace ships every publishable crate at the same
   the code, to Ballista's executor-loss path holding a map guard across an await a graph-lock
   holder was waiting on. The jobs queue already routes work to the host that runs it (`[worker]
   kinds`), gang assembly places a training run's ranks, and fan-out is DataFusion partitioning
-  in one process, so the plane is removed rather than repaired. A measured scaling test of
-  splitting one plan across hosts (DIST-DATA-PLANE D15) informs #613, where plan splitting is
-  revisited on a library that keeps no scheduler of its own. **BREAKING**: the `jammi-ballista`
+  in one process, so the plane is removed rather than repaired; splitting one plan across hosts is
+  revisited on `datafusion-distributed`, a library with no scheduler of its own, when a workload
+  needs it (#613). **BREAKING**: the `jammi-ballista`
   crate, the `[ballista]` config section, `jammi_db::compute_plane` (`ComputePlane`,
   `ComputePlaneSlot`, `Unheld`; the statement classifier moved to `jammi_db::store::statement`),
   `ResultTableSinkExec`, `ResultTableSinkSpec`, `SinkLease`, `ResultStore::adopt_placed_sink`,

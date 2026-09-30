@@ -28,8 +28,8 @@ see `DELTA-INCREMENTAL-EMBEDDING.md`). A fan-in "publish when every shard is ter
 orchestration; the engine has no job dependencies, and orchestration belongs to the consumer's
 runtime.
 
-**D2 — Ballista (S2) is not the retrieval data plane; it is the compute plane for materializations
-(training came off it, and its own place is D15's measured claim).** Principle:
+**D2 — Ballista (S2) is not the retrieval data plane, nor any plane: the engine carries no
+Ballista (D15).** Principle:
 topology is configuration, and the actuator rule (D5). What is true of Ballista 54.1.0:
 
 - *No accelerator resource dimension, no affinity.* `ExecutorSpecification` is `{ task_slots }` and
@@ -315,6 +315,18 @@ conditions read was seen. The units shrink fourfold and stay three, so the shape
 residual; the serves stay at 32, the ladder's minimum run; the largest unit is still a serve one
 GPU finishes in tens of seconds, the regime condition 4 is written for; every condition and bar
 is unchanged.
+
+**Withdrawn 2026-09-30, unrun: the test decides nothing the engine needs now.** With the plane
+removed whatever it showed, the test's only reader was #613. It would have measured Ballista's
+overhead and a plane the same change deletes — tasks run one after another on a one-slot
+executor, a sink writing through the object store — while #613's question is the overhead of
+`datafusion-distributed`, a substrate with no scheduler and a different exchange. What carries
+across substrates is known without it: an embedding's forwards split trivially across hosts. No
+workload needs one table cut across GPUs today; K GPUs already serve K whole-table jobs from the
+jobs fleet (D1). So splitting one plan across hosts is measured on `datafusion-distributed` when a
+workload asks for it, under a protocol timed on the target hardware before it is registered —
+this one was timed only by a CPU rehearsal, and on A100s its registered units could not finish
+within a pod's life. `crates/jammi-ballista` and every surface that existed for it are removed.
 
 ---
 

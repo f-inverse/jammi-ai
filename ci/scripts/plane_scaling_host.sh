@@ -38,7 +38,7 @@ die() { echo "plane_scaling_host.sh: $*" >&2; exit 1; }
 # The workload D15 fixes.
 MODEL_REPO="answerdotai/ModernBERT-large"
 MODEL_DIR="/root/checkpoints/ModernBERT-large"
-ROWS="16384,32768,65536"
+ROWS="4096,8192,16384"
 PARTITIONS=8
 BATCH_SIZE=32
 BATCH_TOKENS=16384

@@ -304,6 +304,18 @@ across hosts — so its verdicts are committed as #613's evidence: a pass by the
 splitting plans on `datafusion-distributed` once the workspace is on DataFusion 55; a fail closes
 that half of #613.
 
+**Amended 2026-09-30, before any leg of the test was filed: units of 4,096, 8,192 and 16,384
+rows.** The first fleet to run the protocol served K = 1's 16,384-row unit at about 52 s a
+`shape-d` serve (the executor runs the plan's eight tasks one after another at about 5 s each, then
+the sink writes for about 12 s). At that rate one take of K = 1 over the registered units is about
+six hours and the six blocks over a day — past the driver's three-hour block and the pods'
+ten-hour life, so the run could never finish. It was stopped with no leg filed; the only
+observation made is those K = 1 serve walls, no K = 2 or K = 4 serve ran, and nothing the pass
+conditions read was seen. The units shrink fourfold and stay three, so the shape fit still has its
+residual; the serves stay at 32, the ladder's minimum run; the largest unit is still a serve one
+GPU finishes in tens of seconds, the regime condition 4 is written for; every condition and bar
+is unchanged.
+
 ---
 
 ## 2. The candidates

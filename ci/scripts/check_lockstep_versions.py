@@ -5,9 +5,11 @@ The Rust crates inherit `[workspace.package] version`; the Python and npm dists
 each state it in their own manifest, and some pin a sibling at it exactly
 (`jammi-ai[embedded]` → `jammi-ai-native==X`). The cookbook is no published
 dist — a notebook installs it from the release's tag — but it carries the same
-version and pins `jammi-ai==X`. A release bump that misses one publishes a dist
-whose pin cannot resolve, or a notebook whose install line names a release that
-never shipped. This lists
+version and pins `jammi-ai==X`. The changelog's newest release section names
+the version the workspace ships. A release bump that misses one publishes a dist
+whose pin cannot resolve, a notebook whose install line names a release that
+never shipped, or a release whose changes the changelog files under another
+version. This lists
 every such site once and fails on any that disagrees with `Cargo.toml`.
 
 Run: `python3 ci/scripts/check_lockstep_versions.py`
@@ -37,6 +39,12 @@ def _pin(requirements: list[str], name: str) -> str | None:
     return None
 
 
+def _latest_release(changelog: str) -> str | None:
+    """The version of the changelog's first `## [X.Y.Z]` section, if any."""
+    m = re.search(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.MULTILINE)
+    return m.group(1) if m else None
+
+
 def sites() -> dict[str, str | None]:
     """Each lockstep site and the version it states."""
     client = _toml("clients/python/pyproject.toml")["project"]
@@ -57,6 +65,7 @@ def sites() -> dict[str, str | None]:
             json.loads((ROOT / "clients/typescript/package-lock.json").read_text())["version"],
         "clients/typescript/package-lock.json root package version":
             json.loads((ROOT / "clients/typescript/package-lock.json").read_text())["packages"][""]["version"],
+        "CHANGELOG.md newest release section": _latest_release((ROOT / "CHANGELOG.md").read_text()),
     }
 
 
@@ -66,9 +75,9 @@ def main() -> int:
     if wrong:
         print(f"lockstep versions: FAIL — the workspace is at {workspace}:", file=sys.stderr)
         for site, found in wrong.items():
-            print(f"  {site}: {found or 'no exact pin'}", file=sys.stderr)
+            print(f"  {site}: {found or 'none'}", file=sys.stderr)
         return 1
-    print(f"lockstep versions: every dist and pin is at {workspace}")
+    print(f"lockstep versions: every site is at {workspace}")
     return 0
 
 

@@ -47,10 +47,24 @@ workspace ships every publishable crate at the same
   one codegen unit (`codegen-units = 1`): the stripped CPU server goes from 216 MiB to 130 MiB and
   its wheel from 79 MiB to 51 MiB (aarch64), with the measured CPU workloads no slower. LTO
   removed nothing further and fat LTO peaked at 28 GiB in one process; `opt-level = "s"` halved the
-  wheel again but cost about a tenth of training throughput, so neither is used. Every wheel build
-  — both servers, both engine wheels — now checks its size with `ci/scripts/assert_wheel_size.sh`,
-  and the CUDA wheels, the largest of each package, rebuild on any PR that changes what is compiled
-  into them.
+  wheel again but cost about a tenth of training throughput, so neither is used. Every workflow
+  that publishes to PyPI now checks its wheel with `ci/scripts/assert_wheel_size.sh` and builds it
+  on the pull request that changes what it is built from — for a compiled wheel, anything the
+  workspace build reads — and a guard (`ci/scripts/check_wheel_gates.py`) holds both.
+- **A catalog backend implements its dialect's `begin`; one operator runs and settles every
+  transaction.** Each backend carried its own copy of run-the-closure, commit-or-roll-back, and
+  dropped a failed rollback's error unread. `CatalogBackend::begin` opens the transaction (SQLite's
+  `BEGIN IMMEDIATE`/`DEFERRED` on its detached task, Postgres's isolation and read-only
+  statements) and returns an `OpenTransaction`; `CatalogBackend::transaction` is now a provided
+  method over it, and a rollback that fails is logged beside the error that caused it.
+  **BREAKING**: an implementer of `CatalogBackend` provides `begin`, not `transaction`.
+- **A one-rung `jammi-bench encode-step` session files repeats unless it is declared a run
+  alone.** The producer named a session's legs `a<take>` whenever it served one rung, which is
+  right only beside repeats measured in a shared session; a revision edge's sides each run alone,
+  so `gpu-perf-ab` found no repeat on any side and judged every unit INVALID. **BREAKING** (bench
+  CLI): `--alone` declares the run alone, and `encode_ab.sh` passes it; without it a session's legs
+  are `r<take>`, the first carrying its vectors. The pod wrapper also resolves the repository root
+  correctly, so the workflow uploads the verdict it pulls.
 - **Every gang topology reduces over NCCL, and the result does not depend on it.** A collective is
   a control plane (the in-process rendezvous, or the fleet's two-phase round over `RunRank`) over a
   transport: inline bytes, or an NCCL device exchange. `[worker] collective` selects the transport

@@ -1,0 +1,49 @@
+# The test runner every hermetic lane uses, locally (`ci/dev.sh cargo nextest
+# run …`) and in CI. Each test runs in a process of its own, so state that is
+# process-global — dispatch counters, armed test hooks, environment variables,
+# the spawn lock — is isolated without any configuration here. A `serial_test`
+# key or a hand-written `static Mutex<()>` guarding such state keeps `cargo
+# test` correct and needs nothing from nextest. What a separate process does
+# NOT isolate is a resource of the host, and each one is a test group below,
+# named after the `serial_test` key it stands for:
+# `ci/scripts/check_serial_keys.py` holds that every key is either one of
+# these groups or named process-local there.
+
+[test-groups]
+# Tests carrying a real wall-clock deadline (P4's 60 s liveness timeout over a
+# 70,000-row fixture). CPU contention alone can blow it, so they run one at a
+# time.
+training_set_stream = { max-threads = 1 }
+# hf-hub's sync API does not coordinate concurrent first-time downloads of the
+# same repo into the on-disk cache across processes. Live lane only.
+patentclip = { max-threads = 1 }
+real_clap = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(jammi-ai) & binary(it) & test(/^training_set_stream::/)'
+test-group = 'training_set_stream'
+
+[[profile.default.overrides]]
+filter = 'package(jammi-ai) & binary(it) & test(/::live_patentclip_/)'
+test-group = 'patentclip'
+
+[[profile.default.overrides]]
+filter = 'package(jammi-ai) & binary(it) & test(/::live_real_clap_/)'
+test-group = 'real_clap'
+
+# CI: every failure is reported (one red binary never hides the rest), and the
+# per-test timings land in JUnit for the run's own record.
+[profile.ci]
+fail-fast = false
+status-level = "fail"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# The Postgres lane, as `ci`: every test opens its own database on one server,
+# holding up to ~24 of its 100 connections (a session pool, a lease keeper's
+# pool, a second session), so at most four run at once.
+[profile.postgres]
+inherits = "ci"
+test-threads = 4

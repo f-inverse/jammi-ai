@@ -707,10 +707,18 @@ async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
     assert_eq!(bytes_col.value(1), b"\x00\x01\xff");
 }
 
-/// Offset order == commit order. Two independent `Publisher`
-/// "sessions" share ONE Postgres database; interleaved publishes still
-/// yield a replay whose `_offset` order equals the true commit order,
-/// because the offset-assigning `UPDATE`'s row lock holds until commit.
+/// Offset order == commit order. Two independent `Publisher` "sessions"
+/// share ONE Postgres database and publish concurrently while a reader
+/// replays the topic from offset 0 over and over. Every replay must be a
+/// gap-free prefix `0..k`: an offset becomes visible only once every lower
+/// offset has committed, because the offset-assigning `UPDATE`'s row lock
+/// holds until commit. That visibility is what makes a watermark-bounded
+/// replay (`_offset > watermark`) complete.
+///
+/// Commit order itself is observable only through what readers see. The
+/// order in which `publish_scoped` calls return is not it: each returns
+/// after its commit *and* its broker fan-out, so two sessions' returns can
+/// reach the client in either order.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
@@ -758,74 +766,93 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
     );
 
     const N: i64 = 100;
-    // A commit-order log: each successful publish appends `(offset, marker)`
-    // the instant it commits, under a shared async lock, so the log's
-    // insertion order IS the true commit order regardless of which session
-    // committed it.
-    let commit_log: Arc<tokio::sync::Mutex<Vec<(u64, i64)>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(2 * N as usize)));
 
-    async fn publish_and_log(
+    // One session's publishes, in the order it made them: `(offset, seq)`.
+    async fn publish_all(
         publisher: &Publisher,
         topic: &TopicDefinition,
         marker: i64,
-        n: i64,
-        log: &Arc<tokio::sync::Mutex<Vec<(u64, i64)>>>,
-    ) {
-        for i in 0..n {
+    ) -> Vec<(u64, i64)> {
+        let mut published = Vec::with_capacity(N as usize);
+        for seq in (0..N).map(|i| marker * 1_000_000 + i) {
             let off = publisher
-                .publish_scoped(topic, None, batch_of(&[marker * 1_000_000 + i]))
+                .publish_scoped(topic, None, batch_of(&[seq]))
                 .await
                 .unwrap();
-            log.lock().await.push((off.value(), marker * 1_000_000 + i));
+            published.push((off.value(), seq));
         }
+        published
     }
 
-    tokio::join!(
-        publish_and_log(&session_a, &topic, 1, N, &commit_log),
-        publish_and_log(&session_b, &topic, 2, N, &commit_log),
+    // The topic from offset 0, one `(offset, seq)` per row, in replay order.
+    async fn replay_from_zero(subscriber: &Subscriber, topic: &TopicDefinition) -> Vec<(u64, i64)> {
+        subscriber
+            .replay_only(
+                topic,
+                Predicate::match_all(),
+                Some(Offset::new(0, chrono::Utc::now())),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|d| {
+                seq_column(&d.batch)
+                    .into_iter()
+                    .map(move |seq| (d.offset.value(), seq))
+            })
+            .collect()
+    }
+
+    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
+
+    // Starts before the first commit and replays until it sees all 2N.
+    let watch = async {
+        loop {
+            let seen: Vec<u64> = replay_from_zero(&subscriber, &topic)
+                .await
+                .into_iter()
+                .map(|(off, _)| off)
+                .collect();
+            let prefix: Vec<u64> = (0..seen.len() as u64).collect();
+            assert_eq!(
+                seen, prefix,
+                "a replay racing two sessions' commits must see a gap-free prefix of offsets: \
+                 an offset visible before a lower one commits is lost to every watermark"
+            );
+            if seen.len() == 2 * N as usize {
+                break;
+            }
+        }
+    };
+
+    let (published_a, published_b, ()) = tokio::join!(
+        publish_all(&session_a, &topic, 1),
+        publish_all(&session_b, &topic, 2),
+        watch,
     );
 
-    // `commit_order` is the log in TRUE commit order (append order, under
-    // the shared lock in `publish_and_log`) — kept UNSORTED and untouched
-    // from here on, so the replay-order assertion below actually compares
-    // against real commit order rather than against itself re-derived from
-    // a sorted copy. `sorted_by_offset` is a SEPARATE clone (the pattern
-    // `two_publishers_over_one_broker_deliver_gap_free_in_order` above uses
-    // for `seen`/`sorted`): sorting it in place would otherwise silently
-    // launder a reversed or reordered log into "already sorted", since
-    // `expected_seq` below would then be re-derived from the sorted copy
-    // instead of the true commit order.
-    let commit_order = commit_log.lock().await.clone();
-    let mut sorted_by_offset = commit_order.clone();
-    sorted_by_offset.sort_by_key(|(off, _)| *off);
-    let offsets: Vec<u64> = sorted_by_offset.iter().map(|(off, _)| *off).collect();
-    let expected: Vec<u64> = (0..(2 * N) as u64).collect();
+    // A session publishes one batch at a time, so each of its publishes
+    // committed before its next began and took the lower offset.
+    for published in [&published_a, &published_b] {
+        assert!(
+            published.windows(2).all(|w| w[0].0 < w[1].0),
+            "a session's sequential publishes must take increasing offsets: {published:?}"
+        );
+    }
+
+    let mut by_offset: Vec<(u64, i64)> = published_a.into_iter().chain(published_b).collect();
+    by_offset.sort_unstable();
+    let offsets: Vec<u64> = by_offset.iter().map(|(off, _)| *off).collect();
     assert_eq!(
-        offsets, expected,
+        offsets,
+        (0..(2 * N) as u64).collect::<Vec<_>>(),
         "offsets assigned across two sessions on one Postgres must be gap-free and unique"
     );
 
-    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
-    let drained = subscriber
-        .replay_only(
-            &topic,
-            Predicate::match_all(),
-            Some(Offset::new(0, chrono::Utc::now())),
-        )
-        .await
-        .unwrap();
-    let replay_seq: Vec<i64> = drained.iter().flat_map(|d| seq_column(&d.batch)).collect();
-    // Derived from the UNSORTED `commit_order` — the true, as-recorded
-    // commit sequence — not `sorted_by_offset`: a replay that merely
-    // reproduced offset order (even if that order diverged from real
-    // commit order) would pass against a sorted expectation but must fail
-    // here.
-    let expected_seq: Vec<i64> = commit_order.iter().map(|(_, marker)| *marker).collect();
     assert_eq!(
-        replay_seq, expected_seq,
-        "replay order (by `_offset`) must equal the true commit order recorded by the shared \
-         commit log -- this is the invariant the offset-assigning UPDATE's row lock provides"
+        replay_from_zero(&subscriber, &topic).await,
+        by_offset,
+        "a replay must return each publish's batch at the offset its publish returned"
     );
 }
 

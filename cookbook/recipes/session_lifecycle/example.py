@@ -41,7 +41,7 @@ def _images_table(rows: list[tuple[str, str]]) -> pa.Table:
     )
 
 
-def main() -> None:
+def main() -> int:
     with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
         db.set_tenant(TENANT)
 
@@ -118,7 +118,8 @@ def main() -> None:
         print("lifecycle events:", kinds)
 
         print("session_lifecycle recipe OK")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

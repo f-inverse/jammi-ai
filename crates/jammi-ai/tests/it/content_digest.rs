@@ -546,7 +546,7 @@ async fn tiny_bert_content_digest_is_unchanged_by_the_arch_extraction() {
 /// task, so a task-dependent digest here would itself be the defect.
 #[tokio::test(flavor = "multi_thread")]
 async fn tiny_open_clip_content_digest_is_unchanged_under_both_tasks() {
-    let fixture = jammi_test_utils::fixture("tiny_open_clip");
+    let fixture = jammi_test_utils::cookbook_fixture("tiny_open_clip");
     for task in [ModelTask::TextEmbedding, ModelTask::ImageEmbedding] {
         assert_content_digest(
             &fixture,

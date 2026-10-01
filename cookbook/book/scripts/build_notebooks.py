@@ -140,8 +140,8 @@ def setup_cell(release: str, *, server: bool, extras: list[str]) -> dict:
         f"""# Setup: jammi {release} — the CUDA engine on an sm_80+ GPU (L4, A100, …), the
 # CPU engine otherwise — and the cookbook's library and fixtures, from the release's
 # tag on GitHub. The chapter runs
-# at `small` scale, over the committed fixtures, in minutes. SCALE = "full" runs
-# it over the published data and real encoders instead: meant for a GPU, and the
+# at `small` scale, over the committed fixtures, on the CPU, in minutes. SCALE = "full"
+# runs it over the published data and real encoders instead, on the GPU: the
 # chapters that fine-tune take hours there.
 import os
 import subprocess
@@ -222,7 +222,7 @@ class Reference:
         return " ".join(p for p in parts if p).rstrip(".") + "."
 
 
-def references(bib: Path = BOOK / "references.bib") -> dict[str, Reference]:
+def references(bib: Path = BOOK / "jammi_cookbook" / "references.bib") -> dict[str, Reference]:
     """Every entry of ``bib``, with each field's braces balanced and TeX undone."""
     text = re.sub(r"^%.*$", "", bib.read_text(), flags=re.M)
     refs: dict[str, Reference] = {}
@@ -313,6 +313,12 @@ def chapter(qmd: Path, release: str, refs: dict[str, Reference]) -> tuple[Path, 
 def recipe(script: Path, release: str) -> tuple[Path, dict]:
     text = script.read_text()
     tree = ast.parse(text)
+    # The notebook ends in `assert main() == 0`, which holds only for a `main`
+    # that returns its exit status; one returning None fails every reader.
+    entry = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"),
+                 None)
+    if entry is None or entry.returns is None or ast.unparse(entry.returns) != "int":
+        raise ValueError(f"{script}: a recipe's `main` returns its exit status (`-> int`)")
     doc = ast.get_docstring(tree) or ""
     title, _, rest = doc.partition("\n")
     rest = re.sub(r"\n*Run with `python [^`]*`\.?\s*$", "", rest).strip()

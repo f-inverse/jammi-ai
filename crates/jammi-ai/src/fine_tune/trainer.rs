@@ -13768,7 +13768,7 @@ mod held_out_eval_tests {
 /// fabricated `true`.
 ///
 /// These tests build a REAL `EncoderAdapters` target — the smallest
-/// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
+/// constructible one, the checked-in `cookbook/fixtures/tiny_modernbert` config +
 /// weights also used by the `it` suite's `encoder_adapters` tests — and read the
 /// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
 /// never trusting `TrainingLoop::training_mode` as ground truth (that mirror
@@ -13799,7 +13799,7 @@ mod encoder_adapters_training_state_tests {
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
 
-    /// The repo-root `tests/fixtures/tiny_modernbert` dir — the same
+    /// The repo-root `cookbook/fixtures/tiny_modernbert` dir — the same
     /// smallest-constructible ModernBERT config + weights
     /// the `it` suite's `encoder_adapters` tests fine-tune end-to-end.
     /// `CARGO_MANIFEST_DIR` is `crates/jammi-ai`; `tests/fixtures` sits two
@@ -13811,7 +13811,7 @@ mod encoder_adapters_training_state_tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("tests")
+            .join("cookbook")
             .join("fixtures")
             .join("tiny_modernbert")
     }

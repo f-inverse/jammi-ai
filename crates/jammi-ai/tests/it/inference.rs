@@ -94,7 +94,7 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
 
     let model_id = format!(
         "local:{}",
-        common::fixture("tiny_open_clip").to_str().unwrap()
+        common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
     );
 
     // Encode a single text query — same path as cross-modal search uses.

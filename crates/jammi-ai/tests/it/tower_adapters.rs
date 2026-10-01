@@ -72,7 +72,7 @@ use crate::common;
 /// `open_clip_config.json` (no `model_type` field at all — the checkpoint
 /// family `EncoderFamily::OpenClip` exists to name).
 fn tiny_open_clip_dir() -> PathBuf {
-    common::fixture("tiny_open_clip")
+    common::cookbook_fixture("tiny_open_clip")
 }
 
 fn tiny_open_clip_model() -> String {

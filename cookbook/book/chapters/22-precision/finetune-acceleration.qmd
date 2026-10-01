@@ -70,15 +70,10 @@ gathered against the real checkpoint that motivated this work — ModernBERT-lar
 are never conflated below.
 
 ```{python}
-from pathlib import Path
+from jammi_cookbook import fixtures
 
-import jammi_cookbook
-
-_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
-TINY_MODERNBERT = _ENGINE_ROOT / "tests" / "fixtures" / "tiny_modernbert"
-
-assert TINY_MODERNBERT.exists(), f"missing engine fixture: {TINY_MODERNBERT}"
-print(f"encoder: {TINY_MODERNBERT}  (tiny ModernBERT architecture, hidden_size=32)")
+TINY_MODERNBERT = fixtures.path("tiny_modernbert")
+print(f"encoder: {TINY_MODERNBERT.name}  (tiny ModernBERT architecture, hidden_size=32)")
 ```
 
 ## Standing up the remote servers — one artifact directory, two processes in sequence

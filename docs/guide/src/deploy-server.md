@@ -138,7 +138,7 @@ can negotiate capability before calling a verb:
 
 ```python
 info = db.get_server_info()
-# {"version": "...", "features": [...], "storage_backends": [...],
+# {"version": "0.51.0", "features": [...], "storage_backends": [...],
 #  "services": ["core", "eval", "event"]}
 if "eval" in info["services"]:
     db.eval_per_query(...)
@@ -238,7 +238,7 @@ The server exposes three HTTP side-channel endpoints on port `8080`:
 
 ```bash
 curl http://localhost:8080/healthz
-# {"status":"ok","version":"0.8.0"}
+# {"status":"ok","version":"0.51.0"}
 
 curl http://localhost:8080/readyz
 # {"status":"ready"}

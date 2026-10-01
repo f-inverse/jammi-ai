@@ -233,7 +233,7 @@ fn modernbert_lora_site_names_are_exactly_its_selectable_sites() {
 }
 
 fn open_clip_json() -> serde_json::Value {
-    let path = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_config.json");
+    let path = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_config.json");
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -241,7 +241,7 @@ fn open_clip_json() -> serde_json::Value {
 fn clip_text_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
     let config = ClipTextConfig::from_open_clip_config(&open_clip_json()).unwrap();
-    let weights = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_model.safetensors");
+    let weights = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_model.safetensors");
 
     let build = |targets: &[&str]| -> AnyEncoder {
         let t = Targets::new(targets);
@@ -261,7 +261,7 @@ fn clip_text_lora_site_names_are_exactly_its_selectable_sites() {
 fn open_clip_vision_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
     let config = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
-    let weights = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_model.safetensors");
+    let weights = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_model.safetensors");
 
     let build = |targets: &[&str]| -> AnyEncoder {
         let t = Targets::new(targets);
@@ -310,7 +310,7 @@ fn both_open_clip_towers_report_one_shared_vocabulary() {
     let json = open_clip_json();
     let tcfg = ClipTextConfig::from_open_clip_config(&json).unwrap();
     let vcfg = OpenClipVisionConfig::from_open_clip_config(&json).unwrap();
-    let weights = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_model.safetensors");
+    let weights = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_model.safetensors");
 
     let t = Targets::new(&[]);
     let tvm = VarMap::new();

@@ -5,6 +5,46 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The published notebooks run nightly as a reader runs them.** The book gate and the nightly
+  render run the chapter sources against wheels built from HEAD, so neither saw what a reader gets:
+  0.50.0's setup cells named a `jammi-server-cu12` PyPI never received, and fifteen notebooks
+  failed on a GPU runtime with every gate green. `cookbook/book/scripts/run_published_notebooks.py`
+  runs each notebook at a release tag in what a fresh runtime gives it — an empty working
+  directory, a new environment holding only the kernel — setup cell included, so it installs the
+  release from PyPI. `cookbook-published.yml` runs it nightly over the newest `py-v*` tag on eight
+  CPU shards; `cookbook-published-gpu.yml` runs it on a RunPod L4 after a release. The render's
+  release-recipe leg, which ran the cookbook's library tests against the last published wheel, is
+  removed: running the notebooks covers it.
+- **Every chapter reads its files through the installed cookbook.** Run as published, five
+  chapters failed for every reader: the bridge chapter read `references.bib` and four precision and
+  refresh chapters read fixtures by climbing from the package to the repository, which an install
+  does not have. `references.bib` ships inside `jammi_cookbook`, and `citation_map.unresolved()`
+  is the one check of the map's two contracts the chapter and the tests share; the chapters read
+  fixtures through `jammi_cookbook.fixtures`, and the patent corpus as `tiny_corpus.parquet` (the
+  same rows). `tiny_modernbert` moves to `cookbook/fixtures/`, the tree the engine's tests and the
+  cookbook share, and `tiny_open_clip`'s second copy under `tests/fixtures/` is deleted. A packaging
+  test refuses any path a recipe, chapter or library module resolves by climbing out of its
+  package. `jammi_cookbook.determinism.committed_ids`, which read a `data/ids/` directory that
+  never existed, is deleted.
+- **Every recipe notebook ends in a `main` that returns its exit status.** A recipe notebook ends
+  in `assert main() == 0`; `search_audit` and `session_lifecycle` returned `None`, so their
+  notebooks failed for every reader while their scripts exited 0. Both return 0, and the notebook
+  builder refuses a recipe whose `main` is not `-> int`.
+- **The `small` scale runs on the CPU on every host.** `jammi_cookbook.scale` defines `small` as the
+  committed fixtures on the CPU, but sessions opened on the default device, so on a GPU runtime two
+  precision chapters' sign-quantized recalls moved by a query against goldens frozen on the CPU.
+  Importing the cookbook at `small` sets `JAMMI_GPU__DEVICE=-1` (an explicit setting wins); `full`
+  runs on the GPU.
+- **A Rust program builds against the published crates on aarch64 Linux.** `gemm-f16`'s FP16
+  kernels do not assemble at `opt-level = 0` there; the workspace compiles them with `+fp16`, which a
+  downstream crate does not inherit. The installation guide gives the profile override
+  (`[profile.dev.package.gemm-f16] opt-level = 1`), and the surfaces chapter's generated project
+  carries it.
+- **Every version a document states is a lockstep site.** The installation guide depended on
+  `jammi-ai = "0.25"`, the cloud-storage guide on `jammi-db` 0.5, and four health-endpoint examples
+  answered 0.8.0 or 0.29.0. The `lockstep versions` guard now reads every jammi dependency and health
+  version in the guide and the READMEs, and the changelog's newest release section, beside the
+  manifests and pins.
 
 ## [0.51.0] - 2026-09-30
 

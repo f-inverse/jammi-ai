@@ -23,7 +23,7 @@ use crate::harness;
 #[tokio::test(flavor = "multi_thread")]
 async fn modernbert_generate_embeddings_cpu_gpu_parity() {
     harness::loss_capture::install();
-    let model = harness::local_fixture_model_id("tiny_modernbert");
+    let model = harness::local_model_id("tiny_modernbert");
 
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
@@ -92,7 +92,7 @@ async fn modernbert_generate_embeddings_cpu_gpu_parity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn modernbert_encode_query_cpu_gpu_parity() {
     harness::loss_capture::install();
-    let model = harness::local_fixture_model_id("tiny_modernbert");
+    let model = harness::local_model_id("tiny_modernbert");
     let query = "a method for quantum error correction in superconducting qubits";
 
     let cpu_dir = TempDir::new().unwrap();

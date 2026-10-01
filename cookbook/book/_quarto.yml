@@ -94,7 +94,7 @@ book:
   appendices:
     - chapters/api-reference.qmd
 
-bibliography: references.bib
+bibliography: jammi_cookbook/references.bib
 
 format:
   html:

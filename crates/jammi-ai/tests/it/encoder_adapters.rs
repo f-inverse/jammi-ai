@@ -29,7 +29,10 @@ fn tiny_bert_model() -> String {
 }
 
 fn tiny_modernbert_model() -> String {
-    "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
+    "local:".to_string()
+        + common::cookbook_fixture("tiny_modernbert")
+            .to_str()
+            .unwrap()
 }
 
 async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {

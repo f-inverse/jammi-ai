@@ -54,7 +54,7 @@ fn root() -> PathBuf {
 }
 
 fn open_clip_dir() -> PathBuf {
-    root().join("tests/fixtures/tiny_open_clip")
+    root().join("cookbook/fixtures/tiny_open_clip")
 }
 
 fn htsat_dir() -> PathBuf {

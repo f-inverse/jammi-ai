@@ -468,10 +468,13 @@ against the engine commit it ships beside. The PR gate
 with `maturin`, force-reinstalls it (`--force-reinstall --no-deps`) over the
 unpinned `jammi-ai` dependency, then runs `check_api_reference.py`, the shared-lib
 pytest suite including `test_closed_loop.py`, the no-deferral grep, and the
-citation check. The nightly `render` job additionally runs `quarto render` over the
-committed cache and a release-recipe leg that re-installs the last published PyPI
-wheel and re-runs the gate, preserving the published-artifact signal HEAD-testing
-alone would lose. So a feature and its proof land atomically in one PR.
+citation check. The nightly `render` job additionally runs `quarto render`, every
+chapter live against its frozen goldens. So a feature and its proof land atomically
+in one PR. What a reader installs is tested separately:
+`.github/workflows/cookbook-published.yml` runs every notebook at the newest release
+tag, as published, in a fresh environment — the setup cell installs the release from
+PyPI — nightly on a CPU, and after a release on a RunPod L4 as well
+(`cookbook-published-gpu.yml`).
 
 **Maintainer implication.** A new or changed verb is not done until: (a) it has
 (or updates) a chapter under `cookbook/book/chapters/`; (b) its entry is
@@ -5062,7 +5065,8 @@ auto-available to every encoder.)
   `test-pg` + a `--no-run` compile-check in `compile-check-gated`.
 - **Cut a release:** PR bumping the version across the lockstep sites (the `lockstep versions`
   guard names each) + the rebuilt cookbook notebooks + `cargo update --workspace` +
-  `CHANGELOG.md`; run the full gate; on merge tag both `vX.Y.Z` and `py-vX.Y.Z`. [§6]
+  `CHANGELOG.md`; run the full gate; on merge prove, then tag both `vX.Y.Z` and `py-vX.Y.Z`; once
+  published, dispatch `cookbook-published.yml` and `cookbook-published-gpu.yml` on the tag. [§6]
 
 ---
 
@@ -5412,6 +5416,12 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   though it never touches CUDA itself, because it ships in the SAME all-or-nothing lockstep release)
   + `.github/workflows/pypi-server-cuda.yml` (auditwheel deliberately skipped) — all four gated on
   the same verdict, same commit, same tag family, reusing `v*`'s dispatch with no extra prove.
+
+Once every publisher is green, run the notebooks as a reader gets them: dispatch
+`.github/workflows/cookbook-published.yml` (CPU runners) and
+`.github/workflows/cookbook-published-gpu.yml` (a RunPod L4), each with `tag` set to the `py-v*`
+tag. They run every published notebook, setup cell included, in a fresh environment against what
+PyPI now serves; a red notebook is a broken release for every reader who opens its Colab link.
 
 `ci/scripts/check_gpu_prove_once.py`'s `PROMOTION_TABLE` is the reviewed cross-check for every one of
 these promotion jobs (workflow, promoting job, gate job); its P6 discovery rule scans EVERY workflow

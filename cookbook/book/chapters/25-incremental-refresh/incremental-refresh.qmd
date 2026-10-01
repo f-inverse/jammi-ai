@@ -46,15 +46,13 @@ one render:
 ```{python}
 import os
 import tempfile
-from pathlib import Path
 
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
+from jammi_cookbook import fixtures
 
-_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
-TINY_BERT = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_bert"
-assert TINY_BERT.exists(), f"missing engine fixture: {TINY_BERT}"
+TINY_BERT = fixtures.path("tiny_bert")
 
 WORDS = [
     "apple", "river", "engine", "violet", "quartz", "harbor",

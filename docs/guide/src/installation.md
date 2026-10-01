@@ -6,9 +6,18 @@ Add Jammi to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-jammi-db = "0.25"
-jammi-ai = "0.25"
+jammi-db = "0.51.0"
+jammi-ai = "0.51.0"
 tokio = { version = "1", features = ["full"] }
+```
+
+On `aarch64` Linux, also compile `gemm-f16` optimized in debug builds. Its FP16 kernels
+fail to assemble at `opt-level = 0` ("instruction requires: fullfp16"); optimized, they
+build for any ARMv8 target and are chosen at run time on hardware that has FP16:
+
+```toml
+[profile.dev.package.gemm-f16]
+opt-level = 1
 ```
 
 ## CLI

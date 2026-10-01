@@ -138,6 +138,17 @@ def test_a_recipe_is_its_docstring_its_body_and_a_run_of_main(tree):
     assert texts[4] == "assert main() == 0"
 
 
+def test_a_recipe_whose_main_returns_nothing_is_refused(tree):
+    script = tree / "cookbook" / "recipes" / "widgets" / "example.py"
+    returns_nothing = RECIPE.replace(
+        "def main() -> int:\n    return 0", "def main() -> None:\n    pass"
+    )
+    assert returns_nothing != RECIPE
+    script.write_text(returns_nothing)
+    with pytest.raises(ValueError, match="returns its exit status"):
+        build.recipe(script, "9.9.9")
+
+
 def test_the_colab_link_opens_the_release_tag(tree):
     path = tree / "cookbook" / "notebooks" / "recipes" / "widgets.ipynb"
     assert build.colab_url(path, "9.9.9") == (

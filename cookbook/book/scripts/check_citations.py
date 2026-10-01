@@ -16,8 +16,9 @@ import re
 import sys
 from pathlib import Path
 
+from jammi_cookbook.citation_map import bibliography_keys
+
 _ROOT = Path(__file__).resolve().parent.parent
-_BIB = _ROOT / "references.bib"
 
 # A citation key in pandoc/Quarto markdown: @key, optionally inside [@key; @key2].
 # Keys are letters/digits/_:-./ and must start after an @ that is not an email
@@ -25,10 +26,6 @@ _BIB = _ROOT / "references.bib"
 _CITE = re.compile(r"(?:^|[\s\[;])@([A-Za-z][\w:.#$%&+?<>~/-]*)")
 _CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`]*`")
-
-
-def _defined_keys() -> set[str]:
-    return set(re.findall(r"@\w+\{([^,]+),", _BIB.read_text()))
 
 
 def _used_keys(text: str) -> set[str]:
@@ -39,7 +36,7 @@ def _used_keys(text: str) -> set[str]:
 
 
 def main() -> int:
-    defined = _defined_keys()
+    defined = bibliography_keys()
     if not defined:
         print("check-citations: references.bib defines no entries.")
         return 1

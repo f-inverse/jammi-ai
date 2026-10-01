@@ -50,7 +50,7 @@ COOKBOOK_FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
 
 PATENTS_URL = f"file://{FIXTURES / 'patents.parquet'}"
 GOLDEN_URL = f"file://{FIXTURES / 'golden_relevance.csv'}"
-TINY_MODERNBERT = f"local:{FIXTURES / 'tiny_modernbert'}"
+TINY_MODERNBERT = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert'}"
 
 TINY_CLASSIFIER = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert_classifier'}"
 LABELS_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_labels.csv'}"

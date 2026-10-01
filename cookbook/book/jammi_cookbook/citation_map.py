@@ -5,7 +5,8 @@ verticals' bridge notes. Each :class:`CitationRow` pins a recipe to its monograp
 reference(s) (Stanković et al. Parts I/II/III), its GNN- or conformal-canon
 reference(s), and the exact ``jammi`` verb it runs.
 
-Two contracts hold this honest, both enforced by ``tests/test_citation_map.py``:
+Two contracts hold this honest; :func:`unresolved` names every breach of either,
+and both the test suite and the bridge chapter fail on one:
 
 * every ``bib_keys`` entry exists in ``references.bib`` (no dangling ``@cite``);
 * every ``jammi_call`` verb appears in the grounded API reference
@@ -19,7 +20,15 @@ primary source; the corrections found against the hand-off spec are recorded in
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from pathlib import Path
+
+_PACKAGE = Path(__file__).resolve().parent
+# The book's bibliography, shipped in the package so an installed cookbook — a
+# reader's runtime — checks the map against the same entries the book renders.
+BIBLIOGRAPHY = _PACKAGE / "references.bib"
+_API_REFERENCE = _PACKAGE / "_api_reference.md"
 
 
 @dataclass(frozen=True)
@@ -103,3 +112,31 @@ CITATION_MAP: tuple[CitationRow, ...] = (
         bib_keys=("tibshirani2019covariateshift", "barber2023beyond"),
     ),
 )
+
+
+def bibliography_keys() -> set[str]:
+    """Every entry key ``references.bib`` defines."""
+    return set(re.findall(r"@\w+\{([^,]+),", BIBLIOGRAPHY.read_text()))
+
+
+def unresolved() -> list[str]:
+    """Each breach of the map's two contracts; empty when the map holds.
+
+    A ``bib_keys`` entry must be a ``references.bib`` key, and a ``jammi_call``
+    must appear in the grounded API reference as a whole word (so ``search`` does
+    not match ``search_by_id``).
+    """
+    defined = bibliography_keys()
+    api = _API_REFERENCE.read_text()
+    dangling = [
+        f"{row.recipe!r} cites {key!r}, which references.bib does not define"
+        for row in CITATION_MAP
+        for key in row.bib_keys
+        if key not in defined
+    ]
+    absent = [
+        f"{row.recipe!r} runs {row.jammi_call!r}, which the API reference does not name"
+        for row in CITATION_MAP
+        if not re.search(rf"\b{re.escape(row.jammi_call)}\b", api)
+    ]
+    return dangling + absent

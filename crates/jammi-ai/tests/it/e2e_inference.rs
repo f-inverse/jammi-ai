@@ -25,7 +25,7 @@ fn tiny_bert_source() -> ModelSource {
 }
 
 fn tiny_modernbert_source() -> ModelSource {
-    ModelSource::local(common::fixture("tiny_modernbert"))
+    ModelSource::local(common::cookbook_fixture("tiny_modernbert"))
 }
 
 async fn session_with_patents() -> (Arc<InferenceSession>, TempDir) {
@@ -728,7 +728,10 @@ async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
-    let model = "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap();
+    let model = "local:".to_string()
+        + common::cookbook_fixture("tiny_modernbert")
+            .to_str()
+            .unwrap();
 
     let vec_a = session
         .encode_text_query(&model, "quantum computing in superconducting systems")

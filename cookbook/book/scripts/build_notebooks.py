@@ -140,8 +140,8 @@ def setup_cell(release: str, *, server: bool, extras: list[str]) -> dict:
         f"""# Setup: jammi {release} — the CUDA engine on an sm_80+ GPU (L4, A100, …), the
 # CPU engine otherwise — and the cookbook's library and fixtures, from the release's
 # tag on GitHub. The chapter runs
-# at `small` scale, over the committed fixtures, in minutes. SCALE = "full" runs
-# it over the published data and real encoders instead: meant for a GPU, and the
+# at `small` scale, over the committed fixtures, on the CPU, in minutes. SCALE = "full"
+# runs it over the published data and real encoders instead, on the GPU: the
 # chapters that fine-tune take hours there.
 import os
 import subprocess
@@ -222,7 +222,7 @@ class Reference:
         return " ".join(p for p in parts if p).rstrip(".") + "."
 
 
-def references(bib: Path = BOOK / "references.bib") -> dict[str, Reference]:
+def references(bib: Path = BOOK / "jammi_cookbook" / "references.bib") -> dict[str, Reference]:
     """Every entry of ``bib``, with each field's braces balanced and TeX undone."""
     text = re.sub(r"^%.*$", "", bib.read_text(), flags=re.M)
     refs: dict[str, Reference] = {}

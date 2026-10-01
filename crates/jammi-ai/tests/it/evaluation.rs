@@ -889,7 +889,7 @@ async fn eval_image_embeddings_end_to_end() {
 
     let tiny_open_clip = format!(
         "local:{}",
-        common::fixture("tiny_open_clip").to_str().unwrap()
+        common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
     );
 
     // Register source with inline images

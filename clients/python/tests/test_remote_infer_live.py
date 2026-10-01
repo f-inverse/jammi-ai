@@ -32,9 +32,9 @@ pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 # The repo's shared generic fixtures: the smallest source + deterministic local
 # model the embedded inference tests already run (`patents.parquet` through
 # `tiny_modernbert`, a 32-dim ModernBERT with committed weights).
-FIXTURES = Path(__file__).resolve().parents[3] / "tests" / "fixtures"
-PATENTS_URL = f"file://{FIXTURES / 'patents.parquet'}"
-TINY_MODERNBERT = f"local:{FIXTURES / 'tiny_modernbert'}"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PATENTS_URL = f"file://{REPO_ROOT / 'tests' / 'fixtures' / 'patents.parquet'}"
+TINY_MODERNBERT = f"local:{REPO_ROOT / 'cookbook' / 'fixtures' / 'tiny_modernbert'}"
 
 
 def test_infer_round_trip_matches_embedded(live_server, tmp_path):

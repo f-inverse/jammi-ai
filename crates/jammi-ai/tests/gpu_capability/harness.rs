@@ -232,13 +232,6 @@ pub fn cookbook_fixture_url(name: &str) -> String {
     format!("file://{}", cookbook_fixture(name).display())
 }
 
-/// `local:` model id for a `tests/fixtures/` encoder fixture — the same id
-/// the CPU `it` suite uses for `tiny_modernbert` / `tiny_open_clip`, which are
-/// committed under `tests/fixtures/` rather than `cookbook/fixtures/`.
-pub fn local_fixture_model_id(fixture_name: &str) -> String {
-    format!("local:{}", fixture(fixture_name).to_str().unwrap())
-}
-
 // ─── Session builders ─────────────────────────────────────────────────────────
 
 /// A JammiConfig rooted at `artifact_dir`, pinned to `device`

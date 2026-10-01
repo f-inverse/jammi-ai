@@ -10,51 +10,13 @@ paper that is not in the bibliography or a Jammi verb that does not exist.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
-from jammi_cookbook import contracts
-from jammi_cookbook.citation_map import CITATION_MAP
-
-_REPO_ROOT = Path(contracts.__file__).resolve().parent.parent
-_BIB = _REPO_ROOT / "references.bib"
-_API_REFERENCE = _REPO_ROOT / "jammi_cookbook" / "_api_reference.md"
+from jammi_cookbook.citation_map import CITATION_MAP, bibliography_keys, unresolved
 
 
-def _bib_keys() -> set[str]:
-    """Every @<type>{<key>, … entry key defined in references.bib."""
-    text = _BIB.read_text()
-    return set(re.findall(r"@\w+\{([^,]+),", text))
-
-
-def test_every_citation_resolves_to_a_bib_entry():
-    """No dangling @cite: every bib_key in the map exists in references.bib."""
-    defined = _bib_keys()
-    assert defined, "references.bib defines no entries"
-    for row in CITATION_MAP:
-        for key in row.bib_keys:
-            assert key in defined, (
-                f"citation map row {row.recipe!r} cites '{key}', which is not a "
-                f"references.bib entry (have: {sorted(defined)})"
-            )
-
-
-def test_every_jammi_call_exists_in_the_api_reference():
-    """The map cannot cite a verb that does not exist on the pinned engine.
-
-    Every recipe's ``jammi_call`` must appear in the grounded API reference
-    (``_api_reference.md``), which ``scripts/check_api_reference.py`` in turn keeps
-    in lockstep with the installed ``jammi`` wheel.
-    """
-    reference = _API_REFERENCE.read_text()
-    for row in CITATION_MAP:
-        # word-boundary match so `search` does not match `search_by_id`
-        pattern = rf"\b{re.escape(row.jammi_call)}\b"
-        assert re.search(pattern, reference), (
-            f"citation map row {row.recipe!r} runs '{row.jammi_call}', which does "
-            f"not appear in the grounded API reference — the map cannot cite a verb "
-            f"that does not exist on the pinned engine."
-        )
+def test_every_citation_and_every_call_resolves():
+    """No dangling @cite, and no row cites a verb the pinned engine lacks."""
+    assert bibliography_keys(), "references.bib defines no entries"
+    assert unresolved() == []
 
 
 def test_map_covers_every_tier_and_the_repair():

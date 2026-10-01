@@ -103,11 +103,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
-import jammi_cookbook
+from jammi_cookbook import fixtures
 
-_ENGINE_ROOT = Path(jammi_cookbook.__file__).resolve().parents[3]
-TINY_BERT = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_bert"
-assert TINY_BERT.exists(), f"missing engine fixture: {TINY_BERT}"
+TINY_BERT = fixtures.path("tiny_bert")
 
 work = Path(tempfile.mkdtemp(prefix="quantized_weights_"))
 gguf_dir = work / "gguf_model"
@@ -353,10 +351,7 @@ narrower, load-bearing one: the quantized path cannot *silently* stop
 learning through the encoder the way the un-wrapped entry point could.
 
 ```{python}
-PAIRS_PATH = _ENGINE_ROOT / "cookbook" / "fixtures" / "tiny_pairs.csv"
-assert PAIRS_PATH.exists(), f"missing engine fixture: {PAIRS_PATH}"
-
-db.add_source("qlora_training", url=str(PAIRS_PATH), format="csv")
+db.add_source("qlora_training", url=fixtures.url("tiny_pairs.csv"), format="csv")
 
 job = db.fine_tune(
     source="qlora_training",

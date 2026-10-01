@@ -14,14 +14,21 @@ from jammi_cookbook.scale import Scale
 BOOK = Path(__file__).resolve().parents[1]
 COOKBOOK = BOOK.parent
 _LITERAL = re.compile(r"fixtures\.(?:path|url|model)\(\s*f?[\"']([^\"'/{]+)")
+# A path climbed out of a module's own directory: in an install that is the
+# environment's site-packages, not the repository the module was built from.
+_CLIMB = re.compile(r"__file__\)(?:\.resolve\(\))?\.(?:parents\[|parent\.parent)")
+
+
+def _sources() -> list[Path]:
+    """Every recipe, chapter and library module a reader's install runs."""
+    return [*COOKBOOK.glob("recipes/*/example.py"), *COOKBOOK.glob("quickstart/*.py"),
+            *BOOK.glob("chapters/**/*.qmd"), *BOOK.glob("jammi_cookbook/*.py")]
 
 
 def _read() -> set[str]:
     """The top-level fixture names every recipe, chapter and library module
     reads — by literal name, and through the `small` encoders."""
-    sources = [*COOKBOOK.glob("recipes/*/example.py"), *COOKBOOK.glob("quickstart/*.py"),
-               *BOOK.glob("chapters/**/*.qmd"), *BOOK.glob("jammi_cookbook/*.py")]
-    names = {m for src in sources for m in _LITERAL.findall(src.read_text())}
+    names = {m for src in _sources() for m in _LITERAL.findall(src.read_text())}
     root = fixtures.path(".").resolve()
     for encoder in (encoders.text, encoders.image, encoders.audio):
         local = Path(encoder(Scale.SMALL).removeprefix("local:")).resolve()
@@ -54,3 +61,16 @@ def test_every_fixture_the_cookbook_reads_ships_in_the_wheel():
     assert {"tiny_bert", "tiny_open_clip", "htsat_clap_tiny", "arxiv_small"} <= read
     missing = sorted(f for n in read for f in _unshipped(n, shipped, excluded))
     assert not missing, f"fixture files the cookbook reads but the wheel omits: {missing}"
+
+
+def test_nothing_the_cookbook_runs_reads_outside_its_installed_package():
+    """A file is reached through the package (``fixtures.path``, a module's own
+    directory), never by climbing from a module to the repository around it: a
+    reader's runtime has the installed package and no checkout."""
+    climbing = sorted(
+        f"{src.relative_to(COOKBOOK)}:{n}"
+        for src in _sources()
+        for n, line in enumerate(src.read_text().splitlines(), 1)
+        if _CLIMB.search(line)
+    )
+    assert not climbing, f"paths resolved outside the installed package: {climbing}"

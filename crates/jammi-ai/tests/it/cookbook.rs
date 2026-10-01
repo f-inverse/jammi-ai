@@ -46,7 +46,7 @@ fn tiny_bert_id() -> String {
 }
 
 fn tiny_open_clip_id() -> String {
-    "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
+    "local:".to_string() + common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
 }
 
 fn htsat_clap_id() -> String {
@@ -57,7 +57,10 @@ fn htsat_clap_id() -> String {
 }
 
 fn tiny_modernbert_id() -> String {
-    "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
+    "local:".to_string()
+        + common::cookbook_fixture("tiny_modernbert")
+            .to_str()
+            .unwrap()
 }
 
 fn tiny_modernbert_classifier_id() -> String {

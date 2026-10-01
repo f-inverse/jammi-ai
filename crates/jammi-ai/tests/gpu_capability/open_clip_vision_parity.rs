@@ -98,7 +98,7 @@ async fn add_image_corpus(session: &Arc<InferenceSession>, parquet_path: &Path) 
 #[tokio::test(flavor = "multi_thread")]
 async fn open_clip_vision_generate_embeddings_cpu_gpu_parity() {
     harness::loss_capture::install();
-    let model = harness::local_fixture_model_id("tiny_open_clip");
+    let model = harness::local_model_id("tiny_open_clip");
 
     let cpu_dir = TempDir::new().unwrap();
     let cpu_corpus = write_image_corpus(cpu_dir.path());
@@ -169,7 +169,7 @@ async fn open_clip_vision_generate_embeddings_cpu_gpu_parity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn open_clip_vision_encode_query_cpu_gpu_parity() {
     harness::loss_capture::install();
-    let model = harness::local_fixture_model_id("tiny_open_clip");
+    let model = harness::local_model_id("tiny_open_clip");
     let image_bytes =
         std::fs::read(harness::cookbook_fixture("tiny_image_corpus").join("img_circle_0.png"))
             .unwrap();

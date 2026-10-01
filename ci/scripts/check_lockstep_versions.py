@@ -6,7 +6,8 @@ each state it in their own manifest, and some pin a sibling at it exactly
 (`jammi-ai[embedded]` → `jammi-ai-native==X`). The cookbook is no published
 dist — a notebook installs it from the release's tag — but it carries the same
 version and pins `jammi-ai==X`. The changelog's newest release section names
-the version the workspace ships. A release bump that misses one publishes a dist
+the version the workspace ships, and every version the guide or a README
+states (a dependency on a jammi crate, a health endpoint's answer) is it. A release bump that misses one publishes a dist
 whose pin cannot resolve, a notebook whose install line names a release that
 never shipped, or a release whose changes the changelog files under another
 version. This lists
@@ -45,6 +46,24 @@ def _latest_release(changelog: str) -> str | None:
     return m.group(1) if m else None
 
 
+# A version a document states: a Cargo dependency on a jammi crate, or the
+# version a server's health endpoint answers with.
+_DOC_VERSION = re.compile(
+    r'^jammi-[\w-]+ = (?:\{ *version = )?"([^"]+)"|"version": ?"([^"]+)"', re.MULTILINE
+)
+
+
+def _documented() -> dict[str, str]:
+    """Each version the guide and the READMEs state, by `file:line`."""
+    docs = [*ROOT.glob("docs/guide/src/**/*.md"), ROOT / "README.md", *ROOT.glob("crates/*/README.md")]
+    return {
+        f"{doc.relative_to(ROOT)}:{text.count(chr(10), 0, m.start()) + 1}": m.group(1) or m.group(2)
+        for doc in docs
+        for text in [doc.read_text()]
+        for m in _DOC_VERSION.finditer(text)
+    }
+
+
 def sites() -> dict[str, str | None]:
     """Each lockstep site and the version it states."""
     client = _toml("clients/python/pyproject.toml")["project"]
@@ -66,6 +85,7 @@ def sites() -> dict[str, str | None]:
         "clients/typescript/package-lock.json root package version":
             json.loads((ROOT / "clients/typescript/package-lock.json").read_text())["packages"][""]["version"],
         "CHANGELOG.md newest release section": _latest_release((ROOT / "CHANGELOG.md").read_text()),
+        **_documented(),
     }
 
 

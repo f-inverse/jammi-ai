@@ -126,6 +126,10 @@ jammi-db = {engine["jammi-db"]}
 arrow = "58"
 tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
 
+# gemm-f16's FP16 kernels do not assemble at opt-level 0 on aarch64 Linux.
+[profile.dev.package.gemm-f16]
+opt-level = 1
+
 [workspace]
 """
     )

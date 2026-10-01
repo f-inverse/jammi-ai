@@ -24,7 +24,7 @@ use crate::harness;
 #[tokio::test(flavor = "multi_thread")]
 async fn clip_text_generate_embeddings_cpu_gpu_parity() {
     harness::loss_capture::install();
-    let model = harness::local_fixture_model_id("tiny_open_clip");
+    let model = harness::local_model_id("tiny_open_clip");
 
     let cpu_dir = TempDir::new().unwrap();
     let cpu = harness::cpu_session(cpu_dir.path()).await;
@@ -93,7 +93,7 @@ async fn clip_text_generate_embeddings_cpu_gpu_parity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn clip_text_encode_query_cpu_gpu_parity() {
     harness::loss_capture::install();
-    let model = harness::local_fixture_model_id("tiny_open_clip");
+    let model = harness::local_model_id("tiny_open_clip");
     let query = "a small figure";
 
     let cpu_dir = TempDir::new().unwrap();

@@ -67,6 +67,7 @@ packages = ["jammi_cookbook"]
 jammi_cookbook = [
     "goldens/*.json",
     "_api_reference.md",
+    "references.bib",
     "_programs/*/*",
     "_fixtures/air_routes/*",
     "_fixtures/arxiv_small/*",
@@ -80,6 +81,7 @@ jammi_cookbook = [
     "_fixtures/tiny_image_corpus/**/*",
     "_fixtures/tiny_image_golden.json",
     "_fixtures/tiny_labels.csv",
+    "_fixtures/tiny_modernbert/*",
     "_fixtures/tiny_modernbert_classifier/*",
     "_fixtures/tiny_modernbert_ner/*",
     "_fixtures/tiny_ner_corpus.parquet",

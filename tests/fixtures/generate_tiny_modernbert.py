@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a minimal ModernBERT model fixture for hermetic end-to-end testing.
 
-Creates tests/fixtures/tiny_modernbert/ with:
+Creates cookbook/fixtures/tiny_modernbert/ with:
   - config.json      (ModernBERT config, hidden=32, 1 layer, 2 heads, vocab=256)
   - model.safetensors (random weights in the correct tensor layout)
   - tokenizer.json    (minimal WordPiece tokenizer with 256-token vocab)
@@ -18,7 +18,7 @@ import numpy as np
 from safetensors.numpy import save_file
 from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, processors
 
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiny_modernbert")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "cookbook", "fixtures", "tiny_modernbert")
 
 # Model dimensions
 HIDDEN = 32

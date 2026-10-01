@@ -51,7 +51,10 @@ use crate::common;
 /// the acceleration report at all — this suite needs an architecture the fused path
 /// is actually reachable on.
 fn tiny_modernbert_model() -> String {
-    "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
+    "local:".to_string()
+        + common::cookbook_fixture("tiny_modernbert")
+            .to_str()
+            .unwrap()
 }
 
 fn training_columns() -> Vec<String> {

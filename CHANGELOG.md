@@ -5,6 +5,12 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **The federation chapter's MariaDB helper does not take MySQL for MariaDB.** On a host with
+  MySQL installed, its `mysqld` passed the helper's check, the MariaDB install was skipped, and no
+  `mariadb-install-db` existed to initialise a data directory: the chapter failed with a `TypeError`.
+  A host has MariaDB only when its daemon and its initialiser are both on the path; otherwise the
+  helper installs it. The nightly published-notebook lane runs its CPU shards in
+  `python:3.12-bookworm` — root, apt and Python with nothing else, as a Colab runtime is.
 - **The published notebooks run nightly as a reader runs them.** The book gate and the nightly
   render run the chapter sources against wheels built from HEAD, so neither saw what a reader gets:
   0.50.0's setup cells named a `jammi-server-cu12` PyPI never received, and fifteen notebooks
@@ -42,8 +48,8 @@ workspace ships every publishable crate at the same
   carries it.
 - **Every version a document states is a lockstep site.** The installation guide depended on
   `jammi-ai = "0.25"`, the cloud-storage guide on `jammi-db` 0.5, and four health-endpoint examples
-  answered 0.8.0 or 0.29.0. The `lockstep versions` guard now reads every jammi dependency and health
-  version in the guide and the READMEs, and the changelog's newest release section, beside the
+  answered 0.8.0 or 0.29.0. The `lockstep versions` guard now reads every jammi dependency and every
+  `"version"` field an example response shows in the guide and the READMEs, and the changelog's newest release section, beside the
   manifests and pins.
 
 ## [0.51.0] - 2026-09-30

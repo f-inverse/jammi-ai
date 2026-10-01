@@ -7,7 +7,8 @@ each state it in their own manifest, and some pin a sibling at it exactly
 dist — a notebook installs it from the release's tag — but it carries the same
 version and pins `jammi-ai==X`. The changelog's newest release section names
 the version the workspace ships, and every version the guide or a README
-states (a dependency on a jammi crate, a health endpoint's answer) is it. A release bump that misses one publishes a dist
+states (a dependency on a jammi crate, a `"version"` field in an example
+response) is it. A release bump that misses one publishes a dist
 whose pin cannot resolve, a notebook whose install line names a release that
 never shipped, or a release whose changes the changelog files under another
 version. This lists
@@ -46,8 +47,10 @@ def _latest_release(changelog: str) -> str | None:
     return m.group(1) if m else None
 
 
-# A version a document states: a Cargo dependency on a jammi crate, or the
-# version a server's health endpoint answers with.
+# A version a document states: a Cargo dependency on a jammi crate, or a
+# `"version"` field in an example response. The docs show only Jammi's own
+# responses (health, server info); one that shows another system's would have
+# to say so in a way this pattern does not read as Jammi's.
 _DOC_VERSION = re.compile(
     r'^jammi-[\w-]+ = (?:\{ *version = )?"([^"]+)"|"version": ?"([^"]+)"', re.MULTILINE
 )

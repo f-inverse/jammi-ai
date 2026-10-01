@@ -4666,8 +4666,10 @@ dependencies = [
  "jammi-test-resources",
  "libc",
  "parquet",
+ "sqlx",
  "tempfile",
  "tonic",
+ "url",
  "uuid",
 ]
 

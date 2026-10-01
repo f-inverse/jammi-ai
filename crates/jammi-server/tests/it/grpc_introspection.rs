@@ -437,7 +437,8 @@ async fn remote_server_info_like_local() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_server_info_reports_postgres_broker_kind() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let broker = jammi_db::config::BrokerConfig::Postgres {
         url: Some(jammi_db::config::Secret::from(url)),
         idle_poll_secs: 5,

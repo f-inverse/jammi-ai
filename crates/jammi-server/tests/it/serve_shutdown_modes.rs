@@ -1161,8 +1161,8 @@ async fn idle_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownOutcome) 
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_drain_completes_within_a_second_on_postgres() {
-    let url = jammi_test_utils::postgres_url();
     let dir = TempDir::new().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let mut cfg = server_config(dir.path(), DEFAULT_TIMING, true);
     cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
         url: jammi_db::config::Secret::from(url),
@@ -1347,8 +1347,8 @@ async fn traffic_then_drain_wall_clock(cfg: JammiConfig) -> (Duration, ShutdownO
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn drain_after_smoke_traffic_completes_within_a_second_on_postgres() {
-    let url = jammi_test_utils::postgres_url();
     let dir = TempDir::new().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let mut cfg = server_config(dir.path(), DEFAULT_TIMING, true);
     cfg.catalog = jammi_db::config::CatalogConfig::Postgres {
         url: jammi_db::config::Secret::from(url),

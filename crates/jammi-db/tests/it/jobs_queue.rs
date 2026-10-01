@@ -12,15 +12,13 @@
 //! expired-lease reclaim scan that the SQLite serialized-UPDATE path cannot.
 //!
 //! The claim and reclaim queries scan `jobs` globally (not tenant- or
-//! id-scoped). On the Postgres lane that table is shared across the whole
-//! test run, so each test first clears it via [`reset_shared_catalog`]. CI's
-//! `test-pg` job runs the Postgres lane with `--test-threads=1`, so the
-//! reset-then-populate sequence is serialised and cannot race a sibling test.
+//! id-scoped); each test's catalog is its own on both lanes, so they see only
+//! the jobs the test submits.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::{make_test_session, queue_session, register_base_model, reset_shared_catalog};
+use crate::common::{make_test_session, queue_session, register_base_model};
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::backend::{BackendKind, SqlValue, TxOptions};
 use jammi_db::catalog::jobs_repo::{
@@ -59,17 +57,6 @@ fn inline_job_params(job_id: &str) -> SubmitJobParams<'_> {
         execution: JobExecution::Inline,
         ..job_params(job_id)
     }
-}
-
-/// A per-run unique suffix for a test's row ids. The Postgres lane shares
-/// one catalog across runs, and `reset_shared_catalog` clears `jobs`/`instances`/
-/// `workers` but NOT `models`/`result_tables` — so a fixed model or table
-/// name (`jammi:fine-tuned:fz`, `rt-1-zombie-table`) would collide with
-/// the previous run's leftover row on the second run against the same
-/// database. Every test that registers a model or a result table names it
-/// through this.
-fn run_suffix() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
 /// Force `lease_expires_at = NULL` on one row via raw SQL — the state a
@@ -1252,7 +1239,6 @@ async fn submit_job_deduped_different_tenants_may_reuse_a_key(backend: BackendKi
     let dir = tempdir().unwrap();
     let session = make_test_session(backend, dir.path()).await;
     let base = Arc::clone(session.catalog());
-    reset_shared_catalog(&base).await;
     register_base_model(&base).await;
 
     let tenant_a = TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e91").unwrap();
@@ -2077,7 +2063,7 @@ async fn create_result_table_cas_rejects_a_zombies_stale_attempt_across_a_reclai
 ) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_session(backend, dir.path()).await;
-    let job_id = format!("rt-1-{}", run_suffix());
+    let job_id = "rt-1".to_string();
     let zombie_table = format!("{job_id}-zombie-table");
     let live_table = format!("{job_id}-live-table");
 
@@ -2900,9 +2886,7 @@ async fn a_double_release_increments_releases_once(backend: BackendKind) {
 async fn clear_partial_result_lets_the_next_attempt_record_its_own_table(backend: BackendKind) {
     let dir = tempdir().unwrap();
     let (_session, catalog) = queue_session(backend, dir.path()).await;
-    let suffix = run_suffix();
-    let t1 = format!("cpr_t1_{suffix}");
-    let t2 = format!("cpr_t2_{suffix}");
+    let (t1, t2) = ("cpr_t1".to_string(), "cpr_t2".to_string());
 
     catalog.submit_job(compute_job_params("cpr")).await.unwrap();
     let claimed = catalog
@@ -3027,7 +3011,7 @@ async fn finalize_cas_still_matches_a_released_lease(backend: BackendKind) {
     assert_eq!(done.releases, 1);
 
     // `finish_job_with_model` (the training finalize).
-    let model = format!("jammi:fine-tuned:fin-{}", run_suffix());
+    let model = "jammi:fine-tuned:fin".to_string();
     catalog
         .submit_job(SubmitJobParams {
             output_model_id: Some(&model),

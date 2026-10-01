@@ -13,9 +13,7 @@ use tempfile::tempdir;
 use test_case::test_case;
 use uuid::Uuid;
 
-/// A fresh, well-formed tenant id — a random UUID per test invocation, never
-/// a fixed literal, so the shared Postgres lane never accumulates rows
-/// across sibling tests or repeated runs.
+/// A fresh, well-formed tenant id — a random UUID per call.
 fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }

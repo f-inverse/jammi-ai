@@ -608,8 +608,7 @@ async fn the_output_row_is_scoped_by_tenant_and_version(backend: BackendKind) {
     let (_session, catalog) = queue_session(backend, dir.path()).await;
     let store = store_over(dir.path(), &catalog);
     let cat_a = Arc::new(catalog.pinned_to_tenant(Some(tenant_a())));
-    // Unique per run: the Postgres lane reuses one database across runs.
-    let tuned = format!("acme/tuned-{}", uuid::Uuid::new_v4().simple());
+    let tuned = "acme/tuned".to_string();
     let base = |version: i32| RegisterModelParams {
         model_id: &tuned,
         version,

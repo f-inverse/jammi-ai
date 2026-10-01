@@ -40,14 +40,11 @@ fn other_root() -> &'static str {
         .1
 }
 
-/// A root NO OTHER test in this file (or this file's `postgres` arm's shared,
-/// persistent lane database) ever shares — for a property that asserts
-/// something about the WHOLE ring ("self is the only member"), which
-/// `root()`'s shared identity would falsify the instant a sibling test's
-/// still-fresh row (seeded moments earlier, well inside the liveness margin)
-/// shares it. The backing directory is leaked (never cleaned up) so it
-/// outlives the process — this root is used exactly once, by exactly one
-/// test, for a process that exits shortly after.
+/// A root no other call returns — for a property that asserts something about
+/// the WHOLE ring ("self is the only member"), which a root another member of
+/// the same catalog shares would falsify. The backing directory is leaked
+/// (never cleaned up) so it outlives the process — this root is used exactly
+/// once, for a process that exits shortly after.
 fn fresh_root() -> String {
     let dir = tempfile::tempdir().unwrap();
     let root = format!("file://{}/jammi_db", dir.path().to_str().unwrap());
@@ -351,8 +348,8 @@ async fn plan_arms_local_when_self_is_the_only_ring_member(kind: BackendKind) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn ring_read_cost_is_measured_at_100_and_10k_instance_rows() {
-    let url = jammi_test_utils::postgres_url();
-    let (_dir, catalog) = catalog_on(BackendKind::Postgres).await;
+    let (dir, catalog) = catalog_on(BackendKind::Postgres).await;
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let self_id = format!("cost-self-{}", jammi_test_utils::unique_suffix());
     seed_instance(&catalog, &self_id, Some("10.0.0.1:9000"), Some(root())).await;
 

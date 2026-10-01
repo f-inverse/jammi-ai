@@ -10,11 +10,6 @@
 //! misses on a one-bit change and never hits on an unpinned anchor; and that the
 //! `derives_from` lineage is correct, walks transitively stack-safely, and
 //! surfaces a cycle as a typed `DependencyCycle`.
-//!
-//! Every result table this module creates gets a fresh UUID-suffixed name
-//! ([`ResultStore::create_table`]), so the shared Postgres lane never needs a
-//! per-test unique source id: lineage/staleness queries here are always keyed
-//! on that unique `table_name`, never on a fixed literal.
 
 use std::sync::Arc;
 
@@ -41,28 +36,6 @@ use test_case::test_case;
 use crate::common::fresh_catalog;
 
 const DIMS: usize = 4;
-
-/// A fresh, effectively-unique `mutable_version` anchor version number.
-///
-/// Every `descriptor()`/`env()` in this module is a fixed literal, so every
-/// `materialize()` call in the whole file shares one `DefinitionHash` — the
-/// input anchors are the ONLY thing that can distinguish one test's `ready`
-/// row from another's in `find_ready_result_tables_by_definition`'s
-/// `(definition_hash, input_anchors)` search. On the Postgres lane (one
-/// shared database for the whole run, rows never cleaned up), two tests
-/// that pinned the SAME literal `mutable_version("docs", N)` anchor would
-/// produce indistinguishable rows; `lookup_cached`/`probe_cache` would then
-/// nondeterministically resolve to whichever sibling test's row sorts first
-/// by `created_at` — including one whose own tempdir (and therefore Parquet
-/// bytes) has already been dropped. A fresh version number per call sidesteps
-/// the ambiguity entirely: no two tests, and no two runs, ever pin the same
-/// anchor.
-fn unique_version() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    jammi_test_utils::unique_suffix().hash(&mut hasher);
-    hasher.finish()
-}
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>) -> ResultStore {
     ResultStore::new(dir, catalog, AnnIndexConfig::default()).unwrap()
@@ -430,7 +403,7 @@ async fn lookup_cached_hits_an_exact_match(backend: BackendKind) {
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let inputs = vec![InputAnchor::mutable_version("docs", 1)];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     let hit = store.lookup_cached(&def, &inputs).await.unwrap();
@@ -450,7 +423,7 @@ async fn lookup_cached_misses_on_a_one_bit_anchor_change(backend: BackendKind) {
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let base_version = unique_version();
+    let base_version = 1;
     let (_record, def) = materialize(
         &store,
         &ctx,
@@ -459,10 +432,7 @@ async fn lookup_cached_misses_on_a_one_bit_anchor_change(backend: BackendKind) {
     .await;
 
     // Same definition, one anchor value changed: a miss.
-    let probe = vec![InputAnchor::mutable_version(
-        "docs",
-        base_version.wrapping_add(1),
-    )];
+    let probe = vec![InputAnchor::mutable_version("docs", base_version + 1)];
     assert_eq!(
         store.lookup_cached(&def, &probe).await.unwrap(),
         None,
@@ -607,18 +577,8 @@ async fn derives_from_closure_surfaces_a_cycle_as_a_typed_error(backend: Backend
     // it is forged here by editing the catalog summary directly, the only way to
     // produce the back-edge the walk must reject as a typed DependencyCycle
     // rather than loop forever.
-    let (x, _) = materialize(
-        &store,
-        &ctx,
-        vec![InputAnchor::mutable_version("docs", unique_version())],
-    )
-    .await;
-    let (y, _) = materialize(
-        &store,
-        &ctx,
-        vec![InputAnchor::mutable_version("docs", unique_version())],
-    )
-    .await;
+    let (x, _) = materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 1)]).await;
+    let (y, _) = materialize(&store, &ctx, vec![InputAnchor::mutable_version("docs", 2)]).await;
 
     force_input_anchor(
         &catalog,
@@ -715,7 +675,7 @@ async fn probe_cache_hits_an_exact_match_with_an_extant_artifact(backend: Backen
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let inputs = vec![InputAnchor::mutable_version("docs", 1)];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     let hit = store.probe_cache(&def, &inputs).await.unwrap();
@@ -740,7 +700,7 @@ async fn probe_cache_misses_when_the_artifact_was_reaped(backend: BackendKind) {
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let inputs = vec![InputAnchor::mutable_version("docs", 1)];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
     reap_artifact(&store, &record).await;
@@ -779,7 +739,7 @@ async fn probe_cache_record_reuses_an_intact_newer_row_when_an_older_same_key_ro
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let inputs = vec![InputAnchor::mutable_version("docs", 1)];
     let (older, def) = materialize(&store, &ctx, inputs.clone()).await;
     let (newer, def_again) = materialize(&store, &ctx, inputs.clone()).await;
     assert_eq!(
@@ -818,7 +778,7 @@ async fn probe_cache_record_falls_through_a_reaped_newest_row_to_an_intact_older
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let inputs = vec![InputAnchor::mutable_version("docs", unique_version())];
+    let inputs = vec![InputAnchor::mutable_version("docs", 1)];
     let (older, def) = materialize(&store, &ctx, inputs.clone()).await;
     let (newer, def_again) = materialize(&store, &ctx, inputs.clone()).await;
     assert_eq!(
@@ -848,7 +808,7 @@ async fn probe_cache_misses_on_a_one_bit_change(backend: BackendKind) {
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let base_version = unique_version();
+    let base_version = 1;
     let (_record, def) = materialize(
         &store,
         &ctx,
@@ -856,10 +816,7 @@ async fn probe_cache_misses_on_a_one_bit_change(backend: BackendKind) {
     )
     .await;
 
-    let probe = vec![InputAnchor::mutable_version(
-        "docs",
-        base_version.wrapping_add(1),
-    )];
+    let probe = vec![InputAnchor::mutable_version("docs", base_version + 1)];
     assert_eq!(
         store.probe_cache(&def, &probe).await.unwrap(),
         None,
@@ -880,7 +837,7 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit(backend: Backen
     let store = store(dir.path(), Arc::clone(&catalog));
     let ctx = QueryContext::from(SessionContext::new());
 
-    let base_version = unique_version();
+    let base_version = 1;
     let inputs = vec![InputAnchor::mutable_version("docs", base_version)];
     let (record, def) = materialize(&store, &ctx, inputs.clone()).await;
 
@@ -895,10 +852,7 @@ async fn probe_cache_record_returns_the_reusable_record_on_a_hit(backend: Backen
     let miss = store
         .probe_cache_record(
             &def,
-            &[InputAnchor::mutable_version(
-                "docs",
-                base_version.wrapping_add(1),
-            )],
+            &[InputAnchor::mutable_version("docs", base_version + 1)],
         )
         .await
         .unwrap();

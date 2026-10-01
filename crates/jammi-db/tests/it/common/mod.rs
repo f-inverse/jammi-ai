@@ -36,34 +36,6 @@ pub async fn catalog_on(kind: BackendKind) -> (tempfile::TempDir, Arc<Catalog>) 
     (dir, Arc::clone(session.catalog()))
 }
 
-/// Empty the job queue, the worker/instance registries, and the
-/// model-artifact state. The Postgres lane runs every test against one
-/// shared database, so a test that counts or claims jobs must start from an
-/// empty queue, and a test that probes for a reusable artifact must
-/// start with none published — a definition another test published under the
-/// same hash is a legitimate hit. On SQLite (a fresh catalog per test) it is a
-/// no-op kept for one code path.
-///
-/// A `models` row that references an artifact goes before the artifact it
-/// holds (`artifact_prefix` is `ON DELETE RESTRICT`); base models stay.
-pub async fn reset_shared_catalog(catalog: &Catalog) {
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                tx.execute("DELETE FROM jobs", &[]).await?;
-                tx.execute("DELETE FROM models WHERE artifact_prefix IS NOT NULL", &[])
-                    .await?;
-                tx.execute("DELETE FROM model_artifacts", &[]).await?;
-                tx.execute("DELETE FROM workers", &[]).await?;
-                tx.execute("DELETE FROM instances", &[]).await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-}
-
 /// The model id [`register_base_model`] registers: the base every queued
 /// fine-tune job in these tests names.
 pub const BASE_MODEL_ID: &str = "q-base";
@@ -357,23 +329,22 @@ pub async fn kept_dir_session(kind: BackendKind) -> jammi_db::session::JammiSess
 }
 
 /// A fresh test session on `kind` (artifacts under `dir`) and its catalog,
-/// with an empty queue ([`reset_shared_catalog`]) and the base model registered
-/// ([`register_base_model`]) — the starting state of every job-queue test.
+/// with the base model registered ([`register_base_model`]) — the starting
+/// state of every job-queue test.
 pub async fn queue_session(
     kind: BackendKind,
     dir: &std::path::Path,
 ) -> (jammi_db::session::JammiSession, Arc<Catalog>) {
     let session = make_test_session(kind, dir).await;
     let catalog = Arc::clone(session.catalog());
-    reset_shared_catalog(&catalog).await;
     register_base_model(&catalog).await;
     (session, catalog)
 }
 
 /// Start a [`jammi_db::catalog::lease_keeper::LeaseKeeper`] whose connect
 /// factory reopens a FRESH `Catalog` on `backend` every time it is invoked
-/// (from inside the keeper thread's own runtime): the on-disk SQLite catalog
-/// under `dir`, or the shared Postgres test database. Called only after the
+/// (from inside the keeper thread's own runtime): `dir`'s catalog, the on-disk
+/// SQLite file or `dir`'s Postgres database. Called only after the
 /// test's own session opened on the same backend.
 pub async fn keeper_for_backend(
     backend: jammi_db::catalog::backend::BackendKind,
@@ -387,7 +358,7 @@ pub async fn keeper_for_backend(
 
     let url = match backend {
         BackendKind::Sqlite => None,
-        BackendKind::Postgres => Some(postgres_url()),
+        BackendKind::Postgres => Some(postgres_database_url(&dir).await),
     };
     LeaseKeeper::start(
         move || {

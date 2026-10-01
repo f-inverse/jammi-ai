@@ -68,17 +68,24 @@ enum Arm {
 #[cfg(feature = "live-postgres-tests")]
 const TEST_IDLE_POLL: Duration = Duration::from_secs(1);
 
-/// Build the driver for `arm`.
-async fn broker_for(arm: Arm) -> Arc<dyn TriggerBroker> {
-    match arm {
+/// The harness over `arm`'s driver. The Postgres arm's broker runs in the
+/// harness dir's own database, so its NOTIFY channel carries this test's
+/// wakes alone.
+async fn harness_for(arm: Arm) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let broker: Arc<dyn TriggerBroker> = match arm {
         Arm::InMemory => Arc::new(InMemoryBroker::new()),
         #[cfg(feature = "live-postgres-tests")]
         Arm::Postgres => Arc::new(
-            PostgresBroker::connect(&jammi_test_utils::postgres_url(), TEST_IDLE_POLL)
-                .await
-                .expect("connect to Postgres broker"),
+            PostgresBroker::connect(
+                &jammi_test_utils::postgres_database_url(dir.path()).await,
+                TEST_IDLE_POLL,
+            )
+            .await
+            .expect("connect to Postgres broker"),
         ),
-    }
+    };
+    build_harness(broker, dir).await
 }
 
 struct Harness {
@@ -91,8 +98,7 @@ struct Harness {
     subscriber: Subscriber,
 }
 
-async fn build_harness(broker: Arc<dyn TriggerBroker>) -> Harness {
-    let dir = tempfile::tempdir().unwrap();
+async fn build_harness(broker: Arc<dyn TriggerBroker>, dir: tempfile::TempDir) -> Harness {
     let sqlite = SqliteBackend::open(&dir.path().join("catalog.db"))
         .await
         .unwrap();
@@ -175,8 +181,7 @@ where
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.live_tail_order");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -219,8 +224,8 @@ async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(Arc::clone(&broker)).await;
+    let h = harness_for(arm).await;
+    let broker = Arc::clone(&h.broker);
     let topic = topic_def("parity.two_publishers");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -287,8 +292,7 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.replay_overlap");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -349,8 +353,7 @@ async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
 async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let broker = broker_for(arm).await;
-    let h = Arc::new(build_harness(broker).await);
+    let h = Arc::new(harness_for(arm).await);
     let topic = topic_def("parity.subscribe_race");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -426,8 +429,7 @@ async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.tenant_scope");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -483,8 +485,7 @@ async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.lag_self_heal");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -571,8 +572,7 @@ async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm)
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.shared_tail");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -633,8 +633,7 @@ async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
 
     let schema: SchemaRef = Arc::new(Schema::new(vec![
         Field::new("i32_col", DataType::Int32, false),
@@ -715,7 +714,8 @@ async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let pg = PostgresBackend::open_with_options(&url, 8, None)
         .await
         .unwrap();
@@ -840,7 +840,8 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn every_accepted_type_round_trips_through_postgres_backing_table() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let pg = PostgresBackend::open_with_options(&url, 4, None)
         .await
         .unwrap();
@@ -1028,13 +1029,14 @@ async fn kill_broker_listener_backends(url: &str) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_listener_killed_recovers_via_replay() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let broker: Arc<dyn TriggerBroker> = Arc::new(
         PostgresBroker::connect(&url, TEST_IDLE_POLL)
             .await
             .expect("connect to Postgres broker"),
     );
-    let h = build_harness(Arc::clone(&broker)).await;
+    let h = build_harness(Arc::clone(&broker), dir).await;
     let topic = topic_def(&format!(
         "parity.pg_listener_killed.{}",
         jammi_test_utils::unique_suffix()
@@ -1095,7 +1097,8 @@ async fn postgres_listener_killed_recovers_via_replay() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_list_consumers_reports_none_until_a_notify_is_seen() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let broker = PostgresBroker::connect(&url, TEST_IDLE_POLL)
         .await
         .expect("connect to Postgres broker");
@@ -1155,14 +1158,15 @@ async fn postgres_list_consumers_reports_none_until_a_notify_is_seen() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_suppressed_notify_recovers_via_idle_tick() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let concrete = Arc::new(
         PostgresBroker::connect(&url, Duration::from_millis(300))
             .await
             .expect("connect to Postgres broker"),
     );
     let broker: Arc<dyn TriggerBroker> = Arc::clone(&concrete) as Arc<dyn TriggerBroker>;
-    let h = build_harness(broker).await;
+    let h = build_harness(broker, dir).await;
     let topic = topic_def(&format!(
         "parity.pg_suppressed_notify.{}",
         jammi_test_utils::unique_suffix()
@@ -1207,8 +1211,7 @@ async fn postgres_suppressed_notify_recovers_via_idle_tick() {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.from_offset_lower_bound_lag");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -1272,8 +1275,7 @@ async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_window(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.from_offset_lower_bound_live");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -1346,7 +1348,8 @@ async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_win
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_backing_multistep_replay_keeps_boundary_group_whole() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let pg = PostgresBackend::open_with_options(&url, 8, None)
         .await
         .unwrap();

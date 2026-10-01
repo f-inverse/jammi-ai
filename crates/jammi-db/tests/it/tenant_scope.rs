@@ -24,21 +24,12 @@ fn widget_schema() -> Arc<Schema> {
     ]))
 }
 
-/// A fresh, well-formed, per-test tenant id — a random UUID, never a fixed
-/// literal. The Postgres lane runs the whole matrix against one shared
-/// database, and the `sources` / mutable-table-registry catalog rows are
-/// global (not scoped to a per-test container the way a uniquely-named
-/// mutable table is), so a fixed tenant literal shared across sibling tests
-/// (or repeated runs) would accumulate rows in that tenant's read-scope and
-/// break exact-list assertions below.
+/// A fresh, well-formed tenant id — a random UUID.
 fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }
 
-/// Register a mutable companion table named `table_id`, keyed on `id`. Every
-/// test picks its own unique `table_id` (via [`unique_suffix`]) so sibling
-/// tests sharing the Postgres lane's one database never collide on the same
-/// backing table.
+/// Register a mutable companion table named `table_id`, keyed on `id`.
 async fn register_widgets(session: &JammiSession, table_id: &str) {
     let def =
         MutableTableDefinitionBuilder::new(MutableTableId::new(table_id).unwrap(), widget_schema())
@@ -463,24 +454,13 @@ async fn catalog_sources_isolated_by_tenant(backend: BackendKind) {
 
     // `list_sources` for a scoped tenant also returns every globally-scoped
     // (`tenant_id IS NULL`) row — by design (a scoped session sees its own
-    // rows plus global rows). On the shared Postgres lane that global pool
-    // accumulates rows from every OTHER test in the suite that registered an
-    // unscoped source, so filter down to this test's own unique-suffixed
-    // names before asserting the set is exactly `{src_a}` / `{src_b}`.
+    // rows plus global rows).
     let sources_a = session_a.catalog().list_sources().await.unwrap();
-    let ids_a: Vec<&str> = sources_a
-        .iter()
-        .map(|s| s.source_id.as_str())
-        .filter(|id| id.ends_with(&suffix))
-        .collect();
+    let ids_a: Vec<&str> = sources_a.iter().map(|s| s.source_id.as_str()).collect();
     assert_eq!(ids_a, vec![src_a.as_str()]);
 
     let sources_b = session_b.catalog().list_sources().await.unwrap();
-    let ids_b: Vec<&str> = sources_b
-        .iter()
-        .map(|s| s.source_id.as_str())
-        .filter(|id| id.ends_with(&suffix))
-        .collect();
+    let ids_b: Vec<&str> = sources_b.iter().map(|s| s.source_id.as_str()).collect();
     assert_eq!(ids_b, vec![src_b.as_str()]);
 }
 
@@ -532,9 +512,7 @@ async fn catalog_list_all_sources_sees_across_tenants(backend: BackendKind) {
         .await
         .unwrap();
 
-    // Cross-tenant enumeration sees every source this test created (and,
-    // on the shared Postgres lane, possibly siblings' — filter down to this
-    // test's own unique-suffixed names before asserting the set).
+    // Cross-tenant enumeration sees every source this test created.
     // Sort for a registration-order-independent set comparison: the catalog
     // orders by `created_at`, which ties across sub-millisecond inserts.
     let mut all: Vec<String> = make_test_session(backend, dir.path())
@@ -545,7 +523,6 @@ async fn catalog_list_all_sources_sees_across_tenants(backend: BackendKind) {
         .unwrap()
         .into_iter()
         .map(|s| s.source_id)
-        .filter(|id| id.ends_with(&suffix))
         .collect();
     all.sort();
     let mut expected = vec![global_src.clone(), src_a.clone(), src_b.clone()];
@@ -611,9 +588,7 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
         .await
         .unwrap();
 
-    // A fresh unscoped session sees only the global row (filtered to this
-    // test's own unique-suffixed names — the shared Postgres lane's global
-    // pool may carry other tests' NULL-tenant rows too).
+    // A fresh unscoped session sees only the global row.
     let fresh_unscoped = make_test_session(backend, dir.path()).await;
     let ids: Vec<String> = fresh_unscoped
         .catalog()
@@ -622,7 +597,6 @@ async fn catalog_unscoped_session_sees_global_only_after_scoped_writes(backend: 
         .unwrap()
         .into_iter()
         .map(|s| s.source_id)
-        .filter(|id| id.ends_with(&suffix))
         .collect();
     assert_eq!(ids, vec![global_src]);
 }

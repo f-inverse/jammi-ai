@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,10 +96,14 @@ def execute(notebook: Path, cwd: Path, cell_timeout: int) -> None:
 
 
 def run_one(root: Path, notebook: Path, work: Path, cell_timeout: int) -> Outcome:
-    """Run `notebook` in a fresh environment and working directory under `work`."""
+    """Run `notebook` in a fresh environment, working directory and temporary
+    directory under `work`, and remove all three once it ends, as a runtime is
+    discarded: a CUDA environment alone holds gigabytes, so keeping each one
+    fills the host before the last notebook runs."""
     home = work / notebook.with_suffix("").as_posix().replace("/", "__")
-    env_dir, cwd = home / "venv", home / "content"
+    env_dir, cwd, tmp = home / "venv", home / "content", home / "tmp"
     cwd.mkdir(parents=True)
+    tmp.mkdir()
     started = time.monotonic()
     try:
         subprocess.run([sys.executable, "-m", "venv", str(env_dir)], check=True)
@@ -108,6 +113,7 @@ def run_one(root: Path, notebook: Path, work: Path, cell_timeout: int) -> Outcom
             **os.environ,
             "PATH": f"{env_dir / 'bin'}{os.pathsep}{os.environ['PATH']}",
             "VIRTUAL_ENV": str(env_dir),
+            "TMPDIR": str(tmp),
         }
         run = subprocess.run(
             [
@@ -127,6 +133,8 @@ def run_one(root: Path, notebook: Path, work: Path, cell_timeout: int) -> Outcom
         error = None if run.returncode == 0 else (run.stderr or run.stdout).strip()
     except subprocess.CalledProcessError as exc:
         error = f"environment setup failed: {exc}"
+    finally:
+        shutil.rmtree(home)
     return Outcome(notebook, time.monotonic() - started, error)
 
 

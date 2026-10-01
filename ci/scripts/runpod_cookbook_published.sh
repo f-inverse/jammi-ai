@@ -5,7 +5,7 @@
 # at NOTEBOOKS_TAG, so each setup cell installs the CUDA wheels from PyPI. The
 # deploy, run and teardown are runpod_lib.sh's, as for every other pod lane.
 #
-# Invoked by cookbook-published.yml's `gpu` leg, dispatched after a release.
+# Invoked by cookbook-published-gpu.yml, dispatched after a release.
 #
 # Requires env: RUNPOD_API_KEY, NOTEBOOKS_TAG (py-vX.Y.Z).
 # Optional env: GIT_REPO, DRIVER_REF (the commit whose driver runs; default

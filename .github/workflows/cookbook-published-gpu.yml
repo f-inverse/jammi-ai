@@ -1,0 +1,37 @@
+name: Cookbook as published (GPU)
+
+# The cookbook notebooks at a release tag, as a reader on a GPU runtime runs
+# them: on a RunPod L4 (sm_89, the class of GPU a Colab reader gets), each in a
+# fresh environment whose setup cell installs the CUDA wheels from PyPI
+# (ci/scripts/runpod_cookbook_published.sh). The CPU lane is
+# cookbook-published.yml. Dispatched by hand after a release: it rents a pod.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to run (py-vX.Y.Z)."
+        required: true
+        type: string
+
+concurrency:
+  group: cookbook-published-gpu-${{ inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    name: GPU (RunPod L4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the notebooks as published on an L4
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          GIT_REPO: https://github.com/${{ github.repository }}.git
+          DRIVER_REF: ${{ github.sha }}
+          NOTEBOOKS_TAG: ${{ inputs.tag }}
+        run: bash ci/scripts/runpod_cookbook_published.sh

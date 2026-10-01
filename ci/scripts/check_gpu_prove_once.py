@@ -873,6 +873,8 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     "ci/scripts/runpod_gpu_perf_ab.sh": "gpu-perf-ab.yml",
     # The how-well A/B driver.
     "ci/scripts/runpod_gpu_howwell.sh": "gpu-howwell.yml",
+    # The published cookbook notebooks on an L4, dispatched after a release.
+    "ci/scripts/runpod_cookbook_published.sh": "cookbook-published-gpu.yml",
     # gpu-dev.sh IS deploy-capable (it can `up` a pod as well as `reap`
     # one), and its one real invoker, gpu-reap.yml, carries RUNPOD_API_KEY
     # at step scope to authenticate the reap call. The whole-file-scope

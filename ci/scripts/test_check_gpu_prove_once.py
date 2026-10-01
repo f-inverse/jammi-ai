@@ -139,6 +139,10 @@ PERF_AB_YML_GOOD = _paid_lane_yml(
 HOWWELL_YML_GOOD = _paid_lane_yml(
     "GPU how-well (RunPod)", "gpu-howwell", "runpod_gpu_howwell.sh", "run-howwell"
 )
+COOKBOOK_PUBLISHED_GPU_YML_GOOD = _paid_lane_yml(
+    "Cookbook as published (GPU)", "cookbook-published-gpu", "runpod_cookbook_published.sh",
+    "run-cookbook-published-gpu",
+)
 
 
 def _gate_job(gate_name: str = "gpu-proof", tag_family: str = "v") -> str:
@@ -383,6 +387,7 @@ def positive_workflows() -> dict[str, str]:
         "gpu-topology.yml": TOPOLOGY_YML_GOOD,
         "gpu-perf-ab.yml": PERF_AB_YML_GOOD,
         "gpu-howwell.yml": HOWWELL_YML_GOOD,
+        "cookbook-published-gpu.yml": COOKBOOK_PUBLISHED_GPU_YML_GOOD,
         # gpu-dev.sh's own row (whole-file scope gave it one: gpu-reap.yml
         # is its only invoker and carries RUNPOD_API_KEY at step scope).
         "gpu-reap.yml": REAP_YML,
@@ -831,7 +836,7 @@ def _driver(call: str) -> str:
 
 
 def fixture_scripts() -> dict[str, str]:
-    """The tracked `ci/scripts/**` map the derivation ranges over: the four
+    """The tracked `ci/scripts/**` map the derivation ranges over: the five
     PAID_POD_LANE_TABLE drivers plus the two non-table deploy-capable
     scripts this tree really has (`gpu-dev.sh`, `test_pod_substrate.sh`)."""
     return {
@@ -839,6 +844,7 @@ def fixture_scripts() -> dict[str, str]:
         "ci/scripts/runpod_gpu_prove.sh": _driver("rp_deploy_arch a100"),
         "ci/scripts/runpod_gpu_perf_ab.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/runpod_gpu_howwell.sh": _driver("rp_deploy_live_a100"),
+        "ci/scripts/runpod_cookbook_published.sh": _driver("rp_deploy_arch l4"),
         "ci/scripts/gpu-dev.sh": _driver("rp_deploy_arch \"$ARCH\""),
         "ci/scripts/test_pod_substrate.sh": _driver("rp_deploy_live \"SECURE|X\""),
         # The topology lane's own row -- calls the second root
@@ -969,6 +975,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
             sorted(derived),
             [
                 "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_cookbook_published.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
                 "ci/scripts/runpod_gpu_perf_ab.sh",
                 "ci/scripts/runpod_gpu_prove.sh",
@@ -1325,6 +1332,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # THIS file (see below) sorts before gpu-dev.sh.
                 "ci/scripts/check_gpu_prove_once.py",
                 "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_cookbook_published.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
                 "ci/scripts/runpod_gpu_perf_ab.sh",
                 "ci/scripts/runpod_gpu_prove.sh",

@@ -8,10 +8,9 @@ name: Cookbook as published
 #
 # Nightly against the newest `py-v*` tag on a CPU, because what a reader
 # installs changes after the tag (a dependency release, a package index
-# refusing a wheel). After a release, dispatch it on the release's tag with
-# `gpu` set: the GPU leg runs the same notebooks on a RunPod L4 (sm_89, the
-# class of GPU a Colab reader gets), where the setup cell installs the CUDA
-# wheels.
+# refusing a wheel). After a release, dispatch it on the release's tag, and
+# cookbook-published-gpu.yml too: the same notebooks on a GPU host, where the
+# setup cell installs the CUDA wheels.
 
 on:
   schedule:
@@ -22,11 +21,6 @@ on:
         description: "Release tag to run (py-vX.Y.Z). Empty: the newest py-v* tag."
         required: false
         type: string
-      gpu:
-        description: "Also run every notebook on a RunPod L4."
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: cookbook-published-${{ inputs.tag || 'newest' }}
@@ -88,19 +82,3 @@ jobs:
           --notebooks published/cookbook/notebooks
           --shard ${{ matrix.shard }}/8
           --work "$RUNNER_TEMP/notebooks"
-
-  gpu:
-    name: GPU (RunPod L4)
-    needs: resolve
-    if: ${{ inputs.gpu }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run the notebooks as published on an L4
-        env:
-          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          GIT_REPO: https://github.com/${{ github.repository }}.git
-          DRIVER_REF: ${{ github.sha }}
-          NOTEBOOKS_TAG: ${{ needs.resolve.outputs.tag }}
-        run: bash ci/scripts/runpod_cookbook_published.sh

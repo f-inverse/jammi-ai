@@ -57,6 +57,9 @@ jobs:
     name: CPU, shard ${{ matrix.shard }}/8
     needs: resolve
     runs-on: ubuntu-latest
+    # What a Colab runtime is: root, a package manager, and Python 3.12 with
+    # nothing else installed (the runner itself carries MySQL and no root).
+    container: python:3.12-bookworm
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -72,10 +75,6 @@ jobs:
           ref: ${{ needs.resolve.outputs.tag }}
           path: published
           sparse-checkout: cookbook/notebooks
-      # Colab's runtime interpreter.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Run the notebooks as published
         run: >
           python cookbook/book/scripts/run_published_notebooks.py

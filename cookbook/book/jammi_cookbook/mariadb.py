@@ -32,14 +32,24 @@ def _which(*names: str) -> str | None:
     return next((found for n in names if (found := shutil.which(n, path=_DAEMON_PATH))), None)
 
 
-def _daemon() -> str | None:
-    return _which("mariadbd", "mysqld")
+@dataclass(frozen=True)
+class _Toolchain:
+    daemon: str
+    initialise: str
 
 
-def install() -> str:
-    """The MariaDB server daemon, installed from the package manager first if
-    the host has none."""
-    if (daemon := _daemon()) is None:
+def _toolchain() -> _Toolchain | None:
+    """The MariaDB daemon and data-directory initialiser, when both are on the
+    path. A MySQL install has a ``mysqld`` and no initialiser, so it is not one."""
+    daemon = _which("mariadbd", "mysqld")
+    initialise = _which("mariadb-install-db", "mysql_install_db")
+    return _Toolchain(daemon, initialise) if daemon and initialise else None
+
+
+def _install() -> _Toolchain:
+    """The MariaDB server's toolchain, installed from the package manager first
+    if the host has none."""
+    if (toolchain := _toolchain()) is None:
         if shutil.which("apt-get"):
             commands = [["apt-get", "update", "-qq"],
                         ["apt-get", "install", "-y", "-qq", "mariadb-server"]]
@@ -50,10 +60,12 @@ def install() -> str:
         env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
         for command in commands:
             subprocess.run(command, check=True, env=env, capture_output=True, text=True)
-        daemon = _daemon()
-    if daemon is None:
-        raise RuntimeError("mariadb-server installed, but no mariadbd or mysqld is on the path")
-    return daemon
+        toolchain = _toolchain()
+    if toolchain is None:
+        raise RuntimeError(
+            "mariadb-server installed, but its daemon and mariadb-install-db are not on the path"
+        )
+    return toolchain
 
 
 @dataclass(frozen=True)
@@ -84,15 +96,14 @@ def _free_port() -> int:
 @contextlib.contextmanager
 def server() -> Iterator[MariaDB]:
     """A fresh MariaDB instance for the ``with`` block, stopped after it."""
-    daemon = install()
+    toolchain = _install()
     home = Path(tempfile.mkdtemp(prefix="jammi_mariadb_"))
     data = home / "data"
-    initialise = _which("mariadb-install-db", "mysql_install_db")
-    subprocess.run([initialise, "--no-defaults", f"--datadir={data}", "--user=root"],
+    subprocess.run([toolchain.initialise, "--no-defaults", f"--datadir={data}", "--user=root"],
                    check=True, capture_output=True, text=True)
     instance = MariaDB(port=_free_port(), socket=home / "mysqld.sock")
     process = subprocess.Popen(
-        [daemon, "--no-defaults", f"--datadir={data}", "--user=root",
+        [toolchain.daemon, "--no-defaults", f"--datadir={data}", "--user=root",
          "--skip-name-resolve", "--bind-address=127.0.0.1", f"--port={instance.port}",
          f"--socket={instance.socket}", f"--pid-file={home / 'mysqld.pid'}",
          f"--log-error={home / 'mysqld.err'}"],

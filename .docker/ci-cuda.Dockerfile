@@ -1,9 +1,9 @@
 # BASE_IMAGE has no default ON PURPOSE, the same fail-closed doctrine
 # ci.Dockerfile's own BASE_IMAGE/RUST_VERSION ARGs are held to: the workflow
-# passes it explicitly (image.yml's `build-cuda` job sets `base_image_amd64`
-# to the CPU base index the same run just pushed, `jammi-ai-ci:sha-<sha>`).
+# passes it explicitly (`ci.yml`'s `build-ci-image-cuda` job sets
+# `base_image_amd64` to the CPU image of the same tree, by content tag).
 #
-# The CUDA base is amd64-only: `build-cuda` passes no `platforms`, so this
+# The CUDA base is amd64-only (`ci_image.py`'s platforms for it), so this
 # FROM pins the platform explicitly and an arm64 caller fails loudly at the
 # base-image resolution step instead of silently emulating.
 ARG BASE_IMAGE
@@ -35,9 +35,8 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 #     `cargo build --release -p jammi-server` (`:126`) — no docker build at all.
 #   * `release-binaries.yml`'s CUDA leg does the same: `container:` this image
 #     (`:405`), `cargo build --release -p jammi-server` (`:460`).
-# The RunPod GPU lanes run this same image as well
-# (`ci/scripts/runpod_lib.sh:98`, `RP_IMAGE` defaulting to
-# `ghcr.io/f-inverse/jammi-ai-ci-cuda:latest`), so the pod-side link surface is
+# The RunPod GPU lanes run this same image as well (`ci/scripts/runpod_lib.sh`'s
+# `RP_IMAGE`, the tree's CUDA CI image), so the pod-side link surface is
 # covered by this same rebuild.
 #
 # The constraint the version expresses is CUDA-MINOR AGREEMENT, and it is local
@@ -59,10 +58,10 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # natural choice of the three, not an obligation binding the two files.
 #
 # The alternative of floating the version (a bare name plus an `exclude=` for
-# the cuda13 builds) is rejected on reproducibility, not on correctness: this
-# image is rebuilt and republished as a mutable `:latest`, so a float would
-# silently re-resolve to a different NCCL on some later rebuild, and the build
-# that produced a given binary would no longer be recoverable from this file.
+# the cuda13 builds) is rejected on reproducibility, not on correctness: a
+# float would re-resolve to a different NCCL on the next build of an image
+# whose content tag did not move, and the build that produced a given binary
+# would no longer be recoverable from this file.
 # Copying the library out of the runtime image (`COPY --from=nvidia/cuda:
 # 12.6.3-runtime-ubi8`) is rejected too: that image ships the runtime package
 # only — no `nccl.h` and no `libnccl.so` development symlink — and link time

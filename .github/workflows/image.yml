@@ -1,83 +1,62 @@
-name: Image (CI base, CPU and CUDA)
+name: Image (CI :latest alias)
 
-# Builds both CI base images through the shared _ci-base-image reusable:
-# the CPU base (jammi-ai-ci) -- a linux/amd64 + linux/arm64 multi-arch index
-# the CPU workflows run inside -- and the CUDA base (jammi-ai-ci-cuda = the
-# CPU base + CUDA toolkit, amd64-only) the GPU build/prove lanes run inside.
-#
-# The CUDA base is `FROM` the CPU base, so the two are ONE workflow with
-# `build-cuda` `needs: build`, and `build-cuda` builds from the CPU index
-# THIS run pushed (`sha-<github.sha>`), never from the mutable `:latest`.
-# Two independent workflows on the same push would race: the CUDA build
-# could pull the previous `:latest` while the CPU build was still in
-# flight. `workflow_run` is not the fix either -- it runs only the default
-# branch's copy of the triggered workflow and still names the base by a
-# mutable tag. A change to either Dockerfile rebuilds both images: the CUDA
-# base must rebuild whenever its base does, and a CUDA-only change rebuilds
-# the CPU base deterministically from the same commit.
+# Points `jammi-ai-ci:latest` and `jammi-ai-ci-cuda:latest` at the CI images of
+# `main`'s tree. No CI run pulls `:latest`: every run uses its own tree's
+# content-tagged images (`_ci-image.yml`), which `ci.yml` builds. The alias
+# serves the devcontainer (`.devcontainer/Dockerfile` builds FROM it).
 
 on:
   push:
     branches: [main]
     paths:
-      - ".docker/ci.Dockerfile"
-      - ".docker/pinned-tools.sh"
-      - ".docker/ci-cuda.Dockerfile"
+      - ".docker/**"
       - "rust-toolchain.toml"
       - ".github/workflows/_ci-base-image.yml"
-      - "ci/scripts/check_merged_index_platforms.sh"
+      - "ci/scripts/ci_image.py"
   workflow_dispatch:
 
-# Serialize per ref, never cancel: an image push in flight must finish,
-# matching the other release/publish lanes.
+# Serialize per ref, never cancel: a tag move in flight must finish.
 concurrency:
   group: image-${{ github.ref }}
   cancel-in-progress: false
 
-# Least privilege at the workflow level; each calling job widens to
-# `packages: write` so the reusable can push to GHCR (a called workflow can
-# hold at most what its caller grants).
 permissions:
   contents: read
 
 jobs:
-  # `github.ref_type != 'tag'` on both jobs:
-  # each `uses:` the LOCAL reusable `_ci-base-image.yml`, whose own
-  # `build-and-push` job pushes to GHCR unconditionally -- P6 discovery
-  # (`check_gpu_prove_once.py`) therefore tables both jobs (`ci-image-cpu`,
-  # `ci-image-cuda`, gate_kind='none'), and a `"none"` row must structurally
-  # PROVE it can never fire on a release tag ref. Without this, a
-  # `workflow_dispatch` against a `v*` tag ref would still rebuild and push
-  # the CI base images, ungated, on a ref this workflow was never meant to
-  # reach (`on:` above carries only `push: branches: [main]` and
-  # `workflow_dispatch`, never `tags:`).
-  build:
+  ci-image:
     if: github.ref_type != 'tag'
     permissions:
       contents: read
-      packages: write
-    uses: ./.github/workflows/_ci-base-image.yml
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
     with:
-      image_suffix: ci
-      dockerfile: .docker/ci.Dockerfile
-      platforms: linux/amd64,linux/arm64
+      await: cpu cuda
 
-  build-cuda:
-    needs: build
+  # A reviewed UNGATED promotion (`check_gpu_prove_once.py`'s table): it moves
+  # a development alias on a merge to `main`, never a release artifact, and
+  # its `if:` keeps a `workflow_dispatch` on a tag ref from reaching it.
+  latest:
+    needs: ci-image
     if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/_ci-base-image.yml
-    with:
-      image_suffix: ci-cuda
-      dockerfile: .docker/ci-cuda.Dockerfile
-      # ci-cuda.Dockerfile's FROM is the CPU base, not a manylinux image --
-      # the reusable's own default `base_image_amd64` is for the CPU base's
-      # FROM, so this job overrides it with the immutable per-commit index
-      # `build` above just promoted (the reusable's `merge-manifest` tags
-      # every run `sha-<github.sha>`, on any branch, while `latest` moves
-      # only on the default branch). `base_image_arm64` stays at its
-      # default: unused, since this job never requests `linux/arm64` in
-      # `platforms`.
-      base_image_amd64: ghcr.io/f-inverse/jammi-ai-ci:sha-${{ github.sha }}
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point :latest at main's images
+        env:
+          CPU: ${{ needs.ci-image.outputs.cpu }}
+          CUDA: ${{ needs.ci-image.outputs.cuda }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "${CPU%:*}:latest" "$CPU"
+          docker buildx imagetools create -t "${CUDA%:*}:latest" "$CUDA"

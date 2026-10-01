@@ -5281,18 +5281,23 @@ dropping mold and the fp16 floor both); its `deny-warnings` input instead export
 `CARGO_TARGET_<TRIPLE>_RUSTFLAGS=-D warnings` for the runner's own host triple, which JOINS with
 (never replaces) config `rustflags` for that same triple — verified against a real cargo. A caller
 must never export a bare `RUSTFLAGS` of its own either, at job or step level — that replaces
-everything the same way, regardless of which mechanism set it (`dep-dag.yml`'s "clear -D warnings
-for one third-party install step" override targets the SAME per-target env var `setup-rust-ci` used,
-not a bare `RUSTFLAGS`, for exactly this reason). CI/dev/release
+everything the same way, regardless of which mechanism set it; a step that must clear `-D warnings`
+overrides the SAME per-target variable `setup-rust-ci` set. CI/dev/release
 base image: `.docker/ci.Dockerfile` (= `jammi-ai-ci`), a multi-arch index (`linux/amd64` +
 `linux/arm64`, one native leg per platform, merged by `_ci-base-image.yml`); the CUDA image extends
-it and stays `linux/amd64`-only.
+it and stays `linux/amd64`-only. Both are tagged by content, `ctx-<hash>` over exactly what defines
+them (`ci/scripts/ci_image.py`: the Dockerfile, every file it copies, the digest-pinned base in
+`.docker/base-images.env`, the toolchain pin, and the build recipe), so a tree always runs in its own
+images: `ci.yml` builds a tree's images when the registry lacks them, every other workflow waits for
+them (`_ci-image.yml`), and `ci/dev.sh` runs the same one locally (`--build-image` builds it for a
+tree no run has pushed yet). `:latest` is only the devcontainer's alias for `main`'s images
+(`image.yml`).
 
 Every multi-arch image this workspace publishes (the CI base image above, and the CPU
 `jammi-ai-server` image) is built the same two-leg-plus-merge way, never a single `docker buildx
 build --platform linux/amd64,linux/arm64` (which would need QEMU emulation for the non-native
 arch): one job per arch, on that arch's own NATIVE runner (`ubuntu-latest` / `ubuntu-24.04-arm`, no
-QEMU), each pushing ONLY its own immutable per-arch tag (`sha-<sha>-<arch>`) — never a real,
+QEMU), each pushing ONLY its own per-arch tag (`<tag>-<arch>`) — never a real,
 consumer-facing tag. A separate merge job then combines those two immutable per-arch sources into
 the real tags with `docker buildx imagetools create`, dry-running the merge first and asserting the
 resulting index's platform set BEFORE the real (pushing) `imagetools create` runs — verify-then-
@@ -5305,28 +5310,41 @@ once prove-gated (`build-and-push` → `merge-cpu-tag`, `v*` tags only, semver/`
 **Run before pushing (the local gate, mirrors `check`):**
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace --exclude jammi-python` (hermetic — zero network)
+- `cargo nextest run --workspace --exclude jammi-python` and `cargo test --workspace --exclude
+  jammi-python --doc` (hermetic — zero network; `.config/nextest.toml` runs each test in a process
+  of its own, and nextest runs no doctests)
 - For Python: `maturin develop` then `pytest crates/jammi-python/tests` (never `cargo build` for
   the wheel).
 
-**The PR gate (`.github/workflows/ci.yml`, everything `needs: check`):** `check` (fmt+clippy) →
-`test` (hermetic, excludes `jammi-python` because the cdylib needs libpython on the linker path) →
-`compile-check-gated` (`--no-run` for live-hub / live-gpu, a *separate job* so accumulated test-binary
-graphs don't exhaust runner disk) → `test-clients` (clients + the **two candle-free boundary guards**)
-→ `dep-direction` (`check_dep_direction.py`) → `oss-only-build` (`--locked` hermeticity) → `ts-client`
-/ `py-client` / `test-python` / `test-pg` (serialised)
-→ `test-live` (main-only, advisory).
+**The PR gate (`.github/workflows/ci.yml`):** a run proves a tree, never a commit. `ci-image`
+resolves the tree's images and `build-ci-image`/`build-ci-image-cuda` build any the registry lacks;
+`plan` records the tree (`record-subject`) and asks whether a run already proved it
+(`ci/scripts/verdict.py probe`). Nothing waits on work it does not consume, so every job starts as
+soon as its image exists: `check` (fmt, workspace clippy, the `postgres,mysql` surface) and
+`clippy-gated` (the feature-gated test surfaces); `test-build` compiles the hermetic test graph once
+(`cargo nextest archive`, plus the doctests) and four `test` partitions run it, each test in a
+process of its own; `test-permission-fault`, `test-lanes` (storage-cloud, golden-parity,
+build-sha), `test-pg` (each test against a database of its own, four at a time), `test-clients`
+(clients + the **two candle-free boundary guards**), `compile-check-gated`, the seven-leg CUDA
+clippy matrix, Metal clippy, `oss-only-build` (`--locked` hermeticity), `dep-audit`, `ts-client` /
+`py-client` / `test-python`, the guards and `distributed`. A tree a run already proved — the merge of
+a pull request whose own run proved its tree — skips every job whose only work is executing tests;
+jobs that compile still run, because `main`'s run writes the compile cache every pull request
+reads (`setup-rust-ci` runs sccache read-only off `main`). `test-live` runs on `main` only, advisory,
+and only the tests `live-hub-tests` adds. `ci-summary / assert` is the one required check, and the
+release gate reads its most recent result over the released tree.
 
-**The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for the `check`, `test`,
-`test-pg`, `guard` and `symbol-index-gates` jobs above plus `docs.yml`'s build, read from the
-workflow files at run time (never a copied list) and run in one process: `static` (fmt, the
-four clippy surfaces, rustdoc `-D warnings`, the guide build — a missing `mdbook` FAILS unless
-`--skip-mdbook`) → `guards` (the guards in `ci/guards.toml` this change can affect, through
-`ci/scripts/run_guards.py` — the runner `ci.yml`'s `guard` job calls) → `index` (`symbol-index-gates`' steps,
-each `run:` block executed WHOLE) → `tests` (the hermetic lane, the `test-hooks` lane,
-golden-parity, and the Postgres lane against `JAMMI_TEST_PG_URL` — a missing database FAILS the
-stage unless `--skip-pg` is passed, because a silently skipped lane is how a shared-database
-leak once reached CI). It refuses to run when HEAD is the base or the tree is dirty (every
+**The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for the `check`,
+`clippy-gated`, `test-build`, `test`, `test-permission-fault`, `test-lanes`, `test-pg`, `guard` and
+`symbol-index-gates` jobs above plus `docs.yml`'s build, read from the workflow files at run time
+(never a copied list) and run in one process: `static` (fmt, the four clippy surfaces, rustdoc
+`-D warnings`, the guide build — a missing `mdbook` FAILS unless `--skip-mdbook`) → `guards` (the
+guards in `ci/guards.toml` this change can affect, through `ci/scripts/run_guards.py` — the runner
+`ci.yml`'s `guard` job calls) → `index` (`symbol-index-gates`' steps, each `run:` block executed
+WHOLE) → `tests` (the hermetic suite under nextest in one run, its doctests, the permission-fault,
+storage-cloud and golden-parity lanes, and the Postgres lane against `JAMMI_TEST_PG_URL` — a
+missing database server FAILS the stage unless `--skip-pg` is passed, because a silently skipped
+lane is how a shared-database leak once reached CI). It refuses to run when HEAD is the base or the tree is dirty (every
 diff-scoped gate would be vacuously green), prints up front which `ci.yml` jobs it does NOT
 cover (CI runs those), and exits with the number of failed commands, each named with its log
 under `$CARGO_TARGET_DIR/merge-path`.
@@ -5384,11 +5402,13 @@ rebuilds the cookbook notebooks (`python cookbook/book/scripts/build_notebooks.p
 release they install. On merge, **prove before tagging**: dispatch
 `.github/workflows/gpu-prove.yml` on the commit to be released (`--ref main` at the tip, or on the
 pushed tag once it exists) and wait for all four shipped arches to go green — **EVERY** release
-publishing job (all-or-nothing: not only the CUDA lanes) gates on that recorded
-verdict rather than proving anything themselves (`ci/scripts/gpu_prove_verdict.py`, consumed via
-`_gpu-proof-required.yml`); a red leg is re-run by hand (`gh run rerun <run_id> --failed`) in that
-same prove run. The verdict check is CHECK-ONCE and FAIL-LOUD — no poll, no deadline: a tag push on a
-commit whose prove is not ALREADY green fails every release workflow immediately, publishing nothing.
+publishing job (all-or-nothing: not only the CUDA lanes) gates on the recorded verdicts of the
+released commit's tree rather than proving anything themselves: its GPU prove and its `ci.yml`
+summary (`ci/scripts/verdict.py require`, consumed via `_proof-required.yml`). A merge whose tree
+its pull request's run already proved needs no wait for `main`'s run. A red leg is re-run by hand
+(`gh run rerun <run_id> --failed`) in that same run. The verdict check is CHECK-ONCE and FAIL-LOUD —
+no poll, no deadline: a tag push on a tree whose proof is not ALREADY green fails every release
+workflow immediately, publishing nothing.
 The order is still prove → green → tag, because a tag push commits the version number and nothing
 here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
 **lightweight, on the same commit, pushed together**:

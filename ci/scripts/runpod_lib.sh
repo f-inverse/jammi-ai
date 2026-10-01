@@ -96,7 +96,9 @@
 # teardown.
 
 : "${RUNPOD_API_KEY:?RUNPOD_API_KEY must be set (GitHub secret)}"
-RP_IMAGE="${RP_IMAGE:-ghcr.io/f-inverse/jammi-ai-ci-cuda:latest}"
+# The tree's own CUDA CI image (`ci_image.py`): a pod runs the environment the
+# tree under test defines. A workflow passes it after waiting for it to exist.
+RP_IMAGE="${RP_IMAGE:-$(python3 "$(dirname "${BASH_SOURCE[0]}")/ci_image.py" refs | sed -n 's/^cuda=//p')}"
 # Minimum NVIDIA driver major the CUDA build needs: the image ships CUDA 12.6 PTX
 # that the deployment driver JIT-compiles at model load, so a pod below r560
 # (< CUDA 12.6) cannot run it — the engine's own startup driver floor rejects it

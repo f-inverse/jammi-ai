@@ -2,6 +2,20 @@ name: CI
 
 # Every pull request, whatever its base: a stacked PR's base is another
 # branch, and its run here is the evidence the stack is green.
+#
+# A run proves a tree, never a commit. `plan` records the tree this run tests
+# (`record-subject`) and asks whether a run already proved it
+# (`ci/scripts/verdict.py probe`): the merge of a pull request whose tree its
+# own run proved lands on `main` with that same tree. A proven tree's run
+# skips every job whose only work is executing tests (each carries
+# `if: needs.plan.outputs.proven != 'true'`, and `ci-summary` counts a skipped
+# job as passed). Jobs that compile still run, because a run on `main` writes
+# the compile cache every pull request reads (`setup-rust-ci`); jobs whose
+# result depends on more than the tree (a hosted runner's image, a live
+# advisory database or model hub, the event) still run too.
+#
+# Nothing waits on work it does not consume: no job needs `check`, and each
+# compile graph that would outlast the hermetic suite runs as a job of its own.
 on:
   push:
     branches: [main]
@@ -11,16 +25,14 @@ concurrency:
   group: ci-${{ github.ref }}
   # A PR ref cancels its own superseded runs (rapid pushes to the same PR
   # should not queue N stale runs). On `main` the RUNNING run is never
-  # cancelled: a main run outlasts the gap between merges, so under
-  # "latest supersedes" a merge streak would cancel every run and leave main
-  # with no verdict at all. A group still holds one PENDING run, though: a
-  # newer merge's run replaces the one waiting, so that waiting commit gets
-  # no run of its own and the next verdict covers it. Every commit was
-  # already green on its own pull request (`ci-summary / assert` gates the
-  # merge).
+  # cancelled, so a merge streak still leaves `main` with verdicts. A group
+  # holds one PENDING run: a newer merge's run replaces the one waiting, and
+  # that waiting commit gets no run of its own. Every commit was already green
+  # on its own pull request (`ci-summary / assert` gates the merge).
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Least privilege: every job here only reads the checkout; nothing publishes.
+# Least privilege: jobs widen this only where they must (reading recorded
+# runs, pushing the tree's CI image).
 permissions:
   contents: read
 
@@ -29,11 +41,72 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # ── The tree's environment and verdict ──────────────────────────────────────
+  # The service images the tree's lanes run beside (its CI images come from the
+  # build jobs below).
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+
+  # This run builds the tree's images when the registry lacks them; a built
+  # tag is skipped inside `_ci-base-image.yml`. Every other workflow on the
+  # same push waits for these two jobs by their `CI image (` name prefix
+  # (`ci_image.py`'s BUILDER_JOB_PREFIX). Reviewed ungated promotions
+  # (`check_gpu_prove_once.py`'s table): a CI environment, never a release
+  # artifact, and the `if:` keeps a tag ref from reaching them.
+  build-ci-image:
+    name: CI image (CPU)
+    if: github.ref_type != 'tag'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_ci-base-image.yml
+    with:
+      dockerfile: .docker/ci.Dockerfile
+
+  # FROM the CPU image of the same tree, so after it.
+  build-ci-image-cuda:
+    name: CI image (CUDA)
+    needs: build-ci-image
+    if: github.ref_type != 'tag'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_ci-base-image.yml
+    with:
+      dockerfile: .docker/ci-cuda.Dockerfile
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      proven: ${{ steps.verdict.outputs.proven }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: subject
+        uses: ./.github/actions/record-subject
+
+      - name: Whether a run already proved this tree
+        id: verdict
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TREE: ${{ steps.subject.outputs.tree }}
+        run: python3 ci/scripts/verdict.py probe --repo "$GITHUB_REPOSITORY" --tree "$TREE" | tee -a "$GITHUB_OUTPUT"
+
+  # ── Lint ───────────────────────────────────────────────────────────────────
   check:
     name: Format & Lint
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -44,18 +117,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # Tests that need something a CI host lacks are compiled only under the
-      # feature naming it, so `--all-targets` above never sees them. These lanes
-      # lint the ones that need no CUDA toolchain to compile; the CUDA-needing
-      # ones are linted in `flash-attn-compile`, the Metal ones in `test-metal`.
-      # `check_lint_surface_closure.py` asserts every gated surface has a lane.
-      - name: Clippy (feature-gated test surfaces)
-        run: |
-          cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings
-          cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
-          cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
-          cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
-
       # jammi-db's `postgres` / `mysql` features compile `source/postgres.rs`
       # and `source/mysql.rs` (the `datafusion-table-providers` compat
       # surface) and nothing else on the merge path activates them, so the
@@ -65,46 +126,123 @@ jobs:
       - name: Clippy jammi-db --features postgres,mysql --all-targets (source-provider feature surface)
         run: cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
 
-  test:
-    name: Test (hermetic)
+  # Tests that need something a CI host lacks are compiled only under the
+  # feature naming it, so `--all-targets` above never sees them. This job lints
+  # the ones that need no CUDA toolchain to compile; the CUDA-needing ones are
+  # linted in `flash-attn-compile`, the Metal ones in `test-metal`.
+  # `check_lint_surface_closure.py` asserts every gated surface has a lane.
+  clippy-gated:
+    name: Clippy (feature-gated test surfaces)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # `jammi-python` links libpython unless maturin builds it, so its Rust
-      # tests run in the `Test (Python)` job, beside its pytest suite.
-      - name: Run tests
-        run: cargo test --workspace --exclude jammi-python
+      - name: Clippy (feature-gated test surfaces)
+        run: |
+          cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings
+          cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
+          cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
+          cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
 
-      # The `test-hooks` lane: the named result-table lifecycle points
-      # (`store/mutable/test_hook.rs`) are compiled only under this feature, so
-      # the two-writer oracles (`tests/it/recovery.rs::
-      # live_writer_survives_peer_recover_*`, a live writer parked at a point
-      # while a peer session's `recover()` sweeps beside it) and the two SIGKILL
-      # crash harnesses (`materialization_crash_recovery.rs`,
-      # `mutable_crash_recovery.rs`) run only here. Not a self dev-dependency:
-      # that would unify the feature into every workspace test build.
-      # `--test-threads=1` because the SIGKILL harnesses respawn this binary.
-      - name: Run tests (test-hooks lane)
-        run: cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1
+  # ── The hermetic suite: build once, run in partitions ──────────────────────
+  # One compile of the workspace's test graph, archived (`cargo nextest
+  # archive`) for the partitions below, which compile nothing. `jammi-python`
+  # links libpython unless maturin builds it, so its Rust tests run in the
+  # `Test (Python)` job, beside its pytest suite. The archive build always runs:
+  # on `main` it is what writes the test graph into the shared compile cache.
+  test-build:
+    name: Test (hermetic) build
+    runs-on: ubuntu-latest
+    needs: [build-ci-image, plan]
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
 
-      # The root-identity determinants are read back from the cloud drivers'
-      # own builders (`storage::builder::location_determinants`), which only
-      # exist under the `storage-*` features no other hermetic lane enables;
-      # this runs their oracles with every cloud driver compiled in.
-      - name: Run tests (storage-cloud lane — root-identity determinants)
-        run: cargo test -p jammi-db --features storage-cloud --lib -- catalog::instance storage::builder
+      - name: Build the hermetic test archive
+        run: cargo nextest archive --workspace --exclude jammi-python --archive-file target/hermetic.tar.zst
 
-      # Tests of how the engine handles an unreadable or undeletable file need a
-      # process that mode bits apply to; this container runs as root. They are
-      # compiled only under `unprivileged-tests`, so this step builds each test
-      # binary with and without the feature, takes the tests the feature adds,
-      # and runs exactly those as an unprivileged account. Each must report one
-      # passed test: a filter that matches nothing exits 0 having run nothing.
+      # nextest does not run doctests.
+      - name: Doctests
+        if: needs.plan.outputs.proven != 'true'
+        run: cargo test --workspace --exclude jammi-python --doc
+
+      - name: Hand the archive to the partitions
+        if: needs.plan.outputs.proven != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermetic-tests
+          path: target/hermetic.tar.zst
+          retention-days: 1
+          # The archive is zstd already.
+          compression-level: 0
+
+  # Each partition runs a slice of every test binary, each test in a process of
+  # its own (`.config/nextest.toml`). The archive is extracted into the
+  # checkout, at the target path it was built with, so a test's baked
+  # `CARGO_BIN_EXE_*` and `CARGO_MANIFEST_DIR` paths resolve. Four partitions:
+  # the suite's serial binary time is ~34 min, and its slowest test ~4.
+  test:
+    name: Test (hermetic) (${{ matrix.partition }}/4)
+    runs-on: ubuntu-latest
+    needs: [build-ci-image, plan, test-build]
+    if: needs.plan.outputs.proven != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trust the checkout (the container's user is not its owner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Outside the checkout: extraction creates `target/` and refuses one that
+      # already exists.
+      - uses: actions/download-artifact@v4
+        with:
+          name: hermetic-tests
+          path: /tmp/hermetic
+
+      - name: Run the partition
+        run: |
+          cargo nextest run --profile ci \
+            --archive-file /tmp/hermetic/hermetic.tar.zst \
+            --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" \
+            --partition slice:${{ matrix.partition }}/4
+
+      - name: Keep the partition's per-test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermetic-timings-${{ matrix.partition }}
+          path: target/nextest/ci/junit.xml
+          retention-days: 30
+
+  # Tests of how the engine handles an unreadable or undeletable file need a
+  # process that mode bits apply to; this container runs as root. They are
+  # compiled only under `unprivileged-tests`, so this job builds each test
+  # binary with and without the feature, takes the tests the feature adds,
+  # and runs exactly those as an unprivileged account. Each must report one
+  # passed test: a filter that matches nothing exits 0 having run nothing.
+  test-permission-fault:
+    name: Test (permission faults)
+    runs-on: ubuntu-latest
+    needs: [build-ci-image, plan]
+    if: needs.plan.outputs.proven != 'true'
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
       - name: Permission-fault tests (unprivileged account)
         shell: bash
         run: |
@@ -140,40 +278,52 @@ jobs:
           test "$ran" -gt 0 || { echo "::error::unprivileged-tests added no tests"; exit 1; }
           echo "$ran permission-fault tests ran unprivileged"
 
+  # The opt-in lanes no default build compiles, each a small graph of its own.
+  test-lanes:
+    name: Test (storage-cloud, golden-parity, build-sha)
+    runs-on: ubuntu-latest
+    needs: [build-ci-image, plan]
+    if: needs.plan.outputs.proven != 'true'
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # The root-identity determinants are read back from the cloud drivers'
+      # own builders (`storage::builder::location_determinants`), which only
+      # exist under the `storage-*` features no other hermetic lane enables;
+      # this runs their oracles with every cloud driver compiled in.
+      - name: Run tests (storage-cloud lane — root-identity determinants)
+        run: cargo test -p jammi-db --features storage-cloud --lib -- catalog::instance storage::builder
+
       # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
-      # default workspace test run above never compiles it, but it is fully
+      # default workspace test build never compiles it, but it is fully
       # hermetic: the oracle is a committed PyTorch dump
       # (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
       # binary), never a network call or a torch install. Without this step
       # `htsat_audio.rs`'s own doc claim ("eval bytes crate-wide are pinned by
       # ... tests/golden_parity.rs") describes a test that compiles and passes
-      # LOCALLY but that CI never runs — a doc citing a proof CI does not
-      # reproduce is exactly the drift this repo's gates exist to close. A
-      # dedicated step (not folded into the `--workspace` run above) because
-      # `golden-parity` is off by default for every OTHER crate too; passing
-      # it workspace-wide would be a silent feature-unification change this
-      # step does not need to make.
+      # LOCALLY but that CI never runs. A step of its own (not folded into the
+      # workspace build) because `golden-parity` is off by default for every
+      # OTHER crate too; passing it workspace-wide would be a silent
+      # feature-unification change this step does not need to make.
       - name: Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)
         run: cargo test -p jammi-encoders --features golden-parity --test golden_parity
 
       # The build-sha HERMETICITY falsifier, as a real CI step (never a
-      # `#[test]`: this needs a REAL commit, and mutating
-      # the actual checkout from inside `cargo test -p jammi-bench`'s own
-      # process would be the wrong layer for it). Runs directly in THIS
-      # job's own ephemeral `actions/checkout@v4` clone — never pushed,
-      # discarded when the job ends, so an empty commit here is harmless.
-      # The "Run tests" step above
-      # (`cargo test --workspace --exclude jammi-python`)
-      # already built `jammi-bench` as part of that workspace test run and
-      # warmed this job's target dir, so the rebuild below only re-runs
-      # `build.rs` + relinks jammi-bench's own binary, not a full workspace
-      # recompile. Complements (never
-      # duplicates) `provenance_baked.rs`'s `edited_tracked_file_forces_
-      # dirty_on_rebuild` (an UNCOMMITTED edit must dirty a rebuild) and
-      # `runtime_env_and_cwd_are_inert` (an ALREADY-BUILT binary must not
-      # react to anything at run time) — this step is the third leg: a REAL
-      # new commit, on a REBUILD, must move the baked sha to match it. This
-      # is ALSO the one place CI exercises a real
+      # `#[test]`: this needs a REAL commit, and mutating the actual checkout
+      # from inside `cargo test -p jammi-bench`'s own process would be the
+      # wrong layer for it). Runs directly in THIS job's own ephemeral
+      # `actions/checkout@v4` clone — never pushed, discarded when the job
+      # ends, so an empty commit here is harmless. The first `cargo run`
+      # builds `jammi-bench`; the second only re-runs `build.rs` and relinks.
+      # Complements (never duplicates) `provenance_baked.rs`'s
+      # `edited_tracked_file_forces_dirty_on_rebuild` (an UNCOMMITTED edit must
+      # dirty a rebuild) and `runtime_env_and_cwd_are_inert` (an ALREADY-BUILT
+      # binary must not react to anything at run time) — this step is the
+      # third leg: a REAL new commit, on a REBUILD, must move the baked sha to
+      # match it. This is ALSO the one place CI exercises a real
       # `actions/checkout@v4` DETACHED HEAD (`crates/jammi-bench/build.rs`'s
       # module doc names this state explicitly): the checkout has no branch
       # ref file to watch, so the commit below rewrites `.git/HEAD` itself —
@@ -183,16 +333,12 @@ jobs:
       # caught long before a real CI run.
       #
       # The `sleep 1` between reading `A` and the commit guards against a
-      # timing false reading: cargo's `rerun-if-changed`
-      # staleness check compares the watched file's mtime against its own
-      # fingerprint stamp, and on a coarse (1s-granularity) filesystem an
-      # empty commit landing in the SAME second as the prior build could
-      # leave the watched file's mtime indistinguishable from "unchanged" —
-      # a false NON-hermeticity reading that has nothing to do with whether
-      # `build.rs` tracks HEAD. `sleep 1` forces the commit's mtime bump
-      # (whatever the filesystem's clock granularity) unambiguously past the
-      # first build's own stamp, so a red run here always means the tracking
-      # mechanism itself is broken, never a timing coincidence.
+      # timing false reading: cargo's `rerun-if-changed` staleness check
+      # compares the watched file's mtime against its own fingerprint stamp,
+      # and on a coarse (1s-granularity) filesystem an empty commit landing in
+      # the SAME second as the prior build could leave the watched file's
+      # mtime indistinguishable from "unchanged" — a false NON-hermeticity
+      # reading that has nothing to do with whether `build.rs` tracks HEAD.
       - name: build-sha hermeticity
         run: |
           set -euo pipefail
@@ -216,18 +362,17 @@ jobs:
               ;;
           esac
 
-  # The gated-lane compile-checks live in their OWN job, not in `test` above.
-  # Each `--no-run` builds a full-workspace test-binary graph; accumulating all
-  # of them plus the run-tests graph in one job's `target/` exhausted the
-  # runner's disk at link time (`mold: … Disk full?` linking the jammi-server
-  # `it` binary). One large graph per job keeps every link within the disk
-  # budget. These only compile-check — the live runs are gated elsewhere.
+  # The gated-lane compile-checks live in their OWN job: each `--no-run` builds
+  # a full-workspace test-binary graph, and accumulating several in one job's
+  # `target/` exhausted the runner's disk at link time (`mold: … Disk full?`
+  # linking the jammi-server `it` binary). These only compile-check — the live
+  # runs are gated elsewhere.
   compile-check-gated:
     name: Compile-check (gated lanes)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -237,35 +382,44 @@ jobs:
       - name: Compile-check live tests
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
 
+  # The tests `live-hub-tests` adds, against the live model hub: `main`-only
+  # and advisory (a hub outage is not a regression). The tests the feature adds
+  # are the difference between the workspace's test list with and without it.
   test-live:
     name: Test (live)
     runs-on: ubuntu-latest
-    container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: test
+    needs: build-ci-image
     if: github.ref == 'refs/heads/main'
     continue-on-error: true
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      - name: Run live tests
+      - name: Run the live tests
         env:
           # Read by `HubSource`'s token fallback chain (`[models] hub_token`
           # > `HF_TOKEN` > the cache's own `token` file) — hf-hub 0.5 itself
           # never reads this variable.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        # Same `jammi-python` exclusion as the hermetic lane: its cdylib and
-        # integration test link libpython, and the `Test (Python)` job runs
-        # them.
-        run: cargo test --workspace --exclude jammi-python --features live-hub-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          list() { cargo nextest list --workspace --exclude jammi-python "$@" --message-format oneline --color never | sort; }
+          filter="$(comm -13 <(list) <(list --features live-hub-tests) \
+            | awk '{ printf "%s(binary_id(%s) & test(=%s))", (NR > 1 ? " | " : ""), $1, $2 }')"
+          test -n "$filter" || { echo "::error::live-hub-tests added no tests"; exit 1; }
+          cargo nextest run --profile ci --workspace --exclude jammi-python --features live-hub-tests -E "$filter"
 
+  # Mostly compilation (the client graphs' clippy and isolated builds), so it
+  # runs on a proven tree too, like every other lint.
   test-clients:
     name: Test (wire / admin / client)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -307,17 +461,41 @@ jobs:
   # build, the `cuda` arms, and every `live-gpu-*` test — with the CUDA toolkit
   # and no GPU. It proves the code builds, never that it computes the right
   # numbers: the `live-gpu-*` tests run on a GPU host (`ci/scripts/runpod_gpu_prove.sh`,
-  # dispatched by `gpu-prove.yml`).
+  # dispatched by `gpu-prove.yml`). One leg per feature graph: each lint
+  # resolves its own features, so the legs share no compile and run side by
+  # side. jammi-encoders gates code on `not(feature = "flash-attn")` as well,
+  # so it is linted with and without flash-attn. `flash-attn` must stay
+  # unreachable from `cuda` (`check_flash_attn_closure.py`), so jammi-ai is
+  # linted without it; its flash surface is reached through jammi-encoders and
+  # jammi-bench.
   #
   # The CUTLASS submodule is initialised in this job's checkout only: a
   # publishing checkout that walked it would ship BSD-3-Clause CUTLASS source in
   # the jammi-kernels tarball.
   flash-attn-compile:
-    name: Clippy (CUDA surfaces, nvcc — no GPU)
+    name: Clippy (CUDA surfaces, nvcc — no GPU) (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    needs: build-ci-image-cuda
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: jammi-kernels
+            cmd: cargo clippy -p jammi-kernels --all-targets --features live-gpu-tests,flash-attn -- -D warnings
+          - crate: jammi-encoders flash-oracle
+            cmd: cargo clippy -p jammi-encoders --all-targets --features live-flash-oracle-tests -- -D warnings
+          - crate: jammi-encoders
+            cmd: cargo clippy -p jammi-encoders --all-targets --features live-gpu-tests -- -D warnings
+          - crate: jammi-lora
+            cmd: cargo clippy -p jammi-lora --all-targets --features live-gpu-tests -- -D warnings
+          - crate: jammi-bench
+            cmd: cargo clippy -p jammi-bench --all-targets --features live-gpu-tests,flash-attn -- -D warnings
+          - crate: jammi-ai
+            cmd: cargo clippy -p jammi-ai --all-targets --features live-gpu-tests,live-gpu-gang-tests -- -D warnings
+          - crate: jammi-server
+            cmd: cargo clippy -p jammi-server --tests --features live-gpu-tests,live-gpu-gang-tests -- -D warnings
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image-cuda.outputs.image }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -335,20 +513,8 @@ jobs:
 
       - uses: ./.github/actions/setup-rust-ci
 
-      # jammi-encoders gates code on `not(feature = "flash-attn")` as well, so
-      # it is linted with and without flash-attn. `flash-attn` must stay
-      # unreachable from `cuda` (`check_flash_attn_closure.py`), so jammi-ai is
-      # linted without it; its flash surface is reached through jammi-encoders
-      # and jammi-bench.
       - name: Clippy CUDA surfaces (nvcc, no GPU)
-        run: |
-          cargo clippy -p jammi-kernels --all-targets --features live-gpu-tests,flash-attn -- -D warnings
-          cargo clippy -p jammi-encoders --all-targets --features live-flash-oracle-tests -- -D warnings
-          cargo clippy -p jammi-encoders --all-targets --features live-gpu-tests -- -D warnings
-          cargo clippy -p jammi-lora --all-targets --features live-gpu-tests -- -D warnings
-          cargo clippy -p jammi-bench --all-targets --features live-gpu-tests,flash-attn -- -D warnings
-          cargo clippy -p jammi-ai --all-targets --features live-gpu-tests,live-gpu-gang-tests -- -D warnings
-          cargo clippy -p jammi-server --tests --features live-gpu-tests,live-gpu-gang-tests -- -D warnings
+        run: ${{ matrix.cmd }}
 
   # Lints the Metal-gated surfaces. It cannot run them: a GitHub-hosted macos-14
   # runner cannot construct a candle Metal device (`Device::new_metal(0)` panics
@@ -360,7 +526,6 @@ jobs:
   test-metal:
     name: Clippy (Metal, macos-14)
     runs-on: macos-14
-    needs: check
     steps:
       - uses: actions/checkout@v4
 
@@ -379,9 +544,9 @@ jobs:
   oss-only-build:
     name: Guard (OSS-only build)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -399,14 +564,14 @@ jobs:
   dep-audit:
     name: Guard (dependency audit)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     # Runs in the same gnu CI image as every other job: `cargo deny` resolves
     # `cargo metadata`, which needs the repo's pinned toolchain (rust-toolchain.toml)
     # and respects `.cargo/config.toml`. The upstream cargo-deny *action*
     # runs in its own Alpine/musl container, where that toolchain is absent and the
     # sccache wrapper has no server — so we install + run the binary here instead.
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     env:
       # `cargo metadata` needs no build cache; skip the sccache wrapper (this lane
       # runs no sccache server) so metadata resolution doesn't try to invoke it.
@@ -425,15 +590,8 @@ jobs:
       # itself, so the advisory check reads the current database, not a stale
       # snapshot — and knowingly-carried advisories live as documented exceptions
       # in `deny.toml`, never a blanket silence. The TOOL's own version is
-      # pinned — deny.toml's own config shape asserts this major
-      # version's schema behavior; an unpinned `cargo install` could silently
-      # pick up a newer cargo-deny release that reads the SAME file
-      # differently, which is a different risk from the advisory DB's own
-      # deliberate freshness above and is not relaxed by pinning this. The CI
-      # image carries it at its pin (`.docker/pinned-tools.sh`), so this step
-      # is a no-op there; it installs only on an image that predates the pin.
-      - name: Provide cargo-deny at its pin
-        run: bash .docker/pinned-tools.sh cargo-deny
+      # pinned (`.docker/pinned-tools.sh`, baked into the CI image) — deny.toml's
+      # own config shape asserts this major version's schema behavior.
       - name: cargo deny (advisories + licenses + bans + sources)
         run: cargo deny check advisories licenses bans sources
 
@@ -531,9 +689,9 @@ jobs:
   test-python:
     name: Test (Python)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -577,15 +735,21 @@ jobs:
             python3 "$script"
           done
 
+  # The backend-parameterised suites' Postgres arms: compiled only under
+  # `live-postgres-tests`, each test against a database of its own on the
+  # service (`jammi_test_utils::postgres_database_url`), so they run in
+  # parallel — at most four at a time, the server's connection budget
+  # (`.config/nextest.toml`'s `postgres` profile).
   test-pg:
     name: Test (Postgres)
     runs-on: ubuntu-latest
+    needs: [ci-image, build-ci-image, plan]
+    if: needs.plan.outputs.proven != 'true'
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-    needs: check
+      image: ${{ needs.build-ci-image.outputs.image }}
     services:
       postgres:
-        image: postgres:16
+        image: ${{ needs.ci-image.outputs.postgres }}
         env:
           POSTGRES_USER: jammi
           POSTGRES_PASSWORD: jammi
@@ -601,19 +765,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
 
-      # The Postgres arms are compiled only under `live-postgres-tests` and fail
-      # naming `JAMMI_TEST_PG_URL` when it is unset. The service container is
-      # reachable as `postgres` on the job's network. Every test shares one
-      # catalog database and serialises its migrate() ledger writes, hence
-      # `--test-threads=1`.
+      # The service container is reachable as `postgres` on the job's network.
       - name: Run Postgres tests
         env:
           JAMMI_TEST_PG_URL: postgres://jammi:jammi@postgres:5432/jammi_test
         run: |
-          cargo test -p jammi-db --features live-postgres-tests --lib -- --test-threads=1
-          cargo test -p jammi-db --features live-postgres-tests --test it -- --test-threads=1
-          cargo test -p jammi-db --features live-postgres-tests,test-hooks --test it -- --test-threads=1
-          cargo test -p jammi-server --features live-postgres-tests --test it -- --test-threads=1
+          cargo nextest run --profile postgres -p jammi-db -p jammi-server \
+            --features jammi-db/live-postgres-tests,jammi-server/live-postgres-tests \
+            -E '(package(jammi-db) & (kind(lib) | binary(it))) | (package(jammi-server) & binary(it))'
 
   # The repository's guards (`ci/guards.toml`), run by the one runner a local
   # check uses too: `ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main`.
@@ -626,8 +785,9 @@ jobs:
   guard:
     name: Guards
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -652,8 +812,10 @@ jobs:
   kube-manifests:
     name: Guard (kubernetes manifests)
     runs-on: ubuntu-latest
+    needs: [build-ci-image, plan]
+    if: needs.plan.outputs.proven != 'true'
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -664,10 +826,6 @@ jobs:
           # alike inside the container (`runner.temp` names the host's path).
           path: ~/.cache/kubeconform
           key: kubeconform-schemas-b582a12a09aa9b5d1edad577a964c504130214fc-1.34.11
-
-      # A no-op in the CI image; installs only on an image that predates a pin.
-      - name: Provide kustomize and kubeconform at their pins
-        run: bash .docker/pinned-tools.sh kustomize kubeconform
 
       - name: kustomize build | kubeconform --strict (base, shape-d, ci)
         run: |
@@ -685,6 +843,13 @@ jobs:
               -cache ~/.cache/kubeconform \
               -
           done
+
+      # kubeconform proves the manifests are valid Kubernetes; this proves each
+      # server would find its config where it looks for it.
+      - name: Every config mount carries the file its server reads
+        run: |
+          python3 ci/scripts/check_kube_config_mounts.py --self-test
+          python3 ci/scripts/check_kube_config_mounts.py
 
   # `.cargo/config.toml`'s `[target.aarch64-unknown-linux-gnu]` `+fp16`
   # stanza is a COMPILE BASELINE, not a runtime floor: `gemm` 0.19's
@@ -710,13 +875,8 @@ jobs:
   # neither this job nor any CI job may ever export a bare `RUSTFLAGS`
   # (which would REPLACE, not join, config.toml) -- asserted directly.
   #
-  # No `container:` (unlike `check`/`test`, which run inside the CI base
-  # image): that image's `:latest` tag only becomes the arm64-carrying
-  # multi-arch index on a push to `main` (`_ci-base-image.yml`'s own rule),
-  # so a `container:` pull here would hit a platform mismatch on any PR run
-  # before that image's `latest` carries an arm64 entry. The toolchain is
-  # installed directly instead, the same mechanism `release-binaries.yml`'s
-  # macOS leg (also a bare, container-less runner) already uses:
+  # No `container:`: the job proves what a bare `cargo` on an aarch64 host
+  # reads from `.cargo/config.toml`, so it installs the toolchain directly —
   # `rust_pin.sh` resolves `rust-toolchain.toml`'s pin into a step output,
   # and `dtolnay/rust-toolchain` (SHA-pinned) installs exactly that channel,
   # native to the runner's own arch, no cross-target request.
@@ -730,14 +890,6 @@ jobs:
   # drops each compile to a few seconds; the toolchain install is the fixed
   # per-run cost either way (GH-hosted runners are ephemeral, so rustup has
   # no cross-run cache of its own). Never a full-workspace build.
-
-      # kubeconform proves the manifests are valid Kubernetes; this proves each
-      # server would find its config where it looks for it.
-      - name: Every config mount carries the file its server reads
-        run: |
-          python3 ci/scripts/check_kube_config_mounts.py --self-test
-          python3 ci/scripts/check_kube_config_mounts.py
-
   arm64-floor-oracle:
     name: arm64 floor oracle
     runs-on: ubuntu-24.04-arm
@@ -844,13 +996,6 @@ jobs:
           grep -q 'target_feature="fp16"' <<<"$cfg"
           echo "rustc's own cfg set for jammi-numerics carries target_feature=\"fp16\" (.cargo/config.toml alone, no CI-side env var at all)"
 
-  # ── Single rolled-up gate ──────────────────────────────────────────────────
-  # The ONE check a branch-protection ruleset should require, instead of listing
-  # every job as a separate context. It fails if any job above failed/cancelled;
-  # a `skipped` job (intentional — e.g. `test-live`, which is main-only) counts
-  # as a pass. `if: always()` makes it emit on every run, so the required check
-  # never hangs "waiting for status". `test-live` is deliberately excluded — it
-  # is `continue-on-error` (a live-network lane allowed to fail).
   # The gates that resolve Rust declarations against a REAL `syn` AST parse
   # (`ci/tools/symbol-index`, `cargo run --release -p symbol-index`) rather
   # than a regex reader. That parse needs the repo's pinned Rust toolchain,
@@ -863,8 +1008,9 @@ jobs:
   symbol-index-gates:
     name: Guard (symbol-index gates)
     runs-on: ubuntu-latest
+    needs: build-ci-image
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -894,12 +1040,34 @@ jobs:
   # The multi-process lanes over Postgres and the S3-class store: the claim,
   # chaos and ladder-rung legs `distributed.yml` defines.
   distributed:
+    needs: [build-ci-image, plan]
+    if: needs.plan.outputs.proven != 'true'
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/distributed.yml
 
+  # ── Single rolled-up gate ──────────────────────────────────────────────────
+  # The ONE check a branch-protection ruleset should require, instead of listing
+  # every job as a separate context. It fails if any job above failed/cancelled;
+  # a `skipped` job — one whose tree `plan` found proven, or `test-live` off
+  # `main` — counts as a pass. `if: always()` makes it emit on every run, so the
+  # required check never hangs "waiting for status". `test-live` is
+  # deliberately excluded — it is `continue-on-error` (a live-network lane
+  # allowed to fail). `verdict.py`'s CI_SUMMARY_JOB names this job: a release
+  # gates on its most recent result over the released tree.
   ci-summary:
     needs:
+      - ci-image
+      - build-ci-image
+      - build-ci-image-cuda
+      - plan
       - check
+      - clippy-gated
+      - test-build
       - test
+      - test-permission-fault
+      - test-lanes
       - compile-check-gated
       - test-clients
       - guard

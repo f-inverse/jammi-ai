@@ -5,6 +5,35 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **CI proves a tree once.** A change paid for CI twice: about 1h35 on its pull request, then up to
+  2h53 on `main` over the same tree. `ci.yml`'s `plan` records the tree a run tests and asks
+  whether a run already proved it (`ci/scripts/verdict.py`, the reader the GPU-prove gate used,
+  now keyed by tree); a proven tree's run skips every job that only executes tests, so a merge
+  whose tree its pull request proved spends `main`'s run on compiling alone. The release gate
+  (`_proof-required.yml`, formerly `_gpu-proof-required.yml`) requires the released tree's GPU prove
+  and its CI summary, so a release no longer waits on `main`'s run.
+- **Nothing in CI waits on work it does not consume.** No job needs `Format & Lint`. The hermetic
+  suite builds once (`cargo nextest archive`) and runs in four partitions, each test in a process
+  of its own (`.config/nextest.toml`; doctests run beside the build). CUDA clippy runs one feature
+  graph per job; the feature-gated lints, the permission-fault lane and the small opt-in lanes run
+  as jobs of their own. The duplicate `test-hooks` lanes are gone — `jammi-test-utils` already
+  enables the feature for every `jammi-db` test build — and `Test (live)` runs only the tests
+  `live-hub-tests` adds, no longer the whole suite after it.
+- **Every Postgres test has a database of its own.** `jammi_test_utils::postgres_database_url`
+  gives a test the database its artifact dir owns, the way the SQLite arm's catalog is
+  `<dir>/catalog.db`, so the Postgres lane runs in parallel (152 s for 1,936 tests, from 29 min at
+  one thread) and the shared-database workarounds — `reset_shared_catalog`, the per-file resets,
+  the sibling-row filters — are deleted.
+- **A tree runs in its own CI image.** The CI images are tagged by content (`ci/scripts/ci_image.py`):
+  the Dockerfile, every file it copies, the digest-pinned base (`.docker/base-images.env`), the
+  toolchain pin and the build recipe. `ci.yml` builds a tree's images when the registry lacks them
+  and every other workflow waits for them (`_ci-image.yml`), so a pull request that changes
+  `.docker/` is tested in the image it defines. `resolve-ci-image` and `vars.JAMMI_CI_IMAGE` are
+  deleted; `:latest` is the devcontainer's alias for `main`'s images; Postgres is pinned by digest
+  (`ci/service-images.env`); `ci/dev.sh` runs the tree's image and `--build-image` builds it.
+- **Only `main` writes the compile cache.** A pull request's sccache entries were scoped to its own
+  merge ref, readable only by its re-runs, and one open pull request held 6 of the repository's
+  10 GB; `setup-rust-ci` now runs sccache read-only off `main`.
 - **A CI job whose remote compile cache is unavailable still builds.** sccache refuses to start its
   server when its startup storage check fails, so a throttled GitHub Actions cache (`ServerBusy:
   Egress is over the account limit`) failed every cargo call in a job before it compiled anything.

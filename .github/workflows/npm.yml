@@ -28,8 +28,8 @@ permissions:
   contents: read
 
 jobs:
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
     # before the package is published (every release publisher gates on the
@@ -38,7 +38,7 @@ jobs:
     # dispatch publish unproven. A branch dispatch skips this job entirely
     # (it never needed a verdict for its build-and-test dry run).
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -46,14 +46,14 @@ jobs:
 
   publish:
     name: Publish to npm
-    # `needs: [gpu-proof]` alone would make this job (build+test included)
-    # skip on a branch dispatch, where `gpu-proof` above never runs at all —
+    # `needs: [proof]` alone would make this job (build+test included)
+    # skip on a branch dispatch, where `proof` above never runs at all —
     # breaking the "branch dispatch is a build-and-test dry run" contract
     # this workflow's header states. `if: always()` keeps build+test
     # unconditional; the
     # actual publish gating lives on the "Publish" step below, whose `if:`
     # is a PURE conjunction of the tag guard and the prove verdict.
-    needs: [gpu-proof]
+    needs: [proof]
     if: always()
     runs-on: ubuntu-latest
     defaults:
@@ -128,7 +128,7 @@ jobs:
         # dispatch builds and tests but never publishes. PURE conjunction
         # (no `||`) — `check_gpu_prove_once.py`'s PROMOTION_TABLE rule
         # asserts this shape holds for every promotion site in the tree.
-        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'
+        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'
         run: |
           set -euo pipefail
           # Key the idempotence probe on the SAME quantity `npm publish`

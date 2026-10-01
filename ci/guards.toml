@@ -213,3 +213,14 @@ needs = ["actionlint"]
 name = "GPU test placement"
 run = "python3 ci/scripts/check_gpu_test_placement.py"
 why = "Every GPU test is in a GPU-only target or a `gpu` module the GPU lane selects; no CPU test runs on a GPU host."
+
+[[guard]]
+name = "test locks classified"
+run = "python3 ci/scripts/check_serial_keys.py"
+why = "Every serial_test key is a nextest test group or process-local, and every hand-written test lock is classified: a lock guarding a host resource still excludes under a process per test."
+
+[[guard]]
+name = "CI image key closure"
+run = "python3 ci/scripts/ci_image.py check"
+why = "A CI image's content tag covers every file its Dockerfile copies and every build argument it takes, and ci.yml's image builders carry the name every other workflow waits on."
+when = ["rig"]

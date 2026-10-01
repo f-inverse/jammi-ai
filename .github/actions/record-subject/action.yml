@@ -1,0 +1,35 @@
+name: record-subject
+description: >
+  Records the tree this run tests as its subject: an artifact named
+  `subject-<tree>`. `ci/scripts/verdict.py` finds the runs that measured a
+  tree through it, so a verdict follows the tree a run tested — a pull
+  request's merge commit, the merge `main` holds, the commit a release tags —
+  never a commit id. Must run after `actions/checkout`, in the job that also
+  decides what the run measures. Once the artifact's 90-day retention ends
+  the run is no longer bound to the tree, and a verdict over it is measured
+  again.
+
+outputs:
+  tree:
+    description: The git tree id of the checkout.
+    value: ${{ steps.tree.outputs.tree }}
+
+runs:
+  using: composite
+  steps:
+    - id: tree
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        tree="$(git rev-parse HEAD^{tree})"
+        echo "tree=$tree" >> "$GITHUB_OUTPUT"
+        printf '%s\n' "$tree" > "$RUNNER_TEMP/subject"
+
+    # A rerun of the same run records the same subject again.
+    - uses: actions/upload-artifact@v4
+      with:
+        name: subject-${{ steps.tree.outputs.tree }}
+        path: ${{ runner.temp }}/subject
+        retention-days: 90
+        overwrite: true

@@ -41,9 +41,9 @@ name: GPU prove (RunPod)
 #
 # EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io,
 # npm, every PyPI dist, the server image, the release binaries) — gates its
-# promotion on the SUMMARY of a prove run already on record for the commit
-# it promotes — `ci/scripts/gpu_prove_verdict.py`, consumed via
-# `_gpu-proof-required.yml`, never a fresh rental of its own, and never a
+# promotion on the SUMMARY of a prove run already on record for the tree of
+# the commit it promotes — `ci/scripts/verdict.py require`, consumed via
+# `_proof-required.yml`, never a fresh rental of its own, and never a
 # wait: the check is a single, immediate, fail-loud lookup (no poll, no
 # deadline). A dev dispatches THIS workflow by hand before tagging a release
 # (see docs/maintainer/dev-gpu.md and MAINTAINER-GUIDE.md's release
@@ -78,8 +78,29 @@ permissions:
   contents: read
 
 jobs:
+  # The tree this run proves, recorded once for the four legs below: the
+  # release gate (`_proof-required.yml`) finds a tree's prove runs through it.
+  subject:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/record-subject
+
+  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
+  # the tree defines, never the one `main` last had.
+  ci-image:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
+
   gpu-prove:
     name: GPU prove on RunPod (${{ matrix.arch }})
+    needs: ci-image
     strategy:
       # Independent legs: an sm_90 (H100) capacity outage must not hide a
       # green sm_80 (A100) result, or vice versa — each arch is its own
@@ -152,6 +173,7 @@ jobs:
         id: prove
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           GPU_PROVE_ARCH: ${{ matrix.arch }}

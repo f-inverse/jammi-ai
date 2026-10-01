@@ -21,9 +21,9 @@ name: Distributed validation
 #     has them.
 #
 # Every leg is a verdict: a red is a regression. `ci.yml` calls this workflow
-# on every pull request and every push to `main`, inside the `ci-summary`
-# check a merge requires; the nightly run re-proves `main` against the
-# moving CI image.
+# on every pull request and every push to `main` whose tree no run proved yet,
+# inside the `ci-summary` check a merge requires; the nightly run measures
+# `main` again.
 on:
   workflow_call:
   workflow_dispatch:
@@ -49,8 +49,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # The tree's CI image and Postgres; a run from `ci.yml` finds the image its
+  # caller built, a nightly one waits for nothing.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
+
   distributed:
     name: ${{ matrix.display }} (Postgres + S3 store)
+    needs: ci-image
     runs-on: ubuntu-latest
     strategy:
       # One leg's failure must not cancel another: each carries its own signal.
@@ -88,10 +99,10 @@ jobs:
               every_train_run_rung_publishes_the_same_adapter
               every_predictor_train_run_rung_publishes_the_same_predictor
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     services:
       postgres:
-        image: postgres:16
+        image: ${{ needs.ci-image.outputs.postgres }}
         env:
           POSTGRES_USER: jammi
           POSTGRES_PASSWORD: jammi

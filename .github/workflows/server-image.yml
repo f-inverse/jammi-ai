@@ -57,39 +57,15 @@ env:
   IMAGE_NAME_CU12: ${{ github.repository_owner }}/jammi-ai-server-cu12
 
 jobs:
-  # Resolves BOTH mutable CI base-image tags (`:latest` for the CPU base,
-  # `:latest` for the CUDA base) to their index digests ONCE per workflow
-  # run, so every leg below -- the two-arch CPU matrix, the self-contained
-  # build, the CUDA build -- builds against the exact same base even if
-  # `:latest` is republished mid-run (see `.github/actions/resolve-ci-image`
-  # and `_ci-base-image.yml`'s own header for why nothing writes the repo
-  # variable itself). `cu12-only` legs still resolve `image` (unused by
-  # them) because this is one job per workflow, not one per image --
-  # cheap, and keeps the resolver invocation count at exactly two reads.
-  resolve-base:
-    name: Resolve CI base images
-    runs-on: ubuntu-latest
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.cpu.outputs.image }}
-      image_cuda: ${{ steps.cuda.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: cpu
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-      - id: cuda
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
 
   # CPU image, main-branch arm: pushed from the default branch (`latest` +
   # sha) via a `workflow_dispatch` run on `main` only -- this workflow
@@ -111,7 +87,7 @@ jobs:
     # a release tag ref, never merely happen to never mention one --
     # `check_gpu_prove_once.py`'s P3 rule pins this exact conjunct.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'
-    needs: [resolve-base]
+    needs: [ci-image]
     strategy:
       fail-fast: false
       matrix:
@@ -164,7 +140,7 @@ jobs:
             type=sha,format=long
           tag-suffix: ${{ matrix.arch }}
           build-args: |
-            BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           platforms: linux/${{ matrix.arch }}
           cache-scope: cpu-${{ matrix.arch }}
@@ -376,12 +352,12 @@ jobs:
   # tag` below is the ONLY job that ever moves the real semver/`sha-<sha>`
   # tags this arm publishes.
   build-and-push:
-    needs: [gpu-proof, resolve-base]
-    # `always()` (pre-existing, for the gpu-proof interaction) bypasses the
-    # DEFAULT implicit "all needs succeeded" gate -- so `resolve-base`'s own
+    needs: [proof, ci-image]
+    # `always()` (pre-existing, for the proof interaction) bypasses the
+    # DEFAULT implicit "all needs succeeded" gate -- so `ci-image`'s own
     # success must be re-asserted explicitly here too, or a failed resolve
     # would let this job run anyway with an empty BASE_IMAGE build-arg.
-    if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success' && needs.resolve-base.result == 'success'
+    if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.ci-image.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -423,7 +399,7 @@ jobs:
             type=sha,format=long
           tag-suffix: ${{ matrix.arch }}
           build-args: |
-            BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           platforms: linux/${{ matrix.arch }}
           cache-scope: cpu-${{ matrix.arch }}
@@ -454,7 +430,7 @@ jobs:
   # Merges `build-and-push`'s two per-arch immutable sources into the real
   # semver/`sha-<sha>` tags -- the ONLY job that ever moves them for this
   # arm. `gate_kind` "chained": gated off `build-and-push` itself (already
-  # gated by `gpu-proof`, direct), carrying the SAME tag-family conjunct
+  # gated by `proof`, direct), carrying the SAME tag-family conjunct
   # (`check_gpu_prove_once.py` P3). Verify-then-promote, same shape as
   # `merge-cpu-main` above.
   merge-cpu-tag:
@@ -632,7 +608,7 @@ jobs:
     # to bypass). `check_gpu_prove_once.py`'s P3 rule pins the exact
     # conjunct `github.ref_type != 'tag'` on every gate_kind='none' row.
     if: github.event_name == 'workflow_dispatch' && inputs.selfcontained && github.ref_type != 'tag'
-    needs: [resolve-base]
+    needs: [ci-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -667,7 +643,7 @@ jobs:
             type=sha,prefix=selfcontained-,format=long
           build-args: |
             RUNTIME_VARIANT=runtime-selfcontained
-            BASE_IMAGE=${{ needs.resolve-base.outputs.image }}
+            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           # Cloudflare Containers (this variant's runtime) is amd64-only
           # -- no arm leg, no merge job, no row. Explicit, never implicit
@@ -703,20 +679,20 @@ jobs:
   # push, or a recovery dispatch run on the tag), always behind the shared
   # GPU-prove verdict. Builds the `runtime-cuda` stage (candle CUDA backend
   # + NVIDIA runtime base) and pushes the same tag scheme as the CPU image.
-  # GPU runtime is not tested on the CI runner itself — `gpu-proof` below
+  # GPU runtime is not tested on the CI runner itself — `proof` below
   # reads the commit's already-recorded proof (a dev dispatches
   # `gpu-prove.yml` by hand before tagging; see docs/maintainer/dev-gpu.md);
   # the `build-cuda-pr` job below proves the Dockerfile compiles on every PR
   # that touches it, before any tag lands.
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
     # before the CUDA image is promoted. The tag guard (not an event guard)
     # is what keeps every promotion arm proven: an event-keyed guard would
     # let a dispatch push an unproven image.
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -732,10 +708,10 @@ jobs:
     # on PRs.) The `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_
     # once.py`'s P3 rule asserts this shape holds for every CUDA promotion
     # job in the tree.
-    needs: [gpu-proof, resolve-base]
+    needs: [proof, ci-image]
     # See build-and-push's identical comment: `always()` needs resolve-
     # base's success re-asserted explicitly too.
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success' && needs.resolve-base.result == 'success'
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.ci-image.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -788,7 +764,7 @@ jobs:
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
-            BASE_IMAGE_CUDA=${{ needs.resolve-base.outputs.image_cuda }}
+            BASE_IMAGE_CUDA=${{ needs.ci-image.outputs.cuda }}
           # The CUDA runtime base has no arm64 build (no NVIDIA GPU target
           # for it); explicit, same
           # loud-failure property as the self-contained image above.
@@ -827,7 +803,7 @@ jobs:
   # no GHCR write.
   build-cuda-pr:
     if: github.event_name == 'pull_request'
-    needs: [resolve-base]
+    needs: [ci-image]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -856,7 +832,7 @@ jobs:
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
             CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
-            BASE_IMAGE_CUDA=${{ needs.resolve-base.outputs.image_cuda }}
+            BASE_IMAGE_CUDA=${{ needs.ci-image.outputs.cuda }}
           # Same explicit-amd64 rule as the pushing CUDA leg above --
           # this build-only verification stays byte-identical in platform
           # coverage to what actually ships.

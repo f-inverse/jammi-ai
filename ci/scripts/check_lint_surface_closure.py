@@ -808,10 +808,11 @@ def find_unprotected_lanes(
 # --------------------------------------------------------------------------- #
 # self-test
 # --------------------------------------------------------------------------- #
-#: The step the host-workflow controls move around. Written once, asserted to
-#: exist exactly once in `ci.yml` before any mutation is judged — a control
-#: that silently moved nothing would "prove" the row goes UNSATISFIED for the
-#: wrong reason.
+#: The lane the host-workflow controls move around — a step's `run:` line, or
+#: a matrix leg's `cmd:`, which the extraction credits the same way. Written
+#: once, asserted to exist exactly once in `ci.yml` before any mutation is
+#: judged — a control that silently moved nothing would "prove" the row goes
+#: UNSATISFIED for the wrong reason.
 _MOVED_STEP_TUPLE = (
     "cargo clippy -p jammi-ai --all-targets "
     "--features live-gpu-tests,live-gpu-gang-tests -- -D warnings"
@@ -842,7 +843,11 @@ def _corpus_with_step_moved(exec_mod, moved_to: str | None, remove_from_ci: bool
         if remove_from_ci:
             ci = dst / "ci.yml"
             text = ci.read_text(encoding="utf-8")
-            hosting = [ln for ln in text.splitlines() if ln.strip() == _MOVED_STEP_TUPLE]
+            hosting = [
+                ln
+                for ln in text.splitlines()
+                if ln.strip() in (_MOVED_STEP_TUPLE, f"cmd: {_MOVED_STEP_TUPLE}")
+            ]
             assert len(hosting) == 1, (
                 "self-test FAILED: expected exactly one "
                 f"`{_MOVED_STEP_TUPLE}` line in ci.yml, found {len(hosting)} -- the host-workflow "

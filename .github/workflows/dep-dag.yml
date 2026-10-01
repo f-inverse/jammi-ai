@@ -49,30 +49,25 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
+
   dep-dag:
     name: Guard (dep-DAG freshness)
+    needs: ci-image
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
-
-      # The CI image carries cargo-build-graph at its pin
-      # (`.docker/pinned-tools.sh`, so the rendered graph matches the committed
-      # block); this step is a no-op there and installs it only on an image
-      # that predates the pin. Clear -D warnings for this step only — an
-      # install compiles a third-party crate and its deps, where a single
-      # upstream warning would otherwise fail the build. Overriding the SAME
-      # per-target var `setup-rust-ci` set (never a bare RUSTFLAGS, which would
-      # also silently drop the mold flag `.cargo/config.toml` still supplies for
-      # this runner's target — an empty CARGO_TARGET_..._RUSTFLAGS joins with
-      # config.toml the same as a non-empty one, contributing nothing extra
-      # while leaving mold in place).
-      - name: Provide build-graph at its pin (the dep-DAG generator's source of truth)
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
-        run: bash .docker/pinned-tools.sh build-graph
 
       # The maintainer guide's crate-dependency DAG is generated from
       # build-graph (the maintainer-chosen source of truth, extracted from

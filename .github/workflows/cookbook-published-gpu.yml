@@ -22,8 +22,19 @@ permissions:
   contents: read
 
 jobs:
+  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
+  # the tree defines, never the one `main` last had.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
+
   gpu:
     name: GPU (RunPod L4)
+    needs: ci-image
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -31,6 +42,7 @@ jobs:
       - name: Run the notebooks as published on an L4
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           DRIVER_REF: ${{ github.sha }}
           NOTEBOOKS_TAG: ${{ inputs.tag }}

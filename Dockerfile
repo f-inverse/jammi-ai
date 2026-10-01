@@ -16,11 +16,10 @@ ARG RUNTIME_VARIANT=runtime-generic
 
 # GLOBAL args (declared before the first FROM, same rule this file already
 # states for RUNTIME_VARIANT above): a bare `docker build` (no `--build-arg`
-# at all -- `deploy-server.md`'s documented commands) still resolves to the
-# mutable `:latest` index each default names, exactly the pre-arm64 behavior;
-# CI overrides both with a digest-pinned ref resolved once per run
-# (`resolve-base`/`resolve-ci-image`, one read, no repo-variable write, no
-# PAT) so every leg of one release build shares one toolchain.
+# at all -- `deploy-server.md`'s documented commands) builds on the `:latest`
+# alias `image.yml` keeps on `main`'s CI images; CI passes the tree's own
+# content-tagged CI images (`_ci-image.yml`), so every leg of one release
+# build shares the toolchain its tree defines.
 #
 # BASE_IMAGE feeds the very next FROM (immediately below, the first FROM in
 # this file) so this single declaration -- default AND all -- is already in
@@ -42,12 +41,10 @@ ARG BASE_IMAGE=ghcr.io/f-inverse/jammi-ai-ci:latest
 ARG BASE_IMAGE_CUDA=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
 
 # ---- builder ----
-# The CI base image carries the full Rust toolchain (rustc 1.94.0,
-# protoc, mold, sccache). Pinning to `:latest` is intentional —
-# the CI image is rebuilt on toolchain bumps and the OSS server
-# inherits that update lockstep with the workspace. `:latest` now resolves
-# to a multi-arch index (linux/amd64 + linux/arm64); each puller's own
-# container runtime selects the manifest matching its own host arch.
+# The CI base image carries the full Rust toolchain (the `rust-toolchain.toml`
+# pin, protoc, mold, sccache). It is a multi-arch index (linux/amd64 +
+# linux/arm64); each puller's own container runtime selects the manifest
+# matching its own host arch.
 FROM ${BASE_IMAGE} AS builder
 
 # Redeclared HERE (post-FROM), same rule the CUDA stage's own

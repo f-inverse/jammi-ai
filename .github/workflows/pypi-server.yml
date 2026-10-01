@@ -44,37 +44,32 @@ permissions:
   contents: read
 
 jobs:
-  # Resolves the mutable CI base-image tag to its index digest ONCE per
-  # workflow run (`.github/actions/resolve-ci-image`), so both legs below
-  # (x86_64, aarch64) build against the exact same base even if `:latest`
-  # is republished mid-run.
-  resolve-base:
-    name: Resolve CI base image
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
+
+  read-manifest:
+    name: Read release feature list
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      image: ${{ steps.resolve.outputs.image }}
       cargo_features: ${{ steps.manifest.outputs.cargo_features }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: resolve
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
 
       # `ci/release-feature-manifest.json`'s `cpu-wheel` lane is the single
       # source of truth for the CPU wheel's cargo feature list — read
-      # here, once, and fed to both arch legs below via `needs.resolve-
-      # base.outputs.cargo_features` (a reusable `uses:` workflow's `with:`
-      # inputs cannot run their own shell, so the read happens in THIS
-      # calling job, same idiom as server-image.yml's CPU/CUDA jobs).
+      # here, once, and fed to both arch legs below via `needs.read-
+      # manifest.outputs.cargo_features` (a reusable `uses:` workflow's `with:`
+      # inputs cannot run their own shell, so the read happens in a job of
+      # this workflow, the same idiom as pypi-server-cuda.yml's).
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
         run: |
@@ -88,13 +83,13 @@ jobs:
 
   server-cpu-x86_64:
     name: jammi-server (CPU, x86_64)
-    needs: [resolve-base]
+    needs: [read-manifest, ci-image]
     permissions:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ${{ needs.resolve-base.outputs.image }}
-      cargo_features: ${{ needs.resolve-base.outputs.cargo_features }}
+      container_image: ${{ needs.ci-image.outputs.cpu }}
+      cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
       package_dir: packaging/server-cpu
       artifact_prefix: server-cpu-x86_64
       platform_tag: manylinux_2_28_x86_64
@@ -102,21 +97,21 @@ jobs:
 
   server-cpu-aarch64:
     name: jammi-server (CPU, aarch64)
-    needs: [resolve-base]
+    needs: [read-manifest, ci-image]
     permissions:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ${{ needs.resolve-base.outputs.image }}
+      container_image: ${{ needs.ci-image.outputs.cpu }}
       runs_on: ubuntu-24.04-arm
-      cargo_features: ${{ needs.resolve-base.outputs.cargo_features }}
+      cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
       package_dir: packaging/server-cpu
       artifact_prefix: server-cpu-aarch64
       platform_tag: manylinux_2_28_aarch64
     secrets: inherit
 
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
     # tag — requires the release commit's already-recorded GPU-prove
     # verdict before the CPU wheel is published (every release publisher
@@ -124,7 +119,7 @@ jobs:
     # CUDA itself, but it ships in the SAME all-or-nothing lockstep release as
     # the CUDA lanes, so it must not promote ahead of an unproven commit).
     if: startsWith(github.ref, 'refs/tags/py-v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -139,8 +134,8 @@ jobs:
     # artifact-only dry run and can never publish. Same recovery contract as
     # `pypi.yml`/`pypi-client.yml` on this lockstep surface. PURE conjunction
     # (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cpu-x86_64.result == 'success' && needs.server-cpu-aarch64.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [server-cpu-x86_64, server-cpu-aarch64, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cpu-x86_64.result == 'success' && needs.server-cpu-aarch64.result == 'success' && needs.proof.result == 'success'
+    needs: [server-cpu-x86_64, server-cpu-aarch64, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

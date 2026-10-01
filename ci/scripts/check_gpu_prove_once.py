@@ -32,12 +32,12 @@ as fixtures that must FAIL, never a grep for one known-bad string):
   P3 (PROMOTION_TABLE, every row reconciled): every reviewed row in
      `PROMOTION_TABLE` (workflow, promoting job, gate job/kind, tag family)
      is structurally sound. A `"direct"` row's gate job must `uses:
-     ./.github/workflows/_gpu-proof-required.yml`; a `"chained"` row's gate
+     ./.github/workflows/_proof-required.yml`; a `"chained"` row's gate
      job must itself be some OTHER row's promoting job in the SAME workflow
      (e.g. `crates.yml`'s `github-release` chains off `publish`, which is
      itself a `"direct"` row); a `"none"` row is a reviewed, deliberately
-     UNGATED promotion (e.g. `image.yml`'s CI base-image
-     rebuild on every merge to `main`, or `server-image.yml`'s manual
+     UNGATED promotion (e.g. `ci.yml`'s `build-ci-image`, which builds the
+     tree's content-tagged CI image, or `server-image.yml`'s manual
      `:latest` refresh on a `workflow_dispatch` against `main` -- neither is
      ever a release-tag promotion) and must structurally prove it
      can NEVER fire on a release tag ref: its job `if:` must be a PURE
@@ -71,27 +71,27 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      lane — is expected and fine, since most rows promote a non-CUDA,
      non-manifest surface).
 
-  P4 (consumer/producer name agreement): `gpu_prove_verdict.py`'s
-     `JOB_NAME_TEMPLATE` matches `gpu-prove.yml`'s own matrix job `name:`
-     line, and the required-arch set the consumer derives
+  P4 (consumer/producer name agreement): `verdict.py`'s
+     `GPU_JOB_TEMPLATE` matches `gpu-prove.yml`'s own matrix job `name:`
+     line, the required-arch set the consumer derives
      (`check_gpu_parity_matrix.py`'s `GENCODE_ARCHES` parser) equals the
      workflow's own matrix `arch:` list — never a hand-typed list on either
-     side.
+     side — and `verdict.py`'s `CI_SUMMARY_JOB` is the job `ci.yml`'s
+     `ci-summary` call of `_summary.yml` reports (`<caller id> / <callee
+     job id>`, neither renamed by a `name:`).
 
   P5 (the reusable actually consults the verdict): P3 only checks a gate
      job's `uses:` line, so gutting
-     `_gpu-proof-required.yml` to `run: echo ok` would otherwise leave P1-P4
-     green with no real promotion gate behind it. `_gpu-proof-required.yml`
+     `_proof-required.yml` to `run: echo ok` would otherwise leave P1-P4
+     green with no real promotion gate behind it. `_proof-required.yml`
      must exist, its `on:` block must be `workflow_call`-only, and its
-     comment-stripped step body must invoke `python3 ci/scripts/
-     gpu_prove_verdict.py` with `--sha` bound to the commit being promoted
-     (`github.sha`/`$GITHUB_SHA`) — a literal sha or a tag name FAILS — and
-     `--repo` bound to `github.repository`/
-     `$GITHUB_REPOSITORY` — a literal/foreign repo would key the verdict
-     lookup at the wrong repo — with any `--workflow` override forbidden
-     from naming anything other than `gpu-prove.yml` itself (a pointed-
-     elsewhere consumer could read a DIFFERENT, unrelated workflow's runs as
-     if they proved this one).
+     comment-stripped step body must invoke `python3 ci/scripts/verdict.py
+     require` (never `probe`, which never denies) with `--tree` bound to the
+     tree of the commit being promoted (`$(git rev-parse
+     $GITHUB_SHA^{tree})`, or the same over `${{ github.sha }}`) — a literal
+     tree, a tag name or another ref FAILS — and `--repo` bound to
+     `github.repository`/`$GITHUB_REPOSITORY` — a literal/foreign repo would
+     key the verdict lookup at the wrong repo.
 
   P6 (DISCOVERY: an unlisted publishing job FAILS by name).
      P3 only reconciles the rows already IN `PROMOTION_TABLE`, so a
@@ -119,8 +119,8 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      `+`-bearing filename — the raw parsed scalar's mere PRESENCE, never
      its resolved identity; a job-level `uses:` value that is present but
      not a string is its own finding) is ALSO a promoting job for P6's
-     purposes and must be listed too — e.g. `image.yml`'s
-     `build`/`build-cuda` jobs (each a job-level `uses: ./.github/workflows/_ci-base-
+     purposes and must be listed too — e.g. `ci.yml`'s
+     `build-ci-image`/`build-ci-image-cuda` jobs (each a job-level `uses: ./.github/workflows/_ci-base-
      image.yml`, which does genuinely push to GHCR) are LISTED rows
      (`gate_kind="none"`, proven structurally unreachable from a tag ref
      per P3's `"none"`-row rule — never reachable via `workflow_dispatch` on a tag
@@ -130,9 +130,9 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      until a human reviews it and adds a row. TWO narrow, hand-
      reviewed exceptions carry their OWN direct, NON-recursive top-level
      step scan instead of a table row: the `REVIEWED_NONPUBLISHING_
-     LOCAL_REUSABLES` allowlist, and `_gpu-proof-required.yml` (whose own
+     LOCAL_REUSABLES` allowlist, and `_proof-required.yml` (whose own
      row's `gate_job` is exempt from THIS rule only when that job's OWN
-     parsed `uses:` scalar resolves exactly to `_gpu-proof-required.yml`
+     parsed `uses:` scalar resolves exactly to `_proof-required.yml`
      — any other value there is still a finding). For each of these two
      exempted-by-name classes, EVERY job inside the exempted file is
      scanned by the step-level publish-primitive rule directly (never
@@ -278,7 +278,7 @@ MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
 
 sys.path.insert(0, str(REPO_ROOT / "ci" / "scripts"))
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
-import gpu_prove_verdict  # noqa: E402
+import verdict  # noqa: E402
 import check_execution_surface_reachability as exec_mod  # noqa: E402
 from check_execution_surface_reachability import (  # noqa: E402
     WorkflowLoadError,
@@ -299,7 +299,7 @@ from check_execution_surface_reachability import (  # noqa: E402
 PROVE_SCRIPT = "ci/scripts/runpod_gpu_prove.sh"
 PROVE_PRODUCER_WORKFLOW = "gpu-prove.yml"
 GATE_WORKFLOW = "_gpu-prove-gate.yml"  # the DELETED renting reusable -- must stay gone.
-PROOF_REQUIRED_WORKFLOW = "_gpu-proof-required.yml"
+PROOF_REQUIRED_WORKFLOW = "_proof-required.yml"
 
 
 @dataclass(frozen=True)
@@ -308,14 +308,14 @@ class PromotionRow:
 
     `gate_kind`:
       - `"direct"`: `gate_job` is a job in THIS workflow that itself
-        `uses: _gpu-proof-required.yml` — the promoting job's `needs:`/
+        `uses: _proof-required.yml` — the promoting job's `needs:`/
         `if:` conjunct names it directly.
       - `"chained"`: `gate_job` is ANOTHER row's `promoting_job` in the
         SAME workflow (already itself gated, directly or chained) — e.g.
         `crates.yml`'s `github-release` chains off `publish`.
       - `"none"`: a reviewed, deliberately UNGATED promotion (e.g.
-        `image.yml`'s CI base-image rebuilds on a merge to
-        `main` — never a release tag promotion). `gate_job` is `None`; P3
+        the tree's CI images `ci.yml` builds — never a release tag
+        promotion). `gate_job` is `None`; P3
         instead asserts the promoting job's `if:` is a PURE top-level
         conjunction carrying the EXACT conjunct `github.ref_type != 'tag'`,
         so it can structurally never fire on a release tag ref (a
@@ -353,11 +353,11 @@ class PromotionRow:
 # publishing job with no row here fails by name instead of going unnoticed.
 PROMOTION_TABLE: dict[str, PromotionRow] = {
     # ---- CUDA lanes (also the ci/release-feature-manifest.json CUDA lanes) ----
-    "cu12-image": PromotionRow("server-image.yml", "build-and-push-cu12", "gpu-proof", "direct"),
-    "cu12-tarball": PromotionRow("release-binaries.yml", "server-cu12-promote", "gpu-proof", "direct"),
-    "cu12-wheel": PromotionRow("pypi-server-cuda.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
+    "cu12-image": PromotionRow("server-image.yml", "build-and-push-cu12", "proof", "direct"),
+    "cu12-tarball": PromotionRow("release-binaries.yml", "server-cu12-promote", "proof", "direct"),
+    "cu12-wheel": PromotionRow("pypi-server-cuda.yml", "publish", "proof", "direct", tag_family="py-v"),
     # ---- server-image.yml's other arms ----
-    "cpu-image-tag": PromotionRow("server-image.yml", "build-and-push", "gpu-proof", "direct"),
+    "cpu-image-tag": PromotionRow("server-image.yml", "build-and-push", "proof", "direct"),
     "cpu-image-main": PromotionRow(
         "server-image.yml", "build-and-push-main", None, "none"
     ),  # manual :latest refresh via workflow_dispatch on main (server-image.yml carries no
@@ -368,40 +368,37 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     # which push only their own `sha-<sha>-<arch>` tag (never a real tag).
     "cpu-image-merge-tag": PromotionRow(
         "server-image.yml", "merge-cpu-tag", "build-and-push", "chained"
-    ),  # chained off build-and-push (itself direct-gated by gpu-proof) -- same tag-family conjunct.
+    ),  # chained off build-and-push (itself direct-gated by proof) -- same tag-family conjunct.
     "cpu-image-merge-main": PromotionRow(
         "server-image.yml", "merge-cpu-main", None, "none"
     ),  # deliberately UNGATED, same as cpu-image-main above -- never a release tag promotion.
     "cpu-image-selfcontained": PromotionRow(
         "server-image.yml", "build-and-push-selfcontained", None, "none"
     ),  # manual dispatch-only opt-in image (Cloudflare Containers) -- never a release tag promotion.
-    # ---- image.yml: CI base images. Each of `build`/`build-cuda`
-    # carries a job-level `uses:` to the LOCAL reusable `_ci-base-image.
-    # yml` (whose own `build-and-push` job pushes to GHCR) -- P6's
-    # fail-closed job-level `uses:` rule presumes ANY such delegation
-    # promoting until reviewed, which is what LISTS these two jobs here;
-    # it also happens to be true that the delegate really does push.
-    # Both are reviewed UNGATED rows: they publish the
-    # toolchain LAYER the release lanes build inside, on a merge to `main`,
-    # never a release tag -- and each job's own `if:` carries
-    # the exact `github.ref_type != 'tag'` conjunct so a workflow_dispatch
-    # on a tag ref can never reach them either.
-    "ci-image-cpu": PromotionRow("image.yml", "build", None, "none"),
-    "ci-image-cuda": PromotionRow("image.yml", "build-cuda", None, "none"),
+    # ---- the tree's CI images. `ci.yml`'s `build-ci-image`/`build-ci-image-
+    # cuda` each carry a job-level `uses:` to the LOCAL reusable `_ci-base-
+    # image.yml` (whose `build-and-push` job pushes the tree's content-tagged
+    # image to GHCR); `image.yml`'s `latest` moves the `:latest` development
+    # alias onto `main`'s images. Reviewed UNGATED rows: a CI environment,
+    # never a release artifact -- and each job's own `if:` carries the exact
+    # `github.ref_type != 'tag'` conjunct so no tag ref can reach them.
+    "ci-image-cpu": PromotionRow("ci.yml", "build-ci-image", None, "none"),
+    "ci-image-cuda": PromotionRow("ci.yml", "build-ci-image-cuda", None, "none"),
+    "ci-image-latest": PromotionRow("image.yml", "latest", None, "none"),
     # ---- release-binaries.yml's remaining lanes ----
-    "cli-binaries": PromotionRow("release-binaries.yml", "promote-binaries", "gpu-proof", "direct"),
-    "server-cpu-tarball": PromotionRow("release-binaries.yml", "server-cpu-promote", "gpu-proof", "direct"),
+    "cli-binaries": PromotionRow("release-binaries.yml", "promote-binaries", "proof", "direct"),
+    "server-cpu-tarball": PromotionRow("release-binaries.yml", "server-cpu-promote", "proof", "direct"),
     # ---- crates.io ----
-    "crates-publish": PromotionRow("crates.yml", "publish", "gpu-proof", "direct"),
+    "crates-publish": PromotionRow("crates.yml", "publish", "proof", "direct"),
     "crates-github-release": PromotionRow("crates.yml", "github-release", "publish", "chained"),
     # ---- npm ----
-    "npm-publish": PromotionRow("npm.yml", "publish", "gpu-proof", "direct", step_name="Publish"),
+    "npm-publish": PromotionRow("npm.yml", "publish", "proof", "direct", step_name="Publish"),
     # ---- PyPI (lockstep "py-v*" tag family) ----
-    "native-wheel": PromotionRow("pypi.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
-    "client-wheel": PromotionRow("pypi-client.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
-    "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "gpu-proof", "direct", tag_family="py-v"),
+    "native-wheel": PromotionRow("pypi.yml", "publish", "proof", "direct", tag_family="py-v"),
+    "client-wheel": PromotionRow("pypi-client.yml", "publish", "proof", "direct", tag_family="py-v"),
+    "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "proof", "direct", tag_family="py-v"),
     "native-cu12-wheel": PromotionRow(
-        "pypi-native-cuda.yml", "publish", "gpu-proof", "direct", tag_family="py-v"
+        "pypi-native-cuda.yml", "publish", "proof", "direct", tag_family="py-v"
     ),
 }
 
@@ -1479,7 +1476,7 @@ def _parse_needs_names(job_body: str) -> list[str]:
     # matches `\n` too, so `\s*` would swallow the newline AND the next
     # line's leading whitespace when `needs:` carries no inline value,
     # landing the cursor on the multi-line list's FIRST `- item` and
-    # letting `(.*)$` capture `- gpu-proof` as a bogus single literal
+    # letting `(.*)$` capture `- proof` as a bogus single literal
     # "needs name" (dash and all) instead of falling through to the
     # multi-line-list branch below.
     needs_m = re.search(r"^[ \t]*needs:[ \t]*(.*)$", job_body, re.MULTILINE)
@@ -2492,7 +2489,7 @@ def _resolved_exempt_step_scan_names(workflow_texts: dict[str, str]) -> set[str]
     """The discovered-on-disk spellings (either extension) of every
     workflow this module scans directly by NAME instead of resolving via
     a table row: `REVIEWED_NONPUBLISHING_LOCAL_REUSABLES` and
-    `PROOF_REQUIRED_WORKFLOW` (`_gpu-proof-required.yml`)."""
+    `PROOF_REQUIRED_WORKFLOW` (`_proof-required.yml`)."""
     names: set[str] = set()
     for base in (*REVIEWED_NONPUBLISHING_LOCAL_REUSABLES, PROOF_REQUIRED_WORKFLOW):
         resolved = resolve_workflow(workflow_texts, base)
@@ -2833,11 +2830,11 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
         return [f"P4: {PROVE_PRODUCER_WORKFLOW} is missing -- cannot verify job-name/arch agreement"]
 
     name_lines = [l for l in text.splitlines() if re.match(r"^\s*name:\s*GPU prove on RunPod", l)]
-    want_name = "name: " + gpu_prove_verdict.JOB_NAME_TEMPLATE.format(arch="${{ matrix.arch }}")
+    want_name = "name: " + verdict.GPU_JOB_TEMPLATE.format(arch="${{ matrix.arch }}")
     if not any(l.strip() == want_name for l in name_lines):
         findings.append(
             f"P4: {PROVE_PRODUCER_WORKFLOW}'s matrix job `name:` does not match "
-            f"gpu_prove_verdict.JOB_NAME_TEMPLATE (want `{want_name}`, found {name_lines})"
+            f"verdict.GPU_JOB_TEMPLATE (want `{want_name}`, found {name_lines})"
         )
 
     arch_m = re.search(r"arch:\s*\[([^\]]*)\]", text)
@@ -2850,6 +2847,42 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
                 f"P4: {PROVE_PRODUCER_WORKFLOW}'s matrix arch list {sorted(workflow_arches)} != "
                 f"shipped GENCODE_ARCHES {sorted(shipped_arches)}"
             )
+    return findings + _check_ci_summary_name(workflow_texts)
+
+
+def _check_ci_summary_name(workflow_texts: dict[str, str]) -> list[str]:
+    """`verdict.CI_SUMMARY_JOB` is `<caller job id> / <callee job id>`: the
+    name the API reports for `ci.yml`'s summary job, a job-level call of
+    `_summary.yml`. Either side renamed by a `name:` would change it."""
+    caller_id, callee_id = (part.strip() for part in verdict.CI_SUMMARY_JOB.split("/"))
+    findings: list[str] = []
+    for workflow, job_id, want_uses in (
+        (verdict.CI_WORKFLOW, caller_id, "./.github/workflows/_summary.yml"),
+        ("_summary.yml", callee_id, None),
+    ):
+        text = workflow_texts.get(workflow)
+        if text is None:
+            findings.append(f"P4: {workflow} is missing -- cannot verify verdict.CI_SUMMARY_JOB")
+            continue
+        stripped = drop_comment_lines(text)
+        jobs, err = jobs_or_fail(stripped)
+        if err is not None:
+            findings.append(f"P4: {workflow}: {err}")
+            continue
+        if job_id not in jobs:
+            findings.append(f"P4: {workflow} has no job `{job_id}` (verdict.CI_SUMMARY_JOB names it)")
+            continue
+        start, end = jobs[job_id]
+        body = stripped.splitlines()[start:end]
+        if any(re.match(r"^    name:", line) for line in body):
+            findings.append(
+                f"P4: {workflow}'s job `{job_id}` carries a `name:`, so the API no longer reports "
+                f"verdict.CI_SUMMARY_JOB (`{verdict.CI_SUMMARY_JOB}`)"
+            )
+        if want_uses is not None and not any(
+            line.strip() == f"uses: {want_uses}" for line in body
+        ):
+            findings.append(f"P4: {workflow}'s job `{job_id}` does not `uses: {want_uses}`")
     return findings
 
 
@@ -2858,27 +2891,24 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
 # CONSULTS the verdict, as an un-bypassable step -- never a whole-file
 # substring check.
 # --------------------------------------------------------------------------- #
-_SHA_ARG_RE = re.compile(r'--sha\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
+_TREE_ARG_RE = re.compile(r'--tree\s+(?:"(?P<q>[^"]*)"|(?P<u>\S+))')
 _REPO_ARG_RE = re.compile(r'--repo\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
-_WORKFLOW_ARG_RE = re.compile(r'--workflow\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
-_GPU_PROVE_VERDICT_INVOCATION = "python3 ci/scripts/gpu_prove_verdict.py"
+_VERDICT_INVOCATION = "python3 ci/scripts/verdict.py require"
 _CONTROL_OPERATOR_RE = re.compile(r"\|\||;|&&")
+_TREE_OF_COMMIT_RE = re.compile(
+    r"^\$\(\s*git\s+rev-parse\s+(?:\$GITHUB_SHA|\$\{\{\s*github\.sha\s*\}\})\^\{tree\}\s*\)$"
+)
 
 
-def _sha_arg_is_commit_bound(value: str) -> bool:
-    """`True` only for the two shapes that key the verdict by the exact
-    commit a caller promotes: the bash env var `$GITHUB_SHA`, or the GitHub
-    expression `${{ github.sha }}` (any internal whitespace). A literal sha
-    or a tag name (`v1.2.3`, `${{ github.ref_name }}`, ...) is REFUSED --
-    proof surface == shipped surface means the verdict
+def _tree_arg_is_commit_bound(value: str) -> bool:
+    """`True` only for the tree of the exact commit a caller promotes:
+    `$(git rev-parse <commit>^{tree})` where `<commit>` is the bash env var
+    `$GITHUB_SHA` or the GitHub expression `${{ github.sha }}`. A literal
+    tree, a tag name (`v1.2.3^{tree}`, `${{ github.ref_name }}`) or any other
+    ref is REFUSED -- proof surface == shipped surface means the verdict
     lookup itself must be bound to the identity being promoted, never a
     sibling ref."""
-    value = value.strip()
-    if value == "$GITHUB_SHA":
-        return True
-    if value.startswith("${{") and value.endswith("}}"):
-        return value[3:-2].strip() == "github.sha"
-    return False
+    return _TREE_OF_COMMIT_RE.match(value.strip()) is not None
 
 
 def _repo_arg_is_bound(value: str) -> bool:
@@ -2892,13 +2922,6 @@ def _repo_arg_is_bound(value: str) -> bool:
     if value.startswith("${{") and value.endswith("}}"):
         return value[3:-2].strip() == "github.repository"
     return False
-
-
-def _unquote(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        value = value[1:-1]
-    return value
 
 
 def _find_step_ranges(lines: list[str], job_start: int, job_end: int) -> list[tuple[int, int]]:
@@ -3021,7 +3044,7 @@ def _join_shell_continuations(text: str) -> list[str]:
     """Logical (backslash-continuation-joined) lines of a shell `run:`
     body -- each physical line ending in a trailing `\\` is folded onto the
     next, so a multi-line invocation's arguments become one line to scan
-    for a trailing control operator or the LAST `--sha`."""
+    for a trailing control operator or the LAST `--tree`."""
     logical: list[str] = []
     buf = ""
     for line in text.splitlines():
@@ -3039,21 +3062,20 @@ def _join_shell_continuations(text: str) -> list[str]:
 
 def check_p5(workflow_texts: dict[str, str]) -> list[str]:
     """P3 only checks a gate job's `uses:` line -- gutting
-    `_gpu-proof-required.yml` to `run: echo ok` would leave P1-P4 green
-    while no promotion is actually conditioned on a real verdict lookup.
-    P5 asserts the reusable ITSELF: it must exist, its `on:` block must be
+    `_proof-required.yml` to `run: echo ok` would leave P1-P4 green while no
+    promotion is actually conditioned on a real verdict lookup. P5 asserts
+    the reusable ITSELF: it must exist, its `on:` block must be
     `workflow_call`-only (the same never-independently-starts doctrine P1
     holds the producer to), and it must contain a real STEP -- not a
     `name:`/`env:` mention, not a quoted echo string -- whose `run:` body
-    invokes `python3 ci/scripts/gpu_prove_verdict.py` as an actual shell
+    invokes `python3 ci/scripts/verdict.py require` as an actual shell
     command, with no `||`/`;`/`&&` after the invocation on its
-    continuation-joined logical line (a trailing `|| true` or a `--sha`
-    that never runs would fail open), no `continue-on-error:`/`if:` on
-    either that step or its job (either would let the verdict check be
-    skipped or silenced), and whose LAST `--sha` argument (argparse's own
-    last-wins semantics, never a first-match regex) is bound to the commit
-    being promoted (`github.sha`/`$GITHUB_SHA`) -- never a literal sha or a
-    tag name."""
+    continuation-joined logical line (a trailing `|| true` would fail open),
+    no `continue-on-error:`/`if:` on either that step or its job (either
+    would let the verdict check be skipped or silenced), and whose LAST
+    `--tree` argument (argparse's own last-wins semantics, never a
+    first-match regex) is the tree of the commit being promoted and whose
+    LAST `--repo` is this repository."""
     findings: list[str] = []
     resolved = resolve_workflow(workflow_texts, PROOF_REQUIRED_WORKFLOW)
     if resolved is None:
@@ -3087,52 +3109,49 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
         for step_start, step_end in _find_step_ranges(lines, job_start, job_end):
             step_keys = _parse_step_keys(lines, step_start, step_end)
             run_text = step_keys.get("run")
-            if run_text is None or _GPU_PROVE_VERDICT_INVOCATION not in run_text:
+            if run_text is None or _VERDICT_INVOCATION not in run_text:
                 continue
             logical_lines = _join_shell_continuations(run_text)
             invocation_line = next(
-                (ll for ll in logical_lines if ll.startswith(_GPU_PROVE_VERDICT_INVOCATION)), None
+                (ll for ll in logical_lines if ll.startswith(_VERDICT_INVOCATION)), None
             )
             if invocation_line is None:
                 # The invocation text is present in this step's `run:` body
                 # (e.g. inside a quoted `echo '...'`) but is not itself the
                 # command that runs -- not a real invocation site.
                 continue
-            remainder = invocation_line[len(_GPU_PROVE_VERDICT_INVOCATION) :]
+            remainder = invocation_line[len(_VERDICT_INVOCATION) :]
             if _CONTROL_OPERATOR_RE.search(remainder):
                 findings.append(
-                    f"P5: {resolved} invokes gpu_prove_verdict.py but a shell control operator "
+                    f"P5: {resolved} invokes verdict.py but a shell control operator "
                     f"(`||`/`;`/`&&`) follows it on its logical line (`{invocation_line}`) -- the "
                     "verdict check could fail open"
                 )
                 continue
             if "if" in step_keys or "continue-on-error" in step_keys or job_if_present or job_coe_present:
                 findings.append(
-                    f"P5: {resolved}'s step invoking gpu_prove_verdict.py (or its job) carries "
+                    f"P5: {resolved}'s step invoking verdict.py (or its job) carries "
                     "`if:`/`continue-on-error:` -- the verdict check could be skipped or its "
                     "failure silenced"
                 )
                 continue
-            sha_matches = list(_SHA_ARG_RE.finditer(invocation_line))
-            if not sha_matches:
-                findings.append(f"P5: {resolved} invokes gpu_prove_verdict.py with no --sha argument at all")
+            tree_matches = list(_TREE_ARG_RE.finditer(invocation_line))
+            if not tree_matches:
+                findings.append(f"P5: {resolved} invokes verdict.py with no --tree argument at all")
                 continue
             # LAST occurrence wins, matching argparse's own last-flag-wins
             # semantics -- never the first match a naive regex would find.
-            sha_m = sha_matches[-1]
-            raw = sha_m.group("q") if sha_m.group("q") is not None else sha_m.group("u")
-            if not _sha_arg_is_commit_bound(raw):
+            tree_m = tree_matches[-1]
+            raw = tree_m.group("q") if tree_m.group("q") is not None else tree_m.group("u")
+            if not _tree_arg_is_commit_bound(raw):
                 findings.append(
-                    f"P5: {resolved}'s --sha argument is `{raw}`, not bound to `github.sha`/`$GITHUB_SHA` -- "
-                    "a literal sha or a tag name would key the verdict by the wrong identity"
+                    f"P5: {resolved}'s --tree argument is `{raw}`, not the tree of `github.sha`/"
+                    "`$GITHUB_SHA` -- a literal tree or a tag name would key the verdict by the wrong identity"
                 )
                 continue
-            # --repo must be pinned to THIS repo too -- a
-            # literal/foreign owner/repo would read a different
-            # repository's runs as if they proved this commit.
             repo_matches = list(_REPO_ARG_RE.finditer(invocation_line))
             if not repo_matches:
-                findings.append(f"P5: {resolved} invokes gpu_prove_verdict.py with no --repo argument at all")
+                findings.append(f"P5: {resolved} invokes verdict.py with no --repo argument at all")
                 continue
             repo_m = repo_matches[-1]
             repo_raw = repo_m.group("q") if repo_m.group("q") is not None else repo_m.group("u")
@@ -3143,26 +3162,11 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
                     "wrong repo"
                 )
                 continue
-            # A --workflow override, if present at all, may
-            # never name anything other than gpu-prove.yml itself -- a
-            # pointed-elsewhere consumer could read a DIFFERENT, unrelated
-            # workflow's runs as if they proved this one.
-            workflow_matches = list(_WORKFLOW_ARG_RE.finditer(invocation_line))
-            if workflow_matches:
-                wf_m = workflow_matches[-1]
-                wf_raw = wf_m.group("q") if wf_m.group("q") is not None else wf_m.group("u")
-                wf_val = _unquote(wf_raw)
-                if wf_val != gpu_prove_verdict.DEFAULT_WORKFLOW:
-                    findings.append(
-                        f"P5: {resolved} overrides --workflow to `{wf_val}` -- only "
-                        f"`{gpu_prove_verdict.DEFAULT_WORKFLOW}` may ever be consulted"
-                    )
-                    continue
             valid_found = True
 
     if not valid_found and not findings:
         findings.append(
-            f"P5: {resolved} does not invoke {_GPU_PROVE_VERDICT_INVOCATION} as a real step's `run:` "
+            f"P5: {resolved} does not invoke {_VERDICT_INVOCATION} as a real step's `run:` "
             "command (a mention in `name:`/`env:`/a quoted echo string does not count)"
         )
     return findings
@@ -3243,7 +3247,7 @@ def main() -> int:
     print("gpu-prove-once: OK -- exactly one prove producer, no renting reusable, every release "
           "publisher's promotion gates on the shared verdict (all-or-nothing, not only the CUDA "
           "lanes), consumer/producer names agree, the reusable actually consults the verdict keyed "
-          "by the promoted commit, no publishing job in the tree is unlisted, every paid pod "
+          "by the promoted commit's tree, no publishing job in the tree is unlisted, every paid pod "
           "lane in PAID_POD_LANE_TABLE (keyed by repo-relative path, never a basename) has exactly "
           "one invoker whose on: block carries no push:/workflow_call: trigger and which nothing "
           "uses:, and every renting driver DERIVED from runpod_lib.sh's own renting closure is "

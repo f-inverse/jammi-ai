@@ -45,33 +45,19 @@ permissions:
   contents: read
 
 jobs:
-  # Resolves the mutable CI base-image tag to its index digest ONCE per
-  # workflow run (`.github/actions/resolve-ci-image`), so both native-Linux
-  # legs below build against the exact same base even if `:latest` is
-  # republished mid-run.
-  resolve-base:
-    name: Resolve CI base image
-    runs-on: ubuntu-latest
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.resolve.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: resolve
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
 
   build-native-linux:
     name: Build native wheel (Linux, ${{ matrix.arch }})
-    needs: [resolve-base]
+    needs: [ci-image]
     strategy:
       fail-fast: false
       matrix:
@@ -82,7 +68,7 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container:
-      image: ${{ needs.resolve-base.outputs.image }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     defaults:
       run:
         working-directory: packaging/native
@@ -213,14 +199,14 @@ jobs:
   # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs
   # (MAP_FAILED) that MSVC does not support.
 
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
     # tag — requires the release commit's already-recorded GPU-prove
     # verdict before the native wheel is published (every release publisher
     # gates on the prove verdict, all-or-nothing, not only the CUDA lanes).
     if: startsWith(github.ref, 'refs/tags/py-v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -233,8 +219,8 @@ jobs:
     # workflow_dispatch comment above. Without the guard a branch dispatch
     # could first-publish an untagged, unreleased build, which PyPI cannot
     # undo. PURE conjunction (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build-native-linux.result == 'success' && needs.build-native-macos.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [build-native-linux, build-native-macos, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build-native-linux.result == 'success' && needs.build-native-macos.result == 'success' && needs.proof.result == 'success'
+    needs: [build-native-linux, build-native-macos, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

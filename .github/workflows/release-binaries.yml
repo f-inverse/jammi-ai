@@ -31,7 +31,7 @@ name: Release Binaries
 #   - the `v*` tag itself: identical to the tag push — every build leg
 #     rebuilds from the tag's own commit, and every promote leg re-attaches
 #     its asset to that release (gated on the tag commit's already-recorded
-#     GPU-prove verdict — see `gpu-proof` below; nothing here starts a new
+#     GPU-prove verdict — see `proof` below; nothing here starts a new
 #     prove run). This recovers a release whose assets are missing without
 #     re-cutting the tag, and an asset attached to release vX is thereby
 #     always built from vX's commit — a caller-chosen branch tip can never
@@ -67,39 +67,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Resolves BOTH mutable CI base-image tags to their index digests ONCE per
-  # workflow run (`.github/actions/resolve-ci-image`), so every leg below --
-  # the Linux CLI/server builds (CPU) and the CUDA server build -- share the
-  # exact same base even if `:latest` is republished mid-run. See
-  # `server-image.yml`'s identical `resolve-base` job for the same rationale.
-  resolve-base:
-    name: Resolve CI base images
-    runs-on: ubuntu-latest
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.cpu.outputs.image }}
-      image_cuda: ${{ steps.cuda.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: cpu
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-      - id: cuda
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [resolve-base]
+    needs: [ci-image]
     permissions:
       contents: read
     outputs:
@@ -124,7 +104,7 @@ jobs:
           # gate).
           - target: x86_64-unknown-linux-gnu
             runs-on: ubuntu-latest
-            container: ${{ needs.resolve-base.outputs.image }}
+            container: ${{ needs.ci-image.outputs.cpu }}
             deny_warnings: "false"
           # Apple-silicon native build. mold is Linux-only (config.toml scopes
           # it to the linux targets) and never applied to this leg either
@@ -134,13 +114,13 @@ jobs:
             container: ""
             deny_warnings: "false"
           # arm Linux runner, native (no QEMU), same manylinux_2_28 CI base
-          # (glibc 2.28 floor) as the x86_64 leg above -- resolved to the
-          # SAME base digest the x86_64 leg uses (`resolve-base`), so both
+          # (glibc 2.28 floor) as the x86_64 leg above -- the SAME
+          # content-tagged image the x86_64 leg uses (`ci-image`), so both
           # halves of one release build on one toolchain. `+fp16` applies
           # unconditionally from `.cargo/config.toml`.
           - target: aarch64-unknown-linux-gnu
             runs-on: ubuntu-24.04-arm
-            container: ${{ needs.resolve-base.outputs.image }}
+            container: ${{ needs.ci-image.outputs.cpu }}
             deny_warnings: "false"
 
     runs-on: ${{ matrix.runs-on }}
@@ -211,8 +191,8 @@ jobs:
     # all (the `if:` requires a tag ref) — there is no release to promote
     # onto and no verdict lookup to make on a ref that can never own one.
     # The `if:` is a PURE conjunction (no `||`).
-    needs: [build, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [build, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.proof.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -267,7 +247,7 @@ jobs:
   # image and PyPI wheel.
   server-cpu:
     name: Build jammi-server (CPU, ${{ matrix.target }})
-    needs: [resolve-base]
+    needs: [ci-image]
     strategy:
       fail-fast: false
       matrix:
@@ -277,7 +257,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    container: ${{ needs.resolve-base.outputs.image }}
+    container: ${{ needs.ci-image.outputs.cpu }}
     permissions:
       contents: read
     # BLOCK: matrix-job outputs are ambiguous across legs (the last leg to
@@ -341,8 +321,8 @@ jobs:
     # is a PURE conjunction (no `||`) — no non-tag branch-dispatch escape
     # hatch: `server-cpu` above already exercises the packaging loop on
     # every dispatch as an artifact-only rehearsal.
-    needs: [server-cpu, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cpu.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [server-cpu, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cpu.result == 'success' && needs.proof.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -407,15 +387,15 @@ jobs:
   # match the host's driver. A GPU-less runner is fine — nothing runs the
   # binary here; the loader-verification step below only asks the loader
   # WHERE it would resolve each entry, never executes the binary itself.
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
     # before the CUDA tarball is uploaded to the release. The tag guard (not
     # an event guard) is what keeps every release-upload arm proven: an
     # event-keyed guard would let a dispatch promote unproven.
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -424,12 +404,12 @@ jobs:
   # Build and proof-check run CONCURRENTLY: the build never needed the
   # verdict to compile, only to be UPLOADED to a release, so splitting it
   # from the promote step below (`server-cu12-promote`) overlaps the build
-  # with `gpu-proof`'s verdict lookup/wait instead of serializing after it.
+  # with `proof`'s verdict lookup/wait instead of serializing after it.
   server-cu12-build:
     name: Build jammi-server (CUDA)
-    needs: [resolve-base]
+    needs: [ci-image]
     runs-on: ubuntu-latest
-    container: ${{ needs.resolve-base.outputs.image_cuda }}
+    container: ${{ needs.ci-image.outputs.cuda }}
     permissions:
       contents: read
     outputs:
@@ -685,7 +665,7 @@ jobs:
       # A workflow artifact, never `release-upload` directly: this job runs
       # on EVERY dispatch/tag push regardless of the GPU-prove verdict (it
       # never needed the verdict to compile), so promoting the tarball
-      # straight to a release from here would bypass `gpu-proof` entirely.
+      # straight to a release from here would bypass `proof` entirely.
       # `server-cu12-promote` below downloads this artifact only after the
       # verdict is confirmed.
       - uses: actions/upload-artifact@v4
@@ -740,8 +720,8 @@ jobs:
     # exercises the CUDA packaging loop on every dispatch as an
     # artifact-only rehearsal, and an ad-hoc branch build is never a proof
     # of anything this job needs to promote from.
-    needs: [server-cu12-build, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cu12-build.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [server-cu12-build, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cu12-build.result == 'success' && needs.proof.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).

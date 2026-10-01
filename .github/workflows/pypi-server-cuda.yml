@@ -5,7 +5,7 @@ name: PyPI (jammi-server-cu12, CUDA)
 # and the `jammi-ai-native` engine wheels. Thin caller of the shared
 # `_pypi-server` reusable; unlike the CPU leg, this leg carries the CUDA
 # DT_NEEDED link-set verification and gates publish behind the commit's
-# already-recorded GPU-prove verdict (build -> proof -> promote; `gpu-proof`
+# already-recorded GPU-prove verdict (build -> proof -> promote; `proof`
 # below reads it, never starts a new prove run) — the binary was proven on a
 # real GPU before it is promoted to PyPI. The publish job lives HERE, not in
 # the reusable — PyPI's token exchange and its attestation verification match
@@ -47,29 +47,15 @@ permissions:
   contents: read
 
 jobs:
-  # Resolves the mutable CUDA CI base-image tag to its index digest ONCE per
-  # workflow run (`.github/actions/resolve-ci-image`) -- V3's pinned set
-  # names this workflow explicitly: the CUDA wheel is a release artifact
-  # like every other consumer of the mutable base.
-  resolve-base:
-    name: Resolve CI base image (CUDA)
-    runs-on: ubuntu-latest
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.resolve.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: resolve
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
 
   read-manifest:
     name: Read release feature list
@@ -98,12 +84,12 @@ jobs:
 
   server-cu12:
     name: jammi-server-cu12 (CUDA)
-    needs: [read-manifest, resolve-base]
+    needs: [read-manifest, ci-image]
     permissions:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ${{ needs.resolve-base.outputs.image }}
+      container_image: ${{ needs.ci-image.outputs.cpu }}
       cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
       package_dir: packaging/server-cu12
       artifact_prefix: server-cu12
@@ -118,10 +104,10 @@ jobs:
   # proof at all (its CPU caller, `pypi-server.yml`, has no need of it).
   # Runs concurrently with `server-cu12` above — it never needed the wheel
   # build to finish first, only to be checked before `publish` below.
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     if: startsWith(github.ref, 'refs/tags/py-v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -136,10 +122,10 @@ jobs:
     # re-proves). A branch dispatch or PR is an artifact-only dry run and can
     # never publish. Same recovery contract as `pypi.yml`/`pypi-client.yml`
     # on this lockstep surface. The `if:` is a PURE conjunction (no `||`):
-    # both `server-cu12` (build+package) and `gpu-proof` (the commit's
+    # both `server-cu12` (build+package) and `proof` (the commit's
     # verdict) must have succeeded before this job runs.
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cu12.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [server-cu12, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cu12.result == 'success' && needs.proof.result == 'success'
+    needs: [server-cu12, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

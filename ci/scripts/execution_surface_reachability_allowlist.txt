@@ -27,9 +27,9 @@
 # a `schedule:` trigger is a finding until a human adds it there, naming its
 # own never-vacuous arm). Every CUDA release lane (`server-image.yml`,
 # `release-binaries.yml`, `pypi-server-cuda.yml` — the last calls
-# `_gpu-proof-required.yml` DIRECTLY; `_pypi-server.yml` carries no gate at
+# `_proof-required.yml` DIRECTLY; `_pypi-server.yml` carries no gate at
 # all, only the build/package steps) instead consumes that commit's
-# already-recorded verdict through `_gpu-proof-required.yml` — a hermetic
+# already-recorded verdict through `_proof-required.yml` — a hermetic
 # API read, never a second invocation of this driver script.
 # NOT merge-path: `gpu-prove.yml`'s own triggers are label/dispatch/
 # an allow-listed schedule only, and it is never `push:`-triggered by a tag

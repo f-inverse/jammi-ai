@@ -185,17 +185,18 @@ jobs:
   # Each partition runs a slice of every test binary, each test in a process of
   # its own (`.config/nextest.toml`). The archive is extracted into the
   # checkout, at the target path it was built with, so a test's baked
-  # `CARGO_BIN_EXE_*` and `CARGO_MANIFEST_DIR` paths resolve. Four partitions:
-  # the suite's serial binary time is ~34 min, and its slowest test ~4.
+  # `CARGO_BIN_EXE_*` and `CARGO_MANIFEST_DIR` paths resolve. Eight
+  # partitions: on a hosted runner the suite is ~110 test-minutes and its
+  # slowest test ~7, so eight slices of four threads each end near that floor.
   test:
-    name: Test (hermetic) (${{ matrix.partition }}/4)
+    name: Test (hermetic) (${{ matrix.partition }}/8)
     runs-on: ubuntu-latest
     needs: [build-ci-image, plan, test-build]
     if: needs.plan.outputs.proven != 'true'
     strategy:
       fail-fast: false
       matrix:
-        partition: [1, 2, 3, 4]
+        partition: [1, 2, 3, 4, 5, 6, 7, 8]
     container:
       image: ${{ needs.build-ci-image.outputs.image }}
     steps:
@@ -216,7 +217,7 @@ jobs:
           cargo nextest run --profile ci \
             --archive-file /tmp/hermetic/hermetic.tar.zst \
             --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" \
-            --partition slice:${{ matrix.partition }}/4
+            --partition slice:${{ matrix.partition }}/8
 
       - name: Keep the partition's per-test timings
         if: always()
@@ -714,12 +715,6 @@ jobs:
           . .venv/bin/activate
           pytest crates/jammi-python/tests -v
 
-      # The crate's Rust tests (`src` unit tests and `tests/it.rs`, which
-      # drives `PyDatabase` from Rust): built without `extension-module`, they
-      # link libpython against the image's system interpreter.
-      - name: Rust tests (jammi-python)
-        run: cargo test -p jammi-python --no-fail-fast
-
       # This lane has the native engine, so it runs the client tests that need it;
       # the ones that also need a built server run in cookbook.yml, which builds one.
       - name: Python client suite (with the embedded engine)
@@ -734,6 +729,24 @@ jobs:
             echo "=== $script ==="
             python3 "$script"
           done
+
+  # The `jammi-python` crate's Rust tests (`src` unit tests and `tests/it.rs`,
+  # which drives `PyDatabase` from Rust): built without `extension-module`,
+  # they link libpython against the image's system interpreter. A job of its
+  # own beside `Test (Python)`, whose release build of the native engine is
+  # the longer compile; mostly compilation, so it runs on a proven tree too.
+  test-python-rust:
+    name: Test (Python, Rust)
+    runs-on: ubuntu-latest
+    needs: build-ci-image
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Rust tests (jammi-python)
+        run: cargo test -p jammi-python --no-fail-fast
 
   # The backend-parameterised suites' Postgres arms: compiled only under
   # `live-postgres-tests`, each test against a database of its own on the
@@ -1080,6 +1093,7 @@ jobs:
       - ts-client
       - py-client
       - test-python
+      - test-python-rust
       - test-pg
       - symbol-index-gates
       - distributed

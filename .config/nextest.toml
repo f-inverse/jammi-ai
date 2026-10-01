@@ -19,6 +19,12 @@ training_set_stream = { max-threads = 1 }
 patentclip = { max-threads = 1 }
 real_clap = { max-threads = 1 }
 
+# A ratchet on the slowest test: on a hosted runner it measures ~400 s, and a
+# test still running at ten minutes fails rather than growing the suite's
+# floor unnoticed.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+
 [[profile.default.overrides]]
 filter = 'package(jammi-ai) & binary(it) & test(/^training_set_stream::/)'
 test-group = 'training_set_stream'

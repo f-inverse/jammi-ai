@@ -1,0 +1,48 @@
+name: _client-wheel
+
+# Builds the base client `jammi-ai` (import `jammi`) as its pure-Python wheel,
+# with the proto stubs it ships generated from `crates/jammi-wire/proto`. The
+# one definition of how the client wheel is built: `ci.yml` calls it on every
+# pull request and on `main`, where the book installs it the way a reader
+# does; `pypi-client.yml` calls it to publish.
+#
+# Artifact: `client-wheel`.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build client wheel (py3-none-any)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate proto stubs
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev]'
+          make generate
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel --outdir dist
+
+      - name: Assert the wheel fits PyPI's per-file limit
+        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-wheel
+          path: clients/python/dist/

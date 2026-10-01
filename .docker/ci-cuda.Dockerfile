@@ -26,15 +26,15 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # the same `install_weak_deps=False` discipline as the toolkit.
 #
 # Those link surfaces, exactly — only ONE of the three is a docker build:
-#   * `server-image.yml` builds through the top-level `Dockerfile`'s
-#     `builder-cuda` stage with `docker buildx` (build-args at
-#     `server-image.yml:747-749` on the `v*`-tag leg and at `:815-817` on the
-#     build-only `pull_request` leg); that stage's own `FROM` is this image.
-#   * `pypi-server-cuda.yml` -> `_pypi-server.yml` takes this image as the job
-#     `container:` (`_pypi-server.yml:100`) and links DIRECTLY inside it with
-#     `cargo build --release -p jammi-server` (`:126`) — no docker build at all.
-#   * `release-binaries.yml`'s CUDA leg does the same: `container:` this image
-#     (`:405`), `cargo build --release -p jammi-server` (`:460`).
+#   * `_server.yml` builds the `server-cu12` binary with this image as its
+#     job `container:`, linking DIRECTLY inside it with `cargo build --release
+#     -p jammi-server` — for `ci.yml` on every change, and for
+#     `pypi-server-cuda.yml` and `release-binaries.yml` at a release.
+#   * `_native-wheel-cu12.yml` builds the CUDA native wheel the same way,
+#     through `ci/scripts/build_native_cu12_wheel.sh`.
+#   * `server-image.yml`'s release leg builds through the top-level
+#     `Dockerfile`'s `builder-cuda` stage with `docker buildx`; that stage's
+#     own `FROM` is this image.
 # The RunPod GPU lanes run this same image as well (`ci/scripts/runpod_lib.sh`'s
 # `RP_IMAGE`, the tree's CUDA CI image), so the pod-side link surface is
 # covered by this same rebuild.

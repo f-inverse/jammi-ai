@@ -5,11 +5,10 @@
 # tag -- rather than trusting the runner label / container image the binary
 # happened to be built on. One script so every leg that stamps an
 # architecture runs the identical check instead of a per-caller
-# reimplementation: `package_release_bin.sh`, `_pypi-server.yml`'s
-# wheel-tagging step (nothing else there asserts the binary's actual arch
-# before `python -m wheel tags --platform-tag` relabels it), and `pypi.yml`'s
-# native-Linux legs, run against the `.so` unzipped out of the maturin
-# wheel.
+# reimplementation: `package_release_bin.sh`, `_server.yml`'s binary job
+# (the server wheel's `--platform-tag` relabel trusts the arch it asserts),
+# and `_native-wheels.yml`'s legs, run against the `.so` unzipped out of the
+# maturin wheel.
 #
 # Usage:
 #   assert_elf_machine.sh <binary> <expected-arch>

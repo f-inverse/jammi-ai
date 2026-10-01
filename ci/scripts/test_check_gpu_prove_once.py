@@ -103,7 +103,7 @@ jobs:
         run: |
           python3 ci/scripts/verdict.py require \\
             --repo "$GITHUB_REPOSITORY" \\
-            --tree "$(git rev-parse $GITHUB_SHA^{tree})"
+            --tree "$(git rev-parse "$GITHUB_SHA^{tree}")"
 """
 
 
@@ -2195,27 +2195,37 @@ class ProofRequiredConsultsVerdictTest(unittest.TestCase):
         self.assertTrue(any("does not invoke" in f for f in findings))
 
     def test_tree_of_a_tag_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse $GITHUB_SHA^{tree})"', '"$(git rev-parse v1.2.3^{tree})"')
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse v1.2.3^{tree})"')
         findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("not the tree of" in f for f in findings), findings)
 
+    def test_quoted_tree_of_a_tag_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse "v1.2.3^{tree}")"')
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("not the tree of" in f for f in findings), findings)
+
+    def test_unquoted_commit_tree_passes(self):
+        good = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse $GITHUB_SHA^{tree})"')
+        findings = cgo.check_p5({"_proof-required.yml": good})
+        self.assertEqual(findings, [])
+
     def test_literal_tree_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse $GITHUB_SHA^{tree})"', "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("not the tree of" in f for f in findings), findings)
 
     def test_the_commit_itself_rather_than_its_tree_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse $GITHUB_SHA^{tree})"', '"$GITHUB_SHA"')
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$GITHUB_SHA"')
         findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("not the tree of" in f for f in findings), findings)
 
     def test_no_tree_argument_at_all_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace(' \\\n            --tree ' + '"$(git rev-parse $GITHUB_SHA^{tree})"', "")
+        bad = PROOF_REQUIRED_YML_GOOD.replace(' \\\n            --tree ' + '"$(git rev-parse "$GITHUB_SHA^{tree}")"', "")
         findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("no --tree argument" in f for f in findings), findings)
 
     def test_workflow_call_expression_form_passes(self):
-        good = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse $GITHUB_SHA^{tree})"', '"$(git rev-parse ${{ github.sha }}^{tree})"')
+        good = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse ${{ github.sha }}^{tree})"')
         findings = cgo.check_p5({"_proof-required.yml": good})
         self.assertEqual(findings, [])
 

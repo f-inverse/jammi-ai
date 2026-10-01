@@ -27,7 +27,7 @@
 # a `schedule:` trigger is a finding until a human adds it there, naming its
 # own never-vacuous arm). Every CUDA release lane (`server-image.yml`,
 # `release-binaries.yml`, `pypi-server-cuda.yml` — the last calls
-# `_proof-required.yml` DIRECTLY; `_pypi-server.yml` carries no gate at
+# `_proof-required.yml` DIRECTLY; `_server.yml` carries no gate at
 # all, only the build/package steps) instead consumes that commit's
 # already-recorded verdict through `_proof-required.yml` — a hermetic
 # API read, never a second invocation of this driver script.
@@ -64,7 +64,7 @@ cargo clippy -p jammi-kernels --all-targets --features cuda -- -D warnings	T3 (p
 # own set-equality rule) — a shell-variable `--features` value would be
 # invisible to this gate's registry. Same off-merge-path residual as the
 # LIVE suites section below — see the HONEST RESIDUAL note above. ---
-cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,mysql,postgres,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped cu12-tarball server release build, written as a literal tuple rather than a manifest-read shell variable. ci/scripts/runpod_gpu_topology.sh's `topology-build` group builds the SAME shipped server verbatim for its fleet — one row, two origins, both off the merge path for the same reason.
+cargo build --release -p jammi-server --bin jammi-server --features cuda,flash-attn,mysql,postgres,storage-cloud	runpod_gpu_prove.sh's capability-surface-build group — the shipped server-cu12 release build, written as a literal tuple rather than a manifest-read shell variable. ci/scripts/runpod_gpu_topology.sh's `topology-build` group builds the SAME shipped server verbatim for its fleet — one row, two origins, both off the merge path for the same reason.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability --no-run	runpod_gpu_prove.sh's capability-surface-build group — compile-checks the jammi-ai capability-surface test binary at the full lane surface, written as a literal tuple.
 cargo test -p jammi-ai --features cuda,flash-attn,live-gpu-tests --test gpu_capability capability_surface -- --nocapture 2>&1)"	runpod_gpu_prove.sh's capability-surface-proof group — the RAGGED normalization of a `cap_out="$(JAMMI_KERNELS_STRICT=1 cargo test ... 2>&1)"` command-substitution line: the extractor's env-assignment stripper consumes `cap_out="$(JAMMI_KERNELS_STRICT=1 ` as its fallback (non-quoted) branch (the surrounding `"..."` never closes before end-of-line with trailing content, so the quoted branch cannot match) and the trailing `2>&1)"` is NOT stripped by anything else — this exact ragged string, not the "obvious" clean reading, is what the registry actually holds.
 

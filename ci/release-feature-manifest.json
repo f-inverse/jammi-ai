@@ -4,12 +4,14 @@
     "compiled artifact: its package, the exact cargo feature list it is",
     "compiled with, and, for a CUDA build, the capability assertions a real",
     "device must prove for it. `lanes` names each shipped artifact family,",
-    "the build it packages, and the workflow job that promotes it.",
+    "the build it packages, the workflow job that promotes it, and the",
+    "workflows that build it (which the feature-literal guard reads).",
     "",
-    "A build is compiled once per tree, by the reusable workflow that defines",
-    "it, and every lane that packages it packages those bytes. Two lanes of",
-    "one build therefore cannot ship different features; a lane whose",
-    "features must differ needs a build of its own.",
+    "A build is compiled once per tree, in `ci.yml`, by the reusable workflow",
+    "that defines it; every lane packages those bytes, and a release promotes",
+    "the ones the run that proved its tree built. Two lanes of one build",
+    "therefore cannot ship different features; a lane whose features must",
+    "differ needs a build of its own.",
     "",
     "Every compile site reads `.builds.<build>.cargo_features` with `jq`",
     "rather than carrying a copy: `.github/workflows/_server.yml` for the",
@@ -243,42 +245,42 @@
     "cu12-tarball": {
       "_doc": "The self-contained CUDA `jammi-server` tarball: the binary, the CUDA runtime `.so`s it links, and an `LD_LIBRARY_PATH` launcher.",
       "build": "server-cu12",
-      "workflow": ".github/workflows/release-binaries.yml:server-cu12-promote"
+      "workflow": ".github/workflows/release-binaries.yml:server-cu12-promote, built by .github/workflows/_server.yml"
     },
     "cu12-wheel": {
       "_doc": "The `jammi-server-cu12` PyPI wheel.",
       "build": "server-cu12",
-      "workflow": ".github/workflows/pypi-server-cuda.yml:publish"
+      "workflow": ".github/workflows/pypi-server-cuda.yml:publish, built by .github/workflows/_server.yml"
     },
     "cu12-image": {
       "_doc": "The `jammi-ai-server-cu12` container image (the Dockerfile's `runtime-cuda` stage).",
       "build": "server-cu12",
-      "workflow": ".github/workflows/server-image.yml:build-and-push-cu12 (Dockerfile builder-cuda stage)"
+      "workflow": ".github/workflows/server-image.yml:build-and-push-cu12, packaging the binary .github/workflows/_server.yml builds"
     },
     "cpu-tarball": {
       "_doc": "The CPU `jammi-server` tarball, x86_64 and aarch64 Linux.",
       "build": "server-cpu",
-      "workflow": ".github/workflows/release-binaries.yml:server-cpu-promote"
+      "workflow": ".github/workflows/release-binaries.yml:server-cpu-promote, built by .github/workflows/_server.yml"
     },
     "cpu-wheel": {
       "_doc": "The `jammi-server` PyPI wheel (CPU), x86_64 and aarch64.",
       "build": "server-cpu",
-      "workflow": ".github/workflows/pypi-server.yml:publish"
+      "workflow": ".github/workflows/pypi-server.yml:publish, built by .github/workflows/_server.yml"
     },
     "cpu-image": {
       "_doc": "The `jammi-ai-server` container image (the Dockerfile's `runtime-generic`/`runtime-selfcontained` stages).",
       "build": "server-cpu",
-      "workflow": ".github/workflows/server-image.yml:build-and-push-main / build-and-push / build-and-push-selfcontained (Dockerfile builder stage); .github/workflows/kube-smoke.yml and compose-smoke.yml (load-only smoke builds of the same builder stage)"
+      "workflow": ".github/workflows/server-image.yml:build-and-push, packaging the binary .github/workflows/_server.yml builds; the image smokes .github/workflows/kube-smoke.yml and .github/workflows/compose-smoke.yml build the same image"
     },
     "native-cpu-wheel": {
       "_doc": "The `jammi-ai-native` PyPI wheel (the embedded CPU engine).",
       "build": "native-cpu",
-      "workflow": ".github/workflows/pypi.yml:build-native-linux / build-native-macos"
+      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_native-wheels.yml"
     },
     "native-cu12-wheel": {
       "_doc": "The `jammi-ai-native-cu12` PyPI wheel (the embedded CUDA engine).",
       "build": "native-cu12",
-      "workflow": ".github/workflows/pypi-native-cuda.yml:build"
+      "workflow": ".github/workflows/pypi-native-cuda.yml:publish, built by .github/workflows/_native-wheel-cu12.yml"
     }
   },
   "server_only_cargo_features": {

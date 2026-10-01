@@ -14,8 +14,16 @@ name: CI
 # result depends on more than the tree (a hosted runner's image, a live
 # advisory database or model hub, the event) still run too.
 #
-# Nothing waits on work it does not consume: no job needs `check`, and each
-# compile graph that would outlast the hermetic suite runs as a job of its own.
+# Every artifact the tree ships is compiled here once, by the reusable workflow
+# its publisher also calls (`_native-wheels.yml`, `_native-wheel-cu12.yml`,
+# `_server.yml`, `_cli.yml`, `_client-wheel.yml`), and every check that runs
+# one installs that build: the Python lanes, the cookbook, the book, the
+# image smokes and the CUDA image check compile nothing of their own.
+#
+# Nothing waits on work it does not consume: no job needs `check`, each
+# compile graph that would outlast the hermetic suite runs as a job of its
+# own, and an artifact is built per consumer set, so a job that installs the
+# Linux x86_64 wheel never waits on the macOS legs.
 on:
   push:
     branches: [main]
@@ -631,17 +639,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Node version `npm.yml` publishes with: this job packs the package
+      # a release promotes.
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "22.23.1"
 
       # `@f-inverse/jammi-client` is generated from the canonical proto at
       # `crates/jammi-wire/proto` by `buf generate` (run inside `npm run build`),
-      # then type-checked and smoke-tested. Running it on every PR catches a
-      # proto change that breaks TS codegen — or a regression in the thin
-      # hand-written wrapper — here, not only at the release-tag publish in
-      # `npm.yml`. Plain ubuntu (not the Rust CI container): this lane needs
-      # Node, not cargo.
+      # then type-checked, smoke-tested and packed: the tarball is what a
+      # release publishes (`npm.yml`), so a proto change that breaks TS
+      # codegen — or a regression in the thin hand-written wrapper — fails
+      # here. Plain ubuntu (not the Rust CI container): this lane needs Node,
+      # not cargo.
       - name: Install
         run: npm ci
 
@@ -653,6 +663,17 @@ jobs:
 
       - name: Test (hermetic)
         run: npm run test
+
+      # `--pack-destination` must exist: npm refuses a missing directory.
+      - name: Pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/ts-client"
+          npm pack --pack-destination "$RUNNER_TEMP/ts-client"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ts-client-package
+          path: ${{ runner.temp }}/ts-client/*.tgz
 
   py-client:
     name: Python client (jammi-ai)
@@ -690,23 +711,20 @@ jobs:
   test-python:
     name: Test (Python)
     runs-on: ubuntu-latest
-    needs: build-ci-image
+    needs: [build-ci-image, native-wheel-linux-x86_64]
     container:
       image: ${{ needs.build-ci-image.outputs.image }}
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
 
       # The pytest suite drives two dists that ship in lockstep — the base
-      # client `jammi-ai` (import `jammi`) and the compiled `jammi-ai-native`
-      # engine (`import jammi_native`), which the base discovers as its
-      # `file://` backend. That is what makes the conformance test
-      # (`jammi.connect`'s remote IS `jammi.RemoteDatabase`, its `file://` arm
-      # the native engine) runnable in this lane. The shared setup-jammi-py
-      # action owns the venv/maturin mechanics; pytest is this lane's own
-      # extra.
+      # client `jammi-ai` (import `jammi`), from source, and the compiled
+      # `jammi-ai-native` engine (`import jammi_native`) this run built, which
+      # the base discovers as its `file://` backend. That is what makes the
+      # conformance test (`jammi.connect`'s remote IS `jammi.RemoteDatabase`,
+      # its `file://` arm the native engine) runnable in this lane.
       - name: Install the base client + native engine
-        uses: ./.github/actions/setup-jammi-py
+        uses: ./.github/actions/install-jammi
         with:
           extra-pip-packages: pytest
 
@@ -715,8 +733,8 @@ jobs:
           . .venv/bin/activate
           pytest crates/jammi-python/tests -v
 
-      # This lane has the native engine, so it runs the client tests that need it;
-      # the ones that also need a built server run in cookbook.yml, which builds one.
+      # This lane has the native engine, so it runs the client tests that need
+      # it; the ones that also need a server run in `cookbook` below.
       - name: Python client suite (with the embedded engine)
         run: |
           . .venv/bin/activate
@@ -732,9 +750,9 @@ jobs:
 
   # The `jammi-python` crate's Rust tests (`src` unit tests and `tests/it.rs`,
   # which drives `PyDatabase` from Rust): built without `extension-module`,
-  # they link libpython against the image's system interpreter. A job of its
-  # own beside `Test (Python)`, whose release build of the native engine is
-  # the longer compile; mostly compilation, so it runs on a proven tree too.
+  # they link libpython against the image's system interpreter — a test
+  # build, not the shipped wheel `Test (Python)` installs. Mostly
+  # compilation, so it runs on a proven tree too.
   test-python-rust:
     name: Test (Python, Rust)
     runs-on: ubuntu-latest
@@ -1060,6 +1078,346 @@ jobs:
       actions: read
     uses: ./.github/workflows/distributed.yml
 
+  # ── The tree's artifacts, each compiled once ──────────────────────────────
+  # Through the definitions the publishers call at a release, so a wheel or
+  # binary that stops building, or a wheel that outgrows PyPI's per-file
+  # limit, fails the change that caused it. Compiling jobs: they run on a
+  # proven tree too, and `main`'s run writes the cache every pull request
+  # reads. Split per consumer set (see the header).
+  native-wheel-linux-x86_64:
+    name: Native wheel (Linux x86_64)
+    needs: build-ci-image
+    uses: ./.github/workflows/_native-wheels.yml
+    with:
+      platforms: linux-x86_64
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  native-wheels:
+    name: Native wheels
+    needs: build-ci-image
+    uses: ./.github/workflows/_native-wheels.yml
+    with:
+      platforms: linux-aarch64 macos-arm64 macos-x86_64
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  native-wheel-cu12:
+    name: Native wheel (CUDA)
+    needs: build-ci-image-cuda
+    uses: ./.github/workflows/_native-wheel-cu12.yml
+    with:
+      cuda-image: ${{ needs.build-ci-image-cuda.outputs.image }}
+
+  server-cpu-x86_64:
+    name: Server (CPU, x86_64)
+    needs: build-ci-image
+    uses: ./.github/workflows/_server.yml
+    with:
+      build: server-cpu
+      arch: x86_64
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  server-cpu-aarch64:
+    name: Server (CPU, aarch64)
+    needs: build-ci-image
+    uses: ./.github/workflows/_server.yml
+    with:
+      build: server-cpu
+      arch: aarch64
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  server-cu12:
+    name: Server (CUDA)
+    needs: [build-ci-image, build-ci-image-cuda]
+    uses: ./.github/workflows/_server.yml
+    with:
+      build: server-cu12
+      arch: x86_64
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+      cuda-image: ${{ needs.build-ci-image-cuda.outputs.image }}
+
+  cli-x86_64:
+    name: CLI (x86_64)
+    needs: build-ci-image
+    uses: ./.github/workflows/_cli.yml
+    with:
+      targets: x86_64-unknown-linux-gnu
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  cli-aarch64:
+    name: CLI (aarch64)
+    needs: build-ci-image
+    uses: ./.github/workflows/_cli.yml
+    with:
+      targets: aarch64-unknown-linux-gnu
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  # The macOS CLI nothing here runs: built so a release promotes it from the
+  # run that proved its tree, like every other asset.
+  cli-macos:
+    name: CLI (macOS)
+    needs: build-ci-image
+    uses: ./.github/workflows/_cli.yml
+    with:
+      targets: aarch64-apple-darwin
+      cpu-image: ${{ needs.build-ci-image.outputs.image }}
+
+  client-wheel:
+    name: Client wheel
+    uses: ./.github/workflows/_client-wheel.yml
+
+  # GPU runtime is not testable here (no GPU on the runners); packaging the
+  # CUDA image from this run's CUDA binary proves its runtime stage assembles
+  # before a tag publishes it.
+  server-image-cuda:
+    name: Server image (CUDA)
+    needs: [server-cu12, cli-x86_64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage the run's binaries as the CUDA builder stage
+        id: binaries
+        uses: ./.github/actions/stage-server-binaries
+        with:
+          server: server-cu12-x86_64-binary
+          cli: jammi-x86_64-unknown-linux-gnu
+          stage: builder-cuda
+
+      - uses: ./.github/actions/docker-publish
+        with:
+          build-args: |
+            RUNTIME_VARIANT=runtime-cuda
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
+          # The CUDA runtime base publishes amd64 only.
+          platforms: linux/amd64
+          push: "false"
+          cache-scope: cu12
+
+  # ── The deploy shapes, over this run's binaries ───────────────────────────
+  kube-smoke:
+    needs: [server-cpu-x86_64, cli-x86_64]
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/kube-smoke.yml
+    with:
+      prebuilt: true
+
+  compose-smoke:
+    needs: [server-cpu-x86_64, server-cpu-aarch64, cli-x86_64, cli-aarch64]
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/compose-smoke.yml
+    with:
+      prebuilt: true
+
+  # ── The cookbook ───────────────────────────────────────────────────────────
+  # Every recipe runs against this run's engine, server and CLI: a recipe is
+  # how a new user learns a verb, so a verb that breaks its recipe breaks
+  # here, before it merges. The same job runs the Python client's live-server
+  # suite, which needs exactly what it already has.
+  cookbook:
+    name: Recipes + live client suite
+    needs: [build-ci-image, native-wheel-linux-x86_64, server-cpu-x86_64, cli-x86_64]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the client, the native engine, the server and the CLI
+        uses: ./.github/actions/install-jammi
+        with:
+          binaries: "true"
+
+      # The recipes resolve their fixtures through the `jammi_cookbook`
+      # package, as a fresh install (a Colab runtime) does; the `cloud` extra
+      # is the local S3-compatible server the cloud-storage recipe reads.
+      - name: Install the cookbook package
+        run: |
+          . .venv/bin/activate
+          pip install -e 'cookbook/book[cloud]'
+
+      - name: Run every recipe
+        run: |
+          . .venv/bin/activate
+          python tests/cookbook_smoke.py
+
+      - name: Python client suite against a live server
+        run: |
+          . .venv/bin/activate
+          make -C clients/python test-live
+
+  # ── The book ───────────────────────────────────────────────────────────────
+  # Every chapter runs its capability live and checks a frozen golden, so a
+  # render IS the check. These jobs render, at `small` scale on CPU, the
+  # chapters this change can move (`ci/scripts/select_render_chapters.py`),
+  # in up to four interleaved slices, against the wheels, server and CLI this
+  # run built; `cookbook-render.yml` renders every chapter nightly. No skip
+  # flag, no continue-on-error: a flaky chapter is a chapter bug to fix, not
+  # a gate to soften. The return half of the engine<->cookbook loop — every
+  # public verb is run by a recipe or an executed chapter cell — is the
+  # repository guard `ci/scripts/check_cookbook_coverage.py`.
+  book-plan:
+    name: Book (chapters this change can move)
+    needs: build-ci-image
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    outputs:
+      slices: ${{ steps.select.outputs.slices }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The pull request's base (or the pushed range's start) must be
+          # present for `git diff <base>...HEAD`.
+          fetch-depth: 0
+
+      # RED-proves the selection rules against synthetic fixtures before the
+      # selector is trusted with a real diff.
+      - name: Selector self-test
+        run: python3 ci/scripts/select_render_chapters.py --self-test
+
+      # A bare `git` in a container step meets "detected dubious ownership":
+      # the checkout belongs to the runner's user, not the container's.
+      - name: Mark the checkout safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Select the chapters and slice them
+        id: select
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            git fetch --quiet origin "$BASE_REF"
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+              && git cat-file -e "$BEFORE" 2>/dev/null; then
+            base="$BEFORE"
+          else
+            base="HEAD~1"
+          fi
+          changed="$RUNNER_TEMP/changed.txt"
+          git diff --name-only "$base...HEAD" > "$changed"
+          count="$(python3 ci/scripts/select_render_chapters.py --diff "$changed" | wc -l)"
+          n=$(( count < 4 ? count : 4 ))
+          slices='[]'
+          for k in $(seq 1 "$n"); do
+            chapters="$(python3 ci/scripts/select_render_chapters.py --diff "$changed" --slice "$k/$n" 2>/dev/null | tr '\n' ' ')"
+            slices="$(jq -c --arg s "$k/$n" --arg c "$chapters" '. + [{slice: $s, chapters: $c}]' <<< "$slices")"
+          done
+          echo "slices=$slices" >> "$GITHUB_OUTPUT"
+          jq . <<< "$slices"
+
+  book-checks:
+    name: Book (API reference, lint, unit tests, citations)
+    needs: [build-ci-image, native-wheel-linux-x86_64, client-wheel]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the client and the native engine, as a reader does
+        uses: ./.github/actions/install-jammi
+        with:
+          client: wheel
+
+      - name: Install the book
+        run: |
+          . .venv/bin/activate
+          pip install -e 'cookbook/book[book,dev,postgres,otlp]'
+
+      - name: API reference matches the engine
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python -m jammi.session_journal -- python scripts/check_api_reference.py
+
+      - name: Lint
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          ruff check jammi_cookbook scripts tests
+
+      - name: Shared-lib unit tests
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          pytest -q
+
+      - name: No-deferral gate
+        working-directory: cookbook/book
+        run: bash scripts/no_deferral_grep.sh
+
+      - name: No dangling citations
+        working-directory: cookbook/book
+        run: |
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          python -m jammi.session_journal -- python scripts/check_citations.py
+
+  book-render:
+    name: Book (render ${{ matrix.slice }})
+    needs: [build-ci-image, book-plan, native-wheel-linux-x86_64, client-wheel, server-cpu-x86_64, cli-x86_64]
+    if: needs.book-plan.outputs.slices != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.book-plan.outputs.slices) }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    env:
+      # The determinism regime: `jammi_cookbook` also sets these on import,
+      # but pinning them in the job env covers anything that reads them first.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      # A chapter that runs a Rust program compiles it against the workspace
+      # crates, through the compile cache `main` writes.
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          deny-warnings: false
+
+      - name: Install the client, the native engine, the server and the CLI
+        uses: ./.github/actions/install-jammi
+        with:
+          client: wheel
+          binaries: "true"
+
+      - name: Install the book
+        run: |
+          . .venv/bin/activate
+          pip install -e 'cookbook/book[book,dev,postgres,otlp]'
+
+      - name: Render this slice's chapters
+        working-directory: cookbook/book
+        env:
+          CHAPTERS: ${{ matrix.chapters }}
+        run: |
+          set -euo pipefail
+          . "$GITHUB_WORKSPACE/.venv/bin/activate"
+          for chapter in $CHAPTERS; do
+            rel="${chapter#cookbook/book/}"
+            echo "::group::quarto render $rel"
+            python -m jammi.session_journal -- quarto render "$rel"
+            echo "::endgroup::"
+          done
+
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
   # every job as a separate context. It fails if any job above failed/cancelled;
@@ -1097,6 +1455,23 @@ jobs:
       - test-pg
       - symbol-index-gates
       - distributed
+      - native-wheel-linux-x86_64
+      - native-wheels
+      - native-wheel-cu12
+      - server-cpu-x86_64
+      - server-cpu-aarch64
+      - server-cu12
+      - cli-x86_64
+      - cli-aarch64
+      - cli-macos
+      - client-wheel
+      - server-image-cuda
+      - kube-smoke
+      - compose-smoke
+      - cookbook
+      - book-plan
+      - book-checks
+      - book-render
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

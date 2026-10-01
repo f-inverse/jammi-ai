@@ -5,8 +5,11 @@ name: Distributed validation
 # (the lane's S3-class store), proving the durable-worker fleet-safety
 # properties and the ladder's fleet rungs under real distribution.
 #
-# One job, three matrix legs split by what decides their outcome (each leg
-# provisions its own Postgres + S3 store so they stay independent):
+# One build, three matrix legs split by what decides their outcome. `build`
+# compiles the `jammi-server` the harness spawns and archives each crate's
+# `distributed` test binary with it (`.config/nextest.toml`'s `distributed`
+# profile), so the legs compile nothing; each leg provisions its own
+# Postgres + S3 store so they stay independent:
 #
 #   * `deterministic` — the claim-correctness tests (exactly-one claim,
 #     cross-tenant isolation), decided by Postgres locking.
@@ -59,9 +62,52 @@ jobs:
     with:
       await: cpu
 
+  build:
+    name: Build (server + test archives)
+    needs: ci-image
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.ci-image.outputs.cpu }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      # The harness spawns `jammi-server` worker processes and resolves the
+      # binary next to the test executable under `{target}/{profile}/`, where
+      # the archive restores it. `storage-s3` is required: each worker writes
+      # its trained-model artifact to the shared `s3://` store root, which
+      # needs the S3 object-store driver compiled in — without it a worker
+      # claims the job, trains, then fails the publish with
+      # `SchemeNotEnabled`, and the job never reaches `completed`. The driver
+      # lives on the server (the CLI is a strict wire client).
+      - name: Build the `jammi-server` binary
+        run: cargo build -p jammi-server --bin jammi-server --features storage-s3
+
+      # One archive per crate: each carries its own feature selection, and
+      # the server rides in both (`archive.include`).
+      - name: Archive the distributed test binaries
+        run: |
+          set -euo pipefail
+          for crate in jammi-ai jammi-bench; do
+            cargo nextest archive --profile distributed -p "$crate" --features live-distributed-tests \
+              --test distributed --archive-file "/tmp/distributed-$crate.tar.zst"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributed-jammi-ai
+          path: /tmp/distributed-jammi-ai.tar.zst
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributed-jammi-bench
+          path: /tmp/distributed-jammi-bench.tar.zst
+          retention-days: 1
+
   distributed:
     name: ${{ matrix.display }} (Postgres + S3 store)
-    needs: ci-image
+    needs: [ci-image, build]
     runs-on: ubuntu-latest
     strategy:
       # One leg's failure must not cancel another: each carries its own signal.
@@ -124,7 +170,6 @@ jobs:
       # enter the environment from `ci/scripts/s3_test_store.sh env`.
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
 
       - name: Cache the pinned S3 store binary
         uses: actions/cache@v4
@@ -163,32 +208,31 @@ jobs:
           done
           [ "$missing" -eq 0 ] || exit 1
 
-      - name: Build the `jammi-server` binary
-        # The harness spawns `jammi-server` worker processes and resolves the
-        # binary next to the test executable under `{target}/{profile}/`. Build
-        # it explicitly so it exists before the harness runs. `storage-s3` is
-        # required: each worker writes its trained-model artifact to the shared
-        # `s3://` store root, which needs the S3 object-store driver compiled in —
-        # without it a worker claims the job, trains, then fails the publish with
-        # `SchemeNotEnabled`, and the job never reaches `completed`. The driver
-        # lives on the server (the CLI is a strict wire client), so the feature
-        # is enabled here.
-        run: cargo build -p jammi-server --bin jammi-server --features storage-s3
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributed-${{ matrix.crate }}
+          path: /tmp/distributed
 
-      - name: Compile-check the distributed harness
-        run: cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed --no-run
-
-      # One test at a time: each spawns its own worker fleet against the shared
-      # catalog and bucket. Every filter must run at least one test — one that
-      # matches nothing exits 0 having run nothing. `check_distributed_legs.py`
-      # asserts every distributed test is named by exactly one leg.
+      # One test at a time (the `distributed` profile): each spawns its own
+      # worker fleet against the shared catalog and bucket. Every filter must
+      # run at least one test — one that matches nothing would pass having run
+      # nothing. `check_distributed_legs.py` asserts every distributed test is
+      # named by exactly one leg.
       - name: Run the ${{ matrix.name }} tests
+        shell: bash
+        env:
+          TESTS: ${{ matrix.tests }}
         run: |
-          for t in ${{ matrix.tests }}; do
-            out="$(cargo test -p ${{ matrix.crate }} --features live-distributed-tests --test distributed -- --test-threads=1 "$t" 2>&1)" \
-              || { echo "$out"; exit 1; }
-            echo "$out"
-            grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out" \
+          set -euo pipefail
+          filter=""
+          for t in $TESTS; do filter="${filter:+$filter | }test($t)"; done
+          cargo nextest run --profile distributed \
+            --archive-file "/tmp/distributed/distributed-${{ matrix.crate }}.tar.zst" \
+            --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" \
+            -E "$filter"
+          junit=target/nextest/distributed/junit.xml
+          for t in $TESTS; do
+            grep -q "<testcase name=\"[^\"]*$t\"" "$junit" \
               || { echo "::error::filter '$t' ran no test"; exit 1; }
           done
 

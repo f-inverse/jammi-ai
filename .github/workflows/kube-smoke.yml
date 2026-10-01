@@ -1,19 +1,27 @@
 name: Kubernetes smoke (kind)
 
-# Builds the CPU `jammi-ai-server` image from THIS commit's Dockerfile, spins
-# up a `kind` cluster, applies `deploy/kubernetes/overlays/ci` (kustomize
-# build | kubectl apply), and drives it with a remote Python client
-# (`tests/compose/shape_c_kube_remote.py`) through a `kubectl rollout
-# restart` — proving the ci overlay's manifests, the image's file-then-env
-# config resolution (ConfigMap baked file, env layer on top), and that a
-# rollout restart's new pod still shares the OLD pod's Postgres catalog and
-# broker, together, not any one of them in isolation. It does NOT
-# assert result durability across the restart -- the overlay's Deployment
-# mounts `emptyDir`, so a new pod starts with an empty local index; see
-# `tests/compose/shape_c_kube_remote.py`'s own module doc for the exact
-# boundary. It reports to no `ci-summary` job, same as `compose-smoke.yml` --
-# that job gates the PR merge path, and this workflow deliberately does not
-# run there.
+# Packages the CPU `jammi-ai-server` image, spins up a `kind` cluster, applies
+# `deploy/kubernetes/overlays/ci` (kustomize build | kubectl apply), and
+# drives it with a remote Python client (`tests/compose/shape_c_kube_remote.py`)
+# through a `kubectl rollout restart` — proving the ci overlay's manifests,
+# the image's file-then-env config resolution (ConfigMap baked file, env layer
+# on top), and that a rollout restart's new pod still shares the OLD pod's
+# Postgres catalog and broker, together, not any one of them in isolation. It
+# does NOT assert result durability across the restart -- the overlay's
+# Deployment mounts `emptyDir`, so a new pod starts with an empty local index;
+# see `tests/compose/shape_c_kube_remote.py`'s own module doc for the exact
+# boundary.
+#
+# Where the image's binaries come from is the one difference between its two
+# callers:
+#   * `ci.yml` calls it on every pull request and on `main` with `prebuilt`:
+#     the image packages the `jammi-server` and `jammi` binaries that run
+#     built (`_server.yml`, `_cli.yml`), through the Dockerfile's
+#     builder-stage contract — nothing compiles twice, and the run's summary
+#     carries the result.
+#   * The nightly (and a dispatch) builds the image the way a self-hoster's
+#     `docker build .` does, compiling the binaries in the Dockerfile's own
+#     builder stage, so that path keeps a check of its own.
 #
 # No GHCR credentials are ever touched by the image build below: the
 # composite runs with `push: "false"` -- a `docker load` into the runner's
@@ -22,16 +30,6 @@ name: Kubernetes smoke (kind)
 # and is not a promotion primitive (`check_gpu_prove_once.py`'s P6 rule reads
 # `push:` values other than a literal `false` as a promotion candidate; this
 # workflow's literal `"false"` is deliberately exempt).
-#
-# Unlike `compose-smoke.yml`, this workflow also carries a `pull_request`
-# trigger (path-filtered, below): a brand-new workflow file cannot be
-# `workflow_dispatch`ed against its own PR branch before it exists on the
-# default branch, so the pre-merge proof for THIS file is the PR's own
-# `pull_request`-triggered run. The filter is kept after merge too -- a
-# manifest, driver, Dockerfile or Python-client change is exactly the class of
-# change this workflow exists to catch (the smoke drives the server through
-# that client, so a change to what a verb returns breaks it), so it keeps
-# running on every PR that touches them, not only on push to main.
 #
 # One amd64 leg only, no arm64 matrix: `helm/kind-action`'s own kind binary
 # is amd64 on `ubuntu-latest`, and the arm64 build of the server image is
@@ -45,19 +43,18 @@ name: Kubernetes smoke (kind)
 # there is no ordering gate in the manifests themselves.
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    inputs:
+      prebuilt:
+        description: >
+          Package the binaries the calling run built (`server-cpu-x86_64-binary`,
+          `jammi-x86_64-unknown-linux-gnu`) instead of compiling them.
+        type: boolean
+        required: true
   schedule:
     # 03:00 UTC nightly.
     - cron: "0 3 * * *"
   workflow_dispatch:
-  pull_request:
-    paths:
-      - deploy/kubernetes/**
-      - tests/compose/**
-      - clients/python/**
-      - .github/workflows/kube-smoke.yml
-      - Dockerfile
 
 permissions:
   contents: read
@@ -90,12 +87,21 @@ jobs:
           echo "JAMMI_AUDIT_MASTER_KEY=${key}" >> "$GITHUB_ENV"
           echo "JAMMI_IMAGE=jammi-ai-server:pr" >> "$GITHUB_ENV"
 
-      # `ci/release-feature-manifest.json`'s `server-cpu` build is the single
-      # source of truth for this build's cargo feature list (fed into the
-      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
-      # — read here, same idiom as server-image.yml.
+      - name: Stage the run's binaries as the builder stage
+        id: binaries
+        if: inputs.prebuilt
+        uses: ./.github/actions/stage-server-binaries
+        with:
+          server: server-cpu-x86_64-binary
+          cli: jammi-x86_64-unknown-linux-gnu
+          stage: builder
+
+      # Compiling instead: `ci/release-feature-manifest.json`'s `server-cpu`
+      # build is the single source of truth for the Dockerfile's
+      # `CARGO_FEATURES` build-arg (required — no default).
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
+        if: ${{ !inputs.prebuilt }}
         run: |
           set -euo pipefail
           features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
@@ -103,7 +109,12 @@ jobs:
             echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+          {
+            echo "build-args<<EOF"
+            echo "BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}"
+            echo "CARGO_FEATURES=$features"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build the CPU image (load, no push)
         uses: ./.github/actions/docker-publish
@@ -111,9 +122,8 @@ jobs:
           push: "false"
           load: "true"
           local-tag: jammi-ai-server:pr
-          build-args: |
-            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
-            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
+          build-args: ${{ steps.manifest.outputs.build-args }}
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
           # No `platforms` input -- native (amd64, this job's own runner).
           # The docker exporter (what `load: true` uses) cannot carry
           # attestations on a stock daemon -- `sbom: false` is the one that

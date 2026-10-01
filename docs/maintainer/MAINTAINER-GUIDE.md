@@ -375,7 +375,7 @@ CatalogService.
 ### 1.5 The engine↔cookbook loop — the in-monorepo contract suite & staleness oracle
 
 The cookbook is a Quarto book inside this monorepo at `cookbook/book/`, wired into
-CI by `.github/workflows/cookbook-book.yml`. It is the discipline loop that makes
+CI by `ci.yml`'s book jobs and the nightly `cookbook-render.yml`. It is the discipline loop that makes
 the cookbook the engine's executable acceptance suite: a feature is not done
 without **chapter + API-guard bump + golden-metric hold**.
 
@@ -463,13 +463,16 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
      covered: add it to `RECIPES` in `tests/cookbook_smoke.py`.
 
 **How the loop closes in CI (the atomicity guarantee).** The book is tested
-against the engine commit it ships beside. The PR gate
-(`.github/workflows/cookbook-book.yml`, the PR job) builds the HEAD embed wheel
-with `maturin`, force-reinstalls it (`--force-reinstall --no-deps`) over the
-unpinned `jammi-ai` dependency, then runs `check_api_reference.py`, the shared-lib
-pytest suite including `test_closed_loop.py`, the no-deferral grep, and the
-citation check. The nightly `render` job additionally runs `quarto render`, every
-chapter live against its frozen goldens. So a feature and its proof land atomically
+against the engine commit it ships beside. `ci.yml`'s book jobs install the
+wheels that same run built (`.github/actions/install-jammi`: the client wheel and
+the native engine, `--force-reinstall --no-deps` over the unpinned `jammi-ai`
+dependency); `book-checks` runs `check_api_reference.py`, the shared-lib pytest
+suite including `test_closed_loop.py`, the no-deferral grep, and the citation
+check, and `book-render` renders the chapters the change can move
+(`ci/scripts/select_render_chapters.py`), in parallel slices, every one live
+against its frozen goldens. The nightly `cookbook-render.yml` runs `quarto
+render` over the whole book against the artifacts of the run that proved
+`main`'s tree. So a feature and its proof land atomically
 in one PR. What a reader installs is tested separately:
 `.github/workflows/cookbook-published.yml` runs every notebook at the newest release
 tag, as published, in a fresh environment — the setup cell installs the release from
@@ -4811,7 +4814,7 @@ proto→engine map lives **once** in Rust (`jammi_ai::wire`). The PyO3 layer is 
       is `checked = len(REQUIRED) + len(MODULE_FUNCTIONS)` (printed as "N surfaces checked"):
       **adding your verb's `REQUIRED` entry IS the count bump** — there is no separate
       magic-number to edit. (`MODULE_FUNCTIONS = ["open_local", "connect"]`.) The guard runs in CI
-      on the in-repo book workflow (`.github/workflows/cookbook-book.yml`), so a verb whose chapter
+      in `ci.yml`'s `book-checks` job, so a verb whose chapter
       calls a kwarg the wheel doesn't expose reds CI before render.
 
 **Retrieval-status reality — do not wire a verb into these expecting them live.** The served
@@ -5305,7 +5308,10 @@ promote, not promote-then-hope. That merge job is the ONLY job that ever moves a
 per-arch build legs never do. `server-image.yml`'s CPU image runs this pattern twice — once
 ungated (`build-and-push-main` → `merge-cpu-main`, `main`-dispatch only, `:latest`/`sha-<sha>`) and
 once prove-gated (`build-and-push` → `merge-cpu-tag`, `v*` tags only, semver/`:latest`/`sha-<sha>`)
-— mirroring `_ci-base-image.yml`'s own single merge job for the CI base image itself.
+— mirroring `_ci-base-image.yml`'s own single merge job for the CI base image itself. A server
+image leg compiles nothing: it packages the `jammi-server` and `jammi` binaries the `ci.yml` run
+that proved the tree built, staged as the Dockerfile's builder stage (`stage-server-binaries`,
+`docker-publish`'s `build-contexts`).
 
 **Run before pushing (the local gate, mirrors `check`):**
 - `cargo fmt --all -- --check`
@@ -5322,15 +5328,34 @@ resolves the tree's images and `build-ci-image`/`build-ci-image-cuda` build any 
 (`ci/scripts/verdict.py probe`). Nothing waits on work it does not consume, so every job starts as
 soon as its image exists: `check` (fmt, workspace clippy, the `postgres,mysql` surface) and
 `clippy-gated` (the feature-gated test surfaces); `test-build` compiles the hermetic test graph once
-(`cargo nextest archive`, plus the doctests) and four `test` partitions run it, each test in a
+(`cargo nextest archive`, plus the doctests) and eight `test` partitions run it, each test in a
 process of its own; `test-permission-fault`, `test-lanes` (storage-cloud, golden-parity,
 build-sha), `test-pg` (each test against a database of its own, four at a time), `test-clients`
 (clients + the **two candle-free boundary guards**), `compile-check-gated`, the seven-leg CUDA
 clippy matrix, Metal clippy, `oss-only-build` (`--locked` hermeticity), `dep-audit`, `ts-client` /
-`py-client` / `test-python`, the guards and `distributed`. A tree a run already proved — the merge of
-a pull request whose own run proved its tree — skips every job whose only work is executing tests;
-jobs that compile still run, because `main`'s run writes the compile cache every pull request
-reads (`setup-rust-ci` runs sccache read-only off `main`). `test-live` runs on `main` only, advisory,
+`py-client` / `test-python`, the guards and `distributed` (one build archives its tests with the
+server they spawn; three legs run them).
+
+Every artifact the tree ships is compiled here once, through the reusable workflow its publisher's
+release promotes from: the native wheels (`_native-wheels.yml`, one call per consumer set, so a job
+installing the Linux x86_64 wheel never waits on the macOS legs, which cross-compile on the arm64
+runner), the CUDA native wheel (`_native-wheel-cu12.yml`), each server build's binary, release
+tarball and wheel (`_server.yml`, per manifest build and arch; the CUDA tarball bundles its runtime
+libraries through `ci/scripts/package_server_tarball.sh`), the `jammi` CLI for every release target
+(`_cli.yml`), the client wheel (`_client-wheel.yml`) and the TypeScript package (`ts-client`'s
+`npm pack`). Every check that runs one installs that build and compiles nothing:
+`test-python`, `cookbook` (every recipe plus the client's live suite), the book
+(`book-plan` selects the chapters the change can move, `book-checks`, `book-render` in up to four
+interleaved slices), `server-image-cuda` (the CUDA image packaged from the run's CUDA binary),
+and the `kube-smoke`/`compose-smoke` deploy shapes (their images packaged from the run's
+binaries). `.github/actions/install-jammi` and `stage-server-binaries` are the two ways a job
+takes a run's builds.
+
+A tree a run already proved — the merge of a pull request whose own run proved its tree — skips
+every job whose only work is executing tests; jobs that compile still run, because `main`'s run
+writes the compile cache every pull request reads (`setup-rust-ci` runs sccache read-only off
+`main`), and the checks that install the shipped artifacts still run, because they test against
+the current package ecosystem. `test-live` runs on `main` only, advisory,
 and only the tests `live-hub-tests` adds. `ci-summary / assert` is the one required check, and the
 release gate reads its most recent result over the released tree.
 
@@ -5395,7 +5420,14 @@ a gate: no CI job asserts against it.
 `require_gpu=true` so a GPU-less build fails fast rather than faking parity. GPU is not testable in CI
 (no GPU runners) — compile-checked only; live GPU is an A10G host gate.
 
-**Release (tag-driven, all OIDC trusted publishing, no tokens).** A version bump PR moves
+**Release (tag-driven, all OIDC trusted publishing, no tokens).** A release compiles nothing: every
+publishing workflow promotes the artifacts of the `ci.yml` run that proved the released tree — its
+most recent green `ci-summary` measurement, which `_proven-artifacts.yml` resolves through
+`ci/scripts/proven_artifacts.py` and confirms still holds every artifact named — so what ships is
+the bytes that run's checks exercised. A run's artifacts and its `subject-<tree>` binding share one
+retention (90 days); a tree older than that is measured again (any `ci.yml` run over it) before it
+can be released. A branch dispatch of a publisher is its rehearsal: the same lookup over the
+branch's tree, with nothing promoted. A version bump PR moves
 `Cargo.toml`'s `[workspace.package] version` (and `Cargo.lock`, `CHANGELOG.md`), every dist and
 exact sibling pin the `lockstep versions` guard lists (`ci/scripts/check_lockstep_versions.py`), and
 rebuilds the cookbook notebooks (`python cookbook/book/scripts/build_notebooks.py`), which pin the
@@ -5414,8 +5446,9 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
 **lightweight, on the same commit, pushed together**:
 - **`v*`** → `.github/workflows/crates.yml` (validate → perf-gate → prove-gated `publish` in
   topological order, skip already-published, block on sparse-index propagation; `github-release`
-  chains off `publish`) + `.github/workflows/npm.yml` (build+test unconditional; the `Publish` step
-  itself is prove-gated) + `.github/workflows/server-image.yml` (the manual `:latest` CPU refresh via
+  chains off `publish`) + `.github/workflows/npm.yml` (the download and version check
+  unconditional; the `Publish` step itself is prove-gated) + `.github/workflows/server-image.yml`
+  (every image packages the proving run's binaries; the manual `:latest` CPU refresh via
   `workflow_dispatch` on `main` is intentionally ungated — `build-and-push-main` pushes each arch's
   own immutable `sha-<sha>-<arch>` leg, `merge-cpu-main` merges them into the real `:latest`/`sha-<sha>`
   tags via `docker buildx imagetools create`, `gate_kind` "none"; `server-image.yml` carries no
@@ -5429,8 +5462,8 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   publishes, via the same dry-run-then-`imagetools create` shape as `merge-cpu-main`. The prove-gated
   tag promotions are `build-and-push`, `merge-cpu-tag`, and `build-and-push-cu12`) +
   `.github/workflows/release-binaries.yml` (every asset family — the CLI matrix, the CPU tarball, the
-  CUDA tarball — is split into an ungated build leg that always runs and a prove-gated promote leg
-  that only attaches to the release on a tag).
+  CUDA tarball — is downloaded from the proving run by a prove-gated promote leg that only attaches
+  to the release on a tag).
 - **`py-v*`** → `.github/workflows/pypi.yml` (native wheel) + `.github/workflows/pypi-client.yml`
   (pure-Python client) + `.github/workflows/pypi-server.yml` (CPU wheel — prove-gated too, even
   though it never touches CUDA itself, because it ships in the SAME all-or-nothing lockstep release)

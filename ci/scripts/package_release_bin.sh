@@ -34,8 +34,8 @@ bin_path="target/release/${bin}"
 # arch -- a mismatched leg (wrong runner, wrong cross-target) fails here,
 # before packaging, rather than shipping a binary that cannot exec on the
 # host its filename promises. Delegates to the shared
-# `assert_elf_machine.sh` -- the same script `_pypi-server.yml`'s
-# wheel-tagging step and `pypi.yml`'s native Linux legs call, so every leg
+# `assert_elf_machine.sh` -- the same script `_server.yml`'s binary job
+# and `_native-wheels.yml`'s legs call, so every leg
 # that stamps an architecture onto an artifact runs one identical check
 # instead of a per-caller reimplementation.
 case "$triple" in

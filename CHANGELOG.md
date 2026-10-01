@@ -13,12 +13,34 @@ workspace ships every publishable crate at the same
   (`_proof-required.yml`, formerly `_gpu-proof-required.yml`) requires the released tree's GPU prove
   and its CI summary, so a release no longer waits on `main`'s run.
 - **Nothing in CI waits on work it does not consume.** No job needs `Format & Lint`. The hermetic
-  suite builds once (`cargo nextest archive`) and runs in four partitions, each test in a process
+  suite builds once (`cargo nextest archive`) and runs in eight partitions, each test in a process
   of its own (`.config/nextest.toml`; doctests run beside the build). CUDA clippy runs one feature
   graph per job; the feature-gated lints, the permission-fault lane and the small opt-in lanes run
   as jobs of their own. The duplicate `test-hooks` lanes are gone — `jammi-test-utils` already
   enables the feature for every `jammi-db` test build — and `Test (live)` runs only the tests
   `live-hub-tests` adds, no longer the whole suite after it.
+- **Each artifact is compiled once per tree, and a release publishes that build.** A pull request
+  compiled the release engine about nine times — the PyPI, cookbook, book, `Test (Python)` and
+  image-smoke workflows each built the native wheel or the server again — and a release compiled
+  every artifact once more at the tag. Now `ci.yml` builds each one through the reusable workflow
+  that defines it (`_native-wheels.yml`, `_native-wheel-cu12.yml`, `_server.yml` for each server
+  build's binary, tarball and wheel, `_cli.yml`, `_client-wheel.yml`, `ts-client`'s `npm pack`),
+  every check installs that build (`install-jammi`, `stage-server-binaries`), and every publisher
+  promotes the artifacts of the run that proved the released tree (`_proven-artifacts.yml`,
+  `ci/scripts/proven_artifacts.py`) — the bytes that run's checks exercised. `cookbook.yml` and
+  `cookbook-book.yml` became `ci.yml` jobs; `setup-jammi-py` and `_pypi-server.yml` are deleted.
+  The release manifest declares `builds`, each lane naming the build it packages, so two
+  packagings of one binary can no longer declare different features. The macOS wheels compile
+  through the cache, and the x86_64 one cross-compiles on the arm64 runner. Images package
+  binaries through the Dockerfile's builder-stage contract (`--build-context builder=<dir>`); a
+  plain `docker build` still compiles them, which the nightly smokes keep checked.
+- **The book renders what a change can move, in parallel.** The selector selected every live
+  chapter for any change under `crates/`, test-only changes included, and the render compiled the
+  CLI and two Rust programs serially inside it (96 min on a pull request). Now a change selects
+  every live chapter only when it touches a build input of what the book runs — read from
+  `cargo metadata`, a package's `tests/`, `benches/` and `examples/` excluded — and the chapters
+  render in up to four slices against the run's own wheels, server and CLI (`JAMMI_CLI_BIN`). The
+  nightly full render installs the artifacts of the run that proved `main`'s tree.
 - **Every Postgres test has a database of its own.** `jammi_test_utils::postgres_database_url`
   gives a test the database its artifact dir owns, the way the SQLite arm's catalog is
   `<dir>/catalog.db`, so the Postgres lane runs in parallel (152 s for 1,936 tests, from 29 min at

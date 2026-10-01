@@ -11,7 +11,10 @@ which it did:
 * in a working checkout (the book renders from one), a surface is built from
   the checkout's own sources — the Rust program against the workspace crates,
   the TypeScript program against ``clients/typescript``, the CLI from
-  ``jammi-cli`` — so the chapter measures the code beside it;
+  ``jammi-cli`` — so the chapter measures the code beside it. A CLI already
+  built from those sources is used as is when ``JAMMI_CLI_BIN`` names it (CI
+  renders the book against the binaries its run built), the way the client's
+  live suite takes ``JAMMI_SERVER_BIN``;
 * anywhere else (a fresh Colab runtime), from what that release published —
   the crates on crates.io, the client on npm, the ``jammi`` binary on the
   GitHub release — installing a missing toolchain (Rust, Node) the way a user
@@ -64,8 +67,11 @@ def _fetch(url: str, dest: Path) -> Path:
 
 
 def cli(version: str) -> str:
-    """The ``jammi`` binary: built from a checkout's ``jammi-cli``, else the
-    release tarball for this platform."""
+    """The ``jammi`` binary: the one ``JAMMI_CLI_BIN`` names, else built from a
+    checkout's ``jammi-cli``, else the release tarball for this platform."""
+    named = os.environ.get("JAMMI_CLI_BIN")
+    if named:
+        return named
     root = checkout()
     if root is not None:
         _run([cargo(), "build", "--release", "-q", "-p", "jammi-cli", "--bin", "jammi"], cwd=root)

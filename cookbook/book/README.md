@@ -29,9 +29,10 @@ scripts/          the API-reference, citation and no-deferral guards
 tests/            the lib's unit tests
 ```
 
-The book lives in the engine monorepo at `cookbook/book/`; the engine CI builds
-the HEAD wheels and renders the chapters a diff can move against them (see
-`.github/workflows/cookbook-book.yml` at the repo root).
+The book lives in the engine monorepo at `cookbook/book/`; the engine CI renders
+the chapters a change can move against the wheels, server and CLI that same run
+built (the book jobs in `.github/workflows/ci.yml` at the repo root), and the
+whole book nightly (`.github/workflows/cookbook-render.yml`).
 
 ## Two scales, one code path
 

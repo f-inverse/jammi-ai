@@ -475,8 +475,14 @@ class ProbeTest(unittest.TestCase):
         w = World()
         w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
         rc, out, err = self._probe(w.fetch)
-        self.assertEqual((rc, out.strip()), (0, "proven=true"))
+        self.assertEqual((rc, out.split()), (0, ["proven=true", "run=7"]))
         self.assertIn("run 7", err)
+
+    def test_the_proving_run_is_the_most_recent_measurement(self):
+        w = World()
+        w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
+        w.bind(run_obj(9, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-02T00:00:00Z")])
+        self.assertEqual(self._probe(w.fetch)[1].split(), ["proven=true", "run=9"])
 
     def test_an_unmeasured_tree_reads_unproven(self):
         rc, out, _ = self._probe(World().fetch)

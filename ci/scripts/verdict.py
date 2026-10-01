@@ -16,11 +16,15 @@ Two questions are asked of it:
                                 arch) and T's CI (`ci.yml`'s summary job) both
                                 hold. A missing or red measurement DENIES, each
                                 naming its remedy.
-    probe --repo R --tree T     `ci.yml`'s `plan`: whether T's CI already holds,
-                                as `proven=true|false` for `$GITHUB_OUTPUT`. A run
-                                that finds T proven skips its test executions;
-                                an unreadable answer is `proven=false` with a
-                                warning, so the run measures T again.
+    probe --repo R --tree T     Whether T's CI already holds, as `proven=true|false`
+                                for `$GITHUB_OUTPUT`, and, when it does, `run=<id>`:
+                                the run whose summary is that measurement, which
+                                holds the artifacts it built for T. `ci.yml`'s
+                                `plan` skips its test executions on a proven T;
+                                the nightly book render installs that run's
+                                artifacts. An unreadable answer is
+                                `proven=false` with a warning, so a run measures
+                                T again.
 
 ## The rule (most-recent-measurement-wins, check once)
 
@@ -258,18 +262,20 @@ def require(
 
 
 def probe(*, repo: str, tree: str, fetch: FetchFn, token: str, out=sys.stdout, err=sys.stderr) -> int:
-    """`ci.yml`'s plan: `proven=true` when `tree`'s CI already holds. Never
-    fails the run: an unreadable record means the run measures again."""
+    """`proven=true` and the proving `run=<id>` when `tree`'s CI already
+    holds, `proven=false` otherwise. Never fails: an unreadable record means
+    the run measures again."""
     try:
         verdict = check_once(fetch, token, repo, ci_requirement(), tree)
     except ApiError as e:
         print(f"::warning::verdict: {e} -- this run measures tree {tree} again", file=err)
         print("proven=false", file=out)
         return 0
+    print(f"proven={'true' if verdict.ok else 'false'}", file=out)
     if verdict.ok:
         m = verdict.proofs[CI_SUMMARY_JOB]
+        print(f"run={m.run_id}", file=out)
         print(f"::notice::tree {tree} is proven by run {m.run_id} ({m.html_url})", file=err)
-    print(f"proven={'true' if verdict.ok else 'false'}", file=out)
     return 0
 
 

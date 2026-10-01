@@ -416,11 +416,27 @@ REVIEWED_NONPUBLISHING_LOCAL_REUSABLES: frozenset[str] = frozenset(
         # A status-aggregator: `permissions: {}`, one job that runs a `jq`
         # pass/fail assertion over its caller's own `needs` context.
         "_summary.yml",
-        # A build-only reusable (`ci.yml`'s `pypi-server.yml`/`pypi-server-
-        # cuda.yml` callers): `permissions: contents: read`, no publish
-        # step anywhere -- its own header comment states the PyPI publish
-        # step deliberately lives in each CALLER instead, never here.
-        "_pypi-server.yml",
+        # The build definitions every artifact compiles through, for
+        # `ci.yml` on every change and for the publishers at a release:
+        # `permissions: contents: read`, no publishing primitive anywhere --
+        # each only uploads workflow artifacts. A publisher downloads what
+        # one built and publishes it from its OWN job (PyPI trusted
+        # publishing cannot be satisfied from inside a reusable; see
+        # `_server.yml`'s header).
+        "_server.yml",
+        "_cli.yml",
+        "_native-wheels.yml",
+        "_native-wheel-cu12.yml",
+        "_client-wheel.yml",
+        # A release's lookup of the run that proved its tree: reads the
+        # verdict and that run's artifact list (`permissions: contents: read,
+        # actions: read`), uploads nothing, publishes nothing.
+        "_proven-artifacts.yml",
+        # The image smokes `ci.yml` calls with its run's binaries: each
+        # `docker-publish` use carries `push: "false"` (a `docker load` into
+        # the runner's own daemon), never a registry write.
+        "kube-smoke.yml",
+        "compose-smoke.yml",
     }
 )
 
@@ -2893,19 +2909,25 @@ def _check_ci_summary_name(workflow_texts: dict[str, str]) -> list[str]:
 # CONSULTS the verdict, as an un-bypassable step -- never a whole-file
 # substring check.
 # --------------------------------------------------------------------------- #
-_TREE_ARG_RE = re.compile(r'--tree\s+(?:"(?P<q>[^"]*)"|(?P<u>\S+))')
+# A double-quoted command substitution may quote its own argument
+# (`"$(git rev-parse "$GITHUB_SHA^{tree}")"`), so that alternative comes
+# first and reads past the inner quotes.
+_TREE_ARG_RE = re.compile(
+    r'--tree\s+(?:"(?P<s>\$\((?:[^()"]|"[^"]*")*\))"|"(?P<q>[^"]*)"|(?P<u>\S+))'
+)
 _REPO_ARG_RE = re.compile(r'--repo\s+(?:"(?P<q>[^"]*)"|(?P<u>\$\{\{[^}]*\}\}|\S+))')
 _VERDICT_INVOCATION = "python3 ci/scripts/verdict.py require"
 _CONTROL_OPERATOR_RE = re.compile(r"\|\||;|&&")
 _TREE_OF_COMMIT_RE = re.compile(
-    r"^\$\(\s*git\s+rev-parse\s+(?:\$GITHUB_SHA|\$\{\{\s*github\.sha\s*\}\})\^\{tree\}\s*\)$"
+    r'^\$\(\s*git\s+rev-parse\s+(?P<quote>"?)(?:\$GITHUB_SHA|\$\{\{\s*github\.sha\s*\}\})\^\{tree\}(?P=quote)\s*\)$'
 )
 
 
 def _tree_arg_is_commit_bound(value: str) -> bool:
     """`True` only for the tree of the exact commit a caller promotes:
     `$(git rev-parse <commit>^{tree})` where `<commit>` is the bash env var
-    `$GITHUB_SHA` or the GitHub expression `${{ github.sha }}`. A literal
+    `$GITHUB_SHA` or the GitHub expression `${{ github.sha }}`, the argument
+    quoted or not. A literal
     tree, a tag name (`v1.2.3^{tree}`, `${{ github.ref_name }}`) or any other
     ref is REFUSED -- proof surface == shipped surface means the verdict
     lookup itself must be bound to the identity being promoted, never a
@@ -3144,7 +3166,7 @@ def check_p5(workflow_texts: dict[str, str]) -> list[str]:
             # LAST occurrence wins, matching argparse's own last-flag-wins
             # semantics -- never the first match a naive regex would find.
             tree_m = tree_matches[-1]
-            raw = tree_m.group("q") if tree_m.group("q") is not None else tree_m.group("u")
+            raw = next(tree_m.group(g) for g in ("s", "q", "u") if tree_m.group(g) is not None)
             if not _tree_arg_is_commit_bound(raw):
                 findings.append(
                     f"P5: {resolved}'s --tree argument is `{raw}`, not the tree of `github.sha`/"

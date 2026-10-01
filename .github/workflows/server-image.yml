@@ -16,25 +16,26 @@ name: Server Image
 #   * the CUDA image `jammi-ai-server-cu12` (`:latest`, `:vX.Y.Z`, …) —
 #     GPU-accelerated inference, same tag scheme as the CPU image, published
 #     on the same `v*` tags. CUDA lives only on the server image.
-#     GPU *runtime* is not testable in CI (no GPU on CI runners), so a
-#     build-only `pull_request` job (below) proves the CUDA Dockerfile compiles
-#     before a tag; the build succeeding is the gate.
+#     GPU *runtime* is not testable in CI (no GPU on CI runners); `ci.yml`
+#     packages the CUDA image from its run's CUDA binary on every pull
+#     request, so a CUDA image that stops building fails before a tag.
 #
-# This workflow is independent of `image.yml`, which builds the CI
-# base images (`ghcr.io/f-inverse/jammi-ai-ci` and `-ci-cuda`). Those are
-# distinct artifacts: the `-ci` images are the toolchain layers used as a
-# build stage; `jammi-ai-server` / `-cu12` are the runtime images users
-# `docker pull`.
+# Every image here packages binaries it does not compile: the `jammi-server`
+# and `jammi` binaries the `ci.yml` run that proved the tree built
+# (`artifacts`, through `_proven-artifacts.yml`), laid out as the
+# Dockerfile's builder stage (`stage-server-binaries`) — the same packaging
+# `ci.yml`'s image checks and smokes run over those bytes. The Dockerfile's
+# own builder stage is the self-hoster's `docker build .` path, which the
+# nightly smokes keep checked.
+#
+# The CI images (`ghcr.io/f-inverse/jammi-ai-ci` and `-ci-cuda`) are a
+# different artifact: the toolchain layers builds run in, built by `ci.yml`;
+# `jammi-ai-server` / `-cu12` are the runtime images users `docker pull`.
 
 on:
   push:
     tags:
       - "v*"
-  pull_request:
-    paths:
-      - "Dockerfile"
-      - ".github/workflows/server-image.yml"
-      - "ci/release-feature-manifest.json"
   workflow_dispatch:
     inputs:
       selfcontained:
@@ -57,15 +58,20 @@ env:
   IMAGE_NAME_CU12: ${{ github.repository_owner }}/jammi-ai-server-cu12
 
 jobs:
-  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
-  # and this run waits until they exist.
-  ci-image:
+  # The binaries every image here packages: the ones the `ci.yml` run that
+  # proved this tree built.
+  artifacts:
     permissions:
       contents: read
       actions: read
-    uses: ./.github/workflows/_ci-image.yml
+    uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      await: cpu cuda
+      artifacts: >-
+        server-cpu-x86_64-binary
+        server-cpu-aarch64-binary
+        server-cu12-x86_64-binary
+        jammi-x86_64-unknown-linux-gnu
+        jammi-aarch64-unknown-linux-gnu
 
   # CPU image, main-branch arm: pushed from the default branch (`latest` +
   # sha) via a `workflow_dispatch` run on `main` only -- this workflow
@@ -87,15 +93,17 @@ jobs:
     # a release tag ref, never merely happen to never mention one --
     # `check_gpu_prove_once.py`'s P3 rule pins this exact conjunct.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'
-    needs: [ci-image]
+    needs: [artifacts]
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-latest
+            target_arch: x86_64
           - arch: arm64
             runner: ubuntu-24.04-arm
+            target_arch: aarch64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -105,28 +113,26 @@ jobs:
       # provenance exchanges for a Sigstore signing cert; `attestations:
       # write` lets it publish the attestation to the repo's attestation
       # store and (push-to-registry) to GHCR alongside the image. Only a
-      # job that actually pushes gets these -- never `build-cuda-pr` below.
+      # job that actually pushes gets these.
       id-token: write
       attestations: write
+      # Downloads the proven binaries from their run.
+      actions: read
 
     steps:
       - uses: actions/checkout@v4
 
-      # `ci/release-feature-manifest.json`'s `server-cpu` build is the single
-      # source of truth for this build's cargo feature list (fed into the
-      # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
-      # — read here rather than hardcoding it a second time,
-      # same idiom as the CUDA jobs' own `manifest` step below.
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+      # The binaries the `ci.yml` run that proved this tree built
+      # (`artifacts`), laid out as the Dockerfile's builder stage: the
+      # image packages them and compiles nothing.
+      - name: Stage the proven binaries
+        id: binaries
+        uses: ./.github/actions/stage-server-binaries
+        with:
+          server: server-cpu-${{ matrix.target_arch }}-binary
+          cli: jammi-${{ matrix.target_arch }}-unknown-linux-gnu
+          stage: builder
+          run-id: ${{ needs.artifacts.outputs.run }}
 
       - uses: ./.github/actions/docker-publish
         id: publish
@@ -139,9 +145,7 @@ jobs:
           tags-spec: |
             type=sha,format=long
           tag-suffix: ${{ matrix.arch }}
-          build-args: |
-            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
-            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
           platforms: linux/${{ matrix.arch }}
           cache-scope: cpu-${{ matrix.arch }}
           push: "true"
@@ -352,20 +356,22 @@ jobs:
   # tag` below is the ONLY job that ever moves the real semver/`sha-<sha>`
   # tags this arm publishes.
   build-and-push:
-    needs: [proof, ci-image]
-    # `always()` (pre-existing, for the proof interaction) bypasses the
-    # DEFAULT implicit "all needs succeeded" gate -- so `ci-image`'s own
-    # success must be re-asserted explicitly here too, or a failed resolve
-    # would let this job run anyway with an empty BASE_IMAGE build-arg.
-    if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.ci-image.result == 'success'
+    needs: [proof, artifacts]
+    # `always()` (for the proof interaction) bypasses the DEFAULT implicit
+    # "all needs succeeded" gate -- so `artifacts`' own success must be
+    # re-asserted explicitly here too, or a failed lookup would let this job
+    # run anyway with no binaries to package.
+    if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.artifacts.result == 'success'
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-latest
+            target_arch: x86_64
           - arch: arm64
             runner: ubuntu-24.04-arm
+            target_arch: aarch64
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -373,23 +379,23 @@ jobs:
       # See build-and-push-main's identical comment: only a pushing job gets these.
       id-token: write
       attestations: write
+      # Downloads the proven binaries from their run.
+      actions: read
 
     steps:
       - uses: actions/checkout@v4
 
-      # See build-and-push-main's identical step: `ci/release-feature-
-      # manifest.json`'s `server-cpu` build is the single source of truth
-      # for this build's cargo feature list.
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+      # The binaries the `ci.yml` run that proved this tree built
+      # (`artifacts`), laid out as the Dockerfile's builder stage: the
+      # image packages them and compiles nothing.
+      - name: Stage the proven binaries
+        id: binaries
+        uses: ./.github/actions/stage-server-binaries
+        with:
+          server: server-cpu-${{ matrix.target_arch }}-binary
+          cli: jammi-${{ matrix.target_arch }}-unknown-linux-gnu
+          stage: builder
+          run-id: ${{ needs.artifacts.outputs.run }}
 
       - uses: ./.github/actions/docker-publish
         id: publish
@@ -398,9 +404,7 @@ jobs:
           tags-spec: |
             type=sha,format=long
           tag-suffix: ${{ matrix.arch }}
-          build-args: |
-            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
-            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
           platforms: linux/${{ matrix.arch }}
           cache-scope: cpu-${{ matrix.arch }}
           push: "true"
@@ -594,12 +598,10 @@ jobs:
   # Self-contained variant: opt-in, dispatch-only. Builds the
   # `runtime-selfcontained` stage (baked config + encoder) from the
   # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
-  # Independent of the tag-triggered generic publish above. Reads the SAME
-  # `cpu-image` manifest lane the generic CPU image does (the
-  # Dockerfile's CPU builder stage requires `CARGO_FEATURES` — no default —
-  # so every job that reaches it, including this one, must pass it); it
-  # builds from the CPU `builder` stage, not `builder-cuda`, so it never
-  # carries a CUDA feature.
+  # Independent of the tag-triggered generic publish above. Packages the
+  # SAME `server-cpu` binary the generic CPU image does (the dispatched
+  # tree's, from the run that proved it), so it never carries a CUDA
+  # feature.
   build-and-push-selfcontained:
     # `&& github.ref_type != 'tag'`: without a ref-type restriction, a
     # workflow_dispatch run against a `v*` tag ref with
@@ -608,7 +610,7 @@ jobs:
     # to bypass). `check_gpu_prove_once.py`'s P3 rule pins the exact
     # conjunct `github.ref_type != 'tag'` on every gate_kind='none' row.
     if: github.event_name == 'workflow_dispatch' && inputs.selfcontained && github.ref_type != 'tag'
-    needs: [ci-image]
+    needs: [artifacts]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -616,23 +618,23 @@ jobs:
       # See build-and-push-main's identical comment: only a pushing job gets these.
       id-token: write
       attestations: write
+      # Downloads the proven binaries from their run.
+      actions: read
 
     steps:
       - uses: actions/checkout@v4
 
-      # See build-and-push-main's identical step: `ci/release-feature-
-      # manifest.json`'s `server-cpu` build is the single source of truth
-      # for this build's cargo feature list.
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
+      # The binaries the `ci.yml` run that proved this tree built
+      # (`artifacts`), laid out as the Dockerfile's builder stage: the
+      # image packages them and compiles nothing.
+      - name: Stage the proven binaries
+        id: binaries
+        uses: ./.github/actions/stage-server-binaries
+        with:
+          server: server-cpu-x86_64-binary
+          cli: jammi-x86_64-unknown-linux-gnu
+          stage: builder
+          run-id: ${{ needs.artifacts.outputs.run }}
 
       - uses: ./.github/actions/docker-publish
         id: publish
@@ -643,13 +645,12 @@ jobs:
             type=sha,prefix=selfcontained-,format=long
           build-args: |
             RUNTIME_VARIANT=runtime-selfcontained
-            BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}
-            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
           # Cloudflare Containers (this variant's runtime) is amd64-only
           # -- no arm leg, no merge job, no row. Explicit, never implicit
           # native-runner behavior, so a future runner-arch change fails
           # loudly instead of silently shipping an arm64 image nothing can
           # run (same loud-failure property the CUDA base already has).
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
           platforms: linux/amd64
           push: "true"
 
@@ -682,8 +683,8 @@ jobs:
   # GPU runtime is not tested on the CI runner itself — `proof` below
   # reads the commit's already-recorded proof (a dev dispatches
   # `gpu-prove.yml` by hand before tagging; see docs/maintainer/dev-gpu.md);
-  # the `build-cuda-pr` job below proves the Dockerfile compiles on every PR
-  # that touches it, before any tag lands.
+  # `ci.yml`'s `server-image-cuda` packages the CUDA image from its run's
+  # CUDA binary on every change, before any tag lands.
   proof:
     name: Proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
@@ -704,14 +705,14 @@ jobs:
     # carries a green GPU-prove verdict. A branch dispatch never pushes this
     # image — the `latest`/semver tag scheme is a promotion, and an unproven
     # promotion arm is exactly what this gate exists to make
-    # unrepresentable. (`build-cuda-pr` below keeps the Dockerfile compiling
-    # on PRs.) The `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_
+    # unrepresentable. (`ci.yml`'s `server-image-cuda` keeps the CUDA image
+    # building on every change.) The `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_
     # once.py`'s P3 rule asserts this shape holds for every CUDA promotion
     # job in the tree.
-    needs: [proof, ci-image]
+    needs: [proof, artifacts]
     # See build-and-push's identical comment: `always()` needs resolve-
     # base's success re-asserted explicitly too.
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.ci-image.result == 'success'
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.artifacts.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -719,38 +720,23 @@ jobs:
       # See build-and-push-main's identical comment: only a pushing job gets these.
       id-token: write
       attestations: write
+      # Downloads the proven binaries from their run.
+      actions: read
 
     steps:
       - uses: actions/checkout@v4
+
+      # The binaries the `ci.yml` run that proved this tree built
+      # (`artifacts`), laid out as the Dockerfile's builder-cuda stage: the
+      # image packages them and compiles nothing.
+      - name: Stage the proven binaries
+        id: binaries
+        uses: ./.github/actions/stage-server-binaries
         with:
-          # Deliberately NOT `submodules: recursive` — a targeted init below
-          # keeps the scope auditable, same idiom as ci.yml's `flash-attn-
-          # compile` job and the other CUDA release lanes.
-          submodules: false
-
-      # `ci/release-feature-manifest.json`'s `server-cu12` build is the single
-      # source of truth for this build's cargo feature list (fed into the
-      # Dockerfile's `CARGO_FEATURES` build-arg below) — read here rather
-      # than hardcoding it a second time. `jq` is preinstalled on
-      # `ubuntu-latest` (no container on this job).
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
-
-      # `flash-attn` (in the manifest's cu12-image feature list) needs
-      # the vendored CUTLASS submodule in the build CONTEXT: `docker/build-
-      # push-action` builds from the local checkout (context: "."), not a
-      # fresh `git clone` inside the container, so the submodule must be
-      # materialized here before the build starts.
-      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
-        run: git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+          server: server-cu12-x86_64-binary
+          cli: jammi-x86_64-unknown-linux-gnu
+          stage: builder-cuda
+          run-id: ${{ needs.artifacts.outputs.run }}
 
       - uses: ./.github/actions/docker-publish
         id: publish
@@ -763,11 +749,10 @@ jobs:
             type=sha,format=long
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
-            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
-            BASE_IMAGE_CUDA=${{ needs.ci-image.outputs.cuda }}
           # The CUDA runtime base has no arm64 build (no NVIDIA GPU target
           # for it); explicit, same
           # loud-failure property as the self-contained image above.
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
           platforms: linux/amd64
           push: "true"
           cache-scope: cu12
@@ -793,49 +778,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}@${{ steps.publish.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
-
-  # Build-only verification for the CUDA image on pull requests that touch the
-  # Dockerfile or this workflow. GPU runtime can't be exercised in CI (no GPU on
-  # the runners), so this proves the CUDA Dockerfile *compiles* (`jammi-server
-  # --features cuda,flash-attn,...` builds, candle's CUDA backend links, the
-  # vendored FlashAttention-2 kernels compile, the runtime stage assembles)
-  # before a `v*` tag triggers the real push. No `--push`, no tags consumed,
-  # no GHCR write.
-  build-cuda-pr:
-    if: github.event_name == 'pull_request'
-    needs: [ci-image]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
-
-      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
-        run: git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
-
-      - uses: ./.github/actions/docker-publish
-        with:
-          build-args: |
-            RUNTIME_VARIANT=runtime-cuda
-            CARGO_FEATURES=${{ steps.manifest.outputs.cargo_features }}
-            BASE_IMAGE_CUDA=${{ needs.ci-image.outputs.cuda }}
-          # Same explicit-amd64 rule as the pushing CUDA leg above --
-          # this build-only verification stays byte-identical in platform
-          # coverage to what actually ships.
-          platforms: linux/amd64
-          push: "false"
-          cache-scope: cu12

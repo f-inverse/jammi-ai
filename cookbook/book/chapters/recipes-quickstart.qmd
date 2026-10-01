@@ -9,7 +9,7 @@ Rust and Python — in the engine **Guide**: the
 quickstart and the
 [How-To Guides](https://f-inverse.github.io/jammi-ai/cookbook-recipes.html). Their
 runnable scripts ship in the `jammi-ai` repo under `cookbook/recipes/` and
-`cookbook/quickstart/`, exercised by the engine's `cookbook.yml` workflow and the
+`cookbook/quickstart/`, exercised by the engine CI's cookbook job and the
 `it/cookbook.rs` integration test.
 
 Where the Guide's How-To Guides are the minimal "how do I call this verb"

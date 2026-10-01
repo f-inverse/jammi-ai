@@ -6,32 +6,20 @@ on:
   # Manual re-run to finish a release whose publish was interrupted: run the
   # dispatch ON the `py-v*` tag (the publish job is tag-guarded; PyPI rejects
   # a re-upload of an existing version, so re-running the tag is idempotent).
-  # The native wheel version comes from the checked-out source (maturin reads
-  # the crate's `version.workspace` from Cargo.toml) — the tag guard is what
-  # pins that source to the released commit; a branch dispatch is a
-  # build-only dry run.
+  # A branch dispatch is a rehearsal: it resolves the branch tree's proving
+  # run and its wheels, and publishes nothing.
   workflow_dispatch:
-  # PR gate: build-only (no publish) on every input compiled into the wheel
-  # (`ci/scripts/check_wheel_gates.py` holds the list), so a wheel that stops
-  # building, or outgrows PyPI's per-file limit
-  # (`ci/scripts/assert_wheel_size.sh`), fails on the PR that caused it.
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - ".cargo/**"
-      - "rust-toolchain.toml"
-      - "packaging/native/**"
-      - ".github/workflows/pypi.yml"
-      - "ci/scripts/assert_wheel_size.sh"
 
 # This workflow ships the `jammi-ai-native` dist — the compiled engine (maturin
-# abi3 wheels, per-platform), built from `packaging/native/pyproject.toml`
-# (module `jammi_native`). The pure-Python base client `jammi-ai` (import
-# `jammi`) is built and published from `clients/python` by `pypi-client.yml` on
-# the SAME `py-v*` tag, so the two ship in lockstep at the shared workspace
-# version.
+# abi3 wheels, per-platform). It compiles nothing: `ci.yml` builds the wheels
+# on every pull request and on `main` (`_native-wheels.yml`), where a wheel
+# that stops building or outgrows PyPI's per-file limit fails the change that
+# caused it, and this workflow publishes the ones the run that proved the
+# tag's tree built — the bytes that run's Python lanes, cookbook and book
+# installed. The tree pins the version (maturin reads the crate's
+# `version.workspace`). The pure-Python base client `jammi-ai` (import
+# `jammi`) is published from `clients/python` by `pypi-client.yml` on the SAME
+# `py-v*` tag, so the two ship in lockstep at the shared workspace version.
 
 # Serialize per ref, never cancel: a publish in flight must finish (PyPI
 # uploads are not resumable), matching the other release lanes.
@@ -45,156 +33,16 @@ permissions:
   contents: read
 
 jobs:
-  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
-  # and this run waits until they exist.
-  ci-image:
+  # What this release publishes: the artifacts the `ci.yml` run that proved
+  # the released tree built — nothing compiles here. On a branch dispatch,
+  # the rehearsal: the same lookup over the branch's tree.
+  artifacts:
     permissions:
       contents: read
       actions: read
-    uses: ./.github/workflows/_ci-image.yml
+    uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      await: cpu
-
-  build-native-linux:
-    name: Build native wheel (Linux, ${{ matrix.arch }})
-    needs: [ci-image]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    container:
-      image: ${{ needs.ci-image.outputs.cpu }}
-    defaults:
-      run:
-        working-directory: packaging/native
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          # mold applies unconditionally from .cargo/config.toml; this lane
-          # never wanted -D warnings (a wheel-build lane, not the lint gate).
-          deny-warnings: false
-
-      # No `--platform-tag` relabel here -- that is `_pypi-server.yml`'s
-      # mechanism only (a prebuilt binary staged into a hatchling wheel).
-      # maturin derives its own platform tag from the container it runs in
-      # (manylinux_2_28_${{ matrix.arch }}).
-      - name: Build native wheel
-        run: maturin build --release --out dist
-
-      # The sufficient ABI floor assert, run against the cdylib INSIDE
-      # the built wheel (maturin, unlike `_pypi-server.yml`'s staged
-      # binary, never leaves a bare .so at a fixed path -- unzip first).
-      - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
-        id: glibc-floor
-        run: |
-          set -euo pipefail
-          wheel="$(ls dist/*.whl)"
-          workdir="$(mktemp -d)"
-          python3 -m zipfile -e "$wheel" "$workdir"
-          so="$(find "$workdir" -name '*.so' -print -quit)"
-          if [ -z "$so" ]; then
-            echo "::error::no .so found inside $wheel -- cannot assert the GLIBC floor" >&2
-            exit 1
-          fi
-          bash ../../ci/scripts/assert_glibc_floor.sh "$so" 2.28
-          echo "so_path=$so" >> "$GITHUB_OUTPUT"
-
-      # maturin derives the wheel's own platform tag
-      # (manylinux_2_28_${{ matrix.arch }}) from the container it runs in --
-      # nothing re-checks that the built `.so`'s actual machine matches
-      # `matrix.arch` before it ships under that tag. Same shared script
-      # `_pypi-server.yml` and `package_release_bin.sh` use, run against the
-      # `.so` this job already unzipped above.
-      - name: Assert the wheel's .so ELF machine matches matrix.arch
-        run: bash ../../ci/scripts/assert_elf_machine.sh "${{ steps.glibc-floor.outputs.so_path }}" ${{ matrix.arch }}
-
-      - name: Assert the wheel fits PyPI's per-file limit
-        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-native-linux-${{ matrix.arch }}
-          path: packaging/native/dist
-
-  build-native-macos:
-    name: Build native wheel (macOS ${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    defaults:
-      run:
-        working-directory: packaging/native
-    strategy:
-      matrix:
-        include:
-          # Pinned to macos-14, the same runner baseline release-binaries.yml's
-          # aarch64 CLI leg builds on, so the release CLI binary and the native
-          # wheel share one macOS baseline (a floating `macos-latest` could
-          # silently raise the wheel's OS floor above the CLI's).
-          - runner: macos-14
-            target: aarch64-apple-darwin
-            artifact: wheels-native-macos-arm64
-            assert_arch: aarch64
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact: wheels-native-macos-x86_64
-            assert_arch: x86_64
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # The native wheel depends on `jammi-wire`, whose `build.rs` compiles the
-      # `jammi.v1` protos with `protoc` on every build (it is the proto/stub
-      # owner). The Linux leg gets `protoc` from the CI base image; the macOS
-      # runners do not ship it, so install it here.
-      - name: Install protoc (macOS)
-        run: brew install protobuf
-
-      - name: Build native wheel
-        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
-        with:
-          target: ${{ matrix.target }}
-          # `working-directory` points the action at `packaging/native/pyproject.toml`,
-          # whose `[tool.maturin] manifest-path` already resolves the crate — no
-          # `--manifest-path` in args.
-          working-directory: packaging/native
-          args: --release --out dist
-        env:
-          RUSTC_WRAPPER: ""
-
-      # The Linux legs above assert their wheel's .so ELF machine matches
-      # matrix.arch; this leg stamps a
-      # platform tag (`macosx_*_arm64`/`macosx_*_x86_64`, maturin-derived
-      # from `matrix.target`) with nothing checking the built `.so`'s
-      # actual Mach-O machine before it shipped under that tag. Same shared
-      # `assert_elf_machine.sh` every other arch-stamping leg calls.
-      - name: Assert the wheel's .so Mach-O machine matches matrix.target
-        run: |
-          set -euo pipefail
-          wheel="$(ls dist/*.whl)"
-          workdir="$(mktemp -d)"
-          python3 -m zipfile -e "$wheel" "$workdir"
-          so="$(find "$workdir" -name '*.so' -print -quit)"
-          if [ -z "$so" ]; then
-            echo "::error::no .so found inside $wheel -- cannot assert its Mach-O machine" >&2
-            exit 1
-          fi
-          bash ../../ci/scripts/assert_elf_machine.sh "$so" ${{ matrix.assert_arch }}
-
-      - name: Assert the wheel fits PyPI's per-file limit
-        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: packaging/native/dist
+      artifacts: wheels-native-linux-x86_64 wheels-native-linux-aarch64 wheels-native-macos-arm64 wheels-native-macos-x86_64
 
   # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs
   # (MAP_FAILED) that MSVC does not support.
@@ -219,18 +67,22 @@ jobs:
     # workflow_dispatch comment above. Without the guard a branch dispatch
     # could first-publish an untagged, unreleased build, which PyPI cannot
     # undo. PURE conjunction (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build-native-linux.result == 'success' && needs.build-native-macos.result == 'success' && needs.proof.result == 'success'
-    needs: [build-native-linux, build-native-macos, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
+    needs: [artifacts, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
+      # Downloads from the proving run, not this one.
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-native-*
           merge-multiple: true
           path: dist
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)

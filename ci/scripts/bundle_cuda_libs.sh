@@ -114,7 +114,7 @@ BUNDLE_FLOOR_STEMS="libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-
 #
 # The platform half (glibc and the GCC/C++ runtimes, plus the dynamic loader
 # itself) is the host's: these are present on every glibc host the tarball
-# targets, the release lane asserts its own glibc floor separately
+# targets, the build asserts its own glibc floor separately
 # (`assert_glibc_floor.sh`), and bundling a second copy of `libstdc++` or
 # `libgcc_s` ahead of the host's on `LD_LIBRARY_PATH` is an ABI hazard rather
 # than a service. The driver half (`libcuda.so.1`, `libnvidia-*`) ships with
@@ -650,12 +650,12 @@ bundle_assert_staged() {
 #       never staged can still resolve `Ok` if the host happens to carry a
 #       copy too. The property this arm asserts is "no host copy outside
 #       `<lib>` satisfies a bundle-able member" — TWO independent mechanisms
-#       run in the release lane for it, because DETECTING a host copy that
+#       run in the packaging for it, because DETECTING a host copy that
 #       WOULD have been used and HIDING every host copy so none CAN be used
 #       are different strengths of the same argument, and neither stands in
 #       for the other:
-#         (1a) DETECTION, THE RELEASE LANE (`release-binaries.yml`'s
-#              `server-cu12-build` job, in the CUDA container, as root) runs
+#         (1a) DETECTION, THE PACKAGING (`package_server_tarball.sh`, run by
+#              `_server.yml` in the CUDA container, as root) runs
 #              the REAL loader (`LD_LIBRARY_PATH=<lib> ldd <binary>`) against
 #              the REAL staged binary and pipes that real report through THIS
 #              SAME parser — `bundle_verify_loader_resolution`, the
@@ -695,7 +695,7 @@ bundle_assert_staged() {
 #              `libnvidia-*`) are DELIBERATELY ABSENT from the jail.
 #              `bundle_assert_jail_file_set` checks
 #              the real jail's file set against exactly this plan, wired
-#              into the release lane between the build and the trace.
+#              into the packaging between the build and the trace.
 #
 #              The report is produced by `ci/scripts/jail_trace.py`, never
 #              `ld.so --list`: `--list` is FATAL (exit 127, one error line,
@@ -1056,7 +1056,7 @@ EOF
 # hermetic macOS suite) rather than copied byte-for-byte — the stage is
 # multi-GB — which REQUIRES `jail_dir` and `lib_dir` to already sit on the
 # SAME, container-native filesystem (a hardlink cannot cross a filesystem
-# boundary): see this function's caller in `release-binaries.yml` for why
+# boundary): see this function's caller in `package_server_tarball.sh` for why
 # the stage itself is built under a container-native path (`/root/...`),
 # never the bind-mounted checkout a `container:` job's `$GITHUB_WORKSPACE`
 # actually is.
@@ -1513,8 +1513,9 @@ EOF
   echo "bundle_cuda_libs.sh: every non-host-provided soname of the DT_NEEDED closure, plus the floor, is staged under ${lib_dir} as a regular file of its own SONAME (checked by filesystem presence; loader verification is a separate, later step — see bundle_verify_loader_resolution)."
 }
 
-# Sourced by the suite (which needs the functions and not the side effects);
-# executed by the release lane.
+# Sourced by the suite (which needs the functions and not the side effects)
+# and by `package_server_tarball.sh`, which packages the CUDA build; run
+# directly, it bundles (`bundle_cuda_libs.sh <binary> <stage-lib-dir> [search-path]`).
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   bundle_main "$@"
 fi

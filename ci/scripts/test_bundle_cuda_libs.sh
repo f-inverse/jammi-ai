@@ -5,12 +5,12 @@
 # stage directory.
 #
 # Why a suite at all: the only caller of that script is
-# `.github/workflows/release-binaries.yml`'s `server-cu12-build` job, whose
-# promote leg runs on a `v*` TAG. Nothing on the merge path executes the
-# derivation, so without this file its first real exercise would be a release
-# — the shape in which a hand-written soname list ships a binary with an
-# unsatisfiable `DT_NEEDED libnccl.so.2`, or a loader-verification arm passes a
-# stage that cannot actually run standalone.
+# `ci/scripts/package_server_tarball.sh`, which `_server.yml` runs for the CUDA
+# build on every change, against the ONE binary that build produces. That run
+# never shows the shapes this suite exists for — a hand-written soname list
+# shipping a binary with an unsatisfiable `DT_NEEDED libnccl.so.2`, or a
+# loader-verification arm passing a stage that cannot actually run standalone
+# — so the rules are exercised here, hermetically, against fixtures.
 #
 # Hermetic in the strict sense: no `readelf`, no real `ldd` run, no ELF file,
 # no network, no CUDA install — so it runs identically on the Linux `Guard`
@@ -54,16 +54,16 @@
 # staged — through the floor, never through the closure.
 #
 # `ci/scripts/fixtures/cu12_loader_report_real.txt` (arm 1a, DETECTION) is a
-# REAL `ldd` report captured from the actual cu12 binary in the release
-# lane's own CUDA container, and check 14 below verifies it against the
+# REAL `ldd` report captured from the actual cu12 binary in the CUDA
+# container its build ran in, and check 14 below verifies it against the
 # measured `DT_NEEDED` set with no `BUNDLE_FIXTURE_PROVISIONAL` needed.
 # `ci/scripts/fixtures/cu12_jail_report_real.txt` (arm 1b, THE JAIL — the
 # chroot half) is the CLEARLY-LABELLED `captured: pending` placeholder (see
 # check 20 below): `BUNDLE_FIXTURE_PROVISIONAL=1` is required to run this
-# suite at all until a maintainer dispatches `release-binaries.yml`,
-# downloads the `cu12-jail-report` workflow artifact, and commits its content
-# in place of the placeholder — the merge path stays red on this file until
-# that real report lands as its own commit.
+# suite at all until a maintainer downloads the `cu12-jail-report` artifact a
+# `ci.yml` run's CUDA server build (`_server.yml`) uploads, and commits its
+# content in place of the placeholder — the merge path stays red on this file
+# until that real report lands as its own commit.
 #
 # Run today: `BUNDLE_FIXTURE_PROVISIONAL=1 bash ci/scripts/test_bundle_cuda_libs.sh`
 # Run once the jail fixture is real: `bash ci/scripts/test_bundle_cuda_libs.sh`
@@ -99,7 +99,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="${HERE}/bundle_cuda_libs.sh"
 REAL_REPORT_FIXTURE="${HERE}/fixtures/cu12_loader_report_real.txt"
 REAL_JAIL_REPORT_FIXTURE="${HERE}/fixtures/cu12_jail_report_real.txt"
-WORKFLOW="${HERE}/../../.github/workflows/release-binaries.yml"
+WORKFLOW="${HERE}/../../.github/workflows/_server.yml"
+PACKAGER="${HERE}/package_server_tarball.sh"
 
 failures=0
 checks=0
@@ -1509,9 +1510,9 @@ assert_contains "jail verify: the spoofed-vdso-self-arrow failure names it" "$ja
 #     unless `BUNDLE_FIXTURE_PROVISIONAL=1` while the fixture is still the
 #     CLEARLY-LABELLED `captured: pending` placeholder — this suite, and
 #     therefore the merge path, stays red on this file until a maintainer
-#     commits the real report (captured by
-#     `release-binaries.yml`'s `server-cu12-build` job, uploaded as the
-#     `cu12-jail-report` workflow artifact) as its own commit.
+#     commits the real report (captured by `_server.yml`'s CUDA build,
+#     uploaded as the `cu12-jail-report` workflow artifact) as its own
+#     commit.
 # ---------------------------------------------------------------------------
 checks=$((checks + 1))
 if [ ! -f "$REAL_JAIL_REPORT_FIXTURE" ]; then
@@ -1657,26 +1658,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 21. The release lane wires this script in, and carries no hand-written
-#     soname list. Parsed YAML (PyYAML), never a regex over the file
-#     text: the property under test is "the Package step's shell script
-#     calls bundle_cuda_libs.sh and never re-declares the seven-name list",
-#     read off the parsed `run:` scalar of the exact step, not a grep that
-#     would pass just as well on a comment mentioning the same words.
+# 21. The CUDA tarball's packaging wires this script in, and carries no
+#     hand-written soname list. `_server.yml` (parsed YAML, never a regex
+#     over the file text) must run `package_server_tarball.sh` in the job
+#     that compiled the binary, and that script — read with every comment
+#     dropped, so a comment mentioning the same words never passes — must
+#     call bundle_cuda_libs.sh and never re-declare the seven-name list.
 # ---------------------------------------------------------------------------
 checks=$((checks + 1))
-workflow_check_out="$(python3 - "$WORKFLOW" <<'PYEOF' 2>&1
+workflow_check_out="$(python3 - "$WORKFLOW" "$PACKAGER" <<'PYEOF' 2>&1
 import sys
 import yaml
 
-path = sys.argv[1]
+path, packager = sys.argv[1], sys.argv[2]
 with open(path) as f:
     doc = yaml.safe_load(f)
 
 jobs = doc.get("jobs", {})
-job = jobs.get("server-cu12-build")
+job = jobs.get("binary")
 if job is None:
-    print("no 'server-cu12-build' job in release-binaries.yml")
+    print("no 'binary' job in _server.yml")
     sys.exit(1)
 
 steps = job.get("steps", [])
@@ -1727,19 +1728,21 @@ def strip_comment_lines(text):
     return "\n".join(strip_inline_comment(line) for line in text.splitlines())
 
 
-package_runs = [strip_comment_lines(s.get("run", "")) for s in steps if s.get("id") == "package"]
-if not package_runs:
-    print("no step with id: package under server-cu12-build")
+tarball_runs = [strip_comment_lines(s.get("run", "")) for s in steps if s.get("id") == "tarball"]
+if not any("package_server_tarball.sh" in run for run in tarball_runs):
+    print("_server.yml's binary job never runs package_server_tarball.sh (step id: tarball)")
     sys.exit(1)
-run_text = "\n".join(package_runs)
+
+with open(packager) as f:
+    run_text = strip_comment_lines(f.read())
 
 if "bundle_cuda_libs.sh" not in run_text:
-    print("the package step never calls bundle_cuda_libs.sh")
+    print("package_server_tarball.sh never calls bundle_cuda_libs.sh")
     sys.exit(1)
 
 hand_list = "libcudart libcublas libcublasLt libcurand libnvrtc libnvrtc-builtins libnccl"
 if hand_list in run_text:
-    print("a seven-name hand-written soname list is literally present in the package step")
+    print("a seven-name hand-written soname list is literally present in package_server_tarball.sh")
     sys.exit(1)
 
 # Both arms present, arm 1a (detection) ordered
@@ -1749,19 +1752,19 @@ if hand_list in run_text:
 # tests above, which never read the workflow at all.
 detect_idx = run_text.find("bundle_verify_loader_resolution")
 if detect_idx == -1:
-    print("the package step never calls bundle_verify_loader_resolution (arm 1a, detection)")
+    print("package_server_tarball.sh never calls bundle_verify_loader_resolution (arm 1a, detection)")
     sys.exit(1)
 
 jail_idx = run_text.find("jail_trace.py")
 if jail_idx == -1:
-    print("the package step never invokes ci/scripts/jail_trace.py (arm 1b, the jail)")
+    print("package_server_tarball.sh never invokes ci/scripts/jail_trace.py (arm 1b, the jail)")
     sys.exit(1)
 build_idx = run_text.find("bundle_build_jail")
 if build_idx == -1:
-    print("the package step never calls bundle_build_jail (arm 1b, the jail)")
+    print("package_server_tarball.sh never calls bundle_build_jail (arm 1b, the jail)")
     sys.exit(1)
 if "bundle_verify_jail_report" not in run_text:
-    print("the package step never calls bundle_verify_jail_report (arm 1b, the jail)")
+    print("package_server_tarball.sh never calls bundle_verify_jail_report (arm 1b, the jail)")
     sys.exit(1)
 if jail_idx < detect_idx:
     print("the jail arm (jail_trace.py) appears before arm 1a's detection call — arm 1a must run FIRST")
@@ -1773,7 +1776,7 @@ if jail_idx < detect_idx:
 # workflow enforces nothing on a real release.
 assert_idx = run_text.find("bundle_assert_jail_file_set")
 if assert_idx == -1:
-    print("the package step never calls bundle_assert_jail_file_set (the jail builder's own file-set rule)")
+    print("package_server_tarball.sh never calls bundle_assert_jail_file_set (the jail builder's own file-set rule)")
     sys.exit(1)
 if not (build_idx < assert_idx < jail_idx):
     print(
@@ -1788,9 +1791,9 @@ PYEOF
 )"
 workflow_check_rc=$?
 if [ "$workflow_check_rc" -eq 0 ]; then
-  ok "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, carries no hand list, and runs arm 1a (detection) before arm 1b (the jail)"
+  ok "_server.yml packages through package_server_tarball.sh, which calls bundle_cuda_libs.sh, carries no hand list, and runs arm 1a (detection) before arm 1b (the jail)"
 else
-  fail "release-binaries.yml's server-cu12-build package step calls bundle_cuda_libs.sh, carries no hand list, and runs arm 1a (detection) before arm 1b (the jail)" \
+  fail "_server.yml packages through package_server_tarball.sh, which calls bundle_cuda_libs.sh, carries no hand list, and runs arm 1a (detection) before arm 1b (the jail)" \
     "$workflow_check_out"
 fi
 

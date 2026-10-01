@@ -109,8 +109,8 @@ That last clause is a determinant of its own, and it is the one a
 trigger-only notion of "merge path" misses. A workflow can qualify under
 Rule 1a and still never see the PR that breaks the lint: `image.yml`
 is `push:`-to-main-only (no `pull_request` trigger at all), and
-`server-image.yml`'s `pull_request` trigger is filtered to the `Dockerfile`,
-its own file and the release manifest. The jammi-ai live-gpu lane moved into either would satisfy
+`devcontainer-image.yml`'s `pull_request` trigger is filtered to
+`.devcontainer/**` and its own file. The jammi-ai live-gpu lane moved into either would satisfy
 its row while a PR editing only
 `crates/jammi-ai/**` ran neither, which is the fail-open this row exists to
 prevent. So a row is credited only by a lane whose HOSTING workflow carries
@@ -135,8 +135,8 @@ corpus every real row must read SATISFIED. It runs the host-workflow
 mutations end-to-end as well, through the real workflow parser: a copy of
 `.github/workflows/` with that step's `run:` line MOVED out of `ci.yml`
 into a synthetic job in `image.yml` (push-to-main + `paths:`), and the
-same move into `server-image.yml` (a `pull_request` whose `paths:` list no
-crate), must each read UNSATISFIED, while the
+same move into `devcontainer-image.yml` (a `pull_request` whose `paths:`
+list no crate), must each read UNSATISFIED, while the
 same copy with nothing moved reads SATISFIED — so the mutation's verdict
 cannot be an artefact of copying the workflows.
 
@@ -1008,7 +1008,7 @@ def self_test() -> int:
     for host, why in (
         ("image.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
         (
-            "server-image.yml",
+            "devcontainer-image.yml",
             "a workflow whose `pull_request` `paths:` list no crate",
         ),
     ):
@@ -1028,23 +1028,21 @@ def self_test() -> int:
         )
 
     # ... and the same predicate must still SAY YES where a host other than
-    # ci.yml genuinely does run on the crate: `pypi-server.yml`'s `paths:`
-    # list `crates/**`. Without this arm, "not ci.yml" would pass for the
-    # rule.
-    def origin_of(workflow: str) -> LaneOrigin:
-        return LaneOrigin(
-            workflow=workflow,
-            pr_lanes=workflow_pr_lanes(exec_mod, REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL / workflow),
-        )
+    # ci.yml genuinely does run on the crate: a workflow whose `paths:` list
+    # `crates/**`. No real workflow besides ci.yml runs on every crate today,
+    # so this one is synthetic, read through the same parser. Without this
+    # arm, "not ci.yml" would pass for the rule.
+    def origin_of(workflow: str, directory: Path = REPO_ROOT / exec_mod.WORKFLOWS_DIR_REL) -> LaneOrigin:
+        return LaneOrigin(workflow=workflow, pr_lanes=workflow_pr_lanes(exec_mod, directory / workflow))
 
     def probe_in(origin: LaneOrigin):
         probe = parse_clippy_lane("cargo clippy -p jammi-server --tests -- -D warnings", origin=origin)
         assert probe is not None
         return probe
 
-    filtered_origin = origin_of("server-image.yml")
+    filtered_origin = origin_of("devcontainer-image.yml")
     assert len(filtered_origin.pr_lanes) == 1 and filtered_origin.pr_lanes[0].paths, (
-        "self-test FAILED: server-image.yml no longer carries a paths-filtered "
+        "self-test FAILED: devcontainer-image.yml no longer carries a paths-filtered "
         "`pull_request` trigger, so the control above tests something else now"
     )
     assert origin_of("image.yml").pr_lanes == (), (
@@ -1053,12 +1051,17 @@ def self_test() -> int:
     )
     assert not lane_runs_on_pr_touching_crate(
         exec_mod, probe_in(filtered_origin), "jammi-ai", crate_dirs
-    ), "self-test FAILED: server-image.yml's paths were read as admitting crates/jammi-ai/**"
+    ), "self-test FAILED: devcontainer-image.yml's paths were read as admitting crates/jammi-ai/**"
+    with tempfile.TemporaryDirectory() as td:
+        (Path(td) / "crates-filtered.yml").write_text(
+            "on:\n  pull_request:\n    branches: [main]\n    paths: ['crates/**']\njobs: {}\n"
+        )
+        crates_origin = origin_of("crates-filtered.yml", Path(td))
     assert lane_runs_on_pr_touching_crate(
-        exec_mod, probe_in(origin_of("pypi-server.yml")), "jammi-server", crate_dirs
+        exec_mod, probe_in(crates_origin), "jammi-server", crate_dirs
     ), (
-        "self-test FAILED (over-strict): pypi-server.yml's `paths:` list `crates/**`, so a "
-        "lane hosted there must be credited for a jammi-server row"
+        "self-test FAILED (over-strict): a workflow whose `paths:` list `crates/**` must be "
+        "credited for a jammi-server row"
     )
 
     # Negative control on the feature axis: a row naming a feature no lane

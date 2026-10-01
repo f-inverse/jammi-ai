@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 """Every wheel published to PyPI is built, and held to PyPI's size limit, on
-the pull request that changes it.
+the pull request that changes it — once — and a release publishes that build.
 
-**Guarded property**: a workflow that publishes to PyPI
+**Guarded property**:
 
-  1. runs `ci/scripts/assert_wheel_size.sh` in the build it publishes from, so
-     a wheel over PyPI's per-file limit fails its own build;
-  2. has a `pull_request` trigger, so that build runs before a tag does; and
-  3. when it compiles the workspace, lists every compiled input
-     (`COMPILED_INPUTS`) in that trigger's `paths:` — or carries no `paths:`
-     filter at all — so the pull request that grows the binary is the one
-     that rebuilds the wheel.
+  1. `ci.yml` runs on every pull request with no `paths:` filter, and every
+     wheel it builds — every local reusable workflow it calls whose build
+     runs `maturin build`, the maturin action, `python -m build` or
+     `wheel tags` — runs `ci/scripts/assert_wheel_size.sh`, so a wheel over
+     PyPI's per-file limit fails the pull request that grew it;
+  2. a workflow that publishes to PyPI publishes what `_proven-artifacts.yml`
+     resolves — the artifacts of the `ci.yml` run that proved the released
+     tree — and compiles nothing itself, so the bytes published are the ones
+     that run built and checked; and
+  3. a publisher has no `pull_request` trigger of its own, so no pull request
+     builds a wheel twice.
 
 PyPI refuses an oversized file at the tag's upload, after the other wheels of
-the same lockstep release are already published; without all three, the first
-run to see the size is that upload.
+the same lockstep release are already published; without the first, the
+first run to see the size is that upload.
 
-**Universe**: the workflows under `.github/workflows/` with a
-`pypa/gh-action-pypi-publish` step. A workflow's build is everything it
-reaches: the local reusable workflows it calls (`uses: ./…`) and the
-`ci/scripts/*.sh` its `run:` lines and those scripts name, transitively.
+**Universe**: `ci.yml`'s local reusable workflows, and the workflows under
+`.github/workflows/` with a `pypa/gh-action-pypi-publish` step. A build is
+everything a workflow reaches: the local reusable workflows and composite
+actions it uses (`uses: ./…`) and the `ci/scripts/*.sh` its `run:` lines and
+those scripts name, transitively.
 
 **Decided over parsed documents**: a workflow is read with a YAML parser; a
 command counts where it is executed — a `run:` string, or a script line that
-is not a comment — never where prose mentions it. A workflow compiles the
-workspace when its build runs `cargo build` or `maturin build`, or uses the
-maturin action.
+is not a comment — never where prose mentions it.
 
 Fail-closed: an empty universe, an unparseable workflow, or a `uses: ./…` or
 script reference that resolves to nothing is a finding, never a silent pass.
@@ -46,22 +49,16 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = Path(".github/workflows")
+PROVING_WORKFLOW = WORKFLOWS / "ci.yml"
 SIZE_CHECK = "ci/scripts/assert_wheel_size.sh"
 PUBLISH_ACTION = "pypa/gh-action-pypi-publish"
 MATURIN_ACTION = "PyO3/maturin-action"
-
-# What a `cargo build` of the workspace reads: a change to any of these can
-# change the bytes a compiled wheel carries.
-COMPILED_INPUTS = (
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates/**",
-    ".cargo/**",
-    "rust-toolchain.toml",
-)
+LOCAL_WORKFLOW = "./.github/workflows/"
+PROMOTION = WORKFLOWS / "_proven-artifacts.yml"
 
 _SCRIPT_REF = re.compile(r"ci/scripts/[\w./-]+\.sh")
-_COMPILES = re.compile(r"\bcargo\s+build\b|\bmaturin\s+build\b")
+_BUILDS_WHEEL = re.compile(r"\bmaturin\s+build\b|\bpython3?\s+-m\s+build\b|\bwheel\s+tags\b")
+_COMPILES = re.compile(r"\bcargo\s+build\b|\bnpm\s+run\s+build\b")
 
 
 def scalars(node, path: tuple[str, ...] = ()) -> Iterator[tuple[tuple[str, ...], str]]:
@@ -91,14 +88,21 @@ def resolve(root: Path, target: Path) -> Path | None:
     return None
 
 
+def load(root: Path, path: Path, findings: list[str]):
+    try:
+        return yaml.safe_load((root / path).read_text())
+    except yaml.YAMLError as error:
+        findings.append(f"{path}: not parseable as YAML ({error})")
+        return None
+
+
 class Build:
-    """What one workflow's build executes and uses, over everything it reaches."""
+    """What a workflow executes and uses, over everything it reaches."""
 
     def __init__(self, root: Path, workflow: Path):
         self.commands: list[str] = []
         self.actions: list[str] = []
         self.findings: list[str] = []
-        self.document = None
         pending = [workflow]
         seen: set[Path] = set()
         while pending:
@@ -115,13 +119,9 @@ class Build:
                 body = executed_lines(text)
                 self.commands.append(body)
             else:
-                try:
-                    document = yaml.safe_load(text)
-                except yaml.YAMLError as error:
-                    self.findings.append(f"{path}: not parseable as YAML ({error})")
+                document = load(root, path, self.findings)
+                if document is None:
                     continue
-                if path == workflow:
-                    self.document = document
                 runs = [value for where, value in scalars(document) if where[-1:] == ("run",)]
                 uses = [value for where, value in scalars(document) if where[-1:] == ("uses",)]
                 self.commands.extend(runs)
@@ -136,10 +136,13 @@ class Build:
     def checks_size(self) -> bool:
         return any(SIZE_CHECK.rsplit("/", 1)[1] in command for command in self.commands)
 
-    def compiles(self) -> bool:
-        return any(_COMPILES.search(command) for command in self.commands) or any(
+    def builds_wheel(self) -> bool:
+        return any(_BUILDS_WHEEL.search(command) for command in self.commands) or any(
             use.startswith(MATURIN_ACTION) for use in self.actions
         )
+
+    def compiles(self) -> bool:
+        return self.builds_wheel() or any(_COMPILES.search(command) for command in self.commands)
 
 
 def pull_request_trigger(document) -> tuple[bool, list[str] | None]:
@@ -156,37 +159,71 @@ def pull_request_trigger(document) -> tuple[bool, list[str] | None]:
     return True, paths
 
 
+def called_reusables(document) -> set[Path]:
+    """The local reusable workflows a workflow's jobs call."""
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return set()
+    return {
+        WORKFLOWS / job["uses"][len(LOCAL_WORKFLOW):].split("@")[0]
+        for job in jobs.values()
+        if isinstance(job, dict) and isinstance(job.get("uses"), str) and job["uses"].startswith(LOCAL_WORKFLOW)
+    }
+
+
 def findings(root: Path) -> list[str]:
     out: list[str] = []
+    proving = load(root, PROVING_WORKFLOW, out) if (root / PROVING_WORKFLOW).is_file() else None
+    if proving is None:
+        out.append(f"{PROVING_WORKFLOW} is missing — no workflow builds the wheels on a pull request")
+    else:
+        on_pr, paths = pull_request_trigger(proving)
+        if not on_pr or paths is not None:
+            out.append(
+                f"{PROVING_WORKFLOW.name}: must run on every pull request, with no `paths:` "
+                "filter — it is where every wheel is built before a tag"
+            )
+        wheel_builds = 0
+        for reusable in sorted(called_reusables(proving)):
+            build = Build(root, reusable)
+            out.extend(build.findings)
+            if not build.builds_wheel():
+                continue
+            wheel_builds += 1
+            if not build.checks_size():
+                out.append(
+                    f"{reusable.name}: builds a wheel `ci.yml` ships but never runs `{SIZE_CHECK}` — "
+                    "a wheel over PyPI's per-file limit would first fail at the tag's upload"
+                )
+        if wheel_builds == 0:
+            out.append(f"{PROVING_WORKFLOW.name} builds no wheel — nothing a release could publish")
     publishers = 0
     for path in sorted((root / WORKFLOWS).glob("*.y*ml")):
-        build = Build(root, path.relative_to(root))
+        workflow = path.relative_to(root)
+        build = Build(root, workflow)
         if not build.publishes():
             continue
         publishers += 1
         out.extend(build.findings)
-        if build.document is None:
+        document = load(root, workflow, out)
+        if document is None:
             continue
         name = path.name
-        if not build.checks_size():
+        if PROMOTION not in called_reusables(document):
             out.append(
-                f"{name}: publishes to PyPI but its build never runs `{SIZE_CHECK}` — a wheel "
-                "over PyPI's per-file limit would first fail at the tag's upload"
+                f"{name}: publishes to PyPI but not what `{PROMOTION.name}` resolves — a release "
+                "publishes the artifacts of the run that proved its tree"
             )
-        on_pr, paths = pull_request_trigger(build.document)
-        if not on_pr:
+        if build.compiles():
             out.append(
-                f"{name}: publishes to PyPI but has no `pull_request` trigger — its wheel is "
-                "first built when a tag is pushed"
+                f"{name}: compiles at release — it must publish the bytes `ci.yml` built and checked, "
+                "not a second build"
             )
-        elif build.compiles() and paths is not None:
-            missing = [entry for entry in COMPILED_INPUTS if entry not in paths]
-            if missing:
-                out.append(
-                    f"{name}: compiles the workspace but its `pull_request` `paths:` leave out "
-                    f"{', '.join(missing)} — a pull request changing those would not rebuild "
-                    "the wheel it changes"
-                )
+        if pull_request_trigger(document)[0]:
+            out.append(
+                f"{name}: has a `pull_request` trigger of its own — `ci.yml` builds its wheel "
+                "on every pull request already, so a pull request would build it twice"
+            )
     if publishers == 0:
         out.append(f"no workflow under {WORKFLOWS} publishes to PyPI — nothing to check")
     return out
@@ -202,77 +239,128 @@ def _tree(files: dict[str, str]) -> Path:
 
 
 def _self_test() -> int:
-    paths = "\n".join(f'              - "{entry}"' for entry in COMPILED_INPUTS)
-    publish = """
+    publisher = """
+        on:
+          push:
+            tags: ["py-v*"]
+        jobs:
+          artifacts:
+            uses: ./.github/workflows/_proven-artifacts.yml
+            with:
+              artifacts: wheel
           publish:
+            needs: artifacts
             runs-on: ubuntu-latest
             steps:
               - uses: pypa/gh-action-pypi-publish@v1
     """
-    good = f"""
-        on:
-          push:
-            tags: ["py-v*"]
-          pull_request:
-            paths:
-{paths}
-              - "packaging/**"
+    promotion = """
+        on: workflow_call
+        jobs:
+          resolve:
+            runs-on: ubuntu-latest
+            steps:
+              - run: python3 ci/scripts/proven_artifacts.py
+    """
+    wheel = """
+        on: workflow_call
         jobs:
           build:
             runs-on: ubuntu-latest
             steps:
               - run: bash ci/scripts/build.sh
-    {publish}"""
+    """
+    proving = """
+        on:
+          push:
+            branches: [main]
+          pull_request:
+        jobs:
+          wheel:
+            uses: ./.github/workflows/_wheel.yml
+    """
     script = "#!/usr/bin/env bash\nmaturin build --release\nbash ci/scripts/assert_wheel_size.sh dist/*.whl\n"
-    check = "#!/usr/bin/env bash\n"
 
-    def tree(workflow: str, build: str = script) -> Path:
-        return _tree(
-            {
-                ".github/workflows/wheel.yml": workflow,
-                "ci/scripts/build.sh": build,
-                "ci/scripts/assert_wheel_size.sh": check,
-            }
-        )
+    def tree(
+        publisher: str = publisher,
+        proving: str | None = proving,
+        build: str = script,
+    ) -> Path:
+        files = {
+            ".github/workflows/pypi.yml": publisher,
+            ".github/workflows/_proven-artifacts.yml": promotion,
+            ".github/workflows/_wheel.yml": wheel,
+            "ci/scripts/build.sh": build,
+            "ci/scripts/assert_wheel_size.sh": "#!/usr/bin/env bash\n",
+        }
+        if proving is not None:
+            files[".github/workflows/ci.yml"] = proving
+        return _tree(files)
 
     cases = [
-        ("a gated compiled wheel passes", tree(good), []),
+        ("a wheel ci.yml builds and checks, promoted at release, passes", tree(), []),
         (
             "a size check named only in a comment does not count",
-            tree(good, "#!/usr/bin/env bash\nmaturin build --release\n# bash ci/scripts/assert_wheel_size.sh\n"),
+            tree(build="#!/usr/bin/env bash\nmaturin build --release\n# bash ci/scripts/assert_wheel_size.sh\n"),
             ["never runs"],
         ),
         (
-            "a compiled input left out of paths is named",
-            tree(good.replace('              - "Cargo.lock"\n', "")),
-            ["leave out Cargo.lock"],
-        ),
-        (
-            "a publisher with no pull_request trigger is refused",
-            tree(good.replace("  pull_request:\n", "  workflow_dispatch:\n")),
-            ["no `pull_request` trigger"],
-        ),
-        (
-            "an unfiltered pull_request trigger covers every input",
-            tree(good.split("            paths:")[0] + "        jobs:" + good.split("        jobs:")[1]),
-            [],
-        ),
-        (
-            "a wheel that compiles nothing needs the trigger and the check, not the inputs",
+            "a publisher that compiles at release is refused",
             tree(
-                good.replace(paths + "\n", ""),
-                "#!/usr/bin/env bash\npython -m build --wheel\nbash ci/scripts/assert_wheel_size.sh dist/*.whl\n",
+                publisher=publisher.replace(
+                    "              - uses: pypa/gh-action-pypi-publish@v1",
+                    "              - run: bash ci/scripts/build.sh\n              - uses: pypa/gh-action-pypi-publish@v1",
+                )
             ),
-            [],
+            ["compiles at release"],
+        ),
+        (
+            "a publisher that bypasses the proving run is refused",
+            tree(publisher=publisher.replace("uses: ./.github/workflows/_proven-artifacts.yml", "uses: ./.github/workflows/_wheel.yml")),
+            ["not what `_proven-artifacts.yml` resolves", "compiles at release"],
+        ),
+        (
+            "a ci.yml filtered by paths is refused",
+            tree(proving=proving.replace("  pull_request:\n", "  pull_request:\n            paths: [crates/**]\n")),
+            ["no `paths:` filter"],
+        ),
+        (
+            "a ci.yml that builds no wheel is a finding",
+            tree(proving=proving.replace("uses: ./.github/workflows/_wheel.yml", "runs-on: ubuntu-latest\n            steps: []")),
+            ["builds no wheel"],
+        ),
+        (
+            "a publisher that also builds on pull requests is refused",
+            tree(publisher=publisher.replace('    tags: ["py-v*"]\n', '    tags: ["py-v*"]\n          pull_request:\n')),
+            ["build it twice"],
+        ),
+        (
+            "a tree with no ci.yml is a finding",
+            tree(proving=None),
+            ["is missing"],
         ),
         (
             "a script the build names but the tree lacks is a finding",
-            _tree({".github/workflows/wheel.yml": good}),
-            ["does not exist", "never runs"],
+            _tree(
+                {
+                    ".github/workflows/pypi.yml": publisher,
+                    ".github/workflows/_proven-artifacts.yml": promotion,
+                    ".github/workflows/_wheel.yml": wheel,
+                    ".github/workflows/ci.yml": proving,
+                }
+            ),
+            ["does not exist", "builds no wheel"],
         ),
         (
             "a tree with no publisher is a finding, not a pass",
-            _tree({".github/workflows/ci.yml": "on: pull_request\njobs: {}\n"}),
+            _tree(
+                {
+                    ".github/workflows/ci.yml": proving,
+                    ".github/workflows/_wheel.yml": wheel,
+                    "ci/scripts/build.sh": script,
+                    "ci/scripts/assert_wheel_size.sh": "#!/usr/bin/env bash\n",
+                }
+            ),
             ["nothing to check"],
         ),
     ]
@@ -301,7 +389,7 @@ def main() -> int:
         print(f"::error::{finding}", file=sys.stderr)
     if found:
         return 1
-    print("wheel gates: every PyPI publisher builds and checks its wheel on the pull request")
+    print("wheel gates: every wheel ci.yml builds is size-checked on every pull request, and every PyPI publisher promotes that build")
     return 0
 
 

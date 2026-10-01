@@ -13,9 +13,9 @@ neither prefix and is declared by no component; the other cases hold the
 classification honest in the directions it could over-reach.
 
 The PASS fixture is the measured `DT_NEEDED` list of the binary the check
-actually runs on (`_pypi-server.yml:144`, `target/release/jammi-server`), read
-off the `server-cu12-binary` artifact of run 34717957779 — not a hand-written
-approximation of it.
+actually runs on (the `server-cu12` build's `jammi-server`, which
+`_server.yml` compiles), read off that binary's artifact in run 34717957779 —
+not a hand-written approximation of it.
 
 Hermetic: no readelf, no binary, no network. `needed_libs` is replaced by a
 fixture, so this exercises `check()`'s classification and its exit code, which

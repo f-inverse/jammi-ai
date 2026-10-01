@@ -53,3 +53,15 @@ path = "junit.xml"
 [profile.postgres]
 inherits = "ci"
 test-threads = 4
+
+# The distributed lane, as `ci`: one build archives each crate's `distributed`
+# test binary together with the `jammi-server` its harness spawns (which the
+# harness finds beside the test binary's own target directory), and each leg
+# runs its tests from that archive one at a time — they share one Postgres and
+# one object store.
+[profile.distributed]
+inherits = "ci"
+test-threads = 1
+archive.include = [
+    { path = "debug/jammi-server", relative-to = "target", on-missing = "error" },
+]

@@ -5,6 +5,11 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A dropped lease hold reports its lease lost.** `LeaseHold`'s drop removed the hold from the
+  keeper but left its `lost` flag unset, so a training thread whose owning future was aborted —
+  dropping a worker's guard after a cancelled `stop_and_join` — kept the clone of that flag and
+  trained to the end of its job, CPU nobody asked for. Dropping a hold now sets the flag: nothing
+  renews the lease any more, so the trainer stops at its next epoch boundary.
 - **CI proves a tree once.** A change paid for CI twice: about 1h35 on its pull request, then up to
   2h53 on `main` over the same tree. `ci.yml`'s `plan` records the tree a run tests and asks
   whether a run already proved it (`ci/scripts/verdict.py`, the reader the GPU-prove gate used,

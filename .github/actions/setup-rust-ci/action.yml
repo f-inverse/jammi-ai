@@ -88,7 +88,18 @@ runs:
       run: |
         set -euo pipefail
         if [ "${{ inputs.no-sccache }}" != "true" ]; then
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          # sccache checks its storage when its server starts and refuses to
+          # start when the check fails (src/server.rs; SCCACHE_IGNORE_SERVER_IO_ERROR
+          # covers only compile responses), so an unavailable GitHub Actions
+          # cache — throttled egress answers `ServerBusy` — would fail every
+          # cargo call in the job. Start the server here against that cache;
+          # when it cannot start, the job compiles through sccache's local disk
+          # cache instead: slower, never red.
+          if SCCACHE_GHA_ENABLED=true sccache --start-server >/tmp/sccache-start.log 2>&1; then
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::the GitHub Actions cache refused sccache ($(grep -m1 -o 'error: .*' /tmp/sccache-start.log)); this job compiles through sccache's local disk cache"
+          fi
         fi
 
         # Fail closed on anything other than the two literal values this

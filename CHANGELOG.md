@@ -5,6 +5,11 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+- **A CI job whose remote compile cache is unavailable still builds.** sccache refuses to start its
+  server when its startup storage check fails, so a throttled GitHub Actions cache (`ServerBusy:
+  Egress is over the account limit`) failed every cargo call in a job before it compiled anything.
+  `setup-rust-ci` starts the server against that cache itself and, when the start fails, keeps the
+  job on sccache's local disk cache with a warning naming the error.
 - **The published notebooks run nightly as a reader runs them.** The book gate and the nightly
   render run the chapter sources against wheels built from HEAD, so neither saw what a reader gets:
   0.50.0's setup cells named a `jammi-server-cu12` PyPI never received, and fifteen notebooks

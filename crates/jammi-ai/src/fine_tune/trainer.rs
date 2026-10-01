@@ -8567,6 +8567,16 @@ mod runner_role_and_agreement_oracle {
     /// prefix — the SAME `Var`s under different names, so the tensors, the
     /// shapes and the sorted order all agree with an unrenamed rank and ONLY
     /// the canonical layout's digest differs. Run on the current thread.
+    /// One rank's run: its outcome and the catalog it ran against. The
+    /// catalog's SQLite file lives in `_dir`, so the two are held together: a
+    /// catalog read after its directory is gone fails as soon as the pool
+    /// opens a new connection.
+    struct RankRun {
+        result: jammi_db::error::Result<TrainingResult>,
+        catalog: Arc<jammi_db::catalog::Catalog>,
+        _dir: tempfile::TempDir,
+    }
+
     fn run_rank(
         call: &BlockingCall,
         tag: String,
@@ -8574,17 +8584,14 @@ mod runner_role_and_agreement_oracle {
         rename: Option<&str>,
         rank_ctx: RankContext,
         role: Option<RunnerRole>,
-    ) -> (
-        jammi_db::error::Result<TrainingResult>,
-        Arc<jammi_db::catalog::Catalog>,
-    ) {
+    ) -> RankRun {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .unwrap();
         let config = gang_config();
-        let (loop_, _dir, catalog) = rt.block_on(async {
+        let (loop_, dir, catalog) = rt.block_on(async {
             let base_model = super::test_fixtures::tiny_bert().await;
             let (catalog, dir) = super::test_fixtures::claimed_job(&tag).await;
             let device = Device::Cpu;
@@ -8619,16 +8626,18 @@ mod runner_role_and_agreement_oracle {
             }
             (builder.build(), dir, catalog)
         });
-        let mut loop_ = match loop_ {
-            Ok(loop_) => loop_,
-            Err(e) => return (Err(e), catalog),
-        };
-        let _enter = rt.enter();
-        let result = loop_.run(
-            call,
-            crate::fine_tune::source::TrainingSource::Resident(pairs(4)),
-        );
-        (result, catalog)
+        let result = loop_.and_then(|mut loop_| {
+            let _enter = rt.enter();
+            loop_.run(
+                call,
+                crate::fine_tune::source::TrainingSource::Resident(pairs(4)),
+            )
+        });
+        RankRun {
+            result,
+            catalog,
+            _dir: dir,
+        }
     }
 
     fn two_rank_contexts() -> Vec<RankContext> {
@@ -8661,23 +8670,26 @@ mod runner_role_and_agreement_oracle {
                 run_rank(&call, tag, store, None, rank_ctx, None)
             }));
         }
-        let mut catalogs = Vec::new();
+        let mut runs = Vec::new();
         for (rank, handle) in handles.into_iter().enumerate() {
-            let (result, catalog) = handle.join().unwrap();
-            result.unwrap_or_else(|e| panic!("rank {rank} must complete: {e}"));
-            catalogs.push(catalog);
+            let run = handle.join().unwrap();
+            if let Err(e) = &run.result {
+                panic!("rank {rank} must complete: {e}");
+            }
+            runs.push(run);
         }
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let written: Vec<bool> = (0..2)
-            .map(|rank| {
-                rt.block_on(
-                    stores[rank]
-                        .fetch_newest_checkpoint(&catalogs[rank], &format!("role-gate-r{rank}")),
-                )
-                .unwrap()
-                .is_some()
-            })
-            .collect();
+        let written: Vec<bool> =
+            (0..2)
+                .map(|rank| {
+                    rt.block_on(stores[rank].fetch_newest_checkpoint(
+                        &runs[rank].catalog,
+                        &format!("role-gate-r{rank}"),
+                    ))
+                    .unwrap()
+                    .is_some()
+                })
+                .collect();
         assert_eq!(
             written,
             vec![true, false],
@@ -8701,8 +8713,10 @@ mod runner_role_and_agreement_oracle {
                 run_rank(&call, tag, file_store(), rename, rank_ctx, None)
             }));
         }
-        let results: Vec<jammi_db::error::Result<TrainingResult>> =
-            handles.into_iter().map(|h| h.join().unwrap().0).collect();
+        let results: Vec<jammi_db::error::Result<TrainingResult>> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().result)
+            .collect();
         // The two digests, from the same names and the same function the
         // trainer binds with: a head built exactly as each rank's was.
         let names = {

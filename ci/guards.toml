@@ -66,7 +66,7 @@ why = "Every How-To and Operations page of the guide names the cookbook chapter 
 [[guard]]
 name = "lockstep versions"
 run = "python3 ci/scripts/check_lockstep_versions.py"
-why = "Every Python and npm dist ships at the workspace version and every exact sibling pin names it, so a release never publishes a pin that cannot resolve."
+why = "Every Python and npm dist ships at the workspace version, every exact sibling pin names it, and the changelog's newest release section is it, so a release never publishes a pin that cannot resolve or files its changes under another version."
 
 [[guard]]
 name = "cookbook notebooks"

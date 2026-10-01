@@ -147,7 +147,7 @@ jobs:
       - name: Install the book (against the HEAD wheel)
         run: |
           . .venv/bin/activate
-          pip install -e 'cookbook/book[book,dev,postgres,otlp]'
+          pip install -e 'cookbook/book[book,dev]'
 
       - name: API reference matches the HEAD wheel
         working-directory: cookbook/book

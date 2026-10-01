@@ -22,12 +22,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The book toolchain. Quarto itself is a system binary installed separately
-# (see .github/workflows/ci.yml); jupyter is the execution engine Quarto drives.
+# Everything rendering the whole book needs: jupyter, the execution engine Quarto
+# drives (Quarto itself is a system binary installed separately), and every extra
+# a chapter or a recipe chapter imports from. A new chapter dependency joins its
+# extra below, and the render picks it up here.
 book = [
     "jupyter>=1.0",
     "nbclient>=0.9",
     "ipykernel>=6.29",
+    "jammi-cookbook[postgres,otlp,cloud]",
 ]
 # An S3-compatible server the cloud-storage recipe runs against, so it needs
 # no cloud account (`recipes/cloud_storage/`).
@@ -36,11 +39,11 @@ cloud = [
 ]
 # A Postgres from pip: the catalog the chapters that run a fleet of servers share
 # (`chapters/distributed-training/`, `chapters/production/`), and the
-# database the federation chapter reads (`chapters/federation/`). Linux x86-64
-# and macOS only: pgserver
-# ships no Linux aarch64 wheel.
+# database the federation chapter reads (`chapters/federation/`). pgserver ships
+# no Linux aarch64 wheel, so the marker leaves it out there: the extra installs on
+# every host, and those chapters need Linux x86-64 or macOS to run.
 postgres = [
-    "pgserver>=0.1",
+    "pgserver>=0.1; sys_platform != 'linux' or platform_machine != 'aarch64'",
 ]
 # The OTLP trace protocol the operations chapter's in-process collector receives
 # spans with (`chapters/production/operations.qmd`).

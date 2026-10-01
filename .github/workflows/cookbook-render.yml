@@ -62,7 +62,7 @@ jobs:
       - name: Install the book (against the HEAD wheel)
         run: |
           . .venv/bin/activate
-          pip install -e 'cookbook/book[book,dev,postgres,otlp]'
+          pip install -e 'cookbook/book[book,dev]'
 
       - name: Render + execute the book
         # Every chapter runs live and fails on a measurement outside its frozen

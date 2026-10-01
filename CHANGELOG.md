@@ -28,7 +28,8 @@ every install instruction installs an engine that runs.
   the script's one-line docstring. Chapter directories drop their creation-order numbers (the
   order lives once, in `_quarto.yml`), four misleading slugs are renamed (`ann-recall`,
   `model-catalog`, `error-taxonomy`, `tenancy-per-verb`), and chapters no longer refer to each
-  other by number.
+  other by number. `jammi-cookbook[book]` installs everything rendering the whole book needs —
+  every extra a chapter imports from — and both render workflows install it.
 - **Every install instruction installs an engine that runs.** The quickstart, the guide, the
   README and the cookbook README told a newcomer to `pip install jammi-ai`, which installs the
   client alone, so `connect("file://…")` raised `NoEmbeddedEngineError`; they said the engine was

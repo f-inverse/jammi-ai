@@ -1,6 +1,6 @@
 # Quickstart: CLI
 
-> **Measured companion:** the [One program, four surfaces](https://f-inverse.github.io/jammi-ai/cookbook/chapters/28-surfaces/surfaces.html) chapter runs this CLI's `sources add` / `embed` / `search` beside Python, Rust and TypeScript and checks they return the same rows.
+> **Measured companion:** the [One program, four surfaces](https://f-inverse.github.io/jammi-ai/cookbook/chapters/surfaces/surfaces.html) chapter runs this CLI's `sources add` / `embed` / `search` beside Python, Rust and TypeScript and checks they return the same rows.
 
 The `jammi` CLI is a strict gRPC client: it talks to a running `jammi-server`
 over the wire and never touches the catalog or storage in-process. Start a

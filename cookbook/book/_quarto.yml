@@ -3,94 +3,94 @@ project:
   output-dir: _book
 
 book:
-  title: "The Theory↔Computation Cookbook"
-  subtitle: "Graph signal processing and the GNN canon, executed and measured on the jammi engine"
+  title: "The Jammi Cookbook"
+  subtitle: "Learn every Jammi capability by running it"
   author: "F-Inverse"
   search: true
   site-url: https://f-inverse.github.io/jammi-ai/cookbook/
   repo-url: https://github.com/f-inverse/jammi-ai
   chapters:
     - index.qmd
-    - chapters/datasets.qmd
-    - part: "Engine recipes & quickstart"
+    - part: "Start here"
       chapters:
-        - chapters/recipes-quickstart.qmd
-    - part: "The ogbn-arxiv keystone vertical"
+        - chapters/recipes/quickstart.qmd
+        - chapters/datasets.qmd
+    - part: "Search"
       chapters:
-        - chapters/01-construct/construct.qmd
-        - chapters/02-analyze/analyze.qmd
-        - chapters/03-learn/learn.qmd
-        - chapters/04-predict/predict.qmd
-    - part: "The fine-tuning methods vertical"
+        - chapters/retrieval/retrieval.qmd
+        - chapters/recipes/image_search.qmd
+        - chapters/recipes/audio_search.qmd
+        - chapters/recipes/cross_modal_search.qmd
+        - chapters/ann-recall/ann-recall.qmd
+        - chapters/segmented-ann/segmented-ann.qmd
+        - chapters/precision/precision.qmd
+        - chapters/precision/binary-precision.qmd
+        - chapters/precision/asymmetric-binary.qmd
+        - chapters/recipes/search_audit.qmd
+    - part: "Models and inference"
       chapters:
-        - chapters/08-finetune-methods/finetune-methods.qmd
-        - chapters/15-finetune-regression/finetune-regression.qmd
-    - part: "The rails and the closed eval loop"
+        - chapters/recipes/model_catalog.qmd
+        - chapters/model-catalog/model-catalog.qmd
+        - chapters/recipes/remote_model.qmd
+        - chapters/precision/compute-precision.qmd
+        - chapters/precision/quantized-weights.qmd
+        - chapters/fanout/fanout.qmd
+    - part: "Evaluation"
       chapters:
-        - chapters/05-rails/rails.qmd
-        - chapters/06-closed-loop/closed-loop.qmd
-    - part: "The bridge — theory, canon, and the citation map"
+        - chapters/recipes/eval_embeddings.qmd
+        - chapters/recipes/eval_inference.qmd
+        - chapters/recipes/eval_inference_ner.qmd
+        - chapters/eval-channels/eval-channels.qmd
+        - chapters/error-taxonomy/error-taxonomy.qmd
+        - chapters/calibration/calibration.qmd
+    - part: "Fine-tuning"
       chapters:
-        - chapters/07-bridge/bridge.qmd
-    - part: "Expansion verticals"
+        - chapters/recipes/fine_tune.qmd
+        - chapters/finetune-methods/finetune-methods.qmd
+        - chapters/finetune-regression/finetune-regression.qmd
+        - chapters/media-tower-lora/media-tower-lora.qmd
+        - chapters/precision/finetune-acceleration.qmd
+        - chapters/distributed-training/distributed-training.qmd
+    - part: "Graphs and prediction"
       chapters:
-        - chapters/08-conformal/conformal.qmd
-        - chapters/09-calibration/calibration.qmd
-        - chapters/10-retrieval/retrieval.qmd
-        - chapters/11-tenancy/tenancy.qmd
-        - chapters/18-tenancy-h3/tenancy-h3.qmd
-    - part: "Streaming & mutable state"
+        - chapters/recipes/graph_and_lineage.qmd
+        - chapters/recipes/context_predictor.qmd
+    - part: "Data that changes"
       chapters:
-        - chapters/12-feature-store/feature-store.qmd
-        - chapters/13-cdc/cdc.qmd
-    - part: "Evaluation and provenance channels"
+        - chapters/recipes/mutable_tables.qmd
+        - chapters/feature-store/feature-store.qmd
+        - chapters/recipes/trigger_streams.qmd
+        - chapters/cdc/cdc.qmd
+        - chapters/point-in-time/point-in-time.qmd
+        - chapters/recompute/recompute.qmd
+        - chapters/incremental-refresh/incremental-refresh.qmd
+        - chapters/recipes/session_lifecycle.qmd
+    - part: "Where data lives"
       chapters:
-        - chapters/14-eval-channels/eval-channels.qmd
-        - chapters/17-channels-taxonomy/channels-taxonomy.qmd
-    - part: "The model catalog"
+        - chapters/recipes/cloud_storage.qmd
+        - chapters/federation/federation.qmd
+    - part: "Running Jammi"
       chapters:
-        - chapters/16-lifecycle/lifecycle.qmd
-    - part: "Temporal correctness"
+        - chapters/unified-client/unified-client.qmd
+        - chapters/recipes/remote_session.qmd
+        - chapters/recipes/flight_sql.qmd
+        - chapters/recipes/compound_query.qmd
+        - chapters/surfaces/surfaces.qmd
+        - chapters/recipes/jobs.qmd
+        - chapters/tenancy/tenancy.qmd
+        - chapters/tenancy-per-verb/tenancy-per-verb.qmd
+        - chapters/production/production.qmd
+        - chapters/production/operations.qmd
+    - part: "Case study: graph machine learning on ogbn-arxiv"
       chapters:
-        - chapters/19-point-in-time/point-in-time.qmd
-    - part: "Temporal correctness — incremental recompute"
-      chapters:
-        - chapters/20-recompute/recompute.qmd
-    - part: "Incremental refresh — versioned embedding tables"
-      chapters:
-        - chapters/25-incremental-refresh/incremental-refresh.qmd
-    - part: "The scale-tier cross-check"
-      chapters:
-        - chapters/14-scale/scale.qmd
-    - part: "The unified client surface"
-      chapters:
-        - chapters/21-unified-client/unified-client.qmd
-        - chapters/28-surfaces/surfaces.qmd
-    - part: "Precision — storage and compute"
-      chapters:
-        - chapters/22-precision/precision.qmd
-        - chapters/22-precision/binary-precision.qmd
-        - chapters/22-precision/compute-precision.qmd
-        - chapters/22-precision/finetune-acceleration.qmd
-        - chapters/22-precision/asymmetric-binary.qmd
-        - chapters/22-precision/quantized-weights.qmd
-    - part: "The ANN index as a set of segments"
-      chapters:
-        - chapters/23-segmented-ann/segmented-ann.qmd
-    - part: "Real-checkpoint media-tower LoRA"
-      chapters:
-        - chapters/24-media-tower-lora/media-tower-lora.qmd
-    - part: "Fan-out inference"
-      chapters:
-        - chapters/26-fanout/fanout.qmd
-    - part: "Databases as sources"
-      chapters:
-        - chapters/30-federation/federation.qmd
-    - part: "Running jammi for real"
-      chapters:
-        - chapters/27-distributed-training/distributed-training.qmd
-        - chapters/29-production/production.qmd
-        - chapters/29-production/operations.qmd
+        - chapters/construct/construct.qmd
+        - chapters/analyze/analyze.qmd
+        - chapters/learn/learn.qmd
+        - chapters/predict/predict.qmd
+        - chapters/conformal/conformal.qmd
+        - chapters/rails/rails.qmd
+        - chapters/closed-loop/closed-loop.qmd
+        - chapters/bridge/bridge.qmd
   appendices:
     - chapters/api-reference.qmd
 

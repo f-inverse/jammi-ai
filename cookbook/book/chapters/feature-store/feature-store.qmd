@@ -1,0 +1,217 @@
+---
+title: "A mutable companion table — a feature store you federate into queries"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Verbs:** `create_mutable_table` · `list_mutable_tables` · `sql`
+(`INSERT` / `REPLACE INTO` / `UPDATE` / `DELETE` against `mutable.public.<name>`)
+· the federating `JOIN` · **Background:** the append-only result log vs mutable
+companion state [@kleppmann2017ddia], the feature store as the substrate that
+serves features into queries [@orr2021featurestore] · **Checked:** measurement (the
+feature table stays equal to the feature recomputed from its source, through
+every change).
+
+The engine's result tables are **append-only** — a query writes a new immutable
+Parquet result; nothing is edited in place. That is the right default for a
+result log [@kleppmann2017ddia]. A practitioner also needs the other half: a
+piece of *mutable companion state* keyed by an entity id — a feature column —
+that is kept current as its source changes and **federated into queries** by
+name. That state is what a feature store is [@orr2021featurestore], and the
+engine's primitive for it is the **mutable companion table**: provisioned with
+a schema and a primary key, changed with ordinary SQL DML, joined into any
+query.
+
+The feature here is real and graph-derived: each paper's **citation in-degree**
+— how many citations point *to* it. The chapter keeps that feature current
+through the two things that happen to a citation graph: new citations arrive,
+and a paper is withdrawn. After each change it checks the one property a feature
+store must hold — **the stored feature equals the feature recomputed from the
+source** — and measures the federated aggregate.
+
+```{python}
+import tempfile
+
+import jammi
+import pyarrow as pa
+from jammi_cookbook import contracts, datasets, scale
+
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+PAPERS = f"{arxiv.papers}.public.{arxiv.papers}"
+CITES = f"{arxiv.cites}.public.{arxiv.cites}"
+FEATURES = "mutable.public.paper_features"
+```
+
+## Provision the companion table
+
+A mutable table is provisioned with a `pyarrow` schema and a primary key, and
+addressed in SQL as `mutable.public.<name>`. `list_mutable_tables()` is the
+control-plane read of what is registered.
+
+```{python}
+db.create_mutable_table(
+    "paper_features",
+    schema=pa.schema([("paper_id", pa.string()), ("in_degree", pa.int64())]),
+    primary_key=["paper_id"],
+)
+for t in db.list_mutable_tables():
+    print(f"{t['id']}  primary_key={t['primary_key']}")
+```
+
+## Populate from the graph as it stood
+
+The feature is derived in SQL from the citation source. To have something to
+keep current, we first build it from the citations made **before the test era**
+— those whose citing paper was published before 2019 — and let the newer
+citations arrive in the next step.
+
+```{python}
+TEST_ERA = 2019
+
+
+def in_degree(where: str) -> str:
+    """The in-degree feature over the citations `where` selects."""
+    return (
+        f"SELECT c.dst AS paper_id, COUNT(*) AS in_degree FROM {CITES} c "
+        f"JOIN {PAPERS} src ON c.src = src.paper_id WHERE {where} GROUP BY c.dst"
+    )
+
+
+def count(statement: str) -> int:
+    return db.sql(statement).column("count")[0].as_py()
+
+
+populated = count(f"INSERT INTO {FEATURES} {in_degree(f'src.year < {TEST_ERA}')}")
+print(f"populated {populated} papers' in-degree from the pre-{TEST_ERA} citations")
+```
+
+## The one property: the store equals its source
+
+A feature store is only as good as its agreement with the data it summarizes.
+This check recomputes the feature from the citation source and compares it, row
+for row, with what the companion table holds — both sides in SQL, federated in
+one query.
+
+```{python}
+def drift(live: str) -> int:
+    """Rows where the stored feature and the feature recomputed over `live` disagree."""
+    return db.sql(
+        f"SELECT COUNT(*) AS n FROM {FEATURES} f "
+        f"FULL OUTER JOIN ({in_degree(live)}) s ON f.paper_id = s.paper_id "
+        f"WHERE COALESCE(f.in_degree, 0) <> COALESCE(s.in_degree, 0)"
+    ).column("n")[0].as_py()
+
+
+print(f"drift against the pre-{TEST_ERA} graph: {drift(f'src.year < {TEST_ERA}')}")
+```
+
+```{python}
+# | echo: false
+assert drift(f"src.year < {TEST_ERA}") == 0
+```
+
+## New citations arrive — `REPLACE INTO`
+
+The test-era papers are published, and their citations arrive. Only the papers
+they cite need a new value; `REPLACE INTO` upserts by primary key — an existing
+paper's row is replaced with its new in-degree, a newly-cited paper's row is
+inserted.
+
+```{python}
+touched = (
+    f"c.dst IN (SELECT c2.dst FROM {CITES} c2 JOIN {PAPERS} p2 ON c2.src = p2.paper_id "
+    f"WHERE p2.year >= {TEST_ERA})"
+)
+upserted = count(f"REPLACE INTO {FEATURES} {in_degree(touched)}")
+print(f"upserted {upserted} papers; drift against the full graph: {drift('TRUE')}")
+```
+
+```{python}
+# | echo: false
+assert drift("TRUE") == 0
+```
+
+## A paper is withdrawn — `UPDATE` and `DELETE`
+
+When a paper is withdrawn, two things change: the papers it cited each lose one
+citation (`UPDATE`), and its own feature row goes (`DELETE`). We withdraw the
+test-era paper that cites the most others.
+
+An `UPDATE` or `DELETE` chooses its rows with any predicate a query could use,
+including a subquery over another relation: the statement's own plan selects
+the rows, and the table rewrites exactly those, in one transaction. The papers
+the withdrawn one cited are a subquery over the citation graph.
+
+```{python}
+withdrawn = db.sql(
+    f"SELECT c.src FROM {CITES} c JOIN {PAPERS} p ON c.src = p.paper_id "
+    f"WHERE p.year >= {TEST_ERA} GROUP BY c.src ORDER BY COUNT(*) DESC, c.src LIMIT 1"
+).column("src")[0].as_py()
+
+decremented = count(
+    f"UPDATE {FEATURES} SET in_degree = in_degree - 1 "
+    f"WHERE paper_id IN (SELECT dst FROM {CITES} WHERE src = '{withdrawn}')"
+)
+deleted = count(f"DELETE FROM {FEATURES} WHERE paper_id = '{withdrawn}'")
+survivors = f"c.src <> '{withdrawn}' AND c.dst <> '{withdrawn}'"
+print(f"withdrew {withdrawn}: {decremented} papers lost a citation, {deleted} row deleted")
+print(f"drift against the surviving graph: {drift(survivors)}")
+```
+
+```{python}
+# | echo: false
+assert drift(survivors) == 0
+contracts.assert_close("feature_store.populated_rows", populated)
+contracts.assert_close("feature_store.upserted_rows", upserted)
+contracts.assert_close("feature_store.withdrawn_citations", decremented)
+```
+
+## Federate the feature into a query
+
+The payoff: the companion table JOINs into a query over the registered papers
+source like any other table. The total citation in-degree per subject:
+
+```{python}
+agg = db.sql(
+    f"SELECT p.subject AS subject, SUM(f.in_degree) AS total FROM {PAPERS} p "
+    f"JOIN {FEATURES} f ON p.paper_id = f.paper_id "
+    "GROUP BY p.subject ORDER BY total DESC, subject"
+).to_pylist()
+total = sum(r["total"] for r in agg)
+edges = db.sql(f"SELECT COUNT(*) AS n FROM {CITES} c WHERE {survivors}").column("n")[0].as_py()
+for r in agg[:6]:
+    print(f"{r['subject']:<16}{r['total']:>8}")
+print(f"\n{len(agg)} subjects · total in-degree {total} · surviving citations {edges}")
+```
+
+```{python}
+# | echo: false
+assert total == edges  # every surviving citation is counted exactly once
+contracts.assert_close("feature_store.total_in_degree", total)
+contracts.assert_close("feature_store.top_subject_total", agg[0]["total"])
+```
+
+The subject totals sum back to the surviving citation count: each citation
+contributes one unit of in-degree to the paper it cites, and every change —
+the arrival, the withdrawal — kept that true.
+
+```{python}
+db.close()
+```
+
+## Bridge note
+
+> **A result log and a feature store are two sides of one storage primitive.**
+> The engine writes query results as an **append-only** log of immutable
+> Parquet — the right default for derived results [@kleppmann2017ddia]. A
+> **mutable companion table** is the complement: registered state keyed by an
+> entity id, kept current with `REPLACE INTO` / `UPDATE` / `DELETE`, and
+> **federated** into queries by name — the role a feature store plays
+> [@orr2021featurestore]. The measured lesson is the feature store's one
+> obligation: after every change, the stored feature equals the feature
+> recomputed from its source.

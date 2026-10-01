@@ -1,0 +1,201 @@
+---
+title: "Provenance, tenancy and measurement through the pipeline"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+The book is a 4-tier × 3-rail grid. The four tiers — **Construct → Analyze →
+Learn → Predict & Quantify** — are the rows you have already walked. The three
+**rails** are the columns: properties every tier carries, not chapters of their
+own. This chapter makes them first-class and works each one end to end.
+
+- **Provenance** — a result rides its audit trail: the `source` fact (how its
+  context was assembled) and the `context_ref` member keys (which rows informed
+  it).
+- **Tenancy** — the engine isolates by tenant at two genuine layers, with one
+  honest caveat.
+- **Measurement** — every recipe ends in a real number, measured live and
+  checked against a frozen golden. A recipe without a measured verdict is not
+  done.
+
+```{python}
+import tempfile
+
+import jammi
+from jammi_cookbook import contracts, datasets, keystone, rails, scale
+
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+embeddings = keystone.embed(db, arxiv, SCALE)
+```
+
+## Rail 1 — Provenance: the exact rows behind a prediction
+
+A prediction here is **auditable**. `predict_with_context_predictor` returns a
+`source` fact — `ann` (the context came from embedding similarity), `edges` (a
+declared graph), or `hybrid` (both) — and a `context_ref`: the keys of the rows
+that informed it. `rails.provenance(result)` extracts that trail.
+
+We train tier 04's year predictor and ask for one paper's year conditioned on
+its citation neighbourhood:
+
+```{python}
+predictor = keystone.train_year_predictor(db, arxiv, SCALE, embeddings)
+target = arxiv.split["test"][0]
+result = db.predict_with_context_predictor(
+    predictor, source=arxiv.papers, target_key=target,
+    edge_source=arxiv.cites, edge_src_column="src", edge_dst_column="dst",
+    edge_direction="out", edge_hops=2,
+)
+trail = rails.provenance(result)
+print(f"prediction:  {result['mean']:.1f} ± {result['std']:.2f}")
+print(f"source:      {trail['source']}")
+print(f"context_ref: {trail['context_ref'][:6]}{' …' if len(trail['context_ref']) > 6 else ''}")
+```
+
+The trail is queryable. The informing rows read back as papers, with their
+subjects — the fact a monograph proof and a throwaway notebook both lack:
+
+```{python}
+keys = ", ".join(f"'{k}'" for k in [target, *trail["context_ref"]])
+rows = db.sql(
+    f"SELECT paper_id, subject, year FROM {arxiv.papers}.public.{arxiv.papers} "
+    f"WHERE paper_id IN ({keys})"
+).to_pylist()
+by_id = {r["paper_id"]: r for r in rows}
+print(f"target {target}: {by_id[target]['subject']}, {by_id[target]['year']}")
+same = sum(by_id[k]["subject"] == by_id[target]["subject"] for k in trail["context_ref"])
+print(f"informing papers sharing its subject: {same}/{len(trail['context_ref'])}")
+for k in trail["context_ref"][:5]:
+    print(f"  {k}  {by_id[k]['subject']}  {by_id[k]['year']}")
+```
+
+```{python}
+# | echo: false
+assert trail["source"] == "edges"
+assert trail["context_ref"] and all(k in by_id for k in trail["context_ref"])
+```
+
+> **Bridge note.** Provenance as a first-class, queryable property of *every*
+> result is what neither the monograph (a paper, not a queryable object) nor a
+> throwaway PyG notebook (results discarded after the run) carries. A prediction
+> here is an audited object: you can see the assembly that produced it and the
+> exact rows that informed it.
+
+## Rail 2 — Tenancy: what the engine isolates, and what it does not
+
+The engine's model has **two genuine isolation layers and one honest caveat**
+(the full showcase is on the Air Routes on-ramp in tier 01):
+
+- **Catalog-listing isolation (a hard zero).** `set_tenant(t)` binds an opaque
+  tenant UUID to the connection; `list_sources` filters the registry to
+  `tenant_id = $cur OR IS NULL`. `rails.assert_listing_isolated` is the oracle.
+- **Row-level discriminator-column isolation (a hard zero).** The analyzer
+  injects `tenant_id = $cur OR IS NULL` onto a `TableScan` **only** when the
+  table's schema carries a `tenant_id` column. `rails.assert_rows_isolated` is
+  the oracle.
+- **The caveat.** A discriminator-less source is **globally readable** — no
+  column to filter on, and the engine does not authenticate. Access-gating
+  lives *above* the engine.
+
+Here the two layers run over the papers, split by era between two tenants:
+
+```{python}
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+TENANT_A = "33333333-3333-3333-3333-333333333333"
+TENANT_B = "44444444-4444-4444-4444-444444444444"
+early, late = arxiv.split["train"] + arxiv.split["valid"], arxiv.split["test"]
+work = tempfile.mkdtemp()
+
+
+def register(name: str, table: pa.Table) -> None:
+    path = f"{work}/{name}.parquet"
+    pq.write_table(table, path)
+    db.add_source(name, url=path, format="parquet")
+
+
+with rails.tenant(db, TENANT_B):
+    register("late_papers", pa.table({"paper_id": late}))
+with rails.tenant(db, TENANT_A):
+    listed = [s["source_id"] for s in db.list_sources()]
+with rails.tenant(db, ""):
+    register("tagged_papers", pa.table({
+        "paper_id": early + late,
+        "tenant_id": [TENANT_A] * len(early) + [TENANT_B] * len(late),
+    }))
+with rails.tenant(db, TENANT_A):
+    seen = [r["paper_id"] for r in db.sql(
+        "SELECT paper_id FROM tagged_papers.public.tagged_papers").to_pylist()]
+
+rails.assert_listing_isolated(listed, {"late_papers"}, tenant_id=TENANT_A)
+rails.assert_rows_isolated(seen, set(late), tenant_id=TENANT_A)
+print(f"A's listing includes B's source: {'late_papers' in listed}")
+print(f"A reads {len(seen)} of the shared source's {len(early) + len(late)} rows "
+      f"(its own {len(early)})")
+```
+
+```{python}
+# | echo: false
+assert sorted(seen) == sorted(early)
+```
+
+> **Bridge note.** The monograph and the graph-conformal literature assume a
+> single global graph; tenancy is the axis they are silent on. Two layers are
+> *substrate* properties; the caveat says cross-tenant data isolation is a
+> property you opt into (a discriminator column) or gate above (an
+> interceptor), not a blanket guarantee.
+
+## Rail 3 — Measurement: a measured verdict or it is not done
+
+Every recipe ends in a real number, measured by the cells that just ran and
+checked against a frozen golden: `contracts.assert_close(metric, observed)`
+reads the golden for the running scale (`goldens/<dataset>.<scale>.json`, or
+`goldens/<dataset>.json` for a dataset whose numbers do not depend on scale)
+and asserts `observed` within its tolerance, returning the number so a cell
+checks and displays at once.
+
+A golden is never typed in. It is what a run measured: with
+`JAMMI_COOKBOOK_FREEZE=1` set, `assert_close` records instead of checking, so
+re-freezing after a deliberate change is running the chapter once and reviewing
+the diff.
+
+The engine does the measuring too. Tier 01's same-subject retrieval number,
+here, is the engine's own `eval_embeddings`: it encodes each golden query with
+the model that produced the table, searches the table, and scores the result.
+
+```{python}
+golden = keystone.subject_golden(db, arxiv)
+report = db.eval_embeddings(
+    source=arxiv.papers, embedding_table=embeddings, golden_source=golden, k=10
+)
+precision = contracts.assert_close(
+    "arxiv.tier01.precision_at_10", report["aggregate"]["precision_at_k"]
+)
+print(f"tier01 precision@10: {precision:.3f}  (frozen at "
+      f"{contracts.golden('arxiv.tier01.precision_at_10').value:.3f})")
+```
+
+Each run is also persisted: `eval_per_query` reads back the run's per-query
+records by its `eval_run_id`, so a measured number can be audited query by
+query.
+
+```{python}
+per_query = db.eval_per_query(report["eval_run_id"])
+worst = min(per_query, key=lambda q: q["metrics"]["ndcg"])
+print(f"{len(per_query)} queries recorded; the weakest: {worst['query_id']} "
+      f"(ndcg {worst['metrics']['ndcg']:.3f})")
+```
+
+The measurement rail is the spine's honesty contract: a recipe whose number
+drifts from its golden **fails CI**. The closed eval loop (next chapter) runs
+the whole spine under that contract in one pass.
+
+```{python}
+db.close()
+```

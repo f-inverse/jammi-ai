@@ -1,0 +1,275 @@
+---
+title: "The theory behind each step"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook  # applies the determinism contract before any heavy import
+```
+
+The book's thesis, made explicit: **one Jammi recipe is one equation in the
+monograph and one line in the GNN/conformal canon.** The verticals carried short
+bridge notes; this chapter writes the full bridge — four signature chapters that
+each take one operation and show it is the *same object at three altitudes*, then
+run it live; the Neptune-contrast framing; and the **verified
+citation map** that pins every recipe to its sources.
+
+Every signature below runs its call live and checks what it measured against
+the golden its tier's chapter froze — at `small` scale in seconds on a CPU, at
+`full` scale over the data the findings are about.
+
+```{python}
+import tempfile
+
+import jammi
+import numpy as np
+from jammi_cookbook import contracts, datasets, keystone, scale
+
+SCALE = scale.current()
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+golden = keystone.subject_golden(db, arxiv)
+embeddings = keystone.embed(db, arxiv, SCALE)
+```
+
+## Signature 1 — Propagation = low-pass graph filter = SGC/APPNP = vector-agg
+
+The headline equivalence. **One equation, three names, one call.**
+
+- **Monograph (Stanković et al. Part II [@stankovic2019gsp2]).** A graph signal is
+  filtered in the graph-spectral domain; smoothing toward neighbours is a
+  **low-pass filter** — it attenuates the high-frequency (idiosyncratic per-node)
+  component and keeps the low-frequency (shared-cluster) component.
+- **GNN canon.** That filter *is* a decoupled propagation layer. The `weighting`
+  argument is the choice of filter:
+  - `weighting="uniform"` = the random-walk operator $\tilde{D}^{-1}\tilde{A}$ —
+    **SGC**-flavoured [@wu2019sgc];
+  - `weighting="degree_normalized"` + `alpha` = symmetric-normalized propagation
+    with a teleport restart, $(1-\alpha)\hat{A}\,H + \alpha\,X^{(0)}$ — this is
+    **APPNP** [@gasteiger2019appnp];
+  - `output="jumping_knowledge"` = stacking (concatenating) the filtered signal at
+    every hop.
+- **Jammi call.** `propagate_embeddings` — and it is **byte-identically
+  deterministic** by construction: a fixed `(group, neighbour)` f64 fold order, no
+  seeding, identical across threads. The reproducible point on the
+  construct→learn spectrum.
+
+We *demonstrate* the equivalence, not assert it: the APPNP filter
+(`degree_normalized` + `alpha`) over the citation graph, measured downstream —
+same-subject retrieval precision.
+
+```{python}
+propagated = keystone.propagate(db, arxiv, embeddings)
+compared = db.eval_compare(
+    embedding_tables=[embeddings, propagated], source=arxiv.papers, golden_source=golden, k=10
+)
+raw, prop = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
+contracts.assert_close("arxiv.tier02.precision_at_10", prop)
+print(f"precision@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {prop - raw:+.3f})")
+```
+
+## Signature 2 — An edge is a self-`search`; a context set is a `search`/walk
+
+Retrieval is the substrate of *both* graphs and prediction.
+
+- **Monograph (Part I [@stankovic2019gsp1]).** A kNN graph is built by, for every
+  node, retrieving its nearest nodes — graph construction *is* retrieval.
+- **GNN canon / Neural Process.** A prediction's context set is the same retrieval:
+  the rows a Neural Process conditions on are a `search`/walk over the graph
+  [@garnelo2018cnp]. The propagated embedding *is* that graph-conditioned context
+  in vector form.
+- **Jammi calls.** `build_neighbor_graph` (the self-kNN edge) and
+  `assemble_context` (the retrieval-conditioned context set) are the same retrieval
+  primitive at two altitudes.
+
+The derived neighbor graph is exactly this self-search: each edge records the
+retrieval that produced it — its `similarity` and its `rank` among the source
+row's neighbours — and a paper's edges are its top `search` hits.
+
+```{python}
+graph = db.build_neighbor_graph(arxiv.papers, embedding_table=embeddings, k=10, exact=True)
+edges = db.sql(f'SELECT src, dst, rank, similarity FROM "jammi.{graph}" ORDER BY src, rank')
+first = edges.slice(0, 3).to_pylist()
+print(f"self-kNN edges: {edges.num_rows}")
+for edge in first:
+    print(f"  {edge['src']} → {edge['dst']}  rank {edge['rank']}  similarity {edge['similarity']:.3f}")
+```
+
+```{python}
+# | echo: false
+assert {"src", "dst", "rank", "similarity"} <= set(edges.column_names)
+assert [e["rank"] for e in first] == sorted(e["rank"] for e in first)
+```
+
+## Signature 3 — Graph-supervised metric learning = contrastive fine-tune over walks
+
+- **Monograph (Part III [@stankovic2020gsp3]).** Learning node representations from
+  graph topology — the machine-learning-on-graphs part.
+- **GNN canon.** node2vec / DeepWalk's skip-gram over biased random walks
+  [@grover2016node2vec], and the inductive aggregate-over-neighbours of GraphSAGE
+  [@hamilton2017graphsage]. The walk sampler turns the graph into positive pairs;
+  the contrastive loss is the objective. Citation-graph contrastive supervision is
+  SPECTER [@cohan2020specter]; nearest-neighbor-of-own-representations contrastive
+  learning is NNCLR [@dwibedi2021nnclr], which works via homophily, not circularity;
+  SciNCL [@ostendorff2022scincl] augments citation embeddings with exactly this kind
+  of k-NN self-similarity graph.
+- **Jammi call.** `fine_tune_graph` — the `edge_provenance` knob names *which*
+  graph supervises the metric: `"declared"` (who-cited-whom, external to the
+  embedding metric) versus `"similarity"` (the k-NN-of-own-embeddings graph,
+  drawn *by* the metric). The two are not equally informative, but neither is the
+  similarity graph a no-op — see the measurement below.
+
+The declared-graph fine-tune, measured against the base encoder (tier 03 runs
+the similarity and random controls beside it; at `full` scale the ordering is
+random < base < similarity < declared):
+
+```{python}
+tuned = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
+    epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
+)
+ft_compared = db.eval_compare(
+    embedding_tables=[embeddings, tuned], source=arxiv.papers, golden_source=golden, k=10
+)
+ft = ft_compared["per_table"][1]["embedding_eval"]["aggregate"]["precision_at_k"]
+contracts.assert_close("arxiv.tier03.declared_precision_at_10", ft)
+print(f"precision@10 base → declared-edge fine-tune: {raw:.3f} → {ft:.3f}")
+```
+
+## Signature 4 — A prediction is a context-conditioned posterior (the moat)
+
+The tier with **no monograph and no Neptune analogue** — the non-redundant core.
+
+- **The Neural-Process family.** The context predictor is a CNP/ANP
+  [@garnelo2018cnp; @kim2019anp] — and the amortized-tabular-prediction line
+  (TabPFN [@hollmann2022tabpfn]). It returns a *posterior* conditioned on a
+  retrieved context set.
+- **Conformal under graph dependence.** Conformal gives finite-sample coverage
+  *under exchangeability* (Vovk et al. [@vovk2005conformal]; Angelopoulos & Bates
+  [@angelopoulos2021conformal]). Under graph dependence and a time-split that
+  coverage can break (Barber et al. [@barber2023beyond]); the graph-aware remedies are
+  CF-GNN [@huang2023cfgnn] and NAPS [@clarkson2023naps], and the covariate-shift
+  remedy is weighted conformal (Tibshirani et al. [@tibshirani2019covariateshift]).
+- **Jammi calls.** `train_context_predictor` / `predict_with_context_predictor` →
+  `conformalize` / `conformalize_interval`.
+
+This is the crux the [tier-04 chapter](../predict/predict.qmd) works in full.
+The signature here is the moat's worked example: the predictor fits a real
+posterior, and under the time-split the regression interval under-covers — the
+test era's residuals run past anything the calibration era holds, so weighted
+conformal cannot repair it — while the classification set holds its coverage,
+the shift being orthogonal to its score.
+
+```{python}
+predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
+year = {
+    r["paper_id"]: r["year"]
+    for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
+}
+cal_ids, test_ids = arxiv.split["valid"], arxiv.split["test"]
+cal_mean, _ = keystone.predict_years(db, arxiv, predictor, cal_ids)
+test_mean, _ = keystone.predict_years(db, arxiv, predictor, test_ids)
+intervals = db.conformalize_interval(
+    cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=0.10
+)
+reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
+contracts.assert_close("arxiv.tier04.reg_cal_mean", float(np.mean(cal_mean)))
+contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
+print(f"posterior mean (cal era):      {np.mean(cal_mean):.2f}   (a real fit, no collapse)")
+print(f"regression interval coverage:  {reg_cov:.3f}   (nominal 0.90)")
+```
+
+```{python}
+# | echo: false
+if SCALE is scale.Scale.FULL:
+    assert reg_cov < 0.80  # the time-split break, at the scale it is about
+```
+
+## The Neptune-contrast framing
+
+The book's organizing conceit. Amazon Neptune is **Database / Analytics / ML**;
+this cookbook is **Construct / Analyze / Learn / Predict & Quantify** — the same
+"unified yet separate" spine, re-expressed as runnable Jammi computation, **plus a
+fourth tier Neptune structurally lacks**: calibrated, provenance-stamped,
+context-conditioned prediction.
+
+Stated plainly:
+
+- **Tiers 01–03 are roughly Neptune-parity (commodity).** Neptune *loads* a graph
+  and runs `CALL neptune.algo.*` (pageRank / degree / wcc) over it; Jammi
+  *constructs* the similarity graph from text **and** registers the declared graph
+  beside it, then propagates and learns over it. Same operations, expressed as
+  substrate computation. Neptune uses **Air Routes** for its queries/algorithms —
+  so does this cookbook's on-ramp.
+- **Tier 04 + bring-your-own-graph is the non-redundant core.** A graph-conditioned
+  prediction with an honest, audited coverage guarantee has **no Neptune analogue**.
+  Neptune switches datasets when it reaches ML — and so do we, to **ogbn-arxiv**,
+  for a credible learn/predict tier; the Air Routes on-ramp stops at tier 02 (its
+  label is near-deterministic from lat/lon, too thin for a learn tier).
+
+(Neptune is a public product named here only as a *contrast*; it is a competitor's
+product, not a Jammi consumer — the engine names no consumer.)
+
+## The verified citation map
+
+Every citation below was **independently verified** (author / year / venue)
+against the primary source — not trusted from a secondary summary. Each is backed by a `references.bib` entry, and a test
+(`tests/test_citation_map.py`) asserts that every row's Jammi call is a verb that
+actually exists in the grounded API reference and that no `@cite` dangles. The
+table renders from the same `citation_map` data the test checks, so the rendered
+map and the asserted map cannot diverge.
+
+```{python}
+# | echo: false
+from IPython.display import Markdown
+
+from jammi_cookbook.citation_map import CITATION_MAP
+
+lines = ["| Recipe | Monograph (Stanković et al.) | GNN / conformal canon | Jammi call |",
+         "|---|---|---|---|"]
+for row in CITATION_MAP:
+    lines.append(f"| {row.recipe} | {row.monograph} | {row.canon} | `{row.jammi_call}` |")
+Markdown("\n".join(lines))
+```
+
+```{python}
+# | echo: false
+# The citation map is the source of truth the verticals' bridge notes cite. This
+# cell checks its two rigor contracts, so the chapter itself fails on a dangling
+# citation or a non-existent verb.
+from jammi_cookbook.citation_map import unresolved
+
+_problems = unresolved()
+assert not _problems, "\n".join(_problems)
+print(f"citation map: {len(CITATION_MAP)} rows, every reference resolved, "
+      f"every Jammi call exists on the pinned engine ✓")
+```
+
+```{python}
+db.close()
+```
+
+### Verification notes — three citations that are easy to get wrong
+
+Three citations in this map are commonly given loosely; the `references.bib`
+entries carry the verified facts:
+
+- **APPNP authorship.** It is often attributed to "Klicpera 2019". The author
+  Johannes **Klicpera later changed his name to Johannes Gasteiger**; the canonical
+  attribution is **Gasteiger, Bojchevski & Günnemann, ICLR 2019** ("Predict then
+  Propagate", arXiv 2018). The bib cites Gasteiger with the name-change noted.
+- **Barber et al. 2023 is a journal paper, not a preprint.** "Conformal prediction
+  beyond exchangeability" appeared in **The Annals of Statistics 51(2):816–845
+  (2023)** — Barber, Candès, Ramdas & Tibshirani. Pinned to the journal.
+- **Angelopoulos & Bates 2021 and TabPFN 2022 are arXiv-year citations with later
+  formal venues.** Angelopoulos & Bates (arXiv 2021) was published in *Foundations
+  and Trends in ML* 16(4), **2023**; TabPFN (Hollmann et al., arXiv 2022) was
+  published at **ICLR 2023**. Both are cited by their arXiv year with the formal
+  venue recorded in the bib `note`.
+
+The remaining canon held exactly as cited: SGC (Wu et al., ICML 2019), node2vec
+(Grover & Leskovec, KDD 2016), GraphSAGE (Hamilton et al., NeurIPS 2017), CNP
+(Garnelo et al., ICML 2018), ANP (Kim et al., ICLR 2019), Vovk et al. (Springer
+2005), Tibshirani et al. (NeurIPS 2019), CF-GNN (Huang et al., NeurIPS 2023), NAPS
+(Clarkson, ICML 2023), and the three Stanković et al. monograph parts (arXiv
+1907.03467 / 1909.10325 / 2001.00426, 2019–2020).

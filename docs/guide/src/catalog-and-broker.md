@@ -1,6 +1,6 @@
 # Catalog Backend and Trigger Broker
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/production.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/production/production.html).
 
 Jammi's catalog (models, sources, eval runs, mutable companion tables) and
 trigger broker (provenance channels, evidence streams) are selected through

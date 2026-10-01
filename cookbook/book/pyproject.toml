@@ -35,15 +35,15 @@ cloud = [
     "moto[server]>=5",
 ]
 # A Postgres from pip: the catalog the chapters that run a fleet of servers share
-# (`chapters/27-distributed-training/`, `chapters/29-production/`), and the
-# database the federation chapter reads (`chapters/30-federation/`). Linux x86-64
+# (`chapters/distributed-training/`, `chapters/production/`), and the
+# database the federation chapter reads (`chapters/federation/`). Linux x86-64
 # and macOS only: pgserver
 # ships no Linux aarch64 wheel.
 postgres = [
     "pgserver>=0.1",
 ]
 # The OTLP trace protocol the operations chapter's in-process collector receives
-# spans with (`chapters/29-production/operations.qmd`).
+# spans with (`chapters/production/operations.qmd`).
 otlp = [
     "opentelemetry-proto>=1.20",
 ]

@@ -13,8 +13,29 @@ release tag the way a reader does — a fresh runtime, the setup cell installing
 the release from PyPI — nightly on a CPU and after a release on a GPU. Its first
 run found nine notebooks that failed for a reader at 0.51.0 — seven on every
 runtime, two only on a GPU; each is fixed, and the causes are now refused by tests
-and guards.
+and guards. The cookbook itself becomes one learning path for a newcomer, and
+every install instruction installs an engine that runs.
 
+- **The cookbook is one learning path for a newcomer.** The book was a companion to a
+  graph-signal-processing monograph whose chapters were numbered in the order they were written;
+  the basics a newcomer needs first — install, connect, register a source, embed, search — were
+  not in it, and the recipes lived outside it behind a page of GitHub links. The book now opens
+  with what Jammi is and how to run a chapter, and reads start here → search → models and
+  inference → evaluation → fine-tuning → graphs and prediction → data that changes → where data
+  lives → running Jammi, with the ogbn-arxiv graph-ML pipeline as a closing case study. Every
+  recipe is a book chapter, generated from its README and script by
+  `scripts/build_notebooks.py`, and its notebook carries the README's explanation in place of
+  the script's one-line docstring. Chapter directories drop their creation-order numbers (the
+  order lives once, in `_quarto.yml`), four misleading slugs are renamed (`ann-recall`,
+  `model-catalog`, `error-taxonomy`, `tenancy-per-verb`), and chapters no longer refer to each
+  other by number.
+- **Every install instruction installs an engine that runs.** The quickstart, the guide, the
+  README and the cookbook README told a newcomer to `pip install jammi-ai`, which installs the
+  client alone, so `connect("file://…")` raised `NoEmbeddedEngineError`; they said the engine was
+  CPU-only, the README pointed engine-free installs at `jammi-client` (a dist last published at
+  0.33.0), and the guide claimed Windows wheels and Python 3.8. They now say
+  `pip install "jammi-ai[embedded]"`, `jammi-ai-native-cu12` for an NVIDIA GPU, and the
+  platforms the wheels are built for.
 - **The federation chapter's MariaDB helper does not take MySQL for MariaDB.** On a host with
   MySQL installed, its `mysqld` passed the helper's check, the MariaDB install was skipped, and no
   `mariadb-install-db` existed to initialise a data directory: the chapter failed with a `TypeError`.

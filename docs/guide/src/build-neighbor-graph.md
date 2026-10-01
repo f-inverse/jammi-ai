@@ -1,6 +1,6 @@
 # Building a similarity graph
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Constructing the Graph](https://f-inverse.github.io/jammi-ai/cookbook/chapters/01-construct/construct.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Constructing the Graph](https://f-inverse.github.io/jammi-ai/cookbook/chapters/construct/construct.html).
 
 `build_neighbor_graph` materializes the **k-nearest-neighbour graph** of an
 existing embedding table: for every row it finds the `k` most similar rows

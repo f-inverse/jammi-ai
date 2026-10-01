@@ -1,6 +1,6 @@
 # Train an In-Context Predictor (Amortized, Adapts Without Retraining)
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Context-Conditioned Prediction](https://f-inverse.github.io/jammi-ai/cookbook/chapters/04-predict/predict.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Context-Conditioned Prediction](https://f-inverse.github.io/jammi-ai/cookbook/chapters/predict/predict.html).
 
 An **in-context predictor** meta-learns to turn a *context set* — a target's
 retrieved neighbours and their outcomes — into a predictive distribution, in one

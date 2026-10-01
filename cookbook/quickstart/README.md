@@ -1,13 +1,13 @@
 # 5-minute quickstart
 
-Goal: a fresh user goes from `pip install jammi-ai` to a successful vector
-query in five minutes. The end-to-end script lives next to this file in
+Goal: a fresh user goes from `pip install "jammi-ai[embedded]"` to a
+successful vector query in five minutes. The end-to-end script lives next to this file in
 [`quickstart.py`](./quickstart.py) — copy-paste it, run it, then read the
 four step-by-step pages for the explanation.
 
 ## Steps
 
-1. [Install](./01_install.md) — `pip install jammi-ai`
+1. [Install](./01_install.md) — `pip install "jammi-ai[embedded]"`
 2. [Connect](./02_connect.md) — open a session against a local artifact dir
 3. [Register a source](./03_register_source.md) — attach a Parquet file
 4. [Generate embeddings + search](./04_vector_search.md) — build a vector

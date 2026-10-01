@@ -1,6 +1,6 @@
 # Scope a Session to a Tenant
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Tenancy](https://f-inverse.github.io/jammi-ai/cookbook/chapters/11-tenancy/tenancy.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Tenancy](https://f-inverse.github.io/jammi-ai/cookbook/chapters/tenancy/tenancy.html).
 
 When more than one logical tenant shares a Jammi engine — a SaaS feature
 store serving two ML teams, a research workbench shared across three labs,

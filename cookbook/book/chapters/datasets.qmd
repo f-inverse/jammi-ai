@@ -110,7 +110,7 @@ The citation graph is **homophilous** on the subject label: a paper cites
 papers of its own subject more often than the subject mix alone would give —
 the chance level is the probability that two papers drawn at random share a
 subject, $\sum_s p_s^2$. That correlation, together with the time split, is
-what later breaks conformal exchangeability (tier 04).
+what later breaks conformal exchangeability ([the prediction chapter](predict/predict.qmd)).
 
 ```{python}
 edges = db.sql(

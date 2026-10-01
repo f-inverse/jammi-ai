@@ -1,30 +1,22 @@
-# The Theory↔Computation Cookbook
+# The Jammi Cookbook
 
-A **runnable book** that bridges *applied theory* — Stanković et al.'s *Data
-Analytics on Graphs* (Foundations & Trends in ML, 2020) and the modern GNN canon
-— with *software and computation*: the [`jammi`](https://pypi.org/project/jammi-ai/)
-engine. The signature move of every recipe: **one Jammi recipe = one equation in
-the monograph = one line in the GNN canon**, executed and measured.
-
-It reads as **4 tiers × 3 rails**, echoing AWS Neptune's Database / Analytics /
-ML split and adding a fourth tier Neptune structurally lacks — calibrated,
-provenance-stamped, context-conditioned prediction:
-
-| Tier | Recipe | Theory |
-|---|---|---|
-| 01 Construct | `build_neighbor_graph` | topology from data (Part I) |
-| 02 Analyze | `propagate_embeddings` | graph signal processing = SGC/APPNP (Part II) |
-| 03 Learn | `fine_tune_graph` | representation learning on graphs (Part III) |
-| 04 Predict & Quantify | `train_context_predictor` + conformal | context-conditioned posterior + honest coverage |
-
-Rails woven through every tier: **provenance**, **tenancy**, **measurement**.
+Learn every Jammi capability by running it. The book is a learning path —
+start here, search, models and inference, evaluation, fine-tuning, graphs and
+prediction, data that changes, where data lives, running Jammi — and ends in a
+case study that puts the pieces together for graph machine learning on
+ogbn-arxiv. Every chapter is code that runs and checks what it measured; every
+recipe under `cookbook/recipes/` is a chapter too. The rendered book:
+<https://f-inverse.github.io/jammi-ai/cookbook/>.
 
 ## Repository layout
 
 ```
 jammi_cookbook/   the shared lib: datasets, encoders, frozen goldens, rails
   goldens/        the frozen measurements, one file per dataset and scale
-chapters/         the book (Quarto .qmd with executable Python cells)
+chapters/         the book (Quarto .qmd with executable Python cells); its order lives
+                  in _quarto.yml
+  recipes/        the recipes as chapters, generated from cookbook/recipes and
+                  cookbook/quickstart by scripts/build_notebooks.py
 scripts/          the API-reference, citation and no-deferral guards
 tests/            the lib's unit tests
 ```
@@ -64,7 +56,7 @@ cd cookbook/book
 python scripts/check_api_reference.py      # confirm the API reference matches the wheel
 pytest                                     # lib unit tests
 quarto render                              # run every chapter at `small` scale
-JAMMI_COOKBOOK_SCALE=full quarto render chapters/03-learn/learn.qmd   # one chapter at `full`, on a GPU
+JAMMI_COOKBOOK_SCALE=full quarto render chapters/learn/learn.qmd   # one chapter at `full`, on a GPU
 ```
 
 The chapters that start a `jammi-server` of their own need the binary on `PATH`

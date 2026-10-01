@@ -26,8 +26,11 @@ The conversion is plain Python — no Quarto — so the check is hermetic:
 * prose stays markdown; a link to another chapter points at the published
   book, and a citation ``[@key]`` reads "(Author Year)", with the chapter's
   references listed in a closing cell;
-* a recipe's docstring is its markdown, its body one code cell, and the
-  ``__main__`` guard becomes a final cell that runs ``main()``.
+* a recipe's README (and any numbered step pages beside it) is its markdown,
+  its script's body one code cell, and the ``__main__`` guard becomes a final
+  cell that runs ``main()``. The same
+  reading of the script is also written as a book chapter under
+  ``chapters/recipes/``, so the book holds every recipe and renders it run.
 
 Run ``python scripts/build_notebooks.py`` to rebuild, ``--check`` to fail when
 a committed notebook differs from what the sources build.
@@ -46,6 +49,8 @@ from pathlib import Path
 BOOK = Path(__file__).resolve().parents[1]
 REPO = BOOK.parents[1]
 OUT = REPO / "cookbook" / "notebooks"
+# Every recipe is also a book chapter, generated here from its script.
+RECIPE_CHAPTERS = BOOK / "chapters" / "recipes"
 GITHUB = "f-inverse/jammi-ai"
 BOOK_URL = "https://f-inverse.github.io/jammi-ai/cookbook"
 
@@ -310,7 +315,61 @@ def chapter(qmd: Path, release: str, refs: dict[str, Reference]) -> tuple[Path, 
                              setup_cell(release, server=server, extras=extras_of(run)), *cells])
 
 
-def recipe(script: Path, release: str) -> tuple[Path, dict]:
+@dataclass(frozen=True)
+class Recipe:
+    """A recipe script read once: what both its notebook and its book chapter
+    are built from."""
+
+    name: str
+    title: str
+    prose: str
+    body: str
+    source: str
+    server: bool
+    extras: list[str]
+
+
+_MD_LINK = re.compile(r"\]\((?!https?://|#|mailto:)([^)\s]+)\)")
+_RUN_IT = re.compile(r"^## Run it\n.*?(?=^## |\Z)", re.S | re.M)
+_H1 = re.compile(r"\A# (.+)\n")
+
+
+def _absolute_links(markdown_text: str, directory: Path) -> str:
+    """Relative links in a recipe's pages, resolved to the files on GitHub."""
+
+    def to_github(m: re.Match) -> str:
+        target = (directory / m.group(1)).resolve().relative_to(REPO.resolve()).as_posix()
+        return f"](https://github.com/{GITHUB}/blob/main/{target})"
+
+    return _MD_LINK.sub(to_github, markdown_text)
+
+
+def _demoted(page: str) -> str:
+    """``page`` with every heading one level down, its fenced code untouched."""
+    lines, fenced = [], False
+    for line in page.split("\n"):
+        if line.startswith("```"):
+            fenced = not fenced
+        lines.append("#" + line if not fenced and line.startswith("#") else line)
+    return "\n".join(lines)
+
+
+def recipe_pages(script: Path) -> tuple[str, str]:
+    """A recipe's title and its prose: the README beside the script — less its
+    command-line "Run it" section, since a notebook and a chapter run the
+    program themselves — followed by any numbered step pages (``NN_*.md``), each
+    one heading level down."""
+    readme = (script.parent / "README.md").read_text()
+    head = _H1.match(readme)
+    if head is None:
+        raise ValueError(f"{script.parent / 'README.md'}: a recipe's README opens with its title")
+    steps = sorted(script.parent.glob("[0-9][0-9]_*.md"))
+    pages = [_RUN_IT.sub("", readme[head.end():]).strip(),
+             *(_demoted(page.read_text()).strip() for page in steps)]
+    return head.group(1).strip(), _absolute_links("\n\n".join(pages), script.parent)
+
+
+def read_recipe(script: Path) -> Recipe:
     text = script.read_text()
     tree = ast.parse(text)
     # The notebook ends in `assert main() == 0`, which holds only for a `main`
@@ -319,9 +378,7 @@ def recipe(script: Path, release: str) -> tuple[Path, dict]:
                  None)
     if entry is None or entry.returns is None or ast.unparse(entry.returns) != "int":
         raise ValueError(f"{script}: a recipe's `main` returns its exit status (`-> int`)")
-    doc = ast.get_docstring(tree) or ""
-    title, _, rest = doc.partition("\n")
-    rest = re.sub(r"\n*Run with `python [^`]*`\.?\s*$", "", rest).strip()
+    title, prose = recipe_pages(script)
     body_nodes = [n for n in tree.body[1:] if not (
         isinstance(n, ast.If) and "__main__" in ast.unparse(n.test))]
     lines = text.split("\n")
@@ -329,21 +386,49 @@ def recipe(script: Path, release: str) -> tuple[Path, dict]:
     end = body_nodes[-1].end_lineno
     body = "\n".join(lines[start:end]).strip("\n")
 
-    name = script.parent.name
-    target = OUT / "recipes" / f"{name}.ipynb"
-    url = colab_url(target, release)
-    source = script.relative_to(REPO).as_posix()
-    server = bool(_NEEDS_SERVER.search(text))
-    cells = [header(title.rstrip("."), source, url),
-             setup_cell(release, server=server, extras=extras_of(text))]
-    if rest:
-        cells.append(markdown(rest))
-    cells += [code(body), code("assert main() == 0")]
+    return Recipe(
+        name=script.parent.name,
+        title=title,
+        prose=prose,
+        body=body,
+        source=script.relative_to(REPO).as_posix(),
+        server=bool(_NEEDS_SERVER.search(text)),
+        extras=extras_of(text),
+    )
+
+
+def recipe_notebook(r: Recipe, release: str) -> tuple[Path, dict]:
+    target = OUT / "recipes" / f"{r.name}.ipynb"
+    cells = [header(r.title, r.source, colab_url(target, release)),
+             setup_cell(release, server=r.server, extras=r.extras)]
+    if r.prose:
+        cells.append(markdown(r.prose))
+    cells += [code(r.body), code("assert main() == 0")]
     return target, notebook(cells)
 
 
+def recipe_chapter(r: Recipe) -> tuple[Path, str]:
+    """The book chapter a recipe renders as: its prose, then its program run
+    whole. Its first cell applies the determinism contract, as every
+    chapter's does."""
+    prose = f"{r.prose}\n\n" if r.prose else ""
+    title = r.title.replace('"', '\\"')
+    return RECIPE_CHAPTERS / f"{r.name}.qmd", (
+        f'---\ntitle: "{title}"\n---\n\n'
+        "<!-- Generated by scripts/build_notebooks.py from "
+        f"{r.source} — edit the recipe, not this page. -->\n\n"
+        "```{python}\n#| echo: false\nimport jammi_cookbook  # noqa: F401\n```\n\n"
+        f"{prose}"
+        f"The program is [`{r.source}`](https://github.com/{GITHUB}/blob/main/{r.source});"
+        " it runs here as it is.\n\n"
+        f"```{{python}}\n{r.body}\n```\n\n"
+        "```{python}\nassert main() == 0\n```\n"
+    )
+
+
 def sources() -> tuple[list[Path], list[Path]]:
-    chapters = sorted((BOOK / "chapters").rglob("*.qmd"))
+    chapters = sorted(p for p in (BOOK / "chapters").rglob("*.qmd")
+                      if RECIPE_CHAPTERS not in p.parents)
     recipes = [REPO / "cookbook" / "quickstart" / "quickstart.py",
                *sorted((REPO / "cookbook" / "recipes").glob("*/example.py"))]
     return chapters, recipes
@@ -376,8 +461,9 @@ def index(built: dict[Path, dict], release: str) -> str:
 def badge(release: str) -> str:
     """The script the rendered book includes on every page: a chapter page
     (``chapters/<path>.html``) gets its notebook's Open-in-Colab badge under
-    its title."""
-    base = colab_url(OUT / "book", release)
+    its title — a recipe chapter (``chapters/recipes/<name>.html``) its
+    recipe's notebook."""
+    base = colab_url(OUT, release)
     img = '<img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">'
     return f"""<script>
 (function () {{
@@ -385,7 +471,8 @@ def badge(release: str) -> str:
   var title = document.querySelector("#title-block-header");
   if (!page || !title) return;
   var link = document.createElement("a");
-  link.href = "{base}/" + page[1] + ".ipynb";
+  var notebook = page[1].indexOf("recipes/") === 0 ? page[1] : "book/" + page[1];
+  link.href = "{base}/" + notebook + ".ipynb";
   link.target = "_blank";
   link.rel = "noopener";
   link.innerHTML = '{img}';
@@ -399,9 +486,11 @@ def build() -> dict[Path, str]:
     """Every generated file and its content."""
     release, refs = version(), references()
     chapters, recipes = sources()
+    read = [read_recipe(s) for s in recipes]
     built = dict(chapter(q, release, refs) for q in chapters)
-    built |= dict(recipe(s, release) for s in recipes)
+    built |= dict(recipe_notebook(r, release) for r in read)
     files = {p: json.dumps(nb, indent=1, ensure_ascii=False) + "\n" for p, nb in built.items()}
+    files |= dict(recipe_chapter(r) for r in read)
     files[OUT / "README.md"] = index(built, release)
     files[BOOK / "_colab.html"] = badge(release)
     return files
@@ -418,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     files = build()
     existing = {p for p in OUT.rglob("*") if p.is_file() and p.suffix in {".ipynb", ".md"}}
+    existing |= set(RECIPE_CHAPTERS.glob("*.qmd"))
     stale = sorted(p for p, text in files.items() if not p.exists() or p.read_text() != text)
     orphans = sorted(existing - set(files))
     if args.check:

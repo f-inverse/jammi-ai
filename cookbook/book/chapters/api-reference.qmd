@@ -2,9 +2,9 @@
 title: "`jammi` API reference"
 ---
 
-The recipes call exactly these `jammi` signatures, grounded against the pinned
-`jammi-ai==0.26.4` wheel. The reference is maintained as a single source of truth
-in the shared library and rendered here; `scripts/check_api_reference.py` fails
-CI if the installed wheel's signatures drift from it.
+Every verb the book's chapters and recipes call, with the signature they call it
+by. The reference lives once, in the cookbook's library, and renders here;
+`scripts/check_api_reference.py` fails CI if the installed client's signatures
+drift from it.
 
 {{< include ../jammi_cookbook/_api_reference.md >}}

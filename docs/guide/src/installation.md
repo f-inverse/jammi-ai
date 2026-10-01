@@ -120,10 +120,15 @@ See [Connect to PostgreSQL / MySQL](./external-sources.md#what-ships).
 ## Python
 
 ```bash
-pip install jammi-ai
+pip install "jammi-ai[embedded]"            # the client and the in-process engine
+pip install jammi-ai jammi-ai-native-cu12   # the same, with the CUDA engine (sm_80+)
+pip install jammi-ai                        # the client alone, for a remote server
 ```
 
-Requires Python 3.8+. Pre-built wheels are available for Linux, macOS, and Windows.
+`jammi.connect("file://…")` runs the engine in-process and needs it installed;
+`connect("grpc://…")` needs only the client. Requires Python 3.9+. Wheels are
+built for Linux (x86_64 and aarch64, glibc 2.28+) and macOS (Apple Silicon and
+Intel); the CUDA engine is Linux x86_64. Windows is not supported.
 
 ## From source
 

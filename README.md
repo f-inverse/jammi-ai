@@ -5,21 +5,22 @@ Jammi is an embeddable AI engine that brings model inference into your data pipe
 ## Install
 
 ```bash
-pip install jammi-ai
+pip install "jammi-ai[embedded]"            # the client and the in-process engine
+pip install jammi-ai jammi-ai-native-cu12   # the same, with the CUDA engine (NVIDIA sm_80+)
+pip install jammi-ai                        # the client alone, for a remote server
 ```
 
-The embed wheel runs the engine in-process and bundles
-[`jammi-client`](./clients/python/) for remote targets. For a lean,
-engine-free deploy footprint that talks to a remote server, install the client
-on its own:
+`jammi-ai` (`import jammi`) is the client; the engine is `jammi-ai-native`, or
+`jammi-ai-native-cu12` on an NVIDIA GPU. `jammi.connect("file://…")` runs the
+engine in-process; `connect("grpc://…")` talks to a `jammi-server`
+(`pip install jammi-server`, or `jammi-server-cu12` on a GPU host) and needs only
+the client.
 
-```bash
-pip install jammi-client
-```
+## Learn it by running it
 
-(GPU/CUDA lives on the server image — the CUDA variant
-[`jammi-ai-server-cu12`](https://github.com/f-inverse/jammi-ai/pkgs/container/jammi-ai-server-cu12) —
-not the embed wheel.)
+[The Jammi Cookbook](https://f-inverse.github.io/jammi-ai/cookbook/) teaches every
+capability as a program you run: open any chapter in Colab, or run it locally.
+Start with the quickstart.
 
 ## Quickstart
 

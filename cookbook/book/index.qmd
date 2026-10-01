@@ -1,53 +1,60 @@
 ---
-title: "Preface"
+title: "Learn Jammi by running it"
 ---
 
 ```{python}
 # | echo: false
 # The first line of every chapter: importing the cookbook applies the
-# determinism contract (single-threaded BLAS, tokenizers off, pinned seed)
-# before any heavy native library is touched.
+# determinism contract (single-threaded BLAS, tokenizers off, pinned seed,
+# and the CPU at the `small` scale) before any heavy native library is touched.
 import jammi_cookbook  # noqa: F401
 ```
 
-This is a **runnable book**. It bridges *applied theory* — Stanković et al.'s
-*Data Analytics on Graphs* (Foundations & Trends in ML, 2020) and the modern GNN
-canon — with *software and computation*: the `jammi` engine. The signature
-move of every recipe is to show that **one Jammi recipe = one equation in the
-monograph = one line in the GNN canon**, *executed and measured*.
+Jammi is an embeddable AI engine: register data sources and query them with SQL,
+generate embeddings and search them, run and fine-tune models, and measure the
+results — in your own process, or against a server, through one API. This book
+teaches every one of those capabilities with a program you run. Each chapter is
+code and the prose that explains it; nothing is a screenshot of a result.
 
-For the short, "how do I call this verb" reference — dual-language (Rust +
-Python) and compile-tested — see the
-[How-To Guides](https://f-inverse.github.io/jammi-ai/cookbook-recipes.html) in
-the engine Guide. This book is the long-form, Python, executed-and-measured
-companion to those recipes.
+## How to read it
 
-## How the book is organized
+Every chapter has an **Open in Colab** badge under its title. A notebook's first
+cell installs this release of Jammi — the CUDA engine on a GPU runtime, the CPU
+engine otherwise — and the cookbook's fixtures, then every cell runs top to
+bottom. To run a chapter locally instead:
 
-It **reads** as **4 tiers × 3 rails**, echoing AWS Neptune's "unified yet
-separate" Database / Analytics / ML split — and adds a **fourth tier Neptune
-structurally lacks**: calibrated, provenance-stamped, context-conditioned
-prediction.
+```bash
+pip install "jammi-ai[embedded]" "jammi-cookbook @ git+https://github.com/f-inverse/jammi-ai#subdirectory=cookbook/book"
+```
 
-| Tier | Recipe | Theory |
-|---|---|---|
-| 01 Construct | `build_neighbor_graph` | topology from data (monograph Part I) |
-| 02 Analyze | `propagate_embeddings` | graph signal processing / low-pass filtering = SGC/APPNP (Part II) |
-| 03 Learn | `fine_tune_graph` | representation learning on graphs (Part III) |
-| 04 Predict & Quantify | `train_context_predictor` + conformal | context-conditioned posterior + honest coverage (no Neptune analogue) |
+Chapters run at the `small` scale by default: committed fixtures and tiny
+encoders, on the CPU, in seconds to minutes. Setting `JAMMI_COOKBOOK_SCALE=full`
+runs the same code over the published datasets and real encoders, on a GPU.
 
-The three **rails** are woven through every tier: **provenance** (the audit
-trail on every result), **tenancy** (the engine's two isolation layers —
-catalog-listing and discriminator-column row filtering — and the honest caveat
-where they stop), and **measurement** (every recipe ends in a real number). The
-book *is* the closed evaluation loop: `construct → propagate → learn → MEASURE`.
+## The path
+
+Start with the quickstart; after it, each part stands on its own. A part's short
+recipes show a capability's core verb in one program; its chapters take a
+capability deep and measure it.
+
+| Part | What you learn |
+|---|---|
+| **Start here** | Install, connect, register a source, embed it and search it; the two datasets the longer chapters use. |
+| **Search** | Dense, lexical and fused retrieval; image, audio and cross-modal search; how much recall the ANN index gives up; how the index grows by segments; storing vectors at lower precision; auditing every search. |
+| **Models and inference** | The model catalog; models served at an endpoint; the dtype inference runs at; quantized checkpoints; how a model stage behaves at any parallelism. |
+| **Evaluation** | Retrieval, classification and NER quality; evaluation and provenance channels; the error each failure raises; calibration of predicted uncertainty. |
+| **Fine-tuning** | LoRA fine-tuning; choosing a method; regression heads; image and audio encoders; what acceleration a job got; one job trained across many ranks. |
+| **Graphs and prediction** | Neighbour graphs, propagation and lineage; predicting from retrieved context. |
+| **Data that changes** | Mutable tables; a feature store; change-data-capture topics; point-in-time joins; detecting and repairing stale results; editing an embedding table in place; storage that ends with the session. |
+| **Where data lives** | Object storage; Postgres and MySQL as sources in one query. |
+| **Running Jammi** | One program embedded or remote; Flight SQL; compound queries; the CLI, Rust and TypeScript; jobs; multi-tenancy; a production catalog and broker; backup, health, metrics and traces. |
+| **Case study: graph machine learning** | Everything together on ogbn-arxiv: build a graph, propagate over it, fine-tune on it, predict with calibrated coverage — and the theory each step implements. |
 
 ## How it stays honest
 
-Every recipe executes in continuous integration and ends in a **real number** it
-just measured — never a stand-in figure — checked against a frozen golden within
-a tolerance. Every chapter runs at two scales with the same code: `small`, over
-committed fixtures and tiny encoders, in seconds on a CPU (what CI and a CPU
-Colab runtime run); and `full`, over the published datasets and real encoders
-on a GPU, where the findings are about the data they name. The engine itself is never edited — the book
-only *calls* the pinned `jammi` API, listed in the [API reference](chapters/api-reference.qmd).
+Every chapter ends in numbers it just measured, checked against values frozen
+from an earlier run, within a stated tolerance; a chapter whose measurement moves
+fails. Every chapter runs on every change to the engine it documents, and every
+notebook is also run nightly exactly as a reader runs it — installed from PyPI in
+a fresh runtime. The [API reference](chapters/api-reference.qmd) lists every
+verb the book calls.

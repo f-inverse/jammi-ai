@@ -1460,10 +1460,12 @@ def check_gate_file_absent(workflows_dir: Path) -> list[str]:
 # P3 (PROMOTION_TABLE reconciliation) + P6 (discovery)
 # --------------------------------------------------------------------------- #
 def cuda_lanes(manifest: dict) -> set[str]:
+    """The manifest's lanes that package a CUDA build."""
+    builds = manifest.get("builds", {})
     return {
         lane
         for lane, spec in manifest.get("lanes", {}).items()
-        if "cuda" in spec.get("cargo_features", [])
+        if "cuda" in builds.get(spec.get("build"), {}).get("cargo_features", [])
     }
 
 

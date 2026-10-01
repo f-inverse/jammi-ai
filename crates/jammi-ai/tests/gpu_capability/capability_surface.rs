@@ -1,6 +1,6 @@
 //! `capability_surface` — the data-driven runtime capability proof, driven
-//! from `ci/release-feature-manifest.json`'s `cu12-tarball` lane (the same
-//! lane `runpod_gpu_prove.sh`'s capability-surface build derives its
+//! from `ci/release-feature-manifest.json`'s `server-cu12` build (the same
+//! build `runpod_gpu_prove.sh`'s capability-surface build derives its
 //! `jammi-ai`-applicable feature subset from).
 //!
 //! Asserts:
@@ -66,7 +66,7 @@
 //! The manifest declares exactly TWO op categories, and each one carries its
 //! own proof mechanism — `fused_op_admission` (the op's own admission delta,
 //! asserted below) and `internal_subkernels` (its parent's delta). There is no
-//! compiled-only category (kernels this lane COMPILES but that dispatch
+//! compiled-only category (kernels this build COMPILES but that dispatch
 //! through no `admit()` site and have no admitted parent either — provable
 //! only by "it compiled", never by "it ran"), and this file reads no such key.
 //! A kernel of that shape is deleted rather than shipped: the census
@@ -162,8 +162,8 @@ use tempfile::TempDir;
 use jammi_kernels::admission::{DtypeClass, ProbedOpKind, PROBED_OPS};
 
 use crate::release_manifest::{
-    internal_subkernel_ops, load_manifest, manifest_string_list, MANIFEST_FLASH_DTYPES,
-    MANIFEST_FUSED_OP_ADMISSION, MANIFEST_LANE,
+    internal_subkernel_ops, load_manifest, manifest_string_list, MANIFEST_BUILD,
+    MANIFEST_FLASH_DTYPES, MANIFEST_FUSED_OP_ADMISSION,
 };
 
 /// This test's `ComputePrecision` as the dtype class [`PROBED_OPS`] resolves
@@ -602,7 +602,7 @@ async fn capability_surface() {
     let declared_ops = manifest_string_list(&manifest, MANIFEST_FUSED_OP_ADMISSION);
     assert!(
         !declared_ops.is_empty(),
-        "ci/release-feature-manifest.json's {MANIFEST_LANE:?} lane must declare a non-empty \
+        "ci/release-feature-manifest.json's {MANIFEST_BUILD:?} build must declare a non-empty \
          fused_op_admission list"
     );
     // Read once: which dtypes (if any) this build's flash cascade preempts
@@ -617,7 +617,7 @@ async fn capability_surface() {
     if jammi_kernels::admission::FLASH_COMPILED {
         assert!(
             !flash_dtypes.is_empty(),
-            "{MANIFEST_LANE:?}'s flash_dtypes must be non-empty when flash_compiled is true"
+            "{MANIFEST_BUILD:?}'s flash_dtypes must be non-empty when flash_compiled is true"
         );
     }
 

@@ -90,7 +90,7 @@ jobs:
           echo "JAMMI_AUDIT_MASTER_KEY=${key}" >> "$GITHUB_ENV"
           echo "JAMMI_IMAGE=jammi-ai-server:pr" >> "$GITHUB_ENV"
 
-      # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
+      # `ci/release-feature-manifest.json`'s `server-cpu` build is the single
       # source of truth for this build's cargo feature list (fed into the
       # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
       # — read here, same idiom as server-image.yml.
@@ -98,9 +98,9 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"

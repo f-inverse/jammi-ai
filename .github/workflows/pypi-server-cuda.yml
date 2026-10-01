@@ -67,17 +67,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # `ci/release-feature-manifest.json` is the single source of truth for
-      # this lane's cargo feature list (`cu12-wheel`) — read here rather
+      # this binary's cargo feature list (`server-cu12`) — read here rather
       # than restating it inline in `with:` below, so a manifest edit moves
       # this build in the same unit with no separate edit to keep in sync.
       # A plain `ubuntu-latest` runner (no container) always has `jq`.
-      - name: Read ci/release-feature-manifest.json (cu12-wheel lane)
+      - name: Read ci/release-feature-manifest.json (server-cu12 build)
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cu12-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cu12-wheel cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"

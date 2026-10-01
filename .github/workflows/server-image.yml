@@ -112,7 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `ci/release-feature-manifest.json`'s `cpu-image` lane is the single
+      # `ci/release-feature-manifest.json`'s `server-cpu` build is the single
       # source of truth for this build's cargo feature list (fed into the
       # Dockerfile's `CARGO_FEATURES` build-arg, required — no default)
       # — read here rather than hardcoding it a second time,
@@ -121,9 +121,9 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
@@ -378,15 +378,15 @@ jobs:
       - uses: actions/checkout@v4
 
       # See build-and-push-main's identical step: `ci/release-feature-
-      # manifest.json`'s `cpu-image` lane is the single source of truth
+      # manifest.json`'s `server-cpu` build is the single source of truth
       # for this build's cargo feature list.
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
@@ -621,15 +621,15 @@ jobs:
       - uses: actions/checkout@v4
 
       # See build-and-push-main's identical step: `ci/release-feature-
-      # manifest.json`'s `cpu-image` lane is the single source of truth
+      # manifest.json`'s `server-cpu` build is the single source of truth
       # for this build's cargo feature list.
       - name: Read release feature list (ci/release-feature-manifest.json)
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cpu-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-image cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
@@ -728,7 +728,7 @@ jobs:
           # compile` job and the other CUDA release lanes.
           submodules: false
 
-      # `ci/release-feature-manifest.json`'s `cu12-image` lane is the single
+      # `ci/release-feature-manifest.json`'s `server-cu12` build is the single
       # source of truth for this build's cargo feature list (fed into the
       # Dockerfile's `CARGO_FEATURES` build-arg below) — read here rather
       # than hardcoding it a second time. `jq` is preinstalled on
@@ -737,9 +737,9 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cu12-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cu12-image cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
@@ -817,9 +817,9 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cu12-image"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cu12-image cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"

@@ -80,7 +80,7 @@ COPY . .
 # in sync by hand.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's cpu-* lanes) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
+    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's server-cpu build) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
     && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
     && cargo build --release \
         --package jammi-server --bin jammi-server \
@@ -131,7 +131,7 @@ COPY . .
 # `jammi-cli`'s own build (no `--features`) is unaffected by the arg's value.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's cu12-image lane) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
+    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's server-cu12 build) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
     && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
     && cargo build --release \
         --package jammi-server --bin jammi-server \

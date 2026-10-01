@@ -95,7 +95,7 @@ runs:
           # The server a published CPU wheel ships: the same capability
           # surface (object stores, database sources) a reader's pip-installed
           # `jammi-server` has, read from the release manifest.
-          features="$(jq -r '.lanes["cpu-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           cargo build --release -p jammi-server --features "$features"
           # The built binary is the `jammi-server` on PATH for every later
           # step: a chapter or recipe that starts a live server finds it the

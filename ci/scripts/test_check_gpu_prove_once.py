@@ -40,11 +40,16 @@ ARCH_LIST = ", ".join(REAL_ARCHES)
 JOB_NAME_LINE = "GPU prove on RunPod (${{ matrix.arch }})"
 
 MANIFEST_GOOD = {
+    "builds": {
+        "server-cu12": {"cargo_features": ["cuda", "flash-attn"]},
+        "server-cpu": {"cargo_features": ["storage-cloud"]},
+    },
     "lanes": {
-        "cu12-image": {"cargo_features": ["cuda", "flash-attn"]},
-        "cu12-tarball": {"cargo_features": ["cuda", "flash-attn"]},
-        "cu12-wheel": {"cargo_features": ["cuda", "flash-attn"]},
-    }
+        "cu12-image": {"build": "server-cu12"},
+        "cu12-tarball": {"build": "server-cu12"},
+        "cu12-wheel": {"build": "server-cu12"},
+        "cpu-wheel": {"build": "server-cpu"},
+    },
 }
 
 PROVE_YML_GOOD = f"""\
@@ -1580,12 +1585,18 @@ class ManifestReconciliationTest(unittest.TestCase):
     def test_cuda_lane_with_no_table_row_fails(self):
         manifest = dict(MANIFEST_GOOD)
         manifest["lanes"] = dict(MANIFEST_GOOD["lanes"])
-        manifest["lanes"]["cu13-new-lane"] = {"cargo_features": ["cuda"]}
+        manifest["lanes"]["cu13-new-lane"] = {"build": "server-cu12"}
         findings = cgo.check_promotion_table(_positive_texts(), manifest)
         self.assertTrue(any("cu13-new-lane" in f and "no PROMOTION_TABLE row" in f for f in findings))
 
+    def test_cpu_lane_needs_no_cuda_row(self):
+        self.assertEqual(cgo.cuda_lanes(MANIFEST_GOOD), {"cu12-image", "cu12-tarball", "cu12-wheel"})
+
     def test_table_row_naming_lane_absent_from_manifest_is_not_flagged(self):
-        manifest = {"lanes": {k: v for k, v in MANIFEST_GOOD["lanes"].items() if k != "cu12-wheel"}}
+        manifest = {
+            **MANIFEST_GOOD,
+            "lanes": {k: v for k, v in MANIFEST_GOOD["lanes"].items() if k != "cu12-wheel"},
+        }
         findings = cgo.check_promotion_table(_positive_texts(), manifest)
         self.assertFalse(
             any("absent from the manifest" in f for f in findings),

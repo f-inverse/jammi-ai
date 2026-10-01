@@ -275,8 +275,8 @@ jobs:
           # never wanted -D warnings.
           deny-warnings: false
 
-      # `ci/release-feature-manifest.json`'s `cpu-tarball` lane is the single
-      # source of truth for this lane's cargo feature list — read
+      # `ci/release-feature-manifest.json`'s `server-cpu` build is the single
+      # source of truth for this binary's cargo feature list — read
       # here rather than restating it, same idiom as `server-cu12-build`
       # below. `jq` is not guaranteed present in the CI base image (not a
       # `dnf install` its own Dockerfile carries), so this step installs it
@@ -286,9 +286,9 @@ jobs:
         run: |
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null
-          features="$(jq -r '.lanes["cpu-tarball"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-tarball cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
@@ -424,7 +424,7 @@ jobs:
           submodules: false
 
       # `ci/release-feature-manifest.json` is the single source of truth for
-      # this lane's cargo feature list (`cu12-tarball`) — read here rather
+      # this binary's cargo feature list (`server-cu12`) — read here rather
       # than restating it, so a manifest edit moves this build in the same unit with no separate edit to keep in
       # sync. `jq` is not guaranteed present in the CUDA CI base image (it
       # is not a `dnf install` this Dockerfile carries), so this step
@@ -436,14 +436,14 @@ jobs:
         run: |
           set -euo pipefail
           command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null
-          features="$(jq -r '.lanes["cu12-tarball"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cu12-tarball cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
 
-      # `flash-attn` (in the manifest's cu12-tarball feature list) needs
+      # `flash-attn` (in the manifest's server-cu12 feature list) needs
       # the vendored CUTLASS submodule at build time (`build.rs::
       # build_flash_attn`). Scoped to this job's own checkout only — same
       # rationale ci.yml's `flash-attn-compile` job documents: independent,

@@ -18,14 +18,14 @@ can never independently drift.
   * `default` -- a `cargo test` invocation with NO `--features` flag at all.
                  Canonicalizes to an EMPTY feature list.
 
-`expected(crate, kind) = (lane ∩ declared(crate)) ∪ (prove_only(crate) iff
-kind == "test")`, where `lane` is this file's own `lanes.cu12-tarball.
-cargo_features` (the single source of truth for the shipped CUDA release
-surface) and `declared(crate)` is `crates/<crate>/Cargo.toml`'s own
+`expected(crate, kind) = (shipped ∩ declared(crate)) ∪ (prove_only(crate) iff
+kind == "test")`, where `shipped` is the manifest's
+`builds.server-cu12.cargo_features` (the single source of truth for the
+shipped CUDA release surface) and `declared(crate)` is `crates/<crate>/Cargo.toml`'s own
 `[features]` table keys, read via stdlib `tomllib` rather than a regex over
 Cargo.toml: a regex's failure direction is a silently NARROWER `declared()`,
 which would under-report a crate's real feature surface and let a genuine
-lane feature slip past the manifest-declared check. Known limit: a
+shipped feature slip past the manifest-declared check. Known limit: a
 `[features]` table's keys miss a crate's IMPLICIT optional-dependency
 features (`dep = { optional = true }` with no matching `[features]` entry)
 -- this fails closed, since such a feature reads as "not declared", never
@@ -57,7 +57,8 @@ except ModuleNotFoundError as e:  # pragma: no cover - the CI image's python is 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = REPO_ROOT / "ci" / "release-feature-manifest.json"
-LANE_NAME = "cu12-tarball"
+# The shipped CUDA build the prove lane proves.
+PROVEN_BUILD = "server-cu12"
 PROVE_SCRIPT = REPO_ROOT / "ci" / "scripts" / "runpod_gpu_prove.sh"
 _PROVE_GROUPS_RE = re.compile(r"^PROVE_GROUPS=\(([^)]*)\)", re.M)
 
@@ -127,8 +128,8 @@ def load_manifest(path: Path = MANIFEST_PATH) -> dict:
     return json.loads(path.read_text())
 
 
-def lane_features(manifest: dict, lane: str = LANE_NAME) -> set[str]:
-    return set(manifest["lanes"][lane]["cargo_features"])
+def build_features(manifest: dict, build: str = PROVEN_BUILD) -> set[str]:
+    return set(manifest["builds"][build]["cargo_features"])
 
 
 def prove_lane_crates(manifest: dict) -> dict:
@@ -159,8 +160,7 @@ def expected(
     if kind == KIND_DEFAULT:
         return []
     manifest = manifest if manifest is not None else load_manifest()
-    lane = lane_features(manifest)
-    base = lane & declared(crate, repo_root)
+    base = build_features(manifest) & declared(crate, repo_root)
     if kind == KIND_TEST:
         prove_only = set(prove_lane_crates(manifest).get(crate, {}).get("prove_only", []))
         base = base | prove_only
@@ -187,8 +187,8 @@ def expected_id(surface: dict[str, dict[str, list[str]]]) -> str:
 
 def current_expected_id(manifest: dict | None = None, repo_root: Path = REPO_ROOT) -> str:
     """`expected_id` over every pair the manifest CURRENTLY declares --
-    moves only when a lane feature is added/removed, a `prove_only` entry
-    changes, or a crate stops/starts declaring a lane feature."""
+    moves only when a shipped feature is added/removed, a `prove_only` entry
+    changes, or a crate stops/starts declaring a shipped feature."""
     manifest = manifest if manifest is not None else load_manifest()
     surface: dict[str, dict[str, list[str]]] = {}
     for crate, kind in sorted(declared_pairs(manifest)):
@@ -215,17 +215,17 @@ def _self_test() -> int:
     manifest = load_manifest()
 
     # Anchor self-test: jammi-server's real Cargo.toml must declare (at
-    # least) the lane features -- a broken tomllib read or a stripped
+    # least) the shipped features -- a broken tomllib read or a stripped
     # Cargo.toml would silently narrow `declared()` and this would trip.
     d = declared("jammi-server")
     check(
-        "anchor-jammi-server-declares-lane",
+        "anchor-jammi-server-declares-shipped",
         {"cuda", "flash-attn", "mysql", "postgres", "storage-cloud"} <= d,
         f"declared(jammi-server)={sorted(d)}",
     )
 
-    # jammi-server: release == the full lane; test == the full lane plus
-    # prove_only (jammi-server declares every lane feature).
+    # jammi-server: release == the full build; test == the full build plus
+    # prove_only (jammi-server declares every shipped feature).
     check(
         "jammi-server-release",
         expected("jammi-server", "release", manifest)
@@ -240,7 +240,7 @@ def _self_test() -> int:
     )
 
     # jammi-ai: does not declare storage-cloud, so its
-    # lane-intersection is exactly {cuda, flash-attn}; test adds prove_only.
+    # shipped intersection is exactly {cuda, flash-attn}; test adds prove_only.
     check(
         "jammi-ai-test",
         expected("jammi-ai", "test", manifest) == ["cuda", "flash-attn", "live-gpu-tests"],
@@ -255,7 +255,7 @@ def _self_test() -> int:
         f"{expected('jammi-bench', 'release', manifest)}",
     )
 
-    # jammi-kernels: test is cuda,flash-attn (both declared and in the lane)
+    # jammi-kernels: test is cuda,flash-attn (both declared and shipped)
     # plus prove_only; default canonicalizes to [] regardless of manifest
     # content.
     check(

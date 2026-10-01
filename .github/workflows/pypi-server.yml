@@ -64,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # `ci/release-feature-manifest.json`'s `cpu-wheel` lane is the single
+      # `ci/release-feature-manifest.json`'s `server-cpu` build is the single
       # source of truth for the CPU wheel's cargo feature list — read
       # here, once, and fed to both arch legs below via `needs.read-
       # manifest.outputs.cargo_features` (a reusable `uses:` workflow's `with:`
@@ -74,9 +74,9 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          features="$(jq -r '.lanes["cpu-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
           if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-wheel cargo_features list" >&2
+            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
             exit 1
           fi
           echo "cargo_features=$features" >> "$GITHUB_OUTPUT"

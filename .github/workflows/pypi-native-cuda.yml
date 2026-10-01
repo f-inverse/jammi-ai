@@ -60,7 +60,7 @@ jobs:
     needs: ci-image
     runs-on: ubuntu-latest
     container:
-      image: ${{ needs.ci-image.outputs.cpu }}
+      image: ${{ needs.ci-image.outputs.cuda }}
     steps:
       - uses: actions/checkout@v4
         with:

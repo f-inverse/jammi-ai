@@ -89,7 +89,7 @@ jobs:
       contents: read
     uses: ./.github/workflows/_pypi-server.yml
     with:
-      container_image: ${{ needs.ci-image.outputs.cpu }}
+      container_image: ${{ needs.ci-image.outputs.cuda }}
       cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
       package_dir: packaging/server-cu12
       artifact_prefix: server-cu12

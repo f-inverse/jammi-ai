@@ -24,7 +24,7 @@ import jammi
 TENANT = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 
 
-def main() -> None:
+def main() -> int:
     if not os.environ.get("JAMMI_AUDIT_MASTER_KEY"):
         # The substrate refuses to sign without a master key. For this runnable
         # demo we set a fixed key if the operator has not provided one; in
@@ -83,7 +83,8 @@ def main() -> None:
         print("audit topic delivered", delivered.num_rows, "row(s)")
 
         print("search_audit recipe OK")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -26,6 +26,10 @@ workspace ships every publishable crate at the same
   test refuses any path a recipe, chapter or library module resolves by climbing out of its
   package. `jammi_cookbook.determinism.committed_ids`, which read a `data/ids/` directory that
   never existed, is deleted.
+- **Every recipe notebook ends in a `main` that returns its exit status.** A recipe notebook ends
+  in `assert main() == 0`; `search_audit` and `session_lifecycle` returned `None`, so their
+  notebooks failed for every reader while their scripts exited 0. Both return 0, and the notebook
+  builder refuses a recipe whose `main` is not `-> int`.
 - **The `small` scale runs on the CPU on every host.** `jammi_cookbook.scale` defines `small` as the
   committed fixtures on the CPU, but sessions opened on the default device, so on a GPU runtime two
   precision chapters' sign-quantized recalls moved by a query against goldens frozen on the CPU.

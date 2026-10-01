@@ -313,6 +313,12 @@ def chapter(qmd: Path, release: str, refs: dict[str, Reference]) -> tuple[Path, 
 def recipe(script: Path, release: str) -> tuple[Path, dict]:
     text = script.read_text()
     tree = ast.parse(text)
+    # The notebook ends in `assert main() == 0`, which holds only for a `main`
+    # that returns its exit status; one returning None fails every reader.
+    entry = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"),
+                 None)
+    if entry is None or entry.returns is None or ast.unparse(entry.returns) != "int":
+        raise ValueError(f"{script}: a recipe's `main` returns its exit status (`-> int`)")
     doc = ast.get_docstring(tree) or ""
     title, _, rest = doc.partition("\n")
     rest = re.sub(r"\n*Run with `python [^`]*`\.?\s*$", "", rest).strip()

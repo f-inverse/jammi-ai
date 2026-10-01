@@ -24,7 +24,7 @@ balancer removes the instance from rotation rather than restarting it.
 
 ```bash
 $ curl -s localhost:8080/healthz
-{"status":"ok","version":"0.51.0"}
+{"status":"ok","version":"0.52.0"}
 
 $ curl -s localhost:8080/readyz          # catalog reachable
 {"status":"ready"}

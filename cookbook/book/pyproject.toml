@@ -2,7 +2,7 @@
 # Not a published package: a notebook installs it from the release's git tag
 # (`…@py-vX#subdirectory=cookbook/book`), so it carries the lockstep version.
 name = "jammi-cookbook"
-version = "0.51.0"
+version = "0.52.0"
 description = "The jammi cookbook's library and fixtures — the datasets, encoders, frozen goldens and rails its recipes and chapters run on."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,7 +15,7 @@ authors = [{ name = "F-Inverse" }]
 # choice. numpy and pyarrow are the data substrate the chapters manipulate; requests
 # fetches the published datasets a `full`-scale run reads.
 dependencies = [
-    "jammi-ai==0.51.0",
+    "jammi-ai==0.52.0",
     "numpy>=1.26,<3",
     "pyarrow>=15",
     "requests>=2.31",

@@ -5,6 +5,16 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+
+## [0.52.0] - 2026-10-01
+
+Every cookbook notebook runs as published. A new lane runs each notebook at a
+release tag the way a reader does — a fresh runtime, the setup cell installing
+the release from PyPI — nightly on a CPU and after a release on a GPU. Its first
+run found nine notebooks that failed for a reader at 0.51.0 — seven on every
+runtime, two only on a GPU; each is fixed, and the causes are now refused by tests
+and guards.
+
 - **The federation chapter's MariaDB helper does not take MySQL for MariaDB.** On a host with
   MySQL installed, its `mysqld` passed the helper's check, the MariaDB install was skipped, and no
   `mariadb-install-db` existed to initialise a data directory: the chapter failed with a `TypeError`.

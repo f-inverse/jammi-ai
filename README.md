@@ -117,7 +117,7 @@ docker run --rm \
   ghcr.io/f-inverse/jammi-ai-server:latest
 
 curl http://localhost:8080/healthz
-# {"status":"ok","version":"0.51.0"}
+# {"status":"ok","version":"0.52.0"}
 ```
 
 Both ports bind to `127.0.0.1`: the server performs no authentication of

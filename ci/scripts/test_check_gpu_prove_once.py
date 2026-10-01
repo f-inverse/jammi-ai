@@ -33,18 +33,23 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_gpu_prove_once as cgo  # noqa: E402
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
-import gpu_prove_verdict  # noqa: E402
+import verdict  # noqa: E402
 
 REAL_ARCHES = sorted(gpu_parity_matrix.load_shipped_cuda_silicon())
 ARCH_LIST = ", ".join(REAL_ARCHES)
 JOB_NAME_LINE = "GPU prove on RunPod (${{ matrix.arch }})"
 
 MANIFEST_GOOD = {
+    "builds": {
+        "server-cu12": {"cargo_features": ["cuda", "flash-attn"]},
+        "server-cpu": {"cargo_features": ["storage-cloud"]},
+    },
     "lanes": {
-        "cu12-image": {"cargo_features": ["cuda", "flash-attn"]},
-        "cu12-tarball": {"cargo_features": ["cuda", "flash-attn"]},
-        "cu12-wheel": {"cargo_features": ["cuda", "flash-attn"]},
-    }
+        "cu12-image": {"build": "server-cu12"},
+        "cu12-tarball": {"build": "server-cu12"},
+        "cu12-wheel": {"build": "server-cu12"},
+        "cpu-wheel": {"build": "server-cpu"},
+    },
 }
 
 PROVE_YML_GOOD = f"""\
@@ -76,7 +81,7 @@ jobs:
 
 
 PROOF_REQUIRED_YML_GOOD = """\
-name: _gpu-proof-required
+name: _proof-required
 
 on:
   workflow_call: {}
@@ -87,18 +92,18 @@ permissions:
 
 jobs:
   proof-required:
-    name: GPU proof required
+    name: Proof required
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)
+      - name: Check the tree's GPU-prove and CI verdicts
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 ci/scripts/gpu_prove_verdict.py \\
+          python3 ci/scripts/verdict.py require \\
             --repo "$GITHUB_REPOSITORY" \\
-            --sha "$GITHUB_SHA"
+            --tree "$(git rev-parse "$GITHUB_SHA^{tree}")"
 """
 
 
@@ -145,12 +150,12 @@ COOKBOOK_PUBLISHED_GPU_YML_GOOD = _paid_lane_yml(
 )
 
 
-def _gate_job(gate_name: str = "gpu-proof", tag_family: str = "v") -> str:
+def _gate_job(gate_name: str = "proof", tag_family: str = "v") -> str:
     return f"""\
   {gate_name}:
-    name: GPU proof required
+    name: Proof required
     if: startsWith(github.ref, 'refs/tags/{tag_family}')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -160,7 +165,7 @@ def _gate_job(gate_name: str = "gpu-proof", tag_family: str = "v") -> str:
 
 def _promoting_job(
     name: str,
-    gate_name: str = "gpu-proof",
+    gate_name: str = "proof",
     if_expr: str | None = None,
     raw_if_block: str | None = None,
     raw_needs_block: str | None = None,
@@ -211,7 +216,7 @@ def _local_reusable_caller_yml(
     if_expr: str = "github.ref_type != 'tag'",
     on_block: str = 'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n',
 ) -> str:
-    """The `image.yml` job shape: a job whose ENTIRE body is a
+    """The `ci.yml` image-builder job shape: a job whose ENTIRE body is a
     job-level `uses: ./.github/workflows/<target>.yml` call, gated (or not)
     by its own `if:` -- drives the recursive-discovery mechanism (a job that merely delegates to a local reusable which itself pushes is
     still a promoting job)."""
@@ -226,9 +231,8 @@ jobs:
 """
 
 
-# The real-tree `image.yml` shape: two local-reusable callers, the CUDA
-# job `needs:` the CPU job it builds `FROM` -- each tabled by its own row
-# (`ci-image-cpu`, `ci-image-cuda`).
+# The real-tree `image.yml` shape: one job moving the `:latest` alias, tabled
+# by its own row (`ci-image-latest`).
 IMAGE_YML = """\
 name: caller
 
@@ -238,13 +242,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  latest:
     if: github.ref_type != 'tag'
-    uses: ./.github/workflows/_ci-base-image.yml
-  build-cuda:
-    needs: build
-    if: github.ref_type != 'tag'
-    uses: ./.github/workflows/_ci-base-image.yml
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker buildx imagetools create -t ghcr.io/f-inverse/jammi-ai-ci:latest ghcr.io/f-inverse/jammi-ai-ci:ctx-0
 """
 
 
@@ -311,7 +313,7 @@ def _server_image_yml(
     merge_main_if: str = "needs.build-and-push-main.result == 'success' && github.ref_type != 'tag'",
 ) -> str:
     jobs = (
-        _gate_job("gpu-proof")
+        _gate_job("proof")
         + _promoting_job("build-and-push-cu12", if_expr=cu12_if)
         + _promoting_job("build-and-push", if_expr=cpu_tag_if)
         + _ungated_job("build-and-push-main", main_if)
@@ -333,7 +335,7 @@ def _release_binaries_yml(
     raw_cu12_needs_block: str | None = None,
 ) -> str:
     jobs = (
-        _gate_job("gpu-proof")
+        _gate_job("proof")
         + _promoting_job(
             "server-cu12-promote", if_expr=cu12_if, raw_if_block=raw_cu12_if_block, raw_needs_block=raw_cu12_needs_block
         )
@@ -344,21 +346,21 @@ def _release_binaries_yml(
 
 
 def _crates_yml(publish_if: str | None = None, github_release_if: str | None = None) -> str:
-    jobs = _gate_job("gpu-proof") + _promoting_job("publish", if_expr=publish_if) + _promoting_job(
+    jobs = _gate_job("proof") + _promoting_job("publish", if_expr=publish_if) + _promoting_job(
         "github-release", gate_name="publish", if_expr=github_release_if
     )
     return _wf("v*", jobs)
 
 
 def _npm_yml(step_if: str | None = None) -> str:
-    jobs = _gate_job("gpu-proof") + _step_gated_job("publish", "gpu-proof", "Publish", step_if=step_if)
+    jobs = _gate_job("proof") + _step_gated_job("publish", "proof", "Publish", step_if=step_if)
     return _wf("v*", jobs)
 
 
 def _simple_publish_yml(
     tag_pattern: str = "py-v*", publish_if: str | None = None, tag_family: str = "py-v"
 ) -> str:
-    jobs = _gate_job("gpu-proof", tag_family=tag_family) + _promoting_job(
+    jobs = _gate_job("proof", tag_family=tag_family) + _promoting_job(
         "publish", if_expr=publish_if, tag_family=tag_family
     )
     return _wf(tag_pattern, jobs)
@@ -372,6 +374,44 @@ def write_tree(root: Path, workflows: dict[str, str], manifest: dict) -> tuple[P
     manifest_path = root / "release-feature-manifest.json"
     manifest_path.write_text(json.dumps(manifest))
     return wf_dir, manifest_path
+
+
+# `ci.yml`'s summary call and `_summary.yml`'s job: the name the API reports
+# for it is `verdict.CI_SUMMARY_JOB` (P4).
+CI_SUMMARY_YML_GOOD = """\
+name: CI
+on:
+  pull_request:
+jobs:
+  build-ci-image:
+    if: github.ref_type != 'tag'
+    uses: ./.github/workflows/_ci-base-image.yml
+  build-ci-image-cuda:
+    needs: build-ci-image
+    if: github.ref_type != 'tag'
+    uses: ./.github/workflows/_ci-base-image.yml
+  ci-summary:
+    needs: [check]
+    if: always()
+    uses: ./.github/workflows/_summary.yml
+    with:
+      needs_json: ${{ toJSON(needs) }}
+"""
+
+SUMMARY_YML_GOOD = """\
+name: Summary
+on:
+  workflow_call:
+    inputs:
+      needs_json:
+        required: true
+        type: string
+jobs:
+  assert:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ok
+"""
 
 
 def positive_workflows() -> dict[str, str]:
@@ -391,7 +431,9 @@ def positive_workflows() -> dict[str, str]:
         # gpu-dev.sh's own row (whole-file scope gave it one: gpu-reap.yml
         # is its only invoker and carries RUNPOD_API_KEY at step scope).
         "gpu-reap.yml": REAP_YML,
-        "_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD,
+        "_proof-required.yml": PROOF_REQUIRED_YML_GOOD,
+        "ci.yml": CI_SUMMARY_YML_GOOD,
+        "_summary.yml": SUMMARY_YML_GOOD,
         "server-image.yml": _server_image_yml(),
         "release-binaries.yml": _release_binaries_yml(),
         "crates.yml": _crates_yml(),
@@ -1543,12 +1585,18 @@ class ManifestReconciliationTest(unittest.TestCase):
     def test_cuda_lane_with_no_table_row_fails(self):
         manifest = dict(MANIFEST_GOOD)
         manifest["lanes"] = dict(MANIFEST_GOOD["lanes"])
-        manifest["lanes"]["cu13-new-lane"] = {"cargo_features": ["cuda"]}
+        manifest["lanes"]["cu13-new-lane"] = {"build": "server-cu12"}
         findings = cgo.check_promotion_table(_positive_texts(), manifest)
         self.assertTrue(any("cu13-new-lane" in f and "no PROMOTION_TABLE row" in f for f in findings))
 
+    def test_cpu_lane_needs_no_cuda_row(self):
+        self.assertEqual(cgo.cuda_lanes(MANIFEST_GOOD), {"cu12-image", "cu12-tarball", "cu12-wheel"})
+
     def test_table_row_naming_lane_absent_from_manifest_is_not_flagged(self):
-        manifest = {"lanes": {k: v for k, v in MANIFEST_GOOD["lanes"].items() if k != "cu12-wheel"}}
+        manifest = {
+            **MANIFEST_GOOD,
+            "lanes": {k: v for k, v in MANIFEST_GOOD["lanes"].items() if k != "cu12-wheel"},
+        }
         findings = cgo.check_promotion_table(_positive_texts(), manifest)
         self.assertFalse(
             any("absent from the manifest" in f for f in findings),
@@ -1573,21 +1621,21 @@ class PromotingIfTest(unittest.TestCase):
         self.assertTrue(any("no top-level conjunct" in f for f in findings))
 
     def test_precedence_bypass_depth0_or_fails(self):
-        findings = self._p3_for("github.event_name == 'push' || always() && needs.gpu-proof.result == 'success'")
+        findings = self._p3_for("github.event_name == 'push' || always() && needs.proof.result == 'success'")
         self.assertTrue(any("depth-0 `||`" in f for f in findings))
 
     def test_paren_string_hiding_or_still_caught(self):
-        findings = self._p3_for("contains(needs.gpu-proof.outputs.v, '(') || needs.gpu-proof.result == 'success'")
+        findings = self._p3_for("contains(needs.proof.outputs.v, '(') || needs.proof.result == 'success'")
         self.assertTrue(any("depth-0 `||`" in f for f in findings), findings)
 
     def test_wrapped_expression_reconstituted_positive(self):
         findings = self._p3_for(
-            "${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success' }}"
+            "${{ always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' }}"
         )
         self.assertEqual(findings, [])
 
     def test_normalization_accepts_no_spaces_around_equals(self):
-        findings = self._p3_for("always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result=='success'")
+        findings = self._p3_for("always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result=='success'")
         self.assertEqual(findings, [])
 
     def test_duplicated_gate_term_under_different_job_name_fails(self):
@@ -1600,7 +1648,7 @@ class PromotingIfTest(unittest.TestCase):
             "    if: >-\n"
             "      always() &&\n"
             "      startsWith(github.ref, 'refs/tags/v') &&\n"
-            "      needs.gpu-proof.result == 'success'\n"
+            "      needs.proof.result == 'success'\n"
         )
         texts = _positive_texts()
         texts["release-binaries.yml"] = _release_binaries_yml(raw_cu12_if_block=raw_if_block)
@@ -1620,17 +1668,17 @@ class GateKindTest(unittest.TestCase):
     rule (module doc's P3 description)."""
 
     def test_direct_gate_job_missing_the_reusable_uses_fails(self):
-        # gpu-proof exists but never `uses: _gpu-proof-required.yml`.
+        # proof exists but never `uses: _proof-required.yml`.
         texts = _positive_texts()
         texts["release-binaries.yml"] = _wf(
             "v*",
-            "  gpu-proof:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo not-the-reusable\n"
+            "  proof:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo not-the-reusable\n"
             + _promoting_job("server-cu12-promote")
             + _promoting_job("promote-binaries")
             + _promoting_job("server-cpu-promote"),
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
-        self.assertTrue(any("does not `uses: ./.github/workflows/_gpu-proof-required.yml`" in f for f in findings))
+        self.assertTrue(any("does not `uses: ./.github/workflows/_proof-required.yml`" in f for f in findings))
 
     def test_chained_gate_job_not_another_row_promoting_job_fails(self):
         # `PROMOTION_TABLE` is a fixed, hand-reviewed constant -- a
@@ -1708,14 +1756,14 @@ class GateKindTest(unittest.TestCase):
         texts = _positive_texts()
         texts["release-binaries.yml"] = _wf(
             "v*",
-            "  gpu-proof:\n    uses: ./.github/workflows/_gpu-proof-required.yml\n"
+            "  proof:\n    uses: ./.github/workflows/_proof-required.yml\n"
             + _promoting_job("server-cu12-promote")
             + _promoting_job("promote-binaries")
             + _promoting_job("server-cpu-promote"),
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
-            any("gate job `gpu-proof`" in f and "tag guard" in f for f in findings), findings
+            any("gate job `proof`" in f and "tag guard" in f for f in findings), findings
         )
 
     def test_promoting_job_missing_tag_guard_fails(self):
@@ -1725,7 +1773,7 @@ class GateKindTest(unittest.TestCase):
         # no ref restriction at all would let the promotion run off any ref.
         texts = _positive_texts()
         texts["release-binaries.yml"] = _release_binaries_yml(
-            cu12_if="always() && needs.gpu-proof.result == 'success'"
+            cu12_if="always() && needs.proof.result == 'success'"
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
@@ -1739,7 +1787,7 @@ class GateKindTest(unittest.TestCase):
         texts = _positive_texts()
         texts["pypi.yml"] = _simple_publish_yml(
             tag_pattern="py-v*",
-            publish_if="always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'",
+            publish_if="always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'",
             tag_family="py-v",
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
@@ -1762,11 +1810,11 @@ class StepGatedTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - uses: actions/checkout@v4\n"
             "      - name: Publish\n"
-            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'\n"
             "        run: npm publish --provenance --access public\n"
             "      - name: Sneak publish\n"
             "        run: npm publish --tag sneak\n",
@@ -1785,11 +1833,11 @@ class StepGatedTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - uses: actions/checkout@v4\n"
             "      - name: Publish\n"
-            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'\n"
             "        run: npm publish --provenance --access public\n"
             "      - name: Sneak docker publish\n"
             '        uses: "./.github/actions/docker-publish"\n'
@@ -1811,11 +1859,11 @@ class StepGatedTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - uses: actions/checkout@v4\n"
             "      - name: Publish\n"
-            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'\n"
             "        run: npm publish --provenance --access public\n"
             "      - name: Publish\n"
             "        run: npm publish --tag sneak\n",
@@ -1836,11 +1884,11 @@ class StepGatedTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - actions/checkout@v4\n"
             "      - name: Publish\n"
-            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'\n"
             "        run: npm publish --provenance --access public\n",
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
@@ -1851,8 +1899,8 @@ class StepGatedTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - uses: actions/checkout@v4\n      - name: Something Else\n        run: echo hi\n",
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
@@ -1867,7 +1915,7 @@ class StepGatedTest(unittest.TestCase):
     def test_step_if_depth0_or_fails(self):
         texts = _positive_texts()
         texts["npm.yml"] = _npm_yml(
-            step_if="github.event_name == 'push' || needs.gpu-proof.result == 'success'"
+            step_if="github.event_name == 'push' || needs.proof.result == 'success'"
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(any("depth-0 `||`" in f for f in findings), findings)
@@ -1878,9 +1926,9 @@ class StepGatedTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n"
-            "    if: always() && needs.gpu-proof.result == 'success'\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n"
+            "    if: always() && needs.proof.result == 'success'\n"
             "    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
             "      - name: Publish\n        if: startsWith(github.ref, 'refs/tags/v')\n        run: echo publish\n",
         )
@@ -2049,20 +2097,50 @@ class GateFileAbsentTest(unittest.TestCase):
             self.assertEqual(cgo.check_gate_file_absent(wf_dir), [])
 
 
+def _p4(**overrides) -> list[str]:
+    texts = {"gpu-prove.yml": PROVE_YML_GOOD, "ci.yml": CI_SUMMARY_YML_GOOD, "_summary.yml": SUMMARY_YML_GOOD}
+    texts.update(overrides)
+    return cgo.check_p4({k: v for k, v in texts.items() if v is not None}, set(REAL_ARCHES))
+
+
 class P4NameArchAgreementTest(unittest.TestCase):
     def test_job_name_template_mismatch_fails(self):
         bad = PROVE_YML_GOOD.replace(JOB_NAME_LINE, "GPU prove for RunPod (${{ matrix.arch }})")
-        findings = cgo.check_p4({"gpu-prove.yml": bad}, set(REAL_ARCHES))
-        self.assertTrue(any("does not match" in f for f in findings))
+        self.assertTrue(any("does not match" in f for f in _p4(**{"gpu-prove.yml": bad})))
 
     def test_arch_list_mismatch_fails(self):
         bad = PROVE_YML_GOOD.replace(f"arch: [{ARCH_LIST}]", "arch: [sm_80]")
-        findings = cgo.check_p4({"gpu-prove.yml": bad}, set(REAL_ARCHES))
-        self.assertTrue(any("!=" in f for f in findings))
+        self.assertTrue(any("!=" in f for f in _p4(**{"gpu-prove.yml": bad})))
 
     def test_positive_agreement_passes(self):
-        findings = cgo.check_p4({"gpu-prove.yml": PROVE_YML_GOOD}, set(REAL_ARCHES))
-        self.assertEqual(findings, [])
+        self.assertEqual(_p4(), [])
+
+
+class P4CiSummaryNameTest(unittest.TestCase):
+    """`verdict.CI_SUMMARY_JOB` is the name the API reports for `ci.yml`'s
+    summary: the caller's job id, then `_summary.yml`'s job id."""
+
+    def test_the_constant_names_the_summary(self):
+        self.assertEqual(verdict.CI_SUMMARY_JOB, "ci-summary / assert")
+
+    def test_a_renamed_caller_job_fails(self):
+        bad = CI_SUMMARY_YML_GOOD.replace("  ci-summary:", "  summary:")
+        self.assertTrue(any("has no job `ci-summary`" in f for f in _p4(**{"ci.yml": bad})))
+
+    def test_a_display_name_on_the_caller_fails(self):
+        bad = CI_SUMMARY_YML_GOOD.replace("  ci-summary:\n", "  ci-summary:\n    name: Summary\n")
+        self.assertTrue(any("carries a `name:`" in f for f in _p4(**{"ci.yml": bad})))
+
+    def test_a_caller_that_does_not_call_summary_fails(self):
+        bad = CI_SUMMARY_YML_GOOD.replace("_summary.yml", "_other.yml")
+        self.assertTrue(any("does not `uses:" in f for f in _p4(**{"ci.yml": bad})))
+
+    def test_a_renamed_callee_job_fails(self):
+        bad = SUMMARY_YML_GOOD.replace("  assert:", "  check:")
+        self.assertTrue(any("has no job `assert`" in f for f in _p4(**{"_summary.yml": bad})))
+
+    def test_a_missing_summary_workflow_fails(self):
+        self.assertTrue(any("_summary.yml is missing" in f for f in _p4(**{"_summary.yml": None})))
 
 
 class SplitTopLevelTest(unittest.TestCase):
@@ -2095,12 +2173,12 @@ class SplitTopLevelTest(unittest.TestCase):
 
 
 class ProofRequiredConsultsVerdictTest(unittest.TestCase):
-    """P5: `_gpu-proof-required.yml` actually CONSULTS the verdict. P3 only
+    """P5: `_proof-required.yml` actually CONSULTS the verdict. P3 only
     checks the gate job's `uses:` line, so without P5 gutting the reusable to
     `run: echo ok` would leave the gate green."""
 
     def test_real_file_passes(self):
-        findings = cgo.check_p5({"_gpu-proof-required.yml": PROOF_REQUIRED_YML_GOOD})
+        findings = cgo.check_p5({"_proof-required.yml": PROOF_REQUIRED_YML_GOOD})
         self.assertEqual(findings, [])
 
     def test_missing_reusable_fails(self):
@@ -2109,84 +2187,88 @@ class ProofRequiredConsultsVerdictTest(unittest.TestCase):
 
     def test_gutted_body_fails(self):
         gutted = (
-            "name: _gpu-proof-required\n\non:\n  workflow_call: {}\n\n"
+            "name: _proof-required\n\non:\n  workflow_call: {}\n\n"
             "jobs:\n  proof-required:\n    runs-on: ubuntu-latest\n"
             "    steps:\n      - run: echo ok\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": gutted})
+        findings = cgo.check_p5({"_proof-required.yml": gutted})
         self.assertTrue(any("does not invoke" in f for f in findings))
 
-    def test_literal_tag_sha_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"', "--sha v1.2.3")
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
-        self.assertTrue(any("not bound to" in f for f in findings), findings)
+    def test_tree_of_a_tag_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse v1.2.3^{tree})"')
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("not the tree of" in f for f in findings), findings)
 
-    def test_literal_hex_sha_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"', f"--sha {'a' * 40}")
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
-        self.assertTrue(any("not bound to" in f for f in findings), findings)
+    def test_quoted_tree_of_a_tag_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse "v1.2.3^{tree}")"')
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("not the tree of" in f for f in findings), findings)
 
-    def test_no_sha_argument_at_all_fails(self):
-        bad = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"\n', "")
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
-        self.assertTrue(any("no --sha argument" in f for f in findings), findings)
+    def test_unquoted_commit_tree_passes(self):
+        good = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse $GITHUB_SHA^{tree})"')
+        findings = cgo.check_p5({"_proof-required.yml": good})
+        self.assertEqual(findings, [])
+
+    def test_literal_tree_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("not the tree of" in f for f in findings), findings)
+
+    def test_the_commit_itself_rather_than_its_tree_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$GITHUB_SHA"')
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("not the tree of" in f for f in findings), findings)
+
+    def test_no_tree_argument_at_all_fails(self):
+        bad = PROOF_REQUIRED_YML_GOOD.replace(' \\\n            --tree ' + '"$(git rev-parse "$GITHUB_SHA^{tree}")"', "")
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("no --tree argument" in f for f in findings), findings)
 
     def test_workflow_call_expression_form_passes(self):
-        good = PROOF_REQUIRED_YML_GOOD.replace('--sha "$GITHUB_SHA"', "--sha ${{ github.sha }}")
-        findings = cgo.check_p5({"_gpu-proof-required.yml": good})
+        good = PROOF_REQUIRED_YML_GOOD.replace('"$(git rev-parse "$GITHUB_SHA^{tree}")"', '"$(git rev-parse ${{ github.sha }}^{tree})"')
+        findings = cgo.check_p5({"_proof-required.yml": good})
         self.assertEqual(findings, [])
+
+    def test_probe_never_counts_as_the_gate(self):
+        # `probe` never denies: a reusable calling it gates nothing.
+        bad = PROOF_REQUIRED_YML_GOOD.replace("verdict.py require", "verdict.py probe")
+        findings = cgo.check_p5({"_proof-required.yml": bad})
+        self.assertTrue(any("does not invoke" in f for f in findings), findings)
 
     def test_not_workflow_call_only_fails(self):
         bad = PROOF_REQUIRED_YML_GOOD.replace(
             "on:\n  workflow_call: {}\n", "on:\n  workflow_call: {}\n  workflow_dispatch:\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("workflow_call`-only" in f for f in findings), findings)
 
     def test_no_repo_argument_at_all_fails(self):
         # --repo must be pinned to THIS repo too.
         bad = PROOF_REQUIRED_YML_GOOD.replace('--repo "$GITHUB_REPOSITORY" \\\n            ', "")
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("no --repo argument" in f for f in findings), findings)
 
     def test_literal_repo_argument_fails(self):
         bad = PROOF_REQUIRED_YML_GOOD.replace(
             '--repo "$GITHUB_REPOSITORY"', "--repo some-other-org/some-other-repo"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
+        findings = cgo.check_p5({"_proof-required.yml": bad})
         self.assertTrue(any("not bound to `github.repository`" in f for f in findings), findings)
 
     def test_repo_expression_form_passes(self):
         good = PROOF_REQUIRED_YML_GOOD.replace('--repo "$GITHUB_REPOSITORY"', "--repo ${{ github.repository }}")
-        findings = cgo.check_p5({"_gpu-proof-required.yml": good})
-        self.assertEqual(findings, [])
-
-    def test_workflow_override_to_something_else_fails(self):
-        # A --workflow override may never name anything other
-        # than gpu-prove.yml -- a pointed-elsewhere consumer could read a
-        # DIFFERENT, unrelated workflow's runs as if they proved this one.
-        bad = PROOF_REQUIRED_YML_GOOD.replace(
-            '--sha "$GITHUB_SHA"', '--sha "$GITHUB_SHA" \\\n            --workflow some-other-workflow.yml'
-        )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": bad})
-        self.assertTrue(any("overrides --workflow" in f for f in findings), findings)
-
-    def test_workflow_override_to_the_same_value_passes(self):
-        good = PROOF_REQUIRED_YML_GOOD.replace(
-            '--sha "$GITHUB_SHA"', '--sha "$GITHUB_SHA" \\\n            --workflow gpu-prove.yml'
-        )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": good})
+        findings = cgo.check_p5({"_proof-required.yml": good})
         self.assertEqual(findings, [])
 
 
 def _proof_required_with_step(step_text: str) -> str:
-    """A `_gpu-proof-required.yml`-shaped fixture whose SECOND step (the
-    one that should invoke gpu_prove_verdict.py) is `step_text` verbatim --
+    """A `_proof-required.yml`-shaped fixture whose SECOND step (the
+    one that should invoke verdict.py) is `step_text` verbatim --
     drives the seven mechanism-evasion fail shapes through `check_p5`."""
     return (
-        "name: _gpu-proof-required\n\non:\n  workflow_call: {}\n\n"
+        "name: _proof-required\n\non:\n  workflow_call: {}\n\n"
         "permissions:\n  contents: read\n  actions: read\n\n"
-        "jobs:\n  proof-required:\n    name: GPU proof required\n"
+        "jobs:\n  proof-required:\n    name: Proof required\n"
         "    runs-on: ubuntu-latest\n    timeout-minutes: 15\n    steps:\n"
         "      - uses: actions/checkout@v4\n" + step_text
     )
@@ -2194,19 +2276,19 @@ def _proof_required_with_step(step_text: str) -> str:
 
 class ProofRequiredMechanismEvasionTest(unittest.TestCase):
     """Each of these seven shapes passes a whole-file substring check plus a
-    FIRST-`--sha`-match regex while the job does not really depend on the
+    FIRST-`--tree`-match regex while the job does not really depend on the
     verdict. Every one must FAIL under P5's mechanism (parse the reusable's
     job -> steps; the invocation must be the actual
     `run:` command of some step, with no trailing control operator, no
     `continue-on-error:`/`if:` on that step or its job, and the LAST
-    `--sha` on that command's line must be commit-bound)."""
+    `--tree` on that command's line must be the promoted commit's tree)."""
 
     def test_invocation_named_only_in_step_name_fails(self):
         step = (
-            "      - name: Check the commit's GPU-prove verdict via python3 ci/scripts/gpu_prove_verdict.py\n"
+            "      - name: Check the commit's GPU-prove verdict via python3 ci/scripts/verdict.py require\n"
             "        run: echo ok\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
         self.assertTrue(findings, findings)
         self.assertTrue(any("does not invoke" in f for f in findings), findings)
 
@@ -2214,9 +2296,9 @@ class ProofRequiredMechanismEvasionTest(unittest.TestCase):
         step = (
             "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
             "        run: |\n"
-            "          echo 'python3 ci/scripts/gpu_prove_verdict.py --sha \"$GITHUB_SHA\"'\n"
+            "          echo 'python3 ci/scripts/verdict.py require --tree \"$(git rev-parse $GITHUB_SHA^{tree})\"'\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
         self.assertTrue(findings, findings)
         self.assertTrue(any("does not invoke" in f for f in findings), findings)
 
@@ -2225,11 +2307,11 @@ class ProofRequiredMechanismEvasionTest(unittest.TestCase):
             "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
             "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
             "        run: |\n"
-            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "          python3 ci/scripts/verdict.py require \\\n"
             "            --repo \"$GITHUB_REPOSITORY\" \\\n"
-            "            --sha \"$GITHUB_SHA\" || true\n"
+            "            --tree \"$(git rev-parse $GITHUB_SHA^{tree})\" || true\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
         self.assertTrue(any("control operator" in f for f in findings), findings)
 
     def test_continue_on_error_step_fails(self):
@@ -2238,11 +2320,11 @@ class ProofRequiredMechanismEvasionTest(unittest.TestCase):
             "        continue-on-error: true\n"
             "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
             "        run: |\n"
-            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "          python3 ci/scripts/verdict.py require \\\n"
             "            --repo \"$GITHUB_REPOSITORY\" \\\n"
-            "            --sha \"$GITHUB_SHA\"\n"
+            "            --tree \"$(git rev-parse $GITHUB_SHA^{tree})\"\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
         self.assertTrue(any("continue-on-error" in f for f in findings), findings)
 
     def test_if_false_step_fails(self):
@@ -2251,37 +2333,37 @@ class ProofRequiredMechanismEvasionTest(unittest.TestCase):
             "        if: false\n"
             "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
             "        run: |\n"
-            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "          python3 ci/scripts/verdict.py require \\\n"
             "            --repo \"$GITHUB_REPOSITORY\" \\\n"
-            "            --sha \"$GITHUB_SHA\"\n"
+            "            --tree \"$(git rev-parse $GITHUB_SHA^{tree})\"\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
         self.assertTrue(any("if:" in f and "continue-on-error" in f for f in findings), findings)
 
-    def test_second_trailing_sha_last_wins_fails(self):
+    def test_second_trailing_tree_last_wins_fails(self):
         step = (
             "      - name: Check the commit's GPU-prove verdict (gpu-prove.yml job conclusions at github.sha)\n"
             "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
             "        run: |\n"
-            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "          python3 ci/scripts/verdict.py require \\\n"
             "            --repo \"$GITHUB_REPOSITORY\" \\\n"
-            "            --sha \"$GITHUB_SHA\" \\\n"
-            "            --sha v1.2.3\n"
+            "            --tree \"$(git rev-parse $GITHUB_SHA^{tree})\" \\\n"
+            "            --tree \"$(git rev-parse v1.2.3^{tree})\"\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
-        self.assertTrue(any("not bound to" in f and "v1.2.3" in f for f in findings), findings)
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("not the tree of" in f and "v1.2.3" in f for f in findings), findings)
 
-    def test_sha_in_step_name_body_has_tag_fails(self):
+    def test_tree_in_step_name_body_has_tag_fails(self):
         step = (
-            "      - name: \"Check the commit's GPU-prove verdict --sha $GITHUB_SHA\"\n"
+            "      - name: \"Check the tree's verdicts --tree $(git rev-parse $GITHUB_SHA^{tree})\"\n"
             "        env:\n          GITHUB_TOKEN: ${{ github.token }}\n"
             "        run: |\n"
-            "          python3 ci/scripts/gpu_prove_verdict.py \\\n"
+            "          python3 ci/scripts/verdict.py require \\\n"
             "            --repo \"$GITHUB_REPOSITORY\" \\\n"
-            "            --sha v1.2.3\n"
+            "            --tree \"$(git rev-parse v1.2.3^{tree})\"\n"
         )
-        findings = cgo.check_p5({"_gpu-proof-required.yml": _proof_required_with_step(step)})
-        self.assertTrue(any("not bound to" in f and "v1.2.3" in f for f in findings), findings)
+        findings = cgo.check_p5({"_proof-required.yml": _proof_required_with_step(step)})
+        self.assertTrue(any("not the tree of" in f and "v1.2.3" in f for f in findings), findings)
 
 
 class YamlExtensionTest(unittest.TestCase):
@@ -2347,7 +2429,7 @@ class NeedsMultilineFormTest(unittest.TestCase):
     below it) must PASS, not be misread as a single literal `- gate` name."""
 
     def test_multiline_needs_list_passes(self):
-        raw_needs_block = "    needs:\n      - gpu-proof\n"
+        raw_needs_block = "    needs:\n      - proof\n"
         texts = _positive_texts()
         texts["release-binaries.yml"] = _release_binaries_yml(raw_cu12_needs_block=raw_needs_block)
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
@@ -2583,12 +2665,12 @@ class JobLevelAndSequenceCarrierTest(unittest.TestCase):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            _gate_job("gpu-proof")
-            + "  publish:\n    needs: [gpu-proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
+            _gate_job("proof")
+            + "  publish:\n    needs: [proof]\n    if: always()\n    runs-on: ubuntu-latest\n"
             "    env:\n      SNEAK_CMD: npm publish --tag sneak\n"
             "    steps:\n      - uses: actions/checkout@v4\n"
             "      - name: Publish\n"
-            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.gpu-proof.result == 'success'\n"
+            "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'\n"
             "        run: npm publish --provenance --access public\n",
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
@@ -2611,12 +2693,12 @@ class JobLevelAndSequenceCarrierTest(unittest.TestCase):
 class RecursiveLocalReusableDiscoveryTest(unittest.TestCase):
     """A job that merely `uses:` a LOCAL reusable workflow
     whose own jobs match a primitive is itself a promoting job too --
-    `_ci-base-image.yml` pushes to GHCR; `image.yml`'s `build`/`build-cuda`
-    jobs (which each `uses:` it) must be discovered."""
+    `_ci-base-image.yml` pushes to GHCR; `ci.yml`'s `build-ci-image`/
+    `build-ci-image-cuda` jobs (which each `uses:` it) must be discovered."""
 
     def test_real_tree_image_callers_are_tabled_not_double_counted(self):
         # positive_workflows() already includes _ci-base-image.yml and
-        # image.yml with the real (gated, two-job) shape and their
+        # ci.yml's builders with the real (gated, two-job) shape and their
         # PROMOTION_TABLE rows -- confirms the recursion finds the caller,
         # never the reusable itself (which would be a bogus THIRD finding).
         findings = cgo.check_p6_discovery(_positive_texts())
@@ -3113,21 +3195,19 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         self.assertIn("_does_not_exist.yml", mine[0])
 
     def test_listed_jobs_job_level_uses_is_never_flagged_regardless_of_target_shape(self):
-        # image.yml's `build` row is REGISTERED (`PROMOTION_TABLE`'s
+        # ci.yml's `build-ci-image` row is REGISTERED (`PROMOTION_TABLE`'s
         # `ci-image-cpu`); once a job is listed, this rule never looks at
         # its `uses:` at all -- not its shape, not whether the target
         # exists, nothing. Repointed here at a target that does not even
         # exist, to prove the exemption is unconditional.
         texts = dict(_positive_texts())
-        texts["image.yml"] = (
-            "name: caller\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\n"
-            "jobs:\n  build:\n    if: github.ref_type != 'tag'\n"
-            "    uses: ./.github/workflows/_does_not_exist_either.yml\n"
-            "  build-cuda:\n    needs: build\n    if: github.ref_type != 'tag'\n"
-            "    uses: ./.github/workflows/_ci-base-image.yml\n"
+        texts["ci.yml"] = texts["ci.yml"].replace(
+            "  build-ci-image:\n    if: github.ref_type != 'tag'\n    uses: ./.github/workflows/_ci-base-image.yml\n",
+            "  build-ci-image:\n    if: github.ref_type != 'tag'\n    uses: ./.github/workflows/_does_not_exist_either.yml\n",
         )
+        self.assertIn("_does_not_exist_either.yml", texts["ci.yml"])
         findings = cgo.check_p6_discovery(texts)
-        mine = [f for f in findings if "image.yml" in f]
+        mine = [f for f in findings if "ci.yml" in f]
         self.assertEqual(mine, [])
 
     def test_reviewed_nonpublishing_local_reusable_is_never_flagged(self):
@@ -3275,42 +3355,42 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
 class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
     """A row's `gate_job` is exempt from P6's job-level `uses:` rule ONLY
     when its own parsed `uses:` resolves exactly to
-    `_gpu-proof-required.yml` (never by name alone), and every
+    `_proof-required.yml` (never by name alone), and every
     exempted-by-name file's (`REVIEWED_NONPUBLISHING_LOCAL_REUSABLES`,
-    `_gpu-proof-required.yml`) own jobs are scanned by the step-level rule
+    `_proof-required.yml`) own jobs are scanned by the step-level rule
     directly -- a publish step added to either is a finding."""
 
     def test_gate_job_repointed_elsewhere_with_the_uses_text_in_its_name_is_a_finding(self):
         # A text-substring check on the
         # gate job's body would have been satisfied by this `name:`
         # value; the PARSED job-level `uses:` (what this rule reads
-        # instead) resolves to `_evil.yml`, never `_gpu-proof-required.yml`.
+        # instead) resolves to `_evil.yml`, never `_proof-required.yml`.
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            "  gpu-proof:\n"
-            '    name: "uses: ./.github/workflows/_gpu-proof-required.yml"\n'
+            "  proof:\n"
+            '    name: "uses: ./.github/workflows/_proof-required.yml"\n'
             "    if: startsWith(github.ref, 'refs/tags/v')\n"
             "    uses: ./.github/workflows/_evil.yml\n"
-            "    secrets: inherit\n" + _step_gated_job("publish", "gpu-proof", "Publish"),
+            "    secrets: inherit\n" + _step_gated_job("publish", "proof", "Publish"),
         )
         texts["_evil.yml"] = (
             "name: evil\n\non:\n  workflow_call:\n\njobs:\n"
             "  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n"
         )
         findings = cgo.check_p6_discovery(texts)
-        mine = [f for f in findings if "npm.yml" in f and "gpu-proof" in f]
+        mine = [f for f in findings if "npm.yml" in f and "proof" in f]
         self.assertGreaterEqual(len(mine), 1, findings)
 
     def test_p3_gate_check_reads_the_parsed_uses_not_a_name_substring(self):
         texts = _positive_texts()
         texts["npm.yml"] = _wf(
             "v*",
-            "  gpu-proof:\n"
-            '    name: "uses: ./.github/workflows/_gpu-proof-required.yml"\n'
+            "  proof:\n"
+            '    name: "uses: ./.github/workflows/_proof-required.yml"\n'
             "    if: startsWith(github.ref, 'refs/tags/v')\n"
             "    uses: ./.github/workflows/_evil.yml\n"
-            "    secrets: inherit\n" + _step_gated_job("publish", "gpu-proof", "Publish"),
+            "    secrets: inherit\n" + _step_gated_job("publish", "proof", "Publish"),
         )
         texts["_evil.yml"] = (
             "name: evil\n\non:\n  workflow_call:\n\njobs:\n"
@@ -3318,19 +3398,19 @@ class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
-            any("npm-publish" in f and "gate job `gpu-proof`" in f and "does not" in f for f in findings),
+            any("npm-publish" in f and "gate job `proof`" in f and "does not" in f for f in findings),
             findings,
         )
 
     def test_gpu_proof_required_itself_gaining_a_publish_step_is_a_finding(self):
         texts = _positive_texts()
-        texts["_gpu-proof-required.yml"] = PROOF_REQUIRED_YML_GOOD.replace(
+        texts["_proof-required.yml"] = PROOF_REQUIRED_YML_GOOD.replace(
             "      - uses: actions/checkout@v4\n",
             "      - uses: actions/checkout@v4\n      - run: npm publish\n",
             1,
         )
         findings = cgo.check_p6_discovery(texts)
-        mine = [f for f in findings if "_gpu-proof-required.yml" in f]
+        mine = [f for f in findings if "_proof-required.yml" in f]
         self.assertGreaterEqual(len(mine), 1, findings)
         self.assertTrue(any("proof-required" in f for f in mine), mine)
 

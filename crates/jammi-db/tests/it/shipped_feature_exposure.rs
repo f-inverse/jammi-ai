@@ -4,14 +4,12 @@
 //! in `deny.toml` naming "the release image and the CUDA lanes" as the features-exposed set,
 //! silently understating it every time a lane was added or a literal `--features` list moved.
 //!
-//! All EIGHT shipped artifact families live under `ci/release-feature-manifest.json`'s
-//! `lanes` object: the six `jammi-server` families (the CUDA tarball, wheel and image, and the
-//! CPU tarball, wheel and image) and the two embedded-engine wheels `jammi-python` builds
-//! (`jammi-ai-native`, `jammi-ai-native-cu12`). A CPU family carries no `capabilities` block
-//! (`check_release_manifest.py` enforces that block is required iff a lane's own
-//! `cargo_features` names `cuda`/`flash-attn`, forbidden otherwise), but its `cargo_features`
-//! sits in exactly the same place as a CUDA lane's. This test derives every family's feature
-//! list from the manifest ALONE — no second, hand-duplicated per-family feature list here.
+//! All EIGHT shipped artifact families are lanes of `ci/release-feature-manifest.json`: the six
+//! `jammi-server` families (the CUDA tarball, wheel and image, and the CPU tarball, wheel and
+//! image) and the two embedded-engine wheels `jammi-python` builds (`jammi-ai-native`,
+//! `jammi-ai-native-cu12`). Each lane names the build it packages, and a family's features are
+//! that build's `cargo_features`. This test derives every family's feature list from the
+//! manifest ALONE — no second, hand-duplicated per-family feature list here.
 //!
 //! This lives as an it-test rather than a `ci/scripts/check_*.py` gate for the same reason
 //! `bans_names_resolve.rs` does: gate scripts are a human-amend-only surface
@@ -19,12 +17,12 @@
 //! `cargo test --workspace` lane already runs this binary on every PR.
 //!
 //! What this test asserts, all fail-closed (never a silent skip):
-//!   1. Every one of the eight shipped families is present under the manifest's `lanes` object
-//!      (a deleted/renamed family is a FINDING here).
+//!   1. Every one of the eight shipped families is a lane of the manifest (a deleted/renamed
+//!      family is a FINDING here).
 //!   2. A native wheel's `pyproject.toml` `[tool.maturin] features`, beyond
-//!      `extension-module` (how maturin links the module, not a capability), equal its lane's
-//!      `cargo_features`: maturin builds from the pyproject, so the manifest's declaration is
-//!      checked against the build input rather than trusted.
+//!      `extension-module` (how maturin links the module, not a capability), equal the
+//!      `cargo_features` of the build its lane packages: maturin builds from the pyproject, so
+//!      the manifest's declaration is checked against the build input rather than trusted.
 //!   3. `deny.toml` carries a GENERATED, marker-delimited exposure line for every advisory whose
 //!      reason names a cargo-gated feature, byte-equal to what today's manifest data computes.
 //!      `exposure = [...]` as a structured key inside `[[advisories.ignore]]` is not an option:
@@ -42,8 +40,8 @@
 //! `--features=<list>` or `-F <list>` invocation, an input default, a matrix value — is
 //! refused by `ci/scripts/check_workflow_feature_literals.py`, which parses every release
 //! workflow (and every local reusable workflow and composite action it reaches) and decides
-//! by value over the whole document; each build site reads its lane's list with a
-//! `jq -r '.lanes["<key>"].cargo_features | ...'` invocation.
+//! by value over the whole document; each build site reads its build's list with a
+//! `jq -r '.builds["<build>"].cargo_features | ...'` invocation.
 //! `cu12_features` in `ci/scripts/runpod_gpu_prove.sh` carries a literal cargo feature tuple
 //! outside that universe on purpose: it is compared against the manifest-derived value with
 //! its own loud `PROVE_SURFACE_DRIFT` error rather than reading the manifest directly.
@@ -74,7 +72,7 @@ fn read_to_string(path: &Path) -> String {
 
 // ---------------------------------------------------------------------------
 // The eight shipped artifact families, in the order the exposure line lists
-// them. All eight live under the manifest's `lanes` key --
+// them. All eight are lanes of the manifest --
 // this is a list of NAMES only, never a second copy of any family's feature
 // list (that stays exclusively in ci/release-feature-manifest.json).
 // ---------------------------------------------------------------------------
@@ -122,26 +120,32 @@ fn manifest_lanes(manifest: &serde_json::Value) -> &serde_json::Map<String, serd
         .unwrap_or_else(|| panic!("ci/release-feature-manifest.json has no `lanes` object"))
 }
 
-fn manifest_lane_features(manifest: &serde_json::Value, lane: &str) -> Vec<String> {
+/// The features a lane ships: the `cargo_features` of the build it packages.
+fn lane_features(manifest: &serde_json::Value, lane: &str) -> Vec<String> {
+    let build = manifest_lanes(manifest)
+        .get(lane)
+        .and_then(|l| l.get("build"))
+        .and_then(|b| b.as_str())
+        .unwrap_or_else(|| panic!("ci/release-feature-manifest.json has no lanes.{lane}.build"));
     manifest
-        .get("lanes")
-        .and_then(|l| l.get(lane))
-        .and_then(|l| l.get("cargo_features"))
+        .get("builds")
+        .and_then(|b| b.get(build))
+        .and_then(|b| b.get("cargo_features"))
         .and_then(|f| f.as_array())
         .unwrap_or_else(|| {
-            panic!("ci/release-feature-manifest.json has no lanes.{lane}.cargo_features array")
+            panic!("ci/release-feature-manifest.json has no builds.{build}.cargo_features array")
         })
         .iter()
         .map(|v| {
             v.as_str()
-                .unwrap_or_else(|| panic!("lanes.{lane}.cargo_features has a non-string entry"))
+                .unwrap_or_else(|| panic!("builds.{build}.cargo_features has a non-string entry"))
                 .to_string()
         })
         .collect()
 }
 
 /// Every family (of the eight) that carries `feature`, in `FAMILY_ORDER` -- driven ENTIRELY by
-/// the manifest (every family, CPU and CUDA alike, lives under `lanes`).
+/// the manifest (every family, CPU and CUDA alike, is a lane).
 fn families_carrying(
     feature: &str,
     features_by_family: &BTreeMap<&str, Vec<String>>,
@@ -175,7 +179,7 @@ fn every_shipped_family_is_present_in_the_manifest() {
     assert!(
         missing.is_empty(),
         "ci/release-feature-manifest.json's `lanes` is missing shipped famil{}: {:?} -- all \
-         eight shipped families (CPU and CUDA alike) must live under `lanes`",
+         eight shipped families (CPU and CUDA alike) must be lanes",
         if missing.len() == 1 { "y" } else { "ies" },
         missing
     );
@@ -187,7 +191,7 @@ fn deny_toml_carries_the_generated_exposure_line_for_every_gated_advisory() {
     let manifest = manifest_json(&root);
     let features_by_family: BTreeMap<&str, Vec<String>> = FAMILY_ORDER
         .iter()
-        .map(|fam| (*fam, manifest_lane_features(&manifest, fam)))
+        .map(|fam| (*fam, lane_features(&manifest, fam)))
         .collect();
 
     let deny_text = read_to_string(&root.join("deny.toml"));
@@ -270,18 +274,18 @@ fn pyproject_shipped_features(pyproject: &str) -> Vec<String> {
 }
 
 #[test]
-fn every_native_wheel_builds_the_features_its_lane_declares() {
+fn every_native_wheel_builds_the_features_its_build_declares() {
     let root = workspace_root();
     let manifest = manifest_json(&root);
     for (family, pyproject) in NATIVE_WHEELS {
-        let mut declared = manifest_lane_features(&manifest, family);
+        let mut declared = lane_features(&manifest, family);
         declared.sort();
         let built = pyproject_shipped_features(&read_to_string(&root.join(pyproject)));
         assert_eq!(
             built, declared,
             "{pyproject} builds {built:?} beyond `{MODULE_LINKAGE_FEATURE}`, but the manifest's \
-             `{family}` lane declares {declared:?} -- the wheel ships what its pyproject builds, \
-             so the two move in one change"
+             `{family}` lane packages a build declaring {declared:?} -- the wheel ships what its \
+             pyproject builds, so the two move in one change"
         );
     }
 }

@@ -57,8 +57,20 @@ permissions:
   contents: read
 
 jobs:
+  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
+  # the tree defines, never the one `main` last had.
+  ci-image:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-howwell'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
+
   gpu-howwell:
     name: how-well A/B on RunPod A100 (sm_80)
+    needs: ci-image
     # Label event only runs for the `run-howwell` label; dispatch always
     # runs. Mirrors gpu-prove.yml's own `run-gpu` gate exactly, one label
     # name over.
@@ -130,6 +142,7 @@ jobs:
         id: howwell
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           HOWWELL_MODEL_DIR: ${{ steps.resolve.outputs.model_dir }}

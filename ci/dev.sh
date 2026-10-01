@@ -9,6 +9,7 @@
 #   ci/dev.sh --with pg,s3 cargo test -p jammi-ai --features live-distributed-tests --test distributed
 #   ci/dev.sh --scratch rebase cargo test --workspace     # a target volume that dies with the command
 #   ci/dev.sh --gc                                        # remove what earlier runs left behind
+#   ci/dev.sh --build-image cargo test -p jammi-db        # after a change to the CI image's inputs
 #
 # Build output, the cargo registry and the sccache live in named Docker
 # volumes, so they persist between runs and never mix with a host `target/`.
@@ -25,10 +26,15 @@
 #                          S3-class store holding the lane's bucket)
 #   --scratch NAME         build into the volume jammi-dev-target-NAME instead
 #                          of the shared one, and remove it on exit
+#   --build-image          build this tree's CPU CI image for the host's arch
+#                          first, the way `_ci-base-image.yml` builds a leg —
+#                          for a tree whose image `ci.yml` has not built yet
 #   --gc                   remove every jammi-dev-* container, network and
 #                          volume that is not one of the kept caches, and every
 #                          dangling image; print what remains
-#   JAMMI_CI_IMAGE         image to use (default: the one the workflows use)
+#   JAMMI_CI_IMAGE         image to use (default: this tree's CI image, by
+#                          content — the one its workflows run in;
+#                          `ci/scripts/ci_image.py refs`)
 #   JAMMI_CI_PLATFORM      e.g. linux/amd64 to match the hosted runners exactly
 #                          (emulated, slow, on an arm64 host); default is native
 #   JAMMI_DEV_DOCKER_ARGS  extra `docker run` arguments (ports, env)
@@ -38,8 +44,9 @@
 #                          refusal naming the number
 set -euo pipefail
 
-image="${JAMMI_CI_IMAGE:-ghcr.io/f-inverse/jammi-ai-ci:latest}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+refs="$(python3 "$repo/ci/scripts/ci_image.py" refs)"
+image="${JAMMI_CI_IMAGE:-$(sed -n 's/^cpu=//p' <<<"$refs")}"
 run="jammi-dev-$$"
 min_free_gib="${JAMMI_DEV_MIN_FREE_GIB:-20}"
 
@@ -48,12 +55,13 @@ min_free_gib="${JAMMI_DEV_MIN_FREE_GIB:-20}"
 kept_volumes=(jammi-dev-target jammi-dev-cargo-registry jammi-dev-cargo-git jammi-dev-sccache)
 
 # The sidecar the workflows declare, by the image the workflows pin.
-pg_image="postgres:16"
+pg_image="$(sed -n 's/^postgres=//p' <<<"$refs")"
 
 with=()
 scratch=""
 store=""
 gc=""
+build_image=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --with) IFS=, read -r -a with <<<"$2"; shift 2 ;;
@@ -61,6 +69,7 @@ while [ "$#" -gt 0 ]; do
     --scratch) scratch="$2"; shift 2 ;;
     --scratch=*) scratch="${1#--scratch=}"; shift ;;
     --gc) gc=1; shift ;;
+    --build-image) build_image=1; shift ;;
     --) shift; break ;;
     -*) echo "ci/dev.sh: unknown option '$1'" >&2; exit 64 ;;
     *) break ;;
@@ -84,6 +93,19 @@ if [ -n "$gc" ]; then
   docker image prune -f >/dev/null
   docker system df
   exit 0
+fi
+
+# The tree's CPU image: built by `ci.yml` once the tree is pushed, or here.
+if [ -n "$build_image" ]; then
+  case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; *) arch=arm64 ;; esac
+  build_args=()
+  while IFS= read -r arg; do build_args+=(--build-arg "$arg"); done \
+    < <(python3 "$repo/ci/scripts/ci_image.py" build-args --dockerfile .docker/ci.Dockerfile --arch "$arch")
+  docker build -f "$repo/.docker/ci.Dockerfile" "${build_args[@]}" -t "$image" "$repo/.docker"
+fi
+if ! docker image inspect "$image" >/dev/null 2>&1 && ! docker manifest inspect "$image" >/dev/null 2>&1; then
+  echo "ci/dev.sh: $image is not built: ci.yml builds a tree's CI image once it is pushed; pass --build-image to build it here" >&2
+  exit 1
 fi
 
 # A run that fills the Docker VM's disk halts the VM; refuse before that

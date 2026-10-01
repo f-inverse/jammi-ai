@@ -139,7 +139,9 @@ async fn intra_batch_row_order_survives_replay(backend: BackendKind) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn intra_batch_row_order_survives_update_churn_on_an_early_row_postgres() {
-    let pg = PostgresBackend::open_with_options(&jammi_test_utils::postgres_url(), 8, None)
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
+    let pg = PostgresBackend::open_with_options(&url, 8, None)
         .await
         .unwrap();
     let backend_impl = BackendImpl::Postgres(pg);

@@ -177,5 +177,5 @@ RUN . /etc/ci-arch-env \
 # built before a pin moved, provides them through the same script; here they
 # are baked so a CI run fetches none of them.
 COPY pinned-tools.sh /tmp/pinned-tools.sh
-RUN bash /tmp/pinned-tools.sh actionlint kustomize kubeconform cargo-deny build-graph \
+RUN bash /tmp/pinned-tools.sh actionlint kustomize kubeconform cargo-nextest cargo-deny build-graph \
     && rm -rf /tmp/pinned-tools.sh /usr/local/cargo/registry /usr/local/cargo/git

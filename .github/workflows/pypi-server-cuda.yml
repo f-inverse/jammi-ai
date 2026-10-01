@@ -2,15 +2,16 @@ name: PyPI (jammi-server-cu12, CUDA)
 
 # Publishes the CUDA (cu12) `jammi-server-cu12` wheel to PyPI on a `py-v*` tag —
 # the SAME lockstep tag as the CPU `jammi-server`, the base client `jammi-ai`,
-# and the `jammi-ai-native` engine wheels. Thin caller of the shared
-# `_pypi-server` reusable; unlike the CPU leg, this leg carries the CUDA
-# DT_NEEDED link-set verification and gates publish behind the commit's
-# already-recorded GPU-prove verdict (build -> proof -> promote; `gpu-proof`
-# below reads it, never starts a new prove run) — the binary was proven on a
-# real GPU before it is promoted to PyPI. The publish job lives HERE, not in
-# the reusable — PyPI's token exchange and its attestation verification match
+# and the `jammi-ai-native` engine wheels. It compiles nothing: `ci.yml`
+# builds the wheel on every pull request and on `main` (`_server.yml`, the
+# `server-cu12` build, including the CUDA DT_NEEDED link-set verification its
+# packaging carries), and this workflow publishes the one the run that proved
+# the tag's tree built. Publishing is gated behind the commit's
+# already-recorded GPU-prove verdict (`proof` below reads it, never starts a
+# new prove run) — the build was proven on a real GPU before it is promoted
+# to PyPI. The publish job lives HERE, not in a reusable — PyPI's token exchange and its attestation verification match
 # different workflow-ref claims for a reusable-workflow publish and can never
-# both pass (see `_pypi-server.yml`'s header). The PyPI trusted publisher for
+# both pass (see `_server.yml`'s header). The PyPI trusted publisher for
 # `jammi-server-cu12` is registered under THIS file's name (workflow
 # `pypi-server-cuda.yml`, environment `pypi`).
 
@@ -18,25 +19,7 @@ on:
   push:
     tags: ["py-v*"]
   workflow_dispatch:
-  # PR gate: build-only (no publish) on every input compiled into the wheel
-  # (`ci/scripts/check_wheel_gates.py` holds the list), so a wheel that stops
-  # building, or outgrows PyPI's per-file limit
-  # (`ci/scripts/assert_wheel_size.sh`), fails on the PR that caused it.
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - ".cargo/**"
-      - "rust-toolchain.toml"
-      - "packaging/server-cu12/**"
-      - ".github/workflows/pypi-server-cuda.yml"
-      - ".github/workflows/_pypi-server.yml"
-      - "ci/scripts/assert_wheel_size.sh"
-      - "ci/release-feature-manifest.json"
 
-# Serialize per ref, never cancel: a publish in flight must finish (PyPI
-# uploads are not resumable), matching the other release lanes.
 concurrency:
   group: pypi-server-cuda-${{ github.ref }}
   cancel-in-progress: false
@@ -47,81 +30,21 @@ permissions:
   contents: read
 
 jobs:
-  # Resolves the mutable CUDA CI base-image tag to its index digest ONCE per
-  # workflow run (`.github/actions/resolve-ci-image`) -- V3's pinned set
-  # names this workflow explicitly: the CUDA wheel is a release artifact
-  # like every other consumer of the mutable base.
-  resolve-base:
-    name: Resolve CI base image (CUDA)
-    runs-on: ubuntu-latest
+  # What this release publishes: the artifacts the `ci.yml` run that proved
+  # the released tree built — nothing compiles here. On a branch dispatch,
+  # the rehearsal: the same lookup over the branch's tree.
+  artifacts:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.resolve.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: resolve
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
-
-  read-manifest:
-    name: Read release feature list
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      cargo_features: ${{ steps.manifest.outputs.cargo_features }}
-    steps:
-      - uses: actions/checkout@v4
-      # `ci/release-feature-manifest.json` is the single source of truth for
-      # this lane's cargo feature list (`cu12-wheel`) — read here rather
-      # than restating it inline in `with:` below, so a manifest edit moves
-      # this build in the same unit with no separate edit to keep in sync.
-      # A plain `ubuntu-latest` runner (no container) always has `jq`.
-      - name: Read ci/release-feature-manifest.json (cu12-wheel lane)
-        id: manifest
-        run: |
-          set -euo pipefail
-          features="$(jq -r '.lanes["cu12-wheel"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cu12-wheel cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
-
-  server-cu12:
-    name: jammi-server-cu12 (CUDA)
-    needs: [read-manifest, resolve-base]
-    permissions:
-      contents: read
-    uses: ./.github/workflows/_pypi-server.yml
+      actions: read
+    uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      container_image: ${{ needs.resolve-base.outputs.image }}
-      cargo_features: ${{ needs.read-manifest.outputs.cargo_features }}
-      package_dir: packaging/server-cu12
-      artifact_prefix: server-cu12
-      platform_tag: manylinux_2_28_x86_64
-      verify_link_set: true
-      # `flash-attn` is now in the manifest's cu12-wheel feature list, which
-      # needs the vendored CUTLASS submodule at build time.
-      init_cutlass_submodule: true
-    secrets: inherit
+      artifacts: server-cu12-x86_64-wheel
 
-  # Hoisted to THIS caller: `_pypi-server.yml` carries no notion of GPU
-  # proof at all (its CPU caller, `pypi-server.yml`, has no need of it).
-  # Runs concurrently with `server-cu12` above — it never needed the wheel
-  # build to finish first, only to be checked before `publish` below.
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     if: startsWith(github.ref, 'refs/tags/py-v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -133,22 +56,26 @@ jobs:
     # workflow_dispatch run on the tag (recovery: PyPI rejects a re-upload of
     # an existing version, so re-running the tag is idempotent; a re-run
     # reuses the commit's already-recorded GPU-prove verdict — it never
-    # re-proves). A branch dispatch or PR is an artifact-only dry run and can
-    # never publish. Same recovery contract as `pypi.yml`/`pypi-client.yml`
-    # on this lockstep surface. The `if:` is a PURE conjunction (no `||`):
-    # both `server-cu12` (build+package) and `gpu-proof` (the commit's
-    # verdict) must have succeeded before this job runs.
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.server-cu12.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [server-cu12, gpu-proof]
+    # re-proves). A branch dispatch is a rehearsal and can never publish.
+    # Same recovery contract as `pypi.yml`/`pypi-client.yml` on this lockstep
+    # surface. The `if:` is a PURE conjunction (no `||`): both `artifacts`
+    # (the proving run, holding the wheel) and `proof` (the commit's verdict)
+    # must have succeeded before this job runs.
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
+    needs: [artifacts, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
+      # Downloads from the proving run, not this one.
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: server-cu12-dist
+          name: server-cu12-x86_64-wheel
           path: dist
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
 
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
         with:

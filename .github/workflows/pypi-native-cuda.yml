@@ -4,9 +4,11 @@ name: PyPI (jammi-ai-native-cu12, CUDA)
 # `jammi-ai-native-cu12`, to PyPI on a `py-v*` tag — the SAME lockstep tag as
 # `jammi-ai`, the CPU `jammi-ai-native` and the servers. It provides the same
 # `jammi_native` module as the CPU wheel, so `jammi-ai` runs on the GPU with
-# no other change. Built in the CUDA CI image by
-# `ci/scripts/build_native_cu12_wheel.sh` (the same recipe a GPU pod verifies
-# the wheel with); its cargo features are `packaging/native-cu12`'s own
+# no other change. `ci.yml` builds it on every pull request and on `main`
+# (`_native-wheel-cu12.yml`: in the CUDA CI image, through
+# `ci/scripts/build_native_cu12_wheel.sh`, the same recipe a GPU pod verifies
+# the wheel with); this workflow publishes the one the run that proved the
+# tag's tree built. Its cargo features are `packaging/native-cu12`'s own
 # `[tool.maturin] features`, as the CPU wheel's are. Publishing is gated on
 # the commit's already-recorded GPU-prove verdict, like every release lane.
 #
@@ -18,22 +20,6 @@ on:
   push:
     tags: ["py-v*"]
   workflow_dispatch:
-  # PR gate: build-only (no publish) on every input compiled into the wheel
-  # (`ci/scripts/check_wheel_gates.py` holds the list), so a wheel that stops
-  # building, or outgrows PyPI's per-file limit
-  # (`ci/scripts/assert_wheel_size.sh`), fails on the PR that caused it.
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
-      - ".cargo/**"
-      - "rust-toolchain.toml"
-      - "packaging/native-cu12/**"
-      - "packaging/native/python/**"
-      - "ci/scripts/build_native_cu12_wheel.sh"
-      - "ci/scripts/assert_wheel_size.sh"
-      - ".github/workflows/pypi-native-cuda.yml"
 
 # Serialize per ref, never cancel: a publish in flight must finish (PyPI
 # uploads are not resumable), matching the other release lanes.
@@ -45,62 +31,21 @@ permissions:
   contents: read
 
 jobs:
-  # Resolves the mutable CUDA CI base-image tag to its index digest once per
-  # run (`.github/actions/resolve-ci-image`), as every release consumer does.
-  resolve-base:
-    name: Resolve CI base image (CUDA)
-    runs-on: ubuntu-latest
+  # What this release publishes: the artifacts the `ci.yml` run that proved
+  # the released tree built — nothing compiles here. On a branch dispatch,
+  # the rehearsal: the same lookup over the branch's tree.
+  artifacts:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.resolve.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: resolve
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
+      actions: read
+    uses: ./.github/workflows/_proven-artifacts.yml
+    with:
+      artifacts: native-cu12-wheel
 
-  build:
-    name: Build jammi-ai-native-cu12 (manylinux_2_28_x86_64)
-    needs: resolve-base
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.resolve-base.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-
-      # `flash-attn` needs the vendored CUTLASS submodule at build time.
-      - name: Init the CUTLASS submodule
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          # A wheel-build lane, not the lint gate.
-          deny-warnings: false
-
-      - name: Build and check the wheel
-        run: bash ci/scripts/build_native_cu12_wheel.sh
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-cu12-dist
-          path: packaging/native-cu12/dist/
-
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     if: startsWith(github.ref, 'refs/tags/py-v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -109,17 +54,21 @@ jobs:
   publish:
     name: Publish to PyPI
     # Publishes ONLY from a `py-v*` tag ref. PURE conjunction (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [build, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
+    needs: [artifacts, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
+      # Downloads from the proving run, not this one.
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: native-cu12-dist
+          name: native-cu12-wheel
           path: dist
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
 
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
         with:

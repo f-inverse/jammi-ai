@@ -32,10 +32,10 @@ it to `PLATFORM` is a one-line, reviewed decision, whereas a silent skip is
 nobody's decision at all.
 
 `PLATFORM` is not a guess: it is the non-CUDA half of the actual `DT_NEEDED`
-list of the binary this check runs on (`target/release/jammi-server`, built by
-`_pypi-server.yml`'s `build-binary` job in the manylinux_2_28 CUDA image and
-verified at `_pypi-server.yml:144`), read off the `server-cu12-binary` artifact
-of run 34717957779. Note `libmvec.so.1`, glibc's vector-math library: it is on
+list of the binary this check runs on (the `server-cu12` build's
+`jammi-server`, which `_server.yml` compiles in the manylinux_2_28 CUDA image
+and checks before packaging its wheel), read off that binary's artifact in run
+34717957779. Note `libmvec.so.1`, glibc's vector-math library: it is on
 that list, and a hand-written "libc, libm, libstdc++, libgcc_s, …" allowlist
 would have reddened the lane on it.
 

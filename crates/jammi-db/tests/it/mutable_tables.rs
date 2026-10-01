@@ -48,10 +48,8 @@ fn events_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Backend-unique mutable-table id. SQLite per-tempdir tests don't strictly
-/// need uniqueness, but the Postgres lane shares one database across every
-/// test in the run; the suffix avoids `relation "<name>" already exists`
-/// errors between parameterised variants.
+/// A mutable-table id no other call returns, so a test creates as many tables
+/// as it needs without naming each.
 fn unique_id(prefix: &str) -> MutableTableId {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -707,10 +705,6 @@ async fn registered_mutable_tables_reload_across_sessions(backend: BackendKind) 
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(ids.value(0), 42);
-
-    // Clean up the persistent row so a re-run doesn't surface stale state on
-    // the shared Postgres catalog.
-    session.drop_mutable_table(&id).await.unwrap();
 }
 
 /// A NULL in a nullable non-text column (`score FLOAT64`) must round-trip

@@ -46,7 +46,7 @@ this file — not even the very first line of `main()` — can ever run in
 that exact scenario, because the Python interpreter itself never starts; a
 check "at entry" inside this script is structurally unable to defend
 against that specific instance, which is why the actual guard against it
-lives OUTSIDE this file, in `release-binaries.yml`'s own invocation of it
+lives OUTSIDE this file, in `package_server_tarball.sh`'s own invocation of it
 (checked immediately before `python3` is exec'd, refusing with a named
 error rather than silently proceeding). `main()` below still checks
 `os.environ` for this variable as its OWN first statement — a real, if

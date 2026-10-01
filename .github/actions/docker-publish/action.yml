@@ -4,11 +4,11 @@ description: >
   Buildx setup, conditional GHCR login (only when `push` is `true` — a
   build-only verification lane never touches GHCR credentials), conditional
   tag/label extraction (skipped when `tags-spec` is empty — a build-only lane
-  needs no tags), and the `docker/build-push-action` invocation itself. This
-  collapses server-image.yml's four jobs (generic CPU, self-contained CPU,
-  CUDA push, CUDA build-only PR-verification) — which differ only in image
-  name, tag scheme, build-args, and whether they push at all — into one
-  parameterized action instead of four repeated step sequences. Must run
+  needs no tags), and the `docker/build-push-action` invocation itself. Every
+  server image build goes through it — `server-image.yml`'s published
+  images, `ci.yml`'s CUDA image check, and the image the smokes load — which
+  differ only in image name, tag scheme, build-args, where the binaries come
+  from, and whether they push at all. Must run
   AFTER `actions/checkout@v4` (local-path composite; the checkout step has to
   have already materialized it, same constraint as `setup-rust-ci`).
 
@@ -99,6 +99,16 @@ inputs:
       the same reason as `sbom` above.
     required: false
     default: "mode=max"
+  build-contexts:
+    description: >
+      Named build contexts passed straight through to
+      `docker/build-push-action` (`name=path`, one per line). A context named
+      after a Dockerfile stage replaces that stage: `builder=<dir>` packages
+      binaries the run already built (see the Dockerfile's builder-stage
+      contract, and `stage-server-binaries`, which lays `<dir>` out). Empty
+      (the default) builds every stage from source.
+    required: false
+    default: ""
   platforms:
     description: >
       Comma-separated buildx platform list passed straight through to
@@ -224,6 +234,7 @@ runs:
         load: ${{ inputs.load }}
         tags: ${{ inputs.load == 'true' && inputs.local-tag || steps.meta.outputs.tags }}
         build-args: ${{ inputs.build-args }}
+        build-contexts: ${{ inputs.build-contexts }}
         # `labels` stays metadata-action's output (or empty on the build-only
         # PR lane) regardless of `load` — labels carry no registry meaning.
         labels: ${{ steps.meta.outputs.labels }}

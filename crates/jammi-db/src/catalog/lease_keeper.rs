@@ -122,7 +122,8 @@ impl Liveness {
 /// A live hold on a lease target with a [`LeaseKeeper`]. Renewed every
 /// `heartbeat` interval until this handle is dropped, at which point the
 /// target is removed from the keeper's list and renewed no more — "release
-/// on drop".
+/// on drop" — and its `lost` flag is set: with nothing renewing it, the lease
+/// is lost to anyone still holding the flag.
 pub struct LeaseHold {
     id: u64,
     holds: Arc<Mutex<HashMap<u64, HeldState>>>,
@@ -166,8 +167,9 @@ impl LeaseHold {
     /// this hold within the lease window — has no thread able to flip a
     /// flag, so it is visible only through [`Self::lost`] itself. The hold
     /// must still be kept alive (not dropped) for as long as the lease
-    /// should keep renewing — dropping it releases the hold, but does not
-    /// retroactively un-flip a flag a caller is still holding a clone of.
+    /// should keep renewing — dropping it releases the hold and sets the
+    /// flag, so a holder of the clone stops rather than working on a lease
+    /// nothing renews.
     pub fn lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.lost)
     }
@@ -175,6 +177,12 @@ impl LeaseHold {
 
 impl Drop for LeaseHold {
     fn drop(&mut self) {
+        // Nothing renews the lease once its hold is gone, so it is lost to
+        // whoever still holds the flag: a training thread whose owning
+        // future was aborted (a `spawn_blocking` thread cannot be
+        // force-aborted) stops at its next epoch boundary instead of running
+        // its job to the end.
+        self.lost.store(true, Ordering::SeqCst);
         self.holds
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

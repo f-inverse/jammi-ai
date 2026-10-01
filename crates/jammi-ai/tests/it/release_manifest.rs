@@ -1,12 +1,12 @@
-//! The release feature manifest's `cu12-tarball` lane (`ci/release-feature-manifest.json`),
+//! The release feature manifest's `server-cu12` build (`ci/release-feature-manifest.json`),
 //! read for the tests that hold it against the kernels' probed-op table. Shared by
 //! this binary and the `gpu_capability` suite.
 
 use jammi_kernels::admission::{ProbedOpKind, PROBED_OPS};
 
-/// The manifest lane this test reads — the same lane `runpod_gpu_prove.sh`'s
+/// The manifest build this test reads — the same build `runpod_gpu_prove.sh`'s
 /// capability-surface build derives its feature list from.
-pub(crate) const MANIFEST_LANE: &str = "cu12-tarball";
+pub(crate) const MANIFEST_BUILD: &str = "server-cu12";
 
 /// `ci/release-feature-manifest.json`, located relative to this crate's
 /// manifest dir (`crates/jammi-ai` → workspace root → `ci/`).
@@ -47,10 +47,10 @@ pub(crate) fn load_manifest() -> serde_json::Value {
 }
 
 pub(crate) fn manifest_string_list(manifest: &serde_json::Value, capability: &str) -> Vec<String> {
-    manifest["lanes"][MANIFEST_LANE]["capabilities"][capability]
+    manifest["builds"][MANIFEST_BUILD]["capabilities"][capability]
         .as_array()
         .unwrap_or_else(|| {
-            panic!("manifest lane {MANIFEST_LANE:?} is missing capabilities.{capability}")
+            panic!("manifest build {MANIFEST_BUILD:?} is missing capabilities.{capability}")
         })
         .iter()
         .map(|v| {

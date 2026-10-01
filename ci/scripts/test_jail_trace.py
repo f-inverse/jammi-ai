@@ -95,7 +95,7 @@ class TestJailTrace(unittest.TestCase):
         `python3 -c` subprocess with the variable set and asserting its
         stdout is python3's own library trace, never the script's output,
         exit 0. This is exactly why the real guard for that case lives in
-        the caller's shell (`release-binaries.yml`), not here.
+        the caller's shell (`package_server_tarball.sh`), not here.
         """
         self.assertEqual(
             sys.platform,

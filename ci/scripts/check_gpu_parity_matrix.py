@@ -256,8 +256,8 @@ SiliconAccountingEntry = ProvenBy | Deferred
 # (`grpc_embedding_gpu`, `gpu_capability`) on each of the four shipped SASS
 # targets. Every CUDA artifact promotion (server image, release
 # binaries, cu12 wheel) gates on that SAME recorded verdict, proven once per
-# commit and shared (`ci/scripts/gpu_prove_verdict.py`, consumed via
-# `_gpu-proof-required.yml`), never a second rental of its own.
+# tree and shared (`ci/scripts/verdict.py`, consumed via
+# `_proof-required.yml`), never a second rental of its own.
 SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
     (
         "sm_80",

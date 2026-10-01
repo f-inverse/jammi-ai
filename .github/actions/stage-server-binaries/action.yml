@@ -1,0 +1,72 @@
+name: stage-server-binaries
+description: >
+  Lays out binaries a run built — a `jammi-server` from `_server.yml` and the
+  `jammi` CLI from `_cli.yml` — as the Dockerfile's builder-stage output
+  (`<dir>/out/jammi-server`, `<dir>/out/jammi`, and, for the CPU builder, an
+  empty `<dir>/out/jammi-data/`), so an image build packages them through
+  `docker-publish`'s `build-contexts: builder=<dir>` instead of compiling
+  them again. Must run AFTER `actions/checkout@v4` (a local-path composite).
+
+inputs:
+  server:
+    description: "The server binary's artifact, e.g. `server-cpu-x86_64-binary`."
+    required: true
+  cli:
+    description: "The CLI tarball's artifact, e.g. `jammi-x86_64-unknown-linux-gnu`."
+    required: true
+  stage:
+    description: >
+      The Dockerfile stage these binaries replace: `builder` (the CPU
+      runtimes, which also take `jammi-data/`) or `builder-cuda`.
+    required: true
+  run-id:
+    description: >
+      The run that built the artifacts; empty (the default) is this run.
+    required: false
+    default: ""
+
+outputs:
+  build-context:
+    description: "The `build-contexts` line for `docker-publish`: `<stage>=<dir>`."
+    value: ${{ steps.layout.outputs.build-context }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.server }}
+        path: ${{ runner.temp }}/server-binaries/server
+        run-id: ${{ inputs.run-id }}
+        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.cli }}
+        path: ${{ runner.temp }}/server-binaries/cli
+        run-id: ${{ inputs.run-id }}
+        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+
+    - name: Lay out the builder stage's output
+      id: layout
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        ROOT: ${{ runner.temp }}/server-binaries
+      run: |
+        set -euo pipefail
+        case "$STAGE" in
+          builder | builder-cuda) ;;
+          *) echo "::error::stage must be builder or builder-cuda, got '$STAGE'" >&2; exit 1 ;;
+        esac
+        out="$ROOT/context/out"
+        mkdir -p "$out"
+        cp "$ROOT/server/jammi-server" "$out/jammi-server"
+        tarball="$(ls "$ROOT"/cli/jammi-*.tar.gz)"
+        tar -xzf "$tarball" -C "$out" jammi
+        # Artifacts do not preserve the exec bit.
+        chmod +x "$out/jammi-server" "$out/jammi"
+        if [ "$STAGE" = builder ]; then
+          mkdir -p "$out/jammi-data"
+        fi
+        echo "build-context=$STAGE=$ROOT/context" >> "$GITHUB_OUTPUT"

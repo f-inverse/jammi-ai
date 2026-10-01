@@ -11,10 +11,9 @@ name: Devcontainer Image
 # every PR that touches it, before a broken devcontainer surprises the next
 # container rebuild.
 #
-# Standalone rather than folded under ci-summary: this lane is path-filtered
-# (like server-image.yml's build-cuda-pr lane), and the required ci-summary
-# context must stay path-filter-free so it never hangs a PR that doesn't
-# touch the devcontainer.
+# Standalone rather than folded under ci-summary: this lane is path-filtered,
+# and the required ci-summary context must stay path-filter-free so it never
+# hangs a PR that doesn't touch the devcontainer.
 
 on:
   pull_request:

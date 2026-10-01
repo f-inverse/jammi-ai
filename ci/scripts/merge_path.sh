@@ -6,23 +6,28 @@
 #   bash ci/scripts/merge_path.sh [--only STAGE[,STAGE]] [--skip-pg] [--skip-tests] [--skip-mdbook]
 #
 # Stages, in order:
-#   static   fmt, the clippy surfaces the `check` job lints, rustdoc -D warnings, the guide build
-#            (ci.yml `check`, docs.yml `build`)
+#   static   fmt, the clippy surfaces the `check` and `clippy-gated` jobs lint,
+#            rustdoc -D warnings, the guide build (ci.yml `check`,
+#            `clippy-gated`, docs.yml `build`)
 #   guards   the guards this change can affect (`ci/guards.toml`) and the
 #            script tests it can affect, through the same runners ci.yml's
 #            `guard` job calls
 #   index    ci.yml's `symbol-index-gates` steps (the guards that build a
 #            workspace crate), each step's `run:` block executed WHOLE (a
 #            multi-line guard split into lines is never evaluated)
-#   tests    the hermetic lane (workspace, test-hooks, golden-parity) and the
-#            Postgres lane (ci.yml `test`, `test-pg`)
+#   tests    the hermetic suite under nextest and its doctests (ci.yml
+#            `test-build` + `test`, which split the same suite across
+#            runners), the permission-fault lane, the storage-cloud and
+#            golden-parity lanes, and the Postgres lane (ci.yml
+#            `test-permission-fault`, `test-lanes`, `test-pg`)
 #
 # Refuses to run when HEAD is the base (nothing to check — every diff-scoped
 # gate would be vacuously green) or the tree is dirty (the gates read
 # committed state; an uncommitted change is invisible to them).
 #
-# The Postgres lane needs a live database in JAMMI_TEST_PG_URL (CI's shape:
-# user jammi, db jammi_test). Without one the stage FAILS, naming the fix,
+# The Postgres lane needs a live database server in JAMMI_TEST_PG_URL (CI's
+# shape: user jammi, db jammi_test; `ci/dev.sh --with pg` starts one). Each
+# test creates a database of its own on it. Without one the stage FAILS, naming the fix,
 # unless --skip-pg is given; likewise `mdbook build` FAILS when mdbook is
 # absent unless --skip-mdbook is given. A silently skipped lane is how the
 # shared-database leak of PR #579 reached CI.
@@ -151,7 +156,7 @@ PY
 # ---------------------------------------------------------------- coverage
 # Which ci.yml jobs this runner covers, printed up front so "green" is never
 # read as "every job".
-COVERED_JOBS="check test test-pg guard symbol-index-gates"
+COVERED_JOBS="check clippy-gated test-build test test-permission-fault test-lanes test-pg guard symbol-index-gates"
 python3 - "$COVERED_JOBS" <<'PY'
 import sys, yaml
 ci = yaml.safe_load(open('.github/workflows/ci.yml'))
@@ -164,12 +169,12 @@ PY
 
 # ---------------------------------------------------------------- static
 if stage_wanted static; then
-  run static "cargo fmt --check" cargo fmt --all -- --check
-  run static "clippy workspace" cargo clippy --workspace --all-targets -- -D warnings
+  run_sh static "cargo fmt --check" "$(ci_step check 'Check formatting')"
+  run_sh static "clippy workspace" "$(ci_step check 'Clippy')"
   run_sh static "clippy feature-gated test surfaces" \
-    "$(ci_step check 'Clippy (feature-gated test surfaces)')"
-  run static "clippy jammi-db postgres,mysql" \
-    cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
+    "$(ci_step clippy-gated 'Clippy (feature-gated test surfaces)')"
+  run_sh static "clippy jammi-db postgres,mysql" \
+    "$(ci_step check 'Clippy jammi-db --features postgres,mysql --all-targets (source-provider feature surface)')"
   run static "rustdoc -D warnings" \
     env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps
   if command -v mdbook >/dev/null 2>&1; then
@@ -216,14 +221,17 @@ fi
 
 # ---------------------------------------------------------------- tests
 if stage_wanted tests && [ "$SKIP_TESTS" = 0 ]; then
-  run tests "cargo test --workspace (hermetic lane)" \
-    cargo test --workspace --exclude jammi-python
-  run tests "jammi-db test-hooks lane" \
-    cargo test -p jammi-db --features test-hooks --test it -- --test-threads=1
-  run tests "jammi-encoders golden-parity" \
-    cargo test -p jammi-encoders --features golden-parity --test golden_parity
+  # CI archives this suite once and runs it in partitions; here it is one run.
+  run tests "hermetic suite (nextest)" \
+    cargo nextest run --profile ci --workspace --exclude jammi-python
+  run_sh tests "doctests" "$(ci_step test-build 'Doctests')"
+  run_sh tests "storage-cloud lane" \
+    "$(ci_step test-lanes 'Run tests (storage-cloud lane — root-identity determinants)')"
+  run_sh tests "jammi-encoders golden-parity" \
+    "$(ci_step test-lanes 'Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)')"
+  printf 'skip  [tests] build-sha hermeticity (CI only: it commits to the checkout)\n'
   run_sh tests "permission-fault tests (unprivileged account)" \
-    "$(ci_step test 'Permission-fault tests (unprivileged account)')"
+    "$(ci_step test-permission-fault 'Permission-fault tests (unprivileged account)')"
   if [ -n "${JAMMI_TEST_PG_URL:-}" ]; then
     run_sh tests "Postgres lane" "$(ci_step test-pg 'Run Postgres tests')"
   elif [ "$SKIP_PG" = 1 ]; then

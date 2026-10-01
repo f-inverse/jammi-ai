@@ -260,12 +260,12 @@ ${REMOTE_CHECKOUT_LINES}
 echo "PROVE_SHA=\$(git rev-parse HEAD)"
 rc=0
 # The vendored FlashAttention-2 build (\`flash-attn\`, in the manifest's
-# cu12-tarball feature list read below) needs the CUTLASS submodule; a plain
+# server-cu12 feature list read below) needs the CUTLASS submodule; a plain
 # shallow \`git clone\` above does not fetch submodules.
 git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass \
   || { echo "::error::CUTLASS submodule init failed (network/remote unreachable?) — refusing to attempt the flash-attn build" >&2; exit 1; }
 
-# capability-surface-build: builds the shipped cu12-tarball server binary and
+# capability-surface-build: builds the shipped server-cu12 binary and
 # compile-checks the jammi-ai capability-surface test binary. The manifest
 # read below is a TRIPWIRE ONLY -- it never feeds the literal
 # \`--features\` arguments the two cargo invocations carry; a divergence
@@ -276,27 +276,27 @@ grc=0
 cu12_features="\$(python3 -c "
 import json
 d = json.load(open('ci/release-feature-manifest.json'))
-print(','.join(d['lanes']['cu12-tarball']['cargo_features']))
+print(','.join(d['builds']['server-cu12']['cargo_features']))
 ")"
 if [ -z "\${cu12_features}" ]; then
-  echo "::error::ci/release-feature-manifest.json produced an empty cu12-tarball cargo_features list" >&2
+  echo "::error::ci/release-feature-manifest.json produced an empty server-cu12 cargo_features list" >&2
   grc=1
 fi
 ai_features="\$(python3 -c "
 import json
 d = json.load(open('ci/release-feature-manifest.json'))
-lane = set(d['lanes']['cu12-tarball']['cargo_features'])
+shipped = set(d['builds']['server-cu12']['cargo_features'])
 server_only = set(d['server_only_cargo_features']['features'])
-print(','.join(sorted(lane - server_only)))
+print(','.join(sorted(shipped - server_only)))
 ")"
 if [ -z "\${ai_features}" ]; then
   echo "::error::deriving the jammi-ai-applicable feature subset from ci/release-feature-manifest.json produced an empty list" >&2
   grc=1
 fi
-echo "cu12-tarball cargo_features=\${cu12_features}"
+echo "server-cu12 cargo_features=\${cu12_features}"
 echo "jammi-ai-applicable subset=\${ai_features}"
 if [ "\${cu12_features}" != "cuda,flash-attn,mysql,postgres,storage-cloud" ]; then
-  echo "::error::PROVE_SURFACE_DRIFT: manifest-derived cu12-tarball cargo_features (\${cu12_features}) no longer matches the literal jammi-server RELEASE tuple this leg builds (cuda,flash-attn,mysql,postgres,storage-cloud) -- update the literal (and its PROVE_TUPLE echo) in the SAME unit as the manifest edit" >&2
+  echo "::error::PROVE_SURFACE_DRIFT: manifest-derived server-cu12 cargo_features (\${cu12_features}) no longer matches the literal jammi-server RELEASE tuple this leg builds (cuda,flash-attn,mysql,postgres,storage-cloud) -- update the literal (and its PROVE_TUPLE echo) in the SAME unit as the manifest edit" >&2
   grc=1
 fi
 if [ "\${ai_features}" != "cuda,flash-attn" ]; then

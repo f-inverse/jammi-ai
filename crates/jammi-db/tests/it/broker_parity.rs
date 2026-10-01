@@ -68,17 +68,24 @@ enum Arm {
 #[cfg(feature = "live-postgres-tests")]
 const TEST_IDLE_POLL: Duration = Duration::from_secs(1);
 
-/// Build the driver for `arm`.
-async fn broker_for(arm: Arm) -> Arc<dyn TriggerBroker> {
-    match arm {
+/// The harness over `arm`'s driver. The Postgres arm's broker runs in the
+/// harness dir's own database, so its NOTIFY channel carries this test's
+/// wakes alone.
+async fn harness_for(arm: Arm) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let broker: Arc<dyn TriggerBroker> = match arm {
         Arm::InMemory => Arc::new(InMemoryBroker::new()),
         #[cfg(feature = "live-postgres-tests")]
         Arm::Postgres => Arc::new(
-            PostgresBroker::connect(&jammi_test_utils::postgres_url(), TEST_IDLE_POLL)
-                .await
-                .expect("connect to Postgres broker"),
+            PostgresBroker::connect(
+                &jammi_test_utils::postgres_database_url(dir.path()).await,
+                TEST_IDLE_POLL,
+            )
+            .await
+            .expect("connect to Postgres broker"),
         ),
-    }
+    };
+    build_harness(broker, dir).await
 }
 
 struct Harness {
@@ -91,8 +98,7 @@ struct Harness {
     subscriber: Subscriber,
 }
 
-async fn build_harness(broker: Arc<dyn TriggerBroker>) -> Harness {
-    let dir = tempfile::tempdir().unwrap();
+async fn build_harness(broker: Arc<dyn TriggerBroker>, dir: tempfile::TempDir) -> Harness {
     let sqlite = SqliteBackend::open(&dir.path().join("catalog.db"))
         .await
         .unwrap();
@@ -175,8 +181,7 @@ where
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.live_tail_order");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -219,8 +224,8 @@ async fn live_tail_delivers_every_offset_exactly_once_in_order(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(Arc::clone(&broker)).await;
+    let h = harness_for(arm).await;
+    let broker = Arc::clone(&h.broker);
     let topic = topic_def("parity.two_publishers");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -287,8 +292,7 @@ async fn two_publishers_over_one_broker_deliver_gap_free_in_order(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.replay_overlap");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -349,8 +353,7 @@ async fn from_offset_in_past_replay_and_live_overlap_no_duplicates(arm: Arm) {
 async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let broker = broker_for(arm).await;
-    let h = Arc::new(build_harness(broker).await);
+    let h = Arc::new(harness_for(arm).await);
     let topic = topic_def("parity.subscribe_race");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -426,8 +429,7 @@ async fn publish_racing_subscribe_is_never_lost(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.tenant_scope");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -483,8 +485,7 @@ async fn tenant_scoped_subscriber_never_sees_another_tenants_rows(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.lag_self_heal");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -571,8 +572,7 @@ async fn subscriber_lag_self_heals_via_chunked_group_completing_replay(arm: Arm)
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.shared_tail");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -633,8 +633,7 @@ async fn two_predicate_subscribers_share_one_driver_subscription(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
 
     let schema: SchemaRef = Arc::new(Schema::new(vec![
         Field::new("i32_col", DataType::Int32, false),
@@ -708,14 +707,23 @@ async fn every_accepted_type_round_trips_through_live_subscribe(arm: Arm) {
     assert_eq!(bytes_col.value(1), b"\x00\x01\xff");
 }
 
-/// Offset order == commit order. Two independent `Publisher`
-/// "sessions" share ONE Postgres database; interleaved publishes still
-/// yield a replay whose `_offset` order equals the true commit order,
-/// because the offset-assigning `UPDATE`'s row lock holds until commit.
+/// Offset order == commit order. Two independent `Publisher` "sessions"
+/// share ONE Postgres database and publish concurrently while a reader
+/// replays the topic from offset 0 over and over. Every replay must be a
+/// gap-free prefix `0..k`: an offset becomes visible only once every lower
+/// offset has committed, because the offset-assigning `UPDATE`'s row lock
+/// holds until commit. That visibility is what makes a watermark-bounded
+/// replay (`_offset > watermark`) complete.
+///
+/// Commit order itself is observable only through what readers see. The
+/// order in which `publish_scoped` calls return is not it: each returns
+/// after its commit *and* its broker fan-out, so two sessions' returns can
+/// reach the client in either order.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let pg = PostgresBackend::open_with_options(&url, 8, None)
         .await
         .unwrap();
@@ -758,74 +766,93 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
     );
 
     const N: i64 = 100;
-    // A commit-order log: each successful publish appends `(offset, marker)`
-    // the instant it commits, under a shared async lock, so the log's
-    // insertion order IS the true commit order regardless of which session
-    // committed it.
-    let commit_log: Arc<tokio::sync::Mutex<Vec<(u64, i64)>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(2 * N as usize)));
 
-    async fn publish_and_log(
+    // One session's publishes, in the order it made them: `(offset, seq)`.
+    async fn publish_all(
         publisher: &Publisher,
         topic: &TopicDefinition,
         marker: i64,
-        n: i64,
-        log: &Arc<tokio::sync::Mutex<Vec<(u64, i64)>>>,
-    ) {
-        for i in 0..n {
+    ) -> Vec<(u64, i64)> {
+        let mut published = Vec::with_capacity(N as usize);
+        for seq in (0..N).map(|i| marker * 1_000_000 + i) {
             let off = publisher
-                .publish_scoped(topic, None, batch_of(&[marker * 1_000_000 + i]))
+                .publish_scoped(topic, None, batch_of(&[seq]))
                 .await
                 .unwrap();
-            log.lock().await.push((off.value(), marker * 1_000_000 + i));
+            published.push((off.value(), seq));
         }
+        published
     }
 
-    tokio::join!(
-        publish_and_log(&session_a, &topic, 1, N, &commit_log),
-        publish_and_log(&session_b, &topic, 2, N, &commit_log),
+    // The topic from offset 0, one `(offset, seq)` per row, in replay order.
+    async fn replay_from_zero(subscriber: &Subscriber, topic: &TopicDefinition) -> Vec<(u64, i64)> {
+        subscriber
+            .replay_only(
+                topic,
+                Predicate::match_all(),
+                Some(Offset::new(0, chrono::Utc::now())),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|d| {
+                seq_column(&d.batch)
+                    .into_iter()
+                    .map(move |seq| (d.offset.value(), seq))
+            })
+            .collect()
+    }
+
+    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
+
+    // Starts before the first commit and replays until it sees all 2N.
+    let watch = async {
+        loop {
+            let seen: Vec<u64> = replay_from_zero(&subscriber, &topic)
+                .await
+                .into_iter()
+                .map(|(off, _)| off)
+                .collect();
+            let prefix: Vec<u64> = (0..seen.len() as u64).collect();
+            assert_eq!(
+                seen, prefix,
+                "a replay racing two sessions' commits must see a gap-free prefix of offsets: \
+                 an offset visible before a lower one commits is lost to every watermark"
+            );
+            if seen.len() == 2 * N as usize {
+                break;
+            }
+        }
+    };
+
+    let (published_a, published_b, ()) = tokio::join!(
+        publish_all(&session_a, &topic, 1),
+        publish_all(&session_b, &topic, 2),
+        watch,
     );
 
-    // `commit_order` is the log in TRUE commit order (append order, under
-    // the shared lock in `publish_and_log`) — kept UNSORTED and untouched
-    // from here on, so the replay-order assertion below actually compares
-    // against real commit order rather than against itself re-derived from
-    // a sorted copy. `sorted_by_offset` is a SEPARATE clone (the pattern
-    // `two_publishers_over_one_broker_deliver_gap_free_in_order` above uses
-    // for `seen`/`sorted`): sorting it in place would otherwise silently
-    // launder a reversed or reordered log into "already sorted", since
-    // `expected_seq` below would then be re-derived from the sorted copy
-    // instead of the true commit order.
-    let commit_order = commit_log.lock().await.clone();
-    let mut sorted_by_offset = commit_order.clone();
-    sorted_by_offset.sort_by_key(|(off, _)| *off);
-    let offsets: Vec<u64> = sorted_by_offset.iter().map(|(off, _)| *off).collect();
-    let expected: Vec<u64> = (0..(2 * N) as u64).collect();
+    // A session publishes one batch at a time, so each of its publishes
+    // committed before its next began and took the lower offset.
+    for published in [&published_a, &published_b] {
+        assert!(
+            published.windows(2).all(|w| w[0].0 < w[1].0),
+            "a session's sequential publishes must take increasing offsets: {published:?}"
+        );
+    }
+
+    let mut by_offset: Vec<(u64, i64)> = published_a.into_iter().chain(published_b).collect();
+    by_offset.sort_unstable();
+    let offsets: Vec<u64> = by_offset.iter().map(|(off, _)| *off).collect();
     assert_eq!(
-        offsets, expected,
+        offsets,
+        (0..(2 * N) as u64).collect::<Vec<_>>(),
         "offsets assigned across two sessions on one Postgres must be gap-free and unique"
     );
 
-    let subscriber = Subscriber::new(Arc::clone(&broker), Arc::clone(&registry));
-    let drained = subscriber
-        .replay_only(
-            &topic,
-            Predicate::match_all(),
-            Some(Offset::new(0, chrono::Utc::now())),
-        )
-        .await
-        .unwrap();
-    let replay_seq: Vec<i64> = drained.iter().flat_map(|d| seq_column(&d.batch)).collect();
-    // Derived from the UNSORTED `commit_order` — the true, as-recorded
-    // commit sequence — not `sorted_by_offset`: a replay that merely
-    // reproduced offset order (even if that order diverged from real
-    // commit order) would pass against a sorted expectation but must fail
-    // here.
-    let expected_seq: Vec<i64> = commit_order.iter().map(|(_, marker)| *marker).collect();
     assert_eq!(
-        replay_seq, expected_seq,
-        "replay order (by `_offset`) must equal the true commit order recorded by the shared \
-         commit log -- this is the invariant the offset-assigning UPDATE's row lock provides"
+        replay_from_zero(&subscriber, &topic).await,
+        by_offset,
+        "a replay must return each publish's batch at the offset its publish returned"
     );
 }
 
@@ -840,7 +867,8 @@ async fn offset_order_equals_commit_order_two_sessions_one_postgres() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn every_accepted_type_round_trips_through_postgres_backing_table() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let pg = PostgresBackend::open_with_options(&url, 4, None)
         .await
         .unwrap();
@@ -1028,13 +1056,14 @@ async fn kill_broker_listener_backends(url: &str) {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_listener_killed_recovers_via_replay() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let broker: Arc<dyn TriggerBroker> = Arc::new(
         PostgresBroker::connect(&url, TEST_IDLE_POLL)
             .await
             .expect("connect to Postgres broker"),
     );
-    let h = build_harness(Arc::clone(&broker)).await;
+    let h = build_harness(Arc::clone(&broker), dir).await;
     let topic = topic_def(&format!(
         "parity.pg_listener_killed.{}",
         jammi_test_utils::unique_suffix()
@@ -1095,7 +1124,8 @@ async fn postgres_listener_killed_recovers_via_replay() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_list_consumers_reports_none_until_a_notify_is_seen() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let broker = PostgresBroker::connect(&url, TEST_IDLE_POLL)
         .await
         .expect("connect to Postgres broker");
@@ -1155,14 +1185,15 @@ async fn postgres_list_consumers_reports_none_until_a_notify_is_seen() {
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_suppressed_notify_recovers_via_idle_tick() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let concrete = Arc::new(
         PostgresBroker::connect(&url, Duration::from_millis(300))
             .await
             .expect("connect to Postgres broker"),
     );
     let broker: Arc<dyn TriggerBroker> = Arc::clone(&concrete) as Arc<dyn TriggerBroker>;
-    let h = build_harness(broker).await;
+    let h = build_harness(broker, dir).await;
     let topic = topic_def(&format!(
         "parity.pg_suppressed_notify.{}",
         jammi_test_utils::unique_suffix()
@@ -1207,8 +1238,7 @@ async fn postgres_suppressed_notify_recovers_via_idle_tick() {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.from_offset_lower_bound_lag");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -1272,8 +1302,7 @@ async fn from_offset_lower_bound_holds_after_lag_replay(arm: Arm) {
 #[cfg_attr(feature = "live-postgres-tests", test_case(Arm::Postgres ; "postgres"))]
 #[tokio::test]
 async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_window(arm: Arm) {
-    let broker = broker_for(arm).await;
-    let h = build_harness(broker).await;
+    let h = harness_for(arm).await;
     let topic = topic_def("parity.from_offset_lower_bound_live");
     h.broker.register_topic(&topic).await.unwrap();
     h.topic_repo.register_topic(&topic).await.unwrap();
@@ -1346,7 +1375,8 @@ async fn from_offset_lower_bound_holds_on_first_live_event_with_empty_replay_win
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn postgres_backing_multistep_replay_keeps_boundary_group_whole() {
-    let url = jammi_test_utils::postgres_url();
+    let dir = tempfile::tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(dir.path()).await;
     let pg = PostgresBackend::open_with_options(&url, 8, None)
         .await
         .unwrap();

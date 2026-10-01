@@ -43,11 +43,8 @@
 //! Every test is parameterised over [`BackendKind`] via `test_case`: the SQLite
 //! lane runs on the hermetic `cargo test` lane, the Postgres lane is generated
 //! under the `live-postgres-tests` feature (CI's "Test (Postgres)" job runs
-//! it). The
-//! Postgres lane shares one catalog DB across the run, so each test first clears
-//! `result_tables` (CI runs that lane `--test-threads=1`, so the
-//! reset-then-populate cannot race a sibling — important because `recover()` is
-//! a cross-tenant admin scan that would otherwise see a sibling's rows).
+//! it). Each test's catalog is its own on both lanes, so `recover()` — a
+//! cross-tenant admin scan — sees only the rows the test creates.
 
 use jammi_test_utils::vq;
 use std::path::Path;
@@ -93,28 +90,12 @@ fn tenant_b() -> TenantId {
     TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
 }
 
-/// Clear `result_tables` so a cross-tenant `recover()` scan sees only the rows
-/// this test creates. The SQLite lane has a fresh tempdir per test, but running
-/// the reset on both lanes keeps one code path; on the shared Postgres DB it is
-/// load-bearing.
-async fn reset_result_tables(catalog: &Catalog) {
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move { tx.execute("DELETE FROM result_tables", &[]).await })
-        })
-        .await
-        .unwrap();
-}
-
-/// Migrate `backend`, build an unscoped (GLOBAL) [`Catalog`] over it — the
-/// shape a startup recovery session has — and clear `result_tables`. Catalog
-/// handles derived via [`Catalog::pinned_to_tenant`] share the same backend.
+/// Migrate `backend` and build an unscoped (GLOBAL) [`Catalog`] over it — the
+/// shape a startup recovery session has. Catalog handles derived via
+/// [`Catalog::pinned_to_tenant`] share the same backend.
 async fn fresh_catalog(backend: BackendImpl) -> Arc<Catalog> {
     backend.migrate().await.unwrap();
-    let catalog = Arc::new(Catalog::from_backend(backend));
-    reset_result_tables(&catalog).await;
-    catalog
+    Arc::new(Catalog::from_backend(backend))
 }
 
 /// A `ResultStore` rooted at `dir` over `catalog`. Every store built on the same

@@ -45,13 +45,11 @@ source (`crates/jammi-kernels/third_party/flash-attention`), gated behind the `f
 feature, and only the CUDA release lanes (the tarball, the `cu12` wheel, the container image)
 compile it in. The servers this chapter starts are pinned to the CPU (`[gpu] device = -1`,
 set through the environment below), whichever `jammi-server` is installed — a CUDA build's
-kernels have no CUDA device to run on here. In CI that server is a plain `cargo build --release -p
-jammi-server`, no `cuda` feature, no `flash-attn` feature (the same binary this book's CI provisions through `setup-jammi-py`'s
-`build-server: "true"` input, which is exactly that bare `cargo build --release -p jammi-server`:
-the nightly full-book render always builds it — `cookbook-render.yml` — and the PR book gate
-builds it when its chapter selector picks a chapter that needs a live server, as this one always
-does when it is selected at all) — because neither this book's PR gate nor its
-nightly render ever has a CUDA device to hand a compiled kernel to. That is a fact about *this
+kernels have no CUDA device to run on here. In CI that server is the CPU `jammi-server` the
+release manifest calls `server-cpu` — no `cuda` feature, no `flash-attn` feature — which `ci.yml`
+builds once per change and every render of this book installs, the per-change render and the
+nightly full-book render (`cookbook-render.yml`) alike, because neither ever has a CUDA device to
+hand a compiled kernel to. That is a fact about *this
 render's own CI machine*, not a gap in the report mechanism: everything below through the
 `## Measured on real GPU hardware, not here` heading is a live, real submission against a live,
 real server — it simply resolves onto CPU, so its `flash` verdict is always the *compiled-away*

@@ -1409,7 +1409,8 @@ mod close_barrier_tests {
     #[cfg(feature = "live-postgres-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn postgres_barrier_closes_a_connection_returned_during_the_close() {
-        let url = jammi_test_utils::postgres_url();
+        let dir = tempfile::tempdir().unwrap();
+        let url = jammi_test_utils::postgres_database_url(dir.path()).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let pool = park_returns(sqlx::postgres::PgPoolOptions::new().max_connections(8), tx)
             .connect_with(

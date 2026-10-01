@@ -8,9 +8,10 @@ name: PyPI (jammi-ai)
 #
 # NOTE (release-time, EXTERNAL — do not act in CI): the `jammi-ai` PyPI project's
 # Trusted-Publisher config must authorize THIS workflow (`pypi-client.yml`), which
-# builds the `jammi-ai` dist from `clients/python`. Confirm it before a `py-v*`
-# publish. CI only BUILDS the wheel; it does not publish on a PR, so
-# this is not a merge blocker.
+# publishes the `jammi-ai` dist built from `clients/python`. Confirm it before
+# a `py-v*` publish. It compiles nothing: `ci.yml` builds the wheel on every
+# pull request and on `main` (`_client-wheel.yml`), and this workflow
+# publishes the one the run that proved the tag's tree built.
 
 on:
   push:
@@ -18,21 +19,10 @@ on:
   # Manual re-run to finish a release whose publish was interrupted: run the
   # dispatch ON the `py-v*` tag (the publish job is tag-guarded; PyPI rejects
   # a re-upload of an existing version, so re-running the tag is idempotent).
-  # A branch dispatch is a build-only dry run — the same recovery semantics
-  # as the lockstep `pypi.yml` / `_pypi-server.yml` lanes.
+  # A branch dispatch is a rehearsal that publishes nothing — the same semantics
+  # as the lockstep `pypi.yml` / `pypi-server.yml` lanes.
   workflow_dispatch:
-  # PR gate: build-only (no publish) when what the wheel is built from
-  # changes — the client package and the protos its stubs are generated from —
-  # so a wheel that stops building fails on the PR that caused it.
-  pull_request:
-    paths:
-      - "clients/python/**"
-      - "crates/jammi-wire/proto/**"
-      - ".github/workflows/pypi-client.yml"
-      - "ci/scripts/assert_wheel_size.sh"
 
-# Serialize per ref, never cancel: a publish in flight must finish (PyPI
-# uploads are not resumable), matching the other release lanes.
 concurrency:
   group: pypi-client-${{ github.ref }}
   cancel-in-progress: false
@@ -43,47 +33,19 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build wheel (py3-none-any)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: clients/python
-    steps:
-      - uses: actions/checkout@v4
+  # What this release publishes: the artifacts the `ci.yml` run that proved
+  # the released tree built — nothing compiles here. On a branch dispatch,
+  # the rehearsal: the same lookup over the branch's tree.
+  artifacts:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_proven-artifacts.yml
+    with:
+      artifacts: client-wheel
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # Generate the proto stubs from the canonical jammi.v1 proto, then build
-      # the universal wheel. The stubs are generated-at-build (never committed),
-      # exactly like the npm client's `src/gen`. The dev extra carries the
-      # pinned `grpcio-tools` — the published wheel's grpcio/protobuf floors
-      # are derived from what that exact generator emits, so installing it
-      # unpinned here could ship a wheel that crashes at import under its own
-      # declared minima.
-      - name: Generate proto stubs
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[dev]'
-          make generate
-
-      - name: Build wheel
-        run: |
-          python -m pip install --upgrade build
-          python -m build --wheel --outdir dist
-
-      - name: Assert the wheel fits PyPI's per-file limit
-        run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: client-dist
-          path: clients/python/dist/
-
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
     # tag — requires the release commit's already-recorded GPU-prove
     # verdict before `jammi-ai` is published (every release publisher gates
@@ -92,7 +54,7 @@ jobs:
     # workflow's header states means it must ship in the SAME all-or-nothing
     # release as `jammi-ai-native`, never ahead of an unproven commit.
     if: startsWith(github.ref, 'refs/tags/py-v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -103,22 +65,26 @@ jobs:
     # Publishes ONLY from a `py-v*` tag ref — a tag push, or a
     # workflow_dispatch run on the tag (recovery: PyPI rejects a re-upload of
     # an existing version, so re-running the tag is idempotent) — whose
-    # commit's GPU-prove verdict is green. A branch dispatch is a build-only
-    # dry run: without the tag guard it could first-publish an untagged
+    # commit's GPU-prove verdict is green. A branch dispatch is a rehearsal:
+    # without the tag guard it could first-publish an untagged
     # version of `jammi-ai` alone, breaking the lockstep this workflow's
     # header states (`jammi-ai`'s `[embedded]` extra must always resolve
     # `jammi-ai-native==X`). PURE conjunction (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.build.result == 'success' && needs.gpu-proof.result == 'success'
-    needs: [build, gpu-proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
+    needs: [artifacts, proof]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
+      # Downloads from the proving run, not this one.
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: client-dist
+          name: client-wheel
           path: dist
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
 
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
         with:

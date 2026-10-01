@@ -14,4 +14,6 @@ parquet.workspace = true
 futures.workspace = true
 tonic.workspace = true
 tempfile = "3"
+sqlx.workspace = true
+url.workspace = true
 uuid.workspace = true

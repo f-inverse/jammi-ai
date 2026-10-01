@@ -51,8 +51,9 @@ Python](./quickstart-python.md).
 
 **Artifact:** [`deploy/docker-compose.yml`](https://github.com/f-inverse/jammi-ai/blob/main/deploy/docker-compose.yml)
 — one `jammi-server` process and one Postgres serving as catalog and broker,
-tested end to end by the `compose-smoke` workflow on every push to `main`
-and nightly.
+tested end to end by the `compose-smoke` workflow on every pull request and
+push to `main` (packaging the binaries that CI run built) and nightly
+(building the image from source).
 
 ```yaml
 {{#include ../../../deploy/docker-compose.yml}}
@@ -189,9 +190,9 @@ the Deployment/Service metadata, never a change to the engine's knobs. Every
 PR validates `kustomize build` + `kubeconform --strict --kubernetes-version
 1.34.11` over every kustomization in the tree, in `ci.yml`'s `Guard
 (kubernetes manifests)`; the `kube-smoke` workflow additionally stands the
-`ci` overlay up on a real `kind` cluster on push to `main`, nightly, on
-manual dispatch, and on any pull request that touches
-`deploy/kubernetes/**` or `tests/compose/**`.
+`ci` overlay up on a real `kind` cluster on every pull request and push to
+`main` (packaging the binaries that CI run built), nightly and on manual
+dispatch (building the image from source).
 
 ```yaml
 {{#include ../../../deploy/kubernetes/base/deployment.yaml}}

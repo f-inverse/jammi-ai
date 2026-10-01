@@ -50,8 +50,20 @@ permissions:
   contents: read
 
 jobs:
+  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
+  # the tree defines, never the one `main` last had.
+  ci-image:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-topology'
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu cuda
+
   gpu-topology:
     name: GPU topology on RunPod (1x1, 1x2, 2 processes, 2 hosts x 2)
+    needs: ci-image
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-topology'
     runs-on: ubuntu-latest
     # Job-level and never cancelling: a cancel SIGKILLs the runner, the EXIT
@@ -77,6 +89,7 @@ jobs:
         id: topology
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           PROVE_EXPECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

@@ -906,7 +906,8 @@ mod tests {
     #[cfg(feature = "live-postgres-tests")]
     #[tokio::test]
     async fn stale_before_clause_postgres_is_sargable_and_agrees_with_the_cast_form() {
-        let url = jammi_test_utils::postgres_url();
+        let dir = tempfile::tempdir().unwrap();
+        let url = jammi_test_utils::postgres_database_url(dir.path()).await;
         // `max_connections(1)` PLUS one explicit transaction for the WHOLE
         // test: a `CREATE TEMP TABLE` is visible only on the connection that
         // created it, and Postgres's `now()` is stable for the lifetime of a

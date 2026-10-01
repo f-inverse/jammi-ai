@@ -1260,18 +1260,10 @@ async fn a_postgres_database_registered_by_its_url_joins_a_file() {
     use jammi_db::source::SourceDefinition;
     use sqlx::{Connection, Executor, PgConnection};
 
-    // A database of its own: the shared test database also holds the
-    // catalog, whose tables a source over it would federate too.
-    let server_url = jammi_test_utils::postgres_url();
-    let database = format!("sources_{}", unique_suffix());
-    let mut server = PgConnection::connect(&server_url).await.unwrap();
-    server
-        .execute(format!("CREATE DATABASE \"{database}\"").as_str())
-        .await
-        .unwrap();
-    let mut url = url::Url::parse(&server_url).unwrap();
-    url.set_path(&database);
-    let mut db = PgConnection::connect(url.as_str()).await.unwrap();
+    // The source is a database holding exactly this test's table.
+    let source_dir = tempdir().unwrap();
+    let url = jammi_test_utils::postgres_database_url(source_dir.path()).await;
+    let mut db = PgConnection::connect(&url).await.unwrap();
     db.execute(
         "CREATE TABLE ratings (id BIGINT PRIMARY KEY, stars INTEGER NOT NULL); \
          INSERT INTO ratings VALUES (1, 5), (2, 3), (3, 4);",
@@ -1358,18 +1350,6 @@ async fn a_postgres_database_registered_by_its_url_joins_a_file() {
         joined, rated_in_file,
         "every rated file row joins its rating"
     );
-
-    // The source's pool outlives the session's handle to it; end its
-    // connections so the database can go.
-    drop(session);
-    for statement in [
-        format!(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{database}'"
-        ),
-        format!("DROP DATABASE \"{database}\""),
-    ] {
-        server.execute(statement.as_str()).await.unwrap();
-    }
 }
 
 async fn count_rows(

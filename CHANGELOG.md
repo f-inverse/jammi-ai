@@ -42,6 +42,11 @@ every install instruction installs an engine that runs.
   A host has MariaDB only when its daemon and its initialiser are both on the path; otherwise the
   helper installs it. The nightly published-notebook lane runs its CPU shards in
   `python:3.12-bookworm` — root, apt and Python with nothing else, as a Colab runtime is.
+- **A CI job whose remote compile cache is unavailable still builds.** sccache refuses to start its
+  server when its startup storage check fails, so a throttled GitHub Actions cache (`ServerBusy:
+  Egress is over the account limit`) failed every cargo call in a job before it compiled anything.
+  `setup-rust-ci` starts the server against that cache itself and, when the start fails, keeps the
+  job on sccache's local disk cache with a warning naming the error.
 - **The published notebooks run nightly as a reader runs them.** The book gate and the nightly
   render run the chapter sources against wheels built from HEAD, so neither saw what a reader gets:
   0.50.0's setup cells named a `jammi-server-cu12` PyPI never received, and fifteen notebooks

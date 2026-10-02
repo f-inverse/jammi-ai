@@ -36,6 +36,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
+      - uses: actions/checkout@v4
       - id: tag
         env:
           REQUESTED: ${{ inputs.tag }}
@@ -52,6 +53,15 @@ jobs:
             || { echo "::error::tag $tag does not exist"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "running the notebooks published at $tag"
+
+      # A notebook installs from PyPI, crates.io, npm and the GitHub release;
+      # until all of them serve the release, every install would fail on its
+      # own. Refuse once, naming what is missing.
+      - name: The release is installable
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 ci/scripts/release_installable.py --tag "$TAG"
 
   cpu:
     name: CPU, shard ${{ matrix.shard }}/8

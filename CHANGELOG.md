@@ -6,6 +6,13 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **The reader lanes wait for a release to be installable.** Dispatched minutes after the 0.53.0
+  tag, the CPU lane failed 13 notebooks on installs: pip's index did not list `jammi-ai-native`
+  0.53.0 yet, and crates.io had no `jammi-ai` 0.53.0 while its publisher validated. Both lanes now
+  first check that PyPI, crates.io, npm and the GitHub release serve the release, through the views
+  pip, cargo and npm read (`ci/scripts/release_installable.py`), and refuse, naming what is
+  missing, before running a notebook; the GPU lane does it before renting its pod.
+
 ## [0.53.0] - 2026-10-02
 
 The two notebooks that failed for 0.52.0 readers run. The TypeScript client reaches npm again, so

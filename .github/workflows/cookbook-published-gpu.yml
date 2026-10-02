@@ -39,6 +39,13 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      # Before renting the pod: every place a notebook installs from serves
+      # the release, or the run would fail install by install.
+      - name: The release is installable
+        env:
+          TAG: ${{ inputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 ci/scripts/release_installable.py --tag "$TAG"
       - name: Run the notebooks as published on an L4
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}

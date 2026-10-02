@@ -1557,9 +1557,8 @@ def build_search_request(
     """
     if (query is None) == (row_key is None):
         raise ValueError("search ranks by exactly one of query (a vector) or row_key")
-    if exact and oversample is not None:
-        raise ValueError("an exact search scores every vector; it takes no oversample")
     request = embedding_pb2.SearchRequest(source_id=source, k=k, select=list(select or []))
+    _set_search_method(request.method, oversample=oversample, exact=exact)
     if query is not None:
         request.query_vector.CopyFrom(embedding_pb2.QueryVector(values=list(query)))
     else:
@@ -1568,11 +1567,22 @@ def build_search_request(
         request.filter = filter
     if embedding_table is not None:
         request.embedding_table = embedding_table
-    if oversample is not None:
-        request.oversample = oversample
-    if exact:
-        request.exact.SetInParent()
     return request
+
+
+def _set_search_method(
+    method: embedding_pb2.SearchMethod, *, oversample: Optional[int], exact: bool
+) -> None:
+    """Fill a request's `SearchMethod` — a search's, or an evaluation's — from
+    the binding's `oversample` / `exact` kwargs. Left empty, the ranking is
+    approximate at the table's own oversample. `exact` scores every vector and
+    takes no `oversample`."""
+    if exact and oversample is not None:
+        raise ValueError("an exact ranking scores every vector; it takes no oversample")
+    if oversample is not None:
+        method.oversample = oversample
+    if exact:
+        method.exact.SetInParent()
 
 
 _LEXICAL_ANALYZER = {
@@ -1759,6 +1769,8 @@ def build_eval_embeddings_request(
     embedding_table: Optional[str] = None,
     k: int = 10,
     cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+    oversample: Optional[int] = None,
+    exact: bool = False,
 ) -> eval_pb2.EvalEmbeddingsRequest:
     """Assemble the `EvalEmbeddingsRequest` for a retrieval-quality eval from the
     binding's flat kwargs.
@@ -1767,14 +1779,17 @@ def build_eval_embeddings_request(
     source's most recent embedding table (the empty-string wire sentinel).
     `golden_source` addresses the golden relevance set by full catalog path or
     bare name. `cohorts` optionally maps a golden-set `query_id` to an opaque
-    `{key: value}` segment map persisted with that query's per-query metrics. The
-    same request the embed binding submits in-process.
+    `{key: value}` segment map persisted with that query's per-query metrics.
+    `oversample` / `exact` rank each query as they rank a search: `exact`
+    scores every vector, so the report measures the embedding with no index
+    approximation in it. The same request the embed binding submits in-process.
     """
     request = eval_pb2.EvalEmbeddingsRequest(
         source_id=source,
         golden_source=golden_source,
         k=k,
     )
+    _set_search_method(request.method, oversample=oversample, exact=exact)
     if embedding_table is not None:
         request.embedding_table = embedding_table
     for query_id, tags in (cohorts or {}).items():
@@ -1834,21 +1849,26 @@ def build_eval_compare_request(
     source: str,
     golden_source: str,
     k: int = 10,
+    oversample: Optional[int] = None,
+    exact: bool = False,
 ) -> eval_pb2.EvalCompareRequest:
     """Assemble the `EvalCompareRequest` for a side-by-side embedding-table
     comparison from the binding's flat kwargs.
 
     `embedding_tables` names at least two result tables (the first is the
     baseline, each subsequent one is compared against it). `golden_source`
-    addresses the golden set by full catalog path or bare name. The same request
-    the embed binding submits in-process.
+    addresses the golden set by full catalog path or bare name. `oversample` /
+    `exact` rank every table's queries as `build_eval_embeddings_request`'s do.
+    The same request the embed binding submits in-process.
     """
-    return eval_pb2.EvalCompareRequest(
+    request = eval_pb2.EvalCompareRequest(
         embedding_tables=list(embedding_tables),
         source_id=source,
         golden_source=golden_source,
         k=k,
     )
+    _set_search_method(request.method, oversample=oversample, exact=exact)
+    return request
 
 
 def build_eval_calibration_request(

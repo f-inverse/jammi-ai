@@ -1,6 +1,6 @@
 //! Golden dataset loading and schema validation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
@@ -125,7 +125,9 @@ pub fn load_retrieval_golden_from_batches(
     has_grades: bool,
     modality: QueryModality,
 ) -> Result<RetrievalGolden> {
-    let mut query_map: HashMap<String, (QueryInput, Vec<RelevanceJudgment>)> = HashMap::new();
+    // Ordered by `query_id`: the queries are evaluated, and their metrics
+    // averaged, in this order, so a report is the same bits on every run.
+    let mut query_map: BTreeMap<String, (QueryInput, Vec<RelevanceJudgment>)> = BTreeMap::new();
 
     for batch in batches {
         let query_ids = extract_string_column(batch, "query_id")?;

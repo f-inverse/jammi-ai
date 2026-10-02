@@ -274,18 +274,27 @@ message SearchRequest {
   optional string embedding_table = 7;
   // How the search ranks. Unset = approximately, through the table's ANN
   // index, at the table's own oversample.
-  oneof method {
-    // Approximately, overriding for this one search a quantized index's
-    // retrieve→rescore breadth (`k * oversample`). Irrelevant for an
-    // `f32`-precision index (single-stage, no rescore).
-    uint32 oversample = 8;
-    // Exactly: every vector scored, the true nearest neighbours.
-    ExactSearch exact = 9;
+  SearchMethod method = 10;
+  reserved 8, 9;
+}
+
+// How a ranking over an embedding table is computed: by a search, or by every
+// query of an evaluation. Unset (or an empty message) = approximately, through
+// the table's ANN index, at the table's own oversample.
+message SearchMethod {
+  oneof kind {
+    // Approximately, overriding a quantized index's retrieve→rescore breadth
+    // (`k * oversample`). Irrelevant for an `f32`-precision index
+    // (single-stage, no rescore).
+    uint32 oversample = 1;
+    // Exactly: every vector scored, the true nearest neighbours, with ties
+    // broken by `_row_id`.
+    ExactSearch exact = 2;
   }
 }
 
-// An exact search: every vector scored. Carries nothing; its presence in
-// `SearchRequest.method` is the choice.
+// An exact ranking: every vector scored. Carries nothing; its presence in
+// `SearchMethod.kind` is the choice.
 message ExactSearch {}
 
 message LexicalSearchRequest {

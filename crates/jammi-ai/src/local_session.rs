@@ -60,8 +60,8 @@ use jammi_datafusion::ModelSource;
 /// converters can satisfy the orphan rule; re-exported here so an embedded
 /// consumer reaches it as `jammi_ai::*`, alongside the [`Session`] it drives.
 pub use jammi_wire::request::{
-    EmbeddingRequest, FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput,
-    SearchQuery, SearchRequest,
+    CompareEvalRequest, EmbeddingEvalRequest, EmbeddingRequest, FineTuneJobId, FineTuneRequest,
+    LexicalSearchRequest, Modality, QueryInput, SearchQuery, SearchRequest,
 };
 
 pub use crate::pipeline::lexical::BuildLexicalIndex;
@@ -726,15 +726,9 @@ impl Session {
     /// Evaluate embedding quality against golden relevance judgments.
     pub async fn eval_embeddings(
         &self,
-        source_id: &str,
-        embedding_table: Option<&str>,
-        golden_source: &str,
-        k: usize,
-        cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+        request: EmbeddingEvalRequest,
     ) -> Result<EmbeddingEvalReport> {
-        self.engine
-            .eval_embeddings(source_id, embedding_table, golden_source, k, cohorts)
-            .await
+        self.engine.eval_embeddings(request).await
     }
 
     /// Read back the persisted per-query eval records for a run.
@@ -765,16 +759,8 @@ impl Session {
     }
 
     /// Compare multiple embedding tables side-by-side.
-    pub async fn eval_compare(
-        &self,
-        embedding_tables: &[String],
-        source_id: &str,
-        golden_source: &str,
-        k: usize,
-    ) -> Result<CompareEvalReport> {
-        self.engine
-            .eval_compare(embedding_tables, source_id, golden_source, k)
-            .await
+    pub async fn eval_compare(&self, request: CompareEvalRequest) -> Result<CompareEvalReport> {
+        self.engine.eval_compare(request).await
     }
 
     // --- mutable tables --------------------------------------------------

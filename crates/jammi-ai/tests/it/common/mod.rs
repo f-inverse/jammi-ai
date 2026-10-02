@@ -792,3 +792,39 @@ pub async fn submit_and_claim(
     assert_eq!(claimed.job_id, job_id);
     (job_id, instance_id, claimed.attempts)
 }
+
+/// An approximate retrieval evaluation of `source_id`'s `embedding_table` (its
+/// most-recent table when `None`) against `golden_source` at cutoff `k`, with
+/// no cohort tags.
+pub fn retrieval_eval(
+    source_id: &str,
+    embedding_table: Option<&str>,
+    golden_source: &str,
+    k: usize,
+) -> jammi_ai::EmbeddingEvalRequest {
+    jammi_ai::EmbeddingEvalRequest {
+        source_id: source_id.into(),
+        embedding_table: embedding_table.map(Into::into),
+        golden_source: golden_source.into(),
+        k,
+        cohorts: Default::default(),
+        method: jammi_ai::SearchMethod::default(),
+    }
+}
+
+/// An approximate comparison of `embedding_tables` (the baseline first) over
+/// `source_id` against `golden_source` at cutoff `k`.
+pub fn compare_eval(
+    embedding_tables: &[String],
+    source_id: &str,
+    golden_source: &str,
+    k: usize,
+) -> jammi_ai::CompareEvalRequest {
+    jammi_ai::CompareEvalRequest {
+        embedding_tables: embedding_tables.to_vec(),
+        source_id: source_id.into(),
+        golden_source: golden_source.into(),
+        k,
+        method: jammi_ai::SearchMethod::default(),
+    }
+}

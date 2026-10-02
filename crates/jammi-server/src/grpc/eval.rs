@@ -63,20 +63,12 @@ impl EvalService for EvalServer {
         // Decode through the shared `jammi_ai::wire` seam — the same decode the
         // embedded binding's `_eval_embeddings_proto` drives — so both transports
         // validate and submit an identical request.
-        let args = jammi_ai::wire::eval_embeddings_from_proto(request.into_inner())?;
+        let request = jammi_ai::wire::eval_embeddings_from_proto(request.into_inner())?;
         let session = self.local();
 
-        let report = scoped(&self.session, tenant, || {
-            session.eval_embeddings(
-                &args.source_id,
-                args.embedding_table.as_deref(),
-                &args.golden_source,
-                args.k,
-                &args.cohorts,
-            )
-        })
-        .await
-        .map_err(map_engine_error)?;
+        let report = scoped(&self.session, tenant, || session.eval_embeddings(request))
+            .await
+            .map_err(map_engine_error)?;
 
         Ok(Response::new(report.into()))
     }
@@ -141,19 +133,12 @@ impl EvalService for EvalServer {
         // Decode through the shared `jammi_ai::wire` seam — the same decode the
         // embedded binding's `_eval_compare_proto` drives — so both transports
         // validate and submit an identical request.
-        let args = jammi_ai::wire::eval_compare_from_proto(request.into_inner())?;
+        let request = jammi_ai::wire::eval_compare_from_proto(request.into_inner())?;
         let session = self.local();
 
-        let report = scoped(&self.session, tenant, || {
-            session.eval_compare(
-                &args.embedding_tables,
-                &args.source_id,
-                &args.golden_source,
-                args.k,
-            )
-        })
-        .await
-        .map_err(map_engine_error)?;
+        let report = scoped(&self.session, tenant, || session.eval_compare(request))
+            .await
+            .map_err(map_engine_error)?;
 
         Ok(Response::new(report.into()))
     }

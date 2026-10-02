@@ -120,6 +120,7 @@ async fn eval_embeddings_and_per_query_over_the_wire() {
             k: 10,
             cohorts: HashMap::new(),
             tenant_id: String::new(),
+            method: None,
         })
         .await
         .expect("eval_embeddings")
@@ -194,6 +195,7 @@ async fn eval_compare_self_comparison_has_zero_deltas_over_the_wire() {
             golden_source: GOLDEN_SOURCE.into(),
             k: 10,
             tenant_id: String::new(),
+            method: None,
         })
         .await
         .expect("eval_compare")
@@ -265,6 +267,7 @@ async fn eval_embeddings_under_a_tenant_scope_over_the_wire() {
             k: 10,
             cohorts: HashMap::new(),
             tenant_id: String::new(),
+            method: None,
         })
         .await
         .expect("tenant-scoped eval_embeddings")

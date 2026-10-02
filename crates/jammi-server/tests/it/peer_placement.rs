@@ -1131,7 +1131,7 @@ async fn force_local_entries_ignore_placement_while_placed_entries_refuse() {
         .expect("a batch build never fans out");
     assert_eq!(graph.status, "ready");
     let hits = store
-        .search_vectors_local(a.context(), &record, &vq(&e(2)), 2)
+        .search_vectors_local(a.context(), &record, &vq(&e(2)), 2, SearchMethod::default())
         .await
         .expect("the eval entry is force-local");
     assert_eq!(hits.len(), 2);

@@ -2560,6 +2560,8 @@ class RemoteDatabase:
         embedding_table: Optional[str] = None,
         k: int = 10,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+        oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> Dict[str, Any]:
         """Evaluate embedding retrieval quality against a golden relevance set.
 
@@ -2572,7 +2574,9 @@ class RemoteDatabase:
         its full catalog path (``<source>.public.<table>``) or bare name.
         ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
         ``{key: value}`` segment map, persisted with that query's per-query
-        metrics (read back via :meth:`eval_per_query`). Maps to
+        metrics (read back via :meth:`eval_per_query`). ``oversample`` / ``exact`` rank each query as they rank a :meth:`search`:
+        ``exact=True`` scores every vector, so the report measures the embedding
+        with no index approximation in it. Maps to
         `EvalService.EvalEmbeddings`.
         """
         request = build_eval_embeddings_request(
@@ -2581,6 +2585,8 @@ class RemoteDatabase:
             embedding_table=embedding_table,
             k=k,
             cohorts=cohorts,
+            oversample=oversample,
+            exact=exact,
         )
         resp = self._call(self._eval.EvalEmbeddings, request)
         return _embedding_report_to_dict(resp)
@@ -2648,6 +2654,8 @@ class RemoteDatabase:
         source: str,
         golden_source: str,
         k: int = 10,
+        oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> Dict[str, Any]:
         """Compare multiple embedding tables side-by-side against one golden set.
 
@@ -2657,13 +2665,16 @@ class RemoteDatabase:
         absolute/relative deltas plus paired ``significance``, ``None`` when
         the runs share no query to pair on). ``golden_source`` addresses the
         golden set by full catalog path (``<source>.public.<table>``) or bare
-        name. Maps to `EvalService.EvalCompare`.
+        name. ``oversample`` / ``exact`` rank every table's queries as
+        :meth:`eval_embeddings` ranks them. Maps to `EvalService.EvalCompare`.
         """
         request = build_eval_compare_request(
             embedding_tables=embedding_tables,
             source=source,
             golden_source=golden_source,
             k=k,
+            oversample=oversample,
+            exact=exact,
         )
         resp = self._call(self._eval.EvalCompare, request)
         return _compare_report_to_dict(resp)

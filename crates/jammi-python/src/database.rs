@@ -1425,19 +1425,10 @@ impl PyDatabase {
     /// produced. A malformed or invalid body raises `ValueError`.
     fn _eval_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let args =
+        let request =
             jammi_ai::wire::eval_embeddings_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = crate::released(
-            &self.runtime,
-            self.session.eval_embeddings(
-                &args.source_id,
-                args.embedding_table.as_deref(),
-                &args.golden_source,
-                args.k,
-                &args.cohorts,
-            ),
-        )
-        .map_err(to_pyerr)?;
+        let report = crate::released(&self.runtime, self.session.eval_embeddings(request))
+            .map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 
@@ -1514,17 +1505,10 @@ impl PyDatabase {
     /// body raises `ValueError`.
     fn _eval_compare_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
-        let args = jammi_ai::wire::eval_compare_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
-        let report = crate::released(
-            &self.runtime,
-            self.session.eval_compare(
-                &args.embedding_tables,
-                &args.source_id,
-                &args.golden_source,
-                args.k,
-            ),
-        )
-        .map_err(to_pyerr)?;
+        let request =
+            jammi_ai::wire::eval_compare_from_bytes(proto_bytes).map_err(status_to_pyerr)?;
+        let report =
+            crate::released(&self.runtime, self.session.eval_compare(request)).map_err(to_pyerr)?;
         serializable_to_pydict(py, &report)
     }
 

@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use jammi_ai::eval::golden::{ensure_column, RelevanceJudgment};
 use jammi_ai::session::InferenceSession;
+use jammi_ai::SearchMethod;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::eval_repo::EvalRunRecord;
+use jammi_db::config::{JammiConfig, StoragePrecision};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_numerics::classification::ClassificationMetrics;
 use jammi_numerics::retrieval::RetrievalMetrics;
@@ -335,6 +337,15 @@ fn tiny_bert_model() -> String {
 async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String, TempDir) {
     let dir = TempDir::new().unwrap();
     let config = common::test_config(dir.path());
+    embeddings_and_golden(config, dir).await
+}
+
+/// The patents embedded with `tiny_bert` under `config`, and the golden
+/// relevance set, in a session over `dir`.
+async fn embeddings_and_golden(
+    config: JammiConfig,
+    dir: TempDir,
+) -> (Arc<InferenceSession>, String, TempDir) {
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
     // Register patents source
@@ -383,19 +394,64 @@ async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String,
     (session, table_name, dir)
 }
 
+/// The four aggregate scores of `table`'s evaluation against the patents'
+/// golden set, ranked by `method`.
+async fn scores(session: &InferenceSession, table: &str, method: SearchMethod) -> [f64; 4] {
+    let report = session
+        .eval_embeddings(jammi_ai::EmbeddingEvalRequest {
+            method,
+            ..common::retrieval_eval(
+                "patents",
+                Some(table),
+                "golden_rel.public.golden_relevance",
+                10,
+            )
+        })
+        .await
+        .unwrap();
+    let a = report.aggregate;
+    [a.recall_at_k, a.precision_at_k, a.mrr, a.ndcg]
+}
+
+/// An exact evaluation measures the embedding, not the index. A binary index
+/// read at oversample 1 ranks by Hamming distance over sign bits alone; scored
+/// exactly, its table evaluates as a full-precision table of the same vectors
+/// does, and through its index it does not.
+#[tokio::test]
+async fn an_exact_evaluation_measures_the_embedding_not_the_index() {
+    let dir = TempDir::new().unwrap();
+    let mut config = common::test_config(dir.path());
+    config.embedding.ann.storage_precision = StoragePrecision::Binary;
+    config.embedding.ann.oversample = Some(1);
+    let (binary, binary_table, _binary_dir) = embeddings_and_golden(config, dir).await;
+    let (full, full_table, _full_dir) = session_with_embeddings_and_golden().await;
+
+    let exact_binary = scores(&binary, &binary_table, SearchMethod::Exact).await;
+    let exact_full = scores(&full, &full_table, SearchMethod::Exact).await;
+    let indexed_binary = scores(&binary, &binary_table, SearchMethod::default()).await;
+
+    assert_eq!(
+        exact_binary, exact_full,
+        "an exact evaluation scores the stored vectors, whatever the index quantizes"
+    );
+    assert_ne!(
+        indexed_binary, exact_binary,
+        "the binary index's own ranking must differ, or this test proves nothing about `method`"
+    );
+}
+
 #[tokio::test]
 async fn eval_embeddings_end_to_end() {
     let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
 
     // eval_embeddings returns retrieval metrics
     let metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&table_name),
             "golden_rel.public.golden_relevance",
             10,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -617,13 +673,15 @@ async fn eval_embeddings_persists_per_query_rows_with_cohorts() {
     cohorts.insert("q1".to_string(), q1_tags);
 
     let report = session
-        .eval_embeddings(
-            "patents",
-            Some(&table_name),
-            "golden_rel.public.golden_relevance",
-            10,
-            &cohorts,
-        )
+        .eval_embeddings(jammi_ai::EmbeddingEvalRequest {
+            cohorts: cohorts.clone(),
+            ..common::retrieval_eval(
+                "patents",
+                Some(&table_name),
+                "golden_rel.public.golden_relevance",
+                10,
+            )
+        })
         .await
         .unwrap();
 
@@ -693,12 +751,12 @@ async fn eval_compare_self_comparison_has_zero_deltas() {
     let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
 
     let comparison = session
-        .eval_compare(
+        .eval_compare(common::compare_eval(
             &[table_name.clone(), table_name.clone()],
             "patents",
             "golden_rel.public.golden_relevance",
             10,
-        )
+        ))
         .await
         .unwrap();
 
@@ -738,24 +796,22 @@ async fn eval_embeddings_is_deterministic() {
     let (session, table_name, _dir) = session_with_embeddings_and_golden().await;
 
     let m1 = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&table_name),
             "golden_rel.public.golden_relevance",
             10,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
     let m2 = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&table_name),
             "golden_rel.public.golden_relevance",
             10,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -836,12 +892,12 @@ async fn eval_compare_distinct_tables_has_nonzero_deltas() {
         .0;
 
     let comparison = session
-        .eval_compare(
+        .eval_compare(common::compare_eval(
             &[rec1.table_name.clone(), rec2.table_name.clone()],
             "patents",
             "golden_rel.public.golden_relevance",
             10,
-        )
+        ))
         .await
         .unwrap();
 
@@ -937,13 +993,12 @@ async fn eval_image_embeddings_end_to_end() {
 
     // Run image-aware eval
     let metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "figures",
             Some(&table_name),
             "golden_img.public.golden_image_relevance",
             5,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1005,12 +1060,12 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
         .0;
 
     let comparison = session
-        .eval_compare(
+        .eval_compare(common::compare_eval(
             &[base.clone(), propagated.table_name.clone()],
             "patents",
             "golden_rel.public.golden_relevance",
             10,
-        )
+        ))
         .await
         .expect("a propagated table evaluates through its input's encoder");
     assert_eq!(comparison.per_table.len(), 2);
@@ -1024,13 +1079,15 @@ async fn a_propagated_table_is_evaluated_through_its_input_encoder() {
         .unwrap()
         .0;
     match session
-        .eval_embeddings(
-            "patents",
-            Some(&structure.table_name),
-            "golden_rel.public.golden_relevance",
-            10,
-            &HashMap::new(),
-        )
+        .eval_embeddings(jammi_ai::EmbeddingEvalRequest {
+            cohorts: HashMap::new().clone(),
+            ..common::retrieval_eval(
+                "patents",
+                Some(&structure.table_name),
+                "golden_rel.public.golden_relevance",
+                10,
+            )
+        })
         .await
     {
         Err(JammiError::NoQueryEncoder { table, producer }) => {
@@ -1094,13 +1151,12 @@ async fn a_base_model_resolves_for_every_tenant_that_uses_it() {
             .unwrap()
             .0;
         let report = session
-            .eval_embeddings(
+            .eval_embeddings(common::retrieval_eval(
                 &patents,
                 Some(&table.table_name),
                 &format!("{golden}.public.golden_relevance"),
                 10,
-                &Default::default(),
-            )
+            ))
             .await;
         assert!(
             report.is_ok(),

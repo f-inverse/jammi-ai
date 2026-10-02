@@ -5,8 +5,9 @@
 //! The transport-neutral eval-task / calibration-shape / cohort-tag conversions
 //! live on the wire substrate ([`jammi_wire`]) and are reused here, not
 //! reimplemented; what stays in the engine crate are the request decoders that
-//! return the engine's flat eval call args (`EvalEmbeddingsArgs`,
-//! `EvalInferenceArgs`, `EvalCompareArgs`, `EvalCalibrationArgs`).
+//! return the engine's eval requests (`EmbeddingEvalRequest`,
+//! `CompareEvalRequest`) and flat call args (`EvalInferenceArgs`,
+//! `EvalCalibrationArgs`).
 //!
 //! The embedded binding builds each request with the same pure-Python assembly
 //! the remote client uses, serializes it, and hands the bytes here — so the
@@ -24,7 +25,10 @@ use tonic::Status;
 
 use crate::eval::{EvalCalibrationShape, EvalTask};
 use jammi_wire::proto::eval as pb;
-use jammi_wire::{calibration_shape_from_proto, cohorts_from_proto, EvalTaskFromWire};
+use jammi_wire::request::{CompareEvalRequest, EmbeddingEvalRequest};
+use jammi_wire::{
+    calibration_shape_from_proto, cohorts_from_proto, search_method_from_proto, EvalTaskFromWire,
+};
 
 /// The engine's `query_id → {key: value}` cohort map. The substrate never
 /// interprets these tags; the decode rebuilds the map verbatim.
@@ -32,52 +36,41 @@ type Cohorts = HashMap<String, BTreeMap<String, String>>;
 
 // ─── EvalEmbeddings ──────────────────────────────────────────────────────────
 
-/// The decoded retrieval-eval target a `EvalEmbeddings` request carries. The
-/// engine method (`Session::eval_embeddings`) takes the source, the optional
-/// embedding table, the golden source, the `k` cap, and the cohort map
-/// separately, so the decode returns them as a struct the binding destructures.
-/// `embedding_table` resolves the empty-string sentinel to `None` at decode (the
-/// engine's "use the most recent table" marker).
-pub struct EvalEmbeddingsArgs {
-    pub source_id: String,
-    pub embedding_table: Option<String>,
-    pub golden_source: String,
-    pub k: usize,
-    pub cohorts: Cohorts,
-}
-
-/// Decode a serialized [`pb::EvalEmbeddingsRequest`] body into the engine
-/// [`EvalEmbeddingsArgs`]. The embedded binding builds the request with the same
+/// Decode a serialized [`pb::EvalEmbeddingsRequest`] body into the engine's
+/// [`EmbeddingEvalRequest`]. The embedded binding builds the request with the same
 /// pure-Python assembly the remote client uses, serializes it, and hands the
 /// bytes here — so the in-process and remote eval-embeddings paths decode through
 /// one shared seam ([`eval_embeddings_from_proto`]). A body that is not a valid
 /// `EvalEmbeddingsRequest` is a client error (`InvalidArgument`).
-pub fn eval_embeddings_from_bytes(body: &[u8]) -> Result<EvalEmbeddingsArgs, Status> {
+pub fn eval_embeddings_from_bytes(body: &[u8]) -> Result<EmbeddingEvalRequest, Status> {
     let req = pb::EvalEmbeddingsRequest::decode(body)
         .map_err(|e| Status::invalid_argument(format!("malformed EvalEmbeddings request: {e}")))?;
     eval_embeddings_from_proto(req)
 }
 
-/// Decode a [`pb::EvalEmbeddingsRequest`] into the engine [`EvalEmbeddingsArgs`].
-/// The required `source_id` / `golden_source` are validated at decode; the
-/// `embedding_table` empty-string sentinel resolves to `None`; the `k` cap
-/// widens to the engine's `usize`; and the cohort tags rebuild through the shared
-/// [`cohorts_from_proto`] — matching the gRPC handler's edge checks.
+/// Decode a [`pb::EvalEmbeddingsRequest`] into the engine's
+/// [`EmbeddingEvalRequest`]. The required `source_id` / `golden_source` are
+/// validated at decode; the `embedding_table` empty-string sentinel resolves to
+/// `None`; the `k` cap widens to the engine's `usize`; the cohort tags rebuild
+/// through the shared [`cohorts_from_proto`]; and the method through the
+/// search's own [`search_method_from_proto`] — matching the gRPC handler's edge
+/// checks.
 pub fn eval_embeddings_from_proto(
     req: pb::EvalEmbeddingsRequest,
-) -> Result<EvalEmbeddingsArgs, Status> {
+) -> Result<EmbeddingEvalRequest, Status> {
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
     if req.golden_source.is_empty() {
         return Err(Status::invalid_argument("golden_source is required"));
     }
-    Ok(EvalEmbeddingsArgs {
+    Ok(EmbeddingEvalRequest {
         source_id: req.source_id,
         embedding_table: optional(req.embedding_table),
         golden_source: req.golden_source,
         k: req.k as usize,
         cohorts: cohorts_from_proto(req.cohorts),
+        method: search_method_from_proto(req.method),
     })
 }
 
@@ -171,35 +164,24 @@ pub fn eval_inference_from_proto(
 
 // ─── EvalCompare ─────────────────────────────────────────────────────────────
 
-/// The decoded compare-eval target a `EvalCompare` request carries. The engine
-/// method (`Session::eval_compare`) takes the embedding tables, the source, the
-/// golden source, and the `k` cap separately, so the decode returns them as a
-/// struct the binding destructures.
-pub struct EvalCompareArgs {
-    pub embedding_tables: Vec<String>,
-    pub source_id: String,
-    pub golden_source: String,
-    pub k: usize,
-}
-
-/// Decode a serialized [`pb::EvalCompareRequest`] body into the engine
-/// [`EvalCompareArgs`]. The embedded binding builds the request with the same
+/// Decode a serialized [`pb::EvalCompareRequest`] body into the engine's
+/// [`CompareEvalRequest`]. The embedded binding builds the request with the same
 /// pure-Python assembly the remote client uses, serializes it, and hands the
 /// bytes here — so the in-process and remote eval-compare paths decode through
 /// one shared seam ([`eval_compare_from_proto`]). A body that is not a valid
 /// `EvalCompareRequest` is a client error (`InvalidArgument`).
-pub fn eval_compare_from_bytes(body: &[u8]) -> Result<EvalCompareArgs, Status> {
+pub fn eval_compare_from_bytes(body: &[u8]) -> Result<CompareEvalRequest, Status> {
     let req = pb::EvalCompareRequest::decode(body)
         .map_err(|e| Status::invalid_argument(format!("malformed EvalCompare request: {e}")))?;
     eval_compare_from_proto(req)
 }
 
-/// Decode a [`pb::EvalCompareRequest`] into the engine [`EvalCompareArgs`]. The
-/// required `source_id` / `golden_source` are validated at decode, and
+/// Decode a [`pb::EvalCompareRequest`] into the engine's [`CompareEvalRequest`].
+/// The required `source_id` / `golden_source` are validated at decode, and
 /// `embedding_tables` must name at least two tables (one baseline and one to
 /// compare against it) — matching the gRPC handler's edge checks. The `k` cap
-/// widens to the engine's `usize`.
-pub fn eval_compare_from_proto(req: pb::EvalCompareRequest) -> Result<EvalCompareArgs, Status> {
+/// widens to the engine's `usize`, and the method decodes as a search's.
+pub fn eval_compare_from_proto(req: pb::EvalCompareRequest) -> Result<CompareEvalRequest, Status> {
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
@@ -211,11 +193,12 @@ pub fn eval_compare_from_proto(req: pb::EvalCompareRequest) -> Result<EvalCompar
             "embedding_tables requires at least two tables",
         ));
     }
-    Ok(EvalCompareArgs {
+    Ok(CompareEvalRequest {
         embedding_tables: req.embedding_tables,
         source_id: req.source_id,
         golden_source: req.golden_source,
         k: req.k as usize,
+        method: search_method_from_proto(req.method),
     })
 }
 

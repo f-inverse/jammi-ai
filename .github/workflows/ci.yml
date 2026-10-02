@@ -1249,16 +1249,62 @@ jobs:
           . .venv/bin/activate
           make -C clients/python test-live
 
+  # ── The guide and the API reference ───────────────────────────────────────
+  # The guide, with every Rust example in it compiled and run against the
+  # workspace, and the rustdoc of every crate: built once per tree, as the
+  # site a release publishes (`pages.yml`), beside the book below.
+  docs:
+    name: Guide and API reference
+    needs: build-ci-image
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ci
+
+      - name: Build the guide
+        run: mdbook build docs/guide
+
+      - name: Build the workspace the guide's examples link against
+        run: cargo build --workspace --exclude jammi-python --quiet
+
+      - name: Test the guide's examples
+        # mdbook compiles each example in a temp dir where rustup cannot find
+        # rust-toolchain.toml by walking up, so it would fall back to the
+        # image's default toolchain, which need not be the one that built the
+        # workspace's deps. Pin the example compiler to the workspace's.
+        run: |
+          RUSTUP_TOOLCHAIN="$(bash ci/scripts/rust_pin.sh)"
+          export RUSTUP_TOOLCHAIN
+          mdbook test docs/guide -L "${CARGO_TARGET_DIR:-target}/debug/deps"
+
+      - name: Build the API reference
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps
+
+      - name: Lay out the site
+        run: |
+          mkdir -p _site
+          cp -r docs/guide/book/. _site/
+          cp -r "${CARGO_TARGET_DIR:-target}/doc" _site/api
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: _site
+
   # ── The book ───────────────────────────────────────────────────────────────
   # Every chapter runs its capability live and checks a frozen golden, so a
   # render IS the check. These jobs render, at `small` scale on CPU, the
-  # chapters this change can move (`ci/scripts/select_render_chapters.py`),
-  # in up to four interleaved slices, against the wheels, server and CLI this
-  # run built; `cookbook-render.yml` renders every chapter nightly. No skip
-  # flag, no continue-on-error: a flaky chapter is a chapter bug to fix, not
-  # a gate to soften. The return half of the engine<->cookbook loop — every
-  # public verb is run by a recipe or an executed chapter cell — is the
-  # repository guard `ci/scripts/check_cookbook_coverage.py`.
+  # pages this change can move (`ci/scripts/select_render_chapters.py`), in
+  # up to four interleaved slices, against the wheels, server and CLI this run
+  # built. No skip flag, no continue-on-error: a flaky chapter is a chapter
+  # bug to fix, not a gate to soften. The return half of the engine<->cookbook
+  # loop — every public verb is run by a recipe or an executed chapter cell —
+  # is the repository guard `ci/scripts/check_cookbook_coverage.py`.
+  #
+  # When the selection is the whole book (every release's tree is one), `book`
+  # assembles the rendered pages into the book a release publishes.
   book-plan:
     name: Book (chapters this change can move)
     needs: build-ci-image
@@ -1267,6 +1313,7 @@ jobs:
       image: ${{ needs.build-ci-image.outputs.image }}
     outputs:
       slices: ${{ steps.select.outputs.slices }}
+      whole_book: ${{ steps.select.outputs.whole_book }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1312,6 +1359,7 @@ jobs:
             slices="$(jq -c --arg s "$k/$n" --arg c "$chapters" '. + [{slice: $s, chapters: $c}]' <<< "$slices")"
           done
           echo "slices=$slices" >> "$GITHUB_OUTPUT"
+          python3 ci/scripts/select_render_chapters.py --diff "$changed" --whole-book 2>/dev/null >> "$GITHUB_OUTPUT"
           jq . <<< "$slices"
 
   book-checks:
@@ -1404,7 +1452,9 @@ jobs:
           . .venv/bin/activate
           pip install -e 'cookbook/book[book,dev]'
 
-      - name: Render this slice's chapters
+      # The `assemble` profile records each page's execution under `_freeze/`
+      # (cookbook/book/_quarto-assemble.yml), which `book` reads.
+      - name: Render this slice's pages
         working-directory: cookbook/book
         env:
           CHAPTERS: ${{ matrix.chapters }}
@@ -1414,9 +1464,46 @@ jobs:
           for chapter in $CHAPTERS; do
             rel="${chapter#cookbook/book/}"
             echo "::group::quarto render $rel"
-            python -m jammi.session_journal -- quarto render "$rel"
+            python -m jammi.session_journal -- quarto render "$rel" --profile assemble
             echo "::endgroup::"
           done
+
+      - if: needs.book-plan.outputs.whole_book == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: book-freeze-${{ strategy.job-index }}
+          path: cookbook/book/_freeze
+          retention-days: 1
+
+  # The book a release publishes, assembled from the pages the slices rendered:
+  # a whole-book render under the `assemble` profile reads each page's recorded
+  # execution and executes nothing. No Python environment is installed here and
+  # the CI image carries no Jupyter, so a page without a record fails this
+  # render rather than running here.
+  book:
+    name: Book (assemble)
+    needs: [build-ci-image, book-plan, book-render]
+    if: needs.book-plan.outputs.whole_book == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.build-ci-image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: book-freeze-*
+          merge-multiple: true
+          path: cookbook/book/_freeze
+
+      - name: Assemble the book
+        working-directory: cookbook/book
+        run: quarto render --profile assemble
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cookbook-book
+          path: cookbook/book/_book
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
@@ -1469,9 +1556,11 @@ jobs:
       - kube-smoke
       - compose-smoke
       - cookbook
+      - docs
       - book-plan
       - book-checks
       - book-render
+      - book
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

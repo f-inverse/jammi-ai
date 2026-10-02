@@ -106,9 +106,11 @@ format:
     toc: true
 
 # Every chapter executes on every render — no freeze. Each runs its capability live
-# and checks the measurement against its frozen golden; a frozen result would mask a
-# moved one. The determinism contract (jammi_cookbook.determinism, applied on import)
-# keeps fresh execution reproducible.
+# and checks the measurement against its frozen golden; a result frozen by an earlier
+# render would mask a moved one. The determinism contract (jammi_cookbook.determinism,
+# applied on import) keeps fresh execution reproducible. CI's `assemble` profile
+# (_quarto-assemble.yml) records each execution only to assemble the book from the
+# same run's renders.
 execute:
   freeze: false
   error: false

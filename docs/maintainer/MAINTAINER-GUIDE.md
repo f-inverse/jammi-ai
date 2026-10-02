@@ -375,7 +375,7 @@ CatalogService.
 ### 1.5 The engine↔cookbook loop — the in-monorepo contract suite & staleness oracle
 
 The cookbook is a Quarto book inside this monorepo at `cookbook/book/`, wired into
-CI by `ci.yml`'s book jobs and the nightly `cookbook-render.yml`. It is the discipline loop that makes
+CI by `ci.yml`'s book jobs and published with each release by `pages.yml`. It is the discipline loop that makes
 the cookbook the engine's executable acceptance suite: a feature is not done
 without **chapter + API-guard bump + golden-metric hold**.
 
@@ -465,12 +465,14 @@ wheels that same run built (`.github/actions/install-jammi`: the client wheel an
 the native engine, `--force-reinstall --no-deps` over the unpinned `jammi-ai`
 dependency); `book-checks` runs `check_api_reference.py`, the shared-lib pytest
 suite including `test_closed_loop.py`, the no-deferral grep, and the citation
-check, and `book-render` renders the chapters the change can move
+check, and `book-render` renders the pages the change can move
 (`ci/scripts/select_render_chapters.py`), in parallel slices, every one live
-against its frozen goldens. The nightly `cookbook-render.yml` runs `quarto
-render` over the whole book against the artifacts of the run that proved
-`main`'s tree. So a feature and its proof land atomically
-in one PR. What a reader installs is tested separately:
+against its frozen goldens. When that selection is every page — a release's
+tree always is, its version bump changing `Cargo.toml` — `book` assembles the
+slices' renders into the whole book without executing anything again
+(Quarto's `_freeze/` records, written under the `assemble` profile,
+`cookbook/book/_quarto-assemble.yml`), and that artifact is what the release
+publishes. So a feature and its proof land atomically in one PR. What a reader installs is tested separately:
 `.github/workflows/cookbook-published.yml` runs every notebook at the newest release
 tag, as published, in a fresh environment — the setup cell installs the release from
 PyPI — nightly on a CPU, and after a release on a RunPod L4 as well
@@ -5358,9 +5360,10 @@ release gate reads its most recent result over the released tree.
 
 **The merge path, locally (`ci/scripts/merge_path.sh`):** one runner for the `check`,
 `clippy-gated`, `test-build`, `test`, `test-permission-fault`, `test-lanes`, `test-pg`, `guard` and
-`symbol-index-gates` jobs above plus `docs.yml`'s build, read from the workflow files at run time
-(never a copied list) and run in one process: `static` (fmt, the four clippy surfaces, rustdoc
-`-D warnings`, the guide build — a missing `mdbook` FAILS unless `--skip-mdbook`) → `guards` (the
+`symbol-index-gates` and `docs` jobs above, read from the workflow files at run time
+(never a copied list) and run in one process: `static` (fmt, the four clippy surfaces, the guide's
+build and its examples — a missing `mdbook` FAILS unless `--skip-mdbook` — and rustdoc
+`-D warnings`) → `guards` (the
 guards in `ci/guards.toml` this change can affect, through `ci/scripts/run_guards.py` — the runner
 `ci.yml`'s `guard` job calls) → `index` (`symbol-index-gates`' steps, each `run:` block executed
 WHOLE) → `tests` (the hermetic suite under nextest in one run, its doctests, the permission-fault,
@@ -5465,7 +5468,11 @@ here can retroactively un-push a tag. Then tag both `v*` and `py-v*`
   (pure-Python client) + `.github/workflows/pypi-server.yml` (CPU wheel — prove-gated too, even
   though it never touches CUDA itself, because it ships in the SAME all-or-nothing lockstep release)
   + `.github/workflows/pypi-server-cuda.yml` (auditwheel deliberately skipped) — all four gated on
-  the same verdict, same commit, same tag family, reusing `v*`'s dispatch with no extra prove.
+  the same verdict, same commit, same tag family, reusing `v*`'s dispatch with no extra prove — +
+  `.github/workflows/pages.yml`, the documentation site: the guide and API reference `ci.yml`'s
+  `docs` job built and the book its `book` job assembled, deployed to GitHub Pages under the same
+  gate. The site therefore always describes the newest release: what PyPI serves and what every
+  chapter's Colab badge installs. The `github-pages` environment admits only `py-v*` tags.
 
 Once every publisher is green, run the notebooks as a reader gets them: dispatch
 `.github/workflows/cookbook-published.yml` (CPU runners) and

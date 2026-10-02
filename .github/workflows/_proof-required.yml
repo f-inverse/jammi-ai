@@ -3,9 +3,10 @@ name: _proof-required
 # Reusable "proof required" gate: EVERY release-publishing workflow calls this
 # instead of renting hardware itself (or, for a non-CUDA publisher, instead of
 # publishing on no evidence at all) — crates.io, npm, every PyPI dist, the
-# server image, and the release binaries all gate on the same recorded
-# verdict. It asks the GitHub REST API, for the tree of the commit THIS caller
-# is promoting (`github.sha`), whether `gpu-prove.yml` has a green measurement
+# server image, the release binaries and the documentation site all gate on
+# the same recorded verdict. It asks the GitHub REST API, for the tree of the
+# commit THIS caller is promoting (`github.sha`), whether `gpu-prove.yml` has a
+# green measurement
 # for every shipped CUDA arch (`crates/jammi-kernels/build.rs` GENCODE_ARCHES)
 # AND `ci.yml`'s summary job is green (`ci/scripts/verdict.py require`, its
 # most-recent-measurement-wins rule). A tree, never a commit: the release tag

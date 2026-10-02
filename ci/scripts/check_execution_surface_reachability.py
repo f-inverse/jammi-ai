@@ -71,19 +71,17 @@ workflow's file name or its job names.
 ### 1b — path-filter capability
 
 A merge-path trigger's OWN `paths:`/`paths-ignore:` filter (per-trigger,
-not per-workflow — `docs.yml` carries DIFFERENT `paths:` lists under its
+not per-workflow — a workflow may carry DIFFERENT `paths:` lists under its
 `push:` and `pull_request:` blocks) must be CAPABLE of matching the
 specific tuple's origin path (its `ci/scripts/**` source file) before that
 trigger credits anything: a workflow whose `on:` block otherwise fires on
 the merge path but whose `paths:` allowlist can never match a change under
-`ci/scripts/**` (seven such workflows exist: `docs.yml`, `image.yml`,
-`dep-dag.yml` — whose one `ci/scripts/` entry is the
-single literal file `ci/scripts/gen_dep_dag.py`, never a glob covering the
-whole directory — `devcontainer-image.yml`, `pypi-server.yml`,
-`pypi-server-cuda.yml`, `server-image.yml`) would never actually RUN in
-response to an edit of `pod_seed_target.sh`/`runpod_gpu_prove.sh`, so
-crediting it as reachability is illusory regardless of what text happens to
-sit in its run bodies. `_glob_to_regex` translates a GitHub Actions path
+`ci/scripts/**` (`devcontainer-image.yml`; `dep-dag.yml` and `image.yml`,
+whose only `ci/scripts/` entries are single literal files, never a glob
+covering the whole directory) would never actually RUN in response to an
+edit of `pod_seed_target.sh`/`runpod_gpu_prove.sh`, so crediting it as
+reachability is illusory regardless of what text happens to sit in its run
+bodies. `_glob_to_regex` translates a GitHub Actions path
 glob (`**`, `*`, `?`, literal segments) to a regex; `_lane_admits_any_origin`
 requires at least one of the tuple's own recorded origins to match.
 
@@ -1357,8 +1355,8 @@ class PathLane:
 def merge_path_lanes(on_dict: dict[str, dict[str, list[str] | None]]) -> list[PathLane]:
     """Every qualifying (Rule 1a) trigger on this workflow, each carrying
     its OWN `paths:`/`paths-ignore:` filter (Rule 1b reads these
-    per-lane — `push:` and `pull_request:` can and do carry DIFFERENT
-    `paths:` lists in this repo, e.g. `docs.yml`)."""
+    per-lane — `push:` and `pull_request:` can carry DIFFERENT `paths:`
+    lists)."""
     lanes: list[PathLane] = []
     push = on_dict.get("push")
     if push is not None and _push_admits_main(push):
@@ -3008,8 +3006,8 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
                     f"{combined!r}"
                 )
 
-    # --- docs.yml's own shape: a comment line NESTED inside a block `paths:`
-    # list must not truncate the list (docs.yml carries this shape) --------
+    # --- a comment line NESTED inside a block `paths:` list must not
+    # truncate the list --------------------------------------------------
     on_dict, on_err = parse_on_block_or_fail(
         'on:\n  push:\n    branches: [main]\n    paths:\n      - "docs/guide/**"\n      # a comment mid-list\n      - "cookbook/recipes/**"\njobs: {}\n'
     )

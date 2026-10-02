@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Select which cookbook/book chapters a diff must render (the FORWARD half
+"""Select which pages of cookbook/book a diff must render (the FORWARD half
 of the engine<->cookbook loop).
 
 Every chapter runs its capability live and checks what it measured against a
-frozen golden, so the render IS the check. Rendering every chapter is the
-nightly's job (`cookbook-render.yml`); this script returns the subset a GIVEN
-diff could move, which `ci.yml`'s book jobs render at `small` scale on CPU,
-spread over parallel slices (`--slice K/N`).
+frozen golden, so the render IS the check. This script returns the pages a
+GIVEN diff could move, which `ci.yml`'s book jobs render at `small` scale on
+CPU, spread over parallel slices (`--slice K/N`). A page is the front page
+(`index.qmd`) or a chapter (`chapters/**/*.qmd`).
 
 Buckets:
 
@@ -16,7 +16,7 @@ Buckets:
   STATIC    No executed cell beyond imports: prose, links, a reference page.
             Selected only when its own file is in the diff.
 
-A chapter is selected when:
+A page is selected when:
 
   * its own `.qmd` is in the diff (either bucket);
   * the diff changes what every live chapter runs on -- every LIVE chapter:
@@ -32,18 +32,25 @@ A chapter is selected when:
   * the diff touches a golden file, `goldens/<dataset>[.<scale>].json` --
     the LIVE chapters that check a `<dataset>.` metric.
 
+A selection that holds every LIVE chapter is the WHOLE BOOK: every page,
+the STATIC ones included, so the run that renders it can assemble the book a
+release publishes (`ci.yml`'s `book` job). A release's tree always is one:
+its version bump changes `Cargo.toml`, a workspace build input.
+
 Usage:
-    python3 ci/scripts/select_render_chapters.py --diff <path-to-file-list>
-    python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha> [--slice K/N]
+    python3 ci/scripts/select_render_chapters.py --diff <path-to-file-list> [--slice K/N | --whole-book]
+    python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha> [--slice K/N | --whole-book]
     python3 ci/scripts/select_render_chapters.py --classify   # dry-run table, no diff
     python3 ci/scripts/select_render_chapters.py --self-test
 
 `--diff` reads a newline-separated list of repo-root-relative changed paths
 (what a CI job's `git diff --name-only` produces) from a file, or `-` for
 stdin. `--base`/`--head` run `git diff --name-only` in-process. Prints the
-selected chapters' repo-root-relative paths, one per line, to stdout; the
+selected pages' repo-root-relative paths, one per line, to stdout; the
 classification table goes to stderr. `--slice K/N` prints only the K-th of N
 interleaved slices of that list (1-based), so N jobs render it in parallel.
+`--whole-book` prints `whole_book=true` or `whole_book=false`, for
+`$GITHUB_OUTPUT`.
 
 Hermetic: no network. `--base`/`--head` shell out to `git diff`, and the
 crate closure to `cargo metadata --no-deps`, which reads manifests only.
@@ -60,7 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CHAPTERS_DIR = REPO_ROOT / "cookbook" / "book" / "chapters"
+BOOK_DIR = REPO_ROOT / "cookbook" / "book"
 
 # The workspace packages whose builds the book runs: `jammi-python` is the
 # native engine (`packaging/native`), and the server and the CLI are the
@@ -142,8 +149,13 @@ def classify_chapter(path: Path) -> Classification:
     return Classification(path, "LIVE", datasets)
 
 
-def classify_all(chapters_dir: Path = CHAPTERS_DIR) -> list[Classification]:
-    return [classify_chapter(p) for p in sorted(chapters_dir.rglob("*.qmd"))]
+def book_pages(book_dir: Path = BOOK_DIR) -> list[Path]:
+    """Every page of the book: the front page, then the chapters in path order."""
+    return [book_dir / "index.qmd", *sorted((book_dir / "chapters").rglob("*.qmd"))]
+
+
+def classify_all(book_dir: Path = BOOK_DIR) -> list[Classification]:
+    return [classify_chapter(p) for p in book_pages(book_dir)]
 
 
 def shipped_package_dirs(metadata: dict) -> list[str]:
@@ -189,17 +201,24 @@ def _is_build_input(path: str, package_dirs: list[str]) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class Selection:
+    classifications: list[Classification]
+    # The pages to render, in path order.
+    pages: list[Path]
+    # Whether `pages` is every page of the book (see the module docstring).
+    whole_book: bool
+
+
 def select(
     changed_paths: list[str],
     *,
     package_dirs: list[str],
-    chapters_dir: Path = CHAPTERS_DIR,
+    book_dir: Path = BOOK_DIR,
     repo_root: Path = REPO_ROOT,
-) -> tuple[list[Classification], list[Path]]:
-    """Return (all classifications, the selected chapter paths in path order)
-    for a diff."""
+) -> Selection:
     changed = {p.strip().replace("\\", "/") for p in changed_paths if p.strip()}
-    classifications = classify_all(chapters_dir)
+    classifications = classify_all(book_dir)
 
     golden_datasets = {m.group(1) for p in changed if (m := GOLDEN_RE.match(p))}
     every_live = any(
@@ -211,12 +230,18 @@ def select(
     def rel(c: Classification) -> str:
         return c.path.relative_to(repo_root).as_posix()
 
-    selected = [
-        c.path
+    chosen = [
+        c
         for c in classifications
         if rel(c) in changed or (c.live and (every_live or c.datasets & golden_datasets))
     ]
-    return classifications, sorted(selected, key=lambda p: p.relative_to(repo_root).as_posix())
+    whole_book = all(c in chosen for c in classifications if c.live)
+    pages = [c.path for c in (classifications if whole_book else chosen)]
+    return Selection(
+        classifications,
+        sorted(pages, key=lambda p: p.relative_to(repo_root).as_posix()),
+        whole_book,
+    )
 
 
 def take_slice(items: list[Path], slice_spec: str) -> list[Path]:
@@ -307,7 +332,8 @@ def _self_test() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        chapters = root / "cookbook" / "book" / "chapters"
+        book = root / "cookbook" / "book"
+        chapters = book / "chapters"
         package_dirs = shipped_package_dirs(_metadata(root))
 
         check("the-closure-follows-normal-and-build-dependencies",
@@ -340,7 +366,10 @@ def _self_test() -> int:
             prose="```\nadd_source(\"docs\") -> generate_embeddings(...)\n```\n",
         ))
 
-        buckets = {c.path.parent.name: c for c in classify_all(chapters)}
+        # The front page: an import and prose, like every STATIC page.
+        _write(book / "index.qmd", _chapter("# | echo: false\nimport jammi_cookbook", prose="Welcome."))
+
+        buckets = {c.path.parent.name: c for c in classify_all(book)}
         check("engine-opening-chapter-is-live", buckets["embed"].bucket == "LIVE",
               buckets["embed"].bucket)
         check("golden-datasets-are-extracted", buckets["embed"].datasets == {"widget"},
@@ -349,13 +378,16 @@ def _self_test() -> int:
               buckets["served"].bucket)
         check("imports-and-prose-are-static", buckets["prose"].bucket == "STATIC",
               buckets["prose"].bucket)
+        check("the-front-page-is-a-static-page", buckets["book"].bucket == "STATIC",
+              buckets["book"].bucket)
+
+        def selection(*paths: str) -> Selection:
+            return select(list(paths), package_dirs=package_dirs, book_dir=book, repo_root=root)
 
         def selected(*paths: str) -> set[str]:
-            _, sel = select(list(paths), package_dirs=package_dirs,
-                            chapters_dir=chapters, repo_root=root)
-            return {p.parent.name for p in sel}
+            return {p.parent.name for p in selection(*paths).pages}
 
-        live = {"embed", "other", "served"}
+        every_page = {"book", "embed", "other", "served", "prose"}
         for trigger in (
             "crates/jammi-ai/src/lib.rs",
             "crates/jammi-db/build.rs",
@@ -370,8 +402,10 @@ def _self_test() -> int:
             "cookbook/book/jammi_cookbook/keystone.py",
             "cookbook/fixtures/tiny_corpus.parquet",
         ):
-            sel = selected(trigger)
-            check(f"{trigger}-selects-every-live-chapter", sel == live, str(sel))
+            sel = selection(trigger)
+            check(f"{trigger}-selects-the-whole-book",
+                  {p.parent.name for p in sel.pages} == every_page and sel.whole_book,
+                  f"{sel.pages} whole_book={sel.whole_book}")
 
         for inert in (
             "crates/jammi-db/tests/it/broker_parity.rs",
@@ -385,19 +419,34 @@ def _self_test() -> int:
             "docs/guide/something.md",
             ".github/workflows/ci.yml",
         ):
-            sel = selected(inert)
-            check(f"{inert}-selects-nothing", sel == set(), str(sel))
+            sel = selection(inert)
+            check(f"{inert}-selects-nothing", sel.pages == [] and not sel.whole_book,
+                  f"{sel.pages} whole_book={sel.whole_book}")
 
-        sel = selected("cookbook/book/jammi_cookbook/goldens/widget.small.json")
-        check("a-golden-diff-selects-its-datasets-chapters", sel == {"embed"}, str(sel))
+        sel = selection("cookbook/book/jammi_cookbook/goldens/widget.small.json")
+        check("a-golden-diff-selects-its-datasets-chapters",
+              {p.parent.name for p in sel.pages} == {"embed"} and not sel.whole_book,
+              f"{sel.pages} whole_book={sel.whole_book}")
         sel = selected("cookbook/book/jammi_cookbook/goldens/gadget.json")
         check("a-scale-free-golden-diff-selects-its-datasets-chapters", sel == {"other"}, str(sel))
 
         sel = selected("cookbook/book/chapters/prose/prose.qmd")
         check("a-self-touched-static-chapter-is-selected", sel == {"prose"}, str(sel))
+        sel = selected("cookbook/book/index.qmd")
+        check("a-self-touched-front-page-is-selected", sel == {"book"}, str(sel))
 
-        _, everything = select(["Cargo.lock"], package_dirs=package_dirs,
-                               chapters_dir=chapters, repo_root=root)
+        # Every LIVE chapter touched by hand, one by one, is still the whole
+        # book: the rule is the coverage of the LIVE pages, not the trigger.
+        sel = selection(*(f"cookbook/book/chapters/{n}/{n}.qmd" for n in ("embed", "other", "served")))
+        check("every-live-chapter-touched-is-the-whole-book",
+              {p.parent.name for p in sel.pages} == every_page and sel.whole_book,
+              f"{sel.pages} whole_book={sel.whole_book}")
+        sel = selection("cookbook/book/chapters/embed/embed.qmd", "cookbook/book/chapters/other/other.qmd")
+        check("a-live-chapter-left-out-is-not-the-whole-book",
+              {p.parent.name for p in sel.pages} == {"embed", "other"} and not sel.whole_book,
+              f"{sel.pages} whole_book={sel.whole_book}")
+
+        everything = selection("Cargo.lock").pages
         slices = [take_slice(everything, f"{k}/2") for k in (1, 2)]
         check("slices-partition-the-selection",
               sorted(p for s in slices for p in s) == sorted(everything)
@@ -457,15 +506,19 @@ def _cmd_classify() -> int:
     return 0
 
 
-def _cmd_select(changed_paths: list[str], slice_spec: str | None) -> int:
-    classifications, selected = select(changed_paths, package_dirs=shipped_package_dirs(cargo_metadata()))
+def _cmd_select(changed_paths: list[str], slice_spec: str | None, whole_book: bool) -> int:
+    selection = select(changed_paths, package_dirs=shipped_package_dirs(cargo_metadata()))
     print("# classification", file=sys.stderr)
-    for line in _table_lines(classifications):
+    for line in _table_lines(selection.classifications):
         print(f"#   {line}", file=sys.stderr)
+    if whole_book:
+        print(f"whole_book={'true' if selection.whole_book else 'false'}")
+        return 0
+    selected = selection.pages
     if slice_spec is not None:
         selected = take_slice(selected, slice_spec)
     if not selected:
-        print("# no chapter needs rendering for this diff", file=sys.stderr)
+        print("# no page needs rendering for this diff", file=sys.stderr)
     for path in selected:
         print(path.relative_to(REPO_ROOT).as_posix())
     return 0
@@ -480,6 +533,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--head", help="head git ref (with --base)")
     ap.add_argument("--slice", help="print only the K-th of N interleaved slices (K/N)")
     ap.add_argument(
+        "--whole-book",
+        action="store_true",
+        help="print whole_book=true|false: whether the selection is every page",
+    )
+    ap.add_argument(
         "--classify",
         action="store_true",
         help="print the full classification table and exit",
@@ -488,6 +546,8 @@ def main(argv: list[str] | None = None) -> int:
         "--self-test", action="store_true", help="run the RED-proof self-tests and exit"
     )
     args = ap.parse_args(argv)
+    if args.slice and args.whole_book:
+        ap.error("--slice and --whole-book are separate questions; ask one")
 
     if args.self_test:
         return _self_test()
@@ -498,14 +558,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.base or args.head:
         if not (args.base and args.head):
             ap.error("--base and --head must be given together")
-        return _cmd_select(_git_diff_names(args.base, args.head), args.slice)
+        return _cmd_select(_git_diff_names(args.base, args.head), args.slice, args.whole_book)
 
     if args.diff:
         if args.diff == "-":
             changed = sys.stdin.read().splitlines()
         else:
             changed = Path(args.diff).read_text().splitlines()
-        return _cmd_select(changed, args.slice)
+        return _cmd_select(changed, args.slice, args.whole_book)
 
     ap.error("one of --diff, --base/--head, --classify, or --self-test is required")
     return 2

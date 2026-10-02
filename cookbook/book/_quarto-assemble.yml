@@ -1,0 +1,7 @@
+# The profile CI renders under (`quarto render --profile assemble`): a page
+# rendered on its own executes as always and records its execution under
+# `_freeze/`, and a whole-book render reads those records instead of executing
+# again. `ci.yml`'s slices render the pages, and its `book` job assembles them
+# into the book a release publishes; the records are fresh from that same run.
+execute:
+  freeze: auto

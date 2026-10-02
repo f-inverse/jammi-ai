@@ -1,0 +1,99 @@
+name: Pages
+
+on:
+  push:
+    tags: ["py-v*"]
+  # Manual re-run to finish a release whose deploy was interrupted: run the
+  # dispatch ON the `py-v*` tag (the deploy job is tag-guarded; deploying the
+  # same site again is idempotent). A branch dispatch is a rehearsal: it
+  # resolves the branch tree's proving run, lays out its site, and deploys
+  # nothing.
+  workflow_dispatch:
+
+# The documentation site describes a release: the guide, the API reference
+# and the cookbook book of the tree a `py-v*` tag names, so what a reader
+# reads is what PyPI serves them and what each chapter's Colab badge
+# installs. It compiles and renders nothing: `ci.yml` builds the guide and
+# the API reference (`docs`) and assembles the book (`book`) on every tree
+# whose book selection is whole — a release's always is, its version bump
+# changing `Cargo.toml` — and this workflow publishes the ones the run that
+# proved the tag's tree built.
+
+# A deploy in flight is never cancelled; a later tag's waits behind it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # What this release publishes: the site the `ci.yml` run that proved the
+  # released tree built. On a branch dispatch, the rehearsal: the same lookup
+  # over the branch's tree.
+  artifacts:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_proven-artifacts.yml
+    with:
+      artifacts: docs-site cookbook-book
+
+  proof:
+    name: Proof required
+    # Any `py-v*` TAG ref requires the release tree's recorded GPU-prove and CI
+    # verdicts before the site is deployed: every release publisher gates on
+    # the same verdict, all-or-nothing, so the site never describes a release
+    # the package indexes refused.
+    if: startsWith(github.ref, 'refs/tags/py-v')
+    uses: ./.github/workflows/_proof-required.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets: inherit
+
+  # The guide at the root, the API reference under `api/`, the book under
+  # `cookbook/`: the paths the guide, the README and every notebook link to.
+  site:
+    name: Lay out the site
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      # Downloads from the proving run, not this one.
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: docs-site
+          path: _site
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cookbook-book
+          path: _site/cookbook
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    # Deploys ONLY from a `py-v*` tag ref whose tree's proof is green. PURE
+    # conjunction (no `||`).
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.site.result == 'success' && needs.proof.result == 'success'
+    needs: [site, proof]
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

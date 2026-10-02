@@ -22,9 +22,10 @@ tests/            the lib's unit tests
 ```
 
 The book lives in the engine monorepo at `cookbook/book/`; the engine CI renders
-the chapters a change can move against the wheels, server and CLI that same run
-built (the book jobs in `.github/workflows/ci.yml` at the repo root), and the
-whole book nightly (`.github/workflows/cookbook-render.yml`).
+the pages a change can move against the wheels, server and CLI that same run
+built (the book jobs in `.github/workflows/ci.yml` at the repo root). When that is
+every page — a release's tree always is — the run also assembles the book, and the
+release publishes it with the guide (`.github/workflows/pages.yml`).
 
 ## Two scales, one code path
 

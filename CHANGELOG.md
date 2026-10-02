@@ -30,6 +30,19 @@ every install instruction installs an engine that runs.
   `model-catalog`, `error-taxonomy`, `tenancy-per-verb`), and chapters no longer refer to each
   other by number. `jammi-cookbook[book]` installs everything rendering the whole book needs —
   every extra a chapter imports from — and both render workflows install it.
+- **The documentation site is a release artifact.** The site deployed the guide and API reference
+  built from `main`, and the book from a nightly render kept in the Actions cache. A full cache
+  evicted that render, and the next deploy published the site without its book and reported
+  success. The site also described `main` while every chapter's Colab badge and install instruction
+  pointed at the release. Now `ci.yml` builds the guide and API reference on every tree (`docs`;
+  the guide's examples and rustdoc `-D warnings` join the required check) and, when a tree's book
+  selection is every page — a release's always is — assembles the whole book from its slices'
+  renders without executing anything again (`book`: Quarto's `_freeze/` records, written under
+  the `assemble` profile). A `py-v*` tag's `pages.yml` deploys the proving run's two artifacts
+  under the same proof gate as every other publisher. `docs.yml` and the nightly
+  `cookbook-render.yml` are deleted; the drift the nightly render caught under an unchanged chapter
+  is caught by the published-notebook lane, against what readers install. A change to the book's
+  front page now renders it.
 - **Every install instruction installs an engine that runs.** The quickstart, the guide, the
   README and the cookbook README told a newcomer to `pip install jammi-ai`, which installs the
   client alone, so `connect("file://…")` raised `NoEmbeddedEngineError`; they said the engine was

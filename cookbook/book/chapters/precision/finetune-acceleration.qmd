@@ -47,9 +47,8 @@ compile it in. The servers this chapter starts are pinned to the CPU (`[gpu] dev
 set through the environment below), whichever `jammi-server` is installed — a CUDA build's
 kernels have no CUDA device to run on here. In CI that server is the CPU `jammi-server` the
 release manifest calls `server-cpu` — no `cuda` feature, no `flash-attn` feature — which `ci.yml`
-builds once per change and every render of this book installs, the per-change render and the
-nightly full-book render (`cookbook-render.yml`) alike, because neither ever has a CUDA device to
-hand a compiled kernel to. That is a fact about *this
+builds once per change and every render of this book installs, because no render of it ever has a
+CUDA device to hand a compiled kernel to. That is a fact about *this
 render's own CI machine*, not a gap in the report mechanism: everything below through the
 `## Measured on real GPU hardware, not here` heading is a live, real submission against a live,
 real server — it simply resolves onto CPU, so its `flash` verdict is always the *compiled-away*
@@ -78,9 +77,8 @@ print(f"encoder: {TINY_MODERNBERT.name}  (tiny ModernBERT architecture, hidden_s
 
 The same `LiveServer` shape [the model-catalog cache emit](../model-catalog/model-catalog.qmd) uses: a real
 `jammi-server` on a loopback port **the kernel assigns to the child itself**, readiness-polled via
-a client handshake, torn down on exit. `jammi-server` must already be on `PATH` — the render
-harness places the freshly built binary there before invoking `quarto render`, exactly as
-`cookbook-render.yml` documents.
+a client handshake, torn down on exit. `jammi-server` must already be on `PATH` — CI's book jobs
+place the run's own binary there before invoking `quarto render`.
 
 This chapter runs **two** such servers, one after the other, over the **same artifact
 directory** — which is why the artifact directory is a constructor *parameter* here rather than

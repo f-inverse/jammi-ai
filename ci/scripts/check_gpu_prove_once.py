@@ -6,7 +6,8 @@ hermetic, static, no build, no GPU. Reads workflow YAML through
 
 **Guarded property**: a release commit is proven ONCE per shipped arch, and
 EVERY release-publishing workflow — CUDA and non-CUDA alike (crates.io, npm,
-every PyPI dist, the server image, the release binaries) — gates its
+every PyPI dist, the server image, the release binaries, the documentation
+site) — gates its
 promotion on that SAME recorded verdict, all-or-nothing: a tag push
 publishes NOTHING until the commit's prove is green. The prove lane itself
 is a manual dev run, never in the critical path of any automated workflow --
@@ -105,7 +106,8 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      and `uses:` lines, whitespace-tolerant, never five literal marker
      strings: `cargo publish`, `npm publish`, `twine upload`, `maturin
      upload`, `docker push`, `gh release create`/`upload`, `pypa/gh-action-
-     pypi-publish`, `softprops/action-gh-release`, `docker/build-push-
+     pypi-publish`, `softprops/action-gh-release`, `actions/deploy-pages`,
+     `docker/build-push-
      action` — any `push:` value that is not literally `false`/`"false"`,
      including an unquoted `true`, `'true'`, or any `${{ }}` expression —
      `./.github/actions/docker-publish` and its cross-repo form under the
@@ -400,6 +402,8 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "native-cu12-wheel": PromotionRow(
         "pypi-native-cuda.yml", "publish", "proof", "direct", tag_family="py-v"
     ),
+    # ---- the documentation site (GitHub Pages), deployed per "py-v*" release ----
+    "pages-site": PromotionRow("pages.yml", "deploy", "proof", "direct", tag_family="py-v"),
 }
 
 # Local reusable workflows REVIEWED, by direct human inspection, to invoke
@@ -1846,6 +1850,8 @@ _SIMPLE_PRIMITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("gh release create/upload", re.compile(r"gh\s+release\s+(create|upload)")),
     ("pypa/gh-action-pypi-publish", re.compile(r"pypa/gh-action-pypi-publish")),
     ("softprops/action-gh-release", re.compile(r"softprops/action-gh-release")),
+    # The documentation site a reader reads: deploying it is a release's promotion.
+    ("actions/deploy-pages", re.compile(r"actions/deploy-pages")),
     ("ci/scripts/publish_crates.sh", re.compile(r"ci/scripts/publish_crates\.sh")),
     # `docker buildx imagetools create` merges per-arch immutable sources into
     # one multi-arch index under a REAL tag -- itself a promotion, distinct

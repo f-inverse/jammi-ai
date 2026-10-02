@@ -52,7 +52,9 @@ mod postgres {
 
     #[tokio::test]
     async fn postgres_ping_succeeds_against_live_url() {
-        let pg = PostgresBackend::open_with_options(&jammi_test_utils::postgres_url(), 4, None)
+        let dir = tempfile::tempdir().unwrap();
+        let url = jammi_test_utils::postgres_database_url(dir.path()).await;
+        let pg = PostgresBackend::open_with_options(&url, 4, None)
             .await
             .expect("open postgres backend");
         let backend = BackendImpl::Postgres(pg);

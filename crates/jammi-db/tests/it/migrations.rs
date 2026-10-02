@@ -1203,14 +1203,6 @@ impl Drop for LedgerBarrierArmed {
     }
 }
 
-/// `url` with its database path replaced by `db`.
-#[cfg(feature = "live-postgres-tests")]
-fn with_database(url: &str, db: &str) -> String {
-    let mut parsed = url::Url::parse(url).expect("JAMMI_TEST_PG_URL parses as a URL");
-    parsed.set_path(&format!("/{db}"));
-    parsed.to_string()
-}
-
 /// Two independent `PostgresBackend`s (separate pools) race `migrate()` on a
 /// FRESH database created for this test alone. Both must return `Ok` and the
 /// ledger must name every migration exactly once. Without the advisory lock
@@ -1227,7 +1219,7 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
     use jammi_db::catalog::backend_postgres::PostgresBackend;
 
     const TEST_NAME: &str = "concurrent_migrate_on_fresh_postgres_is_safe";
-    let admin_url = jammi_test_utils::postgres_url();
+    let admin_url = jammi_test_utils::postgres_server_url();
 
     let admin = sqlx::PgPool::connect(&admin_url)
         .await
@@ -1237,7 +1229,7 @@ async fn concurrent_migrate_on_fresh_postgres_is_safe() {
         .execute(&admin)
         .await
         .expect("CREATE DATABASE for the fresh-catalog race");
-    let fresh_url = with_database(&admin_url, &db_name);
+    let fresh_url = jammi_test_utils::with_database(&admin_url, &db_name);
 
     // The body runs on its own task so the database is dropped whether it
     // passes or panics; the panic is re-raised afterwards, payload intact.
@@ -1493,21 +1485,7 @@ async fn migration_032_creates_result_table_versions(
 ) {
     use jammi_db::catalog::backend::BackendKind;
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
 
     // The table exists and holds no row for a table this test never created
@@ -2112,21 +2090,7 @@ async fn migration_034_is_ordered_after_033_and_pins_the_pair_at_the_schema_edge
     );
 
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
 
     // Both columns exist and are nullable, on both dialects.
@@ -2296,21 +2260,7 @@ async fn migration_035_is_ordered_after_034_and_adds_instances_peer_addr_result_
     );
 
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
 
     // Both columns exist and are nullable, on both dialects -- the SAME
@@ -2428,21 +2378,7 @@ async fn migration_036_is_ordered_after_035_and_adds_instances_result_root_ident
         "the result_root_identity migration must follow 035"
     );
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
     let columns: Vec<(String, bool)> = backend
         .transaction(
@@ -2521,21 +2457,7 @@ async fn migration_037_is_ordered_after_036_and_adds_assembly_failures_next_afte
         "the assembly cooldown/counter migration must follow 036"
     );
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
     let columns: Vec<(String, bool)> = backend
         .transaction(
@@ -2676,21 +2598,7 @@ async fn migration_038_adds_worker_devices_and_047_drops_its_compute_tables(
     );
 
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     assert!(
         position("047_drop_compute_cluster_state") > position("039_canonical_stamps"),
         "the drop must follow 039, whose triggers and constraints it takes with the table"
@@ -2914,21 +2822,7 @@ async fn migration_039_is_ordered_after_038_and_the_enforcement_set_is_exact(
     );
 
     let dir = tempdir().unwrap();
-    let backend = match kind {
-        BackendKind::Sqlite => {
-            BackendImpl::Sqlite(open_sqlite_backend(&dir.path().join("catalog.db")).await)
-        }
-        BackendKind::Postgres => {
-            let url = jammi_test_utils::postgres_url();
-            BackendImpl::Postgres(
-                jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(
-                    &url, 4, None,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-    };
+    let backend = jammi_test_utils::open_backend(kind, dir.path()).await;
     backend.migrate().await.unwrap();
 
     match kind {
@@ -3184,20 +3078,19 @@ async fn migration_039_on_an_unclassifiable_value_fails_closed() {
 /// `catalog::lease::pg_canonical_stamp`'s GUC-independence: `to_char` with an explicit picture must
 /// render the SAME text regardless of the session's `DateStyle`/`TimeZone`, unlike a bare `::text`
 /// cast. `SET LOCAL` (transaction-scoped, reverted automatically at commit or rollback) rather than
-/// `SET`, since this runs on a POOLED connection another test could reuse afterward.
-/// Self-contained: no table at all, a plain `SELECT` of a literal expression, never touching the
-/// shared schema.
+/// `SET`, since this runs on a POOLED connection the pool hands out again afterward.
+/// Self-contained: no table at all, a plain `SELECT` of a literal expression.
 #[cfg(feature = "live-postgres-tests")]
 #[tokio::test]
 async fn pg_canonical_stamp_is_independent_of_session_datestyle_and_timezone() {
     use jammi_db::catalog::lease::pg_canonical_stamp;
 
-    let url = jammi_test_utils::postgres_url();
-    let backend = BackendImpl::Postgres(
-        jammi_db::catalog::backend_postgres::PostgresBackend::open_with_options(&url, 2, None)
-            .await
-            .unwrap(),
-    );
+    let dir = tempdir().unwrap();
+    let backend = jammi_test_utils::open_backend(
+        jammi_db::catalog::backend::BackendKind::Postgres,
+        dir.path(),
+    )
+    .await;
 
     let default_render: String = backend
         .transaction(TxOptions::default(), |tx| {

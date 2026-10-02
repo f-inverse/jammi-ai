@@ -16,11 +16,10 @@ ARG RUNTIME_VARIANT=runtime-generic
 
 # GLOBAL args (declared before the first FROM, same rule this file already
 # states for RUNTIME_VARIANT above): a bare `docker build` (no `--build-arg`
-# at all -- `deploy-server.md`'s documented commands) still resolves to the
-# mutable `:latest` index each default names, exactly the pre-arm64 behavior;
-# CI overrides both with a digest-pinned ref resolved once per run
-# (`resolve-base`/`resolve-ci-image`, one read, no repo-variable write, no
-# PAT) so every leg of one release build shares one toolchain.
+# at all -- `deploy-server.md`'s documented commands) builds on the `:latest`
+# alias `image.yml` keeps on `main`'s CI images; CI passes the tree's own
+# content-tagged CI images (`_ci-image.yml`), so every leg of one release
+# build shares the toolchain its tree defines.
 #
 # BASE_IMAGE feeds the very next FROM (immediately below, the first FROM in
 # this file) so this single declaration -- default AND all -- is already in
@@ -42,12 +41,20 @@ ARG BASE_IMAGE=ghcr.io/f-inverse/jammi-ai-ci:latest
 ARG BASE_IMAGE_CUDA=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
 
 # ---- builder ----
-# The CI base image carries the full Rust toolchain (rustc 1.94.0,
-# protoc, mold, sccache). Pinning to `:latest` is intentional —
-# the CI image is rebuilt on toolchain bumps and the OSS server
-# inherits that update lockstep with the workspace. `:latest` now resolves
-# to a multi-arch index (linux/amd64 + linux/arm64); each puller's own
-# container runtime selects the manifest matching its own host arch.
+# The CI base image carries the full Rust toolchain (the `rust-toolchain.toml`
+# pin, protoc, mold, sccache). It is a multi-arch index (linux/amd64 +
+# linux/arm64); each puller's own container runtime selects the manifest
+# matching its own host arch.
+#
+# What the runtime stages take from a builder is `/out`: the stripped
+# `jammi-server` and `jammi`, plus an empty `jammi-data/` (the CPU builder
+# only). That layout is the stage's whole contract, so a build can replace
+# the stage with binaries already compiled: CI passes
+# `--build-context builder=<dir>` (or `builder-cuda=<dir>`), where `<dir>/out`
+# holds the binaries its run built through `_server.yml` and `_cli.yml`, and
+# BuildKit uses that directory instead of building the stage
+# (https://docs.docker.com/reference/cli/docker/buildx/build/#build-context).
+# A plain `docker build` compiles them here.
 FROM ${BASE_IMAGE} AS builder
 
 # Redeclared HERE (post-FROM), same rule the CUDA stage's own
@@ -57,9 +64,9 @@ FROM ${BASE_IMAGE} AS builder
 # below, never silently build a plausible-but-wrong feature list — the
 # fail-OPEN behavior an empty/absent build-arg had before (a mistyped or
 # missing `--build-arg CARGO_FEATURES=...` still built successfully) is
-# exactly the #507 defect this closes. `server-image.yml`'s three CPU
-# image jobs pass this from `ci/release-feature-manifest.json`'s
-# `cpu-image` lane via `jq`.
+# exactly the #507 defect this closes. `server-image.yml`'s CPU image
+# jobs pass this from `ci/release-feature-manifest.json`'s `server-cpu`
+# build via `jq`.
 ARG CARGO_FEATURES
 
 WORKDIR /workspace
@@ -83,24 +90,24 @@ COPY . .
 # in sync by hand.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's cpu-* lanes) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
+    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's server-cpu build) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
     && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
     && cargo build --release \
         --package jammi-server --bin jammi-server \
         --features "${features}" \
     && cargo build --release --package jammi-cli --bin jammi \
-    && cp target/release/jammi-server /tmp/jammi-server \
-    && cp target/release/jammi /tmp/jammi \
-    && strip /tmp/jammi-server /tmp/jammi
+    && mkdir -p /out \
+    && cp target/release/jammi-server target/release/jammi /out/ \
+    && strip /out/jammi-server /out/jammi
 
 # An empty directory the distroless runtime can COPY --chown into place as the
 # writable artifact dir — distroless has no shell to `mkdir` at runtime.
-RUN mkdir -p /tmp/jammi-data
+RUN mkdir -p /out/jammi-data
 
 # ---- builder: cuda ----
 # The CUDA CI base extends `jammi-ai-ci` with the CUDA 12.6 toolkit (nvcc), GCC 13
-# (CUDA 12.6 supports GCC ≤ 13.2), and `CUDA_COMPUTE_CAP=80` — the same image the
-# (now-retired) CUDA wheel lane built against. `candle-core/cuda` reads CUDA_COMPUTE_CAP
+# (CUDA 12.6 supports GCC ≤ 13.2), and `CUDA_COMPUTE_CAP=80`. Its output is the
+# CPU builder's `/out` contract, without `jammi-data/`. `candle-core/cuda` reads CUDA_COMPUTE_CAP
 # at build time to target the GPU architecture; CC/CXX/PATH for nvcc are baked into the base.
 # `--platform=linux/amd64` is explicit here (never implicit native-runner
 # behavior): the CUDA base publishes amd64 only, so an arm builder fails
@@ -116,8 +123,8 @@ FROM --platform=linux/amd64 ${BASE_IMAGE_CUDA} AS builder-cuda
 # `:?` guard below rather than silently building a plausible-but-wrong
 # feature list (the old default masked exactly a missing/mistyped
 # `--build-arg`, which built successfully anyway). `server-image.yml`'s CUDA
-# jobs pass the manifest-derived (`ci/release-feature-manifest.json`, lane
-# `cu12-image`) feature list explicitly via this build-arg.
+# jobs pass the manifest-derived (`ci/release-feature-manifest.json`, build
+# `server-cu12`) feature list explicitly via this build-arg.
 ARG CARGO_FEATURES
 
 WORKDIR /workspace
@@ -128,21 +135,20 @@ COPY . .
 # (compiled for compute capability 80 — PTX, forward-compatible via JIT to
 # 8.6/8.9/9.0) and, when the published lane's manifest includes it, the
 # vendored FlashAttention-2 kernels (`flash-attn`, needs the CUTLASS
-# submodule already present in the build context — see server-image.yml's
-# submodule-checkout step). Both binaries are built so the GPU image carries
+# submodule already present in the build context). Both binaries are built so the GPU image carries
 # the admin `jammi` CLI too. `jammi-server/` prefixes every feature name so
 # `jammi-cli`'s own build (no `--features`) is unaffected by the arg's value.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/workspace/target,sharing=locked \
-    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's cu12-image lane) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
+    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's server-cu12 build) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
     && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
     && cargo build --release \
         --package jammi-server --bin jammi-server \
         --features "${features}" \
     && cargo build --release --package jammi-cli --bin jammi \
-    && cp target/release/jammi-server /tmp/jammi-server \
-    && cp target/release/jammi /tmp/jammi \
-    && strip /tmp/jammi-server /tmp/jammi
+    && mkdir -p /out \
+    && cp target/release/jammi-server target/release/jammi /out/ \
+    && strip /out/jammi-server /out/jammi
 
 # ---- runtime base ----
 # Distroless `cc` ships glibc and libstdc++ (Rust binaries linked
@@ -164,8 +170,8 @@ FROM gcr.io/distroless/cc-debian12 AS runtime-base
 # long-running `jammi-server` (the entrypoint) and the strict-client `jammi` CLI
 # ship: the CLI's admin verbs (`sources`, `query`, …) run against the server in
 # the same image (`jammi --target grpc://… …`).
-COPY --from=builder /tmp/jammi-server /usr/local/bin/jammi-server
-COPY --from=builder /tmp/jammi /usr/local/bin/jammi
+COPY --from=builder /out/jammi-server /usr/local/bin/jammi-server
+COPY --from=builder /out/jammi /usr/local/bin/jammi
 
 # Health side-channel on 8080, gRPC + Flight SQL on 8081.
 EXPOSE 8080 8081
@@ -204,7 +210,7 @@ CMD ["serve"]
 # must be writable by the nonroot user (uid 65532) even when no volume is
 # mounted — `--chown` makes the baked directory writable; a mounted named
 # volume inherits its ownership, and a bind mount must be `chown 65532:65532`.
-COPY --from=builder --chown=65532:65532 /tmp/jammi-data /var/lib/jammi
+COPY --from=builder --chown=65532:65532 /out/jammi-data /var/lib/jammi
 VOLUME ["/var/lib/jammi"]
 
 # Point zero-config `jammi-server` at the declared volume rather than the user's
@@ -280,8 +286,8 @@ FROM --platform=linux/amd64 nvidia/cuda:12.6.3-runtime-ubi8 AS runtime-cuda
 # Bring both stripped CUDA-build binaries across from the CUDA builder: the
 # long-running `jammi-server` (the entrypoint) and the strict-client `jammi` CLI
 # (admin verbs against the running server).
-COPY --from=builder-cuda /tmp/jammi-server /usr/local/bin/jammi-server
-COPY --from=builder-cuda /tmp/jammi /usr/local/bin/jammi
+COPY --from=builder-cuda /out/jammi-server /usr/local/bin/jammi-server
+COPY --from=builder-cuda /out/jammi /usr/local/bin/jammi
 
 # Health side-channel on 8080, gRPC + Flight SQL on 8081.
 EXPOSE 8080 8081

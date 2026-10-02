@@ -370,12 +370,15 @@ async fn dropping_the_guard_after_a_cancelled_stop_and_join_aborts_the_task() {
     // detached finalize lands" before the detached thread ever had the
     // chance to land one, which is vacuous. The same rendezvous is used at
     // `release_and_stop_leaves_running_with_null_lease_and_no_new_bundle`
-    // in this file for exactly this reason.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(FAST_TIMING.heartbeat + 120);
+    // in this file for exactly this reason. The abort dropped the job's
+    // lease hold, which sets the flag the trainer checks at every epoch
+    // boundary, so it returns within an epoch -- never after running the
+    // rest of its 20 000 epochs, CPU nobody asked for.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(FAST_TIMING.heartbeat + 10);
     while training_test_hooks::training_threads_finished() <= threads_before {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the abandoned training thread never returned"
+            "the abandoned training thread kept training after its lease hold was dropped"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

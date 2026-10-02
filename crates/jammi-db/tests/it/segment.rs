@@ -31,20 +31,7 @@ use test_case::test_case;
 
 async fn fresh_catalog(backend: BackendImpl) -> Arc<Catalog> {
     backend.migrate().await.unwrap();
-    let catalog = Arc::new(Catalog::from_backend(backend));
-    // The Postgres lane shares one DB across the run; clear the child table then
-    // the parent so a cross-test scan sees only this test's rows.
-    catalog
-        .backend_arc()
-        .transaction(Default::default(), |tx| {
-            Box::pin(async move {
-                tx.execute("DELETE FROM index_segments", &[]).await?;
-                tx.execute("DELETE FROM result_tables", &[]).await
-            })
-        })
-        .await
-        .unwrap();
-    catalog
+    Arc::new(Catalog::from_backend(backend))
 }
 
 fn store(dir: &std::path::Path, catalog: Arc<Catalog>, precision: StoragePrecision) -> ResultStore {

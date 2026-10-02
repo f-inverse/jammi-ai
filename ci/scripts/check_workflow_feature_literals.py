@@ -29,7 +29,7 @@ the crate's own `[features]` table) appears in a feature-list position:
 Prose that mentions a feature, an expression such as
 `${{ steps.cuda.outputs.image }}`, and a list made of shell or workflow
 variables are none of these and pass. The manifest-read idiom
-(`jq -r '.lanes[…].cargo_features | join(",")'`) names no feature at all.
+(`jq -r '.builds[…].cargo_features | join(",")'`) names no feature at all.
 
 Fail-closed: a lane naming a workflow that does not exist, a `uses: ./…` that
 resolves to nothing, an unparseable document, or an empty universe is a
@@ -236,7 +236,7 @@ def self_test() -> int:
           b:
             steps:
               - run: |
-                  features="$(jq -r '.lanes["cu12-wheel"].cargo_features | join(",")' m.json)"
+                  features="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' m.json)"
                   cargo build -p jammi-server --features "$features"
         """,
         set(),

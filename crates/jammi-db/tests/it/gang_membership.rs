@@ -9,13 +9,7 @@
 //! `migrations.rs` / `gang_instance_freshness.rs` shape: every test also
 //! runs a `::postgres` arm gated by `live-postgres-tests`.
 //!
-//! The Postgres arm runs every test in the lane against ONE shared, persistent
-//! database (`jammi_test_utils::unique_suffix`'s doc), so two disciplines hold
-//! in this file: a test never asserts a count over rows it did not seed (it
-//! asserts the presence or absence of ITS row), and a test that plants a row
-//! the listing predicate cannot tolerate (a corrupted `peer_addr`) deletes
-//! that row BEFORE its assertion, on every arm, so a failure never leaks the
-//! poison into every later listing in the lane.
+//! Each test's catalog is its own on both arms (`jammi_test_utils::open_backend`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -1016,9 +1010,6 @@ async fn peer_addr_of_returns_the_typed_error_for_a_corrupted_peer_addr(kind: Ba
     .await;
     force_corrupt_peer_addr(&catalog, &id).await;
     let result = catalog.peer_addr_of(&id, LEASE).await;
-    // The poison row leaves the shared database before any assertion can
-    // fail, so a red here never cascades into every later listing.
-    force_delete_instance(&catalog, &id).await;
     let err = result.expect_err("a corrupted peer_addr must be a typed error, never a silent None");
     match err {
         JammiError::Catalog(msg) => {
@@ -1056,9 +1047,6 @@ async fn list_gang_members_returns_the_typed_error_for_a_corrupted_peer_addr(kin
     let result = catalog
         .list_gang_members(listing("fine_tune", "someone-else", &shared_root()))
         .await;
-    // Same discipline as the `peer_addr_of` case: the poison row is gone
-    // before the assertion, on every arm.
-    force_delete_instance(&catalog, &id).await;
     let err =
         result.expect_err("a corrupted peer_addr candidate must be a typed error, never dropped");
     match err {
@@ -1179,9 +1167,7 @@ async fn prune_window_does_not_prune_a_member_merely_stale_within_the_window(kin
         !catalog.fresh_instance(&id, lease).await.unwrap(),
         "25s ago must already read stale past the 20s margin"
     );
-    // The oracle is row-scoped: `prune_instances` returns the count over the
-    // WHOLE table, which on the shared Postgres database also counts every
-    // stale row a sibling test left behind, so the count is never asserted.
+    // The oracle is row-scoped: what must survive is THIS member's row.
     catalog
         .prune_instances(instance_prune_window(lease))
         .await

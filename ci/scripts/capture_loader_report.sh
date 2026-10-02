@@ -7,7 +7,7 @@
 #
 # Runs `ldd` with `LD_LIBRARY_PATH` set to the staged `lib/` directory ONLY —
 # the same shape the tarball's own launcher uses at `exec` time
-# (`.github/workflows/release-binaries.yml`'s `LAUNCH` heredoc). This capture
+# (`ci/scripts/package_server_tarball.sh`'s `LAUNCH` heredoc). This capture
 # step does NOT restrict the loader's search the way the chroot/`unshare`
 # shape `bundle_verify_loader_resolution`'s module doc describes would (see
 # `ci/scripts/bundle_cuda_libs.sh`'s stop-rule note for why that shape is not

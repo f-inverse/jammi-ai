@@ -631,18 +631,22 @@ The CPU image ignores GPU config and runs inference on the CPU.
 
 ### Building from source
 
-The Dockerfile lives at the workspace root and uses BuildKit cache mounts for the cargo registry and target directory:
+The Dockerfile lives at the workspace root and uses BuildKit cache mounts for the cargo registry and target directory. The cargo features a build compiles in are required, never defaulted; the published images use the release manifest's lists:
 
 ```bash
 # CPU image (default).
-DOCKER_BUILDKIT=1 docker build -t jammi-ai-server:dev -f Dockerfile .
+DOCKER_BUILDKIT=1 docker build -t jammi-ai-server:dev -f Dockerfile \
+  --build-arg CARGO_FEATURES="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)" .
 
 # CUDA image — selected by the RUNTIME_VARIANT build-arg.
-DOCKER_BUILDKIT=1 docker build -t jammi-ai-server-cu12:dev \
-  --build-arg RUNTIME_VARIANT=runtime-cuda -f Dockerfile .
+DOCKER_BUILDKIT=1 docker build -t jammi-ai-server-cu12:dev -f Dockerfile \
+  --build-arg RUNTIME_VARIANT=runtime-cuda \
+  --build-arg CARGO_FEATURES="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)" .
 ```
 
 Cold builds take ~30 minutes (the workspace is large); warm builds with cache hits land at ~3 minutes. The CUDA build additionally compiles candle's CUDA kernels, so its cold build is longer.
+
+To package binaries you have already built, replace the builder stage with a directory holding them: `<dir>/out/jammi-server`, `<dir>/out/jammi`, and (for the CPU images) an empty `<dir>/out/jammi-data/`, then pass `--build-context builder=<dir>` (`builder-cuda=<dir>` for the CUDA image) and no `CARGO_FEATURES`. This is how the published images are made: they package the binaries the CI run that proved the release built.
 
 ### Supply chain: SBOM, provenance, attestations
 
@@ -682,7 +686,7 @@ non-empty objects"); the index's platform count is what breaks the tie. A
 separate `gh attestation verify oci://... --bundle-from-oci` step then
 verifies the Sigstore-signed bundle `attest-build-provenance` published as
 an OCI referrer — the check above never touches that bundle.
-The `compose-smoke` workflow's own build (`load: true`, loaded into the
-runner's daemon, never pushed) carries neither: `sbom` and `provenance` are
+The smokes' own builds (`compose-smoke` and `kube-smoke`: `load: true`,
+loaded into the runner's daemon, never pushed) carry neither: `sbom` and `provenance` are
 explicitly `false` there, since the stock Docker exporter a `load` build
 uses cannot carry attestations.

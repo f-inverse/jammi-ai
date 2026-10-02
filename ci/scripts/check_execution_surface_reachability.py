@@ -231,13 +231,13 @@ origin bookkeeping) before any tuple is extracted.
 ### disclosed narrowness, not silently assumed
 
 `workflow_call`-only workflows (reusable workflows with no direct trigger
-of their own, e.g. `_gpu-proof-required.yml`, `_pypi-server.yml`) are never
+of their own, e.g. `_proof-required.yml`, `_server.yml`) are never
 evaluated TRANSITIVELY through a caller's `uses:` — a cargo invocation
 living inside a reusable workflow's own body would not be credited even if
 its caller is genuinely merge-path, because nothing in this class lives
-there (`_pypi-server.yml`'s own `cargo build ... --features
-${{ inputs.cargo_features }}` is a parameterized value that could never
-character-match a literal registered tuple anyway). A gated tuple inside a
+there (`_server.yml`'s own `cargo build ... --features "$FEATURES"` is a
+manifest-read value that could never character-match a literal registered
+tuple anyway). A gated tuple inside a
 reusable workflow would require real call-graph resolution here. Workflow
 discovery globs BOTH `*.yml` AND `*.yaml` (GitHub Actions accepts either
 extension).
@@ -354,7 +354,7 @@ repo's own design, never a merge-path trigger for this class's own scripts,
 and never in the critical path of an automated workflow at all — see that
 workflow's own header for the canonical statement of why; every CUDA
 release lane instead consumes its already-recorded verdict via
-`_gpu-proof-required.yml`. That leaves exactly two honest choices per
+`_proof-required.yml`. That leaves exactly two honest choices per
 tuple, never a silent third:
 
   (a) `gpu-prove.yml` is promoted to a REQUIRED merge-path check.

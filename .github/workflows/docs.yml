@@ -46,8 +46,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
+
   build:
     name: Build
+    needs: ci-image
     # For a `workflow_run` trigger (a Cookbook render completed on main), only
     # republish if that render succeeded — a failed render leaves the last good
     # _book cache in place, which a direct push still serves.
@@ -56,7 +67,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci

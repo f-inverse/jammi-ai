@@ -6,40 +6,43 @@ name: Release Binaries
 # independent job set: a failure here cannot wedge the crates.io publish, and vice
 # versa.
 #
-# Three asset families ship, each split into a build leg (runs on every ref,
-# artifact-only, never consults the verdict) and a promote leg (tag-only,
-# gated on the shared GPU-prove verdict — every release publisher gates on
-# the prove verdict, all-or-nothing, not only the CUDA lanes):
-#   - the CPU `jammi` CLI (`build` matrix: x86_64-linux + aarch64-linux +
-#     aarch64-darwin builds it, `promote-binaries` matrix uploads it),
-#   - the CPU `jammi-server` tarball (`server-cpu` matrix builds it,
-#     x86_64-linux + aarch64-linux; `server-cpu-promote` matrix uploads it), and
-#   - the CUDA `jammi-server` tarball (`server-cu12-build` builds it,
-#     `server-cu12-promote` uploads it, x86_64-linux) — the binary plus the
-#     CUDA runtime `.so`s it links and an `LD_LIBRARY_PATH` launcher, so it
-#     runs on any host with an NVIDIA driver and no system CUDA install.
+# It compiles nothing. `ci.yml` builds and packages every asset below on every
+# pull request and on `main` (`_cli.yml` for the CLI, `_server.yml` for the
+# server tarballs), and a release attaches the ones the run that proved the
+# tag's tree built (`artifacts`, through `_proven-artifacts.yml`) — the bytes
+# that run's checks exercised. Three asset families ship, each attached by a
+# promote leg (tag-only, gated on the shared GPU-prove verdict — every release
+# publisher gates on the prove verdict, all-or-nothing, not only the CUDA
+# lanes):
+#   - the CPU `jammi` CLI (x86_64-linux + aarch64-linux + aarch64-darwin;
+#     `promote-binaries` matrix),
+#   - the CPU `jammi-server` tarball (the `server-cpu` build, x86_64-linux +
+#     aarch64-linux; `server-cpu-promote` matrix), and
+#   - the CUDA `jammi-server` tarball (the `server-cu12` build, x86_64-linux;
+#     `server-cu12-promote`) — the binary plus the CUDA runtime `.so`s it
+#     links and an `LD_LIBRARY_PATH` launcher, so it runs on any host with an
+#     NVIDIA driver and no system CUDA install
+#     (`ci/scripts/package_server_tarball.sh`).
 # The same GPU build also ships as the `jammi-ai-server-cu12` container image
 # (`server-image.yml`) and the `jammi-server-cu12` PyPI wheel (`pypi-server-cuda.yml`).
 #
 # `workflow_dispatch` has two modes, keyed on the REF the dispatch runs on:
-#   - a branch: every BUILD leg is a no-release exercise — assets are
-#     uploaded as workflow artifacts only; no release is touched. Every
-#     PROMOTE leg (`promote-binaries`, `server-cpu-promote`,
-#     `server-cu12-promote`) does not run at all on a branch ref (its `if:`
-#     requires a `v*` tag) — there is no release to promote onto and no
-#     verdict lookup to make on a ref that can never own one.
-#   - the `v*` tag itself: identical to the tag push — every build leg
-#     rebuilds from the tag's own commit, and every promote leg re-attaches
-#     its asset to that release (gated on the tag commit's already-recorded
-#     GPU-prove verdict — see `gpu-proof` below; nothing here starts a new
-#     prove run). This recovers a release whose assets are missing without
-#     re-cutting the tag, and an asset attached to release vX is thereby
-#     always built from vX's commit — a caller-chosen branch tip can never
-#     be promoted onto a release.
+#   - a branch: a rehearsal — `artifacts` resolves the branch tree's proving
+#     run and confirms it holds every asset; no release is touched. Every
+#     promote leg requires a `v*` tag in its `if:`, so none runs on a branch
+#     ref — there is no release to promote onto and no verdict lookup to
+#     make on a ref that can never own one.
+#   - the `v*` tag itself: identical to the tag push — every promote leg
+#     re-attaches its asset to that release (gated on the tag commit's
+#     already-recorded GPU-prove verdict — see `proof` below; nothing here
+#     starts a new prove run). This recovers a release whose assets are
+#     missing without re-cutting the tag, and an asset attached to release vX
+#     is thereby always one built from vX's tree — a caller-chosen branch tip
+#     can never be promoted onto a release.
 # On a `v*` tag push the assets always go to the release named by the tag.
 #
 # The release these assets attach to is created idempotently by whichever leg
-# reaches it first. This workflow's binary legs and `crates.yml`'s
+# reaches it first. This workflow's promote legs and `crates.yml`'s
 # `github-release` job all run `gh release create … || true` before they touch
 # the release, so the first creates it and the rest no-op on the "already exists"
 # error. So there is no ordering dependency on `crates.yml` (whose
@@ -51,168 +54,46 @@ on:
   push:
     tags: ["v*"]
   # No inputs: run the dispatch ON the `v*` tag to re-attach assets to that
-  # release; run it on a branch for an artifacts-only exercise.
+  # release; run it on a branch for a rehearsal.
   workflow_dispatch:
 
 concurrency:
   group: release-binaries-${{ github.ref }}
   cancel-in-progress: false
 
-# Least privilege at the workflow level; the build legs widen to
+# Least privilege at the workflow level; the promote legs widen to
 # `contents: write` per job — they create the release and attach assets.
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  # Resolves BOTH mutable CI base-image tags to their index digests ONCE per
-  # workflow run (`.github/actions/resolve-ci-image`), so every leg below --
-  # the Linux CLI/server builds (CPU) and the CUDA server build -- share the
-  # exact same base even if `:latest` is republished mid-run. See
-  # `server-image.yml`'s identical `resolve-base` job for the same rationale.
-  resolve-base:
-    name: Resolve CI base images
-    runs-on: ubuntu-latest
+  # The assets this release attaches: the ones the `ci.yml` run that proved
+  # the released tree built.
+  artifacts:
     permissions:
       contents: read
-    outputs:
-      image: ${{ steps.cpu.outputs.image }}
-      image_cuda: ${{ steps.cuda.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - id: cpu
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
-      - id: cuda
-        uses: ./.github/actions/resolve-ci-image
-        with:
-          ref: ${{ vars.JAMMI_CI_IMAGE_CUDA || 'ghcr.io/f-inverse/jammi-ai-ci-cuda:latest' }}
-
-  build:
-    name: Build ${{ matrix.target }}
-    needs: [resolve-base]
-    permissions:
-      contents: read
-    outputs:
-      # BLOCK: GitHub Actions matrix-job outputs are ambiguous across legs
-      # (the last matrix leg to finish wins for ALL legs) -- this output is
-      # informational parity with the non-matrixed legs only; `promote-
-      # binaries` below never reads it, and instead recomputes the exact
-      # asset filename by locating the one file its own downloaded artifact
-      # contains (deterministic: `package_release_bin.sh`'s name is
-      # `<bin>-<version>-<triple>.tar.gz`, and the version comes from the
-      # SAME checked-out commit both jobs share).
-      asset: ${{ steps.package.outputs.asset }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # manylinux_2_28 glibc floor for portability — built inside the CI
-          # base image (the same toolchain layer the crates.io publish uses),
-          # so the binary links against glibc 2.28 and runs on any newer host.
-          # mold applies unconditionally from .cargo/config.toml; this leg
-          # never wanted -D warnings (a release-packaging lane, not the lint
-          # gate).
-          - target: x86_64-unknown-linux-gnu
-            runs-on: ubuntu-latest
-            container: ${{ needs.resolve-base.outputs.image }}
-            deny_warnings: "false"
-          # Apple-silicon native build. mold is Linux-only (config.toml scopes
-          # it to the linux targets) and never applied to this leg either
-          # way; no -D warnings here, same as the Linux leg above.
-          - target: aarch64-apple-darwin
-            runs-on: macos-14
-            container: ""
-            deny_warnings: "false"
-          # arm Linux runner, native (no QEMU), same manylinux_2_28 CI base
-          # (glibc 2.28 floor) as the x86_64 leg above -- resolved to the
-          # SAME base digest the x86_64 leg uses (`resolve-base`), so both
-          # halves of one release build on one toolchain. `+fp16` applies
-          # unconditionally from `.cargo/config.toml`.
-          - target: aarch64-unknown-linux-gnu
-            runs-on: ubuntu-24.04-arm
-            container: ${{ needs.resolve-base.outputs.image }}
-            deny_warnings: "false"
-
-    runs-on: ${{ matrix.runs-on }}
-    container: ${{ matrix.container }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          deny-warnings: ${{ matrix.deny_warnings }}
-
-      # The Linux build runs in the CI container, which already carries the
-      # Rust toolchain, protoc, and mold. The macOS runner needs protoc and a
-      # Rust toolchain installed natively.
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-
-      # Read the pin rather than restate it — a second copy of the version here
-      # would drift from rust-toolchain.toml without anything noticing.
-      - name: Resolve the pinned Rust toolchain (macOS)
-        if: runner.os == 'macOS'
-        id: rust-pin
-        shell: bash
-        run: |
-          set -euo pipefail
-          channel="$(bash ci/scripts/rust_pin.sh)"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      # SHA-pinned (release lane); the branch name in the ref is inert — the
-      # toolchain actually installed is the explicit `toolchain:` input below.
-      - name: Install Rust toolchain (macOS)
-        if: runner.os == 'macOS'
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.channel }}
-          targets: ${{ matrix.target }}
-
-      - name: Build jammi (CPU, release)
-        run: cargo build --release -p jammi-cli --bin jammi
-
-      - name: Package
-        id: package
-        shell: bash
-        run: bash ci/scripts/package_release_bin.sh jammi "${{ matrix.target }}"
-
-      # ALWAYS a workflow artifact -- on every ref (branch dispatch OR a
-      # `v*` tag push). This job never consults the GPU-prove verdict (it
-      # never promotes anything on its own); `promote-binaries` below is the
-      # ONLY job that attaches this asset to a release, and it does so only
-      # on a proven tag ref. A unique per-target artifact name is required
-      # -- GitHub rejects two artifacts of the same name in one run, and
-      # this matrix has three legs.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: jammi-${{ matrix.target }}
-          path: ${{ steps.package.outputs.asset }}
+      actions: read
+    uses: ./.github/workflows/_proven-artifacts.yml
+    with:
+      artifacts: >-
+        jammi-x86_64-unknown-linux-gnu
+        jammi-aarch64-unknown-linux-gnu
+        jammi-aarch64-apple-darwin
+        server-cpu-x86_64-tarball
+        server-cpu-aarch64-tarball
+        server-cu12-x86_64-tarball
 
   promote-binaries:
     name: Promote ${{ matrix.target }} to the release
     # build → proof → promote: attaches to the release ONLY on a `v*` tag ref
     # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green
     # (every release publisher gates on the prove verdict, all-or-nothing,
-    # not only the CUDA lanes). `build`
-    # above already exercises the packaging loop on every dispatch as an
-    # artifact-only rehearsal; a branch dispatch never reaches this job at
+    # not only the CUDA lanes). A branch dispatch never reaches this job at
     # all (the `if:` requires a tag ref) — there is no release to promote
     # onto and no verdict lookup to make on a ref that can never own one.
     # The `if:` is a PURE conjunction (no `||`).
-    needs: [build, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [artifacts, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -229,16 +110,20 @@ jobs:
       # attaches an asset to a release gets these.
       id-token: write
       attestations: write
+      # Downloads from the proving run, not this one.
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           name: jammi-${{ matrix.target }}
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
 
-      # Deterministic recompute (see `build`'s own `outputs.asset` comment
-      # above for why this is not read cross-matrix): the downloaded
-      # artifact's directory holds exactly one file, packaged by
+      # Located rather than read from a job output: a matrix job's outputs
+      # are ambiguous across legs (the last leg to finish wins). The
+      # downloaded artifact's directory holds exactly one file, packaged by
       # `package_release_bin.sh` as `jammi-<version>-${{ matrix.target }}
       # .tar.gz` from this same checked-out commit's Cargo.toml.
       - name: Locate the downloaded asset
@@ -261,77 +146,6 @@ jobs:
           asset: ${{ steps.locate.outputs.asset }}
 
   # ---- CPU jammi-server tarball ----
-  # Mirrors the CPU `jammi` CLI job above: two-leg matrix (x86_64-linux,
-  # aarch64-linux), both built in the CI base image (glibc 2.28 floor), with
-  # the broker + cloud-storage features that match the published server
-  # image and PyPI wheel.
-  server-cpu:
-    name: Build jammi-server (CPU, ${{ matrix.target }})
-    needs: [resolve-base]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    container: ${{ needs.resolve-base.outputs.image }}
-    permissions:
-      contents: read
-    # BLOCK: matrix-job outputs are ambiguous across legs (the last leg to
-    # finish wins for ALL legs) -- `server-cpu-promote` below never reads
-    # this cross-matrix; it recomputes the exact asset filename by locating
-    # the one file its own downloaded artifact contains, same pattern
-    # `promote-binaries` already uses for the CLI matrix above.
-    outputs:
-      asset: ${{ steps.package.outputs.asset }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          # mold applies unconditionally from .cargo/config.toml; this lane
-          # never wanted -D warnings.
-          deny-warnings: false
-
-      # `ci/release-feature-manifest.json`'s `cpu-tarball` lane is the single
-      # source of truth for this lane's cargo feature list — read
-      # here rather than restating it, same idiom as `server-cu12-build`
-      # below. `jq` is not guaranteed present in the CI base image (not a
-      # `dnf install` its own Dockerfile carries), so this step installs it
-      # on demand.
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null
-          features="$(jq -r '.lanes["cpu-tarball"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cpu-tarball cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
-
-      - name: Build jammi-server (CPU, release)
-        run: cargo build --release -p jammi-server --bin jammi-server --features ${{ steps.manifest.outputs.cargo_features }}
-
-      - name: Package
-        id: package
-        shell: bash
-        run: bash ci/scripts/package_release_bin.sh jammi-server "${{ matrix.target }}"
-
-      # ALWAYS a workflow artifact -- this job never consults the GPU-prove
-      # verdict (it never promotes anything on its own); `server-cpu-
-      # promote` below is the only job that attaches this asset to a
-      # release, and only on a proven tag ref. A unique per-target artifact
-      # name is required -- GitHub rejects two artifacts of the same name in
-      # one run, and this matrix has two legs.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: jammi-server-cpu-${{ matrix.target }}
-          path: ${{ steps.package.outputs.asset }}
-
   server-cpu-promote:
     name: Promote jammi-server (CPU, ${{ matrix.target }}) to the release
     # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
@@ -339,16 +153,17 @@ jobs:
     # (every release publisher gates on the prove verdict, all-or-nothing,
     # not only the CUDA lanes). The `if:`
     # is a PURE conjunction (no `||`) — no non-tag branch-dispatch escape
-    # hatch: `server-cpu` above already exercises the packaging loop on
-    # every dispatch as an artifact-only rehearsal.
-    needs: [server-cpu, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cpu.result == 'success' && needs.gpu-proof.result == 'success'
+    # hatch.
+    needs: [artifacts, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            arch: x86_64
           - target: aarch64-unknown-linux-gnu
+            arch: aarch64
     runs-on: ubuntu-latest
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
@@ -356,16 +171,19 @@ jobs:
       # See `promote-binaries`'s identical comment.
       id-token: write
       attestations: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: jammi-server-cpu-${{ matrix.target }}
+          name: server-cpu-${{ matrix.arch }}-tarball
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
 
-      # Deterministic recompute (see `server-cpu`'s own `outputs.asset`
-      # comment above for why this is not read cross-matrix): the downloaded
-      # artifact's directory holds exactly one file, packaged by
+      # Located rather than read from a job output (see `promote-binaries`'s
+      # identical step): the downloaded artifact's directory holds exactly
+      # one file, packaged by
       # `package_release_bin.sh` as `jammi-server-<version>-${{
       # matrix.target }}.tar.gz` from this same checked-out commit's
       # Cargo.toml.
@@ -388,360 +206,29 @@ jobs:
         with:
           asset: ${{ steps.locate.outputs.asset }}
 
-  # ---- CUDA jammi-server tarball ----
-  # Built in the CUDA CI base image (CUDA 12.6 toolkit). The tarball is
-  # self-sufficient: it bundles the CUDA-enabled binary, every CUDA runtime
-  # shared library the binary needs on a host with only an NVIDIA driver, and
-  # a `jammi-server` launcher that prepends the bundled `lib/` to
-  # `LD_LIBRARY_PATH` then execs the binary. The set to bundle is DERIVED —
-  # `ci/scripts/bundle_cuda_libs.sh`, sourced by the Package step below —
-  # from the binary's own transitive `DT_NEEDED` closure plus a measured
-  # floor of dlopen-only members (`libnvrtc-builtins`, which `libnvrtc.so.12`
-  # never links, only `dlopen`s — see that script's own module doc for the
-  # `readelf -d` measurement), never a hand-kept list of names (a hand list
-  # can pass a green suite with `libnccl` and `libnvrtc-builtins` missing
-  # from the stage directory). The derivation, the RPATH/RUNPATH assertion,
-  # and the real-loader verification below are what run here — see that
-  # script's module doc for the full argument. The driver's own libraries
-  # (`libcuda.so.1`, `libnvidia-*`) are deliberately NOT bundled — they must
-  # match the host's driver. A GPU-less runner is fine — nothing runs the
-  # binary here; the loader-verification step below only asks the loader
-  # WHERE it would resolve each entry, never executes the binary itself.
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
     # before the CUDA tarball is uploaded to the release. The tag guard (not
     # an event guard) is what keeps every release-upload arm proven: an
     # event-keyed guard would let a dispatch promote unproven.
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
     secrets: inherit
-
-  # Build and proof-check run CONCURRENTLY: the build never needed the
-  # verdict to compile, only to be UPLOADED to a release, so splitting it
-  # from the promote step below (`server-cu12-promote`) overlaps the build
-  # with `gpu-proof`'s verdict lookup/wait instead of serializing after it.
-  server-cu12-build:
-    name: Build jammi-server (CUDA)
-    needs: [resolve-base]
-    runs-on: ubuntu-latest
-    container: ${{ needs.resolve-base.outputs.image_cuda }}
-    permissions:
-      contents: read
-    outputs:
-      asset: ${{ steps.package.outputs.asset }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Deliberately NOT `submodules: recursive` on the checkout itself —
-          # initialise only the one submodule this leg needs, explicitly, so
-          # the scope is auditable from this one line (same idiom as
-          # ci.yml's `flash-attn-compile` job).
-          submodules: false
-
-      # `ci/release-feature-manifest.json` is the single source of truth for
-      # this lane's cargo feature list (`cu12-tarball`) — read here rather
-      # than restating it, so a manifest edit moves this build in the same unit with no separate edit to keep in
-      # sync. `jq` is not guaranteed present in the CUDA CI base image (it
-      # is not a `dnf install` this Dockerfile carries), so this step
-      # installs it on demand rather than assuming it — cheap (a single
-      # package, already-cached dnf metadata) and avoids a separate
-      # `.docker/ci-cuda.Dockerfile` edit for one CLI tool.
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        run: |
-          set -euo pipefail
-          command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null
-          features="$(jq -r '.lanes["cu12-tarball"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty cu12-tarball cargo_features list" >&2
-            exit 1
-          fi
-          echo "cargo_features=$features" >> "$GITHUB_OUTPUT"
-
-      # `flash-attn` (in the manifest's cu12-tarball feature list) needs
-      # the vendored CUTLASS submodule at build time (`build.rs::
-      # build_flash_attn`). Scoped to this job's own checkout only — same
-      # rationale ci.yml's `flash-attn-compile` job documents: independent,
-      # ephemeral runners mean this cannot leak an initialised CUTLASS tree
-      # into any other job's checkout. A bare `git` in a container `run:`
-      # step hits "fatal: detected dubious ownership" without the
-      # `safe.directory` line.
-      - name: Init the CUTLASS submodule (scoped to this job's checkout only)
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          # mold applies unconditionally from .cargo/config.toml; this lane
-          # never wanted -D warnings.
-          deny-warnings: false
-
-      - name: Build jammi-server (CUDA, release)
-        run: cargo build --release -p jammi-server --bin jammi-server --features ${{ steps.manifest.outputs.cargo_features }}
-
-      - name: Package
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Same parse + shape assert as package_release_bin.sh (sed echoes
-          # the line unchanged on no-substitution — a garbage asset name
-          # would upload silently).
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          case "$version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::could not parse a semver workspace version out of Cargo.toml (got: '${version}')" >&2; exit 1 ;;
-          esac
-          # ONE variable for both the asset name's triple and the
-          # assert's expected arch -- a second hardcoded `x86_64` here
-          # could drift from the asset name's triple with no gate to catch
-          # it.
-          triple=x86_64-unknown-linux-gnu
-          arch=${triple%%-*}
-          asset="jammi-server-cu12-${version}-${triple}.tar.gz"
-
-          # This tarball's own name asserts x86_64-unknown-linux-gnu, so the
-          # just-built binary's ELF machine must be x86_64 before it ships
-          # under that name. The CPU server leg above gets this via
-          # `package_release_bin.sh`'s ELF-machine assert -- this leg is
-          # bespoke (CUDA lib bundling + launcher assembly) and never goes
-          # through that script, so it calls the same shared
-          # `assert_elf_machine.sh` directly.
-          bash ci/scripts/assert_elf_machine.sh target/release/jammi-server "$arch"
-
-          # Container-native path, deliberately OUTSIDE $GITHUB_WORKSPACE:
-          # a `container:` job's workspace is bind-mounted in from the
-          # runner HOST (a different filesystem/device than the container's
-          # own writable layer), and the jail arm below needs to `cp -al` (hardlink) this multi-GB stage into the
-          # jail — a hardlink cannot cross that boundary. `/root` is this
-          # container's own filesystem and this job already runs as root
-          # (the `dnf install` above needs no `sudo`).
-          stage="/root/jammi-server-cu12"
-          mkdir -p "${stage}/lib"
-          strip target/release/jammi-server
-          cp target/release/jammi-server "${stage}/bin-jammi-server"
-
-          # DERIVED staging: source the script rather
-          # than exec it, so this shell keeps `bundle_needed_sonames` and
-          # `bundle_verify_loader_resolution` in scope for the loader
-          # verification right below — the release lane's own `set -euo
-          # pipefail` stays in effect (unlike the hermetic suite, which takes
-          # it back off deliberately to assert on exit codes; nothing here
-          # does that). `bundle_main` itself asserts no `DT_RPATH`/
-          # `DT_RUNPATH` first, then stages the binary's transitive
-          # `DT_NEEDED` closure (minus the host-provided set) union the
-          # measured dlopen-only floor, then asserts every required soname
-          # landed as a same-named file — failing by name, never silently,
-          # on anything it cannot satisfy. No search path is passed: this
-          # image's default (`/usr/local/cuda-12.6/lib64` then `/usr/lib64`,
-          # where the `libnccl` RPM installs) is `bundle_cuda_libs.sh`'s own
-          # `BUNDLE_DEFAULT_SEARCH_PATH`.
-          . ci/scripts/bundle_cuda_libs.sh
-          bundle_main target/release/jammi-server "${stage}/lib"
-
-          # Loader verification, arm 1a — DETECTION, the release lane's own
-          # real execution; arm 1b right below is the jail (the chroot
-          # half), and `ci/scripts/test_bundle_cuda_libs.sh` is arm 1c, the
-          # hermetic fixture-parse half for both; see `bundle_cuda_libs.sh`'s
-          # module doc. Runs the REAL loader against the REAL stage, in this
-          # container (toolkit present, no NVIDIA driver — the `not found`
-          # driver lines this arm tolerates by name are expected here), and
-          # pipes the report through the SAME parser the hermetic suite
-          # drives over committed fixture text. Runs FIRST, unconditionally —
-          # arm 1b below never runs instead of this, only in addition to it;
-          # a failure here (`set -euo pipefail`) stops the step before arm
-          # 1b, the launcher, or the tarball are ever built.
-          loader_report="$(LD_LIBRARY_PATH="${stage}/lib" ldd target/release/jammi-server 2>&1 || true)"
-          # Captured verbatim for `ci/scripts/fixtures/cu12_loader_report_real.txt`
-          # (the real-report fixture) — uploaded as a workflow artifact below
-          # so a maintainer can refresh that fixture without renting a pod:
-          # this container already has the toolkit and no driver, which is
-          # exactly the shape the shipped arm sees on a release. Written
-          # BEFORE the verify call so a failing verify still leaves the
-          # report on disk for the `if: always()` upload below.
-          printf '%s\n' "$loader_report" > cu12_loader_report_real.txt
-          # shellcheck disable=SC2046
-          bundle_verify_loader_resolution "${stage}/lib" "$loader_report" $(bundle_needed_sonames target/release/jammi-server)
-
-          # Loader verification, arm 1b — THE JAIL (the chroot half — see
-          # `ci/scripts/jail_trace.py`'s own module doc for the measured
-          # reasons). Arm
-          # 1a above can only DETECT a host copy that would have satisfied a
-          # bundled member; this arm HIDES every host copy so none CAN, by
-          # running a TOLERANT `LD_TRACE_LOADED_OBJECTS` trace inside a real
-          # `chroot` jail — never `ld.so --list`, which is FATAL (exit
-          # 127, no report at all) on the FIRST missing library, and this
-          # jail deliberately ships with the driver libraries absent. The
-          # jail (`bundle_build_jail`) contains nothing but: the real
-          # binary; the staged `lib/` HARDLINKED in wholesale (`cp -al`
-          # — why `stage` above is a container-native path — and NEVER
-          # written to again afterward); same-named copies of the
-          # platform closure of the binary AND every staged object (a
-          # bundled CUDA library can itself need a platform member the
-          # binary never names directly), sourced from arm 1a's own report
-          # above (`bundle_platform_sources_from_report`) and copied
-          # byte-for-byte into the SEPARATE `/platform` directory (never
-          # hardlinked, never written into the `lib/` directory the shipped
-          # stage's own inodes live under, so a destination-name collision
-          # with the shipped stage is structurally impossible rather than
-          # merely unlikely); and the loader ITSELF at its real `PT_INTERP`
-          # path (anywhere else, its own self-reported trace line gains
-          # a `=>` the shipped parser misreads as a defect on an otherwise
-          # correct jail). Driver members are deliberately absent.
-          # `bundle_assert_jail_file_set` checks the
-          # real jail's file set against exactly this plan before the trace
-          # ever runs. Docker's default capability set includes
-          # `CAP_SYS_CHROOT` (probed against `docker run --rm ubuntu:24.04`,
-          # no `--privileged`/`--cap-add` needed), so this container needs no
-          # extra privilege for `os.chroot` itself to succeed — if it is
-          # nonetheless denied (EPERM), `jail_trace.py` exits 2 and this step
-          # FAILS naming the missing capability rather than silently falling
-          # back to arm 1a's already-passed result above.
-          interp="$(bundle_binary_interp target/release/jammi-server)"
-          interp_rel="${interp#/}"
-          jail="/root/jammi-server-cu12-jail"
-          rm -rf "$jail"
-          bundle_build_jail target/release/jammi-server "${stage}/lib" "$jail" "$loader_report"
-
-          # The jail BUILDER's own file-set rule,
-          # wired into the lane between the build and the trace, so a
-          # regression that stages an extra host-shaped path (or drops an
-          # expected one) is caught here — before the trace ever runs, not
-          # only in the hermetic suite over a fixture tree.
-          lib_listing="$(cd "${stage}/lib" && ls)"
-          # shellcheck disable=SC2046
-          platform_basenames="$(bundle_jail_platform_closure target/release/jammi-server "${stage}/lib")"
-          expected_relpaths="$(bundle_jail_expected_relpaths "$lib_listing" "$platform_basenames" "$interp_rel")"
-          # shellcheck disable=SC2086
-          bundle_assert_jail_file_set "$jail" $expected_relpaths
-
-          # `python3` itself is a dynamically-
-          # linked executable — if THIS shell already carries
-          # LD_TRACE_LOADED_OBJECTS, the loader that starts `python3`
-          # traces `python3`'s OWN dependency list and exits 0 WITHOUT ever
-          # running jail_trace.py's code at all (measured:
-          # `LD_TRACE_LOADED_OBJECTS=1 python3 -c 'print(2)'` prints
-          # python3's own trace, never "2", exit 0) — a check inside
-          # jail_trace.py cannot defend against this specific case, since
-          # its own code never runs; refused HERE, before python3 is ever
-          # exec'd, is the only place this hazard can actually be caught.
-          if [ -n "${LD_TRACE_LOADED_OBJECTS+x}" ]; then
-            echo "::error::LD_TRACE_LOADED_OBJECTS is already set in this shell — invoking python3 in this state would trace python3 ITSELF (jail_trace.py's own code would never run), not the jail. Refusing before python3 is exec'd." >&2
-            exit 1
-          fi
-          jail_report="$(python3 ci/scripts/jail_trace.py "$jail" "$interp" /jammi-server "${BUNDLE_JAIL_LIB_DIR}:${BUNDLE_JAIL_PLATFORM_DIR}")" && jail_rc=0 || jail_rc=$?
-          if [ "$jail_rc" -eq 2 ]; then
-            echo "::error::jail_trace.py: os.chroot(${jail}) was denied (EPERM) — CAP_SYS_CHROOT is likely missing from this job's container; the jail arm cannot run here." >&2
-            exit 1
-          fi
-          if [ "$jail_rc" -eq 3 ]; then
-            echo "::error::jail_trace.py: the trace failed before producing a report (bad path, missing loader, or exec failure) — see the step log above for the child's own diagnostic." >&2
-            exit 1
-          fi
-          if [ "$jail_rc" -ne 0 ]; then
-            echo "::error::jail_trace.py exited ${jail_rc}, neither the success (0) nor either named failure (2, 3) code — treating as a defect." >&2
-            exit 1
-          fi
-          # The report and the measured DT_NEEDED set it must be judged
-          # against are captured TOGETHER, from the SAME lane run, as one
-          # fixture — a later drift between a hand-kept BINARY_NEEDED and
-          # what this run actually measured can never desync the two halves
-          # of the oracle.
-          {
-            printf '%s\n' "$jail_report"
-            printf '%s\n' "# --- BINARY_NEEDED ---"
-            bundle_needed_sonames target/release/jammi-server
-          } > cu12_jail_report_real.txt
-          # shellcheck disable=SC2046
-          bundle_verify_jail_report "$interp" "$jail_report" $(bundle_needed_sonames target/release/jammi-server)
-          rm -rf "$jail"
-
-          # The launcher: a host with only an NVIDIA driver has no system CUDA,
-          # so put the bundled libs on the loader path before exec. `exec`
-          # replaces the shell so signals and the exit code pass through.
-          cat > "${stage}/jammi-server" <<'LAUNCH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          export LD_LIBRARY_PATH="${here}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-          exec "${here}/bin-jammi-server" "$@"
-          LAUNCH
-          chmod +x "${stage}/jammi-server"
-
-          # `-C`, not a bare `tar -czf "$asset" "$stage"`: `$stage` is an
-          # absolute, container-native path (`/root/...`), and taring it
-          # directly would embed that absolute path in the archive rather
-          # than the relative `jammi-server-cu12/...` layout the launcher
-          # and every consumer of this tarball expect.
-          tar -czf "$asset" -C "$(dirname "$stage")" "$(basename "$stage")"
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
-
-      # A workflow artifact, never `release-upload` directly: this job runs
-      # on EVERY dispatch/tag push regardless of the GPU-prove verdict (it
-      # never needed the verdict to compile), so promoting the tarball
-      # straight to a release from here would bypass `gpu-proof` entirely.
-      # `server-cu12-promote` below downloads this artifact only after the
-      # verdict is confirmed.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: jammi-server-cu12-tarball
-          path: ${{ steps.package.outputs.asset }}
-
-      # The real loader-report fixture, captured where the arm actually
-      # runs (this container: toolkit present, driver absent) rather than a
-      # rented pod. Runs on EVERY dispatch/tag push, same as the tarball
-      # itself; `workflow_dispatch` on a branch ref already runs this leg
-      # artifact-only with no release touched (`server-cu12-promote` below
-      # requires a `v*` tag — see this workflow's own module doc), so a
-      # maintainer refreshes `ci/scripts/fixtures/cu12_loader_report_real.txt`
-      # by dispatching on a branch and committing this artifact's content.
-      # No pod rental for this fixture.
-      #
-      # `if: always()` — the file is written to
-      # disk BEFORE arm 1a's verify call, so a FAILING verify (or a failing
-      # arm 1b below it) must not prevent this artifact from uploading; a
-      # capture-without-enforcing fallback arm would otherwise be
-      # unreachable, since GitHub Actions skips every later step in a job
-      # once one step fails.
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: cu12-loader-report
-          path: cu12_loader_report_real.txt
-
-      # The jail's own real report (arm 1b, the chroot half), same
-      # rationale as the artifact above: a maintainer refreshes
-      # `ci/scripts/fixtures/cu12_jail_report_real.txt` by dispatching on a
-      # branch and committing this artifact's content. No pod rental for this fixture either. `if: always()`
-      # for the identical reason — the file is written before `bundle_
-      # verify_jail_report` runs, so a failing verify still uploads it for
-      # diagnosis; if the trace itself never produced a report at all (a
-      # `jail_trace.py` exit 2/3, no file ever written), the upload step
-      # correctly has nothing to attach and that failure is diagnosed from
-      # the step log instead.
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: cu12-jail-report
-          path: cu12_jail_report_real.txt
 
   server-cu12-promote:
     name: Promote jammi-server (CUDA) to the release
     # build → proof → promote: uploads to the release ONLY on a `v*` tag ref
     # (push or dispatch-on-tag) whose commit's GPU-prove verdict is green.
     # The `if:` is a PURE conjunction (no `||`) — there is no non-tag
-    # branch-dispatch escape hatch here: `server-cu12-build` above already
-    # exercises the CUDA packaging loop on every dispatch as an
-    # artifact-only rehearsal, and an ad-hoc branch build is never a proof
-    # of anything this job needs to promote from.
-    needs: [server-cu12-build, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.server-cu12-build.result == 'success' && needs.gpu-proof.result == 'success'
+    # branch-dispatch escape hatch here: an ad-hoc branch build is never a
+    # proof of anything this job needs to promote from.
+    needs: [artifacts, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       # `gh release create` / `gh release upload` (the release-upload action).
@@ -749,19 +236,33 @@ jobs:
       # See `promote-binaries`'s identical comment.
       id-token: write
       attestations: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          name: jammi-server-cu12-tarball
+          name: server-cu12-x86_64-tarball
+          run-id: ${{ needs.artifacts.outputs.run }}
+          github-token: ${{ github.token }}
+
+      # Located rather than named twice: the downloaded artifact holds
+      # exactly one file, packaged by `package_server_tarball.sh` as
+      # `jammi-server-cu12-<version>-x86_64-unknown-linux-gnu.tar.gz`.
+      - name: Locate the downloaded asset
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="$(ls jammi-server-cu12-*-x86_64-unknown-linux-gnu.tar.gz)"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
 
       # Before the upload: the attestation's subject is the exact tarball
       # bytes about to be attached to the release.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ needs.server-cu12-build.outputs.asset }}
+          subject-path: ${{ steps.locate.outputs.asset }}
 
       # Release attach (any `v*` tag ref) or workflow-artifact upload (branch
       # dispatch) — the shared release-upload action decides which, and owns
@@ -770,4 +271,4 @@ jobs:
       # dispatch arm is inert here; the action keeps one uniform contract.
       - uses: ./.github/actions/release-upload
         with:
-          asset: ${{ needs.server-cu12-build.outputs.asset }}
+          asset: ${{ steps.locate.outputs.asset }}

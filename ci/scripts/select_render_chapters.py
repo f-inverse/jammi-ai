@@ -3,66 +3,56 @@
 of the engine<->cookbook loop).
 
 Every chapter runs its capability live and checks what it measured against a
-frozen golden, so the render IS the check. Rendering every chapter on every
-push is the nightly's job (`cookbook-render.yml`); this script returns the
-subset a GIVEN diff could move, which the PR gate
-(`.github/workflows/cookbook-book.yml`) renders at `small` scale on CPU.
+frozen golden, so the render IS the check. Rendering every chapter is the
+nightly's job (`cookbook-render.yml`); this script returns the subset a GIVEN
+diff could move, which `ci.yml`'s book jobs render at `small` scale on CPU,
+spread over parallel slices (`--slice K/N`).
 
 Buckets:
 
-  LIVE                An executed ```{python}``` cell does more than import:
-                      it opens an engine, runs verbs, and asserts. A change
-                      to the engine the book's wheel is built from, to the
-                      book's own library, or to the fixtures it reads can
-                      move it.
+  LIVE      An executed ```{python}``` cell does more than import: it opens
+            an engine, runs verbs, and asserts.
 
-  LIVE_NEEDS_SERVER   A LIVE chapter that starts a `jammi-server` of its own
-                      (the client's `LiveServer` harness) or connects to a
-                      `grpc://` target. NEEDS_SERVER is a LANE CAPABILITY,
-                      not a selection filter: such a chapter is selected by
-                      exactly the LIVE rules, and `--needs-server` reports
-                      whether the selected set asks the caller to build the
-                      server. Excluding the chapter instead would let a
-                      touched one merge having executed nowhere -- the
-                      nightly renders the PRE-merge base.
-
-  STATIC              No executed cell beyond imports: prose, links, a
-                      reference page. Selected only when its own file is in
-                      the diff.
+  STATIC    No executed cell beyond imports: prose, links, a reference page.
+            Selected only when its own file is in the diff.
 
 A chapter is selected when:
 
-  * its own `.qmd` is in the diff (any bucket);
-  * the diff touches the engine (ENGINE_PREFIXES) or the book's inputs
-    (BOOK_INPUT_PREFIXES: its library, its packaging, the fixtures) -- every
-    LIVE chapter;
+  * its own `.qmd` is in the diff (either bucket);
+  * the diff changes what every live chapter runs on -- every LIVE chapter:
+      - a build input of a package the book runs (`SHIPPED_PACKAGES`: the
+        native engine, the server and the CLI) or of a workspace crate they
+        depend on, normally or at build time (read from `cargo metadata
+        --no-deps`). Every file in such a package's directory is a build
+        input except its `tests/`, `benches/` and `examples/`; the same rule
+        covers the Python packages the book installs (`PYTHON_PACKAGES`);
+      - the workspace's build configuration, or the CI image the render
+        runs in, which carries quarto and python (`WORKSPACE_INPUTS`);
+      - the book's own library, packaging or fixtures (`BOOK_INPUT_PREFIXES`);
   * the diff touches a golden file, `goldens/<dataset>[.<scale>].json` --
     the LIVE chapters that check a `<dataset>.` metric.
 
 Usage:
     python3 ci/scripts/select_render_chapters.py --diff <path-to-file-list>
-    python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha>
+    python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha> [--slice K/N]
     python3 ci/scripts/select_render_chapters.py --classify   # dry-run table, no diff
     python3 ci/scripts/select_render_chapters.py --self-test
-    python3 ci/scripts/select_render_chapters.py --base <sha> --head <sha> --needs-server
 
 `--diff` reads a newline-separated list of repo-root-relative changed paths
 (what a CI job's `git diff --name-only` produces) from a file, or `-` for
 stdin. `--base`/`--head` run `git diff --name-only` in-process. Prints the
 selected chapters' repo-root-relative paths, one per line, to stdout; the
-classification table goes to stderr.
+classification table goes to stderr. `--slice K/N` prints only the K-th of N
+interleaved slices of that list (1-based), so N jobs render it in parallel.
 
-`--needs-server` prints, INSTEAD of the chapter list, exactly `true` or
-`false` on one line: whether the set this same diff selects contains a
-LIVE_NEEDS_SERVER chapter. A workflow reads it into a step output and builds
-the server on exactly that condition.
-
-Hermetic: no network. `--base`/`--head` shell out to `git diff` only.
+Hermetic: no network. `--base`/`--head` shell out to `git diff`, and the
+crate closure to `cargo metadata --no-deps`, which reads manifests only.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -72,9 +62,24 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHAPTERS_DIR = REPO_ROOT / "cookbook" / "book" / "chapters"
 
-# Paths that feed the PR-wheel build (`.github/actions/setup-jammi-py`,
-# mode: wheel).
-ENGINE_PREFIXES = ("crates/", "packaging/native/", "clients/python/")
+# The workspace packages whose builds the book runs: `jammi-python` is the
+# native engine (`packaging/native`), and the server and the CLI are the
+# binaries the chapters start and shell out to.
+SHIPPED_PACKAGES = ("jammi-python", "jammi-server", "jammi-cli")
+# The Python packages the book installs from the checkout: the native
+# engine's packaging and the base client.
+PYTHON_PACKAGES = ("packaging/native", "clients/python")
+# A package directory's subtrees that build nothing the package ships.
+NON_BUILD_DIRS = frozenset({"tests", "benches", "examples"})
+# Workspace-wide build inputs: a trailing `/` is a directory, anything else
+# one file.
+WORKSPACE_INPUTS = (
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/",
+    ".docker/",
+)
 # What every chapter reads besides the engine: the book's library, its
 # packaging, and the committed fixtures. The goldens live under the library
 # but select narrowly, by dataset (GOLDEN_RE).
@@ -96,10 +101,6 @@ _CELL_EVAL_FALSE_RE = re.compile(r"^#\|\s*eval:\s*false\s*$")
 # option or comment, or a blank.
 _INERT_LINE_RE = re.compile(r"^\s*(?:$|#|import\s|from\s+\S+\s+import\s)")
 
-# A `connect()` call whose target literal is `grpc://`.
-GRPC_CONNECT_RE = re.compile(r"connect\(\s*f?[\"']grpc://")
-# A chapter that starts its own `jammi-server` through the client's harness.
-LIVE_SERVER_RE = re.compile(r"\bLiveServer\(")
 # The goldens a chapter checks: `assert_close("<dataset>.…")` / `golden(…)`.
 GOLDEN_CHECK_RE = re.compile(r"\b(?:golden|assert_close)\(\s*f?[\"']([a-zA-Z0-9_]+)\.")
 
@@ -107,12 +108,12 @@ GOLDEN_CHECK_RE = re.compile(r"\b(?:golden|assert_close)\(\s*f?[\"']([a-zA-Z0-9_
 @dataclass(frozen=True)
 class Classification:
     path: Path
-    bucket: str  # LIVE | LIVE_NEEDS_SERVER | STATIC
+    bucket: str  # LIVE | STATIC
     datasets: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def live(self) -> bool:
-        return self.bucket != "STATIC"
+        return self.bucket == "LIVE"
 
 
 def _executed_python_cells(text: str) -> list[str]:
@@ -138,8 +139,6 @@ def classify_chapter(path: Path) -> Classification:
     datasets = frozenset(m.group(1) for m in GOLDEN_CHECK_RE.finditer(executed))
     if all(_INERT_LINE_RE.match(line) for line in executed.splitlines()):
         return Classification(path, "STATIC", datasets)
-    if LIVE_SERVER_RE.search(executed) or GRPC_CONNECT_RE.search(executed):
-        return Classification(path, "LIVE_NEEDS_SERVER", datasets)
     return Classification(path, "LIVE", datasets)
 
 
@@ -147,39 +146,99 @@ def classify_all(chapters_dir: Path = CHAPTERS_DIR) -> list[Classification]:
     return [classify_chapter(p) for p in sorted(chapters_dir.rglob("*.qmd"))]
 
 
+def shipped_package_dirs(metadata: dict) -> list[str]:
+    """The repo-relative directories of `SHIPPED_PACKAGES` and of every
+    workspace crate they reach through normal or build dependencies, plus
+    `PYTHON_PACKAGES`. `metadata` is `cargo metadata --no-deps` output: a
+    workspace dependency carries the `path` it resolves to; dev-dependencies
+    build only tests, so they are not followed. An optional dependency is
+    followed whatever features enable it."""
+    root = Path(metadata["workspace_root"])
+    members = set(metadata["workspace_members"])
+    by_name = {p["name"]: p for p in metadata["packages"] if p["id"] in members}
+    missing = [name for name in SHIPPED_PACKAGES if name not in by_name]
+    if missing:
+        raise SystemExit(f"select_render_chapters: no workspace package named {missing}")
+
+    seen: set[str] = set()
+    stack = list(SHIPPED_PACKAGES)
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        stack.extend(
+            dep["name"]
+            for dep in by_name[name]["dependencies"]
+            if dep.get("path") and dep.get("kind") in (None, "build") and dep["name"] in by_name
+        )
+    crate_dirs = {
+        Path(by_name[name]["manifest_path"]).parent.relative_to(root).as_posix() for name in seen
+    }
+    return sorted(crate_dirs | set(PYTHON_PACKAGES))
+
+
+def _is_build_input(path: str, package_dirs: list[str]) -> bool:
+    for directory in package_dirs:
+        prefix = directory + "/"
+        if path.startswith(prefix):
+            return path[len(prefix):].split("/", 1)[0] not in NON_BUILD_DIRS
+    return any(
+        path.startswith(entry) if entry.endswith("/") else path == entry
+        for entry in WORKSPACE_INPUTS
+    )
+
+
 def select(
     changed_paths: list[str],
     *,
+    package_dirs: list[str],
     chapters_dir: Path = CHAPTERS_DIR,
     repo_root: Path = REPO_ROOT,
-) -> tuple[list[Classification], set[Path]]:
-    """Return (all classifications, selected chapter paths) for a diff."""
+) -> tuple[list[Classification], list[Path]]:
+    """Return (all classifications, the selected chapter paths in path order)
+    for a diff."""
     changed = {p.strip().replace("\\", "/") for p in changed_paths if p.strip()}
     classifications = classify_all(chapters_dir)
 
     golden_datasets = {m.group(1) for p in changed if (m := GOLDEN_RE.match(p))}
     every_live = any(
-        p.startswith(ENGINE_PREFIXES + BOOK_INPUT_PREFIXES) and not GOLDEN_RE.match(p)
+        _is_build_input(p, package_dirs)
+        or (p.startswith(BOOK_INPUT_PREFIXES) and not GOLDEN_RE.match(p))
         for p in changed
     )
 
     def rel(c: Classification) -> str:
         return c.path.relative_to(repo_root).as_posix()
 
-    selected = {
+    selected = [
         c.path
         for c in classifications
-        if rel(c) in changed
-        or (c.live and (every_live or c.datasets & golden_datasets))
-    }
-    return classifications, selected
+        if rel(c) in changed or (c.live and (every_live or c.datasets & golden_datasets))
+    ]
+    return classifications, sorted(selected, key=lambda p: p.relative_to(repo_root).as_posix())
 
 
-def selection_needs_server(
-    classifications: list[Classification], selected: set[Path]
-) -> bool:
-    """Does rendering `selected` require a running `jammi-server`?"""
-    return any(c.bucket == "LIVE_NEEDS_SERVER" and c.path in selected for c in classifications)
+def take_slice(items: list[Path], slice_spec: str) -> list[Path]:
+    """The K-th of N interleaved slices of `items` (`slice_spec` is `K/N`,
+    1-based): items K, K+N, K+2N, ... Interleaving spreads neighbouring
+    chapters, which tend to share fixtures and cost, across the slices."""
+    match = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", slice_spec)
+    if not match or int(match.group(1)) > int(match.group(2)):
+        raise SystemExit(f"select_render_chapters: --slice wants K/N with 1 <= K <= N, got {slice_spec!r}")
+    k, n = int(match.group(1)), int(match.group(2))
+    return items[k - 1 :: n]
+
+
+def cargo_metadata(repo_root: Path = REPO_ROOT) -> dict:
+    out = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(out.stdout)
 
 
 # --------------------------------------------------------------------------
@@ -199,9 +258,40 @@ def _chapter(*cells: str, prose: str = "") -> str:
     return f"---\ntitle: t\n---\n\n{fenced}{prose}"
 
 
+def _metadata(root: Path) -> dict:
+    """A workspace shaped like the real one: the shipped packages reach
+    `jammi-db` and `jammi-wire`; `jammi-test-utils` is a dev-dependency only;
+    `jammi-bench` depends on the engine but nothing shipped depends on it."""
+
+    def package(name: str, *deps: tuple[str, str | None]) -> dict:
+        return {
+            "name": name,
+            "id": f"path+file://{root}/crates/{name}#0.1.0",
+            "manifest_path": f"{root}/crates/{name}/Cargo.toml",
+            "dependencies": [
+                {"name": dep, "kind": kind, "path": f"{root}/crates/{dep}"} for dep, kind in deps
+            ]
+            + [{"name": "serde", "kind": None}],
+        }
+
+    packages = [
+        package("jammi-python", ("jammi-ai", None), ("jammi-test-utils", "dev")),
+        package("jammi-server", ("jammi-ai", None), ("jammi-wire", "build")),
+        package("jammi-cli", ("jammi-db", None)),
+        package("jammi-ai", ("jammi-db", None)),
+        package("jammi-db", ("jammi-test-utils", "dev")),
+        package("jammi-wire"),
+        package("jammi-test-utils", ("jammi-db", None)),
+        package("jammi-bench", ("jammi-ai", None)),
+    ]
+    return {
+        "workspace_root": str(root),
+        "workspace_members": [p["id"] for p in packages],
+        "packages": packages,
+    }
+
+
 def _self_test() -> int:
-    import contextlib
-    import io
     import tempfile
 
     failures: list[str] = []
@@ -218,6 +308,13 @@ def _self_test() -> int:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         chapters = root / "cookbook" / "book" / "chapters"
+        package_dirs = shipped_package_dirs(_metadata(root))
+
+        check("the-closure-follows-normal-and-build-dependencies",
+              package_dirs == ["clients/python", "crates/jammi-ai", "crates/jammi-cli",
+                               "crates/jammi-db", "crates/jammi-python", "crates/jammi-server",
+                               "crates/jammi-wire", "packaging/native"],
+              str(package_dirs))
 
         # A chapter that opens an engine and checks a golden is LIVE, and
         # names the dataset it checks.
@@ -230,10 +327,7 @@ def _self_test() -> int:
         _write(chapters / "other" / "other.qmd", _chapter(
             'db = jammi.connect(f"file://{tmp}")\ncontracts.assert_close("gadget.n", 1)',
         ))
-        # grpc:// and the LiveServer harness each need a server.
-        _write(chapters / "remote" / "remote.qmd", _chapter(
-            'remote = jammi.connect("grpc://127.0.0.1:8081")\nremote.list_models()',
-        ))
+        # A chapter that talks to a server it starts is LIVE like any other.
         _write(chapters / "served" / "served.qmd", _chapter(
             "from jammi.testing import LiveServer",
             "with LiveServer(tmp) as server:\n    jammi.connect(server.endpoint).list_models()",
@@ -251,56 +345,79 @@ def _self_test() -> int:
               buckets["embed"].bucket)
         check("golden-datasets-are-extracted", buckets["embed"].datasets == {"widget"},
               str(buckets["embed"].datasets))
-        check("grpc-chapter-needs-server", buckets["remote"].bucket == "LIVE_NEEDS_SERVER",
-              buckets["remote"].bucket)
-        check("harness-chapter-needs-server", buckets["served"].bucket == "LIVE_NEEDS_SERVER",
+        check("server-starting-chapter-is-live", buckets["served"].bucket == "LIVE",
               buckets["served"].bucket)
         check("imports-and-prose-are-static", buckets["prose"].bucket == "STATIC",
               buckets["prose"].bucket)
 
-        def selected(*paths: str) -> tuple[list[Classification], set[str]]:
-            cls, sel = select(list(paths), chapters_dir=chapters, repo_root=root)
-            return cls, {p.parent.name for p in sel}
+        def selected(*paths: str) -> set[str]:
+            _, sel = select(list(paths), package_dirs=package_dirs,
+                            chapters_dir=chapters, repo_root=root)
+            return {p.parent.name for p in sel}
 
-        live = {"embed", "other", "remote", "served"}
-        for trigger in ("crates/jammi-ai/src/lib.rs", "cookbook/book/jammi_cookbook/keystone.py",
-                        "cookbook/fixtures/tiny_corpus.parquet"):
-            _, sel = selected(trigger)
+        live = {"embed", "other", "served"}
+        for trigger in (
+            "crates/jammi-ai/src/lib.rs",
+            "crates/jammi-db/build.rs",
+            "crates/jammi-wire/proto/jammi/v1/data.proto",
+            "crates/jammi-server/Cargo.toml",
+            "packaging/native/python/jammi_native/__init__.py",
+            "clients/python/jammi/remote.py",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            ".docker/ci.Dockerfile",
+            "cookbook/book/jammi_cookbook/keystone.py",
+            "cookbook/fixtures/tiny_corpus.parquet",
+        ):
+            sel = selected(trigger)
             check(f"{trigger}-selects-every-live-chapter", sel == live, str(sel))
 
-        _, sel = selected("cookbook/book/jammi_cookbook/goldens/widget.small.json")
+        for inert in (
+            "crates/jammi-db/tests/it/broker_parity.rs",
+            "crates/jammi-ai/benches/encode.rs",
+            "crates/jammi-server/examples/serve.rs",
+            "crates/jammi-test-utils/src/lib.rs",
+            "crates/jammi-bench/src/lib.rs",
+            "clients/python/tests/test_remote.py",
+            "crates/jammi-db-extra/src/lib.rs",
+            "Cargo.toml.orig",
+            "docs/guide/something.md",
+            ".github/workflows/ci.yml",
+        ):
+            sel = selected(inert)
+            check(f"{inert}-selects-nothing", sel == set(), str(sel))
+
+        sel = selected("cookbook/book/jammi_cookbook/goldens/widget.small.json")
         check("a-golden-diff-selects-its-datasets-chapters", sel == {"embed"}, str(sel))
-        _, sel = selected("cookbook/book/jammi_cookbook/goldens/gadget.json")
+        sel = selected("cookbook/book/jammi_cookbook/goldens/gadget.json")
         check("a-scale-free-golden-diff-selects-its-datasets-chapters", sel == {"other"}, str(sel))
 
-        cls, sel = selected("docs/guide/something.md")
-        check("docs-only-diff-selects-nothing", sel == set(), str(sel))
-        check("an-empty-selection-needs-no-server",
-              selection_needs_server(cls, set()) is False)
-
-        _, sel = selected("cookbook/book/chapters/prose/prose.qmd")
+        sel = selected("cookbook/book/chapters/prose/prose.qmd")
         check("a-self-touched-static-chapter-is-selected", sel == {"prose"}, str(sel))
 
-        cls, sel = select(["cookbook/book/chapters/remote/remote.qmd"],
-                          chapters_dir=chapters, repo_root=root)
-        check("a-self-touched-needs-server-chapter-flags-the-server",
-              selection_needs_server(cls, sel) is True)
-        cls, sel = select(["cookbook/book/chapters/embed/embed.qmd"],
-                          chapters_dir=chapters, repo_root=root)
-        check("a-plain-live-selection-needs-no-server",
-              selection_needs_server(cls, sel) is False)
+        _, everything = select(["Cargo.lock"], package_dirs=package_dirs,
+                               chapters_dir=chapters, repo_root=root)
+        slices = [take_slice(everything, f"{k}/2") for k in (1, 2)]
+        check("slices-partition-the-selection",
+              sorted(p for s in slices for p in s) == sorted(everything)
+              and not set(slices[0]) & set(slices[1]),
+              str(slices))
+        check("slices-interleave", slices[0] == everything[0::2], str(slices[0]))
+        check("a-slice-beyond-the-selection-is-empty",
+              take_slice(everything, f"{len(everything) + 1}/{len(everything) + 1}") == [])
+        for bad in ("0/2", "3/2", "1", "a/b"):
+            try:
+                take_slice(everything, bad)
+                check(f"slice-{bad}-is-refused", False, "accepted")
+            except SystemExit:
+                check(f"slice-{bad}-is-refused", True)
 
-        # The `--needs-server` CLI surface: a workflow captures its stdout
-        # straight into a step output, so exactly one token goes to stdout
-        # and the table to stderr.
-        for touched, want in (("remote", "true\n"), ("embed", "false\n")):
-            out, err = io.StringIO(), io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                rc = _cmd_needs_server([f"cookbook/book/chapters/{touched}/{touched}.qmd"],
-                                       chapters_dir=chapters, repo_root=root)
-            check(f"needs-server-cli-prints-a-bare-{want.strip()}",
-                  rc == 0 and out.getvalue() == want and "# classification" in err.getvalue(),
-                  f"exit {rc}, stdout={out.getvalue()!r}")
+        try:
+            shipped_package_dirs({**_metadata(root), "packages": []})
+            check("a-missing-shipped-package-fails-loudly", False, "accepted")
+        except SystemExit:
+            check("a-missing-shipped-package-fails-loudly", True)
 
     if failures:
         print(f"self-test: FAIL ({len(failures)}/{total} failing): {failures}", file=sys.stderr)
@@ -325,16 +442,12 @@ def _git_diff_names(base: str, head: str) -> list[str]:
     return out.stdout.splitlines()
 
 
-def _table_lines(
-    classifications: list[Classification], repo_root: Path = REPO_ROOT
-) -> list[str]:
-    """`repo_root` is a parameter only so `_self_test` can render the table
-    for a synthetic tree; every production caller takes the default."""
+def _table_lines(classifications: list[Classification]) -> list[str]:
     lines = []
     for c in classifications:
-        rel = c.path.relative_to(repo_root).as_posix()
+        rel = c.path.relative_to(REPO_ROOT).as_posix()
         ds = ",".join(sorted(c.datasets)) if c.datasets else "-"
-        lines.append(f"{c.bucket:24s} {ds:30s} {rel}")
+        lines.append(f"{c.bucket:8s} {ds:30s} {rel}")
     return lines
 
 
@@ -344,37 +457,16 @@ def _cmd_classify() -> int:
     return 0
 
 
-def _cmd_needs_server(
-    changed_paths: list[str],
-    *,
-    chapters_dir: Path = CHAPTERS_DIR,
-    repo_root: Path = REPO_ROOT,
-) -> int:
-    """Print exactly `true`/`false`: does the set THIS diff selects need a
-    running `jammi-server`? One machine-readable token on stdout, so a
-    workflow can capture it straight into a step output; the classification
-    table still goes to stderr, never mixed into the answer.
-
-    The directory overrides exist for `_self_test`; `main()` takes the
-    defaults."""
-    classifications, selected = select(changed_paths, chapters_dir=chapters_dir,
-                                       repo_root=repo_root)
-    print("# classification", file=sys.stderr)
-    for line in _table_lines(classifications, repo_root):
-        print(f"#   {line}", file=sys.stderr)
-    print("true" if selection_needs_server(classifications, selected) else "false")
-    return 0
-
-
-def _cmd_select(changed_paths: list[str]) -> int:
-    classifications, selected = select(changed_paths)
+def _cmd_select(changed_paths: list[str], slice_spec: str | None) -> int:
+    classifications, selected = select(changed_paths, package_dirs=shipped_package_dirs(cargo_metadata()))
     print("# classification", file=sys.stderr)
     for line in _table_lines(classifications):
         print(f"#   {line}", file=sys.stderr)
+    if slice_spec is not None:
+        selected = take_slice(selected, slice_spec)
     if not selected:
         print("# no chapter needs rendering for this diff", file=sys.stderr)
-        return 0
-    for path in sorted(selected, key=lambda p: p.relative_to(REPO_ROOT).as_posix()):
+    for path in selected:
         print(path.relative_to(REPO_ROOT).as_posix())
     return 0
 
@@ -386,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--base", help="base git ref (with --head)")
     ap.add_argument("--head", help="head git ref (with --base)")
+    ap.add_argument("--slice", help="print only the K-th of N interleaved slices (K/N)")
     ap.add_argument(
         "--classify",
         action="store_true",
@@ -393,12 +486,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--self-test", action="store_true", help="run the RED-proof self-tests and exit"
-    )
-    ap.add_argument(
-        "--needs-server",
-        action="store_true",
-        help="print `true`/`false` (does the selected set need a running jammi-server?) "
-        "instead of the chapter list",
     )
     args = ap.parse_args(argv)
 
@@ -408,20 +495,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.classify:
         return _cmd_classify()
 
-    run = _cmd_needs_server if args.needs_server else _cmd_select
-
     if args.base or args.head:
         if not (args.base and args.head):
             ap.error("--base and --head must be given together")
-        changed = _git_diff_names(args.base, args.head)
-        return run(changed)
+        return _cmd_select(_git_diff_names(args.base, args.head), args.slice)
 
     if args.diff:
         if args.diff == "-":
             changed = sys.stdin.read().splitlines()
         else:
             changed = Path(args.diff).read_text().splitlines()
-        return run(changed)
+        return _cmd_select(changed, args.slice)
 
     ap.error("one of --diff, --base/--head, --classify, or --self-test is required")
     return 2

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# The third-party tools the guard lanes run, each pinned once, here. The CI
-# image installs them at build time; a lane on a bare runner, or on an image
-# built before a pin moved, provides them through this same script, so a
-# version and its checksum never live in two places.
+# The third-party tools the CI lanes run, each pinned once, here. The CI image
+# installs them at build time (this file is an input of its content tag, so a
+# moved pin is a new image); a lane on a bare runner, or a host outside the
+# image, provides them through this same script, so a version and its checksum
+# never live in two places.
 #
 #   .docker/pinned-tools.sh TOOL...
 #
@@ -69,6 +70,18 @@ provide() {
       )
       release "https://github.com/yannh/kubeconform/releases/download/v${v}/kubeconform-linux-${arch}.tar.gz" \
         "${sum[$arch]}" kubeconform
+      ;;
+    # The test runner every hermetic lane uses (`.config/nextest.toml`).
+    cargo-nextest)
+      v=0.9.146
+      at_pin "$v" cargo-nextest nextest --version && return
+      declare -A triple=([amd64]=x86_64-unknown-linux-gnu [arm64]=aarch64-unknown-linux-gnu)
+      declare -A sum=(
+        [amd64]=682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428
+        [arm64]=b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9
+      )
+      release "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${v}/cargo-nextest-${v}-${triple[$arch]}.tar.gz" \
+        "${sum[$arch]}" cargo-nextest
       ;;
     # deny.toml's shape asserts this major version's schema behavior; the
     # RustSec advisory database the tool reads stays deliberately live.

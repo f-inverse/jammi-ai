@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::common::{kept_dir_session, unique_suffix};
+use crate::common::kept_dir_session;
 use arrow::array::{Array, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
@@ -23,12 +23,8 @@ use jammi_db::trigger::Predicate;
 use test_case::test_case;
 use uuid::Uuid;
 
-/// A fresh, well-formed, per-test tenant id — a random UUID, never a fixed
-/// literal. The Postgres lane runs the whole matrix against one shared
-/// database, and the audit/lifecycle-topic machinery this module exercises
-/// registers under a real tenant scope, so a fixed literal shared across
-/// sibling tests (or repeated runs) would accumulate rows in that tenant's
-/// read-scope and break exact-count assertions below.
+/// A fresh, well-formed tenant id — a random UUID: the audit/lifecycle-topic
+/// machinery this module exercises registers under a real tenant scope.
 fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }
@@ -249,11 +245,8 @@ async fn persistent_record_references_hash_after_deletion(backend: BackendKind) 
     let tenant = fresh_tenant();
     s.bind_tenant(tenant);
 
-    // Persistent companion table holding just the hash lineage — a fixed
-    // logical name (unlike the ephemeral tables below, whose physical name
-    // already embeds a fresh session id) so it needs its own per-test suffix
-    // on the shared Postgres lane.
-    let lineage_table = format!("query_lineage_{}", unique_suffix());
+    // Persistent companion table holding just the hash lineage.
+    let lineage_table = "query_lineage".to_string();
     let lineage_id = MutableTableId::new(lineage_table.clone()).unwrap();
     let lineage_schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
         "image_hash",

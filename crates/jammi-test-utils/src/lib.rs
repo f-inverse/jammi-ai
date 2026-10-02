@@ -18,8 +18,10 @@ use jammi_db::session::JammiSession;
 // embedding pipeline produced).
 pub use jammi_db::store::schema::embedding_batch_with_null_hash;
 
-/// The URL of the live Postgres the Postgres-backed tests run against, read
-/// from `JAMMI_TEST_PG_URL`.
+/// The URL of the live Postgres server the Postgres-backed tests create their
+/// databases on, read from `JAMMI_TEST_PG_URL`. A test's catalog is never this
+/// database: it is [`postgres_database_url`]'s, one per test. Only a test that
+/// creates databases of its own connects here.
 ///
 /// A test that calls this (directly or through a Postgres [`BackendKind`]) is
 /// compiled only under its crate's `live-postgres-tests` feature; with that
@@ -27,14 +29,134 @@ pub use jammi_db::store::schema::embedding_batch_with_null_hash;
 ///
 /// # Panics
 /// When `JAMMI_TEST_PG_URL` is unset or empty.
-pub fn postgres_url() -> String {
+pub fn postgres_server_url() -> String {
     jammi_test_resources::env("JAMMI_TEST_PG_URL")
 }
 
+/// `url` with its database replaced by `database`.
+///
+/// # Panics
+/// When `url` does not parse as a URL.
+pub fn with_database(url: &str, database: &str) -> String {
+    let mut parsed = url::Url::parse(url).expect("JAMMI_TEST_PG_URL parses as a URL");
+    parsed.set_path(&format!("/{database}"));
+    parsed.to_string()
+}
+
+/// The prefix every per-test database carries, followed by the unix
+/// second it was created at; [`sweep_stale_databases`] reads the age back from
+/// the name.
+const TEST_DATABASE_PREFIX: &str = "jammi_t_";
+
+/// A per-test database older than this belongs to a run that has ended (no test
+/// runs for a day), so the sweep may drop it.
+const TEST_DATABASE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The Postgres database `dir` owns, as a URL on [`postgres_server_url`]'s
+/// server: the one named in `<dir>/catalog.postgres`, created on first use.
+///
+/// It is the Postgres arm's catalog the way `<dir>/catalog.db` is the SQLite
+/// arm's ([`open_backend`]), so every test has a catalog of its own on both
+/// backends, and every open of the same `dir` — a test restarting its own
+/// catalog — reaches the same database. A database outlives its test only
+/// until a later test's sweep finds it stale.
+///
+/// # Panics
+/// When `JAMMI_TEST_PG_URL` is unset, the server refuses the connection, or
+/// `dir` cannot hold the name file.
+pub async fn postgres_database_url(dir: &Path) -> String {
+    use sqlx::Connection;
+
+    let server = postgres_server_url();
+    let database = claim_database_name(dir);
+    let mut admin = sqlx::PgConnection::connect(&server)
+        .await
+        .expect("connect to JAMMI_TEST_PG_URL");
+    sweep_stale_databases(&mut admin).await;
+    // Every opener creates; a database another opener of this `dir` already
+    // created is the one this opener wants.
+    match sqlx::query(&format!("CREATE DATABASE \"{database}\""))
+        .execute(&mut admin)
+        .await
+    {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(e)) if matches!(e.code().as_deref(), Some("42P04" | "23505")) => {
+        }
+        Err(e) => panic!("CREATE DATABASE {database}: {e}"),
+    }
+    with_database(&server, &database)
+}
+
+/// The database name recorded in `<dir>/catalog.postgres`, minting and
+/// recording one when the file is absent. The name is written whole to a
+/// scratch file and linked into place, so a concurrent reader sees either no
+/// file or the complete name, and only one minted name ever wins.
+fn claim_database_name(dir: &Path) -> String {
+    let path = dir.join("catalog.postgres");
+    if let Ok(name) = std::fs::read_to_string(&path) {
+        return name;
+    }
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock reads after the epoch")
+        .as_secs();
+    let minted = format!(
+        "{TEST_DATABASE_PREFIX}{created}_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let scratch = dir.join(format!(
+        "catalog.postgres.{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::write(&scratch, &minted).expect("write the catalog name");
+    let linked = std::fs::hard_link(&scratch, &path);
+    std::fs::remove_file(&scratch).expect("remove the scratch catalog name");
+    match linked {
+        Ok(()) => minted,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::read_to_string(&path).expect("read the catalog name another opener recorded")
+        }
+        Err(e) => panic!("record the catalog name in {}: {e}", path.display()),
+    }
+}
+
+/// Drop every per-test database older than [`TEST_DATABASE_TTL`]. A
+/// database some session still holds is in use, not stale: Postgres refuses
+/// to drop it (`55006`), and the sweep leaves it.
+async fn sweep_stale_databases(admin: &mut sqlx::PgConnection) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock reads after the epoch")
+        .as_secs();
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT datname FROM pg_database WHERE starts_with(datname, $1)")
+            .bind(TEST_DATABASE_PREFIX)
+            .fetch_all(&mut *admin)
+            .await
+            .expect("list the per-test databases");
+    let stale = names.into_iter().filter(|name| {
+        name[TEST_DATABASE_PREFIX.len()..]
+            .split('_')
+            .next()
+            .and_then(|secs| secs.parse::<u64>().ok())
+            .is_some_and(|created| now.saturating_sub(created) > TEST_DATABASE_TTL.as_secs())
+    });
+    for name in stale {
+        match sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
+            .execute(&mut *admin)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55006") => {}
+            Err(e) => panic!("DROP DATABASE {name}: {e}"),
+        }
+    }
+}
+
 /// Build a [`JammiSession`] backed by `kind` for parameterized integration
-/// tests. The caller passes an artifact dir (used by SQLite for the catalog
-/// file and by both backends for result-table parquet); the Postgres variant
-/// connects to [`postgres_url`] and runs migrations.
+/// tests. The caller passes an artifact dir: it holds the catalog on both
+/// backends ([`open_backend`]) and the result-table parquet; the session runs
+/// migrations.
 ///
 /// # Panics
 /// When the session cannot be opened, or `kind` is Postgres and
@@ -53,9 +175,9 @@ pub async fn make_test_session(kind: BackendKind, artifact_dir: &Path) -> JammiS
     }
 }
 
-/// A catalog backend of `kind`, not yet migrated: the SQLite file
-/// `<dir>/catalog.db`, or a pool on the live Postgres at [`postgres_url`]
-/// (which ignores `dir`).
+/// `dir`'s catalog backend of `kind`, not yet migrated: the SQLite file
+/// `<dir>/catalog.db`, or a pool on `dir`'s Postgres database
+/// ([`postgres_database_url`]).
 ///
 /// # Panics
 /// When the backend cannot be opened, or `kind` is Postgres and
@@ -68,7 +190,7 @@ pub async fn open_backend(kind: BackendKind, dir: &Path) -> BackendImpl {
                 .expect("open sqlite backend"),
         ),
         BackendKind::Postgres => BackendImpl::Postgres(
-            PostgresBackend::open_with_options(&postgres_url(), 8, None)
+            PostgresBackend::open_with_options(&postgres_database_url(dir).await, 8, None)
                 .await
                 .expect("open postgres backend"),
         ),
@@ -107,7 +229,7 @@ impl DistributedBackends {
     /// that is unset or empty.
     pub fn from_env() -> Self {
         Self {
-            pg_url: postgres_url(),
+            pg_url: postgres_server_url(),
             s3_endpoint: jammi_test_resources::env("JAMMI_TEST_S3_ENDPOINT"),
             s3_bucket: jammi_test_resources::env("JAMMI_TEST_S3_BUCKET"),
             access_key_id: jammi_test_resources::env("AWS_ACCESS_KEY_ID"),
@@ -148,18 +270,10 @@ impl DistributedBackends {
     }
 }
 
-/// Backend-unique id suffix for any tenant id / source id / table name /
-/// channel name a parameterized integration test creates.
-///
-/// The Postgres lane runs the whole matrix against ONE shared database (see
-/// `make_test_session`), so two tests — or the two `BackendKind` arms of the
-/// same test — must never write under the same catalog identifier: a fixed
-/// literal collides with a sibling test's rows (or a prior run's), producing
-/// cumulative-row-count and "already exists" failures that are a harness bug,
-/// not a product regression. SQLite tests get a fresh on-disk catalog per
-/// `tempdir()` and don't strictly need this, but calling it unconditionally
-/// keeps one code path for both backends instead of a Postgres-only special
-/// case.
+/// A suffix no other call returns — in this process or a concurrent one — for
+/// a name a test creates. A store shared beyond one test's catalog requires
+/// it: the distributed lanes' Postgres catalog and S3 bucket
+/// ([`DistributedBackends::unique_result_root`]).
 pub fn unique_suffix() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);

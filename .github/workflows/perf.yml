@@ -47,11 +47,22 @@ env:
   RAYON_NUM_THREADS: "1"
 
 jobs:
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
+
   perf-scale:
     name: CPU-hermetic scale tiers (measured-rate gate)
+    needs: ci-image
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci

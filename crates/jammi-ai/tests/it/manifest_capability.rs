@@ -6,8 +6,8 @@ use jammi_ai::fine_tune::ComputePrecision;
 use jammi_kernels::admission::{ProbedOpKind, PROBED_OPS};
 
 use crate::release_manifest::{
-    internal_subkernel_ops, load_manifest, manifest_string_list, MANIFEST_FLASH_DTYPES,
-    MANIFEST_FUSED_OP_ADMISSION, MANIFEST_LANE,
+    internal_subkernel_ops, load_manifest, manifest_string_list, MANIFEST_BUILD,
+    MANIFEST_FLASH_DTYPES, MANIFEST_FUSED_OP_ADMISSION,
 };
 
 /// The manifest capability list every [`ProbedOpKind::InternalSubkernel`] row
@@ -29,11 +29,11 @@ const MANIFEST_INTERNAL_SUBKERNELS: &str = "internal_subkernels";
 /// a "claimed but unprovable" entry.
 /// Returns `(op, parent)` pairs, sorted by op.
 fn manifest_internal_subkernels(manifest: &serde_json::Value) -> Vec<(String, String)> {
-    let obj = manifest["lanes"][MANIFEST_LANE]["capabilities"][MANIFEST_INTERNAL_SUBKERNELS]
+    let obj = manifest["builds"][MANIFEST_BUILD]["capabilities"][MANIFEST_INTERNAL_SUBKERNELS]
         .as_object()
         .unwrap_or_else(|| {
             panic!(
-                "manifest lane {MANIFEST_LANE:?}'s capabilities.{MANIFEST_INTERNAL_SUBKERNELS} \
+                "manifest build {MANIFEST_BUILD:?}'s capabilities.{MANIFEST_INTERNAL_SUBKERNELS} \
                  must be an OBJECT keyed by op (each value carrying `parent` + `launch_site`), \
                  not an array — see ci/scripts/check_release_manifest.py"
             )
@@ -130,7 +130,7 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
             .iter()
             .map(|s| (*s).to_string())
             .collect::<Vec<String>>(),
-        "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_FUSED_OP_ADMISSION} must name EXACTLY the \
+        "manifest build {MANIFEST_BUILD:?}'s {MANIFEST_FUSED_OP_ADMISSION} must name EXACTLY the \
          PROBED_OPS rows that dispatch through admit()/admit_cascade(). A key only the manifest \
          names is a capability nothing can prove; a key only PROBED_OPS names is a real \
          admission decision the release manifest does not claim (which is how the f16 \
@@ -154,7 +154,7 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
     let declared_subkernels = manifest_internal_subkernels(&manifest);
     assert_eq!(
         declared_subkernels, expected_subkernels,
-        "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_INTERNAL_SUBKERNELS} must name EXACTLY the \
+        "manifest build {MANIFEST_BUILD:?}'s {MANIFEST_INTERNAL_SUBKERNELS} must name EXACTLY the \
          PROBED_OPS rows with no admission gate of their own, AND agree with the table on each \
          one's `parent` — the op whose fused dispatch is the only thing that proves the \
          subkernel ran. A name-only match with a wrong parent is a claimed proof that does not \
@@ -177,10 +177,10 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
     // tolerated — it claims no capability, so it is dead schema for
     // `ci/scripts/check_release_manifest.py` to prune, not a false claim this
     // test can see on a device.
-    let capabilities = manifest["lanes"][MANIFEST_LANE]["capabilities"]
+    let capabilities = manifest["builds"][MANIFEST_BUILD]["capabilities"]
         .as_object()
         .unwrap_or_else(|| {
-            panic!("manifest lane {MANIFEST_LANE:?} must carry a `capabilities` object")
+            panic!("manifest build {MANIFEST_BUILD:?} must carry a `capabilities` object")
         });
     let unaccounted: Vec<String> = capabilities
         .iter()
@@ -195,7 +195,7 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
         .collect();
     assert!(
         unaccounted.is_empty(),
-        "manifest lane {MANIFEST_LANE:?} names something in a capability that carries no proof \
+        "manifest build {MANIFEST_BUILD:?} names something in a capability that carries no proof \
          mechanism — {unaccounted:?}. Only {MANIFEST_FUSED_OP_ADMISSION} (its own admission \
          delta) and {MANIFEST_INTERNAL_SUBKERNELS} (its parent's) may name ops, and \
          {MANIFEST_FLASH_DTYPES} may name dtypes. A kernel that compiles but dispatches \
@@ -218,7 +218,7 @@ fn manifest_capability_categories_match_probed_ops_by_kind() {
         .collect();
     assert!(
         non_dtype.is_empty(),
-        "manifest lane {MANIFEST_LANE:?}'s {MANIFEST_FLASH_DTYPES} must name only \
+        "manifest build {MANIFEST_BUILD:?}'s {MANIFEST_FLASH_DTYPES} must name only \
          ComputePrecision dtype tokens {tokens:?} — {non_dtype:?} are not dtypes, and this \
          capability is exempt from the op-bearing check above precisely on the grounds that it \
          names dtypes"

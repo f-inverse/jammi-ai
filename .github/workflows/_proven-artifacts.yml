@@ -1,0 +1,50 @@
+name: _proven-artifacts
+
+# Names the run whose artifacts a release promotes: the `ci.yml` run that
+# proved the tree being released (its most recent green `ci-summary`
+# measurement), once `ci/scripts/proven_artifacts.py` has confirmed it still
+# holds every artifact the caller names. A release compiles nothing: each
+# promoting job downloads those artifacts by this run id
+# (`actions/download-artifact`'s `run-id`, with `actions: read`) and
+# publishes the bytes that run's checks exercised.
+#
+# On a branch dispatch, the caller's rehearsal: the same lookup over the
+# branch's tree, with nothing promoted.
+
+on:
+  workflow_call:
+    inputs:
+      artifacts:
+        description: "Space-separated names of the artifacts the release promotes."
+        type: string
+        required: true
+    outputs:
+      run:
+        description: "The run id holding them."
+        value: ${{ jobs.resolve.outputs.run }}
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: The run that proved this tree
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the run and its artifacts
+        id: resolve
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ARTIFACTS: ${{ inputs.artifacts }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          python3 ci/scripts/proven_artifacts.py --repo "$GITHUB_REPOSITORY" --tree "$tree" --artifacts "$ARTIFACTS" >> "$GITHUB_OUTPUT"

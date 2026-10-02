@@ -35,14 +35,10 @@ fn set_master_key() {
     std::env::set_var(MASTER_KEY_ENV, TEST_KEY);
 }
 
-/// A fresh, well-formed, per-test tenant id — a random UUID, never a fixed
-/// literal. `AUDIT_TABLE_NAME`/`AUDIT_TOPIC` are fixed, reserved, process-wide
-/// names by design (the whole point of the audit primitive is one shared
-/// physical table/topic scoped by `tenant_id`), so on the Postgres lane
-/// (one shared database across the whole run) tenant identity is the ONLY
-/// isolation axis available — a fixed literal reused across sibling tests (or
-/// repeated runs) would accumulate rows into that tenant's `fetch_recent`
-/// read-scope and break every exact-count assertion below.
+/// A fresh, well-formed tenant id — a random UUID. `AUDIT_TABLE_NAME` /
+/// `AUDIT_TOPIC` are fixed, reserved names by design (the audit primitive is one
+/// physical table/topic scoped by `tenant_id`), so a tenant is what separates
+/// one scope's rows from another's.
 fn fresh_tenant() -> TenantId {
     TenantId::from_uuid(Uuid::new_v4()).unwrap()
 }

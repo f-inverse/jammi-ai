@@ -209,6 +209,52 @@ async fn lost_flag_sets_after_a_peer_reclaims_the_held_job() {
     );
 }
 
+/// Dropping a hold ends its lease's renewal, so the flag a training loop
+/// read off it (`lost_flag`) must report the lease lost: a trainer whose
+/// owning future was aborted keeps that clone and nothing else, and must
+/// stop at its next check rather than run its job to the end.
+#[tokio::test]
+async fn dropping_a_hold_sets_the_lost_flag_its_holders_read() {
+    let dir = tempdir().unwrap();
+    let catalog = seeded_catalog(dir.path()).await;
+    catalog
+        .submit_job(SubmitJobParams {
+            job_id: "abandoned",
+            kind: "fine_tune",
+            execution: JobExecution::Queued,
+            spec: "{}",
+            model_ref: Some("keeper-base::1"),
+            output_model_id: None,
+            model_source: None,
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let claimed = catalog
+        .claim_next("instance-a", &["fine_tune"], Duration::from_secs(3))
+        .await
+        .unwrap()
+        .expect("job claimed");
+
+    let keeper = keeper_for(dir.path().to_path_buf(), fast_intervals()).await;
+    let hold = keeper.hold(LeaseTarget::Job {
+        job_id: claimed.job_id.clone(),
+        instance_id: "instance-a".to_string(),
+        attempts: claimed.attempts,
+    });
+    let cancel = hold.lost_flag();
+    assert!(
+        !cancel.load(std::sync::atomic::Ordering::SeqCst),
+        "a live hold's flag must not start set"
+    );
+
+    drop(hold);
+    assert!(
+        cancel.load(std::sync::atomic::Ordering::SeqCst),
+        "a dropped hold renews nothing, so its flag must read lost"
+    );
+}
+
 /// A keeper whose connect factory never succeeds must not come back as a
 /// handle whose holds all read "live": `start` retries inside the lease
 /// window (more than one attempt lands) and then returns the typed

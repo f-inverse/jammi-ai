@@ -15,10 +15,9 @@
 //! The SQLite lane is always generated; the Postgres lane is generated only when
 //! the `live-postgres-tests` feature is on. The Postgres lane is where the
 //! contract bites hardest: the four-edge scan runs under PG `Serializable` and
-//! still surfaces the typed `ModelReferenced` rather than a raw FK error. On the Postgres lane that one catalog DB is shared across
-//! the whole run, so each test first clears the referential tables via
-//! [`reset_catalog`]; CI's `test-pg` job runs the lane with `--test-threads=1`,
-//! so the reset-then-populate sequence cannot race a sibling test.
+//! still surfaces the typed `ModelReferenced` rather than a raw FK error. Each
+//! test's catalog is its own on both lanes, so the global referential scan and
+//! the partial-index checks see only the rows the test creates.
 
 use std::str::FromStr;
 
@@ -38,16 +37,13 @@ use jammi_test_utils::make_test_session;
 use tempfile::tempdir;
 use test_case::test_case;
 
-/// A session on `backend` and its base (unscoped) catalog, with the shared
-/// referential tables cleared so the four-edge scan and the partial-index
-/// checks see only this test's rows.
+/// A session on `backend` and its base (unscoped) catalog.
 async fn lifecycle_catalog(
     backend: BackendKind,
     dir: &std::path::Path,
 ) -> (JammiSession, std::sync::Arc<Catalog>) {
     let session = make_test_session(backend, dir).await;
     let catalog = std::sync::Arc::clone(session.catalog());
-    reset_catalog(&catalog).await;
     (session, catalog)
 }
 
@@ -57,27 +53,6 @@ fn tenant_a() -> TenantId {
 
 fn tenant_b() -> TenantId {
     TenantId::from_str("01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b").unwrap()
-}
-
-/// Clear every row from the referential tables (children before parents, so the
-/// FK-backed deletes do not block) so the global referential scan and the
-/// partial-index checks see only the rows this test creates. The SQLite lane has
-/// a fresh tempdir per test, but running the reset there too keeps both lanes on
-/// one path. Run under `--test-threads=1` on the Postgres lane, so it cannot race
-/// a sibling test.
-async fn reset_catalog(catalog: &Catalog) {
-    catalog
-        .backend_arc()
-        .transaction(TxOptions::default(), |tx| {
-            Box::pin(async move {
-                for table in ["eval_runs", "jobs", "result_tables", "models", "sources"] {
-                    tx.execute(&format!("DELETE FROM {table}"), &[]).await?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
 }
 
 fn register_params(model_id: &str) -> RegisterModelParams<'_> {

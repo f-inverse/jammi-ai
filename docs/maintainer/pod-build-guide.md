@@ -724,10 +724,10 @@ git lfs ls-files    # the fixtures must be listed as materialized, not pointers
 **Documented residual:** the pod's own bootstrap `git clone` has the same
 gap — nothing in `ci/scripts/runpod_lib.sh` or `ci/scripts/gpu-dev.sh`
 fetches lfs objects, so a suite run against the bootstrap checkout rather
-than a pushed tree depends on the image's own git-lfs configuration. Only
-the two cookbook workflows set `lfs: true` (`.github/workflows/cookbook-book.yml`)
-on their checkout today. It is not claimed closed; the fail-closed panic
-above is what keeps it from being silent.
+than a pushed tree depends on the image's own git-lfs configuration. No CI
+workflow fetches LFS objects on its checkout either: no hermetic suite reads
+these fixtures. It is not claimed closed; the fail-closed panic above is what
+keeps it from being silent.
 
 **Getting a model checkpoint onto the pod.** The CUDA CI image ships
 `python3` 3.12 with **no `pip` module and no `hf` on PATH**, so the usual

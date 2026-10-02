@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """Assert `ci/release-feature-manifest.json` is internally consistent.
 
-**Guarded property**: the manifest's three CUDA release lanes describe ONE
-shipped capability surface, and every op it names is classified by exactly
-ONE proof mechanism. The three CPU release lanes ship no capability
-surface at all — `capabilities` is required iff a lane's own
+**Guarded property**: every shipped lane packages a declared build, the
+CUDA builds declare ONE capability surface, and every op that surface names
+is classified by exactly ONE proof mechanism. A CPU build ships no
+capability surface at all — `capabilities` is required iff a build's own
 `cargo_features` reaches `cuda`/`flash-attn`, forbidden otherwise.
 
-The manifest is duplicated three ways on purpose (one block per lane, so a
-lane that genuinely diverges can say so), which makes silent divergence the
-failure mode: a reviewer editing one lane's `capabilities` and missing the
-other two ships a manifest that claims three different surfaces for three
-builds of the same feature list. And because a category IS a proof mechanism
+The two CUDA builds (the server and the embedded engine) compile the same
+kernels, so their capability blocks must agree; a reviewer editing one and
+missing the other would ship a manifest claiming two surfaces for one
+kernel set. And because a category IS a proof mechanism
 (`fused_op_admission` = an observed dispatch-registry delta;
 `internal_subkernels` = an admitted parent's observed delta — see the
 manifest's own `_schema_doc`), an op named in two categories is a
@@ -30,22 +29,27 @@ either name ops under a mechanism or not carry the mechanism at all.
 Checks (hermetic: reads the manifest and the tracked Rust sources, no
 network, no build, no toolchain):
 
-  1. The file parses; `lanes` exists and is non-empty. `capabilities` is
-     REQUIRED, with both category keys present (each non-empty, no
-     capability key outside the closed set — the two categories plus the
-     non-op build facts `cuda_compiled`/`flash_compiled`/`flash_dtypes`), on
-     every lane whose `cargo_features` names `cuda` or `flash-attn`
-     (SYNTACTIC here — a literal feature-name match; the toolchain-bearing
+  0. `builds` and `lanes` exist and are non-empty. Every lane carries
+     exactly `_doc`, `build` and `workflow`, and its `build` names a
+     declared build; every build is packaged by at least one lane. Features
+     and capabilities belong to the build, so a lane carrying either is a
+     FINDING (the closed lane key set), never a second copy to drift.
+  1. `capabilities` is REQUIRED, with both category keys present (each
+     non-empty, no capability key outside the closed set — the two
+     categories plus the non-op build facts
+     `cuda_compiled`/`flash_compiled`/`flash_dtypes`), on every build whose
+     `cargo_features` names `cuda` or `flash-attn` (SYNTACTIC here — a
+     literal feature-name match; the toolchain-bearing
      `check_flash_attn_closure.py` re-derives the same fact from the real
      feature graph) — and `capabilities` is FORBIDDEN (a FINDING if present)
-     on every OTHER lane (a CPU family ships no capability surface).
+     on every OTHER build (a CPU build ships no capability surface).
      Fail-closed: a missing/renamed/extra key is a FINDING, never a silently
      skipped check.
-  2. Every lane's `capabilities` block, among the lanes that carry one, is
-     IDENTICAL to every other such lane's, compared as canonical JSON (key
-     order included, so the file stays reviewable as N literally-equal
-     blocks) — the CUDA families today; a lane with no `capabilities` block
-     (a CPU family) is never compared.
+  2. Every build's `capabilities` block, among the builds that carry one, is
+     IDENTICAL to every other such build's, compared as canonical JSON (key
+     order included, so the file stays reviewable as literally-equal
+     blocks); a build with no `capabilities` block (a CPU build) is never
+     compared.
   3. Every op named across the two categories appears in EXACTLY ONE of
      them, and at most once within its own category.
   4. Every `internal_subkernels` entry carries a `parent` and a
@@ -56,12 +60,12 @@ network, no build, no toolchain):
      `cascade_counters_for(` somewhere in `crates/*/src` (so a renamed
      registry key breaks this file instead of leaving an orphan claim).
 
-What this does NOT check: whether a lane's declared capability is TRUE on a
+What this does NOT check: whether a build's declared capability is TRUE on a
 real device. That is `capability_surface.rs`'s job (a live registry-delta
 probe) and `check_flash_attn_closure.py`'s (the feature-graph closure). This
 gate is the internal-consistency floor underneath both.
 
-  5. The top-level key set is CLOSED at exactly `{_schema_doc,
+  5. The top-level key set is CLOSED at exactly `{_schema_doc, builds,
      lanes, server_only_cargo_features, prove_lane}` -- an extra top-level
      key is a FINDING, never silently ignored (the same "closed set, not a
      denylist" discipline `capabilities` already gets, one level up).
@@ -92,7 +96,12 @@ import prove_surface  # noqa: E402
 # The top-level key set is CLOSED -- see module doc point 5. A new top-level
 # section needs this constant widened in the SAME unit that adds it, never a
 # silent extra key nobody validates.
-TOP_LEVEL_KEYS = frozenset({"_schema_doc", "lanes", "server_only_cargo_features", "prove_lane"})
+TOP_LEVEL_KEYS = frozenset(
+    {"_schema_doc", "builds", "lanes", "server_only_cargo_features", "prove_lane"}
+)
+# A lane is a packaging of one build; its key set is closed so features or
+# capabilities can never come back onto a lane as a second copy.
+LANE_KEYS = frozenset({"_doc", "build", "workflow"})
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 assert (REPO_ROOT / "Cargo.toml").is_file(), (
@@ -110,7 +119,7 @@ OBJECT_CATEGORIES = ("internal_subkernels",)
 CATEGORIES = ("fused_op_admission", "internal_subkernels")
 
 # The capability keys that are NOT proof mechanisms: build facts about the
-# lane that name no op. Together with CATEGORIES these close the set of keys
+# build that name no op. Together with CATEGORIES these close the set of keys
 # a `capabilities` block may carry — anything else is a finding, so a third
 # op-bearing category cannot be introduced by a manifest-only edit (see this
 # module's doc).
@@ -122,20 +131,20 @@ NON_CATEGORY_CAPABILITY_KEYS = frozenset(
 # ways a dispatch-registry key is named in this workspace.
 _REGISTRY_KEY_RE = re.compile(r"(?:cascade_)?counters_for\(\s*\"([a-z0-9_]+)\"")
 
-# `capabilities` is REQUIRED on a lane iff its `cargo_features` names
+# `capabilities` is REQUIRED on a build iff its `cargo_features` names
 # either of these — SYNTACTIC here (this gate has no toolchain, no cargo
 # metadata): a literal feature-name match, never a derived closure over the
 # workspace feature graph. `check_flash_attn_closure.py` (toolchain-bearing)
 # re-derives the SAME fact from the real graph and is the DERIVED half of
 # this rule; this file only enforces that the manifest's OWN two halves
-# (which lanes carry a block, and whether siblings agree) are internally
+# (which builds carry a block, and whether siblings agree) are internally
 # consistent with the literal `cargo_features` list sitting right next to
 # them.
 _CAPABILITY_TRIGGER_FEATURES = frozenset({"cuda", "flash-attn"})
 
 
-def _lane_needs_capabilities(lane: dict) -> bool:
-    feats = lane.get("cargo_features")
+def _build_needs_capabilities(build: dict) -> bool:
+    feats = build.get("cargo_features")
     if not isinstance(feats, list):
         return False
     return any(f in _CAPABILITY_TRIGGER_FEATURES for f in feats)
@@ -153,36 +162,36 @@ def registry_key_literals(repo_root: Path) -> set[str]:
     return keys
 
 
-def _category_ops(caps: dict, lane_name: str, problems: list[str]) -> dict[str, list[str]]:
-    """Per-category op names for one lane, appending a finding for any
+def _category_ops(caps: dict, build_name: str, problems: list[str]) -> dict[str, list[str]]:
+    """Per-category op names for one build, appending a finding for any
     missing or wrongly-shaped category."""
     ops: dict[str, list[str]] = {}
     for cat in LIST_CATEGORIES:
         if cat not in caps:
-            problems.append(f"lane `{lane_name}`: capabilities has no `{cat}` key")
+            problems.append(f"build `{build_name}`: capabilities has no `{cat}` key")
             continue
         value = caps[cat]
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            problems.append(f"lane `{lane_name}`: `{cat}` must be a list of op-name strings")
+            problems.append(f"build `{build_name}`: `{cat}` must be a list of op-name strings")
             continue
         ops[cat] = list(value)
     for cat in OBJECT_CATEGORIES:
         if cat not in caps:
-            problems.append(f"lane `{lane_name}`: capabilities has no `{cat}` key")
+            problems.append(f"build `{build_name}`: capabilities has no `{cat}` key")
             continue
         value = caps[cat]
         if not isinstance(value, dict):
-            problems.append(f"lane `{lane_name}`: `{cat}` must be an object keyed by op name")
+            problems.append(f"build `{build_name}`: `{cat}` must be an object keyed by op name")
             continue
         ops[cat] = list(value.keys())
     # A category that is present but names no op is an EMPTY PROOF SLOT: it
-    # asserts a mechanism the lane exercises for nothing, and it is where the
+    # asserts a mechanism the build exercises for nothing, and it is where the
     # next unwired kernel gets parked instead of being wired or deleted. The
     # manifest must drop the mechanism rather than carry it empty.
     for cat, named in ops.items():
         if not named:
             problems.append(
-                f"lane `{lane_name}`: `{cat}` is present but EMPTY — a proof mechanism "
+                f"build `{build_name}`: `{cat}` is present but EMPTY — a proof mechanism "
                 f"that names no op is an empty slot the next unwired kernel gets filed "
                 f"into; name an op under it or remove the category"
             )
@@ -194,7 +203,7 @@ def _category_ops(caps: dict, lane_name: str, problems: list[str]) -> dict[str, 
         if key in CATEGORIES or key in NON_CATEGORY_CAPABILITY_KEYS:
             continue
         problems.append(
-            f"lane `{lane_name}`: unknown capability key `{key}` — the proof mechanisms "
+            f"build `{build_name}`: unknown capability key `{key}` — the proof mechanisms "
             f"are exactly {list(CATEGORIES)} and the non-op build facts are exactly "
             f"{sorted(NON_CATEGORY_CAPABILITY_KEYS)}; a key naming ops under any other "
             f"mechanism has no defined proof, so it cannot be added by a manifest-only edit"
@@ -262,64 +271,91 @@ def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
 
     _check_prove_lane(manifest, repo_root, problems)
 
+    builds = manifest.get("builds")
+    if not isinstance(builds, dict) or not builds:
+        return problems + ["manifest has no (or an empty) `builds` object — nothing to check"]
     lanes = manifest.get("lanes")
     if not isinstance(lanes, dict) or not lanes:
-        return ["manifest has no (or an empty) `lanes` object — nothing to check"]
+        return problems + ["manifest has no (or an empty) `lanes` object — nothing ships"]
 
-    # (1b)/(2) `capabilities` is REQUIRED iff the lane's own
-    # `cargo_features` names `cuda`/`flash-attn` (SYNTACTIC — see
-    # `_lane_needs_capabilities`'s own doc), FORBIDDEN otherwise; among the
-    # lanes that DO carry one, every block must be IDENTICAL (compared as
-    # canonical JSON) — a CPU family (no capabilities) is never compared
-    # against, or mistaken for a divergence from, the CUDA lanes' block.
-    canonical: dict[str, str] = {}
+    # (0) Every lane packages a declared build, carries nothing of its own
+    # beyond that binding, and every build is packaged by some lane.
+    packaged: set[str] = set()
     for lane_name, lane in lanes.items():
         if not isinstance(lane, dict):
             problems.append(f"lane `{lane_name}`: must be an object")
             continue
-        needs_caps = _lane_needs_capabilities(lane)
-        caps = lane.get("capabilities")
+        extra = sorted(set(lane) - LANE_KEYS)
+        missing = sorted(LANE_KEYS - set(lane))
+        if extra:
+            problems.append(
+                f"lane `{lane_name}`: carries {extra} — a lane is exactly {sorted(LANE_KEYS)}; "
+                f"features and capabilities belong to the build it packages"
+            )
+        if missing:
+            problems.append(f"lane `{lane_name}`: missing {missing}")
+        build = lane.get("build")
+        if build not in builds:
+            problems.append(f"lane `{lane_name}`: packages `{build}`, which is not a declared build")
+        else:
+            packaged.add(build)
+    for build_name in sorted(set(builds) - packaged):
+        problems.append(f"build `{build_name}`: no lane packages it — a build nothing ships")
+
+    # (1b)/(2) `capabilities` is REQUIRED iff the build's own
+    # `cargo_features` names `cuda`/`flash-attn` (SYNTACTIC — see
+    # `_build_needs_capabilities`'s own doc), FORBIDDEN otherwise; among the
+    # builds that DO carry one, every block must be IDENTICAL (compared as
+    # canonical JSON) — a CPU build (no capabilities) is never compared
+    # against, or mistaken for a divergence from, the CUDA builds' block.
+    canonical: dict[str, str] = {}
+    for build_name, build in builds.items():
+        if not isinstance(build, dict):
+            problems.append(f"build `{build_name}`: must be an object")
+            continue
+        needs_caps = _build_needs_capabilities(build)
+        caps = build.get("capabilities")
         if needs_caps:
             if not isinstance(caps, dict):
                 problems.append(
-                    f"lane `{lane_name}`: `cargo_features` names `cuda` or `flash-attn` but "
+                    f"build `{build_name}`: `cargo_features` names `cuda` or `flash-attn` but "
                     f"has no `capabilities` object (capabilities is REQUIRED here)"
                 )
                 continue
-            canonical[lane_name] = json.dumps(caps, indent=2, sort_keys=False)
+            canonical[build_name] = json.dumps(caps, indent=2, sort_keys=False)
         elif caps is not None:
             problems.append(
-                f"lane `{lane_name}`: `cargo_features` names neither `cuda` nor "
+                f"build `{build_name}`: `cargo_features` names neither `cuda` nor "
                 f"`flash-attn` — `capabilities` must be ABSENT (forbidden on a "
-                f"non-CUDA family), found a {type(caps).__name__}"
+                f"CPU build), found a {type(caps).__name__}"
             )
     if len(set(canonical.values())) > 1:
         reference = next(iter(canonical))
-        for lane_name, blob in canonical.items():
+        for build_name, blob in canonical.items():
             if blob != canonical[reference]:
                 problems.append(
-                    f"lane `{lane_name}`'s capabilities block differs from lane "
-                    f"`{reference}`'s — the CUDA lanes build one feature list and "
-                    f"must declare one capability surface (edit all lanes in one unit)"
+                    f"build `{build_name}`'s capabilities block differs from build "
+                    f"`{reference}`'s — the CUDA builds compile one kernel set and "
+                    f"must declare one capability surface (edit every build in one unit)"
                 )
 
     known_registry_keys = registry_key_literals(repo_root)
 
-    for lane_name, lane in lanes.items():
-        caps = lane.get("capabilities") if isinstance(lane, dict) else None
+    for build_name, build in builds.items():
+        caps = build.get("capabilities") if isinstance(build, dict) else None
         if not isinstance(caps, dict):
             continue
 
         # (1)/(3) category shape, then exactly-one-category membership.
-        ops = _category_ops(caps, lane_name, problems)
+        ops = _category_ops(caps, build_name, problems)
         seen: dict[str, str] = {}
         for cat in CATEGORIES:
             for op in ops.get(cat, []):
                 if op in seen and seen[op] == cat:
-                    problems.append(f"lane `{lane_name}`: op `{op}` listed twice in `{cat}`")
+                    problems.append(f"build `{build_name}`: op `{op}` listed twice in `{cat}`")
                 elif op in seen:
                     problems.append(
-                        f"lane `{lane_name}`: op `{op}` appears in both `{seen[op]}` and "
+                        f"build `{build_name}`: op `{op}` appears in both `{seen[op]}` and "
                         f"`{cat}` — the categories are DIFFERENT proof mechanisms, so an "
                         f"op belongs to exactly one"
                     )
@@ -333,7 +369,7 @@ def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
             for op, entry in subkernels.items():
                 if not isinstance(entry, dict):
                     problems.append(
-                        f"lane `{lane_name}`: internal sub-kernel `{op}` must be an object "
+                        f"build `{build_name}`: internal sub-kernel `{op}` must be an object "
                         f"with `parent` and `launch_site`"
                     )
                     continue
@@ -341,22 +377,22 @@ def check_manifest(manifest: dict, repo_root: Path = REPO_ROOT) -> list[str]:
                 launch_site = entry.get("launch_site")
                 if not isinstance(parent, str) or not parent:
                     problems.append(
-                        f"lane `{lane_name}`: internal sub-kernel `{op}` has no `parent` — "
+                        f"build `{build_name}`: internal sub-kernel `{op}` has no `parent` — "
                         f"its whole proof is the parent's observed dispatch"
                     )
                 elif parent not in admitted and parent not in known_registry_keys:
                     problems.append(
-                        f"lane `{lane_name}`: internal sub-kernel `{op}`'s parent "
+                        f"build `{build_name}`: internal sub-kernel `{op}`'s parent "
                         f"`{parent}` is neither a `fused_op_admission` op nor a dispatch-"
                         f"registry key named in crates/*/src — an unprovable parent"
                     )
                 if not isinstance(launch_site, str) or not launch_site:
                     problems.append(
-                        f"lane `{lane_name}`: internal sub-kernel `{op}` has no `launch_site`"
+                        f"build `{build_name}`: internal sub-kernel `{op}` has no `launch_site`"
                     )
                 elif not (repo_root / launch_site).is_file():
                     problems.append(
-                        f"lane `{lane_name}`: internal sub-kernel `{op}`'s launch_site "
+                        f"build `{build_name}`: internal sub-kernel `{op}`'s launch_site "
                         f"`{launch_site}` does not exist"
                     )
 
@@ -394,9 +430,14 @@ def _fixture_manifest() -> dict:
         },
     }
     return {
-        "lanes": {
+        "builds": {
             "a": {"cargo_features": ["cuda", "flash-attn"], "capabilities": json.loads(json.dumps(caps))},
             "b": {"cargo_features": ["cuda", "flash-attn"], "capabilities": json.loads(json.dumps(caps))},
+        },
+        "lanes": {
+            "a-wheel": {"_doc": "", "build": "a", "workflow": "w.yml:publish"},
+            "a-image": {"_doc": "", "build": "a", "workflow": "w.yml:push"},
+            "b-wheel": {"_doc": "", "build": "b", "workflow": "w.yml:publish"},
         },
         "prove_lane": {
             "crates": {
@@ -425,54 +466,77 @@ def _self_test() -> int:
     m = _fixture_manifest()
     check("well-formed-manifest-is-green", check_manifest(m, REPO_ROOT) == [], f"{check_manifest(m, REPO_ROOT)}")
 
-    # 1. A lane whose capability block diverges from its siblings.
+    # 1. A build whose capability block diverges from its siblings.
     m = _fixture_manifest()
-    m["lanes"]["b"]["capabilities"]["fused_op_admission"] = [
+    m["builds"]["b"]["capabilities"]["fused_op_admission"] = [
         "layer_norm",
         "low_rank_residual_linear",
         "sneaked_in",
     ]
     probs = check_manifest(m, REPO_ROOT)
-    check("divergent-lane-capability-block-caught", any("differs from lane" in p for p in probs), f"{probs}")
+    check("divergent-build-capability-block-caught", any("differs from build" in p for p in probs), f"{probs}")
 
-    # 1b. A CPU family carrying `capabilities` is a FINDING — the
+    # 1b. A CPU build carrying `capabilities` is a FINDING — the
     # syntactic rule reads `cargo_features`, never the presence of the
     # block alone.
     m = _fixture_manifest()
-    m["lanes"]["c"] = {
+    m["builds"]["c"] = {
         "cargo_features": ["storage-cloud"],
-        "capabilities": json.loads(json.dumps(m["lanes"]["a"]["capabilities"])),
+        "capabilities": json.loads(json.dumps(m["builds"]["a"]["capabilities"])),
     }
+    m["lanes"]["c-wheel"] = {"_doc": "", "build": "c", "workflow": "w.yml:publish"}
     probs = check_manifest(m, REPO_ROOT)
     check(
-        "capabilities-on-cpu-family-caught",
-        any("must be ABSENT" in p and "lane `c`" in p for p in probs),
+        "capabilities-on-cpu-build-caught",
+        any("must be ABSENT" in p and "build `c`" in p for p in probs),
         f"{probs}",
     )
 
-    # 1c. A CUDA family (cargo_features names `cuda`) with NO
+    # 1c. A CUDA build (cargo_features names `cuda`) with NO
     # `capabilities` block is a FINDING — capabilities is REQUIRED there.
     m = _fixture_manifest()
-    del m["lanes"]["b"]["capabilities"]
+    del m["builds"]["b"]["capabilities"]
     probs = check_manifest(m, REPO_ROOT)
     check(
-        "capabilities-missing-on-cuda-family-caught",
-        any("capabilities is REQUIRED here" in p and "lane `b`" in p for p in probs),
+        "capabilities-missing-on-cuda-build-caught",
+        any("capabilities is REQUIRED here" in p and "build `b`" in p for p in probs),
         f"{probs}",
     )
 
-    # 1d. A CPU family with NO `capabilities` block (the real,
+    # 1d. A CPU build with NO `capabilities` block (the real,
     # correct shape) is accepted.
     m = _fixture_manifest()
-    m["lanes"]["c"] = {"cargo_features": ["storage-cloud"]}
+    m["builds"]["c"] = {"cargo_features": ["storage-cloud"]}
+    m["lanes"]["c-wheel"] = {"_doc": "", "build": "c", "workflow": "w.yml:publish"}
     probs = check_manifest(m, REPO_ROOT)
-    check("cpu-family-without-capabilities-accepted", probs == [], f"{probs}")
+    check("cpu-build-without-capabilities-accepted", probs == [], f"{probs}")
+
+    # 1e. A lane must package a declared build.
+    m = _fixture_manifest()
+    m["lanes"]["a-wheel"]["build"] = "gone"
+    probs = check_manifest(m, REPO_ROOT)
+    check("lane-naming-an-undeclared-build-caught",
+          any("`gone`, which is not a declared build" in p for p in probs), f"{probs}")
+
+    # 1f. A build no lane packages ships nothing.
+    m = _fixture_manifest()
+    del m["lanes"]["b-wheel"]
+    probs = check_manifest(m, REPO_ROOT)
+    check("build-no-lane-packages-caught",
+          any("build `b`: no lane packages it" in p for p in probs), f"{probs}")
+
+    # 1g. Features (or capabilities) back on a lane are a second copy to drift.
+    m = _fixture_manifest()
+    m["lanes"]["a-image"]["cargo_features"] = ["cuda"]
+    probs = check_manifest(m, REPO_ROOT)
+    check("lane-carrying-features-caught",
+          any("lane `a-image`: carries ['cargo_features']" in p for p in probs), f"{probs}")
 
     # 2. An op in two categories at once — the two mechanisms contradict.
     #    Here an ADMITTED op is also claimed as a parentless sub-kernel.
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["internal_subkernels"]["layer_norm"] = {
+    for build in m["builds"].values():
+        build["capabilities"]["internal_subkernels"]["layer_norm"] = {
             "parent": "low_rank_residual_linear",
             "launch_site": "Cargo.toml",
         }
@@ -482,8 +546,8 @@ def _self_test() -> int:
     # 2b. The other direction of the same overlap (a sub-kernel that ALSO
     #     claims its own admission site).
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["fused_op_admission"] = [
+    for build in m["builds"].values():
+        build["capabilities"]["fused_op_admission"] = [
             "layer_norm",
             "low_rank_residual_linear",
             "scaled_cast_add",
@@ -493,22 +557,22 @@ def _self_test() -> int:
 
     # 3. A duplicate inside one category.
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["fused_op_admission"] = ["layer_norm", "layer_norm", "low_rank_residual_linear"]
+    for build in m["builds"].values():
+        build["capabilities"]["fused_op_admission"] = ["layer_norm", "layer_norm", "low_rank_residual_linear"]
     probs = check_manifest(m, REPO_ROOT)
     check("duplicate-within-a-category-caught", any("listed twice" in p for p in probs), f"{probs}")
 
     # 4. A launch_site that does not resolve.
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["internal_subkernels"]["scaled_cast_add"]["launch_site"] = "crates/gone/src/nope.rs"
+    for build in m["builds"].values():
+        build["capabilities"]["internal_subkernels"]["scaled_cast_add"]["launch_site"] = "crates/gone/src/nope.rs"
     probs = check_manifest(m, REPO_ROOT)
     check("dangling-launch-site-caught", any("does not exist" in p for p in probs), f"{probs}")
 
     # 5. A parent that is neither an admitted op nor a real registry key.
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = "not_a_real_parent"
+    for build in m["builds"].values():
+        build["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = "not_a_real_parent"
     probs = check_manifest(m, REPO_ROOT)
     check("unresolvable-parent-caught", any("unprovable parent" in p for p in probs), f"{probs}")
 
@@ -516,15 +580,15 @@ def _self_test() -> int:
     #     accepted — this is the real `attention_block_flash` shape, so the
     #     check above must not be satisfied by "is in fused_op_admission".
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = "attention_block_flash"
+    for build in m["builds"].values():
+        build["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = "attention_block_flash"
     probs = check_manifest(m, REPO_ROOT)
     check("registry-key-only-parent-accepted", probs == [], f"{probs}")
 
     # 6. A missing category key fails closed rather than skipping silently.
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        del lane["capabilities"]["internal_subkernels"]
+    for build in m["builds"].values():
+        del build["capabilities"]["internal_subkernels"]
     probs = check_manifest(m, REPO_ROOT)
     check("missing-category-key-caught", any("has no `internal_subkernels` key" in p for p in probs), f"{probs}")
 
@@ -532,14 +596,14 @@ def _self_test() -> int:
     #     manifest would have had if the last compiled-only op were deleted
     #     while its category stayed. Both the list and the object category.
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
+    for build in m["builds"].values():
         # Re-point the sub-kernel's parent at a real REGISTRY KEY first, so
         # draining the admission list does not ALSO orphan the parent
         # citation — the property under test is the emptiness alone.
-        lane["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = (
+        build["capabilities"]["internal_subkernels"]["scaled_cast_add"]["parent"] = (
             "attention_block_flash"
         )
-        lane["capabilities"]["fused_op_admission"] = []
+        build["capabilities"]["fused_op_admission"] = []
     probs = check_manifest(m, REPO_ROOT)
     check(
         "empty-list-category-caught",
@@ -548,8 +612,8 @@ def _self_test() -> int:
     )
 
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["internal_subkernels"] = {}
+    for build in m["builds"].values():
+        build["capabilities"]["internal_subkernels"] = {}
     probs = check_manifest(m, REPO_ROOT)
     check(
         "empty-object-category-caught",
@@ -565,8 +629,8 @@ def _self_test() -> int:
         ("some_new_mechanism", {"some_kernel": {"parent": "low_rank_residual_linear"}}),
     ):
         m = _fixture_manifest()
-        for lane in m["lanes"].values():
-            lane["capabilities"][extra_key] = json.loads(json.dumps(extra_value))
+        for build in m["builds"].values():
+            build["capabilities"][extra_key] = json.loads(json.dumps(extra_value))
         probs = check_manifest(m, REPO_ROOT)
         check(
             f"unknown-op-bearing-category-caught[{extra_key}]",
@@ -577,13 +641,15 @@ def _self_test() -> int:
     # 6d. The non-category build facts are NOT mistaken for a category (a
     #     closed-set check that reds on `flash_dtypes` would be unusable).
     m = _fixture_manifest()
-    for lane in m["lanes"].values():
-        lane["capabilities"]["flash_dtypes"] = ["bf16", "f16"]
+    for build in m["builds"].values():
+        build["capabilities"]["flash_dtypes"] = ["bf16", "f16"]
     probs = check_manifest(m, REPO_ROOT)
     check("non-category-build-facts-accepted", probs == [], f"{probs}")
 
-    # 7. An empty/absent `lanes` object can never pass vacuously.
-    probs = check_manifest({"lanes": {}}, REPO_ROOT)
+    # 7. An empty/absent `builds` or `lanes` object can never pass vacuously.
+    probs = check_manifest({**_fixture_manifest(), "builds": {}}, REPO_ROOT)
+    check("empty-builds-object-caught", probs != [], f"{probs}")
+    probs = check_manifest({**_fixture_manifest(), "lanes": {}}, REPO_ROOT)
     check("empty-lanes-object-caught", probs != [], f"{probs}")
 
     # 9. An extra top-level key is caught -- the closed-set rule.
@@ -631,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {MANIFEST_PATH.relative_to(REPO_ROOT)}: {p}", file=sys.stderr)
         print(f"release-manifest: FAIL ({len(problems)} finding(s))", file=sys.stderr)
         return 1
-    print("release-manifest: lanes agree, every op is in exactly one category, citations resolve")
+    print("release-manifest: every lane packages a build, the CUDA builds agree, every op is in exactly one category, citations resolve")
     return 0
 
 

@@ -1,0 +1,238 @@
+name: _server
+
+# Builds one `jammi-server` binary — a build of `ci/release-feature-manifest.json`
+# (`server-cpu` or `server-cu12`) on one arch — and packages it as that build's
+# release tarball and PyPI wheel. The one definition of how a server binary is
+# compiled and packaged: `ci.yml` calls it on every pull request and on `main`,
+# where its tests, cookbook and image smokes use the binary, and a release
+# promotes the tarball and wheel the run that proved its tree built
+# (`_proven-artifacts.yml`).
+#
+# Everything but the build and the arch is derived:
+#   - the cargo features: the build's `cargo_features` in the manifest;
+#   - the CI image: the CPU image, or the CUDA image for a CUDA build;
+#   - the runner: native per arch (`ubuntu-latest`, `ubuntu-24.04-arm`);
+#   - the CUTLASS submodule: initialised when the features reach
+#     `flash-attn`, whose kernels build from it;
+#   - the wheel: `packaging/<build>`, tagged `manylinux_2_28_<arch>`, and
+#     checked by the package's own `verify_link_set.py` when it carries one
+#     (the CUDA wheel, whose CUDA libraries arrive as dependency wheels).
+#
+# Artifacts: `<build>-<arch>-binary` (the stripped `jammi-server`),
+# `<build>-<arch>-tarball` (`ci/scripts/package_server_tarball.sh`; a CUDA
+# build's also leaves its loader and jail reports, `cu12-loader-report` and
+# `cu12-jail-report`) and `<build>-<arch>-wheel`. Nothing here publishes:
+# PyPI trusted publishing matches the OIDC token's `job_workflow_ref` (the
+# called file) while its PEP-740 attestation matches the caller file, so a
+# publish from inside a reusable workflow can never satisfy both
+# (https://github.com/pypa/gh-action-pypi-publish/issues/166). Each publisher
+# downloads what it ships and publishes it from its own job.
+
+on:
+  workflow_call:
+    inputs:
+      build:
+        description: "The manifest build: `server-cpu` or `server-cu12`."
+        type: string
+        required: true
+      arch:
+        description: "`x86_64` or `aarch64`."
+        type: string
+        required: true
+      cpu-image:
+        description: "The tree's CPU CI image."
+        type: string
+        required: true
+      cuda-image:
+        description: "The tree's CUDA CI image (used by a CUDA build)."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan (${{ inputs.build }}, ${{ inputs.arch }})
+    runs-on: ubuntu-latest
+    outputs:
+      features: ${{ steps.plan.outputs.features }}
+      image: ${{ steps.plan.outputs.image }}
+      runner: ${{ steps.plan.outputs.runner }}
+      cutlass: ${{ steps.plan.outputs.cutlass }}
+      cuda: ${{ steps.plan.outputs.cuda }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The build's features, image and runner
+        id: plan
+        shell: bash
+        env:
+          BUILD: ${{ inputs.build }}
+          ARCH: ${{ inputs.arch }}
+          CPU_IMAGE: ${{ inputs.cpu-image }}
+          CUDA_IMAGE: ${{ inputs.cuda-image }}
+        run: |
+          set -euo pipefail
+          features="$(jq -r --arg b "$BUILD" '.builds[$b].cargo_features // empty | join(",")' ci/release-feature-manifest.json)"
+          if [ -z "$features" ]; then
+            echo "::error::ci/release-feature-manifest.json declares no cargo_features for build '$BUILD'" >&2
+            exit 1
+          fi
+          case "$ARCH" in
+            x86_64) runner=ubuntu-latest ;;
+            aarch64) runner=ubuntu-24.04-arm ;;
+            *) echo "::error::unsupported arch '$ARCH' (expected x86_64 or aarch64)" >&2; exit 1 ;;
+          esac
+          if [[ ",$features," == *",cuda,"* ]]; then
+            if [ -z "$CUDA_IMAGE" ] || [ "$ARCH" != x86_64 ]; then
+              echo "::error::build '$BUILD' is a CUDA build: it needs the CUDA image and arch x86_64" >&2
+              exit 1
+            fi
+            image="$CUDA_IMAGE"; cuda=true
+          else
+            image="$CPU_IMAGE"; cuda=false
+          fi
+          if [[ ",$features," == *",flash-attn,"* ]]; then cutlass=true; else cutlass=false; fi
+          {
+            echo "features=$features"
+            echo "image=$image"
+            echo "runner=$runner"
+            echo "cutlass=$cutlass"
+            echo "cuda=$cuda"
+          } >> "$GITHUB_OUTPUT"
+
+  binary:
+    name: Build jammi-server (${{ inputs.build }}, ${{ inputs.arch }})
+    needs: plan
+    runs-on: ${{ needs.plan.outputs.runner }}
+    container: ${{ needs.plan.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      # `flash-attn` builds its kernels from the vendored CUTLASS submodule
+      # (`build.rs::build_flash_attn`). Scoped to this job's checkout.
+      - name: Init the CUTLASS submodule
+        if: needs.plan.outputs.cutlass == 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          # A release build, not the lint gate.
+          deny-warnings: false
+
+      - name: Build jammi-server (release)
+        env:
+          FEATURES: ${{ needs.plan.outputs.features }}
+        run: cargo build --release -p jammi-server --bin jammi-server --features "$FEATURES"
+
+      - name: Strip the binary
+        run: strip target/release/jammi-server
+
+      # Built inside a manylinux_2_28 container does not by itself prove the
+      # LINKED symbol versions stay at or below the floor. `sort -V`, never a
+      # lexical sort, which returns "2.9" over "2.34".
+      - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
+        run: bash ci/scripts/assert_glibc_floor.sh target/release/jammi-server 2.28
+
+      - name: Assert the binary's ELF machine matches the arch
+        run: bash ci/scripts/assert_elf_machine.sh target/release/jammi-server "${{ inputs.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build }}-${{ inputs.arch }}-binary
+          path: target/release/jammi-server
+
+      # In the image the binary compiled in: a CUDA build's tarball stages
+      # the CUDA runtime libraries from the toolkit that image carries.
+      - name: Package the release tarball
+        id: tarball
+        run: bash ci/scripts/package_server_tarball.sh "${{ inputs.build }}" "${{ inputs.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build }}-${{ inputs.arch }}-tarball
+          path: ${{ steps.tarball.outputs.asset }}
+
+      # The real loader and jail reports, written before their checks run so a
+      # failing check still leaves them: a maintainer refreshes
+      # `ci/scripts/fixtures/cu12_{loader,jail}_report_real.txt` from these,
+      # never by renting a pod.
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.plan.outputs.cuda == 'true'
+        with:
+          name: cu12-loader-report
+          path: cu12_loader_report_real.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.plan.outputs.cuda == 'true'
+        with:
+          name: cu12-jail-report
+          path: cu12_jail_report_real.txt
+
+  wheel:
+    name: Package wheel (${{ inputs.build }}, ${{ inputs.arch }})
+    needs: binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.build }}-${{ inputs.arch }}-binary
+          path: artifact
+
+      # Artifacts do not preserve the exec bit, so re-apply it.
+      - name: Stage the binary into the wheel package
+        env:
+          PACKAGE: packaging/${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          cp artifact/jammi-server "$PACKAGE/jammi_server/bin/jammi-server"
+          chmod +x "$PACKAGE/jammi_server/bin/jammi-server"
+
+      # Fail here — not on a user's machine at execve — if the binary links a
+      # library the wheel's runtime dependencies do not deliver. DT_NEEDED
+      # survives stripping (it lives in .dynamic), so this checks the exact
+      # bytes shipped.
+      - name: Verify the runtime link set is covered by the wheel dependencies
+        if: hashFiles(format('packaging/{0}/verify_link_set.py', inputs.build)) != ''
+        env:
+          PACKAGE: packaging/${{ inputs.build }}
+        run: python3 "$PACKAGE/verify_link_set.py" artifact/jammi-server
+
+      - name: Build the wheel
+        working-directory: packaging/${{ inputs.build }}
+        env:
+          PLATFORM_TAG: manylinux_2_28_${{ inputs.arch }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build wheel
+          python -m build --wheel --outdir dist
+          # A bin-bearing wheel is NOT py3-none-any (hatchling only sees the
+          # Python sources); relabel to the platform tag the binary actually
+          # requires so pip installs it only on a compatible host.
+          python -m wheel tags --platform-tag "$PLATFORM_TAG" --remove dist/*.whl
+
+      # PyPI refuses a file over its per-file limit at the tag's publish; the
+      # wheel that outgrew it fails here instead, on the change that grew it.
+      - name: Assert the wheel fits PyPI's per-file limit
+        run: bash ci/scripts/assert_wheel_size.sh packaging/${{ inputs.build }}/dist/*.whl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build }}-${{ inputs.arch }}-wheel
+          path: packaging/${{ inputs.build }}/dist/

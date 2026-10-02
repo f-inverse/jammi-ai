@@ -27,11 +27,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
+  # and this run waits until they exist.
+  ci-image:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_ci-image.yml
+    with:
+      await: cpu
+
   validate:
     name: Validate
+    needs: ci-image
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust-ci
@@ -66,9 +77,10 @@ jobs:
 
   perf-gate:
     name: Performance regression gate (release-blocking)
+    needs: ci-image
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     # The release tag is the authoritative same-box-ish performance gate: a
     # structural throughput regression (a path that went quadratic, a serialized
     # parallel section, a dropped fast path) SHOULD block a release. Each
@@ -111,8 +123,8 @@ jobs:
       - name: Run the CPU-hermetic scale tiers (measured-rate gate)
         run: bash ci/scripts/perf/run_scale_tiers.sh
 
-  gpu-proof:
-    name: GPU proof required
+  proof:
+    name: Proof required
     # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
     # requires the release commit's already-recorded GPU-prove verdict
     # before ANY crate is published (every release publisher gates on the
@@ -120,7 +132,7 @@ jobs:
     # keeps every promotion arm proven: an event-keyed guard would let a
     # dispatch publish unproven.
     if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/_gpu-proof-required.yml
+    uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
@@ -138,11 +150,11 @@ jobs:
     # `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_once.py`'s
     # PROMOTION_TABLE rule asserts this shape holds for every promotion job
     # in the tree.
-    needs: [validate, perf-gate, gpu-proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.validate.result == 'success' && needs.perf-gate.result == 'success' && needs.gpu-proof.result == 'success'
+    needs: [ci-image, validate, perf-gate, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.validate.result == 'success' && needs.perf-gate.result == 'success' && needs.proof.result == 'success'
     runs-on: ubuntu-latest
     container:
-      image: ${{ vars.JAMMI_CI_IMAGE || 'ghcr.io/f-inverse/jammi-ai-ci:latest' }}
+      image: ${{ needs.ci-image.outputs.cpu }}
     environment: crates-io
     permissions:
       id-token: write

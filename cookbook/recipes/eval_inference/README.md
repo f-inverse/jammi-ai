@@ -7,20 +7,9 @@ against gold labels.
 want a single number — accuracy, macro F1, per-class F1 — to compare
 two classifiers, or to track drift over time on the same classifier.
 
-## What `example.py` does
-
-1. Connects to a temporary artifact dir
-2. Registers the tiny corpus as `corpus` (parquet)
-3. Registers `tiny_labels.csv` as `golden` (csv) — `(id, label)` rows
-4. Runs `db.eval_inference` with the local
-   `tiny_modernbert_classifier` fixture against the `content` column
-5. Prints the returned aggregate `accuracy`, macro `f1`, per-class
-   metrics, and the count of per-record predictions
-6. Asserts every reported rate is in `[0.0, 1.0]`
-
 ## API surface exercised
 
-- `Database.eval_inference(*, model, source, columns, task, golden_source, label_column)`
+- `Session.eval_inference(*, model, source, columns, task, golden_source, label_column)`
 
 The returned dict carries `aggregate` (tagged by `"task"` — currently
 `"classification"`) with `accuracy`, `f1`, and `per_class`, plus
@@ -49,4 +38,4 @@ metric.
 python cookbook/recipes/eval_inference/example.py
 ```
 
-Exits 0 on success, prints the metrics dict + `eval_inference: OK`.
+It prints accuracy, macro F1 and the per-class scores, then the predictions' shape.

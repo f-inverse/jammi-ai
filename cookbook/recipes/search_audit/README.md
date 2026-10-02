@@ -10,19 +10,6 @@ This is the primitive every audited-ML deployment in a regulated setting
 what this model returned for this query, and prove the record hasn't been
 altered."
 
-## What this recipe shows
-
-- Build a `PerQueryAudit` record (query id, model id/version, query lineage,
-  top-K result ids, retrieval scores).
-- `db.audit.log([...])` — the substrate injects `tenant_id`, signs the record
-  with a per-tenant HMAC-SHA256 key, stores it, and publishes it.
-- `db.audit.fetch_by_query_id(...)` / `db.audit.fetch_recent(...)` — typed reads,
-  tenant-scoped.
-- `record.verify()` — re-derive the key and check the signature.
-- Plain SQL over `mutable.public."_jammi_search_audit"` — same tenant scope.
-- `db.subscribe_collect("jammi.audit.search.v1", ...)` — every logged record is
-  also delivered on a trigger topic for alerting / analytics / warehouse sinks.
-
 ## Run it
 
 The audit master key is required — the substrate refuses to sign without it:

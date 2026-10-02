@@ -10,16 +10,6 @@ a number that tells you how good the retrieval is. This is the audio
 counterpart of the image `eval_embeddings` recipe; audio is simply the third
 embedding modality the engine supports alongside text and images.
 
-## Flow
-
-1. **Load** a small audio corpus (inline audio bytes in a Parquet source)
-2. **Generate** L2-normalized audio embeddings over the audio column
-3. **Search** the index with an encoded audio query (cosine ANN)
-4. **Eval** retrieval quality (Recall@K / MRR) against a held-out golden set
-5. **Fine-tune** a projection head on audio triplets and re-eval (tuned ≠ base)
-6. **Fine-tune** LoRA adapters *inside* the audio tower on the same triplets
-   (adapted ≠ base), then watch a wrong selector get **refused**
-
 ## Model
 
 Any **HuggingFace CLAP** audio model works — its `config.json` declares
@@ -43,103 +33,14 @@ weights, so its retrieval numbers are meaningless — it exercises the full
 pipeline, not model quality. Point `JAMMI_AUDIO_MODEL` at a real CLAP
 checkpoint for real numbers.
 
-## What `example.py` does
-
-1. Connects to a temporary artifact dir
-2. Reads the 20 committed mono WAV clips under
-   `cookbook/fixtures/tiny_audio_corpus/` into a Parquet `corpus` source
-   (`clip_id`, `audio` bytes)
-3. `db.generate_embeddings(source="corpus", model=MODEL, columns=["audio"], key="clip_id", modality="audio")`
-4. `db.encode_query(model=MODEL, query=wav_bytes, modality="audio")` → `db.search("corpus", query=vec, k=5)` (returns a `pyarrow.Table`)
-5. Builds the audio-query golden source from `tiny_audio_golden.json` and calls
-   `db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)`
-6. Prints the base aggregate Recall@K / precision@K / MRR / nDCG and the
-   per-query records. It **reports** the metrics; it does **not** assert a
-   quality bar.
-7. Builds synthetic `(anchor, positive, negative)` audio triplets from the
-   corpus (positive = same timbre family, negative = a different family) and
-   calls
-   `db.fine_tune(source="triplets", base_model=MODEL, columns=["anchor","positive","negative"], method="lora", task="audio_embedding", ...)`.
-   Empty `target_modules` ⇒ a trainable **projection head on the frozen CLAP
-   audio tower** (the cheap, low-risk lightweight mode). It then re-embeds the
-   corpus with the tuned model, re-evals, and prints base-vs-tuned metrics for
-   narrative. For correctness it re-encodes the **same** query clip through the
-   tuned model and asserts the **embedding vector** changed (max elementwise
-   `|Δ| > 1e-4` versus the base encoding) — the real invariant fine-tuning
-   guarantees, and a deterministic check. (Asserting on the coarse top-k metrics
-   instead is flaky: on this tiny eval set the rankings rarely flip even when the
-   vectors move.) It proves the adapter alters audio retrieval — not that it
-   improves it; the random-weight fixture's direction is not meaningful, real
-   lift comes from a real checkpoint.
-8. Runs the **other** fine-tune mode on the same triplets:
-   `target_modules=["query", "value", "linear1"]` puts LoRA **inside the
-   HTSAT-Swin tower** itself — `query`/`value` are the Swin blocks' attention
-   projections (indexed by stage), `linear1` the audio projection head's first
-   linear (an unindexed site). It re-encodes the same query clip through the
-   adapted model and asserts the same `|Δ| > 1e-4` change.
-9. Submits one more job with `target_modules=["q_proj"]` — a real selector on
-   plenty of decoder checkpoints and on **nothing** in an HTSAT-Swin tower —
-   and asserts `job.wait()` raises `jammi.errors.TrainingError` whose message
-   echoes `q_proj` *and* names this tower's real sites (`query`, `linear1`, …).
-   It prints the message.
-
-### What each leg proves, and the honesty rule
-
-Both fine-tune legs ship and both are real; they are different capabilities:
-
-- **The projection-head leg** (empty `target_modules`) trains a new map on top
-  of a tower whose weights never move — cheap, low-risk, no site names needed.
-- **The tower leg** (non-empty `target_modules`) moves the tower's own
-  representation — more capacity for a domain the base checkpoint never saw, at
-  more compute, and it needs the site vocabulary of *this* architecture.
-
-Both prove the adapter is trained *and applied when the model is served*: an
-adapter that trained but was silently dropped at serve time leaves the two query
-vectors bit-identical, and that is what the `|Δ|` check catches. Both assert
-**change, not improvement** — the default fixture has **random weights**, so the
-*direction* of the change carries no information.
-
-What neither leg can check from here is the saved adapter's *kind* — that it is
-an encoder-adapters bundle carrying the audio tower's id. That is
-engine-internal and is pinned by the engine's own integration tests; the client
-surface (`describe_model`) reports only the model's id, backend, task and
-status, so the recipe asserts the task and leans on the `|Δ|` check for the rest.
-
-**The refusal leg** proves a selector matching no site fails the *job* rather
-than publishing an adapter that changes nothing, and that the message is
-actionable — it carries this architecture's own site names.
-
-The **independently-known improvement number** — tuned retrieval quality beating
-the base by a measured margin — is not this recipe's to claim. It needs a real
-checkpoint and a committed GPU-produced cache, and no chapter measures it. A
-recipe running a random-weight
-fixture on a laptop can honestly prove mechanism; it cannot prove quality.
-
-The pairing semantics (what a "positive" *means*) are the caller's training
-data, not the trainer's: the trainer only minimizes the contrastive triplet
-loss over whatever clips you pair.
-
-## Stepwise scripts
-
-`example.py` runs every phase in one process (this is the version wired into
-`tests/cookbook_smoke.py`). The numbered scripts decompose the search-and-eval
-flow and share a persistent workdir, so run them in order:
-
-```bash
-python cookbook/recipes/audio_search/01-load-corpus.py
-python cookbook/recipes/audio_search/02-generate-embeddings.py
-python cookbook/recipes/audio_search/03-search.py
-python cookbook/recipes/audio_search/04-eval.py
-```
-
 ## API surface exercised
 
-- `Database.generate_embeddings(*, source, model, columns, key, modality="audio")`
-- `Database.encode_query(*, model, query, modality="audio")` → `list[float]`
-- `Database.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
-- `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
-- `Database.fine_tune(*, source, base_model, columns, method, task="audio_embedding", target_modules=[...], ...)` → `TrainingJob`
-- `Database.describe_model(model_id)` → `dict | None`
+- `Session.generate_embeddings(*, source, model, columns, key, modality="audio")`
+- `Session.encode_query(*, model, query, modality="audio")` → `list[float]`
+- `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
+- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
+- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Session.describe_model(model_id)` → `dict | None`
 
 ### Audio triplet schema (fine-tune input)
 
@@ -205,4 +106,5 @@ bytes.
 python cookbook/recipes/audio_search/example.py
 ```
 
-Exits 0 on success, prints the top-K and the metrics dict + `audio_search: OK`.
+It prints the top five, the base and tuned retrieval metrics, how far each
+adaptation moved the query's vector, and the refusal's message.

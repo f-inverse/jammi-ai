@@ -81,7 +81,7 @@ selects (the BM25 query is intersected with them, their scores unchanged).
 ```python
 hits = db.lexical_search("patents", text="quantum error correction", k=10,
                          filter="year >= 2021")
-print(hits.select(["id", "title", "bm25_score", "bm25_rank"]).to_pandas())
+print(hits.select(["id", "title", "bm25_score", "bm25_rank"]))
 ```
 
 ### Rust

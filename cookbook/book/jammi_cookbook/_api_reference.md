@@ -52,8 +52,8 @@ the committed cache and runs `file://` on CPU.
 - `db.sql(query) -> pyarrow.Table` · `db.encode_query(*, model, query, modality=None, dimensions=None) -> list[float]` — `dimensions` encodes to the model's leading coordinates, renormalised, to search a table generated at the same width. On a `RemoteDatabase`, `db.sql()` runs over the Flight SQL lane (`pyarrow.flight`) and carries the connection's bearer credential on that lane.
 - `db.rrf_fuse(ranked_lists, *, k_rrf=None) -> list[(str, float)]`
 
-A registered file source is queried as `<source>.public.<source>`
-(catalog.schema.table). An engine-produced embedding table is queried as
+A registered file source is queried as `<source>.public.<table>`
+(catalog.schema.table), the table being the file's name without its extension. An engine-produced embedding table is queried as
 `"jammi.<table>"` (a quoted single identifier).
 
 ## Tier 01 — Construct

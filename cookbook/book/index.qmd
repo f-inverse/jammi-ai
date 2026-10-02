@@ -34,7 +34,7 @@ runs the same code over the published datasets and real encoders, on a GPU.
 ## The path
 
 Start with the quickstart; after it, each part stands on its own. A part's short
-recipes show a capability's core verb in one program; its chapters take a
+recipes walk a capability's verbs one step at a time; its chapters take a
 capability deep and measure it.
 
 | Part | What you learn |

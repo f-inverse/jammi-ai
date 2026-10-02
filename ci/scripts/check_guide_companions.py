@@ -57,7 +57,7 @@ RECIPE_URL = re.compile(
 LINK = re.compile(r"\]\(([^)\s]+)\)")
 SUMMARY_ENTRY = re.compile(r"^\s*-\s*\[[^\]]*\]\(\./([^)]+)\)")
 RENDERED_CHAPTER = re.compile(r"^\s*-\s*chapters/(\S+)\.qmd\s*$")
-SMOKE_RECIPE = re.compile(r"\b(?:example|stepwise)\(\s*\"([a-z0-9_]+)\"")
+SMOKE_RECIPE = re.compile(r"\bexample\(\s*\"([a-z0-9_]+)\"")
 SMOKE_QUICKSTART = re.compile(r"COOKBOOK\s*/\s*\"quickstart\"")
 
 

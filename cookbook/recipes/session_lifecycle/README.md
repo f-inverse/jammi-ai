@@ -6,12 +6,6 @@ timeout scanner force-closes a session past its deadline. Every transition
 publishes to the `jammi.audit.session_lifecycle.v1` trigger topic, giving an
 audit-log aggregator durable proof that the data was deleted.
 
-Run it:
-
-```bash
-python cookbook/recipes/session_lifecycle/example.py
-```
-
 ## When to use it
 
 Use an ephemeral session for sensitive transient data that must not outlive the
@@ -28,18 +22,11 @@ ordinary mutable tables. The pattern is: keep the *throwaway working set*
 *lineage* (hashes, ids, scores) to a persistent table — before you close the
 session, while the working data still exists.
 
-## API
+## Run it
 
-```python
-with db.ephemeral_session(timeout_seconds=3600) as ephem:
-    ephem.create_ephemeral_table("imgs", schema=schema, primary_key=["image_id"])
-    ephem.insert("imgs", batch=table)
-    rows = ephem.sql("imgs", "SELECT image_hash FROM {table}")
-# close() runs on exit: tables dropped, `closed` event published
+```bash
+python cookbook/recipes/session_lifecycle/example.py
 ```
 
-`{table}` in a `sql` query is replaced by the tenant-scoped reference to the
-named ephemeral table. The context manager is the recommended path; `Drop` is
-best-effort. Lifecycle events (`opened`, `closed`, `timed_out`,
-`partial_deletion_failure`) carry the session id, tenant, table count, and
-deleted-row count.
+It prints the rows held during the session, the lineage that outlives it, and
+the lifecycle events that prove the deletion.

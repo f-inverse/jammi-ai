@@ -30,6 +30,21 @@ every install instruction installs an engine that runs.
   `model-catalog`, `error-taxonomy`, `tenancy-per-verb`), and chapters no longer refer to each
   other by number. `jammi-cookbook[book]` installs everything rendering the whole book needs —
   every extra a chapter imports from — and both render workflows install it.
+- **Every recipe teaches a step at a time.** A recipe was one `main()` that its notebook and book
+  chapter ran in a single cell, after a README listing what the function did; the reader pressed
+  run once and could inspect nothing between steps. Each recipe script is now a sequence of
+  `# %%` cells — a markdown cell explaining a step, then its code — that runs top to bottom as a
+  script, and `build_notebooks.py` makes each cell a notebook cell and a chapter cell, after the
+  README's overview. The builder refuses a recipe with a `main`, or with code outside a cell. The
+  quickstart's four step pages, whose code was never run, fold into its cells — running them
+  found that a registered file reads as `<source>.public.<table>`, named after the file, not
+  `<source>.public.<source>` as the page, the mutable-tables README and the book's API reference
+  said. The image and audio recipes' numbered stepwise scripts, a second copy of the same flow,
+  are deleted. The recipe READMEs name the client's `Session`, not a `Database` class that no
+  longer exists; the search-audit recipe's lineage no longer borrows one domain's vocabulary; the
+  guide's quickstart includes the program itself, and its recipes page, which mirrored 11 of 21
+  READMEs, points at the cookbook. The README's and the guide's snippets print Arrow tables
+  without pandas, which `jammi-ai` does not install.
 - **The documentation site is a release artifact.** The site deployed the guide and API reference
   built from `main`, and the book from a nightly render kept in the Actions cache. A full cache
   evicted that render, and the next deploy published the site without its book and reported

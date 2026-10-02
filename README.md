@@ -42,7 +42,8 @@ db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="i
 
 query_vec = db.encode_query(model=MODEL, query="quantum computing applications")
 results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
-print(results.to_pandas())
+for row in results.to_pylist():
+    print(f"{row['similarity']:.3f}  {row['title']}")
 ```
 
 For runnable end-to-end recipes — mutable tables, trigger streams, eval,

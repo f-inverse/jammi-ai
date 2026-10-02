@@ -16,36 +16,42 @@ has never seen — from the task's own rows, retrieved as context.
 patients, products) with few rows each, and want a calibrated prediction
 for a new group without training a model per group.
 
-## What `example.py` does
+The program is [`cookbook/recipes/context_predictor/example.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/recipes/context_predictor/example.py); its steps run here in order.
 
-1. Builds a synthetic dataset: 16 tasks of 24 rows, each task with its own
-   level; a row's 4-dimensional features cluster by task
-2. `import_embeddings` — the features become the embedding table (bring
-   your own vectors)
-3. `train_context_predictor` — meta-train across tasks; a quarter of the
-   tasks are held out
-4. `predict_with_context_predictor` — a mean and a spread for rows of a
-   held-out task, with the context rows that informed each prediction —
-   compared with the best context-free guess, the overall mean
-
-The program is [`cookbook/recipes/context_predictor/example.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/recipes/context_predictor/example.py); it runs here as it is.
+A context predictor is trained across many small tasks at once. For a target
+row it retrieves the target's nearest neighbours (by embedding) from the same
+task, reads their outcomes, and predicts the target's outcome as a
+distribution. It never trains on the task it is asked about: the task is
+learned from the context, in one forward pass.
 
 ```{python}
-from __future__ import annotations
-
 import tempfile
 from pathlib import Path
 
-import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+import jammi
 
 TASKS = 16
 ROWS_PER_TASK = 24
 DIM = 4
 
+home = Path(tempfile.mkdtemp())
+db = jammi.connect(f"file://{home}/engine")
+```
 
+## A synthetic meta-dataset
+
+16 tasks of 24 rows. Each task has its own level, and every row's outcome
+`y` is the task's level plus a little noise. A row's 4-dimensional features
+cluster around its task's centroid, so its nearest neighbours are rows of
+its own task. A predictor that learned to read the level off the context
+can predict rows of a task it has never seen, where the best any
+context-free model can do is the overall mean.
+
+```{python}
 def meta_dataset(seed: int = 0) -> tuple[pa.Table, pa.Table]:
     """The source rows `(_row_id, task, y)` and their feature vectors
     `(_row_id, vector)`, keyed by one identity."""
@@ -71,65 +77,80 @@ def meta_dataset(seed: int = 0) -> tuple[pa.Table, pa.Table]:
     return source, vectors
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}/engine") as db:
-        source, vectors = meta_dataset()
-        pq.write_table(source, Path(tmp) / "rows.parquet")
-        pq.write_table(vectors, Path(tmp) / "features.parquet")
-        db.add_source("rows", url=str(Path(tmp) / "rows.parquet"), format="parquet")
+source, vectors = meta_dataset()
+pq.write_table(source, home / "rows.parquet")
+pq.write_table(vectors, home / "features.parquet")
+db.add_source("rows", url=str(home / "rows.parquet"), format="parquet")
+```
 
-        # 1. The features ARE the embedding: imported, not computed.
-        db.import_embeddings(
-            source="rows",
-            model="synthetic-features",
-            vectors_url=str(Path(tmp) / "features.parquet"),
-            key="_row_id",
-            dimensions=DIM,
-        )
+## Bring your own vectors
 
-        # 2. Meta-train. Tasks (not rows) are split into train and held-out
-        #    test, so the test tasks are unseen at training time.
-        job = db.train_context_predictor(
-            "rows",
-            key_column="_row_id",
-            task_column="task",
-            value_column="y",
-            context_k=8,
-            hidden_dim=32,
-            num_heads=2,
-            epochs=60,
-            test_task_fraction=0.25,
-            seed=0,
-        )
-        job.wait()
-        model_id = job.output_model_id
-        print(f"trained {model_id}; final loss {job.metrics()['final_loss']:.3f}")
+Here the features are the embedding. `import_embeddings` makes them the
+source's embedding table, keyed like its rows, instead of computing one.
 
-        # 3. Predict rows of the last task — held out, never trained on — and
-        #    compare with the best context-free guess, the overall mean.
-        truth = {r["_row_id"]: r["y"] for r in source.to_pylist()}
-        overall = float(np.mean(list(truth.values())))
-        errors, baseline = [], []
-        for r in range(6):
-            key = f"t{TASKS - 1:02d}_r{r:02d}"
-            prediction = db.predict_with_context_predictor(
-                model_id, source="rows", target_key=key
-            )
-            mean, std = prediction["mean"], prediction["std"]
-            print(
-                f"{key}: y={truth[key]:+.2f}  predicted {mean:+.2f} ± {std:.2f}  "
-                f"(context: {len(prediction['context_ref'])} rows, via {prediction['source']})"
-            )
-            errors.append(abs(mean - truth[key]))
-            baseline.append(abs(overall - truth[key]))
-        print(
-            f"mean absolute error on the held-out task: {np.mean(errors):.3f} "
-            f"(overall mean as the guess: {np.mean(baseline):.3f})"
-        )
-        assert np.mean(errors) < np.mean(baseline), "the context beats no context"
-    return 0
+```{python}
+db.import_embeddings(
+    source="rows",
+    model="synthetic-features",
+    vectors_url=str(home / "features.parquet"),
+    key="_row_id",
+    dimensions=DIM,
+)
+```
+
+## Meta-train
+
+`train_context_predictor` is a job. It splits tasks, not rows, into train
+and held-out test, so the test tasks are unseen at training time;
+`context_k` is how many neighbours each prediction reads.
+
+```{python}
+job = db.train_context_predictor(
+    "rows",
+    key_column="_row_id",
+    task_column="task",
+    value_column="y",
+    context_k=8,
+    hidden_dim=32,
+    num_heads=2,
+    epochs=60,
+    test_task_fraction=0.25,
+    seed=0,
+)
+job.wait()
+model_id = job.output_model_id
+print(f"trained {model_id}; final loss {job.metrics()['final_loss']:.3f}")
+```
+
+## Predict a task it never saw
+
+`predict_with_context_predictor` returns a mean and a spread for one row,
+with the context rows that informed it. The rows come from the last task,
+held out from training, and the errors are compared with the best
+context-free guess, the overall mean.
+
+```{python}
+truth = {r["_row_id"]: r["y"] for r in source.to_pylist()}
+overall = float(np.mean(list(truth.values())))
+errors, baseline = [], []
+for r in range(6):
+    key = f"t{TASKS - 1:02d}_r{r:02d}"
+    prediction = db.predict_with_context_predictor(model_id, source="rows", target_key=key)
+    mean, std = prediction["mean"], prediction["std"]
+    print(
+        f"{key}: y={truth[key]:+.2f}  predicted {mean:+.2f} ± {std:.2f}  "
+        f"(context: {len(prediction['context_ref'])} rows, via {prediction['source']})"
+    )
+    errors.append(abs(mean - truth[key]))
+    baseline.append(abs(overall - truth[key]))
+
+print(
+    f"mean absolute error on the held-out task: {np.mean(errors):.3f} "
+    f"(overall mean as the guess: {np.mean(baseline):.3f})"
+)
+assert np.mean(errors) < np.mean(baseline), "the context beats no context"
 ```
 
 ```{python}
-assert main() == 0
+db.close()
 ```

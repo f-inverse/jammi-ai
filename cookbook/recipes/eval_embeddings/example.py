@@ -1,11 +1,10 @@
-"""Measure recall@k / nDCG of a vector index against a golden relevance set.
+"""Measure recall@k, precision@k, MRR and nDCG of an embedding table against a golden set.
 
-Run with `python cookbook/recipes/eval_embeddings/example.py`. Exits 0 on
-success.
+Run with `python cookbook/recipes/eval_embeddings/example.py`, or a step at a
+time as a notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
-
+# %%
 import csv
 import json
 import tempfile
@@ -14,116 +13,113 @@ from pathlib import Path
 import jammi
 from jammi_cookbook import fixtures
 
-CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
-GOLDEN_PATH = fixtures.path("tiny_golden.json")
 MODEL = fixtures.model("tiny_bert")
 
+home = Path(tempfile.mkdtemp())
+db = jammi.connect(f"file://{home}")
 
-def expand_golden_to_csv(json_path: Path, out_path: Path) -> None:
-    """Flatten the per-query-with-list-of-relevant-ids JSON into the
-    one-row-per-(query, relevant_id) CSV that `eval_embeddings` ingests.
-    """
-    queries = json.loads(json_path.read_text())
-    with out_path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["query_id", "query_text", "relevant_id"])
-        for q in queries:
-            for rid in q["relevant_ids"]:
-                writer.writerow([q["query_id"], q["query_text"], str(rid)])
+# %% [markdown]
+# ## Embed the corpus
+#
+# The table under evaluation: 32-dimensional embeddings of the corpus's
+# `content`.
 
+# %%
+db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
+base = db.generate_embeddings(
+    source="corpus", model=MODEL, columns=["content"], key="id", modality="text"
+)
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
-        tmp_path = Path(tmp)
+# %% [markdown]
+# ## The golden set
+#
+# Relevance judgments: for each query, the corpus rows that should come back.
+# `eval_embeddings` reads them as a source with one row per
+# `(query_id, query_text, relevant_id)`, so the committed JSON, one entry per
+# query with a list of relevant ids, is flattened into that shape first.
 
-        # 1. Register the corpus and build the embedding index.
-        db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
-        base = db.generate_embeddings(
-            source="corpus",
-            model=MODEL,
-            columns=["content"],
-            key="id",
-            modality="text",
-        )
+# %%
+golden_csv = home / "golden.csv"
+with golden_csv.open("w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["query_id", "query_text", "relevant_id"])
+    for q in json.loads(fixtures.path("tiny_golden.json").read_text()):
+        for rid in q["relevant_ids"]:
+            writer.writerow([q["query_id"], q["query_text"], str(rid)])
 
-        # 2. Expand the JSON golden set into the CSV shape eval_embeddings
-        #    consumes, then register it as a source.
-        golden_csv = tmp_path / "golden.csv"
-        expand_golden_to_csv(GOLDEN_PATH, golden_csv)
-        db.add_source("golden", url=str(golden_csv), format="csv")
+db.add_source("golden", url=str(golden_csv), format="csv")
 
-        # 3. Run the retrieval eval.
-        metrics = db.eval_embeddings(
-            source="corpus",
-            golden_source="golden.public.golden",
-            k=5,
-        )
+# %% [markdown]
+# ## Evaluate
+#
+# `eval_embeddings` encodes every query with the table's own model, searches
+# the source's embedding table to depth `k`, and scores the ranking against
+# the judgments. `aggregate` holds the means over the queries; `per_query`
+# holds each query's own scores.
 
-        # 4. Sanity-check every aggregate metric is in [0, 1].
-        aggregate = metrics["aggregate"]
-        print("aggregate:")
-        for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
-            value = aggregate[key]
-            assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
-            print(f"  {key:<16} {value:.4f}")
+# %%
+metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
 
-        # 5. Drill into the per-query records (one entry per golden-set query).
-        per_query = metrics["per_query"]
-        assert len(per_query) > 0, "per_query must carry one record per query"
-        first = per_query[0]
-        assert first["query_id"], "per_query records carry the golden-set query_id"
-        print(f"per_query: {len(per_query)} records (first: {first['query_id']})")
+aggregate = metrics["aggregate"]
+for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
+    assert 0.0 <= aggregate[key] <= 1.0, f"{key} out of range: {aggregate[key]}"
+    print(f"{key:<16} {aggregate[key]:.4f}")
 
-        # 6. Per-query results are also persisted in the catalog, keyed by the
-        #    run's eval_run_id. Read them back to inspect Recall@{1,3,5,10},
-        #    MRR, nDCG, and distance for each query — and any cohort tags you
-        #    attached at eval time (see step 7).
-        eval_run_id = metrics["eval_run_id"]
-        persisted = db.eval_per_query(eval_run_id)
-        assert len(persisted) == len(per_query), "one persisted row per query"
-        row = persisted[0]
-        for key in ("recall@1", "recall@3", "recall@5", "recall@10", "mrr", "ndcg", "distance"):
-            assert key in row["metrics"], f"persisted metric '{key}' present"
-        print(f"persisted per-query rows: {len(persisted)} (run {eval_run_id})")
+per_query = metrics["per_query"]
+assert len(per_query) > 0, "per_query must carry one record per query"
+assert per_query[0]["query_id"], "per_query records carry the golden-set query_id"
+print(f"per_query: {len(per_query)} records (first: {per_query[0]['query_id']})")
 
-        # 7. Optional: attach opaque cohort tags per query_id so you can later
-        #    aggregate quality by segment. The substrate stores them verbatim;
-        #    it never interprets the keys/values.
-        tagged = db.eval_embeddings(
-            source="corpus",
-            golden_source="golden.public.golden",
-            k=5,
-            cohorts={"q1": {"split": "val"}},
-        )
-        tagged_rows = db.eval_per_query(tagged["eval_run_id"])
-        by_query = {r["query_id"]: r for r in tagged_rows}
-        if "q1" in by_query:
-            assert by_query["q1"]["cohorts"].get("split") == "val", "cohort stored verbatim"
-            print("cohort tag round-trip: OK (q1 -> {'split': 'val'})")
+# %% [markdown]
+# ## The run is kept
+#
+# Each run's per-query results are stored in the catalog under its
+# `eval_run_id`, with recall at 1, 3, 5 and 10, MRR, nDCG and distance for
+# each query. `eval_per_query` reads them back.
 
-        # 8. Compare two embedding tables on the same golden set: the base
-        #    embeddings, and the same embeddings smoothed over the corpus's own
-        #    k-NN graph. The first table is the baseline; every other entry
-        #    carries its per-metric delta against it.
-        graph = db.build_neighbor_graph("corpus", k=3, exact=True)
-        smoothed = db.propagate_embeddings(
-            "corpus", embedding_table=base, edge_graph_table=graph, hops=1, alpha=0.5
-        )
-        compared = db.eval_compare(
-            embedding_tables=[base, smoothed],
-            source="corpus",
-            golden_source="golden.public.golden",
-            k=5,
-        )
-        baseline, candidate = compared["per_table"]
-        assert baseline["delta"] is None
-        base_recall = baseline["embedding_eval"]["aggregate"]["recall_at_k"]
-        recall_delta = candidate["delta"]["recall_at_k"]["absolute"]
-        print(f"compare: base recall@5 {base_recall:.4f}; smoothed Δ {recall_delta:+.4f}")
+# %%
+eval_run_id = metrics["eval_run_id"]
+persisted = db.eval_per_query(eval_run_id)
+assert len(persisted) == len(per_query), "one persisted row per query"
+for key in ("recall@1", "recall@3", "recall@5", "recall@10", "mrr", "ndcg", "distance"):
+    assert key in persisted[0]["metrics"], f"persisted metric '{key}' present"
+print(f"persisted per-query rows: {len(persisted)} (run {eval_run_id})")
 
-    print("eval_embeddings: OK")
-    return 0
+# %% [markdown]
+# ## Tag queries by cohort
+#
+# `cohorts` attaches tags to queries by id, so quality can later be broken
+# down by segment. The engine stores them as given and never interprets them.
 
+# %%
+tagged = db.eval_embeddings(
+    source="corpus", golden_source="golden.public.golden", k=5, cohorts={"q1": {"split": "val"}}
+)
+by_query = {r["query_id"]: r for r in db.eval_per_query(tagged["eval_run_id"])}
+assert by_query["q1"]["cohorts"].get("split") == "val", "cohort stored verbatim"
+print(f"q1 cohorts: {by_query['q1']['cohorts']}")
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %% [markdown]
+# ## Compare two tables
+#
+# `eval_compare` scores several embedding tables on one golden set. The first
+# is the baseline, and every other carries its per-metric delta against it.
+# Here the candidate is the same embeddings smoothed over the corpus's own
+# k-nearest-neighbour graph.
+
+# %%
+graph = db.build_neighbor_graph("corpus", k=3, exact=True)
+smoothed = db.propagate_embeddings(
+    "corpus", embedding_table=base, edge_graph_table=graph, hops=1, alpha=0.5
+)
+compared = db.eval_compare(
+    embedding_tables=[base, smoothed], source="corpus", golden_source="golden.public.golden", k=5
+)
+baseline, candidate = compared["per_table"]
+assert baseline["delta"] is None
+base_recall = baseline["embedding_eval"]["aggregate"]["recall_at_k"]
+recall_delta = candidate["delta"]["recall_at_k"]["absolute"]
+print(f"base recall@5 {base_recall:.4f}; smoothed Δ {recall_delta:+.4f}")
+
+# %%
+db.close()

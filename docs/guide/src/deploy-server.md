@@ -41,7 +41,7 @@ info = client.get_flight_info(
 )
 reader = client.do_get(info.endpoints[0].ticket)
 table = reader.read_all()
-print(table.to_pandas())
+print(table)
 ```
 
 ### Query embedding tables

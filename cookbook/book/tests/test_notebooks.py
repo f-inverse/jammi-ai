@@ -49,22 +49,25 @@ BIB = r"""
 
 RECIPE = '''"""Widgets: make one.
 
-It is made in a moment.
-
 Run with `python cookbook/recipes/widgets/example.py`.
 """
 
-from __future__ import annotations
-
+# %%
 import jammi
 
+db = jammi.connect("file:///tmp/widgets")
 
-def main() -> int:
-    return 0
+# %% [markdown]
+# ## Make a widget
+#
+# One call, from [the fixture](../../fixtures/widget.csv).
 
+# %%
+widget = db.sql("SELECT 1 AS widget")
+assert widget.num_rows == 1
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()
 '''
 
 
@@ -142,21 +145,29 @@ def test_the_setup_installs_the_extras_the_code_needs():
     assert "jammi-cookbook[postgres] @ git+" in fleet
 
 
-def test_a_recipe_is_its_readme_its_body_and_a_run_of_main(tree):
+def test_a_recipe_is_its_readme_then_its_steps(tree):
     script = tree / "cookbook" / "recipes" / "widgets" / "example.py"
     target, nb = build.recipe_notebook(build.read_recipe(script), "9.9.9")
     assert target.name == "widgets.ipynb"
+    kinds = [c["cell_type"] for c in nb["cells"]]
     texts = [_text(c) for c in nb["cells"]]
     assert texts[0].startswith("# Widgets: make one\n")
     # The README's prose, its relative link resolved to GitHub, its
     # command-line "Run it" section dropped.
     assert texts[2] == ("It is made in a moment, from [the fixture]("
                         "https://github.com/f-inverse/jammi-ai/blob/main/cookbook/fixtures/widget.csv).")
-    assert texts[3].startswith("from __future__ import annotations") and "__main__" not in texts[3]
-    assert texts[4] == "assert main() == 0"
+    # Then the script's cells in order: the docstring is not one, a markdown
+    # cell loses its comment markers and resolves its links, a code cell is
+    # the code as written.
+    assert kinds[3:] == ["code", "markdown", "code", "code"]
+    assert texts[3] == 'import jammi\n\ndb = jammi.connect("file:///tmp/widgets")'
+    assert texts[4] == ("## Make a widget\n\nOne call, from [the fixture]("
+                        "https://github.com/f-inverse/jammi-ai/blob/main/cookbook/fixtures/widget.csv).")
+    assert texts[5] == 'widget = db.sql("SELECT 1 AS widget")\nassert widget.num_rows == 1'
+    assert texts[6] == "db.close()"
 
 
-def test_a_recipe_is_also_a_book_chapter_that_runs_it_whole(tree):
+def test_a_recipe_is_also_a_book_chapter_that_runs_its_steps_in_order(tree):
     script = tree / "cookbook" / "recipes" / "widgets" / "example.py"
     target, qmd = build.recipe_chapter(build.read_recipe(script))
     assert target == tree / "cookbook" / "book" / "chapters" / "recipes" / "widgets.qmd"
@@ -165,18 +176,24 @@ def test_a_recipe_is_also_a_book_chapter_that_runs_it_whole(tree):
     assert "cookbook/recipes/widgets/example.py" in qmd
     cells = re.findall(r"```\{python\}\n(.*?)```", qmd, re.S)
     assert cells[0].endswith("import jammi_cookbook  # noqa: F401\n")
-    assert cells[1].startswith("from __future__ import annotations") and "__main__" not in cells[1]
-    assert cells[2] == "assert main() == 0\n"
+    assert cells[1:] == ['import jammi\n\ndb = jammi.connect("file:///tmp/widgets")\n',
+                         'widget = db.sql("SELECT 1 AS widget")\nassert widget.num_rows == 1\n',
+                         "db.close()\n"]
+    assert qmd.index("## Make a widget") < qmd.index("widget = db.sql")
 
 
-def test_a_recipe_whose_main_returns_nothing_is_refused(tree):
+@pytest.mark.parametrize("shape, message", [
+    ('def main() -> int:\n    return 0\n\n\n'
+     'if __name__ == "__main__":\n    raise SystemExit(main())\n',
+     "not a `main` it calls"),
+    ("import jammi\n\n# %%\ndb = None\n", "belongs to a `# %%` cell"),
+    ("# %% [markdown]\n# Prose.\nx = 1\n", "comment lines only"),
+    ("# %%\n\n# %%\nx = 1\n", "a cell is empty"),
+])
+def test_a_recipe_that_is_not_a_sequence_of_cells_is_refused(tree, shape, message):
     script = tree / "cookbook" / "recipes" / "widgets" / "example.py"
-    returns_nothing = RECIPE.replace(
-        "def main() -> int:\n    return 0", "def main() -> None:\n    pass"
-    )
-    assert returns_nothing != RECIPE
-    script.write_text(returns_nothing)
-    with pytest.raises(ValueError, match="returns its exit status"):
+    script.write_text('"""Widgets."""\n\n' + shape)
+    with pytest.raises(ValueError, match=message):
         build.read_recipe(script)
 
 

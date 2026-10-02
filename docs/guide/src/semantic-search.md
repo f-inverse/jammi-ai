@@ -38,7 +38,7 @@ let results = session.search("patents", query, 10, None, SearchMethod::default()
 query_vec = db.encode_query(model="sentence-transformers/all-MiniLM-L6-v2", query="quantum computing applications")
 
 results = db.search("patents", query=query_vec, k=10)  # pyarrow.Table
-print(results.to_pandas())
+print(results)
 ```
 
 ## What search returns

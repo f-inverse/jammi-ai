@@ -10,26 +10,16 @@ caching enriched rows, holding cursor state, recording user feedback, or
 any "small table I want to UPDATE / DELETE / INSERT from SQL" workload —
 without standing up an external Postgres.
 
-## What `example.py` does
-
-1. Connects to a temporary artifact dir
-2. Creates a `notes` mutable table with an `int64` primary key + `utf8`
-   body column
-3. Inserts three rows through DataFusion DML (`INSERT INTO ...`)
-4. Verifies count and ordering via `SELECT`
-5. Drops the table, then asserts a `SELECT` after the drop raises
-6. Demonstrates the idempotent `drop_mutable_table(..., if_exists=True)`
-
 ## API surface exercised
 
-- `Database.create_mutable_table(name, *, schema, primary_key, ...)`
-- `Database.sql("INSERT INTO mutable.public.<name> ...")`
-- `Database.sql("SELECT ... FROM mutable.public.<name>")`
-- `Database.drop_mutable_table(name, *, if_exists=False)`
+- `Session.create_mutable_table(name, *, schema, primary_key, ...)`
+- `Session.sql("INSERT INTO mutable.public.<name> ...")`
+- `Session.sql("SELECT ... FROM mutable.public.<name>")`
+- `Session.drop_mutable_table(name, *, if_exists=False)`
 
 The DataFusion namespace for mutable tables is always
 `mutable.public.<name>` — distinct from registered sources, which live
-under `<source>.public.<source>`.
+under `<source>.public.<table>`, the table named after the file.
 
 ## Run it
 
@@ -37,4 +27,4 @@ under `<source>.public.<source>`.
 python cookbook/recipes/mutable_tables/example.py
 ```
 
-Exits 0 on success, prints `mutable_tables: OK` on the last line.
+It prints the three rows it wrote, then the error SQL raises once the table is gone.

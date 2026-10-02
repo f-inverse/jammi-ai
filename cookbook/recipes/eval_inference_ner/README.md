@@ -8,21 +8,9 @@ gold span per row) and you want strict entity-level precision, recall,
 and F1 — both overall and per entity type — to compare two NER models
 or to track regressions on the same one.
 
-## What `example.py` does
-
-1. Connects to a temporary artifact dir
-2. Registers `tiny_ner_corpus.parquet` as `corpus` (parquet)
-3. Registers `tiny_ner_gold.csv` as `golden` (csv) — one row per gold
-   entity span: `(id, label, start, end)`
-4. Runs `db.eval_inference` with the local `tiny_modernbert_ner`
-   fixture against the `text` column, `task="ner"`
-5. Prints the returned aggregate `precision`, `recall`, `f1`, the
-   per-type breakdown, and the count of per-record predictions
-6. Asserts every reported rate is in `[0.0, 1.0]`
-
 ## API surface exercised
 
-- `Database.eval_inference(*, model, source, columns, task, golden_source, label_column)`
+- `Session.eval_inference(*, model, source, columns, task, golden_source, label_column)`
 
 The returned dict carries `aggregate` (tagged by `"task"` — `"ner"` for
 this recipe) with `precision`, `recall`, `f1`, and `per_type` (one
@@ -62,4 +50,4 @@ from the metric (same alignment rule the classification recipe uses).
 python cookbook/recipes/eval_inference_ner/example.py
 ```
 
-Exits 0 on success, prints the metrics dict + `eval_inference (ner): OK`.
+It prints precision, recall and F1, overall and per entity type.

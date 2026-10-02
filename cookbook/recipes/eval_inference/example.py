@@ -1,83 +1,87 @@
-"""Measure classification accuracy / F1 against gold labels.
+"""Score a classifier against gold labels: accuracy, macro F1, per class.
 
-Run with `python cookbook/recipes/eval_inference/example.py`. Exits 0 on
-success.
+Run with `python cookbook/recipes/eval_inference/example.py`, or a step at a
+time as a notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
-
+# %%
 import tempfile
-from pathlib import Path
 
 import jammi
 from jammi_cookbook import fixtures
 
-CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
-LABELS_PATH = fixtures.path("tiny_labels.csv")
 MODEL = fixtures.model("tiny_modernbert_classifier")
 
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
+# %% [markdown]
+# ## Register the corpus and the gold labels
+#
+# The gold source is one `(id, label)` row per labelled corpus row.
 
-        # 1. Register the corpus and the gold labels.
-        db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
-        db.add_source("golden", url=str(LABELS_PATH), format="csv")
+# %%
+db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
+db.add_source("golden", url=str(fixtures.path("tiny_labels.csv")), format="csv")
 
-        # 2. Run inference + eval against the gold labels.
-        metrics = db.eval_inference(
-            model=MODEL,
-            source="corpus",
-            columns=["content"],
-            task="classification",
-            golden_source="golden.public.tiny_labels",
-            label_column="label",
-        )
+# %% [markdown]
+# ## Run the classifier and score it
+#
+# `eval_inference` runs the model over `columns`, aligns each prediction with
+# its gold label by `id`, and returns the scores: `aggregate` holds accuracy
+# and macro F1 (F1 averaged over the classes), tagged with the task.
 
-        # 3. Sanity-check the aggregate metrics. `f1` is macro F1 averaged
-        #    across classes. The aggregate is tagged by task kind.
-        aggregate = metrics["aggregate"]
-        assert aggregate["task"] == "classification", aggregate["task"]
-        for key in ("accuracy", "f1"):
-            value = aggregate[key]
-            assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
+# %%
+metrics = db.eval_inference(
+    model=MODEL,
+    source="corpus",
+    columns=["content"],
+    task="classification",
+    golden_source="golden.public.tiny_labels",
+    label_column="label",
+)
 
-        # 4. Per-class metrics live under `aggregate.per_class` — dict keyed
-        #    by label.
-        per_class = aggregate.get("per_class", {})
-        assert isinstance(per_class, dict), f"per_class shape: {type(per_class)}"
+aggregate = metrics["aggregate"]
+assert aggregate["task"] == "classification", aggregate["task"]
+for key in ("accuracy", "f1"):
+    assert 0.0 <= aggregate[key] <= 1.0, f"{key} out of range: {aggregate[key]}"
+print(f"accuracy:  {aggregate['accuracy']:.4f}")
+print(f"macro_f1:  {aggregate['f1']:.4f}")
 
-        # 5. Per-record predictions live under `per_record` (one entry per
-        #    aligned predicted/gold pair).
-        per_record = metrics["per_record"]
-        assert len(per_record) > 0, "per_record must carry one entry per aligned row"
+# %% [markdown]
+# ## Read the breakdowns
+#
+# `aggregate["per_class"]` scores each label on its own; `per_record` holds one
+# aligned prediction and gold label per row.
 
-        print(f"accuracy:  {aggregate['accuracy']:.4f}")
-        print(f"macro_f1:  {aggregate['f1']:.4f}")
-        print("per_class:")
-        for label, stats in per_class.items():
-            print(
-                f"  {label:<12} precision={stats['precision']:.4f}"
-                f"  recall={stats['recall']:.4f}  f1={stats['f1']:.4f}"
-            )
-        print(f"per_record: {len(per_record)} predictions")
+# %%
+per_class = aggregate.get("per_class", {})
+assert isinstance(per_class, dict), f"per_class shape: {type(per_class)}"
+for label, stats in per_class.items():
+    print(
+        f"{label:<12} precision={stats['precision']:.4f}"
+        f"  recall={stats['recall']:.4f}  f1={stats['f1']:.4f}"
+    )
 
-        # 6. The predictions themselves, without the gold labels: `infer` runs
-        #    the model over the source and returns one row per source row,
-        #    keyed by `id`, with the model's outputs as columns.
-        predictions = db.infer(
-            source="corpus",
-            model=MODEL,
-            columns=["content"],
-            task="classification",
-            key="id",
-        )
-        assert predictions.num_rows == 20, predictions.num_rows
-        print(f"infer: {predictions.num_rows} rows, columns {predictions.column_names}")
+per_record = metrics["per_record"]
+assert len(per_record) > 0, "per_record must carry one entry per aligned row"
+print(f"{len(per_record)} rows scored; the first: {per_record[0]}")
 
-    print("eval_inference: OK")
-    return 0
+# %% [markdown]
+# ## The predictions alone
+#
+# Without gold labels, `infer` runs the model over a source and returns one
+# row per source row, keyed by `key`, with the model's outputs as columns.
 
+# %%
+predictions = db.infer(
+    source="corpus",
+    model=MODEL,
+    columns=["content"],
+    task="classification",
+    key="id",
+)
+assert predictions.num_rows == 20, predictions.num_rows
+print(f"{predictions.num_rows} rows, columns {predictions.column_names}")
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()

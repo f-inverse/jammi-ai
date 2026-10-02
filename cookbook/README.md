@@ -7,9 +7,10 @@ at least one of them (`ci/scripts/check_cookbook_coverage.py` fails a change tha
 adds a verb nothing runs), and every notebook runs nightly exactly as a reader
 runs it.
 
-- **Recipes** (`quickstart/`, `recipes/`) — one short `example.py` per
-  capability, beside a README that explains it, run end to end against the
-  committed fixtures in seconds on a CPU. Each is also a chapter of the book.
+- **Recipes** (`quickstart/`, `recipes/`) — one short program per capability,
+  one step per cell (`# %%`), beside a README with the overview. Each runs
+  against the committed fixtures in seconds on a CPU, as a script, as a Colab
+  notebook a step at a time, and as a chapter of the book.
 - **Chapters** (`book/`) — a capability taken deep and measured over a real
   dataset at `small` scale on a CPU, or at `full` scale on a GPU. See
   [`book/README.md`](./book/README.md).

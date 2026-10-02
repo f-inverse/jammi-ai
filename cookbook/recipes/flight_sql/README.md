@@ -8,35 +8,16 @@ to multiple readers without each one holding an embedded session. The
 same protocol is what `dbt-flightsql`, the official Flight SQL JDBC
 driver, and BI tools speak natively.
 
-## What `example.py` does
-
-1. Starts a `jammi-server` over a temp `artifact_dir` with
-   `jammi.testing.LiveServer`, which binds kernel-assigned ports and waits
-   until the server answers a handshake
-2. Opens a `pyarrow.flight.FlightClient` against the server's endpoint
-3. Submits `SELECT 1 AS one` over Flight SQL and confirms the response
-4. Stops the server and waits for it to exit
-
-## Prerequisites
-
-- A `jammi-server` binary on PATH: `pip install jammi-server`, or
-  `cargo build --release -p jammi-server` with `target/release` on PATH
-- `pip install pyarrow` (already a `jammi-ai` dependency)
-
-The script auto-detects `JAMMI_BIN` (env var) or falls back to the
-workspace's `target/release/jammi-server`.
-
-## API surface exercised
-
-- `pyarrow.flight.FlightClient.execute(query)` over the Flight SQL
-  command dialect
-- `jammi-server` — the OSS deployment-shape binary entrypoint
+The program uses `pyarrow.flight.FlightClient` alone: `get_flight_info` with
+the encoded statement, then `do_get` on the ticket it returns. It needs a
+`jammi-server` on PATH — `pip install jammi-server`, or
+`cargo build --release -p jammi-server` with `target/release` on PATH.
 
 ## Run it
 
 ```bash
-cargo build --release -p jammi-server      # one-time build
+pip install jammi-server
 python cookbook/recipes/flight_sql/example.py
 ```
 
-Exits 0 on success, prints the query result + `flight_sql: OK`.
+It prints the one-row result of `SELECT 1 AS one`.

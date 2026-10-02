@@ -302,12 +302,12 @@ def code_only(text: str) -> str:
 
 def smoke_registered(script: str, smoke_text: str) -> bool:
     """Whether `tests/cookbook_smoke.py` runs `script` (relative to
-    cookbook/): a recipe directory named by `example("…")` / `stepwise("…")`,
-    or the quickstart script's own path segment."""
+    cookbook/): a recipe directory named by `example("…")`, or the
+    quickstart script's own path segment."""
     parts = Path(script).parts
     if parts[0] == "recipes":
         name = parts[1]
-        return bool(re.search(rf'\b(?:example|stepwise)\(\s*"{re.escape(name)}"', smoke_text))
+        return bool(re.search(rf'\bexample\(\s*"{re.escape(name)}"', smoke_text))
     return f'"{parts[0]}" / "{parts[-1]}"' in smoke_text
 
 

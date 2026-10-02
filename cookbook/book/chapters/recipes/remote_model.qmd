@@ -14,17 +14,9 @@ embeddings API, or an inference server the engine does not run itself. The
 deployment declares the endpoint once, and every verb that takes a model
 takes `remote:<name>`.
 
-Run it:
-
-```bash
-python cookbook/recipes/remote_model/example.py
-```
-
-The script serves its own stand-in endpoint (a hashed bag-of-words embedder
+The program serves its own stand-in endpoint (a hashed bag-of-words embedder
 speaking the OpenAI-compatible embeddings protocol), so it runs with no
-network and no key.
-
-## Declare the model
+network and no key. Against a hosted API, the declaration reads:
 
 ```toml
 [models.remote.hosted-encoder]
@@ -37,14 +29,7 @@ headers = { Authorization = { file = "/run/secrets/embeddings-key" } }
 # timeout_secs = 60, max_in_flight = 4, max_retries = 2
 ```
 
-Then use `remote:hosted-encoder` wherever a model id goes:
-
-```python
-db.generate_embeddings(source="corpus", model="remote:hosted-encoder",
-                       columns=["content"], key="id", modality="text")
-vec = db.encode_query(model="remote:hosted-encoder", query="...")
-db.search("corpus", query=vec, k=10)
-```
+and `remote:hosted-encoder` goes wherever a model id does.
 
 ## What to know
 
@@ -65,11 +50,14 @@ db.search("corpus", query=vec, k=10)
 See the guide's [Remote Models](https://github.com/f-inverse/jammi-ai/blob/main/docs/guide/src/remote-models.md)
 page for the full reference.
 
-The program is [`cookbook/recipes/remote_model/example.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/recipes/remote_model/example.py); it runs here as it is.
+The program is [`cookbook/recipes/remote_model/example.py`](https://github.com/f-inverse/jammi-ai/blob/main/cookbook/recipes/remote_model/example.py); its steps run here in order.
+
+A model the engine does not run itself — a hosted embeddings API, or an
+inference server on another machine — is declared once in the deployment's
+configuration and named `remote:<name>` in every verb a local model is used
+in.
 
 ```{python}
-from __future__ import annotations
-
 import hashlib
 import json
 import math
@@ -79,19 +67,25 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
-
 import jammi
 from jammi_cookbook import fixtures
 
-CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
+os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
+
 DIMS = 32
 TOKEN = "local-demo-token"
+```
 
+## A stand-in endpoint
 
+This program serves its own endpoint, speaking the OpenAI-compatible
+embeddings protocol behind a bearer token: a hashed bag-of-words embedder,
+where texts that share words point the same way. It runs with no network and
+no key; in production, the declaration below points at a hosted API instead.
+
+```{python}
 def bag_of_words(text: str) -> list[float]:
-    """A unit vector with one bucket per hashed word: texts sharing words
-    point the same way."""
+    """A unit vector with one bucket per hashed word."""
     vector = [0.0] * DIMS
     for word in text.lower().split():
         bucket = int.from_bytes(hashlib.sha256(word.encode()).digest()[:4], "big") % DIMS
@@ -128,17 +122,23 @@ class EmbeddingsEndpoint(BaseHTTPRequestHandler):
         pass
 
 
-def main() -> int:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingsEndpoint)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            # 1. Declare the remote model. The credential never reaches the
-            #    catalog or a result table: what a table records as its model
-            #    run is the URL, the model name, the width and the revision.
-            config = Path(tmp) / "jammi.toml"
-            config.write_text(
-                f"""
+server = ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingsEndpoint)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+```
+
+## Declare the model
+
+A `[models.remote.<name>]` section names the endpoint's URL and protocol,
+the model to ask it for, its output width, a revision pin, and the headers
+to send — credentials inline or `{ file = "…" }`. The credential never
+reaches the catalog or a result table: a table records its model run as the
+URL, the model name, the width and the revision.
+
+```{python}
+home = Path(tempfile.mkdtemp())
+config = home / "jammi.toml"
+config.write_text(
+    f"""
 [models.remote.bag-of-words]
 protocol = "openai_embeddings"
 url = "http://127.0.0.1:{server.server_port}/v1/embeddings"
@@ -147,35 +147,30 @@ dimensions = {DIMS}
 revision = "demo-1"
 headers = {{ Authorization = "Bearer {TOKEN}" }}
 """
-            )
-            model = "remote:bag-of-words"
-            with jammi.connect(f"file://{tmp}/data", config=str(config)) as db:
-                db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
+)
+MODEL = "remote:bag-of-words"
 
-                # 2. Embed the corpus through the endpoint.
-                db.generate_embeddings(
-                    source="corpus",
-                    model=model,
-                    columns=["content"],
-                    key="id",
-                    modality="text",
-                )
+db = jammi.connect(f"file://{home}/data", config=str(config))
+db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
+```
 
-                # 3. The query goes to the same endpoint, so it lands in the
-                #    same space as the table.
-                query = db.encode_query(model=model, query="quantum computing error correction")
-                rows = db.search("corpus", query=query, k=3).to_pylist()
-                if not rows:
-                    raise RuntimeError("the search returned no rows")
+## Embed through the endpoint, and search
 
-                print("id        similarity  title")
-                for row in rows:
-                    print(f"{row['_row_id']:<8}  {row['similarity']:>9.4f}  {row['title']}")
-    finally:
-        server.shutdown()
-    return 0
+`generate_embeddings` sends the rows to the endpoint in chunks, at most
+`max_in_flight` requests at a time. The query goes to the same endpoint, so
+it lands in the table's space.
+
+```{python}
+db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id", modality="text")
+
+query = db.encode_query(model=MODEL, query="quantum computing error correction")
+rows = db.search("corpus", query=query, k=3).to_pylist()
+assert rows, "the search returned no rows"
+for row in rows:
+    print(f"{row['_row_id']:<8}  {row['similarity']:>9.4f}  {row['title']}")
 ```
 
 ```{python}
-assert main() == 0
+db.close()
+server.shutdown()
 ```

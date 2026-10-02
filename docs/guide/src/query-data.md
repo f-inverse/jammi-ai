@@ -71,7 +71,7 @@ for batch in &results {
 
 ```python
 table = db.sql("SELECT id, title, year FROM patents.public.patents WHERE year > 2020 ORDER BY year")
-print(table.to_pandas())
+print(table)
 ```
 
 ### CLI

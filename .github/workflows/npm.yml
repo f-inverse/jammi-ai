@@ -101,7 +101,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tarball="$(ls package/*.tgz)"
+          # Absolute: npm reads a relative `dir/file.tgz` as a GitHub
+          # `owner/repo` shorthand and tries to clone it; a path from the
+          # root is only ever a file.
+          tarball="$(ls "$PWD"/package/*.tgz)"
           version="$(tar -xzOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"

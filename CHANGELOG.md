@@ -6,6 +6,12 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **The npm publisher hands npm the tarball's absolute path.** Promoting the proving run's
+  package (#707) passed `npm publish` a relative `package/<name>.tgz`, which npm reads as a
+  GitHub `owner/repo` shorthand: it tried to clone `github.com/package/…` and failed, so
+  `@f-inverse/jammi-client` 0.52.0 was not published. A branch rehearsal skips the publish
+  step, so only a release ran it. The path is absolute now, and is only ever a file.
+
 ## [0.52.0] - 2026-10-01
 
 Every cookbook notebook runs as published. A new lane runs each notebook at a

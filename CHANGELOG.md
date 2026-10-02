@@ -6,6 +6,12 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-10-02
+
+The two notebooks that failed for 0.52.0 readers run. The TypeScript client reaches npm again, so
+the surfaces chapter installs it; and an evaluation can rank exactly, so the analyze chapter's Air
+Routes leg measures the same number on every machine.
+
 - **An evaluation can rank exactly.** `eval_embeddings` and `eval_compare` take the same choice a
   search does: through the table's ANN index (the default, with an optional `oversample`) or
   `exact=True`, every vector scored, ties broken by row key. Evaluated exactly, a report measures

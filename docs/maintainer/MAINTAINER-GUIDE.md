@@ -5479,6 +5479,10 @@ Once every publisher is green, run the notebooks as a reader gets them: dispatch
 `.github/workflows/cookbook-published-gpu.yml` (a RunPod L4), each with `tag` set to the `py-v*`
 tag. They run every published notebook, setup cell included, in a fresh environment against what
 PyPI now serves; a red notebook is a broken release for every reader who opens its Colab link.
+Each first checks that PyPI, crates.io, npm and the GitHub release all serve the release, through
+the views pip, cargo and npm read (`ci/scripts/release_installable.py`), and refuses, naming what
+is missing, before it runs a notebook or rents a pod: a registry serves a new version minutes
+after its publisher finishes.
 
 `ci/scripts/check_gpu_prove_once.py`'s `PROMOTION_TABLE` is the reviewed cross-check for every one of
 these promotion jobs (workflow, promoting job, gate job); its P6 discovery rule scans EVERY workflow

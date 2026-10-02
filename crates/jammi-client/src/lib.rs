@@ -21,7 +21,6 @@
 //! * **Shared conversions.** Request encode / response decode reuse the
 //!   [`jammi_wire`] conversions the server's receive side uses.
 
-use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::time::Duration;
@@ -70,8 +69,8 @@ use jammi_wire::proto::training::FineTuneSpec;
 use jammi_wire::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_wire::proto::trigger::{PublishRequest, SubscribeRequest, TopicName};
 use jammi_wire::request::{
-    EmbeddingRequest, FineTuneJobId, FineTuneRequest, LexicalSearchRequest, Modality, QueryInput,
-    SearchQuery, SearchRequest,
+    CompareEvalRequest, EmbeddingEvalRequest, EmbeddingRequest, FineTuneJobId, FineTuneRequest,
+    LexicalSearchRequest, Modality, QueryInput, SearchQuery, SearchRequest,
 };
 use jammi_wire::{
     audit_error_from_status, cohorts_to_proto, config_to_proto, decode_subscribed_batch,
@@ -650,21 +649,26 @@ impl DataClient {
     /// Evaluate embedding quality against golden relevance judgments.
     pub async fn eval_embeddings(
         &self,
-        source_id: &str,
-        embedding_table: Option<&str>,
-        golden_source: &str,
-        k: usize,
-        cohorts: &HashMap<String, BTreeMap<String, String>>,
+        request: EmbeddingEvalRequest,
     ) -> Result<EmbeddingEvalReport> {
+        let EmbeddingEvalRequest {
+            source_id,
+            embedding_table,
+            golden_source,
+            k,
+            cohorts,
+            method,
+        } = request;
         let resp = self
             .eval_client()
             .eval_embeddings(eval_pb::EvalEmbeddingsRequest {
-                source_id: source_id.to_string(),
-                embedding_table: embedding_table.unwrap_or_default().to_string(),
-                golden_source: golden_source.to_string(),
+                source_id,
+                embedding_table: embedding_table.unwrap_or_default(),
+                golden_source,
                 k: k as u32,
-                cohorts: cohorts_to_proto(cohorts),
+                cohorts: cohorts_to_proto(&cohorts),
                 tenant_id: String::new(),
+                method: jammi_wire::search_method_to_proto(method),
             })
             .await
             .map_err(|s| error_from_status(&s))?
@@ -714,21 +718,23 @@ impl DataClient {
     }
 
     /// Compare multiple embedding tables side-by-side.
-    pub async fn eval_compare(
-        &self,
-        embedding_tables: &[String],
-        source_id: &str,
-        golden_source: &str,
-        k: usize,
-    ) -> Result<CompareEvalReport> {
+    pub async fn eval_compare(&self, request: CompareEvalRequest) -> Result<CompareEvalReport> {
+        let CompareEvalRequest {
+            embedding_tables,
+            source_id,
+            golden_source,
+            k,
+            method,
+        } = request;
         let resp = self
             .eval_client()
             .eval_compare(eval_pb::EvalCompareRequest {
-                embedding_tables: embedding_tables.to_vec(),
-                source_id: source_id.to_string(),
-                golden_source: golden_source.to_string(),
+                embedding_tables,
+                source_id,
+                golden_source,
                 k: k as u32,
                 tenant_id: String::new(),
+                method: jammi_wire::search_method_to_proto(method),
             })
             .await
             .map_err(|s| error_from_status(&s))?

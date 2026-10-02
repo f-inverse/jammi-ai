@@ -229,26 +229,28 @@ pub fn result_table_from_proto(table: pb::ResultTable) -> Result<ResultTableReco
     ))
 }
 
-/// A search's `method` on the wire: unset for an approximate search at the
-/// table's own oversample. [`search_method_from_proto`] is the inverse.
-pub fn search_method_to_proto(method: SearchMethod) -> Option<pb::search_request::Method> {
-    match method {
-        SearchMethod::Approximate { oversample: None } => None,
+/// A ranking's [`SearchMethod`] on the wire — a search's or an evaluation's:
+/// unset for an approximate ranking at the table's own oversample.
+/// [`search_method_from_proto`] is the inverse.
+pub fn search_method_to_proto(method: SearchMethod) -> Option<pb::SearchMethod> {
+    let kind = match method {
+        SearchMethod::Approximate { oversample: None } => return None,
         SearchMethod::Approximate {
             oversample: Some(v),
-        } => Some(pb::search_request::Method::Oversample(v as u32)),
-        SearchMethod::Exact => Some(pb::search_request::Method::Exact(pb::ExactSearch {})),
-    }
+        } => pb::search_method::Kind::Oversample(v as u32),
+        SearchMethod::Exact => pb::search_method::Kind::Exact(pb::ExactSearch {}),
+    };
+    Some(pb::SearchMethod { kind: Some(kind) })
 }
 
 /// The [`SearchMethod`] a wire `method` names.
-pub fn search_method_from_proto(method: Option<pb::search_request::Method>) -> SearchMethod {
-    match method {
+pub fn search_method_from_proto(method: Option<pb::SearchMethod>) -> SearchMethod {
+    match method.and_then(|m| m.kind) {
         None => SearchMethod::default(),
-        Some(pb::search_request::Method::Oversample(v)) => SearchMethod::Approximate {
+        Some(pb::search_method::Kind::Oversample(v)) => SearchMethod::Approximate {
             oversample: Some(v as usize),
         },
-        Some(pb::search_request::Method::Exact(_)) => SearchMethod::Exact,
+        Some(pb::search_method::Kind::Exact(_)) => SearchMethod::Exact,
     }
 }
 
@@ -395,5 +397,38 @@ mod result_table_kind_tests {
         let back = result_table_from_proto(wire).expect("the projection reconstructs");
         assert_eq!(back.kind, ResultTableKind::TrainingSet);
         assert_eq!(back.row_count, 7);
+    }
+}
+
+#[cfg(test)]
+mod search_method_tests {
+    use super::{search_method_from_proto, search_method_to_proto};
+    use crate::proto::embedding as pb;
+    use jammi_db::index::SearchMethod;
+
+    #[test]
+    fn every_method_round_trips_through_the_wire() {
+        for method in [
+            SearchMethod::default(),
+            SearchMethod::Approximate {
+                oversample: Some(8),
+            },
+            SearchMethod::Exact,
+        ] {
+            assert_eq!(
+                search_method_from_proto(search_method_to_proto(method)),
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_or_empty_method_is_the_default_approximate_ranking() {
+        assert_eq!(search_method_to_proto(SearchMethod::default()), None);
+        assert_eq!(search_method_from_proto(None), SearchMethod::default());
+        assert_eq!(
+            search_method_from_proto(Some(pb::SearchMethod { kind: None })),
+            SearchMethod::default()
+        );
     }
 }

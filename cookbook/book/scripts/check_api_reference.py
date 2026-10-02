@@ -87,7 +87,7 @@ REQUIRED: dict[str, list[str]] = {
     "list_workers": [],
     "prune_jobs": [],
     "eval_embeddings": ["source", "golden_source"],
-    "eval_compare": ["embedding_tables", "source", "golden_source"],
+    "eval_compare": ["embedding_tables", "source", "golden_source", "exact"],
     "eval_inference": ["model", "source", "columns", "task", "golden_source", "label_column"],
     "eval_per_query": [],
     # model catalog (control plane)

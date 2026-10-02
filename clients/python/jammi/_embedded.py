@@ -1491,6 +1491,8 @@ class EmbeddedBackend:
         embedding_table: Optional[str] = None,
         k: int = 10,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
+        oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> Dict[str, Any]:
         """Evaluate embedding retrieval quality against a golden relevance set.
 
@@ -1502,7 +1504,9 @@ class EmbeddedBackend:
         golden set by its full catalog path (``<source>.public.<table>``) or bare
         name. ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
         ``{key: value}`` segment map, persisted with that query's per-query
-        metrics (read back via :meth:`eval_per_query`). Same handle shape and verb
+        metrics (read back via :meth:`eval_per_query`). ``oversample`` / ``exact`` rank each query as they rank a :meth:`search`:
+        ``exact=True`` scores every vector, so the report measures the embedding
+        with no index approximation in it. Same handle shape and verb
         signature as the remote `RemoteDatabase.eval_embeddings`; the request is
         assembled with the shared `EvalEmbeddingsRequest` builder and submitted
         through the engine's wire seam.
@@ -1513,6 +1517,8 @@ class EmbeddedBackend:
             embedding_table=embedding_table,
             k=k,
             cohorts=cohorts,
+            oversample=oversample,
+            exact=exact,
         )
         return self._native._eval_embeddings_proto(request.SerializeToString())
 
@@ -1569,6 +1575,8 @@ class EmbeddedBackend:
         source: str,
         golden_source: str,
         k: int = 10,
+        oversample: Optional[int] = None,
+        exact: bool = False,
     ) -> Dict[str, Any]:
         """Compare multiple embedding tables side-by-side against one golden set.
 
@@ -1577,8 +1585,9 @@ class EmbeddedBackend:
         against it (per-metric absolute/relative deltas plus paired
         ``significance``, ``None`` when the runs share no query to pair on).
         ``golden_source`` addresses the golden set by full catalog path
-        (``<source>.public.<table>``) or bare name. Same handle shape and verb
-        signature as the remote `RemoteDatabase.eval_compare`; the request is
+        (``<source>.public.<table>``) or bare name. ``oversample`` / ``exact``
+        rank every table's queries as :meth:`eval_embeddings` ranks them. Same
+        handle shape and verb signature as the remote `RemoteDatabase.eval_compare`; the request is
         assembled with the shared `EvalCompareRequest` builder and submitted
         through the engine's wire seam.
         """
@@ -1587,6 +1596,8 @@ class EmbeddedBackend:
             source=source,
             golden_source=golden_source,
             k=k,
+            oversample=oversample,
+            exact=exact,
         )
         return self._native._eval_compare_proto(request.SerializeToString())
 

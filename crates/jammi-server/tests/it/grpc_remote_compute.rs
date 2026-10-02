@@ -30,7 +30,7 @@ use arrow::array::StringArray;
 use arrow_schema::{DataType, Field, Schema};
 use jammi_ai::fine_tune::{FineTuneConfig, FineTuneMethod};
 use jammi_ai::local_session::{ChannelColumn, ChannelSpec};
-use jammi_ai::{Modality, Session};
+use jammi_ai::{CompareEvalRequest, EmbeddingEvalRequest, Modality, SearchMethod, Session};
 use jammi_client::DataClient;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
@@ -184,6 +184,30 @@ async fn remote_infer_round_trips_like_local() {
     let _ = server.handle.await;
 }
 
+/// The approximate evaluation of the patents' most-recent table both
+/// transports run.
+fn retrieval_eval() -> EmbeddingEvalRequest {
+    EmbeddingEvalRequest {
+        source_id: "patents".into(),
+        embedding_table: None,
+        golden_source: GOLDEN_SOURCE.into(),
+        k: 10,
+        cohorts: Default::default(),
+        method: SearchMethod::default(),
+    }
+}
+
+/// The approximate comparison of `tables` both transports run.
+fn compare_eval(tables: &[String]) -> CompareEvalRequest {
+    CompareEvalRequest {
+        embedding_tables: tables.to_vec(),
+        source_id: "patents".into(),
+        golden_source: GOLDEN_SOURCE.into(),
+        k: 10,
+        method: SearchMethod::default(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_eval_round_trips_like_local() {
     let server = start_engine_server().await;
@@ -191,13 +215,12 @@ async fn remote_eval_round_trips_like_local() {
     let local = local(&server);
     let table = embed_patents_and_golden(&local).await;
 
-    let cohorts = std::collections::HashMap::new();
     let remote_report = remote
-        .eval_embeddings("patents", None, GOLDEN_SOURCE, 10, &cohorts)
+        .eval_embeddings(retrieval_eval())
         .await
         .expect("remote eval_embeddings");
     let local_report = local
-        .eval_embeddings("patents", None, GOLDEN_SOURCE, 10, &cohorts)
+        .eval_embeddings(retrieval_eval())
         .await
         .expect("local eval_embeddings");
 
@@ -226,12 +249,8 @@ async fn remote_eval_round_trips_like_local() {
 
     // eval_compare: a self-comparison yields the baseline + one zero-delta entry.
     let compare_tables = [table.clone(), table.clone()];
-    let remote_compare = remote
-        .eval_compare(&compare_tables, "patents", GOLDEN_SOURCE, 10)
-        .await;
-    let local_compare = local
-        .eval_compare(&compare_tables, "patents", GOLDEN_SOURCE, 10)
-        .await;
+    let remote_compare = remote.eval_compare(compare_eval(&compare_tables)).await;
+    let local_compare = local.eval_compare(compare_eval(&compare_tables)).await;
     match (&remote_compare, &local_compare) {
         (Ok(r), Ok(l)) => assert_eq!(
             r.per_table.len(),
@@ -260,13 +279,12 @@ async fn remote_eval_reconstructs_the_exact_error_variant() {
     let local = local(&server);
     add_patents(&local).await; // no embeddings generated
 
-    let cohorts = std::collections::HashMap::new();
     let local_err = local
-        .eval_embeddings("patents", None, GOLDEN_SOURCE, 10, &cohorts)
+        .eval_embeddings(retrieval_eval())
         .await
         .expect_err("local eval with no embedding table must fail");
     let remote_err = remote
-        .eval_embeddings("patents", None, GOLDEN_SOURCE, 10, &cohorts)
+        .eval_embeddings(retrieval_eval())
         .await
         .expect_err("remote eval with no embedding table must fail");
 

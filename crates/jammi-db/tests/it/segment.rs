@@ -20,7 +20,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource, VectorIndex};
+use jammi_db::index::{validate_query, QuerySource, SearchMethod, VectorIndex};
 use jammi_db::session::QueryContext;
 use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_numerics::distance::cosine_distance;
@@ -360,7 +360,7 @@ async fn search_vectors_local_with_no_catalog_width_attributes_a_wrong_width_que
     // The conforming query serves.
     let query = validate_query(vec![1.0, 0.0, 0.0, 0.1], width, QuerySource::Caller).unwrap();
     let hits = store
-        .search_vectors_local(&ctx, &record, &query, 1)
+        .search_vectors_local(&ctx, &record, &query, 1, SearchMethod::default())
         .await
         .unwrap();
     assert_eq!(hits[0].0, "a");
@@ -434,7 +434,7 @@ async fn a_width_fault_names_the_artifact_it_was_found_against() {
     // A query that matched a 2-wide authority elsewhere meets this table's
     // 4-wide segment: the segment's own check, the segment's own name.
     let err = store
-        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0]), 3)
+        .search_vectors_local(&ctx, &record, &vq(&[1.0, 0.0]), 3, SearchMethod::default())
         .await
         .expect_err("a validated query of another width must be refused by the segment");
     assert!(

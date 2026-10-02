@@ -326,6 +326,7 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
             k: 10,
             cohorts: std::collections::HashMap::new(),
             tenant_id: String::new(),
+            method: None,
         })
         .await
         .expect("eval_embeddings")

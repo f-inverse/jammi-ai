@@ -45,8 +45,7 @@ pub use eval::{
     eval_calibration_from_bytes, eval_calibration_from_proto, eval_compare_from_bytes,
     eval_compare_from_proto, eval_embeddings_from_bytes, eval_embeddings_from_proto,
     eval_inference_from_bytes, eval_inference_from_proto, eval_per_query_from_bytes,
-    eval_per_query_from_proto, EvalCalibrationArgs, EvalCompareArgs, EvalEmbeddingsArgs,
-    EvalInferenceArgs,
+    eval_per_query_from_proto, EvalCalibrationArgs, EvalInferenceArgs,
 };
 pub use inference::{
     edge_gather_from_proto, edge_gather_to_proto, infer_from_bytes, infer_from_proto,

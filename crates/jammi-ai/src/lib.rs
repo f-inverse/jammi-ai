@@ -67,10 +67,13 @@ pub mod wire;
 
 /// The in-process consumer surface: a [`Session`] over the embedded engine. It
 /// rides the `local` feature alongside the engine it drives; the request/result
-/// vocabulary ([`Modality`], the query and search shapes) lives on the
+/// vocabulary ([`Modality`], the query, search and evaluation shapes) lives on the
 /// `jammi-wire` substrate and is re-exported through it.
 #[cfg(feature = "local")]
-pub use local_session::{Modality, QueryInput, SearchMethod, SearchQuery, SearchRequest, Session};
+pub use local_session::{
+    CompareEvalRequest, EmbeddingEvalRequest, Modality, QueryInput, SearchMethod, SearchQuery,
+    SearchRequest, Session,
+};
 
 /// Engine introspection shapes the [`Session`] surface returns: a per-source
 /// [`SourceDescriptor`] (registry identity joined with its embedding result

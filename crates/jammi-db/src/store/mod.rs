@@ -3339,17 +3339,25 @@ impl ResultStore {
     /// segment locally through [`Self::resolve_search_mode_local`] and
     /// searches the sync [`SegmentedIndex::search_final`]. Any replica can
     /// (the content-addressed cache over the shared root); a batch build never
-    /// fans out per node.
+    /// fans out per node. `method` ranks as it does for a search.
     pub async fn search_vectors_local(
         &self,
         ctx: &QueryContext,
         table: &ResultTableRecord,
         query: &ValidatedQuery,
         k: usize,
+        method: crate::index::SearchMethod,
     ) -> Result<Vec<(String, f32)>> {
-        match self.resolve_search_mode_local(table).await? {
-            Some(index) => {
-                let oversample = self.ann.resolve_oversample(None, table.oversample);
+        let local = match method {
+            crate::index::SearchMethod::Exact => None,
+            crate::index::SearchMethod::Approximate { oversample } => self
+                .resolve_search_mode_local(table)
+                .await?
+                .map(|index| (index, oversample)),
+        };
+        match local {
+            Some((index, oversample)) => {
+                let oversample = self.ann.resolve_oversample(oversample, table.oversample);
                 index.search_final(query, k, oversample, &Admission::Every)
             }
             None => {

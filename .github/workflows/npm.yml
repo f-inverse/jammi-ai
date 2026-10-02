@@ -109,6 +109,14 @@ jobs:
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # The publish's own package resolution, on every dispatch: a branch
+      # rehearsal skips `Publish`, so this is where a tarball npm cannot
+      # resolve fails, before a release does.
+      - name: npm resolves the promoted tarball
+        env:
+          TARBALL: ${{ steps.package.outputs.tarball }}
+        run: npm pack --dry-run "$TARBALL"
+
       - name: Verify tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
         env:

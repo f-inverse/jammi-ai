@@ -77,7 +77,9 @@ treatment = db.generate_embeddings(
 ## 3 — compare on a held-out golden set
 
 Run `eval_compare` with the baseline table **first**; every subsequent table
-carries its `delta` against that baseline. The golden set is a registered
+carries its `delta` against that baseline. Rank **exactly**: the question is
+whether the representation improved, so neither table's index approximation may
+move the verdict. The golden set is a registered
 source of `(query_id, query_text, relevant_id[, relevance_grade])` rows — see
 [Evaluate and Compare Models](./evaluation.md) for its schema.
 
@@ -88,12 +90,13 @@ source of `(query_id, query_text, relevant_id[, relevance_grade])` rows — see
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession, baseline_table: String, treatment_table: String) -> jammi_db::error::Result<()> {
 let comparison = session
-    .eval_compare(
-        &[baseline_table, treatment_table], // baseline FIRST
-        "patents",
-        "golden.public.golden_relevance",   // held-out golden set
-        10,                                 // k for recall@k / precision@k
-    )
+    .eval_compare(jammi_ai::CompareEvalRequest {
+        embedding_tables: vec![baseline_table, treatment_table], // baseline FIRST
+        source_id: "patents".into(),
+        golden_source: "golden.public.golden_relevance".into(), // held-out golden set
+        k: 10,                                                  // k for recall@k / precision@k
+        method: jammi_ai::SearchMethod::Exact,                  // the embeddings, not the index
+    })
     .await?;
 
 for entry in comparison.per_table.iter().skip(1) {
@@ -125,6 +128,7 @@ comparison = db.eval_compare(
     source="patents",
     golden_source="golden.public.golden_relevance",
     k=10,
+    exact=True,  # the embeddings, not the index
 )
 for entry in comparison["per_table"][1:]:
     delta = entry["delta"]
@@ -233,13 +237,14 @@ cohorts.insert(
 // ... one entry per query_id ...
 
 let report = session
-    .eval_embeddings(
-        "patents",
-        Some(treatment_table),
-        "golden.public.golden_relevance",
-        10,
-        &cohorts,
-    )
+    .eval_embeddings(jammi_ai::EmbeddingEvalRequest {
+        source_id: "patents".into(),
+        embedding_table: Some(treatment_table.into()),
+        golden_source: "golden.public.golden_relevance".into(),
+        k: 10,
+        cohorts,
+        method: jammi_ai::SearchMethod::Exact,
+    })
     .await?;
 
 // Read the persisted per-query rows back by run id; each row carries its

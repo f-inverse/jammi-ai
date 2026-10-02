@@ -1,11 +1,13 @@
 //! Request vocabulary the consumer surface shares with the wire.
 //!
 //! These owned, serialisable request shapes are what a session verb takes
-//! (`Modality` / `QueryInput` / `SearchRequest`) and the addressable id a
-//! fine-tune job returns (`FineTuneJobId`). They hold no engine state, so they
-//! live on the wire substrate: the embedded session and the data-plane client
-//! both build verbs from them, and the gRPC converters map them on/off the wire.
+//! (`Modality` / `QueryInput` / `SearchRequest` / `EmbeddingEvalRequest`) and
+//! the addressable id a fine-tune job returns (`FineTuneJobId`). They hold no
+//! engine state, so they live on the wire substrate: the embedded session and
+//! the data-plane client both build verbs from them, and the gRPC converters
+//! map them on/off the wire.
 
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 
 use jammi_datafusion::ModelTask;
@@ -140,6 +142,43 @@ pub struct LexicalSearchRequest {
     pub filter: Option<String>,
     /// Columns to project. Empty keeps every hydrated column.
     pub select: Vec<String>,
+}
+
+/// An embedding table's retrieval evaluation: each golden query encoded by the
+/// table's model and ranked against the table, the ranking scored against the
+/// query's relevant rows.
+pub struct EmbeddingEvalRequest {
+    /// Source whose embedding table is evaluated.
+    pub source_id: String,
+    /// Which embedding table of the source. `None` selects the source's
+    /// most-recent ready table.
+    pub embedding_table: Option<String>,
+    /// The golden relevance source, a bare name or `<source>.public.<table>`.
+    pub golden_source: String,
+    /// Retrieval cutoff.
+    pub k: usize,
+    /// Opaque per-query tags, `query_id → {key: value}`, stored with each
+    /// query's metrics and never interpreted.
+    pub cohorts: HashMap<String, BTreeMap<String, String>>,
+    /// How each query's ranking is computed, as a search's is: through the
+    /// table's ANN index, or exactly, so the report measures the embedding
+    /// with no index approximation in it.
+    pub method: SearchMethod,
+}
+
+/// Several embedding tables evaluated on one golden set: the first is the
+/// baseline, and every other carries its per-metric delta against it.
+pub struct CompareEvalRequest {
+    /// The tables compared, the baseline first. At least two.
+    pub embedding_tables: Vec<String>,
+    /// Source the tables embed.
+    pub source_id: String,
+    /// The golden relevance source, a bare name or `<source>.public.<table>`.
+    pub golden_source: String,
+    /// Retrieval cutoff.
+    pub k: usize,
+    /// How every table's rankings are computed.
+    pub method: SearchMethod,
 }
 
 /// A flattened column-source fine-tune submission. Every knob the submit

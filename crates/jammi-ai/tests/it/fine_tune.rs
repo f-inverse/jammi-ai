@@ -1302,23 +1302,21 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
 
     // Eval audio→audio retrieval for both, against the held-out golden set.
     let base_metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "audio_corpus",
             Some(&base_rec.table_name),
             "audio_golden.public.audio_golden",
             5,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
     let ft_metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "audio_corpus",
             Some(&ft_rec.table_name),
             "audio_golden.public.audio_golden",
             5,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -1924,25 +1922,23 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
 
     // Eval base embeddings against golden relevance
     let base_metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&base_rec.table_name),
             "golden_rel.public.golden_relevance",
             10,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
     // Eval fine-tuned embeddings against golden relevance
     let ft_metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&ft_rec.table_name),
             "golden_rel.public.golden_relevance",
             10,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 

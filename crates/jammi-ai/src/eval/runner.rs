@@ -18,6 +18,7 @@ use jammi_wire::eval::report::{
     InferenceEvalReport, MetricDelta, PerQueryRecord, PerRecordCalibration, PerRecordPrediction,
     TableEvalReport, PER_QUERY_RECALL_KS,
 };
+use jammi_wire::request::{CompareEvalRequest, EmbeddingEvalRequest};
 
 use jammi_numerics::classification::ClassificationMetrics;
 use jammi_numerics::ner::{Entity, NerMetrics};
@@ -103,20 +104,28 @@ impl<'a> EvalRunner<'a> {
     /// opt-in flag. `cohorts` maps a golden-set `query_id` to an opaque
     /// `{key: value}` segment map; a query with no entry stores `{}`.
     ///
-    /// Uses the same search infrastructure as `db.search()` — SidecarIndex for ANN
-    /// when available, exact_vector_search as fallback.
+    /// Each query is ranked as `db.search()` ranks it, by the request's
+    /// [`SearchMethod`](jammi_db::index::SearchMethod): through the table's ANN
+    /// index (an exact scan when it has none), or exactly.
     ///
     /// `golden_source` is an unquoted relation reference (a bare name or a
     /// dotted `<source>.public.<table>`); each part is quoted independently
     /// before interpolation, so a hyphenated or reserved name resolves verbatim.
     pub async fn eval_embeddings(
         &self,
-        source_id: &str,
-        embedding_table: Option<&str>,
-        golden_source: &str,
-        k: usize,
-        cohorts: &HashMap<String, BTreeMap<String, String>>,
+        request: &EmbeddingEvalRequest,
     ) -> Result<EmbeddingEvalReport> {
+        let EmbeddingEvalRequest {
+            source_id,
+            embedding_table,
+            golden_source,
+            k,
+            cohorts,
+            method,
+        } = request;
+        let (source_id, golden_source, k) = (source_id.as_str(), golden_source.as_str(), *k);
+        let embedding_table = embedding_table.as_deref();
+
         // 1. Resolve embedding table.
         let table = self
             .session
@@ -204,7 +213,7 @@ impl<'a> EvalRunner<'a> {
             // FORCE-LOCAL: eval is a batch per-query loop; it loads every
             // segment locally and never fans out per node.
             let search_results = result_store
-                .search_vectors_local(self.session.context(), &table, &query_vec, k)
+                .search_vectors_local(self.session.context(), &table, &query_vec, k, *method)
                 .await?;
 
             let retrieved_ids: Vec<String> =
@@ -607,13 +616,8 @@ impl<'a> EvalRunner<'a> {
 
     /// Compare multiple embedding tables side-by-side.
     /// First table is the baseline; deltas are computed for all others.
-    pub async fn eval_compare(
-        &self,
-        embedding_tables: &[String],
-        source_id: &str,
-        golden_source: &str,
-        k: usize,
-    ) -> Result<CompareEvalReport> {
+    pub async fn eval_compare(&self, request: &CompareEvalRequest) -> Result<CompareEvalReport> {
+        let embedding_tables = &request.embedding_tables;
         if embedding_tables.len() < 2 {
             return Err(JammiError::Eval(
                 "eval_compare requires at least 2 embedding tables".into(),
@@ -622,11 +626,17 @@ impl<'a> EvalRunner<'a> {
 
         // `eval_compare` does not surface cohort tagging; each per-table eval
         // persists per-query rows with empty cohorts.
-        let no_cohorts: HashMap<String, BTreeMap<String, String>> = HashMap::new();
         let mut all_reports: Vec<(String, EmbeddingEvalReport)> = Vec::new();
         for table_name in embedding_tables {
             let report = self
-                .eval_embeddings(source_id, Some(table_name), golden_source, k, &no_cohorts)
+                .eval_embeddings(&EmbeddingEvalRequest {
+                    source_id: request.source_id.clone(),
+                    embedding_table: Some(table_name.clone()),
+                    golden_source: request.golden_source.clone(),
+                    k: request.k,
+                    cohorts: HashMap::new(),
+                    method: request.method,
+                })
                 .await?;
             all_reports.push((table_name.clone(), report));
         }

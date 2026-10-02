@@ -603,13 +603,12 @@ async fn recipe_evaluation() {
 
     // eval_embeddings (cookbook recipe)
     let metrics = session
-        .eval_embeddings(
+        .eval_embeddings(common::retrieval_eval(
             "patents",
-            None, // use latest embedding table
+            None,
             "golden.public.golden_relevance",
             10,
-            &Default::default(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -637,12 +636,12 @@ async fn recipe_evaluation() {
         .0;
 
     let comparison = session
-        .eval_compare(
+        .eval_compare(common::compare_eval(
             &[record.table_name.clone(), record2.table_name.clone()],
             "patents",
             "golden.public.golden_relevance",
             10,
-        )
+        ))
         .await
         .unwrap();
 

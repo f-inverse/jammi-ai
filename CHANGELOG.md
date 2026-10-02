@@ -6,11 +6,34 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **An evaluation can rank exactly.** `eval_embeddings` and `eval_compare` take the same choice a
+  search does: through the table's ANN index (the default, with an optional `oversample`) or
+  `exact=True`, every vector scored, ties broken by row key. Evaluated exactly, a report measures
+  the embedding with no index approximation in it, and rows that share an identical vector are
+  ordered the same way on every machine — an index returns whichever of them its walk reaches
+  first.
+  The choice is one wire message, `jammi.v1.embedding.SearchMethod`, that `SearchRequest`,
+  `EvalEmbeddingsRequest` and `EvalCompareRequest` all carry (`SearchRequest`'s `oversample` /
+  `exact` fields move into it). In Rust the verbs take `EmbeddingEvalRequest` /
+  `CompareEvalRequest`, like `search` takes `SearchRequest`, and the decoders return them.
+- **An evaluation report is the same bits on every run.** The golden queries were grouped in a
+  hash map whose order is random per process, so their metrics were averaged in a different order
+  each run and the means moved in their last bits; they are evaluated in `query_id` order now, and
+  `per_query` lists them in that order.
+- **The analyze chapter's Air Routes leg evaluates exactly.** At `small` scale its tiny encoder
+  maps 3,504 airports to 702 distinct vectors, and half the queries tie at the tenth place, so the
+  index-ranked precision read 0.147 on arm64, 0.159 on an x86 runner and 0.169 on an L4 host
+  against a golden of 0.1475 ± 0.02: the 0.52.0 notebook failed for GPU readers.
+- The book's API reference listed an `eval_embeddings(model=…)` keyword that does not exist; it
+  lists `embedding_table`, `oversample` and `exact`.
+
 - **The npm publisher hands npm the tarball's absolute path.** Promoting the proving run's
   package (#707) passed `npm publish` a relative `package/<name>.tgz`, which npm reads as a
   GitHub `owner/repo` shorthand: it tried to clone `github.com/package/…` and failed, so
   `@f-inverse/jammi-client` 0.52.0 was not published. A branch rehearsal skips the publish
-  step, so only a release ran it. The path is absolute now, and is only ever a file.
+  step, so only a release ran it. The path is absolute now, and is only ever a file; and every
+  dispatch, a rehearsal included, resolves the tarball as the publish will (`npm pack --dry-run`),
+  so a spec npm cannot resolve fails before a release.
 
 ## [0.52.0] - 2026-10-01
 

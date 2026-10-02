@@ -143,8 +143,8 @@ def test_int8_storage_precision_and_oversample_reachable_through_public_api(
        fails hard if the override never reaches the engine.
     2. The request assembled by the public binding for a given `oversample`
        actually carries it — a direct, deterministic proof that the keyword
-       reaches the wire message (`SearchRequest.oversample` is an optional
-       proto3 field: present+equal when passed, absent when omitted), rather
+       reaches the wire message (`SearchRequest.method.oversample` is a
+       oneof member: present+equal when passed, absent when omitted), rather
        than inferring reachability solely from end-to-end retrieval quality.
     """
     from jammi._assembly import build_search_request
@@ -186,11 +186,11 @@ def test_int8_storage_precision_and_oversample_reachable_through_public_api(
     request_with_override = build_search_request(
         "vectors", query=vectors[0], k=1, oversample=N_CORPUS * 2
     )
-    assert request_with_override.HasField("oversample")
-    assert request_with_override.oversample == N_CORPUS * 2
+    assert request_with_override.method.HasField("oversample")
+    assert request_with_override.method.oversample == N_CORPUS * 2
 
     request_without_override = build_search_request("vectors", query=vectors[0], k=1)
-    assert not request_without_override.HasField("oversample")
+    assert not request_without_override.HasField("method")
 
 
 def test_exact_search_scores_every_vector(tmp_path: Path) -> None:
@@ -209,7 +209,9 @@ def test_exact_search_scores_every_vector(tmp_path: Path) -> None:
         hit = db.search("vectors", query=vectors[i], k=1, exact=True).to_pylist()[0]
         assert hit["_row_id"] == ids[i]
 
-    assert build_search_request("vectors", query=vectors[0], k=1, exact=True).HasField("exact")
+    assert build_search_request(
+        "vectors", query=vectors[0], k=1, exact=True
+    ).method.HasField("exact")
     with pytest.raises(ValueError, match="no oversample"):
         db.search("vectors", query=vectors[0], k=1, exact=True, oversample=4)
 

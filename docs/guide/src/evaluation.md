@@ -40,13 +40,14 @@ db.add_source("golden", path="/data/golden_relevance.csv", format="csv")
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-let report = session.eval_embeddings(
-    "patents",
-    None,                                // use latest embedding table
-    "golden.public.golden_relevance",    // golden dataset
-    10,                                  // k for recall@k, precision@k
-    &std::collections::HashMap::new(),   // no cohort tags
-).await?;
+let report = session.eval_embeddings(jammi_ai::EmbeddingEvalRequest {
+    source_id: "patents".into(),
+    embedding_table: None,                              // use latest embedding table
+    golden_source: "golden.public.golden_relevance".into(), // golden dataset
+    k: 10,                                              // k for recall@k, precision@k
+    cohorts: Default::default(),                        // no cohort tags
+    method: jammi_ai::SearchMethod::default(),          // through the table's ANN index
+}).await?;
 
 println!("recall@10:    {}", report.aggregate.recall_at_k);
 println!("precision@10: {}", report.aggregate.precision_at_k);
@@ -73,7 +74,7 @@ print(f"nDCG:         {agg['ndcg']:.3f}")
 
 ### Per-query drill-down
 
-The report also carries a `per_query` array — one record per golden-set query, in golden order. This is what sample-based statistical rules (Welch's t, Mann-Whitney U) consume at gate time.
+The report also carries a `per_query` array — one record per golden-set query, ordered by `query_id`. This is what sample-based statistical rules (Welch's t, Mann-Whitney U) consume at gate time.
 
 ```rust,no_run
 # extern crate jammi_db;
@@ -81,7 +82,14 @@ The report also carries a `per_query` array — one record per golden-set query,
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession) -> jammi_db::error::Result<()> {
-# let report = session.eval_embeddings("patents", None, "golden.public.golden_relevance", 10, &std::collections::HashMap::new()).await?;
+# let report = session.eval_embeddings(jammi_ai::EmbeddingEvalRequest {
+#     source_id: "patents".into(),
+#     embedding_table: None,
+#     golden_source: "golden.public.golden_relevance".into(),
+#     k: 10,
+#     cohorts: Default::default(),
+#     method: jammi_ai::SearchMethod::default(),
+# }).await?;
 for record in &report.per_query {
     println!("{}: recall={:.3} ndcg={:.3}",
         record.query_id, record.metrics.recall, record.metrics.ndcg);
@@ -106,6 +114,28 @@ for record in metrics["per_query"]:
 
 All metrics are in [0, 1]. Higher is better.
 
+### Through the index, or exactly
+
+Each query is ranked as a [search](./semantic-search.md) ranks it. By default
+that is through the table's ANN index, so the report measures the embedding as
+it is served, index approximation included. `exact=True` (in Rust,
+`method: SearchMethod::Exact`) scores every vector instead, so the report
+measures the embedding alone. An exact ranking also breaks ties by row key, so
+rows that share an identical vector are ordered the same way on every machine,
+where an index returns whichever of them its walk reaches first. Rank exactly to
+compare embeddings; rank through the index to measure the system.
+
+```python
+metrics = db.eval_embeddings(
+    source="patents",
+    golden_source="golden.public.golden_relevance",
+    k=10,
+    exact=True,
+)
+```
+
+`eval_compare` takes the same `exact` (and `oversample`) for every table it scores.
+
 ## Compare models (A/B)
 
 Compare a base model against a fine-tuned model:
@@ -118,12 +148,13 @@ Compare a base model against a fine-tuned model:
 # extern crate tokio;
 # use jammi_ai::session::InferenceSession;
 # async fn ex(session: &InferenceSession, base_table: String, finetuned_table: String) -> jammi_db::error::Result<()> {
-let comparison = session.eval_compare(
-    &[base_table.clone(), finetuned_table.clone()],
-    "patents",
-    "golden.public.golden_relevance",
-    10,
-).await?;
+let comparison = session.eval_compare(jammi_ai::CompareEvalRequest {
+    embedding_tables: vec![base_table.clone(), finetuned_table.clone()],
+    source_id: "patents".into(),
+    golden_source: "golden.public.golden_relevance".into(),
+    k: 10,
+    method: jammi_ai::SearchMethod::default(),
+}).await?;
 
 // The first entry is the baseline (`delta: None`); every subsequent entry
 // carries a delta against it.

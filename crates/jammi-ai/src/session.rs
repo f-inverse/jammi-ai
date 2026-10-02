@@ -2293,20 +2293,15 @@ impl InferenceSession {
 
     /// Evaluate embedding quality against golden relevance judgments.
     ///
-    /// `cohorts` maps a golden-set `query_id` to an opaque `{key: value}`
-    /// segment map persisted alongside that query's per-query metrics
-    /// (`_jammi_eval_per_query`, spec J9). Pass an empty map for no tags.
+    /// The request's `cohorts` map a golden-set `query_id` to an opaque
+    /// `{key: value}` segment map persisted alongside that query's per-query
+    /// metrics (`_jammi_eval_per_query`); its `method` ranks each query as a
+    /// search's does.
     pub async fn eval_embeddings(
         &self,
-        source_id: &str,
-        embedding_table: Option<&str>,
-        golden_source: &str,
-        k: usize,
-        cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
+        request: jammi_wire::request::EmbeddingEvalRequest,
     ) -> Result<crate::eval::EmbeddingEvalReport> {
-        EvalRunner { session: self }
-            .eval_embeddings(source_id, embedding_table, golden_source, k, cohorts)
-            .await
+        EvalRunner { session: self }.eval_embeddings(&request).await
     }
 
     /// Read back the persisted per-query eval records for a run, scoped to the
@@ -2344,14 +2339,9 @@ impl InferenceSession {
     /// Compare multiple embedding tables side-by-side.
     pub async fn eval_compare(
         &self,
-        embedding_tables: &[String],
-        source_id: &str,
-        golden_source: &str,
-        k: usize,
+        request: jammi_wire::request::CompareEvalRequest,
     ) -> Result<crate::eval::CompareEvalReport> {
-        EvalRunner { session: self }
-            .eval_compare(embedding_tables, source_id, golden_source, k)
-            .await
+        EvalRunner { session: self }.eval_compare(&request).await
     }
 
     /// Evaluate whether a predictor's uncertainty is honest.

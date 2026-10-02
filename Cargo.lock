@@ -4271,7 +4271,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jammi-admin"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -4285,7 +4285,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-ai"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4350,7 +4350,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-bench"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "bytes",
@@ -4387,7 +4387,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-cli"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-client"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-datafusion"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4445,7 +4445,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-db"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4503,7 +4503,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-encoders"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4523,7 +4523,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-kernels"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "approx",
  "bindgen_cuda",
@@ -4539,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-lora"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-numerics"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "approx",
  "nalgebra 0.34.2",
@@ -4569,7 +4569,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-python"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4594,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-server"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4649,7 +4649,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-test-resources"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "candle-core",
  "jammi-kernels",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-test-utils"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "jammi-wire"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "arrow",
  "arrow-array",

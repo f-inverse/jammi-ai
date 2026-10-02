@@ -12,8 +12,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::AnnIndexConfig;
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::session::QueryContext;
 use jammi_db::store::manifest::{
     ComputeDevice, ComputePrecision, ContentDigest, LocalRun, MaterializationEnv, ModelIdentity,
@@ -281,7 +280,7 @@ async fn promotable_building_row_fixture(
 /// only needs real bytes on disk, never rows that match the table's current
 /// Parquet.
 fn built_segment_index(n: usize) -> SidecarIndex {
-    let mut idx = SidecarIndex::new(
+    let mut idx = SidecarBuilder::new(
         DIMS,
         &AnnIndexConfig::default(),
         AnnIndexConfig::default().storage_precision,
@@ -291,8 +290,7 @@ fn built_segment_index(n: usize) -> SidecarIndex {
         let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
         idx.add(&format!("seg-row-{i}"), &v).unwrap();
     }
-    idx.build().unwrap();
-    idx
+    idx.build().unwrap()
 }
 
 /// Every sidecar file segment `seg` of `table_name` actually wrote under

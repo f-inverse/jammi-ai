@@ -26,8 +26,8 @@ use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::segment::{rescore, search_unit};
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{SegmentSearchPhase, VectorIndex};
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
+use jammi_db::index::SegmentSearchPhase;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_test_utils::vq;
@@ -44,12 +44,11 @@ use crate::common::grpc::{
 
 /// Build a fully-built one-segment [`SidecarIndex`] over `rows` at `precision`.
 pub fn built_index(rows: &[(&str, [f32; 4])], precision: StoragePrecision) -> SidecarIndex {
-    let mut idx = SidecarIndex::new(4, &AnnIndexConfig::default(), precision).unwrap();
+    let mut idx = SidecarBuilder::new(4, &AnnIndexConfig::default(), precision).unwrap();
     for (id, v) in rows {
         idx.add(id, v).unwrap();
     }
-    idx.build().unwrap();
-    idx
+    idx.build().unwrap()
 }
 
 /// Register a `building` embedding table on `store` and return the writer's

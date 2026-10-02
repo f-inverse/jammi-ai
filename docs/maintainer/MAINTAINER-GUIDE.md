@@ -915,12 +915,16 @@ Every trait/enum/base surface a maintainer extends, with anchors and invariants.
   (`ANN_MANIFEST_VERSION=3`). Metric hardcoded `Cos`; quantization is
   `StoragePrecision`-driven (`F32`/`F16`/`Int8`/`Binary`,
   `crates/jammi-db/src/config/mod.rs`), passed as an explicit `precision` argument to
-  `SidecarIndex::new`/`load` — never read off `self.ann` internally, so a
+  `SidecarBuilder::new`/`SidecarIndex::load` — never read off `self.ann` internally, so a
   rebuild/load always uses the caller's resolved precision (the catalog row's
-  persisted value), not today's deployment default. `SidecarIndex::index_options`
-  is the **sole place USearch field names appear**. A quantized (`F16`/`Int8`)
-  build also accumulates exact `f32` vectors in `SidecarIndex::add` and flushes
-  them to the `.rawf32` rescore companion on `save` (`RawVectorCompanion`,
+  persisted value), not today's deployment default. `index_options`
+  is the **sole place USearch field names appear**. A `SidecarIndex` is built by a
+  `SidecarBuilder` (or loaded) and never grows: `add` takes each row's exact `f32`
+  vector, and `build` inserts the whole graph in key order through ONE USearch thread
+  context, reserved once — every context draws HNSW levels from its own identically
+  seeded generator, so inserting through one per core would tie the graph to the
+  building host's core count. A quantized (`F16`/`Int8`/`Binary`) index keeps those
+  exact vectors and flushes them to the `.rawf32` rescore companion on `save` (`RawVectorCompanion`,
   mmap'd read-only on `load`); `get_exact` reads it (falling back to `get` at
   `F32`, whose own USearch vectors are already exact). `Binary` is USearch's
   `B1` scalar kind: each dimension is packed to a single sign bit,

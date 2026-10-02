@@ -6,14 +6,13 @@
 //! embeddings, carved small enough to ship in the engine git object store (no
 //! LFS) yet measured on real vectors. It is built once, off-box, by this module
 //! and committed; CI only ever *loads* it (the recall gate in [`crate::recall`]
-//! never rebuilds the sidecar — USearch's default build is nondeterministic).
+//! never rebuilds the sidecar).
 //!
 //! The build is a closed function of its inputs (the two source parquets and the
 //! two subset counts) under a sorted-`_row_id` projection, so re-running it on
-//! the same cache reproduces the same corpus and query slices. The frozen
-//! sidecar itself is *not* reproducible bit-for-bit (the nondeterministic build
-//! is exactly why it is frozen and committed once), so the committed `.usearch`
-//! is the single authority — this builder writes it once.
+//! the same cache reproduces the same corpus and query slices. The committed
+//! `.usearch` is the single graph the gate measures — this builder writes it
+//! once.
 //!
 //! ## Provenance recorded
 //!
@@ -31,7 +30,7 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
-use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::sidecar::SidecarBuilder;
 use jammi_db::index::VectorIndex;
 
 use crate::corpus;
@@ -207,11 +206,11 @@ fn freeze_sidecar(
     dim: usize,
     precision: StoragePrecision,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision)?;
+    let mut builder = SidecarBuilder::new(dim, &AnnIndexConfig::default(), precision)?;
     for (id, v) in rows {
-        index.add(id, v)?;
+        builder.add(id, v)?;
     }
-    index.build()?;
+    let index = builder.build()?;
     VectorIndex::save(&index, base)?;
     Ok(())
 }
@@ -343,11 +342,11 @@ async fn freeze_and_measure_quantized_precision(
     // Freeze the quantized sidecar over the SAME corpus the committed F32
     // bundle indexes — the ONE build, committed, never rebuilt by the gate.
     let base = fixture_dir.join(stem);
-    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision)?;
+    let mut builder = SidecarBuilder::new(dim, &AnnIndexConfig::default(), precision)?;
     for (id, v) in &corpus_rows {
-        index.add(id, v)?;
+        builder.add(id, v)?;
     }
-    index.build()?;
+    let index = builder.build()?;
     VectorIndex::save(&index, &base)?;
 
     let mut rescored = BTreeMap::new();
@@ -652,11 +651,12 @@ pub async fn build_binary_recall_fixture(
     // Freeze the Binary sidecar over the SAME corpus the committed F32/Int8
     // bundles index — the ONE build, committed, never rebuilt by the gate.
     let base = fixture_dir.join(FROZEN_BINARY_STEM);
-    let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary)?;
+    let mut builder =
+        SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary)?;
     for (id, v) in &corpus_rows {
-        index.add(id, v)?;
+        builder.add(id, v)?;
     }
-    index.build()?;
+    let index = builder.build()?;
     VectorIndex::save(&index, &base)?;
 
     eprintln!(
@@ -884,7 +884,7 @@ pub struct SegmentRecallFloorRecord {
 /// fixture corpus (`fixture_dir/corpus_vectors.parquet` — the SAME real
 /// embeddings the frozen `F32`/`Int8`/`Binary` bundles index) into
 /// [`SEGMENT_COUNT`] segments under each of [`SEGMENT_PARTITIONINGS`], freeze
-/// one [`SidecarIndex`] per segment AT THAT PRECISION
+/// one [`SidecarIndex`](jammi_db::index::sidecar::SidecarIndex) per segment AT THAT PRECISION
 /// (`fixture_dir/{partitioning}_{precision}_seg{i}.*` — ONE build per segment,
 /// committed, never rebuilt by the gate), assemble them into a
 /// [`jammi_db::index::SegmentedIndex`], and measure its held-out

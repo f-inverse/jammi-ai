@@ -294,7 +294,7 @@ impl<'a> ServedIndex<'a> {
 /// How many of `index`'s rows `mask` hides at `version`.
 fn hidden_rows(mask: &DeletionMask, version: i64, index: &SidecarIndex) -> usize {
     mask.entries()
-        .filter(|(key, horizon)| *horizon >= version && index.contains(key))
+        .filter(|(key, horizon)| *horizon >= version && index.contains_row(key))
         .count()
 }
 
@@ -734,6 +734,7 @@ impl SegmentedIndex {
 mod tests {
     use super::*;
     use crate::config::AnnIndexConfig;
+    use crate::index::sidecar::SidecarBuilder;
     use crate::index::{validate_query, QuerySource};
 
     /// A test query validated at the literal's own width — the width of the
@@ -750,12 +751,11 @@ mod tests {
     /// in-memory buffer, so `search_final` rescores without any save/load.
     fn segment(rows: &[(&str, Vec<f32>)], precision: StoragePrecision) -> SidecarIndex {
         let dim = rows[0].1.len();
-        let mut idx = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision).unwrap();
+        let mut idx = SidecarBuilder::new(dim, &AnnIndexConfig::default(), precision).unwrap();
         for (id, v) in rows {
             idx.add(id, v).unwrap();
         }
-        idx.build().unwrap();
-        idx
+        idx.build().unwrap()
     }
 
     /// One segment's rows paired with the precision to build them at — the input
@@ -1016,12 +1016,12 @@ mod tests {
 
         let build = |rows: &[(String, Vec<f32>)]| {
             let mut idx =
-                SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+                SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Int8)
+                    .unwrap();
             for (id, v) in rows {
                 idx.add(id, v).unwrap();
             }
-            idx.build().unwrap();
-            idx
+            idx.build().unwrap()
         };
         let seg = SegmentedIndex::new(vec![
             (SegmentId(0), build(&seg_a)),
@@ -1149,12 +1149,11 @@ mod tests {
     }
 
     fn wide_segment(rows: &[(String, Vec<f32>)], precision: StoragePrecision) -> SidecarIndex {
-        let mut idx = SidecarIndex::new(32, &AnnIndexConfig::default(), precision).unwrap();
+        let mut idx = SidecarBuilder::new(32, &AnnIndexConfig::default(), precision).unwrap();
         for (id, v) in rows {
             idx.add(id, v).unwrap();
         }
-        idx.build().unwrap();
-        idx
+        idx.build().unwrap()
     }
 
     /// Run `search_final` through a counting exact-vector closure and return

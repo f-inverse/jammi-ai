@@ -5,7 +5,7 @@
   },
   "cosent.precision_at_10": {
     "tol": 0.03,
-    "value": 0.4019999999999997
+    "value": 0.40249999999999986
   },
   "graph.precision_at_10": {
     "tol": 0.03,

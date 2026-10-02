@@ -19,8 +19,8 @@ use jammi_db::catalog::segment_repo::IndexSegment;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{validate_query, QuerySource, SearchMethod, VectorIndex};
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
+use jammi_db::index::{validate_query, QuerySource, SearchMethod};
 use jammi_db::session::QueryContext;
 use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use jammi_numerics::distance::cosine_distance;
@@ -75,12 +75,11 @@ async fn record_of(store: &ResultStore, building: &BuildingTable) -> ResultTable
 
 /// Build a fully-built one-segment [`SidecarIndex`] over `rows` at `precision`.
 fn built_index(rows: &[(&str, [f32; 4])], precision: StoragePrecision) -> SidecarIndex {
-    let mut idx = SidecarIndex::new(4, &AnnIndexConfig::default(), precision).unwrap();
+    let mut idx = SidecarBuilder::new(4, &AnnIndexConfig::default(), precision).unwrap();
     for (id, v) in rows {
         idx.add(id, v).unwrap();
     }
-    idx.build().unwrap();
-    idx
+    idx.build().unwrap()
 }
 
 // Test 3 — appending a second segment leaves the first segment's on-disk bundle

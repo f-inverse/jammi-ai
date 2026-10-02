@@ -1987,8 +1987,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
             // moment a segment can be registered (segment 0, stamped with A's
             // tenant from the parent row).
             {
-                use jammi_db::index::VectorIndex;
-                let mut index = jammi_db::index::sidecar::SidecarIndex::new(
+                let mut index = jammi_db::index::sidecar::SidecarBuilder::new(
                     DIMS,
                     store.ann_config(),
                     info.storage_precision(),
@@ -1998,7 +1997,7 @@ async fn materialize_table_for_tenant_a() -> (Arc<InferenceSession>, Session, St
                     let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
                     index.add(&format!("row-{i}"), &v).unwrap();
                 }
-                index.build().unwrap();
+                let index = index.build().unwrap();
                 info.append_segment(&index).await.unwrap();
             }
 
@@ -2120,8 +2119,7 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
         // moment a segment can be registered (segment 0, stamped with A's
         // tenant from the parent row).
         {
-            use jammi_db::index::VectorIndex;
-            let mut index = jammi_db::index::sidecar::SidecarIndex::new(
+            let mut index = jammi_db::index::sidecar::SidecarBuilder::new(
                 DIMS,
                 store.ann_config(),
                 info.storage_precision(),
@@ -2131,7 +2129,7 @@ async fn materialize_global_table() -> (Arc<InferenceSession>, Session, String, 
                 let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
                 index.add(&format!("row-{i}"), &v).unwrap();
             }
-            index.build().unwrap();
+            let index = index.build().unwrap();
             info.append_segment(&index).await.unwrap();
         }
 

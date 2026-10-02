@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::segment::{SegmentId, SegmentedIndex};
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_numerics::distance::cosine_distance;
 use jammi_test_utils::vq;
 
@@ -48,12 +47,11 @@ fn corpus(n: usize, dims: usize) -> Vec<Vec<f32>> {
 
 fn build(rows: &[(usize, &Vec<f32>)], dims: usize) -> SidecarIndex {
     let mut index =
-        SidecarIndex::new(dims, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+        SidecarBuilder::new(dims, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
     for (i, v) in rows {
         index.add(&format!("{i:08}"), v).unwrap();
     }
-    index.build().unwrap();
-    index
+    index.build().unwrap()
 }
 
 /// `vectors` divided into `segments` contiguous runs, each built on its own

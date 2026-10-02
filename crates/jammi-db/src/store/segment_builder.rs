@@ -30,8 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
-use crate::index::sidecar::SidecarIndex;
-use crate::index::VectorIndex;
+use crate::index::sidecar::{SidecarBuilder, SidecarIndex};
 
 /// The rows of the segment being gathered.
 struct OpenSegment {
@@ -71,7 +70,7 @@ impl SegmentBuilder {
         precision: StoragePrecision,
         rows_per_segment: NonZeroUsize,
     ) -> Self {
-        let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let parallelism = crate::config::host_parallelism().get();
         Self {
             dimensions,
             ann,
@@ -138,11 +137,11 @@ impl SegmentBuilder {
         self.builds.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let start = Instant::now();
-            let mut index = SidecarIndex::new(dimensions, &ann, precision)?;
+            let mut builder = SidecarBuilder::new(dimensions, &ann, precision)?;
             for (row_id, vector) in rows.row_ids.iter().zip(&rows.vectors) {
-                index.add(row_id, vector)?;
+                builder.add(row_id, vector)?;
             }
-            index.build()?;
+            let index = builder.build()?;
             Ok((index, start.elapsed()))
         }));
         Ok(())
@@ -154,6 +153,7 @@ mod tests {
     use super::*;
     use crate::index::validate_query;
     use crate::index::QuerySource;
+    use crate::index::VectorIndex;
 
     fn vector(i: usize) -> Vec<f32> {
         let x = i as f32;

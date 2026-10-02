@@ -184,17 +184,16 @@ mod tests {
         validate_query(v.to_vec(), v.len(), QuerySource::Caller).unwrap()
     }
 
-    use crate::index::sidecar::SidecarIndex;
+    use crate::index::sidecar::{SidecarBuilder, SidecarIndex};
     use crate::index::VectorIndex;
     use crate::storage::sidecar_layout::save_sidecar;
 
     fn build_small_index(precision: StoragePrecision) -> SidecarIndex {
-        let mut idx = SidecarIndex::new(4, &AnnIndexConfig::default(), precision).unwrap();
+        let mut idx = SidecarBuilder::new(4, &AnnIndexConfig::default(), precision).unwrap();
         idx.add("row-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.add("row-b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
         idx.add("row-c", &[0.0, 0.0, 1.0, 0.0]).unwrap();
-        idx.build().unwrap();
-        idx
+        idx.build().unwrap()
     }
 
     /// A cache and the registry it shares — the same registry must back both the
@@ -282,9 +281,9 @@ mod tests {
         // Rebuild with a different row set → a new manifest (fresh created_at +
         // count) → a new key → a correct re-fetch (not the stale cached dir).
         let mut rebuilt =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         rebuilt.add("row-z", &[0.0, 0.0, 0.0, 1.0]).unwrap();
-        rebuilt.build().unwrap();
+        let rebuilt = rebuilt.build().unwrap();
         save_sidecar(&handle, &rebuilt).await.unwrap();
 
         let reloaded = cache

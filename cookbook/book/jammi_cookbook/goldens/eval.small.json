@@ -5,7 +5,7 @@
   },
   "compare.precision_delta": {
     "tol": 0.01,
-    "value": 0.02250000000000013
+    "value": 0.023000000000000242
   },
   "ner.f1": {
     "tol": 0.0,

@@ -76,7 +76,7 @@ use crate::error::{JammiError, Result};
 use crate::index::peer::{AllLocal, NoPeers, PeerFailureCounters, PeerTransport, SegmentPlacement};
 use crate::index::placed::{PlacedIndex, SegmentSource, ServedSources};
 use crate::index::segment::{SegmentId, SegmentedIndex};
-use crate::index::sidecar::SidecarIndex;
+use crate::index::sidecar::{SidecarBuilder, SidecarIndex};
 use crate::index::VectorIndex;
 use crate::index::{Admission, ValidatedQuery};
 use crate::session::QueryContext;
@@ -4810,7 +4810,7 @@ impl ResultStore {
     ) -> Result<()> {
         let precision = table.storage_precision.unwrap_or_default();
         let batches = storage::reader::read_all_record_batches(parquet_handle).await?;
-        let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
+        let mut builder = SidecarBuilder::new(dimensions, &self.ann, precision)?;
         for batch in batches {
             let row_ids = batch
                 .column_by_name("_row_id")
@@ -4829,13 +4829,13 @@ impl ResultStore {
                         .downcast_ref::<arrow::array::Float32Array>()
                         .ok_or_else(|| JammiError::Other("Vector not Float32".into()))?;
                     let vec: Vec<f32> = (0..float_arr.len()).map(|j| float_arr.value(j)).collect();
-                    index.add(row_id, &vec)?;
+                    builder.add(row_id, &vec)?;
                 }
             }
         }
 
-        if index.len() > 0 {
-            index.build()?;
+        if !builder.is_empty() {
+            let index = builder.build()?;
             recovered.append_segment(&index).await?;
         }
         Ok(())
@@ -4921,17 +4921,17 @@ impl ResultStore {
         )?;
 
         let mut writer = self.open_writer(building.parquet_url(), schema).await?;
-        let mut index = SidecarIndex::new(dimensions, &self.ann, precision)?;
+        let mut builder = SidecarBuilder::new(dimensions, &self.ann, precision)?;
         if !rows.is_empty() {
             writer.write_batch(&batch).await?;
             for (key, vector) in rows {
-                index.add(key, vector)?;
+                builder.add(key, vector)?;
             }
         }
         let row_count = writer.close().await?;
 
-        if index.len() > 0 {
-            index.build()?;
+        if !builder.is_empty() {
+            let index = builder.build()?;
             building.append_segment(&index).await?;
         }
 

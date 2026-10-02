@@ -1,6 +1,6 @@
 # Deploy as a Server
 
-> **Measured companion:** for the long-form, executed-and-measured treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/production.html).
+> **Measured companion:** for the long-form, executed-and-measured treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/production/production.html).
 
 Jammi can run as an Arrow Flight SQL server, making all registered sources and embedding tables queryable from any Arrow-compatible client. Use this when multiple services, BI tools, or non-Rust/Python consumers need to query Jammi's data.
 
@@ -41,7 +41,7 @@ info = client.get_flight_info(
 )
 reader = client.do_get(info.endpoints[0].ticket)
 table = reader.read_all()
-print(table.to_pandas())
+print(table)
 ```
 
 ### Query embedding tables
@@ -138,7 +138,7 @@ can negotiate capability before calling a verb:
 
 ```python
 info = db.get_server_info()
-# {"version": "0.51.0", "features": [...], "storage_backends": [...],
+# {"version": "0.52.0", "features": [...], "storage_backends": [...],
 #  "services": ["core", "eval", "event"]}
 if "eval" in info["services"]:
     db.eval_per_query(...)
@@ -238,7 +238,7 @@ The server exposes three HTTP side-channel endpoints on port `8080`:
 
 ```bash
 curl http://localhost:8080/healthz
-# {"status":"ok","version":"0.51.0"}
+# {"status":"ok","version":"0.52.0"}
 
 curl http://localhost:8080/readyz
 # {"status":"ready"}

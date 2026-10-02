@@ -1,51 +1,15 @@
-"""Audio-to-audio search over a tiny synthetic corpus with a CLAP model.
+"""Audio-to-audio search with a CLAP model: index, search, evaluate, and two ways to adapt it.
 
-End-to-end walkthrough: load a small audio corpus -> generate audio
-embeddings -> run cosine nearest-neighbour search with an audio query ->
-evaluate retrieval quality (Recall@K / MRR) against a held-out golden set ->
-domain-tune a projection head on audio triplets and re-evaluate.
-
-The numbered scripts (`01-load-corpus.py` ... `04-eval.py`) decompose the
-search-and-eval flow step by step; this file runs every phase in one process
-and is the version wired into `tests/cookbook_smoke.py`.
-
-Fine-tuning, two modes. Phase 5 trains a lightweight projection head on a
-*frozen* CLAP audio tower from `(anchor, positive, negative)` audio triplets and
-re-runs the eval, showing the tuned embeddings differ from the base. Phase 6
-runs the other mode on the same triplets: LoRA adapters injected INSIDE the
-HTSAT-Swin tower's own sites (`query`/`value` are the Swin blocks' attention
-projections, `linear1` the audio projection head's first linear), so the
-tower's representation itself moves rather than a new head learning on top of a
-frozen one. Both are real and both ship — the head is cheap and leaves the
-tower untouched, the tower adapter has more capacity and costs more compute.
-Phase 7 is the refusal: a `target_modules` list naming no site on this tower
-fails the JOB instead of quietly training zero parameters.
-
-The triplets here are synthetic — positive = a same-family clip, negative = a
-different-family clip — but what makes a clip a "positive"
-(augmentation-similar, or co-occurring-complementary) is entirely the caller's
-data; the trainer only minimizes the contrastive objective over whatever clips
-you pair.
-
-Model. The default model is the hermetic `htsat_clap_tiny` fixture so the recipe
-runs offline in CI in well under 60s. Any HuggingFace CLAP audio model works the
-same way — point `JAMMI_AUDIO_MODEL` at a Hugging Face repo id or
-`local:<path>` whose `config.json` declares `model_type = "clap_audio_model"`
-(or lists `ClapModel` / `ClapAudioModelWithProjection` in `architectures`) and
-whose checkpoint exposes the `audio_model.audio_encoder.*` + `audio_projection.*`
-tower keys, alongside a `preprocessor_config.json` feature-extractor config:
-
-    JAMMI_AUDIO_MODEL=laion/clap-htsat-fused   # (illustrative)
-
-The fixture has random weights, so its embeddings are garbage and the eval
-numbers are not meaningful — the recipe measures and reports them to exercise
-the full path; real retrieval quality comes from a real CLAP checkpoint.
-
-Run with `python cookbook/recipes/audio_search/example.py`. Exits 0 on success.
+Run with `python cookbook/recipes/audio_search/example.py`, or a step at a time
+as a notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
+# %% [markdown]
+# `JAMMI_AUDIO_MODEL` names the checkpoint, any CLAP audio model as a Hugging
+# Face repo id or `local:<path>`; the default is the random-weight
+# `htsat_clap_tiny` fixture, which runs offline in seconds.
 
+# %%
 import json
 import os
 import tempfile
@@ -55,367 +19,277 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 import jammi
-from jammi_cookbook import fixtures
 from jammi.errors import TrainingError
+from jammi_cookbook import fixtures
 
 AUDIO_CORPUS_DIR = fixtures.path("tiny_audio_corpus")
-GOLDEN_PATH = fixtures.path("tiny_audio_golden.json")
-
-# Default to the hermetic local fixture so CI runs offline. Override with
-# JAMMI_AUDIO_MODEL=<hf-repo-id> or `local:<path>` for any CLAP-format model.
 DEFAULT_MODEL = fixtures.model("htsat_clap_tiny")
 MODEL = os.environ.get("JAMMI_AUDIO_MODEL", DEFAULT_MODEL)
+METRICS = ("recall_at_k", "precision_at_k", "mrr", "ndcg")
+print(f"model: {MODEL}")
 
+home = Path(tempfile.mkdtemp())
+db = jammi.connect(f"file://{home}")
 
-def load_corpus_table() -> pa.Table:
-    """Read every `clip_*.wav` in the corpus dir into an Arrow table with the
-    inline audio bytes the embedding pipeline consumes.
+# %% [markdown]
+# ## Load the clips
+#
+# The corpus is 20 synthetic one-second clips in five timbre families, held
+# inline as WAV bytes in a Parquet source: `clip_id`, and `audio`.
 
-    Schema: `clip_id` (utf8 key), `audio` (binary, the raw WAV bytes).
-    """
-    rows = sorted(AUDIO_CORPUS_DIR.glob("clip_*.wav"))
-    assert rows, f"no corpus clips under {AUDIO_CORPUS_DIR}"
-    ids = [p.stem for p in rows]
-    blobs = [p.read_bytes() for p in rows]
-    return pa.table(
+# %%
+paths = sorted(AUDIO_CORPUS_DIR.glob("clip_*.wav"))
+assert paths, f"no corpus clips under {AUDIO_CORPUS_DIR}"
+pq.write_table(
+    pa.table(
         {
-            "clip_id": pa.array(ids, type=pa.utf8()),
-            "audio": pa.array(blobs, type=pa.binary()),
+            "clip_id": pa.array([p.stem for p in paths], type=pa.utf8()),
+            "audio": pa.array([p.read_bytes() for p in paths], type=pa.binary()),
         }
-    )
+    ),
+    home / "corpus.parquet",
+)
+db.add_source("corpus", url=str(home / "corpus.parquet"), format="parquet")
 
+# %% [markdown]
+# ## Embed them
+#
+# `generate_embeddings` with `modality="audio"` runs the audio tower over the
+# `audio` column. The encoder is read from the checkpoint's CLAP config and
+# owns decoding, resampling and the log-mel front end; the vectors are
+# L2-normalized.
 
-def build_audio_golden(json_path: Path) -> pa.Table:
-    """Flatten the per-query golden JSON into the (query_id, query_audio,
-    relevant_id) shape `db.eval_embeddings` consumes in audio mode.
+# %%
+db.generate_embeddings(
+    source="corpus", model=MODEL, columns=["audio"], key="clip_id", modality="audio"
+)
 
-    The presence of a `query_audio` (binary) column is what switches the eval
-    runner from text/image-query to audio-query encoding.
-    """
-    queries = json.loads(json_path.read_text())
-    query_ids: list[str] = []
-    query_audios: list[bytes] = []
-    relevant_ids: list[str] = []
-    for q in queries:
-        audio_bytes = (AUDIO_CORPUS_DIR / q["query_audio"]).read_bytes()
-        for rid in q["relevant_ids"]:
-            query_ids.append(q["query_id"])
-            query_audios.append(audio_bytes)
-            relevant_ids.append(str(rid))
-    return pa.table(
+# %% [markdown]
+# ## Search with a clip
+#
+# A query clip is encoded by the same tower, and `search` returns its nearest
+# corpus clips by cosine similarity.
+
+# %%
+query_wav = (AUDIO_CORPUS_DIR / "queries" / "q_sine.wav").read_bytes()
+query_vec = db.encode_query(model=MODEL, query=query_wav, modality="audio")
+assert query_vec, "query embedding must be non-empty"
+print(f"query embedding dim: {len(query_vec)}")
+
+results = db.search("corpus", query=query_vec, k=5)
+assert results.num_rows > 0, "search must return a non-empty top-K"
+print(f"top-{results.num_rows} for q_sine: {results.column('clip_id').to_pylist()}")
+
+# %% [markdown]
+# ## Measure retrieval quality
+#
+# The golden set holds a held-out query clip per family and the corpus clips
+# of that family. A `query_audio` (binary) column is what switches
+# `eval_embeddings` to audio queries. The numbers are reported, not judged:
+# the fixture's weights are random.
+
+# %%
+query_ids, query_audios, relevant_ids = [], [], []
+for q in json.loads(fixtures.path("tiny_audio_golden.json").read_text()):
+    audio_bytes = (AUDIO_CORPUS_DIR / q["query_audio"]).read_bytes()
+    for rid in q["relevant_ids"]:
+        query_ids.append(q["query_id"])
+        query_audios.append(audio_bytes)
+        relevant_ids.append(str(rid))
+pq.write_table(
+    pa.table(
         {
             "query_id": pa.array(query_ids, type=pa.utf8()),
             "query_audio": pa.array(query_audios, type=pa.binary()),
             "relevant_id": pa.array(relevant_ids, type=pa.utf8()),
         }
-    )
+    ),
+    home / "golden.parquet",
+)
+db.add_source("golden", url=str(home / "golden.parquet"), format="parquet")
 
+base_metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
+for key in METRICS:
+    value = base_metrics["aggregate"][key]
+    assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
+    print(f"{key:<16} {value:.4f}")
+assert len(base_metrics["per_query"]) > 0, "per_query must carry one record per query"
 
-def corpus_by_family() -> dict[str, list[tuple[str, bytes]]]:
-    """Group the corpus clips by timbre family (the token in
-    `clip_<family>_<idx>.wav`), preserving a deterministic order."""
-    families: dict[str, list[tuple[str, bytes]]] = {}
-    for path in sorted(AUDIO_CORPUS_DIR.glob("clip_*.wav")):
-        stem = path.stem  # clip_sine_0
-        family = stem[len("clip_") :].rsplit("_", 1)[0]  # -> sine
-        families.setdefault(family, []).append((stem, path.read_bytes()))
-    assert families, f"no corpus clips under {AUDIO_CORPUS_DIR}"
-    return families
+# %% [markdown]
+# ## Triplets to train on
+#
+# `(anchor, positive, negative)` clip triplets: for each clip, the positive is
+# the next clip of its family and the negative a clip of another family. What
+# makes a clip a "positive" — augmentation-similar, or co-occurring — is the
+# caller's data; the trainer only minimizes the triplet loss over whatever
+# clips are paired.
 
+# %%
+families: dict[str, list[bytes]] = {}
+for path in paths:
+    family = path.stem[len("clip_"):].rsplit("_", 1)[0]
+    families.setdefault(family, []).append(path.read_bytes())
 
-def build_audio_triplets() -> pa.Table:
-    """Synthetic `(anchor, positive, negative)` audio triplets.
+names = list(families)
+anchors, positives, negatives = [], [], []
+for fi, name in enumerate(names):
+    clips, others = families[name], families[names[(fi + 1) % len(names)]]
+    for ci, anchor in enumerate(clips):
+        anchors.append(anchor)
+        positives.append(clips[(ci + 1) % len(clips)])
+        negatives.append(others[ci % len(others)])
 
-    For each clip: positive = the next clip in the same family, negative = a
-    clip from a different family. All three columns are raw audio bytes — the
-    same encoded clips the embedding pipeline consumes. The trainer encodes
-    them through the frozen audio tower + projection head and minimizes the
-    triplet loss; the *meaning* of the pairing is this builder's choice, not
-    the trainer's.
-    """
-    families = corpus_by_family()
-    fam_names = list(families)
-    anchors: list[bytes] = []
-    positives: list[bytes] = []
-    negatives: list[bytes] = []
-    for fi, fam in enumerate(fam_names):
-        clips = families[fam]
-        neg_clips = families[fam_names[(fi + 1) % len(fam_names)]]
-        for ci, (_, anchor) in enumerate(clips):
-            positives.append(clips[(ci + 1) % len(clips)][1])
-            negatives.append(neg_clips[ci % len(neg_clips)][1])
-            anchors.append(anchor)
-    return pa.table(
+pq.write_table(
+    pa.table(
         {
             "anchor": pa.array(anchors, type=pa.binary()),
             "positive": pa.array(positives, type=pa.binary()),
             "negative": pa.array(negatives, type=pa.binary()),
         }
+    ),
+    home / "audio_triplets.parquet",
+)
+db.add_source("triplets", url=str(home / "audio_triplets.parquet"), format="parquet")
+
+# %% [markdown]
+# ## Adapt it cheaply: a head on a frozen tower
+#
+# With no `target_modules`, fine-tuning trains a projection head on top of the
+# frozen audio tower: cheap, and the tower is untouched. Re-embedding the
+# corpus with the tuned model and evaluating again compares the two.
+
+# %%
+job = db.fine_tune(
+    source="triplets",
+    base_model=MODEL,
+    columns=["anchor", "positive", "negative"],
+    method="lora",
+    task="audio_embedding",
+    lora_rank=4,
+    learning_rate=1e-3,
+    epochs=8,
+    batch_size=4,
+    warmup_steps=0,
+    validation_fraction=0.0,
+    early_stopping_metric="train_loss",
+)
+job.wait()
+tuned_model = job.output_model_id
+assert tuned_model.startswith("jammi:fine-tuned:"), f"unexpected model_id: {tuned_model}"
+print(f"fine-tuned audio model: {tuned_model}")
+
+db.generate_embeddings(
+    source="corpus", model=tuned_model, columns=["audio"], key="clip_id", modality="audio"
+)
+tuned_metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
+for key in METRICS:
+    value = tuned_metrics["aggregate"][key]
+    assert 0.0 <= value <= 1.0, f"tuned {key} out of range: {value}"
+for label, run in (("base ", base_metrics), ("tuned", tuned_metrics)):
+    print(f"{label}: " + "  ".join(f"{k}={run['aggregate'][k]:.4f}" for k in METRICS))
+
+# %% [markdown]
+# ## The head changed the embedding
+#
+# The same query clip, encoded through the tuned model, must come out
+# different from the base encoding. This checks the vectors, not the metrics
+# above: on a set this small the rankings rarely flip even when the vectors
+# move. It checks change, not improvement — the fixture's weights are random.
+
+# %%
+tuned_query_vec = db.encode_query(model=tuned_model, query=query_wav, modality="audio")
+assert len(tuned_query_vec) == len(query_vec), (
+    f"tuned dim {len(tuned_query_vec)} differs from base dim {len(query_vec)}"
+)
+max_abs_diff = max(abs(b - t) for b, t in zip(query_vec, tuned_query_vec))
+print(f"query embedding max |Δ| (base vs tuned): {max_abs_diff:.6f}")
+assert max_abs_diff > 1e-4, (
+    f"the tuned query vector equals the base one (max |Δ| = {max_abs_diff:.2e}): "
+    "the projection head did not change the embedding"
+)
+
+# %% [markdown]
+# ## Adapt the tower itself
+#
+# A non-empty `target_modules` puts LoRA inside the HTSAT-Swin tower, on the
+# same triplets: `query` and `value` are the Swin blocks' attention
+# projections, `linear1` the audio projection's first linear. The tower's own
+# representation moves — more capacity for a domain the base checkpoint never
+# saw, at more compute. The adapted model registers under the audio task, and
+# the same query encodes differently through it: an adapter that trained but
+# was dropped at serve time would leave the two vectors identical.
+
+# %%
+tower_job = db.fine_tune(
+    source="triplets",
+    base_model=MODEL,
+    columns=["anchor", "positive", "negative"],
+    method="lora",
+    task="audio_embedding",
+    target_modules=["query", "value", "linear1"],
+    lora_rank=4,
+    learning_rate=5e-3,
+    epochs=2,
+    batch_size=4,
+    warmup_steps=0,
+    validation_fraction=0.0,
+    early_stopping_metric="train_loss",
+)
+tower_job.wait()
+tower_model = tower_job.output_model_id
+assert tower_model.startswith("jammi:fine-tuned:"), f"unexpected model_id: {tower_model}"
+print(f"tower-adapted audio model: {tower_model}")
+
+described = db.describe_model(tower_model)
+assert described is not None, f"{tower_model} missing from the catalog"
+assert described["task"] == "audio_embedding", f"registered under the wrong task: {described}"
+
+tower_query_vec = db.encode_query(model=tower_model, query=query_wav, modality="audio")
+assert len(tower_query_vec) == len(query_vec), (
+    f"tower-adapted dim {len(tower_query_vec)} differs from base dim {len(query_vec)}"
+)
+tower_max_abs_diff = max(abs(b - t) for b, t in zip(query_vec, tower_query_vec))
+print(f"query embedding max |Δ| (base vs tower-adapted): {tower_max_abs_diff:.6f}")
+assert tower_max_abs_diff > 1e-4, (
+    f"the adapted query vector equals the base one (max |Δ| = {tower_max_abs_diff:.2e}): "
+    "the adapter was trained but is not applied when the model is served"
+)
+
+# %% [markdown]
+# ## A selector that matches nothing is refused
+#
+# `q_proj` is a real site on many decoder checkpoints and on nothing in an
+# HTSAT-Swin tower. Selecting no site would train zero parameters and publish
+# an adapter that changes nothing, so the engine fails the job, and the
+# message names this tower's real sites. `linear1` appears only in this
+# tower's site list, so it is the part of the message that proves it.
+
+# %%
+refused = db.fine_tune(
+    source="triplets",
+    base_model=MODEL,
+    columns=["anchor", "positive", "negative"],
+    method="lora",
+    task="audio_embedding",
+    target_modules=["q_proj"],
+    lora_rank=4,
+    epochs=1,
+    batch_size=4,
+    warmup_steps=0,
+    validation_fraction=0.0,
+    early_stopping_metric="train_loss",
+)
+try:
+    refused.wait()
+except TrainingError as error:
+    message = str(error)
+    print(f"refused: {message}")
+    assert "q_proj" in message, f"the refusal must echo the submitted selector: {message}"
+    assert "query" in message and "linear1" in message, (
+        f"the refusal must name this tower's real sites: {message}"
     )
+else:
+    raise AssertionError("a target_modules list matching no site must fail the job")
 
-
-def aggregate_line(metrics: dict) -> str:
-    """One-line summary of the four aggregate retrieval metrics."""
-    agg = metrics["aggregate"]
-    return "  ".join(
-        f"{key}={agg[key]:.4f}"
-        for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg")
-    )
-
-
-def main() -> int:
-    print(f"audio_search: model = {MODEL}")
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
-        tmp_path = Path(tmp)
-
-        # 1. Load the corpus clips into a Parquet source (inline audio bytes).
-        corpus_parquet = tmp_path / "corpus.parquet"
-        pq.write_table(load_corpus_table(), corpus_parquet)
-        db.add_source("corpus", url=str(corpus_parquet), format="parquet")
-
-        # 2. Generate audio embeddings over the `audio` column. The model is
-        #    auto-detected from its CLAP config; the backend owns
-        #    decode -> resample -> log-mel -> forward; output is L2-normalized.
-        db.generate_embeddings(
-            source="corpus",
-            model=MODEL,
-            columns=["audio"],
-            key="clip_id",
-            modality="audio",
-        )
-
-        # 3. Encode a single audio query and run cosine ANN search.
-        query_wav = (AUDIO_CORPUS_DIR / "queries" / "q_sine.wav").read_bytes()
-        query_vec = db.encode_query(model=MODEL, query=query_wav, modality="audio")
-        assert query_vec, "query embedding must be non-empty"
-        print(f"query embedding dim: {len(query_vec)}")
-
-        results = db.search("corpus", query=query_vec, k=5)  # pyarrow.Table
-        assert results.num_rows > 0, "search must return a non-empty top-K"
-        top_ids = results.column("clip_id").to_pylist()
-        print(f"top-{results.num_rows} for q_sine: {top_ids}")
-
-        # 4. Evaluate retrieval quality against the held-out golden set. The
-        #    eval encodes each golden `query_audio`, searches, and reports
-        #    Recall@K / MRR per query and in aggregate. We measure and report
-        #    — we do NOT assert a quality target (the fixture model has random
-        #    weights; real numbers come from a real CLAP checkpoint).
-        golden_parquet = tmp_path / "golden.parquet"
-        pq.write_table(build_audio_golden(GOLDEN_PATH), golden_parquet)
-        db.add_source("golden", url=str(golden_parquet), format="parquet")
-
-        base_metrics = db.eval_embeddings(
-            source="corpus",
-            golden_source="golden.public.golden",
-            k=5,
-        )
-
-        aggregate = base_metrics["aggregate"]
-        print("base aggregate retrieval metrics:")
-        for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
-            value = aggregate[key]
-            assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
-            print(f"  {key:<16} {value:.4f}")
-
-        per_query = base_metrics["per_query"]
-        assert len(per_query) > 0, "per_query must carry one record per query"
-        print(f"per_query: {len(per_query)} records")
-
-        # 5. Domain-tune a projection head on audio triplets, then re-evaluate.
-        #    Empty target_modules => a trainable projection head on the FROZEN
-        #    CLAP audio tower (the cheap, low-risk lightweight mode). The
-        #    triplet loss only needs (anchor, positive, negative) clips; the
-        #    pairing semantics are ours, above, not the trainer's.
-        triplets_parquet = tmp_path / "audio_triplets.parquet"
-        pq.write_table(build_audio_triplets(), triplets_parquet)
-        db.add_source("triplets", url=str(triplets_parquet), format="parquet")
-
-        job = db.fine_tune(
-            source="triplets",
-            base_model=MODEL,
-            columns=["anchor", "positive", "negative"],
-            method="lora",
-            task="audio_embedding",
-            lora_rank=4,
-            learning_rate=1e-3,
-            epochs=8,
-            batch_size=4,
-            warmup_steps=0,
-            validation_fraction=0.0,
-            early_stopping_metric="train_loss",
-        )
-        job.wait()
-        tuned_model = job.output_model_id
-        assert tuned_model.startswith("jammi:fine-tuned:"), (
-            f"unexpected fine-tuned model_id: {tuned_model}"
-        )
-        print(f"fine-tuned audio model: {tuned_model}")
-
-        # Re-embed the corpus with the tuned model and eval against the same
-        # held-out golden set.
-        db.generate_embeddings(
-            source="corpus",
-            model=tuned_model,
-            columns=["audio"],
-            key="clip_id",
-            modality="audio",
-        )
-        tuned_metrics = db.eval_embeddings(
-            source="corpus",
-            golden_source="golden.public.golden",
-            k=5,
-        )
-        for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
-            value = tuned_metrics["aggregate"][key]
-            assert 0.0 <= value <= 1.0, f"tuned {key} out of range: {value}"
-
-        print(f"base : {aggregate_line(base_metrics)}")
-        print(f"tuned: {aggregate_line(tuned_metrics)}")
-
-        # The projection head changed the audio embeddings — re-encode the SAME
-        # query through the tuned tower+head and compare the vectors to the base
-        # encoding (`query_vec`, from step 3). Vector change is the real
-        # invariant fine-tuning guarantees: the training loss moves, so the
-        # projected embeddings must differ. We assert on the vectors, not on the
-        # coarse top-k metrics above — on this tiny eval set the rankings rarely
-        # flip even when the vectors move, so a metric-inequality check passes
-        # only intermittently. (With the random-weight fixture the *direction*
-        # of the change is not meaningful; a real CLAP checkpoint is where
-        # tuning lifts quality. We assert change, not improvement.)
-        tuned_query_vec = db.encode_query(model=tuned_model, query=query_wav, modality="audio")
-        assert len(tuned_query_vec) == len(query_vec), (
-            "tuned query embedding dim must match the base dim "
-            f"(base={len(query_vec)}, tuned={len(tuned_query_vec)})"
-        )
-        max_abs_diff = max(
-            abs(b - t) for b, t in zip(query_vec, tuned_query_vec)
-        )
-        print(f"query embedding max |Δ| (base vs tuned): {max_abs_diff:.6f}")
-        assert max_abs_diff > 1e-4, (
-            "fine-tuned audio embeddings should differ from base: the tuned "
-            "query vector is identical to the base vector "
-            f"(max |Δ| = {max_abs_diff:.2e} <= 1e-4) — the projection head did "
-            "not change the embedding"
-        )
-
-        # 6. The OTHER fine-tune mode, on the SAME triplets: a NON-empty
-        #    target_modules puts LoRA adapters INSIDE the HTSAT-Swin tower
-        #    itself. Phase 5's head learns a new map on top of a tower whose
-        #    weights never move; this leg moves the tower's own representation
-        #    — more capacity for a domain the base checkpoint never saw, at
-        #    more compute, and it needs the site names of THIS architecture
-        #    (`query`/`value` are the Swin blocks' attention projections,
-        #    indexed by stage; `linear1` is the audio projection head's first
-        #    linear, an unindexed site).
-        tower_job = db.fine_tune(
-            source="triplets",
-            base_model=MODEL,
-            columns=["anchor", "positive", "negative"],
-            method="lora",
-            task="audio_embedding",
-            target_modules=["query", "value", "linear1"],
-            lora_rank=4,
-            learning_rate=5e-3,
-            epochs=2,
-            batch_size=4,
-            warmup_steps=0,
-            validation_fraction=0.0,
-            early_stopping_metric="train_loss",
-        )
-        tower_job.wait()
-        tower_model = tower_job.output_model_id
-        assert tower_model.startswith("jammi:fine-tuned:"), (
-            f"unexpected fine-tuned model_id: {tower_model}"
-        )
-        print(f"tower-adapted audio model: {tower_model}")
-
-        # The adapted model registers in the catalog under the MEDIA task, so
-        # model resolution finds an audio encoder, not a text one. This is the
-        # most the *client* surface says about the artifact: the saved
-        # adapter's kind (encoder adapters, and which tower they were injected
-        # into) is engine-internal and is pinned by the engine's own
-        # integration tests, not readable from `describe_model` here. What this
-        # recipe can prove at the consumer surface is the next check: the
-        # served embedding actually moved.
-        described = db.describe_model(tower_model)
-        assert described is not None, f"{tower_model} missing from the catalog"
-        assert described["task"] == "audio_embedding", (
-            f"tower-adapted model registered under the wrong task: {described}"
-        )
-
-        # Same invariant as phase 5, one layer deeper: the adapted tower serves
-        # under the new model id, so the SAME query clip encodes differently.
-        # A LoRA delta that trained but was silently dropped at serve time
-        # would leave these two vectors identical. Change, not improvement —
-        # the fixture's weights are random, so the direction means nothing.
-        tower_query_vec = db.encode_query(
-            model=tower_model, query=query_wav, modality="audio"
-        )
-        assert len(tower_query_vec) == len(query_vec), (
-            "tower-adapted query embedding dim must match the base dim "
-            f"(base={len(query_vec)}, tuned={len(tower_query_vec)})"
-        )
-        tower_max_abs_diff = max(
-            abs(b - t) for b, t in zip(query_vec, tower_query_vec)
-        )
-        print(
-            f"query embedding max |Δ| (base vs tower-adapted): "
-            f"{tower_max_abs_diff:.6f}"
-        )
-        assert tower_max_abs_diff > 1e-4, (
-            "the tower adapter should change the served audio embedding: the "
-            "adapted query vector is identical to the base vector "
-            f"(max |Δ| = {tower_max_abs_diff:.2e} <= 1e-4) — the adapter was "
-            "trained but is not being applied when the model is served"
-        )
-
-        # 7. The refusal. `q_proj` is a real site name on plenty of decoder
-        #    checkpoints and on nothing in an HTSAT-Swin tower — exactly the
-        #    plausible-but-wrong string carried over from another
-        #    architecture's recipe. Selecting no site would train zero
-        #    parameters and publish an adapter that changes nothing, so the
-        #    engine fails the JOB instead, and the message names this tower's
-        #    real sites so the fix is a paste, not a search.
-        refused = db.fine_tune(
-            source="triplets",
-            base_model=MODEL,
-            columns=["anchor", "positive", "negative"],
-            method="lora",
-            task="audio_embedding",
-            target_modules=["q_proj"],
-            lora_rank=4,
-            epochs=1,
-            batch_size=4,
-            warmup_steps=0,
-            validation_fraction=0.0,
-            early_stopping_metric="train_loss",
-        )
-        try:
-            refused.wait()
-        except TrainingError as exc:
-            message = str(exc)
-            print(f"refused, as designed: {message}")
-            assert "q_proj" in message, (
-                f"the refusal must echo the submitted selector: {message}"
-            )
-            # `linear1` is the discriminating half: it appears ONLY in this
-            # tower's site list. (`query` also appears in the message's
-            # generic suffix-matching aside, so on its own it would not prove
-            # the audio tower's vocabulary was printed.)
-            assert "query" in message and "linear1" in message, (
-                "the refusal must name this tower's real site names so the "
-                f"caller can paste one: {message}"
-            )
-        else:
-            raise AssertionError(
-                "a target_modules list matching no site on the audio tower "
-                "must FAIL the job, never publish an empty adapter under a "
-                "fine-tuned model id"
-            )
-
-    print("audio_search: OK")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()

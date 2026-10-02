@@ -1,19 +1,18 @@
 # Jammi AI Cookbook
 
-Learn every jammi capability by running it. The cookbook has two halves, and
-every capability the Python client ships is run by at least one of them
-(`ci/scripts/check_cookbook_coverage.py` fails a change that adds a verb
-nothing runs):
+Learn every jammi capability by running it. **Start with [the book](https://f-inverse.github.io/jammi-ai/cookbook/)**:
+one learning path that holds every recipe below and the long-form chapters, each
+with an Open-in-Colab badge. Every capability the Python client ships is run by
+at least one of them (`ci/scripts/check_cookbook_coverage.py` fails a change that
+adds a verb nothing runs), and every notebook runs nightly exactly as a reader
+runs it.
 
-- **Recipes** (`quickstart/`, `recipes/`) — one short `example.py` per
-  capability, run end to end against the committed fixtures, in seconds, on a
-  CPU. Start here.
-- **The book** (`book/`) — long-form chapters that run a capability over a real
-  dataset and check what they measured against frozen goldens: graph
-  construction, propagation and fine-tuning on ogbn-arxiv, conformal
-  prediction and calibration, retrieval, tenancy, point-in-time joins,
-  incremental refresh, precision and more. Every chapter runs at `small` scale
-  on a CPU in seconds and at `full` scale on a GPU. See
+- **Recipes** (`quickstart/`, `recipes/`) — one short program per capability,
+  one step per cell (`# %%`), beside a README with the overview. Each runs
+  against the committed fixtures in seconds on a CPU, as a script, as a Colab
+  notebook a step at a time, and as a chapter of the book.
+- **Chapters** (`book/`) — a capability taken deep and measured over a real
+  dataset at `small` scale on a CPU, or at `full` scale on a GPU. See
   [`book/README.md`](./book/README.md).
 
 ## Recipes
@@ -59,7 +58,7 @@ weights are committed as built by `tests/fixtures/generate_tiny_*.py`.
 ## Running
 
 ```bash
-pip install jammi-ai
+pip install "jammi-ai[embedded]" "jammi-cookbook @ git+https://github.com/f-inverse/jammi-ai#subdirectory=cookbook/book"
 # or, from a source checkout: build the engine into the current environment
 maturin develop --release -m crates/jammi-python/Cargo.toml
 

@@ -1,22 +1,19 @@
-"""Ephemeral session storage — auto-deleted on session end.
+"""Ephemeral session storage: tables deleted when the session ends, with proof.
 
-An ephemeral session is a tenant-scoped storage context whose tables are
-deleted automatically when the session ends: on explicit `close`, on context-
-manager exit, or when the timeout scanner force-closes it. Every transition
-publishes to the `jammi.audit.session_lifecycle.v1` trigger topic, so an audit-
-log aggregator can prove the deletion happened.
-
-Use it for sensitive transient data — uploaded images, derived embeddings,
-draft inputs — that must not outlive the request that produced it. Put long-
-lived data (the audit record, the persistent corpus) in ordinary tables; the
-ephemeral session holds only the throwaway working set.
-
-Run from the repo root:  python cookbook/recipes/session_lifecycle/example.py
+Run with `python cookbook/recipes/session_lifecycle/example.py`, or a step at
+a time as a notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
+# %% [markdown]
+# An ephemeral session is a tenant-scoped storage context whose tables are
+# deleted when the session ends: on `close()`, on leaving its `with` block, or
+# when the timeout scanner force-closes it. Every transition is published to
+# the `jammi.audit.session_lifecycle.v1` topic, so an audit-log aggregator can
+# prove the deletion happened.
 
+# %%
 import hashlib
+import json
 import tempfile
 
 import pyarrow as pa
@@ -25,101 +22,84 @@ import jammi
 
 TENANT = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+db.set_tenant(TENANT)
 
-def _images_table(rows: list[tuple[str, str]]) -> pa.Table:
-    return pa.table(
-        {
-            "image_id": [r[0] for r in rows],
-            "image_hash": [r[1] for r in rows],
-        },
-        schema=pa.schema(
-            [
-                pa.field("image_id", pa.string(), nullable=False),
-                pa.field("image_hash", pa.string(), nullable=False),
-            ]
-        ),
+# %% [markdown]
+# ## What outlives the request
+#
+# Only lineage is durable: the hashes of the uploaded images go in an ordinary
+# mutable table. The images themselves are the throwaway working set.
+
+# %%
+db.create_mutable_table(
+    "query_lineage",
+    schema=pa.schema([pa.field("image_hash", pa.string(), nullable=False)]),
+    primary_key=["image_hash"],
+)
+
+uploads = {"img-1": b"...image one bytes...", "img-2": b"...image two bytes..."}
+hashes = {iid: "sha256:" + hashlib.sha256(data).hexdigest() for iid, data in uploads.items()}
+
+# %% [markdown]
+# ## Work in an ephemeral session
+#
+# Tables created in the session belong to it. `ephem.sql` replaces `{table}`
+# with the tenant-scoped reference to the named ephemeral table. The lineage
+# is written to the persistent table before the session closes, while the
+# working data still exists; leaving the block closes the session, which drops
+# its tables and publishes a `closed` event.
+
+# %%
+images_schema = pa.schema(
+    [
+        pa.field("image_id", pa.string(), nullable=False),
+        pa.field("image_hash", pa.string(), nullable=False),
+    ]
+)
+
+with db.ephemeral_session(timeout_seconds=3600) as ephem:
+    ephem.create_ephemeral_table("query_images", schema=images_schema, primary_key=["image_id"])
+    batch = pa.table(
+        {"image_id": list(hashes), "image_hash": list(hashes.values())}, schema=images_schema
     )
+    inserted = ephem.insert("query_images", batch=batch)
+    assert inserted == 2, "two rows stored in the ephemeral table"
+    assert ephem.count_rows("query_images") == 2
 
+    stored = ephem.sql("query_images", "SELECT image_hash FROM {table}")
+    for h in stored.column("image_hash").to_pylist():
+        db.sql(f"INSERT INTO mutable.public.query_lineage (image_hash) VALUES ('{h}')")
+    print("ephemeral rows during session:", ephem.count_rows("query_images"))
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
-        db.set_tenant(TENANT)
+# %% [markdown]
+# ## After the session
+#
+# The persistent lineage survives, referring to the hashes, never to the
+# deleted working data.
 
-        # A persistent table that will keep the *hash* lineage after the raw
-        # working data is deleted — what NOT to put in ephemeral storage.
-        db.create_mutable_table(
-            "query_lineage",
-            schema=pa.schema([pa.field("image_hash", pa.string(), nullable=False)]),
-            primary_key=["image_hash"],
-        )
+# %%
+lineage = db.sql("SELECT image_hash FROM mutable.public.query_lineage")
+assert lineage.num_rows == 2, "hash lineage persists after session close"
+print("persistent lineage rows after close:", lineage.num_rows)
 
-        # Hash two "uploaded" images. Only the hashes are durable.
-        uploads = {"img-1": b"...image one bytes...", "img-2": b"...image two bytes..."}
-        hashes = {
-            iid: "sha256:" + hashlib.sha256(data).hexdigest()
-            for iid, data in uploads.items()
-        }
+# %% [markdown]
+# ## The proof of deletion
+#
+# The lifecycle topic carries an `opened` and a `closed` event for the
+# session; the `closed` one reports how many rows were deleted. Lifecycle
+# events (`opened`, `closed`, `timed_out`, `partial_deletion_failure`) carry
+# the session id, the tenant, the table count and the deleted-row count.
 
-        # 1. Open an ephemeral session as a context manager. Tables created
-        #    inside are deleted on exit.
-        with db.ephemeral_session(timeout_seconds=3600) as ephem:
-            ephem.create_ephemeral_table(
-                "query_images",
-                schema=pa.schema(
-                    [
-                        pa.field("image_id", pa.string(), nullable=False),
-                        pa.field("image_hash", pa.string(), nullable=False),
-                    ]
-                ),
-                primary_key=["image_id"],
-            )
-            rows = [(iid, h) for iid, h in hashes.items()]
-            inserted = ephem.insert("query_images", batch=_images_table(rows))
-            assert inserted == 2, "two rows stored in the ephemeral table"
-            assert ephem.count_rows("query_images") == 2
+# %%
+events = db.subscribe_collect("jammi.audit.session_lifecycle.v1", from_offset=0)
+records = [json.loads(r) for r in events.column("record").to_pylist()]
+kinds = [r["event"] for r in records]
+assert "opened" in kinds, "opened event published"
+assert "closed" in kinds, "closed event published"
+closed = next(r for r in records if r["event"] == "closed")
+assert closed["deleted_row_count"] == 2, "closed event reports deleted rows"
+print("lifecycle events:", kinds)
 
-            # 2. Use the ephemeral data (here: read the hashes back), then write
-            #    only the hash lineage to the PERSISTENT table — before close,
-            #    while the ephemeral data still exists.
-            stored = ephem.sql("query_images", "SELECT image_hash FROM {table}")
-            for h in stored.column("image_hash").to_pylist():
-                db.sql(
-                    f"INSERT INTO mutable.public.query_lineage (image_hash) VALUES ('{h}')"
-                )
-            print("ephemeral rows during session:", ephem.count_rows("query_images"))
-        # 3. Context exit called close(): every ephemeral table is dropped and a
-        #    `closed` event was published to jammi.audit.session_lifecycle.v1.
-
-        # 4. The persistent lineage survives; it references the hashes, never the
-        #    deleted working data.
-        lineage = db.sql("SELECT image_hash FROM mutable.public.query_lineage")
-        assert lineage.num_rows == 2, "hash lineage persists after session close"
-        print("persistent lineage rows after close:", lineage.num_rows)
-
-        # 5. The lifecycle stream carries the proof-of-deletion events. Replay
-        #    from offset 0 and confirm an `opened` and a `closed` event landed.
-        #    The session published exactly two events (opened + closed), each one
-        #    batch; `max_batches=2` matches that count so the replay read does not
-        #    block waiting on the live tail.
-        events = db.subscribe_collect(
-            "jammi.audit.session_lifecycle.v1", from_offset=0
-        )
-        import json
-
-        kinds = [json.loads(r)["event"] for r in events.column("record").to_pylist()]
-        assert "opened" in kinds, "opened event published"
-        assert "closed" in kinds, "closed event published"
-        closed = next(
-            json.loads(r)
-            for r in events.column("record").to_pylist()
-            if json.loads(r)["event"] == "closed"
-        )
-        assert closed["deleted_row_count"] == 2, "closed event reports deleted rows"
-        print("lifecycle events:", kinds)
-
-        print("session_lifecycle recipe OK")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()

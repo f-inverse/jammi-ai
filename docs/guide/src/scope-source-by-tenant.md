@@ -1,6 +1,6 @@
 # Scope a Federated Source by Tenant
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Tenancy](https://f-inverse.github.io/jammi-ai/cookbook/chapters/11-tenancy/tenancy.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Tenancy](https://f-inverse.github.io/jammi-ai/cookbook/chapters/tenancy/tenancy.html).
 
 The session-scoped tenant binding ([`multi-tenant.md`](./multi-tenant.md))
 relies on every table the engine reads carrying a `tenant_id` column. That

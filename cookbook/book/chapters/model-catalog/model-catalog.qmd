@@ -1,0 +1,149 @@
+---
+title: "The model catalog — referential integrity on either transport"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Verbs:** `fine_tune` · `list_models` · `describe_model` · `delete_model` ·
+`prune_jobs` · `[jobs] retention_days` · **Background:** the model catalog as a
+*referenced store* — a model is a row other rows point at
+[@kleppmann2017ddia], so a hard delete is *refused* while a reference holds, and
+absence is a *typed* condition, not an ambiguous failure · **Checked:** parity (the
+same lifecycle, the same outcomes, in process and against a server).
+
+The engine's model catalog lets you **see** the models it serves and has
+trained — `list_models`, `describe_model` — and **clean them up** —
+`delete_model`. A model enters the catalog by being used: loading one records it,
+and training records both its base and the model it produced. And a model is a
+row other rows point at: the job that trained it names it, so deleting it while
+that job is on record would leave a dangling reference. The engine refuses that
+delete, typed, until the reference is gone.
+
+This chapter runs the whole lifecycle as one function, against an in-process
+engine and against a live server, and checks that every outcome — including
+every refusal's class — is the same on both.
+
+```{python}
+import tempfile
+from pathlib import Path
+
+import jammi
+from jammi.errors import ModelNotFound, ModelReferenced
+from jammi.testing import LiveServer
+from jammi_cookbook import fixtures
+
+BASE = fixtures.model("tiny_bert")
+PAIRS = str(fixtures.path("tiny_pairs.csv"))
+```
+
+## The lifecycle, written once
+
+Train registers two rows: the base model, recorded when the job loads it, and
+the fine-tuned model, written when the job finishes. The finished job is on
+record for `[jobs] retention_days` (30 by default), and until it is pruned it
+references both. So the lifecycle has four outcomes to observe: the listing,
+the refused delete, the absent delete, and — once the job is gone — the delete
+that succeeds.
+
+```{python}
+def outcome(delete) -> str:
+    """What a delete did: the refusal's class, or that it succeeded."""
+    try:
+        delete()
+        return "deleted"
+    except (ModelReferenced, ModelNotFound) as refused:
+        return type(refused).__name__
+
+
+def train_and_refuse(db) -> tuple[str, dict]:
+    db.add_source("pairs", url=PAIRS, format="csv")
+    job = db.fine_tune(
+        source="pairs", base_model=BASE, columns=["text_a", "text_b", "score"],
+        method="lora", task="text_embedding", lora_rank=4, epochs=1,
+    )
+    job.wait()
+    tuned = job.output_model_id
+    return tuned, {
+        "listed": sorted((m["task"], m["status"]) for m in db.list_models()),
+        "described": {k: db.describe_model(tuned)[k] for k in ("task", "status")},
+        "delete_referenced": outcome(lambda: db.delete_model(tuned)),
+        "delete_absent": outcome(lambda: db.delete_model("jammi:fine-tuned:absent")),
+        "delete_absent_if_exists": outcome(
+            lambda: db.delete_model("jammi:fine-tuned:absent", if_exists=True)
+        ),
+    }
+
+
+def prune_and_delete(db, tuned: str) -> dict:
+    db.prune_jobs()
+    return {
+        "jobs_left": len(db.list_jobs()),
+        "delete_unreferenced": outcome(lambda: db.delete_model(tuned)),
+        "described_after": db.describe_model(tuned),
+    }
+```
+
+## In process, then against a server
+
+Retention is a deployment setting: each engine is reopened over the same
+catalog with `retention_days = 0` — a configuration file for the in-process
+engine, the matching environment variable for the server — so the finished job
+is past it and `prune_jobs` removes it.
+
+```{python}
+home = Path(tempfile.mkdtemp())
+config = home / "retention.toml"
+config.write_text("[jobs]\nretention_days = 0\n")
+
+with jammi.connect(f"file://{home / 'embedded'}") as db:
+    tuned, local = train_and_refuse(db)
+with jammi.connect(f"file://{home / 'embedded'}", config=str(config)) as db:
+    local.update(prune_and_delete(db, tuned))
+
+served_dir = home / "served"
+with LiveServer(served_dir) as server, jammi.connect(server.endpoint) as db:
+    tuned, served = train_and_refuse(db)
+with LiveServer(served_dir, env={"JAMMI_JOBS__RETENTION_DAYS": "0"}) as server, \
+        jammi.connect(server.endpoint) as db:
+    served.update(prune_and_delete(db, tuned))
+
+for key in local:
+    print(f"{key:<26} {local[key]!s:<48} same on the server: {local[key] == served[key]}")
+```
+
+```{python}
+# | echo: false
+assert local == served
+assert local["delete_referenced"] == "ModelReferenced"
+assert local["delete_absent"] == "ModelNotFound"
+assert local["delete_absent_if_exists"] == "deleted"
+assert local["jobs_left"] == 0 and local["delete_unreferenced"] == "deleted"
+assert local["described_after"] is None
+```
+
+## Reading the outcomes
+
+- **Two rows, both `registered`.** Loading the base model recorded it; the
+  finished job wrote the fine-tuned model. `describe_model` reads one back by
+  id, and `None` once it is gone.
+- **A referenced delete is refused with `ModelReferenced`.** The job that
+  trained the model names it, so the delete would leave that reference
+  dangling. The refusal is a class, not a message to parse — the same class in
+  process and from a server.
+- **An absent delete is `ModelNotFound`,** a condition distinct from a
+  referenced one, and `if_exists=True` makes it a no-op for cleanup code that
+  does not care.
+- **Pruning ends the reference.** With the job past its retention and pruned,
+  nothing points at the model, and the same delete succeeds.
+
+## Bridge note
+
+> **A catalog is a set of rows that point at each other.** Deleting a model
+> while a job still names it would break the pointer, so the engine refuses it
+> with a typed error [@kleppmann2017ddia]; retention bounds how long a finished
+> job holds its references, and pruning releases them. The outcomes are typed
+> classes, identical on both transports — the property that lets one program
+> manage a catalog in process or on a server without branching on either.

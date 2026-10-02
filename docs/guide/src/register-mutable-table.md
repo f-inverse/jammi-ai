@@ -1,6 +1,6 @@
 # Register a Mutable Companion Table
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Feature Store](https://f-inverse.github.io/jammi-ai/cookbook/chapters/12-feature-store/feature-store.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Feature Store](https://f-inverse.github.io/jammi-ai/cookbook/chapters/feature-store/feature-store.html).
 
 A *mutable companion table* lives in the same backend database as the
 Jammi catalog (SQLite by default, Postgres in shared deployments), supports

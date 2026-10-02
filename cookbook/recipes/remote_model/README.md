@@ -5,17 +5,9 @@ embeddings API, or an inference server the engine does not run itself. The
 deployment declares the endpoint once, and every verb that takes a model
 takes `remote:<name>`.
 
-Run it:
-
-```bash
-python cookbook/recipes/remote_model/example.py
-```
-
-The script serves its own stand-in endpoint (a hashed bag-of-words embedder
+The program serves its own stand-in endpoint (a hashed bag-of-words embedder
 speaking the OpenAI-compatible embeddings protocol), so it runs with no
-network and no key.
-
-## Declare the model
+network and no key. Against a hosted API, the declaration reads:
 
 ```toml
 [models.remote.hosted-encoder]
@@ -28,14 +20,7 @@ headers = { Authorization = { file = "/run/secrets/embeddings-key" } }
 # timeout_secs = 60, max_in_flight = 4, max_retries = 2
 ```
 
-Then use `remote:hosted-encoder` wherever a model id goes:
-
-```python
-db.generate_embeddings(source="corpus", model="remote:hosted-encoder",
-                       columns=["content"], key="id", modality="text")
-vec = db.encode_query(model="remote:hosted-encoder", query="...")
-db.search("corpus", query=vec, k=10)
-```
+and `remote:hosted-encoder` goes wherever a model id does.
 
 ## What to know
 
@@ -55,3 +40,9 @@ db.search("corpus", query=vec, k=10)
 
 See the guide's [Remote Models](../../../docs/guide/src/remote-models.md)
 page for the full reference.
+
+## Run it
+
+```bash
+python cookbook/recipes/remote_model/example.py
+```

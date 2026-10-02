@@ -1,6 +1,6 @@
 # Did Structure Help? A Graph-ML Evaluation Recipe
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Graph Signal Processing](https://f-inverse.github.io/jammi-ai/cookbook/chapters/02-analyze/analyze.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Graph Signal Processing](https://f-inverse.github.io/jammi-ai/cookbook/chapters/analyze/analyze.html).
 
 When you produce a structure-aware embedding table — a fine-tuned model, a
 propagated table, or any treatment that folds graph context into the

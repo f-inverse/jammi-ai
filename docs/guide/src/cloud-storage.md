@@ -18,7 +18,7 @@ The released `jammi-server` binaries, wheels and images and both embedded-engine
 
 ```toml
 [dependencies]
-jammi-db = { version = "0.51.0", features = ["storage-s3", "storage-gcs"] }
+jammi-db = { version = "0.52.0", features = ["storage-s3", "storage-gcs"] }
 ```
 
 `jammi-server` and `jammi-python` (the embedded engine's crate) forward the same five features by name.

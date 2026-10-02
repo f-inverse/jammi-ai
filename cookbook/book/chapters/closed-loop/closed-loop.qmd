@@ -1,0 +1,123 @@
+---
+title: "The whole pipeline in one measured pass"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+This is the closing chapter of the keystone: the whole spine run as **one
+measured pass** from a fresh engine —
+
+> **construct → propagate → learn → predict & quantify → MEASURE**
+
+— every stage carrying a measured verdict, each checked against the golden the
+stage's own chapter froze. So this chapter is also the book's consistency check:
+the spine run end to end must reproduce what its tiers measured one at a time.
+
+```{python}
+import tempfile
+
+import jammi
+import numpy as np
+from jammi_cookbook import contracts, datasets, keystone, scale
+
+SCALE = scale.current()
+ALPHA = 0.10
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+golden = keystone.subject_golden(db, arxiv)
+print(f"scale: {SCALE}")
+```
+
+## Stage 1 — Construct: the graph carries signal the embeddings cannot
+
+```{python}
+embeddings = keystone.embed(db, arxiv, SCALE)
+cites = db.sql(
+    f"SELECT a.subject = b.subject AS same FROM {arxiv.cites}.public.{arxiv.cites} e "
+    f"JOIN {arxiv.papers}.public.{arxiv.papers} a ON e.src = a.paper_id "
+    f"JOIN {arxiv.papers}.public.{arxiv.papers} b ON e.dst = b.paper_id"
+).column("same").to_pylist()
+cite_homophily = contracts.assert_close("arxiv.tier01.cite_homophily", sum(cites) / len(cites))
+print(f"citation-graph subject homophily: {cite_homophily:.3f}")
+```
+
+## Stages 2 and 3 — Propagate and Learn
+
+APPNP over the citation graph (a low-pass filter), then a contrastive
+fine-tune supervised by the declared citations, measured side by side against
+the raw embeddings in one `eval_compare`.
+
+```{python}
+propagated = keystone.propagate(db, arxiv, embeddings)
+tuned = keystone.fine_tune_on_graph(
+    db, arxiv, SCALE, edge_source=arxiv.cites, provenance="declared",
+    epochs=keystone.FINE_TUNE_EPOCHS[SCALE],
+)
+compared = db.eval_compare(
+    embedding_tables=[embeddings, propagated, tuned],
+    source=arxiv.papers, golden_source=golden, k=10,
+)
+raw, prop, ft = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
+contracts.assert_close("arxiv.tier01.precision_at_10", raw)
+contracts.assert_close("arxiv.tier02.precision_at_10", prop)
+contracts.assert_close("arxiv.tier03.declared_precision_at_10", ft)
+print(f"precision@10  raw {raw:.3f} → propagated {prop:.3f} → declared fine-tune {ft:.3f}")
+```
+
+## Stage 4 — Predict & Quantify
+
+The year predictor, its conformal interval, and the subject classifier's
+conformal set, over the 2018 calibration era and the 2019-onward test era.
+
+```{python}
+predictor = keystone.train_year_predictor(db, arxiv, SCALE, propagated)
+year = {
+    r["paper_id"]: r["year"]
+    for r in db.sql(f"SELECT paper_id, year FROM {arxiv.papers}.public.{arxiv.papers}").to_pylist()
+}
+cal_ids, test_ids = arxiv.split["valid"], arxiv.split["test"]
+cal_mean, _ = keystone.predict_years(db, arxiv, predictor, cal_ids)
+test_mean, _ = keystone.predict_years(db, arxiv, predictor, test_ids)
+intervals = db.conformalize_interval(
+    cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=ALPHA
+)
+reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
+contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
+print(f"year interval coverage:       {reg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
+
+scores = keystone.subject_scores(db, arxiv, propagated)
+sets = db.conformalize(
+    scores.cal_scores.tolist(), scores.cal_labels.tolist(), scores.test_scores.tolist(),
+    alpha=ALPHA, score="aps",
+)
+marg_cov = float(np.mean([y in s for y, s in zip(scores.test_labels, sets)]))
+contracts.assert_close("arxiv.tier04.marginal_coverage", marg_cov)
+print(f"subject APS set coverage:     {marg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
+```
+
+```{python}
+# | echo: false
+if SCALE is scale.Scale.FULL:
+    assert raw < min(prop, ft)  # propagation and the declared fine-tune both lift precision
+    assert reg_cov < 1 - ALPHA - 0.1  # the year interval under-covers
+    # The subject set holds nominal, to within three binomial standard errors.
+    assert abs(marg_cov - (1 - ALPHA)) < 3 * np.sqrt(ALPHA * (1 - ALPHA) / len(sets))
+```
+
+## The loop, closed
+
+Every stage above ran live and matched the golden its own chapter froze. At
+`full` scale the spine reads: citation homophily ≈ 0.50 (the precondition);
+propagation lifts same-subject precision, and the declared-edge fine-tune lifts
+it by about as much, though propagation trains nothing. Under the time split the
+year interval under-covers — the finding the governed calibration cohort
+(tier 04) answers — while the subject set holds its coverage, the shift being
+orthogonal to its score. At `small` scale the same pass runs in seconds on a CPU and holds its
+own frozen numbers.
+
+```{python}
+db.close()
+```

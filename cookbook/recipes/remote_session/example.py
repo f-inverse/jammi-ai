@@ -1,30 +1,18 @@
 """One program, two transports: the same session over an embedded engine and a server.
 
-`jammi.connect(target)` picks the transport from the target alone —
-`file://…` runs the engine in this process, `grpc://…` talks to a
-`jammi-server`. Both return a `Session` with the same verbs, so the program
-below runs unchanged against either. A handful of features exist on one
-transport only; `db.supports(capability)` says which, and calling one the
-backend lacks raises `NotSupportedOnBackend`.
-
-1. Start a server (`jammi.testing.LiveServer`) over its own artifact directory
-2. Run one function — register, embed, search — on an embedded session and on
-   a remote one, and compare the answers
-3. `db.supports(...)` on both, and the remote-only `db.session_id`
-4. `jammi.parse_target` — how a target string picks its transport
-5. The session journal: `jammi.observe` reports every session opened and
-   closed, `jammi.open_sessions()` / `jammi.open_session_labels()` list the
-   ones open now, and `jammi.describe_sessions` names them — how a program
-   (or a notebook) finds a session it forgot to close
-
-Needs a `jammi-server` binary on PATH: `pip install jammi-server`, or
-`cargo build --release -p jammi-server` with `target/release` on PATH.
-
-Run with `python cookbook/recipes/remote_session/example.py`.
+Run with `python cookbook/recipes/remote_session/example.py`, or a step at a
+time as a notebook: each `# %%` cell is one step. Needs a `jammi-server` on
+PATH (`pip install jammi-server`).
 """
 
-from __future__ import annotations
+# %% [markdown]
+# ## Watch sessions open and close
+#
+# `jammi.observe` calls back on every session the process opens and closes,
+# and returns the function that stops it. A program, or a notebook, uses it to
+# find a session it forgot to close.
 
+# %%
 import tempfile
 
 import jammi
@@ -36,9 +24,33 @@ from jammi_cookbook import fixtures
 CORPUS_URL = str(fixtures.path("tiny_corpus.parquet"))
 MODEL = fixtures.model("tiny_bert")
 
+events: list[str] = []
+unsubscribe = jammi.observe(
+    lambda handle, label: events.append(f"opened {label}"),
+    lambda handle, label: events.append(f"closed {label}"),
+)
 
+# %% [markdown]
+# ## The target picks the transport
+#
+# `jammi.connect(target)` reads the transport from the target alone:
+# `file://…` runs the engine in this process, `grpc://…` talks to a
+# `jammi-server`. `jammi.parse_target` shows the reading.
+
+# %%
+local_dir, server_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+for target in (f"file://{local_dir}", "grpc://127.0.0.1:8081"):
+    print(f"{target} → {jammi.parse_target(target)}")
+
+# %% [markdown]
+# ## One program
+#
+# Both transports return a `Session` with the same methods, so one function
+# runs unchanged against either: register the corpus, embed it, and return the
+# five rows nearest a query.
+
+# %%
 def nearest(db) -> list[int]:
-    """The same program for either transport: the five patents nearest a query."""
     db.add_source("corpus", url=CORPUS_URL, format="parquet")
     db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id")
     query = db.encode_query(model=MODEL, query="quantum error correction")
@@ -46,42 +58,52 @@ def nearest(db) -> list[int]:
     return [int(h["_row_id"]) for h in hits]
 
 
-def main() -> int:
-    events: list[str] = []
-    unsubscribe = jammi.observe(
-        lambda handle, label: events.append(f"opened {label}"),
-        lambda handle, label: events.append(f"closed {label}"),
-    )
-    with tempfile.TemporaryDirectory() as local_dir, tempfile.TemporaryDirectory() as srv_dir:
-        for target in (f"file://{local_dir}", "grpc://127.0.0.1:8081"):
-            print(f"{target} → {jammi.parse_target(target)}")
+# %% [markdown]
+# ## Run it embedded
+#
+# A few features exist on one transport only. `db.supports(capability)` says
+# which, and using one the backend lacks raises `NotSupportedOnBackend`: an
+# embedded engine has no connection, so it has no `session_id`.
 
-        with jammi.connect(f"file://{local_dir}") as embedded:
-            local_hits = nearest(embedded)
-            print(f"embedded: {local_hits}")
-            print(f"embedded supports audit: {embedded.supports(Capability.AUDIT)}")
-            try:
-                embedded.session_id
-                raise AssertionError("the embedded engine has no connection id")
-            except NotSupportedOnBackend as absent:
-                print(f"embedded session_id: {absent}")
+# %%
+with jammi.connect(f"file://{local_dir}") as embedded:
+    local_hits = nearest(embedded)
+    print(f"embedded: {local_hits}")
+    print(f"embedded supports audit: {embedded.supports(Capability.AUDIT)}")
+    try:
+        embedded.session_id
+        raise AssertionError("the embedded engine has no connection id")
+    except NotSupportedOnBackend as absent:
+        print(f"embedded session_id: {absent}")
 
-        with LiveServer(srv_dir) as server, jammi.connect(server.endpoint) as remote:
-            open_now = dict(jammi.open_session_labels())
-            print(f"open sessions: {jammi.describe_sessions(open_now)}")
-            assert len(jammi.open_sessions()) == 1, "only the remote session is open"
-            remote_hits = nearest(remote)
-            print(f"remote ({server.endpoint}): {remote_hits}")
-            print(f"remote supports audit: {remote.supports(Capability.AUDIT)}")
-            print(f"remote session_id: {remote.session_id}")
-            assert remote.supports(Capability.SESSION_ID)
+# %% [markdown]
+# ## Run it against a server
+#
+# `LiveServer` starts a real `jammi-server` over its own artifact directory and
+# stops it when the block ends. While the remote session is open,
+# `jammi.open_session_labels()` lists it, and `jammi.describe_sessions` names
+# it.
 
-        assert local_hits == remote_hits, "one engine, two transports, one answer"
-    unsubscribe()
-    print("journal:", "; ".join(events))
-    assert not jammi.open_session_labels(), "every session was closed"
-    return 0
+# %%
+with LiveServer(server_dir) as server, jammi.connect(server.endpoint) as remote:
+    open_now = dict(jammi.open_session_labels())
+    print(f"open sessions: {jammi.describe_sessions(open_now)}")
+    assert len(jammi.open_sessions()) == 1, "only the remote session is open"
+    remote_hits = nearest(remote)
+    print(f"remote ({server.endpoint}): {remote_hits}")
+    print(f"remote supports audit: {remote.supports(Capability.AUDIT)}")
+    print(f"remote session_id: {remote.session_id}")
+    assert remote.supports(Capability.SESSION_ID)
 
+# %% [markdown]
+# ## One engine, one answer
+#
+# Both transports ran the same engine over the same data, so they return the
+# same rows. The journal saw both sessions open and close.
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+assert local_hits == remote_hits, "one engine, two transports, one answer"
+
+unsubscribe()
+print("journal:", "; ".join(events))
+assert not jammi.open_session_labels(), "every session was closed"

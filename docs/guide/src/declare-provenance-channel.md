@@ -1,6 +1,6 @@
 # Declare a Custom Provenance Channel
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Provenance Channels](https://f-inverse.github.io/jammi-ai/cookbook/chapters/17-channels-taxonomy/channels-taxonomy.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Provenance Channels](https://f-inverse.github.io/jammi-ai/cookbook/chapters/error-taxonomy/error-taxonomy.html).
 
 Every row that flows through Jammi carries provenance — `retrieved_by` and `annotated_by` lists that record *how* the row was found and *what was added after retrieval*. Jammi ships two built-in channels — `vector` (declares `similarity`) and `inference` (declares `inference_model`, `inference_task`, `inference_confidence`) — but the catalog accepts any channel a consumer wants to register. Each channel declares the columns it contributes; the engine merges those columns into every result `RecordBatch` at query time.
 

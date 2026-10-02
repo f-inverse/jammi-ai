@@ -3,8 +3,8 @@ name: Cookbook as published
 # The cookbook notebooks as a reader runs them: each notebook at a release tag,
 # in a fresh environment, setup cell included, so it installs that release from
 # PyPI and the cookbook from the tag (cookbook/book/scripts/run_published_notebooks.py).
-# The book gate and the nightly render run the chapter sources against wheels
-# built from HEAD; only this lane sees what a reader gets from PyPI.
+# CI's book jobs run the chapter sources against the wheels each run built;
+# only this lane sees what a reader gets from PyPI.
 #
 # Nightly against the newest `py-v*` tag on a CPU, because what a reader
 # installs changes after the tag (a dependency release, a package index
@@ -57,6 +57,9 @@ jobs:
     name: CPU, shard ${{ matrix.shard }}/8
     needs: resolve
     runs-on: ubuntu-latest
+    # What a Colab runtime is: root, a package manager, and Python 3.12 with
+    # nothing else installed (the runner itself carries MySQL and no root).
+    container: python:3.12-bookworm
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -72,10 +75,6 @@ jobs:
           ref: ${{ needs.resolve.outputs.tag }}
           path: published
           sparse-checkout: cookbook/notebooks
-      # Colab's runtime interpreter.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Run the notebooks as published
         run: >
           python cookbook/book/scripts/run_published_notebooks.py

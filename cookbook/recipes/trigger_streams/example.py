@@ -1,80 +1,87 @@
-"""Publish + subscribe on a Jammi topic via the in-process broker.
+"""Publish to a Jammi topic and read it back, on the in-process broker.
 
-Run with `python cookbook/recipes/trigger_streams/example.py`. Exits 0
-on success.
+Run with `python cookbook/recipes/trigger_streams/example.py`, or a step at a
+time as a notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
-
+# %%
 import tempfile
 
 import pyarrow as pa
 
 import jammi
 
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
-def events_schema() -> pa.Schema:
-    return pa.schema(
-        [
-            pa.field("event_id", pa.int64(), nullable=False),
-            pa.field("payload", pa.string(), nullable=False),
-        ]
-    )
+# %% [markdown]
+# ## Register a topic
+#
+# A topic carries Arrow record batches of one schema. Registering it adds it
+# to the catalog, where `list_topics` finds it.
 
+# %%
+schema = pa.schema(
+    [
+        pa.field("event_id", pa.int64(), nullable=False),
+        pa.field("payload", pa.string(), nullable=False),
+    ]
+)
+topic_id = db.register_topic("events.demo", schema=schema)
+assert topic_id, "register_topic returned empty id"
 
-def main() -> int:
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
+topics = db.list_topics()
+assert "events.demo" in topics, f"events.demo missing from {topics}"
+print(topics)
 
-        # 1. Register a topic with a typed schema.
-        topic_id = db.register_topic("events.demo", schema=events_schema())
-        assert topic_id, "register_topic returned empty id"
+# %% [markdown]
+# ## Publish a batch
+#
+# The broker assigns each topic's batches sequential offsets, from 0 for a
+# fresh topic, and `publish_topic` returns the one it assigned.
 
-        # 2. The catalog now lists the topic for the current tenant.
-        topics = db.list_topics()
-        assert "events.demo" in topics, f"events.demo missing from {topics}"
+# %%
+batch = pa.table(
+    {
+        "event_id": pa.array([1, 2, 3], type=pa.int64()),
+        "payload": pa.array(["alpha", "beta", "gamma"], type=pa.string()),
+    },
+    schema=schema,
+)
+offset = db.publish_topic("events.demo", batch=batch)
+assert offset == 0, f"expected offset 0, got {offset}"
 
-        # 3. Publish one batch. The broker assigns sequential offsets per
-        #    topic, starting at 0 for a fresh topic.
-        batch = pa.table(
-            {
-                "event_id": pa.array([1, 2, 3], type=pa.int64()),
-                "payload": pa.array(["alpha", "beta", "gamma"], type=pa.string()),
-            },
-            schema=events_schema(),
-        )
-        offset = db.publish_topic("events.demo", batch=batch)
-        assert offset == 0, f"expected offset 0, got {offset}"
+# %% [markdown]
+# ## Read it back from an offset
+#
+# Every published batch is also stored in the topic's backing table, so a
+# subscriber can replay from any offset. `subscribe_collect` drains that table
+# from `from_offset` and returns what it read.
 
-        # 4. Subscribe from offset 0 — drives the backing-table replay
-        #    path. `max_batches=1` matches the published batch count so
-        #    the call returns immediately without racing the live tail.
-        collected = db.subscribe_collect(
-            "events.demo", from_offset=0
-        )
-        assert collected.column("event_id").to_pylist() == [1, 2, 3]
-        assert collected.column("payload").to_pylist() == ["alpha", "beta", "gamma"]
+# %%
+collected = db.subscribe_collect("events.demo", from_offset=0)
+assert collected.column("event_id").to_pylist() == [1, 2, 3]
+assert collected.column("payload").to_pylist() == ["alpha", "beta", "gamma"]
+print(collected.to_pydict())
 
-        # 5. Drop the topic and confirm it leaves the catalog.
-        db.drop_topic("events.demo")
-        topics = db.list_topics()
-        assert "events.demo" not in topics, "events.demo persisted after drop"
+# %% [markdown]
+# ## Drop the topic
+#
+# `drop_topic` removes it from the catalog. With `if_exists=True`, a topic
+# that is already gone is not an error; without it, the error names the topic.
 
-        # 6. Idempotent drop — `if_exists=True` swallows the missing case.
-        db.drop_topic("events.demo", if_exists=True)
+# %%
+db.drop_topic("events.demo")
+assert "events.demo" not in db.list_topics(), "events.demo persisted after drop"
 
-        # 7. Strict drop on a missing topic raises with a useful message.
-        try:
-            db.drop_topic("never.registered")
-        except (ValueError, RuntimeError) as exc:
-            assert "never.registered" in str(exc), (
-                f"drop-missing error lost topic name: {exc}"
-            )
-        else:
-            raise AssertionError("drop-missing must raise")
+db.drop_topic("events.demo", if_exists=True)
 
-    print("trigger_streams: OK")
-    return 0
+try:
+    db.drop_topic("never.registered")
+except (ValueError, RuntimeError) as missing:
+    assert "never.registered" in str(missing), f"drop-missing error lost topic name: {missing}"
+    print(missing)
+else:
+    raise AssertionError("drop-missing must raise")
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()

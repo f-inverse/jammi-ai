@@ -1,6 +1,6 @@
 # Query Your Data with SQL
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Constructing the Graph](https://f-inverse.github.io/jammi-ai/cookbook/chapters/01-construct/construct.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Constructing the Graph](https://f-inverse.github.io/jammi-ai/cookbook/chapters/construct/construct.html).
 
 Register data files as named sources, then query them with full SQL. Sources are persisted in the catalog and survive session restarts.
 
@@ -71,7 +71,7 @@ for batch in &results {
 
 ```python
 table = db.sql("SELECT id, title, year FROM patents.public.patents WHERE year > 2020 ORDER BY year")
-print(table.to_pandas())
+print(table)
 ```
 
 ### CLI

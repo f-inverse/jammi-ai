@@ -1,0 +1,199 @@
+---
+title: "Propagating embeddings over a graph"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Verbs:** `propagate_embeddings` · `eval_compare` · **Background:** graph signal
+processing — low-pass filtering on the graph (Stanković et al. 2020, Part II)
+= SGC/APPNP decoupled propagation · **Checked:** measurement (does propagation
+help retrieval?).
+
+Tier 01 produced raw text embeddings. Tier 02 **propagates** them over the
+declared citation graph — smoothing each paper's vector toward its neighbours'.
+In graph-signal-processing terms this is a **low-pass filter on the graph**: it
+attenuates the high-frequency component (idiosyncratic per-paper noise) and
+keeps the low-frequency component (the shared topic a citation cluster agrees
+on).
+
+First, tier 01's embeddings — the signal to filter:
+
+```{python}
+import tempfile
+
+import jammi
+from jammi_cookbook import contracts, datasets, encoders, keystone, scale
+
+SCALE = scale.current()
+MODEL = encoders.text(SCALE)
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+arxiv = datasets.arxiv(db, SCALE)
+embeddings = keystone.embed(db, arxiv, SCALE)
+```
+
+## One call: APPNP over the citation graph
+
+`propagate_embeddings` takes the embedding table and a registered edge source;
+`weighting="degree_normalized"` with `alpha` is APPNP. The keystone's step:
+
+```{python}
+# | echo: false
+keystone.show(keystone.propagate)
+```
+
+```{python}
+propagated = keystone.propagate(db, arxiv, embeddings)
+def count(table: str) -> int:
+    return db.sql(f'SELECT COUNT(*) AS n FROM "jammi.{table}"').to_pylist()[0]["n"]
+
+
+print(f"raw rows: {count(embeddings)}   propagated rows: {count(propagated)}")
+print("produced by:", db.describe_table(propagated)["descriptor"]["producer"])
+```
+
+The propagated table is a new, searchable embedding table in the same vector
+space, and it records how it was produced — `describe_table` names the
+producer and its parameters.
+
+## The measurement rail: propagation as a denoiser
+
+The honest test of a low-pass filter is whether it improves a *downstream*
+measurement. `eval_compare` runs the same same-subject retrieval golden (tier
+01) against both tables — queries are encoded by the model that produced the
+raw vectors, since propagation keeps their space — and reports each table's
+metrics and the delta against the first.
+
+```{python}
+golden = keystone.subject_golden(db, arxiv)
+compared = db.eval_compare(
+    embedding_tables=[embeddings, propagated], source=arxiv.papers, golden_source=golden, k=10
+)
+raw, prop = compared["per_table"]
+raw_precision = raw["embedding_eval"]["aggregate"]["precision_at_k"]
+prop_precision = prop["embedding_eval"]["aggregate"]["precision_at_k"]
+delta = prop["delta"]["precision_at_k"]["absolute"]
+print(f"precision@10 raw:        {raw_precision:.3f}")
+print(f"precision@10 propagated: {prop_precision:.3f}")
+print(f"Δ (denoising gain):   {delta:+.3f}")
+```
+
+```{python}
+# | echo: false
+contracts.assert_close("arxiv.tier02.precision_at_10", prop_precision, tol=0.02)
+contracts.assert_close("arxiv.tier02.precision_delta", delta, tol=0.02)
+assert abs((prop_precision - raw_precision) - delta) < 1e-9
+```
+
+At `full` scale propagation lifts same-subject precision: an embedding model's
+vectors carry the topic, and averaging over citation neighbours — who mostly
+share it — sharpens it. The encoder matters: a masked-language-model backbone
+(`answerdotai/ModernBERT-base`, mean-pooled) retrieves far worse (precision\@10
+0.36 against 0.51 here) and its vectors carry too little topic for
+propagation to sharpen — measured, it moves precision by −0.003. At `small` scale the random-weight encoder's vectors carry
+little to sharpen, so read the small numbers as a check that the pipeline runs
+and holds its values, not as a finding.
+
+## Bridge note (a signature chapter — deepened in the bridge chapters)
+
+> **Propagation = one low-pass graph filter = one SGC/APPNP layer = the
+> vector-agg over neighbours.** One equation, three names, one
+> `propagate_embeddings` call — and the `weighting` knob *is* the method choice:
+>
+> - `weighting="uniform"` = the random-walk operator $\tilde{D}^{-1}\tilde{A}$
+>   (SGC-flavoured, Wu et al. 2019);
+> - `weighting="degree_normalized"` + `alpha` = symmetric-normalized propagation
+>   with a teleport restart, $(1-\alpha)\hat{A}\,H + \alpha\,X^{(0)}$ — this is
+>   **APPNP** (Gasteiger/Klicpera et al. 2019), used above;
+> - `output="jumping_knowledge"` = concatenating the signal at every hop.
+>
+> The propagation is **deterministic by construction** — a fixed `(group,
+> neighbour)` f64 fold order, byte-identical across threads, no seeding — so it
+> is the reproducible point on the construct→learn spectrum.
+
+---
+
+# Air Routes — propagation over the route graph
+
+The same low-pass filter runs on **Air Routes**: the airport embeddings,
+propagated over the declared `route` graph (the flight network), undirected.
+
+> **Neptune-contrast.** Neptune Analytics ships `pageRank`/`degree`/`wcc` as
+> `CALL`s over the Air Routes graph; here, propagation-as-low-pass-filter is a
+> Jammi recipe — the *same* operation over the *same* route graph, expressed as
+> substrate computation.
+
+```{python}
+air = datasets.air_routes(db)
+air_embeddings = db.generate_embeddings(
+    source=air.airports, model=MODEL, columns=["desc", "city", "country", "region"], key="code"
+)
+air_propagated = db.propagate_embeddings(
+    air.airports,
+    embedding_table=air_embeddings,
+    edge_source=air.routes,
+    edge_src_column="src",
+    edge_dst_column="dst",
+    direction="undirected",
+    hops=2,
+    weighting="degree_normalized",
+)
+```
+
+## The measurement rail: raw → propagated
+
+The target is **same-continent** retrieval: ask with an airport's description,
+count how many of the ten airports retrieved are on its continent. Continent is
+near-solved by latitude and longitude, so this is a *teaching* label, not a
+benchmark; but the raw→propagated delta over it is a legitimate measured number.
+
+```{python}
+airports = db.sql(
+    f"SELECT code, desc, continent FROM {air.airports}.public.{air.airports} "
+    "WHERE continent <> ''"
+).to_pylist()
+air_golden = datasets.same_label_golden(
+    db, airports, key="code", label="continent", text="desc", queries=200,
+    name="air_continent_golden",
+)
+air_compared = db.eval_compare(
+    embedding_tables=[air_embeddings, air_propagated],
+    source=air.airports,
+    golden_source=air_golden,
+    k=10,
+)
+air_raw, air_prop = air_compared["per_table"]
+air_raw_precision = air_raw["embedding_eval"]["aggregate"]["precision_at_k"]
+air_prop_precision = air_prop["embedding_eval"]["aggregate"]["precision_at_k"]
+air_delta = air_prop["delta"]["precision_at_k"]["absolute"]
+print(f"precision@10 raw:        {air_raw_precision:.3f}")
+print(f"precision@10 propagated: {air_prop_precision:.3f}")
+print(f"Δ (denoising gain):   {air_delta:+.3f}")
+```
+
+```{python}
+# | echo: false
+contracts.assert_close("air.tier01.precision_at_10", air_raw_precision, tol=0.02)
+contracts.assert_close("air.tier02.precision_at_10", air_prop_precision, tol=0.02)
+contracts.assert_close("air.tier02.precision_delta", air_delta, tol=0.02)
+if SCALE is scale.Scale.FULL:
+    assert air_delta > 0.03  # the flight network is intracontinental: it sharpens continent
+```
+
+At `full` scale propagating over routes lifts same-continent precision by several
+points: the route graph is mostly intracontinental (tier 01), so an airport's
+route-neighbours carry its continent. At `small` scale the random-weight encoder's
+vectors carry nothing to sharpen, and the delta sits within noise of zero — a
+pipeline check, not a finding.
+
+This is where the Air Routes on-ramp **stops** (tier 02). Its text is too thin
+and its label too near-deterministic for a credible learn/predict tier — those
+live on the ogbn-arxiv keystone. The on-ramp's job is done: two graphs
+constructed and contrasted, a low-pass filter measured, and the tenancy rail
+made vivid.
+
+```{python}
+db.close()
+```

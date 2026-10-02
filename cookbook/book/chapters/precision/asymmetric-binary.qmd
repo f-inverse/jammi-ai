@@ -1,0 +1,240 @@
+---
+title: "Asymmetric binary quantization: a per-dimension threshold recovers the bits a real embedding's own anisotropy collapses"
+---
+
+```{python}
+# | echo: false
+import jammi_cookbook
+```
+
+**Verbs:** `storage_precision = "binary"`'s own coarse-code fit — a per-dimension
+threshold τ learned from the corpus (`sign(v − τ)`, median default), replacing the old
+fixed-`0` `sign(v)` — applied automatically, with no new config knob, through the same
+`jammi.connect(..., config=...)` / `search()` surface `binary-precision.qmd` measures ·
+**Background:** anisotropy in real transformer embeddings — a large shared "common-mean"
+direction nearly every representation projects onto
+[@ethayarajh2019anisotropy] — composed with HNSW as the navigable proximity graph the
+binary sidecar is built over [@malkov2020hnsw] and the recall-vs-memory trade
+quantization buys [@johnson2021billion] · **Checked:** measurement (the anisotropy diagnosis
+itself — `‖μ‖/E‖v‖` and the collapsed-dimension count — plain-vs-asymmetric no-rescore
+recall@1/@10 against the engine's exact search, and the rescore companion's identity to the
+normalized input; every number measured live).
+
+`binary-precision.qmd` measured `storage_precision = "binary"`'s retrieve→rescore trade —
+one packed sign bit per dimension, Hamming-ranked, a mandatory exact rescore recovering
+most of the recall the coarse code gives up. What that chapter's own numpy oracle did NOT
+question is the packing rule itself: `sign(v)`, a threshold fixed at exactly `0`, for
+every dimension, on every corpus. That rule is silently wrong for a real transformer
+embedding. Real embeddings are **anisotropic** — nearly every row shares a large common
+direction (measured below: at `full` scale, on ModernBERT-base, a corpus mean vector whose own
+norm is almost as large as a typical row's) — so a fixed threshold at `0` does
+not split a dimension's values into two roughly-balanced halves; on a dimension the shared
+mean dominates, `sign(v)` returns the SAME bit for nearly every row, and a bit that never
+disagrees across the corpus carries zero Hamming-distance information. The engine's
+`binary` sidecar therefore fits a **per-dimension τ from the corpus itself** — `sign(v − τ)`, `τ` a per-dimension median by default — so
+each dimension's own bit boundary tracks where that dimension's values actually split, not
+an assumption the corpus is centered at the origin. This chapter measures the diagnosis
+that motivates the fix, the fix's own effect on collapsed dimensions and no-rescore recall,
+and confirms the fix is exactly as narrow as its own design claims: **storage-side only,
+touching nothing but the coarse Hamming code** — the exact-`f32` rescore companion, and
+therefore the final answer once rescore runs, is unaffected.
+
+## The corpus and the oracle
+
+The same corpus the two preceding chapters measure — the papers embedded once, held-out
+queries, the engine's exact search as ground truth. At `full` scale these are
+ModernBERT-base embeddings; at `small`, the random-weight fixture encoder's — which, measured
+below, is anisotropic too: mean-pooled transformer states share a common direction whether or
+not the weights were trained.
+
+```{python}
+import numpy as np
+import jammi
+from jammi_cookbook import contracts, precision, scale
+
+SCALE = scale.current()
+K = precision.K
+corpus = precision.corpus(SCALE)
+vectors, queries = corpus.vectors, corpus.queries
+print(f"corpus {len(corpus.corpus_ids):,} papers × {corpus.dims} dims, "
+      f"{len(queries)} held-out queries")
+```
+
+## The diagnosis — how anisotropic is the corpus?
+
+`‖μ‖ / E‖v‖`: the corpus mean vector's norm over the average row norm. Near `0`, the rows
+share no direction; near `1`, nearly every row projects heavily onto the same one
+[@ethayarajh2019anisotropy]. A **collapsed dimension** puts more than 99% (or fewer than 1%)
+of rows on the same side of a threshold: its bit is nearly constant across the corpus, so it
+can never tell two rows' Hamming codes apart.
+
+```{python}
+mu = vectors.mean(axis=0)
+anisotropy = float(np.linalg.norm(mu) / np.linalg.norm(vectors, axis=1).mean())
+
+
+def collapsed(threshold) -> int:
+    above = (vectors > threshold).mean(axis=0)
+    return int(np.sum((above < 0.01) | (above > 0.99)))
+
+
+THRESHOLDS = {"zero": np.zeros(corpus.dims), "median": np.median(vectors, axis=0), "mean": mu}
+dead = {name: collapsed(t) for name, t in THRESHOLDS.items()}
+print(f"‖μ‖ / E‖v‖ = {anisotropy:.4f}")
+for name, n in dead.items():
+    print(f"collapsed dims (of {corpus.dims}) at a {name} threshold: {n}")
+```
+
+```{python}
+# | echo: false
+contracts.assert_close("asymmetric_binary.anisotropy_ratio", anisotropy, tol=0.01)
+for name, n in dead.items():
+    contracts.assert_close(f"asymmetric_binary.collapsed_dims_{name}", float(n), tol=0.0)
+assert dead["median"] <= dead["zero"], "a corpus-fit threshold never collapses more dimensions"
+```
+
+On a real, anisotropic embedding a large share of dimensions is dead under a fixed-`0` rule —
+every one contributes the same bit to every row. Centering each dimension at its own corpus
+median eliminates that collapse: not by adding information, but by putting each dimension's
+bit boundary where its values actually split.
+
+## The fix, isolated — `sign(v)` against `sign(v − τ)`, in numpy
+
+Before touching the engine: rank the whole corpus by raw Hamming distance at each threshold,
+with no candidate restriction and no rescore — the packing rule's own effect on recall.
+
+```{python}
+def hamming_recall(threshold) -> tuple[float, float]:
+    bits = vectors > threshold
+    at_1, at_k = 0, 0.0
+    for q, truth in zip(queries, corpus.exact):
+        ranked = np.argsort(((q > threshold) != bits).sum(axis=1), kind="stable")
+        ids = [corpus.corpus_ids[j] for j in ranked[:K]]
+        at_1 += ids[0] == truth[0]
+        at_k += len(set(ids) & set(truth)) / K
+    return at_1 / len(queries), at_k / len(queries)
+
+
+no_rescore = {name: hamming_recall(t) for name, t in THRESHOLDS.items()}
+print(f"{'threshold':>10}{'recall@1':>11}{'recall@10':>11}")
+for name, (r1, r10) in no_rescore.items():
+    print(f"{name:>10}{r1:>11.4f}{r10:>11.4f}")
+```
+
+```{python}
+# | echo: false
+for name, (r1, r10) in no_rescore.items():
+    contracts.assert_close(f"asymmetric_binary.{name}_no_rescore_at_1", r1, tol=0.0)
+    contracts.assert_close(f"asymmetric_binary.{name}_no_rescore_at_10", r10, tol=0.0)
+assert no_rescore["median"][1] > no_rescore["zero"][1], \
+    "centering the threshold recovers recall a fixed-0 code loses on an anisotropic corpus"
+```
+
+Both corpus-fit thresholds clear the fixed-`0` rule: the diagnosis is not a curiosity, it costs no-rescore recall, and centering recovers
+information the fixed rule threw away. Median is the engine's default because it splits every
+dimension exactly in half — the most information a bit can carry. Neither closes the gap to
+the exact answer: a 1-bit-per-dimension code is lossy, and that gap is what rescore closes.
+
+## The engine's own code — reachable, with no separate knob
+
+The corpus-fit median threshold is the only way `binary` packs: no `[embedding.ann]` key
+selects the fixed-`0` rule or another reduction. The proof is the config surface itself —
+every config struct denies unknown fields, so a key it does not declare is refused when the
+session opens, never parsed and ignored:
+
+```{python}
+try:
+    with precision.built(corpus, "binary", None, extra='binary_threshold_kind = "mean"\n'):
+        pass
+    refused = None
+except jammi.errors.InvalidArgument as exc:
+    refused = str(exc)
+print(f"refused: {refused}")
+```
+
+```{python}
+# | echo: false
+assert refused is not None and "binary_threshold_kind" in refused
+```
+
+## Through the engine — the no-rescore proxy and the rescored default
+
+`oversample=1` hands the rescore only `k` coarse candidates, so it is the engine's own
+near-no-rescore reading; the table's default (`32`) is the search a caller gets.
+
+```{python}
+with precision.built(corpus, "binary", None) as (db, table):
+    proxy = (precision.recall(db, corpus, k=1, oversample=1),
+             precision.recall(db, corpus, oversample=1))
+    rescored = (precision.recall(db, corpus, k=1), precision.recall(db, corpus))
+    companion = np.concatenate([
+        np.fromfile(path, dtype=np.float32).reshape(-1, corpus.dims)
+        for path in precision.bundle_files(db, table)["rawf32"]])
+with precision.built(corpus, "f32", None) as (db, _):
+    exact_ceiling = (precision.recall(db, corpus, k=1), precision.recall(db, corpus))
+print(f"{'':>30}{'recall@1':>11}{'recall@10':>11}")
+for label, (r1, r10) in [("engine, oversample=1", proxy), ("engine, rescored (default)", rescored),
+                         ("numpy median, no rescore", no_rescore["median"]),
+                         ("f32, exact", exact_ceiling)]:
+    print(f"{label:>30}{r1:>11.4f}{r10:>11.4f}")
+```
+
+```{python}
+# | echo: false
+contracts.assert_close("asymmetric_binary.engine_os1_at_10", proxy[1], tol=0.02)
+contracts.assert_close("asymmetric_binary.engine_rescored_at_10", rescored[1], tol=0.02)
+assert rescored[1] >= proxy[1] - 1e-9, "rescore never loses recall"
+```
+
+## Cosine-invariance — the rescore companion never sees τ
+
+τ touches only the coarse Hamming code the graph is built from. The `.rawf32` companion the
+rescore reads holds the table's vectors as ingested — L2-normalized, as every embedding table
+stores them before any precision-specific packing runs. Read back off the segments, in order,
+it equals the normalized input:
+
+```{python}
+unit = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+max_diff = float(np.abs(companion - unit).max())
+print(f"companion {companion.shape[0]:,} × {companion.shape[1]}; "
+      f"max |companion − normalize(input)| = {max_diff:.2e}")
+```
+
+```{python}
+# | echo: false
+assert companion.shape == vectors.shape
+assert max_diff < 1e-5, "the companion is the normalized input, untouched by the threshold"
+```
+
+Whatever the coarse threshold gets wrong about which candidates to propose, the rescore's
+answer is computed from exact data every time.
+
+## Honest framing — a floor raised, not a solved 1-bit code
+
+The corpus-fit threshold is a real improvement at the level it works on — the coarse,
+no-rescore ranking — and it comes entirely from reviving the dimensions the anisotropy killed,
+never from holding more information than one bit per dimension can. It does not make `binary`
+a substitute for `f32`; the mandatory rescore is still what closes the gap to the exact answer.
+
+## Bridge note
+
+> **The right threshold is a property of the corpus, not an assumption about it.** A fixed
+> `sign(v)` at `0` silently assumes an embedding space is centered at the origin along
+> every dimension — real transformer embeddings are anisotropic instead
+> [@ethayarajh2019anisotropy], and that assumption costs real Hamming-distance information
+> on the dimensions where it is most wrong. Fitting a per-dimension threshold from the
+> corpus itself (`sign(v − τ)`, median by default, no separate config knob — confirmed here
+> by an unsupported key being refused loud at load, never parsed and silently ignored)
+> eliminates the collapsed dimensions and
+> measurably improves no-rescore recall, both in an isolated numpy fold and through the
+> real engine's own `search()`. It stays exactly as narrow as its design claims: the
+> exact-`f32` rescore companion is confirmed to hold the same L2-normalized vectors every
+> precision's ingestion path normalizes, untouched by τ, so
+> the fix only ever changes WHICH coarse candidates retrieve→rescore considers, never how
+> the final answer is scored — cosine-invariant, storage-side, benefiting every binary
+> index built on top of HNSW's navigable proximity graph [@malkov2020hnsw] with no trainer,
+> wire, or API change. And it is honestly partial: `binary` is still a 1-bit-per-dimension
+> code, no-rescore recall stays well under the exact baseline even after the fix, and the
+> mandatory rescore stage `binary-precision.qmd` measured is still what does most of the
+> work of recovering the true answer [@johnson2021billion] — the threshold fix raises the
+> floor the coarse code hands to rescore; it does not replace rescore.

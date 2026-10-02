@@ -1,6 +1,6 @@
 # Reference Topologies
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/production.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → One Postgres, Every Process](https://f-inverse.github.io/jammi-ai/cookbook/chapters/production/production.html).
 
 The same engine binary — and the same Rust crate / Python wheel for the
 embedded case — serves every deployment shape below. Nothing here is a

@@ -1,6 +1,6 @@
 # Semantic Search
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/10-retrieval/retrieval.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/retrieval/retrieval.html).
 
 Perform ANN vector similarity search over embedding tables. Results include all original source columns, similarity scores, and evidence provenance.
 
@@ -38,7 +38,7 @@ let results = session.search("patents", query, 10, None, SearchMethod::default()
 query_vec = db.encode_query(model="sentence-transformers/all-MiniLM-L6-v2", query="quantum computing applications")
 
 results = db.search("patents", query=query_vec, k=10)  # pyarrow.Table
-print(results.to_pandas())
+print(results)
 ```
 
 ## What search returns

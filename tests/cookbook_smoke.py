@@ -16,10 +16,8 @@ Run with `python tests/cookbook_smoke.py`.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,35 +30,23 @@ QUICKSTART_BUDGET_S = 60.0
 
 @dataclass(frozen=True)
 class Recipe:
-    """One or more scripts run in order. A stepwise recipe's steps share one
-    fresh working directory, handed to them through `workdir_env`."""
-
     name: str
-    steps: tuple[Path, ...]
-    workdir_env: str | None = None
+    script: Path
 
 
 def example(name: str) -> Recipe:
-    return Recipe(name, (COOKBOOK / "recipes" / name / "example.py",))
-
-
-def stepwise(name: str, workdir_env: str) -> Recipe:
-    steps = tuple(sorted((COOKBOOK / "recipes" / name).glob("[0-9][0-9]-*.py")))
-    assert steps, f"no numbered steps under cookbook/recipes/{name}"
-    return Recipe(f"{name} (stepwise)", steps, workdir_env=workdir_env)
+    return Recipe(name, COOKBOOK / "recipes" / name / "example.py")
 
 
 RECIPES: tuple[Recipe, ...] = (
-    Recipe("quickstart", (COOKBOOK / "quickstart" / "quickstart.py",)),
+    Recipe("quickstart", COOKBOOK / "quickstart" / "quickstart.py"),
     example("mutable_tables"),
     example("cloud_storage"),
     example("trigger_streams"),
     example("eval_embeddings"),
     example("image_search"),
     example("cross_modal_search"),
-    stepwise("image_search", "JAMMI_IMAGE_WORKDIR"),
     example("audio_search"),
-    stepwise("audio_search", "JAMMI_AUDIO_WORKDIR"),
     example("eval_inference"),
     example("eval_inference_ner"),
     example("search_audit"),
@@ -87,28 +73,17 @@ class Result:
 
 def run_recipe(recipe: Recipe) -> Result:
     start = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="jammi-cookbook-smoke-") as workdir:
-        env = dict(os.environ)
-        if recipe.workdir_env is not None:
-            env[recipe.workdir_env] = workdir
-        returncode, stderr = 0, ""
-        for step in recipe.steps:
-            completed = subprocess.run(
-                [sys.executable, "-m", "jammi.session_journal", "--", sys.executable, str(step)],
-                capture_output=True,
-                text=True,
-                cwd=REPO_ROOT,
-                env=env,
-            )
-            returncode, stderr = completed.returncode, completed.stderr
-            if returncode != 0:
-                stderr = f"[{step.name}]\n{stderr}"
-                break
+    completed = subprocess.run(
+        [sys.executable, "-m", "jammi.session_journal", "--", sys.executable, str(recipe.script)],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
     return Result(
         name=recipe.name,
         elapsed_s=time.monotonic() - start,
-        returncode=returncode,
-        stderr=stderr,
+        returncode=completed.returncode,
+        stderr=completed.stderr,
     )
 
 

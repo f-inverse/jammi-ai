@@ -1,6 +1,6 @@
 # Operability
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Operating It](https://f-inverse.github.io/jammi-ai/cookbook/chapters/29-production/operations.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Operating It](https://f-inverse.github.io/jammi-ai/cookbook/chapters/production/operations.html).
 
 How to run a Jammi server in production: what it exposes for observability, how
 it shuts down cleanly, the resource limits it enforces, and how it behaves when
@@ -24,7 +24,7 @@ balancer removes the instance from rotation rather than restarting it.
 
 ```bash
 $ curl -s localhost:8080/healthz
-{"status":"ok","version":"0.51.0"}
+{"status":"ok","version":"0.52.0"}
 
 $ curl -s localhost:8080/readyz          # catalog reachable
 {"status":"ready"}

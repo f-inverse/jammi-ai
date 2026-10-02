@@ -9,18 +9,6 @@ bucket, from `jammi.connect("file://…")`. The embedded engine speaks the same
 the results must outlive the machine that computed them — a notebook runtime,
 a batch job on a spot instance — without standing up a server.
 
-## What `example.py` does
-
-1. Serves S3 locally from `moto` (the cookbook's `cloud` extra) and uploads
-   the tiny corpus into a bucket
-2. Runs one program — register the corpus, embed it with the fixture
-   `tiny_bert`, search it — against local disk: the golden
-3. Runs the same program with the source at
-   `s3://jammi-cookbook/sources/tiny_corpus.parquet` and a `[storage]`
-   `result_root` of `s3://jammi-cookbook/results`
-4. Asserts the S3 run returns the golden's rows with the golden's scores, and
-   that the result table's Parquet and index segments are in the bucket
-
 ## The configuration
 
 ```toml
@@ -41,8 +29,8 @@ or from the SDK's credential chain against real S3. See
 ## API surface exercised
 
 - `jammi.connect("file://…", config=…)` with a `[storage]` section
-- `Database.add_source(name, url="s3://…", format="parquet")`
-- `Database.generate_embeddings(...)`, `encode_query(...)`, `search(...)`
+- `Session.add_source(name, url="s3://…", format="parquet")`
+- `Session.generate_embeddings(...)`, `encode_query(...)`, `search(...)`
 
 ## Run it
 
@@ -51,4 +39,5 @@ pip install -e 'cookbook/book[cloud]'
 python cookbook/recipes/cloud_storage/example.py
 ```
 
-Exits 0 on success.
+It prints the top five over local disk and over the bucket, which agree, and
+the result table's objects in the bucket.

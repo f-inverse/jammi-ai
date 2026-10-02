@@ -7,8 +7,8 @@
 #
 # Stages, in order:
 #   static   fmt, the clippy surfaces the `check` and `clippy-gated` jobs lint,
-#            rustdoc -D warnings, the guide build (ci.yml `check`,
-#            `clippy-gated`, docs.yml `build`)
+#            the guide's build and its examples, rustdoc -D warnings (ci.yml
+#            `check`, `clippy-gated`, `docs`)
 #   guards   the guards this change can affect (`ci/guards.toml`) and the
 #            script tests it can affect, through the same runners ci.yml's
 #            `guard` job calls
@@ -28,7 +28,7 @@
 # The Postgres lane needs a live database server in JAMMI_TEST_PG_URL (CI's
 # shape: user jammi, db jammi_test; `ci/dev.sh --with pg` starts one). Each
 # test creates a database of its own on it. Without one the stage FAILS, naming the fix,
-# unless --skip-pg is given; likewise `mdbook build` FAILS when mdbook is
+# unless --skip-pg is given; likewise the guide's steps FAIL when mdbook is
 # absent unless --skip-mdbook is given. A silently skipped lane is how the
 # shared-database leak of PR #579 reached CI.
 #
@@ -156,14 +156,14 @@ PY
 # ---------------------------------------------------------------- coverage
 # Which ci.yml jobs this runner covers, printed up front so "green" is never
 # read as "every job".
-COVERED_JOBS="check clippy-gated test-build test test-permission-fault test-lanes test-pg guard symbol-index-gates"
+COVERED_JOBS="check clippy-gated docs test-build test test-permission-fault test-lanes test-pg guard symbol-index-gates"
 python3 - "$COVERED_JOBS" <<'PY'
 import sys, yaml
 ci = yaml.safe_load(open('.github/workflows/ci.yml'))
 covered = set(sys.argv[1].split())
 jobs = [j for j in ci['jobs'] if j != 'ci-summary']
 missing = [j for j in jobs if j not in covered]
-print(f"merge_path: covers {len(jobs) - len(missing)} of {len(jobs)} ci.yml jobs (plus docs.yml's build)")
+print(f"merge_path: covers {len(jobs) - len(missing)} of {len(jobs)} ci.yml jobs")
 print("merge_path: NOT run here (CI runs them): " + ", ".join(missing))
 PY
 
@@ -175,17 +175,19 @@ if stage_wanted static; then
     "$(ci_step clippy-gated 'Clippy (feature-gated test surfaces)')"
   run_sh static "clippy jammi-db postgres,mysql" \
     "$(ci_step check 'Clippy jammi-db --features postgres,mysql --all-targets (source-provider feature surface)')"
-  run static "rustdoc -D warnings" \
-    env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps
   if command -v mdbook >/dev/null 2>&1; then
-    run static "mdbook build docs/guide" mdbook build docs/guide
+    run_sh static "the guide" "$(ci_step docs 'Build the guide')"
+    run_sh static "the workspace the guide's examples link against" \
+      "$(ci_step docs "Build the workspace the guide's examples link against")"
+    run_sh static "the guide's examples" "$(ci_step docs "Test the guide's examples")"
   elif [ "$SKIP_MDBOOK" = 1 ]; then
-    printf 'skip  [static] mdbook build docs/guide (--skip-mdbook; docs.yml runs it)\n'
+    printf 'skip  [static] the guide and its examples (--skip-mdbook; ci.yml docs runs them)\n'
   else
     ran=$((ran + 1)); failed=$((failed + 1))
-    FAILED_LIST+=("[static] mdbook build docs/guide: mdbook is not installed — install it (cargo install mdbook) or pass --skip-mdbook explicitly")
-    printf 'FAIL  [static] mdbook build docs/guide: mdbook not installed (pass --skip-mdbook to skip explicitly)\n'
+    FAILED_LIST+=("[static] the guide: mdbook is not installed — install it (cargo install mdbook) or pass --skip-mdbook explicitly")
+    printf 'FAIL  [static] the guide: mdbook not installed (pass --skip-mdbook to skip explicitly)\n'
   fi
+  run_sh static "rustdoc -D warnings" "$(ci_step docs 'Build the API reference')"
 fi
 
 # ---------------------------------------------------------------- guards

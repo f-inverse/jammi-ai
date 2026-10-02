@@ -8,23 +8,10 @@ a golden relevance set.
 you "is my new encoder better than the one I shipped last month?" The
 same loop powers nightly regression dashboards and A/B model comparison.
 
-## What `example.py` does
-
-1. Connects to a temporary artifact dir
-2. Registers the tiny corpus as a Parquet source
-3. Builds 32-dim embeddings over the `content` column with the local
-   `tiny_bert` fixture
-4. Reads `cookbook/fixtures/tiny_golden.json`, expands it into the
-   `(query_id, query_text, relevant_id)` CSV shape `eval_embeddings`
-   consumes, and registers it as a `golden` source
-5. Calls `db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)`
-6. Asserts each aggregate metric is in `[0.0, 1.0]` and the per-query
-   records carry their golden-set `query_id`
-
 ## API surface exercised
 
-- `Database.generate_embeddings(*, source, model, columns, key, modality="text")`
-- `Database.eval_embeddings(*, source, golden_source, model=None, k=10)`
+- `Session.generate_embeddings(*, source, model, columns, key, modality="text")`
+- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
 
 The returned dict carries `aggregate` (mean across queries — `recall_at_k`,
 `precision_at_k`, `mrr`, `ndcg`) and `per_query` (one entry per query with
@@ -49,4 +36,4 @@ Image queries are supported via a `query_image` BLOB column instead of
 python cookbook/recipes/eval_embeddings/example.py
 ```
 
-Exits 0 on success, prints the metrics dict + `eval_embeddings: OK`.
+It prints the four aggregate scores, the stored run, a cohort tag read back, and the smoothed table's recall delta.

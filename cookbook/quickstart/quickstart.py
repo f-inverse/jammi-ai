@@ -1,76 +1,127 @@
-"""5-minute Jammi AI quickstart — register, embed, search.
+"""Jammi in five minutes: connect, register a source, embed it, search it.
 
-Walks the four steps from `cookbook/quickstart/`'s README:
-
-1. `jammi.connect("file://…")` — open a local in-process session
-2. `db.add_source` — attach the tiny corpus fixture
-3. `db.generate_embeddings(..., modality="text")` — build a 32-dim USEARCH-backed index
-4. `db.encode_query(...)` + `db.search(...)` — execute a similarity query (returns a table)
-
-`connect(target)` is the one front door: a `file://` target runs the engine
-in-process; flipping to a `https://` / `grpc://` target — no code change —
-talks to a remote server via the `jammi-ai` client.
-
-Uses the local `cookbook/fixtures/tiny_bert` encoder so the script runs
-without network access. Swap `MODEL` for a Hugging Face Hub model ID like
-`sentence-transformers/all-MiniLM-L6-v2` for production.
-
-Exits 0 in well under 30 seconds on CPU.
+Run with `python cookbook/quickstart/quickstart.py`, or a step at a time as a
+notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
+# %% [markdown]
+# ## 1. Install
+#
+# ```bash
+# pip install "jammi-ai[embedded]"
+# ```
+#
+# `jammi-ai` is the client (`import jammi`). The `[embedded]` extra adds the
+# engine itself, `jammi-ai-native`, so the client can run it in your process;
+# without it the client only reaches a remote `jammi-server`, and a `file://`
+# target raises `NoEmbeddedEngineError`. On an NVIDIA GPU of compute capability
+# 8.0 or newer (A100, L4, RTX 30-series and later), install the CUDA engine in
+# place of the CPU one: `pip install jammi-ai jammi-ai-native-cu12`. It carries
+# its CUDA libraries as pip dependencies; the host needs only the NVIDIA driver.
+#
+# Jammi runs on Python 3.9 or newer, on Linux (x86_64 or aarch64, glibc 2.28+)
+# and macOS (Apple Silicon or Intel); the CUDA engine is Linux x86_64. Windows
+# is not supported: the storage layer uses POSIX memory mapping.
+#
+# Both imports succeed once the engine is installed. `jammi_cookbook` holds the
+# small datasets and models the cookbook runs on.
 
+# %%
 import os
 import tempfile
-from pathlib import Path
 
-# Pin the engine to CPU so the example is reproducible on any machine. Engine
-# tuning (device, batch size, memory) is configuration, read from the
-# environment — `connect(target)` itself takes only the target.
+import jammi
+import jammi_native  # noqa: F401 -- the engine the [embedded] extra installed
+from jammi_cookbook import fixtures
+
+# %% [markdown]
+# ## 2. Connect
+#
+# `jammi.connect(target)` is the one front door. A `file://` target runs the
+# engine in this process, with its catalog and every result table kept under
+# that directory; a `grpc://host:8081` or `https://host` target opens a session
+# against a remote `jammi-server` instead, with the same methods.
+#
+# Device and batch size are engine configuration, read from the environment
+# (or a `JAMMI_CONFIG` TOML file) when the engine starts, so they apply the same
+# way in your process or behind a server. `JAMMI_GPU__DEVICE=-1` forces the CPU
+# and `0` pins a device; without it the engine takes GPU 0 when there is one.
+# `JAMMI_ENGINE__BATCH_SIZE` sets the batch size, here small for a 20-row
+# corpus.
+
+# %%
 os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
 os.environ.setdefault("JAMMI_ENGINE__BATCH_SIZE", "8")
 
-import jammi
-from jammi_cookbook import fixtures
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
-CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
+# %% [markdown]
+# ## 3. Register a source
+#
+# `add_source` registers a file so SQL and embedding jobs can name it. The
+# `url` is a local path, or `s3://bucket/key`, `gs://bucket/key` or
+# `azure://container/blob` for object storage; `format` is `parquet`, `csv` or
+# `json`. This corpus is 20 short paper abstracts with an `id`, a `title`, the
+# `content`, a `year` and a `category`.
+
+# %%
+db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
+
+# %% [markdown]
+# A registered file is a table in SQL, named `<source>.public.<table>`, where
+# the table is the file's name without its extension: `corpus.public.tiny_corpus`
+# here. Every query returns a `pyarrow.Table`.
+
+# %%
+for row in db.sql("SELECT id, title, year FROM corpus.public.tiny_corpus LIMIT 3").to_pylist():
+    print(row)
+
+# %% [markdown]
+# ## 4. Embed the corpus and search it
+#
+# `generate_embeddings` runs an encoder over every row of `corpus`, writes the
+# vectors and the `key` column to a Parquet result table, and builds an ANN
+# index beside it. The job is checkpointed: interrupted and run again, it picks
+# up where it left off.
+#
+# `model` is a Hugging Face Hub id or a local directory (`local:/path`, holding
+# `config.json`, `model.safetensors` and `tokenizer.json`). The quickstart uses
+# `tiny_bert`, a 32-dimensional single-layer model that needs no network. A real
+# workload would name a Hub model such as
+# `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions), and nothing else
+# changes.
+
+# %%
 MODEL = fixtures.model("tiny_bert")
 
+db.generate_embeddings(
+    source="corpus",
+    model=MODEL,
+    columns=["content"],
+    key="id",
+    modality="text",
+)
 
-def main() -> int:
-    # 1. Connect to a local, in-process engine rooted at the temp dir. The session
-    #    is a context manager, and block exit CLOSES it — the embedded engine
-    #    holds its catalog until close() returns, so it must be released before
-    #    the directory is removed (the `with` items unwind in reverse order).
-    with tempfile.TemporaryDirectory() as tmp, jammi.connect(f"file://{tmp}") as db:
-        # 2. Register the tiny corpus as a Parquet source.
-        db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
+# %% [markdown]
+# The query is encoded by the model that built the index, so its vector has
+# the index's dimension. `search` returns the `k` nearest rows as a
+# `pyarrow.Table`: the source's columns, `_row_id`, and `similarity` (cosine,
+# 1.0 for identical). `filter="year > 2020"` ranks only the rows a predicate
+# selects, and `select=[...]` picks the columns; joining sources, or running a
+# model over the results, is SQL through `db.sql(...)`.
 
-        # 3. Build a 32-dim embedding table over the `content` column.
-        db.generate_embeddings(
-            source="corpus",
-            model=MODEL,
-            columns=["content"],
-            key="id",
-            modality="text",
-        )
+# %%
+query = db.encode_query(model=MODEL, query="how does quantum computing work?")
+results = db.search("corpus", query=query, k=3)
+assert results.num_rows == 3
 
-        # 4. Encode a query and run a top-3 similarity search.
-        query_vec = db.encode_query(model=MODEL, query="how does quantum computing work?")
-        results = db.search("corpus", query=query_vec, k=3)  # pyarrow.Table
+for row in results.to_pylist():
+    print(f"{row['_row_id']:<8} {row['similarity']:>9.4f}  {row['title']}")
 
-        rows = results.to_pylist()
-        if not rows:
-            raise RuntimeError("quickstart returned zero rows")
+# %% [markdown]
+# An embedded engine holds its catalog until the session closes. A session is
+# also a context manager: `with jammi.connect(...) as db:` closes it when the
+# block ends.
 
-        print("id        similarity  title")
-        for row in rows:
-            print(
-                f"{row['_row_id']:<8}  {row['similarity']:>9.4f}  {row['title']}"
-            )
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()

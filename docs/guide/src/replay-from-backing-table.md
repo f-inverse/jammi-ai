@@ -1,6 +1,6 @@
 # Replay Events from the Backing Table
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Change Data Capture](https://f-inverse.github.io/jammi-ai/cookbook/chapters/13-cdc/cdc.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Change Data Capture](https://f-inverse.github.io/jammi-ai/cookbook/chapters/cdc/cdc.html).
 
 Every topic's event log is a Phase-2 mutable companion table named
 `__topic_<topic_id>`. The double-underscore prefix is reserved for

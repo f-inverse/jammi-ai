@@ -196,20 +196,20 @@ Lane = DirectCell | WrapperLane | Recipe
 # --------------------------------------------------------------------------- #
 ACCOUNTING: list[tuple[str, Lane]] = [
     ("acceleration_report", Recipe("recipes/jobs/example.py", "job.acceleration_report(")),
-    ("add_channel_columns", DirectCell("14-eval-channels/eval-channels.qmd", "db.add_channel_columns(")),
+    ("add_channel_columns", DirectCell("eval-channels/eval-channels.qmd", "db.add_channel_columns(")),
     ("add_source", Recipe("quickstart/quickstart.py", "db.add_source(")),
-    ("asof_join", DirectCell("19-point-in-time/point-in-time.qmd", "db.asof_join(")),
-    ("assemble_context", DirectCell("10-retrieval/retrieval.qmd", "db.assemble_context(")),
+    ("asof_join", DirectCell("point-in-time/point-in-time.qmd", "db.asof_join(")),
+    ("assemble_context", DirectCell("retrieval/retrieval.qmd", "db.assemble_context(")),
     ("audit", Recipe("recipes/search_audit/example.py", "db.audit.log(")),
-    ("build_lexical_index", DirectCell("10-retrieval/retrieval.qmd", "db.build_lexical_index(")),
+    ("build_lexical_index", DirectCell("retrieval/retrieval.qmd", "db.build_lexical_index(")),
     ("build_neighbor_graph", Recipe("recipes/graph_and_lineage/example.py", "db.build_neighbor_graph(")),
     ("cancel", Recipe("recipes/jobs/example.py", "by_handle.cancel(")),
     ("cancel_job", Recipe("recipes/jobs/example.py", "db.cancel_job(")),
-    ("close", DirectCell("25-incremental-refresh/incremental-refresh.qmd", "db.close(")),
-    ("compact_embeddings", DirectCell("25-incremental-refresh/incremental-refresh.qmd", "db.compact_embeddings(")),
-    ("conformalize", DirectCell("08-conformal/conformal.qmd", "db.conformalize(")),
-    ("conformalize_cqr", DirectCell("08-conformal/conformal.qmd", "db.conformalize_cqr(")),
-    ("conformalize_interval", DirectCell("08-conformal/conformal.qmd", "db.conformalize_interval(")),
+    ("close", DirectCell("incremental-refresh/incremental-refresh.qmd", "db.close(")),
+    ("compact_embeddings", DirectCell("incremental-refresh/incremental-refresh.qmd", "db.compact_embeddings(")),
+    ("conformalize", DirectCell("conformal/conformal.qmd", "db.conformalize(")),
+    ("conformalize_cqr", DirectCell("conformal/conformal.qmd", "db.conformalize_cqr(")),
+    ("conformalize_interval", DirectCell("conformal/conformal.qmd", "db.conformalize_interval(")),
     ("connect", Recipe("quickstart/quickstart.py", "jammi.connect(")),
     ("create_mutable_table", Recipe("recipes/mutable_tables/example.py", "db.create_mutable_table(")),
     ("delete_model", Recipe("recipes/model_catalog/example.py", "db.delete_model(")),
@@ -222,12 +222,12 @@ ACCOUNTING: list[tuple[str, Lane]] = [
     ("drop_topic", Recipe("recipes/trigger_streams/example.py", "db.drop_topic(")),
     ("encode_query", Recipe("recipes/remote_session/example.py", "db.encode_query(")),
     ("ephemeral_session", Recipe("recipes/session_lifecycle/example.py", "db.ephemeral_session(")),
-    ("eval_calibration", DirectCell("09-calibration/calibration.qmd", "db.eval_calibration(")),
+    ("eval_calibration", DirectCell("calibration/calibration.qmd", "db.eval_calibration(")),
     ("eval_compare", Recipe("recipes/eval_embeddings/example.py", "db.eval_compare(")),
     ("eval_embeddings", Recipe("recipes/eval_embeddings/example.py", "db.eval_embeddings(")),
     ("eval_inference", Recipe("recipes/eval_inference/example.py", "db.eval_inference(")),
     ("eval_per_query", Recipe("recipes/eval_embeddings/example.py", "db.eval_per_query(")),
-    ("expire_versions", DirectCell("25-incremental-refresh/incremental-refresh.qmd", "db.expire_versions(")),
+    ("expire_versions", DirectCell("incremental-refresh/incremental-refresh.qmd", "db.expire_versions(")),
     ("fine_tune", Recipe("recipes/fine_tune/example.py", "db.fine_tune(")),
     ("fine_tune_graph", Recipe("recipes/fine_tune/example.py", "db.fine_tune_graph(")),
     ("generate_embeddings", Recipe("quickstart/quickstart.py", "db.generate_embeddings(")),
@@ -238,13 +238,13 @@ ACCOUNTING: list[tuple[str, Lane]] = [
     ("job", Recipe("recipes/jobs/example.py", "db.job(")),
     ("job_id", Recipe("recipes/jobs/example.py", "by_handle.job_id")),
     ("kind", Recipe("recipes/jobs/example.py", "by_handle.kind")),
-    ("lexical_search", DirectCell("10-retrieval/retrieval.qmd", "db.lexical_search(")),
-    ("list_channels", DirectCell("14-eval-channels/eval-channels.qmd", "db.list_channels(")),
-    ("list_index_segments", DirectCell("25-incremental-refresh/incremental-refresh.qmd", "db.list_index_segments(")),
+    ("lexical_search", DirectCell("retrieval/retrieval.qmd", "db.lexical_search(")),
+    ("list_channels", DirectCell("eval-channels/eval-channels.qmd", "db.list_channels(")),
+    ("list_index_segments", DirectCell("incremental-refresh/incremental-refresh.qmd", "db.list_index_segments(")),
     ("list_jobs", Recipe("recipes/jobs/example.py", "db.list_jobs(")),
     ("list_models", Recipe("recipes/model_catalog/example.py", "db.list_models(")),
-    ("list_mutable_tables", DirectCell("12-feature-store/feature-store.qmd", "db.list_mutable_tables(")),
-    ("list_sources", DirectCell("01-construct/construct.qmd", "db.list_sources(")),
+    ("list_mutable_tables", DirectCell("feature-store/feature-store.qmd", "db.list_mutable_tables(")),
+    ("list_sources", DirectCell("construct/construct.qmd", "db.list_sources(")),
     ("list_topics", Recipe("recipes/trigger_streams/example.py", "db.list_topics(")),
     ("list_workers", Recipe("recipes/jobs/example.py", "db.list_workers(")),
     ("metrics", Recipe("recipes/jobs/example.py", "job.metrics(")),
@@ -261,10 +261,10 @@ ACCOUNTING: list[tuple[str, Lane]] = [
     ("publish_topic", Recipe("recipes/trigger_streams/example.py", "db.publish_topic(")),
     ("recompute", Recipe("recipes/graph_and_lineage/example.py", "db.recompute(")),
     ("reconcile", Recipe("recipes/graph_and_lineage/example.py", "db.reconcile(")),
-    ("refresh_embeddings", DirectCell("25-incremental-refresh/incremental-refresh.qmd", "db.refresh_embeddings(")),
-    ("register_channel", DirectCell("14-eval-channels/eval-channels.qmd", "db.register_channel(")),
+    ("refresh_embeddings", DirectCell("incremental-refresh/incremental-refresh.qmd", "db.refresh_embeddings(")),
+    ("register_channel", DirectCell("eval-channels/eval-channels.qmd", "db.register_channel(")),
     ("register_topic", Recipe("recipes/trigger_streams/example.py", "db.register_topic(")),
-    ("rrf_fuse", DirectCell("10-retrieval/retrieval.qmd", "db.rrf_fuse(")),
+    ("rrf_fuse", DirectCell("retrieval/retrieval.qmd", "db.rrf_fuse(")),
     ("search", Recipe("quickstart/quickstart.py", "db.search(")),
     ("session_id", Recipe("recipes/remote_session/example.py", "remote.session_id")),
     ("set_tenant", Recipe("recipes/search_audit/example.py", "db.set_tenant(")),
@@ -273,8 +273,8 @@ ACCOUNTING: list[tuple[str, Lane]] = [
     ("status", Recipe("recipes/jobs/example.py", "by_handle.status(")),
     ("subscribe_collect", Recipe("recipes/trigger_streams/example.py", "db.subscribe_collect(")),
     ("supports", Recipe("recipes/remote_session/example.py", "remote.supports(")),
-    ("tenant", WrapperLane("rails.py", "db.tenant()", "01-construct/construct.qmd", "rails.tenant(")),
-    ("tenant_scope", DirectCell("14-eval-channels/eval-channels.qmd", "db.tenant_scope(")),
+    ("tenant", WrapperLane("rails.py", "db.tenant()", "construct/construct.qmd", "rails.tenant(")),
+    ("tenant_scope", DirectCell("eval-channels/eval-channels.qmd", "db.tenant_scope(")),
     ("train_context_predictor", Recipe("recipes/context_predictor/example.py", "db.train_context_predictor(")),
     ("verify_materialization", Recipe("recipes/graph_and_lineage/example.py", "db.verify_materialization(")),
     ("wait", Recipe("recipes/jobs/example.py", "job.wait(")),
@@ -302,12 +302,12 @@ def code_only(text: str) -> str:
 
 def smoke_registered(script: str, smoke_text: str) -> bool:
     """Whether `tests/cookbook_smoke.py` runs `script` (relative to
-    cookbook/): a recipe directory named by `example("…")` / `stepwise("…")`,
-    or the quickstart script's own path segment."""
+    cookbook/): a recipe directory named by `example("…")`, or the
+    quickstart script's own path segment."""
     parts = Path(script).parts
     if parts[0] == "recipes":
         name = parts[1]
-        return bool(re.search(rf'\b(?:example|stepwise)\(\s*"{re.escape(name)}"', smoke_text))
+        return bool(re.search(rf'\bexample\(\s*"{re.escape(name)}"', smoke_text))
     return f'"{parts[0]}" / "{parts[-1]}"' in smoke_text
 
 

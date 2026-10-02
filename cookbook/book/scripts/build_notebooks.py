@@ -26,8 +26,12 @@ The conversion is plain Python — no Quarto — so the check is hermetic:
 * prose stays markdown; a link to another chapter points at the published
   book, and a citation ``[@key]`` reads "(Author Year)", with the chapter's
   references listed in a closing cell;
-* a recipe's docstring is its markdown, its body one code cell, and the
-  ``__main__`` guard becomes a final cell that runs ``main()``.
+* a recipe's README is its overview, and its script's ``# %%`` cells are its
+  steps: a ``# %% [markdown]`` cell becomes markdown (its comment markers
+  dropped), a ``# %%`` cell a code cell, in order. The script runs top to
+  bottom as a program; the reader runs it a step at a time. The same reading
+  of the script is also written as a book chapter under ``chapters/recipes/``,
+  so the book holds every recipe and renders it run.
 
 Run ``python scripts/build_notebooks.py`` to rebuild, ``--check`` to fail when
 a committed notebook differs from what the sources build.
@@ -46,6 +50,8 @@ from pathlib import Path
 BOOK = Path(__file__).resolve().parents[1]
 REPO = BOOK.parents[1]
 OUT = REPO / "cookbook" / "notebooks"
+# Every recipe is also a book chapter, generated here from its script.
+RECIPE_CHAPTERS = BOOK / "chapters" / "recipes"
 GITHUB = "f-inverse/jammi-ai"
 BOOK_URL = "https://f-inverse.github.io/jammi-ai/cookbook"
 
@@ -310,40 +316,135 @@ def chapter(qmd: Path, release: str, refs: dict[str, Reference]) -> tuple[Path, 
                              setup_cell(release, server=server, extras=extras_of(run)), *cells])
 
 
-def recipe(script: Path, release: str) -> tuple[Path, dict]:
+@dataclass(frozen=True)
+class Recipe:
+    """A recipe script read once: what both its notebook and its book chapter
+    are built from."""
+
+    name: str
+    title: str
+    # The README's overview.
+    prose: str
+    # The script's steps in order, each ("markdown" | "code", text).
+    cells: list[tuple[str, str]]
+    source: str
+    server: bool
+    extras: list[str]
+
+
+_MD_LINK = re.compile(r"\]\((?!https?://|#|mailto:)([^)\s]+)\)")
+_RUN_IT = re.compile(r"^## Run it\n.*?(?=^## |\Z)", re.S | re.M)
+_H1 = re.compile(r"\A# (.+)\n")
+
+
+def _absolute_links(markdown_text: str, directory: Path) -> str:
+    """Relative links in a recipe's pages, resolved to the files on GitHub."""
+
+    def to_github(m: re.Match) -> str:
+        target = (directory / m.group(1)).resolve().relative_to(REPO.resolve()).as_posix()
+        return f"](https://github.com/{GITHUB}/blob/main/{target})"
+
+    return _MD_LINK.sub(to_github, markdown_text)
+
+
+def recipe_pages(script: Path) -> tuple[str, str]:
+    """A recipe's title and its overview: the README beside the script, less
+    its command-line "Run it" section, since a notebook and a chapter run the
+    program themselves."""
+    readme = (script.parent / "README.md").read_text()
+    head = _H1.match(readme)
+    if head is None:
+        raise ValueError(f"{script.parent / 'README.md'}: a recipe's README opens with its title")
+    overview = _RUN_IT.sub("", readme[head.end():]).strip()
+    return head.group(1).strip(), _absolute_links(overview, script.parent)
+
+
+# A cell marker of the percent format: `# %%` opens a code cell, `# %% [markdown]`
+# a markdown cell whose every line is a comment.
+_CELL_MARK = re.compile(r"^# %%(?P<markdown> \[markdown\])?[ \t]*$", re.M)
+
+
+def recipe_cells(script: Path) -> list[tuple[str, str]]:
+    """A recipe script's steps: after its docstring, every line belongs to a
+    ``# %%`` cell, and there is no ``main`` — a program that runs inside one
+    function reads as a single step."""
     text = script.read_text()
     tree = ast.parse(text)
-    # The notebook ends in `assert main() == 0`, which holds only for a `main`
-    # that returns its exit status; one returning None fails every reader.
-    entry = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main"),
-                 None)
-    if entry is None or entry.returns is None or ast.unparse(entry.returns) != "int":
-        raise ValueError(f"{script}: a recipe's `main` returns its exit status (`-> int`)")
-    doc = ast.get_docstring(tree) or ""
-    title, _, rest = doc.partition("\n")
-    rest = re.sub(r"\n*Run with `python [^`]*`\.?\s*$", "", rest).strip()
-    body_nodes = [n for n in tree.body[1:] if not (
-        isinstance(n, ast.If) and "__main__" in ast.unparse(n.test))]
-    lines = text.split("\n")
-    start = body_nodes[0].lineno - 1 - len(getattr(body_nodes[0], "decorator_list", []))
-    end = body_nodes[-1].end_lineno
-    body = "\n".join(lines[start:end]).strip("\n")
+    docstring = tree.body[0] if tree.body else None
+    if not (isinstance(docstring, ast.Expr) and isinstance(docstring.value, ast.Constant)
+            and isinstance(docstring.value.value, str)):
+        raise ValueError(f"{script}: a recipe opens with its docstring")
+    if any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body) or any(
+            isinstance(n, ast.If) and "__main__" in ast.unparse(n.test) for n in tree.body):
+        raise ValueError(f"{script}: a recipe's steps are its `# %%` cells, run top to bottom, "
+                         "not a `main` it calls")
+    rest = "\n".join(text.split("\n")[docstring.end_lineno:])
+    marks = list(_CELL_MARK.finditer(rest))
+    if not marks or rest[:marks[0].start()].strip():
+        raise ValueError(f"{script}: every line after the docstring belongs to a `# %%` cell")
+    cells = []
+    for mark, following in zip(marks, [*marks[1:], None], strict=True):
+        body = rest[mark.end():following.start() if following else len(rest)].strip("\n")
+        if mark.group("markdown"):
+            lines = body.split("\n")
+            if any(line and not line.startswith("#") for line in lines):
+                raise ValueError(f"{script}: a `# %% [markdown]` cell is comment lines only")
+            prose = "\n".join(line[2:] if line.startswith("# ") else line[1:] for line in lines)
+            cells.append(("markdown", _absolute_links(prose.strip(), script.parent)))
+        else:
+            cells.append(("code", body.rstrip()))
+    if any(not text for _, text in cells):
+        raise ValueError(f"{script}: a cell is empty")
+    return cells
 
-    name = script.parent.name
-    target = OUT / "recipes" / f"{name}.ipynb"
-    url = colab_url(target, release)
-    source = script.relative_to(REPO).as_posix()
-    server = bool(_NEEDS_SERVER.search(text))
-    cells = [header(title.rstrip("."), source, url),
-             setup_cell(release, server=server, extras=extras_of(text))]
-    if rest:
-        cells.append(markdown(rest))
-    cells += [code(body), code("assert main() == 0")]
+
+def read_recipe(script: Path) -> Recipe:
+    text = script.read_text()
+    title, prose = recipe_pages(script)
+    return Recipe(
+        name=script.parent.name,
+        title=title,
+        prose=prose,
+        cells=recipe_cells(script),
+        source=script.relative_to(REPO).as_posix(),
+        server=bool(_NEEDS_SERVER.search(text)),
+        extras=extras_of(text),
+    )
+
+
+def recipe_notebook(r: Recipe, release: str) -> tuple[Path, dict]:
+    target = OUT / "recipes" / f"{r.name}.ipynb"
+    cells = [header(r.title, r.source, colab_url(target, release)),
+             setup_cell(release, server=r.server, extras=r.extras)]
+    if r.prose:
+        cells.append(markdown(r.prose))
+    cells += [markdown(text) if kind == "markdown" else code(text) for kind, text in r.cells]
     return target, notebook(cells)
 
 
+def recipe_chapter(r: Recipe) -> tuple[Path, str]:
+    """The book chapter a recipe renders as: its overview, then its steps run
+    in order. Its first cell applies the determinism contract, as every
+    chapter's does."""
+    prose = f"{r.prose}\n\n" if r.prose else ""
+    steps = "\n\n".join(text if kind == "markdown" else f"```{{python}}\n{text}\n```"
+                         for kind, text in r.cells)
+    title = r.title.replace('"', '\\"')
+    return RECIPE_CHAPTERS / f"{r.name}.qmd", (
+        f'---\ntitle: "{title}"\n---\n\n'
+        "<!-- Generated by scripts/build_notebooks.py from "
+        f"{r.source} — edit the recipe, not this page. -->\n\n"
+        "```{python}\n#| echo: false\nimport jammi_cookbook  # noqa: F401\n```\n\n"
+        f"{prose}"
+        f"The program is [`{r.source}`](https://github.com/{GITHUB}/blob/main/{r.source});"
+        " its steps run here in order.\n\n"
+        f"{steps}\n"
+    )
+
+
 def sources() -> tuple[list[Path], list[Path]]:
-    chapters = sorted((BOOK / "chapters").rglob("*.qmd"))
+    chapters = sorted(p for p in (BOOK / "chapters").rglob("*.qmd")
+                      if RECIPE_CHAPTERS not in p.parents)
     recipes = [REPO / "cookbook" / "quickstart" / "quickstart.py",
                *sorted((REPO / "cookbook" / "recipes").glob("*/example.py"))]
     return chapters, recipes
@@ -376,8 +477,9 @@ def index(built: dict[Path, dict], release: str) -> str:
 def badge(release: str) -> str:
     """The script the rendered book includes on every page: a chapter page
     (``chapters/<path>.html``) gets its notebook's Open-in-Colab badge under
-    its title."""
-    base = colab_url(OUT / "book", release)
+    its title — a recipe chapter (``chapters/recipes/<name>.html``) its
+    recipe's notebook."""
+    base = colab_url(OUT, release)
     img = '<img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">'
     return f"""<script>
 (function () {{
@@ -385,7 +487,8 @@ def badge(release: str) -> str:
   var title = document.querySelector("#title-block-header");
   if (!page || !title) return;
   var link = document.createElement("a");
-  link.href = "{base}/" + page[1] + ".ipynb";
+  var notebook = page[1].indexOf("recipes/") === 0 ? page[1] : "book/" + page[1];
+  link.href = "{base}/" + notebook + ".ipynb";
   link.target = "_blank";
   link.rel = "noopener";
   link.innerHTML = '{img}';
@@ -399,9 +502,11 @@ def build() -> dict[Path, str]:
     """Every generated file and its content."""
     release, refs = version(), references()
     chapters, recipes = sources()
+    read = [read_recipe(s) for s in recipes]
     built = dict(chapter(q, release, refs) for q in chapters)
-    built |= dict(recipe(s, release) for s in recipes)
+    built |= dict(recipe_notebook(r, release) for r in read)
     files = {p: json.dumps(nb, indent=1, ensure_ascii=False) + "\n" for p, nb in built.items()}
+    files |= dict(recipe_chapter(r) for r in read)
     files[OUT / "README.md"] = index(built, release)
     files[BOOK / "_colab.html"] = badge(release)
     return files
@@ -418,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     files = build()
     existing = {p for p in OUT.rglob("*") if p.is_file() and p.suffix in {".ipynb", ".md"}}
+    existing |= set(RECIPE_CHAPTERS.glob("*.qmd"))
     stale = sorted(p for p, text in files.items() if not p.exists() or p.read_text() != text)
     orphans = sorted(existing - set(files))
     if args.check:

@@ -1,6 +1,6 @@
 # The Materialization Contract: Verifiable Result-Table Identity
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Incremental Recompute](https://f-inverse.github.io/jammi-ai/cookbook/chapters/20-recompute/recompute.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Incremental Recompute](https://f-inverse.github.io/jammi-ai/cookbook/chapters/recompute/recompute.html).
 
 Every result table Jammi publishes carries a *verifiable identity*: a sidecar
 attestation that lets a later reader assert **"this artifact is the output of

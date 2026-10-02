@@ -1,27 +1,16 @@
 """Embed and search with a model served at a remote endpoint.
 
-A model the engine does not run itself — a hosted embeddings API, or an
-inference server on another machine — is declared once in the deployment's
-configuration and referenced as `remote:<name>`, in every verb a local model
-is used in:
-
-1. declare the endpoint under `[models.remote.<name>]` in `jammi.toml`
-   (URL, the model name to ask for, its output width, a revision pin, and
-   headers — credentials inline or `{ file = "…" }`)
-2. `db.generate_embeddings(..., model="remote:<name>")` — the plan sends the
-   rows to the endpoint in chunks, at most `max_in_flight` requests at once
-3. `db.encode_query(model="remote:<name>", ...)` + `db.search(...)`
-
-The endpoint here is a stand-in served by this script, speaking the
-OpenAI-compatible embeddings protocol: a hashed bag-of-words embedder, so
-the recipe runs with no network and no key. Point `url` at a hosted API (and
-put its key in `headers`) for production.
-
-Run from the repo root:  python cookbook/recipes/remote_model/example.py
+Run with `python cookbook/recipes/remote_model/example.py`, or a step at a
+time as a notebook: each `# %%` cell is one step.
 """
 
-from __future__ import annotations
+# %% [markdown]
+# A model the engine does not run itself — a hosted embeddings API, or an
+# inference server on another machine — is declared once in the deployment's
+# configuration and named `remote:<name>` in every verb a local model is used
+# in.
 
+# %%
 import hashlib
 import json
 import math
@@ -31,19 +20,25 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
-
 import jammi
 from jammi_cookbook import fixtures
 
-CORPUS_PATH = fixtures.path("tiny_corpus.parquet")
+os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
+
 DIMS = 32
 TOKEN = "local-demo-token"
 
+# %% [markdown]
+# ## A stand-in endpoint
+#
+# This program serves its own endpoint, speaking the OpenAI-compatible
+# embeddings protocol behind a bearer token: a hashed bag-of-words embedder,
+# where texts that share words point the same way. It runs with no network and
+# no key; in production, the declaration below points at a hosted API instead.
 
+# %%
 def bag_of_words(text: str) -> list[float]:
-    """A unit vector with one bucket per hashed word: texts sharing words
-    point the same way."""
+    """A unit vector with one bucket per hashed word."""
     vector = [0.0] * DIMS
     for word in text.lower().split():
         bucket = int.from_bytes(hashlib.sha256(word.encode()).digest()[:4], "big") % DIMS
@@ -80,17 +75,23 @@ class EmbeddingsEndpoint(BaseHTTPRequestHandler):
         pass
 
 
-def main() -> int:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingsEndpoint)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            # 1. Declare the remote model. The credential never reaches the
-            #    catalog or a result table: what a table records as its model
-            #    run is the URL, the model name, the width and the revision.
-            config = Path(tmp) / "jammi.toml"
-            config.write_text(
-                f"""
+server = ThreadingHTTPServer(("127.0.0.1", 0), EmbeddingsEndpoint)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+# %% [markdown]
+# ## Declare the model
+#
+# A `[models.remote.<name>]` section names the endpoint's URL and protocol,
+# the model to ask it for, its output width, a revision pin, and the headers
+# to send — credentials inline or `{ file = "…" }`. The credential never
+# reaches the catalog or a result table: a table records its model run as the
+# URL, the model name, the width and the revision.
+
+# %%
+home = Path(tempfile.mkdtemp())
+config = home / "jammi.toml"
+config.write_text(
+    f"""
 [models.remote.bag-of-words]
 protocol = "openai_embeddings"
 url = "http://127.0.0.1:{server.server_port}/v1/embeddings"
@@ -99,34 +100,28 @@ dimensions = {DIMS}
 revision = "demo-1"
 headers = {{ Authorization = "Bearer {TOKEN}" }}
 """
-            )
-            model = "remote:bag-of-words"
-            with jammi.connect(f"file://{tmp}/data", config=str(config)) as db:
-                db.add_source("corpus", url=str(CORPUS_PATH), format="parquet")
+)
+MODEL = "remote:bag-of-words"
 
-                # 2. Embed the corpus through the endpoint.
-                db.generate_embeddings(
-                    source="corpus",
-                    model=model,
-                    columns=["content"],
-                    key="id",
-                    modality="text",
-                )
+db = jammi.connect(f"file://{home}/data", config=str(config))
+db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
 
-                # 3. The query goes to the same endpoint, so it lands in the
-                #    same space as the table.
-                query = db.encode_query(model=model, query="quantum computing error correction")
-                rows = db.search("corpus", query=query, k=3).to_pylist()
-                if not rows:
-                    raise RuntimeError("the search returned no rows")
+# %% [markdown]
+# ## Embed through the endpoint, and search
+#
+# `generate_embeddings` sends the rows to the endpoint in chunks, at most
+# `max_in_flight` requests at a time. The query goes to the same endpoint, so
+# it lands in the table's space.
 
-                print("id        similarity  title")
-                for row in rows:
-                    print(f"{row['_row_id']:<8}  {row['similarity']:>9.4f}  {row['title']}")
-    finally:
-        server.shutdown()
-    return 0
+# %%
+db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id", modality="text")
 
+query = db.encode_query(model=MODEL, query="quantum computing error correction")
+rows = db.search("corpus", query=query, k=3).to_pylist()
+assert rows, "the search returned no rows"
+for row in rows:
+    print(f"{row['_row_id']:<8}  {row['similarity']:>9.4f}  {row['title']}")
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# %%
+db.close()
+server.shutdown()

@@ -445,6 +445,9 @@ def positive_workflows() -> dict[str, str]:
         "pypi-server.yml": _simple_publish_yml(),
         "pypi-server-cuda.yml": _simple_publish_yml(),
         "pypi-native-cuda.yml": _simple_publish_yml(),
+        "pages.yml": _wf(
+            "py-v*", _gate_job("proof", tag_family="py-v") + _promoting_job("deploy", tag_family="py-v")
+        ),
     }
 
 
@@ -2545,6 +2548,15 @@ class PrimitivePatternShapesTest(unittest.TestCase):
             "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
             "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
             "      - uses: softprops/action-gh-release@v2\n"
+        )
+        findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
+        self.assertTrue(any("sneak" in f for f in findings), findings)
+
+    def test_deploy_pages_unlisted_fails(self):
+        rogue = (
+            "name: rogue\n\non:\n  push:\n    branches: [main]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - uses: actions/deploy-pages@v4\n"
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
         self.assertTrue(any("sneak" in f for f in findings), findings)

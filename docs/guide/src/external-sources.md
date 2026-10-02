@@ -1,6 +1,6 @@
 # Connect to PostgreSQL / MySQL
 
-> **Measured companion:** [Databases as sources — Postgres, MySQL and a file in one query](https://f-inverse.github.io/jammi-ai/cookbook/chapters/30-federation/federation.html)
+> **Measured companion:** [Databases as sources — Postgres, MySQL and a file in one query](https://f-inverse.github.io/jammi-ai/cookbook/chapters/federation/federation.html)
 > federates a Postgres table and a MariaDB table, joins them with a CSV file, and embeds
 > from the Postgres table, on the embedded engine and on a server.
 

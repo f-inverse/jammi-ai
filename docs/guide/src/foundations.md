@@ -67,7 +67,7 @@ No Python runs in the serving or training path.
 - **Identical bytes at any fan-out.** The rows a model forwards together
   are decided once, by row cost, and carried as a chunk id the exchange
   hashes on. A plan fanned over one partition or sixteen forwards identical
-  chunks and writes identical bytes ([The Cookbook → Fan-out inference](https://f-inverse.github.io/jammi-ai/cookbook/chapters/26-fanout/fanout.html)
+  chunks and writes identical bytes ([The Cookbook → Fan-out inference](https://f-inverse.github.io/jammi-ai/cookbook/chapters/fanout/fanout.html)
   builds one table at one, two and four partitions and asserts the artifact
   digests equal).
 - **Model outputs under a correctness contract.** Every result table
@@ -77,7 +77,7 @@ No Python runs in the serving or training path.
   import). Definition hashes, verification and recompute apply to model
   outputs as they do to any other table
   ([The Materialization Contract](./materialization-contract.md); the book's
-  recompute chapter, `cookbook/book/chapters/20-recompute/`, runs a
+  recompute chapter, `cookbook/book/chapters/recompute/`, runs a
   recompute over unmoved inputs and asserts it byte-identical).
 - **Training as a durable job.** A fine-tuning job is admitted, claimed
   under a lease and recorded like any other job; its training set is a

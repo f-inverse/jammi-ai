@@ -1,6 +1,6 @@
 # Hybrid Retrieval: Lexical (BM25) + Reciprocal-Rank Fusion
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/10-retrieval/retrieval.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Retrieval](https://f-inverse.github.io/jammi-ai/cookbook/chapters/retrieval/retrieval.html).
 
 Dense vector search finds rows that *mean* the same thing as your query; lexical
 (BM25) search finds rows that contain the same *words*. Each misses what the
@@ -81,7 +81,7 @@ selects (the BM25 query is intersected with them, their scores unchanged).
 ```python
 hits = db.lexical_search("patents", text="quantum error correction", k=10,
                          filter="year >= 2021")
-print(hits.select(["id", "title", "bm25_score", "bm25_rank"]).to_pandas())
+print(hits.select(["id", "title", "bm25_score", "bm25_rank"]))
 ```
 
 ### Rust

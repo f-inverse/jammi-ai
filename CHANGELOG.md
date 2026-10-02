@@ -5,6 +5,72 @@ workspace ships every publishable crate at the same
 `workspace.package.version`; PyPI `jammi-ai` mirrors that version.
 
 ## [Unreleased]
+
+## [0.52.0] - 2026-10-01
+
+Every cookbook notebook runs as published. A new lane runs each notebook at a
+release tag the way a reader does — a fresh runtime, the setup cell installing
+the release from PyPI — nightly on a CPU and after a release on a GPU. Its first
+run found nine notebooks that failed for a reader at 0.51.0 — seven on every
+runtime, two only on a GPU; each is fixed, and the causes are now refused by tests
+and guards. The cookbook itself becomes one learning path for a newcomer, and
+every install instruction installs an engine that runs.
+
+- **The cookbook is one learning path for a newcomer.** The book was a companion to a
+  graph-signal-processing monograph whose chapters were numbered in the order they were written;
+  the basics a newcomer needs first — install, connect, register a source, embed, search — were
+  not in it, and the recipes lived outside it behind a page of GitHub links. The book now opens
+  with what Jammi is and how to run a chapter, and reads start here → search → models and
+  inference → evaluation → fine-tuning → graphs and prediction → data that changes → where data
+  lives → running Jammi, with the ogbn-arxiv graph-ML pipeline as a closing case study. Every
+  recipe is a book chapter, generated from its README and script by
+  `scripts/build_notebooks.py`, and its notebook carries the README's explanation in place of
+  the script's one-line docstring. Chapter directories drop their creation-order numbers (the
+  order lives once, in `_quarto.yml`), four misleading slugs are renamed (`ann-recall`,
+  `model-catalog`, `error-taxonomy`, `tenancy-per-verb`), and chapters no longer refer to each
+  other by number. `jammi-cookbook[book]` installs everything rendering the whole book needs —
+  every extra a chapter imports from — and both render workflows install it.
+- **Every recipe teaches a step at a time.** A recipe was one `main()` that its notebook and book
+  chapter ran in a single cell, after a README listing what the function did; the reader pressed
+  run once and could inspect nothing between steps. Each recipe script is now a sequence of
+  `# %%` cells — a markdown cell explaining a step, then its code — that runs top to bottom as a
+  script, and `build_notebooks.py` makes each cell a notebook cell and a chapter cell, after the
+  README's overview. The builder refuses a recipe with a `main`, or with code outside a cell. The
+  quickstart's four step pages, whose code was never run, fold into its cells — running them
+  found that a registered file reads as `<source>.public.<table>`, named after the file, not
+  `<source>.public.<source>` as the page, the mutable-tables README and the book's API reference
+  said. The image and audio recipes' numbered stepwise scripts, a second copy of the same flow,
+  are deleted. The recipe READMEs name the client's `Session`, not a `Database` class that no
+  longer exists; the search-audit recipe's lineage no longer borrows one domain's vocabulary; the
+  guide's quickstart includes the program itself, and its recipes page, which mirrored 11 of 21
+  READMEs, points at the cookbook. The README's and the guide's snippets print Arrow tables
+  without pandas, which `jammi-ai` does not install.
+- **The documentation site is a release artifact.** The site deployed the guide and API reference
+  built from `main`, and the book from a nightly render kept in the Actions cache. A full cache
+  evicted that render, and the next deploy published the site without its book and reported
+  success. The site also described `main` while every chapter's Colab badge and install instruction
+  pointed at the release. Now `ci.yml` builds the guide and API reference on every tree (`docs`;
+  the guide's examples and rustdoc `-D warnings` join the required check) and, when a tree's book
+  selection is every page — a release's always is — assembles the whole book from its slices'
+  renders without executing anything again (`book`: Quarto's `_freeze/` records, written under
+  the `assemble` profile). A `py-v*` tag's `pages.yml` deploys the proving run's two artifacts
+  under the same proof gate as every other publisher. `docs.yml` and the nightly
+  `cookbook-render.yml` are deleted; the drift the nightly render caught under an unchanged chapter
+  is caught by the published-notebook lane, against what readers install. A change to the book's
+  front page now renders it.
+- **Every install instruction installs an engine that runs.** The quickstart, the guide, the
+  README and the cookbook README told a newcomer to `pip install jammi-ai`, which installs the
+  client alone, so `connect("file://…")` raised `NoEmbeddedEngineError`; they said the engine was
+  CPU-only, the README pointed engine-free installs at `jammi-client` (a dist last published at
+  0.33.0), and the guide claimed Windows wheels and Python 3.8. They now say
+  `pip install "jammi-ai[embedded]"`, `jammi-ai-native-cu12` for an NVIDIA GPU, and the
+  platforms the wheels are built for.
+- **The federation chapter's MariaDB helper does not take MySQL for MariaDB.** On a host with
+  MySQL installed, its `mysqld` passed the helper's check, the MariaDB install was skipped, and no
+  `mariadb-install-db` existed to initialise a data directory: the chapter failed with a `TypeError`.
+  A host has MariaDB only when its daemon and its initialiser are both on the path; otherwise the
+  helper installs it. The nightly published-notebook lane runs its CPU shards in
+  `python:3.12-bookworm` — root, apt and Python with nothing else, as a Colab runtime is.
 - **A dropped lease hold reports its lease lost.** `LeaseHold`'s drop removed the hold from the
   keeper but left its `lost` flag unset, so a training thread whose owning future was aborted —
   dropping a worker's guard after a cancelled `stop_and_join` — kept the clone of that flag and
@@ -103,8 +169,8 @@ workspace ships every publishable crate at the same
   carries it.
 - **Every version a document states is a lockstep site.** The installation guide depended on
   `jammi-ai = "0.25"`, the cloud-storage guide on `jammi-db` 0.5, and four health-endpoint examples
-  answered 0.8.0 or 0.29.0. The `lockstep versions` guard now reads every jammi dependency and health
-  version in the guide and the READMEs, and the changelog's newest release section, beside the
+  answered 0.8.0 or 0.29.0. The `lockstep versions` guard now reads every jammi dependency and every
+  `"version"` field an example response shows in the guide and the READMEs, and the changelog's newest release section, beside the
   manifests and pins.
 
 ## [0.51.0] - 2026-09-30

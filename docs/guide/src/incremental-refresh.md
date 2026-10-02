@@ -1,6 +1,6 @@
 # Refresh an Embedding Table Incrementally
 
-> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Incremental Refresh](https://f-inverse.github.io/jammi-ai/cookbook/chapters/25-incremental-refresh/incremental-refresh.html).
+> **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Incremental Refresh](https://f-inverse.github.io/jammi-ai/cookbook/chapters/incremental-refresh/incremental-refresh.html).
 
 An embedding table produced by `generate_embeddings` is a function of its
 source: `D(S)`. When the source changes, `refresh_embeddings` re-embeds only

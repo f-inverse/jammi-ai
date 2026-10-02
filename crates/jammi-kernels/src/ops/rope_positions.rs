@@ -77,8 +77,8 @@
 //! the `flash-attn` feature, so a link to it is unresolvable — and
 //! therefore silently unrendered, never even checked, per rustdoc's
 //! default of only checking `pub`-reachable item docs — whenever this
-//! crate's docs build without that feature, which is `docs.yml`'s own
-//! `cargo doc --workspace --no-deps` invocation): both take the BASE
+//! crate's docs build without that feature, which is `ci.yml`'s `docs`
+//! job's own `cargo doc --workspace --no-deps` invocation): both take the BASE
 //! `cos`/`sin` table plus `lengths: &[usize]` and derive the per-row
 //! `positions` (via [`ragged_positions_from_lengths`]) and the gathered
 //! `[total, d]` table (via [`gather_ragged_tables`]'s `Tensor::index_select`

@@ -21,7 +21,7 @@ NOTEBOOKS = Path(__file__).resolve().parents[2] / "notebooks"
 def test_the_shards_run_every_committed_notebook_exactly_once():
     notebooks = runner.notebooks_under(NOTEBOOKS)
     assert Path("recipes/quickstart.ipynb") in notebooks
-    assert Path("book/01-construct/construct.ipynb") in notebooks
+    assert Path("book/construct/construct.ipynb") in notebooks
     shards = [runner.Shard(i, 8).select(notebooks) for i in range(1, 9)]
     assert sorted(nb for shard in shards for nb in shard) == notebooks
     assert max(map(len, shards)) - min(map(len, shards)) <= 1

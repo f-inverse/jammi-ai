@@ -9,18 +9,15 @@
 //!   on-disk size. The swept graphs are not committed (one full-scale graph is
 //!   hundreds of MiB; N would blow the LFS budget), so this axis is an on-box
 //!   *reference* — recall rides along as provenance, it is not a portable gate.
-//! * **search** — sweep `search_expansion` (ef_search) over ONE frozen graph,
-//!   re-dialed at query time. Recall rises and QPS falls as ef grows. Because it
-//!   re-dials a single (committable) index, this axis is re-derivable — the
-//!   portable recall-floor gate the cookbook re-runs against its own oracle.
+//! * **search** — sweep `search_expansion` (ef_search) over ONE built graph,
+//!   re-dialed at query time. Recall rises and QPS falls as ef grows.
 //! * **precision** — sweep `storage_precision` (`F32` exact, `Int8` quantized,
 //!   `Binary` sign-quantized) and, at a quantized precision, the
 //!   retrieve→rescore `oversample`. Like the build axis, quantization is baked
 //!   in at construction, so each point is a separately built graph and this
-//!   axis is an on-box reference here — the portable, COMMITTED recall floor
-//!   for each shipped quantized precision (`Int8`, `Binary`) lives in a
-//!   dedicated `cargo test` gate over its own frozen fixture bundle (mirroring
-//!   the search axis's frozen-graph discipline), not in this on-box sweep.
+//!   axis is an on-box reference — the committed recall floor for each shipped
+//!   precision is the `cargo test` gate over the committed slice
+//!   (`crate::recall`), not this sweep.
 //!
 //! The exact ground truth does not depend on the ANN knobs, so it is computed
 //! once per query and reused across every swept point.
@@ -30,14 +27,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
-use jammi_db::index::exact::exact_vector_search;
 use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::index::VectorIndex;
 use jammi_db::index::{validate_query, Admission, QuerySource};
+use jammi_db::index::{SegmentId, SegmentedIndex};
 
-use crate::corpus;
-use crate::operator_mirror::retrieve_then_rescore;
-use crate::recall::recall_at_k_for_query;
+use crate::recall::{recall_at_k_for_query, Slice};
 use crate::report::{Measurement, PrecisionSweepPoint, RecallSweepTier, SweepPoint, RECALL_KS};
 
 /// The k QPS is reported at — a typical retrieval breadth on the recall curve,
@@ -85,54 +80,23 @@ const BUILD_GRID: &[AnnIndexConfig] = &[
 /// above it.
 const EF_GRID: &[usize] = &[8, 16, 32, 64, 128, 256];
 
-/// Run both sweep axes over a corpus + held-out query parquet, returning the tier.
+/// Run every sweep axis over a corpus + held-out query parquet, returning the
+/// tier.
 ///
 /// `corpus_path` holds the vectors every graph is built over and the exact
 /// oracle scores; `query_path` holds a disjoint held-out query set. The exact
-/// top-`max(RECALL_KS)` is computed once per query and reused for every point.
+/// neighbours are computed once per query ([`Slice::load`]) and reused for
+/// every point.
 pub async fn run(
     corpus_path: &Path,
     query_path: &Path,
 ) -> Result<RecallSweepTier, Box<dyn std::error::Error>> {
-    const CORPUS_TABLE: &str = "sweep_corpus";
-    const QUERY_TABLE: &str = "sweep_queries";
-
-    let corpus_url = corpus::storage_url(corpus_path)?;
-    let ctx = corpus::register(&corpus_url, CORPUS_TABLE).await?;
-    let corpus_rows = corpus::load_vectors(&ctx, CORPUS_TABLE).await?;
-    if corpus_rows.is_empty() {
-        return Err("recall-sweep corpus is empty".into());
-    }
-    let dim = corpus_rows[0].1.len();
-
-    let query_url = corpus::storage_url(query_path)?;
-    let query_ctx = corpus::register(&query_url, QUERY_TABLE).await?;
-    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, QUERY_TABLE)
-        .await?
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    if queries.is_empty() {
-        return Err("recall-sweep query set is empty".into());
-    }
-
-    // Exact ground truth is independent of the ANN knobs: compute the top
-    // max-k once per query and reuse for every swept point.
-    let max_k = RECALL_KS.iter().copied().max().unwrap_or(0);
-    let mut exact: Vec<Vec<(String, f32)>> = Vec::with_capacity(queries.len());
-    for q in &queries {
-        exact.push(
-            exact_vector_search(
-                &ctx,
-                CORPUS_TABLE,
-                &validate_query(q.to_vec(), dim, QuerySource::Caller)?,
-                max_k,
-                None,
-                &Admission::Every,
-            )
-            .await?,
-        );
-    }
+    let Slice {
+        rows: corpus_rows,
+        dim,
+        queries,
+        truth: exact,
+    } = Slice::load(corpus_path, query_path, "sweep").await?;
 
     let tmp = tempfile::tempdir()?;
 
@@ -198,12 +162,10 @@ pub async fn run(
     // precision, the retrieve→rescore `oversample`). Each point is a
     // SEPARATELY BUILT graph — quantization is baked in at construction,
     // unlike `search_expansion` — so this axis shares the build axis's
-    // on-box-reference discipline. Every point is save+load round-tripped (not
-    // measured on the fresh in-memory build) so a quantized point's rescore
-    // reads back through the mmap'd `.rawf32` companion exactly the way a
-    // loaded production index does — a freshly built, never-saved index has no
-    // rescore companion yet, so its `get_exact` would silently fall back to
-    // USearch's own lossy reconstruction and the rescore would recover nothing.
+    // on-box-reference discipline. Every point is saved, loaded back as a
+    // one-segment table and searched through `search_final`, so a quantized
+    // point's rescore reads the mmap'd `.rawf32` companion exactly as a
+    // served table does.
     // Each quantized precision's shipped default oversample is its OWN
     // (`StoragePrecision::default_oversample`), not one shared number: `Binary`'s
     // single-bit Hamming coarse stage needs a much wider candidate pool than
@@ -231,16 +193,17 @@ pub async fn run(
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         VectorIndex::save(&index, &base)?;
         let size = std::fs::metadata(base.with_extension("usearch"))?.len();
-        let loaded = SidecarIndex::load(&base, &AnnIndexConfig::default(), precision)?;
+        let table = SegmentedIndex::new(vec![(
+            SegmentId(0),
+            SidecarIndex::load(&base, &AnnIndexConfig::default(), precision)?,
+        )])?;
         let (recall, qps) = recall_and_qps_with(&queries, &exact, |q, k| {
-            if precision.needs_rescore() {
-                retrieve_then_rescore(&loaded, q, k, oversample.max(1))
-            } else {
-                loaded.search(
-                    &validate_query(q.to_vec(), loaded.dimensions(), QuerySource::Caller)?,
-                    k,
-                )
-            }
+            table.search_final(
+                &validate_query(q.to_vec(), table.dimensions(), QuerySource::Caller)?,
+                k,
+                oversample,
+                &Admission::Every,
+            )
         })?;
         precision_sweep.push(PrecisionSweepPoint {
             precision,
@@ -287,8 +250,8 @@ fn recall_and_qps(
 /// Recall@k for every k in [`RECALL_KS`] plus QPS at [`QPS_K`], retrieving each
 /// query's top-`k` through the caller-supplied `retrieve` closure rather than a
 /// single fixed index — the shared measurement loop the build/search axes (a
-/// plain `index.search`) and the precision axis (`search` or the two-stage
-/// retrieve→rescore, depending on the point's precision) both drive.
+/// plain `index.search`) and the precision axis (a one-segment table's
+/// `search_final`) both drive.
 fn recall_and_qps_with<F>(
     queries: &[Vec<f32>],
     exact: &[Vec<(String, f32)>],

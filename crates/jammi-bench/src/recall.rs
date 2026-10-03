@@ -1,5 +1,6 @@
-//! The ANN-vs-exact recall mechanism: how the harness measures how well a
-//! frozen sidecar index recovers the exact nearest neighbours.
+//! The ANN-vs-exact recall mechanism: how the harness measures how well the
+//! ANN index the engine builds for a table recovers the exact nearest
+//! neighbours.
 //!
 //! ## The two retrievers
 //!
@@ -7,10 +8,14 @@
 //!   over every corpus vector returning the `k` closest under a `(dist, _row_id)`
 //!   total order. It is deterministic and exhaustive, so its top-`k` *is* ground
 //!   truth: recall is measured against it, never the other way round.
-//! * **Frozen ANN** — a [`SidecarIndex`] **loaded** from a committed `.usearch`
-//!   bundle, built once on the emit box over the committed corpus. The recall
-//!   gate only ever [`SidecarIndex::load`]s it, so what it measures is that
-//!   committed graph's recall, on whatever host runs the gate.
+//! * **Built ANN** — the table the engine under test builds over the committed
+//!   corpus slice ([`Slice::build`]): each segment a [`SidecarIndex`] built over
+//!   its rows in sorted `_row_id` order and saved as a bundle, then loaded back
+//!   and searched through [`SegmentedIndex::search_final`] — the entry every
+//!   table search goes through. A single graph is a table of one segment
+//!   ([`SINGLE_GRAPH`]), not a separate path. A graph is a function of its
+//!   rows, so the gate measures the graph this engine builds — never one an
+//!   earlier engine left behind.
 //!
 //! ## Recall as a set-intersection floor
 //!
@@ -32,105 +37,93 @@
 //! * **Corpus-as-query** — the queries are corpus rows themselves. Each query's
 //!   true nearest neighbour is itself (distance ~0), so recall@1 is structurally
 //!   near-1.0 whatever the index quality. This exercises the
-//!   load / oracle / intersect / average mechanism (see
+//!   build / load / oracle / intersect / average mechanism (see
 //!   `ann_over_same_corpus_recovers_exact_neighbours`); it is *not* a meaningful
 //!   quality floor, because a query finding itself says nothing about how the ANN
 //!   handles unseen points.
 //! * **Held-out queries** ([`recall_curve_held_out`]) — the queries come from a
 //!   *separate* embedding set, disjoint from the indexed corpus by construction.
-//!   No query is its own neighbour, so recall@k measures how well the frozen ANN
+//!   No query is its own neighbour, so recall@k measures how well the ANN
 //!   recovers the exact neighbours of unseen points — the quantity a deployed
 //!   index is actually judged on. This is the path the `arxiv` subcommand drives
 //!   and the path a real recall floor is asserted against.
 //!
-//! Both run the *same* primitive ([`mean_recall_at_k`]); they differ only in
-//! where the query vectors come from. The held-out path takes its queries from a
-//! separate parquet rather than from the corpus rows.
+//! Both run the *same* primitive ([`Slice::recall`]); they differ only in where
+//! the query vectors come from.
 //!
-//! ## What the engine gate proves vs. what the cookbook proves
+//! ## What the engine gate proves vs. what the cookbook shows
 //!
 //! The hermetic cargo-test gate
-//! (`tests::recall_floor_gates_clear_their_committed_floors`) loads a *small
-//! committed fixture* — a deterministic sorted-`_row_id` subset of the real
-//! 170k cache (real embeddings: corpus rows + held-out query rows, with a
-//! sidecar frozen over the subset once) — and asserts the held-out recall@k
-//! clears a committed floor measured on that same slice, for every precision
-//! the fixture carries a frozen bundle for. This proves the held-out gate
-//! works hermetically on real embeddings, inside `cargo test`, with no LFS
-//! dependency.
+//! (`tests::recall_floor_gates_clear_their_committed_floors`) builds over a
+//! *small committed slice* — a deterministic sorted-`_row_id` subset of the
+//! real 170k cache (real embeddings: corpus rows + held-out query rows) — and
+//! asserts the held-out recall@k clears a committed floor measured on that
+//! same slice (`fixture.rs`'s `measure_floors`), for every precision the gate
+//! builds. This proves the held-out gate works hermetically on real
+//! embeddings, inside `cargo test`, with no LFS dependency: the engine repo
+//! carries no LFS, so the slice ships in the git object store.
 //!
-//! The *full* 168k held-out recall gate runs in the cookbook chapter (a later
-//! step), which reads the Git-LFS cache the fixture is subset from. The split is
-//! deliberate: the engine repo carries no LFS, so the engine gate proves the
-//! held-out floor holds on a small provable projection that ships in the git
-//! object store, and the cookbook gate proves it at full scale on the same
-//! artifacts the fixture is carved from.
+//! Recall on a whole published corpus is the cookbook's to show: its
+//! ANN-recall chapter embeds the corpus and measures the engine's own search
+//! against an exact scan, at whatever scale the reader runs.
 //!
 //! ## The precision axis: retrieve→rescore recovery
 //!
-//! [`mean_recall_at_k_rescored`] generalizes the held-out measurement to a
-//! quantized [`StoragePrecision`]: at `Int8`/`Binary` the loaded graph's own
-//! vectors are lossy, so a search is the engine's two-stage retrieve→rescore —
-//! an oversampled candidate pool off the quantized graph, exactly re-ranked
-//! against the `.rawf32` rescore companion. Because recall@k is order-blind
-//! (see above), `oversample == 1` measures the quantized graph's own naive
-//! top-k (nothing for the rescore to recover), while the deployment's default
-//! oversample measures how much of the quantization loss the rescore recovers.
-//! Every quantized row in `tests::RECALL_GATE_TABLE` pairs a `primary`
-//! (retrieve→rescore) variant against a `baseline` (`oversample = 1`) variant,
-//! both loaded from a second frozen bundle (e.g. `frozen_int8`, built once
-//! over the SAME fixture corpus by `fixture.rs`'s
-//! `build_precision_recall_fixture`) — the gate asserts both that each variant
-//! clears its own committed floor AND that the `primary` variant clears the
-//! `baseline` by a real margin — the measured proof that
+//! At a quantized [`StoragePrecision`] (`Int8`/`Binary`) the loaded graph's
+//! own vectors are lossy, so [`SegmentedIndex::search_final`] is the engine's
+//! two-stage retrieve→rescore — an oversampled candidate pool off the
+//! quantized graph, exactly re-ranked against the `.rawf32` rescore companion.
+//! Because recall@k is order-blind (see above), `oversample == 1` measures the
+//! quantized graph's own naive top-k (nothing for the rescore to recover),
+//! while the deployment's default oversample measures how much of the
+//! quantization loss the rescore recovers. Every quantized row in
+//! `tests::RECALL_GATE_TABLE` pairs a `primary` (retrieve→rescore) variant
+//! against a `baseline` (`oversample = 1`) variant, both searching the ONE
+//! table built at that precision over the SAME slice — the gate asserts both
+//! that each variant clears its own committed floor AND that the `primary`
+//! variant clears the `baseline` by a real margin — the measured proof that
 //! oversampling-then-rescoring recovers neighbours the lossy graph alone
 //! misses, not just a floor two numbers happen to both clear.
 //!
 //! ## The binary gate is a confidence interval, not a point estimate
 //!
-//! A single-seed point recall on a small held-out query set can invert at
-//! real scale — a lucky or unlucky draw of which queries happen to land in
-//! this committed slice can pass or fail the gate independently of the
-//! underlying index quality. [`recall_ci_at_k_rescored`] instead treats each
-//! query's recall@k ([`recall_at_k_for_query`]) as one bootstrap sample: it
-//! resamples the held-out query set with replacement (the engine's own
+//! A point recall on a small held-out query set can pass or fail on which
+//! queries happen to land in this committed slice, independently of the
+//! underlying index quality. [`Anchor::CiLower`] instead treats each query's
+//! recall@k ([`recall_at_k_for_query`]) as one bootstrap sample: it resamples
+//! the held-out query set with replacement (the engine's own
 //! [`jammi_numerics::stats::bootstrap_ci`], seeded and deterministic — the
 //! same percentile-bootstrap kernel `eval.rs`'s `eval_compare` significance CI
-//! already uses) and reports the point mean alongside a 95% CI. The `Binary`
-//! row in `tests::RECALL_GATE_TABLE` sets its `anchor` to
-//! `tests::Anchor::CiLower` rather than `tests::Anchor::Point` — the ONLY
-//! difference from `Int8`'s row — which is what makes
-//! `tests::recall_floor_gates_clear_their_committed_floors` assert the CI's
-//! LOWER bound rather than the point mean for that row, so a noisy
-//! single-sample draw cannot pass (or fail) the gate on chance alone: the
-//! gate only passes when the *worst plausible* mean over resamples of this
-//! query set still clears the floor.
+//! already uses) and checks the floor against the 95% CI's lower bound. The
+//! `Binary` row in `tests::RECALL_GATE_TABLE` is anchored there rather than at
+//! [`Anchor::Point`] — the ONLY difference from `Int8`'s row — so a noisy draw
+//! of queries cannot pass (or fail) the gate on chance alone: the gate only
+//! passes when the *worst plausible* mean over resamples of this query set
+//! still clears the floor.
 //!
 //! ## The segment axis: does the merge recover what a lone graph would find
 //!
-//! [`mean_recall_at_k_segmented`] generalizes the held-out measurement again,
-//! this time along the ANN index's *topology* rather than its storage
-//! precision: instead of one frozen [`SidecarIndex`] over the whole corpus, `N`
-//! frozen sidecars — each over a disjoint subset of the SAME corpus — are
-//! loaded and assembled into one [`SegmentedIndex`], whose
+//! The same measurement varies the table's *topology* as well as its storage
+//! precision: instead of one segment over the whole corpus, `N` segments —
+//! each built over a disjoint subset of the SAME corpus — are loaded and
+//! assembled into one [`SegmentedIndex`], whose
 //! [`SegmentedIndex::search_final`] fans the query across every segment and
-//! merges the results (`jammi_db::index::segment`'s `DEFAULT_SEGMENT_OVERFETCH_FACTOR`
-//! over-fetches from each segment before the merge). One graph is one draw of
-//! HNSW's random levels, so — mirroring the frozen-single-graph discipline
-//! above — a real recall floor over this axis needs the draw varied and
-//! averaged, and the one lever this harness can pull deterministically is not
-//! the HNSW level seed (USearch fixes it) but the *partitioning*: which corpus rows
-//! land in which segment. `tests::segment_merge_recall_clears_its_committed_floor_and_tracks_the_single_graph`
-//! asserts the committed floor holds across every committed partitioning
-//! (`fixture.rs`'s `build_segment_recall_fixture` freezes more than one), each
-//! standing in for an independent draw of the graph. Alongside the floor, that
-//! gate also measures the SAME corpus as a single (`N = 1`) frozen
-//! [`SidecarIndex`] at the SAME precision and asserts the merge's recall does
-//! not fall more than a committed margin below it — the merge-vs-single-graph
-//! tracking check that gives `DEFAULT_SEGMENT_OVERFETCH_FACTOR` real teeth: an
-//! under-provisioned over-fetch would surface here as the merge losing recall
-//! the single graph recovers, exactly the failure mode the constant's SEAM
-//! note names.
+//! merges the results (`jammi_db::index::segment`'s
+//! `DEFAULT_SEGMENT_OVERFETCH_FACTOR` over-fetches from each segment before the
+//! merge). One graph is one draw of HNSW's random levels, so a real recall
+//! floor over this axis needs the draw varied, and the one lever this harness
+//! can pull deterministically is not the HNSW level seed (USearch fixes it) but
+//! the *partitioning*: which corpus rows land in which segment.
+//! `tests::segment_merge_recall_clears_its_committed_floor_and_tracks_the_single_graph`
+//! asserts the committed floor holds across every partitioning in
+//! [`SEGMENT_PARTITIONINGS`] (more than one), each standing in for an
+//! independent draw of the graph. Alongside the floor, that gate also measures
+//! the SAME corpus as [`SINGLE_GRAPH`] at the SAME precision and asserts the
+//! merge's recall does not fall more than a committed margin below it — the
+//! merge-vs-single-graph tracking check that gives
+//! `DEFAULT_SEGMENT_OVERFETCH_FACTOR` real teeth: an under-provisioned
+//! over-fetch would surface here as the merge losing recall the single graph
+//! recovers, exactly the failure mode the constant's SEAM note names.
 //!
 //! The committed floor is measured at `Int8` and `Binary`, never `F32`: at
 //! `F32`, [`StoragePrecision::needs_rescore`] is `false`, so
@@ -140,27 +133,27 @@
 //! HNSW segment's own recall already sits at (or above) `1.0`, so an `F32`
 //! floor would guard nothing precision-specific (a near-tautological "recall
 //! is always `1.0`" floor). `Int8`/`Binary` segments are lossy enough on
-//! their own — see [`mean_recall_at_k_rescored`]'s doc and the committed
-//! single-graph `int8_no_rescore`/`binary_no_rescore` numbers — that
-//! `search_final`'s retrieve→rescore-in-merge design has real recall to
-//! recover, which is exactly what this floor and the tracking margin measure.
+//! their own — see the committed single-graph
+//! `int8_no_rescore`/`binary_no_rescore` numbers — that `search_final`'s
+//! retrieve→rescore-in-merge design has real recall to recover, which is
+//! exactly what this floor and the tracking margin measure.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use jammi_db::session::QueryContext;
+use serde::{Deserialize, Serialize};
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
-use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::index::{validate_query, Admission, QuerySource};
 use jammi_db::index::{SegmentId, SegmentedIndex, VectorIndex};
-use jammi_numerics::stats::{bootstrap_ci, Interval};
+use jammi_numerics::stats::bootstrap_ci;
 
 use crate::corpus;
 use crate::report::{Measurement, RECALL_KS};
 
-/// Bootstrap resamples [`recall_ci_at_k_rescored`] draws to build its
+/// Bootstrap resamples an [`Anchor::CiLower`] measurement draws to build its
 /// confidence interval.
 ///
 /// Matches `eval.rs`'s `BOOTSTRAP_ITERATIONS` — the same percentile-bootstrap
@@ -172,56 +165,319 @@ use crate::report::{Measurement, RECALL_KS};
 /// while keeping the hermetic gate fast — the loop is bounded by
 /// `iterations * queries.len()`, a few hundred thousand array reads, not a
 /// re-run of the search path.
-pub(crate) const RECALL_BOOTSTRAP_ITERATIONS: usize = 2000;
+const RECALL_BOOTSTRAP_ITERATIONS: usize = 2000;
 
-/// Two-tailed significance level for [`recall_ci_at_k_rescored`]'s CI — a 95%
-/// interval, the same level `eval.rs`'s bootstrap significance CI uses.
-pub(crate) const RECALL_BOOTSTRAP_ALPHA: f64 = 0.05;
+/// Two-tailed significance level for an [`Anchor::CiLower`] measurement's CI —
+/// a 95% interval, the same level `eval.rs`'s bootstrap significance CI uses.
+const RECALL_BOOTSTRAP_ALPHA: f64 = 0.05;
 
-/// Fixed seed for [`recall_ci_at_k_rescored`]'s bootstrap resampling.
+/// Fixed seed for an [`Anchor::CiLower`] measurement's bootstrap resampling.
 ///
 /// The bootstrap is a function of the sample *multiset*
 /// ([`jammi_numerics::stats::bootstrap_ci`] canonicalizes its resample basis
 /// by sorting), so a fixed seed is sufficient for a reproducible interval —
-/// the committed CI is deterministic across boxes and reruns, the same
-/// determinism discipline every other committed number in this harness
-/// carries.
-pub(crate) const RECALL_BOOTSTRAP_SEED: u64 = 0xB17A_5EED;
+/// the same samples give the same interval on every box and rerun.
+const RECALL_BOOTSTRAP_SEED: u64 = 0xB17A_5EED;
 
-/// A recall@k point estimate plus its bootstrap confidence interval — the
-/// mean of [`recall_samples_at_k_rescored`]'s per-query samples, and the
-/// `[lower, upper]` interval [`jammi_numerics::stats::bootstrap_ci`] derives
-/// by resampling those same samples with replacement.
-#[derive(Debug, Clone, Copy)]
-pub struct RecallCi {
-    /// The point recall@k — the plain mean over the query set, identical to
-    /// what [`mean_recall_at_k_rescored`] returns for the same inputs.
-    pub point: f64,
-    /// The bootstrap confidence interval over the query-set mean.
-    pub interval: Interval,
+/// Which value of a recall@k measurement its floor is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Anchor {
+    /// The mean recall over the query set.
+    Point,
+    /// The lower bound of the mean's 95% bootstrap confidence interval over
+    /// the query set — for a measurement noisy enough at this query count that
+    /// a point could pass or fail on the draw of queries alone.
+    CiLower,
 }
 
-/// File names of the committed *held-out* recall fixture, relative to its bundle
-/// directory.
-///
-/// The held-out bundle holds three inputs rather than two: the corpus the oracle
-/// scans and the sidecar is frozen over ([`HELD_OUT_CORPUS_FILE`] +
-/// [`HELD_OUT_SIDECAR_STEM`]), and a *separate* query parquet
-/// ([`HELD_OUT_QUERY_FILE`]) whose rows are disjoint from the corpus. The
+/// One recall@k measurement over a query set.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Recall {
+    /// The mean of the per-query recalls.
+    pub(crate) point: f64,
+    /// The value the measurement's [`Anchor`] checks a floor against: the
+    /// point itself, or its bootstrap CI's lower bound.
+    pub(crate) anchored: f64,
+}
+
+/// File names of the committed *held-out* recall slice, relative to its
+/// directory: the corpus every table is built over and the oracle scans, and a
+/// *separate* query parquet whose rows are disjoint from the corpus. The
 /// disjointness is what makes the recall a generalization measurement rather
-/// than a query-by-example one. Naming the files once keeps the fixture builder
-/// (which writes them) and the gate (which reads them) on one definition.
-const HELD_OUT_CORPUS_FILE: &str = "corpus_vectors.parquet";
-const HELD_OUT_QUERY_FILE: &str = "query_vectors.parquet";
-const HELD_OUT_SIDECAR_STEM: &str = "frozen";
+/// than a query-by-example one. Named once for the slice carver (which writes
+/// them) and the gate (which reads them).
+pub(crate) const HELD_OUT_CORPUS_FILE: &str = "corpus_vectors.parquet";
+pub(crate) const HELD_OUT_QUERY_FILE: &str = "query_vectors.parquet";
 
-/// The table name the held-out query set registers under inside its
-/// `QueryContext`, distinct from [`RECALL_TABLE`] so corpus and queries can
-/// coexist in one context.
-const HELD_OUT_QUERY_TABLE: &str = "recall_held_out_queries";
+/// How many segments each of [`SEGMENT_PARTITIONINGS`] splits the slice into.
+/// `2` is the smallest split that exercises the cross-segment merge at all.
+pub(crate) const SEGMENT_COUNT: usize = 2;
 
-/// The table name the recall corpus registers under inside its `QueryContext`.
-const RECALL_TABLE: &str = "recall_corpus";
+/// A layout of the slice's rows into a table's segments — the deterministic
+/// axis the segment gate varies in place of the HNSW level seed USearch does
+/// not let it pin (see the module's "segment axis" section).
+pub(crate) struct Partitioning {
+    /// The partitioning's name: its `floor.json` key and its bundles' stem.
+    pub(crate) name: &'static str,
+    /// How many segments the table has.
+    pub(crate) segments: usize,
+    /// `(row, rows, segments)` → the segment slice row `row` of `rows` (0-based,
+    /// in sorted `_row_id` order) lands in.
+    assign: fn(usize, usize, usize) -> usize,
+}
+
+/// Even-width contiguous blocks: row `i` of `rows` lands in segment
+/// `i * segments / rows`. Mirrors how an append-only table's segments actually
+/// accumulate — each batch of newly-added rows is contiguous in insertion
+/// order.
+fn contiguous_blocks(i: usize, rows: usize, segments: usize) -> usize {
+    ((i * segments) / rows.max(1)).min(segments - 1)
+}
+
+/// Round-robin: row `i` lands in segment `i % segments`. A structurally
+/// different assignment from [`contiguous_blocks`] over the SAME rows — each
+/// row's true nearest neighbours are scattered across segments differently, so
+/// the two partitionings are independent draws of "which segment a row's
+/// neighbours end up in", not a relabeling of the same split.
+fn round_robin(i: usize, _rows: usize, segments: usize) -> usize {
+    i % segments
+}
+
+/// The whole slice as one segment: the table a freshly built embedding table
+/// is, and the baseline the segment merge is tracked against.
+pub(crate) const SINGLE_GRAPH: Partitioning = Partitioning {
+    name: "single_graph",
+    segments: 1,
+    assign: contiguous_blocks,
+};
+
+/// The partitionings the segment floor is measured and gated over — at least
+/// two, so the floor holds across more than one draw of the graph.
+pub(crate) const SEGMENT_PARTITIONINGS: &[Partitioning] = &[
+    Partitioning {
+        name: "seg_block",
+        segments: SEGMENT_COUNT,
+        assign: contiguous_blocks,
+    },
+    Partitioning {
+        name: "seg_interleaved",
+        segments: SEGMENT_COUNT,
+        assign: round_robin,
+    },
+];
+
+/// A table's segments, saved as bundles, and the precision they were built
+/// at — the precision they are read back at.
+pub(crate) struct SegmentBundles {
+    precision: StoragePrecision,
+    bases: Vec<PathBuf>,
+}
+
+/// The deepest k [`Slice::recall`] measures: the last of [`RECALL_KS`], which
+/// ascends.
+const TRUTH_DEPTH: usize = RECALL_KS[RECALL_KS.len() - 1];
+
+/// A corpus and a query set, loaded for recall measurement: the corpus rows in
+/// sorted `_row_id` order — the order every table over them is built in — the
+/// query vectors, and each query's exact top-[`TRUTH_DEPTH`] neighbours.
+///
+/// The exact neighbours are a property of the corpus and the query alone, never
+/// of the table under measurement, so they are computed once at load: the
+/// oracle's `(dist, _row_id)` order is total, so a query's exact top-`k` is the
+/// first `k` of its top-[`TRUTH_DEPTH`].
+pub(crate) struct Slice {
+    pub(crate) rows: Vec<(String, Vec<f32>)>,
+    pub(crate) dim: usize,
+    pub(crate) queries: Vec<Vec<f32>>,
+    pub(crate) truth: Vec<Vec<(String, f32)>>,
+}
+
+/// Load the committed slice under `fixture_dir` ([`Slice::load`]).
+pub(crate) async fn load_slice(
+    fixture_dir: &Path,
+    prefix: &str,
+) -> Result<Slice, Box<dyn std::error::Error>> {
+    Slice::load(
+        &fixture_dir.join(HELD_OUT_CORPUS_FILE),
+        &fixture_dir.join(HELD_OUT_QUERY_FILE),
+        prefix,
+    )
+    .await
+}
+
+impl Slice {
+    /// Load the corpus parquet at `corpus_path` and the query parquet at
+    /// `query_path`, registering them as `{prefix}_corpus` and
+    /// `{prefix}_queries` so slices loaded side by side never collide, and run
+    /// the exact oracle once per query.
+    pub(crate) async fn load(
+        corpus_path: &Path,
+        query_path: &Path,
+        prefix: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let table = format!("{prefix}_corpus");
+        let ctx = corpus::register(&corpus::storage_url(corpus_path)?, &table).await?;
+        let mut rows = corpus::load_vectors(&ctx, &table).await?;
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let dim = rows
+            .first()
+            .map(|(_, v)| v.len())
+            .ok_or_else(|| format!("the corpus {} is empty", corpus_path.display()))?;
+
+        let query_table = format!("{prefix}_queries");
+        let query_ctx = corpus::register(&corpus::storage_url(query_path)?, &query_table).await?;
+        let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
+            .await?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        if queries.is_empty() {
+            return Err(format!(
+                "the query set {} is empty — no queries to measure recall over",
+                query_path.display()
+            )
+            .into());
+        }
+
+        let mut truth = Vec::with_capacity(queries.len());
+        for query in &queries {
+            let query = validate_query(query.to_vec(), dim, QuerySource::Caller)?;
+            truth.push(
+                exact_vector_search(&ctx, &table, &query, TRUTH_DEPTH, None, &Admission::Every)
+                    .await?,
+            );
+        }
+        Ok(Self {
+            rows,
+            dim,
+            queries,
+            truth,
+        })
+    }
+
+    /// Build the table `part` lays the slice's rows out as, at `precision`:
+    /// each segment a sidecar built over its rows in order and saved as a
+    /// bundle under `dir` — the build and save a table's segment goes through.
+    pub(crate) fn build(
+        &self,
+        dir: &Path,
+        precision: StoragePrecision,
+        part: &Partitioning,
+    ) -> Result<SegmentBundles, Box<dyn std::error::Error>> {
+        let mut builders = (0..part.segments)
+            .map(|_| SidecarBuilder::new(self.dim, &AnnIndexConfig::default(), precision))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (i, (id, v)) in self.rows.iter().enumerate() {
+            builders[(part.assign)(i, self.rows.len(), part.segments)].add(id, v)?;
+        }
+        let bases = builders
+            .into_iter()
+            .enumerate()
+            .map(|(idx, builder)| {
+                if builder.is_empty() {
+                    return Err(format!(
+                        "partitioning {} left segment {idx} empty — a segment holds at least one row",
+                        part.name
+                    )
+                    .into());
+                }
+                let base = dir.join(format!("{}_{precision:?}_seg{idx}", part.name));
+                VectorIndex::save(&builder.build()?, &base)?;
+                Ok(base)
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok(SegmentBundles { precision, bases })
+    }
+
+    /// The table's recall@k over the slice's queries: each query's top-`k`
+    /// from the table `bundles` hold — loaded and searched as a table is
+    /// served, through [`SegmentedIndex::search_final`] at `oversample` —
+    /// intersected with the exact oracle's top-`k` over the slice corpus
+    /// ([`recall_at_k_for_query`]), then averaged, and anchored by `anchor`.
+    ///
+    /// Errors when `k` exceeds [`TRUTH_DEPTH`], the depth the exact
+    /// neighbours were computed to.
+    pub(crate) fn recall(
+        &self,
+        bundles: &SegmentBundles,
+        oversample: usize,
+        k: usize,
+        anchor: Anchor,
+    ) -> Result<Recall, Box<dyn std::error::Error>> {
+        if k > TRUTH_DEPTH {
+            return Err(format!(
+                "recall@{k} is deeper than the {TRUTH_DEPTH} exact neighbours the slice holds"
+            )
+            .into());
+        }
+        let samples = self.recall_samples(bundles, oversample, k)?;
+        let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
+        let point = mean(&samples);
+        let anchored = match anchor {
+            Anchor::Point => point,
+            Anchor::CiLower => {
+                bootstrap_ci(
+                    &samples,
+                    mean,
+                    RECALL_BOOTSTRAP_ITERATIONS,
+                    RECALL_BOOTSTRAP_ALPHA,
+                    RECALL_BOOTSTRAP_SEED,
+                )?
+                .lower
+            }
+        };
+        Ok(Recall { point, anchored })
+    }
+
+    /// [`Self::recall`] at every k in [`RECALL_KS`], keyed by k.
+    pub(crate) fn recall_curve(
+        &self,
+        bundles: &SegmentBundles,
+        oversample: usize,
+        anchor: Anchor,
+    ) -> Result<BTreeMap<usize, Recall>, Box<dyn std::error::Error>> {
+        let mut curve = BTreeMap::new();
+        for &k in &RECALL_KS {
+            curve.insert(k, self.recall(bundles, oversample, k, anchor)?);
+        }
+        Ok(curve)
+    }
+
+    /// One recall@k sample per query, in query order — what
+    /// [`Self::recall`] averages and resamples.
+    fn recall_samples(
+        &self,
+        bundles: &SegmentBundles,
+        oversample: usize,
+        k: usize,
+    ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let segments = bundles
+            .bases
+            .iter()
+            .enumerate()
+            .map(|(i, base)| {
+                let index =
+                    SidecarIndex::load(base, &AnnIndexConfig::default(), bundles.precision)?;
+                Ok::<_, Box<dyn std::error::Error>>((SegmentId(i as i64), index))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let table = SegmentedIndex::new(segments)?;
+        // The table is the artifact under measurement — its own width is the
+        // authority every query is checked against.
+        let dim = table.dimensions();
+
+        self.queries
+            .iter()
+            .zip(&self.truth)
+            .map(|(query, truth)| {
+                let query = validate_query(query.to_vec(), dim, QuerySource::Caller)?;
+                let ann = table.search_final(&query, k, oversample, &Admission::Every)?;
+                Ok(recall_at_k_for_query(&ann, truth, k))
+            })
+            .collect()
+    }
+}
 
 /// Recall@k for one query: the fraction of the exact top-`k` neighbours the ANN
 /// also returned, as a set intersection over `_row_id`s.
@@ -250,387 +506,40 @@ pub(crate) fn recall_at_k_for_query(
     hits as f64 / k as f64
 }
 
-/// Mean recall@k over a query set: load the frozen sidecar once, and for each
-/// query intersect its ANN top-`k` against the exact oracle's top-`k`.
+/// Measure the held-out `F32` recall curve over the committed slice under
+/// `fixture_dir`.
 ///
-/// `sidecar_base` is the bundle base path (the `.usearch`/`.rowmap`/`.manifest`
-/// stem) — [`SidecarIndex::load`] reconstructs the *frozen* graph; it is never
-/// rebuilt. `table_name` is the corpus already registered in `ctx`, over which
-/// [`exact_vector_search`] computes ground truth. The two retrievers run over
-/// the same vectors (the sidecar was frozen over this corpus), so the
-/// intersection is meaningful.
+/// Builds the slice's `F32` [`SINGLE_GRAPH`] and queries it with the slice's
+/// *separate* held-out query vectors, whose `_row_id`s are disjoint from the
+/// corpus by construction — so no query is its own nearest neighbour and
+/// recall@k measures how well the ANN recovers the exact neighbours of unseen
+/// points. For each k in [`RECALL_KS`] this runs the exact oracle over the
+/// corpus (ground truth) and the table, and reports the mean set-intersection
+/// recall@k.
 ///
-/// An empty `queries` yields 0.0 — there is nothing to average, and a caller
-/// asserting a floor over no queries is a bug the 0.0 surfaces rather than a
-/// vacuous 1.0 hiding it.
-///
-/// A thin `F32`, single-stage wrapper over [`mean_recall_at_k_rescored`] — the
-/// oversample is irrelevant at `F32` ([`StoragePrecision::needs_rescore`] is
-/// `false`, so the rescore stage never runs), kept as its own name because it
-/// is the path every existing F32-only caller (the arxiv tier, the
-/// build/search sweep axes) already uses.
-pub async fn mean_recall_at_k(
-    ctx: &QueryContext,
-    table_name: &str,
-    sidecar_base: &std::path::Path,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<f64, Box<dyn std::error::Error>> {
-    mean_recall_at_k_rescored(
-        ctx,
-        table_name,
-        sidecar_base,
-        StoragePrecision::F32,
-        1,
-        queries,
-        k,
-    )
-    .await
-}
-
-/// Mean recall@k over a query set, for a frozen sidecar bundle loaded at
-/// `precision` and queried through the engine's own two-stage
-/// retrieve→rescore ([`crate::operator_mirror::retrieve_then_rescore`]) when
-/// that precision is quantized.
-///
-/// At `F32` the loaded index's own stored vectors are already exact
-/// ([`StoragePrecision::needs_rescore`] is `false`), so this stays the
-/// original single-stage path: `index.search(query, k)` directly, `oversample`
-/// unused. At a quantized precision (`F16`/`Int8`) this mirrors the production
-/// path in `jammi_ai::operator::vector_search_exec`: the loaded graph's own
-/// (lossy) `search` proposes `k * oversample` candidates, each candidate's
-/// *exact* `f32` vector is read back via [`SidecarIndex::get_exact`] (the
-/// mmap'd rescore companion, never the quantized graph's own reconstruction),
-/// cosine distance is recomputed against it, and the re-ranked set is
-/// truncated to `k`.
-///
-/// Because recall@k is a *set* intersection (order-blind, see
-/// [`recall_at_k_for_query`]), `oversample == 1` measures exactly the
-/// quantized graph's own naive top-`k` — the rescore recomputes distances for
-/// the same `k` ids the lossy graph already chose, so it can re-rank them but
-/// recover nothing the graph missed. `oversample > 1` is what lets the exact
-/// rescore recover a true neighbour the quantized graph ranked just outside
-/// its naive top-`k` but still surfaced within the wider `k * oversample`
-/// candidate pool — the recall-recovery mechanism the retrieve→rescore design
-/// exists for.
-pub async fn mean_recall_at_k_rescored(
-    ctx: &QueryContext,
-    table_name: &str,
-    sidecar_base: &std::path::Path,
-    precision: StoragePrecision,
-    oversample: usize,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<f64, Box<dyn std::error::Error>> {
-    let samples = recall_samples_at_k_rescored(
-        ctx,
-        table_name,
-        sidecar_base,
-        precision,
-        oversample,
-        queries,
-        k,
-    )
-    .await?;
-    if samples.is_empty() {
-        return Ok(0.0);
-    }
-    Ok(samples.iter().sum::<f64>() / samples.len() as f64)
-}
-
-/// Per-query recall@k samples over a query set, for a frozen sidecar bundle
-/// loaded at `precision` — the SAME retrieve→rescore path
-/// [`mean_recall_at_k_rescored`] averages, but returned as the individual
-/// per-query fractions rather than collapsed to their mean. `mean_recall_at_k_rescored`
-/// is exactly `samples.iter().sum() / samples.len()` over what this returns;
-/// [`recall_ci_at_k_rescored`] is what these samples exist for — a bootstrap
-/// CI resamples this exact multiset.
-///
-/// An empty `queries` yields an empty sample set, mirroring
-/// [`mean_recall_at_k_rescored`]'s "no queries, nothing to measure" contract.
-async fn recall_samples_at_k_rescored(
-    ctx: &QueryContext,
-    table_name: &str,
-    sidecar_base: &std::path::Path,
-    precision: StoragePrecision,
-    oversample: usize,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    if queries.is_empty() {
-        return Ok(Vec::new());
-    }
-    // LOAD the frozen sidecar — never rebuild. The committed graph is the one
-    // whose recall is being measured.
-    let index = SidecarIndex::load(sidecar_base, &AnnIndexConfig::default(), precision)?;
-
-    let mut samples = Vec::with_capacity(queries.len());
-    for query in queries {
-        let query = &validate_query(query.to_vec(), index.dimensions(), QuerySource::Caller)?;
-        let exact = exact_vector_search(ctx, table_name, query, k, None, &Admission::Every).await?;
-        let ann = if precision.needs_rescore() {
-            crate::operator_mirror::retrieve_then_rescore(&index, query, k, oversample.max(1))?
-        } else {
-            index.search(query, k)?
-        };
-        samples.push(recall_at_k_for_query(&ann, &exact, k));
-    }
-    Ok(samples)
-}
-
-/// Per-query segment-merge recall@k samples over a query set — the
-/// multi-segment analogue of [`recall_samples_at_k_rescored`]. LOADS (never
-/// rebuilds) each of `segment_bases` as its own frozen [`SidecarIndex`] at
-/// `precision`, assembles them in order into one [`SegmentedIndex`] via
-/// [`SegmentedIndex::new`], then measures the ASSEMBLED merge's
-/// [`SegmentedIndex::search_final`] top-`k` against the exact oracle's
-/// top-`k`, one sample per query.
-///
-/// `segment_bases` is ordered — position `i` becomes [`SegmentId`]`(i)` — but
-/// the merge's own correctness does not depend on that order (see
-/// `jammi_db::index::segment`'s merge tests); ordering here only pins the
-/// tie-break identity, not the recall this measures. An empty `queries`
-/// yields an empty sample set, mirroring [`recall_samples_at_k_rescored`]'s
-/// contract.
-async fn recall_samples_at_k_segmented(
-    ctx: &QueryContext,
-    table_name: &str,
-    segment_bases: &[PathBuf],
-    precision: StoragePrecision,
-    oversample: usize,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    if queries.is_empty() {
-        return Ok(Vec::new());
-    }
-    // LOAD every segment — never rebuild. The committed graphs are the ones
-    // whose merged recall is being measured.
-    let segments = segment_bases
-        .iter()
-        .enumerate()
-        .map(|(i, base)| {
-            let index = SidecarIndex::load(base, &AnnIndexConfig::default(), precision)?;
-            Ok::<_, Box<dyn std::error::Error>>((SegmentId(i as i64), index))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let merged = SegmentedIndex::new(segments)?;
-    // The merged set is the artifact under measurement — its own width is
-    // the authority every query is checked against.
-    let dim = merged.dimensions();
-
-    let mut samples = Vec::with_capacity(queries.len());
-    for query in queries {
-        let query = &validate_query(query.to_vec(), dim, QuerySource::Caller)?;
-        let exact = exact_vector_search(ctx, table_name, query, k, None, &Admission::Every).await?;
-        let ann = merged.search_final(query, k, oversample.max(1), &Admission::Every)?;
-        samples.push(recall_at_k_for_query(&ann, &exact, k));
-    }
-    Ok(samples)
-}
-
-/// Mean segment-merge recall@k over a query set — the multi-segment analogue
-/// of [`mean_recall_at_k_rescored`]. Exactly the mean of
-/// [`recall_samples_at_k_segmented`]'s per-query samples.
-pub async fn mean_recall_at_k_segmented(
-    ctx: &QueryContext,
-    table_name: &str,
-    segment_bases: &[PathBuf],
-    precision: StoragePrecision,
-    oversample: usize,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<f64, Box<dyn std::error::Error>> {
-    let samples = recall_samples_at_k_segmented(
-        ctx,
-        table_name,
-        segment_bases,
-        precision,
-        oversample,
-        queries,
-        k,
-    )
-    .await?;
-    if samples.is_empty() {
-        return Ok(0.0);
-    }
-    Ok(samples.iter().sum::<f64>() / samples.len() as f64)
-}
-
-/// Segment-merge recall@k point estimate AND bootstrap confidence interval —
-/// the multi-segment analogue of [`recall_ci_at_k_rescored`], built on
-/// [`recall_samples_at_k_segmented`]'s per-query samples exactly as
-/// `recall_ci_at_k_rescored` is built on [`recall_samples_at_k_rescored`]'s
-/// (same [`RECALL_BOOTSTRAP_ITERATIONS`]/[`RECALL_BOOTSTRAP_ALPHA`]/
-/// [`RECALL_BOOTSTRAP_SEED`]). This is what a `Binary` segment set is
-/// measured through: `Binary`'s Hamming coarse stage is noisy enough at a
-/// per-segment row count this small that a single-sample point estimate could
-/// invert, the same reasoning [`recall_ci_at_k_rescored`]'s module-level
-/// "binary gate is a confidence interval" section gives for the single-graph
-/// `Binary` row.
-///
-/// Errors when `queries` is empty, mirroring `recall_ci_at_k_rescored`'s
-/// contract: a CI over zero samples is not a measurement.
-pub async fn recall_ci_at_k_segmented(
-    ctx: &QueryContext,
-    table_name: &str,
-    segment_bases: &[PathBuf],
-    precision: StoragePrecision,
-    oversample: usize,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<RecallCi, Box<dyn std::error::Error>> {
-    let samples = recall_samples_at_k_segmented(
-        ctx,
-        table_name,
-        segment_bases,
-        precision,
-        oversample,
-        queries,
-        k,
-    )
-    .await?;
-    if samples.is_empty() {
-        return Err(
-            "recall_ci_at_k_segmented: empty query set — a bootstrap CI needs at least one sample"
-                .into(),
-        );
-    }
-    let point = samples.iter().sum::<f64>() / samples.len() as f64;
-    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
-    let interval = bootstrap_ci(
-        &samples,
-        mean,
-        RECALL_BOOTSTRAP_ITERATIONS,
-        RECALL_BOOTSTRAP_ALPHA,
-        RECALL_BOOTSTRAP_SEED,
-    )?;
-    Ok(RecallCi { point, interval })
-}
-
-/// Recall@k point estimate AND bootstrap confidence interval over a query set,
-/// for a frozen sidecar bundle loaded at `precision` — the statistically sound
-/// alternative to [`mean_recall_at_k_rescored`]'s bare point estimate (see the
-/// module-level "binary gate is a confidence interval" section).
-///
-/// Draws [`recall_samples_at_k_rescored`] (one sample per query — the SAME
-/// retrieve→rescore path `mean_recall_at_k_rescored` averages) and bootstraps
-/// their mean via the engine's own
-/// [`jammi_numerics::stats::bootstrap_ci`]: [`RECALL_BOOTSTRAP_ITERATIONS`]
-/// resamples of the query set (with replacement), under the fixed
-/// [`RECALL_BOOTSTRAP_SEED`], at the [`RECALL_BOOTSTRAP_ALPHA`] two-tailed
-/// level. `RecallCi::point` is the plain mean (identical to what
-/// `mean_recall_at_k_rescored` returns for the same inputs); `RecallCi::interval`
-/// is the `[2.5th, 97.5th]` percentile interval over that mean, resampled —
-/// the width a caller should treat as "how much this point estimate could move
-/// on a different draw of this same query set".
-///
-/// Errors — rather than reporting a vacuous interval — when `queries` is
-/// empty: a CI over zero samples is not a measurement, it is a hidden 0.0/0.0
-/// masquerading as a confidence interval.
-pub async fn recall_ci_at_k_rescored(
-    ctx: &QueryContext,
-    table_name: &str,
-    sidecar_base: &std::path::Path,
-    precision: StoragePrecision,
-    oversample: usize,
-    queries: &[Vec<f32>],
-    k: usize,
-) -> Result<RecallCi, Box<dyn std::error::Error>> {
-    let samples = recall_samples_at_k_rescored(
-        ctx,
-        table_name,
-        sidecar_base,
-        precision,
-        oversample,
-        queries,
-        k,
-    )
-    .await?;
-    if samples.is_empty() {
-        return Err(
-            "recall_ci_at_k_rescored: empty query set — a bootstrap CI needs at least one sample"
-                .into(),
-        );
-    }
-    let point = samples.iter().sum::<f64>() / samples.len() as f64;
-    let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len() as f64;
-    let interval = bootstrap_ci(
-        &samples,
-        mean,
-        RECALL_BOOTSTRAP_ITERATIONS,
-        RECALL_BOOTSTRAP_ALPHA,
-        RECALL_BOOTSTRAP_SEED,
-    )?;
-    Ok(RecallCi { point, interval })
-}
-
-/// Measure the held-out recall curve over a committed fixture bundle directory.
-///
-/// The directory holds three inputs: the corpus parquet
-/// ([`HELD_OUT_CORPUS_FILE`]), the frozen sidecar bundle over that corpus
-/// ([`HELD_OUT_SIDECAR_STEM`]`.usearch`/`.rowmap`/`.manifest.json`), and a
-/// *separate* held-out query parquet ([`HELD_OUT_QUERY_FILE`]) whose `_row_id`s
-/// are disjoint from the corpus by construction.
-///
-/// Unlike a corpus-as-query measurement, the query vectors are *not* projected
-/// out of the corpus — they come from the separate query parquet, so no query is
-/// its own nearest neighbour and recall@k measures how well the frozen ANN
-/// recovers the exact neighbours of unseen points. For each k in [`RECALL_KS`]
-/// this runs the
-/// exact oracle over the corpus (ground truth) and the loaded (never rebuilt)
-/// sidecar over the same corpus, querying both with the held-out vectors, and
-/// reports the mean set-intersection recall@k.
-///
-/// This is the real recall-floor path: the committed fixture is a deterministic
-/// subset of the 170k cache, and the cargo-test gate asserts each recall@k
-/// clears a floor measured on this same slice. The absence of any input is
-/// reported as an error rather than a faked number.
+/// A missing input is an error, never a faked number.
 pub async fn recall_curve_held_out(
     fixture_dir: &Path,
 ) -> Result<BTreeMap<usize, Measurement>, Box<dyn std::error::Error>> {
-    let corpus_path = fixture_dir.join(HELD_OUT_CORPUS_FILE);
-    let query_path = fixture_dir.join(HELD_OUT_QUERY_FILE);
-    let sidecar_base = fixture_dir.join(HELD_OUT_SIDECAR_STEM);
-
-    let corpus_url = corpus::storage_url(&corpus_path)?;
-    let ctx = corpus::register(&corpus_url, RECALL_TABLE).await?;
-
-    // The query set is a SEPARATE embedding set, disjoint from the corpus — read
-    // its vectors back through the same load path the corpus uses, registered
-    // under its own table so it never collides with the corpus.
-    let query_url = corpus::storage_url(&query_path)?;
-    let query_ctx = corpus::register(&query_url, HELD_OUT_QUERY_TABLE).await?;
-    let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, HELD_OUT_QUERY_TABLE)
-        .await?
+    let slice = load_slice(fixture_dir, "recall").await?;
+    let work = tempfile::tempdir()?;
+    let table = slice.build(work.path(), StoragePrecision::F32, &SINGLE_GRAPH)?;
+    Ok(slice
+        .recall_curve(&table, 1, Anchor::Point)?
         .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    if queries.is_empty() {
-        return Err(format!(
-            "held-out recall fixture at {} has an empty query set — no queries to measure recall over",
-            fixture_dir.display()
-        )
-        .into());
-    }
-
-    let mut curve = BTreeMap::new();
-    for &k in &RECALL_KS {
-        let recall = mean_recall_at_k(&ctx, RECALL_TABLE, &sidecar_base, &queries, k).await?;
-        curve.insert(k, Measurement::measured(recall, "fraction"));
-    }
-    Ok(curve)
+        .map(|(k, recall)| (k, Measurement::measured(recall.point, "fraction")))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jammi_db::index::sidecar::SidecarBuilder;
 
     use jammi_db::storage::StorageUrl;
     use tempfile::tempdir;
 
     use crate::corpus;
+    use crate::fixture::{read_floor_json, FloorEntry, FloorRecord, QUANTIZED_PRECISIONS};
 
     /// A tiny deterministic corpus: `n` rows of width `dim`, each a distinct
     /// pseudo-random *direction* drawn from a seeded LCG (the same generator the
@@ -658,62 +567,46 @@ mod tests {
             .collect()
     }
 
-    /// Build a sidecar over `rows` and freeze it to `base` (`.usearch`/`.rowmap`/
-    /// `.manifest`). This is the *one* build — it stands in for the on-box emit;
-    /// the recall path under test only ever loads what this writes.
-    fn freeze_sidecar(base: &std::path::Path, rows: &[(String, Vec<f32>)], dim: usize) {
-        let mut index =
-            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
-        for (id, v) in rows {
-            index.add(id, v).unwrap();
-        }
-        let index = index.build().unwrap();
-        VectorIndex::save(&index, base).unwrap();
-    }
-
-    /// The recall computation is correct: a sidecar frozen over the *same*
+    /// The recall computation is correct: a table built over the *same*
     /// vectors the exact oracle scores recovers the exact neighbours, so
-    /// recall@k == 1.0 for every k. This proves the load-frozen-ANN /
-    /// run-exact-oracle / set-intersect / average path end to end.
-    ///
-    /// The MEANINGFUL real-embedding recall FLOOR (recall@k ≥ 0.95 over the
-    /// committed 170k corpus) is asserted by a committed-fixture gate added after
-    /// the on-box emit — a later PR. Synthetic vectors here prove the mechanism
-    /// is correct; they cannot stand in for real-embedding recall quality.
+    /// recall@k == 1.0 for every k. This proves the load / oracle / build /
+    /// save / load / search / set-intersect / average path end to end.
+    /// Synthetic vectors prove the mechanism; the real-embedding recall floor
+    /// is the committed-slice gate's.
     #[tokio::test]
     async fn ann_over_same_corpus_recovers_exact_neighbours() {
         let dim = 8;
         let n = 64;
         let rows = tiny_rows(n, dim);
+        // Queries are exact corpus rows, so the exact top-1 of each is itself —
+        // a hand-checkable oracle. Use a handful spread across the corpus.
+        let queries: Vec<(String, Vec<f32>)> = [0usize, 7, 31, 63]
+            .iter()
+            .map(|&i| rows[i].clone())
+            .collect();
 
         let dir = tempdir().unwrap();
         let corpus_path = dir.path().join("tiny.parquet");
-        let sidecar_base = dir.path().join("tiny");
-
+        let query_path = dir.path().join("tiny_queries.parquet");
         corpus::write_vectors(&corpus_path, &rows, dim)
             .await
             .unwrap();
-        freeze_sidecar(&sidecar_base, &rows, dim);
-
-        let url = StorageUrl::parse(corpus_path.to_str().unwrap()).unwrap();
-        let table = "tiny_corpus";
-        let ctx = corpus::register(&url, table).await.unwrap();
-
-        // Queries are exact corpus rows, so the exact top-1 of each is itself —
-        // a hand-checkable oracle. Use a handful spread across the corpus.
-        let queries: Vec<Vec<f32>> = [0usize, 7, 31, 63]
-            .iter()
-            .map(|&i| rows[i].1.clone())
-            .collect();
+        corpus::write_vectors(&query_path, &queries, dim)
+            .await
+            .unwrap();
+        let slice = Slice::load(&corpus_path, &query_path, "tiny")
+            .await
+            .unwrap();
+        let built = slice
+            .build(dir.path(), StoragePrecision::F32, &SINGLE_GRAPH)
+            .unwrap();
 
         // On the same corpus, exact and HNSW agree at this scale: recall is 1.0.
         for k in [1usize, 10] {
-            let recall = mean_recall_at_k(&ctx, table, &sidecar_base, &queries, k)
-                .await
-                .unwrap();
+            let recall = slice.recall(&built, 1, k, Anchor::Point).unwrap();
             assert_eq!(
-                recall, 1.0,
-                "ANN over the same frozen corpus must recover the exact top-{k}"
+                recall.point, 1.0,
+                "ANN over the same corpus must recover the exact top-{k}"
             );
         }
     }
@@ -771,475 +664,173 @@ mod tests {
         assert_eq!(recall_at_k_for_query(&[], &exact, 10), 0.0);
     }
 
-    /// Where a [`RecallGateRow`]'s floor is checked against a measurement:
-    /// the bare point mean, or the bootstrap-CI lower bound.
-    ///
-    /// This is the ONE bit of data that carries the CI-anchored discipline
-    /// (see the module header's "binary gate is a confidence interval"
-    /// section) on the `Binary` row: [`measure_variant`]'s `match anchor`
-    /// is the only place this field changes behavior, and it changes ONLY
-    /// which value is handed back for the floor check — a row's `precision`
-    /// never enters that decision.
-    #[derive(Debug, Clone, Copy)]
-    enum Anchor {
-        /// [`mean_recall_at_k_rescored`]'s bare mean.
-        Point,
-        /// [`recall_ci_at_k_rescored`]'s `interval.lower` — a noisy
-        /// single-sample draw of the query set cannot pass on chance alone.
-        CiLower,
-    }
-
-    /// Where a [`Variant`]'s query-time `oversample` comes from.
-    #[derive(Debug, Clone, Copy)]
-    enum Oversample {
-        /// A literal — always `1` for a no-rescore baseline, and for `F32`
-        /// (where the value is irrelevant: `StoragePrecision::needs_rescore`
-        /// is `false`, so the rescore stage this parameter widens never
-        /// runs).
-        Fixed(usize),
-        /// Read live from `floor.json`'s `precision.<key>` — the
-        /// deployment's stamped default oversample for a quantized
-        /// precision's retrieve→rescore stage.
-        FromFloorKey(&'static str),
-    }
-
-    /// One measured variant of a [`RecallGateRow`]: the `oversample` its
-    /// search runs at, and the `floor.json` path (object-key segments,
-    /// before the per-k key) its floor lives under.
-    struct Variant {
-        oversample: Oversample,
-        floor_path: &'static [&'static str],
-    }
-
-    /// One precision's recall-floor gate, expressed entirely as data: which
-    /// frozen sidecar to load, which [`Anchor`] its floors are checked
-    /// against, its always-measured `primary` variant, and an optional
-    /// `baseline` variant.
-    ///
-    /// When `baseline` is `Some`, [`assert_recall_gate_row_clears_floor`]
-    /// also asserts `primary` clears `baseline` by
-    /// [`RESCORE_RECOVERY_MARGIN`] — the retrieve→rescore recovery proof.
-    /// `F32` has no `baseline` (its single-stage `primary` measurement
-    /// leaves nothing to recover from), so "recovery margin applicable" is
-    /// never its own field — it is exactly `baseline.is_some()`.
-    struct RecallGateRow {
-        precision: StoragePrecision,
-        sidecar_stem: &'static str,
-        anchor: Anchor,
-        primary: Variant,
-        baseline: Option<Variant>,
-    }
-
-    /// The three precision-recall floor gates, as data: `F32` (single-stage,
-    /// point-anchored, no recovery margin), `Int8` (retrieve→rescore,
-    /// point-anchored), `Binary` (retrieve→rescore, CI-lower-anchored — the
-    /// ONLY difference from `Int8`'s row is its `anchor`).
-    const RECALL_GATE_TABLE: &[RecallGateRow] = &[
-        RecallGateRow {
-            precision: StoragePrecision::F32,
-            sidecar_stem: HELD_OUT_SIDECAR_STEM,
-            anchor: Anchor::Point,
-            primary: Variant {
-                oversample: Oversample::Fixed(1),
-                floor_path: &["recall"],
-            },
-            baseline: None,
-        },
-        RecallGateRow {
-            precision: StoragePrecision::Int8,
-            sidecar_stem: FROZEN_INT8_STEM,
-            anchor: Anchor::Point,
-            primary: Variant {
-                oversample: Oversample::FromFloorKey("oversample_rescored"),
-                floor_path: &["precision", "int8_rescored"],
-            },
-            baseline: Some(Variant {
-                oversample: Oversample::Fixed(1),
-                floor_path: &["precision", "int8_no_rescore"],
-            }),
-        },
-        RecallGateRow {
-            precision: StoragePrecision::Binary,
-            sidecar_stem: FROZEN_BINARY_STEM,
-            anchor: Anchor::CiLower,
-            primary: Variant {
-                oversample: Oversample::FromFloorKey("binary_oversample_rescored"),
-                floor_path: &["precision", "binary_rescored"],
-            },
-            baseline: Some(Variant {
-                oversample: Oversample::Fixed(1),
-                floor_path: &["precision", "binary_no_rescore"],
-            }),
-        },
-    ];
-
-    /// The file stem of the committed frozen `Int8` sidecar bundle — the
-    /// SAME held-out fixture corpus [`HELD_OUT_SIDECAR_STEM`]'s `F32` bundle
-    /// indexes, quantized. See `fixture.rs`'s `build_precision_recall_fixture`.
-    const FROZEN_INT8_STEM: &str = "frozen_int8";
-
-    /// The file stem of the committed frozen `Binary` sidecar bundle — the
-    /// SAME held-out fixture corpus, sign-quantized. See `fixture.rs`'s
-    /// `build_binary_recall_fixture`.
-    const FROZEN_BINARY_STEM: &str = "frozen_binary";
-
-    /// The minimum recall@k gap `primary − baseline` a [`RecallGateRow`]
-    /// with a `baseline` must clear for the retrieve→rescore recovery to
-    /// count as real. Measured on the committed fixture the Int8 gap is
+    /// The minimum recall@k gap `rescored − no_rescore` a quantized
+    /// precision's single graph must clear for the retrieve→rescore recovery
+    /// to count as real. Measured on the committed slice the Int8 gap is
     /// 0.27/0.17/0.10 at k=1/10/100 (Binary's is wider still, its Hamming
     /// coarse stage being lossier) — this margin is set an order of
     /// magnitude below the smallest Int8 gap, so it has real teeth (a
     /// rescore that silently returned the quantized graph's own top-k,
     /// recovering nothing, collapses the gap to ~0 and trips it) while
-    /// leaving generous headroom against load-path or USearch-version drift.
+    /// leaving generous headroom against platform or USearch-version drift.
     const RESCORE_RECOVERY_MARGIN: f64 = 0.03;
 
-    /// Absolute path to the committed held-out recall fixture bundle
-    /// (`fixtures/scale/` — corpus, held-out queries, and the frozen
-    /// `F32`/`Int8`/`Binary` sidecar bundles), shared by every gate that
-    /// reads it.
+    /// Absolute path to the committed held-out recall slice
+    /// (`fixtures/scale/` — corpus, held-out queries and `floor.json`), shared
+    /// by every gate that reads it.
     fn scale_fixture_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join("scale")
     }
 
-    /// Parse the committed `floor.json` out of a fixture bundle directory.
-    fn load_floor_json(fixture_dir: &Path) -> serde_json::Value {
-        let floor_json = std::fs::read_to_string(fixture_dir.join("floor.json"))
-            .expect("committed floor.json must be present in the fixture bundle");
-        serde_json::from_str(&floor_json).expect("floor.json must be valid JSON")
+    /// Assert `recall`'s anchored value clears `floors`' floor at `k`.
+    fn assert_clears(label: &str, k: usize, recall: Recall, floors: &BTreeMap<usize, FloorEntry>) {
+        let floor = floors
+            .get(&k)
+            .unwrap_or_else(|| panic!("floor.json has no {label} floor at k={k}"))
+            .floor;
+        assert!(
+            recall.anchored >= floor,
+            "{label} recall@{k} = {} fell below committed floor {floor}",
+            recall.anchored,
+        );
     }
 
-    /// Register the fixture's corpus and held-out query tables under names
-    /// prefixed by `table_prefix` (so concurrently-loaded rows never
-    /// collide), and load the query vectors — the ONE fixture-loading path
-    /// every [`RecallGateRow`] shares.
-    async fn register_gate_fixture(
-        fixture_dir: &Path,
-        table_prefix: &str,
-    ) -> (QueryContext, String, Vec<Vec<f32>>) {
-        let corpus_path = fixture_dir.join(HELD_OUT_CORPUS_FILE);
-        let corpus_url = corpus::storage_url(&corpus_path).unwrap();
-        let corpus_table = format!("{table_prefix}_recall_corpus");
-        let ctx = corpus::register(&corpus_url, &corpus_table).await.unwrap();
-
-        let query_path = fixture_dir.join(HELD_OUT_QUERY_FILE);
-        let query_url = corpus::storage_url(&query_path).unwrap();
-        let query_table = format!("{table_prefix}_recall_queries");
-        let query_ctx = corpus::register(&query_url, &query_table).await.unwrap();
-        let queries: Vec<Vec<f32>> = corpus::load_vectors(&query_ctx, &query_table)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(_, v)| v)
+    /// The committed floors cover exactly [`QUANTIZED_PRECISIONS`], in order —
+    /// so no precision's gate passes by being absent from the record.
+    fn assert_covers_quantized_precisions(label: &str, committed: &[StoragePrecision]) {
+        let expected: Vec<StoragePrecision> = QUANTIZED_PRECISIONS
+            .iter()
+            .map(|spec| spec.precision)
             .collect();
-        (ctx, corpus_table, queries)
+        assert_eq!(
+            committed, expected,
+            "floor.json's {label} floors must cover every quantized precision"
+        );
     }
 
-    /// Read the floor at `path` (object-key segments) then `k` then
-    /// `"floor"` out of a parsed `floor.json`.
-    fn floor_at(floor: &serde_json::Value, path: &[&str], k: usize) -> f64 {
-        let mut v = floor;
-        for segment in path {
-            v = &v[*segment];
-        }
-        v[k.to_string()]["floor"]
-            .as_f64()
-            .unwrap_or_else(|| panic!("floor.json missing {}.{k}.floor", path.join(".")))
-    }
-
-    /// Resolve a [`Variant`]'s `oversample` — either the literal, or a live
-    /// read of `floor.json`'s stamped default.
-    fn resolve_oversample(oversample: Oversample, floor: &serde_json::Value) -> usize {
-        match oversample {
-            Oversample::Fixed(n) => n,
-            Oversample::FromFloorKey(key) => floor["precision"][key]
-                .as_u64()
-                .unwrap_or_else(|| panic!("floor.json missing precision.{key}"))
-                as usize,
-        }
-    }
-
-    /// The frozen bundle a [`Variant`] is measured over. Fixed for a whole
-    /// [`RecallGateRow`] (`primary` and `baseline` search the SAME bundle) —
-    /// bundled so [`measure_variant`] takes one "where to search" argument
-    /// instead of four.
-    struct SearchTarget<'a> {
-        ctx: &'a QueryContext,
-        table: &'a str,
-        sidecar_base: &'a Path,
-        precision: StoragePrecision,
-    }
-
-    /// Measure one [`Variant`] at `k`: the plain point mean (identical
-    /// whichever `anchor` is used — only the returned "value a floor is
-    /// checked against" differs), and that checked value — the SAME point
-    /// mean at [`Anchor::Point`], or the bootstrap-CI lower bound at
-    /// [`Anchor::CiLower`].
-    async fn measure_variant(
-        target: &SearchTarget<'_>,
-        anchor: Anchor,
-        oversample: usize,
-        queries: &[Vec<f32>],
-        k: usize,
-    ) -> (f64, f64) {
-        match anchor {
-            Anchor::Point => {
-                let point = mean_recall_at_k_rescored(
-                    target.ctx,
-                    target.table,
-                    target.sidecar_base,
-                    target.precision,
-                    oversample,
-                    queries,
-                    k,
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "point recall path over {} at k={k} must run: {e}",
-                        target.sidecar_base.display()
-                    )
-                });
-                (point, point)
-            }
-            Anchor::CiLower => {
-                let ci = recall_ci_at_k_rescored(
-                    target.ctx,
-                    target.table,
-                    target.sidecar_base,
-                    target.precision,
-                    oversample,
-                    queries,
-                    k,
-                )
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "bootstrap-CI recall path over {} at k={k} must run: {e}",
-                        target.sidecar_base.display()
-                    )
-                });
-                (ci.point, ci.interval.lower)
-            }
-        }
-    }
-
-    /// Measure and assert one [`RecallGateRow`] over the committed fixture:
-    /// `primary` clears its own floor at every k, and — when `baseline` is
-    /// present — `baseline` clears its own floor AND `primary` clears
-    /// `baseline` by [`RESCORE_RECOVERY_MARGIN`].
-    ///
-    /// This is the ONE parameterized assertion every precision's gate runs
-    /// through: which value is compared against a floor (point vs CI lower)
-    /// is driven purely by `row.anchor`, and whether the recovery-margin
-    /// check runs at all is driven purely by whether `row.baseline` is
-    /// `Some` — no branch here inspects `row.precision`.
-    async fn assert_recall_gate_row_clears_floor(
-        row: &RecallGateRow,
-        fixture_dir: &Path,
-        floor: &serde_json::Value,
-    ) {
-        let sidecar_base = fixture_dir.join(row.sidecar_stem);
-        let (ctx, corpus_table, queries) =
-            register_gate_fixture(fixture_dir, row.sidecar_stem).await;
-        let target = SearchTarget {
-            ctx: &ctx,
-            table: &corpus_table,
-            sidecar_base: &sidecar_base,
-            precision: row.precision,
-        };
-
-        for &k in &RECALL_KS {
-            let primary_oversample = resolve_oversample(row.primary.oversample, floor);
-            let (primary_point, primary_anchor_value) =
-                measure_variant(&target, row.anchor, primary_oversample, &queries, k).await;
-            let primary_floor = floor_at(floor, row.primary.floor_path, k);
-            assert!(
-                primary_anchor_value >= primary_floor,
-                "{:?} {} recall@{k} = {primary_anchor_value} fell below committed floor {primary_floor}",
-                row.precision,
-                row.primary.floor_path.join("."),
-            );
-
-            let Some(baseline) = &row.baseline else {
-                continue;
-            };
-            let baseline_oversample = resolve_oversample(baseline.oversample, floor);
-            let (baseline_point, baseline_anchor_value) =
-                measure_variant(&target, row.anchor, baseline_oversample, &queries, k).await;
-            let baseline_floor = floor_at(floor, baseline.floor_path, k);
-            assert!(
-                baseline_anchor_value >= baseline_floor,
-                "{:?} {} recall@{k} = {baseline_anchor_value} fell below committed floor {baseline_floor}",
-                row.precision,
-                baseline.floor_path.join("."),
-            );
-            assert!(
-                primary_point - baseline_point >= RESCORE_RECOVERY_MARGIN,
-                "{:?} rescore recovery at k={k} was only {} (primary={primary_point}, baseline={baseline_point}) \
-                 — below the {RESCORE_RECOVERY_MARGIN} margin the retrieve→rescore design must clear",
-                row.precision,
-                primary_point - baseline_point,
-            );
-        }
-    }
-
-    /// The unified held-out recall-floor gate: for every row in
-    /// [`RECALL_GATE_TABLE`] (`F32` single-stage, `Int8` and `Binary`
-    /// retrieve→rescore), measure over the committed fixture and assert it
-    /// clears its committed floor, driven by one loop over explicit data
-    /// rather than a hand-written function per precision.
+    /// The held-out recall-floor gate over each single graph: the `F32` graph
+    /// clears its floors, and each quantized graph clears its `rescored` and
+    /// `no_rescore` floors with `rescored` clearing `no_rescore` by
+    /// [`RESCORE_RECOVERY_MARGIN`] — the retrieve→rescore recovery proof.
+    /// Every table is built from the slice by the engine under test.
     #[tokio::test]
     async fn recall_floor_gates_clear_their_committed_floors() {
         let fixture_dir = scale_fixture_dir();
-        let floor = load_floor_json(&fixture_dir);
-        for row in RECALL_GATE_TABLE {
-            assert_recall_gate_row_clears_floor(row, &fixture_dir, &floor).await;
+        let floors: FloorRecord = read_floor_json(&fixture_dir).unwrap();
+        let slice = load_slice(&fixture_dir, "gate").await.unwrap();
+        let work = tempdir().unwrap();
+
+        let f32_graph = slice
+            .build(work.path(), StoragePrecision::F32, &SINGLE_GRAPH)
+            .unwrap();
+        for (k, recall) in slice.recall_curve(&f32_graph, 1, Anchor::Point).unwrap() {
+            assert_clears("F32", k, recall, &floors.recall);
+        }
+
+        assert_covers_quantized_precisions(
+            "precision",
+            &floors
+                .precision
+                .iter()
+                .map(|q| q.precision)
+                .collect::<Vec<_>>(),
+        );
+        for q in &floors.precision {
+            let graph = slice
+                .build(work.path(), q.precision, &SINGLE_GRAPH)
+                .unwrap();
+            let rescored = slice.recall_curve(&graph, q.oversample, q.anchor).unwrap();
+            let no_rescore = slice.recall_curve(&graph, 1, q.anchor).unwrap();
+            for &k in &RECALL_KS {
+                let label = format!("{:?}", q.precision);
+                assert_clears(&format!("{label} rescored"), k, rescored[&k], &q.rescored);
+                assert_clears(
+                    &format!("{label} no-rescore"),
+                    k,
+                    no_rescore[&k],
+                    &q.no_rescore,
+                );
+                let recovered = rescored[&k].point - no_rescore[&k].point;
+                assert!(
+                    recovered >= RESCORE_RECOVERY_MARGIN,
+                    "{label} rescore recovery at k={k} was only {recovered} (rescored={}, \
+                     no_rescore={}) — below the {RESCORE_RECOVERY_MARGIN} margin the \
+                     retrieve→rescore design must clear",
+                    rescored[&k].point,
+                    no_rescore[&k].point,
+                );
+            }
         }
     }
 
-    /// The committed segment-merge recall floor gate — its OWN gate, not a
-    /// [`RecallGateRow`]: the axis under test is the ANN index's segment
-    /// TOPOLOGY (how many segments, which corpus rows land in which), which
-    /// means something different from `RecallGateRow::precision`, so folding
-    /// it into that table would special-case a field for an unrelated axis
-    /// rather than model the two axes separately.
-    ///
-    /// Reads `floor.json`'s `"segment_merge"` section (written by
-    /// `fixture.rs`'s `build_segment_recall_fixture`): for EVERY committed
-    /// precision (`Int8`, `Binary` — the ones where
-    /// [`StoragePrecision::needs_rescore`] is `true`, so `search_final`'s
+    /// The segment-merge recall floor gate: for every quantized precision
+    /// (where [`StoragePrecision::needs_rescore`] is `true`, so `search_final`'s
     /// retrieve→rescore-in-merge stage actually runs; see the module-level
-    /// "segment axis" section for why `F32` is not a committed precision
-    /// here) and every committed partitioning under it (each a deterministic
+    /// "segment axis" section for why `F32` is not gated here) and every
+    /// partitioning in [`SEGMENT_PARTITIONINGS`] (each a deterministic
     /// stand-in for an independent HNSW build seed USearch does not let this
-    /// harness pin), assembles the `N` committed segment bundles into one
-    /// [`SegmentedIndex`] and asserts its measured recall clears the
-    /// committed floor at every k in [`RECALL_KS`] — the point mean
-    /// ([`mean_recall_at_k_segmented`]) at `Int8`, the bootstrap-CI lower
-    /// bound ([`recall_ci_at_k_segmented`]) at `Binary`, driven purely by the
-    /// row's own committed `anchor`. It ALSO measures the SAME corpus +
-    /// queries as a single (`N = 1`) frozen [`SidecarIndex`] at that SAME
-    /// precision and asserts the merge never falls more than the committed
-    /// `single_graph_tracking_margin` below that single-graph baseline — the
-    /// check that gives `jammi_db::index::segment::DEFAULT_SEGMENT_OVERFETCH_FACTOR`
-    /// real teeth over a precision where per-segment recall is genuinely
-    /// below `1.0`.
+    /// harness pin), builds the partitioning's table and asserts its recall
+    /// clears the committed floor at every k in [`RECALL_KS`]. It ALSO builds
+    /// the SAME corpus as [`SINGLE_GRAPH`] at that SAME precision and asserts
+    /// the merge never falls more than the committed
+    /// `single_graph_tracking_margin` below it — the check that gives
+    /// `jammi_db::index::segment::DEFAULT_SEGMENT_OVERFETCH_FACTOR` real
+    /// teeth over a precision where per-segment recall is genuinely below
+    /// `1.0`.
     #[tokio::test]
     async fn segment_merge_recall_clears_its_committed_floor_and_tracks_the_single_graph() {
         let fixture_dir = scale_fixture_dir();
-        let floor = load_floor_json(&fixture_dir);
-        let segment_merge = &floor["segment_merge"];
-        let segment_count = segment_merge["segment_count"]
-            .as_u64()
-            .expect("floor.json missing segment_merge.segment_count")
-            as usize;
-        let precisions = segment_merge["precisions"]
-            .as_object()
-            .expect("floor.json segment_merge.precisions must be an object");
-        assert!(
-            !precisions.is_empty(),
-            "the segment_merge fixture must carry at least one committed precision"
+        let floors: FloorRecord = read_floor_json(&fixture_dir).unwrap();
+        let segment_merge = &floors.segment_merge;
+        assert_eq!(segment_merge.segment_count, SEGMENT_COUNT);
+        assert_covers_quantized_precisions(
+            "segment_merge",
+            &segment_merge
+                .precisions
+                .iter()
+                .map(|s| s.precision)
+                .collect::<Vec<_>>(),
         );
 
-        let (ctx, corpus_table, queries) =
-            register_gate_fixture(&fixture_dir, "segment_merge").await;
+        let slice = load_slice(&fixture_dir, "segment_merge").await.unwrap();
+        let work = tempdir().unwrap();
 
-        for (precision_key, spec) in precisions {
-            let precision = match precision_key.as_str() {
-                "int8" => StoragePrecision::Int8,
-                "binary" => StoragePrecision::Binary,
-                other => panic!("floor.json segment_merge.precisions has unknown key {other}"),
-            };
-            let oversample = spec["oversample"].as_u64().unwrap_or_else(|| {
-                panic!("floor.json missing segment_merge.{precision_key}.oversample")
-            }) as usize;
-            let anchor = spec["anchor"].as_str().unwrap_or_else(|| {
-                panic!("floor.json missing segment_merge.{precision_key}.anchor")
-            });
-            let tracking_margin = spec["single_graph_tracking_margin"]
-                .as_f64()
-                .unwrap_or_else(|| {
+        for spec in &segment_merge.precisions {
+            let label = format!("{:?}", spec.precision);
+            // The single graph the merge is tracked against, built and measured
+            // here by the same engine as the segments.
+            let single = slice
+                .build(work.path(), spec.precision, &SINGLE_GRAPH)
+                .unwrap();
+            let single_graph = slice
+                .recall_curve(&single, spec.oversample, Anchor::Point)
+                .unwrap();
+
+            for part in SEGMENT_PARTITIONINGS {
+                let floors_k = spec.partitionings.get(part.name).unwrap_or_else(|| {
                     panic!(
-                        "floor.json missing segment_merge.{precision_key}.single_graph_tracking_margin"
+                        "floor.json has no {label} floors for partitioning {}",
+                        part.name
                     )
                 });
-            let single_graph = &spec["single_graph"];
-            let partitionings = spec["partitionings"].as_object().unwrap_or_else(|| {
-                panic!("floor.json segment_merge.{precision_key}.partitionings must be an object")
-            });
-            assert!(
-                !partitionings.is_empty(),
-                "segment_merge.{precision_key} must carry at least one committed partitioning"
-            );
-
-            for (name, per_k) in partitionings {
-                let segment_bases: Vec<std::path::PathBuf> = (0..segment_count)
-                    .map(|i| fixture_dir.join(format!("{name}_{precision_key}_seg{i}")))
-                    .collect();
+                let segmented = slice.build(work.path(), spec.precision, part).unwrap();
+                let merged = slice
+                    .recall_curve(&segmented, spec.oversample, spec.anchor)
+                    .unwrap();
                 for &k in &RECALL_KS {
-                    let (point, anchor_value) = match anchor {
-                        "point" => {
-                            let point = mean_recall_at_k_segmented(
-                                &ctx,
-                                &corpus_table,
-                                &segment_bases,
-                                precision,
-                                oversample,
-                                &queries,
-                                k,
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "segment-merge recall@{k} over {precision_key}/{name} must run: {e}"
-                                )
-                            });
-                            (point, point)
-                        }
-                        "ci_lower" => {
-                            let ci = recall_ci_at_k_segmented(
-                                &ctx,
-                                &corpus_table,
-                                &segment_bases,
-                                precision,
-                                oversample,
-                                &queries,
-                                k,
-                            )
-                            .await
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "segment-merge recall CI@{k} over {precision_key}/{name} must run: {e}"
-                                )
-                            });
-                            (ci.point, ci.interval.lower)
-                        }
-                        other => panic!(
-                            "floor.json segment_merge.{precision_key}.anchor has unknown value {other}"
-                        ),
-                    };
-                    let floor_k = per_k[k.to_string()]["floor"].as_f64().unwrap_or_else(|| {
-                        panic!(
-                            "floor.json missing segment_merge.{precision_key}.partitionings.{name}.{k}.floor"
-                        )
-                    });
+                    let merged_k = merged[&k];
+                    assert_clears(&format!("{label} {}", part.name), k, merged_k, floors_k);
+                    let single_k = single_graph[&k].point;
                     assert!(
-                        anchor_value >= floor_k,
-                        "segment_merge[{precision_key}][{name}] recall@{k} = {anchor_value} fell \
-                         below committed floor {floor_k}"
-                    );
-
-                    let single = single_graph[k.to_string()].as_f64().unwrap_or_else(|| {
-                        panic!("floor.json missing segment_merge.{precision_key}.single_graph.{k}")
-                    });
-                    assert!(
-                        single - point <= tracking_margin,
-                        "segment_merge[{precision_key}][{name}] recall@{k} = {point} fell more \
-                         than {tracking_margin} below the single-graph baseline {single} — the \
-                         retrieve→rescore-in-merge design did not recover the per-segment loss"
+                        single_k - merged_k.point <= spec.single_graph_tracking_margin,
+                        "{label} {} recall@{k} = {} fell more than {} below the single-graph \
+                         baseline {single_k} — the retrieve→rescore-in-merge design did not \
+                         recover the per-segment loss",
+                        part.name,
+                        merged_k.point,
+                        spec.single_graph_tracking_margin,
                     );
                 }
             }

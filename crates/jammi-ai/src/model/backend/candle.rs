@@ -1016,7 +1016,7 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // arms are gone.
     //
     // Every filename the resolver's preference chain considers
-    // (`arch::TOKENIZER_CANDIDATE_NAMES`) is an UNCONDITIONAL arm of this ONE
+    // (`arch::TOKENIZER_CANDIDATES`) is an UNCONDITIONAL arm of this ONE
     // slot, anchored under `model_dir`, exactly mirroring the `1_Pooling`/
     // `preprocessor` pattern above. `gated` is true for the arm
     // `resolved.tokenizer` actually names (using its own path, so the
@@ -1026,18 +1026,14 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // is `None` — carries an absent-marker path (`model_dir.join(name)`),
     // `gated: false`, so `compute_model_fingerprint` still records its
     // snapshot and a later appearance of any of them trips `probe`.
-    let selected = match &resolved.tokenizer {
-        Some(TokenizerSource::HuggingFaceJson(p) | TokenizerSource::OpenClipBpe(p)) => Some(p),
-        Some(TokenizerSource::WordPiece { vocab, .. }) => Some(vocab),
-        None => None,
-    };
+    let selected = resolved.tokenizer.as_ref().map(TokenizerSource::artifact);
     slots.push(RawSlot {
-        arms: crate::model::arch::TOKENIZER_CANDIDATE_NAMES
+        arms: crate::model::arch::TOKENIZER_CANDIDATES
             .into_iter()
-            .map(|name| {
+            .map(|(name, _)| {
                 match selected.filter(|p| p.file_name() == Some(std::ffi::OsStr::new(name))) {
                     Some(path) => RawArm {
-                        path: path.clone(),
+                        path: path.to_path_buf(),
                         anchor: model_dir.clone(),
                         gated: true,
                     },
@@ -1752,7 +1748,7 @@ impl CandleModel {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             JammiError::Inference(format!(
                 "No tokenizer loaded for this model: its checkpoint ships none of {:?}",
-                crate::model::arch::TOKENIZER_CANDIDATE_NAMES
+                crate::model::arch::TOKENIZER_CANDIDATES.map(|(name, _)| name)
             ))
         })?;
         tokenizer.encode_batch(texts, Some(self.text_forward()?.max_sequence_length()))

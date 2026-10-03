@@ -14,8 +14,8 @@ type Result<T> = std::result::Result<T, JammiError>;
 /// Three source layouts are supported transparently:
 ///   * HuggingFace `tokenizer.json` (any architecture) via [`Self::from_file`].
 ///   * OpenCLIP's native `bpe_simple_vocab_16e6.txt.gz` via
-///     [`Self::from_open_clip_bpe`] — used when an OpenCLIP repo ships the
-///     legacy vocab file instead of a converted `tokenizer.json`.
+///     [`Self::from_open_clip_bpe`] — used when an OpenCLIP repo ships its
+///     native vocab file instead of a converted `tokenizer.json`.
 ///   * A BERT-family WordPiece `vocab.txt` (and its `tokenizer_config.json`)
 ///     via [`Self::from_wordpiece_vocab`] — used when a checkpoint ships no
 ///     converted `tokenizer.json`.

@@ -98,7 +98,7 @@ use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::tokenizer::{BatchEncoding, TokenizerWrapper};
-use jammi_ai::model::{LoadedModel, ModelId, ResolvedModel, TokenizerSource};
+use jammi_ai::model::{LoadedModel, ModelId, ResolvedModel};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
@@ -481,9 +481,9 @@ fn loader_token_batches(
 /// they pass differs.
 #[derive(Debug, Clone)]
 pub struct FinetuneRunParams {
-    /// Directory holding `config.json` + `model.safetensors` (+ optionally
-    /// `tokenizer.json` — REQUIRED for the real `EncoderAdapters` target;
-    /// see this module's doc).
+    /// Directory holding `config.json` + `model.safetensors` (+ a tokenizer,
+    /// one of `jammi_ai::model::arch::TOKENIZER_CANDIDATES` — REQUIRED for the
+    /// real `EncoderAdapters` target; see this module's doc).
     pub model_dir: PathBuf,
     /// Which tower of `model_dir`'s checkpoint this run trains, and hence
     /// which of the two row vectors below carries this run's data (see
@@ -980,7 +980,7 @@ impl Checkpoint {
 /// The tokenizer requirement is scoped to [`Task::Text`]: only the
 /// text path turns rows into token ids. A media task's rows are already
 /// encoded images/clips the tower's own front end consumes, so demanding a
-/// `tokenizer.json` there would refuse every legitimate audio checkpoint
+/// tokenizer there would refuse every legitimate audio checkpoint
 /// (the committed `htsat_clap_tiny` fixture ships none, and needs none).
 fn load_base_model(
     checkpoint: &Checkpoint,
@@ -990,15 +990,15 @@ fn load_base_model(
 ) -> Result<Arc<LoadedModel>, Box<dyn std::error::Error + Send + Sync>> {
     let config_path = checkpoint.config_path.clone();
     let model_config = checkpoint.config_json.clone();
-    let tokenizer_path = model_dir.join("tokenizer.json");
-    let has_tokenizer = tokenizer_path.exists();
-    if task == Task::Text && !has_tokenizer {
+    let tokenizer = arch::tokenizer_source(model_dir);
+    if task == Task::Text && tokenizer.is_none() {
         return Err(format!(
-            "finetune-run: {} has no tokenizer.json — the EncoderAdapters training target \
-             requires a real tokenizer to turn the fixture's text pairs into token ids (this \
-             tier never falls back to synthetic ids the way finetune-step does, because a \
+            "finetune-run: {} has no tokenizer (none of {:?}) — the EncoderAdapters training \
+             target requires a real tokenizer to turn the fixture's text pairs into token ids \
+             (this tier never falls back to synthetic ids the way finetune-step does, because a \
              synthetic-id run would never touch the committed fixture's real text at all)",
-            model_dir.display()
+            model_dir.display(),
+            arch::TOKENIZER_CANDIDATES.map(|(name, _)| name)
         )
         .into());
     }
@@ -1029,7 +1029,7 @@ fn load_base_model(
         task: task.model_task(),
         config_path,
         weights_paths: vec![checkpoint.weights_path.clone()],
-        tokenizer: has_tokenizer.then_some(TokenizerSource::HuggingFaceJson(tokenizer_path)),
+        tokenizer,
         model_config,
         preprocessor_config,
         pooling_config,

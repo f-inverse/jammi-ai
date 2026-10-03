@@ -67,7 +67,7 @@ pub use jammi_datafusion::{ModelSource, ModelTask};
 /// Where the tokenizer for a resolved model lives, and what shape it is.
 ///
 /// Most checkpoints carry an HF-converted `tokenizer.json`; stock OpenCLIP
-/// repos instead ship the legacy gzipped BPE vocab, and many BERT-family
+/// repos instead ship OpenCLIP's native gzipped BPE vocab, and many BERT-family
 /// checkpoints ship only a WordPiece `vocab.txt`. The resolver picks the first
 /// of those present, in that order, and the loader dispatches on the variant.
 #[derive(Debug, Clone)]
@@ -85,6 +85,34 @@ pub enum TokenizerSource {
         vocab: std::path::PathBuf,
         config: Option<std::path::PathBuf>,
     },
+}
+
+impl TokenizerSource {
+    /// The source for `artifact`, a checkpoint's first-present tokenizer
+    /// candidate of `layout`; `config` is its `tokenizer_config.json`, which a
+    /// resolver looks for only when `layout.reads_config()`.
+    pub(crate) fn of(
+        layout: arch::TokenizerLayout,
+        artifact: std::path::PathBuf,
+        config: Option<std::path::PathBuf>,
+    ) -> Self {
+        match layout {
+            arch::TokenizerLayout::HuggingFaceJson => Self::HuggingFaceJson(artifact),
+            arch::TokenizerLayout::OpenClipBpe => Self::OpenClipBpe(artifact),
+            arch::TokenizerLayout::WordPiece => Self::WordPiece {
+                vocab: artifact,
+                config,
+            },
+        }
+    }
+
+    /// The artifact the loader builds the tokenizer from.
+    pub(crate) fn artifact(&self) -> &std::path::Path {
+        match self {
+            Self::HuggingFaceJson(p) | Self::OpenClipBpe(p) => p,
+            Self::WordPiece { vocab, .. } => vocab,
+        }
+    }
 }
 
 /// A resolved model — files located, NOT yet loaded.

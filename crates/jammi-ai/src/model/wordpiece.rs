@@ -49,12 +49,16 @@ enum SpecialToken {
 }
 
 impl SpecialToken {
-    fn content(token: Option<&Self>, default: &'static str) -> String {
-        match token {
-            Some(Self::Bare(content) | Self::Added { content }) => content.clone(),
-            None => default.to_string(),
+    fn content(&self) -> &str {
+        match self {
+            Self::Bare(content) | Self::Added { content } => content,
         }
     }
+}
+
+/// The special token `token` names, else `BertTokenizer`'s `default`.
+fn special(token: Option<&SpecialToken>, default: &str) -> String {
+    token.map_or(default, SpecialToken::content).to_string()
 }
 
 /// Build the tokenizer from a checkpoint's `vocab.txt` and, when it ships
@@ -84,11 +88,11 @@ fn build_wordpiece_tokenizer(vocab: &Path, config: &WordPieceConfig) -> Result<T
         model_id: String::new(),
         message: format!("WordPiece vocabulary path {} is not UTF-8", vocab.display()),
     })?;
-    let unk = SpecialToken::content(config.unk_token.as_ref(), "[UNK]");
-    let sep = SpecialToken::content(config.sep_token.as_ref(), "[SEP]");
-    let pad = SpecialToken::content(config.pad_token.as_ref(), "[PAD]");
-    let cls = SpecialToken::content(config.cls_token.as_ref(), "[CLS]");
-    let mask = SpecialToken::content(config.mask_token.as_ref(), "[MASK]");
+    let unk = special(config.unk_token.as_ref(), "[UNK]");
+    let sep = special(config.sep_token.as_ref(), "[SEP]");
+    let pad = special(config.pad_token.as_ref(), "[PAD]");
+    let cls = special(config.cls_token.as_ref(), "[CLS]");
+    let mask = special(config.mask_token.as_ref(), "[MASK]");
 
     let model = WordPiece::from_file(vocab_file)
         .unk_token(unk.clone())

@@ -336,7 +336,7 @@ impl ModelResolver {
         let Some((weights_paths, weights_format)) = local_weights(&artifact_dir) else {
             return Ok(None);
         };
-        let tokenizer = discover_local_tokenizer(&artifact_dir);
+        let tokenizer = arch::tokenizer_source(&artifact_dir);
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &model_config, &model_id.0)?;
 
@@ -398,7 +398,7 @@ impl ModelResolver {
             });
         };
 
-        let tokenizer = discover_local_tokenizer(path);
+        let tokenizer = arch::tokenizer_source(path);
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
 
@@ -855,46 +855,21 @@ fn read_local_pooling_config(dir: &Path, model_id: &str) -> Result<Option<serde_
         })
 }
 
-/// Locate a Hub repo's tokenizer artifact, in [`TokenizerSource`]'s
-/// preference order: an HF-shape `tokenizer.json`, then OpenCLIP's native
-/// `bpe_simple_vocab_16e6.txt.gz`, then a WordPiece `vocab.txt` with the
-/// repo's `tokenizer_config.json` when it ships one.
+/// A Hub repo's tokenizer: the first of [`arch::TOKENIZER_CANDIDATES`] the
+/// repo holds, in network order, and its `tokenizer_config.json` when that
+/// layout reads one.
 async fn hub_tokenizer(repo: &HubRepo<'_>) -> Result<Option<TokenizerSource>> {
-    if let Some(path) = repo.get(arch::TOKENIZER_JSON_FILENAME).await? {
-        return Ok(Some(TokenizerSource::HuggingFaceJson(path)));
+    for (name, layout) in arch::TOKENIZER_CANDIDATES {
+        if let Some(artifact) = repo.get(name).await? {
+            let config = if layout.reads_config() {
+                repo.get(arch::TOKENIZER_CONFIG_FILENAME).await?
+            } else {
+                None
+            };
+            return Ok(Some(TokenizerSource::of(layout, artifact, config)));
+        }
     }
-    if let Some(path) = repo.get(arch::OPEN_CLIP_BPE_VOCAB_FILENAME).await? {
-        return Ok(Some(TokenizerSource::OpenClipBpe(path)));
-    }
-    let Some(vocab) = repo.get(arch::WORDPIECE_VOCAB_FILENAME).await? else {
-        return Ok(None);
-    };
-    Ok(Some(TokenizerSource::WordPiece {
-        vocab,
-        config: repo.get(arch::TOKENIZER_CONFIG_FILENAME).await?,
-    }))
-}
-
-/// Locate a tokenizer artifact inside a local model directory, in the same
-/// preference order as [`hub_tokenizer`].
-fn discover_local_tokenizer(dir: &Path) -> Option<TokenizerSource> {
-    let hf = dir.join(arch::TOKENIZER_JSON_FILENAME);
-    if hf.exists() {
-        return Some(TokenizerSource::HuggingFaceJson(hf));
-    }
-    let bpe = dir.join(arch::OPEN_CLIP_BPE_VOCAB_FILENAME);
-    if bpe.exists() {
-        return Some(TokenizerSource::OpenClipBpe(bpe));
-    }
-    let vocab = dir.join(arch::WORDPIECE_VOCAB_FILENAME);
-    if vocab.exists() {
-        let config = dir.join(arch::TOKENIZER_CONFIG_FILENAME);
-        return Some(TokenizerSource::WordPiece {
-            vocab,
-            config: config.exists().then_some(config),
-        });
-    }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]

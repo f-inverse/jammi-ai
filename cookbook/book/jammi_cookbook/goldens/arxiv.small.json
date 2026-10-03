@@ -89,11 +89,11 @@
   },
   "tier02.precision_at_10": {
     "tol": 0.02,
-    "value": 0.426
+    "value": 0.4265000000000002
   },
   "tier02.precision_delta": {
     "tol": 0.02,
-    "value": 0.02249999999999963
+    "value": 0.023000000000000242
   },
   "tier03.base_precision_at_10": {
     "tol": 0.02,

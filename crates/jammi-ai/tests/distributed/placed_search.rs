@@ -69,8 +69,7 @@ use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::result_repo::{Producer, ResultTableKind, ResultTableRecord};
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::sidecar::SidecarBuilder;
 use jammi_db::store::{BuildingTable, ResultTableOrigin};
 use jammi_numerics::distance::cosine_distance;
 use jammi_wire::proto::embedding::embedding_service_client::EmbeddingServiceClient;
@@ -146,7 +145,7 @@ async fn build_placed_table(
 
     let mut all_rows = Vec::with_capacity(SEGMENTS * ROWS_PER_SEGMENT);
     for seg in 0..SEGMENTS {
-        let mut idx = SidecarIndex::new(DIMS, &AnnIndexConfig::default(), precision)
+        let mut idx = SidecarBuilder::new(DIMS, &AnnIndexConfig::default(), precision)
             .expect("build a small sidecar index");
         let mut seg_rows = Vec::with_capacity(ROWS_PER_SEGMENT);
         for row in 0..ROWS_PER_SEGMENT {
@@ -155,7 +154,7 @@ async fn build_placed_table(
             idx.add(&id, &v).expect("add a row to the sidecar index");
             seg_rows.push((id, v));
         }
-        idx.build().expect("build the sidecar index");
+        let idx = idx.build().expect("build the sidecar index");
         let segment_id = table
             .append_segment(&idx)
             .await

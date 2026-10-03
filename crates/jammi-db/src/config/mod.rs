@@ -2407,7 +2407,7 @@ impl Default for JammiConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            execution_threads: num_cpus(),
+            execution_threads: host_parallelism(),
             memory_limit: MemoryLimit::Share(Self::DEFAULT_MEMORY_SHARE),
             batch_size: 8192,
         }
@@ -2564,7 +2564,9 @@ impl Default for ServerConfig {
     }
 }
 
-fn num_cpus() -> std::num::NonZeroUsize {
+/// How many threads this host runs at once — its available parallelism, or 1
+/// when the platform cannot say.
+pub(crate) fn host_parallelism() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
 }
 

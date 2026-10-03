@@ -169,17 +169,16 @@ pub(crate) fn local_base_path(handle: &JammiObjectStore) -> Result<std::path::Pa
 mod tests {
     use super::*;
     use crate::config::{AnnIndexConfig, StoragePrecision};
-    use crate::index::VectorIndex;
+    use crate::index::sidecar::SidecarBuilder;
     use crate::storage::{JammiObjectStore, StorageRegistry, StorageUrl};
 
     fn build_small_index() -> SidecarIndex {
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         idx.add("row-a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         idx.add("row-b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
         idx.add("row-c", &[0.0, 0.0, 1.0, 0.0]).unwrap();
-        idx.build().unwrap();
-        idx
+        idx.build().unwrap()
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@ use std::collections::HashSet;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::index::VectorIndex;
 use jammi_db::index::{validate_query, QuerySource};
 
@@ -118,7 +118,8 @@ impl HardNegativeMiner {
         // Precision is pinned to `F32` (exact, no rescore companion) rather
         // than the deployment default — mining quality should never silently
         // degrade because an operator set a quantized default for search.
-        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32)?;
+        let mut builder =
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32)?;
         for cand in candidates {
             if cand.embedding.len() != dim {
                 return Err(JammiError::FineTune(format!(
@@ -127,9 +128,9 @@ impl HardNegativeMiner {
                     cand.embedding.len()
                 )));
             }
-            index.add(&cand.id, &cand.embedding)?;
+            builder.add(&cand.id, &cand.embedding)?;
         }
-        index.build()?;
+        let index = builder.build()?;
 
         Ok(Self { index, config })
     }

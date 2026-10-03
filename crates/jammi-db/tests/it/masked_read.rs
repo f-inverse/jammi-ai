@@ -20,7 +20,7 @@ use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::JammiError;
 use jammi_db::index::segment::{SegmentId, SegmentedIndex};
-use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::index::VectorIndex;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
@@ -42,12 +42,11 @@ use crate::common;
 const DIMS: usize = 4;
 
 fn seg(rows: &[(&str, [f32; 4])], p: StoragePrecision) -> SidecarIndex {
-    let mut idx = SidecarIndex::new(DIMS, &AnnIndexConfig::default(), p).unwrap();
+    let mut idx = SidecarBuilder::new(DIMS, &AnnIndexConfig::default(), p).unwrap();
     for (id, v) in rows {
         idx.add(id, v).unwrap();
     }
-    idx.build().unwrap();
-    idx
+    idx.build().unwrap()
 }
 
 fn ids(hits: &[(String, f32)]) -> Vec<String> {

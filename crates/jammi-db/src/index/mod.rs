@@ -151,14 +151,9 @@ pub fn backend_version() -> &'static str {
     usearch::version()
 }
 
-/// Trait for ANN vector indexes keyed by `_row_id`.
+/// A built ANN vector index keyed by `_row_id`: searched and saved, never
+/// grown.
 pub trait VectorIndex: Send + Sync {
-    /// Add a vector with its row ID to the index.
-    fn add(&mut self, row_id: &str, vector: &[f32]) -> Result<()>;
-
-    /// Build the index graph. Must be called after all `add()` calls.
-    fn build(&mut self) -> Result<()>;
-
     /// Search for the `k` nearest neighbors, returning `(row_id, cosine_distance)` sorted ascending.
     /// The query is a [`ValidatedQuery`] (finite); the index enforces its own
     /// width on it and refuses a mismatch as a typed error.

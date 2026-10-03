@@ -63,8 +63,7 @@ use jammi_db::catalog::status::ResultTableStatus;
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, LeaseConfig};
 use jammi_db::error::JammiError;
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::VectorIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::session::QueryContext;
 use jammi_db::storage::StorageUrl;
 use jammi_db::store::manifest::{
@@ -217,7 +216,7 @@ fn inputs() -> Vec<InputAnchor> {
 /// A built one-segment index over the same rows [`write_closed_embedding_parquet`]
 /// writes, at the store's default precision.
 fn built_index(n: usize) -> SidecarIndex {
-    let mut idx = SidecarIndex::new(
+    let mut idx = SidecarBuilder::new(
         DIMS,
         &AnnIndexConfig::default(),
         AnnIndexConfig::default().storage_precision,
@@ -227,8 +226,7 @@ fn built_index(n: usize) -> SidecarIndex {
         let v: Vec<f32> = (0..DIMS).map(|d| (i * DIMS + d) as f32).collect();
         idx.add(&format!("row-{i}"), &v).unwrap();
     }
-    idx.build().unwrap();
-    idx
+    idx.build().unwrap()
 }
 
 /// `SELECT count(*)` over the registered table in `ctx`.

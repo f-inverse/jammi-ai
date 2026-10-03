@@ -25,7 +25,7 @@
   },
   "int8_vs_f32_graph_ratio": {
     "tol": 0.03,
-    "value": 0.6569795140543115
+    "value": 0.6546486529698617
   },
   "override8_on_os1_recall_at_10": {
     "tol": 0.02,

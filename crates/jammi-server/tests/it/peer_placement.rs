@@ -49,10 +49,8 @@ use jammi_db::index::peer::{
     ExactRescoreRequest as DomainExactRescoreRequest, PeerAddr, PeerError, PeerTransport,
     SegmentPlacement, SegmentSearchRequest as DomainSegmentSearchRequest, SegmentUnit,
 };
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{
-    validate_query, Admission, QuerySource, SegmentId, ValidatedQuery, VectorIndex,
-};
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
+use jammi_db::index::{validate_query, Admission, QuerySource, SegmentId, ValidatedQuery};
 use jammi_db::session::QueryContext;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::storage::StorageUrl;
@@ -1316,12 +1314,11 @@ fn built_index_at_width(
     width: usize,
     precision: StoragePrecision,
 ) -> SidecarIndex {
-    let mut idx = SidecarIndex::new(width, &AnnIndexConfig::default(), precision).unwrap();
+    let mut idx = SidecarBuilder::new(width, &AnnIndexConfig::default(), precision).unwrap();
     for (id, v) in rows {
         idx.add(id, v).unwrap();
     }
-    idx.build().unwrap();
-    idx
+    idx.build().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AnnIndexConfig, StoragePrecision};
+use crate::config::{host_parallelism, AnnIndexConfig, StoragePrecision};
 use crate::error::{JammiError, Result};
 use crate::index::{ValidatedQuery, VectorIndex};
 
@@ -148,11 +148,11 @@ const BINARY_THRESHOLD_SAMPLE_CAP: usize = 100_000;
 
 /// Fit the per-dimension threshold τ (length `dimensions`) a
 /// [`StoragePrecision::Binary`] sidecar sign-packs the corpus (at
-/// [`SidecarIndex::build`]) and every query (at [`SidecarIndex::search`])
+/// [`SidecarBuilder::build`]) and every query (at [`VectorIndex::search`])
 /// against — [`pack_threshold_bits`]'s `sign(v − τ)`, not a fixed `sign(v)`.
 ///
 /// `vectors` is `dimensions`-wide `f32` records in internal-key order (the
-/// same buffer [`SidecarIndex::exact_vectors`] accumulates). Only the first
+/// buffer [`SidecarIndex`]'s `add` accumulates). Only the first
 /// `min(row_count, `[`BINARY_THRESHOLD_SAMPLE_CAP`]`)` rows are read — a
 /// bounded, DETERMINISTIC (insertion-order, never random) sample, so the same
 /// corpus always fits the same τ regardless of corpus size, satisfying the
@@ -219,8 +219,8 @@ fn median_threshold(vectors: &[f32], dimensions: usize, sample_rows: usize) -> V
 /// is zero-initialized, so this is a property of the construction, not a
 /// separate masking step).
 ///
-/// The ONE function both [`SidecarIndex::build`] (corpus rows, once τ is
-/// fit) and [`SidecarIndex::search`] (queries) pack through — USearch's
+/// The ONE function both [`SidecarBuilder::build`] (corpus rows, once τ is
+/// fit) and [`VectorIndex::search`] (queries) pack through — USearch's
 /// Hamming metric counts every bit position in the buffer, padding included,
 /// so packing the two sides against a different threshold would silently
 /// bias every Hamming distance by a fixed, easy-to-miss amount (it would just
@@ -266,7 +266,7 @@ struct RawVectorCompanion {
 impl RawVectorCompanion {
     /// Write the companion's bytes: `vectors` is `dimensions`-wide `f32`
     /// records concatenated in internal-key order (i.e. exactly the buffer
-    /// [`SidecarIndex::add`] accumulates).
+    /// [`SidecarBuilder::add`] accumulates).
     fn write(path: &Path, dimensions: usize, vectors: &[f32]) -> Result<()> {
         // A release-vanishing `debug_assert!` here would be reachable, not
         // decorative — a caller bug that hands a non-whole-record buffer
@@ -315,8 +315,24 @@ impl RawVectorCompanion {
     }
 }
 
+/// Size `index` for `rows` nodes and `contexts` thread contexts.
+///
+/// USearch gives every thread context its own HNSW level generator, each
+/// seeded alike, and a growing reserve replaces them all. A build therefore
+/// reserves its full row count once with a single context: inserting through
+/// N contexts would repeat every level draw N times, tying the graph to the
+/// building host's core count (USearch sizes contexts to it by default),
+/// while one context draws one uninterrupted level sequence — the
+/// independent per-node draw HNSW construction assumes.
+fn reserve(index: &usearch::Index, rows: usize, contexts: usize) -> Result<()> {
+    index
+        .reserve_capacity_and_threads(rows, contexts)
+        .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))
+}
+
 /// Sidecar ANN index backed by USearch, with a Jammi-owned `_row_id` mapping
-/// and a JSON manifest.
+/// and a JSON manifest. Built by a [`SidecarBuilder`] or loaded from a saved
+/// bundle, never grown: its graph holds exactly the rows it was built over.
 ///
 /// Files produced per embedding table:
 /// - `.usearch` — USearch serialized graph
@@ -331,19 +347,15 @@ pub struct SidecarIndex {
     /// caller keeping a second copy of the vectors. Holds only the ids (the same
     /// strings already in `row_map`), never the embeddings.
     row_index: HashMap<String, u64>,
-    built: bool,
     /// The precision this index's own USearch-stored vectors are quantized
     /// to. `F32` means `get`/`export` already return the exact vector; a
-    /// quantized precision means they don't, and `rescore` (or, mid-build,
-    /// `exact_vectors`) is the exact-vector source instead.
+    /// quantized precision means they don't, and `rescore` (or, before a
+    /// save, `exact_vectors`) is the exact-vector source instead.
     storage_precision: StoragePrecision,
-    /// Exact `f32` vectors accumulated in internal-key order as [`Self::add`]
-    /// is called, flushed into the `.rawf32` rescore companion by
-    /// [`Self::save`]. `Some` (initially empty) only when
-    /// [`StoragePrecision::needs_rescore`] — an `F32` build tracks nothing
-    /// here because USearch's own storage is already exact. `None` after
-    /// [`Self::load`]: a loaded index reads exact vectors back through
-    /// `rescore`'s mmap, never rebuilds this buffer into memory.
+    /// The exact `f32` vectors of a freshly built quantized index, in key
+    /// order: the source a rescore reads until [`Self::save`] writes them to
+    /// the `.rawf32` companion. `None` for an `F32` index (its own vectors are
+    /// exact) and for a loaded one (it reads the companion through `rescore`).
     exact_vectors: Option<Vec<f32>>,
     /// The raw-`f32` rescore companion, present iff this index was loaded at
     /// a quantized precision (its sibling `.rawf32` file is opened at load
@@ -351,12 +363,12 @@ pub struct SidecarIndex {
     /// `None` for an `F32` index.
     rescore: Option<RawVectorCompanion>,
     /// The per-dimension threshold τ a [`StoragePrecision::Binary`] index's
-    /// sign-packing (both the corpus at [`Self::build`] and every query at
-    /// [`Self::search`]) is applied against. `Some` (length `dimensions`)
-    /// once a `Binary` index has been built ([`Self::build`] fits it from the
-    /// accumulated corpus) or loaded ([`Self::load`] reads it back from the
-    /// `.threshold` companion). `None` for every other precision, and for a
-    /// `Binary` index that has neither been built nor loaded yet.
+    /// sign-packing (both the corpus at [`SidecarBuilder::build`] and every
+    /// query at [`VectorIndex::search`]) is applied against. `Some` (length
+    /// `dimensions`) for a `Binary` index with rows — fit from the corpus at
+    /// the build, or read back from the `.threshold` companion by
+    /// [`Self::load`]. `None` for every other precision, and for an empty
+    /// `Binary` index (there is no corpus to fit).
     binary_threshold: Option<Vec<f32>>,
     /// Which reduction ([`ThresholdKind`]) [`Self::binary_threshold`] was fit
     /// with. `Some` iff `binary_threshold` is — persisted in the manifest so
@@ -404,39 +416,9 @@ struct AnnManifest {
 }
 
 impl SidecarIndex {
-    /// Create a new empty sidecar index for vectors of the given dimension, at
-    /// `precision`, tuned by the HNSW knobs in `ann`. The build-time knobs
-    /// (`connectivity`, `build_expansion`) take effect as vectors are added;
-    /// `search_expansion` governs queries against the resulting graph.
-    /// `precision` is the table's resolved storage precision (a fresh table's
-    /// deployment default, or an existing table's persisted catalog value for
-    /// a rebuild) — never read off `ann` here, so a caller cannot forget which
-    /// one applies.
-    pub fn new(
-        dimensions: usize,
-        ann: &AnnIndexConfig,
-        precision: StoragePrecision,
-    ) -> Result<Self> {
-        let index = usearch::Index::new(&index_options(dimensions, ann, precision))
-            .map_err(|e| JammiError::Other(format!("USearch index creation: {e}")))?;
-
-        Ok(Self {
-            dimensions,
-            index,
-            row_map: Vec::new(),
-            row_index: HashMap::new(),
-            built: false,
-            storage_precision: precision,
-            exact_vectors: precision.needs_rescore().then(Vec::new),
-            rescore: None,
-            binary_threshold: None,
-            threshold_kind: None,
-        })
-    }
-
     /// The precision this index's own USearch-stored vectors are quantized
     /// to — the value a loaded index verified against the catalog row at
-    /// [`Self::load`], or the value it was constructed with at [`Self::new`].
+    /// [`Self::load`], or the one its [`SidecarBuilder`] was given.
     pub fn storage_precision(&self) -> StoragePrecision {
         self.storage_precision
     }
@@ -447,9 +429,11 @@ impl SidecarIndex {
         self.dimensions
     }
 
-    /// Whether `row_id` is indexed here — the membership check an input edge
-    /// runs before asking for a row's exact vector, so an unknown id is a
-    /// caller fault and never mistaken for a torn bundle.
+    /// Whether `row_id` is indexed here (an O(1) lookup) — the membership
+    /// check an input edge runs before asking for a row's exact vector, so an
+    /// unknown id is a caller fault and never mistaken for a torn bundle, and
+    /// the test a version's deletion mask is intersected with to count a
+    /// segment's dead rows.
     pub fn contains_row(&self, row_id: &str) -> bool {
         self.row_index.contains_key(row_id)
     }
@@ -480,44 +464,37 @@ impl SidecarIndex {
     /// Fetch the **exact** `f32` vector for `row_id` — the retrieve→rescore
     /// source of truth. For a quantized index this reads the mmap'd rescore
     /// companion by internal key (O(1), no Parquet scan) when loaded, or the
-    /// in-memory `exact_vectors` buffer for a freshly built index that
-    /// has not yet been saved/loaded (the companion is only opened at
-    /// [`Self::load`]). For an `F32` index (which carries no companion or
-    /// buffer — its own vectors are already exact) this falls back to
-    /// [`Self::get`]. `None` if the id is not indexed.
+    /// in-memory exact vectors of an index that has not been saved/loaded
+    /// (the companion is only opened at [`Self::load`]). For a built `F32`
+    /// index (which carries no companion or buffer — its own vectors are
+    /// already exact) this falls back to [`Self::get`]. `None` if the id is
+    /// not indexed.
     ///
     /// A quantized index with neither the companion nor the in-memory buffer
     /// (a state the constructors never produce, but this guard refuses to
     /// paper over) is a hard error: silently falling back to [`Self::get`]
     /// here would hand the caller USearch's own **lossy** reconstruction under
     /// the name "exact", corrupting every rescore that reads it.
-    /// Whether this segment indexes `row_id` (an O(1) `row_index` lookup) —
-    /// the membership test a version's deletion mask is intersected with to
-    /// count a segment's dead rows once per load.
-    pub fn contains(&self, row_id: &str) -> bool {
-        self.row_index.contains_key(row_id)
-    }
-
     pub fn get_exact(&self, row_id: &str) -> Result<Option<Vec<f32>>> {
         let Some(&key) = self.row_index.get(row_id) else {
             return Ok(None);
         };
-        match &self.rescore {
-            Some(companion) => Ok(companion.get(key)),
-            None if self.storage_precision.needs_rescore() => match &self.exact_vectors {
-                Some(vectors) => {
-                    let start = key as usize * self.dimensions;
-                    let end = start + self.dimensions;
-                    Ok(vectors.get(start..end).map(<[f32]>::to_vec))
-                }
-                None => Err(JammiError::Other(format!(
+        match (&self.rescore, &self.exact_vectors) {
+            (Some(companion), _) => Ok(companion.get(key)),
+            (None, Some(vectors)) => {
+                let start = key as usize * self.dimensions;
+                let end = start + self.dimensions;
+                Ok(vectors.get(start..end).map(<[f32]>::to_vec))
+            }
+            (None, None) if self.storage_precision.needs_rescore() => {
+                Err(JammiError::Other(format!(
                     "get_exact: quantized index ({:?}) has no rescore companion and no \
                      in-memory exact-vector buffer for '{row_id}' — refusing to fall back to \
                      USearch's lossy reconstruction",
                     self.storage_precision
-                ))),
-            },
-            None => self.get(row_id),
+                )))
+            }
+            (None, None) => self.get(row_id),
         }
     }
 
@@ -546,7 +523,7 @@ impl SidecarIndex {
             file.write_all(bytes)?;
         }
 
-        // Save the raw-f32 rescore companion, only when this build tracked one
+        // Save the raw-f32 rescore companion, only when this build kept one
         // (a quantized precision with at least one vector added).
         if let Some(vectors) = self.exact_vectors.as_ref() {
             if !self.row_map.is_empty() {
@@ -556,9 +533,8 @@ impl SidecarIndex {
         }
 
         // Save the Binary sidecar's per-dimension threshold τ companion, only
-        // when `build` actually fit one (a `Binary` build with at least one
-        // row added — `build` never sets `binary_threshold` on an empty
-        // index).
+        // when the build actually fit one (a `Binary` build with at least one
+        // row — an empty one has no corpus to fit τ from).
         if let Some(threshold) = self.binary_threshold.as_ref() {
             let threshold_path = base_path.with_extension(THRESHOLD_COMPANION_EXTENSION);
             std::fs::write(&threshold_path, bytemuck::cast_slice(threshold))?;
@@ -768,7 +744,6 @@ impl SidecarIndex {
             index,
             row_map,
             row_index,
-            built: true,
             storage_precision: manifest.scalar_kind,
             exact_vectors: None,
             rescore,
@@ -859,78 +834,6 @@ impl SidecarIndex {
 }
 
 impl VectorIndex for SidecarIndex {
-    fn add(&mut self, row_id: &str, vector: &[f32]) -> Result<()> {
-        if vector.len() != self.dimensions {
-            return Err(JammiError::Other(format!(
-                "Vector dimension mismatch: expected {}, got {}",
-                self.dimensions,
-                vector.len()
-            )));
-        }
-        let key = self.row_map.len() as u64;
-        match self.storage_precision {
-            // A Binary index's own USearch storage is `b1x8`-typed
-            // sign-packed against a corpus-wide per-dimension threshold τ —
-            // unknown until every row has been seen. So a Binary row is only
-            // accumulated here (into `exact_vectors` below); [`Self::build`]
-            // fits τ from the whole corpus and inserts every row into the
-            // USearch graph in one bulk pass.
-            StoragePrecision::Binary => {}
-            StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
-                // Reserve space if needed.
-                if self.index.capacity() <= self.index.size() {
-                    let new_cap = (self.index.capacity() + 1).max(64);
-                    self.index
-                        .reserve(new_cap)
-                        .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))?;
-                }
-                self.index
-                    .add(key, vector)
-                    .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
-            }
-        }
-        if let Some(buf) = self.exact_vectors.as_mut() {
-            buf.extend_from_slice(vector);
-        }
-        self.row_map.push(row_id.to_string());
-        self.row_index.insert(row_id.to_string(), key);
-        Ok(())
-    }
-
-    fn build(&mut self) -> Result<()> {
-        // USearch builds incrementally during add() for every precision
-        // EXCEPT Binary, whose corpus rows `add` only accumulated into
-        // `exact_vectors` (see above) — this is where a Binary index's
-        // per-dimension threshold τ is fit from the whole corpus and every
-        // row is bulk-inserted into the USearch graph, sign-packed against
-        // it. Every other precision was already inserted incrementally, so
-        // this stays a no-op for them.
-        if self.storage_precision == StoragePrecision::Binary && !self.row_map.is_empty() {
-            let vectors = self.exact_vectors.as_ref().expect(
-                "a Binary sidecar always tracks exact_vectors (StoragePrecision::Binary::needs_rescore() is true)",
-            );
-            let kind = DEFAULT_BINARY_THRESHOLD_KIND;
-            let threshold = fit_binary_threshold(vectors, self.dimensions, kind);
-
-            self.index
-                .reserve(self.row_map.len())
-                .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))?;
-            for key in 0..self.row_map.len() as u64 {
-                let start = key as usize * self.dimensions;
-                let vector = &vectors[start..start + self.dimensions];
-                let packed = pack_threshold_bits(vector, &threshold);
-                self.index
-                    .add(key, usearch::b1x8::from_u8s(&packed))
-                    .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
-            }
-            self.binary_threshold = Some(threshold);
-            self.threshold_kind = Some(kind);
-        }
-        // We just mark it as built for correctness tracking.
-        self.built = true;
-        Ok(())
-    }
-
     fn search(&self, query: &ValidatedQuery, k: usize) -> Result<Vec<(String, f32)>> {
         self.traverse(query, k, None)
     }
@@ -941,6 +844,117 @@ impl VectorIndex for SidecarIndex {
 
     fn len(&self) -> usize {
         self.row_map.len()
+    }
+}
+
+/// The rows of a [`SidecarIndex`] to be, in key order. [`Self::build`] turns
+/// them into the index in one pass, so a graph is never searched, saved or
+/// grown while it is missing rows.
+pub struct SidecarBuilder {
+    dimensions: usize,
+    index: usearch::Index,
+    storage_precision: StoragePrecision,
+    row_map: Vec<String>,
+    row_index: HashMap<String, u64>,
+    /// Every row's exact `f32` vector, flattened in key order.
+    vectors: Vec<f32>,
+}
+
+impl SidecarBuilder {
+    /// A builder for an index over vectors of width `dimensions`, at
+    /// `precision`, tuned by the HNSW knobs in `ann`. The build-time knobs
+    /// (`connectivity`, `build_expansion`) shape the graph [`Self::build`]
+    /// inserts; `search_expansion` governs queries against it. `precision` is
+    /// the table's resolved storage precision (a fresh table's deployment
+    /// default, or an existing table's persisted catalog value for a rebuild) —
+    /// never read off `ann` here, so a caller cannot forget which one applies.
+    pub fn new(
+        dimensions: usize,
+        ann: &AnnIndexConfig,
+        precision: StoragePrecision,
+    ) -> Result<Self> {
+        let index = usearch::Index::new(&index_options(dimensions, ann, precision))
+            .map_err(|e| JammiError::Other(format!("USearch index creation: {e}")))?;
+        Ok(Self {
+            dimensions,
+            index,
+            storage_precision: precision,
+            row_map: Vec::new(),
+            row_index: HashMap::new(),
+            vectors: Vec::new(),
+        })
+    }
+
+    /// Take the next row, keyed after every row before it.
+    pub fn add(&mut self, row_id: &str, vector: &[f32]) -> Result<()> {
+        if vector.len() != self.dimensions {
+            return Err(JammiError::Other(format!(
+                "Vector dimension mismatch: expected {}, got {}",
+                self.dimensions,
+                vector.len()
+            )));
+        }
+        let key = self.row_map.len() as u64;
+        self.vectors.extend_from_slice(vector);
+        self.row_map.push(row_id.to_string());
+        self.row_index.insert(row_id.to_string(), key);
+        Ok(())
+    }
+
+    /// Number of rows taken so far.
+    pub fn len(&self) -> usize {
+        self.row_map.len()
+    }
+
+    /// Whether no row has been taken.
+    pub fn is_empty(&self) -> bool {
+        self.row_map.is_empty()
+    }
+
+    /// The index over every row taken, its graph inserted in key order.
+    pub fn build(self) -> Result<SidecarIndex> {
+        let Self {
+            dimensions,
+            index,
+            storage_precision,
+            row_map,
+            row_index,
+            vectors,
+        } = self;
+        let rows = row_map.len();
+        // A Binary graph stores each row sign-packed against a per-dimension
+        // threshold τ fit from the whole corpus, so τ exists only now.
+        let threshold = (storage_precision == StoragePrecision::Binary && rows > 0)
+            .then(|| fit_binary_threshold(&vectors, dimensions, DEFAULT_BINARY_THRESHOLD_KIND));
+
+        reserve(&index, rows, 1)?;
+        for key in 0..rows {
+            let vector = &vectors[key * dimensions..(key + 1) * dimensions];
+            match &threshold {
+                Some(threshold) => index.add(
+                    key as u64,
+                    usearch::b1x8::from_u8s(&pack_threshold_bits(vector, threshold)),
+                ),
+                None => index.add(key as u64, vector),
+            }
+            .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
+        }
+        // Every search holds a context of its own while it runs, so the
+        // built graph gets one per thread the host runs at once, as a loaded
+        // graph does.
+        reserve(&index, rows, host_parallelism().get())?;
+
+        Ok(SidecarIndex {
+            dimensions,
+            index,
+            row_map,
+            row_index,
+            storage_precision,
+            exact_vectors: storage_precision.needs_rescore().then_some(vectors),
+            rescore: None,
+            threshold_kind: threshold.is_some().then_some(DEFAULT_BINARY_THRESHOLD_KIND),
+            binary_threshold: threshold,
+        })
     }
 }
 
@@ -975,7 +989,7 @@ mod tests {
             search_expansion: 100,
             ..AnnIndexConfig::default()
         };
-        let idx = SidecarIndex::new(8, &ann, StoragePrecision::F32).unwrap();
+        let idx = SidecarBuilder::new(8, &ann, StoragePrecision::F32).unwrap();
         assert_eq!(idx.index.connectivity(), 32);
         assert_eq!(idx.index.expansion_add(), 200);
         assert_eq!(idx.index.expansion_search(), 100);
@@ -985,7 +999,8 @@ mod tests {
     fn default_config_reproduces_backend_defaults() {
         // A zeroed config is the documented no-op: every knob resolves to the
         // backend's built-in default, so an unset deployment is unchanged.
-        let idx = SidecarIndex::new(8, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+        let idx =
+            SidecarBuilder::new(8, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         assert_eq!(idx.index.connectivity(), USEARCH_DEFAULT_CONNECTIVITY);
         assert_eq!(idx.index.expansion_add(), USEARCH_DEFAULT_EXPANSION_ADD);
         assert_eq!(
@@ -1010,9 +1025,9 @@ mod tests {
             search_expansion: 0,
             ..AnnIndexConfig::default()
         };
-        let mut idx = SidecarIndex::new(4, &build, StoragePrecision::F32).unwrap();
+        let mut idx = SidecarBuilder::new(4, &build, StoragePrecision::F32).unwrap();
         idx.add("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         idx.save(&base).unwrap();
 
         // Load with a non-zero search_expansion → re-applied to the loaded graph.
@@ -1044,9 +1059,9 @@ mod tests {
     /// ready for a tamper-then-reload teeth test.
     fn save_valid_bundle(base: &Path) {
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         idx.add("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         idx.save(base).unwrap();
     }
 
@@ -1225,9 +1240,9 @@ mod tests {
         let base = dir.path().join("f32_no_companion");
 
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         idx.add("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         idx.save(&base).unwrap();
 
         assert!(
@@ -1258,11 +1273,11 @@ mod tests {
             [0.25, 0.5, 0.75, 1.0],
         ];
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
         for (i, v) in vectors.iter().enumerate() {
             idx.add(&format!("row-{i}"), v).unwrap();
         }
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         idx.save(&base).unwrap();
 
         assert!(
@@ -1290,15 +1305,15 @@ mod tests {
         // A freshly built quantized index — never saved or loaded — has no
         // rescore companion yet (`rescore` is only opened by `load`).
         // `get_exact` must still return the TRUE exact vector by reading the
-        // in-memory `exact_vectors` buffer `add` accumulated, never falling
+        // in-memory exact vectors `add` accumulated, never falling
         // back to USearch's own lossy `get` under the "exact" name.
         let vectors: [[f32; 4]; 2] = [[1.0, 0.0, 0.0, 0.0], [0.25, 0.5, 0.75, 1.0]];
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
         for (i, v) in vectors.iter().enumerate() {
             idx.add(&format!("row-{i}"), v).unwrap();
         }
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         assert!(
             idx.rescore.is_none(),
             "a pre-save index has no rescore companion yet"
@@ -1322,9 +1337,9 @@ mod tests {
         // in-memory exact-vector buffer, `get_exact` must hard-error rather
         // than silently fall back to USearch's own lossy `get`.
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::Int8).unwrap();
         idx.add("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        idx.build().unwrap();
+        let mut idx = idx.build().unwrap();
         idx.exact_vectors = None;
 
         assert!(
@@ -1397,12 +1412,11 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..12).map(|i| synthetic_vector(i + 1, dim)).collect();
 
         let mut idx =
-            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         for (i, v) in vectors.iter().enumerate() {
             idx.add(&format!("row-{i}"), v).unwrap();
         }
-        idx.build().unwrap();
-
+        let idx = idx.build().unwrap();
         let query = vq(&vectors[5]);
         let hits = idx.search(&query, 1).unwrap();
         assert_eq!(hits.len(), 1);
@@ -1433,12 +1447,11 @@ mod tests {
             .collect();
 
         let mut idx =
-            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         for (id, v) in &vectors {
             idx.add(id, v).unwrap();
         }
-        idx.build().unwrap();
-
+        let idx = idx.build().unwrap();
         // Save + reload before searching: `get_exact` serves the exact vector
         // from the `.rawf32` rescore companion only once it is open (populated
         // by `load`, mirroring exactly how production always searches a
@@ -1510,10 +1523,10 @@ mod tests {
         let base = dir.path().join("binary_manifest");
 
         let mut idx =
-            SidecarIndex::new(8, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(8, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         let vector = [1.0, -1.0, 0.5, -0.5, 0.0, 2.0, -2.0, 3.0];
         idx.add("a", &vector).unwrap();
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         idx.save(&base).unwrap();
 
         let manifest = read_manifest_json(&base);
@@ -1565,10 +1578,10 @@ mod tests {
         let base = dir.path().join("binary_scalar_kind_mismatch");
 
         let mut idx =
-            SidecarIndex::new(8, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(8, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         idx.add("a", &[1.0, -1.0, 0.5, -0.5, 0.0, 2.0, -2.0, 3.0])
             .unwrap();
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         idx.save(&base).unwrap();
 
         match SidecarIndex::load(&base, &AnnIndexConfig::default(), StoragePrecision::F32) {
@@ -1775,11 +1788,11 @@ mod tests {
         );
 
         let mut idx =
-            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         for (id, v) in &corpus {
             idx.add(id, v).unwrap();
         }
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         let fitted_threshold = idx.binary_threshold.clone().unwrap();
         let collapsed_at_mean = count_collapsed_dims(&corpus_vectors, dim, &fitted_threshold);
         assert!(
@@ -1879,12 +1892,12 @@ mod tests {
     fn binary_threshold_round_trips_through_save_and_load_and_query_uses_it() {
         let dim = 32;
         let mut idx =
-            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         let vectors: Vec<Vec<f32>> = (0..40).map(|i| synthetic_vector(i + 1, dim)).collect();
         for (i, v) in vectors.iter().enumerate() {
             idx.add(&format!("row-{i}"), v).unwrap();
         }
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         let built_threshold = idx.binary_threshold.clone().unwrap();
         assert_eq!(idx.threshold_kind, Some(DEFAULT_BINARY_THRESHOLD_KIND));
 
@@ -1923,13 +1936,12 @@ mod tests {
 
         let build = || {
             let mut idx =
-                SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary)
+                SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary)
                     .unwrap();
             for (id, v) in &vectors {
                 idx.add(id, v).unwrap();
             }
-            idx.build().unwrap();
-            idx
+            idx.build().unwrap()
         };
 
         let idx_a = build();
@@ -1950,9 +1962,90 @@ mod tests {
         );
     }
 
+    /// The serialized `.usearch` graph of `rows` built through a
+    /// [`SidecarIndex`] at `precision`.
+    fn sidecar_graph_bytes(rows: &[Vec<f32>], precision: StoragePrecision) -> Vec<u8> {
+        let mut idx =
+            SidecarBuilder::new(rows[0].len(), &AnnIndexConfig::default(), precision).unwrap();
+        for (i, v) in rows.iter().enumerate() {
+            idx.add(&format!("row-{i}"), v).unwrap();
+        }
+        let idx = idx.build().unwrap();
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("graph");
+        idx.save(&base).unwrap();
+        std::fs::read(base.with_extension("usearch")).unwrap()
+    }
+
+    /// The serialized graph of `rows` inserted in order into a bare USearch
+    /// index driven from `contexts` thread contexts — the build a host with
+    /// `contexts` cores gets when it lets USearch size its contexts.
+    fn usearch_graph_bytes(
+        rows: &[Vec<f32>],
+        precision: StoragePrecision,
+        contexts: usize,
+    ) -> Vec<u8> {
+        let dim = rows[0].len();
+        let index = usearch::Index::new(&index_options(dim, &AnnIndexConfig::default(), precision))
+            .unwrap();
+        index
+            .reserve_capacity_and_threads(rows.len(), contexts)
+            .unwrap();
+        let flat: Vec<f32> = rows.concat();
+        let threshold = fit_binary_threshold(&flat, dim, DEFAULT_BINARY_THRESHOLD_KIND);
+        for (key, v) in rows.iter().enumerate() {
+            match precision {
+                StoragePrecision::Binary => index.add(
+                    key as u64,
+                    usearch::b1x8::from_u8s(&pack_threshold_bits(v, &threshold)),
+                ),
+                StoragePrecision::F32 | StoragePrecision::F16 | StoragePrecision::Int8 => {
+                    index.add(key as u64, v)
+                }
+            }
+            .unwrap();
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("graph.usearch");
+        index.save(path.to_str().unwrap()).unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn a_graph_is_a_function_of_its_rows_never_of_the_hosts_core_count() {
+        // USearch draws each node's HNSW level from the generator of the
+        // thread context that inserts it, and every context's generator
+        // starts from the same seed. Inserting through N contexts therefore
+        // repeats each level draw N times, so the same rows built on hosts
+        // with different core counts would yield different graphs — and
+        // different neighbours for the same query. A sidecar inserts through
+        // one context, so its graph is the single-context build of its rows
+        // in key order, whatever host builds it.
+        let dim = 32;
+        let rows: Vec<Vec<f32>> = (0..1000).map(|i| synthetic_vector(i + 1, dim)).collect();
+        for precision in [
+            StoragePrecision::F32,
+            StoragePrecision::F16,
+            StoragePrecision::Int8,
+            StoragePrecision::Binary,
+        ] {
+            let one_context = usearch_graph_bytes(&rows, precision, 1);
+            assert_ne!(
+                one_context,
+                usearch_graph_bytes(&rows, precision, 4),
+                "{precision:?}: a four-context build must differ from a one-context build, \
+                 otherwise this test cannot see a core-count dependence"
+            );
+            assert!(
+                sidecar_graph_bytes(&rows, precision) == one_context,
+                "{precision:?}: a sidecar's graph must be the one-context build of its rows"
+            );
+        }
+    }
+
     #[test]
     fn rescore_is_byte_identical_regardless_of_binary_threshold() {
-        // The exact-f32 rescore companion is populated from `exact_vectors`
+        // The exact-f32 rescore companion is populated from the exact vectors
         // (`add`'s ORIGINAL, un-thresholded vectors) and never touched by τ,
         // so `get_exact` must return byte-identical results no matter which
         // threshold the coarse Hamming stage used — τ can only ever change
@@ -1969,12 +2062,11 @@ mod tests {
             .collect();
 
         let mut idx =
-            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::Binary).unwrap();
         for (id, v) in &vectors {
             idx.add(id, v).unwrap();
         }
-        idx.build().unwrap();
-
+        let mut idx = idx.build().unwrap();
         let exact_with_fitted_threshold: Vec<Vec<f32>> = vectors
             .iter()
             .map(|(id, _)| idx.get_exact(id).unwrap().unwrap())
@@ -1985,7 +2077,7 @@ mod tests {
         // Swap in a DIFFERENT threshold (the fixed all-zero one) directly
         // on the already-built index — a private-field test-only override,
         // never a public API — to isolate τ's effect to the coarse stage
-        // alone; `exact_vectors`/the `.rawf32` rescore path never reads this
+        // alone; the exact vectors/the `.rawf32` rescore path never read this
         // field.
         idx.binary_threshold = Some(vec![0.0; dim]);
 
@@ -1998,7 +2090,7 @@ mod tests {
         assert_eq!(
             exact_with_fitted_threshold, exact_with_zero_threshold,
             "get_exact/rescore must be byte-identical regardless of the binary threshold — it \
-             reads exact_vectors, which τ never touches"
+             reads the exact vectors, which τ never touches"
         );
         assert_ne!(
             candidates_with_fitted, candidates_with_zero,

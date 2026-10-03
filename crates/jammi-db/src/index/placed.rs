@@ -940,6 +940,7 @@ pub(crate) fn local_load_estimate(
 mod tests {
     use super::*;
     use crate::index::peer::NoPeers;
+    use crate::index::sidecar::SidecarBuilder;
     use crate::index::{validate_query, QuerySource};
 
     /// A test query validated at the literal's own width — the width of the
@@ -964,12 +965,11 @@ mod tests {
 
     fn segment(rows: &[(&str, Vec<f32>)], precision: StoragePrecision) -> SidecarIndex {
         let dim = rows[0].1.len();
-        let mut idx = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision).unwrap();
+        let mut idx = SidecarBuilder::new(dim, &AnnIndexConfig::default(), precision).unwrap();
         for (id, v) in rows {
             idx.add(id, v).unwrap();
         }
-        idx.build().unwrap();
-        idx
+        idx.build().unwrap()
     }
 
     fn corpus() -> Vec<(&'static str, Vec<f32>)> {

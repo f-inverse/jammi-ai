@@ -8,7 +8,7 @@ use datafusion::datasource::file_format::options::ParquetReadOptions;
 use datafusion::prelude::SessionContext;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
-use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::index::VectorIndex;
 use jammi_db::session::QueryContext;
 use jammi_db::storage::{ObjectParquetWriter, StorageRegistry, StorageUrl};
@@ -21,12 +21,11 @@ use tempfile::tempdir;
 fn sidecar_add_search_and_edge_cases() {
     // Core: add vectors, search returns correct nearest neighbor
     let mut index =
-        SidecarIndex::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+        SidecarBuilder::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
     index.add("row_a", &[1.0, 0.0, 0.0]).unwrap();
     index.add("row_b", &[0.0, 1.0, 0.0]).unwrap();
     index.add("row_c", &[0.9, 0.1, 0.0]).unwrap();
-    index.build().unwrap();
-
+    let index = index.build().unwrap();
     assert_eq!(index.len(), 3);
 
     let results = index.search(&vq(&[1.0, 0.0, 0.0]), 2).unwrap();
@@ -42,7 +41,10 @@ fn sidecar_add_search_and_edge_cases() {
     assert_eq!(results.len(), 3);
 
     // Edge: empty index
-    let empty = SidecarIndex::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+    let empty = SidecarBuilder::new(3, &AnnIndexConfig::default(), StoragePrecision::F32)
+        .unwrap()
+        .build()
+        .unwrap();
     assert!(empty.search(&vq(&[1.0, 0.0, 0.0]), 5).unwrap().is_empty());
     assert!(empty.is_empty());
 }
@@ -52,11 +54,10 @@ fn sidecar_add_search_and_edge_cases() {
 #[test]
 fn sidecar_get_returns_stored_vectors() {
     let mut index =
-        SidecarIndex::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+        SidecarBuilder::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
     index.add("row_a", &[1.0, 0.0, 0.0]).unwrap();
     index.add("row_b", &[0.0, 1.0, 0.0]).unwrap();
-    index.build().unwrap();
-
+    let index = index.build().unwrap();
     // A stored vector is readable back by its id — the index is the single owner
     // of the embeddings, so callers need not keep a second id→vector copy.
     let a = index.get("row_a").unwrap().expect("row_a is indexed");
@@ -91,11 +92,11 @@ fn sidecar_save_load_roundtrip() {
     let base_path = dir.path().join("test_index");
 
     let mut index =
-        SidecarIndex::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+        SidecarBuilder::new(3, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
     index.add("id_1", &[1.0, 0.0, 0.0]).unwrap();
     index.add("id_2", &[0.0, 1.0, 0.0]).unwrap();
     index.add("id_3", &[0.0, 0.0, 1.0]).unwrap();
-    index.build().unwrap();
+    let index = index.build().unwrap();
     index.save(&base_path).unwrap();
 
     // Sidecar bundle produced
@@ -133,9 +134,9 @@ fn sidecar_load_rejects_corrupted_rowmap() {
     let base_path = dir.path().join("bad_version");
 
     let mut index =
-        SidecarIndex::new(2, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+        SidecarBuilder::new(2, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
     index.add("r1", &[1.0, 0.0]).unwrap();
-    index.build().unwrap();
+    let index = index.build().unwrap();
     index.save(&base_path).unwrap();
 
     // Corrupt the rowmap version byte

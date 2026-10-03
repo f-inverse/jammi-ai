@@ -6,6 +6,22 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **An ANN index is the same graph on every host.** USearch gives each thread context its own
+  HNSW level generator, every one seeded alike, and sizes the contexts to the host's core count; a
+  sidecar inserted its rows through all of them in turn, so each level draw repeated once per core
+  and the same rows built a different graph — and returned different neighbours — on a 16-core
+  laptop, a 4-core runner and a reader's GPU host. The binary-precision notebook failed for 0.53.0
+  readers on an L4 host on it (recall@1 at oversample 8: 0.45 against 0.5 ± 0.0375). A sidecar now
+  builds its graph in one pass, through one context reserved for every row at once — one
+  uninterrupted level sequence, the independent per-node draw HNSW construction assumes — and
+  widens to a context per host thread for search afterwards. A binary graph is byte-identical on
+  every host. The book's small goldens that index-ranked numbers feed are re-frozen; each moved
+  within its tolerance.
+- **A sidecar is built, then immutable.** `SidecarBuilder` takes the rows (`new`, `add`) and
+  `build` returns the `SidecarIndex`; an index is only ever built or loaded, so one is never
+  searched or saved while it is missing rows, and never grows. `VectorIndex` is the query surface
+  alone (`search`, `save`, `len`). `SidecarIndex::contains` is gone; `contains_row` was the same
+  method.
 - **The reader lanes wait for a release to be installable.** Dispatched minutes after the 0.53.0
   tag, the CPU lane failed 13 notebooks on installs: pip's index did not list `jammi-ai-native`
   0.53.0 yet, and crates.io had no `jammi-ai` 0.53.0 while its publisher validated. Both lanes now

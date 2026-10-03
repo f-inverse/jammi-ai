@@ -481,7 +481,7 @@ async fn delete_one_key() {
         after.storage_precision.unwrap_or_default(),
     )
     .unwrap();
-    assert!(idx.contains("7"));
+    assert!(idx.contains_row("7"));
 }
 
 /// `recompute` of a versioned table yields a NEW single-segment

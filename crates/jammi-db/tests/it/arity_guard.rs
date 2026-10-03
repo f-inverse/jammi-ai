@@ -14,8 +14,8 @@ use jammi_db::catalog::result_repo::{Producer, ResultTableKind};
 use jammi_db::catalog::Catalog;
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::error::{JammiError, Result};
-use jammi_db::index::sidecar::SidecarIndex;
-use jammi_db::index::{PeerAddr, SegmentId, SegmentPlacement, VectorIndex};
+use jammi_db::index::sidecar::SidecarBuilder;
+use jammi_db::index::{PeerAddr, SegmentId, SegmentPlacement};
 use jammi_db::store::{BuildingTable, ResultStore, ResultTableOrigin};
 use tempfile::tempdir;
 
@@ -67,11 +67,12 @@ async fn two_segment_table(store: &ResultStore) -> BuildingTable {
         [("c", [0.0, 0.0, 1.0, 0.0]), ("d", [0.0, 0.0, 0.0, 1.0])],
     ] {
         let mut idx =
-            SidecarIndex::new(4, &AnnIndexConfig::default(), StoragePrecision::default()).unwrap();
+            SidecarBuilder::new(4, &AnnIndexConfig::default(), StoragePrecision::default())
+                .unwrap();
         for (id, v) in rows {
             idx.add(id, &v).unwrap();
         }
-        idx.build().unwrap();
+        let idx = idx.build().unwrap();
         table.append_segment(&idx).await.unwrap();
     }
     table

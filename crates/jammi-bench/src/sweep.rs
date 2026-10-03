@@ -31,7 +31,7 @@ use std::time::Instant;
 
 use jammi_db::config::{AnnIndexConfig, StoragePrecision};
 use jammi_db::index::exact::exact_vector_search;
-use jammi_db::index::sidecar::SidecarIndex;
+use jammi_db::index::sidecar::{SidecarBuilder, SidecarIndex};
 use jammi_db::index::VectorIndex;
 use jammi_db::index::{validate_query, Admission, QuerySource};
 
@@ -141,11 +141,11 @@ pub async fn run(
     for (i, cfg) in BUILD_GRID.iter().enumerate() {
         let base = tmp.path().join(format!("build_{i}"));
         let t0 = Instant::now();
-        let mut index = SidecarIndex::new(dim, cfg, StoragePrecision::F32)?;
+        let mut builder = SidecarBuilder::new(dim, cfg, StoragePrecision::F32)?;
         for (id, v) in &corpus_rows {
-            index.add(id, v)?;
+            builder.add(id, v)?;
         }
-        index.build()?;
+        let index = builder.build()?;
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         VectorIndex::save(&index, &base)?;
         let size = std::fs::metadata(base.with_extension("usearch"))?.len();
@@ -165,11 +165,12 @@ pub async fn run(
     // query-time knob mutates a loaded graph, so every point shares one build.
     let base = tmp.path().join("search_base");
     {
-        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32)?;
+        let mut builder =
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32)?;
         for (id, v) in &corpus_rows {
-            index.add(id, v)?;
+            builder.add(id, v)?;
         }
-        index.build()?;
+        let index = builder.build()?;
         VectorIndex::save(&index, &base)?;
     }
     let mut search_sweep = Vec::with_capacity(EF_GRID.len());
@@ -222,11 +223,11 @@ pub async fn run(
     for (i, &(precision, oversample)) in precision_grid.iter().enumerate() {
         let base = tmp.path().join(format!("precision_{i}"));
         let t0 = Instant::now();
-        let mut index = SidecarIndex::new(dim, &AnnIndexConfig::default(), precision)?;
+        let mut builder = SidecarBuilder::new(dim, &AnnIndexConfig::default(), precision)?;
         for (id, v) in &corpus_rows {
-            index.add(id, v)?;
+            builder.add(id, v)?;
         }
-        index.build()?;
+        let index = builder.build()?;
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
         VectorIndex::save(&index, &base)?;
         let size = std::fs::metadata(base.with_extension("usearch"))?.len();

@@ -8,12 +8,9 @@
 //!   total order. It is deterministic and exhaustive, so its top-`k` *is* ground
 //!   truth: recall is measured against it, never the other way round.
 //! * **Frozen ANN** — a [`SidecarIndex`] **loaded** from a committed `.usearch`
-//!   bundle. USearch's HNSW build is nondeterministic (default `IndexOptions`
-//!   pins no seed and no thread count), so the index is built and frozen *once*
-//!   on the emit box and committed; the recall gate only ever [`SidecarIndex::load`]s
-//!   it. Rebuilding here would measure a different graph than the one shipped,
-//!   and the number would not be reproducible — so this module loads and never
-//!   builds.
+//!   bundle, built once on the emit box over the committed corpus. The recall
+//!   gate only ever [`SidecarIndex::load`]s it, so what it measures is that
+//!   committed graph's recall, on whatever host runs the gate.
 //!
 //! ## Recall as a set-intersection floor
 //!
@@ -118,11 +115,11 @@
 //! loaded and assembled into one [`SegmentedIndex`], whose
 //! [`SegmentedIndex::search_final`] fans the query across every segment and
 //! merges the results (`jammi_db::index::segment`'s `DEFAULT_SEGMENT_OVERFETCH_FACTOR`
-//! over-fetches from each segment before the merge). USearch's HNSW build is
-//! nondeterministic, so — mirroring the frozen-single-graph discipline above —
-//! a real recall floor over this axis needs the seed varied and averaged, and
-//! the one lever this harness can pull deterministically is not the
-//! (uncontrollable) HNSW build seed but the *partitioning*: which corpus rows
+//! over-fetches from each segment before the merge). One graph is one draw of
+//! HNSW's random levels, so — mirroring the frozen-single-graph discipline
+//! above — a real recall floor over this axis needs the draw varied and
+//! averaged, and the one lever this harness can pull deterministically is not
+//! the HNSW level seed (USearch fixes it) but the *partitioning*: which corpus rows
 //! land in which segment. `tests::segment_merge_recall_clears_its_committed_floor_and_tracks_the_single_graph`
 //! asserts the committed floor holds across every committed partitioning
 //! (`fixture.rs`'s `build_segment_recall_fixture` freezes more than one), each
@@ -628,6 +625,7 @@ pub async fn recall_curve_held_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jammi_db::index::sidecar::SidecarBuilder;
 
     use jammi_db::storage::StorageUrl;
     use tempfile::tempdir;
@@ -665,11 +663,11 @@ mod tests {
     /// the recall path under test only ever loads what this writes.
     fn freeze_sidecar(base: &std::path::Path, rows: &[(String, Vec<f32>)], dim: usize) {
         let mut index =
-            SidecarIndex::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
+            SidecarBuilder::new(dim, &AnnIndexConfig::default(), StoragePrecision::F32).unwrap();
         for (id, v) in rows {
             index.add(id, v).unwrap();
         }
-        index.build().unwrap();
+        let index = index.build().unwrap();
         VectorIndex::save(&index, base).unwrap();
     }
 

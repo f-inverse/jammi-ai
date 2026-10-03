@@ -34,7 +34,8 @@ import jammi
 import pgserver
 import pyarrow.parquet as pq
 from jammi.testing import LiveServer
-from jammi_cookbook import contracts, fixtures, mariadb
+from jammi_cookbook import fixtures, mariadb
+from jammi_cookbook.claims import claim
 
 MODEL = fixtures.model("tiny_bert")
 LABELS = str(fixtures.path("tiny_labels.csv"))
@@ -137,10 +138,10 @@ print(rows(spread))
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("federation.groups", spread.num_rows, tol=0.0)
-contracts.assert_close("federation.documents", sum(spread.column("documents").to_pylist()),
-                       tol=0.0)
+documents = db.sql("SELECT COUNT(*) AS n FROM docs.public.documents").column("n")[0].as_py()
+claim("the three-source join counts every document exactly once",
+      sum(spread.column("documents").to_pylist()) == documents,
+      f"{documents} documents over {spread.num_rows} groups")
 ```
 
 Every one of the twenty documents found its organisation and its label: the join
@@ -172,10 +173,8 @@ print(file_ranked)
 ```
 
 ```{python}
-# | echo: false
-assert ranked == file_ranked, (ranked, file_ranked)
-contracts.assert_close("federation.nearest_id", ranked[1][0], tol=0.0)
-contracts.assert_close("federation.nearest_similarity", ranked[1][1], tol=1e-4)
+claim("searching the federated table ranks exactly as searching the same rows from a file",
+      ranked == file_ranked)
 ```
 
 The hits are keys into the database, so the other stores describe them — who filed
@@ -214,8 +213,8 @@ postgres.cleanup()
 ```
 
 ```{python}
-# | echo: false
-assert remote_spread.to_pylist() == spread.to_pylist(), (remote_spread, spread)
+claim("a server answers the federated join exactly as the embedded engine does",
+      remote_spread.to_pylist() == spread.to_pylist())
 ```
 
 The server's join is the embedded engine's, row for row. The database drivers ship in

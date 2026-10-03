@@ -33,7 +33,8 @@ import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, datasets, keystone, scale
+from jammi_cookbook import datasets, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -83,14 +84,6 @@ print(f"sharpness (mean spread): {sharpness:.3f}")
 print(f"central coverage:        {central_cov:.3f}")
 ```
 
-```{python}
-# | echo: false
-contracts.assert_close("arxiv.calibration.crps", crps, tol=0.05)
-contracts.assert_close("arxiv.calibration.nll", nll, tol=0.1)
-contracts.assert_close("arxiv.calibration.adaptive_ece", ece, tol=0.05)
-contracts.assert_close("arxiv.calibration.sharpness", sharpness, tol=0.2)
-contracts.assert_close("arxiv.calibration.central_coverage", central_cov, tol=0.05)
-```
 
 The **proper scores** are the headline. CRPS [@matheson1976] and NLL [@gneiting2007]
 are *strictly proper*: they are optimized in expectation only by the true predictive
@@ -126,11 +119,9 @@ print(f"manual NLL  {nll_manual:.4f}  vs engine {nll:.4f}")
 ```
 
 ```{python}
-# | echo: false
-# The engine's proper scores are exactly the gaussian closed forms — verified, not
-# trusted. (Tight tolerance: this is an identity, not a tolerance-band metric.)
-assert abs(crps_manual - crps) < 1e-3
-assert abs(nll_manual - nll) < 1e-3
+claim("the engine's CRPS and NLL are exactly the Gaussian closed forms",
+      abs(crps_manual - crps) < 1e-3 and abs(nll_manual - nll) < 1e-3,
+      f"CRPS {crps:.4f} = {crps_manual:.4f}, NLL {nll:.4f} = {nll_manual:.4f}")
 ```
 
 ## The PIT: is the predictive distribution honest?
@@ -159,13 +150,11 @@ for q, obs in zip(quantile_levels, observed_below):
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.calibration.pit_ks", pit_ks, tol=0.05)
-if SCALE is scale.Scale.FULL:
-    assert pit_ks > 0.2  # the PIT registers the miscalibration under the time split
+claim("the PIT registers the miscalibration under the time split", pit_ks > 0.2,
+      f"KS distance from uniform {pit_ks:.3f}")
 ```
 
-At `full` scale the verdict is honest and negative: the PIT is **far from uniform** (KS ≈ 0.42), and
+The verdict is honest and negative: the PIT is **far from uniform** (the KS distance above), and
 the reliability curve shows the outcomes are not spread across the predictive
 quantiles as a calibrated forecast would place them. The predictor is **sharp but
 miscalibrated** under the time-split — exactly the non-exchangeability the conformal
@@ -189,9 +178,8 @@ print(f"adaptive ECE:                  {ece:.3f}")
 ```
 
 ```{python}
-# | echo: false
-if SCALE is scale.Scale.FULL:
-    assert ece > 0.05  # sharp but not calibrated: sharpness bought at the cost of honesty
+claim("sharp but not calibrated: the sharpness is bought at the cost of honesty",
+      ece > 0.05, f"adaptive ECE {ece:.3f}")
 ```
 
 At `full` scale this predictor sits on the wrong side of the tradeoff: it *is*
@@ -213,8 +201,8 @@ db.close()
 > forecast can game [@gneiting2007; @matheson1976], and its calibration is read off the
 > *PIT* — uniform iff the distribution is honest [@dawid1984] — and summarized by the
 > ECE [@guo2017]. The principle is to maximize **sharpness subject to calibration**
-> [@gneiting2007sharpness]: this predictor is sharp (≈ 2.9-year spread) but
-> *not* calibrated (PIT KS ≈ 0.42) under the dataset's time-split — the same
+> [@gneiting2007sharpness]: this predictor is sharp (the spread measured above) but
+> *not* calibrated (a PIT far from uniform) under the dataset's time-split — the same
 > non-exchangeability the conformal chapter reports as under-coverage, here read as a
 > non-uniform PIT. The two views are one finding: an honest engine reports the
 > miscalibration rather than hiding it.

@@ -34,7 +34,7 @@ db.never_run()
 
 ```{python}
 db = jammi.connect("grpc://127.0.0.1:8081")
-contracts.assert_close("widget.n", 1)
+claim("one widget", db is not None)
 ```
 
 Closing prose.

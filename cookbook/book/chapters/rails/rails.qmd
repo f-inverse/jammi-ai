@@ -17,15 +17,16 @@ own. This chapter makes them first-class and works each one end to end.
   it).
 - **Tenancy** — the engine isolates by tenant at two genuine layers, with one
   honest caveat.
-- **Measurement** — every recipe ends in a real number, measured live and
-  checked against a frozen golden. A recipe without a measured verdict is not
-  done.
+- **Measurement** — every recipe ends in a real number, measured live, and in
+  the claim that number backs, checked on the run that showed it. A recipe
+  without a measured verdict is not done.
 
 ```{python}
 import tempfile
 
 import jammi
-from jammi_cookbook import contracts, datasets, keystone, rails, scale
+from jammi_cookbook import datasets, keystone, rails, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -75,9 +76,11 @@ for k in trail["context_ref"][:5]:
 ```
 
 ```{python}
-# | echo: false
-assert trail["source"] == "edges"
-assert trail["context_ref"] and all(k in by_id for k in trail["context_ref"])
+claim("the prediction reports that its context came from the declared edges",
+      trail["source"] == "edges")
+claim("and every row it names reads back as a paper",
+      bool(trail["context_ref"]) and all(k in by_id for k in trail["context_ref"]),
+      f"{len(trail['context_ref'])} rows")
 ```
 
 > **Bridge note.** Provenance as a first-class, queryable property of *every*
@@ -141,8 +144,8 @@ print(f"A reads {len(seen)} of the shared source's {len(early) + len(late)} rows
 ```
 
 ```{python}
-# | echo: false
-assert sorted(seen) == sorted(early)
+claim("tenant A reads exactly its own rows of the shared source", sorted(seen) == sorted(early),
+      f"{len(seen)} of {len(early) + len(late)}")
 ```
 
 > **Bridge note.** The monograph and the graph-conformal literature assume a
@@ -153,17 +156,12 @@ assert sorted(seen) == sorted(early)
 
 ## Rail 3 — Measurement: a measured verdict or it is not done
 
-Every recipe ends in a real number, measured by the cells that just ran and
-checked against a frozen golden: `contracts.assert_close(metric, observed)`
-reads the golden for the running scale (`goldens/<dataset>.<scale>.json`, or
-`goldens/<dataset>.json` for a dataset whose numbers do not depend on scale)
-and asserts `observed` within its tolerance, returning the number so a cell
-checks and displays at once.
-
-A golden is never typed in. It is what a run measured: with
-`JAMMI_COOKBOOK_FREEZE=1` set, `assert_close` records instead of checking, so
-re-freezing after a deliberate change is running the chapter once and reviewing
-the diff.
+Every recipe ends in a real number, measured by the cells that just ran, and in
+the claim that number backs: `claim(statement, holds, evidence)` prints the
+statement beside the run's own numbers, and raises, naming it, when it does not
+hold. A claim is a relation the capability guarantees — an ordering, a bound, an
+equality the engine defines — so it holds on any host, at either scale, on any
+GPU. A frozen number would only say what one machine measured once.
 
 The engine does the measuring too. Tier 01's same-subject retrieval number,
 here, is the engine's own `eval_embeddings`: it encodes each golden query with
@@ -174,11 +172,8 @@ golden = keystone.subject_golden(db, arxiv)
 report = db.eval_embeddings(
     source=arxiv.papers, embedding_table=embeddings, golden_source=golden, k=10
 )
-precision = contracts.assert_close(
-    "arxiv.tier01.precision_at_10", report["aggregate"]["precision_at_k"]
-)
-print(f"tier01 precision@10: {precision:.3f}  (frozen at "
-      f"{contracts.golden('arxiv.tier01.precision_at_10').value:.3f})")
+precision = report["aggregate"]["precision_at_k"]
+print(f"tier01 precision@10: {precision:.3f}")
 ```
 
 Each run is also persisted: `eval_per_query` reads back the run's per-query
@@ -190,10 +185,11 @@ per_query = db.eval_per_query(report["eval_run_id"])
 worst = min(per_query, key=lambda q: q["metrics"]["ndcg"])
 print(f"{len(per_query)} queries recorded; the weakest: {worst['query_id']} "
       f"(ndcg {worst['metrics']['ndcg']:.3f})")
+claim("the run is persisted query by query", len(per_query) == len(report["per_query"]))
 ```
 
-The measurement rail is the spine's honesty contract: a recipe whose number
-drifts from its golden **fails CI**. The closed eval loop (next chapter) runs
+The measurement rail is the spine's honesty contract: a recipe whose claim does
+not hold **fails CI**, which renders every chapter a change can move. The closed eval loop (next chapter) runs
 the whole spine under that contract in one pass.
 
 ```{python}

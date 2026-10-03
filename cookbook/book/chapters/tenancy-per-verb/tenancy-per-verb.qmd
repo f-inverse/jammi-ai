@@ -41,6 +41,7 @@ import pyarrow.parquet as pq
 from jammi.errors import BackendError, NotFound
 from jammi.testing import LiveServer
 from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 from jammi_cookbook.rails import tenant
 
 TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -136,8 +137,7 @@ print(f"the two transports agree on every cell: {local == served}")
 ```
 
 ```{python}
-# | echo: false
-assert local == served
+claim("the two transports agree on every cell", local == served)
 ```
 
 ### The hard zeros — B reaches none of A's resource
@@ -148,9 +148,9 @@ for verb, leaked in local["leaks"].items():
 ```
 
 ```{python}
-# | echo: false
-assert all(v == 0 for v in local["leaks"].values()), "a tenant-scoped verb leaked"
-assert local["a_own_rows"] == [1, 2]  # the zero is not vacuous: A reads its own rows
+claim("no tenant-scoped verb leaks A's resources to B", all(v == 0 for v in local["leaks"].values()),
+      f"{len(local['leaks'])} verbs")
+claim("and the zero is not vacuous: A reads its own rows", local["a_own_rows"] == [1, 2])
 ```
 
 The catalog reads filter each registry to the current tenant's rows and the
@@ -168,8 +168,10 @@ print(f"  A reads B's discriminator-less source whole: {local['caveat']} rows")
 ```
 
 ```{python}
-# | echo: false
-assert all(count > 0 for count in local["shared"].values()) and local["caveat"] == 3
+claim("what is global by design is visible to every tenant",
+      all(count > 0 for count in local["shared"].values()))
+claim("and a discriminator-less source is read whole by anyone who names it", local["caveat"] == 3,
+      f"{local['caveat']} rows")
 ```
 
 Three things are visible to every tenant, on purpose. The engine's built-in
@@ -191,9 +193,9 @@ for what, alive in local["survives"].items():
 ```
 
 ```{python}
-# | echo: false
-assert all(local["collisions"].values()) and local["b_drop_raised"]
-assert all(local["survives"].values())
+claim("a name collision never clobbers another tenant's resource",
+      all(local["collisions"].values()) and local["b_drop_raised"])
+claim("and every one of A's resources survives B's attempts", all(local["survives"].values()))
 ```
 
 A mutable table's name is unique across tenants, so B reusing A's name is
@@ -245,8 +247,9 @@ print(f"B naming A's table refused: {b_refused}; A's re-read after: {own_after} 
 ```
 
 ```{python}
-# | echo: false
-assert own > 0 and own_after == own and b_refused and a_global == b_global > 0
+claim("a tenant's result table resolves for its owner and is refused to another tenant",
+      own > 0 and b_refused and own_after == own)
+claim("and a table materialized with no tenant bound is visible to both", a_global == b_global > 0)
 ```
 
 ## Part B — the BYO-auth seam, from the consumer side

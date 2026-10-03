@@ -12,16 +12,17 @@ measured pass** from a fresh engine —
 
 > **construct → propagate → learn → predict & quantify → MEASURE**
 
-— every stage carrying a measured verdict, each checked against the golden the
-stage's own chapter froze. So this chapter is also the book's consistency check:
-the spine run end to end must reproduce what its tiers measured one at a time.
+— every stage carrying a measured verdict, each the claim the stage's own chapter
+makes. So this chapter is also the book's consistency check: run end to end, the
+spine must hold what its tiers showed one at a time.
 
 ```{python}
 import tempfile
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, datasets, keystone, scale
+from jammi_cookbook import datasets, keystone, scale, shift
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 ALPHA = 0.10
@@ -40,8 +41,11 @@ cites = db.sql(
     f"JOIN {arxiv.papers}.public.{arxiv.papers} a ON e.src = a.paper_id "
     f"JOIN {arxiv.papers}.public.{arxiv.papers} b ON e.dst = b.paper_id"
 ).column("same").to_pylist()
-cite_homophily = contracts.assert_close("arxiv.tier01.cite_homophily", sum(cites) / len(cites))
-print(f"citation-graph subject homophily: {cite_homophily:.3f}")
+cite_homophily = sum(cites) / len(cites)
+chance = keystone.subject_chance(db, arxiv)
+print(f"citation-graph subject homophily: {cite_homophily:.3f}   (chance {chance:.3f})")
+claim("citations link papers of one subject far more often than chance — the precondition",
+      cite_homophily > chance, f"{cite_homophily:.3f} against {chance:.3f}")
 ```
 
 ## Stages 2 and 3 — Propagate and Learn
@@ -61,9 +65,6 @@ compared = db.eval_compare(
     source=arxiv.papers, golden_source=golden, k=10,
 )
 raw, prop, ft = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
-contracts.assert_close("arxiv.tier01.precision_at_10", raw)
-contracts.assert_close("arxiv.tier02.precision_at_10", prop)
-contracts.assert_close("arxiv.tier03.declared_precision_at_10", ft)
 print(f"precision@10  raw {raw:.3f} → propagated {prop:.3f} → declared fine-tune {ft:.3f}")
 ```
 
@@ -85,7 +86,6 @@ intervals = db.conformalize_interval(
     cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=ALPHA
 )
 reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
-contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
 print(f"year interval coverage:       {reg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
 
 scores = keystone.subject_scores(db, arxiv, propagated)
@@ -94,29 +94,30 @@ sets = db.conformalize(
     alpha=ALPHA, score="aps",
 )
 marg_cov = float(np.mean([y in s for y, s in zip(scores.test_labels, sets)]))
-contracts.assert_close("arxiv.tier04.marginal_coverage", marg_cov)
 print(f"subject APS set coverage:     {marg_cov:.3f}   (nominal {1 - ALPHA:.2f})")
 ```
 
 ```{python}
-# | echo: false
+band = shift.binomial_band(ALPHA, len(sets))
+claim("the subject sets hold nominal coverage, to within three binomial standard errors",
+      abs(marg_cov - (1 - ALPHA)) < band, f"{marg_cov:.3f}, nominal {1 - ALPHA:.2f} ± {band:.3f}")
 if SCALE is scale.Scale.FULL:
-    assert raw < min(prop, ft)  # propagation and the declared fine-tune both lift precision
-    assert reg_cov < 1 - ALPHA - 0.1  # the year interval under-covers
-    # The subject set holds nominal, to within three binomial standard errors.
-    assert abs(marg_cov - (1 - ALPHA)) < 3 * np.sqrt(ALPHA * (1 - ALPHA) / len(sets))
+    claim("propagation and the declared fine-tune both lift precision@10", raw < min(prop, ft),
+          f"raw {raw:.3f}, propagated {prop:.3f}, fine-tuned {ft:.3f}")
+    claim("the year interval under-covers under the time split", reg_cov < 1 - ALPHA - 0.1,
+          f"coverage {reg_cov:.3f}")
 ```
 
 ## The loop, closed
 
-Every stage above ran live and matched the golden its own chapter froze. At
-`full` scale the spine reads: citation homophily ≈ 0.50 (the precondition);
+Every stage above ran live and held its own chapter's claims. At `full` scale
+the spine reads: citations link same-subject papers far above chance (the precondition);
 propagation lifts same-subject precision, and the declared-edge fine-tune lifts
 it by about as much, though propagation trains nothing. Under the time split the
 year interval under-covers — the finding the governed calibration cohort
 (tier 04) answers — while the subject set holds its coverage, the shift being
-orthogonal to its score. At `small` scale the same pass runs in seconds on a CPU and holds its
-own frozen numbers.
+orthogonal to its score. At `small` scale the same pass runs in seconds on a CPU, and every claim
+that holds at both scales holds there too.
 
 ```{python}
 db.close()

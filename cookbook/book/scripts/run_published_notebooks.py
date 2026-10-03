@@ -11,7 +11,7 @@ This runs the notebooks exactly as they were tagged, each in what a fresh
 runtime gives it: an empty working directory and a new virtual environment
 holding only the notebook kernel, with that environment's `bin` on `PATH` (where
 a pip-installed `jammi-server` lands). A notebook passes when every cell runs;
-its cells assert their own measurements against the frozen goldens.
+its cells check the claims the chapter makes on that run.
 
 Run against a checkout of the release tag:
 

@@ -122,6 +122,16 @@ def train_year_predictor(db, arxiv: Arxiv, scale: Scale, embeddings: str) -> str
     return job.output_model_id
 
 
+def subject_chance(db, arxiv: Arxiv) -> float:
+    """The chance that two papers drawn at random share a subject, ``Σ p_s²``
+    over the subject mix — the level a graph's subject homophily is read
+    against."""
+    mix = db.sql(
+        f"SELECT COUNT(*) AS n FROM {arxiv.papers}.public.{arxiv.papers} GROUP BY subject"
+    ).column("n").to_pylist()
+    return sum((n / sum(mix)) ** 2 for n in mix)
+
+
 def subject_golden(db, arxiv: Arxiv) -> str:
     """The same-subject retrieval golden: 200 papers asked by their titles, each
     relevant to every other paper of its subject — a target independent of any

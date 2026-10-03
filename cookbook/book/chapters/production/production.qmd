@@ -36,7 +36,8 @@ import jammi
 import pgserver
 import pyarrow as pa
 from jammi.testing import LiveServer
-from jammi_cookbook import contracts, fixtures
+from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 
 MODEL = fixtures.model("tiny_bert")
 CORPUS = fixtures.url("tiny_corpus.parquet")
@@ -108,11 +109,11 @@ for (key, score), (key_e, score_e) in zip(served, embedded):
 ```
 
 ```{python}
-# | echo: false
-assert server_broker == local_broker == "postgres"
-assert table in seen
-assert served == embedded
-contracts.assert_close("production.shared_catalog_rows", len(embedded))
+claim("both processes run on the shared Postgres catalog and broker",
+      server_broker == local_broker == "postgres")
+claim("the embedded engine sees the table the server made", table in seen)
+claim("and its search returns exactly the server's rows and scores", served == embedded,
+      f"{len(embedded)} rows")
 ```
 
 The embedded engine did not copy anything and was not told about the table: it read
@@ -158,12 +159,11 @@ print(f"replayed from the backing table:     {replay.num_rows} events")
 ```
 
 ```{python}
-# | echo: false
-assert offsets == [0, 1, 2]
-assert not subscriber.is_alive()
-assert live.select(["op", "key"]).equals(published)
-assert replay.select(["op", "key"]).equals(published)
-contracts.assert_close("production.events_received", live.num_rows)
+claim("each publish takes the next offset", offsets == [0, 1, 2])
+claim("the subscriber in the other process receives every event, in order, and returns",
+      not subscriber.is_alive() and live.select(["op", "key"]).equals(published),
+      f"{live.num_rows} events")
+claim("and a replay reads them back as published", replay.select(["op", "key"]).equals(published))
 ```
 
 The live subscriber and the replay agree because they are the same thing: `NOTIFY`

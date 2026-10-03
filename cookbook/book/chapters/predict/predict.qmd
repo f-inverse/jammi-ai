@@ -32,15 +32,16 @@ prediction** with an honest coverage guarantee. It carries two results:
 
 Both are findings at `full` scale (4,000 papers, `gte-modernbert-base`). At `small` scale
 every cell below runs the same computation on the 400-paper core with a
-random-weight encoder: the numbers check the pipeline and are frozen as
-regression goldens, and the findings are asserted at `full` only.
+random-weight encoder: the numbers show the pipeline at work, and the findings
+are claimed at `full` only.
 
 ```{python}
 import tempfile
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, datasets, keystone, scale, shift
+from jammi_cookbook import datasets, keystone, scale, shift
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 ALPHA = 0.10  # ask for 90% coverage
@@ -92,11 +93,8 @@ print(f"mean predictive std:     {pred_std:.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.reg_cal_mean", float(cal_mean.mean()), tol=1.0)
-contracts.assert_close("arxiv.tier04.reg_test_mean", float(test_mean.mean()), tol=1.0)
-contracts.assert_close("arxiv.tier04.reg_pred_std", pred_std, tol=0.5)
-assert pred_std > 0.05  # standardized in z-space: the Gaussian head did not collapse
+claim("the Gaussian head does not collapse: its predictions keep their spread",
+      pred_std > 0.05, f"standard deviation {pred_std:.3f} in z-space")
 ```
 
 The interval comes from the engine: calibrate the absolute residual
@@ -115,11 +113,9 @@ print(f"mean interval width: {reg_width:.2f} years")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov, tol=0.04)
-contracts.assert_close("arxiv.tier04.reg_interval_width", reg_width, tol=0.6)
 if SCALE is scale.Scale.FULL:
-    assert reg_cov < 1 - ALPHA  # the time split breaks exchangeability: under-coverage
+    claim("the time split breaks exchangeability, and the interval under-covers",
+          reg_cov < 1 - ALPHA, f"coverage {reg_cov:.3f} against a nominal {1 - ALPHA:.2f}")
 ```
 
 At `full` scale the interval **under-covers**: realised coverage falls below
@@ -178,16 +174,13 @@ print(f"corr(|residual|, test-likeness): {reg_corr:+.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.reg_cal_resid_mag", float(cal_resid.mean()), tol=0.25)
-contracts.assert_close("arxiv.tier04.reg_test_resid_mag", float(test_resid.mean()), tol=0.25)
-contracts.assert_close("arxiv.tier04.reg_weighted_coverage", wt_reg_cov, tol=0.04)
-contracts.assert_close("arxiv.tier04.reg_resid_corr", reg_corr, tol=0.2)
 if SCALE is scale.Scale.FULL:
-    # Residual size tracks test-era likeness, so the reweight helps, and the
-    # test era's larger residuals keep it well short of nominal.
-    assert reg_corr > 0 and reg_cov < wt_reg_cov < 1 - ALPHA
-    assert test_resid.mean() > 1.25 * cal_resid.mean()
+    claim("residual size tracks test-era likeness, so the reweighting helps",
+          reg_corr > 0 and reg_cov < wt_reg_cov,
+          f"correlation {reg_corr:+.3f}; coverage {reg_cov:.3f} → {wt_reg_cov:.3f}")
+    claim("and the test era's larger residuals keep it short of nominal",
+          wt_reg_cov < 1 - ALPHA and test_resid.mean() > 1.25 * cal_resid.mean(),
+          f"mean residual {test_resid.mean():.3f} against {cal_resid.mean():.3f}")
 ```
 
 ### The provenance rail
@@ -213,9 +206,10 @@ for how, served in (("similarity", by_similarity), ("citations", by_citation)):
 ```
 
 ```{python}
-# | echo: false
-assert by_similarity["source"] == "ann" and by_citation["source"] == "edges"
-assert all(ref in year for ref in by_citation["context_ref"])
+claim("each context reports how it was assembled",
+      by_similarity["source"] == "ann" and by_citation["source"] == "edges")
+claim("and the citation context holds only papers the walk reached",
+      all(ref in year for ref in by_citation["context_ref"]))
 ```
 
 ## Part B — subject classification under the same shift
@@ -239,8 +233,9 @@ print(f"{len(scores.classes)} classes; test-era accuracy: {accuracy:.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.classifier_accuracy", accuracy, tol=0.04)
+claim("the nearest-neighbour vote predicts the subject well above chance",
+      accuracy > 2 / len(scores.classes),
+      f"accuracy {accuracy:.3f} over {len(scores.classes)} classes")
 ```
 
 ### Marginal conformal holds under this shift
@@ -260,12 +255,9 @@ print(f"engine APS marginal coverage: {marg_cov:.3f}   (mean set size {marg_size
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.marginal_coverage", marg_cov, tol=0.03)
-contracts.assert_close("arxiv.tier04.marginal_set_size", marg_size, tol=0.6)
-if SCALE is scale.Scale.FULL:
-    # Within three binomial standard errors of nominal on the test era.
-    assert abs(marg_cov - (1 - ALPHA)) < 3 * np.sqrt(ALPHA * (1 - ALPHA) / len(sets))
+band = shift.binomial_band(ALPHA, len(sets))
+claim("marginal conformal coverage lands within three binomial standard errors of nominal",
+      abs(marg_cov - (1 - ALPHA)) < band, f"coverage {marg_cov:.3f}, nominal {1 - ALPHA:.2f} ± {band:.3f}")
 ```
 
 At `full` scale realised coverage sits **at** the nominal 0.90, to within
@@ -302,13 +294,11 @@ print(f"local marginal coverage          {local_cov:.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.local_marginal_coverage", local_cov, tol=0.03)
 max_delta = max(abs(d) for d in deltas.values())
-contracts.assert_close("arxiv.tier04.weighting_max_abs_delta", max_delta, tol=0.01)
+claim("every weighting scheme moves coverage by under two points", max_delta < 0.02,
+      f"largest move {max_delta:.3f}")
 if SCALE is scale.Scale.FULL:
-    assert max_delta < 0.02  # every scheme moves coverage by under two points
-    assert min(deltas.values()) < 0  # and not systematically in one direction
+    claim("and not systematically in one direction", min(deltas.values()) < 0)
 ```
 
 At `full` scale the density ratio estimated over three neighbourhood sizes moves
@@ -328,10 +318,9 @@ print(f"corr(nonconformity, test-likeness): {corr:+.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier04.score_shift_corr", corr, tol=0.12)
 if SCALE is scale.Scale.FULL:
-    assert abs(corr) < 0.25
+    claim("the nonconformity score barely tracks test-era likeness", abs(corr) < 0.25,
+          f"correlation {corr:+.3f}")
 ```
 
 At `full` scale the correlation is near zero: the time-split shift lies almost

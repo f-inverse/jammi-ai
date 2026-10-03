@@ -34,6 +34,7 @@ import jammi
 from jammi.errors import ModelNotFound, ModelReferenced
 from jammi.testing import LiveServer
 from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 
 BASE = fixtures.model("tiny_bert")
 PAIRS = str(fixtures.path("tiny_pairs.csv"))
@@ -115,13 +116,14 @@ for key in local:
 ```
 
 ```{python}
-# | echo: false
-assert local == served
-assert local["delete_referenced"] == "ModelReferenced"
-assert local["delete_absent"] == "ModelNotFound"
-assert local["delete_absent_if_exists"] == "deleted"
-assert local["jobs_left"] == 0 and local["delete_unreferenced"] == "deleted"
-assert local["described_after"] is None
+claim("the catalog verbs answer identically in process and over the wire", local == served)
+claim("deleting a model a job still references is refused",
+      local["delete_referenced"] == "ModelReferenced")
+claim("deleting an absent model is a typed not-found, and if_exists makes it a no-op",
+      local["delete_absent"] == "ModelNotFound" and local["delete_absent_if_exists"] == "deleted")
+claim("once its jobs are pruned the model deletes, and the catalog no longer describes it",
+      local["jobs_left"] == 0 and local["delete_unreferenced"] == "deleted"
+      and local["described_after"] is None)
 ```
 
 ## Reading the outcomes

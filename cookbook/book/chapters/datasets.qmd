@@ -28,8 +28,8 @@ Every chapter runs its capability live. What it runs over is a **scale**:
   `gte-modernbert-base`, a ModernBERT trained for embeddings), on a GPU: the
   book's findings at the size they are about.
 
-The chapter code is the same at both; the data, the encoders and the frozen
-goldens a run is checked against differ. Choose with the environment variable
+The chapter code is the same at both; only the data and the encoders differ.
+Choose with the environment variable
 `JAMMI_COOKBOOK_SCALE` (`small` when unset) before the chapter starts:
 
 ```{python}
@@ -51,7 +51,8 @@ dataset at two sizes, the smaller keeping the larger's character.
 import tempfile
 
 import jammi
-from jammi_cookbook import contracts, datasets
+from jammi_cookbook import datasets, keystone
+from jammi_cookbook.claims import claim
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 air = datasets.air_routes(db)
@@ -82,11 +83,11 @@ print("ATL:", atl)
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("datasets.air_airports", count(air.airports))
-contracts.assert_close("datasets.air_routes", count(air.routes))
-contracts.assert_close("datasets.air_contains", count(air.contains))
-assert atl["continent"] == "NA"
+claim("every airport sits under one continent and one country edge",
+      count(air.contains) == 2 * count(air.airports),
+      f"{count(air.contains)} edges for {count(air.airports)} airports")
+claim("so the hierarchy gives every airport its continent", atl["continent"] == "NA",
+      f"ATL in {atl['continent']}")
 ```
 
 ## ogbn-arxiv
@@ -113,6 +114,11 @@ subject, $\sum_s p_s^2$. That correlation, together with the time split, is
 what later breaks conformal exchangeability ([the prediction chapter](predict/predict.qmd)).
 
 ```{python}
+# | echo: false
+keystone.show(keystone.subject_chance)
+```
+
+```{python}
 edges = db.sql(
     f"SELECT a.subject AS sa, b.subject AS sb "
     f"FROM {arxiv.cites}.public.{arxiv.cites} e "
@@ -120,19 +126,15 @@ edges = db.sql(
     f"JOIN {arxiv.papers}.public.{arxiv.papers} b ON e.dst = b.paper_id"
 ).to_pylist()
 homophily = sum(r["sa"] == r["sb"] for r in edges) / len(edges)
-mix = db.sql(
-    f"SELECT COUNT(*) AS c FROM {arxiv.papers}.public.{arxiv.papers} GROUP BY subject"
-).column("c").to_pylist()
-chance = sum((c / sum(mix)) ** 2 for c in mix)
+chance = keystone.subject_chance(db, arxiv)
 print(f"citation-edge subject homophily: {homophily:.3f}  (chance for this subject mix: {chance:.3f})")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("datasets.arxiv_papers", count(arxiv.papers))
-contracts.assert_close("datasets.arxiv_cites", count(arxiv.cites))
-contracts.assert_close("datasets.arxiv_homophily", homophily, tol=1e-9)
-assert homophily > chance
+claim("the time split partitions the papers: every paper falls in exactly one era",
+      sum(len(ids) for ids in arxiv.split.values()) == count(arxiv.papers))
+claim("citations connect papers of one subject far more often than chance",
+      homophily > chance, f"{homophily:.3f} against {chance:.3f}")
 ```
 
 An embedded engine holds its catalog until `close()` returns, so a chapter

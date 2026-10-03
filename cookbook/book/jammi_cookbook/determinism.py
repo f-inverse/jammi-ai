@@ -2,10 +2,9 @@
 
 Importing :mod:`jammi_cookbook` pins the process into the reproducible regime the
 whole book depends on: single-threaded BLAS/OMP, tokenizer parallelism off, a
-fixed dtype, and a pinned seed. Metrics are asserted to tolerances, not
-bit-equality: BLAS matmul order varies across machines, so measurements are
-compared against frozen goldens within a tolerance (see
-:mod:`jammi_cookbook.contracts`).
+fixed dtype, and a pinned seed. A chapter's claims are relations, never
+bit-equalities of a measurement: BLAS matmul order varies across machines, so a
+claim states what holds on any of them (see :mod:`jammi_cookbook.claims`).
 """
 
 from __future__ import annotations
@@ -34,11 +33,11 @@ def _apply_env() -> None:
         "RAYON_NUM_THREADS": "1",
         "TOKENIZERS_PARALLELISM": "false",
     }
-    # The small scale runs on the CPU (jammi_cookbook.scale), so its goldens hold
-    # on any host: an encoder on a GPU agrees with the CPU only within the
-    # engine's device-parity tolerance, and a recall over sign-quantized vectors
-    # turns that into a different query. Every session and spawned server reads
-    # the device from this variable.
+    # The small scale runs on the CPU (jammi_cookbook.scale), so it measures the
+    # same numbers on any host: an encoder on a GPU agrees with the CPU only
+    # within the engine's device-parity tolerance, and a recall over
+    # sign-quantized vectors turns that into a different query. Every session
+    # and spawned server reads the device from this variable.
     if _scale.current() is _scale.Scale.SMALL:
         pinned["JAMMI_GPU__DEVICE"] = "-1"
     # setdefault, not overwrite: an operator who has deliberately set a value

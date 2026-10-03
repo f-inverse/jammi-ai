@@ -37,7 +37,8 @@ import tempfile
 
 import jammi
 import pyarrow as pa
-from jammi_cookbook import contracts, datasets, scale
+from jammi_cookbook import datasets, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -111,8 +112,8 @@ print(f"drift against the pre-{TEST_ERA} graph: {drift(f'src.year < {TEST_ERA}')
 ```
 
 ```{python}
-# | echo: false
-assert drift(f"src.year < {TEST_ERA}") == 0
+claim(f"the store equals its source over the pre-{TEST_ERA} graph",
+      drift(f"src.year < {TEST_ERA}") == 0, f"{populated} papers")
 ```
 
 ## New citations arrive — `REPLACE INTO`
@@ -132,8 +133,8 @@ print(f"upserted {upserted} papers; drift against the full graph: {drift('TRUE')
 ```
 
 ```{python}
-# | echo: false
-assert drift("TRUE") == 0
+claim("after the upsert the store equals the full graph", drift("TRUE") == 0,
+      f"{upserted} papers upserted")
 ```
 
 ## A paper is withdrawn — `UPDATE` and `DELETE`
@@ -164,11 +165,8 @@ print(f"drift against the surviving graph: {drift(survivors)}")
 ```
 
 ```{python}
-# | echo: false
-assert drift(survivors) == 0
-contracts.assert_close("feature_store.populated_rows", populated)
-contracts.assert_close("feature_store.upserted_rows", upserted)
-contracts.assert_close("feature_store.withdrawn_citations", decremented)
+claim("after the withdrawal the store equals the surviving graph", drift(survivors) == 0,
+      f"{decremented} papers lost a citation")
 ```
 
 ## Federate the feature into a query
@@ -190,10 +188,8 @@ print(f"\n{len(agg)} subjects · total in-degree {total} · surviving citations 
 ```
 
 ```{python}
-# | echo: false
-assert total == edges  # every surviving citation is counted exactly once
-contracts.assert_close("feature_store.total_in_degree", total)
-contracts.assert_close("feature_store.top_subject_total", agg[0]["total"])
+claim("joined into the query, the feature counts every surviving citation exactly once",
+      total == edges, f"{total} = {edges}")
 ```
 
 The subject totals sum back to the surviving citation count: each citation

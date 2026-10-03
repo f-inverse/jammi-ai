@@ -38,6 +38,7 @@ import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
 from jammi_cookbook import datasets, encoders, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 MODEL = encoders.text(SCALE)
@@ -83,9 +84,11 @@ for what, reused in outcomes.items():
 ```
 
 ```{python}
-# | echo: false
-assert outcomes == {"the same neighbour graph": True, "a graph with k = 5": False,
-                    "the same propagation": True, "the same embeddings": False}
+claim("an identical request over result tables is reused, and a changed parameter computes anew",
+      outcomes["the same neighbour graph"] and outcomes["the same propagation"]
+      and not outcomes["a graph with k = 5"])
+claim("embeddings over a file source are never reused: a file has no version to pin",
+      not outcomes["the same embeddings"])
 ```
 
 Each request names the embedding table it reads: the propagation above published a
@@ -113,10 +116,10 @@ print(f"against another definition:      {changed['staleness']}  "
 ```
 
 ```{python}
-# | echo: false
-assert fresh["staleness"] == "fresh"
-assert changed["staleness"] == "stale"
-assert [r["reason"] for r in changed["reasons"]] == ["definition_changed"]
+claim("a table is fresh against its own definition", fresh["staleness"] == "fresh")
+claim("and stale against a changed one, which it names",
+      changed["staleness"] == "stale"
+      and [r["reason"] for r in changed["reasons"]] == ["definition_changed"])
 ```
 
 ## A changed input — sense the drift, then recompute
@@ -143,10 +146,10 @@ print(f"derived from the embeddings: "
 ```
 
 ```{python}
-# | echo: false
-assert report["outcome"] == "published" and report["inferred_rows"] == 1
-assert drift["staleness"] == "stale"
-assert [r["reason"] for r in drift["reasons"]] == ["input_advanced"]
+claim("the refresh re-embeds only the changed row",
+      report["outcome"] == "published" and report["inferred_rows"] == 1)
+claim("and the graph built on the old version senses its input advanced",
+      drift["staleness"] == "stale" and [r["reason"] for r in drift["reasons"]] == ["input_advanced"])
 ```
 
 `derives_from` names what is built on a table, one hop at a time. The repair is
@@ -165,10 +168,11 @@ print(f"the recomputed graph: "
 ```
 
 ```{python}
-# | echo: false
-assert len(repair["recomputed"]) == 2
-assert all(step["outcome"]["outcome"] == "computed" for step in repair["recomputed"])
-assert db.staleness(new_graph, db.describe_table(new_graph)["definition_hash"])["staleness"] == "fresh"
+claim("one recompute repairs the graph and sweeps the propagation built on it",
+      len(repair["recomputed"]) == 2
+      and all(step["outcome"]["outcome"] == "computed" for step in repair["recomputed"]))
+claim("and the repaired graph is fresh",
+      db.staleness(new_graph, db.describe_table(new_graph)["definition_hash"])["staleness"] == "fresh")
 ```
 
 A recompute over inputs that have *not* moved produces the same artifact, and
@@ -181,9 +185,10 @@ print(f"recompute over unmoved inputs: "
 ```
 
 ```{python}
-# | echo: false
-assert db.verify_materialization(
-    again, expected_definition=db.describe_table(new_graph)["definition_hash"])["verdict"] == "match"
+claim("a recompute over unmoved inputs reproduces the artifact its definition names",
+      db.verify_materialization(
+          again, expected_definition=db.describe_table(new_graph)["definition_hash"])["verdict"]
+      == "match")
 ```
 
 ## The job queue underneath
@@ -202,8 +207,8 @@ db.close()
 ```
 
 ```{python}
-# | echo: false
-assert {"embedding", "neighbor_graph", "propagate"} <= set(kinds)
+claim("every producer above ran as a job on the one queue",
+      {"embedding", "neighbor_graph", "propagate"} <= set(kinds))
 ```
 
 ## The boundary — mechanism, not the loop

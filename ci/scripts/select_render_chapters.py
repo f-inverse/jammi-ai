@@ -2,8 +2,8 @@
 """Select which pages of cookbook/book a diff must render (the FORWARD half
 of the engine<->cookbook loop).
 
-Every chapter runs its capability live and checks what it measured against a
-frozen golden, so the render IS the check. This script returns the pages a
+Every chapter runs its capability live and checks the claims it makes on that
+run, so the render IS the check. This script returns the pages a
 GIVEN diff could move, which `ci.yml`'s book jobs render at `small` scale on
 CPU, spread over parallel slices (`--slice K/N`). A page is the front page
 (`index.qmd`) or a chapter (`chapters/**/*.qmd`).
@@ -28,9 +28,7 @@ A page is selected when:
         covers the Python packages the book installs (`PYTHON_PACKAGES`);
       - the workspace's build configuration, or the CI image the render
         runs in, which carries quarto and python (`WORKSPACE_INPUTS`);
-      - the book's own library, packaging or fixtures (`BOOK_INPUT_PREFIXES`);
-  * the diff touches a golden file, `goldens/<dataset>[.<scale>].json` --
-    the LIVE chapters that check a `<dataset>.` metric.
+      - the book's own library, packaging or fixtures (`BOOK_INPUT_PREFIXES`).
 
 A selection that holds every LIVE chapter is the WHOLE BOOK: every page,
 the STATIC ones included, so the run that renders it can assemble the book a
@@ -63,7 +61,7 @@ import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -88,15 +86,13 @@ WORKSPACE_INPUTS = (
     ".docker/",
 )
 # What every chapter reads besides the engine: the book's library, its
-# packaging, and the committed fixtures. The goldens live under the library
-# but select narrowly, by dataset (GOLDEN_RE).
+# packaging, and the committed fixtures.
 BOOK_INPUT_PREFIXES = (
     "cookbook/book/jammi_cookbook/",
     "cookbook/book/pyproject.toml",
     "cookbook/fixtures/",
     "tests/fixtures/",
 )
-GOLDEN_RE = re.compile(r"^cookbook/book/jammi_cookbook/goldens/([a-zA-Z0-9_]+)(?:\.[a-z]+)?\.json$")
 
 # Executed-cell fence: quarto's python cell opener is exactly ```{python}
 # (optionally with trailing whitespace); an option such as `#| eval: false`
@@ -108,15 +104,11 @@ _CELL_EVAL_FALSE_RE = re.compile(r"^#\|\s*eval:\s*false\s*$")
 # option or comment, or a blank.
 _INERT_LINE_RE = re.compile(r"^\s*(?:$|#|import\s|from\s+\S+\s+import\s)")
 
-# The goldens a chapter checks: `assert_close("<dataset>.…")` / `golden(…)`.
-GOLDEN_CHECK_RE = re.compile(r"\b(?:golden|assert_close)\(\s*f?[\"']([a-zA-Z0-9_]+)\.")
-
 
 @dataclass(frozen=True)
 class Classification:
     path: Path
     bucket: str  # LIVE | STATIC
-    datasets: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def live(self) -> bool:
@@ -143,10 +135,9 @@ def _executed_python_cells(text: str) -> list[str]:
 
 def classify_chapter(path: Path) -> Classification:
     executed = "\n".join(_executed_python_cells(path.read_text()))
-    datasets = frozenset(m.group(1) for m in GOLDEN_CHECK_RE.finditer(executed))
     if all(_INERT_LINE_RE.match(line) for line in executed.splitlines()):
-        return Classification(path, "STATIC", datasets)
-    return Classification(path, "LIVE", datasets)
+        return Classification(path, "STATIC")
+    return Classification(path, "LIVE")
 
 
 def book_pages(book_dir: Path = BOOK_DIR) -> list[Path]:
@@ -220,11 +211,8 @@ def select(
     changed = {p.strip().replace("\\", "/") for p in changed_paths if p.strip()}
     classifications = classify_all(book_dir)
 
-    golden_datasets = {m.group(1) for p in changed if (m := GOLDEN_RE.match(p))}
     every_live = any(
-        _is_build_input(p, package_dirs)
-        or (p.startswith(BOOK_INPUT_PREFIXES) and not GOLDEN_RE.match(p))
-        for p in changed
+        _is_build_input(p, package_dirs) or p.startswith(BOOK_INPUT_PREFIXES) for p in changed
     )
 
     def rel(c: Classification) -> str:
@@ -233,7 +221,7 @@ def select(
     chosen = [
         c
         for c in classifications
-        if rel(c) in changed or (c.live and (every_live or c.datasets & golden_datasets))
+        if rel(c) in changed or (c.live and every_live)
     ]
     whole_book = all(c in chosen for c in classifications if c.live)
     pages = [c.path for c in (classifications if whole_book else chosen)]
@@ -342,16 +330,15 @@ def _self_test() -> int:
                                "crates/jammi-wire", "packaging/native"],
               str(package_dirs))
 
-        # A chapter that opens an engine and checks a golden is LIVE, and
-        # names the dataset it checks.
+        # A chapter that opens an engine and checks a claim is LIVE.
         _write(chapters / "embed" / "embed.qmd", _chapter(
-            "import jammi\nfrom jammi_cookbook import contracts",
+            "import jammi\nfrom jammi_cookbook.claims import claim",
             'db = jammi.connect(f"file://{tmp}")\n'
-            'contracts.assert_close("widget.recall", db.sql("SELECT 1").num_rows)',
+            'claim("one row", db.sql("SELECT 1").num_rows == 1)',
         ))
-        # A LIVE chapter that checks another dataset's goldens.
+        # Another LIVE chapter.
         _write(chapters / "other" / "other.qmd", _chapter(
-            'db = jammi.connect(f"file://{tmp}")\ncontracts.assert_close("gadget.n", 1)',
+            'db = jammi.connect(f"file://{tmp}")\nclaim("connected", db is not None)',
         ))
         # A chapter that talks to a server it starts is LIVE like any other.
         _write(chapters / "served" / "served.qmd", _chapter(
@@ -372,8 +359,6 @@ def _self_test() -> int:
         buckets = {c.path.parent.name: c for c in classify_all(book)}
         check("engine-opening-chapter-is-live", buckets["embed"].bucket == "LIVE",
               buckets["embed"].bucket)
-        check("golden-datasets-are-extracted", buckets["embed"].datasets == {"widget"},
-              str(buckets["embed"].datasets))
         check("server-starting-chapter-is-live", buckets["served"].bucket == "LIVE",
               buckets["served"].bucket)
         check("imports-and-prose-are-static", buckets["prose"].bucket == "STATIC",
@@ -422,13 +407,6 @@ def _self_test() -> int:
             sel = selection(inert)
             check(f"{inert}-selects-nothing", sel.pages == [] and not sel.whole_book,
                   f"{sel.pages} whole_book={sel.whole_book}")
-
-        sel = selection("cookbook/book/jammi_cookbook/goldens/widget.small.json")
-        check("a-golden-diff-selects-its-datasets-chapters",
-              {p.parent.name for p in sel.pages} == {"embed"} and not sel.whole_book,
-              f"{sel.pages} whole_book={sel.whole_book}")
-        sel = selected("cookbook/book/jammi_cookbook/goldens/gadget.json")
-        check("a-scale-free-golden-diff-selects-its-datasets-chapters", sel == {"other"}, str(sel))
 
         sel = selected("cookbook/book/chapters/prose/prose.qmd")
         check("a-self-touched-static-chapter-is-selected", sel == {"prose"}, str(sel))
@@ -495,8 +473,7 @@ def _table_lines(classifications: list[Classification]) -> list[str]:
     lines = []
     for c in classifications:
         rel = c.path.relative_to(REPO_ROOT).as_posix()
-        ds = ",".join(sorted(c.datasets)) if c.datasets else "-"
-        lines.append(f"{c.bucket:8s} {ds:30s} {rel}")
+        lines.append(f"{c.bucket:8s} {rel}")
     return lines
 
 

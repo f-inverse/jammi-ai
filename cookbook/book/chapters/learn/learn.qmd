@@ -33,7 +33,8 @@ import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, datasets, keystone, scale
+from jammi_cookbook import datasets, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -109,13 +110,10 @@ for arm, entry in zip(arms, compared["per_table"]):
 ```
 
 ```{python}
-# | echo: false
-for arm in arms:
-    contracts.assert_close(f"arxiv.tier03.{arm}_precision_at_10", precision[arm], tol=0.02)
 if SCALE is scale.Scale.FULL:
-    # The finding, at the scale it is about: random hurts, a self-similarity
-    # bootstrap helps a little, the declared graph helps most.
-    assert gain["random"] < 0 < gain["similarity"] < gain["declared"]
+    claim("random walks hurt, a self-similarity bootstrap helps a little, the declared graph most",
+          gain["random"] < 0 < gain["similarity"] < gain["declared"],
+          ", ".join(f"{arm} {gain[arm]:+.3f}" for arm in ("random", "similarity", "declared")))
 ```
 
 At `full` scale the ordering is **random (harmful) < base < similarity (real,

@@ -45,7 +45,8 @@ import jammi
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, encoders, fixtures, scale
+from jammi_cookbook import encoders, fixtures, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 IMAGE_MODEL = encoders.image(SCALE)
@@ -139,11 +140,10 @@ for tower, spec in TOWERS.items():
 ```
 
 ```{python}
-# | echo: false
-for tower in TOWERS:
-    assert control[tower] == 0.0, (tower, control[tower])
-    assert change[tower] > 0.0, tower
-    contracts.assert_close(f"media_tower.{tower}.change_max_abs_diff", change[tower], tol=1e-4)
+claim("the same checkpoint serves the same input bit-identically",
+      all(control[tower] == 0.0 for tower in TOWERS))
+claim("and each tower's adapter moves its embedding", all(change[tower] > 0.0 for tower in TOWERS),
+      ", ".join(f"{tower} {change[tower]:.2e}" for tower in TOWERS))
 ```
 
 The control is exactly zero: the same checkpoint serves the same input
@@ -166,8 +166,8 @@ for tower, diff in round_trip.items():
 ```
 
 ```{python}
-# | echo: false
-assert all(diff == 0.0 for diff in round_trip.values()), round_trip
+claim("reloaded by a fresh engine from the catalog, every adapted model serves bit-identically",
+      all(diff == 0.0 for diff in round_trip.values()))
 ```
 
 ## 4 — adapting one tower leaves the other alone
@@ -187,8 +187,7 @@ for label, diff in selectivity.items():
 ```
 
 ```{python}
-# | echo: false
-assert all(diff == 0.0 for diff in selectivity.values()), selectivity
+claim("adapting one tower leaves the other bit-identical", all(diff == 0.0 for diff in selectivity.values()))
 ```
 
 Bit-identical, not merely close: the untouched tower is served exactly as the base
@@ -230,12 +229,12 @@ db.close()
 ```
 
 ```{python}
-# | echo: false
 for name, rows in contract.items():
     (good, _), (null, null_error), (corrupt, corrupt_error) = rows
-    assert (good, null, corrupt) == ("ok", "error", "error"), (name, rows)
-    assert "null" in null_error.lower(), (name, null_error)
-    assert "row 2" in corrupt_error, (name, corrupt_error)
+    claim(f"{name}: the valid row is served, the null and the corrupt rows refused",
+          (good, null, corrupt) == ("ok", "error", "error"))
+    claim(f"{name}: each refusal names its row — the null as null, the corrupt by position",
+          "null" in null_error.lower() and "row 2" in corrupt_error)
 ```
 
 The valid row is served in every arm; the null row names itself as null; the

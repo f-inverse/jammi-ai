@@ -13,8 +13,8 @@ import jammi_cookbook
 · **Background:** retrieval and inference *evaluation as an engine verb* —
 precision\@k / recall\@k / MRR / nDCG, accuracy / F1, entity-span
 precision/recall — and the evidence-provenance channel as a typed, append-only,
-tenant-scoped registry [@kleppmann2017ddia] · **Checked:** measurement (every
-aggregate against its golden) + parity (the remote report equals the embedded
+tenant-scoped registry [@kleppmann2017ddia] · **Checked:** measurement (the
+reports' own identities) + parity (the remote report equals the embedded
 one, value for value) + tenancy (channel isolation, measured).
 
 An evaluation run in-process is one call on the embedded engine. The same verbs are
@@ -29,7 +29,8 @@ import uuid
 
 import jammi
 from jammi.testing import LiveServer
-from jammi_cookbook import contracts, datasets, fixtures, keystone, scale
+from jammi_cookbook import datasets, fixtures, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 TENANTS = (str(uuid.uuid4()), str(uuid.uuid4()))
@@ -169,13 +170,14 @@ print(f"ner:            precision {ner['precision']:.3f}  recall {ner['recall']:
 ```
 
 ```{python}
-# | echo: false
-for metric in ("precision_at_k", "recall_at_k", "mrr", "ndcg"):
-    contracts.assert_close(f"eval.retrieval.{metric}", agg[metric], tol=0.01)
-contracts.assert_close("eval.compare.precision_delta", delta["absolute"], tol=0.01)
-contracts.assert_close("eval.classification.accuracy", cls["accuracy"])
-contracts.assert_close("eval.ner.f1", ner["f1"])
-assert len(local["per_query"]) == len(local["retrieval"]["per_query"])
+baseline = local["compared"]["per_table"][0]["embedding_eval"]["aggregate"]["precision_at_k"]
+propagated = treated["embedding_eval"]["aggregate"]["precision_at_k"]
+claim("the report is persisted one row per query",
+      len(local["per_query"]) == len(local["retrieval"]["per_query"]))
+claim("the comparison's delta is the propagated table's precision@10 less the raw table's",
+      abs(delta["absolute"] - (propagated - baseline)) < 1e-9,
+      f"{propagated:.3f} − {baseline:.3f}")
+claim("propagation raises precision@10", delta["absolute"] > 0, f"{delta['absolute']:+.3f}")
 ```
 
 ## The same report from either transport
@@ -219,9 +221,9 @@ for verb in local:
 ```
 
 ```{python}
-# | echo: false
-for verb in local:
-    assert not differences(canonical(local[verb]), canonical(served[verb])), verb
+claim("the server's report equals the in-process one, verb by verb",
+      all(not differences(canonical(local[verb]), canonical(served[verb])) for verb in local),
+      ", ".join(local))
 ```
 
 ## Provenance channels — typed, append-only, tenant-scoped
@@ -246,10 +248,12 @@ print(f"unbound listing: {sorted(c['channel_id'] for c in channels['unbound'])}"
 ```
 
 ```{python}
-# | echo: false
-assert [c["name"] for c in annotated["columns"]] == ["label", "confidence", "rank"]
-assert not leak and a_scored["columns"] != b_scored["columns"]
-assert {c["channel_id"] for c in channels["unbound"]} == {"vector", "inference", "bm25"}
+claim("a channel's columns are appended to, never changed",
+      [c["name"] for c in annotated["columns"]] == ["label", "confidence", "rank"])
+claim("tenant B sees none of A's channels and registers its own scored_by",
+      not leak and a_scored["columns"] != b_scored["columns"])
+claim("a session bound to no tenant sees only the engine's own channels",
+      {c["channel_id"] for c in channels["unbound"]} == {"vector", "inference", "bm25"})
 ```
 
 Tenant B cannot see tenant A's channels, and registers its own `scored_by` —

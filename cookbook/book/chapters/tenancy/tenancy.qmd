@@ -48,7 +48,8 @@ import tempfile
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, datasets, encoders, scale
+from jammi_cookbook import datasets, encoders, scale
+from jammi_cookbook.claims import claim
 from jammi_cookbook.rails import assert_listing_isolated, assert_rows_isolated, tenant
 
 SCALE = scale.current()
@@ -154,9 +155,10 @@ This is the claim that is easy to overstate and that this chapter must not re-br
 (Property 2), not source separation.
 
 ```{python}
-# | echo: false
-assert listing_leak == 0 and discriminator_leak == 0  # the two hard zeros
-contracts.assert_close("tenancy_b.caveat_visible", caveat_visible)
+claim("a tenant's listing shows no other tenant's source", listing_leak == 0)
+claim("the discriminator scopes the rows: none of B's reach A", discriminator_leak == 0)
+claim("a source with no discriminator is globally readable: A reads every one of B's rows",
+      caveat_visible == len(b_papers), f"{caveat_visible} of {len(b_papers)}")
 ```
 
 ## Property 4 — the same recipe, scoped per tenant
@@ -196,10 +198,11 @@ print(f"scopes tile the corpus: {a_visible} + {b_visible} = {a_visible + b_visib
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("tenancy_b.parity_a_precision_at_10", a_precision, tol=0.03)
-contracts.assert_close("tenancy_b.parity_b_precision_at_10", b_precision, tol=0.03)
-assert a_visible + b_visible == len(subject), "the tenant scopes tile the corpus"
+claim("the tenant scopes tile the corpus", a_visible + b_visible == len(subject),
+      f"{a_visible} + {b_visible} = {len(subject)}")
+claim("the same recipe answers in each tenant's scope, over that tenant's rows",
+      a_queries > 0 and b_queries > 0,
+      f"precision@10 {a_precision:.3f} for A, {b_precision:.3f} for B")
 ```
 
 The two numbers differ because the tenants hold different subjects, and some subjects
@@ -279,13 +282,13 @@ for name, tenant_id, own in (("A", TENANT_A, a_papers), ("B", TENANT_B, b_papers
 ```
 
 ```{python}
-# | echo: false
-assert served == in_process, "the declaration scopes both transports identically"
+claim("the declaration scopes both transports identically", served == in_process)
 for tenant_id, own in ((TENANT_A, a_papers), (TENANT_B, b_papers)):
     view = in_process[tenant_id]
-    assert view["rows of the other tenant"] == 0  # the hard zero, through every verb
-    assert view["sql rows"] == view["embedded rows"] == len(own)
-    assert view["search reach"] <= len(own)
+    claim(f"tenant {tenant_id[:8]}… reads none of the other tenant's rows, through every verb",
+          view["rows of the other tenant"] == 0)
+    claim(f"and sql, embedding and search all stay within its own {len(own)} rows",
+          view["sql rows"] == view["embedded rows"] == len(own) and view["search reach"] <= len(own))
 ```
 
 Every verb reads the source through the same scan, so the one declaration scopes all of

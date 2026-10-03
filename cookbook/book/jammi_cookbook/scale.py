@@ -8,9 +8,10 @@ Every chapter runs its capability live. What it runs over is a scale:
   "at scale" run: the same chapter, the same code, over the data the book's
   findings are about.
 
-The chapter code is identical at both; only the data, the encoders and the
-frozen goldens a run is checked against differ. Choose with
-``JAMMI_COOKBOOK_SCALE`` (``small`` when unset).
+The chapter code is identical at both; only the data and the encoders differ.
+A claim only the full data can show is guarded by ``SCALE is Scale.FULL`` in the
+chapter, so a small run never claims a finding its fixtures cannot bear. Choose
+with ``JAMMI_COOKBOOK_SCALE`` (``small`` when unset).
 """
 
 from __future__ import annotations

@@ -43,6 +43,13 @@ class World(tv.World):
         )
         self.uploads[run_id] = [{"name": n, "expired": n in expired} for n in uploads]
 
+    def cookbook_run(self, run_id: int, conclusion: str, completed_at: str, uploads=("cookbook-book",)):
+        self.bind(
+            tv.run_obj(run_id, workflow=vd.COOKBOOK_WORKFLOW),
+            [tv.named_job(vd.COOKBOOK_JOB, conclusion, completed_at, html_url=f"https://x/{run_id}")],
+        )
+        self.uploads[run_id] = [{"name": n, "expired": False} for n in uploads]
+
     def fetch(self, url: str, token: str) -> dict:
         m = re.search(r"/actions/runs/(\d+)/artifacts", url)
         if m:
@@ -53,9 +60,11 @@ class World(tv.World):
         return super().fetch(url, token)
 
 
-def _resolve(world: World, names=WHEELS):
+def _resolve(world: World, names=WHEELS, lane="ci"):
     out, err = io.StringIO(), io.StringIO()
-    rc = pa.resolve(repo=tv.REPO, tree=tv.TREE, names=list(names), fetch=world.fetch, token="tok", out=out, err=err)
+    rc = pa.resolve(
+        repo=tv.REPO, tree=tv.TREE, lane=lane, names=list(names), fetch=world.fetch, token="tok", out=out, err=err
+    )
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -116,6 +125,26 @@ class ResolveTest(unittest.TestCase):
         rc, out, err = _resolve(w)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("::error::", err)
+
+
+class LaneTest(unittest.TestCase):
+    def test_every_lane_is_measured_by_one_job(self):
+        for lane, requirement in pa.LANES.items():
+            self.assertEqual(len(requirement().jobs), 1, lane)
+
+    def test_the_cookbook_lane_names_its_own_run(self):
+        w = World()
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
+        w.cookbook_run(8, "success", "2026-01-01T01:00:00Z")
+        rc, out, _ = _resolve(w, names=["cookbook-book"], lane="cookbook")
+        self.assertEqual((rc, out.split()), (0, ["run=8"]))
+
+    def test_a_ci_run_never_proves_the_cookbook_lane(self):
+        w = World()
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z", uploads=["cookbook-book"])
+        rc, out, err = _resolve(w, names=["cookbook-book"], lane="cookbook")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn(f"has no {vd.COOKBOOK_WORKFLOW} run", err)
 
 
 if __name__ == "__main__":

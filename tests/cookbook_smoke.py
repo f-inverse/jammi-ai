@@ -1,10 +1,11 @@
-"""Cookbook smoke runner — every recipe is a CI gate.
+"""Cookbook smoke runner — every recipe is a release gate.
 
-Runs the quickstart and every recipe. Fails the build if any recipe exits
-non-zero, if quickstart wall-clock exceeds 60 seconds, or if the smoke runner
-itself errors. The recipes that talk to a server (`remote_session`,
-`flight_sql`) start one with `jammi.testing.LiveServer`, which runs the
-`jammi-server` on PATH; the lane that runs this puts one there.
+Runs the quickstart and every recipe, with the real Hub models they teach with;
+the cookbook lane (`.github/workflows/cookbook-gpu.yml`) runs it on a GPU. Fails
+if any recipe exits non-zero, if quickstart wall-clock exceeds 60 seconds, or if
+the smoke runner itself errors. The recipes that talk to a server
+(`remote_session`, `flight_sql`) start one with `jammi.testing.LiveServer`,
+which runs the `jammi-server` on PATH; the lane that runs this puts one there.
 
 Every step runs under `python -m jammi.session_journal`, so a recipe that
 leaves a session open — in any process it starts — fails by the session's

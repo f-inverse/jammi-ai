@@ -14,10 +14,9 @@ on:
 # and the cookbook book of the tree a `py-v*` tag names, so what a reader
 # reads is what PyPI serves them and what each chapter's Colab badge
 # installs. It compiles and renders nothing: `ci.yml` builds the guide and
-# the API reference (`docs`) and assembles the book (`book`) on every tree
-# whose book selection is whole — a release's always is, its version bump
-# changing `Cargo.toml` — and this workflow publishes the ones the run that
-# proved the tag's tree built.
+# the API reference (`docs`), `cookbook-gpu.yml` renders and assembles the
+# book on real models, and this workflow publishes what the runs that proved
+# the tag's tree built.
 
 # A deploy in flight is never cancelled; a later tag's waits behind it.
 concurrency:
@@ -28,16 +27,27 @@ permissions:
   contents: read
 
 jobs:
-  # What this release publishes: the site the `ci.yml` run that proved the
-  # released tree built. On a branch dispatch, the rehearsal: the same lookup
-  # over the branch's tree.
-  artifacts:
+  # What this release publishes: the guide and API reference the `ci.yml` run
+  # that proved the released tree built, and the book the `cookbook-gpu.yml`
+  # run that proved it rendered. On a branch dispatch, the rehearsal: the same
+  # lookups over the branch's tree.
+  docs:
     permissions:
       contents: read
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      artifacts: docs-site cookbook-book
+      lane: ci
+      artifacts: docs-site
+
+  book:
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/_proven-artifacts.yml
+    with:
+      lane: cookbook
+      artifacts: cookbook-book
 
   proof:
     name: Proof required
@@ -56,7 +66,7 @@ jobs:
   # `cookbook/`: the paths the guide, the README and every notebook link to.
   site:
     name: Lay out the site
-    needs: artifacts
+    needs: [docs, book]
     runs-on: ubuntu-latest
     permissions:
       # Downloads from the proving run, not this one.
@@ -66,14 +76,14 @@ jobs:
         with:
           name: docs-site
           path: _site
-          run-id: ${{ needs.artifacts.outputs.run }}
+          run-id: ${{ needs.docs.outputs.run }}
           github-token: ${{ github.token }}
 
       - uses: actions/download-artifact@v4
         with:
           name: cookbook-book
           path: _site/cookbook
-          run-id: ${{ needs.artifacts.outputs.run }}
+          run-id: ${{ needs.book.outputs.run }}
           github-token: ${{ github.token }}
 
       - uses: actions/upload-pages-artifact@v3

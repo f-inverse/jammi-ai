@@ -148,6 +148,9 @@ COOKBOOK_PUBLISHED_GPU_YML_GOOD = _paid_lane_yml(
     "Cookbook as published (GPU)", "cookbook-published-gpu", "runpod_cookbook_published.sh",
     "run-cookbook-published-gpu",
 )
+COOKBOOK_GPU_YML_GOOD = _paid_lane_yml(
+    verdict.COOKBOOK_JOB, "cookbook", "runpod_cookbook_gpu.sh", "cookbook-gpu"
+)
 
 
 def _gate_job(gate_name: str = "proof", tag_family: str = "v") -> str:
@@ -428,6 +431,7 @@ def positive_workflows() -> dict[str, str]:
         "gpu-perf-ab.yml": PERF_AB_YML_GOOD,
         "gpu-howwell.yml": HOWWELL_YML_GOOD,
         "cookbook-published-gpu.yml": COOKBOOK_PUBLISHED_GPU_YML_GOOD,
+        "cookbook-gpu.yml": COOKBOOK_GPU_YML_GOOD,
         # gpu-dev.sh's own row (whole-file scope gave it one: gpu-reap.yml
         # is its only invoker and carries RUNPOD_API_KEY at step scope).
         "gpu-reap.yml": REAP_YML,
@@ -881,7 +885,7 @@ def _driver(call: str) -> str:
 
 
 def fixture_scripts() -> dict[str, str]:
-    """The tracked `ci/scripts/**` map the derivation ranges over: the five
+    """The tracked `ci/scripts/**` map the derivation ranges over: the six
     PAID_POD_LANE_TABLE drivers plus the two non-table deploy-capable
     scripts this tree really has (`gpu-dev.sh`, `test_pod_substrate.sh`)."""
     return {
@@ -890,6 +894,7 @@ def fixture_scripts() -> dict[str, str]:
         "ci/scripts/runpod_gpu_perf_ab.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/runpod_gpu_howwell.sh": _driver("rp_deploy_live_a100"),
         "ci/scripts/runpod_cookbook_published.sh": _driver("rp_deploy_arch l4"),
+        "ci/scripts/runpod_cookbook_gpu.sh": _driver("rp_deploy_arch l4"),
         "ci/scripts/gpu-dev.sh": _driver("rp_deploy_arch \"$ARCH\""),
         "ci/scripts/test_pod_substrate.sh": _driver("rp_deploy_live \"SECURE|X\""),
         # The topology lane's own row -- calls the second root
@@ -1020,6 +1025,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
             sorted(derived),
             [
                 "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_cookbook_gpu.sh",
                 "ci/scripts/runpod_cookbook_published.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
                 "ci/scripts/runpod_gpu_perf_ab.sh",
@@ -1377,6 +1383,7 @@ class DerivedRentingDriverTest(unittest.TestCase):
                 # THIS file (see below) sorts before gpu-dev.sh.
                 "ci/scripts/check_gpu_prove_once.py",
                 "ci/scripts/gpu-dev.sh",
+                "ci/scripts/runpod_cookbook_gpu.sh",
                 "ci/scripts/runpod_cookbook_published.sh",
                 "ci/scripts/runpod_gpu_howwell.sh",
                 "ci/scripts/runpod_gpu_perf_ab.sh",
@@ -2101,7 +2108,12 @@ class GateFileAbsentTest(unittest.TestCase):
 
 
 def _p4(**overrides) -> list[str]:
-    texts = {"gpu-prove.yml": PROVE_YML_GOOD, "ci.yml": CI_SUMMARY_YML_GOOD, "_summary.yml": SUMMARY_YML_GOOD}
+    texts = {
+        "gpu-prove.yml": PROVE_YML_GOOD,
+        "ci.yml": CI_SUMMARY_YML_GOOD,
+        "_summary.yml": SUMMARY_YML_GOOD,
+        "cookbook-gpu.yml": COOKBOOK_GPU_YML_GOOD,
+    }
     texts.update(overrides)
     return cgo.check_p4({k: v for k, v in texts.items() if v is not None}, set(REAL_ARCHES))
 
@@ -2117,6 +2129,20 @@ class P4NameArchAgreementTest(unittest.TestCase):
 
     def test_positive_agreement_passes(self):
         self.assertEqual(_p4(), [])
+
+
+class P4CookbookJobNameTest(unittest.TestCase):
+    """`verdict.COOKBOOK_JOB` is the `name:` of a job in `cookbook-gpu.yml`."""
+
+    def test_the_named_job_passes(self):
+        self.assertEqual(_p4(), [])
+
+    def test_a_renamed_job_fails(self):
+        bad = COOKBOOK_GPU_YML_GOOD.replace(f"    name: {verdict.COOKBOOK_JOB}", "    name: Cookbook")
+        self.assertTrue(any("verdict.COOKBOOK_JOB" in f for f in _p4(**{"cookbook-gpu.yml": bad})))
+
+    def test_a_missing_workflow_fails(self):
+        self.assertTrue(any("cookbook-gpu.yml is missing" in f for f in _p4(**{"cookbook-gpu.yml": None})))
 
 
 class P4CiSummaryNameTest(unittest.TestCase):

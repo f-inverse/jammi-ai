@@ -20,11 +20,13 @@ scripts/          the API-reference, citation and no-deferral guards
 tests/            the lib's unit tests
 ```
 
-The book lives in the engine monorepo at `cookbook/book/`; the engine CI renders
-the pages a change can move against the wheels, server and CLI that same run
-built (the book jobs in `.github/workflows/ci.yml` at the repo root). When that is
-every page — a release's tree always is — the run also assembles the book, and the
-release publishes it with the guide (`.github/workflows/pages.yml`).
+The book lives in the engine monorepo at `cookbook/book/`. Its chapters run real
+Hub models, so they render on a rented GPU, in the cookbook lane
+(`.github/workflows/cookbook-gpu.yml` at the repo root), against the CUDA engine,
+server and CLI the tree's CI built; that run also assembles the book, and the
+release publishes it with the guide (`.github/workflows/pages.yml`). The engine
+CI checks what needs no model: the book's library, its API reference and that
+every public verb has a runnable example.
 
 ## Two scales, one code path
 

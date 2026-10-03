@@ -40,6 +40,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
+      lane: ci
       artifacts: native-cu12-wheel
 
   proof:

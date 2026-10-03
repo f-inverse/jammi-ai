@@ -13,9 +13,10 @@ Two questions are asked of it:
 
     require --repo R --tree T   The release gate (`_proof-required.yml`): T's GPU
                                 prove (`gpu-prove.yml`, one job per shipped CUDA
-                                arch) and T's CI (`ci.yml`'s summary job) both
-                                hold. A missing or red measurement DENIES, each
-                                naming its remedy.
+                                arch), T's CI (`ci.yml`'s summary job) and T's
+                                cookbook (`cookbook-gpu.yml`, every recipe and
+                                page on real models) all hold. A missing or red
+                                measurement DENIES, each naming its remedy.
     probe --repo R --tree T     Whether T's CI already holds, as `proven=true|false`
                                 for `$GITHUB_OUTPUT`, with a notice naming the run
                                 whose summary is that measurement. `ci.yml`'s
@@ -73,6 +74,10 @@ GPU_WORKFLOW = "gpu-prove.yml"
 # Pinned against `gpu-prove.yml`'s own matrix `name:` line by
 # `check_gpu_prove_once.py`'s P4 rule, so producer and consumer never drift.
 GPU_JOB_TEMPLATE = "GPU prove on RunPod ({arch})"
+COOKBOOK_WORKFLOW = "cookbook-gpu.yml"
+# The one job that runs every recipe and page and assembles the book, pinned
+# against `cookbook-gpu.yml`'s job `name:` by the same P4 rule.
+COOKBOOK_JOB = "Cookbook on RunPod"
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,21 @@ def gpu_requirement() -> Requirement:
         f"dispatch the prove lane: gh workflow run {GPU_WORKFLOW} --ref <tag-or-branch-holding-the-tree>, "
         "wait for green, then re-run this workflow's failed jobs. Prove first, then tag.",
     )
+
+
+def cookbook_requirement() -> Requirement:
+    return Requirement(
+        COOKBOOK_WORKFLOW,
+        (COOKBOOK_JOB,),
+        f"run the cookbook lane: gh workflow run {COOKBOOK_WORKFLOW} --ref <branch-holding-the-tree> "
+        "(or label the pull request `cookbook-gpu`), wait for green, then re-run this workflow's "
+        "failed jobs.",
+    )
+
+
+def release_requirements() -> list[Requirement]:
+    """What a release requires of its tree: the GPU prove, CI and the cookbook."""
+    return [gpu_requirement(), ci_requirement(), cookbook_requirement()]
 
 
 def bound_runs(fetch: FetchFn, token: str, repo: str, workflow: str, tree: str) -> list[dict]:
@@ -290,7 +310,7 @@ def main(argv: list[str]) -> int:
     return require(
         repo=args.repo,
         tree=args.tree,
-        requirements=[gpu_requirement(), ci_requirement()],
+        requirements=release_requirements(),
         fetch=github_api.default_fetch,
         token=token,
     )

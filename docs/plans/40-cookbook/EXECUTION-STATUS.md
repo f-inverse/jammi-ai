@@ -555,9 +555,22 @@ API — the bare id raises `table not found`.)
   ViT-B/32, LAION CLAP, DistilBERT SST-2, dslim/bert-base-NER; all Apache-2.0 or
   MIT, fetched on demand, attributed in `cookbook/book/NOTICE`). The random-weight
   encoders remain engine test fixtures and moved to `tests/fixtures/` (CLAUDE.md:
-  generic fixtures live there). No download cache or revision pin in CI (user
-  direction: readers bring hardware and network, testing runs on rented pods);
-  the book's CI jobs authenticate with `HF_TOKEN`.
+  generic fixtures live there). No download cache or revision pin (user
+  direction: readers bring hardware and network, testing runs on rented pods).
+- **Real models never run in `ci.yml`; the cookbook runs on a rented GPU.** The
+  first cut kept CI's per-pull-request CPU book render and recipe job and gave
+  them `HF_TOKEN`: CI downloaded every model and spent about three hours a run
+  fine-tuning MiniLM on CPU (render slices 1h25, 19m, 54m, 2h54), and since any
+  engine change selects every chapter, almost every pull request would pay it.
+  CLAUDE.md's test discipline keeps default tests hermetic and gates live ones,
+  and the user's direction puts real-model testing on pods. `ci.yml` keeps what
+  needs no model (`book-checks`, the coverage guard, the client's live-server
+  suite over `tests/fixtures`); `cookbook-gpu.yml` installs the tree's CI-built
+  CUDA engine, client, server and CLI on an L4, runs every recipe, renders every
+  page and assembles the book `pages.yml` publishes. It fires on the
+  `cookbook-gpu` label and dispatch, like `gpu-prove.yml`, and the release gate
+  (`verdict.py require`) requires it beside CI and the GPU prove.
+  `select_render_chapters.py` sliced CI's render and is deleted.
 - **`cookbook/fixtures` holds what the cookbook reads; every test-only fixture
   lives under `tests/fixtures`.** The rule that moved the random-weight
   encoders also moves `finetune_heldout`, the fine-tune bench's held-out split:

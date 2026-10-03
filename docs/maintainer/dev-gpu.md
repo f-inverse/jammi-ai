@@ -570,18 +570,22 @@ the **summary** of a prove run already on record for the commit it is
 promoting, not on a fresh rental of its own: `_proof-required.yml` calls
 `ci/scripts/verdict.py require`, which asks the GitHub API whether, over the
 runs that recorded that commit's tree as their subject, every shipped arch's
-prove job — and `ci.yml`'s summary job — most recently concluded `success`.
+prove job, `ci.yml`'s summary job and `cookbook-gpu.yml`'s cookbook job — every
+recipe and page on real models, over the tree's own builds, on an L4 — most
+recently concluded `success`. The cookbook lane fires on the `cookbook-gpu` PR
+label and manual dispatch only, under the same rules as the prove lane.
 This is a CHECK-ONCE, FAIL-LOUD lookup — no poll, no deadline, no grace
 window. An in-progress run over that tree is invisible to the
 check; it is never waited on. Nothing here starts a prove run — a red or
 missing verdict fails EVERY release workflow immediately, with the exact
-remedy (`gh workflow run gpu-prove.yml --ref <ref>`, or `gh run rerun
-<run_id> --failed` for one red leg) printed in the job log.
+remedy (`gh workflow run gpu-prove.yml --ref <ref>`, `gh workflow run
+cookbook-gpu.yml --ref <ref>`, or `gh run rerun <run_id> --failed` for one red
+leg) printed in the job log.
 
-**Release order:** before tagging, dispatch `gpu-prove.yml` on the commit to
-be released (`--ref main` at the tip, or on the pushed tag once it exists);
-once every shipped arch is green, push `v*` and `py-v*` together, on the
-same commit. A tag push on a commit whose prove is not ALREADY green
+**Release order:** before tagging, dispatch `gpu-prove.yml` and
+`cookbook-gpu.yml` on the commit to be released (`--ref main` at the tip, or on
+the pushed tag once it exists); once every shipped arch and the cookbook are
+green, push `v*` and `py-v*` together, on the same commit. A tag push on a commit whose prove is not ALREADY green
 publishes NOTHING — every publisher fails immediately, by design: prove
 first, then tag, because a tag push commits the version number. See
 MAINTAINER-GUIDE.md's release runbook for the exact sequencing.

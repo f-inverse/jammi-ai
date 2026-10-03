@@ -39,7 +39,7 @@ pub enum MutableAction {
         #[arg(long = "index", value_name = "NAME=...,columns=...,unique=...")]
         indexes: Vec<String>,
         /// Optional monotonic ordering column (must be Int64 or UInt64). When
-        /// set, the table can back a Phase-4 trigger-stream topic.
+        /// set, the table can back a trigger-stream topic.
         #[arg(long)]
         order_column: Option<String>,
     },
@@ -91,15 +91,12 @@ pub async fn run(
             }
             let def = builder.build()?;
             let pk_repr = def.primary_key.join(",");
-            let idx_repr = if def.indexes.is_empty() {
-                "[]".to_string()
-            } else {
-                def.indexes
-                    .iter()
-                    .map(|i| i.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
+            let idx_repr = def
+                .indexes
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
             session.create_mutable_table(def).await?;
             println!(
                 "Mutable table '{name}' registered (primary_key=[{pk_repr}], indexes=[{idx_repr}])."

@@ -3,10 +3,10 @@
 # Runtime variant selector for the final image. This MUST be a GLOBAL arg (declared before the
 # first FROM) so it is in scope for the `FROM ${RUNTIME_VARIANT}` selector at the bottom:
 #   runtime-generic        (default) — operator-supplied config + volume (CPU)
-#   runtime-selfcontained  — standalone, baked config + encoder (e.g. Cloudflare Containers) (CPU)
+#   runtime-selfcontained  — standalone, baked config, no volume (e.g. Cloudflare Containers) (CPU)
 #   runtime-cuda           — CUDA build: GPU-accelerated inference, NVIDIA runtime base
 #
-# CUDA lives only on the server image (M2 §1, §5d). The CPU variants build on the generic
+# CUDA lives only on the server image. The CPU variants build on the generic
 # CI base (`jammi-ai-ci`) and a distroless runtime; the CUDA variant builds on the CUDA CI
 # base (`jammi-ai-ci-cuda`, which carries the CUDA 12.6 toolkit + CUDA_COMPUTE_CAP=80) and a
 # CUDA runtime base that ships `libcudart` for candle's cudarc backend. Each runtime stage
@@ -159,8 +159,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # turnkey `jammi-server` entrypoint. The generic variant (`runtime-generic`)
 # boots zero-config (local SQLite catalog under `/var/lib/jammi`) and accepts an
 # operator config via `--config`. The self-contained variant
-# (`runtime-selfcontained`) bakes a config + encoder so it boots standalone on a
-# runtime that provides neither (e.g. Cloudflare Containers). The CUDA variant
+# (`runtime-selfcontained`) bakes a config so it boots standalone on a runtime
+# that provides neither a config nor a volume (e.g. Cloudflare Containers). The CUDA variant
 # (`runtime-cuda`) has its own NVIDIA runtime base below — distroless ships no
 # CUDA libraries.
 FROM gcr.io/distroless/cc-debian12 AS runtime-base
@@ -232,28 +232,22 @@ USER nonroot:nonroot
 # ---- runtime: self-contained ----
 # Boots with zero external config and no mounted volume: the baked
 # config (`deploy/jammi.selfcontained.toml`) points `artifact_dir`
-# under `/tmp` (the only path the distroless nonroot user can write
-# without a provisioned volume) and the baked `htsat_clap_tiny`
-# encoder fixture lets `EncodeAudioQuery` / `GenerateAudioEmbeddings`
-# run offline. Clients pass the encoder per request as
-# `model_id = "local:/opt/jammi/models/htsat_clap_tiny"`.
+# under `/tmp`, the only path the distroless nonroot user can write
+# without a provisioned volume. Models are named per request: a Hub
+# id is fetched on first use into `HF_HOME` below, and a deployment
+# that must serve without network builds `FROM` this stage, copies its
+# checkpoint in, and names it `local:<path>`.
 #
 # No `VOLUME` here — declaring one on a runtime that provides no
 # volume just yields an anonymous mount the deploy can't reach.
 FROM runtime-base AS runtime-selfcontained
 
 COPY deploy/jammi.selfcontained.toml /etc/jammi/jammi.toml
-COPY tests/fixtures/htsat_clap_tiny /opt/jammi/models/htsat_clap_tiny
 
-# This stage never fetches from the Hub (the baked config's own doc: "no
-# network fetch, no Hub credentials" — its one encoder is the baked
-# `local:` fixture above) and, like `runtime-generic`, provides no `HOME`
-# for the nonroot user. Still set for the same reason every other stage
-# sets it: a future non-`local:` `model_id` request against this image gets
-# `HubSource`'s typed config error resolved against a real, writable path
-# under `/tmp` (this stage's only writable root, matching its baked
-# `artifact_dir = "/tmp/jammi"`) rather than either a panic or an
-# unwritable `/var/lib/jammi` this stage never provisions.
+# The Hub cache lives under `/tmp` with the rest of this stage's state: like
+# `runtime-generic`, the stage provides no `HOME` for the nonroot user, and
+# `/tmp` is its only writable root (matching the baked
+# `artifact_dir = "/tmp/jammi"`).
 ENV HF_HOME=/tmp/jammi/hf
 
 USER nonroot:nonroot
@@ -336,6 +330,6 @@ CMD ["serve"]
 
 # ---- final ----
 # Resolve the variant chosen by the global `RUNTIME_VARIANT` arg at the top of this file
-# (`--build-arg RUNTIME_VARIANT=runtime-selfcontained` to bake config + encoder;
+# (`--build-arg RUNTIME_VARIANT=runtime-selfcontained` to bake the standalone config;
 #  `--build-arg RUNTIME_VARIANT=runtime-cuda` for the GPU server image).
 FROM ${RUNTIME_VARIANT}

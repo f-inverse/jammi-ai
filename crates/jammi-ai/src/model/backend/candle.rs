@@ -1002,12 +1002,11 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
         absence_tolerated: !preprocessor_config_is_required(resolved),
     });
 
-    // The tokenizer slot: NOT required — every resolver path (`discover_local_tokenizer`
-    // locally; `resolve_hf_hub`'s `tokenizer.json` /
-    // `bpe_simple_vocab_16e6.txt.gz` fallback chain remotely)
-    // already re-derives `tokenizer: None` when NEITHER file is present
-    // instead of erroring, and `CandleBackend::load`'s `.transpose()?` over
-    // that `Option` accepts `None`: the reload succeeds with
+    // The tokenizer slot: NOT required — every resolver path
+    // (`discover_local_tokenizer` locally, `hub_tokenizer` remotely) already
+    // re-derives `tokenizer: None` when NONE of its files is present instead
+    // of erroring, and `CandleBackend::load`'s `.transpose()?` over that
+    // `Option` accepts `None`: the reload succeeds with
     // `self.tokenizer == None`, matching cold-process semantics exactly. A
     // text-encoding call fails LATER with that path's own typed error ("No
     // tokenizer loaded for ... model") at USE time, not at load time; a CLAP
@@ -1016,42 +1015,63 @@ fn all_candidate_paths(resolved: &ResolvedModel) -> Result<Vec<DigestSlot>> {
     // slot for which this holds unconditionally, regardless of how many
     // arms are gone.
     //
-    // Both filenames the resolver's preference chain considers —
-    // `tokenizer.json` (checked first) and `bpe_simple_vocab_16e6.txt.gz`
-    // (the OpenCLIP fallback) — are UNCONDITIONAL arms of this ONE slot,
-    // anchored under `model_dir`, exactly mirroring the `1_Pooling`/
-    // `preprocessor` pattern above. `gated` is true for whichever arm
+    // Every filename the resolver's preference chain considers
+    // (`arch::TOKENIZER_CANDIDATE_NAMES`) is an UNCONDITIONAL arm of this ONE
+    // slot, anchored under `model_dir`, exactly mirroring the `1_Pooling`/
+    // `preprocessor` pattern above. `gated` is true for the arm
     // `resolved.tokenizer` actually names (using its own path, so the
     // anchor-mismatch refusal below still fires if that path is ever outside
     // `model_dir`) and the digest keeps hashing only the file the loader
-    // actually read; the OTHER arm — and BOTH arms when `resolved.tokenizer`
+    // actually read; every other arm — and every arm when `resolved.tokenizer`
     // is `None` — carries an absent-marker path (`model_dir.join(name)`),
     // `gated: false`, so `compute_model_fingerprint` still records its
-    // `None` snapshot and a later appearance of either file trips `probe`.
-    let tokenizer_json_default = model_dir.join("tokenizer.json");
-    let tokenizer_bpe_default = model_dir.join("bpe_simple_vocab_16e6.txt.gz");
-    let (json_path, json_gated, bpe_path, bpe_gated) = match &resolved.tokenizer {
-        Some(TokenizerSource::HuggingFaceJson(p)) => {
-            (p.clone(), true, tokenizer_bpe_default, false)
-        }
-        Some(TokenizerSource::OpenClipBpe(p)) => (tokenizer_json_default, false, p.clone(), true),
-        None => (tokenizer_json_default, false, tokenizer_bpe_default, false),
+    // snapshot and a later appearance of any of them trips `probe`.
+    let selected = match &resolved.tokenizer {
+        Some(TokenizerSource::HuggingFaceJson(p) | TokenizerSource::OpenClipBpe(p)) => Some(p),
+        Some(TokenizerSource::WordPiece { vocab, .. }) => Some(vocab),
+        None => None,
     };
     slots.push(RawSlot {
-        arms: vec![
-            RawArm {
-                path: json_path,
-                anchor: model_dir.clone(),
-                gated: json_gated,
-            },
-            RawArm {
-                path: bpe_path,
-                anchor: model_dir.clone(),
-                gated: bpe_gated,
-            },
-        ],
+        arms: crate::model::arch::TOKENIZER_CANDIDATE_NAMES
+            .into_iter()
+            .map(|name| {
+                match selected.filter(|p| p.file_name() == Some(std::ffi::OsStr::new(name))) {
+                    Some(path) => RawArm {
+                        path: path.clone(),
+                        anchor: model_dir.clone(),
+                        gated: true,
+                    },
+                    None => RawArm {
+                        path: model_dir.join(name),
+                        anchor: model_dir.clone(),
+                        gated: false,
+                    },
+                }
+            })
+            .collect(),
         absence_tolerated: true,
     });
+
+    // A WordPiece vocabulary's `tokenizer_config.json` is read TOGETHER with
+    // the vocabulary, not instead of it, so it is its own single-arm slot
+    // rather than a fourth alternate above — present only while the
+    // WordPiece arm is the selected tokenizer, the only time the loader reads
+    // it. Gated when the resolver found it; otherwise an absent-marker, so
+    // its later appearance (which changes casing, accents and special tokens)
+    // trips `probe`. `absence_tolerated: true`: without it the loader builds
+    // `BertTokenizer`'s defaults.
+    if let Some(TokenizerSource::WordPiece { config, .. }) = &resolved.tokenizer {
+        slots.push(RawSlot {
+            arms: vec![RawArm {
+                gated: config.is_some(),
+                path: config.clone().unwrap_or_else(|| {
+                    model_dir.join(crate::model::arch::TOKENIZER_CONFIG_FILENAME)
+                }),
+                anchor: model_dir.clone(),
+            }],
+            absence_tolerated: true,
+        });
+    }
 
     // Weights ALTERNATES slot: the resolver's OWN `model.safetensors` /
     // `open_clip_model.safetensors` / `model.gguf` preference chain
@@ -1729,10 +1749,12 @@ impl CandleModel {
     /// Tokenise `texts` at the text tower's own truncation, at the batch's
     /// natural width.
     fn encode(&self, texts: &[&str]) -> Result<BatchEncoding> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| JammiError::Inference("No tokenizer loaded for this model".into()))?;
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            JammiError::Inference(format!(
+                "No tokenizer loaded for this model: its checkpoint ships none of {:?}",
+                crate::model::arch::TOKENIZER_CANDIDATE_NAMES
+            ))
+        })?;
         tokenizer.encode_batch(texts, Some(self.text_forward()?.max_sequence_length()))
     }
 
@@ -3283,6 +3305,9 @@ impl ModelBackend for CandleBackend {
             .map(|src| match src {
                 TokenizerSource::HuggingFaceJson(p) => TokenizerWrapper::from_file(p),
                 TokenizerSource::OpenClipBpe(p) => TokenizerWrapper::from_open_clip_bpe(p),
+                TokenizerSource::WordPiece { vocab, config } => {
+                    TokenizerWrapper::from_wordpiece_vocab(vocab, config.as_deref())
+                }
             })
             .transpose()?;
 

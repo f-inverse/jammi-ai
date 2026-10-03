@@ -551,16 +551,7 @@ impl ModelResolver {
                 }
             };
 
-        // Prefer the HF-converted tokenizer.json if it exists; otherwise
-        // fall back to the OpenCLIP native vocab file for stock OpenCLIP
-        // repos that ship `bpe_simple_vocab_16e6.txt.gz` instead.
-        let tokenizer = match repo.get("tokenizer.json").await? {
-            Some(path) => Some(TokenizerSource::HuggingFaceJson(path)),
-            None => repo
-                .get("bpe_simple_vocab_16e6.txt.gz")
-                .await?
-                .map(TokenizerSource::OpenClipBpe),
-        };
+        let tokenizer = hub_tokenizer(&repo).await?;
 
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
@@ -864,17 +855,44 @@ fn read_local_pooling_config(dir: &Path, model_id: &str) -> Result<Option<serde_
         })
 }
 
-/// Locate a tokenizer artifact inside a local model directory, preferring
-/// an HF-shape `tokenizer.json` and falling back to OpenCLIP's native
-/// `bpe_simple_vocab_16e6.txt.gz`.
+/// Locate a Hub repo's tokenizer artifact, in [`TokenizerSource`]'s
+/// preference order: an HF-shape `tokenizer.json`, then OpenCLIP's native
+/// `bpe_simple_vocab_16e6.txt.gz`, then a WordPiece `vocab.txt` with the
+/// repo's `tokenizer_config.json` when it ships one.
+async fn hub_tokenizer(repo: &HubRepo<'_>) -> Result<Option<TokenizerSource>> {
+    if let Some(path) = repo.get(arch::TOKENIZER_JSON_FILENAME).await? {
+        return Ok(Some(TokenizerSource::HuggingFaceJson(path)));
+    }
+    if let Some(path) = repo.get(arch::OPEN_CLIP_BPE_VOCAB_FILENAME).await? {
+        return Ok(Some(TokenizerSource::OpenClipBpe(path)));
+    }
+    let Some(vocab) = repo.get(arch::WORDPIECE_VOCAB_FILENAME).await? else {
+        return Ok(None);
+    };
+    Ok(Some(TokenizerSource::WordPiece {
+        vocab,
+        config: repo.get(arch::TOKENIZER_CONFIG_FILENAME).await?,
+    }))
+}
+
+/// Locate a tokenizer artifact inside a local model directory, in the same
+/// preference order as [`hub_tokenizer`].
 fn discover_local_tokenizer(dir: &Path) -> Option<TokenizerSource> {
-    let hf = dir.join("tokenizer.json");
+    let hf = dir.join(arch::TOKENIZER_JSON_FILENAME);
     if hf.exists() {
         return Some(TokenizerSource::HuggingFaceJson(hf));
     }
-    let bpe = dir.join("bpe_simple_vocab_16e6.txt.gz");
+    let bpe = dir.join(arch::OPEN_CLIP_BPE_VOCAB_FILENAME);
     if bpe.exists() {
         return Some(TokenizerSource::OpenClipBpe(bpe));
+    }
+    let vocab = dir.join(arch::WORDPIECE_VOCAB_FILENAME);
+    if vocab.exists() {
+        let config = dir.join(arch::TOKENIZER_CONFIG_FILENAME);
+        return Some(TokenizerSource::WordPiece {
+            vocab,
+            config: config.exists().then_some(config),
+        });
     }
     None
 }

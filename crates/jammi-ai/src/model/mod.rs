@@ -16,6 +16,7 @@ pub(crate) mod memo;
 pub(crate) mod oom;
 pub mod resolver;
 pub mod tokenizer;
+pub(crate) mod wordpiece;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,8 +67,9 @@ pub use jammi_datafusion::{ModelSource, ModelTask};
 /// Where the tokenizer for a resolved model lives, and what shape it is.
 ///
 /// Most checkpoints carry an HF-converted `tokenizer.json`; stock OpenCLIP
-/// repos instead ship the legacy gzipped BPE vocab. The resolver picks
-/// whichever is present and the loader dispatches on the variant.
+/// repos instead ship the legacy gzipped BPE vocab, and many BERT-family
+/// checkpoints ship only a WordPiece `vocab.txt`. The resolver picks the first
+/// of those present, in that order, and the loader dispatches on the variant.
 #[derive(Debug, Clone)]
 pub enum TokenizerSource {
     /// HuggingFace-shape `tokenizer.json` (works for BERT-family, ModernBERT,
@@ -76,15 +78,13 @@ pub enum TokenizerSource {
     /// OpenCLIP-native `bpe_simple_vocab_16e6.txt.gz` — built directly into a
     /// BPE tokenizer at load time, no HF pre-conversion required.
     OpenClipBpe(std::path::PathBuf),
-}
-
-impl TokenizerSource {
-    /// Filesystem path of the tokenizer artifact.
-    pub fn path(&self) -> &std::path::Path {
-        match self {
-            Self::HuggingFaceJson(p) | Self::OpenClipBpe(p) => p,
-        }
-    }
+    /// A WordPiece `vocab.txt`, built into the BERT tokenizer at load time and
+    /// configured by the checkpoint's `tokenizer_config.json` when it ships
+    /// one (casing, accent stripping, special tokens).
+    WordPiece {
+        vocab: std::path::PathBuf,
+        config: Option<std::path::PathBuf>,
+    },
 }
 
 /// A resolved model — files located, NOT yet loaded.

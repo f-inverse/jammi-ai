@@ -44,6 +44,27 @@ pub const WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
     "model.gguf",
 ];
 
+/// The tokenizer artifact a checkpoint ships as a HuggingFace-converted file.
+pub const TOKENIZER_JSON_FILENAME: &str = "tokenizer.json";
+
+/// The OpenCLIP-native BPE vocabulary a stock OpenCLIP repo ships.
+pub const OPEN_CLIP_BPE_VOCAB_FILENAME: &str = "bpe_simple_vocab_16e6.txt.gz";
+
+/// The WordPiece vocabulary a BERT-family checkpoint ships.
+pub const WORDPIECE_VOCAB_FILENAME: &str = "vocab.txt";
+
+/// The tokenizer settings that configure a [`WORDPIECE_VOCAB_FILENAME`]
+/// tokenizer (casing, accent stripping, special tokens).
+pub const TOKENIZER_CONFIG_FILENAME: &str = "tokenizer_config.json";
+
+/// Tokenizer artifacts in their frozen precedence: the resolver picks the
+/// first that exists, and the model fingerprint tracks every one of them.
+pub const TOKENIZER_CANDIDATE_NAMES: [&str; 3] = [
+    TOKENIZER_JSON_FILENAME,
+    OPEN_CLIP_BPE_VOCAB_FILENAME,
+    WORDPIECE_VOCAB_FILENAME,
+];
+
 /// The OpenCLIP checkpoint's config and weights. A checkpoint carrying both
 /// resolves through them, whatever else it ships: OpenCLIP hub repositories
 /// commonly mirror a transformers `config.json` and `model.safetensors`,

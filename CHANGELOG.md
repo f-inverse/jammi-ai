@@ -44,6 +44,10 @@ found two engine gaps a reader would have hit with the first popular model they 
   admitted on Ampere or newer and refused with its remedy elsewhere, a real encoder quantized to
   `q8_0` and fine-tuned with QLoRA, a ModernBERT fine-tune's acceleration report read against its
   kernel counters — in place of numbers reported from machines the book never ran on.
+- **The self-contained server image bakes configuration only.** It baked the random-weight
+  `htsat_clap_tiny` test fixture as its one encoder, so a client that named it received noise.
+  Requests name their model: a Hub id is fetched on first use into the image's `/tmp` cache, and
+  a deployment that must serve offline builds on the image with its own checkpoint.
 - **The remote-model recipe calls a real encoder.** Its endpoint speaks the OpenAI-compatible
   protocol in front of a sentence encoder, not a hashed bag of words.
 - **A fused kernel's fallback is a notice, not a warning.** A model outside a fused kernel's

@@ -426,13 +426,13 @@ fn build_embed_fixture_with_pooling(
     Ok(())
 }
 
-/// The engine's shared tiny fixtures, REFERENCED from the cookbook tree (the
+/// The engine's shared tiny fixtures, REFERENCED from `tests/fixtures` (the
 /// same directories the `jammi-encoders` tests reference), never copied into
 /// this crate: a 32-dim 1-layer BERT and a 32-dim 1-layer ModernBERT
 /// classifier.
 fn fixture_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../cookbook/fixtures")
+        .join("../../tests/fixtures")
         .join(name)
 }
 

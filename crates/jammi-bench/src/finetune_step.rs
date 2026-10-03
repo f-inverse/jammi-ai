@@ -1013,7 +1013,7 @@ mod tests {
             .expect("crates/<name>")
             .parent()
             .expect("workspace root")
-            .join("cookbook")
+            .join("tests")
             .join("fixtures")
             .join("tiny_modernbert")
     }

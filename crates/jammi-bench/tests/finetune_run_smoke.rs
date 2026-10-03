@@ -18,7 +18,7 @@ use std::process::Command;
 
 /// `tests/fixtures/tiny_bert` — the SAME generic, committed fixture
 /// `jammi_test_utils::fixture("tiny_bert")` resolves to
-/// (`workspace_root().join("cookbook").join("fixtures")`), spelled as a
+/// (`workspace_root().join("tests").join("fixtures")`), spelled as a
 /// relative path here (mirroring `finetune_step_kernel_disable.rs`'s own
 /// `model_dir()`) rather than adding `jammi-test-utils` as a dev-dependency
 /// of this `[[bin]]`-only crate — BERT architecture, real `tokenizer.json`,

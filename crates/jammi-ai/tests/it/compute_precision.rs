@@ -4,7 +4,7 @@
 // the materialization identity for both the `Embedding` and `Inference`
 // model-producing paths; and the fail-loud bf16 refusal. Uses the tiny BERT /
 // ModernBERT-classifier / ModernBERT-NER fixtures checked into
-// `cookbook/fixtures/` — no network access required. Candle's CPU backend
+// `tests/fixtures/` — no network access required. Candle's CPU backend
 // supports F16, so this runs fully on CPU.
 
 use crate::common;

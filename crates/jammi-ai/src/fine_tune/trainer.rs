@@ -13825,7 +13825,7 @@ mod encoder_adapters_training_state_tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("cookbook")
+            .join("tests")
             .join("fixtures")
             .join("tiny_modernbert")
     }
@@ -14038,7 +14038,7 @@ mod media_front_end_wall_tests {
     /// The `tests/fixtures/htsat_clap_tiny` dir (config.json,
     /// model.safetensors, preprocessor_config.json) — same fixture
     /// the `it` suite's `tower_adapters` tests use. `CARGO_MANIFEST_DIR` is
-    /// `crates/jammi-ai`; `cookbook/fixtures` sits two levels up, at the
+    /// `crates/jammi-ai`; `tests/fixtures` sits two levels up, at the
     /// workspace root.
     fn htsat_clap_tiny_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14046,7 +14046,7 @@ mod media_front_end_wall_tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("cookbook")
+            .join("tests")
             .join("fixtures")
             .join("htsat_clap_tiny")
     }

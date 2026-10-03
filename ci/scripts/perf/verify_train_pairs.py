@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Byte-verify a ``train_pairs.jsonl`` against the committed
-``cookbook/fixtures/finetune_heldout/train_ids_sha256.json`` before a
+``tests/fixtures/finetune_heldout/train_ids_sha256.json`` before a
 ``ci/scripts/perf/finetune_run_ab.sh`` leg reads it.
 
 The check is the pair identity set (no missing id, no extra id, no
@@ -10,7 +10,7 @@ The committed file passes by construction; the check exists because
 
 Run: ``python3 ci/scripts/perf/verify_train_pairs.py``
      (defaults to the committed fixture paths under
-     ``cookbook/fixtures/finetune_heldout/``)
+     ``tests/fixtures/finetune_heldout/``)
 Self-test: ``python3 ci/scripts/perf/verify_train_pairs.py --self-test``
      (a synthetic 2-pair fixture, GREEN on committed-shaped hashes, RED on
      a flipped byte / a missing id / an extra pair / a wrong count / a
@@ -29,7 +29,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-FIXTURE_DIR = REPO_ROOT / "cookbook" / "fixtures" / "finetune_heldout"
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "finetune_heldout"
 DEFAULT_PAIRS = FIXTURE_DIR / "train_pairs.jsonl"
 DEFAULT_HASHES = FIXTURE_DIR / "train_ids_sha256.json"
 

@@ -3,7 +3,7 @@ name: GPU how-well (RunPod)
 # Runs the fine-tune how-well A/B on a real NVIDIA A100 (sm_80)
 # via an ephemeral RunPod pod — `ci/scripts/perf/finetune_run_ab.sh` driving
 # `jammi-bench finetune-run` per (rung, seed, take) against the committed
-# cookbook/fixtures/finetune_heldout/ fixture, judged (leg premises, identity,
+# tests/fixtures/finetune_heldout/ fixture, judged (leg premises, identity,
 # the lr=0 control, the paired sign test and equivalence test) by
 # `jammi-bench ladder train-run` as the torch edge of that ladder.
 #

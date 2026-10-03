@@ -1,7 +1,9 @@
-//! Cookbook smoke tests — verifies every code path documented in the cookbook.
+//! The cookbook recipes' calls, run hermetically.
 //!
-//! These are not unit tests. They exercise the exact user-facing API patterns
-//! from the cookbook recipes to ensure the documentation is accurate.
+//! Each test makes the user-facing calls a recipe makes, over the engine's
+//! random-weight test checkpoints and the cookbook's committed data, so a change
+//! that breaks a recipe's call shape fails here, offline. The recipes themselves
+//! run over real Hub models in CI's cookbook job (`tests/cookbook_smoke.py`).
 
 use std::sync::Arc;
 
@@ -19,8 +21,7 @@ use crate::common;
 
 /// Register the `cdc_orders` topic the publish/subscribe cookbook recipes use,
 /// via the typed dual-registration path (broker driver + catalog) the
-/// `register_topic` verb runs — the engine's topic-registration entry point now
-/// that the Flight-SQL `CREATE TOPIC` DDL is gone.
+/// `register_topic` verb runs — the engine's topic-registration entry point.
 async fn register_cdc_orders_topic(session: &jammi_db::session::JammiSession) {
     use arrow_schema::{DataType, Field, Schema};
     let topic = jammi_db::trigger::TopicDefinition {

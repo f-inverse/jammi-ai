@@ -5,18 +5,17 @@ Produces:
 - `tiny_corpus.parquet`     — 20-row synthetic patent corpus (id, title,
   abstract, year, category, assignee_id)
 - `tiny_golden.json`        — relevance judgments for `eval_embeddings`
-- `tiny_labels.csv`         — per-row gold labels for `eval_inference`
-  classification
+- `tiny_labels.csv`         — each corpus row's subject, `physics` or
+  `biology`, which the federation chapter joins
 - `tiny_pairs.csv`          — contrastive text pairs for `fine_tune`
 - `tiny_reviews.parquet`    — 24 short product and service reviews (id, text)
   for sentiment classification
 - `tiny_review_labels.csv`  — each review's gold sentiment, `POSITIVE` or
   `NEGATIVE` — the label set of the stock SST-2 sentiment classifiers
-- `tiny_ner_corpus.parquet` — 20-row generic PER/ORG sentence corpus for
-  `eval_inference` NER (id, text)
+- `tiny_ner_corpus.parquet` — 20-row generic PER/ORG sentence corpus for the
+  `eval_inference_ner` recipe and the eval-channels chapter (id, text)
 - `tiny_ner_gold.csv`       — per-span gold entities for the NER corpus
-  (id, label, start, end), label set restricted to PER + ORG to match the
-  shipped `tiny_modernbert_ner` id2label
+  (id, label, start, end), people and organisations only
 - `tiny_image_corpus/`      — 20 synthetic 224x224 PNGs (geometric line
   drawings, 5 shape families) for the `image_search` recipe
 - `tiny_image_golden.json`  — query-image -> expected corpus-image top-K
@@ -155,11 +154,13 @@ def write_golden() -> None:
 
 
 def write_labels() -> None:
-    """Per-row classification labels for `eval_inference`.
+    """Each corpus row's subject, collapsed to two classes.
 
-    Two-class collapse (physics+chemistry → 'physics', biology+cs+engineering
-    → 'biology') keeps the label set inside the tiny_modernbert_classifier
-    fixture's vocabulary (which only knows 'physics' and 'biology').
+    Physics and chemistry → 'physics'; biology, cs and engineering →
+    'biology'. The federation chapter joins these labels to the corpus, and
+    the engine's classification-eval tests score their
+    `tiny_modernbert_classifier` test checkpoint against them, so the label
+    set stays inside that checkpoint's vocabulary ('physics' and 'biology').
     """
     label_map = {
         "physics": "physics",
@@ -321,14 +322,17 @@ NER_CORPUS: list[tuple[int, str, list[tuple[str, int, int]]]] = [
 
 
 def write_ner_corpus() -> None:
-    """20-row generic PER/ORG sentence corpus for the NER eval recipe.
+    """20-row generic PER/ORG sentence corpus for the NER recipe and the
+    eval-channels chapter.
 
     Hand-authored sentences with deterministic byte offsets — re-run the
-    generator and `tiny_ner_corpus.parquet` reproduces bit-for-bit. The
-    label set is restricted to PER + ORG to match the shipped
-    `tiny_modernbert_ner` id2label (`O / B-PER / I-PER / B-ORG / I-ORG`);
-    introducing LOC would require retraining that model fixture and is
-    out of scope for the cookbook recipe.
+    generator and `tiny_ner_corpus.parquet` reproduces bit-for-bit. The gold
+    set labels people and organisations only: the types the engine's
+    `tiny_modernbert_ner` test checkpoint emits (`O / B-PER / I-PER / B-ORG /
+    I-ORG`), which its NER-eval tests score against this gold. A real tagger
+    such as the recipe's `dslim/bert-base-NER` also tags locations and a
+    miscellaneous class; the recipe shows those as spans the gold set never
+    asks about.
 
     All names and organizations are fictional / public-domain pop-culture
     references — no tenant or proprietary content lives in the OSS

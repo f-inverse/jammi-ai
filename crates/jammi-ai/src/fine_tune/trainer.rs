@@ -7380,7 +7380,7 @@ mod test_fixtures {
     use jammi_datafusion::ModelSource;
     use jammi_datafusion::ModelTask;
 
-    /// Load the hermetic `tiny_bert` cookbook fixture through a real
+    /// Load the hermetic `tiny_bert` test fixture through a real
     /// `InferenceSession`'s model cache — the same resolve+backend-load path
     /// serving uses (see `ModelCache::load_owned_for_test`'s doc on
     /// `session.rs`'s equivalent seam). Real, but tiny and local: no network,
@@ -14003,7 +14003,7 @@ mod encoder_adapters_training_state_tests {
 /// `training_mode` dispatch) rather than asserting on a fabricated number.
 ///
 /// Builds a real `TrainingTarget::EncoderAdapters` over the checked-in
-/// `htsat_clap_tiny` cookbook fixture (the same 4-stage HTSAT-Swin CLAP
+/// `htsat_clap_tiny` test fixture (the same 4-stage HTSAT-Swin CLAP
 /// audio tower the `it` suite's `tower_adapters::clap_audio_tower_adapter_
 /// trains_and_serves` fine-tunes end-to-end) and a real base model loaded
 /// through the SAME `ModelResolver` + `CandleBackend::load` pair the
@@ -14472,7 +14472,7 @@ mod encode_texts_bucketing_oracle {
     /// so the tokenizer's emitted token ids are valid inputs to the
     /// encoder's own embedding table. Mirrors
     /// `test_fixtures::tiny_bert`'s real model-cache load path, substituting
-    /// `tiny_modernbert_fixture_dir` for the cookbook `tiny_bert` fixture.
+    /// `tiny_modernbert_fixture_dir` for the `tiny_bert` fixture.
     async fn tiny_modernbert_base_model() -> Arc<LoadedModel> {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());

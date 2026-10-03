@@ -340,9 +340,10 @@ pub fn workspace_root() -> PathBuf {
 
 /// Root of the test fixtures directory (at workspace root). Houses the
 /// generic test-only fixtures (`patents.parquet`, `assignees.csv`,
-/// `golden_relevance.csv`, and the tiny random-weight encoders —
+/// `golden_relevance.csv`, the tiny random-weight encoders —
 /// `tiny_bert/`, `tiny_modernbert*/`, `tiny_open_clip/`, `htsat_clap_*/` — that
-/// exercise every model path offline).
+/// exercise every model path offline, and the fine-tune bench's held-out split,
+/// `finetune_heldout/`).
 pub fn fixtures_dir() -> PathBuf {
     workspace_root().join("tests").join("fixtures")
 }

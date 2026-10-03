@@ -24,7 +24,7 @@
 //!   and storage backends through either transport; both always carry `file`
 //!   and `memory` backends, sorted and de-duplicated.
 //!
-//! Hermetic: the encoder is the local `tiny_bert` cookbook fixture and the
+//! Hermetic: the encoder is the local `tiny_bert` test fixture and the
 //! corpus is the bundled `patents.parquet`; no live network, no download.
 
 use std::sync::Arc;

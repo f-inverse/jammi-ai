@@ -17,7 +17,7 @@
 //! * **Tenant** — `bind_tenant` (async) over the wire is observed by a later
 //!   `tenant()` read; the binding is keyed by the client's session id.
 //!
-//! Hermetic: the encoder is the local `tiny_bert` cookbook fixture and the
+//! Hermetic: the encoder is the local `tiny_bert` test fixture and the
 //! corpus is the bundled `patents.parquet`; no live network, no download.
 
 use jammi_ai::SearchMethod;

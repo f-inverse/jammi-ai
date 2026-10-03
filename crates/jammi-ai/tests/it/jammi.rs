@@ -1,7 +1,7 @@
 //! The SDK front door, embedded path. `Jammi::open(Target::Local(config))` must
 //! yield a working in-process [`Session`] — the one-call "use the SDK, run any
 //! shape" entry point. This drives the real source → generate-embeddings →
-//! search pipeline over the patents fixture and the tiny BERT cookbook model
+//! search pipeline over the patents fixture and the `tiny_bert` test model
 //! through the `Session` the factory returns, proving the front door produces a
 //! live embedded session, not just a constructed value.
 

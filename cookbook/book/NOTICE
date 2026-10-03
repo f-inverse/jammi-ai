@@ -40,7 +40,5 @@ ogbn-arxiv
   License: ODC-BY 1.0 (Open Data Commons Attribution License). Built on the
     Microsoft Academic Graph. Citation: Hu et al., "Open Graph Benchmark:
     Datasets for Machine Learning on Graphs," NeurIPS 2020.
-  Committed excerpts: cookbook/fixtures/arxiv_small/ (a citation-connected
-    subset of papers and their citations) and cookbook/fixtures/finetune_heldout/
-    (supervised title/abstract pairs; its full ODC-BY 1.0 attribution is in
-    that directory's NOTICE).
+  Committed excerpt: cookbook/fixtures/arxiv_small/ (a citation-connected
+    subset of papers and their citations).

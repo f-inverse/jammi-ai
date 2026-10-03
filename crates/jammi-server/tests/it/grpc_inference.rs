@@ -3,7 +3,7 @@
 //! An in-process Tonic server hosts the gRPC chain including the
 //! `InferenceService`. A client registers the `patents.parquet` fixture as a
 //! source and calls `Infer` over its `abstract` column with the local
-//! `tiny_bert` cookbook encoder, then decodes the returned `ArrowBatch` and
+//! `tiny_bert` test encoder, then decodes the returned `ArrowBatch` and
 //! asserts the inference output rows round-trip. This pins the wire adapter's
 //! contract: the verb routes through the `Session` abstraction
 //! and carries the engine's `Vec<RecordBatch>` back as Arrow IPC.

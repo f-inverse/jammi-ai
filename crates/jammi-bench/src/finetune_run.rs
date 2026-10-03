@@ -197,7 +197,7 @@ fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
 /// One (anchor, positive, negative) text triplet, keyed by a stable id — the
 /// shape both the train split and the held-out fixture are supplied in,
 /// regardless of which [`Objective`] this run trains. The committed held-out
-/// fixture (`cookbook/fixtures/finetune_heldout`) mines an
+/// fixture (`tests/fixtures/finetune_heldout`) mines an
 /// EXPLICIT negative per row (`heldout_ids.txt`'s
 /// `anchor_id\tpositive_id\tnegative_id` shape); [`Objective::Triplet`]
 /// consumes all three columns natively, [`Objective::Mnrl`] consumes only

@@ -43,27 +43,28 @@ pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
-# The classifier model and its golden labels are deterministic CPU cookbook
-# fixtures (real safetensors weights + per-id labels), the same ones the
-# engine's hermetic inference-eval tests drive.
+# The models are the engine's deterministic random-weight test checkpoints
+# under `tests/fixtures` (real safetensors weights), the same ones its hermetic
+# inference-eval tests drive; the labels, NER corpus and gold spans are the
+# cookbook's committed data.
 COOKBOOK_FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
 
 PATENTS_URL = f"file://{FIXTURES / 'patents.parquet'}"
 GOLDEN_URL = f"file://{FIXTURES / 'golden_relevance.csv'}"
-TINY_MODERNBERT = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert'}"
+TINY_MODERNBERT = f"local:{FIXTURES / 'tiny_modernbert'}"
 
-TINY_CLASSIFIER = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert_classifier'}"
+TINY_CLASSIFIER = f"local:{FIXTURES / 'tiny_modernbert_classifier'}"
 LABELS_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_labels.csv'}"
 
 # A second deterministic encoder distinct from `tiny_modernbert`, so a compare
 # over the two embedding tables produces a genuinely non-zero delta (not the
 # all-zero self-comparison that hides an order-sensitive significance CI).
-TINY_BERT = f"local:{COOKBOOK_FIXTURES / 'tiny_bert'}"
+TINY_BERT = f"local:{FIXTURES / 'tiny_bert'}"
 
 # The deterministic NER model + its corpus and per-span gold, the same fixtures
 # the engine's hermetic NER eval drives. NER per-record entities carry a
 # `confidence`, the field whose cross-transport parity this module pins.
-TINY_NER = f"local:{COOKBOOK_FIXTURES / 'tiny_modernbert_ner'}"
+TINY_NER = f"local:{FIXTURES / 'tiny_modernbert_ner'}"
 NER_CORPUS_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_ner_corpus.parquet'}"
 NER_GOLD_URL = f"file://{COOKBOOK_FIXTURES / 'tiny_ner_gold.csv'}"
 

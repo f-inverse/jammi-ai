@@ -5864,7 +5864,7 @@ mod r5_f2_classification_pooling_tests {
         vec![Arc::new(StringArray::from(vec!["fine row", "another row"])) as ArrayRef]
     }
 
-    /// A `ResolvedModel` for the `tiny_modernbert_classifier` cookbook
+    /// A `ResolvedModel` for the `tiny_modernbert_classifier` test
     /// fixture (`model_type: "modernbert"`, `id2label` present — the exact
     /// shape `CandleBackend::load`'s `is_classification` gate requires),
     /// resolved for `ModelTask::Classification` — the SAME construction a
@@ -5992,7 +5992,7 @@ mod r5_f2_classification_pooling_tests {
         }
     }
 
-    /// A `ResolvedModel` for the SAME `tiny_modernbert_classifier` cookbook
+    /// A `ResolvedModel` for the SAME `tiny_modernbert_classifier` test
     /// fixture as above (its `config.json` carries `id2label` — a real
     /// checkpoint's default classification-head declaration), but resolved
     /// for `ModelTask::TextEmbedding` instead of `Classification` — the

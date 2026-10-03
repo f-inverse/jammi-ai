@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The train-run producer: drives `jammi-bench finetune-run` over the
-# committed `cookbook/fixtures/finetune_heldout/` held-out fixture beside
+# committed `tests/fixtures/finetune_heldout/` held-out fixture beside
 # `crates/jammi-bench/reference/torch_finetune_run.py` — the same run in
 # PyTorch + PEFT — one leg per (seed, arm, repeat): the `fused` arm and the
 # twin's two widths, `torch` and `torch-natural`, `{r1, r2}` same-seed
@@ -9,12 +9,12 @@
 #
 # NOT `stacked_sweep.sh`-shaped for its measured legs: no cookbook book
 # stack, no server. Every input a MEASURED leg reads is a committed repo
-# path (the fixture under `cookbook/fixtures/finetune_heldout/`, a local
+# path (the fixture under `tests/fixtures/finetune_heldout/`, a local
 # `--model-dir` checkpoint the operator already has on-box); no leg itself
 # builds the cookbook corpus, starts a `jammi-server`, or touches the
 # network.
 #
-# HELD-OUT FIXTURE LAYOUT (cookbook/fixtures/finetune_heldout/):
+# HELD-OUT FIXTURE LAYOUT (tests/fixtures/finetune_heldout/):
 #   heldout_ids.txt       the committed held-out id list -- what
 #                         `heldout_ids_sha256` hashes.
 #   heldout_pairs.jsonl   the held-out pair text.
@@ -26,7 +26,7 @@
 # (sha256 per pair id, exact count 1372, no extras/duplicates): an overridden
 # path is never trusted on name alone.
 #
-# Batch size: 32 (`cookbook/fixtures/finetune_heldout/README.md` -- the
+# Batch size: 32 (`tests/fixtures/finetune_heldout/README.md` -- the
 # chapter-config value every real `db.fine_tune(...)` call over this exact
 # pair set already uses; 128 held-out pairs is a multiple of both 32 and the engine's own
 # unset-default 8, so this pick does not change the fixture's own held-out
@@ -281,7 +281,7 @@ arm_selected() {
     *) return 1 ;;
   esac
 }
-FIXTURE_DIR="$REPO_ROOT/cookbook/fixtures/finetune_heldout"
+FIXTURE_DIR="$REPO_ROOT/tests/fixtures/finetune_heldout"
 TRAIN_JSONL="${TRAIN_JSONL:-$FIXTURE_DIR/train_pairs.jsonl}"
 HELDOUT_IDS="${HELDOUT_IDS:-$FIXTURE_DIR/heldout_ids.txt}"
 HELDOUT_JSONL="${HELDOUT_JSONL:-$FIXTURE_DIR/heldout_pairs.jsonl}"
@@ -304,14 +304,14 @@ fi
 if [ "$FINETUNE_RUN_AB_DRY_RUN" != "1" ]; then
   for f in "$HELDOUT_IDS" "$HELDOUT_JSONL"; do
     if [ ! -f "$f" ]; then
-      echo "::error::committed fixture file not found: $f (cookbook/fixtures/finetune_heldout/) — refusing before any leg runs." >&2
+      echo "::error::committed fixture file not found: $f (tests/fixtures/finetune_heldout/) — refusing before any leg runs." >&2
       exit 1
     fi
   done
 
   # A stale or hand-edited file fails here, before any leg runs.
   python3 "$DIR/verify_train_pairs.py" --pairs "$TRAIN_JSONL" \
-    || { echo "::error::$TRAIN_JSONL failed byte-verification against cookbook/fixtures/finetune_heldout/train_ids_sha256.json — refusing before any leg runs." >&2; exit 1; }
+    || { echo "::error::$TRAIN_JSONL failed byte-verification against tests/fixtures/finetune_heldout/train_ids_sha256.json — refusing before any leg runs." >&2; exit 1; }
 fi
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"

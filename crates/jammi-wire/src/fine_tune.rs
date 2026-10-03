@@ -699,7 +699,7 @@ impl FineTuneConfig {
 /// One held-out example's stable id and the model's loss on it.
 ///
 /// `example_id` is the STABLE id from the committed fixture (a string triple
-/// id, `cookbook/fixtures/finetune_heldout/heldout_ids.txt`), never a
+/// id, `tests/fixtures/finetune_heldout/heldout_ids.txt`), never a
 /// row index: index-based ids would silently repoint at a different example
 /// if the fixture's row order ever changed, which a stable string id cannot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

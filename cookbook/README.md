@@ -53,9 +53,8 @@ what that model really does.
 `fixtures/` holds the data the recipes and the book's `small` scale read: small
 corpora with their labels and golden sets (`tiny_corpus.parquet`,
 `tiny_golden.json`, `tiny_reviews.parquet`, the image and audio corpora), and
-small excerpts of the book's datasets (`arxiv_small/`, `air_routes/`,
-`finetune_heldout/`). The data files regenerate with
-`python cookbook/fixtures/generate.py`.
+small excerpts of the book's datasets (`arxiv_small/`, `air_routes/`). The data
+files regenerate with `python cookbook/fixtures/generate.py`.
 
 ## Running
 

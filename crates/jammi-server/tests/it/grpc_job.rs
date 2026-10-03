@@ -4,7 +4,7 @@
 //! client registers the shipped `training_pairs.csv` fixture as a source
 //! (through the embedding service's `AddSource`, which backs onto the same
 //! engine session), starts a minimal LoRA fine-tune over its contrastive
-//! `(text_a, text_b, score)` columns with the local `tiny_bert` cookbook
+//! `(text_a, text_b, score)` columns with the local `tiny_bert` test
 //! encoder via the `FineTuneSpec` arm of `SubmitJob`, then polls `JobStatus`
 //! until a terminal state and asserts the job completed with the output
 //! model id `SubmitJob` returned. This pins the wire adapter's contract:

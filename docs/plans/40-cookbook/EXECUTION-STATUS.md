@@ -558,6 +558,13 @@ API — the bare id raises `table not found`.)
   generic fixtures live there). No download cache or revision pin in CI (user
   direction: readers bring hardware and network, testing runs on rented pods);
   the book's CI jobs authenticate with `HF_TOKEN`.
+- **`cookbook/fixtures` holds what the cookbook reads; every test-only fixture
+  lives under `tests/fixtures`.** The rule that moved the random-weight
+  encoders also moves `finetune_heldout`, the fine-tune bench's held-out split:
+  the perf harness reads it, no recipe or chapter does, and the cookbook package
+  never shipped it. Its ODC-BY attribution moves with it, in its own `NOTICE`.
+  Data both read (`tiny_labels.csv`, the NER corpus and gold) stays with the
+  cookbook, and the engine's tests read it from there.
 - **A `vocab.txt`-only checkpoint is an engine fix, not a model chosen around
   it.** The most-used Hub sentiment and NER checkpoints ship no `tokenizer.json`
   and failed with "No tokenizer loaded". Picking other models would leave the gap

@@ -12,7 +12,7 @@
 //!
 //! * **Round-trip parity** — the same call through either transport returns the
 //!   same result against the same engine, on realistic inputs (the `tiny_bert`
-//!   cookbook encoder over the shipped `patents` corpus, a real golden set, a
+//!   test encoder over the shipped `patents` corpus, a real golden set, a
 //!   real mutable-table definition, a real channel).
 //! * **Error parity** — a real failure returns the *same*
 //!   `JammiError` variant + fields from both transports. The mutable case is

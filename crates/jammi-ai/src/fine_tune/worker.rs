@@ -11171,7 +11171,7 @@ mod tests {
         )
     }
 
-    /// A LoRA-injected BERT encoder over the committed `tiny_bert` cookbook
+    /// A LoRA-injected BERT encoder over the committed `tiny_bert` test
     /// fixture (safetensors + a real tokenizer), built through the worker's
     /// own `build_encoder_adapters` at `lora_dropout` — the encoder a job of
     /// this spec trains — registered into `varmap`.

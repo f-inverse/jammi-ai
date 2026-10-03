@@ -7,9 +7,9 @@
 //! embeddings. The unification is exercised across two modalities:
 //!
 //! * `AUDIO` over a synthetic three-tone WAV corpus encoded by the
-//!   `htsat_clap_tiny` real-key cookbook fixture.
+//!   `htsat_clap_tiny` real-key test fixture.
 //! * `TEXT` over the `patents.parquet` fixture's `abstract` column encoded by
-//!   the `tiny_bert` cookbook fixture.
+//!   the `tiny_bert` test fixture.
 //!
 //! Both are hermetic: the audio corpus is built in-process and both encoders
 //! are local fixtures (no network, no download). This pins the wire adapter's

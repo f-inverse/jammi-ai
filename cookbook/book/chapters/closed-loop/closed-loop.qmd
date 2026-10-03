@@ -2,11 +2,6 @@
 title: "The whole pipeline in one measured pass"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 This is the closing chapter of the keystone: the whole spine run as **one
 measured pass** from a fresh engine —
 

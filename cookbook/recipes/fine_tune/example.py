@@ -1,7 +1,7 @@
-"""Fine-tune `tiny_bert` with LoRA, from labelled pairs and from a citation graph.
+"""Fine-tune a sentence encoder with LoRA, from labelled pairs and from a citation graph.
 
 Run with `python cookbook/recipes/fine_tune/example.py`, or a step at a time
-as a notebook: each `# %%` cell is one step. Seconds on a CPU.
+as a notebook: each `# %%` cell is one step. A minute or two on a CPU.
 """
 
 # %%
@@ -10,7 +10,7 @@ import tempfile
 import jammi
 from jammi_cookbook import fixtures
 
-BASE_MODEL = fixtures.model("tiny_bert")
+BASE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
@@ -53,11 +53,14 @@ print(f"model_id: {model_id}")
 # ## Use the fine-tuned model
 #
 # The new id names a model like any other: here it encodes a query, loaded
-# from the catalog, in the base model's 32 dimensions.
+# from the catalog, in the base model's 384 dimensions. LoRA trains a small
+# update beside the frozen base weights, so the base model is unchanged and
+# both ids keep working.
 
 # %%
 query_vec = db.encode_query(model=model_id, query="quantum computing applications")
-assert len(query_vec) == 32, f"tiny_bert is 32-dim; got {len(query_vec)}-dim from fine-tuned"
+base_vec = db.encode_query(model=BASE_MODEL, query="quantum computing applications")
+assert len(query_vec) == len(base_vec) == 384, (len(query_vec), len(base_vec))
 
 # %% [markdown]
 # ## Fine-tune from a graph instead

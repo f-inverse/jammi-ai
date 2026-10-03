@@ -30,11 +30,10 @@ from moto.server import ThreadedMotoServer
 import jammi
 from jammi_cookbook import fixtures
 
-os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
 os.environ.setdefault("JAMMI_ENGINE__BATCH_SIZE", "8")
 
 CORPUS = fixtures.path("tiny_corpus.parquet")
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 BUCKET = "jammi-cookbook"
 QUERY = "how does quantum computing work?"
 

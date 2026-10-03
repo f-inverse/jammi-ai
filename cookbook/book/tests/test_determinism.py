@@ -1,19 +1,8 @@
-"""Unit tests for the determinism contract."""
+"""Unit tests for the book's per-step seeds."""
 
 from __future__ import annotations
 
-import os
-
 from jammi_cookbook import determinism
-
-
-def test_env_pinned_on_import():
-    assert os.environ["OMP_NUM_THREADS"] == "1"
-    assert os.environ["TOKENIZERS_PARALLELISM"] == "false"
-
-
-def test_the_small_scale_runs_on_the_cpu():
-    assert os.environ["JAMMI_GPU__DEVICE"] == "-1"
 
 
 def test_seeded_is_pure_and_stable():

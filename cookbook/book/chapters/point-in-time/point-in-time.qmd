@@ -2,11 +2,6 @@
 title: "Point-in-time correctness — the feature value as it was known, not as it is now"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `asof_join` (backward · inclusive · `by` entity · `tolerance` look-back ·
 deterministic tie-break) · `verify_materialization` (the materialized training set's
 definition hash + input as-of anchors) · the contrast against a naive current-state
@@ -361,7 +356,7 @@ pq.write_table(pa.table({
              "spectral kernels and the laplacian", "conformal prediction under shift"],
 }), f"{docs}/docs.parquet")
 db.add_source("docs", url=f"{docs}/docs.parquet", format="parquet")
-db.generate_embeddings(source="docs", model=fixtures.model("tiny_bert"), columns=["text"],
+db.generate_embeddings(source="docs", model="sentence-transformers/all-MiniLM-L6-v2", columns=["text"],
                        key="_row_id")
 graph = db.build_neighbor_graph("docs", k=2, exact=True)
 manifest = db.describe_table(graph)

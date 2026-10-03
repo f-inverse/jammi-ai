@@ -1,664 +1,133 @@
 ---
-title: "Fine-tune acceleration, made visible — the per-job report, and f16's honest limits"
+title: "Fine-tune acceleration: what your job's kernels actually did"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
+**Verbs:** `fine_tune(..., backbone_dtype=...)` · `TrainingJob.acceleration_report()` ·
+`TrainingJob.metrics()` · **Background:** of the two reduced-precision floats, `bf16`
+keeps `f32`'s exponent range and trains without loss scaling [@kalamkar2019bfloat16],
+where `f16` is the type mixed-precision training first needed loss scaling for
+[@micikevicius2018mixedprecision]; FlashAttention computes a whole attention block in
+one IO-aware kernel [@dao2022flashattention] · **Checked:** live (a LoRA fine-tune of
+ModernBERT on this machine; the job's acceleration report and its kernel dispatch
+counters read back and checked against each other).
 
-**Verbs:** `fine_tune(..., backbone_dtype=...)` on `[gpu]` · `TrainingJob.acceleration_report()`
-— the same handle `wait()`/`status()`/`metrics()` already carry · **Background:** mixed-precision
-training's two reduced-precision floats are not interchangeable — `bf16` carries `f32`'s full
-8-bit exponent range and needs no loss-scaling [@kalamkar2019bfloat16], `f16`'s narrower 5-bit
-exponent is the dtype the original mixed-precision-training recipe *did* need loss-scaling for
-[@micikevicius2018mixedprecision] — and FlashAttention fuses the whole attention block into one
-IO-aware kernel rather than fusing a single primitive [@dao2022flashattention] · **Checked:**
-measurement (a live fine-tune submitted over the remote `grpc://` client, its per-job
-acceleration report read back through `pending` — byte-exact and stable, against a live server
-configured not to claim — → `determined` under a claiming successor process that opens the same
-catalog, both dtypes' outcomes asserted)
-+ the GPU-only facts (FlashAttention-2's own `f16` admission, and bounded training memory at
-the measured shapes — cited rather than recomputed here).
+## A job learns its acceleration when it runs
 
-## A third precision knob — and the first one this book cannot fully render
+The training step is built from fused kernels: one GPU or CPU kernel where an eager
+implementation would launch several operators — layer norm, the gated feed-forward,
+the attention block, the LoRA update, the optimizer step. Whether each one runs
+fused depends on the device, the dtype and the model's shapes. A fine-tune is a job,
+submitted now and claimed later by whichever worker has capacity, so none of that
+is known when you submit. `acceleration_report()` records what was decided, per
+job, when a worker claims it: `pending` until then, `determined` after.
 
-[The storage-precision chapters](precision.qmd) measure `storage_precision` (what an ANN sidecar keeps on
-disk); [the one before this](compute-precision.qmd) measured `compute_precision` (what dtype
-*inference* runs at). This chapter measures a third, independent knob: `fine_tune`'s own
-`backbone_dtype` — what dtype the encoder's weights and activations run at *during training*.
-Same three literals (`f32` / `f16` / `bf16`), same load-boundary honesty contract, but a
-different lifecycle entirely: a fine-tune is not a call that returns a value, it is a **job** —
-submitted, queued, claimed by a worker, and only *then* does the engine know which device it
-landed on and which fused kernels that job's own dtype can actually reach. That gap between
-"submitted" and "known" is exactly what `TrainingJob.acceleration_report()` exists to close: a
-per-job, claim-time determination of whether this job's fused kernels and FlashAttention are
-`Hold`ing (dispatching for real) or `Miss`ing (declining, with the same domain-check reason key
-the kernel's own admission gate recorded) — read back through the SAME handle `wait()` and
-`metrics()` already live on, on both the embedded and the remote transport.
-
-## The honesty contract: which surface, which build
-
-`fine_tune`'s **remote** arm (`jammi.connect("grpc://…").fine_tune(...)`) is the only public
-surface that can ever reach a *flash-compiled* binary: FlashAttention is vendored CUTLASS/CUDA
-source (`crates/jammi-kernels/third_party/flash-attention`), gated behind the `flash-attn` cargo
-feature, and only the CUDA release lanes (the tarball, the `cu12` wheel, the container image)
-compile it in. The servers this chapter starts are pinned to the CPU (`[gpu] device = -1`,
-set through the environment below), whichever `jammi-server` is installed — a CUDA build's
-kernels have no CUDA device to run on here. In CI that server is the CPU `jammi-server` the
-release manifest calls `server-cpu` — no `cuda` feature, no `flash-attn` feature — which `ci.yml`
-builds once per change and every render of this book installs, because no render of it ever has a
-CUDA device to hand a compiled kernel to. That is a fact about *this
-render's own CI machine*, not a gap in the report mechanism: everything below through the
-`## Measured on real GPU hardware, not here` heading is a live, real submission against a live,
-real server — it simply resolves onto CPU, so its `flash` verdict is always the *compiled-away*
-reason, never a *declined-on-domain* one. The declined-on-domain evidence, and the numbers a real
-CUDA server produces, are reported honestly as measured elsewhere, exactly the way
-[the compute-precision chapter](compute-precision.qmd) reports its own `bf16`-on-Ampere number.
-
-## The fixture — a real server, a GPU-free encoder
-
-The live cells below spin up a real `jammi-server` subprocess and drive it over `grpc://` with
-the engine's own public `tiny_modernbert` fixture (hidden size 32, one layer) — the same
-GPU-free, hermetic ModernBERT-architecture stand-in [the model-catalog chapter](../model-catalog/model-catalog.qmd)
-trains against. The facts measured on real hardware, cited further down, were
-gathered against the real checkpoint that motivated this work — ModernBERT-large
-[@warner2024modernbert], `head_dim = 64` — which this render does not download or train; the two
-are never conflated below.
+The model is ModernBERT (`Alibaba-NLP/gte-modernbert-base`, 149M parameters), with
+LoRA adapters on its attention and feed-forward projections, trained on 30 scored
+text pairs for one epoch.
 
 ```{python}
-from jammi_cookbook import fixtures
-
-TINY_MODERNBERT = fixtures.path("tiny_modernbert")
-print(f"encoder: {TINY_MODERNBERT.name}  (tiny ModernBERT architecture, hidden_size=32)")
-```
-
-## Standing up the remote servers — one artifact directory, two processes in sequence
-
-The same `LiveServer` shape [the model-catalog cache emit](../model-catalog/model-catalog.qmd) uses: a real
-`jammi-server` on a loopback port **the kernel assigns to the child itself**, readiness-polled via
-a client handshake, torn down on exit. `jammi-server` must already be on `PATH` — CI's book jobs
-place the run's own binary there before invoking `quarto render`.
-
-This chapter runs **two** such servers, one after the other, over the **same artifact
-directory** — which is why the artifact directory is a constructor *parameter* here rather than
-something the harness invents per instance. Server **A** mounts the training surface but is
-configured not to claim; server **B** is today's ordinary all-in-one. They are strictly
-sequential, never concurrent, because this render's catalog is SQLite and SQLite is a
-single-process store: the first server must have really exited before the second may open the
-same directory. The section below the submission cell says what that buys and what the knob
-actually is.
-
-One detail worth naming, because it is the difference between a chapter that renders and a
-chapter that flakes: this cell never *picks* a port. Binding a socket in this process to learn a
-free port, closing it, and handing the number to the child opens a release-then-rebind window —
-any other process on the machine (a parallel render, another test) can take that port in between,
-and the server dies on a bind error that looks like a chapter bug. Instead both listeners are
-configured `127.0.0.1:0`, so the **child** holds each binding from the instant the kernel assigns
-it, and the child announces the addresses it actually got on stdout in a fixed, machine-parseable
-line (`jammi-server listening flight=<addr> health=<addr>`, printed after bind and before serve —
-the engine's own subprocess harnesses read exactly this banner). The reader below keeps draining
-that pipe for the process's whole life, not just until the banner: a full stdout pipe would block
-the child's own logging.
-
-```{python}
-import inspect
 import tempfile
-import time
 
 import jammi
-from jammi.testing import LiveServer
+from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 
-print(inspect.getsource(LiveServer))
+BASE = "Alibaba-NLP/gte-modernbert-base"
 
-# One artifact directory, opened by BOTH servers below, in sequence.
-ARTIFACT_DIR = tempfile.mkdtemp(prefix="jammi_srv_ftaccel_")
+db = jammi.connect(f"file://{tempfile.mkdtemp()}")
+db.add_source("pairs", url=fixtures.url("tiny_pairs.csv"), format="csv")
 
-# Server A: the training surface is mounted and accepts submissions, but this
-# process never claims — `[worker] enabled = false`.
-server_a = LiveServer(
-    ARTIFACT_DIR, env={"JAMMI_WORKER__ENABLED": "false", "JAMMI_GPU__DEVICE": "-1"}
-).__enter__()
-# The literal `grpc://` target — the same public front door every other
-# remote-transport chapter in this book opens, over a real live server this
-# render itself just started.
-remote_a = jammi.connect(server_a.endpoint)
-print(f"server A (worker disabled) up at {server_a.endpoint}")
-print(f"  artifact dir: {ARTIFACT_DIR}")
+
+def fine_tune(dtype: str):
+    return db.fine_tune(source="pairs", base_model=BASE, columns=["text_a", "text_b", "score"],
+                        method="lora", task="text_embedding", epochs=1, batch_size=8, seed=0,
+                        backbone_dtype=dtype, target_modules=["Wqkv", "Wo", "Wi"])
 ```
 
-```{python}
-import pyarrow as pa
-import pyarrow.parquet as pq
+## Ask for `bf16`
 
-# A tiny, generic (anchor, positive) pairs corpus — the same `pairs` training
-# format the model-catalog cache emit uses. Deterministic content; no consumer
-# vocabulary.
-PAIRS = {
-    "anchor": ["a graph", "a node", "an edge", "a model"] * 3,
-    "positive": ["a network", "a vertex", "a link", "a net"] * 3,
-}
-_work = tempfile.mkdtemp(prefix="jammi_ftaccel_corpus_")
-_corpus_path = f"{_work}/pairs.parquet"
-pq.write_table(pa.table(PAIRS), _corpus_path)
-
-remote_a.add_source("ftaccel_pairs", url=f"file://{_corpus_path}", format="parquet")
-print("registered a 12-row (anchor, positive) pairs source")
-```
-
-## Submitting an `f16` fine-tune, and reading its report across the job's lifecycle
-
-`fine_tune`'s `backbone_dtype` only takes effect on the LoRA-adapter arm (`target_modules`
-non-empty) — that is the arm that actually materializes a dtype-typed encoder to run the
-acceleration probe against. Submission itself writes `{"state": "pending"}` into the job's report
-column: the job exists, but no worker has claimed it yet, so no device is even known. That marker
-is an **explicit written state**, not an empty column: an unset report is `None` on this surface
-(an honest absence of information, deliberately distinguishable from `pending`), so a
-just-submitted job is never `None` — the tri-state is `None` / `pending` / `determined`, and the
-cell below pins the middle one exactly.
-
-In an all-in-one server the claiming worker runs *inside the very process that accepted the
-submission*: between the submit RPC returning and a status RPC landing, that worker's claim loop
-can already have claimed the job, resolved the device and replaced the marker with a
-`"determined"` report — a genuine race, not a flake. A state the chapter cannot
-deterministically observe is a state it must not claim to have measured, so this section removes
-the race by **configuration**, not a code path. `WorkerConfig::enabled`
-(`crates/jammi-db/src/config/mod.rs`) is a runtime setting that answers exactly one question: does
-THIS process run the claim loop? With `[worker] enabled = false` (or the
-environment override `JAMMI_WORKER__ENABLED=false`) the process still mounts and serves the
-training surface and still accepts submissions — it simply never claims, and submitted jobs stay
-`queued`. Submission and claiming are separable by a deployment knob; and because it is one key
-read by whatever arm decides whether to spawn the loop, the same knob is honored identically by a server over the wire and by the embedded,
-in-process arm — not two settings that have to be kept in agreement. The race is therefore not
-*widened*, it is **removed**: with no claimant in the process, `pending` is not a window to be
-caught, it is the job's steady state. The cell below asserts one byte-exact dict and one
-byte-exact status string on **every** poll of a multi-poll window that outlasts a claiming
-worker's own idle poll.
-
-The cell sleeps, so it is worth being exact about why that is correct here. A sleep that widens
-a race window is a way of *making a flaky assertion pass*; a sleep that spans more than the interval a claimant would have woken on is a way of
-*demonstrating that nothing claims*. The first hides a state the chapter cannot observe; the
-second measures one it can. `WorkerConfig`'s default `idle_poll_secs = 1` — the interval an idle
-worker polls for a queued job on — is the number that has to be exceeded, and the span below
-exceeds it.
+`backbone_dtype` is the dtype the frozen backbone trains in. `bf16` halves its
+memory and runs on tensor cores, on a GPU that has them (compute capability 8.0,
+Ampere, or newer). On any other device the job is refused, with the reason and the
+alternative named, rather than run in another dtype behind your back. So a program
+can ask for `bf16` and fall back on the refusal:
 
 ```{python}
-import json
-
-BASE_MODEL = f"local:{TINY_MODERNBERT}"
-TARGET_MODULES = ["Wqkv", "Wo", "Wi"]  # ModernBERT's own LoRA-eligible linear names
-
-job_a = remote_a.fine_tune(
-    source="ftaccel_pairs",
-    base_model=BASE_MODEL,
-    columns=["anchor", "positive"],
-    method="lora",
-    task="text_embedding",
-    epochs=1,
-    batch_size=4,
-    seed=0,
-    backbone_dtype="f16",
-    target_modules=TARGET_MODULES,
-)
-JOB_A_ID, JOB_A_MODEL_ID = job_a.job_id, job_a.output_model_id
-print(f"submitted job {JOB_A_ID} to a server that does not claim")
-
-# `WorkerConfig`'s own default idle poll — the interval a CLAIMING process
-# wakes on to look for a queued job. The observation span below must EXCEED it,
-# or "still pending" would prove nothing about claiming.
-WORKER_IDLE_POLL_SECONDS = 1.0
-POLL_COUNT = 4
-POLL_GAP_SECONDS = 0.5
-
-observed = []
-t0 = time.monotonic()
-for i in range(POLL_COUNT):
-    if i:
-        time.sleep(POLL_GAP_SECONDS)
-    report, status = job_a.acceleration_report(), job_a.status()
-    observed.append((time.monotonic() - t0, report, status))
-    # Byte-exact on the PARSED dict and the status string, EVERY poll. One
-    # value each, no branch: with no claimant in this process there is exactly
-    # one legal answer, and a `determined` report here would be a real bug.
-    assert report == {"state": "pending"}, report
-    assert status == "queued", status
-
-for at, report, status in observed:
-    print(f"  t+{at:>4.2f}s  acceleration_report()={report}  status()={status!r}")
-
-span = observed[-1][0]
-assert len(observed) >= 3, observed
-assert span > WORKER_IDLE_POLL_SECONDS, span
-print(
-    f"\nstable: {len(observed)} polls spanning {span:.2f}s > the {WORKER_IDLE_POLL_SECONDS}s "
-    "worker idle poll — pending is this job's steady state, not a window"
-)
-```
-
-## Handing the queue to a claiming process
-
-Server A has done everything a submission-only deployment can do: the job is real, queued, and
-recorded in the catalog. To determine anything about it, something has to *claim* it — and the
-claim is what computes the `"determined"` report the rest of this chapter measures.
-
-The order below is forced by the store, not chosen for convenience. This render's catalog is
-SQLite, a single-process store, so server A must have really exited before server B may open the
-same artifact directory — and the successor's successful open is itself the proof that the
-predecessor released the catalog, rather than a sidecar poll of a lock file or a sleep-and-hope.
-On Postgres the same knob composes differently and better: a multi-process catalog lets an
-`enabled = false` submission front end and an `enabled = true` worker run **concurrently**,
-which is the deployment shape the flag exists for. The strict sequencing here is SQLite's
-constraint showing through, not the flag's.
-
-What survives the process boundary is the queue itself. Server B is the ordinary all-in-one —
-no override, `enabled` at its default `true` — and it claims a job it never accepted, submitted
-by a process that no longer exists, because the job lives in the catalog rather than in either
-server's memory. On SQLite that is the rule in general: a queued job is claimed by the next
-claiming process that opens the directory.
-
-```{python}
-# Server A closes FIRST, and the close is AWAITED — a single-process store is
-# not released until the process is really gone.
-remote_a.close()
-server_a.__exit__(None, None, None)
-assert server_a.returncode is not None, "server A did not exit"
-print(f"server A closed (returncode={server_a.returncode})")
-
-# Server B: today's all-in-one, no override, `enabled` at its default. That
-# this open SUCCEEDS on the same directory is the release proof.
-server_b = LiveServer(ARTIFACT_DIR, env={"JAMMI_GPU__DEVICE": "-1"}).__enter__()
-remote = jammi.connect(server_b.endpoint)
-print(f"server B (worker enabled, the default) up at {server_b.endpoint}, same artifact dir")
-```
-
-A job handle is **re-attachable across connections**, on both arms: `db.job(job_id)`
-hands back a handle to a job this session never submitted — the same
-`jammi.RemoteJob` here that `fine_tune` returns, and the embedded arm's own
-`Job` there. That is what makes the sequence below expressible through the public
-surface at all: server A's handle died with server A's channel, and the id is the only thing
-that crosses. Existence is resolved at attach time, by one `JobStatus` call, rather
-than left for the first read to discover: a job id with no row visible to this session's
-tenant raises the typed `jammi.errors.BackendError` — the same class on both transports —
-instead of handing back a handle that fails later.
-
-`JobStatusResponse.output_model_id` reads the same on both arms at every lifecycle state —
-queued, running, completed, failed — not only once the job completes: for a LoRA fine-tune
-it is the DETERMINISTIC `jammi:fine-tuned:{job_id}` id, stamped at SUBMISSION time (it
-depends only on `job_id`, never the run's outcome). The server resolves
-it via `resolve_model_id` (`crates/jammi-ai/src/fine_tune/training_job.rs`) into that field
-(`crates/jammi-wire/proto/jammi/v1/job.proto`), and the embedded attach calls
-the SAME engine function, so this client duplicates no naming rule of its own —
-`list_jobs()`'s `output_model_id` relays the SAME catalog column verbatim, so the two
-reads agree from submission onward, not only after completion. Nothing about server
-B's claim loop is asserted at attach time here regardless — whether it has already finished
-this job by then is a race, and a race is exactly what this chapter refuses to assert into.
-The re-attach *after* `wait()` in the cell below is the deterministic read once the job is
-terminal, and it recovers the very id server A was handed at submit — over a connection to
-a process that never accepted the submission.
-
-```{python}
-# Job A, over server B's connection, through the public verb. Same job id —
-# nothing is resubmitted.
-job_f16 = remote.job(JOB_A_ID)
-assert job_f16.job_id == JOB_A_ID
-
-# The queue outlived the process that accepted it: a job server B never saw
-# submitted leaves `queued` under server B's own claim loop.
-job_f16.wait()
-assert job_f16.status() == "completed", job_f16.status()
-
-# A second attach, now that the job is terminal — the deterministic
-# `output_model_id` read. Server B recovers the exact output id server A was
-# handed at submit, from the catalog alone.
-assert remote.job(JOB_A_ID).output_model_id == JOB_A_MODEL_ID
-
-report_f16 = job_f16.acceleration_report()
-print(json.dumps(report_f16, indent=2, sort_keys=True))
-
-assert report_f16["state"] == "determined"
-assert report_f16["dtype"] == "f16"
-assert report_f16["device"] == "cpu"  # both servers are pinned to the CPU
-```
-
-## Reading `Holds` and `Miss` — the real vocabulary, on a real (CPU) job
-
-The report's `ops` map is one entry per fused primitive this job's own probe exercised — a real
-forward pass **plus one backward and one optimizer step**, which is what makes the epilogue and
-optimizer kernels below observable at all — each `{"holds": bool, "reason": str}`. `holds: true`
-means the SAME dispatch registry the kernel's own admission gate maintains actually recorded a
-fused hit for THIS job; `holds: false` carries the exact domain-check `reason` key the admission
-predicate itself produced, never a re-derived one — read out of *this
-job's own probe window* rather than a process-lifetime warning list, so a repeated miss can never
-be attributed some other job's predicate.
-
-The report keys are **dtype-neutral**: `cast_scale` and `cast_add` name a cast boundary whose
-actual registry key is resolved from the job's backbone dtype at probe time (this `f16` job's
-`cast_scale_f16_f32` / `cast_add_f16`; a `bf16` job's `cast_scale_bf16_f32` / `cast_add_bf16` —
-the same two report keys either way). This one CPU job `Hold`s on all nine of the primitives its
-probe attributed a clean dispatch to — `layer_norm`, `rope`, `softmax`, `geglu`, `dropout`,
-`low_rank_residual_linear`, `cast_scale`, `cast_add`, `adamw_step` — and `Miss`es on the one
-remaining entry, `attention_block`; `flash` (a separate field, discussed below) `Miss`es too. The
-map's *membership* is itself a measured fact, not a fixed-size table: an op whose before/after
-dispatch counters show no clean single-arm signal is omitted entirely rather than guessed at (the
-mechanism, and a GPU report that omits more, are discussed further down). Each `Miss` teaches a
-different, independent limit:
-
-```{python}
-for op in sorted(report_f16["ops"]):
-    entry = report_f16["ops"][op]
-    mark = "Hold" if entry["holds"] else "Miss"
-    print(f"  {op:<24s} {mark:<5s} reason={entry['reason']}")
-
-print(f"\n  {'flash':<24s} {'Hold' if report_f16['flash']['holds'] else 'Miss':<5s} "
-      f"reason={report_f16['flash']['reason']}")
-
-# Measured, per op — the verdicts and reason keys the prose below explains, each
-# asserted individually so a widened probe (a new attributed op appearing in the
-# map) cannot quietly invalidate any claim made here.
-HOLDING = (
-    # forward-pass encoder + LoRA kernels
-    "layer_norm", "rope", "softmax", "geglu", "dropout", "low_rank_residual_linear",
-    # backward-pass cast boundary — dtype-neutral report keys, f16 registry keys here
-    "cast_scale", "cast_add",
-    # optimizer step
-    "adamw_step",
-)
-for op in HOLDING:
-    assert report_f16["ops"][op] == {"holds": True, "reason": "domain_ok"}, report_f16["ops"][op]
-
-assert report_f16["ops"]["attention_block"] == {
-    "holds": False,
-    "reason": "dtype_f32_matching_between_qkv_and_mask_on_cpu",
-}, report_f16["ops"]["attention_block"]
-# Why flash is out of reach depends on the installed server, never on this job: a CPU
-# build has no CUDA code at all; a CUDA build has it, but its device is the CPU.
-assert report_f16["flash"] in (
-    {"holds": False, "reason": "cuda_not_compiled"},
-    {"holds": False, "reason": "device_is_cpu_or_metal_not_cuda"},
-), report_f16["flash"]
-
-n_hold = sum(1 for e in report_f16["ops"].values() if e["holds"])
-print(f"\n  attributed ops: {len(report_f16['ops'])}   Hold: {n_hold}   "
-      f"Miss: {len(report_f16['ops']) - n_hold}")
-```
-
-- **`layer_norm` / `rope` / `softmax` / `geglu` / `dropout` / `low_rank_residual_linear` →
-  `Hold`, `domain_ok`.** All six hold for `F16` on CPU. The last two both read the SAME
-  `lora_linear_fused` registry — the LoRA-epilogue fused kernel — whose admission predicate
-  accepts a matched `(F32, F32)`, `(BF16, BF16)` or `(F16, F16)` base/LoRA dtype pair
-  (`crates/jammi-lora/src/lora_linear.rs`'s `lora_linear_admission_predicate`, declined-pair
-  reason `base_dtype_f32_bf16_or_f16_matched`). Every one of these six kernels is
-  dtype-domain-gated with a portable CPU implementation alongside its CUDA one — the *numeric*
-  benefit (one rounding point instead of several) is real on CPU too, even though the *wall-clock*
-  benefit is a CUDA-only property. A CPU render `Hold`ing these is therefore not a mistake; it is
-  the honest, correct value of a domain check whose domain never mentioned the device.
-- **`cast_scale` / `cast_add` → `Hold`, `domain_ok`.** The LoRA residual's **backward-pass** cast
-  boundary: the gradient arrives in the backbone's reduced-precision dtype and has to reach `f32`
-  (`cast_scale`), and the base and LoRA gradient paths have to be added back across that same
-  boundary (`cast_add`). Both are two-kernel chains a fused kernel collapses into one, which is
-  also why they exist **only** for a reduced-precision backbone — an `f32` job takes a
-  structurally different, admission-free branch and these keys are simply absent from its report,
-  not `Miss`ing. They are the reason this chapter's probe runs a backward and an optimizer step
-  rather than a forward pass alone: a forward-only probe could not honestly claim to have measured
-  either. They appear on an `f16` job **at all** because the report key is dtype-neutral and the
-  registry key is resolved from the job's own backbone dtype: a probed-op table hard-coding the
-  `bf16` registry keys would report an `f16` job's real, fused cast epilogue as nothing at all — a
-  silent-eager blind spot on the headline dtype.
-- **`adamw_step` → `Hold`, `domain_ok`.** The fused multi-tensor AdamW step — the optimizer, not
-  the model. Worth stating plainly because it is the one op whose domain is on a *different axis*
-  than everything else in this list: its own predicate requires `theta`/`first_moment`/
-  `second_moment`/`grad` to be `F32`, contiguous and co-located, and that stays true no matter
-  what `backbone_dtype` the job declared — a mixed-precision recipe keeps `f32` master weights and
-  moments precisely so the update step is not the thing that loses precision. So `adamw_step`
-  `Hold`s here for the same reason it would `Hold` on an `f32` or `bf16` job: the op's dtype
-  DOMAIN is not the job's dtype CLASS.
-- **`attention_block` → `Miss`, `dtype_f32_matching_between_qkv_and_mask_on_cpu`.** This is the
-  op's fused kernel's OWN per-device dtype domain, not a re-derivation: its `cpu_fwd` arm
-  implements `F32` only (no `F16`/`BF16` `MatMul` on CPU), so an `F16` job's qkv tensor fails this
-  check before the predicate ever reaches its SEPARATE, later `head_dim` gate — the two are
-  independent checks, and this one simply fires first for this dtype. That head_dim gate is real
-  and durable regardless: `attention_block_fused` (like FlashAttention itself, below) is compiled
-  for exactly one fixed head dimension (`64`), and `tiny_modernbert`'s `hidden_size=32` over 2
-  heads gives `head_dim=16` — an `f32` job on this same fixture clears the dtype gate above and
-  then Misses on `head_dim_is_attention_block_fixed_head_dim` instead (the ONE gate a dtype change
-  cannot route around here). ModernBERT-base *and* ModernBERT-large both clear the shape gate in
-  practice — `768 / 12 = 64` heads-to-hidden, `1024 / 16 = 64` — this render's own fixture is
-  simply built too small to reach it, on purpose (hermetic, CPU-fast).
-- **`flash` → `Miss`, `cuda_not_compiled` or `device_is_cpu_or_metal_not_cuda`.** The flash
-  cascade short-circuits on a compiled/device-level fact *before* it ever consults a domain
-  check: a CPU `jammi-server` has no `cuda` feature at all (`cuda_not_compiled`), and a CUDA one
-  pinned to the CPU has the code but not the device. Either is the honest floor every dtype gets
-  on a CPU, discussed next.
-
-## `bf16` is refused, loud — the training-side peer of the inference gate
-
-[The compute-precision chapter](compute-precision.qmd) measured `bf16` refused at *inference*
-load time on a CPU-only build. Fine-tuning's own gate is a different function
-(`validate_backbone_precision`, checked once the claiming worker resolves a device) with a
-**coarser** predicate: it refuses `bf16` on *any* non-CUDA device, not specifically below an
-Ampere compute-capability floor — because a CPU (like this chapter's servers') is exactly the
-device class `bf16` never runs on, floor or no floor.
-
-```{python}
+job = fine_tune("bf16")
+print(f"just submitted: {job.acceleration_report()}")
 try:
-    job_bf16 = remote.fine_tune(
-        source="ftaccel_pairs",
-        base_model=BASE_MODEL,
-        columns=["anchor", "positive"],
-        method="lora",
-        task="text_embedding",
-        epochs=1,
-        batch_size=4,
-        seed=0,
-        backbone_dtype="bf16",
-        target_modules=TARGET_MODULES,
-    )
-    JOB_BF16_ID = job_bf16.job_id
-    job_bf16.wait()
-    raise RuntimeError("bf16 must be refused on this CPU-only build — it completed instead")
-except jammi.errors.TrainingError as exc:
-    message = str(exc)
-    print(f"caught {type(exc).__name__}: {message}")
-    for token in ("bf16", "requires a CUDA device", "Use f16"):
-        assert token in message, f"expected {token!r} in the refusal message: {message}"
-
-print("\nbf16 fine-tuning was refused loud, with the typed remedy message pointing at f16 — "
-      "never a silent downgrade, never a silently-eager bf16 run.")
+    job.wait()
+except jammi.errors.TrainingError as refusal:
+    print(f"refused: {refusal}")
+    claim("bf16 is refused with the reason and the alternatives named",
+          all(t in str(refusal) for t in ("bf16", "requires a CUDA device", "f32")))
+    job = fine_tune("f32")
+    job.wait()
+print(f"trained in {job.acceleration_report()['dtype']}")
 ```
 
-## Both outcomes, from the catalog — `list_jobs`
+## Read the report
 
-Two jobs have now run through this artifact directory, submitted by two different processes over
-two different connections: the `f16` one server A accepted and server B claimed and completed,
-and the `bf16` one server B claimed and failed. Neither handle is needed to see them. `db.list_jobs()`
-is the tenant-scoped listing peer of `job(job_id)` — the same `JobSummary` field
-set on both arms (`job_id`, `kind`, `status`, `base_model_id`, `output_model_id`, `created_at`,
-`error`), most recent first, with `error` empty unless a job failed. Neither arm maps `error`
-onto `None`, so a caller branches on one thing on both transports. There is no progress surface
-here by construction: a listing shows terminal facts, not a percentage — read
-`job(job_id).progress()` on the individual handle for that.
+The report names the device the worker resolved, the dtype, whether this build has
+CUDA and FlashAttention compiled in, and, per fused operation, whether it held or
+the domain check that turned it down:
 
 ```{python}
-jobs = remote.list_jobs()
-for j in jobs:
-    print(f"  {j['job_id']}  status={j['status']:<10s} "
-          f"output_model_id={j['output_model_id']!r} error={j['error'][:40]!r}")
+report = job.acceleration_report()
+print(f"device {report['device']}   dtype {report['dtype']}   "
+      f"cuda compiled {report['cuda_compiled']}   flash compiled {report['flash_compiled']}")
+for op, verdict in sorted(report["ops"].items()):
+    print(f"  {op:<26} {'held' if verdict['holds'] else 'declined':<9} {verdict['reason']}")
+print(f"  {'flash attention':<26} {'held' if report['flash']['holds'] else 'declined':<9} "
+      f"{report['flash']['reason']}")
 
-by_id = {j["job_id"]: j for j in jobs}
-assert set(by_id) == {JOB_A_ID, JOB_BF16_ID}, sorted(by_id)
-# Most recent first — the bf16 submission is the later of the two.
-assert jobs[0]["job_id"] == JOB_BF16_ID, jobs[0]["job_id"]
-
-# Both are LoRA fine-tunes, so BOTH carry their deterministic output id from
-# submission — it depends only on job_id, never the run's outcome. `error` is
-# what distinguishes them: empty for the completed job, populated for the
-# failed one — never `None` on either.
-done, refused = by_id[JOB_A_ID], by_id[JOB_BF16_ID]
-assert done["status"] == "completed", done["status"]
-assert done["output_model_id"] == JOB_A_MODEL_ID, done["output_model_id"]
-assert done["error"] == "", repr(done["error"])
-assert refused["status"] == "failed", refused["status"]
-assert refused["output_model_id"] == f"jammi:fine-tuned:{JOB_BF16_ID}", (
-    refused["output_model_id"]
-)
-assert refused["error"] != "", "a failed job must record its error message"
-assert "bf16" in refused["error"], refused["error"]
-
-# The field set is the wire's, exactly — no arm adds or drops a key.
-SUMMARY_KEYS = {
-    "job_id", "kind", "status", "base_model_id", "output_model_id", "created_at", "error",
-    "claimed_by", "ranks",
-}
-for j in jobs:
-    assert set(j) == SUMMARY_KEYS, sorted(set(j) ^ SUMMARY_KEYS)
-    # One server ran each job as a single rank: the claimant is that rank's
-    # instance, whether the run completed or was refused.
-    assert j["claimed_by"] != "" and j["ranks"] == [j["claimed_by"]], j
+claim("the report is determined once the job has run", report["state"] == "determined")
+claim("every declined operation names the check that declined it",
+      all(v["holds"] or v["reason"] != "domain_ok" for v in report["ops"].values()))
 ```
+
+On a CPU every fused operation holds at `f32`, ModernBERT's attention included —
+its 64-wide heads are the shape the fused attention block implements — and
+FlashAttention is declined because it is CUDA code: `cuda_not_compiled` on the CPU
+build, or a non-CUDA device on a CUDA build. On an Ampere-or-newer GPU with the
+CUDA build, `bf16` trains, and FlashAttention takes over the attention block.
 
 ```{python}
-# | echo: false
-remote.close()
-server_b.__exit__(None, None, None)
+if report["device"].startswith("cuda") and report["flash_compiled"] and report["dtype"] == "bf16":
+    claim("on a bf16-capable GPU, FlashAttention runs the attention",
+          report["flash"]["holds"], report["flash"]["reason"])
+else:
+    claim("off a bf16-capable GPU, FlashAttention is declined with its reason",
+          not report["flash"]["holds"] and report["flash"]["reason"] != "domain_ok",
+          report["flash"]["reason"])
 ```
 
-## Measured on real GPU hardware, not here
+## The counters agree with the report
 
-Everything above is a live, real submission — it simply resolves onto a CPU-only build, because
-that is what this render's own CI machine can offer. What follows is reported, not recomputed
-*in this render*: the FlashAttention-2 admission result below is the same live submission this
-chapter's own cells make, re-run once against a real NVIDIA A100 80GB with a
-`cuda,flash-attn`-featured `jammi-server`, to close the one gap a CPU-only render structurally
-cannot close; the stability and memory findings that follow it are this capability's own
-dedicated probe, measured at the production target shape. Both are cited by fact,
-never transcribed as a headline this render invented.
+The report is the decision; the job's metrics count what the kernels then did —
+for every fused operation, how many calls ran fused, ran eager, or were declined.
+An operation the report says held never fell back to its eager composition, and
+when FlashAttention held, its counter shows it ran the attention:
 
-**The stability probe: `f16` inside the `bf16`-calibrated band.** The probe measures whether
-raw `f16` forward/backward is even numerically stable at all, relative to the reduced-precision dtype already known-good (`bf16`). Three seeds
-(`{2, 3, 4}`), three dtypes (`f16` / `bf16` / `f32`), the same small fine-tune shape (batch 2,
-sequence 128, 3 epochs, fully eager), scored on the held-out `held_out_example_mean` at the final
-epoch:
+```{python}
+dispatches = job.metrics()["kernel_dispatches"]
+for key, count in sorted(dispatches.items()):
+    print(f"  {key:<26} fused {count['fused']:>5}   eager {count['eager']:>5}   "
+          f"declined {count['declined']:>5}")
 
-| seed | `\|f16 − f32\|` | `\|bf16 − f32\|` |
-|-----:|---------------:|----------------:|
-|    2 |         0.2528 |          0.3575 |
-|    3 |         0.2025 |          0.0304 |
-|    4 |         0.0819 |          0.3016 |
-
-`bf16` — the accepted-good reduced-precision dtype — is itself what CALIBRATES the acceptance
-band: `max(2 × max_seed|bf16 − f32|, 0.02) = max(2 × 0.3575, 0.02) = 0.715`. Every one of `f16`'s
-three per-seed deltas (0.2528 / 0.2025 / 0.0819) sits inside that band, and no seed shows
-late-epoch divergence (an `f16` per-epoch value exceeding 1.5× that seed's `f32` value at the
-same epoch) — 3-of-3 seeds pass. `f16` is therefore numerically admitted for training at the
-probed shape: not "as good as `bf16`" on any single seed (seed 2 and 3 both show `f16` *further*
-from `f32` than `bf16` is), but inside the same acceptance band `bf16` itself has to clear.
-
-**Bounded training memory: shape bucketing, training-only.** At batch 16, sequence 128,
-ModernBERT-large [@warner2024modernbert] on an 80GB A100, `f16` fine-tuning **completes**,
-`steps_measured` at the full expected count, peak memory **44.3 GB, flat** after the initial ramp
-(1 Hz `nvidia-smi` sampling); `bf16`/`f32` complete at the same shape too, with finite, comparable
-losses. What keeps it bounded: `cudarc` (and candle's own CUDA backend) carries no caching
-allocator — every distinct tensor shape a training loop ever requests is a fresh `cuMemAlloc`, so
-a loop whose per-step shapes are drawn from an unbounded set grows the allocator's reserved
-footprint with the **count of distinct shapes ever seen**, independent of dtype; at this shape an
-unbucketed `f16` run grows 0→49 GB→78 GB and OOMs in the backward pass. (`f16` exposes it first
-because under the disabled-fusion arm it declines every fused kernel — the very `Miss`es this
-chapter's live cells show above — and runs the fully-eager composition.) The trainer therefore
-buckets each batch's natural tokenizer-padded width up to the nearest power of two (a bounded,
-5-rung ladder at `max_seq_length=128`) at its own batch-construction seam — never inside
-`jammi-encoders`' eager arithmetic, where padding an activation inside a mean/variance reduction
-would corrupt the math.
-
-**The eval pass keeps its natural width.** `encode_texts` dispatches on `self.training_mode`:
-bucket-up padding stays on the training-step path, while `evaluate` / `evaluate_held_out` use a
-`tokenize_natural_width` sibling matching the tokenizer's own natural per-batch width. Bucketing
-the eval pass too would round a real held-out batch whose natural width is 321 tokens up to the
-512 rung — `max_seq_length`'s own cap — a roughly 2.5× softmax-intermediate blow-up that OOMs
-`bf16` and `f16` alike (it is dtype-independent) at batch 8, sequence 512, in an early-step ramp
-to roughly 63 GB. With natural-width eval, `batch 8, sequence 512` **completes** for both `bf16`
-and `f16`, under both the fused and the disabled-fusion arm, with a full 1 Hz memory trace —
-stable around **60.4 GB peak**, no OOM.
-
-**FlashAttention-2's own admission gate, measured Holding on real hardware.** `flash`'s cascade
-(all five gates must pass, in order): the `flash-attn` cargo feature was compiled in; the
-resolved device is CUDA; that device's compute-capability major/minor is in the validated set
-`{80, 86, 89, 90}`; the tensor's dtype is `BF16` **or** `F16`; and `head_dim` is exactly the one dimension the vendored
-kernel was compiled for (`64`). ModernBERT-large clears the shape gate by construction
-(`1024 / 16 = 64`). This is not a code-reading inference: submitting the exact same `f16`
-fine-tune this chapter's live cells submit — same call, same corpus, same
-`TrainingJob.acceleration_report()` read — against ModernBERT-large on a real NVIDIA A100 80GB,
-with `jammi-server` built `--features cuda,flash-attn`, returns
-
-```json
-{
-  "state": "determined",
-  "device": "NVIDIA A100 80GB PCIe",
-  "dtype": "f16",
-  "cuda_compiled": true,
-  "flash_compiled": true,
-  "flash": {"holds": true, "reason": "domain_ok"}
-}
+held = [op for op, v in report["ops"].items() if v["holds"] and f"{op}_fused" in dispatches]
+claim("no held operation fell back to eager",
+      all(dispatches[f"{op}_fused"]["eager"] == 0 for op in held), ", ".join(held))
+claim("the held operations ran fused",
+      sum(dispatches[f"{op}_fused"]["fused"] for op in held) > 0)
+if report["flash"]["holds"]:
+    claim("FlashAttention ran the attention", dispatches["attention_block_flash"]["fused"] > 0)
 ```
 
-— `flash.holds: true` on `f16`, the same `domain_ok` reason a `bf16` job on the same hardware
-gets. Two translation units back this (`flash_fwd_hdim64_fp16_sm80.cu` /
-`flash_bwd_hdim64_fp16_sm80.cu`, upstream FlashAttention-2's own most-tested dtype
-[@dao2022flashattention]), and the engine's own `flash_torch_parity_f16.rs` oracle proves the
-kernel bit-for-bit against a `torch` reference — this live submission is the admission-gate
-proof; that oracle is the numerics proof, and the two are deliberately separate concerns.
+The report is what to read when a fine-tune is slower than it should be: a
+declined operation names the check that declined it — the device, the dtype, or a
+shape outside the kernel's domain — and that is what to change.
 
-Two honest observations about what a GPU report for this job looks like. First, on real A100
-hardware the LoRA epilogue genuinely dispatches fused at `f16` — the engine's own committed
-A/B provenance for the production checkpoint — ModernBERT-large, not this render's tiny
-fixture — records `lora_linear_fused` firing on every training forward of an `f16` run with
-**zero** eager fallbacks: all sixteen committed legs of that `f16` sweep report
-`lora_linear_fused_dispatches = 13104` against `lora_linear_eager_dispatches = 0`
-(`docs/plans/63-how-well/measurements/f16-sweep/raw/`). One honesty note on that citation: the
-sweep's own artifact is stamped `INVALID` as an **A/B verdict** (its merge-time premise
-pre-registered the flash-cascade differential as `BF16`-only, so every `f16` leg violated it and
-no sign test ran) — the dispatch counters cited here are raw recorded per-leg facts that verdict
-does not touch, and nothing about the A/B comparison is claimed from them. So a GPU report shows
-`low_rank_residual_linear` `Hold`ing just as the CPU cells above do. Second, a GPU report's `ops` map may omit `rope`, `softmax`,
-and `attention_block` entirely rather than reporting them: `two_arm_holds` (the mechanism that
-turns a before/after dispatch-counter delta into a report entry) declines to fabricate an entry
-for an op whose counters show no clean single-arm signal, and once FlashAttention itself owns
-the whole attention block, those per-primitive counters no longer move the way they do under
-the eager/fused-primitive composition this chapter's CPU cells exercise. An omitted op is an
-honest "no independent signal", never a smoothed-over claim.
-
-## The `bf16`-vs-`f16` guidance, grounded in what is actually measured
-
-- **On a CUDA device of compute capability ≥ 8.0, prefer `bf16`.** It needs no loss-scaling
-  [@micikevicius2018mixedprecision], preserves `f32`'s exponent range
-  [@kalamkar2019bfloat16], and every fused kernel accepts it.
-- **`f16` is the right choice off that floor** — a pre-Ampere CUDA device, or (uniquely) CPU,
-  where `bf16` is refused outright (measured above) rather than merely slower. The stability
-  probe backs this: at the probed shape, `f16` sits inside the same acceptance band `bf16` itself
-  calibrates, 3 of 3 seeds, no late-epoch divergence.
-- **`f16` at batch 16, sequence 128 runs, bounded, at 44.3 GB, and the batch 8, sequence 512
-  stress shape runs too, at ~60.4 GB.** Both rest on the trainer's shape bucketing being
-  training-only (above).
-
-## Bridge note
-
-> **A third precision axis, and the first with a lifecycle.** `storage_precision` and
-> `compute_precision` are properties of a single call; `backbone_dtype` is a property of a
-> **job**, and the fact this chapter adds to the book is that a job's own acceleration
-> determination has to be *computed and read back*, not assumed — `{"state": "pending"}` at
-> submission, `{"state": "determined", "ops": {...}, "flash": {...}}` once a worker resolves a
-> device, each entry carrying the SAME `Hold`/`Miss` + `reason` vocabulary the kernel's own
-> admission gate produces. Both halves are observed here over live servers because submission and
-> claiming are separable by **configuration** (`WorkerConfig::enabled`), not by a second code
-> path: one process accepts and never claims, a second opens the same catalog and claims what the
-> first accepted — which also makes the queue's survival across a process boundary a measured
-> fact rather than a design claim. On this render's CPU-only server every `ops` entry this chapter
-> measured is real (the nine named primitives genuinely `Hold` — a portable, dtype-only domain
-> check `f16` clears everywhere it is dtype-eligible, including the backward-pass cast
-> boundary its report key names dtype-neutrally and the `f32`-domain optimizer step — while
-> `attention_block`'s per-device dtype gate genuinely `Miss`es, for the reason this chapter names
-> exactly), and `flash` is always
-> the honest compiled-away floor. The numbers only a real CUDA server can produce —
-> FlashAttention-2's own `f16` admission actually `Hold`ing, and bounded training memory at both
-> measured shapes — are reported as measured on real A100 hardware, cited rather
-> than recomputed, the same honesty contract [the compute-precision chapter](compute-precision.qmd)
-> already keeps for `bf16`.
+```{python}
+db.close()
+```

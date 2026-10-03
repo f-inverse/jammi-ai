@@ -2,11 +2,6 @@
 title: "The theory behind each step"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook  # applies the determinism contract before any heavy import
-```
-
 The book's thesis, made explicit: **one Jammi recipe is one equation in the
 monograph and one line in the GNN/conformal canon.** The verticals carried short
 bridge notes; this chapter writes the full bridge — four signature chapters that

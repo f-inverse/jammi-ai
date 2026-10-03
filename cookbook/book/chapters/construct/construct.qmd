@@ -2,11 +2,6 @@
 title: "Building a graph from data"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `generate_embeddings` · `build_neighbor_graph` · `eval_embeddings`
 · **Background:** topology from data — graph construction and the Laplacian
 (Stanković et al. 2020, Part I) · **Checked:** provenance (where each edge came
@@ -26,9 +21,9 @@ case study turns on.
   carries signal the embeddings cannot reconstruct — who actually cited whom.
 
 This chapter builds both, live. At `small` scale (the default) it runs in
-seconds on a CPU over 400 papers with a random-weight fixture encoder; at
-`full` scale the same cells run 4,000 papers through an embedding-trained
-ModernBERT (`gte-modernbert-base`) on a GPU (see
+under a minute on a CPU over 400 papers with a compact sentence encoder
+(`all-MiniLM-L6-v2`); at `full` scale the same cells run 4,000 papers through
+an embedding-trained ModernBERT (`gte-modernbert-base`) on a GPU (see
 *The two datasets, at two scales*).
 
 The keystone's steps are defined once, in `jammi_cookbook.keystone`, so every
@@ -109,13 +104,12 @@ claim("so do the encoder's nearest neighbours", neighbor_homophily > chance,
 
 The citation graph is well above chance at both scales — that correlation is
 what later breaks conformal exchangeability (tier 04). The neighbor graph's
-homophily is a property of the encoder. At `full` scale the embedding model's
-neighbours share a subject about as often as citations do. At `small` scale
-the fixture encoder's weights are random, yet its neighbours still beat
-chance: a word is the same random vector wherever it appears, so papers that
-share vocabulary land near each other — lexical overlap alone, no learned
-meaning. The declared graph carries the subject signal whatever the encoder
-knows.
+homophily is a property of the encoder: an embedding model trained to place
+text by meaning puts papers on one subject near each other, so its
+neighbours share a subject far more often than chance.
+The two graphs agree on subject for different reasons — the encoder from what
+the papers say, the citations from what their authors read — which is why
+later tiers can use one to sharpen the other.
 
 ## The measurement rail: retrieval precision from the embeddings
 

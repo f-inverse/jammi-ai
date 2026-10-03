@@ -1,52 +1,17 @@
-"""The determinism contract, applied on import.
+"""Seeds for the book's sampling steps.
 
-Importing :mod:`jammi_cookbook` pins the process into the reproducible regime the
-whole book depends on: single-threaded BLAS/OMP, tokenizer parallelism off, a
-fixed dtype, and a pinned seed. A chapter's claims are relations, never
-bit-equalities of a measurement: BLAS matmul order varies across machines, so a
-claim states what holds on any of them (see :mod:`jammi_cookbook.claims`).
+A chapter's claims are relations that hold on any machine, device and thread
+count, never bit-equalities of a measurement (see :mod:`jammi_cookbook.claims`),
+so the cookbook leaves the engine to run as it would for any program: on the
+reader's GPU when there is one, on every core otherwise. What the book does fix
+is the seed of each step that samples — a split, a shuffle, a synthetic draw —
+so that step draws the same rows on every run.
 """
 
 from __future__ import annotations
 
-import os
-
-from . import scale as _scale
-
-# The pinned seed every :func:`seeded` call folds in.
+# The seed every :func:`seeded` call folds in.
 SEED = 0
-
-
-def _apply_env() -> None:
-    """Pin the threading / tokenizer / dtype environment, and the device the
-    running scale runs on.
-
-    Set before any heavy native library (BLAS, tokenizers, torch) reads these on
-    its first use. Importing the cookbook is therefore the first thing a chapter
-    does, ahead of importing jammi.
-    """
-    pinned = {
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-        "RAYON_NUM_THREADS": "1",
-        "TOKENIZERS_PARALLELISM": "false",
-    }
-    # The small scale runs on the CPU (jammi_cookbook.scale), so it measures the
-    # same numbers on any host: an encoder on a GPU agrees with the CPU only
-    # within the engine's device-parity tolerance, and a recall over
-    # sign-quantized vectors turns that into a different query. Every session
-    # and spawned server reads the device from this variable.
-    if _scale.current() is _scale.Scale.SMALL:
-        pinned["JAMMI_GPU__DEVICE"] = "-1"
-    # setdefault, not overwrite: an operator who has deliberately set a value
-    # (e.g. the opt-in full-scale run) keeps it; the default regime is otherwise.
-    for key, value in pinned.items():
-        os.environ.setdefault(key, value)
-
-
-_apply_env()
 
 
 def seeded(name: str) -> int:

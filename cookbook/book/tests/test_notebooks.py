@@ -175,8 +175,7 @@ def test_a_recipe_is_also_a_book_chapter_that_runs_its_steps_in_order(tree):
     assert "It is made in a moment, from" in qmd
     assert "cookbook/recipes/widgets/example.py" in qmd
     cells = re.findall(r"```\{python\}\n(.*?)```", qmd, re.S)
-    assert cells[0].endswith("import jammi_cookbook  # noqa: F401\n")
-    assert cells[1:] == ['import jammi\n\ndb = jammi.connect("file:///tmp/widgets")\n',
+    assert cells == ['import jammi\n\ndb = jammi.connect("file:///tmp/widgets")\n',
                          'widget = db.sql("SELECT 1 AS widget")\nassert widget.num_rows == 1\n',
                          "db.close()\n"]
     assert qmd.index("## Make a widget") < qmd.index("widget = db.sql")

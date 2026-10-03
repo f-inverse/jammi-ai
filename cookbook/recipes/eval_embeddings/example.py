@@ -13,7 +13,7 @@ from pathlib import Path
 import jammi
 from jammi_cookbook import fixtures
 
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 home = Path(tempfile.mkdtemp())
 db = jammi.connect(f"file://{home}")
@@ -21,8 +21,8 @@ db = jammi.connect(f"file://{home}")
 # %% [markdown]
 # ## Embed the corpus
 #
-# The table under evaluation: 32-dimensional embeddings of the corpus's
-# `content`.
+# The table under evaluation: the corpus's `content`, embedded by a sentence
+# encoder (`all-MiniLM-L6-v2`, 384 dimensions).
 
 # %%
 db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
@@ -55,7 +55,9 @@ db.add_source("golden", url=str(golden_csv), format="csv")
 # `eval_embeddings` encodes every query with the table's own model, searches
 # the source's embedding table to depth `k`, and scores the ranking against
 # the judgments. `aggregate` holds the means over the queries; `per_query`
-# holds each query's own scores.
+# holds each query's own scores. Each query has two to four relevant papers
+# among the corpus's 20, so a random ranking would recall about a quarter of
+# them in its top five.
 
 # %%
 metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
@@ -64,6 +66,8 @@ aggregate = metrics["aggregate"]
 for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
     assert 0.0 <= aggregate[key] <= 1.0, f"{key} out of range: {aggregate[key]}"
     print(f"{key:<16} {aggregate[key]:.4f}")
+
+assert aggregate["recall_at_k"] > 0.5, "the encoder recalls far more than a random ranking"
 
 per_query = metrics["per_query"]
 assert len(per_query) > 0, "per_query must carry one record per query"

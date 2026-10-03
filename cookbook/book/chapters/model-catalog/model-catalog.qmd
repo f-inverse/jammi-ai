@@ -2,11 +2,6 @@
 title: "The model catalog — referential integrity on either transport"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `fine_tune` · `list_models` · `describe_model` · `delete_model` ·
 `prune_jobs` · `[jobs] retention_days` · **Background:** the model catalog as a
 *referenced store* — a model is a row other rows point at
@@ -36,7 +31,7 @@ from jammi.testing import LiveServer
 from jammi_cookbook import fixtures
 from jammi_cookbook.claims import claim
 
-BASE = fixtures.model("tiny_bert")
+BASE = "sentence-transformers/all-MiniLM-L6-v2"
 PAIRS = str(fixtures.path("tiny_pairs.csv"))
 ```
 

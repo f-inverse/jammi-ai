@@ -25,7 +25,7 @@ from jammi.testing import LiveServer
 from jammi_cookbook import fixtures
 
 CORPUS_URL = fixtures.url("tiny_corpus.parquet")
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # %% [markdown]
 # ## A second source to join
@@ -110,6 +110,43 @@ assert width > 0 and all(len(r["vector"]) == width for r in annotated)
 print(f"annotated: {len(annotated)} US-held patents, {width}-dim vectors")
 for row in annotated[:3]:
     print(f"  {row['id']:>2}  {row['company_name']:<20}  {row['title']}")
+
+# %% [markdown]
+# ## Aggregate vectors in SQL
+#
+# `vector_mean`, `vector_sum` and `vector_max` reduce a group of vectors
+# element by element, the way `avg`, `sum` and `max` reduce numbers. Grouping
+# the patents' vectors by category gives each category's centroid, the
+# direction its abstracts share; searching the corpus with a centroid finds
+# that category's patents. The sum is the count times the mean, and the
+# element-wise maximum is at least the mean in every element.
+
+# %%
+CENTROIDS = f"""
+    SELECT p.category, count(*) AS patents,
+           vector_mean(ann.vector) AS centroid,
+           vector_sum(ann.vector)  AS total,
+           vector_max(ann.vector)  AS peak
+    FROM annotate('{MODEL}', 'text_embedding',
+                  'corpus.public.tiny_corpus', 'id', 'content') AS ann
+    JOIN corpus.public.tiny_corpus AS p ON ann._row_id = arrow_cast(p.id, 'Utf8')
+    GROUP BY p.category
+    ORDER BY p.category
+"""
+
+with jammi.connect(f"file://{tempfile.mkdtemp()}") as db:
+    db.add_source("corpus", url=CORPUS_URL, format="parquet")
+    groups = db.sql(CENTROIDS).to_pylist()
+    db.generate_embeddings(source="corpus", model=MODEL, columns=["content"], key="id")
+    for g in groups:
+        centroid, total, peak = (np.asarray(g[c]) for c in ("centroid", "total", "peak"))
+        np.testing.assert_allclose(total, g["patents"] * centroid, rtol=1e-4, atol=1e-5)
+        assert np.all(peak >= centroid - 1e-6)
+        hits = db.search("corpus", query=g["centroid"], k=3,
+                         select=["id", "category", "title"]).to_pylist()
+        print(f"{g['category']:<12} ({g['patents']} patents) -> "
+              f"{[(h['id'], h['category']) for h in hits]}")
+        assert hits[0]["category"] == g["category"], (g["category"], hits)
 
 # %% [markdown]
 # ## Run them against a server

@@ -2,11 +2,6 @@
 title: "Operating it — backup and restore, health, metrics and traces"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `pg_dump` · `verify_materialization` · `reconcile` · `list_sources` ·
 `/healthz` · `/readyz` · `/metrics` · `[observability] otlp_endpoint` ·
 `InferenceObserver` (Rust) · `jammi.testing.LiveServer` · **Background:** a backup is a pair of consistent snapshots —
@@ -41,7 +36,7 @@ from jammi_cookbook import fixtures
 from jammi_cookbook.claims import claim
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2, trace_service_pb2_grpc
 
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CORPUS = fixtures.url("tiny_corpus.parquet")
 QUERY = "how does quantum computing work?"
 PG_BIN = Path(pgserver.__file__).parent / "pginstall" / "bin"
@@ -302,7 +297,7 @@ run = subprocess.run(
     [programs.cargo(), "run", "-q", "--manifest-path", str(project / "Cargo.toml"),
      "--", CORPUS, MODEL],
     capture_output=True, text=True,
-    env=dict(os.environ, JAMMI_ARTIFACT_DIR=str(work / "observed"), JAMMI_GPU__DEVICE="-1"))
+    env=dict(os.environ, JAMMI_ARTIFACT_DIR=str(work / "observed")))
 assert run.returncode == 0, run.stderr[-4000:]
 observed = [json.loads(line) for line in run.stdout.splitlines()]
 corpus_rows = pq.read_table(fixtures.path("tiny_corpus.parquet")).num_rows

@@ -2,11 +2,6 @@
 title: "One program, four surfaces — Python, the CLI, Rust and TypeScript"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `jammi sources add` · `jammi embed` · `jammi search` (the CLI) ·
 `InferenceSession::add_source` / `generate_text_embeddings` / `search_by_id` (Rust) ·
 `catalog.addSource` / `embedding.generateEmbeddings` / `embedding.search` (TypeScript,
@@ -46,7 +41,7 @@ from jammi_cookbook.claims import claim
 
 VERSION = importlib.metadata.version("jammi-ai")
 CORPUS = fixtures.url("tiny_corpus.parquet")
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 ROW_KEY = "1"
 work = Path(tempfile.mkdtemp(prefix="jammi_surfaces_"))
 

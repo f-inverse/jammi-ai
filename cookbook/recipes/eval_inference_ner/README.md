@@ -37,9 +37,11 @@ these columns — one row per entity span (multiple spans on the same
 
 `label_column` is the kwarg you pass at call time — `label` in this
 recipe. `start` is inclusive, `end` is exclusive, both byte offsets
-into the source row's text column. The label set must match the
-shipped model's `id2label` minus the `B-`/`I-` prefixes —
-`tiny_modernbert_ner` knows `PER` and `ORG` only.
+into the source row's text column. Labels are the model's `id2label`
+types without the `B-`/`I-` prefixes. The recipe's model,
+`dslim/bert-base-NER` (a BERT fine-tuned on CoNLL-2003), knows `PER`,
+`ORG`, `LOC` and `MISC`; the gold set labels `PER` and `ORG` only, so a
+`LOC` or `MISC` the model finds counts against its precision.
 
 Rows in the source without a matching gold `id` are silently dropped
 from the metric (same alignment rule the classification recipe uses).

@@ -56,7 +56,7 @@ why = "The book consumes the engine; no engine crate references cookbook/book/."
 [[guard]]
 name = "cookbook coverage"
 run = "python3 ci/scripts/check_cookbook_coverage.py"
-why = "Every public Python surface of jammi is run by a recipe or an executed book-chapter cell, so a verb cannot ship without its runnable example."
+why = "Every public surface of jammi — each Python client verb, each `jammi` CLI command and each SQL function the engine registers — is run by a recipe or an executed book-chapter cell, so none can ship without its runnable example."
 
 [[guard]]
 name = "guide companions"

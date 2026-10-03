@@ -1,4 +1,4 @@
-"""Score a classifier against gold labels: accuracy, macro F1, per class.
+"""Score a sentiment classifier against gold labels: accuracy, macro F1, per class.
 
 Run with `python cookbook/recipes/eval_inference/example.py`, or a step at a
 time as a notebook: each `# %%` cell is one step.
@@ -10,18 +10,24 @@ import tempfile
 import jammi
 from jammi_cookbook import fixtures
 
-MODEL = fixtures.model("tiny_modernbert_classifier")
+MODEL = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
 # %% [markdown]
-# ## Register the corpus and the gold labels
+# The classifier is DistilBERT fine-tuned on SST-2, the Stanford sentiment
+# treebank, from the Hugging Face Hub: it labels a text `POSITIVE` or
+# `NEGATIVE`, and its label names are read from the checkpoint's own
+# `config.json`.
 #
-# The gold source is one `(id, label)` row per labelled corpus row.
+# ## Register the reviews and the gold labels
+#
+# The corpus is 24 short product and service reviews, half of each sentiment;
+# the gold source is one `(id, label)` row per review.
 
 # %%
-db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")
-db.add_source("golden", url=str(fixtures.path("tiny_labels.csv")), format="csv")
+db.add_source("reviews", url=str(fixtures.path("tiny_reviews.parquet")), format="parquet")
+db.add_source("golden", url=str(fixtures.path("tiny_review_labels.csv")), format="csv")
 
 # %% [markdown]
 # ## Run the classifier and score it
@@ -33,10 +39,10 @@ db.add_source("golden", url=str(fixtures.path("tiny_labels.csv")), format="csv")
 # %%
 metrics = db.eval_inference(
     model=MODEL,
-    source="corpus",
-    columns=["content"],
+    source="reviews",
+    columns=["text"],
     task="classification",
-    golden_source="golden.public.tiny_labels",
+    golden_source="golden.public.tiny_review_labels",
     label_column="label",
 )
 
@@ -74,13 +80,13 @@ print(f"{len(per_record)} rows scored; the first: {per_record[0]}")
 
 # %%
 predictions = db.infer(
-    source="corpus",
+    source="reviews",
     model=MODEL,
-    columns=["content"],
+    columns=["text"],
     task="classification",
     key="id",
 )
-assert predictions.num_rows == 20, predictions.num_rows
+assert predictions.num_rows == 24, predictions.num_rows
 print(f"{predictions.num_rows} rows, columns {predictions.column_names}")
 
 # %%

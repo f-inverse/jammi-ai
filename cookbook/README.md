@@ -8,9 +8,10 @@ adds a verb nothing runs), and every notebook runs nightly exactly as a reader
 runs it.
 
 - **Recipes** (`quickstart/`, `recipes/`) — one short program per capability,
-  one step per cell (`# %%`), beside a README with the overview. Each runs
-  against the committed fixtures in seconds on a CPU, as a script, as a Colab
-  notebook a step at a time, and as a chapter of the book.
+  one step per cell (`# %%`), beside a README with the overview. Each runs a
+  real model over a small committed dataset, in seconds to minutes on a CPU,
+  as a script, as a Colab notebook a step at a time, and as a chapter of the
+  book.
 - **Chapters** (`book/`) — a capability taken deep and measured over a real
   dataset at `small` scale on a CPU, or at `full` scale on a GPU. See
   [`book/README.md`](./book/README.md).
@@ -38,22 +39,23 @@ runs it.
 | Audit every search a session runs | [`recipes/search_audit/`](./recipes/search_audit/) |
 | Run one program embedded and against a server | [`recipes/remote_session/`](./recipes/remote_session/) |
 | Query a `jammi-server` over Flight SQL | [`recipes/flight_sql/`](./recipes/flight_sql/) |
-| Join sources and run a model inside one SQL query, embedded and over Flight SQL | [`recipes/compound_query/`](./recipes/compound_query/) |
+| Join sources, run a model and aggregate vectors inside one SQL query, embedded and over Flight SQL | [`recipes/compound_query/`](./recipes/compound_query/) |
+| Operate a server from the command line | [`recipes/cli/`](./recipes/cli/) |
 | Embed and search with a model served at an endpoint | [`recipes/remote_model/`](./recipes/remote_model/) |
 
-Every recipe uses a committed fixture model, so it runs without network
-access; each recipe's README names the Hugging Face model a production caller
-would use instead.
+Every recipe runs a real, pretrained checkpoint from the Hugging Face Hub — a
+sentence encoder, LAION's CLIP and CLAP, a sentiment classifier, an entity
+tagger — downloaded on first use and cached, so the results a recipe prints are
+what that model really does.
 
 ## Fixtures
 
-`fixtures/` holds everything the recipes and the book's `small` scale read:
-tiny text, image and audio encoders (`tiny_bert/`, `tiny_open_clip/`,
-`htsat_clap_tiny/`, …), small corpora with their goldens (`tiny_corpus.parquet`,
-`tiny_golden.json`, the image and audio corpora), and small excerpts of the
-book's datasets (`arxiv_small/`, `air_routes/`, `finetune_heldout/`). The data
-files regenerate with `python cookbook/fixtures/generate.py`; the encoder
-weights are committed as built by `tests/fixtures/generate_tiny_*.py`.
+`fixtures/` holds the data the recipes and the book's `small` scale read: small
+corpora with their labels and golden sets (`tiny_corpus.parquet`,
+`tiny_golden.json`, `tiny_reviews.parquet`, the image and audio corpora), and
+small excerpts of the book's datasets (`arxiv_small/`, `air_routes/`,
+`finetune_heldout/`). The data files regenerate with
+`python cookbook/fixtures/generate.py`.
 
 ## Running
 

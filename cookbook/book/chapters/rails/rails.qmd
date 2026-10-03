@@ -2,11 +2,6 @@
 title: "Provenance, tenancy and measurement through the pipeline"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 The book is a 4-tier × 3-rail grid. The four tiers — **Construct → Analyze →
 Learn → Predict & Quantify** — are the rows you have already walked. The three
 **rails** are the columns: properties every tier carries, not chapters of their

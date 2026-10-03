@@ -5,13 +5,13 @@ as a notebook: each `# %%` cell is one step.
 """
 
 # %% [markdown]
-# `JAMMI_IMAGE_MODEL` names the checkpoint, any OpenCLIP-format model id or
-# `local:<path>`; the default is the random-weight `tiny_open_clip` fixture,
-# which runs offline in seconds.
+# The encoder is an OpenCLIP checkpoint from the Hugging Face Hub, LAION's
+# CLIP ViT-B/32, downloaded on first use (about 600 MB) and cached. Any
+# OpenCLIP-format model id, or a local directory as `local:<path>`, works the
+# same way.
 
 # %%
 import json
-import os
 import tempfile
 from pathlib import Path
 
@@ -23,9 +23,7 @@ from jammi.errors import TrainingError
 from jammi_cookbook import fixtures
 
 IMAGE_CORPUS_DIR = fixtures.path("tiny_image_corpus")
-DEFAULT_MODEL = fixtures.model("tiny_open_clip")
-MODEL = os.environ.get("JAMMI_IMAGE_MODEL", DEFAULT_MODEL)
-print(f"model: {MODEL}")
+MODEL = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 
 home = Path(tempfile.mkdtemp())
 db = jammi.connect(f"file://{home}")
@@ -84,9 +82,8 @@ print(f"top-{results.num_rows} for q_circle: {results.column('image_id').to_pyli
 #
 # The golden set holds a held-out query image per family and the corpus images
 # of that family. A `query_image` (binary) column in place of `query_text` is
-# what switches `eval_embeddings` to image queries. The numbers are reported,
-# not judged: the fixture's weights are random, and a real checkpoint is where
-# they mean something.
+# what switches `eval_embeddings` to image queries. Each family has four
+# drawings in the corpus, so a random ranking would recall one in four at k=5.
 
 # %%
 query_ids, query_images, relevant_ids = [], [], []
@@ -114,6 +111,7 @@ for key in ("recall_at_k", "precision_at_k", "mrr", "ndcg"):
     assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
     print(f"{key:<16} {value:.4f}")
 assert len(metrics["per_query"]) > 0, "per_query must carry one record per query"
+assert metrics["aggregate"]["recall_at_k"] > 0.5, "CLIP recalls each family well above chance"
 
 # %% [markdown]
 # ## Triplets to train on
@@ -191,10 +189,9 @@ assert described["task"] == "image_embedding", f"registered under the wrong task
 #
 # The same query image, encoded through the adapted model, must come out
 # different from the base encoding: an adapter that trained but was dropped at
-# serve time would leave the two vectors identical. This checks change, not
-# improvement — the fixture's weights are random, so the direction of the
-# change carries no information — and it checks the vectors rather than top-k
-# metrics, which on a set this small rarely flip even when the vectors move.
+# serve time would leave the two vectors identical. The base model already
+# ranks every family perfectly here, so the check reads the vectors, which
+# move, rather than top-k metrics, which have nowhere left to go.
 
 # %%
 tuned_query_vec = db.encode_query(model=tuned_model, query=query_png, modality="image")

@@ -12,7 +12,7 @@ import jammi
 from jammi.errors import BackendError
 from jammi_cookbook import fixtures
 
-BASE_MODEL = fixtures.model("tiny_bert")
+BASE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 home = Path(tempfile.mkdtemp())
 engine = f"file://{home}/engine"
@@ -66,7 +66,7 @@ job.wait()
 tuned = job.output_model_id
 
 for model in db.list_models():
-    print(f"model {model['model_id'][-40:]}: {model['task']} ({model['status']})")
+    print(f"model {model['model_id']}: {model['task']} ({model['status']})")
 described = db.describe_model(tuned)
 print(f"describe_model: {described}")
 assert described is not None and described["model_id"] == tuned

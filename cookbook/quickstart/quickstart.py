@@ -44,13 +44,12 @@ from jammi_cookbook import fixtures
 #
 # Device and batch size are engine configuration, read from the environment
 # (or a `JAMMI_CONFIG` TOML file) when the engine starts, so they apply the same
-# way in your process or behind a server. `JAMMI_GPU__DEVICE=-1` forces the CPU
-# and `0` pins a device; without it the engine takes GPU 0 when there is one.
-# `JAMMI_ENGINE__BATCH_SIZE` sets the batch size, here small for a 20-row
-# corpus.
+# way in your process or behind a server. The engine takes GPU 0 when there is
+# one; `JAMMI_GPU__DEVICE=-1` forces the CPU and `1` picks another device.
+# `JAMMI_ENGINE__BATCH_SIZE` sets how many rows an encoder runs at once, here
+# small for a 20-row corpus.
 
 # %%
-os.environ.setdefault("JAMMI_GPU__DEVICE", "-1")
 os.environ.setdefault("JAMMI_ENGINE__BATCH_SIZE", "8")
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -84,15 +83,13 @@ for row in db.sql("SELECT id, title, year FROM corpus.public.tiny_corpus LIMIT 3
 # index beside it. The job is checkpointed: interrupted and run again, it picks
 # up where it left off.
 #
-# `model` is a Hugging Face Hub id or a local directory (`local:/path`, holding
-# `config.json`, `model.safetensors` and `tokenizer.json`). The quickstart uses
-# `tiny_bert`, a 32-dimensional single-layer model that needs no network. A real
-# workload would name a Hub model such as
-# `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions), and nothing else
-# changes.
+# `model` is a Hugging Face Hub id, downloaded on first use and cached, or a
+# local directory (`local:/path`) holding the same files. The quickstart uses
+# `sentence-transformers/all-MiniLM-L6-v2`, a small sentence encoder (384
+# dimensions, about 90 MB) that embeds this corpus in seconds on a CPU.
 
 # %%
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 db.generate_embeddings(
     source="corpus",
@@ -113,10 +110,18 @@ db.generate_embeddings(
 # %%
 query = db.encode_query(model=MODEL, query="how does quantum computing work?")
 results = db.search("corpus", query=query, k=3)
-assert results.num_rows == 3
 
 for row in results.to_pylist():
-    print(f"{row['_row_id']:<8} {row['similarity']:>9.4f}  {row['title']}")
+    print(f"{row['_row_id']:<8} {row['similarity']:>9.4f}  {row['category']:<8} {row['title']}")
+
+# %% [markdown]
+# The three nearest abstracts are physics papers on quantum computing. The
+# encoder places text by meaning, so a question lands next to the abstracts
+# that answer it rather than the ones that merely share a word.
+
+# %%
+assert results.num_rows == 3
+assert set(results.column("category").to_pylist()) == {"physics"}, results.to_pylist()
 
 # %% [markdown]
 # An embedded engine holds its catalog until the session closes. A session is

@@ -2,11 +2,6 @@
 title: "Fine-tuning methods, measured side-by-side"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `fine_tune` (the loss / hard-negative / Matryoshka knobs) +
 `generate_embeddings(dimensions=…)` +
 `fine_tune_graph` · `eval_compare` · **Background:** contrastive metric learning —

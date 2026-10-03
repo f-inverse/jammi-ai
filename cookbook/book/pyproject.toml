@@ -15,6 +15,7 @@ authors = [{ name = "F-Inverse" }]
 # choice. numpy and pyarrow are the data substrate the chapters manipulate; requests
 # fetches the published datasets a `full`-scale run reads.
 dependencies = [
+    "huggingface_hub>=0.24",
     "jammi-ai==0.54.0",
     "numpy>=1.26,<3",
     "pyarrow>=15",
@@ -62,10 +63,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 packages = ["jammi_cookbook"]
 
-# The install carries the fixtures the recipes and the `small` scale read, so a
+# The install carries the data fixtures the recipes and the `small` scale read, so a
 # fresh Colab runtime runs every recipe and chapter with no working checkout. `_fixtures` links to
-# `cookbook/fixtures`, which also holds engine-test and benchmark fixtures the
-# cookbook never reads; only the ones named here ship.
+# `cookbook/fixtures`; only the files named here ship.
 [tool.setuptools.package-data]
 jammi_cookbook = [
     "_api_reference.md",
@@ -73,31 +73,19 @@ jammi_cookbook = [
     "_programs/*/*",
     "_fixtures/air_routes/*",
     "_fixtures/arxiv_small/*",
-    "_fixtures/htsat_clap_tiny/*",
     "_fixtures/tiny_audio_corpus/**/*",
     "_fixtures/tiny_audio_golden.json",
-    "_fixtures/tiny_bert/*",
     "_fixtures/tiny_citation_graph/*",
     "_fixtures/tiny_corpus.parquet",
     "_fixtures/tiny_golden.json",
     "_fixtures/tiny_image_corpus/**/*",
     "_fixtures/tiny_image_golden.json",
     "_fixtures/tiny_labels.csv",
-    "_fixtures/tiny_modernbert/*",
-    "_fixtures/tiny_modernbert_classifier/*",
-    "_fixtures/tiny_modernbert_ner/*",
     "_fixtures/tiny_ner_corpus.parquet",
     "_fixtures/tiny_ner_gold.csv",
-    "_fixtures/tiny_open_clip/*",
     "_fixtures/tiny_pairs.csv",
-]
-
-# The tiny CLAP checkpoint's directory also holds the engine's own parity goldens.
-[tool.setuptools.exclude-package-data]
-jammi_cookbook = [
-    "_fixtures/htsat_clap_tiny/golden_manifest.json",
-    "_fixtures/htsat_clap_tiny/goldens.safetensors",
-    "_fixtures/htsat_clap_tiny/pinned_input.safetensors",
+    "_fixtures/tiny_review_labels.csv",
+    "_fixtures/tiny_reviews.parquet",
 ]
 
 [tool.ruff]

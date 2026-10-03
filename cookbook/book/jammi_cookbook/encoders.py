@@ -1,44 +1,35 @@
-"""The encoder a chapter runs at each scale.
+"""The encoders the chapters run.
 
-``small`` runs the committed fixture encoders — randomly initialized, a few
-hundred kilobytes, seconds on a CPU: they exercise every code path, but their
-vectors carry no meaning, so a small run's quality numbers are regression
-checks, not findings. ``full`` runs the real encoders the book's findings are
-about.
+Every one is a real, pretrained checkpoint on the Hugging Face Hub, fetched on
+first use and cached, so every number a chapter shows is a real model's. Text
+has one encoder per scale: ``small`` runs a compact sentence encoder that
+embeds and fine-tunes in minutes on a CPU, ``full`` the larger one the book's
+at-scale findings are about. The image and audio encoders are each one
+checkpoint at both scales.
 """
 
 from __future__ import annotations
 
-from . import fixtures
 from .scale import Scale
 
-# `full`'s text encoder is embedding-trained: a masked-LM backbone's pooled
+# Both text encoders are embedding-trained: a masked-LM backbone's pooled
 # states (ModernBERT-base's own) retrieve poorly, and graph propagation has
 # nothing to denoise in them.
-_TEXT = {Scale.SMALL: "tiny_bert", Scale.FULL: "Alibaba-NLP/gte-modernbert-base"}
-# One OpenCLIP checkpoint carries both an image and a text tower.
-_IMAGE = {Scale.SMALL: "tiny_open_clip", Scale.FULL: "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"}
-_AUDIO = {Scale.SMALL: "htsat_clap_tiny", Scale.FULL: "laion/clap-htsat-fused"}
+_TEXT = {
+    Scale.SMALL: "sentence-transformers/all-MiniLM-L6-v2",
+    Scale.FULL: "Alibaba-NLP/gte-modernbert-base",
+}
 
+#: One OpenCLIP checkpoint, carrying both an image and a text tower.
+IMAGE = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 
-def _model(models: dict[Scale, str], scale: Scale) -> str:
-    model = models[scale]
-    return fixtures.model(model) if scale is Scale.SMALL else model
+#: A CLAP checkpoint, carrying both an audio and a text tower.
+AUDIO = "laion/clap-htsat-fused"
 
 
 def text(scale: Scale) -> str:
     """The text encoder's model id at ``scale``."""
-    return _model(_TEXT, scale)
-
-
-def image(scale: Scale) -> str:
-    """The image (and paired text) encoder's model id at ``scale``."""
-    return _model(_IMAGE, scale)
-
-
-def audio(scale: Scale) -> str:
-    """The audio encoder's model id at ``scale``."""
-    return _model(_AUDIO, scale)
+    return _TEXT[scale]
 
 
 def training_dtype(scale: Scale) -> str:

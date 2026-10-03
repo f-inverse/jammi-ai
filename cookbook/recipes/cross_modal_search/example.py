@@ -8,12 +8,11 @@ a time as a notebook: each `# %%` cell is one step.
 # An OpenCLIP-format checkpoint carries a vision tower and a text tower that
 # project into one shared space, so a text query encoded by the text tower
 # searches an image index directly: no separate text encoder, no projection
-# bridge. `JAMMI_CROSS_MODAL_MODEL` names the checkpoint; the default is the
-# random-weight `tiny_open_clip` fixture.
+# bridge. The checkpoint is LAION's CLIP ViT-B/32 from the Hugging Face Hub,
+# downloaded on first use (about 600 MB) and cached.
 
 # %%
 import math
-import os
 import tempfile
 from pathlib import Path
 
@@ -23,11 +22,9 @@ import pyarrow.parquet as pq
 import jammi
 from jammi_cookbook import fixtures
 
-DEFAULT_MODEL = fixtures.model("tiny_open_clip")
-MODEL = os.environ.get("JAMMI_CROSS_MODAL_MODEL", DEFAULT_MODEL)
+MODEL = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 K = 5
 FAMILIES = ["circle", "triangle", "square", "hexagon", "grating"]
-print(f"model: {MODEL}")
 
 home = Path(tempfile.mkdtemp())
 db = jammi.connect(f"file://{home}")
@@ -107,17 +104,20 @@ for (_, got), (_, want) in zip(ranked, oracle):
 print(f"top-{K} equals the cosine ranking in the shared space (dim {len(query_vec)})")
 
 # %% [markdown]
-# ## With a trained checkpoint
+# ## Every prompt finds its own shape
 #
-# A trained model ranks first an image of the family its prompt names. With the
-# random-weight fixture this step has nothing to show and prints nothing.
+# Ask for each of the five shape families in words, and the nearest image is a
+# drawing of the family named: the text tower and the vision tower agree on what
+# "a hexagon" looks like, though neither saw these drawings in training. Each
+# family has four drawings; the rest of each top four shows where the model
+# hesitates between shapes that look alike.
 
 # %%
-if MODEL != DEFAULT_MODEL:
-    for name in FAMILIES:
-        vec = db.encode_query(model=MODEL, query=f"a drawing of a {name}")
-        best = db.search("figures", query=vec, k=1).column("figure_id").to_pylist()[0]
-        print(f"'a drawing of a {name}' -> {best}")
+for name in FAMILIES:
+    vec = db.encode_query(model=MODEL, query=f"a drawing of a {name}")
+    top = db.search("figures", query=vec, k=4).column("figure_id").to_pylist()
+    print(f"'a drawing of a {name}' -> {top}")
+    assert f"_{name}_" in top[0], (name, top)
 
 # %%
 db.close()

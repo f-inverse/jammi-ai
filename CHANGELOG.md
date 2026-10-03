@@ -6,6 +6,54 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+The cookbook runs real models. A newcomer who opened the quickstart asked "how does quantum
+computing work?" and got back a paper on chiral amines, because every recipe and chapter ran a
+random-weight encoder so it could run offline; the book taught the API and never showed the
+engine work. Every page now runs a pretrained checkpoint from the Hugging Face Hub, and doing so
+found two engine gaps a reader would have hit with the first popular model they tried.
+
+- **The cookbook runs real, pretrained models.** Text runs `sentence-transformers/all-MiniLM-L6-v2`
+  at `small` scale and `Alibaba-NLP/gte-modernbert-base` at `full`; images LAION's CLIP ViT-B/32;
+  audio LAION's CLAP; classification a DistilBERT SST-2 sentiment model over 24 new hand-written
+  reviews (`tiny_reviews.parquet`); NER a BERT CoNLL tagger (`dslim/bert-base-NER`). Each is
+  downloaded on first use. The quickstart's quantum question returns the three quantum papers,
+  image and audio search find each shape and timbre family, and the eval recipes report real
+  accuracy, F1 and recall beside what a random ranking would score. Claims that held only because
+  the encoder was noise are restated as what a real encoder guarantees, or claimed at `full`
+  scale where only the full data shows them; claims that now hold at `small` scale are no longer
+  held back for `full`. The random-weight encoders are engine test fixtures, under
+  `tests/fixtures/`, and the cookbook package no longer ships them.
+- **A BERT checkpoint that ships only `vocab.txt` loads.** The most-used Hub sentiment and NER
+  checkpoints ship `vocab.txt` and `tokenizer_config.json` but no converted `tokenizer.json`; the
+  engine loaded them without a tokenizer and failed at inference with "No tokenizer loaded for
+  this model". It now builds the BERT WordPiece tokenizer `transformers` builds from the same
+  files (casing, accent stripping, CJK splitting, special tokens), verified against `transformers`'
+  own encodings.
+- **Importing the cookbook no longer pins the engine to one CPU thread.** `jammi_cookbook` set
+  `RAYON_NUM_THREADS=1`, single-threaded BLAS and, at `small` scale, the CPU, on import, in the
+  reader's own process — a leftover of frozen goldens that made Jammi look slow and ignored the
+  reader's GPU. A chapter's claims hold on any device and thread count, so the engine now runs as
+  it does for any program.
+- **Every `jammi` CLI command and SQL function has a runnable example.** A `cli` recipe operates a
+  live server through every command; `compound_query` aggregates vectors with `vector_mean`,
+  `vector_sum` and `vector_max` and searches with each category's centroid; incremental refresh
+  shows the `jammi_content_hash` it compares. The coverage guard parses the CLI's command tree and
+  the engine's SQL functions from source, beside the Python verbs, so none can ship without one.
+- **The precision chapters teach.** Compute precision, quantized weights and fine-tune
+  acceleration are rewritten to run on the reader's own device and check what it does — `bf16`
+  admitted on Ampere or newer and refused with its remedy elsewhere, a real encoder quantized to
+  `q8_0` and fine-tuned with QLoRA, a ModernBERT fine-tune's acceleration report read against its
+  kernel counters — in place of numbers reported from machines the book never ran on.
+- **The remote-model recipe calls a real encoder.** Its endpoint speaks the OpenAI-compatible
+  protocol in front of a sentence encoder, not a hashed bag of words.
+- **A fused kernel's fallback is a notice, not a warning.** A model outside a fused kernel's
+  domain (MiniLM's 32-wide attention heads) runs the eager composition, correctly; the
+  once-per-process log line is now `info`, quiet under the library's default level, and the
+  acceleration report still records it per job.
+- **The CLI's tables line up.** The catalog's status and backend enums ignored a format width, so
+  `jammi models list` ran its columns together; `jammi mutable create` no longer prints
+  `indexes=[[]]` for a table without an index.
+
 ## [0.54.0] - 2026-10-03
 
 The binary-precision notebook that failed for 0.53.0 readers on an L4 host runs: an ANN index is

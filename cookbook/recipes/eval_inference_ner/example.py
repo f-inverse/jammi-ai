@@ -10,7 +10,7 @@ import tempfile
 import jammi
 from jammi_cookbook import fixtures
 
-MODEL = fixtures.model("tiny_modernbert_ner")
+MODEL = "dslim/bert-base-NER"
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
@@ -75,6 +75,33 @@ for entry in per_record:
     assert isinstance(entry["predicted"], list)
     assert isinstance(entry["gold"], list)
 print(f"{len(per_record)} rows scored; the first: {per_record[0]}")
+
+# %% [markdown]
+# ## Where the model and the gold set disagree
+#
+# The tagger knows four types — people, organisations, locations and a
+# miscellaneous class — while this gold set labels only people and companies,
+# so some disagreements are the model naming something the gold set never
+# asks about, and some are a boundary drawn differently. Each line is one span
+# the two sets do not share; offsets are bytes into the row's text.
+
+# %%
+texts = {str(r["id"]): r["text"].encode() for r in
+         db.sql("SELECT id, text FROM corpus.public.tiny_ner_corpus").to_pylist()}
+
+
+def spans(entities: list[dict]) -> set[tuple[str, int, int]]:
+    return {(e["label"], e["start"], e["end"]) for e in entities}
+
+
+for entry in per_record:
+    text = texts[entry["record_id"]]
+    predicted, gold = spans(entry["predicted"]), spans(entry["gold"])
+    for side, only in (("predicted only", predicted - gold), ("gold only", gold - predicted)):
+        for label, start, end in sorted(only):
+            print(f"  row {entry['record_id']:>2}  {side:<15} {label:<5} {text[start:end].decode()!r}")
+
+assert aggregate["f1"] > 0.7, "a trained entity tagger finds most people and companies"
 
 # %%
 db.close()

@@ -2,11 +2,6 @@
 title: "The error taxonomy — each failure names its cause"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `register_channel` · `add_channel_columns` · `list_channels` ·
 `search` · `lexical_search` · `describe_table` · `jammi.errors` · **Background:** a typed error vocabulary — a failure with a known
 cause names it, as a gRPC status code on the wire [@grpcstatuscodes] and as a

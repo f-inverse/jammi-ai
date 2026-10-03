@@ -6,6 +6,12 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-10-03
+
+The binary-precision notebook that failed for 0.53.0 readers on an L4 host runs: an ANN index is
+now the same graph on every host. And the cookbook's chapters end in the claims each capability
+guarantees, checked against the numbers that run measured, instead of numbers frozen on one machine.
+
 - **The cookbook checks claims, not frozen numbers.** Every chapter checked its measurements
   against goldens — values one machine recorded once, at each scale — so a reader whose host
   rounded differently, or whose GPU was not the one a full-scale golden was frozen on, saw a

@@ -598,9 +598,14 @@ API — the bare id raises `table not found`.)
   checkpoint.
 - **The precision chapters run on the reader's device.** compute-precision,
   quantized-weights and finetune-acceleration cited numbers from machines the book
-  never ran on; each now runs live and claims what holds on the device present
-  (bf16 runs and agrees with f32 on Ampere or newer, or is refused with its
-  remedy; FlashAttention holds on a capable GPU or names why not).
+  never ran on; each now runs live and claims what holds on the device present:
+  bf16 runs and agrees with f32 on Ampere or newer, or is refused with its
+  remedy; in bf16 only the GPU's architecture can decline FlashAttention (the
+  engine runs on every sm_80+ GPU, FlashAttention on the architectures the build
+  validated, else `arch_in_flash_validated_set`); FlashAttention's counter shows
+  it ran exactly when the report says it held. The report's `device` is the GPU's
+  own name, so no claim branches on it beyond `"cpu"` — the first GPU render
+  failed on a `startswith("cuda")` branch that never matched.
 - **Every public surface has a runnable example.** The coverage guard parses the
   CLI's clap enums and the engine's SQL function impls beside the Python verbs
   (111 surfaces); a `cli` recipe runs every command, `compound_query` the vector

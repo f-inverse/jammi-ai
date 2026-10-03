@@ -89,15 +89,28 @@ claim("every declined operation names the check that declined it",
 On a CPU every fused operation holds at `f32`, ModernBERT's attention included —
 its 64-wide heads are the shape the fused attention block implements — and
 FlashAttention is declined because it is CUDA code: `cuda_not_compiled` on the CPU
-build, or a non-CUDA device on a CUDA build. On an Ampere-or-newer GPU with the
-CUDA build, `bf16` trains, and FlashAttention takes over the attention block.
+build, or a non-CUDA device on a CUDA build.
 
 ```{python}
-if report["device"].startswith("cuda") and report["flash_compiled"] and report["dtype"] == "bf16":
-    claim("on a bf16-capable GPU, FlashAttention runs the attention",
-          report["flash"]["holds"], report["flash"]["reason"])
+if report["device"] == "cpu":
+    claim("on a CPU at f32 every fused operation holds",
+          report["dtype"] == "f32" and all(v["holds"] for v in report["ops"].values()),
+          ", ".join(op for op, v in report["ops"].items() if not v["holds"]))
+```
+
+A `bf16` job trains only on a GPU — the engine refuses it on any other device, and
+runs on no GPU older than Ampere — and in `bf16` ModernBERT's attention is inside
+FlashAttention's domain: its dtype and its 64-wide heads. So on a build with
+FlashAttention compiled in, one check is left that can turn FlashAttention down:
+the GPU's architecture, when it is not one the build validated FlashAttention on.
+
+```{python}
+if report["dtype"] == "bf16" and report["flash_compiled"]:
+    claim("in bf16, only the GPU's architecture can decline FlashAttention",
+          report["flash"]["holds"] or report["flash"]["reason"] == "arch_in_flash_validated_set",
+          report["flash"]["reason"])
 else:
-    claim("off a bf16-capable GPU, FlashAttention is declined with its reason",
+    claim("outside bf16 on a FlashAttention build, FlashAttention is declined with its reason",
           not report["flash"]["holds"] and report["flash"]["reason"] != "domain_ok",
           report["flash"]["reason"])
 ```
@@ -107,7 +120,8 @@ else:
 The report is the decision; the job's metrics count what the kernels then did —
 for every fused operation, how many calls ran fused, ran eager, or were declined.
 An operation the report says held never fell back to its eager composition, and
-when FlashAttention held, its counter shows it ran the attention:
+FlashAttention's counter shows it ran the attention exactly when the report says it
+held:
 
 ```{python}
 dispatches = job.metrics()["kernel_dispatches"]
@@ -120,13 +134,15 @@ claim("no held operation fell back to eager",
       all(dispatches[f"{op}_fused"]["eager"] == 0 for op in held), ", ".join(held))
 claim("the held operations ran fused",
       sum(dispatches[f"{op}_fused"]["fused"] for op in held) > 0)
-if report["flash"]["holds"]:
-    claim("FlashAttention ran the attention", dispatches["attention_block_flash"]["fused"] > 0)
+flash_runs = dispatches["attention_block_flash"]["fused"]
+claim("FlashAttention ran exactly when the report says it held",
+      (flash_runs > 0) == report["flash"]["holds"], f"{flash_runs} fused calls")
 ```
 
 The report is what to read when a fine-tune is slower than it should be: a
-declined operation names the check that declined it — the device, the dtype, or a
-shape outside the kernel's domain — and that is what to change.
+declined operation names the check that declined it — the device, its
+architecture, the dtype, or a shape outside the kernel's domain — and that is what
+to change.
 
 ```{python}
 db.close()

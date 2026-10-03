@@ -46,7 +46,7 @@ the emit box.
 | Verb | Bench tier | Named scale | Committed baseline | Threshold | Gated quantity |
 |------|-----------|-------------|--------------------|-----------|----------------|
 | `fine_tune` | `train-scale` | 1 536 in-batch-negative pairs, one GradCache backward + AdamW step, `Device::Cpu` | 180.0 pairs/s | 30% rel. drop | throughput (pairs/s) |
-| `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (frozen sidecar) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **recall fraction** (not a rate) — `measured >= floor`, an inequality gate whose absolute margin absorbs cross-box float drift; the fraction is bit-for-bit only on the same box |
+| `search` + `build_neighbor_graph` | `arxiv` | 2 000-row corpus slice, 100 held-out 768-dim queries (sidecar built by the engine under test) | recall@{1,10,100} = {1.0, 1.0, 0.997} | floor = measured − 0.04 (absolute margin) | **recall fraction** (not a rate) — `measured >= floor`, an inequality gate whose absolute margin absorbs cross-box float drift; the fraction is bit-for-bit only on the same box |
 
 ### The serving path is not a row here
 

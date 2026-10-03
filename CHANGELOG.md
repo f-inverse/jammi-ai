@@ -22,6 +22,17 @@ workspace ships every publishable crate at the same
   searched or saved while it is missing rows, and never grows. `VectorIndex` is the query surface
   alone (`search`, `save`, `len`). `SidecarIndex::contains` is gone; `contains_row` was the same
   method.
+- **The recall gate measures the graphs this engine builds.** The bench's recall gate searched
+  sidecar bundles committed in July (50 MB under `crates/jammi-bench/fixtures/scale/`), so a
+  change to how the engine builds an index never reached it, and its floors were never re-measured
+  after a change to how it searches one: the Binary segment merge had recovered recall@1 0.99 since
+  the per-segment rescore landed, against a floor of 0.82. The gate now builds every table it
+  measures from the committed slice and searches it through `SegmentedIndex::search_final`, the
+  entry every table search takes — a single graph is a table of one segment — where it searched
+  single graphs through a bench-side copy of a rescore routine production no longer has. Each
+  query's exact neighbours are computed once, so both gates run in about a tenth of the time.
+  `jammi-bench measure-floors` re-measures `floor.json`, one typed record written whole, and
+  replaces the three `build-*-recall-fixture` commands.
 - **The reader lanes wait for a release to be installable.** Dispatched minutes after the 0.53.0
   tag, the CPU lane failed 13 notebooks on installs: pip's index did not list `jammi-ai-native`
   0.53.0 yet, and crates.io had no `jammi-ai` 0.53.0 while its publisher validated. Both lanes now

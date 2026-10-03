@@ -68,7 +68,6 @@ mod graph_sample;
 mod kernel_arm;
 mod ladder;
 mod leg;
-mod operator_mirror;
 mod propagate;
 mod rate_gate;
 mod recall;
@@ -349,8 +348,9 @@ enum Command {
     /// The realistic quality tier over a committed corpus. Measures the
     /// ANN-vs-exact recall curve (recall@k for k∈{1,10,100}) over a HELD-OUT
     /// query set — a query parquet disjoint from the indexed corpus — so recall
-    /// reflects how the frozen sidecar recovers the exact neighbours of unseen
-    /// points, the exact oracle's top-k vs the sidecar's, set-intersected; the
+    /// reflects how the sidecar this engine builds over the corpus recovers the
+    /// exact neighbours of unseen points, the exact oracle's top-k vs the
+    /// sidecar's, set-intersected; the
     /// perf metrics (embed throughput, search QPS, propagate latency, peak RSS)
     /// ride along as explicit `not yet measured` markers until the perf lane
     /// lands.
@@ -377,8 +377,7 @@ enum Command {
     /// build_expansion → build time + index size) and the query knob
     /// (search_expansion → recall vs QPS over one re-dialed graph), emitting the
     /// `recall_sweep` tier. An on-box emitter (it builds a graph per build-knob
-    /// point): run with `RAYON_NUM_THREADS=1` and read the JSON; the committed
-    /// curve is its output, not a CI step.
+    /// point): the committed curve is its output, not a CI step.
     RecallSweep {
         /// Corpus vectors parquet — built into each swept graph and scored by
         /// the exact oracle.
@@ -388,13 +387,11 @@ enum Command {
         #[arg(long)]
         query_src: PathBuf,
     },
-    /// Internal: build the committed held-out recall fixture from the full scale
+    /// Internal: carve the committed held-out recall slice from the full scale
     /// cache. Reads the source corpus + held-out query parquets, takes the
-    /// deterministic first-N / first-M sorted-`_row_id` subsets, freezes one
-    /// sidecar over the corpus slice, and writes the fixture bundle + `floor.json`
-    /// (floor = measured recall − margin). Run off-box once with
-    /// `RAYON_NUM_THREADS=1`; the bundle is committed and CI only loads it. Not a
-    /// CI step — the provenance-recording builder for the committed fixture.
+    /// deterministic first-N / first-M sorted-`_row_id` subsets, writes them as
+    /// the slice, and measures its `floor.json` (as `measure-floors` does). Run
+    /// off-box once; the slice is committed. Not a CI step.
     #[command(hide = true)]
     BuildScaleFixture {
         /// Source corpus vectors parquet (the full cache corpus).
@@ -403,7 +400,7 @@ enum Command {
         /// Source held-out query vectors parquet (disjoint from the corpus).
         #[arg(long)]
         query_src: PathBuf,
-        /// Output directory for the fixture bundle (the committed `fixtures/scale/`).
+        /// Output directory for the slice (the committed `fixtures/scale/`).
         #[arg(long)]
         out_dir: PathBuf,
         /// How many corpus rows to keep (first N by sorted `_row_id`).
@@ -413,52 +410,16 @@ enum Command {
         #[arg(long)]
         query_rows: usize,
     },
-    /// Internal: build the committed precision-recall fixture — freezes an
-    /// `Int8` sidecar over the ALREADY-COMMITTED `fixtures/scale/` corpus (the
-    /// same real embeddings the frozen `F32` bundle indexes) and merges a
-    /// `"precision"` section (measured recall@k for the two-stage
-    /// retrieve→rescore at the deployment default oversample, and for the
-    /// naive `oversample = 1` no-rescore baseline; floor = measured − margin)
-    /// into the existing `floor.json`. Run off-box once with
-    /// `RAYON_NUM_THREADS=1` after `build-scale-fixture` has produced the `F32`
-    /// fixture; the bundle is committed and CI only loads it. Not a CI step —
-    /// the provenance-recording builder for the committed precision floor.
+    /// Internal: re-measure the committed recall slice's `floor.json` with
+    /// this engine — builds every table the recall gate builds from the slice
+    /// (the `F32`, `Int8` and `Binary` single graphs and the `Int8`/`Binary`
+    /// segment partitionings), measures their held-out recall@k, and rewrites
+    /// the floors (`floor = measured − margin`, or `CI_lower − margin` where
+    /// CI-anchored), keeping the slice's provenance. Run after a deliberate
+    /// change to how the engine builds or searches an index, and commit the
+    /// record. Not a CI step.
     #[command(hide = true)]
-    BuildPrecisionRecallFixture,
-    /// Internal: build the committed `Binary`-precision recall fixture —
-    /// freezes a `Binary` (`B1`/Hamming) sidecar over the ALREADY-COMMITTED
-    /// `fixtures/scale/` corpus (the same real embeddings the frozen
-    /// `F32`/`Int8` bundles index) and merges `binary_*` keys (measured
-    /// recall@k for the two-stage retrieve→rescore at `Binary`'s own default
-    /// oversample, and for the naive `oversample = 1` no-rescore baseline;
-    /// floor = bootstrap-CI-lower-bound − margin, NOT measured − margin — see
-    /// `fixture.rs`'s `build_binary_recall_fixture`) into the existing
-    /// `floor.json`. Run off-box once with `RAYON_NUM_THREADS=1` after
-    /// `build-scale-fixture` and `build-precision-recall-fixture` have
-    /// produced the `F32`/`Int8` fixtures; the bundle is committed and CI only
-    /// loads it. Not a CI step — the provenance-recording builder for the
-    /// committed `Binary` floor.
-    #[command(hide = true)]
-    BuildBinaryRecallFixture,
-    /// Internal: build the committed segment-merge recall fixture — for each
-    /// of the `Int8`/`Binary` precisions (the ones whose `search_final` runs a
-    /// real retrieve→rescore stage), splits the ALREADY-COMMITTED
-    /// `fixtures/scale/` corpus into two or more segments under each of
-    /// several committed row→segment partitionings, freezes one sidecar per
-    /// segment AT THAT PRECISION, assembles a `SegmentedIndex` per
-    /// partitioning, measures its held-out `search_final` recall@k against the
-    /// exact oracle, and merges a `"segment_merge"` section (per-precision,
-    /// per-partitioning measured recall@k + floor, the live single-graph
-    /// baseline at that precision, and the merge-vs-single-graph tracking
-    /// margin — see `fixture.rs`'s `build_segment_recall_fixture`) into the
-    /// existing `floor.json`. Run off-box once with `RAYON_NUM_THREADS=1`
-    /// after `build-precision-recall-fixture` and
-    /// `build-binary-recall-fixture` have produced the single-graph
-    /// `Int8`/`Binary` fixtures; the segment bundles are committed and CI only
-    /// ever loads them. Not a CI step — the provenance-recording builder for
-    /// the committed segment-merge floor.
-    #[command(hide = true)]
-    BuildSegmentRecallFixture,
+    MeasureFloors,
     /// The CPU-hermetic training tier: measures the engine's in-batch-negative
     /// fine-tune throughput (pairs/s) through one GradCache backward + AdamW step
     /// on `Device::Cpu`, and re-triggers the activation-memory negative control —
@@ -929,13 +890,21 @@ async fn main() -> std::process::ExitCode {
             out_dir,
             corpus_rows,
             query_rows,
-        } => {
-            run_build_scale_fixture(&corpus_src, &query_src, &out_dir, corpus_rows, query_rows)
-                .await
-        }
-        Command::BuildPrecisionRecallFixture => run_build_precision_recall_fixture().await,
-        Command::BuildBinaryRecallFixture => run_build_binary_recall_fixture().await,
-        Command::BuildSegmentRecallFixture => run_build_segment_recall_fixture().await,
+        } => print_floors(
+            "build-scale-fixture",
+            fixture::build_held_out_fixture(
+                &corpus_src,
+                &query_src,
+                &out_dir,
+                corpus_rows,
+                query_rows,
+            )
+            .await,
+        ),
+        Command::MeasureFloors => print_floors(
+            "measure-floors",
+            fixture::measure_floors(&arxiv_fixture_dir()).await,
+        ),
         Command::TrainScale => run_train_scale().await,
         Command::TrainMeasureOnce { path, pairs } => run_train_measure_once(&path, pairs),
         Command::TrainThroughputOnce { pairs } => run_train_throughput_once(pairs),
@@ -2521,13 +2490,11 @@ async fn run_search_rss() -> std::process::ExitCode {
 /// Run the realistic-tier recall path and emit the tier.
 ///
 /// Measures the ANN-vs-exact recall curve (recall@k for k∈{1,10,100}) over the
-/// committed *held-out* recall fixture bundle — a corpus, a sidecar frozen over
-/// it, and a SEPARATE disjoint query set — filling the `recall` slots with real
-/// datapoints; the perf metrics (embed/search QPS, propagate latency, peak RSS)
-/// stay explicit `not yet measured` markers — they are the perf lane, measured
-/// in a later PR. The fixture bundle is committed under `fixtures/scale/`; until
-/// it is present this subcommand fails loudly rather than emitting a faked
-/// recall number.
+/// committed *held-out* recall slice — a corpus this engine builds a sidecar
+/// over, and a SEPARATE disjoint query set — filling the `recall` slots with
+/// real datapoints; the perf metrics (embed/search QPS, propagate latency, peak
+/// RSS) stay explicit `not yet measured` markers. A missing slice fails loudly
+/// rather than emitting a faked recall number.
 async fn run_arxiv() -> std::process::ExitCode {
     let fixture_dir = arxiv_fixture_dir();
     let recall = match recall::recall_curve_held_out(&fixture_dir).await {
@@ -2568,9 +2535,9 @@ async fn run_arxiv() -> std::process::ExitCode {
 /// the `recall_sweep` tier.
 ///
 /// The on-box emitter for the recall-vs-cost curve: it builds one graph per
-/// build-knob point (so it is not a CI step — run it off-box with
-/// `RAYON_NUM_THREADS=1`) and re-dials `search_expansion` over one frozen graph
-/// for the query-cost axis. The committed curve is this command's JSON output.
+/// build-knob point (so it is not a CI step) and re-dials `search_expansion`
+/// over one built graph for the query-cost axis. The committed curve is this
+/// command's JSON output.
 async fn run_recall_sweep(
     corpus_src: &std::path::Path,
     query_src: &std::path::Path,
@@ -2624,122 +2591,22 @@ async fn run_recall_sweep(
     std::process::ExitCode::SUCCESS
 }
 
-/// Build the committed held-out recall fixture from the full scale cache and
-/// print the resulting floor record.
-///
-/// Off-box one-shot: subsets the source parquets, freezes the one sidecar, and
-/// writes the fixture bundle plus `floor.json`. Prints the measured recall and
-/// the derived floors so the operator sees the numbers being committed.
-async fn run_build_scale_fixture(
-    corpus_src: &std::path::Path,
-    query_src: &std::path::Path,
-    out_dir: &std::path::Path,
-    corpus_rows: usize,
-    query_rows: usize,
+/// Print the floor record `subcommand` wrote, so the operator sees the numbers
+/// being committed.
+fn print_floors(
+    subcommand: &str,
+    record: Result<fixture::FloorRecord, Box<dyn std::error::Error>>,
 ) -> std::process::ExitCode {
-    match fixture::build_held_out_fixture(corpus_src, query_src, out_dir, corpus_rows, query_rows)
-        .await
-    {
-        Ok(record) => match serde_json::to_string_pretty(&record) {
-            Ok(json) => {
-                println!("{json}");
-                std::process::ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("failed to serialize floor record: {e}");
-                std::process::ExitCode::FAILURE
-            }
-        },
-        Err(e) => {
-            eprintln!("build-scale-fixture failed: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
+    leg_exit(
+        subcommand,
+        record.and_then(|record| {
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }),
+    )
 }
 
-/// Build the committed precision-recall fixture (the frozen `Int8` sidecar +
-/// its `floor.json` `"precision"` section) over the already-committed
-/// `fixtures/scale/` corpus, and print the resulting floor record.
-///
-/// Off-box one-shot: freezes the one `Int8` sidecar and merges the measured
-/// recall@k (rescored and no-rescore) into the existing `floor.json`. Prints
-/// the measured recall and the derived floors so the operator sees the
-/// numbers being committed.
-async fn run_build_precision_recall_fixture() -> std::process::ExitCode {
-    match fixture::build_precision_recall_fixture(&arxiv_fixture_dir()).await {
-        Ok(record) => match serde_json::to_string_pretty(&record) {
-            Ok(json) => {
-                println!("{json}");
-                std::process::ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("failed to serialize precision floor record: {e}");
-                std::process::ExitCode::FAILURE
-            }
-        },
-        Err(e) => {
-            eprintln!("build-precision-recall-fixture failed: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// Build the committed `Binary`-precision recall fixture (the frozen `Binary`
-/// sidecar + its `floor.json` `binary_*` keys) over the already-committed
-/// `fixtures/scale/` corpus, and print the resulting floor record.
-///
-/// Off-box one-shot: freezes the one `Binary` sidecar and merges the measured
-/// recall@k (rescored at `Binary`'s own default oversample, and no-rescore)
-/// into the existing `floor.json`. Prints the measured recall and the derived
-/// floors so the operator sees the numbers being committed.
-async fn run_build_binary_recall_fixture() -> std::process::ExitCode {
-    match fixture::build_binary_recall_fixture(&arxiv_fixture_dir()).await {
-        Ok(record) => match serde_json::to_string_pretty(&record) {
-            Ok(json) => {
-                println!("{json}");
-                std::process::ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("failed to serialize binary precision floor record: {e}");
-                std::process::ExitCode::FAILURE
-            }
-        },
-        Err(e) => {
-            eprintln!("build-binary-recall-fixture failed: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// Build the committed segment-merge recall fixture (the frozen per-segment
-/// `Int8`/`Binary` sidecars + its `floor.json` `"segment_merge"` section) over
-/// the already-committed `fixtures/scale/` corpus, and print the resulting
-/// floor record.
-///
-/// Off-box one-shot: freezes the per-precision, per-partitioning segment
-/// sidecars and merges the measured recall@k, the single-graph baseline at
-/// each precision, and the tracking margin into the existing `floor.json`.
-/// Prints the record so the operator sees the numbers being committed.
-async fn run_build_segment_recall_fixture() -> std::process::ExitCode {
-    match fixture::build_segment_recall_fixture(&arxiv_fixture_dir()).await {
-        Ok(record) => match serde_json::to_string_pretty(&record) {
-            Ok(json) => {
-                println!("{json}");
-                std::process::ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("failed to serialize segment recall floor record: {e}");
-                std::process::ExitCode::FAILURE
-            }
-        },
-        Err(e) => {
-            eprintln!("build-segment-recall-fixture failed: {e}");
-            std::process::ExitCode::FAILURE
-        }
-    }
-}
-
-/// The committed recall-fixture bundle directory, resolved against the crate
+/// The committed recall slice's directory, resolved against the crate
 /// root so the path is stable regardless of the working directory the harness
 /// is launched from.
 fn arxiv_fixture_dir() -> PathBuf {

@@ -13,7 +13,7 @@
 //! * **Committed Parquet** — a real-embedding corpus emitted once on the GPU box
 //!   and committed as an artifact. [`load_vectors`] reads its `(_row_id,
 //!   vector)` rows back through the same register / [`extend_with_fixed_size_list_f32`]
-//!   path the synthetic loader uses, so a frozen sidecar can be built over the
+//!   path the synthetic loader uses, so a sidecar can be built over the
 //!   identical vectors the exact oracle scores.
 //!
 //! Both origins register under `jammi.{table_name}` and are read by the engine's

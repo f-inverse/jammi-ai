@@ -11179,7 +11179,7 @@ mod tests {
         varmap: &candle_nn::VarMap,
         lora_dropout: f64,
     ) -> jammi_encoders::AnyEncoder {
-        let dir = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let dir = jammi_test_utils::fixture("tiny_bert");
         let catalog_dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(Catalog::open(catalog_dir.path()).await.unwrap());
         let base_model_id = register_local_base_model(&catalog, &dir).await;
@@ -11331,8 +11331,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());
         let session = crate::session::InferenceSession::new(config).await.unwrap();
-        let source =
-            jammi_datafusion::ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+        let source = jammi_datafusion::ModelSource::Local(jammi_test_utils::fixture("tiny_bert"));
         session
             .model_cache()
             .get_or_load(&source, ModelTask::TextEmbedding)

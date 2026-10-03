@@ -16,7 +16,7 @@ use arrow::array::StringArray;
 use arrow_ipc::reader::StreamReader;
 use jammi_server::grpc::proto::inference::inference_service_client::InferenceServiceClient;
 use jammi_server::grpc::proto::inference::{InferRequest, ModelTask};
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::fixture;
 
 use super::common::grpc::{channel, start_engine_server, with_session, TENANT_A};
 
@@ -24,7 +24,7 @@ use super::common::grpc::{channel, start_engine_server, with_session, TENANT_A};
 // service; the corpus is the shipped patents parquet read over the `abstract`
 // column with the local tiny_bert encoder.
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn patents_url() -> String {

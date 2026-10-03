@@ -250,7 +250,7 @@ fn contract_lr_schedule_is_monotonic_after_warmup() {
 // Uses local tiny_bert fixture — no network access needed.
 
 pub(crate) fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 pub(crate) async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
@@ -999,10 +999,7 @@ async fn keep_last_n_checkpoints_zero_is_refused() {
 // only difference is the modality of the encoded inputs.
 
 fn htsat_clap_model() -> String {
-    "local:".to_string()
-        + common::cookbook_fixture("htsat_clap_tiny")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + common::fixture("htsat_clap_tiny").to_str().unwrap()
 }
 
 /// Every `clip_*.wav` under the tiny audio corpus, keyed by stem, grouped by

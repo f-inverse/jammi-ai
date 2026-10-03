@@ -3512,7 +3512,7 @@ mod clap_frontend_parse_validation_tests {
     use super::*;
 
     fn real_htsat_clap_preprocessor_config() -> serde_json::Value {
-        // Mirrors `cookbook/fixtures/htsat_clap_tiny/preprocessor_config.json`.
+        // Mirrors `tests/fixtures/htsat_clap_tiny/preprocessor_config.json`.
         serde_json::json!({
             "feature_extractor_type": "ClapFeatureExtractor",
             "feature_size": 32,
@@ -4543,7 +4543,7 @@ mod ner_nonfinite_logit_tests {
     /// to exercise `forward_ner`'s non-finite-logit handling.
     fn model_with_hidden_states(nan_row: usize) -> CandleModel {
         const HIDDEN: usize = 4;
-        let tokenizer_path = jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json");
+        let tokenizer_path = jammi_test_utils::fixture("tiny_bert").join("tokenizer.json");
         let tokenizer = TokenizerWrapper::from_file(&tokenizer_path).unwrap();
         let mut id2label = HashMap::new();
         id2label.insert(0u32, "O".to_string());
@@ -4719,7 +4719,7 @@ mod digest_fingerprint_tests {
         adapter_path: Option<std::path::PathBuf>,
     ) -> ResolvedModel {
         std::fs::create_dir_all(dst).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for name in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
         }
@@ -5028,7 +5028,7 @@ mod digest_fingerprint_tests {
         // shape the refusal exists to reject.
         let outside_tokenizer = outside_tmp.path().join("tokenizer.json");
         std::fs::copy(
-            jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json"),
+            jammi_test_utils::fixture("tiny_bert").join("tokenizer.json"),
             &outside_tokenizer,
         )
         .unwrap();
@@ -5463,7 +5463,7 @@ mod digest_fingerprint_tests {
     /// test here.
     fn resolved_with_config_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
         std::fs::create_dir_all(dst).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for name in ["model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
         }
@@ -5507,7 +5507,7 @@ mod digest_fingerprint_tests {
 
         // config.json — the UNSELECTED arm, never read by this load — APPEARS.
         std::fs::copy(
-            jammi_test_utils::cookbook_fixture("tiny_bert").join("config.json"),
+            jammi_test_utils::fixture("tiny_bert").join("config.json"),
             dst.join("config.json"),
         )
         .unwrap();
@@ -5532,7 +5532,7 @@ mod digest_fingerprint_tests {
         // The alternate arm ALSO exists on disk — tracked even though this
         // load did not select it.
         std::fs::copy(
-            jammi_test_utils::cookbook_fixture("tiny_bert").join("config.json"),
+            jammi_test_utils::fixture("tiny_bert").join("config.json"),
             dst.join("open_clip_config.json"),
         )
         .unwrap();
@@ -5579,7 +5579,7 @@ mod digest_fingerprint_tests {
     /// fixture is hand-built rather than routed through the resolver.
     fn resolved_with_weights_arm(dst: &std::path::Path, selected_name: &str) -> ResolvedModel {
         std::fs::create_dir_all(dst).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for name in ["config.json", "tokenizer.json"] {
             std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
         }
@@ -5635,7 +5635,7 @@ mod digest_fingerprint_tests {
 
         // model.safetensors — the UNSELECTED, preferred arm — APPEARS.
         std::fs::copy(
-            jammi_test_utils::cookbook_fixture("tiny_bert").join("model.safetensors"),
+            jammi_test_utils::fixture("tiny_bert").join("model.safetensors"),
             dst.join("model.safetensors"),
         )
         .unwrap();
@@ -5720,7 +5720,7 @@ mod digest_fingerprint_tests {
         extra_shard_count: usize,
     ) -> ResolvedModel {
         std::fs::create_dir_all(dst).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for name in ["config.json", "tokenizer.json", "model.safetensors"] {
             std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
         }
@@ -5876,7 +5876,7 @@ mod r5_f2_classification_pooling_tests {
     /// produce for a caller that loaded this model to classify.
     fn tiny_modernbert_classifier_resolved(dst: &std::path::Path) -> ResolvedModel {
         std::fs::create_dir_all(dst).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_modernbert_classifier");
+        let fixture = jammi_test_utils::fixture("tiny_modernbert_classifier");
         for name in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
         }

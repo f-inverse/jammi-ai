@@ -7390,7 +7390,7 @@ mod test_fixtures {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());
         let session = crate::session::InferenceSession::new(config).await.unwrap();
-        let source = ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+        let source = ModelSource::Local(jammi_test_utils::fixture("tiny_bert"));
         let guard = session
             .model_cache()
             .get_or_load(&source, ModelTask::TextEmbedding)
@@ -13782,7 +13782,7 @@ mod held_out_eval_tests {
 /// fabricated `true`.
 ///
 /// These tests build a REAL `EncoderAdapters` target — the smallest
-/// constructible one, the checked-in `cookbook/fixtures/tiny_modernbert` config +
+/// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
 /// weights also used by the `it` suite's `encoder_adapters` tests — and read the
 /// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
 /// never trusting `TrainingLoop::training_mode` as ground truth (that mirror
@@ -13813,7 +13813,7 @@ mod encoder_adapters_training_state_tests {
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
 
-    /// The repo-root `cookbook/fixtures/tiny_modernbert` dir — the same
+    /// The repo-root `tests/fixtures/tiny_modernbert` dir — the same
     /// smallest-constructible ModernBERT config + weights
     /// the `it` suite's `encoder_adapters` tests fine-tune end-to-end.
     /// `CARGO_MANIFEST_DIR` is `crates/jammi-ai`; `tests/fixtures` sits two
@@ -14035,7 +14035,7 @@ mod media_front_end_wall_tests {
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder, TrainingResult};
 
-    /// The `cookbook/fixtures/htsat_clap_tiny` dir (config.json,
+    /// The `tests/fixtures/htsat_clap_tiny` dir (config.json,
     /// model.safetensors, preprocessor_config.json) — same fixture
     /// the `it` suite's `tower_adapters` tests use. `CARGO_MANIFEST_DIR` is
     /// `crates/jammi-ai`; `cookbook/fixtures` sits two levels up, at the

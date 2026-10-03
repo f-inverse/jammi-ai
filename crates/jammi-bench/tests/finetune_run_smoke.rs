@@ -16,15 +16,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// `cookbook/fixtures/tiny_bert` — the SAME generic, committed fixture
-/// `jammi_test_utils::cookbook_fixture("tiny_bert")` resolves to
+/// `tests/fixtures/tiny_bert` — the SAME generic, committed fixture
+/// `jammi_test_utils::fixture("tiny_bert")` resolves to
 /// (`workspace_root().join("cookbook").join("fixtures")`), spelled as a
 /// relative path here (mirroring `finetune_step_kernel_disable.rs`'s own
 /// `model_dir()`) rather than adding `jammi-test-utils` as a dev-dependency
 /// of this `[[bin]]`-only crate — BERT architecture, real `tokenizer.json`,
 /// no `1_Pooling/` (falls back to mean pooling), no consumer shape.
 fn model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
 }
 
 /// Write `n` synthetic (anchor, positive, negative) triplets as JSONL, using

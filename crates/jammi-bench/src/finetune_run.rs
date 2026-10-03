@@ -2923,13 +2923,13 @@ mod tests {
         );
     }
 
-    /// `cookbook/fixtures/tiny_bert` — the SAME generic, committed fixture
+    /// `tests/fixtures/tiny_bert` — the SAME generic, committed fixture
     /// `finetune_run_smoke.rs` drives via the compiled CLI (BERT
     /// architecture, real tokenizer, no consumer shape), resolved relative
     /// to this crate's own manifest dir so this IN-PROCESS test needs no
     /// extra dev-dependency.
     fn tiny_bert_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
     }
 
     /// The committed OpenCLIP fixture — `open_clip_config.json` +
@@ -2937,12 +2937,12 @@ mod tests {
     /// that hard-coded `config.json`/`model.safetensors` joins cannot see at
     /// all.
     fn tiny_open_clip_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_open_clip")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_open_clip")
     }
 
     /// The committed HF-CLAP audio fixture.
     fn htsat_clap_tiny_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/htsat_clap_tiny")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/htsat_clap_tiny")
     }
 
     /// Resolve a model dir through the ONE chain, panicking with the real
@@ -3182,7 +3182,7 @@ mod tests {
     /// second layer to restrict AWAY from).
     ///
     /// No committed HF-shaped DistilBERT fixture exists under
-    /// `cookbook/fixtures` (unlike `tiny_bert`), and this crate does not
+    /// `tests/fixtures` (unlike `tiny_bert`), and this crate does not
     /// invent a new committed fixture family to get one — this mirrors
     /// `jammi-encoders`' own `tests/it/distilbert.rs::write_synthetic_weights`
     /// exactly (same tensor names/prefix, same generic random content,
@@ -4719,7 +4719,7 @@ mod tests {
     fn refusal_site_names_are_selectors_that_really_train() {
         let distilbert_dir = write_synthetic_distilbert_model_dir(1);
         let modernbert_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_modernbert_local");
+            .join("../../tests/fixtures/tiny_modernbert_local");
         let cases: Vec<(PathBuf, Task)> = vec![
             (tiny_bert_model_dir(), Task::Text),
             (distilbert_dir.path().to_path_buf(), Task::Text),

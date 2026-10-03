@@ -25,7 +25,7 @@ use jammi_server::grpc::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_server::grpc::proto::eval::{
     EvalCompareRequest, EvalEmbeddingsRequest, EvalPerQueryRequest,
 };
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::fixture;
 use std::collections::HashMap;
 use tonic::codegen::Body;
 
@@ -34,7 +34,7 @@ use super::common::grpc::{channel, start_engine_server, with_session, EngineServ
 const GOLDEN_SOURCE: &str = "golden_rel.public.golden_relevance";
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn patents_url() -> String {

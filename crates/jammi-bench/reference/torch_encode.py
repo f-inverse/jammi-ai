@@ -70,7 +70,7 @@ own allocator counters (`peak_vram_allocator_bytes`) are provenance, never the
 compared quantity.
 
 `--dry-run` needs no checkpoint and no jammi leg: it serves the repository's
-own `cookbook/fixtures/tiny_bert` through the SAME loader and the same code
+own `tests/fixtures/tiny_bert` through the SAME loader and the same code
 path over a small corpus it writes itself.
 """
 
@@ -95,7 +95,7 @@ import torch_finetune_step as tfs  # noqa: E402
 RUNG = "torch"
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
-DRY_RUN_MODEL_DIR = os.path.join(REPO_ROOT, "cookbook", "fixtures", "tiny_bert")
+DRY_RUN_MODEL_DIR = os.path.join(REPO_ROOT, "tests", "fixtures", "tiny_bert")
 DRY_RUN_ROWS = (8, 24)
 DRY_RUN_WORDS = ("quantum", "error", "correction", "codes", "of", "the", "ribosome", "structure")
 

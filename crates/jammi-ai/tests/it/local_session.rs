@@ -34,7 +34,7 @@ async fn seed(session: &Arc<InferenceSession>) {
 }
 
 fn tiny_bert() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 /// `Session::generate_embeddings(Text)` produces the same result table the

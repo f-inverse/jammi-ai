@@ -36,7 +36,7 @@ import jammi
 
 # crates/jammi-python/tests/this_file -> repo root is three parents up.
 _ROOT = Path(__file__).resolve().parents[3]
-_TINY_BERT = _ROOT / "cookbook" / "fixtures" / "tiny_bert"
+_TINY_BERT = _ROOT / "tests" / "fixtures" / "tiny_bert"
 _TRAINING_PAIRS = _ROOT / "tests" / "fixtures" / "training_pairs.csv"
 
 _RUN_WORKER_ENV = "JAMMI_WORKER__ENABLED"

@@ -94,7 +94,7 @@ async fn text_embeddings_via_open_clip_share_latent_dim_with_vision() {
 
     let model_id = format!(
         "local:{}",
-        common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
+        common::fixture("tiny_open_clip").to_str().unwrap()
     );
 
     // Encode a single text query — same path as cross-modal search uses.
@@ -639,7 +639,7 @@ mod live {
     async fn live_real_clap_e2e_matches_committed_embedding() {
         const MIN_COS_E2E: f32 = 0.999;
 
-        let real_dir = common::cookbook_fixture("htsat_clap_real");
+        let real_dir = common::fixture("htsat_clap_real");
         let goldens =
             candle_core::safetensors::load(real_dir.join("goldens.safetensors"), &Device::Cpu)
                 .expect("load real goldens.safetensors");

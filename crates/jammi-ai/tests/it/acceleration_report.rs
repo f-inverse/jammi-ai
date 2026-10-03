@@ -51,10 +51,7 @@ use crate::common;
 /// the acceleration report at all — this suite needs an architecture the fused path
 /// is actually reachable on.
 fn tiny_modernbert_model() -> String {
-    "local:".to_string()
-        + common::cookbook_fixture("tiny_modernbert")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
 }
 
 fn training_columns() -> Vec<String> {
@@ -657,10 +654,7 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
 /// difference (`head_dim == 64` vs `16`) is irrelevant to this test, which
 /// asserts the `flash` field, never `attention_block`.
 fn tiny_bert_head64_model() -> String {
-    "local:".to_string()
-        + common::cookbook_fixture("tiny_bert_head64")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + common::fixture("tiny_bert_head64").to_str().unwrap()
 }
 
 /// The acceleration report's `flash` field for a BERT-family job.
@@ -1856,10 +1850,7 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
     let job = session
         .fine_tune(
             "audio_triplets",
-            &("local:".to_string()
-                + common::cookbook_fixture("htsat_clap_tiny")
-                    .to_str()
-                    .unwrap()),
+            &("local:".to_string() + common::fixture("htsat_clap_tiny").to_str().unwrap()),
             &[
                 "anchor".to_string(),
                 "positive".to_string(),

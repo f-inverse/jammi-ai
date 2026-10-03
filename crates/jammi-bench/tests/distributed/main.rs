@@ -17,7 +17,7 @@ use std::process::Command;
 use jammi_test_utils::fleet::jammi_server_binary;
 
 fn model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
 }
 
 fn write_triplets_jsonl(dir: &Path, name: &str, n: usize, offset: usize) -> PathBuf {

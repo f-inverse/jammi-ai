@@ -36,7 +36,7 @@ use jammi_server::grpc::proto::pipeline::{
     AssembleContextRequest, BuildNeighborGraphRequest, Cascade, GenerateStructureEmbeddingsRequest,
     PropagateEmbeddingsRequest, RecomputeRequest,
 };
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::fixture;
 use tonic::codegen::Body;
 
 use super::common::grpc::{
@@ -44,7 +44,7 @@ use super::common::grpc::{
 };
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn patents_url() -> String {

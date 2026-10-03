@@ -15,7 +15,7 @@ use jammi_db::store::sink::filter_ok_and_extract_vectors;
 use tempfile::TempDir;
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn session_with_patents() -> (Arc<InferenceSession>, TempDir) {
@@ -237,7 +237,7 @@ async fn failed_rows_skipped_in_embedding_output() {
 #[tokio::test]
 async fn infer_persists_results_to_parquet() {
     let (session, _dir) = session_with_patents().await;
-    let model_source = ModelSource::local(common::cookbook_fixture("tiny_bert"));
+    let model_source = ModelSource::local(common::fixture("tiny_bert"));
 
     let results = session
         .infer(

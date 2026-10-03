@@ -243,7 +243,7 @@ USER nonroot:nonroot
 FROM runtime-base AS runtime-selfcontained
 
 COPY deploy/jammi.selfcontained.toml /etc/jammi/jammi.toml
-COPY cookbook/fixtures/htsat_clap_tiny /opt/jammi/models/htsat_clap_tiny
+COPY tests/fixtures/htsat_clap_tiny /opt/jammi/models/htsat_clap_tiny
 
 # This stage never fetches from the Hub (the baked config's own doc: "no
 # network fetch, no Hub credentials" — its one encoder is the baked

@@ -2774,7 +2774,7 @@ is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
 device 0 exists, and fails naming the device when it cannot be opened.
 `--features golden-parity` runs in CI's hermetic `test` job
 (`.github/workflows/ci.yml`): its oracle is a committed PyTorch dump
-(`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
+(`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
 never a network call or a torch install. `parity-test` needs a PyTorch
 environment and `live-gpu-tests` a GPU, which no hosted runner has: CI lints
 the `live-gpu-tests` surfaces (the `flash-attn-compile` job), and they run on

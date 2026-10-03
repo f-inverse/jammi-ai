@@ -903,7 +903,7 @@ async fn p_r_a_resident_loader_holds_its_eager_reservation_while_training_runs()
     let job = session
         .fine_tune(
             "p_r",
-            &("local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+            &("local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()),
             &["anchor".to_string(), "positive".to_string()],
             jammi_ai::fine_tune::FineTuneMethod::Lora,
             ModelTask::TextEmbedding,
@@ -1048,7 +1048,7 @@ async fn f1_a_table_whose_eager_read_exceeds_the_pool_trains_to_completion_throu
     let job = session
         .fine_tune(
             "f1",
-            &("local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+            &("local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()),
             &["text".to_string(), "target".to_string()],
             jammi_ai::fine_tune::FineTuneMethod::Lora,
             ModelTask::Regression,
@@ -1141,7 +1141,7 @@ async fn f4_a_validation_window_not_a_multiple_of_batch_size_completes() {
     let job = session
         .fine_tune(
             "f4",
-            &("local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+            &("local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()),
             &["text".to_string(), "target".to_string()],
             jammi_ai::fine_tune::FineTuneMethod::Lora,
             ModelTask::Regression,
@@ -1214,7 +1214,7 @@ async fn f5_a_nan_target_in_the_validation_suffix_refuses_before_step_zero_under
     let job = session
         .fine_tune(
             "f5",
-            &("local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+            &("local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()),
             &["text".to_string(), "target".to_string()],
             jammi_ai::fine_tune::FineTuneMethod::Lora,
             ModelTask::Regression,
@@ -1328,8 +1328,7 @@ async fn p_t2_a_tenant_scoped_job_trains_through_the_stream_over_exactly_its_own
             let job = session
                 .fine_tune(
                     "p_t2",
-                    &("local:".to_string()
-                        + common::cookbook_fixture("tiny_bert").to_str().unwrap()),
+                    &("local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()),
                     &["text".to_string(), "target".to_string()],
                     jammi_ai::fine_tune::FineTuneMethod::Lora,
                     ModelTask::Regression,

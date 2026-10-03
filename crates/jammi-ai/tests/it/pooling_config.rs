@@ -1,7 +1,7 @@
 //! Config-driven pooling: the text-embedding path must pool with the
 //! strategy a model's `1_Pooling/config.json` declares, not an unconditional
 //! mean. Reuses the hermetic `tiny_bert` fixture (32-dim, 1 layer) checked
-//! into `cookbook/fixtures/tiny_bert/` — no network access required.
+//! into `tests/fixtures/tiny_bert/` — no network access required.
 //!
 //! The oracle: dir A (CLS-declared) and dir B (mean-declared) share the
 //! IDENTICAL weights/tokenizer/config and differ only in `1_Pooling/`, so
@@ -39,7 +39,7 @@ const TEXT: &str = "the quick brown fox jumps over the lazy dog";
 /// `1_Pooling/` subfolder at all.
 pub(crate) fn build_local_model_dir(dst: &Path, pooling_flags: Option<&serde_json::Value>) {
     std::fs::create_dir_all(dst).unwrap();
-    let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+    let fixture = jammi_test_utils::fixture("tiny_bert");
     for name in TINY_BERT_FILES {
         std::fs::copy(fixture.join(name), dst.join(name)).unwrap();
     }

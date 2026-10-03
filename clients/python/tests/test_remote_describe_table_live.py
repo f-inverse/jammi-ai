@@ -29,7 +29,7 @@ pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 REPO = Path(__file__).resolve().parents[3]
 PATENTS_URL = f"file://{REPO / 'tests' / 'fixtures' / 'patents.parquet'}"
-TINY_BERT = f"local:{REPO / 'cookbook' / 'fixtures' / 'tiny_bert'}"
+TINY_BERT = f"local:{REPO / 'tests' / 'fixtures' / 'tiny_bert'}"
 
 
 def _sidecar(artifact_dir: Path, table: str) -> Path:

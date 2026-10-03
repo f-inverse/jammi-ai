@@ -24,7 +24,7 @@ services:
     # teardown short.
     stop_grace_period: 30s
     volumes:
-      - ../cookbook/fixtures/tiny_bert:/fixtures/tiny_bert:ro
+      - ../tests/fixtures/tiny_bert:/fixtures/tiny_bert:ro
       - ../tests/fixtures/patents.parquet:/fixtures/patents.parquet:ro
       # `shape_b_release.py`'s long fine-tune runs over this corpus.
       - ../tests/fixtures/training_pairs.csv:/fixtures/training_pairs.csv:ro

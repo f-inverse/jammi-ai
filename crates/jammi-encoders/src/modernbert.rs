@@ -6927,7 +6927,7 @@ mod tests {
     /// walk that skips layer 0 from one that skips EVERY attention norm).
     fn tiny_modernbert_fixture() -> (ModernBertConfig, std::path::PathBuf) {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_modernbert_local");
+            .join("../../tests/fixtures/tiny_modernbert_local");
         let raw =
             std::fs::read_to_string(dir.join("config.json")).expect("read tiny_modernbert config");
         let config: ModernBertConfig = serde_json::from_str(&raw).expect("parse ModernBertConfig");

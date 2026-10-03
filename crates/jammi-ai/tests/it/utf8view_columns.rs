@@ -233,7 +233,7 @@ fn write_image_path_parquet(dir: &std::path::Path) -> PathBuf {
 }
 
 fn tiny_open_clip_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
 }
 
 /// The end-to-end trigger the spec calls for: a Parquet source with a plain
@@ -339,10 +339,7 @@ fn write_audio_path_parquet(dir: &std::path::Path) -> PathBuf {
 }
 
 fn tiny_htsat_clap_model() -> String {
-    "local:".to_string()
-        + common::cookbook_fixture("htsat_clap_tiny")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + common::fixture("htsat_clap_tiny").to_str().unwrap()
 }
 
 /// The audio peer of [`parquet_utf8_path_column_scans_as_utf8view_and_embeds`]:

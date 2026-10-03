@@ -76,6 +76,7 @@ book:
         - chapters/recipes/flight_sql.qmd
         - chapters/recipes/compound_query.qmd
         - chapters/surfaces/surfaces.qmd
+        - chapters/recipes/cli.qmd
         - chapters/recipes/jobs.qmd
         - chapters/tenancy/tenancy.qmd
         - chapters/tenancy-per-verb/tenancy-per-verb.qmd
@@ -107,8 +108,7 @@ format:
 
 # Every chapter executes on every render — no freeze. Each runs its capability live
 # and checks the claims it makes on that run; a result frozen by an earlier render
-# would check nothing. The determinism contract (jammi_cookbook.determinism,
-# applied on import) keeps fresh execution reproducible. CI's `assemble` profile
+# would check nothing. CI's `assemble` profile
 # (_quarto-assemble.yml) records each execution only to assemble the book from the
 # same run's renders.
 execute:

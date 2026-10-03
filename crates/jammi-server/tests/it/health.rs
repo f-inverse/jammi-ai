@@ -209,11 +209,11 @@ mod gauges {
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use jammi_db::store::CachePolicy;
     use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
-    use jammi_test_utils::{cookbook_fixture, fixture_url, test_config};
+    use jammi_test_utils::{fixture, fixture_url, test_config};
     use tokio::sync::watch;
 
     fn tiny_bert_model() -> String {
-        format!("local:{}", cookbook_fixture("tiny_bert").display())
+        format!("local:{}", fixture("tiny_bert").display())
     }
 
     struct Served {

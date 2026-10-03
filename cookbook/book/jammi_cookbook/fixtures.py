@@ -1,10 +1,10 @@
-"""The cookbook's fixtures: the small corpora, golden sets and tiny model
-checkpoints every recipe and chapter runs on.
+"""The cookbook's fixtures: the small corpora, label sets and golden sets every
+recipe and chapter runs on. The models they run are real checkpoints on the
+Hugging Face Hub, fetched on first use; nothing here is a model.
 
 They ship inside this package, so a fresh install — a Colab runtime, a laptop
 with no repository checkout — runs every recipe as it is. In a checkout,
-``_fixtures`` is a link to ``cookbook/fixtures``, the tree the engine's own
-tests read too, so both read the same bytes.
+``_fixtures`` is a link to ``cookbook/fixtures``.
 """
 
 from __future__ import annotations
@@ -25,8 +25,3 @@ def path(name: str) -> Path:
 def url(name: str) -> str:
     """The fixture ``name`` as the ``file://`` URL ``add_source`` registers."""
     return path(name).as_uri()
-
-
-def model(name: str) -> str:
-    """The checkpoint directory ``name`` as a local model id (``local:<path>``)."""
-    return f"local:{path(name)}"

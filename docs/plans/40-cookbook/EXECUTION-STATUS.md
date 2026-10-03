@@ -544,6 +544,103 @@ API — the bare id raises `table not found`.)
   `<source>.public.<source>` (catalog.schema.table), not by bare name — noted for
   the keystone's tier chapters.
 
+### `cookbook-real-models` (2026-10-03)
+
+- **Real checkpoints on every reader path, not random-weight fixtures.** The
+  quickstart's first search ranked a chiral-amines paper first for "how does
+  quantum computing work?"; every page taught the API over noise. CLAUDE.md's
+  hermetic rule governs `cargo test`, not a reader's run, and the north star is a
+  newcomer learning by running proper code. Every recipe and chapter now runs a
+  Hub checkpoint (all-MiniLM-L6-v2 / gte-modernbert-base text, LAION CLIP
+  ViT-B/32, LAION CLAP, DistilBERT SST-2, dslim/bert-base-NER; all Apache-2.0 or
+  MIT, fetched on demand, attributed in `cookbook/book/NOTICE`). The random-weight
+  encoders remain engine test fixtures and moved to `tests/fixtures/` (CLAUDE.md:
+  generic fixtures live there). No download cache or revision pin in CI (user
+  direction: readers bring hardware and network, testing runs on rented pods);
+  the book's CI jobs authenticate with `HF_TOKEN`.
+- **A `vocab.txt`-only checkpoint is an engine fix, not a model chosen around
+  it.** The most-used Hub sentiment and NER checkpoints ship no `tokenizer.json`
+  and failed with "No tokenizer loaded". Picking other models would leave the gap
+  for every user (CLAUDE.md: no band-aids). `TokenizerSource::WordPiece` builds the
+  `BertTokenizer` pipeline from the same files; its oracle is `transformers`'
+  own encodings. The tokenizer candidates are one typed table
+  (`arch::TOKENIZER_CANDIDATES`) both resolvers walk, as config and weights walk
+  `resolution_order`, so the local and Hub arms cannot choose differently.
+- **A fused-kernel fallback logs `info`, not `warn`.** A model outside a kernel's
+  domain (MiniLM's 32-wide heads) runs the eager composition correctly; the
+  reader cannot act on the line, and the per-job acceleration report already
+  records it. The library's default level is `warn`, a server's `info`.
+- **The cookbook no longer pins threads or the CPU, and `determinism.py` is
+  deleted.** The pins served frozen goldens; claims hold on any device and thread
+  count, and the pins silently made the reader's own process single-threaded.
+  `seeded()` had no caller left.
+- **Scale-dependent claims, by one rule.** A property of the method stays a claim
+  at both scales; a finding only the full data shows is guarded `SCALE is
+  Scale.FULL` with the small run's numbers described in prose. Under a real
+  encoder: citation propagation on 400 papers ties (retrieval 0.5655 vs 0.5650,
+  analyze +0.001, eval-channels +0.001) → `full`; the binary median threshold
+  does not beat zero on MiniLM (2 of 384 dims collapse at 0) → `full`; weighted
+  conformal moves coverage by noise on a few hundred papers (knn-10 Δ −0.073) →
+  `full`; "vectors dominate the graph" now holds at 384 dims (ratio 0.32) and
+  "routes sharpen continent" at small (+0.081) → unguarded; dense retrieval beats
+  chance (0.57 vs 0.36) is the new both-scale claim.
+- **The binary sidecar keeps the per-dimension median threshold.** Measured: on
+  MiniLM median and zero rank alike without rescore (recall@10 0.630 vs 0.648 over
+  40 queries, within noise) because few dimensions collapse; on ModernBERT at
+  `full` median clearly beats zero. Median splits every dimension in half, the
+  most a bit can carry for any encoder; no engine change.
+- **The self-contained server image bakes configuration only.** It baked the
+  random-weight `htsat_clap_tiny` as its one encoder, so a client passing that
+  `local:` id got noise — this PR's defect class. CLAUDE.md: deployment is
+  configuration, and the engine names no consumer's modality choice. The stage
+  already gave the Hub cache a writable home under `/tmp`; a Hub id is fetched on
+  first use, and an offline deployment builds on the image with its own
+  checkpoint.
+- **The precision chapters run on the reader's device.** compute-precision,
+  quantized-weights and finetune-acceleration cited numbers from machines the book
+  never ran on; each now runs live and claims what holds on the device present:
+  bf16 runs and agrees with f32 on Ampere or newer, or is refused with its
+  remedy; in bf16 only the GPU's architecture can decline FlashAttention (the
+  engine runs on every sm_80+ GPU, FlashAttention on the architectures the build
+  validated, else `arch_in_flash_validated_set`); FlashAttention's counter shows
+  it ran exactly when the report says it held. The report's `device` is the GPU's
+  own name, so no claim branches on it beyond `"cpu"` — the first GPU render
+  failed on a `startswith("cuda")` branch that never matched.
+- **A drained child's capture ends at the bytes resident when its exit is
+  observed (#716).** `DrainedChild`'s reader concluded EOF on the first idle
+  50 ms poll after the reap, so whether a capture with a still-writing
+  fd-inheriting grandchild came back `SettleExpired` depended on that writer
+  never being descheduled for 50 ms; `grandchild_capture_is_incomplete_not_survived`
+  failed at load 28. Root cause: completeness inferred from a quiet interval. A
+  reaped child's unread bytes are a prefix of what its pipe holds (POSIX
+  `pipe()`: reads are first-in-first-out; `FIONREAD` on a pipe counts the bytes
+  waiting — Linux `fs/pipe.c` and XNU `bsd/kern/sys_pipe.c` `pipe_ioctl`), so
+  the reader reads exactly that count once it observes the exit, and stops. No
+  other process, silent or writing, and no scheduling can move that boundary; a
+  reaped child's unix readers are waited for without a clock, and
+  `SettleExpired` remains for a child never reaped and for the non-unix blocking
+  reader. Rejected: a faster writer or a longer poll in the oracle (moves the
+  margin, keeps the dependence). The oracles construct holding and streaming
+  without timing — the holder holds until the test releases its stdin, the
+  streamer writes without pause after a ready handshake — and each reader
+  mutation (skip the resident bytes, the idle-poll rule, read to close) fails one
+  of them.
+- **The foreign-library harness checks trust once, before any content, and
+  tests that directly.** Its `Role::Grandchild` existed only to build an
+  untrustworthy capture from a writing grandchild, which the boundary above makes
+  impossible; the role, its modes and its two tests are gone, and the primitive's
+  grandchild behaviour is pinned in `jammi_test_utils::child`. `classify` had the
+  trust gate copied into five arms; `classify_exit` gates once and pairs each
+  content-decided code with its `Evidence`, and
+  `untrusted_evidence_is_incomplete_however_well_it_reads` pins the order for
+  every such code. `Attempt::Incomplete`'s doc listed truncation as a reason the
+  harness deliberately does not veto on; it now matches `incompleteness_reason`.
+- **Every public surface has a runnable example.** The coverage guard parses the
+  CLI's clap enums and the engine's SQL function impls beside the Python verbs
+  (111 surfaces); a `cli` recipe runs every command, `compound_query` the vector
+  aggregates, incremental refresh `jammi_content_hash`. The guard's recipe lane
+  reads SQL inside string literals as code and only docstrings as prose.
+
 ## Audit history
 
 _(Populated before each merge: findings + remediations.)_

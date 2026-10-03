@@ -103,7 +103,7 @@ radius is likely a missing edge, i.e. a true positive).
 job = db.fine_tune_graph(
     node_source="nodes", id_column="id", text_column="text",
     edge_source="edges", edge_src_column="src", edge_dst_column="dst",
-    base_model="local:/models/tiny_bert",
+    base_model="sentence-transformers/all-MiniLM-L6-v2",
     edge_provenance="declared",   # "declared" teaches; "similarity" echoes
     walk_length=4, walks_per_node=2, return_p=1.0, in_out_q=1.0,
     graph_hard_negatives=1, exclude_hops=1, min_negatives=1,
@@ -135,7 +135,7 @@ let sample = GraphSampleConfig {
     hard_negatives: 1, exclude_hops: 1, min_negatives: 1, seed: 0,
 };
 let job = session
-    .fine_tune_graph(&sources, "local:/models/tiny_bert", sample, Some(FineTuneConfig::default()))
+    .fine_tune_graph(&sources, "sentence-transformers/all-MiniLM-L6-v2", sample, Some(FineTuneConfig::default()))
     .await?;
 job.wait().await?;
 # Ok(()) }
@@ -153,7 +153,7 @@ graph = db.build_neighbor_graph("nodes", k=10, exact=True)
 job = db.fine_tune_graph(
     node_source="nodes", id_column="id", text_column="text",
     edge_graph_table=graph, edge_provenance="similarity",
-    base_model="local:/models/tiny_bert",
+    base_model="sentence-transformers/all-MiniLM-L6-v2",
 )
 ```
 

@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch_grad_oracle as tgo  # noqa: E402
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-TINY_FIXTURE_DIR = os.path.join(REPO_ROOT, "cookbook", "fixtures", "tiny_modernbert_classifier")
+TINY_FIXTURE_DIR = os.path.join(REPO_ROOT, "tests", "fixtures", "tiny_modernbert_classifier")
 
 
 ALL_SITES = [
@@ -133,7 +133,7 @@ class CheckpointIdentityTests(unittest.TestCase):
     `grad_oracle.rs`'s module doc's determinant table): it hashes the base
     checkpoint's actual BYTES instead. Driven against the SAME committed
     fixture `grad_oracle.rs`'s own tests use
-    (`cookbook/fixtures/tiny_modernbert_classifier`), never a fabricated
+    (`tests/fixtures/tiny_modernbert_classifier`), never a fabricated
     tempdir stand-in, so this pins the REAL function against REAL files.
     """
 

@@ -30,7 +30,7 @@ async fn smoke_full_pipeline() {
         .unwrap();
 
     // Generate embeddings
-    let tiny_bert = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let tiny_bert = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
     let record = session
         .generate_text_embeddings(
             "patents",

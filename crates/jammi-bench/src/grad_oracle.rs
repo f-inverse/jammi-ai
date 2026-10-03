@@ -340,7 +340,7 @@ mod tests {
 
     fn tiny_model_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_modernbert_classifier")
+            .join("../../tests/fixtures/tiny_modernbert_classifier")
     }
 
     fn gradients_of(

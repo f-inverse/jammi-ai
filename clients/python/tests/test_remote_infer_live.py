@@ -34,7 +34,7 @@ pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 # `tiny_modernbert`, a 32-dim ModernBERT with committed weights).
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PATENTS_URL = f"file://{REPO_ROOT / 'tests' / 'fixtures' / 'patents.parquet'}"
-TINY_MODERNBERT = f"local:{REPO_ROOT / 'cookbook' / 'fixtures' / 'tiny_modernbert'}"
+TINY_MODERNBERT = f"local:{REPO_ROOT / 'tests' / 'fixtures' / 'tiny_modernbert'}"
 
 
 def test_infer_round_trip_matches_embedded(live_server, tmp_path):

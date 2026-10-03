@@ -19,7 +19,7 @@ import jammi
 from jammi.errors import JobCancelled
 from jammi_cookbook import fixtures
 
-BASE_MODEL = fixtures.model("tiny_bert")
+BASE_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 home = Path(tempfile.mkdtemp())
 engine = f"file://{home}/engine"

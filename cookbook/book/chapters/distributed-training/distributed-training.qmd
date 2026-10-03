@@ -2,11 +2,6 @@
 title: "One job, many ranks — distributed training as a gang"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `fine_tune(world_size=…)` · `[worker] local_ranks` · `[distributed]
 max_world_size` · `[server] peer_bind` / `peer_advertise` · `list_workers` ·
 **Background:** data-parallel
@@ -44,7 +39,7 @@ import numpy as np
 from jammi_cookbook import fixtures
 from jammi_cookbook.claims import claim
 
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 PAIRS = fixtures.url("tiny_pairs.csv")
 PROBES = ["quantum error correction methods", "protein folding with transformers",
           "graph kernels for chemistry", "solid electrolyte interphase control"]
@@ -61,7 +56,7 @@ def engine(local_ranks: int):
 
 
 def train(db, world_size: int, batch_size: int):
-    """Fine-tune the tiny encoder on the scored pairs; return the loss curve and
+    """Fine-tune the encoder on the scored pairs; return the loss curve and
     the adapted model's embedding of every probe."""
     job = db.fine_tune(
         source="pairs", base_model=MODEL, columns=["text_a", "text_b", "score"],

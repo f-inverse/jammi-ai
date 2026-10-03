@@ -366,10 +366,7 @@ fn write_pairs_csv(dir: &std::path::Path) -> String {
 }
 
 fn tiny_bert_model() -> String {
-    "local:".to_string()
-        + jammi_test_utils::cookbook_fixture("tiny_bert")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + jammi_test_utils::fixture("tiny_bert").to_str().unwrap()
 }
 
 /// The `world_size == 2` job's REAL spec — the SAME shape `jammi-ai`'s

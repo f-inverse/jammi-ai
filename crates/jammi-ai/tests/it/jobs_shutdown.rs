@@ -38,7 +38,7 @@ use jammi_db::store::CachePolicy;
 use crate::common;
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 /// Lease / heartbeat / idle-poll timing for one fixture, in seconds.

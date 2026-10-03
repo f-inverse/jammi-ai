@@ -2,11 +2,6 @@
 title: "Propagating embeddings over a graph"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `propagate_embeddings` · `eval_compare` (approximate and exact) · **Background:** graph signal
 processing — low-pass filtering on the graph (Stanković et al. 2020, Part II)
 = SGC/APPNP decoupled propagation · **Checked:** measurement (does propagation
@@ -84,18 +79,19 @@ print(f"Δ (denoising gain):   {delta:+.3f}")
 ```{python}
 claim("the comparison's delta is the propagated table's precision@10 less the raw table's",
       abs((prop_precision - raw_precision) - delta) < 1e-9)
-claim("propagation over the citations lifts same-subject precision@10", delta > 0,
-      f"{raw_precision:.3f} → {prop_precision:.3f}")
+if SCALE is scale.Scale.FULL:
+    claim("propagation over the citations lifts same-subject precision@10", delta > 0,
+          f"{raw_precision:.3f} → {prop_precision:.3f}")
 ```
 
 At `full` scale propagation lifts same-subject precision: an embedding model's
 vectors carry the topic, and averaging over citation neighbours — who mostly
 share it — sharpens it. The encoder matters: a masked-language-model backbone
 (`answerdotai/ModernBERT-base`, mean-pooled) retrieves far worse, and its vectors
-carry too little topic for propagation to sharpen. At `small` scale the
-random-weight encoder's vectors carry little topic of their own: what lift there
-is comes from the citations, so read it as the pipeline at work, not as a finding
-about the encoder.
+carry too little topic for propagation to sharpen. At `small` scale the sentence
+encoder already places most of the 400 papers by subject, and their 1,577
+citations have little to add: the delta sits within noise of zero. What
+propagation buys depends on what the graph knows that the encoder does not.
 
 ## Bridge note (a signature chapter — deepened in the bridge chapters)
 
@@ -185,16 +181,14 @@ print(f"Δ (denoising gain):   {air_delta:+.3f}")
 ```
 
 ```{python}
-if SCALE is scale.Scale.FULL:
-    claim("the flight network is intracontinental, so propagating over it sharpens continent",
-          air_delta > 0.03, f"precision@10 {air_raw_precision:.3f} → {air_prop_precision:.3f}")
+claim("the flight network is intracontinental, so propagating over it sharpens continent",
+      air_delta > 0.03, f"precision@10 {air_raw_precision:.3f} → {air_prop_precision:.3f}")
 ```
 
-At `full` scale propagating over routes lifts same-continent precision by several
-points: the route graph is mostly intracontinental (tier 01), so an airport's
-route-neighbours carry its continent. At `small` scale the random-weight encoder's
-vectors carry nothing to sharpen, and the delta sits within noise of zero — a
-pipeline check, not a finding.
+Propagating over routes lifts same-continent precision by several points: the
+route graph is mostly intracontinental (tier 01), so an airport's route-neighbours
+carry its continent, which its thin text — a name and a city — barely does. Here
+the graph knows what the encoder does not, and propagation shows it.
 
 This is where the Air Routes on-ramp **stops** (tier 02). Its text is too thin
 and its label too near-deterministic for a credible learn/predict tier — those

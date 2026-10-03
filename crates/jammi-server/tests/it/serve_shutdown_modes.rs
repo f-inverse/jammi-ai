@@ -35,7 +35,7 @@ use jammi_server::grpc::proto::training::{FineTuneConfig, FineTuneMethod, FineTu
 use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_server::grpc::proto::trigger::{SubscribeRequest, TopicName};
 use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
-use jammi_test_utils::{cookbook_fixture, fixture_url, test_config};
+use jammi_test_utils::{fixture, fixture_url, test_config};
 use tempfile::TempDir;
 use tokio::sync::watch;
 use tonic::transport::Channel;
@@ -44,7 +44,7 @@ use tonic::Code;
 use super::common::grpc::channel;
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 /// Lease / heartbeat seconds for one server.

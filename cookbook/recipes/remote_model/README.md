@@ -5,9 +5,9 @@ embeddings API, or an inference server the engine does not run itself. The
 deployment declares the endpoint once, and every verb that takes a model
 takes `remote:<name>`.
 
-The program serves its own stand-in endpoint (a hashed bag-of-words embedder
-speaking the OpenAI-compatible embeddings protocol), so it runs with no
-network and no key. Against a hosted API, the declaration reads:
+The program serves its own endpoint, speaking the OpenAI-compatible
+embeddings protocol and backed by a real sentence encoder, so it runs with no
+account and no key. Against a hosted API, the declaration reads:
 
 ```toml
 [models.remote.hosted-encoder]

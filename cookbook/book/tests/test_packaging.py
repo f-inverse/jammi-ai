@@ -8,12 +8,11 @@ from pathlib import Path
 
 import tomllib
 
-from jammi_cookbook import encoders, fixtures
-from jammi_cookbook.scale import Scale
+from jammi_cookbook import fixtures
 
 BOOK = Path(__file__).resolve().parents[1]
 COOKBOOK = BOOK.parent
-_LITERAL = re.compile(r"fixtures\.(?:path|url|model)\(\s*f?[\"']([^\"'/{]+)")
+_LITERAL = re.compile(r"fixtures\.(?:path|url)\(\s*f?[\"']([^\"'/{]+)")
 # A path climbed out of a module's own directory: in an install that is the
 # environment's site-packages, not the repository the module was built from.
 _CLIMB = re.compile(r"__file__\)(?:\.resolve\(\))?\.(?:parents\[|parent\.parent)")
@@ -27,13 +26,8 @@ def _sources() -> list[Path]:
 
 def _read() -> set[str]:
     """The top-level fixture names every recipe, chapter and library module
-    reads — by literal name, and through the `small` encoders."""
-    names = {m for src in _sources() for m in _LITERAL.findall(src.read_text())}
-    root = fixtures.path(".").resolve()
-    for encoder in (encoders.text, encoders.image, encoders.audio):
-        local = Path(encoder(Scale.SMALL).removeprefix("local:")).resolve()
-        names.add(local.relative_to(root).parts[0])
-    return names
+    reads."""
+    return {m for src in _sources() for m in _LITERAL.findall(src.read_text())}
 
 
 def _packaged(patterns: list[str]) -> set[Path]:
@@ -43,23 +37,22 @@ def _packaged(patterns: list[str]) -> set[Path]:
     return {f.resolve() for p in patterns for f in package.glob(p) if f.is_file()}
 
 
-def _unshipped(name: str, shipped: set[Path], excluded: set[Path]) -> list[str]:
+def _unshipped(name: str, shipped: set[Path]) -> list[str]:
     """The files of fixture ``name`` — the file itself, or every file under the
-    directory — that the wheel neither ships nor deliberately excludes."""
+    directory — that the wheel does not ship."""
     target = fixtures.path(name)
     files = [target] if target.is_file() else [f for f in target.rglob("*") if f.is_file()]
     root = fixtures.path(".").resolve()
-    return [f.resolve().relative_to(root).as_posix() for f in files
-            if f.resolve() not in shipped | excluded]
+    return [f.resolve().relative_to(root).as_posix() for f in files if f.resolve() not in shipped]
 
 
 def test_every_fixture_the_cookbook_reads_ships_in_the_wheel():
     setuptools = tomllib.loads((BOOK / "pyproject.toml").read_text())["tool"]["setuptools"]
-    excluded = _packaged(setuptools["exclude-package-data"]["jammi_cookbook"])
-    shipped = _packaged(setuptools["package-data"]["jammi_cookbook"]) - excluded
+    shipped = _packaged(setuptools["package-data"]["jammi_cookbook"])
     read = _read()
-    assert {"tiny_bert", "tiny_open_clip", "htsat_clap_tiny", "arxiv_small"} <= read
-    missing = sorted(f for n in read for f in _unshipped(n, shipped, excluded))
+    assert {"tiny_corpus.parquet", "tiny_reviews.parquet", "tiny_image_corpus",
+            "arxiv_small"} <= read
+    missing = sorted(f for n in read for f in _unshipped(n, shipped))
     assert not missing, f"fixture files the cookbook reads but the wheel omits: {missing}"
 
 

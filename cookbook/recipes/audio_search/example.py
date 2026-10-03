@@ -5,9 +5,9 @@ as a notebook: each `# %%` cell is one step.
 """
 
 # %% [markdown]
-# `JAMMI_AUDIO_MODEL` names the checkpoint, any CLAP audio model as a Hugging
-# Face repo id or `local:<path>`; the default is the random-weight
-# `htsat_clap_tiny` fixture, which runs offline in seconds.
+# The encoder is LAION's CLAP (HTSAT audio tower, fused variant) from the
+# Hugging Face Hub, downloaded on first use (about 600 MB) and cached. Any CLAP
+# audio model id, or a local directory as `local:<path>`, works the same way.
 
 # %%
 import json
@@ -23,10 +23,8 @@ from jammi.errors import TrainingError
 from jammi_cookbook import fixtures
 
 AUDIO_CORPUS_DIR = fixtures.path("tiny_audio_corpus")
-DEFAULT_MODEL = fixtures.model("htsat_clap_tiny")
-MODEL = os.environ.get("JAMMI_AUDIO_MODEL", DEFAULT_MODEL)
+MODEL = "laion/clap-htsat-fused"
 METRICS = ("recall_at_k", "precision_at_k", "mrr", "ndcg")
-print(f"model: {MODEL}")
 
 home = Path(tempfile.mkdtemp())
 db = jammi.connect(f"file://{home}")
@@ -85,8 +83,8 @@ print(f"top-{results.num_rows} for q_sine: {results.column('clip_id').to_pylist(
 #
 # The golden set holds a held-out query clip per family and the corpus clips
 # of that family. A `query_audio` (binary) column is what switches
-# `eval_embeddings` to audio queries. The numbers are reported, not judged:
-# the fixture's weights are random.
+# `eval_embeddings` to audio queries. Each family has four clips in the
+# corpus, so a random ranking would recall one in four at k=5.
 
 # %%
 query_ids, query_audios, relevant_ids = [], [], []
@@ -193,8 +191,8 @@ for label, run in (("base ", base_metrics), ("tuned", tuned_metrics)):
 #
 # The same query clip, encoded through the tuned model, must come out
 # different from the base encoding. This checks the vectors, not the metrics
-# above: on a set this small the rankings rarely flip even when the vectors
-# move. It checks change, not improvement — the fixture's weights are random.
+# above: CLAP already ranks these timbres almost perfectly, so the rankings
+# have little room to move even when the vectors do.
 
 # %%
 tuned_query_vec = db.encode_query(model=tuned_model, query=query_wav, modality="audio")

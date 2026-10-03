@@ -39,7 +39,7 @@ use jammi_server::grpc::proto::training::{
     FineTuneMethod, FineTuneSpec, GaussianObjective, GraphEdgeSource, GraphFineTuneSources,
     GraphFineTuneSpec, GraphSampleConfig, PredictiveHead,
 };
-use jammi_test_utils::{cookbook_fixture, fixture_url};
+use jammi_test_utils::{fixture, fixture_url};
 use tonic::transport::Channel;
 
 use super::common::grpc::start_engine_server_with_worker_enabled;
@@ -50,7 +50,7 @@ use super::common::grpc::{
 };
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn training_url() -> String {
@@ -396,7 +396,7 @@ async fn list_training_jobs_is_tenant_scoped_and_carries_the_status_projection()
     // fixture path plus a version suffix — not the submit-time `local:` string.
     assert!(
         row.base_model_id
-            .starts_with(&cookbook_fixture("tiny_bert").display().to_string()),
+            .starts_with(&fixture("tiny_bert").display().to_string()),
         "base_model_id is the catalog id of the submitted base model, got '{}'",
         row.base_model_id
     );

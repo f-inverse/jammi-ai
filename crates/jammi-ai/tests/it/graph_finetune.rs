@@ -492,7 +492,7 @@ async fn fine_tune_graph_duplicate_node_id_fails() {
         .await
         .unwrap();
 
-    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
     let sources = GraphFineTuneSources {
         node_source: "nodes".into(),
         id_column: "id".into(),
@@ -949,7 +949,7 @@ async fn two_attempts_of_one_graph_job_never_displace_each_others_table() {
         .await
         .unwrap();
 
-    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
     let sources = GraphFineTuneSources {
         node_source: "nodes".into(),
         id_column: "id".into(),
@@ -1299,7 +1299,7 @@ async fn two_community_graph(dir: &std::path::Path) -> TwoCommunityGraph {
         .await
         .unwrap();
 
-    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
 
     let sources = GraphFineTuneSources {
         node_source: "nodes".into(),
@@ -1688,7 +1688,7 @@ async fn fine_tune_graph_isolated_graph_fails() {
         .await
         .unwrap();
 
-    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
     let sources = GraphFineTuneSources {
         node_source: "nodes".into(),
         id_column: "id".into(),

@@ -3481,7 +3481,7 @@ mod tests {
 
     fn fixture_config() -> serde_json::Value {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/htsat_clap_tiny/config.json");
+            .join("../../tests/fixtures/htsat_clap_tiny/config.json");
         let s = std::fs::read_to_string(path).expect("read config.json");
         serde_json::from_str(&s).expect("parse config.json")
     }
@@ -3745,7 +3745,7 @@ mod tests {
 
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/htsat_clap_tiny");
+            .join("../../tests/fixtures/htsat_clap_tiny");
         let weights = dir.join("model.safetensors");
         let config = HtsatAudioConfig::from_hf_clap_config(&fixture_config()).unwrap();
         assert_eq!(config.projection_hidden_act, "relu", "fixture act changed");

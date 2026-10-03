@@ -55,7 +55,7 @@ from transformers.models.clap.feature_extraction_clap import ClapFeatureExtracto
 
 # tests/fixtures/generate_clap_frontend.py -> repo root is two parents up.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-OUT = os.path.join(REPO_ROOT, "cookbook", "fixtures", "htsat_clap_frontend")
+OUT = os.path.join(REPO_ROOT, "tests", "fixtures", "htsat_clap_frontend")
 
 # laion/clap-htsat-fused feature-extractor geometry.
 PARAMS = dict(

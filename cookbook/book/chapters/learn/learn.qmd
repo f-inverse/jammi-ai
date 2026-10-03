@@ -2,11 +2,6 @@
 title: "Fine-tuning an encoder on a graph"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `fine_tune_graph` · `eval_compare` · **Background:** representation
 learning on graphs — node2vec / contrastive (Stanković et al. 2020, Part III;
 Hamilton 2017); citation-graph contrastive supervision (SPECTER, Cohan et al.
@@ -129,9 +124,12 @@ partial) < declared (largest)**:
 - **random** — harmful: training against structureless pairs degrades the
   metric rather than merely failing to improve it.
 
-At `small` scale all three runs are two epochs on a random-weight encoder, so
-their numbers check the pipeline, not the finding; run this chapter at `full`
-scale to see the ordering, measured.
+At `small` scale the base is already a trained sentence encoder, and each run is
+two epochs over a few hundred papers' edges — too little to teach it much about
+subjects it already separates. On this book's own small run the declared and
+similarity runs stayed level with the base (precision@10 0.565 against 0.566),
+and only the random graph moved it, down (0.557). Run this chapter at `full`
+scale to see the whole ordering, measured.
 
 ```{python}
 db.close()

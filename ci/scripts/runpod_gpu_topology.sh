@@ -363,7 +363,7 @@ grc=${start_rc}
 [ "\$grc" -ne 0 ] || ${TOPOLOGY_REMOTE_DIR}/venv/bin/python ci/scripts/gpu_topology_fleet.py \\
   --endpoint grpc://${GN_IP0}:7000 \\
   --pairs ${RP_REMOTE_ROOT}/jammi-ai/tests/fixtures/training_triplets.csv \\
-  --model local:${RP_REMOTE_ROOT}/jammi-ai/cookbook/fixtures/tiny_bert \\
+  --model local:${RP_REMOTE_ROOT}/jammi-ai/tests/fixtures/tiny_bert \\
   --world-size $((RP_GPU_COUNT * 2)) --per-rank-batch 2 --expect-hosts 2 ${reference} \\
   > ${TOPOLOGY_REMOTE_DIR}/fleet-${phase}.json || grc=\$?
 cat ${TOPOLOGY_REMOTE_DIR}/fleet-${phase}.json 2>/dev/null | head -c 4000

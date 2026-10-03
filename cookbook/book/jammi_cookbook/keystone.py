@@ -53,8 +53,8 @@ def propagate(db, arxiv: Arxiv, embeddings: str) -> str:
 # Tier 03's epochs: a graph-supervised contrastive fine-tune converges over tens
 # of epochs (SPECTER trains for tens), and at full scale the declared-edge gain
 # is still rising at 15; the two control graphs train at a matched, cheaper
-# budget. The small scale's encoder has nothing to converge to, so a short run
-# exercises the same path.
+# budget. Convergence is a full-scale finding, so the small scale runs the same
+# path for two epochs, which a CPU finishes.
 FINE_TUNE_EPOCHS = {Scale.SMALL: 2, Scale.FULL: 15}
 CONTROL_EPOCHS = {Scale.SMALL: 2, Scale.FULL: 5}
 
@@ -93,8 +93,8 @@ def fine_tune_on_graph(
 # task, and a paper's year is only weakly predictable from its neighbours, so at
 # full scale a larger step oscillates above the objective's starting value
 # rather than descending it: at 1e-4 the held-out score falls smoothly to its
-# floor by about epoch 30 and is flat around it. The small scale's random-weight
-# encoder has nothing to learn, so its short run exercises the same path.
+# floor by about epoch 30 and is flat around it. The small scale's few hundred
+# papers train in a shorter run at a larger step.
 PREDICTOR_BUDGET = {
     Scale.SMALL: {"epochs": 20, "learning_rate": 5e-3},
     Scale.FULL: {"epochs": 30, "learning_rate": 1e-4},

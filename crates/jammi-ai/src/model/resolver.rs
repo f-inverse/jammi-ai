@@ -336,7 +336,7 @@ impl ModelResolver {
         let Some((weights_paths, weights_format)) = local_weights(&artifact_dir) else {
             return Ok(None);
         };
-        let tokenizer = discover_local_tokenizer(&artifact_dir);
+        let tokenizer = arch::tokenizer_source(&artifact_dir);
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &model_config, &model_id.0)?;
 
@@ -398,7 +398,7 @@ impl ModelResolver {
             });
         };
 
-        let tokenizer = discover_local_tokenizer(path);
+        let tokenizer = arch::tokenizer_source(path);
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
 
@@ -551,16 +551,7 @@ impl ModelResolver {
                 }
             };
 
-        // Prefer the HF-converted tokenizer.json if it exists; otherwise
-        // fall back to the OpenCLIP native vocab file for stock OpenCLIP
-        // repos that ship `bpe_simple_vocab_16e6.txt.gz` instead.
-        let tokenizer = match repo.get("tokenizer.json").await? {
-            Some(path) => Some(TokenizerSource::HuggingFaceJson(path)),
-            None => repo
-                .get("bpe_simple_vocab_16e6.txt.gz")
-                .await?
-                .map(TokenizerSource::OpenClipBpe),
-        };
+        let tokenizer = hub_tokenizer(&repo).await?;
 
         let estimated_memory =
             estimate_residency(weights_format, &weights_paths, &config, &source.to_string())?;
@@ -864,19 +855,21 @@ fn read_local_pooling_config(dir: &Path, model_id: &str) -> Result<Option<serde_
         })
 }
 
-/// Locate a tokenizer artifact inside a local model directory, preferring
-/// an HF-shape `tokenizer.json` and falling back to OpenCLIP's native
-/// `bpe_simple_vocab_16e6.txt.gz`.
-fn discover_local_tokenizer(dir: &Path) -> Option<TokenizerSource> {
-    let hf = dir.join("tokenizer.json");
-    if hf.exists() {
-        return Some(TokenizerSource::HuggingFaceJson(hf));
+/// A Hub repo's tokenizer: the first of [`arch::TOKENIZER_CANDIDATES`] the
+/// repo holds, in network order, and its `tokenizer_config.json` when that
+/// layout reads one.
+async fn hub_tokenizer(repo: &HubRepo<'_>) -> Result<Option<TokenizerSource>> {
+    for (name, layout) in arch::TOKENIZER_CANDIDATES {
+        if let Some(artifact) = repo.get(name).await? {
+            let config = if layout.reads_config() {
+                repo.get(arch::TOKENIZER_CONFIG_FILENAME).await?
+            } else {
+                None
+            };
+            return Ok(Some(TokenizerSource::of(layout, artifact, config)));
+        }
     }
-    let bpe = dir.join("bpe_simple_vocab_16e6.txt.gz");
-    if bpe.exists() {
-        return Some(TokenizerSource::OpenClipBpe(bpe));
-    }
-    None
+    Ok(None)
 }
 
 #[cfg(test)]

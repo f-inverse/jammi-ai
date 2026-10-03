@@ -11,7 +11,7 @@ recipe under `cookbook/recipes/` is a chapter too. The rendered book:
 ## Repository layout
 
 ```
-jammi_cookbook/   the shared lib: datasets, encoders, claims, rails
+jammi_cookbook/   the shared lib: datasets, encoders, claims, rails, data fixtures
 chapters/         the book (Quarto .qmd with executable Python cells); its order lives
                   in _quarto.yml
   recipes/        the recipes as chapters, generated from cookbook/recipes and
@@ -35,13 +35,17 @@ the capability guarantees — an ordering, a bound, an equality the engine defin
 so it holds on any host and GPU; a chapter never checks a number one machine
 measured once. `JAMMI_COOKBOOK_SCALE` picks what a chapter runs over:
 
-* `small` (the default) — the committed fixtures and tiny fixture encoders, on
-  the CPU, in seconds per chapter. What CI renders.
+* `small` (the default) — the committed samples of the datasets and a compact
+  sentence encoder (`all-MiniLM-L6-v2`), in seconds to minutes per chapter on a
+  CPU. What CI renders.
 * `full` — the published datasets (fetched once, checksum-gated, into
-  `~/.cache/jammi-cookbook`) and real encoders, on a GPU.
+  `~/.cache/jammi-cookbook`) and a larger text encoder (`gte-modernbert-base`),
+  on a GPU.
 
-The chapter code is identical at both; only the data and the encoders differ. A
-claim only the published data can show — a finding the tiny fixtures cannot bear —
+Both scales run real, pretrained models from the Hugging Face Hub, downloaded
+on first use; the chapter code is identical at both, and only the data and the
+text encoder differ. A chapter runs on the GPU when the reader has one. A
+claim only the published data can show — a finding the small samples are too few to bear —
 is guarded by `SCALE is Scale.FULL`, and every other claim holds at both scales.
 
 ## Develop

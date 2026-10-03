@@ -2,11 +2,6 @@
 title: "Multi-tenancy as a measured property"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `set_tenant` · `list_sources` · `sql` (the analyzer's discriminator rewrite)
 · `add_source(tenant_column=…)` · `generate_embeddings` · `search` · **Background:** tenant isolation as a property of the catalog + the query analyzer, not a
 feature flag · **Checked:** tenancy (`rails.tenant` / `assert_listing_isolated` /

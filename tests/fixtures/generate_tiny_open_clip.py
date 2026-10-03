@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a minimal OpenCLIP (vision + text) model fixture for hermetic testing.
 
-Creates cookbook/fixtures/tiny_open_clip/ with:
+Creates tests/fixtures/tiny_open_clip/ with:
   - open_clip_config.json  (OpenCLIP config, width=32, 1 layer, image_size=8, patch_size=4)
   - open_clip_model.safetensors (random weights matching OpenCLIP ViT + text layout)
 
@@ -12,7 +12,7 @@ pipeline for both modalities. Vision and text share the EMBED_DIM latent space.
 
 Also generates:
   - tests/fixtures/figures.parquet with inline PNG image data
-  - cookbook/fixtures/tiny_open_clip/tokenizer.json — a tiny HF-shape tokenizer
+  - tests/fixtures/tiny_open_clip/tokenizer.json — a tiny HF-shape tokenizer
     that maps the printable ASCII vocabulary to token IDs and reserves the
     highest ID for <|endoftext|> (matches OpenCLIP's EOT-pool convention).
 """
@@ -28,7 +28,7 @@ import pyarrow.parquet as pq
 from safetensors.numpy import save_file
 
 FIXTURES = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(FIXTURES, "..", "..", "cookbook", "fixtures", "tiny_open_clip")
+OUT = os.path.join(FIXTURES, "..", "..", "tests", "fixtures", "tiny_open_clip")
 
 # Model dimensions (tiny)
 WIDTH = 32        # Hidden dimension (vision tower)

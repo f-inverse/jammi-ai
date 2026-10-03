@@ -37,7 +37,8 @@ encoder, both verified against the pinned ``candle-core`` 0.11.0 source under
 dimension be divisible by the block size (``candle-core``
 ``src/quantized/mod.rs::check_shape``) — the reason this only works on a
 fixture whose ``hidden_size`` (and every matmul-site tensor's last dim) is a
-multiple of 32, e.g. this book's ``tiny_bert`` fixture (``hidden_size=32``).
+multiple of 32 — true of every BERT-family checkpoint, whose hidden and
+intermediate sizes are multiples of 64.
 """
 
 from __future__ import annotations
@@ -64,8 +65,8 @@ def bert_matmul_site_weight_names(num_layers: int) -> set[str]:
     matmul_site_names``'s ``Bert`` arm names, reproduced here the same way
     ``crates/jammi-ai/tests/it/gguf_qlora.rs::bert_matmul_site_prefixes`` does
     (that module is ``pub(crate)``, unreachable from outside the engine crate) —
-    an independent re-derivation from the same raw (unwrapped) BERT tensor
-    names ``tiny_bert/model.safetensors`` itself carries.
+    an independent re-derivation from the raw (unwrapped) BERT tensor names a
+    sentence-transformers checkpoint's ``model.safetensors`` carries.
     """
     names: set[str] = set()
     for n in range(num_layers):
@@ -88,7 +89,9 @@ def _read_safetensors(path: Path) -> dict[str, np.ndarray]:
     A minimal from-scratch reader of the safetensors container (an 8-byte LE
     header length, a JSON header, then raw little-endian tensor bytes) — the
     book has no ``safetensors`` Python dependency, and the format is simple
-    enough that adding one would buy nothing over reading it directly.
+    enough that adding one would buy nothing over reading it directly. An
+    integer tensor is an index buffer a checkpoint carries beside its weights
+    (BERT's ``embeddings.position_ids``), never a weight, so it is left out.
     """
     raw = path.read_bytes()
     (header_len,) = struct.unpack_from("<Q", raw, 0)
@@ -97,6 +100,8 @@ def _read_safetensors(path: Path) -> dict[str, np.ndarray]:
     tensors: dict[str, np.ndarray] = {}
     for name, meta in header.items():
         if name == "__metadata__":
+            continue
+        if meta["dtype"] in ("I64", "I32"):
             continue
         if meta["dtype"] != "F32":
             raise ValueError(

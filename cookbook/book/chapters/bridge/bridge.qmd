@@ -2,11 +2,6 @@
 title: "The theory behind each step"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook  # applies the determinism contract before any heavy import
-```
-
 The book's thesis, made explicit: **one Jammi recipe is one equation in the
 monograph and one line in the GNN/conformal canon.** The verticals carried short
 bridge notes; this chapter writes the full bridge — four signature chapters that
@@ -14,9 +9,9 @@ each take one operation and show it is the *same object at three altitudes*, the
 run it live; the Neptune-contrast framing; and the **verified
 citation map** that pins every recipe to its sources.
 
-Every signature below runs its call live and checks what it measured against
-the golden its tier's chapter froze — at `small` scale in seconds on a CPU, at
-`full` scale over the data the findings are about.
+Every signature below runs its call live and claims what it measured. A finding
+only the published data shows is claimed at `full` scale, over the data it is
+about; the `small` run prints its numbers beside it.
 
 ```{python}
 import tempfile
@@ -66,8 +61,13 @@ compared = db.eval_compare(
 )
 raw, prop = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
 print(f"precision@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {prop - raw:+.3f})")
-claim("propagation over the citations lifts same-subject precision@10", prop > raw)
+if SCALE is scale.Scale.FULL:
+    claim("propagation over the citations lifts same-subject precision@10", prop > raw)
 ```
+
+At `small` scale the citations among 400 papers are too few to move a trained
+sentence encoder's precision; the [analysis chapter](../analyze/analyze.qmd) shows
+the two level there, and the lift at `full` scale.
 
 ## Signature 2 — An edge is a self-`search`; a context set is a `search`/walk
 

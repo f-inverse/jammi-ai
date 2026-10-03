@@ -16,7 +16,7 @@ use jammi_lora::{
 };
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
 }
 
 fn load_config() -> BertConfig {
@@ -34,7 +34,7 @@ fn weights_path() -> PathBuf {
 /// `attention_block_admission_predicate` admits, next to `tiny_bert`'s own
 /// `head_dim = 32/2 = 16` (always refused, a counted eager fallback).
 fn fixture_dir_head64() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert_head64")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert_head64")
 }
 
 fn load_config_head64() -> BertConfig {

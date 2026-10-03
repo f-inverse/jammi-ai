@@ -2,11 +2,6 @@
 title: "The unified client surface — one connect, one Session, two honest transports"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `pip install jammi-ai[embedded]` · `jammi.connect(target)` -> a
 transport-agnostic `Session` (`file://` -> an in-process `EmbeddedBackend`, direct FFI;
 `grpc://` -> a `RemoteDatabase`) · `supports(Capability.X)` · the `JammiError` taxonomy

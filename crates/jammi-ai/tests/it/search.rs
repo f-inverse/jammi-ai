@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use crate::common;
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn session_with_embeddings() -> (Arc<InferenceSession>, TempDir) {
@@ -727,7 +727,7 @@ async fn search_returns_semantically_relevant_results() {
 // ─── Cross-modal: OpenCLIP text query against image embeddings ──────────────
 
 fn tiny_open_clip_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_open_clip").to_str().unwrap()
 }
 
 /// Embed an image corpus with OpenCLIP vision, embed a text query with the

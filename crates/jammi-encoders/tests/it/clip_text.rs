@@ -10,7 +10,7 @@ use candle_nn::VarBuilder;
 use jammi_encoders::{ClipText, ClipTextConfig};
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_open_clip")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_open_clip")
 }
 
 fn load_config() -> ClipTextConfig {

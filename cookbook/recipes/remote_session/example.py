@@ -22,7 +22,7 @@ from jammi.testing import LiveServer
 from jammi_cookbook import fixtures
 
 CORPUS_URL = str(fixtures.path("tiny_corpus.parquet"))
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 events: list[str] = []
 unsubscribe = jammi.observe(

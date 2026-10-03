@@ -2,11 +2,6 @@
 title: "Databases as sources — Postgres, MySQL and a file in one query"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `add_source(url="postgres://…")` · `add_source(url="mysql://…")` ·
 `add_source(url=…, format=…)` · `sql` · `generate_embeddings` · `search` ·
 `jammi.testing.LiveServer` · **Checked:** measurement (the database-backed rows are the
@@ -37,7 +32,7 @@ from jammi.testing import LiveServer
 from jammi_cookbook import fixtures, mariadb
 from jammi_cookbook.claims import claim
 
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 LABELS = str(fixtures.path("tiny_labels.csv"))
 work = Path(tempfile.mkdtemp(prefix="jammi_federation_"))
 stack = contextlib.ExitStack()

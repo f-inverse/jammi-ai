@@ -44,6 +44,39 @@ pub const WEIGHTS_CANDIDATE_NAMES: [&str; 3] = [
     "model.gguf",
 ];
 
+/// What a checkpoint's tokenizer artifact is, and so how it is loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerLayout {
+    /// A HuggingFace-converted `tokenizer.json`, any architecture.
+    HuggingFaceJson,
+    /// OpenCLIP's native gzipped BPE vocabulary.
+    OpenClipBpe,
+    /// A BERT-family WordPiece vocabulary, configured by the checkpoint's
+    /// [`TOKENIZER_CONFIG_FILENAME`].
+    WordPiece,
+}
+
+impl TokenizerLayout {
+    /// Whether this layout is configured by the checkpoint's
+    /// [`TOKENIZER_CONFIG_FILENAME`], read beside the artifact.
+    pub fn reads_config(self) -> bool {
+        matches!(self, Self::WordPiece)
+    }
+}
+
+/// Tokenizer artifacts in their frozen precedence, each with its layout. The
+/// local and the Hub resolver both take the first a checkpoint holds, and the
+/// model fingerprint tracks every one of them.
+pub const TOKENIZER_CANDIDATES: [(&str, TokenizerLayout); 3] = [
+    ("tokenizer.json", TokenizerLayout::HuggingFaceJson),
+    ("bpe_simple_vocab_16e6.txt.gz", TokenizerLayout::OpenClipBpe),
+    ("vocab.txt", TokenizerLayout::WordPiece),
+];
+
+/// The tokenizer settings a [`TokenizerLayout::WordPiece`] vocabulary reads
+/// (casing, accent stripping, special tokens).
+pub const TOKENIZER_CONFIG_FILENAME: &str = "tokenizer_config.json";
+
 /// The OpenCLIP checkpoint's config and weights. A checkpoint carrying both
 /// resolves through them, whatever else it ships: OpenCLIP hub repositories
 /// commonly mirror a transformers `config.json` and `model.safetensors`,
@@ -305,6 +338,20 @@ pub fn config_model_type(config: &serde_json::Value) -> &str {
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| UNDECLARED_MODEL_TYPE_FAMILY.adapter_model_type())
+}
+
+/// The tokenizer under `dir`: the first of [`TOKENIZER_CANDIDATES`] present,
+/// with `dir`'s [`TOKENIZER_CONFIG_FILENAME`] when that layout reads one —
+/// the same choice the Hub resolver makes of a repository. `None` when the
+/// directory carries none; a caller that needs text owns the refusal.
+pub fn tokenizer_source(dir: &Path) -> Option<super::TokenizerSource> {
+    let (artifact, layout) = TOKENIZER_CANDIDATES
+        .into_iter()
+        .map(|(name, layout)| (dir.join(name), layout))
+        .find(|(artifact, _)| artifact.exists())?;
+    let config = Some(dir.join(TOKENIZER_CONFIG_FILENAME))
+        .filter(|config| layout.reads_config() && config.exists());
+    Some(super::TokenizerSource::of(layout, artifact, config))
 }
 
 /// The first EXISTING config file under `dir`, walking the config names in

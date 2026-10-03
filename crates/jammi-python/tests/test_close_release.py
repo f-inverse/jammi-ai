@@ -34,7 +34,7 @@ import pytest
 import jammi
 
 _ROOT = Path(__file__).resolve().parents[3]
-_TINY_BERT = _ROOT / "cookbook" / "fixtures" / "tiny_bert"
+_TINY_BERT = _ROOT / "tests" / "fixtures" / "tiny_bert"
 _TRAINING_PAIRS = _ROOT / "tests" / "fixtures" / "training_pairs.csv"
 
 # The successor: opens the released directory with the DEFAULT config (a

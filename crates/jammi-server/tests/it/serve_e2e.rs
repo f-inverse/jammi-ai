@@ -24,7 +24,7 @@ use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality, 
 use jammi_server::grpc::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_server::grpc::proto::eval::EvalEmbeddingsRequest;
 use jammi_server::runtime::OssServer;
-use jammi_test_utils::{cookbook_fixture, fixture, test_config};
+use jammi_test_utils::{fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -38,13 +38,13 @@ fn test_oss_config(artifact_dir: &std::path::Path, health: &str, flight: &str) -
 }
 
 fn htsat_clap_model_id() -> String {
-    format!("local:{}", cookbook_fixture("htsat_clap_tiny").display())
+    format!("local:{}", fixture("htsat_clap_tiny").display())
 }
 
 /// Local text encoder for the eval leg — the same `tiny_bert` fixture the
 /// `grpc_eval` suite embeds the patents corpus with.
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 /// Canonical golden-set source name for the `golden_relevance.csv` fixture,

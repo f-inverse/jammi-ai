@@ -2,11 +2,6 @@
 title: "Conformal prediction — scores, sets, and the weighted restore"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `conformalize` (`score ∈ {lac, aps, raps}`) · `conformalize_interval` ·
 `conformalize_cqr` · **Background:** distribution-free finite-sample coverage under
 exchangeability [@vovk2005conformal; @angelopoulos2021conformal], the nonconformity-score families

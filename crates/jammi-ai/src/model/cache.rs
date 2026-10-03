@@ -857,7 +857,7 @@ mod cache_key_tests {
 
         let dir = tmp.path().join("tiny_bert");
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
         }
@@ -1030,7 +1030,7 @@ mod f3_prime_tests {
     fn tiny_bert_source(root: &std::path::Path, name: &str) -> (ModelSource, usize) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
         }
@@ -1508,7 +1508,7 @@ mod single_flight_tests {
     fn tiny_bert_source(root: &std::path::Path, name: &str) -> ModelSource {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
         }
@@ -1647,7 +1647,7 @@ mod r5_f1_tokenizer_tests {
     fn tiny_bert_source(root: &std::path::Path, name: &str) -> ModelSource {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
         }
@@ -1813,7 +1813,7 @@ mod r5_f1_tokenizer_tests {
 
         // (4) RESTORE `tokenizer.json`: the file a cold process would
         // happily use again is back on disk.
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         std::fs::copy(
             fixture.join("tokenizer.json"),
             model_dir.join("tokenizer.json"),
@@ -1895,7 +1895,7 @@ mod admission_wake_tests {
     fn tiny_bert_source(root: &std::path::Path, name: &str) -> (ModelSource, usize) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = jammi_test_utils::cookbook_fixture("tiny_bert");
+        let fixture = jammi_test_utils::fixture("tiny_bert");
         for file in ["config.json", "model.safetensors", "tokenizer.json"] {
             std::fs::copy(fixture.join(file), dir.join(file)).unwrap();
         }

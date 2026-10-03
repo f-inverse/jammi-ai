@@ -331,7 +331,7 @@ async fn catalog_eval_run_crud_and_latest() {
 // Uses tiny_bert (32-dim, local) so no network access needed.
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn session_with_embeddings_and_golden() -> (Arc<InferenceSession>, String, TempDir) {
@@ -945,7 +945,7 @@ async fn eval_image_embeddings_end_to_end() {
 
     let tiny_open_clip = format!(
         "local:{}",
-        common::cookbook_fixture("tiny_open_clip").to_str().unwrap()
+        common::fixture("tiny_open_clip").to_str().unwrap()
     );
 
     // Register source with inline images

@@ -149,7 +149,7 @@ class VerifyTokenizerTests(unittest.TestCase):
 
     def test_verify_against_a_real_tokenizer_fixture(self):
         repo_root = Path(__file__).resolve().parents[3]
-        tokenizer_json = repo_root / "cookbook" / "fixtures" / "tiny_bert" / "tokenizer.json"
+        tokenizer_json = repo_root / "tests" / "fixtures" / "tiny_bert" / "tokenizer.json"
         self.assertTrue(
             tokenizer_json.is_file(),
             f"{tokenizer_json} is a tracked fixture: this checkout is incomplete",

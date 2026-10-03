@@ -19,9 +19,10 @@ import jammi
 
 db = jammi.connect("https://engine.example.com")
 db.add_source("patents", url="s3://corpus/patents.parquet", format="parquet")
-db.generate_embeddings(source="patents", model="local:tiny_bert",
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+db.generate_embeddings(source="patents", model=MODEL,
                        columns=["abstract"], key="id", modality="text")
-q = db.encode_query(model="local:tiny_bert", query="quantum computing")
+q = db.encode_query(model=MODEL, query="quantum computing")
 hits = db.search("patents", query=q, k=5)   # -> pyarrow.Table
 ```
 

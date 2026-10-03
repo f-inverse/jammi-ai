@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every public Python surface of jammi is run by something a reader runs.
+"""Every public surface of jammi is run by something a reader runs.
 
 The cookbook is where a new user learns jammi by running it, so the public
 client surface and the cookbook move together: a verb the engine ships is
@@ -18,7 +18,13 @@ runnable example.
   - every `Capability` value (`clients/python/jammi/_capability.py`) — each
     names a one-sided member (`audit`, `ephemeral_session`, `preload_model`,
     `session_id`) that one transport carries;
-  - every function `jammi/__init__.py` exports in `__all__`.
+  - every function `jammi/__init__.py` exports in `__all__`;
+  - every `jammi` CLI command (`jammi models list`), read from the clap enums of
+    `crates/jammi-cli/src`: `main.rs`'s `Commands`, and the `*Action` enum
+    each `#[command(subcommand)]` variant names, in clap's kebab-case;
+  - every SQL function the engine registers (`sql vector_mean`), read from each
+    `crates/*/src` file that implements a DataFusion function trait: its
+    `...NAME` string constants and the literals its `...name()` fns return.
 
 ## How a surface is exercised — three lanes, each re-verified on every run
 
@@ -53,9 +59,11 @@ Hermetic: reads files in the working tree only; no wheel, no network.
 from __future__ import annotations
 
 import ast
+import io
 import re
 import sys
-from collections.abc import Callable
+import tokenize
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +74,8 @@ CHAPTERS = BOOK / "chapters"
 LIB = BOOK / "jammi_cookbook"
 COOKBOOK = REPO_ROOT / "cookbook"
 SMOKE = REPO_ROOT / "tests" / "cookbook_smoke.py"
+CRATES = REPO_ROOT / "crates"
+CLI = CRATES / "jammi-cli" / "src"
 
 Reader = Callable[[Path], "str | None"]
 
@@ -149,8 +159,114 @@ def module_functions(read: Reader) -> set[str]:
     return found
 
 
-def load_shipped(read: Reader) -> set[str]:
-    shipped = protocol_members(read) | capability_members(read) | module_functions(read)
+def _braced(text: str, open_at: int) -> str:
+    """The text between the `{` at `open_at` and its matching `}`."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1 : i]
+    raise CoverageError("unbalanced braces in a Rust source")
+
+
+def _enum_variants(text: str, enum: str, path: Path) -> list[tuple[str, str]]:
+    """`(command name, rest)` for each variant of `enum`: the name clap gives
+    it (an explicit `#[command(name = ...)]`, else the kebab-cased variant),
+    and the text after the variant's identifier (its fields or payload)."""
+    m = re.search(rf"\benum\s+{re.escape(enum)}\s*\{{", text)
+    if m is None:
+        raise CoverageError(f"enum {enum} not found in {path.relative_to(REPO_ROOT)}")
+    body = re.sub(r"^\s*//[^\n]*", "", _braced(text, m.end() - 1), flags=re.MULTILINE)
+    chunks, depth, current = [], 0, []
+    for ch in body:
+        if ch in "{(<[":
+            depth += 1
+        elif ch in "})>]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            chunks.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    chunks.append("".join(current))
+    variants = []
+    for chunk in filter(str.strip, chunks):
+        ident = re.match(r"\s*((?:#\[[^\]]*\]\s*)*)([A-Z]\w*)(.*)\Z", chunk, re.DOTALL)
+        if ident is None:
+            raise CoverageError(f"unparseable variant of {enum}: {chunk.strip()[:60]!r}")
+        rename = re.search(r'#\[command\([^\]]*\bname\s*=\s*"([^"]+)"', ident.group(1))
+        name = rename.group(1) if rename else re.sub(r"(?<!^)(?=[A-Z])", "-", ident.group(2))
+        variants.append((name.lower(), ident.group(3)))
+    return variants
+
+
+_SUBCOMMAND = re.compile(r"#\[command\(subcommand\)\]\s*\w+\s*:\s*commands::(\w+)::(\w+)")
+
+
+def cli_commands(read: Reader) -> set[str]:
+    """Every `jammi` command a user can type, from the CLI's clap enums."""
+    main = CLI / "main.rs"
+    text = read(main)
+    if text is None:
+        raise CoverageError(f"{main.relative_to(REPO_ROOT)} not found")
+    commands: set[str] = set()
+    for name, rest in _enum_variants(text, "Commands", main):
+        sub = _SUBCOMMAND.search(rest)
+        if sub is None:
+            commands.add(f"jammi {name}")
+            continue
+        module = CLI / "commands" / f"{sub.group(1)}.rs"
+        module_text = read(module)
+        if module_text is None:
+            raise CoverageError(f"{module.relative_to(REPO_ROOT)} not found")
+        commands |= {
+            f"jammi {name} {action}"
+            for action, _ in _enum_variants(module_text, sub.group(2), module)
+        }
+    return commands
+
+
+_SQL_IMPL = re.compile(
+    r"\bimpl\s+(?:ScalarUDFImpl|AggregateUDFImpl|WindowUDFImpl|TableFunctionImpl)\s+for\b"
+)
+_NAME_CONST = re.compile(r"\bconst\s+\w*NAME\s*:\s*&(?:'static\s+)?str\s*=\s*\"(\w+)\"")
+_NAME_FN = re.compile(r"\bfn\s+\w*name\s*\([^)]*\)\s*->\s*&(?:'static\s+)?str\s*\{")
+
+
+def sql_functions(read: Reader, rust_sources: Iterable[Path]) -> set[str]:
+    """Every SQL function the engine registers: the names each source file
+    implementing a DataFusion function trait declares."""
+    functions: set[str] = set()
+    for path in rust_sources:
+        text = read(path)
+        if text is None or not _SQL_IMPL.search(text):
+            continue
+        names = set(_NAME_CONST.findall(text))
+        for fn in _NAME_FN.finditer(text):
+            names |= set(re.findall(r'"(\w+)"', _braced(text, fn.end() - 1)))
+        if not names:
+            raise CoverageError(
+                f"{path.relative_to(REPO_ROOT)} implements a SQL function but declares no "
+                "name this guard can read (a `...NAME` string constant or a `...name()` fn "
+                "returning a literal)"
+            )
+        functions |= {f"sql {n}" for n in names}
+    if not functions:
+        raise CoverageError("no SQL function implementation found under crates/*/src")
+    return functions
+
+
+def load_shipped(read: Reader, rust_sources: Iterable[Path]) -> set[str]:
+    shipped = (
+        protocol_members(read)
+        | capability_members(read)
+        | module_functions(read)
+        | cli_commands(read)
+        | sql_functions(read, rust_sources)
+    )
     if not shipped:
         raise CoverageError("parsed an empty shipped set")
     return shipped
@@ -278,6 +394,36 @@ ACCOUNTING: list[tuple[str, Lane]] = [
     ("train_context_predictor", Recipe("recipes/context_predictor/example.py", "db.train_context_predictor(")),
     ("verify_materialization", Recipe("recipes/graph_and_lineage/example.py", "db.verify_materialization(")),
     ("wait", Recipe("recipes/jobs/example.py", "job.wait(")),
+    # The `jammi` CLI, a strict client of a running server.
+    ("jammi status", Recipe("recipes/cli/example.py", 'cli("status"')),
+    ("jammi sources add", Recipe("recipes/cli/example.py", 'cli("sources", "add"')),
+    ("jammi sources list", Recipe("recipes/cli/example.py", 'cli("sources", "list"')),
+    ("jammi embed", Recipe("recipes/cli/example.py", 'cli("embed"')),
+    ("jammi search", Recipe("recipes/cli/example.py", 'cli("search"')),
+    ("jammi models list", Recipe("recipes/cli/example.py", 'cli("models", "list"')),
+    ("jammi models describe", Recipe("recipes/cli/example.py", 'cli("models", "describe"')),
+    ("jammi models delete", Recipe("recipes/cli/example.py", '"models", "delete"')),
+    ("jammi jobs list", Recipe("recipes/cli/example.py", 'cli("jobs", "list"')),
+    ("jammi jobs status", Recipe("recipes/cli/example.py", 'cli("jobs", "status"')),
+    ("jammi jobs cancel", Recipe("recipes/cli/example.py", 'cli("jobs", "cancel"')),
+    ("jammi jobs prune", Recipe("recipes/cli/example.py", 'cli("jobs", "prune"')),
+    ("jammi workers list", Recipe("recipes/cli/example.py", 'cli("workers", "list"')),
+    ("jammi mutable create", Recipe("recipes/cli/example.py", 'cli("mutable", "create"')),
+    ("jammi mutable list", Recipe("recipes/cli/example.py", 'cli("mutable", "list"')),
+    ("jammi mutable drop", Recipe("recipes/cli/example.py", 'cli("mutable", "drop"')),
+    ("jammi trigger register", Recipe("recipes/cli/example.py", 'cli("trigger", "register"')),
+    ("jammi trigger list", Recipe("recipes/cli/example.py", 'cli("trigger", "list"')),
+    ("jammi trigger drop", Recipe("recipes/cli/example.py", 'cli("trigger", "drop"')),
+    ("jammi channels register", Recipe("recipes/cli/example.py", 'cli("channels", "register"')),
+    ("jammi channels add-column", Recipe("recipes/cli/example.py", 'cli("channels", "add-column"')),
+    ("jammi channels list", Recipe("recipes/cli/example.py", 'cli("channels", "list"')),
+    ("jammi reconcile", Recipe("recipes/cli/example.py", 'cli("reconcile"')),
+    # The SQL functions the engine registers on every session.
+    ("sql annotate", Recipe("recipes/compound_query/example.py", "FROM annotate(")),
+    ("sql vector_mean", Recipe("recipes/compound_query/example.py", "vector_mean(")),
+    ("sql vector_sum", Recipe("recipes/compound_query/example.py", "vector_sum(")),
+    ("sql vector_max", Recipe("recipes/compound_query/example.py", "vector_max(")),
+    ("sql jammi_content_hash", DirectCell("incremental-refresh/incremental-refresh.qmd", "jammi_content_hash(")),
 ]
 
 
@@ -294,10 +440,30 @@ def executed_cells(text: str) -> str:
 
 
 def code_only(text: str) -> str:
-    """Python source with comments and docstrings removed."""
-    text = re.sub(r'""".*?"""', "", text, flags=re.DOTALL)
-    text = re.sub(r"'''.*?'''", "", text, flags=re.DOTALL)
-    return re.sub(r"#.*", "", text)
+    """Python source with comments and docstrings blanked out. A string that
+    is an expression statement of its own (a docstring) is prose; every other
+    string, an embedded SQL statement included, is code."""
+    docstrings = {
+        (node.lineno, node.col_offset)
+        for node in ast.walk(ast.parse(text))
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    starts = [0]
+    for line in text.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    chars = list(text)
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if tok.type == tokenize.COMMENT or (
+            tok.type == tokenize.STRING and tok.start in docstrings
+        ):
+            begin = starts[tok.start[0] - 1] + tok.start[1]
+            end = starts[tok.end[0] - 1] + tok.end[1]
+            for i in range(begin, end):
+                if chars[i] != "\n":
+                    chars[i] = " "
+    return "".join(chars)
 
 
 def smoke_registered(script: str, smoke_text: str) -> bool:
@@ -397,6 +563,21 @@ def self_test() -> int:
         "def connect(): ...\n"
     )
     util = "def helper(): ...\nclass NotAFunction: ...\n"
+    cli_main = (
+        "enum Commands {\n"
+        "    /// Report the server.\n"
+        "    Status,\n"
+        "    Things {\n"
+        "        #[command(subcommand)]\n"
+        "        action: commands::things::ThingAction,\n"
+        "    },\n"
+        "    Embed(commands::embed::EmbedArgs),\n"
+        "}\n"
+    )
+    cli_things = "pub enum ThingAction {\n    List,\n    AddColumn { name: String },\n}\n"
+    udf = 'pub const THING_NAME: &str = "thing_hash";\nimpl ScalarUDFImpl for Thing {}\n'
+    nameless_udf = "impl ScalarUDFImpl for Anonymous {}\n"
+    udf_path = CRATES / "demo" / "src" / "udf.rs"
     chapter = (
         "```{python}\ndb.alpha()\nrails.wrap(db)\n```\n"
         "```{python}\n#| eval: false\ndb.gamma()\n```\n"
@@ -412,14 +593,23 @@ def self_test() -> int:
         COOKBOOK / "recipes" / "demo" / "example.py": (
             '"""Calls db.connect() only in prose."""\n'
             "jammi.connect(x)\nhandle.kind\ndb.audit.log([])\njammi.helper()\n"
+            'cli("status")\ncli("things", "list")\ncli("things", "add-column", "n")\n'
+            'cli("embed")\nSQL = f"""SELECT thing_hash({x}) FROM t"""\n'
         ),
         SMOKE: 'RECIPES = (example("demo"),)\n',
+        CLI / "main.rs": cli_main,
+        CLI / "commands" / "things.rs": cli_things,
+        udf_path: udf,
     }
     read = files.get
     failures: list[str] = []
 
-    shipped = load_shipped(read)
-    expected = {"kind", "alpha", "beta", "gamma", "audit", "connect", "helper"}
+    shipped = load_shipped(read, [udf_path])
+    expected = {
+        "kind", "alpha", "beta", "gamma", "audit", "connect", "helper",
+        "jammi status", "jammi things list", "jammi things add-column", "jammi embed",
+        "sql thing_hash",
+    }
     if shipped != expected:
         failures.append(f"shipped set parsed as {sorted(shipped)}, expected {sorted(expected)}")
 
@@ -431,6 +621,11 @@ def self_test() -> int:
         ("audit", Recipe("recipes/demo/example.py", "db.audit.log(")),
         ("connect", Recipe("recipes/demo/example.py", "jammi.connect(")),
         ("helper", Recipe("recipes/demo/example.py", "jammi.helper(")),
+        ("jammi status", Recipe("recipes/demo/example.py", 'cli("status"')),
+        ("jammi things list", Recipe("recipes/demo/example.py", 'cli("things", "list"')),
+        ("jammi things add-column", Recipe("recipes/demo/example.py", '"add-column"')),
+        ("jammi embed", Recipe("recipes/demo/example.py", 'cli("embed"')),
+        ("sql thing_hash", Recipe("recipes/demo/example.py", "thing_hash(")),
     ]
     if clean := reconcile(shipped, good, read):
         failures.append(f"a fully accounted set reported findings: {clean}")
@@ -455,6 +650,15 @@ def self_test() -> int:
     )
     unregistered = dict(files) | {SMOKE: "RECIPES = ()\n"}
     bites("an unregistered recipe", good, "not run by tests/cookbook_smoke.py", unregistered)
+    bites("an unexercised CLI command", [r for r in good if r[0] != "jammi embed"],
+          "`jammi embed` is shipped")
+    bites("an unexercised SQL function", [r for r in good if r[0] != "sql thing_hash"],
+          "`sql thing_hash` is shipped")
+    try:
+        load_shipped((dict(files) | {udf_path: nameless_udf}).get, [udf_path])
+        failures.append("a SQL function with no readable name was not refused")
+    except CoverageError:
+        pass
 
     if failures:
         for f in failures:
@@ -471,7 +675,7 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return self_test()
     try:
-        shipped = load_shipped(_disk)
+        shipped = load_shipped(_disk, sorted(CRATES.glob("*/src/**/*.rs")))
     except CoverageError as exc:
         print(f"cookbook-coverage: FAIL (uncomputable) — {exc}", file=sys.stderr)
         return 1

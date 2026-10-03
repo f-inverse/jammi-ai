@@ -67,7 +67,7 @@ fn the_all_off_arm_reaches_what_the_block_kernel_absorbs_on_the_tower_that_has_i
         &["--all"],
     );
     let bert = derive(
-        &fixture("../../cookbook/fixtures/tiny_bert_head64"),
+        &fixture("../../tests/fixtures/tiny_bert_head64"),
         "query,value",
         &["--all"],
     );
@@ -133,7 +133,7 @@ fn the_how_well_reference_arm_is_the_two_families_on_either_tower() {
             "Wqkv,Wo",
         ),
         (
-            fixture("../../cookbook/fixtures/tiny_bert_head64"),
+            fixture("../../tests/fixtures/tiny_bert_head64"),
             "query,value",
         ),
     ] {

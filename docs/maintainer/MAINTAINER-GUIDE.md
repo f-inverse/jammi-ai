@@ -2720,7 +2720,7 @@ outcome through the shared mechanism:
   same `&'static` on every later call — no new hand-declared static needed.
   `DispatchCounters::snapshot()` returns a `DispatchSnapshot { fused, eager }`
   (`Relaxed` atomics).
-- **`warn_fallback_once(op, predicate)`** — a `tracing::warn!` emitted at most
+- **`note_fallback_once(op, predicate)`** — a `tracing::info!` emitted at most
   once per process per `(op, predicate)` pair, so a fallback-heavy run does not
   spam.
 - **`admit(mode, op, predicate_name, predicate_holds, counters)`** is the single
@@ -2774,7 +2774,7 @@ is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
 device 0 exists, and fails naming the device when it cannot be opened.
 `--features golden-parity` runs in CI's hermetic `test` job
 (`.github/workflows/ci.yml`): its oracle is a committed PyTorch dump
-(`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
+(`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
 never a network call or a torch install. `parity-test` needs a PyTorch
 environment and `live-gpu-tests` a GPU, which no hosted runner has: CI lints
 the `live-gpu-tests` surfaces (the `flash-attn-compile` job), and they run on

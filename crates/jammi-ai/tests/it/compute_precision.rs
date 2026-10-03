@@ -4,7 +4,7 @@
 // the materialization identity for both the `Embedding` and `Inference`
 // model-producing paths; and the fail-loud bf16 refusal. Uses the tiny BERT /
 // ModernBERT-classifier / ModernBERT-NER fixtures checked into
-// `cookbook/fixtures/` — no network access required. Candle's CPU backend
+// `tests/fixtures/` — no network access required. Candle's CPU backend
 // supports F16, so this runs fully on CPU.
 
 use crate::common;
@@ -30,15 +30,15 @@ use tempfile::TempDir;
 const TEXT: &str = "the quick brown fox jumps over the lazy dog";
 
 fn tiny_bert_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_bert"))
+    ModelSource::local(common::fixture("tiny_bert"))
 }
 
 fn tiny_modernbert_classifier_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_modernbert_classifier"))
+    ModelSource::local(common::fixture("tiny_modernbert_classifier"))
 }
 
 fn tiny_modernbert_ner_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_modernbert_ner"))
+    ModelSource::local(common::fixture("tiny_modernbert_ner"))
 }
 
 /// Resolve + load a fixture through the live engine path
@@ -191,7 +191,7 @@ async fn run_embedding_and_read_definition_hash(
     let (record, _outcome) = session
         .generate_text_embeddings(
             "patents",
-            &common::cookbook_fixture("tiny_bert").display().to_string(),
+            &common::fixture("tiny_bert").display().to_string(),
             &["abstract".to_string()],
             "id",
             jammi_db::store::CachePolicy::Bypass,
@@ -443,7 +443,7 @@ async fn bf16_inference_request_is_rejected_loudly() {
 async fn a_serve_records_its_kernel_admission_on_the_loaded_model() {
     let dir = TempDir::new().unwrap();
     let session = session_with_patents_at(dir.path(), ComputePrecision::F32).await;
-    let model_id = common::cookbook_fixture("tiny_bert").display().to_string();
+    let model_id = common::fixture("tiny_bert").display().to_string();
     session
         .generate_text_embeddings(
             "patents",

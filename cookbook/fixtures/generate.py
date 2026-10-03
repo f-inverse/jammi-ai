@@ -8,6 +8,10 @@ Produces:
 - `tiny_labels.csv`         — per-row gold labels for `eval_inference`
   classification
 - `tiny_pairs.csv`          — contrastive text pairs for `fine_tune`
+- `tiny_reviews.parquet`    — 24 short product and service reviews (id, text)
+  for sentiment classification
+- `tiny_review_labels.csv`  — each review's gold sentiment, `POSITIVE` or
+  `NEGATIVE` — the label set of the stock SST-2 sentiment classifiers
 - `tiny_ner_corpus.parquet` — 20-row generic PER/ORG sentence corpus for
   `eval_inference` NER (id, text)
 - `tiny_ner_gold.csv`       — per-span gold entities for the NER corpus
@@ -169,6 +173,56 @@ def write_labels() -> None:
         writer.writerow(["id", "label"])
         for row in CORPUS:
             writer.writerow([row[0], label_map[row[4]]])
+
+
+REVIEWS: list[tuple[int, str, str]] = [
+    (1, "The headphones sound crisp and the battery lasts all week.", "POSITIVE"),
+    (2, "The zipper broke the second time I used the bag.", "NEGATIVE"),
+    (3, "Setup took two minutes and everything just worked.", "POSITIVE"),
+    (4, "Customer support kept me on hold for an hour and never solved the problem.", "NEGATIVE"),
+    (5, "A warm, funny film with a cast that clearly enjoyed every scene.", "POSITIVE"),
+    (6, "The plot dragged and the ending made no sense.", "NEGATIVE"),
+    (7, "Fresh bread, friendly staff, and fair prices. We will be back.", "POSITIVE"),
+    (8, "Our soup arrived cold and the waiter ignored us all evening.", "NEGATIVE"),
+    (9, "This blender crushes ice without any trouble.", "POSITIVE"),
+    (10, "The screen cracked within a week of normal use.", "NEGATIVE"),
+    (11, "Not bad at all, I would happily buy it again.", "POSITIVE"),
+    (12, "I wanted to like this keyboard, but half the keys stick.", "NEGATIVE"),
+    (13, "The hotel room was spotless and the view was stunning.", "POSITIVE"),
+    (14, "The room smelled of smoke and the shower barely worked.", "NEGATIVE"),
+    (15, "Fast delivery, sturdy packaging, and the shoes fit perfectly.", "POSITIVE"),
+    (16, "The jacket faded after one wash.", "NEGATIVE"),
+    (17, "The tutorial was clear, patient, and genuinely useful.", "POSITIVE"),
+    (18, "The app crashes every time I try to upload a photo.", "NEGATIVE"),
+    (19, "I was skeptical, but this vacuum is worth every penny.", "POSITIVE"),
+    (20, "Great, another update that deletes my saved settings.", "NEGATIVE"),
+    (21, "The concert was electric from the first song to the last.", "POSITIVE"),
+    (22, "Tickets were overpriced and the sound was muddy.", "NEGATIVE"),
+    (23, "Comfortable chair, and my back pain is finally gone.", "POSITIVE"),
+    (24, "Nothing about this phone case fits the phone it claims to fit.", "NEGATIVE"),
+]
+
+
+def write_reviews() -> None:
+    """Hand-written reviews and their gold sentiment for classification.
+
+    Balanced, twelve of each label, and not all easy: a negation ("Not bad at
+    all") and a sarcastic complaint ("Great, another update…") are the rows a
+    real sentiment model can get wrong, which is what makes its per-class
+    report worth reading.
+    """
+    pq.write_table(
+        pa.table({
+            "id": pa.array([r[0] for r in REVIEWS], type=pa.int64()),
+            "text": pa.array([r[1] for r in REVIEWS]),
+        }),
+        OUT / "tiny_reviews.parquet",
+    )
+    with (OUT / "tiny_review_labels.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "label"])
+        for row_id, _, label in REVIEWS:
+            writer.writerow([row_id, label])
 
 
 def write_pairs() -> None:
@@ -607,6 +661,7 @@ def main() -> None:
     write_corpus()
     write_golden()
     write_labels()
+    write_reviews()
     write_pairs()
     write_ner_corpus()
     write_ner_gold()

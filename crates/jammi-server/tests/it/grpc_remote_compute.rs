@@ -38,13 +38,13 @@ use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableError, MutableTableId};
 use jammi_db::ChannelId;
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::fixture;
 use tonic::transport::Endpoint;
 
 use super::common::grpc::{start_engine_server, start_engine_server_with_devices, EngineServer};
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn file_connection(name: &str, format: FileFormat) -> SourceConnection {

@@ -57,7 +57,7 @@ from transformers import ClapAudioConfig, ClapAudioModelWithProjection
 
 # tests/fixtures/generate_htsat_clap.py -> repo root is two parents up.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FIXTURES = os.path.join(REPO_ROOT, "cookbook", "fixtures")
+FIXTURES = os.path.join(REPO_ROOT, "tests", "fixtures")
 TINY_OUT = os.path.join(FIXTURES, "htsat_clap_tiny")
 REAL_OUT = os.path.join(FIXTURES, "htsat_clap_real")
 

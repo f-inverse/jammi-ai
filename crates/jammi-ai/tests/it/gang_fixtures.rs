@@ -65,10 +65,7 @@ pub(crate) fn gang_config_with_dropout(epochs: usize, lora_dropout: f64) -> Fine
 }
 
 pub(crate) fn tiny_bert_model() -> String {
-    "local:".to_string()
-        + jammi_test_utils::cookbook_fixture("tiny_bert")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + jammi_test_utils::fixture("tiny_bert").to_str().unwrap()
 }
 
 /// The pairs as a CSV source file under `dir`, returned as a `file://` URL.

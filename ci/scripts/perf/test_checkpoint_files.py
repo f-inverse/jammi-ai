@@ -29,7 +29,7 @@ def write_checkpoint(directory: Path, payload: bytes = b"\x00" * 8) -> None:
 
 class CheckpointFiles(unittest.TestCase):
     def test_a_committed_fixture_is_a_whole_checkpoint(self):
-        fixture = REPO_ROOT / "cookbook" / "fixtures" / "tiny_bert_head64"
+        fixture = REPO_ROOT / "tests" / "fixtures" / "tiny_bert_head64"
         self.assertEqual(checkpoint_files.defects(fixture), [])
 
     def test_weights_without_a_tokenizer_are_refused_by_name(self):

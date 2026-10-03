@@ -1457,7 +1457,7 @@ def test_job_handle_protocol_is_satisfied_by_both_handles():
 # below needs a real `Job` handle bound to a genuine catalog row, which
 # needs a real base model + source.
 _METRICS_TEST_ROOT = Path(__file__).resolve().parents[3]
-_METRICS_TEST_TINY_BERT = _METRICS_TEST_ROOT / "cookbook" / "fixtures" / "tiny_bert"
+_METRICS_TEST_TINY_BERT = _METRICS_TEST_ROOT / "tests" / "fixtures" / "tiny_bert"
 _METRICS_TEST_TRAINING_PAIRS = (
     _METRICS_TEST_ROOT / "tests" / "fixtures" / "training_pairs.csv"
 )

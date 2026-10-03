@@ -999,7 +999,7 @@ mod tests {
     static CLIP_COUNTER_SERIAL: Mutex<()> = Mutex::new(());
 
     /// The committed, generic ModernBERT fixture
-    /// (`cookbook/fixtures/tiny_modernbert/config.json` +
+    /// (`tests/fixtures/tiny_modernbert/config.json` +
     /// `model.safetensors`) — synthetic, tiny (hidden=32, 1 layer),
     /// no consumer data shape. Located the same way
     /// `jammi_test_utils::workspace_root` does (two levels up from
@@ -1013,7 +1013,7 @@ mod tests {
             .expect("crates/<name>")
             .parent()
             .expect("workspace root")
-            .join("cookbook")
+            .join("tests")
             .join("fixtures")
             .join("tiny_modernbert")
     }
@@ -1617,7 +1617,7 @@ mod tests {
     /// this bundle also contains.
     fn tiny_model_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_modernbert_classifier")
+            .join("../../tests/fixtures/tiny_modernbert_classifier")
     }
 
     /// A CPU, single-Wqkv-site LoRA config over the tiny fixture — small

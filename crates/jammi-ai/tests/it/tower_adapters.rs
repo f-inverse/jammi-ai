@@ -72,7 +72,7 @@ use crate::common;
 /// `open_clip_config.json` (no `model_type` field at all — the checkpoint
 /// family `EncoderFamily::OpenClip` exists to name).
 fn tiny_open_clip_dir() -> PathBuf {
-    common::cookbook_fixture("tiny_open_clip")
+    common::fixture("tiny_open_clip")
 }
 
 fn tiny_open_clip_model() -> String {
@@ -82,7 +82,7 @@ fn tiny_open_clip_model() -> String {
 /// The HF-CLAP fixture: a 4-stage HTSAT-Swin audio tower plus its
 /// `preprocessor_config.json` front-end geometry.
 fn htsat_clap_tiny_dir() -> PathBuf {
-    common::cookbook_fixture("htsat_clap_tiny")
+    common::fixture("htsat_clap_tiny")
 }
 
 fn htsat_clap_tiny_model() -> String {
@@ -1086,7 +1086,7 @@ async fn unsupported_model_type_refuses_instead_of_coercing_to_bert() {
     // default arm would train happily.
     let model_dir = dir.path().join("gpt2_flavoured_bert");
     std::fs::create_dir_all(&model_dir).unwrap();
-    let fixture = common::cookbook_fixture("tiny_bert");
+    let fixture = common::fixture("tiny_bert");
     for name in ["model.safetensors", "tokenizer.json"] {
         std::fs::copy(fixture.join(name), model_dir.join(name)).unwrap();
     }
@@ -1171,7 +1171,7 @@ async fn an_absent_model_type_trains_and_serves_as_bert() {
 
     // A byte-for-byte `tiny_bert` copy with ONE key REMOVED — the mirror of
     // the test above, which changes that same key's VALUE.
-    let fixture = common::cookbook_fixture("tiny_bert");
+    let fixture = common::fixture("tiny_bert");
     let model_dir = dir.path().join("bert_without_model_type");
     std::fs::create_dir_all(&model_dir).unwrap();
     for name in ["model.safetensors", "tokenizer.json"] {
@@ -1351,7 +1351,7 @@ async fn cross_family_adapter_refuses_at_load() {
     .unwrap();
     let mut resolved = resolver
         .resolve(
-            &ModelSource::local(common::cookbook_fixture("tiny_bert")),
+            &ModelSource::local(common::fixture("tiny_bert")),
             ModelTask::TextEmbedding,
         )
         .await
@@ -1579,7 +1579,7 @@ async fn unmatched_target_modules_on_bert_name_the_dotted_site_paths() {
     let job = session
         .fine_tune(
             "training",
-            &format!("local:{}", common::cookbook_fixture("tiny_bert").display()),
+            &format!("local:{}", common::fixture("tiny_bert").display()),
             &[
                 "text_a".to_string(),
                 "text_b".to_string(),

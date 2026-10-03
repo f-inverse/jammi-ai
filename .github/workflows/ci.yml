@@ -309,7 +309,7 @@ jobs:
       # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
       # default workspace test build never compiles it, but it is fully
       # hermetic: the oracle is a committed PyTorch dump
-      # (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
+      # (`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
       # binary), never a network call or a torch install. Without this step
       # `htsat_audio.rs`'s own doc claim ("eval bytes crate-wide are pinned by
       # ... tests/golden_parity.rs") describes a test that compiles and passes
@@ -1223,6 +1223,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.build-ci-image.outputs.image }}
+    env:
+      # The recipes run real checkpoints from the Hugging Face Hub (see book-render).
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -1368,11 +1371,6 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.build-ci-image.outputs.image }}
-    env:
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      TOKENIZERS_PARALLELISM: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -1426,12 +1424,10 @@ jobs:
     container:
       image: ${{ needs.build-ci-image.outputs.image }}
     env:
-      # The determinism regime: `jammi_cookbook` also sets these on import,
-      # but pinning them in the job env covers anything that reads them first.
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      TOKENIZERS_PARALLELISM: "false"
+      # The chapters run real checkpoints from the Hugging Face Hub, fetched on
+      # first use; an authenticated download is not rate-limited the way an
+      # anonymous one from a shared runner address is.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 

@@ -1,7 +1,7 @@
 //! CPU-hermetic proof that the BERT loader accepts legacy `LayerNorm.gamma`/`LayerNorm.beta`
 //! names (Google's original BERT checkpoints) in place of `weight`/`bias`.
 //!
-//! Derives temp checkpoints from `cookbook/fixtures/tiny_bert/model.safetensors`
+//! Derives temp checkpoints from `tests/fixtures/tiny_bert/model.safetensors`
 //! (via `candle_core::safetensors::load`/`save`) rather than shipping a second
 //! binary fixture. The fixture's three `LayerNorm` sites (`embeddings.LayerNorm`,
 //! `encoder.layer.0.attention.output.LayerNorm`, `encoder.layer.0.output.LayerNorm`,
@@ -25,7 +25,7 @@ use jammi_encoders::{Bert, BertConfig, EncoderError, Pooling};
 use jammi_lora::LoraBuildConfig;
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
 }
 
 fn fixture_config() -> BertConfig {

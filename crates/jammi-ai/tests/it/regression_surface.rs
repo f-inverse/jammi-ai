@@ -214,7 +214,7 @@ fn std_dev(values: &[f32]) -> f32 {
 }
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn add_source(session: &Arc<InferenceSession>, name: &str, file: &str) {

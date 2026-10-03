@@ -183,7 +183,7 @@ pub(crate) fn write_json(dir: &Path, name: &str, value: &serde_json::Value) {
 
 pub(crate) fn write_tokenizer(dir: &Path) {
     std::fs::copy(
-        jammi_test_utils::cookbook_fixture("tiny_bert").join("tokenizer.json"),
+        jammi_test_utils::fixture("tiny_bert").join("tokenizer.json"),
         dir.join("tokenizer.json"),
     )
     .unwrap();

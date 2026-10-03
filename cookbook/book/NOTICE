@@ -11,6 +11,17 @@ Dataset attributions are recorded by the loaders that fetch them, in
 jammi_cookbook/datasets.py and below.
 
 --------------------------------------------------------------------------------
+Models. Every recipe and chapter runs pretrained checkpoints from the Hugging
+Face Hub, fetched on first use into the reader's own cache and never committed:
+
+  sentence-transformers/all-MiniLM-L6-v2                      Apache-2.0
+  Alibaba-NLP/gte-modernbert-base                             Apache-2.0
+  laion/CLIP-ViT-B-32-laion2B-s34B-b79K                       MIT
+  laion/clap-htsat-fused                                      Apache-2.0
+  distilbert/distilbert-base-uncased-finetuned-sst-2-english  Apache-2.0
+  dslim/bert-base-NER                                         MIT
+
+--------------------------------------------------------------------------------
 Datasets. A `full`-scale run fetches the published datasets on demand,
 checksum-gated, and never commits them. A `small`-scale run reads small derived
 copies committed under cookbook/fixtures/, redistributed under each source's

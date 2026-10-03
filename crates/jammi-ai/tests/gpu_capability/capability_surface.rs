@@ -133,7 +133,7 @@
 //! `{fused: 0, eager: 0}` on a real device and fail this test, not because the
 //! op is unadmitted but because nothing in this file's forward reaches its
 //! call site. [`bert_probe_dtype`] is a SECOND, independent probe — a real
-//! `jammi_encoders::Bert` built from `cookbook/fixtures/tiny_bert_head64`
+//! `jammi_encoders::Bert` built from `tests/fixtures/tiny_bert_head64`
 //! (`hidden_size=64, num_attention_heads=1` → `head_dim=64`, `hidden_act:
 //! "gelu"` — a real BERT checkpoint, not a synthetic one) — run at every dtype
 //! this suite probes ModernBERT at. The two probes are independent
@@ -237,7 +237,7 @@ fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
 /// [`PROBED_OPS`]'s [`ProbedOpKind::Cascade`] rows.
 ///
 /// Logged informationally rather than asserted `Holds`: `admit_cascade` has
-/// no `fallback_warnings`-shaped reason channel, `mem_efficient_attention`
+/// no `fallback_notices`-shaped reason channel, `mem_efficient_attention`
 /// additionally has its OWN shape/capability domain (independent of dtype) —
 /// declining on this test's tiny fixture shape is a legitimate `DomainMiss`,
 /// not evidence against f32/bf16 dtype admission — and
@@ -459,7 +459,7 @@ fn probe_dtype(config: &ModernBertConfig, weights: &Path, dtype: DType, device: 
 // a second architecture is required at all).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `cookbook/fixtures/tiny_bert_head64`, located the same way
+/// `tests/fixtures/tiny_bert_head64`, located the same way
 /// [`MANIFEST_PATH`] is (relative to this crate's manifest dir). A real BERT
 /// checkpoint (`hidden_size=64, num_attention_heads=1` → `head_dim=64`,
 /// `hidden_act: "gelu"`), not a synthetic one — no `write_synthetic_checkpoint`
@@ -469,7 +469,7 @@ fn probe_dtype(config: &ModernBertConfig, weights: &Path, dtype: DType, device: 
 /// fixtures.
 const BERT_GELU_FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../cookbook/fixtures/tiny_bert_head64"
+    "/../../tests/fixtures/tiny_bert_head64"
 );
 
 /// `BERT_GELU_FIXTURE_DIR/config.json`, deserialised the same way

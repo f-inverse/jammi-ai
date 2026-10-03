@@ -19,11 +19,11 @@ use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_server::grpc::proto::job::job_service_client::JobServiceClient;
 use jammi_server::grpc::proto::job::ListWorkersRequest;
 use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
-use jammi_test_utils::{cookbook_fixture, fixture_url, test_config};
+use jammi_test_utils::{fixture, fixture_url, test_config};
 use tokio::sync::watch;
 
 fn tiny_bert() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn config(dir: &std::path::Path, preload: Vec<PreloadEntry>) -> JammiConfig {

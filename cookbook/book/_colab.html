@@ -5,7 +5,7 @@
   if (!page || !title) return;
   var link = document.createElement("a");
   var notebook = page[1].indexOf("recipes/") === 0 ? page[1] : "book/" + page[1];
-  link.href = "https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.53.0/cookbook/notebooks/" + notebook + ".ipynb";
+  link.href = "https://colab.research.google.com/github/f-inverse/jammi-ai/blob/py-v0.54.0/cookbook/notebooks/" + notebook + ".ipynb";
   link.target = "_blank";
   link.rel = "noopener";
   link.innerHTML = '<img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">';

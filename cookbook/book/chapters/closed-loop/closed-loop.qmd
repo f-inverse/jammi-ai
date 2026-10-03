@@ -111,7 +111,8 @@ propagation lifts same-subject precision, and the declared-edge fine-tune lifts
 it by about as much, though propagation trains nothing. Under the time split the
 year interval under-covers — the finding the governed calibration cohort
 (tier 04) answers — while the subject set holds its coverage, the shift being
-orthogonal to its score. At `small` scale the same pass runs in seconds on a CPU, and every claim
+orthogonal to its score. At `small` scale the same pass runs on a CPU in well under
+an hour — most of it the declared fine-tune — and in minutes on a GPU, and every claim
 that holds at both scales holds there too.
 
 ```{python}

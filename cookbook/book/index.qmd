@@ -21,9 +21,10 @@ pip install "jammi-ai[embedded]" "jammi-cookbook @ git+https://github.com/f-inve
 
 Every chapter runs real, pretrained models from the Hugging Face Hub, downloaded
 on first use. Chapters run at the `small` scale by default: small samples of the
-datasets and a compact text encoder, in seconds to minutes on a CPU and less on a
-GPU. Setting `JAMMI_COOKBOOK_SCALE=full` runs the same code over the published
-datasets and a larger text encoder, on a GPU.
+datasets and a compact text encoder. Most chapters take seconds to minutes on a
+CPU; the ones that fine-tune an encoder take from a quarter of an hour to a few
+hours on a CPU, and minutes on a GPU. Setting `JAMMI_COOKBOOK_SCALE=full` runs the
+same code over the published datasets and a larger text encoder, on a GPU.
 
 ## The path
 

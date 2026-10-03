@@ -8,10 +8,10 @@ first cell installs the release it was built for — ``jammi-ai`` with the CUDA
 engine (``jammi-ai-native-cu12``) on an sm_80+ GPU runtime and the CPU engine
 otherwise, ``jammi-server`` when the chapter starts one, and the cookbook's
 library and fixtures from the release's own tag on GitHub (the book is not a
-published package). It runs the chapter at
-``small`` scale, in minutes; ``full`` — the published data and the larger text
-encoder, where a keystone fine-tune alone takes hours on an L4 — is one line to
-opt into.
+published package). It runs the chapter at ``small`` scale — seconds to minutes,
+or for a chapter that fine-tunes an encoder, minutes on a GPU and up to hours on a
+CPU; ``full`` — the published data and the larger text encoder, where a keystone
+fine-tune alone takes hours on an L4 — is one line to opt into.
 
 A notebook and its Colab link name the workspace version: the notebooks at tag
 ``py-v<version>`` install exactly that release, so a link never runs a chapter
@@ -146,10 +146,11 @@ def setup_cell(release: str, *, server: bool, extras: list[str]) -> dict:
         f"""# Setup: jammi {release} — the CUDA engine on an sm_80+ GPU (L4, A100, …), the
 # CPU engine otherwise — and the cookbook's library and fixtures, from the release's
 # tag on GitHub. The chapter runs
-# at `small` scale, over the committed samples with a compact text encoder, in
-# minutes; the models it runs are downloaded from the Hugging Face Hub on first
-# use. SCALE = "full" runs it over the published data and a larger text encoder
-# instead, on the GPU: the chapters that fine-tune take hours there.
+# at `small` scale, over the committed samples with a compact text encoder: seconds
+# to minutes, or for a chapter that fine-tunes an encoder, minutes on a GPU and up
+# to hours on a CPU. The models it runs are downloaded from the Hugging Face Hub on
+# first use. SCALE = "full" runs it over the published data and a larger text
+# encoder instead, on the GPU: the chapters that fine-tune take hours there.
 import os
 import subprocess
 import sys

@@ -606,6 +606,35 @@ API — the bare id raises `table not found`.)
   it ran exactly when the report says it held. The report's `device` is the GPU's
   own name, so no claim branches on it beyond `"cpu"` — the first GPU render
   failed on a `startswith("cuda")` branch that never matched.
+- **A drained child's capture ends at the bytes resident when its exit is
+  observed (#716).** `DrainedChild`'s reader concluded EOF on the first idle
+  50 ms poll after the reap, so whether a capture with a still-writing
+  fd-inheriting grandchild came back `SettleExpired` depended on that writer
+  never being descheduled for 50 ms; `grandchild_capture_is_incomplete_not_survived`
+  failed at load 28. Root cause: completeness inferred from a quiet interval. A
+  reaped child's unread bytes are a prefix of what its pipe holds (POSIX
+  `pipe()`: reads are first-in-first-out; `FIONREAD` on a pipe counts the bytes
+  waiting — Linux `fs/pipe.c` and XNU `bsd/kern/sys_pipe.c` `pipe_ioctl`), so
+  the reader reads exactly that count once it observes the exit, and stops. No
+  other process, silent or writing, and no scheduling can move that boundary; a
+  reaped child's unix readers are waited for without a clock, and
+  `SettleExpired` remains for a child never reaped and for the non-unix blocking
+  reader. Rejected: a faster writer or a longer poll in the oracle (moves the
+  margin, keeps the dependence). The oracles construct holding and streaming
+  without timing — the holder holds until the test releases its stdin, the
+  streamer writes without pause after a ready handshake — and each reader
+  mutation (skip the resident bytes, the idle-poll rule, read to close) fails one
+  of them.
+- **The foreign-library harness checks trust once, before any content, and
+  tests that directly.** Its `Role::Grandchild` existed only to build an
+  untrustworthy capture from a writing grandchild, which the boundary above makes
+  impossible; the role, its modes and its two tests are gone, and the primitive's
+  grandchild behaviour is pinned in `jammi_test_utils::child`. `classify` had the
+  trust gate copied into five arms; `classify_exit` gates once and pairs each
+  content-decided code with its `Evidence`, and
+  `untrusted_evidence_is_incomplete_however_well_it_reads` pins the order for
+  every such code. `Attempt::Incomplete`'s doc listed truncation as a reason the
+  harness deliberately does not veto on; it now matches `incompleteness_reason`.
 - **Every public surface has a runnable example.** The coverage guard parses the
   CLI's clap enums and the engine's SQL function impls beside the Python verbs
   (111 surfaces); a `cli` recipe runs every command, `compound_query` the vector

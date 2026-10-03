@@ -39,6 +39,7 @@ import uuid
 import jammi
 from jammi.errors import AlreadyExists, FailedPrecondition, InvalidArgument, NotFound
 from jammi.testing import LiveServer
+from jammi_cookbook.claims import claim
 
 CONDITIONS = (InvalidArgument, NotFound, AlreadyExists, FailedPrecondition)
 ```
@@ -89,7 +90,6 @@ for name in local:
 ```
 
 ```{python}
-# | echo: false
 expected = {
     "register twice": ("AlreadyExists", "ALREADY_EXISTS"),
     "extend an unregistered channel": ("NotFound", "NOT_FOUND"),
@@ -97,7 +97,8 @@ expected = {
     "an empty channel id": ("InvalidArgument", "INVALID_ARGUMENT"),
 }
 for name, (cls, code) in expected.items():
-    assert local[name][0] == cls and served[name] == (cls, code), name
+    claim(f"{name} raises {cls} on both transports, and {code} on the wire",
+          local[name][0] == cls and served[name] == (cls, code))
 ```
 
 Every failure raises the same class on both transports, and the server's status
@@ -149,20 +150,22 @@ for name, (cls, code, message) in served_missing.items():
 ```
 
 ```{python}
-# | echo: false
-assert local_missing.keys() == served_missing.keys() == {
-    "search before any embedding table",
-    "lexical_search before any index",
-    "describe a table never built",
-}
-for name, (cls, code, message) in served_missing.items():
-    assert local_missing[name][0] == cls and code == "NOT_FOUND", name
-    assert local_missing[name][2] == message, name
-assert served_missing["search before any embedding table"][0] == "NoReadyIndex"
-assert "generate_embeddings" in served_missing["search before any embedding table"][2]
-assert served_missing["lexical_search before any index"][0] == "NoReadyIndex"
-assert "build_lexical_index" in served_missing["lexical_search before any index"][2]
-assert served_missing["describe a table never built"][0] == "NotFound"
+claim("each missing-artifact failure is measured on both transports",
+      local_missing.keys() == served_missing.keys() == {
+          "search before any embedding table",
+          "lexical_search before any index",
+          "describe a table never built",
+      })
+claim("each raises the same class with the same message in process and from a server, as NOT_FOUND",
+      all(local_missing[name][0] == cls and code == "NOT_FOUND" and local_missing[name][2] == message
+          for name, (cls, code, message) in served_missing.items()))
+claim("a search with nothing to search is NoReadyIndex, naming the verb that builds it",
+      served_missing["search before any embedding table"][0] == "NoReadyIndex"
+      and "generate_embeddings" in served_missing["search before any embedding table"][2]
+      and served_missing["lexical_search before any index"][0] == "NoReadyIndex"
+      and "build_lexical_index" in served_missing["lexical_search before any index"][2])
+claim("and a table never built is NotFound",
+      served_missing["describe a table never built"][0] == "NotFound")
 ```
 
 ## Bridge note

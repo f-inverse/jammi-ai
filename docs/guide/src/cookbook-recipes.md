@@ -16,4 +16,5 @@ is a short program, one step per cell, beside a README. It runs three ways:
 
 CI runs every recipe on every change (`tests/cookbook_smoke.py`), and runs
 every notebook nightly as a reader does, installed from PyPI. The longer
-chapters take one capability deep and measure it against frozen results.
+chapters take one capability deep and end in the claims it guarantees, each
+checked against the numbers that run measured.

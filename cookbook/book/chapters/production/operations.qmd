@@ -37,7 +37,8 @@ import grpc
 import jammi
 import pgserver
 from jammi.testing import LiveServer
-from jammi_cookbook import contracts, fixtures
+from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 from opentelemetry.proto.collector.trace.v1 import trace_service_pb2, trace_service_pb2_grpc
 
 MODEL = fixtures.model("tiny_bert")
@@ -155,11 +156,11 @@ print(f"search after the restore returns the same ranking: {after == before}")
 ```
 
 ```{python}
-# | echo: false
-assert set(verdicts.values()) <= {"match", "match_with_unpinned_inputs"}
-assert report["orphan_count"] == report["rows_failed_count"] == report["damaged_count"] == 0
-assert after == before
-contracts.assert_close("production.restored_tables_verified", len(verdicts))
+claim("every restored table verifies against its manifest",
+      set(verdicts.values()) <= {"match", "match_with_unpinned_inputs"}, f"{len(verdicts)} tables")
+claim("the restore leaves no orphan, failed or damaged row",
+      report["orphan_count"] == report["rows_failed_count"] == report["damaged_count"] == 0)
+claim("and the restored deployment answers the search as the lost one did", after == before)
 ```
 
 Each verdict recomputes the table's artifact digest and compares it with the one its
@@ -254,15 +255,15 @@ print(f"exported  {len(spans)} Search spans, service.name = {spans[0]['service']
 ```
 
 ```{python}
-# | echo: false
-assert health[0] == 200 and json.loads(health[1])["status"] == "ok"
-assert ready[0] == 200 and json.loads(ready[1])["status"] == "ready"
-assert unready[0] == 503 and json.loads(unready[1])["status"] == "not_ready"
-assert still_live[0] == 200
-assert ready_again[0] == 200
-assert searched == SEARCHES
-assert len(spans) == SEARCHES and all(s["service"] == "jammi" for s in spans)
-contracts.assert_close("production.search_spans", len(spans))
+claim("a serving server is live and ready",
+      health[0] == 200 and json.loads(health[1])["status"] == "ok"
+      and ready[0] == 200 and json.loads(ready[1])["status"] == "ready")
+claim("with its catalog stopped, it stays live but reports itself not ready",
+      unready[0] == 503 and json.loads(unready[1])["status"] == "not_ready" and still_live[0] == 200)
+claim("and is ready again once the catalog is back", ready_again[0] == 200)
+claim("every search is traced as one span of the jammi service",
+      searched == SEARCHES and len(spans) == SEARCHES and all(s["service"] == "jammi" for s in spans),
+      f"{len(spans)} spans")
 restored.cleanup()
 ```
 
@@ -312,12 +313,10 @@ for batch in observed:
 ```
 
 ```{python}
-# | echo: false
-assert sum(b["rows"] for b in observed) == corpus_rows
-assert all(b["errors"] == 0 for b in observed)
-assert len({b["model"] for b in observed}) == 1
-assert all(b["latency_ms"] > 0 for b in observed)
-contracts.assert_close("production.observed_rows", sum(b["rows"] for b in observed))
+claim("the observer sees every row of the corpus, in batches with no errors",
+      sum(b["rows"] for b in observed) == corpus_rows and all(b["errors"] == 0 for b in observed))
+claim("each batch names the one model and a measured latency",
+      len({b["model"] for b in observed}) == 1 and all(b["latency_ms"] > 0 for b in observed))
 ```
 
 Every row the embedding run produced passed the observer exactly once, in batches, each

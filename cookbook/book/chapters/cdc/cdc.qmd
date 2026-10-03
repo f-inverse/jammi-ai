@@ -36,7 +36,8 @@ import threading
 import jammi
 import pyarrow as pa
 import pyarrow.compute as pc
-from jammi_cookbook import contracts, datasets, scale
+from jammi_cookbook import datasets, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -75,8 +76,7 @@ print(f"{changes.num_rows} events in {len(years)} yearly batches, offsets 0..{le
 ```
 
 ```{python}
-# | echo: false
-assert list(offset_of.values()) == list(range(len(years)))  # each publish takes the next offset
+claim("each publish takes the next offset", list(offset_of.values()) == list(range(len(years))))
 ```
 
 ## Replay the log — a collect is a finite drain
@@ -96,9 +96,8 @@ print(f"replayed {replay.num_rows} events = {papers} papers + {cites} citations"
 ```
 
 ```{python}
-# | echo: false
-assert replay.num_rows == papers + cites
-contracts.assert_close("cdc.events", replay.num_rows)
+claim("the replay holds exactly one event per paper and one per citation",
+      replay.num_rows == papers + cites, f"{replay.num_rows} = {papers} + {cites}")
 ```
 
 ## A selective subscribe — only the new papers
@@ -115,9 +114,8 @@ for event in adds.slice(0, 3).to_pylist():
 ```
 
 ```{python}
-# | echo: false
-assert adds.num_rows == papers
-assert set(adds.column("op").to_pylist()) == {"add"}
+claim("the predicate delivers every add and nothing else",
+      adds.num_rows == papers and set(adds.column("op").to_pylist()) == {"add"})
 ```
 
 ## Resume from a checkpoint
@@ -137,9 +135,8 @@ print(f"resumed at offset {CHECKPOINT}: {tail.num_rows} events ({unseen} changes
 ```
 
 ```{python}
-# | echo: false
-assert tail.num_rows == unseen
-contracts.assert_close("cdc.tail_events", tail.num_rows)
+claim("resuming at the checkpoint reads exactly the changes not yet seen",
+      tail.num_rows == unseen, f"{tail.num_rows} events")
 ```
 
 ## Resume *and* filter — a downstream feature, kept current
@@ -166,9 +163,8 @@ print(f"{new_cites.num_rows} new citations across {increments.num_rows} papers; 
 ```
 
 ```{python}
-# | echo: false
-assert agree
-contracts.assert_close("cdc.tail_cites", new_cites.num_rows)
+claim("the folded stream gives exactly the in-degree the test era added", agree,
+      f"{new_cites.num_rows} citations")
 ```
 
 ## Following the live tail
@@ -203,8 +199,8 @@ print(followed["batch"].to_pylist())
 ```
 
 ```{python}
-# | echo: false
-assert followed["batch"].column("op").to_pylist() == ["retract"]
+claim("the follower receives the correction published while it waited",
+      followed["batch"].column("op").to_pylist() == ["retract"])
 ```
 
 ```{python}

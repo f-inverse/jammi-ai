@@ -69,6 +69,13 @@ def quantiles(
     return sorted_cal[np.minimum(reach, len(cal))]
 
 
+def binomial_band(alpha: float, n: int) -> float:
+    """Three binomial standard errors of a ``1 − alpha`` coverage measured over
+    ``n`` test points: the band a valid split-conformal coverage lands within on
+    all but a rare draw."""
+    return 3 * float(np.sqrt(alpha * (1 - alpha) / n))
+
+
 def score_coverage(
     cal: np.ndarray, test: np.ndarray, *, weights: Weights | None, alpha: float
 ) -> float:

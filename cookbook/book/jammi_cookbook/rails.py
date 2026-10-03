@@ -3,7 +3,7 @@
 The rails are the columns of the book's 4-tier × 3-rail grid — woven through
 every tier, not a chapter of their own. These helpers compose ``jammi``; they
 implement no graph or ML logic. The third rail, measurement, is
-:func:`jammi_cookbook.contracts.assert_close`.
+:func:`jammi_cookbook.claims.claim`.
 """
 
 from __future__ import annotations

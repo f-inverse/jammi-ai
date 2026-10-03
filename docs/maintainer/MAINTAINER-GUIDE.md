@@ -411,12 +411,13 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
    CI fails *here, loudly*, rather than a chapter calling a stale kwarg at execute
    time.
 
-2. **The goldens — `cookbook/book/jammi_cookbook/goldens/`.** Every chapter ends in measured
-   numbers checked against frozen goldens: `contracts.assert_close("<dataset>.<key>", value)` reads
-   `goldens/<dataset>.json`, or `goldens/<dataset>.<scale>.json` for a dataset whose numbers depend
-   on the scale. A golden is never typed in: `JAMMI_COOKBOOK_FREEZE=1` records what a live run
-   measured. `tests/test_goldens.py` proves the converse statically — every frozen golden is one a
-   chapter still checks.
+2. **The claims — `cookbook/book/jammi_cookbook/claims.py`.** Every finding ends in the claim it
+   makes: `claim(statement, holds, evidence)` prints the statement beside the run's own numbers and
+   raises `ClaimFailed`, naming it, when it does not hold. A claim is a relation the capability
+   guarantees — an ordering, a bound, an equality the engine defines — so it holds on any host and
+   GPU, at either scale; a finding only the published data can show is guarded by
+   `SCALE is Scale.FULL`. The book freezes no measurement: a number one machine measured once is
+   not a claim about the engine.
 
 3. **The chapters — `cookbook/book/chapters/`.** The book `_quarto.yml` orders as a learning
    path: start here, search, models and inference, evaluation, fine-tuning, graphs and prediction,
@@ -466,8 +467,8 @@ the native engine, `--force-reinstall --no-deps` over the unpinned `jammi-ai`
 dependency); `book-checks` runs `check_api_reference.py`, the shared-lib pytest
 suite including `test_closed_loop.py`, the no-deferral grep, and the citation
 check, and `book-render` renders the pages the change can move
-(`ci/scripts/select_render_chapters.py`), in parallel slices, every one live
-against its frozen goldens. When that selection is every page — a release's
+(`ci/scripts/select_render_chapters.py`), in parallel slices, every one live,
+checking its claims. When that selection is every page — a release's
 tree always is, its version bump changing `Cargo.toml` — `book` assembles the
 slices' renders into the whole book without executing anything again
 (Quarto's `_freeze/` records, written under the `assemble` profile,
@@ -480,9 +481,9 @@ PyPI — nightly on a CPU, and after a release on a RunPod L4 as well
 
 **Maintainer implication.** A new or changed verb is not done until: (a) it has
 (or updates) a chapter under `cookbook/book/chapters/`; (b) its entry is
-added/updated in `REQUIRED` in `check_api_reference.py`; and (c) the relevant
-golden in `cookbook/book/jammi_cookbook/goldens/` either holds or is re-frozen with
-a justification. Cross-reference §4.1 (the wire-verb playbook) — a
+added/updated in `REQUIRED` in `check_api_reference.py`; and (c) every claim the
+chapters make still holds — a claim that no longer holds is an engine bug, or a
+claim the engine was never entitled to make, and is fixed as one or the other. Cross-reference §4.1 (the wire-verb playbook) — a
 new typed verb's Python leg is exactly what this guard checks; adding the verb
 without touching `REQUIRED` leaves the surface unproven, and adding a recipe that
 calls it without bumping the wheel fails the gate.
@@ -1078,8 +1079,7 @@ severities and distinct gRPC mappings:
 
   Consumer-facing spec & cross-transport parity contract: cookbook chapter
   `cookbook/book/chapters/error-taxonomy/error-taxonomy.qmd`. It measures
-  each `(failure mode → gRPC code)` cell against a frozen golden on the live
-  `grpc://` transport, asserts the same normalized error *class* on the embedded
+  each `(failure mode → gRPC code)` cell on the live `grpc://` transport, asserts the same normalized error *class* on the embedded
   engine, and asserts **no typed failure collapses to `INTERNAL`/`UNKNOWN`**
   (`INTERNAL` is the documented residual for a genuine fault). One nuance: an
   invalid dtype *string* is rejected **client-side** (a `ValueError`, never reaches

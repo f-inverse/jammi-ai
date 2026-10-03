@@ -27,7 +27,8 @@ from collections import defaultdict
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, datasets, encoders, keystone, scale
+from jammi_cookbook import datasets, encoders, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 MODEL = encoders.text(SCALE)
@@ -134,10 +135,10 @@ for name, (p, n) in metrics.items():
 ```
 
 ```{python}
-# | echo: false
-for name, (p, n) in metrics.items():
-    contracts.assert_close(f"retrieval.{name}.precision_at_10", p, tol=0.02)
-    contracts.assert_close(f"retrieval.{name}.ndcg_at_10", n, tol=0.02)
+claim("propagating the embeddings over citations ranks better than the raw embeddings",
+      metrics["dense_prop"][0] > metrics["dense_raw"][0]
+      and metrics["dense_prop"][1] > metrics["dense_raw"][1],
+      f"precision@10 {metrics['dense_prop'][0]:.3f} against {metrics['dense_raw'][0]:.3f}")
 ```
 
 ## The honest fusion finding
@@ -158,14 +159,14 @@ for i, metric in enumerate(("precision@10", "nDCG@10")):
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("retrieval.fusion_gain_precision", float(gain[0]), tol=0.02)
-contracts.assert_close("retrieval.fusion_gain_ndcg", float(gain[1]), tol=0.02)
 if SCALE is scale.Scale.FULL:
-    # Neither metric moves by two standard errors: fusion is a wash.
-    assert all(abs(g) < 2 * e for g, e in zip(gain, se))
-    assert fused == "rrf_raw_prop" and single == "dense_prop"
-    assert metrics["rrf_raw_bm25"][0] < metrics["dense_prop"][0]
+    claim("the best fusion is the two dense arms, and the best single arm the propagated one",
+          fused == "rrf_raw_prop" and single == "dense_prop")
+    claim("fusion is a wash: neither metric moves by two standard errors",
+          all(abs(g) < 2 * e for g, e in zip(gain, se)),
+          f"precision@10 {gain[0]:+.3f} ± {se[0]:.3f}, nDCG@10 {gain[1]:+.3f} ± {se[1]:.3f}")
+    claim("the hybrid dense + lexical list lands below the propagated arm",
+          metrics["rrf_raw_bm25"][0] < metrics["dense_prop"][0])
 ```
 
 At `full` scale **fusion is a wash**. RRF of the two dense arms lands next to the
@@ -230,11 +231,12 @@ print(f"lexical filtered top-{K}: {lexical_filtered}")
 ```
 
 ```{python}
-# | echo: false
-assert len(admitted) < n_papers
-assert dense_filtered == first_admitted(everything)
-assert lexical_filtered == first_admitted(lexical_all)
-assert set(dense_filtered) <= admitted and set(lexical_filtered) <= admitted
+claim("the filter is selective", len(admitted) < n_papers, f"{len(admitted)} of {n_papers} papers")
+claim("a filtered dense search returns exactly the first admitted rows of the full ranking",
+      dense_filtered == first_admitted(everything))
+claim("so does a filtered lexical search", lexical_filtered == first_admitted(lexical_all))
+claim("and neither returns a row the predicate refuses",
+      set(dense_filtered) <= admitted and set(lexical_filtered) <= admitted)
 ```
 
 A search that ranked first and filtered after would have had to rank the
@@ -260,8 +262,9 @@ print("context keys:", context["context_keys"][:8])
 ```
 
 ```{python}
-# | echo: false
-assert context["source"] == "hybrid" and context["context_size"] >= 5
+claim("a hybrid context is assembled from both sources and holds at least k members",
+      context["source"] == "hybrid" and context["context_size"] >= 5,
+      f"{context['context_size']} members")
 ```
 
 ```{python}

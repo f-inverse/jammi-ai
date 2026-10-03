@@ -23,7 +23,8 @@ import tempfile
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, datasets, keystone, scale
+from jammi_cookbook import datasets, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
@@ -64,8 +65,8 @@ compared = db.eval_compare(
     embedding_tables=[embeddings, propagated], source=arxiv.papers, golden_source=golden, k=10
 )
 raw, prop = (e["embedding_eval"]["aggregate"]["precision_at_k"] for e in compared["per_table"])
-contracts.assert_close("arxiv.tier02.precision_at_10", prop)
 print(f"precision@10 raw → APPNP-propagated: {raw:.3f} → {prop:.3f}   (Δ {prop - raw:+.3f})")
+claim("propagation over the citations lifts same-subject precision@10", prop > raw)
 ```
 
 ## Signature 2 — An edge is a self-`search`; a context set is a `search`/walk
@@ -96,9 +97,10 @@ for edge in first:
 ```
 
 ```{python}
-# | echo: false
-assert {"src", "dst", "rank", "similarity"} <= set(edges.column_names)
-assert [e["rank"] for e in first] == sorted(e["rank"] for e in first)
+claim("every derived edge records the retrieval that produced it",
+      {"src", "dst", "rank", "similarity"} <= set(edges.column_names))
+claim("and a paper's edges are its hits in rank order",
+      [e["rank"] for e in first] == sorted(e["rank"] for e in first))
 ```
 
 ## Signature 3 — Graph-supervised metric learning = contrastive fine-tune over walks
@@ -132,8 +134,9 @@ ft_compared = db.eval_compare(
     embedding_tables=[embeddings, tuned], source=arxiv.papers, golden_source=golden, k=10
 )
 ft = ft_compared["per_table"][1]["embedding_eval"]["aggregate"]["precision_at_k"]
-contracts.assert_close("arxiv.tier03.declared_precision_at_10", ft)
 print(f"precision@10 base → declared-edge fine-tune: {raw:.3f} → {ft:.3f}")
+if SCALE is scale.Scale.FULL:
+    claim("the declared-edge fine-tune lifts same-subject precision@10", ft > raw)
 ```
 
 ## Signature 4 — A prediction is a context-conditioned posterior (the moat)
@@ -173,16 +176,16 @@ intervals = db.conformalize_interval(
     cal_mean.tolist(), [float(year[k]) for k in cal_ids], test_mean.tolist(), alpha=0.10
 )
 reg_cov = float(np.mean([lo <= year[k] <= hi for k, (lo, hi) in zip(test_ids, intervals)]))
-contracts.assert_close("arxiv.tier04.reg_cal_mean", float(np.mean(cal_mean)))
-contracts.assert_close("arxiv.tier04.reg_interval_coverage", reg_cov)
 print(f"posterior mean (cal era):      {np.mean(cal_mean):.2f}   (a real fit, no collapse)")
 print(f"regression interval coverage:  {reg_cov:.3f}   (nominal 0.90)")
+claim("the posterior is a real fit: its mean lies among the dataset's years",
+      min(year.values()) <= np.mean(cal_mean) <= max(year.values()))
 ```
 
 ```{python}
-# | echo: false
 if SCALE is scale.Scale.FULL:
-    assert reg_cov < 0.80  # the time-split break, at the scale it is about
+    claim("the time split breaks the interval's coverage, at the scale it is about",
+          reg_cov < 0.80, f"coverage {reg_cov:.3f}")
 ```
 
 ## The Neptune-contrast framing

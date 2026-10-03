@@ -19,8 +19,8 @@ predictions. It carries two payloads:
 
 1. **A measured tour of the score families** — APS, RAPS, LAC for the
    subject-classification sets; the absolute-residual interval and CQR for the
-   year-regression intervals. Every coverage and size is measured here and
-   checked against a frozen golden.
+   year-regression intervals. Every coverage and size is measured here, and
+   each finding ends in the claim it makes.
 2. **The score-aligned weighted restore** — the keystone (tier 04) showed that on
    the *real* ogbn-arxiv time-split, importance-weighting is a **no-op** for the
    subject sets, because the shift is nearly orthogonal to their conformal score. Here we demonstrate the
@@ -39,7 +39,8 @@ import tempfile
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, datasets, keystone, scale, shift
+from jammi_cookbook import datasets, keystone, scale, shift
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 alpha = 0.10
@@ -100,19 +101,12 @@ print(f"RAPS: coverage {raps_cov:.3f}   mean set size {raps_size:.2f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.conformal.lac_coverage", lac_cov, tol=0.03)
-contracts.assert_close("arxiv.conformal.lac_set_size", lac_size, tol=0.6)
-contracts.assert_close("arxiv.conformal.aps_coverage", aps_cov, tol=0.03)
-contracts.assert_close("arxiv.conformal.aps_set_size", aps_size, tol=0.6)
-contracts.assert_close("arxiv.conformal.raps_coverage", raps_cov, tol=0.03)
-contracts.assert_close("arxiv.conformal.raps_set_size", raps_size, tol=0.6)
-if SCALE is scale.Scale.FULL:
-    # Every family holds nominal to within three binomial standard errors of
-    # the test era's size, and the set sizes order LAC < RAPS < APS.
-    se = float(np.sqrt(alpha * (1 - alpha) / len(test_labels)))
-    assert all(abs(c - (1 - alpha)) < 3 * se for c in (lac_cov, aps_cov, raps_cov))
-    assert lac_size < raps_size < aps_size
+band = shift.binomial_band(alpha, len(test_labels))
+claim("every family covers to within three binomial standard errors of nominal",
+      all(abs(c - (1 - alpha)) < band for c in (lac_cov, aps_cov, raps_cov)),
+      f"LAC {lac_cov:.3f}, APS {aps_cov:.3f}, RAPS {raps_cov:.3f}; nominal {1 - alpha:.2f} ± {band:.3f}")
+claim("and their sets order LAC < RAPS < APS in size", lac_size < raps_size < aps_size,
+      f"{lac_size:.2f} < {raps_size:.2f} < {aps_size:.2f}")
 ```
 
 Two facts, measured at `full` scale. First, **every family holds its
@@ -178,15 +172,10 @@ print(f"CQR interval:          coverage {cqr_cov:.3f}   width {cqr_width:.2f} ye
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.conformal.interval_coverage", iv_cov, tol=0.04)
-contracts.assert_close("arxiv.conformal.interval_width", iv_width, tol=0.6)
-contracts.assert_close("arxiv.conformal.cqr_coverage", cqr_cov, tol=0.04)
-contracts.assert_close("arxiv.conformal.cqr_width", cqr_width, tol=0.6)
 if SCALE is scale.Scale.FULL:
-    # Both under-cover under the time split; CQR recovers a little more
-    # coverage, still far short of nominal.
-    assert iv_cov < cqr_cov < 1 - alpha - 0.1
+    claim("both intervals under-cover under the time split; CQR recovers a little more, "
+          "still far short of nominal", iv_cov < cqr_cov < 1 - alpha - 0.1,
+          f"{iv_cov:.3f} < {cqr_cov:.3f}, nominal {1 - alpha:.2f}")
 ```
 
 At `full` scale both intervals **under-cover** under the time split — unlike the
@@ -250,8 +239,8 @@ print(f"corr(nonconformity, shift feature): {shift_corr:+.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.conformal.synthetic_shift_corr", shift_corr, tol=0.08)
+claim("the synthetic shift aligns with the nonconformity score", shift_corr > 0.3,
+      f"correlation {shift_corr:+.3f}")
 ```
 
 The diagnostic that distinguishes this from the keystone: the nonconformity
@@ -308,15 +297,11 @@ print(f"Δ (weighted − marginal):            {weighted_cov - marginal_cov:+.3f
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.conformal.synthetic_marginal_coverage", marginal_cov, tol=0.02)
-contracts.assert_close("arxiv.conformal.synthetic_weighted_coverage", weighted_cov, tol=0.02)
 if SCALE is scale.Scale.FULL:
-    # The inverse of the keystone's no-op: on a score-aligned shift the marginal
-    # pass under-covers and the exact-weight pass holds nominal, on average.
-    assert shift_corr > 0.3
-    assert marginal_cov < 1 - alpha - 0.01
-    assert weighted_cov >= 1 - alpha
+    claim("on a score-aligned shift the marginal pass under-covers",
+          marginal_cov < 1 - alpha - 0.01, f"coverage {marginal_cov:.3f}")
+    claim("and the exact-weight pass holds nominal", weighted_cov >= 1 - alpha,
+          f"coverage {weighted_cov:.3f}")
 ```
 
 Averaged over the draws, marginal split-conformal **under-covers** on the biased

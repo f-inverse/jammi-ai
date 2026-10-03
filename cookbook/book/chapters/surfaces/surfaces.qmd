@@ -41,7 +41,8 @@ from pathlib import Path
 
 import jammi
 from jammi.testing import LiveServer
-from jammi_cookbook import contracts, fixtures, programs
+from jammi_cookbook import fixtures, programs
+from jammi_cookbook.claims import claim
 
 VERSION = importlib.metadata.version("jammi-ai")
 CORPUS = fixtures.url("tiny_corpus.parquet")
@@ -155,11 +156,8 @@ print(f"surfaces agreeing with Python: {agreeing} of {len(surfaces)}")
 ```
 
 ```{python}
-# | echo: false
-assert agreeing == len(surfaces), surfaces
-contracts.assert_close("surfaces.agreeing", agreeing, tol=0.0)
-contracts.assert_close("surfaces.nearest_id", python_rows[1][0], tol=0.0)
-contracts.assert_close("surfaces.nearest_similarity", python_rows[1][1], tol=1e-4)
+claim("every surface returns the same neighbours", agreeing == len(surfaces),
+      f"{agreeing} of {len(surfaces)} surfaces")
 ```
 
 All four surfaces return the same three rows in the same order, with the same

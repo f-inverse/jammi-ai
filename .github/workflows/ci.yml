@@ -1294,7 +1294,7 @@ jobs:
           path: _site
 
   # ── The book ───────────────────────────────────────────────────────────────
-  # Every chapter runs its capability live and checks a frozen golden, so a
+  # Every chapter runs its capability live and checks the claims it makes, so a
   # render IS the check. These jobs render, at `small` scale on CPU, the
   # pages this change can move (`ci/scripts/select_render_chapters.py`), in
   # up to four interleaved slices, against the wheels, server and CLI this run

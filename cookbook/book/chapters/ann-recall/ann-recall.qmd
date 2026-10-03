@@ -31,7 +31,8 @@ import time
 from pathlib import Path
 
 import jammi
-from jammi_cookbook import contracts, datasets, encoders, keystone, scale
+from jammi_cookbook import datasets, encoders, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 MODEL = encoders.text(SCALE)
@@ -77,8 +78,8 @@ db.close()
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("scale.default_recall_at_10", default_recall, tol=0.02)
+claim("the default search finds nearly every true neighbour", default_recall >= 0.95,
+      f"recall@{K} {default_recall:.3f}")
 ```
 
 ## The dial — search effort against recall
@@ -104,11 +105,10 @@ for ef, (r, qps) in curve.items():
 ```
 
 ```{python}
-# | echo: false
 recalls = [r for r, _ in curve.values()]
-assert recalls == sorted(recalls), "recall does not fall as the search widens"
-contracts.assert_close("scale.recall_at_ef10", curve[K][0], tol=0.05)
-contracts.assert_close("scale.recall_at_ef128", curve[128][0], tol=0.02)
+claim("recall never falls as the search widens", recalls == sorted(recalls))
+claim("the narrowest search misses neighbours the widest finds", curve[K][0] < curve[128][0],
+      f"recall@{K} {curve[K][0]:.3f} at ef {K}, {curve[128][0]:.3f} at ef 128")
 ```
 
 Recall climbs with the effort toward the exact answer. The queries-per-second

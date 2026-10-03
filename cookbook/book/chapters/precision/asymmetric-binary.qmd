@@ -50,7 +50,8 @@ not the weights were trained.
 ```{python}
 import numpy as np
 import jammi
-from jammi_cookbook import contracts, precision, scale
+from jammi_cookbook import precision, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 K = precision.K
@@ -86,11 +87,11 @@ for name, n in dead.items():
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("asymmetric_binary.anisotropy_ratio", anisotropy, tol=0.01)
-for name, n in dead.items():
-    contracts.assert_close(f"asymmetric_binary.collapsed_dims_{name}", float(n), tol=0.0)
-assert dead["median"] <= dead["zero"], "a corpus-fit threshold never collapses more dimensions"
+claim("the corpus is anisotropic: its mean direction carries most of a row's norm",
+      anisotropy > 0.5, f"‖μ‖ / E‖v‖ = {anisotropy:.4f}")
+claim("a fixed-0 threshold collapses dimensions", dead["zero"] > 0,
+      f"{dead['zero']} of {corpus.dims}")
+claim("a median threshold, splitting every dimension in half, collapses none", dead["median"] == 0)
 ```
 
 On a real, anisotropic embedding a large share of dimensions is dead under a fixed-`0` rule —
@@ -122,12 +123,10 @@ for name, (r1, r10) in no_rescore.items():
 ```
 
 ```{python}
-# | echo: false
-for name, (r1, r10) in no_rescore.items():
-    contracts.assert_close(f"asymmetric_binary.{name}_no_rescore_at_1", r1, tol=0.0)
-    contracts.assert_close(f"asymmetric_binary.{name}_no_rescore_at_10", r10, tol=0.0)
-assert no_rescore["median"][1] > no_rescore["zero"][1], \
-    "centering the threshold recovers recall a fixed-0 code loses on an anisotropic corpus"
+for name in ("median", "mean"):
+    claim(f"a {name} threshold recovers no-rescore recall the fixed-0 code loses",
+          no_rescore[name][1] > no_rescore["zero"][1],
+          f"recall@{K} {no_rescore[name][1]:.4f} against {no_rescore['zero'][1]:.4f}")
 ```
 
 Both corpus-fit thresholds clear the fixed-`0` rule: the diagnosis is not a curiosity, it costs no-rescore recall, and centering recovers
@@ -153,8 +152,8 @@ print(f"refused: {refused}")
 ```
 
 ```{python}
-# | echo: false
-assert refused is not None and "binary_threshold_kind" in refused
+claim("the config surface refuses a key that would select another threshold",
+      refused is not None and "binary_threshold_kind" in refused)
 ```
 
 ## Through the engine — the no-rescore proxy and the rescored default
@@ -180,10 +179,11 @@ for label, (r1, r10) in [("engine, oversample=1", proxy), ("engine, rescored (de
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("asymmetric_binary.engine_os1_at_10", proxy[1], tol=0.02)
-contracts.assert_close("asymmetric_binary.engine_rescored_at_10", rescored[1], tol=0.02)
-assert rescored[1] >= proxy[1] - 1e-9, "rescore never loses recall"
+claim("rescoring a wider candidate set never loses recall", rescored[1] >= proxy[1],
+      f"recall@{K} {rescored[1]:.4f} against {proxy[1]:.4f} at oversample 1")
+claim("rescored at the default, binary comes within two points of the exact ceiling",
+      rescored[1] >= exact_ceiling[1] - 0.02,
+      f"recall@{K} {rescored[1]:.4f} against {exact_ceiling[1]:.4f}")
 ```
 
 ## Cosine-invariance — the rescore companion never sees τ
@@ -201,9 +201,8 @@ print(f"companion {companion.shape[0]:,} × {companion.shape[1]}; "
 ```
 
 ```{python}
-# | echo: false
-assert companion.shape == vectors.shape
-assert max_diff < 1e-5, "the companion is the normalized input, untouched by the threshold"
+claim("the rescore companion is the normalized input, untouched by the threshold",
+      companion.shape == vectors.shape and max_diff < 1e-5, f"max difference {max_diff:.2e}")
 ```
 
 Whatever the coarse threshold gets wrong about which candidates to propose, the rescore's

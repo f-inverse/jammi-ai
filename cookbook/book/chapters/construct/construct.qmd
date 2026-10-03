@@ -47,7 +47,8 @@ keystone.show(keystone.embed)
 import tempfile
 
 import jammi
-from jammi_cookbook import contracts, datasets, encoders, scale
+from jammi_cookbook import datasets, encoders, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 MODEL = encoders.text(SCALE)
@@ -91,8 +92,7 @@ def homophily(edges: list[dict]) -> float:
     return sum(subject[e["src"]] == subject[e["dst"]] for e in edges) / len(edges)
 
 
-mix = [sum(1 for s in subject.values() if s == label) for label in set(subject.values())]
-chance = sum((c / len(subject)) ** 2 for c in mix)
+chance = keystone.subject_chance(db, arxiv)
 cite_homophily = homophily(cites)
 neighbor_homophily = homophily(rows(neighbor_graph, "src, dst"))
 print(f"citation-graph homophily:  {cite_homophily:.3f}")
@@ -101,10 +101,10 @@ print(f"chance (subject mix):      {chance:.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier01.cite_homophily", cite_homophily, tol=1e-9)
-contracts.assert_close("arxiv.tier01.neighbor_homophily", neighbor_homophily, tol=0.02)
-assert cite_homophily > chance  # the tier-04 precondition, at either scale
+claim("citations connect papers of one subject far more often than chance",
+      cite_homophily > chance, f"{cite_homophily:.3f} against {chance:.3f}")
+claim("so do the encoder's nearest neighbours", neighbor_homophily > chance,
+      f"{neighbor_homophily:.3f} against {chance:.3f}")
 ```
 
 The citation graph is well above chance at both scales — that correlation is
@@ -135,10 +135,6 @@ precision = report["aggregate"]["precision_at_k"]
 print(f"tier01 precision@10 (raw embeddings): {precision:.3f}")
 ```
 
-```{python}
-# | echo: false
-contracts.assert_close("arxiv.tier01.precision_at_10", precision, tol=0.02)
-```
 
 ## Bridge note (deepened in the bridge chapters)
 
@@ -209,10 +205,8 @@ print(f"contains homophily (continent): {contains_h:.3f}")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("air.tier01.route_homophily", route_h, tol=1e-9)
-contracts.assert_close("air.tier01.contains_homophily", contains_h, tol=1e-9)
-assert contains_h > route_h
+claim("the declared hierarchy is more continent-consistent than the route graph",
+      contains_h > route_h, f"{contains_h:.3f} against {route_h:.3f}")
 ```
 
 The declared hierarchy is near-perfectly continent-consistent (the few
@@ -275,8 +269,8 @@ print(f"B's 'air_eu' visible to A: {'air_eu' in a_listed}")
 ```
 
 ```{python}
-# | echo: false
-rails.assert_listing_isolated(a_listed, {"air_eu"}, tenant_id=TENANT_A)
+claim("a source registered under tenant B is absent from tenant A's listing",
+      not set(a_listed) & {"air_eu"})
 ```
 
 ### Layer 2 — row-level isolation via a discriminator column (a hard zero)
@@ -307,9 +301,9 @@ print(f"overlap: {len(set(seen_a) & set(seen_b))}")
 ```
 
 ```{python}
-# | echo: false
 rails.assert_rows_isolated(seen_a, set(eu), tenant_id=TENANT_A)
-assert set(seen_a) == set(na) and set(seen_b) == set(eu)
+claim("the discriminator gives each tenant exactly its own rows of the shared source",
+      set(seen_a) == set(na) and set(seen_b) == set(eu))
 ```
 
 ### The caveat — a discriminator-less source is globally readable
@@ -332,9 +326,8 @@ print(f"tenant A reads B's discriminator-less source: {len(seen_global)} of {len
 ```
 
 ```{python}
-# | echo: false
-assert set(seen_global) == set(eu), "a discriminator-less source is globally readable"
-contracts.assert_close("air.tenancy.global_source_visible", len(seen_global))
+claim("a discriminator-less source is globally readable: A reads every one of its rows",
+      set(seen_global) == set(eu), f"{len(seen_global)} of {len(eu)}")
 ```
 
 ```{python}

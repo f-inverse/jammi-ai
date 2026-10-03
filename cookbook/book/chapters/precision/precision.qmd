@@ -40,7 +40,8 @@ precision. The ground truth each recall is scored against is `search(exact=True)
 table: it scores every stored vector, so it returns the true top-`k` whatever an index holds.
 
 ```{python}
-from jammi_cookbook import contracts, precision, scale
+from jammi_cookbook import precision, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 K = precision.K
@@ -65,9 +66,7 @@ print(f"f32 sidecar: {f32_bytes}")
 ```
 
 ```{python}
-# | echo: false
-assert "rawf32" not in f32_bytes, "an f32 index writes no rescore companion"
-contracts.assert_close("precision.f32_recall_at_10", recall_f32, tol=0.01)
+claim("an f32 index writes no rescore companion: its own vectors are exact", "rawf32" not in f32_bytes)
 ```
 
 ## `int8` at the default oversample — the recall-vs-memory headline
@@ -88,12 +87,11 @@ print(f"int8 rescore companion (.rawf32): {int8_bytes['rawf32']:,} bytes")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("precision.int8_os4_recall_at_10", recall_int8, tol=0.01)
-contracts.assert_close("precision.int8_vs_f32_graph_ratio", graph_ratio, tol=0.03)
-assert graph_ratio < 1.0, "an int8 graph is smaller than an f32 one"
+claim(f"int8 at the default oversample keeps f32's recall@{K} to within a point",
+      recall_int8 >= recall_f32 - 0.01, f"{recall_int8:.4f} against {recall_f32:.4f}")
+claim("an int8 graph is smaller than an f32 one", graph_ratio < 1.0, f"ratio {graph_ratio:.4f}")
 if SCALE is scale.Scale.FULL:
-    assert graph_ratio < 0.5, "at a real embedding width the vectors dominate the graph"
+    claim("at a real embedding width the vectors dominate the graph", graph_ratio < 0.5)
 ```
 
 The two-stage design at work: the graph a search traverses is small and lossy, but the
@@ -137,11 +135,10 @@ for ov in GRID:
 ```
 
 ```{python}
-# | echo: false
-for ov in GRID:
-    contracts.assert_close(f"precision.int8_os{ov}_sweep_recall_at_10", sweep[ov], tol=0.02)
-assert all(sweep[a] <= sweep[b] + 1e-9 for a, b in zip(GRID, GRID[1:])), sweep
-assert sweep[1] < sweep[4], "a narrow candidate set loses true neighbours"
+claim("widening the candidate set never loses recall",
+      all(sweep[a] <= sweep[b] for a, b in zip(GRID, GRID[1:])))
+claim("a narrow candidate set loses true neighbours", sweep[1] < sweep[4],
+      f"recall@{K} {sweep[1]:.4f} at 1, {sweep[4]:.4f} at 4")
 ```
 
 Recall never falls as the candidate set widens. The narrowest setting, `oversample=1` — as
@@ -167,11 +164,10 @@ print(f"per-request override to 8:  recall@{K} = {widened:.4f}")
 ```
 
 ```{python}
-# | echo: false
-assert table_default == explicit_one, "no override resolves to the table's own default"
-assert widened >= table_default
-assert widened == sweep[8], "a per-request 8 is the table-default 8's search"
-contracts.assert_close("precision.override8_on_os1_recall_at_10", widened, tol=0.02)
+claim("a search with no override uses the table's own default", table_default == explicit_one)
+claim("a per-request 8 is the same search as a table default of 8", widened == sweep[8])
+claim("and it never loses recall against the table's default of 1", widened >= table_default,
+      f"recall@{K} {widened:.4f} against {table_default:.4f}")
 ```
 
 An override recovers exactly the recall a wider table default gives, on the same on-disk

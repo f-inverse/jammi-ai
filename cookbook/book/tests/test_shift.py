@@ -9,6 +9,7 @@ Tibshirani et al. (2019) state it.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from jammi_cookbook import shift
 
@@ -58,3 +59,10 @@ def test_exact_weights_restore_what_a_score_aligned_shift_breaks():
     # rows, and the test row's mass at +∞ makes the weighted pass conservative.
     assert marginal < 1 - ALPHA - 0.1
     assert 1 - ALPHA <= weighted < 1 - ALPHA + 0.05
+
+
+def test_the_binomial_band_is_three_standard_errors_of_the_nominal_coverage():
+    # 90% nominal over 100 test points: one standard error is sqrt(0.09 / 100) = 0.03.
+    assert shift.binomial_band(0.10, 100) == pytest.approx(0.09)
+    # The band narrows as the square root of the test set grows.
+    assert shift.binomial_band(0.10, 400) == pytest.approx(shift.binomial_band(0.10, 100) / 2)

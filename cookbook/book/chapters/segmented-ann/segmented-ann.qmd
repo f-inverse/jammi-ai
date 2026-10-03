@@ -31,7 +31,8 @@ from urllib.parse import urlparse
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, fixtures
+from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 
 MODEL = fixtures.model("tiny_bert")
 work = Path(tempfile.mkdtemp())
@@ -58,10 +59,10 @@ for s in segments:
 ```
 
 ```{python}
-# | echo: false
-assert [s["segment_id"] for s in segments] == [0]
-assert segments[0]["row_count"] == patents.num_rows
-assert Path(urlparse(segments[0]["index_path"]).path).name.startswith(f"{table}__seg0")
+claim("a fresh table's index is one segment holding every row",
+      [s["segment_id"] for s in segments] == [0] and segments[0]["row_count"] == patents.num_rows)
+claim("its bundle is named after the table and the segment",
+      Path(urlparse(segments[0]["index_path"]).path).name.startswith(f"{table}__seg0"))
 ```
 
 The answer comes from the engine, never from opening its catalog file: an embedded
@@ -93,8 +94,8 @@ print(f"approximate == exact for {agree}/{len(keys)} queries (k={K})")
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("segmented_ann.n1.search_matches_exact_fraction", agree / len(keys))
+claim("over one small segment the approximate search ranks exactly as the exact search",
+      agree == len(keys), f"{agree}/{len(keys)} queries")
 ```
 
 ## Appending a segment leaves its neighbour untouched
@@ -136,17 +137,15 @@ print(f"refresh: {report['outcome']}, {report['inferred_rows']} rows embedded")
 ```
 
 ```{python}
-# | echo: false
-assert report["outcome"] == "published" and report["inferred_rows"] == added.num_rows
 seg0_after = next(s for s in after if s["segment_id"] == 0)
-assert (seg0_after["index_path"], seg0_after["row_count"]) == (
-    segments[0]["index_path"], segments[0]["row_count"])
-assert digest(seg0_after["index_path"]) == seg0_before
-assert [s["row_count"] for s in after if s["segment_id"] != 0] == [added.num_rows]
-```
-
-```{python}
-print(f"segment 0 bytes unchanged by the append: {digest(seg0_after['index_path']) == seg0_before}")
+claim("a refresh embeds only the added rows and publishes them",
+      report["outcome"] == "published" and report["inferred_rows"] == added.num_rows)
+claim("into a new segment of their own",
+      [s["row_count"] for s in after if s["segment_id"] != 0] == [added.num_rows])
+claim("leaving segment 0 where it was, byte for byte",
+      (seg0_after["index_path"], seg0_after["row_count"])
+      == (segments[0]["index_path"], segments[0]["row_count"])
+      and digest(seg0_after["index_path"]) == seg0_before)
 ```
 
 ## A search merges every segment
@@ -163,8 +162,8 @@ db.close()
 ```
 
 ```{python}
-# | echo: false
-assert self_found == len(all_keys)
+claim("every row finds itself first, in either segment", self_found == len(all_keys),
+      f"{self_found}/{len(all_keys)}")
 ```
 
 ## What was measured

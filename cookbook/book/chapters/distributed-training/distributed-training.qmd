@@ -41,7 +41,8 @@ from pathlib import Path
 
 import jammi
 import numpy as np
-from jammi_cookbook import contracts, fixtures
+from jammi_cookbook import fixtures
+from jammi_cookbook.claims import claim
 
 MODEL = fixtures.model("tiny_bert")
 PAIRS = fixtures.url("tiny_pairs.csv")
@@ -99,13 +100,13 @@ for world_size in (2, 3):
 ```
 
 ```{python}
-# | echo: false
 for world_size in (2, 3):
     curve, vectors = runs[world_size]
-    contracts.assert_close(f"distributed.local_w{world_size}_max_loss_diff",
-                           float(np.abs(curve - reference_curve).max()), tol=1e-6)
-    contracts.assert_close(f"distributed.local_w{world_size}_max_embedding_diff",
-                           float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
+    loss_diff = float(np.abs(curve - reference_curve).max())
+    embedding_diff = float(np.abs(vectors - reference_vectors).max())
+    claim(f"a gang of {world_size} trains the single process's loss curve and embeddings",
+          loss_diff < 1e-6 and embedding_diff < 1e-6,
+          f"largest difference {max(loss_diff, embedding_diff):.1e}")
 ```
 
 The loss curves and the adapted model's embeddings agree across rank counts: the gang
@@ -227,16 +228,14 @@ print(f"peer gang vs 1 rank: max |Δ loss| {np.abs(curve - reference_curve).max(
 ```
 
 ```{python}
-# | echo: false
-assert len(fleet) == 2, fleet
-# The gang spanned both servers: one rank on each, rank 0 on the claimant.
-assert sorted(peer_job["ranks"]) == sorted(fleet.values()), (peer_job, fleet)
-assert peer_job["claimed_by"] == peer_job["ranks"][0], peer_job
+claim("the gang spans both servers: one rank on each, rank 0 on the claimant",
+      len(fleet) == 2 and sorted(peer_job["ranks"]) == sorted(fleet.values())
+      and peer_job["claimed_by"] == peer_job["ranks"][0])
 curve, vectors = runs["peer"]
-contracts.assert_close("distributed.peer_w2_max_loss_diff",
-                       float(np.abs(curve - reference_curve).max()), tol=1e-6)
-contracts.assert_close("distributed.peer_w2_max_embedding_diff",
-                       float(np.abs(vectors - reference_vectors).max()), tol=1e-6)
+peer_diff = max(float(np.abs(curve - reference_curve).max()),
+                float(np.abs(vectors - reference_vectors).max()))
+claim("and trains what the single process trains", peer_diff < 1e-6,
+      f"largest difference {peer_diff:.1e}")
 postgres.cleanup()
 ```
 
@@ -273,9 +272,9 @@ db.close()
 ```
 
 ```{python}
-# | echo: false
-assert all(refusals.values()), refusals
-assert "serveable world of 2" in refusals["three ranks on a two-rank host"]
+claim("every layout the hosts cannot serve is refused", all(refusals.values()))
+claim("and the refusal names the world the hosts can serve",
+      "serveable world of 2" in refusals["three ranks on a two-rank host"])
 ```
 
 Each refusal names the knob that would change the answer.

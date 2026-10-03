@@ -6,6 +6,17 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+- **The cookbook checks claims, not frozen numbers.** Every chapter checked its measurements
+  against goldens — values one machine recorded once, at each scale — so a reader whose host
+  rounded differently, or whose GPU was not the one a full-scale golden was frozen on, saw a
+  notebook fail on code that had worked. Each finding now ends in the claim it makes:
+  `jammi_cookbook.claims.claim(statement, holds, evidence)` prints the statement beside the run's
+  own numbers and raises `ClaimFailed`, naming it, when it does not hold. A claim is a relation the
+  capability guarantees — rescore recovers what raw Hamming loses, a refresh appends a segment and
+  leaves segment 0 byte for byte, a gang trains what one process trains — so it holds on any host
+  and GPU. A finding only the published data can show is claimed under `SCALE is Scale.FULL`.
+  `jammi_cookbook.contracts`, the goldens and `JAMMI_COOKBOOK_FREEZE` are gone; chapter prose cites
+  the run's printed numbers instead of figures recorded elsewhere.
 - **An ANN index is the same graph on every host.** USearch gives each thread context its own
   HNSW level generator, every one seeded alike, and sizes the contexts to the host's core count; a
   sidecar inserted its rows through all of them in turn, so each level draw repeated once per core
@@ -15,8 +26,7 @@ workspace ships every publishable crate at the same
   builds its graph in one pass, through one context reserved for every row at once — one
   uninterrupted level sequence, the independent per-node draw HNSW construction assumes — and
   widens to a context per host thread for search afterwards. A binary graph is byte-identical on
-  every host. The book's small goldens that index-ranked numbers feed are re-frozen; each moved
-  within its tolerance.
+  every host.
 - **A sidecar is built, then immutable.** `SidecarBuilder` takes the rows (`new`, `add`) and
   `build` returns the `SidecarIndex`; an index is only ever built or loaded, so one is never
   searched or saved while it is missing rows, and never grows. `VectorIndex` is the query surface

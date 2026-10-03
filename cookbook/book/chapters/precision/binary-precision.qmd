@@ -46,15 +46,12 @@ and its own top-1. Every table imports the same vectors.
 
 ```{python}
 import numpy as np
-from jammi_cookbook import contracts, precision, scale
+from jammi_cookbook import precision, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 K = precision.K
 corpus = precision.corpus(SCALE)
-# Recall@1 moves a whole query at a time, and a coordinate at the sign boundary
-# can quantize to either bit on another CPU: its tolerance admits one query's
-# difference and never two.
-AT_1_TOL = max(0.02, 1.5 / len(corpus.queries))
 print(f"corpus {len(corpus.corpus_ids):,} papers × {corpus.dims} dims, "
       f"{len(corpus.queries)} held-out queries")
 ```
@@ -91,14 +88,10 @@ print(f"binary graph {binary_bytes['usearch']:,} bytes ({graph_ratio:.1%} of f32
 ```
 
 ```{python}
-# | echo: false
-assert (default_at_1, default_at_10) == (explicit_at_1, explicit_at_10), \
-    "an unset oversample resolves to binary's own default of 32"
-for metric, value in [("f32_at_1", f32_at_1), ("f32_at_10", f32_at_10),
-                      ("binary_default_at_1", default_at_1), ("binary_default_at_10", default_at_10)]:
-    contracts.assert_close(f"binary_precision.{metric}", value,
-                           tol=AT_1_TOL if metric.endswith("_at_1") else 0.02)
-contracts.assert_close("binary_precision.graph_ratio", graph_ratio, tol=0.03)
+claim("an unset oversample resolves to binary's own default of 32",
+      (default_at_1, default_at_10) == (explicit_at_1, explicit_at_10))
+claim(f"rescored at that default, binary keeps f32's recall@{K} to within two points",
+      default_at_10 >= f32_at_10 - 0.02, f"{default_at_10:.4f} against {f32_at_10:.4f}")
 ```
 
 ### The whole graph file is not 32× smaller
@@ -122,9 +115,9 @@ print(f"file ratio    {graph_ratio:.4f} — what a deployment keeps resident")
 ```
 
 ```{python}
-# | echo: false
-assert abs(payload_binary / payload_f32 - 1 / 32) < 1e-9
-assert graph_ratio > payload_binary / payload_f32, "link overhead does not shrink with precision"
+claim("the vector payload shrinks exactly 32×", abs(payload_binary / payload_f32 - 1 / 32) < 1e-9)
+claim("the graph file shrinks by less, because the links do not shrink with precision",
+      payload_binary / payload_f32 < graph_ratio < 1, f"file ratio {graph_ratio:.4f}")
 ```
 
 "Binary is 32× smaller" is true of the vectors inside the graph; the file shrinks by the
@@ -157,11 +150,9 @@ print(f"engine, rescored at the default:  recall@1 {default_at_1:.4f}   recall@{
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("binary_precision.hamming_no_rescore_at_1", hamming_at_1, tol=0.0)
-contracts.assert_close("binary_precision.hamming_no_rescore_at_10", hamming_at_10, tol=0.0)
-assert hamming_at_1 < default_at_1 and hamming_at_10 < default_at_10, \
-    "rescore recovers what the raw Hamming ranking loses"
+claim("the engine's rescore recovers what the raw Hamming ranking loses",
+      hamming_at_1 < default_at_1 and hamming_at_10 < default_at_10,
+      f"recall@{K} {default_at_10:.4f} against {hamming_at_10:.4f}")
 ```
 
 A single sign bit per dimension, ranked by raw Hamming distance, is a coarse ranking; the
@@ -187,12 +178,10 @@ for ov in GRID:
 ```
 
 ```{python}
-# | echo: false
-for ov in GRID:
-    contracts.assert_close(f"binary_precision.os{ov}_at_1", sweep[ov][0], tol=AT_1_TOL)
-    contracts.assert_close(f"binary_precision.os{ov}_at_10", sweep[ov][1], tol=0.02)
-assert sweep[1][1] < sweep[32][1], "a narrow candidate set loses true neighbours"
-assert all(sweep[a][1] <= sweep[b][1] + 1e-9 for a, b in zip(GRID, GRID[1:])), sweep
+claim("a narrow candidate set loses true neighbours", sweep[1][1] < sweep[32][1],
+      f"recall@{K} {sweep[1][1]:.4f} at 1, {sweep[32][1]:.4f} at 32")
+claim("widening the candidate set never loses recall",
+      all(sweep[a][1] <= sweep[b][1] for a, b in zip(GRID, GRID[1:])))
 ```
 
 Unlike `int8`, whose recall reached the exact baseline by the shared default of `4`,
@@ -213,9 +202,9 @@ print(f"per-request override to 32:   recall@{K} {widened:.4f}")
 ```
 
 ```{python}
-# | echo: false
-assert widened == sweep[32][1], "a per-request 32 is the table-default 32's search"
-assert widened > narrow
+claim("a per-request 32 is the same search as a table default of 32", widened == sweep[32][1])
+claim("and it recovers what the table's own default of 1 lost", widened > narrow,
+      f"recall@{K} {widened:.4f} against {narrow:.4f}")
 ```
 
 The override recovers, on the same on-disk graph and with no rebuild, the recall a wider table

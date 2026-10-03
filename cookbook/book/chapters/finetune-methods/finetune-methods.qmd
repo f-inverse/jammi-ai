@@ -32,7 +32,8 @@ from pathlib import Path
 import jammi
 import pyarrow as pa
 import pyarrow.parquet as pq
-from jammi_cookbook import contracts, datasets, encoders, keystone, scale
+from jammi_cookbook import datasets, encoders, keystone, scale
+from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
 BASE = encoders.text(SCALE)
@@ -168,10 +169,9 @@ for name, entry in zip(methods, compared["per_table"][1:]):
 ```
 
 ```{python}
-# | echo: false
-contracts.assert_close("finetune.base_precision_at_10", base, tol=0.01)
-for name, value in results.items():
-    contracts.assert_close(f"finetune.{name}.precision_at_10", value, tol=0.03)
+claim("each method's delta is its precision@10 less the base's",
+      all(abs(entry["delta"]["precision_at_k"]["absolute"] - (results[name] - base)) < 1e-9
+          for name, entry in zip(methods, compared["per_table"][1:])))
 ```
 
 ## Reading the spectrum
@@ -184,6 +184,8 @@ significant = [
 spread = max(results.values()) - min(results.values())
 print(f"spread across the methods:         {spread:.3f}")
 print(f"methods whose gain excludes zero:  {significant or 'none'}")
+claim("the losses barely differ: one supervision, different negative policies", spread < 0.05,
+      f"spread {spread:.3f}")
 ```
 
 A method earns a verdict only when its confidence interval excludes zero; a
@@ -226,10 +228,9 @@ for name, row in prefix.items():
 ```
 
 ```{python}
-# | echo: false
-for name, row in prefix.items():
-    for w, value in row.items():
-        contracts.assert_close(f"finetune.prefix.{name}.{w}", value, tol=0.03)
+claim("a quarter-width index keeps at least 90% of the full width's precision@10",
+      all(row[widths[-1]] >= 0.9 * row[widths[0]] for row in prefix.values()),
+      ", ".join(f"{name} {row[widths[-1]]:.3f} of {row[widths[0]]:.3f}" for name, row in prefix.items()))
 ```
 
 Read each row left to right: how much retrieval quality a model keeps as its

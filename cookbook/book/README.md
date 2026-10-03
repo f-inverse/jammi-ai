@@ -11,8 +11,7 @@ recipe under `cookbook/recipes/` is a chapter too. The rendered book:
 ## Repository layout
 
 ```
-jammi_cookbook/   the shared lib: datasets, encoders, frozen goldens, rails
-  goldens/        the frozen measurements, one file per dataset and scale
+jammi_cookbook/   the shared lib: datasets, encoders, claims, rails
 chapters/         the book (Quarto .qmd with executable Python cells); its order lives
                   in _quarto.yml
   recipes/        the recipes as chapters, generated from cookbook/recipes and
@@ -29,18 +28,21 @@ release publishes it with the guide (`.github/workflows/pages.yml`).
 
 ## Two scales, one code path
 
-Every chapter runs its capability live and checks what it measured against a
-frozen golden. `JAMMI_COOKBOOK_SCALE` picks what it runs over:
+Every chapter runs its capability live and ends each finding in the claim it
+makes: `claim(statement, holds, evidence)` prints the statement beside the run's
+own numbers and raises, naming it, when it does not hold. A claim is a relation
+the capability guarantees — an ordering, a bound, an equality the engine defines —
+so it holds on any host and GPU; a chapter never checks a number one machine
+measured once. `JAMMI_COOKBOOK_SCALE` picks what a chapter runs over:
 
 * `small` (the default) — the committed fixtures and tiny fixture encoders, on
   the CPU, in seconds per chapter. What CI renders.
 * `full` — the published datasets (fetched once, checksum-gated, into
   `~/.cache/jammi-cookbook`) and real encoders, on a GPU.
 
-The chapter code is identical at both; only the data, the encoders and the
-goldens differ. A golden is never typed in: `JAMMI_COOKBOOK_FREEZE=1` records
-what a run measured, and re-freezing after a deliberate change is running the
-chapter once at that scale and reviewing the diff.
+The chapter code is identical at both; only the data and the encoders differ. A
+claim only the published data can show — a finding the tiny fixtures cannot bear —
+is guarded by `SCALE is Scale.FULL`, and every other claim holds at both scales.
 
 ## Develop
 

@@ -1,6 +1,6 @@
 //! Runtime admission scaffolding shared by every fused op's call site: a
 //! CUDA compute-capability probe, per-op fused/eager dispatch counters, a
-//! log-once-per-process WARN helper, and a `Strict` mode that turns a failed
+//! log-once-per-process notice helper, and a `Strict` mode that turns a failed
 //! domain check into a hard error instead of a silent fallback.
 //!
 //! This module contains no fusion POLICY (no op decides here whether it
@@ -369,9 +369,9 @@ pub fn admit_cascade(
     if op_is_disabled(disabled_ops(), fired_disables(), op) {
         counters.declined.fetch_add(1, Ordering::Relaxed);
         // The SAME probe-capture window `admit_inner` records into,
-        // independent of `warn_disabled_once`'s log-once dedupe.
+        // independent of `note_disabled_once`'s log-once dedupe.
         record_probe_miss(op, DISABLED_PREDICATE_KEY);
-        warn_disabled_once(op);
+        note_disabled_once(op);
         return Ok(CascadeOutcome::Declined);
     }
     match outcome {
@@ -564,49 +564,49 @@ impl DispatchCounters {
     }
 }
 
-/// One recorded fallback warning: `(op, predicate_key, message)` — see
-/// [`fallback_warnings_emitted`]'s doc for what `predicate_key`
+/// One recorded fallback notice: `(op, predicate_key, message)` — see
+/// [`fallback_notices_emitted`]'s doc for what `predicate_key`
 /// distinguishes.
-type FallbackWarning = (&'static str, &'static str, String);
+type FallbackNotice = (&'static str, &'static str, String);
 
-/// Process-wide, append-only record of every fallback warning this process
-/// has actually EMITTED (not merely "would have logged"): [`FallbackWarning`]
-/// triples, pushed by [`warn_fallback_once_with_message`] in the SAME
-/// guarded block that fires `tracing::warn!`. This is the deterministic
+/// Process-wide, append-only record of every fallback notice this process
+/// has actually EMITTED (not merely "would have logged"): [`FallbackNotice`]
+/// triples, pushed by [`note_fallback_once_with_message`] in the SAME
+/// guarded block that fires `tracing::info!`. This is the deterministic
 /// oracle a test asserts against, in place of capturing the `tracing` log
 /// line itself — `tracing`'s callsite `Interest` cache is PROCESS-GLOBAL, so
 /// a thread-local `tracing::subscriber::set_default` guard around one test
 /// races every OTHER test in this shared binary that can reach the same
-/// `tracing::warn!` callsite concurrently (this crate used exactly that
+/// `tracing::info!` callsite concurrently (this crate used exactly that
 /// pattern until it flaked under `cargo test --test-threads=N`: a sibling
 /// test on another thread with no subscriber installed could win the
 /// callsite's first-touch `Interest` decision and starve this test's
 /// capture of every event). A plain, process-wide `Mutex<Vec<_>>` has no
 /// such hazard: every thread that reaches this function pushes into the
-/// SAME vector regardless of scheduling, and [`fallback_warnings_emitted`]
+/// SAME vector regardless of scheduling, and [`fallback_notices_emitted`]
 /// reads it directly — no subscriber, no callsite cache, no thread-local
 /// guard.
 ///
 /// Same provenance family as [`disabled_ops_fired`]: an append-only,
 /// process-wide record a test (or a durable run artifact) can assert
 /// against deterministically rather than eyeballing a log stream.
-fn fallback_warnings() -> &'static Mutex<Vec<FallbackWarning>> {
-    static WARNINGS: OnceLock<Mutex<Vec<FallbackWarning>>> = OnceLock::new();
-    WARNINGS.get_or_init(|| Mutex::new(Vec::new()))
+fn fallback_notices() -> &'static Mutex<Vec<FallbackNotice>> {
+    static NOTICES: OnceLock<Mutex<Vec<FallbackNotice>>> = OnceLock::new();
+    NOTICES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Every fallback warning this process has emitted so far, in emission
+/// Every fallback notice this process has emitted so far, in emission
 /// order: `(op, predicate_key, message)`. `predicate_key` is either the
 /// call site's own `predicate_name` (a genuine domain-predicate failure —
-/// `warn_predicate_failed_once`'s path) or the literal
-/// `"disabled_by_JAMMI_KERNELS_DISABLE"` (`warn_disabled_once`'s path,
+/// `note_predicate_failed_once`'s path) or the literal
+/// `"disabled_by_JAMMI_KERNELS_DISABLE"` (`note_disabled_once`'s path,
 /// the same fixed key `op_is_disabled`'s callers use elsewhere in this
 /// module) — the two are always distinguishable by this field alone,
-/// without needing to compare `message` text. See `fallback_warnings`'s
+/// without needing to compare `message` text. See `fallback_notices`'s
 /// doc for why this is the oracle a test asserts against instead of a
 /// captured `tracing` log line.
-pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
-    fallback_warnings()
+pub fn fallback_notices_emitted() -> Vec<FallbackNotice> {
+    fallback_notices()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
@@ -616,17 +616,17 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
 // The probe-window capture sink
 // =============================================================================
 //
-// [`fallback_warnings_emitted`] above is a LOG-ONCE record: every entry is
-// pushed inside `warn_fallback_once_with_message`'s
+// [`fallback_notices_emitted`] above is a LOG-ONCE record: every entry is
+// pushed inside `note_fallback_once_with_message`'s
 // `seen.insert((op, predicate))` guard, so a given `(op, predicate)` pair
 // appears AT MOST ONCE per process. That makes it a fine oracle for "did this
-// process ever warn about X", and a WRONG source for "why did THIS job's
+// process ever note X", and a WRONG source for "why did THIS job's
 // probe miss": a job whose miss repeats a pair some earlier job already
 // burned pushes nothing, and a reader taking the most recent entry for the op
 // gets the most recent DIFFERENT predicate — a fabricated reason, persisted
 // durably on the job record.
 //
-// A naive before/after window over `fallback_warnings_emitted()` cannot fix
+// A naive before/after window over `fallback_notices_emitted()` cannot fix
 // that either: the dedupe is UPSTREAM of the record, so the window is empty
 // in exactly the repeat case that needs it. The sink below is therefore a
 // SECOND, independent channel: while armed, `admit_inner`'s miss path ALWAYS
@@ -645,14 +645,14 @@ pub fn fallback_warnings_emitted() -> Vec<FallbackWarning> {
 // reads a two-arm op's predicate name. `CascadeDispatchCounters`'s
 // `fused`/`declined` fields are independent of the sink.
 
-/// The predicate key `warn_disabled_once` logs and the sink records for a
+/// The predicate key `note_disabled_once` logs and the sink records for a
 /// `JAMMI_KERNELS_DISABLE`-forced eager arm. Hoisted to a `const` so the two
 /// producers cannot drift: a consumer distinguishing "deliberate instruction"
 /// from "domain-predicate failure" compares against this ONE spelling.
 pub const DISABLED_PREDICATE_KEY: &str = "disabled_by_JAMMI_KERNELS_DISABLE";
 
 /// One captured miss: `(op, predicate_key)` — the same two fields
-/// [`fallback_warnings_emitted`] carries, without the formatted message
+/// [`fallback_notices_emitted`] carries, without the formatted message
 /// (a consumer reading this wants the verbatim key, not log prose).
 pub type ProbeMiss = (&'static str, &'static str);
 
@@ -712,7 +712,7 @@ thread_local! {
     /// **Thread-local, not process-wide, on purpose**: a process-wide sink
     /// would mix a concurrently-probing second worker's misses into this
     /// job's window, which is the same misattribution the process-lifetime
-    /// warn list already commits. Thread-local means a window captures
+    /// notice list already commits. Thread-local means a window captures
     /// exactly the misses raised by the thread that armed it.
     ///
     /// `None` when unarmed — the hot path pays one TLS access plus an
@@ -809,7 +809,7 @@ pub fn probe_capture_is_armed() -> bool {
 /// Arms a probe-window capture sink on THIS thread and returns the guard that
 /// owns it. While armed, EVERY [`admit`] miss on this thread records its
 /// `(op, predicate)` pair into the window, independent of the log-once dedupe
-/// [`fallback_warnings_emitted`] applies (which is left exactly as it is —
+/// [`fallback_notices_emitted`] applies (which is left exactly as it is —
 /// this does not change what gets logged).
 ///
 /// **Thread-locality is a real constraint on the caller.** The window
@@ -983,40 +983,40 @@ pub fn probe_capture_reason_for(window: &[ProbeMiss], op: &str) -> Option<&'stat
         .map(|&(_, predicate)| predicate)
 }
 
-/// Emits a `tracing::warn!` at most once per process for a given
+/// Emits a `tracing::info!` at most once per process for a given
 /// `(op, predicate)` pair, with `message` as the log line — split out from
-/// [`warn_fallback_once`] so [`warn_disabled_once`] can share the SAME
+/// [`note_fallback_once`] so [`note_disabled_once`] can share the SAME
 /// log-once-per-process dedup set while emitting a message that does not
 /// misattribute a deliberate `JAMMI_KERNELS_DISABLE` instruction as a
 /// "domain check failed" defect.
 ///
-/// Records into [`fallback_warnings`] in the SAME guarded block that fires
-/// `tracing::warn!` — a mutation that replaces this function's body (or
-/// [`warn_fallback_once`]'s) wholesale with `()` removes BOTH the log line
-/// and the record, so [`fallback_warnings_emitted`] coming back without
+/// Records into [`fallback_notices`] in the SAME guarded block that fires
+/// `tracing::info!` — a mutation that replaces this function's body (or
+/// [`note_fallback_once`]'s) wholesale with `()` removes BOTH the log line
+/// and the record, so [`fallback_notices_emitted`] coming back without
 /// the expected entry is what a test observes; it does not need to capture
 /// the `tracing` output at all.
-fn warn_fallback_once_with_message(op: &'static str, predicate: &'static str, message: &str) {
+fn note_fallback_once_with_message(op: &'static str, predicate: &'static str, message: &str) {
     static SEEN: OnceLock<Mutex<HashSet<(&'static str, &'static str)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let mut seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if seen.insert((op, predicate)) {
-        tracing::warn!(op, predicate, "{message}");
-        fallback_warnings()
+        tracing::info!(op, predicate, "{message}");
+        fallback_notices()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((op, predicate, message.to_string()));
     }
 }
 
-/// Emits a `tracing::warn!` at most once per process for a given
-/// `(op, predicate)` pair — the log-once-per-process WARN naming the op AND
+/// Emits a `tracing::info!` at most once per process for a given
+/// `(op, predicate)` pair — the log-once-per-process notice naming the op AND
 /// the failed predicate. Used for a genuine domain-predicate failure; see
-/// `warn_disabled_once` for the `JAMMI_KERNELS_DISABLE` path's own,
+/// `note_disabled_once` for the `JAMMI_KERNELS_DISABLE` path's own,
 /// differently-worded message (the disabled path is not a predicate
 /// failure and must not read as one in the log).
-pub fn warn_fallback_once(op: &'static str, predicate: &'static str) {
-    warn_fallback_once_with_message(
+pub fn note_fallback_once(op: &'static str, predicate: &'static str) {
+    note_fallback_once_with_message(
         op,
         predicate,
         "fused-kernel domain check failed; falling back to the eager composition",
@@ -1242,7 +1242,7 @@ pub fn disabled_ops_fired() -> Vec<String> {
 /// Why an [`admit_inner`] call landed on the `Eager` arm — `None` when the
 /// predicate held (`Fused`). Exposed on [`AdmitDecision`] (not just as a
 /// side-effecting log line) so a lattice cell can assert on it DIRECTLY:
-/// deleting the statement that computes/emits the disabled-path warning
+/// deleting the statement that computes/emits the disabled-path notice
 /// then breaks compilation (`reason` becomes unbound) rather than silently
 /// surviving — see [`AdmitDecision`]'s doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,8 +1258,8 @@ enum FallbackReason {
 /// PLUS why (`None` on `Fused`) — the `reason` field is what makes cell 5
 /// (disabled path) and cell 3/7 (predicate-failure path) distinguishable
 /// to a test without capturing a `tracing` log line, closing the mutant
-/// that deletes the disabled path's own warning: `reason` is produced BY
-/// the warn helper call (`warn_disabled_once`/`warn_predicate_failed_once`
+/// that deletes the disabled path's own notice: `reason` is produced BY
+/// the notice helper call (`note_disabled_once`/`note_predicate_failed_once`
 /// return the [`FallbackReason`] they log), so a mutation that deletes
 /// that call cannot compile (the `let reason = ..;` binding used in the
 /// return value would be gone) — it is not merely untested, it is
@@ -1270,15 +1270,15 @@ struct AdmitDecision {
     reason: Option<FallbackReason>,
 }
 
-/// Emits the disabled-path warning — a message DISTINCT from
-/// [`warn_fallback_once`]'s ("fused-kernel domain check failed…"), because
+/// Emits the disabled-path notice — a message DISTINCT from
+/// [`note_fallback_once`]'s ("fused-kernel domain check failed…"), because
 /// a `JAMMI_KERNELS_DISABLE` entry is not a domain-check failure at all;
 /// conflating the two log lines would misattribute a deliberate
 /// instruction as a predicate defect. Returns [`FallbackReason::Disabled`]
 /// unconditionally — see [`AdmitDecision`]'s doc for why this return value
 /// (not just the log side effect) is what a test asserts on.
-fn warn_disabled_once(op: &'static str) -> FallbackReason {
-    warn_fallback_once_with_message(
+fn note_disabled_once(op: &'static str) -> FallbackReason {
+    note_fallback_once_with_message(
         op,
         DISABLED_PREDICATE_KEY,
         "op disabled via JAMMI_KERNELS_DISABLE",
@@ -1286,13 +1286,13 @@ fn warn_disabled_once(op: &'static str) -> FallbackReason {
     FallbackReason::Disabled
 }
 
-/// Emits the predicate-failure warning via [`warn_fallback_once`], then
+/// Emits the predicate-failure notice via [`note_fallback_once`], then
 /// returns [`FallbackReason::PredicateFailed`] — see
-/// [`warn_disabled_once`]'s doc for the sibling disabled-path helper and
+/// [`note_disabled_once`]'s doc for the sibling disabled-path helper and
 /// why each returns its own [`FallbackReason`] rather than being a bare
 /// side effect.
-fn warn_predicate_failed_once(op: &'static str, predicate_name: &'static str) -> FallbackReason {
-    warn_fallback_once(op, predicate_name);
+fn note_predicate_failed_once(op: &'static str, predicate_name: &'static str) -> FallbackReason {
+    note_fallback_once(op, predicate_name);
     FallbackReason::PredicateFailed
 }
 
@@ -1320,11 +1320,11 @@ fn admit_inner(
         // function is still strictly proven fused.
         counters.record(DispatchOutcome::Eager);
         // The probe window records EVERY miss,
-        // independent of `warn_disabled_once`'s log-once dedupe below — a
-        // repeat of an already-warned `(op, predicate)` pair still belongs to
+        // independent of `note_disabled_once`'s log-once dedupe below — a
+        // repeat of an already-noted `(op, predicate)` pair still belongs to
         // the job whose window is armed right now.
         record_probe_miss(op, DISABLED_PREDICATE_KEY);
-        let reason = warn_disabled_once(op);
+        let reason = note_disabled_once(op);
         return Ok(AdmitDecision {
             outcome: DispatchOutcome::Eager,
             reason: Some(reason),
@@ -1340,13 +1340,13 @@ fn admit_inner(
     }
     counters.record(DispatchOutcome::Eager);
     // Recorded BEFORE the mode match, so a `Strict` run's hard error is
-    // captured too: `Strict` returns before `warn_predicate_failed_once` is
+    // captured too: `Strict` returns before `note_predicate_failed_once` is
     // ever reached, and a window that saw the counter move but has no entry
     // for why would be exactly the blind spot this sink exists to close.
     record_probe_miss(op, predicate_name);
     match mode {
         AdmissionMode::Fallback => {
-            let reason = warn_predicate_failed_once(op, predicate_name);
+            let reason = note_predicate_failed_once(op, predicate_name);
             Ok(AdmitDecision {
                 outcome: DispatchOutcome::Eager,
                 reason: Some(reason),
@@ -1843,7 +1843,7 @@ pub enum ProbedOpKind {
     TwoArm,
     /// An [`admit_cascade`] site: [`cascade_counters_for`]'s
     /// `fused`/`declined` split is the observable. `admit_cascade` has NO
-    /// `fallback_warnings`-shaped reason channel, so a decline can only ever
+    /// `fallback_notices`-shaped reason channel, so a decline can only ever
     /// be reported at the coarse `capability_or_domain_miss` grain.
     Cascade,
     /// A kernel with NO admission gate of its own: it is launched
@@ -2780,16 +2780,16 @@ mod tests {
     }
 
     #[test]
-    fn warn_fallback_once_is_idempotent_per_process() {
+    fn note_fallback_once_is_idempotent_per_process() {
         // Calling it twice with the same key must not panic, and
-        // `fallback_warnings_emitted()` must record exactly ONE entry for
+        // `fallback_notices_emitted()` must record exactly ONE entry for
         // this (op, predicate) pair regardless of how many times it fires
         // — the `seen.insert` dedup guards the push the same way it guards
-        // the `tracing::warn!` call.
-        warn_fallback_once("dedup_test_op", "dedup_predicate");
-        warn_fallback_once("dedup_test_op", "dedup_predicate");
-        warn_fallback_once("dedup_test_op", "dedup_predicate");
-        let count = fallback_warnings_emitted()
+        // the `tracing::info!` call.
+        note_fallback_once("dedup_test_op", "dedup_predicate");
+        note_fallback_once("dedup_test_op", "dedup_predicate");
+        note_fallback_once("dedup_test_op", "dedup_predicate");
+        let count = fallback_notices_emitted()
             .iter()
             .filter(|(op, predicate, _)| *op == "dedup_test_op" && *predicate == "dedup_predicate")
             .count();
@@ -2803,15 +2803,15 @@ mod tests {
     /// this drives BOTH `admit_inner` arms itself (through a dedicated,
     /// test-unique op name, so this assertion is independent of whichever
     /// other test happens to run first/concurrently) and asserts the two
-    /// recorded messages differ. It reads `fallback_warnings_emitted()`
+    /// recorded messages differ. It reads `fallback_notices_emitted()`
     /// rather than a thread-local `tracing::subscriber::set_default` guard:
     /// the guard races `tracing`'s process-global callsite `Interest` cache
     /// against every sibling test reaching the same callsite concurrently,
     /// and fails intermittently under `cargo test --test-threads=N` (8 of
-    /// 200 runs). `fallback_warnings_emitted()` has no such race.
+    /// 200 runs). `fallback_notices_emitted()` has no such race.
     #[test]
-    fn fallback_warning_messages_are_distinct_between_the_disabled_and_predicate_failure_paths() {
-        let op = "fallback_warning_distinctness_op";
+    fn fallback_notice_messages_are_distinct_between_the_disabled_and_predicate_failure_paths() {
+        let op = "fallback_notice_distinctness_op";
         let counters = DispatchCounters::new();
 
         admit_inner(
@@ -2833,17 +2833,17 @@ mod tests {
         )
         .expect("a disabled op never errors");
 
-        let warnings = fallback_warnings_emitted();
-        let predicate_failure_message = warnings
+        let notices = fallback_notices_emitted();
+        let predicate_failure_message = notices
             .iter()
             .find(|(o, p, _)| *o == op && *p == "distinctness_pred")
             .map(|(_, _, m)| m.clone())
-            .expect("predicate-failure warn must be recorded");
-        let disabled_message = warnings
+            .expect("predicate-failure notice must be recorded");
+        let disabled_message = notices
             .iter()
             .find(|(o, p, _)| *o == op && *p == "disabled_by_JAMMI_KERNELS_DISABLE")
             .map(|(_, _, m)| m.clone())
-            .expect("disabled warn must be recorded");
+            .expect("disabled notice must be recorded");
 
         assert_ne!(
             predicate_failure_message, disabled_message,
@@ -3116,23 +3116,23 @@ mod tests {
         assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
         // The observability half of cell 3: the ONLY signal that this call
         // took the eager arm because the PREDICATE failed (not because the
-        // op was disabled) is this warning — see `fallback_warnings`'s doc
+        // op was disabled) is this notice — see `fallback_notices`'s doc
         // for why this is asserted via the process-wide record rather than
         // a captured `tracing` log line. Kills the `replace
-        // warn_fallback_once with ()` mutant: deleting that call stops
+        // note_fallback_once with ()` mutant: deleting that call stops
         // this entry from ever being pushed, while `decision.reason` above
-        // (produced by `warn_predicate_failed_once`'s unconditional return
-        // value, not by the warn call's side effect) would still read
+        // (produced by `note_predicate_failed_once`'s unconditional return
+        // value, not by the notice call's side effect) would still read
         // correctly — this assertion is what that mutant needs to survive
         // past.
-        let warnings = fallback_warnings_emitted();
+        let notices = fallback_notices_emitted();
         assert!(
-            warnings.iter().any(|(op, predicate, message)| {
+            notices.iter().any(|(op, predicate, message)| {
                 *op == "lattice_op"
                     && *predicate == "pred_failed"
                     && message == "fused-kernel domain check failed; falling back to the eager composition"
             }),
-            "the predicate-failure warn must actually be recorded for (lattice_op, pred_failed); warnings={warnings:?}"
+            "the predicate-failure notice must actually be recorded for (lattice_op, pred_failed); notices={notices:?}"
         );
     }
 
@@ -3148,28 +3148,28 @@ mod tests {
     /// 9 are, and a fresh, test-unique op name so a concurrently-running
     /// test can never make this one's `disabled` observation ambiguous.
     #[test]
-    fn lattice_cell_03_predicate_failure_warn_is_recorded_through_the_real_admit() {
+    fn lattice_cell_03_predicate_failure_notice_is_recorded_through_the_real_admit() {
         if std::env::var_os("JAMMI_KERNELS_DISABLE").is_none() {
-            let op = "lattice_cell_03_real_admit_warn_op";
-            const OP: ProbedOp = test_two_arm!("lattice_cell_03_real_admit_warn_op");
+            let op = "lattice_cell_03_real_admit_notice_op";
+            const OP: ProbedOp = test_two_arm!("lattice_cell_03_real_admit_notice_op");
             let counters = DispatchCounters::new();
             let outcome = admit(
                 AdmissionMode::Fallback,
                 &OP,
-                "warn_observability_pred",
+                "notice_observability_pred",
                 false,
                 &counters,
             )
             .expect("Fallback mode never errors");
             assert_eq!(outcome, DispatchOutcome::Eager);
-            let warnings = fallback_warnings_emitted();
+            let notices = fallback_notices_emitted();
             assert!(
-                warnings.iter().any(|(o, p, m)| {
+                notices.iter().any(|(o, p, m)| {
                     *o == op
-                        && *p == "warn_observability_pred"
+                        && *p == "notice_observability_pred"
                         && m == "fused-kernel domain check failed; falling back to the eager composition"
                 }),
-                "the predicate-failure warn must be recorded through the real admit(); warnings={warnings:?}"
+                "the predicate-failure notice must be recorded through the real admit(); notices={notices:?}"
             );
         }
     }
@@ -3198,8 +3198,8 @@ mod tests {
 
     #[test]
     fn lattice_cell_05_disabled_predicate_holds_fallback_is_eager() {
-        // Closes the mutant that deletes the disabled path's own warning
-        // (`warn_disabled_once` inside `admit_inner`): `decision.reason` is
+        // Closes the mutant that deletes the disabled path's own notice
+        // (`note_disabled_once` inside `admit_inner`): `decision.reason` is
         // produced BY that call, not read from a captured log line, so a
         // mutation removing it fails to compile rather than surviving.
         let counters = DispatchCounters::new();
@@ -3221,15 +3221,15 @@ mod tests {
         assert_eq!(counters.snapshot(), DispatchSnapshot { fused: 0, eager: 1 });
         // The observability half of cell 5: the ONLY signal on this arm
         // that the fused predicate WOULD have held but the op ran eager
-        // anyway is this warning (with the fixed
+        // anyway is this notice (with the fixed
         // `disabled_by_JAMMI_KERNELS_DISABLE` key, not the call site's own
-        // predicate name) — see `fallback_warnings`'s doc. Kills the
-        // `replace warn_fallback_once_with_message with ()` mutant: that
-        // mutation removes both `warn_disabled_once`'s and
-        // `warn_predicate_failed_once`'s log line AND this push (they
+        // predicate name) — see `fallback_notices`'s doc. Kills the
+        // `replace note_fallback_once_with_message with ()` mutant: that
+        // mutation removes both `note_disabled_once`'s and
+        // `note_predicate_failed_once`'s log line AND this push (they
         // share the one function), while `decision.reason` above would
         // still read `Some(Disabled)` unaffected (it is the unconditional
-        // return value of `warn_disabled_once`, not derived from the warn
+        // return value of `note_disabled_once`, not derived from the notice
         // call's side effect) — this assertion is what that mutant needs
         // to survive past.
         //
@@ -3248,14 +3248,14 @@ mod tests {
         // (`strict_mode_disable_forces_layer_norm_eager_and_the_run_still_succeeds`
         // and its siblings), which spawns the real CLI in a fresh child
         // process for exactly this reason.
-        let warnings = fallback_warnings_emitted();
+        let notices = fallback_notices_emitted();
         assert!(
-            warnings.iter().any(|(op, predicate, message)| {
+            notices.iter().any(|(op, predicate, message)| {
                 *op == "lattice_op"
                     && *predicate == "disabled_by_JAMMI_KERNELS_DISABLE"
                     && message == "op disabled via JAMMI_KERNELS_DISABLE"
             }),
-            "the disabled-path warn must actually be recorded for (lattice_op, disabled_by_JAMMI_KERNELS_DISABLE); warnings={warnings:?}"
+            "the disabled-path notice must actually be recorded for (lattice_op, disabled_by_JAMMI_KERNELS_DISABLE); notices={notices:?}"
         );
     }
 
@@ -4063,9 +4063,9 @@ mod tests {
 
     /// An armed window records the miss AND survives the log-once dedupe: the
     /// SAME `(op, predicate)` pair captured twice, in two successive windows,
-    /// even though `fallback_warnings_emitted()` records it only the first
+    /// even though `fallback_notices_emitted()` records it only the first
     /// time. The second window is exactly the case a before/after diff of
-    /// the warn list reports as empty.
+    /// the notice list reports as empty.
     #[test]
     fn armed_window_records_a_miss_even_when_the_log_once_dedupe_suppresses_it() {
         let counters = DispatchCounters::new();
@@ -4089,12 +4089,12 @@ mod tests {
             vec![("probe_sink_dedupe_op", "probe_sink_dedupe_predicate")]
         );
 
-        let warns_after_first = fallback_warnings_emitted()
+        let notices_after_first = fallback_notices_emitted()
             .into_iter()
             .filter(|(op, _, _)| *op == "probe_sink_dedupe_op")
             .count();
         assert_eq!(
-            warns_after_first, 1,
+            notices_after_first, 1,
             "the log-once record holds exactly one entry for this pair"
         );
 
@@ -4108,11 +4108,11 @@ mod tests {
              only, never what a probe window may attribute to its own job"
         );
         assert_eq!(
-            fallback_warnings_emitted()
+            fallback_notices_emitted()
                 .into_iter()
                 .filter(|(op, _, _)| *op == "probe_sink_dedupe_op")
                 .count(),
-            warns_after_first,
+            notices_after_first,
             "and the dedupe itself is UNCHANGED — the sink is a second channel, not a \
              relaxation of the log-once contract"
         );
@@ -4396,8 +4396,8 @@ mod tests {
     }
 
     /// A `Strict`-mode predicate failure records into the window even though
-    /// it returns `Err` before any warn helper runs — the arm that has NO
-    /// entry in `fallback_warnings_emitted()` at all.
+    /// it returns `Err` before any notice helper runs — the arm that has NO
+    /// entry in `fallback_notices_emitted()` at all.
     #[test]
     fn strict_mode_predicate_failure_still_records_into_the_window() {
         let counters = DispatchCounters::new();
@@ -4416,15 +4416,15 @@ mod tests {
         assert_eq!(
             probe_capture_reason_for(&window.misses, "probe_sink_strict_op"),
             Some("probe_sink_strict_predicate"),
-            "Strict returns before warn_predicate_failed_once, so the warn list has nothing — \
+            "Strict returns before note_predicate_failed_once, so the notice list has nothing — \
              the window must still know why"
         );
         assert!(
-            !fallback_warnings_emitted()
+            !fallback_notices_emitted()
                 .into_iter()
                 .any(|(op, _, _)| op == "probe_sink_strict_op"),
-            "control: the warn list genuinely has no entry for this op, so the assertion above \
-             is not passing through the warn-list channel by accident"
+            "control: the notice list genuinely has no entry for this op, so the assertion above \
+             is not passing through the notice-list channel by accident"
         );
     }
 

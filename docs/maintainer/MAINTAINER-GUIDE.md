@@ -2720,7 +2720,7 @@ outcome through the shared mechanism:
   same `&'static` on every later call — no new hand-declared static needed.
   `DispatchCounters::snapshot()` returns a `DispatchSnapshot { fused, eager }`
   (`Relaxed` atomics).
-- **`warn_fallback_once(op, predicate)`** — a `tracing::warn!` emitted at most
+- **`note_fallback_once(op, predicate)`** — a `tracing::info!` emitted at most
   once per process per `(op, predicate)` pair, so a fallback-heavy run does not
   spam.
 - **`admit(mode, op, predicate_name, predicate_holds, counters)`** is the single

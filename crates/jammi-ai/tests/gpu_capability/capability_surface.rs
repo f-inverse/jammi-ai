@@ -237,7 +237,7 @@ fn two_arm_ops_for(dtype: DtypeClass) -> Vec<(&'static str, &'static str)> {
 /// [`PROBED_OPS`]'s [`ProbedOpKind::Cascade`] rows.
 ///
 /// Logged informationally rather than asserted `Holds`: `admit_cascade` has
-/// no `fallback_warnings`-shaped reason channel, `mem_efficient_attention`
+/// no `fallback_notices`-shaped reason channel, `mem_efficient_attention`
 /// additionally has its OWN shape/capability domain (independent of dtype) —
 /// declining on this test's tiny fixture shape is a legitimate `DomainMiss`,
 /// not evidence against f32/bf16 dtype admission — and

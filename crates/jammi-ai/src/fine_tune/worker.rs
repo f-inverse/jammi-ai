@@ -8370,7 +8370,7 @@ fn validate_backbone_precision(
 // A compute precision the public API accepts (`ComputePrecision`) is either
 // accelerated by the fused kernels or it silently runs the eager composition.
 // The fallback `tracing::warn` is deduplicated for the life of the PROCESS
-// (`jammi_kernels::admission::warn_fallback_once`), so on its own a second
+// (`jammi_kernels::admission::note_fallback_once`), so on its own a second
 // f16 job would read the same silence as a first, accelerated one. This
 // section computes a compact, per-JOB determination — computed from the SAME
 // admission predicates the kernels use, never a parallel re-derivation of
@@ -8397,7 +8397,7 @@ fn validate_backbone_precision(
 // reused verbatim, never invented here. That window is armed for exactly the
 // forward+backward+step below and records every miss on this thread,
 // independent of the log-once `(op, predicate)` dedupe
-// `fallback_warnings_emitted()` applies for LOGGING. Reading the deduped
+// `fallback_notices_emitted()` applies for LOGGING. Reading the deduped
 // warn list instead would attribute the most recent DIFFERENT predicate to a
 // job whose own miss repeated an already-burned pair — see
 // `reason_from_probe_window`'s doc. A `holds: false` op with no entry in its
@@ -8508,7 +8508,7 @@ fn dtype_class_of(
 /// `jammi_kernels::admission::snapshot_all()` (whose key set reflects only
 /// ops looked up at least once in THIS process, so an identical job would get
 /// a different report shape depending on what ran before it). Only [`jammi_kernels::admission::ProbedOpKind::TwoArm`] rows
-/// appear: a cascade has no `fallback_warnings`-shaped reason channel (the
+/// appear: a cascade has no `fallback_notices`-shaped reason channel (the
 /// flash cascade gets the report's own dedicated top-level `flash` field
 /// instead), and an `InternalSubkernel` row has no registry key for any probe
 /// to read a delta from at all.
@@ -8538,7 +8538,7 @@ const REASON_UNAVAILABLE: &str = "reason_unavailable";
 /// [`jammi_kernels::admission::probe_capture_begin`]'s sink DURING this job's
 /// probe, never a re-derived guess and never another job's entry.
 ///
-/// **Never [`jammi_kernels::admission::fallback_warnings_emitted`]'s most
+/// **Never [`jammi_kernels::admission::fallback_notices_emitted`]'s most
 /// recent entry for the op.** That list is
 /// process-lifetime AND deduplicated on `(op, predicate)` — a job whose miss
 /// repeats a pair an earlier job already burned pushes nothing, so the "most

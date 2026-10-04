@@ -13,7 +13,7 @@ use jammi_datafusion::ModelTask;
 use jammi_db::config::JammiConfig;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
-use jammi_test_utils::{cookbook_fixture, fixture_url, test_config};
+use jammi_test_utils::{fixture, fixture_url, test_config};
 use tokio::sync::watch;
 
 struct Served {
@@ -171,7 +171,7 @@ async fn healthz_stays_200_while_draining() {
                 method: FineTuneMethod::Lora,
                 task: ModelTask::TextEmbedding,
                 common: TrainingCommon {
-                    base_model: format!("local:{}", cookbook_fixture("tiny_bert").display()),
+                    base_model: format!("local:{}", fixture("tiny_bert").display()),
                     config: FineTuneConfig {
                         epochs: 20_000,
                         batch_size: 8,

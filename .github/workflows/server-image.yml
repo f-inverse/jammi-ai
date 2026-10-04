@@ -8,8 +8,8 @@ name: Server Image
 #   * the generic CPU image `jammi-ai-server` (`:latest`, `:vX.Y.Z`, …) —
 #     operator-supplied config + mounted volume; published on tags and dispatch.
 #   * the self-contained CPU image (`jammi-ai-server:selfcontained`, `:sha-…`) —
-#     baked config + `htsat_clap_tiny` encoder, boots standalone on a runtime that
-#     provides no config/volume (Cloudflare Containers). Published on
+#     baked config, boots standalone on a runtime that provides no config or
+#     volume (Cloudflare Containers). Published on
 #     dispatch when `selfcontained=true`, always from the dispatched
 #     ref (so it carries whatever the default branch has, incl.
 #     EmbeddingService) — it is never gated on a tag.
@@ -66,6 +66,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
+      lane: ci
       artifacts: >-
         server-cpu-x86_64-binary
         server-cpu-aarch64-binary
@@ -596,7 +597,7 @@ jobs:
           gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
 
   # Self-contained variant: opt-in, dispatch-only. Builds the
-  # `runtime-selfcontained` stage (baked config + encoder) from the
+  # `runtime-selfcontained` stage (baked config) from the
   # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
   # Independent of the tag-triggered generic publish above. Packages the
   # SAME `server-cpu` binary the generic CPU image does (the dispatched

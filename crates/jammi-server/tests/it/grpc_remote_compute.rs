@@ -12,7 +12,7 @@
 //!
 //! * **Round-trip parity** — the same call through either transport returns the
 //!   same result against the same engine, on realistic inputs (the `tiny_bert`
-//!   cookbook encoder over the shipped `patents` corpus, a real golden set, a
+//!   test encoder over the shipped `patents` corpus, a real golden set, a
 //!   real mutable-table definition, a real channel).
 //! * **Error parity** — a real failure returns the *same*
 //!   `JammiError` variant + fields from both transports. The mutable case is
@@ -38,13 +38,13 @@ use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::mutable::{MutableTableDefinitionBuilder, MutableTableError, MutableTableId};
 use jammi_db::ChannelId;
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::fixture;
 use tonic::transport::Endpoint;
 
 use super::common::grpc::{start_engine_server, start_engine_server_with_devices, EngineServer};
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn file_connection(name: &str, format: FileFormat) -> SourceConnection {

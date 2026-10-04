@@ -75,6 +75,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
+      lane: ci
       artifacts: >-
         jammi-x86_64-unknown-linux-gnu
         jammi-aarch64-unknown-linux-gnu

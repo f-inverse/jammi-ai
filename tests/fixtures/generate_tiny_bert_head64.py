@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a `head_dim == 64` BERT model fixture for the K4 GPU device leg.
 
-Creates cookbook/fixtures/tiny_bert_head64/ with:
+Creates tests/fixtures/tiny_bert_head64/ with:
   - config.json      (BERT config, hidden=64, 1 layer, 1 head -> head_dim=64)
   - model.safetensors (random weights in the correct tensor layout)
   - tokenizer.json    (the SAME 256-token WordPiece vocab as `tiny_bert`,
@@ -31,8 +31,8 @@ import numpy as np
 from safetensors.numpy import save_file
 
 SELF_DIR = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(SELF_DIR, "..", "..", "cookbook", "fixtures", "tiny_bert_head64")
-TINY_BERT_DIR = os.path.join(SELF_DIR, "..", "..", "cookbook", "fixtures", "tiny_bert")
+OUT = os.path.join(SELF_DIR, "..", "..", "tests", "fixtures", "tiny_bert_head64")
+TINY_BERT_DIR = os.path.join(SELF_DIR, "..", "..", "tests", "fixtures", "tiny_bert")
 
 # Model dimensions — `hidden_size / num_attention_heads == 64` is the whole
 # point of this fixture (`head_dim == 64`).

@@ -2,11 +2,6 @@
 title: "Media-tower LoRA — change, control, round trip, selectivity, and the corrupt-row contract"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `fine_tune(method="lora", task=…, target_modules=…)` on an image, a text
 and an audio tower · `encode_query` · `infer` · **Background:** LoRA — a frozen base
 weight plus a trainable low-rank update [@hu2022lora] — injected into OpenCLIP's
@@ -19,8 +14,8 @@ towers with the same `fine_tune` verb: the vision and text towers of one OpenCLI
 checkpoint (`task=` alone chooses which) and the audio tower of a CLAP checkpoint,
 each with `target_modules` naming real sites on that tower's own architecture —
 `in_proj`/`c_fc` on OpenCLIP's attention block, `query`/`value`/`linear1` on
-HTSAT-Swin. At `small` scale the towers are the committed random-weight fixtures;
-at `full`, the real checkpoints. Either way the chapter measures five things,
+HTSAT-Swin. The towers are real checkpoints from the Hugging Face Hub, LAION's
+CLIP ViT-B/32 and CLAP, at either scale. The chapter measures five things,
 because a single "the vector changed" check leaves four questions open:
 
 1. **Change** — the adapter moves the served embedding. Direction and quality are
@@ -49,8 +44,8 @@ from jammi_cookbook import encoders, fixtures, scale
 from jammi_cookbook.claims import claim
 
 SCALE = scale.current()
-IMAGE_MODEL = encoders.image(SCALE)
-AUDIO_MODEL = encoders.audio(SCALE)
+IMAGE_MODEL = encoders.IMAGE
+AUDIO_MODEL = encoders.AUDIO
 work = Path(tempfile.mkdtemp())
 home = f"file://{tempfile.mkdtemp()}"
 db = jammi.connect(home)
@@ -248,5 +243,5 @@ so it refuses the whole call rather than one row.
 > reason to exist; the control makes that change interpretable; the round trip makes
 > "saved" mean what a fresh engine can serve; selectivity keeps an adapter on its own
 > tower; and the per-row contract keeps one bad input from failing a batch. Each is
-> measured here through the same public surface a caller uses, on random fixtures at
-> `small` and on real OpenCLIP and CLAP checkpoints at `full`.
+> measured here through the same public surface a caller uses, on real OpenCLIP and
+> CLAP checkpoints.

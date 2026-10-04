@@ -17,8 +17,9 @@ name: CI
 # Every artifact the tree ships is compiled here once, by the reusable workflow
 # its publisher also calls (`_native-wheels.yml`, `_native-wheel-cu12.yml`,
 # `_server.yml`, `_cli.yml`, `_client-wheel.yml`), and every check that runs
-# one installs that build: the Python lanes, the cookbook, the book, the
-# image smokes and the CUDA image check compile nothing of their own.
+# one installs that build: the Python lanes, the live client suite, the image
+# smokes and the CUDA image check compile nothing of their own. The cookbook
+# lane (`cookbook-gpu.yml`) installs the same builds on a GPU.
 #
 # Nothing waits on work it does not consume: no job needs `check`, each
 # compile graph that would outlast the hermetic suite runs as a job of its
@@ -309,7 +310,7 @@ jobs:
       # golden-parity is opt-in (`crates/jammi-encoders/Cargo.toml`) so the
       # default workspace test build never compiles it, but it is fully
       # hermetic: the oracle is a committed PyTorch dump
-      # (`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
+      # (`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, tracked
       # binary), never a network call or a torch install. Without this step
       # `htsat_audio.rs`'s own doc claim ("eval bytes crate-wide are pinned by
       # ... tests/golden_parity.rs") describes a test that compiles and passes
@@ -734,7 +735,7 @@ jobs:
           pytest crates/jammi-python/tests -v
 
       # This lane has the native engine, so it runs the client tests that need
-      # it; the ones that also need a server run in `cookbook` below.
+      # it; the ones that also need a server run in `client-live` below.
       - name: Python client suite (with the embedded engine)
         run: |
           . .venv/bin/activate
@@ -1212,13 +1213,13 @@ jobs:
     with:
       prebuilt: true
 
-  # ── The cookbook ───────────────────────────────────────────────────────────
-  # Every recipe runs against this run's engine, server and CLI: a recipe is
-  # how a new user learns a verb, so a verb that breaks its recipe breaks
-  # here, before it merges. The same job runs the Python client's live-server
-  # suite, which needs exactly what it already has.
-  cookbook:
-    name: Recipes + live client suite
+  # ── The Python client against a live server ────────────────────────────────
+  # The client's live-server suite, over this run's engine, server and CLI and
+  # the engine's test checkpoints (`tests/fixtures`). The cookbook's recipes
+  # and chapters run real Hub models, so they run on a GPU in the cookbook
+  # lane (`cookbook-gpu.yml`), never in this hermetic workflow.
+  client-live:
+    name: Python client against a live server
     needs: [build-ci-image, native-wheel-linux-x86_64, server-cpu-x86_64, cli-x86_64]
     runs-on: ubuntu-latest
     container:
@@ -1231,19 +1232,6 @@ jobs:
         with:
           binaries: "true"
 
-      # The recipes resolve their fixtures through the `jammi_cookbook`
-      # package, as a fresh install (a Colab runtime) does; the `cloud` extra
-      # is the local S3-compatible server the cloud-storage recipe reads.
-      - name: Install the cookbook package
-        run: |
-          . .venv/bin/activate
-          pip install -e 'cookbook/book[cloud]'
-
-      - name: Run every recipe
-        run: |
-          . .venv/bin/activate
-          python tests/cookbook_smoke.py
-
       - name: Python client suite against a live server
         run: |
           . .venv/bin/activate
@@ -1252,7 +1240,8 @@ jobs:
   # ── The guide and the API reference ───────────────────────────────────────
   # The guide, with every Rust example in it compiled and run against the
   # workspace, and the rustdoc of every crate: built once per tree, as the
-  # site a release publishes (`pages.yml`), beside the book below.
+  # site a release publishes (`pages.yml`), beside the book `cookbook-gpu.yml`
+  # renders.
   docs:
     name: Guide and API reference
     needs: build-ci-image
@@ -1294,85 +1283,19 @@ jobs:
           path: _site
 
   # ── The book ───────────────────────────────────────────────────────────────
-  # Every chapter runs its capability live and checks the claims it makes, so a
-  # render IS the check. These jobs render, at `small` scale on CPU, the
-  # pages this change can move (`ci/scripts/select_render_chapters.py`), in
-  # up to four interleaved slices, against the wheels, server and CLI this run
-  # built. No skip flag, no continue-on-error: a flaky chapter is a chapter
-  # bug to fix, not a gate to soften. The return half of the engine<->cookbook
-  # loop — every public verb is run by a recipe or an executed chapter cell —
-  # is the repository guard `ci/scripts/check_cookbook_coverage.py`.
-  #
-  # When the selection is the whole book (every release's tree is one), `book`
-  # assembles the rendered pages into the book a release publishes.
-  book-plan:
-    name: Book (chapters this change can move)
-    needs: build-ci-image
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    outputs:
-      slices: ${{ steps.select.outputs.slices }}
-      whole_book: ${{ steps.select.outputs.whole_book }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # The pull request's base (or the pushed range's start) must be
-          # present for `git diff <base>...HEAD`.
-          fetch-depth: 0
-
-      # RED-proves the selection rules against synthetic fixtures before the
-      # selector is trusted with a real diff.
-      - name: Selector self-test
-        run: python3 ci/scripts/select_render_chapters.py --self-test
-
-      # A bare `git` in a container step meets "detected dubious ownership":
-      # the checkout belongs to the runner's user, not the container's.
-      - name: Mark the checkout safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Select the chapters and slice them
-        id: select
-        shell: bash
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          BEFORE: ${{ github.event.before }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT" = pull_request ]; then
-            git fetch --quiet origin "$BASE_REF"
-            base="origin/$BASE_REF"
-          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
-              && git cat-file -e "$BEFORE" 2>/dev/null; then
-            base="$BEFORE"
-          else
-            base="HEAD~1"
-          fi
-          changed="$RUNNER_TEMP/changed.txt"
-          git diff --name-only "$base...HEAD" > "$changed"
-          count="$(python3 ci/scripts/select_render_chapters.py --diff "$changed" | wc -l)"
-          n=$(( count < 4 ? count : 4 ))
-          slices='[]'
-          for k in $(seq 1 "$n"); do
-            chapters="$(python3 ci/scripts/select_render_chapters.py --diff "$changed" --slice "$k/$n" 2>/dev/null | tr '\n' ' ')"
-            slices="$(jq -c --arg s "$k/$n" --arg c "$chapters" '. + [{slice: $s, chapters: $c}]' <<< "$slices")"
-          done
-          echo "slices=$slices" >> "$GITHUB_OUTPUT"
-          python3 ci/scripts/select_render_chapters.py --diff "$changed" --whole-book 2>/dev/null >> "$GITHUB_OUTPUT"
-          jq . <<< "$slices"
-
+  # The book's checks that need no model: its API reference against the engine,
+  # its library's lint and unit tests, the no-deferral gate and its citations.
+  # Every chapter runs real Hub models and checks its claims on them, so the
+  # chapters render, and the book a release publishes is assembled, on a GPU in
+  # the cookbook lane (`cookbook-gpu.yml`). Every public verb is run by a recipe
+  # or an executed chapter cell: the repository guard
+  # `ci/scripts/check_cookbook_coverage.py`.
   book-checks:
     name: Book (API reference, lint, unit tests, citations)
     needs: [build-ci-image, native-wheel-linux-x86_64, client-wheel]
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.build-ci-image.outputs.image }}
-    env:
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      TOKENIZERS_PARALLELISM: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -1413,97 +1336,6 @@ jobs:
         run: |
           . "$GITHUB_WORKSPACE/.venv/bin/activate"
           python -m jammi.session_journal -- python scripts/check_citations.py
-
-  book-render:
-    name: Book (render ${{ matrix.slice }})
-    needs: [build-ci-image, book-plan, native-wheel-linux-x86_64, client-wheel, server-cpu-x86_64, cli-x86_64]
-    if: needs.book-plan.outputs.slices != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.book-plan.outputs.slices) }}
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    env:
-      # The determinism regime: `jammi_cookbook` also sets these on import,
-      # but pinning them in the job env covers anything that reads them first.
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
-      MKL_NUM_THREADS: "1"
-      TOKENIZERS_PARALLELISM: "false"
-    steps:
-      - uses: actions/checkout@v4
-
-      # A chapter that runs a Rust program compiles it against the workspace
-      # crates, through the compile cache `main` writes.
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          deny-warnings: false
-
-      - name: Install the client, the native engine, the server and the CLI
-        uses: ./.github/actions/install-jammi
-        with:
-          client: wheel
-          binaries: "true"
-
-      - name: Install the book
-        run: |
-          . .venv/bin/activate
-          pip install -e 'cookbook/book[book,dev]'
-
-      # The `assemble` profile records each page's execution under `_freeze/`
-      # (cookbook/book/_quarto-assemble.yml), which `book` reads.
-      - name: Render this slice's pages
-        working-directory: cookbook/book
-        env:
-          CHAPTERS: ${{ matrix.chapters }}
-        run: |
-          set -euo pipefail
-          . "$GITHUB_WORKSPACE/.venv/bin/activate"
-          for chapter in $CHAPTERS; do
-            rel="${chapter#cookbook/book/}"
-            echo "::group::quarto render $rel"
-            python -m jammi.session_journal -- quarto render "$rel" --profile assemble
-            echo "::endgroup::"
-          done
-
-      - if: needs.book-plan.outputs.whole_book == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: book-freeze-${{ strategy.job-index }}
-          path: cookbook/book/_freeze
-          retention-days: 1
-
-  # The book a release publishes, assembled from the pages the slices rendered:
-  # a whole-book render under the `assemble` profile reads each page's recorded
-  # execution and executes nothing. No Python environment is installed here and
-  # the CI image carries no Jupyter, so a page without a record fails this
-  # render rather than running here.
-  book:
-    name: Book (assemble)
-    needs: [build-ci-image, book-plan, book-render]
-    if: needs.book-plan.outputs.whole_book == 'true'
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: book-freeze-*
-          merge-multiple: true
-          path: cookbook/book/_freeze
-
-      - name: Assemble the book
-        working-directory: cookbook/book
-        run: quarto render --profile assemble
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cookbook-book
-          path: cookbook/book/_book
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The ONE check a branch-protection ruleset should require, instead of listing
@@ -1555,12 +1387,9 @@ jobs:
       - server-image-cuda
       - kube-smoke
       - compose-smoke
-      - cookbook
+      - client-live
       - docs
-      - book-plan
       - book-checks
-      - book-render
-      - book
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

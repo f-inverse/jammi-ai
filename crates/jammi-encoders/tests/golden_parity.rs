@@ -41,7 +41,7 @@ const TOL_ABS: f32 = 1e-4;
 const MIN_COS: f32 = 1.0 - 1e-5;
 
 fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/htsat_clap_tiny")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/htsat_clap_tiny")
 }
 
 /// The committed per-boundary golden activations, loaded once.

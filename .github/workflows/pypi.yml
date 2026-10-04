@@ -42,6 +42,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
+      lane: ci
       artifacts: wheels-native-linux-x86_64 wheels-native-linux-aarch64 wheels-native-macos-arm64 wheels-native-macos-x86_64
 
   # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs

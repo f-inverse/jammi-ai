@@ -3,8 +3,8 @@ name: Cookbook as published
 # The cookbook notebooks as a reader runs them: each notebook at a release tag,
 # in a fresh environment, setup cell included, so it installs that release from
 # PyPI and the cookbook from the tag (cookbook/book/scripts/run_published_notebooks.py).
-# CI's book jobs run the chapter sources against the wheels each run built;
-# only this lane sees what a reader gets from PyPI.
+# The cookbook lane (cookbook-gpu.yml) runs the chapter sources against the
+# builds a tree's CI made; only this lane sees what a reader gets from PyPI.
 #
 # Nightly against the newest `py-v*` tag on a CPU, because what a reader
 # installs changes after the tag (a dependency release, a package index

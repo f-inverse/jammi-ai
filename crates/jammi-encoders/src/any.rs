@@ -733,7 +733,7 @@ mod tests {
     /// refusals, which happen before any forward.
     fn tiny_audio(device: &Device) -> HtsatAudio {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/htsat_clap_tiny/config.json");
+            .join("../../tests/fixtures/htsat_clap_tiny/config.json");
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let cfg = crate::htsat_audio::HtsatAudioConfig::from_hf_clap_config(&json).unwrap();

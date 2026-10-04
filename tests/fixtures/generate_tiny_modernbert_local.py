@@ -38,7 +38,7 @@ Two pinned inputs are dumped, and both matter:
             an implementation that applies the band but drops padding, or that
             lets a pad token contribute, fails here while passing `unpadded`.
 
-Outputs, under cookbook/fixtures/tiny_modernbert_local/ (all committed; the
+Outputs, under tests/fixtures/tiny_modernbert_local/ (all committed; the
 Rust test needs no torch and makes no network call):
 
     config.json          tiny ModernBertConfig with real key layout
@@ -62,7 +62,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 from transformers import ModernBertConfig, ModernBertModel
 
-OUT = Path(__file__).resolve().parents[2] / "cookbook" / "fixtures" / "tiny_modernbert_local"
+OUT = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "tiny_modernbert_local"
 
 HIDDEN = 32
 INTERMEDIATE = 64

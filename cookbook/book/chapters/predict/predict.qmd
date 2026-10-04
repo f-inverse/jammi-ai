@@ -2,11 +2,6 @@
 title: "Predicting from graph context, with honest coverage"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `train_context_predictor` + `predict_with_context_predictor` +
 `conformalize_interval` + `conformalize` · **Background:** context-conditioned
 posterior (Garnelo et al. 2018 CNP; Kim et al. 2019 ANP) + conformal coverage
@@ -15,15 +10,14 @@ et al. 2023; Tibshirani et al. 2019; CF-GNN, Huang et al. 2023; NAPS, Clarkson
 et al. 2023) · **Checked:** provenance (which rows informed each prediction) +
 measurement (coverage).
 
-This is the tier Neptune structurally lacks: a **graph-conditioned
-prediction** with an honest coverage guarantee. It carries two results:
+This tier makes a **graph-conditioned prediction** with an honest coverage
+guarantee. It carries two results:
 
 1. **A regression-conformal workflow that runs end to end.** A Gaussian context
-   predictor of a paper's *year* — a high-offset target (2014–2020) that
-   collapses (std ≈ 0.001, mean ≈ 2163) unless the engine standardizes it.
-   Writing this recipe found that collapse; the engine now standardizes the
-   predictor's target and its context members' values in z-space and
-   de-standardizes what it serves. The recipe runs because of that fix.
+   predictor of a paper's *year* — a high-offset target (2014–2020), which a
+   predictor fit on raw values collapses to a near-constant output. The engine
+   standardizes the predictor's target and its context members' values in
+   z-space, and de-standardizes what it serves.
 2. **The conformal-under-shift lesson.** The dataset's time split breaks one
    crux and spares the other. The year interval *under-covers*, and the
    textbook weighted-conformal remedy moves it only a little; the
@@ -31,9 +25,10 @@ prediction** with an honest coverage guarantee. It carries two results:
    touches its score. Each outcome comes with the diagnostic that explains it.
 
 Both are findings at `full` scale (4,000 papers, `gte-modernbert-base`). At `small` scale
-every cell below runs the same computation on the 400-paper core with a
-random-weight encoder: the numbers show the pipeline at work, and the findings
-are claimed at `full` only.
+every cell below runs the same computation on the 400-paper sample with a compact
+sentence encoder: the workflow, its provenance and its marginal coverage are claimed
+at both scales, but a few hundred calibration papers are too few for the shift
+findings to stand out of their own noise, so those are claimed at `full` only.
 
 ```{python}
 import tempfile
@@ -295,9 +290,9 @@ print(f"local marginal coverage          {local_cov:.3f}")
 
 ```{python}
 max_delta = max(abs(d) for d in deltas.values())
-claim("every weighting scheme moves coverage by under two points", max_delta < 0.02,
-      f"largest move {max_delta:.3f}")
 if SCALE is scale.Scale.FULL:
+    claim("every weighting scheme moves coverage by under two points", max_delta < 0.02,
+          f"largest move {max_delta:.3f}")
     claim("and not systematically in one direction", min(deltas.values()) < 0)
 ```
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Hermetic self-consistency guard for the committed how-well held-out
-fixture (`cookbook/fixtures/finetune_heldout/`).
+fixture (`tests/fixtures/finetune_heldout/`).
 
 The fixture FILES COMMITTED there agree with EACH OTHER. No network, no
 re-mining -- every check below is a pure function of checkout content, so it
@@ -23,8 +23,8 @@ Checks:
    `per_pair_hashes` is the TRAIN pairs' already-committed `pair_sha256`
    values (`train_ids_sha256.json`, in committed row order) followed by the
    HELDOUT pairs' freshly-recomputed `_pair_sha256` values
-   (`heldout_pairs.jsonl`, in committed line order) -- the exact
-   `derive()`/`_write_manifest()` Merkle-style definition, entirely
+   (`heldout_pairs.jsonl`, in committed line order) -- the Merkle-style
+   definition the manifest's digest was computed with, entirely
    reconstructable from committed content (the train side reuses its
    already-committed hash rather than needing the train TEXT, which this
    fixture deliberately never commits).
@@ -41,7 +41,7 @@ Checks:
 
 Run: `python3 ci/scripts/perf/check_heldout_fixture_integrity.py`
 Self-test: `python3 ci/scripts/perf/check_heldout_fixture_integrity.py --self-test`
-Hermetic: reads only files under `cookbook/fixtures/finetune_heldout/`
+Hermetic: reads only files under `tests/fixtures/finetune_heldout/`
 (or a throwaway self-test fixture directory) -- no network, no build, no GPU.
 """
 
@@ -54,7 +54,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-FIXTURE_DIR = REPO_ROOT / "cookbook" / "fixtures" / "finetune_heldout"
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "finetune_heldout"
 
 # The per-pair hash definition the fixture's hashes were computed with.
 # ci/scripts/perf/verify_train_pairs.py uses the SAME definition -- both cite
@@ -349,7 +349,7 @@ def main() -> int:
         print(f"\ncheck-heldout-fixture-integrity: {len(findings)} finding(s).", file=sys.stderr)
         return 1
     print(
-        "check-heldout-fixture-integrity: PASS -- cookbook/fixtures/finetune_heldout/ is "
+        "check-heldout-fixture-integrity: PASS -- tests/fixtures/finetune_heldout/ is "
         "self-consistent (heldout_pairs.jsonl ids == heldout_ids.txt exactly and in order, "
         "manifest.json's heldout_ids_sha256/dataset_sha256 both recompute clean, NOTICE exists)."
     )

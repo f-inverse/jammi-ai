@@ -24,7 +24,7 @@
 //!   and storage backends through either transport; both always carry `file`
 //!   and `memory` backends, sorted and de-duplicated.
 //!
-//! Hermetic: the encoder is the local `tiny_bert` cookbook fixture and the
+//! Hermetic: the encoder is the local `tiny_bert` test fixture and the
 //! corpus is the bundled `patents.parquet`; no live network, no download.
 
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use jammi_ai::{Modality, ServerInfo, Session, SourceDescriptor};
 use jammi_db::catalog::result_repo::{CreateResultTableParams, Producer, ResultTableKind};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::store::CachePolicy;
-use jammi_test_utils::{cookbook_fixture, fixture};
+use jammi_test_utils::fixture;
 use tonic::transport::Endpoint;
 
 #[cfg(feature = "live-postgres-tests")]
@@ -43,7 +43,7 @@ use super::common::grpc::start_engine_server_with_broker;
 use super::common::grpc::{start_engine_server, EngineServer};
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn patents_connection() -> SourceConnection {

@@ -16,7 +16,7 @@ import tempfile
 import jammi
 from jammi_cookbook import fixtures
 
-MODEL = fixtures.model("tiny_bert")
+MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 db.add_source("corpus", url=str(fixtures.path("tiny_corpus.parquet")), format="parquet")

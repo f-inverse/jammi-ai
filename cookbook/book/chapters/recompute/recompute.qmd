@@ -2,11 +2,6 @@
 title: "Staleness and recompute — sensing a derived table's drift, and repairing it"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `generate_embeddings` → `build_neighbor_graph` → `propagate_embeddings`
 under `cache="use"` · `describe_table` · `staleness` · `derives_from` ·
 `refresh_embeddings` · `recompute(table, cascade=…)` · `verify_materialization` ·

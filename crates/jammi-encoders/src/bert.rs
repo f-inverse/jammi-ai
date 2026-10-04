@@ -1397,7 +1397,7 @@ mod tests {
     /// count what the test itself assembled.
     fn tiny_bert_fixture() -> (BertConfig, std::path::PathBuf) {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_bert");
+            .join("../../tests/fixtures/tiny_bert");
         let raw = std::fs::read_to_string(dir.join("config.json")).expect("read tiny_bert config");
         let config: BertConfig = serde_json::from_str(&raw).expect("parse BertConfig");
         (config, dir.join("model.safetensors"))

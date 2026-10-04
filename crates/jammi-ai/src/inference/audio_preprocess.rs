@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_the_real_htsat_clap_config() {
-        // The actual `cookbook/fixtures/htsat_clap_tiny/preprocessor_config.json`
+        // The actual `tests/fixtures/htsat_clap_tiny/preprocessor_config.json`
         // values must never be rejected by the domain check.
         let config = ClapFrontendConfig {
             n_mels: 32,
@@ -1737,7 +1737,7 @@ mod tests {
 
     // -- CLAP fusion front-end parity against the committed golden -----------
     //
-    // Oracle: `cookbook/fixtures/htsat_clap_frontend/goldens.safetensors`,
+    // Oracle: `tests/fixtures/htsat_clap_frontend/goldens.safetensors`,
     // dumped from the real HuggingFace `ClapFeatureExtractor`
     // (laion/clap-htsat-fused geometry, truncation="fusion") by
     // `tests/fixtures/generate_clap_frontend.py`. Hermetic: the golden is a
@@ -1760,8 +1760,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn frontend_fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/htsat_clap_frontend")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/htsat_clap_frontend")
     }
 
     /// Read the feature-extractor geometry from the committed manifest so the

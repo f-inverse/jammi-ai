@@ -77,9 +77,10 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      line, the required-arch set the consumer derives
      (`check_gpu_parity_matrix.py`'s `GENCODE_ARCHES` parser) equals the
      workflow's own matrix `arch:` list — never a hand-typed list on either
-     side — and `verdict.py`'s `CI_SUMMARY_JOB` is the job `ci.yml`'s
+     side — `verdict.py`'s `CI_SUMMARY_JOB` is the job `ci.yml`'s
      `ci-summary` call of `_summary.yml` reports (`<caller id> / <callee
-     job id>`, neither renamed by a `name:`).
+     job id>`, neither renamed by a `name:`), and `verdict.py`'s
+     `COOKBOOK_JOB` is the `name:` of a job in `cookbook-gpu.yml`.
 
   P5 (the reusable actually consults the verdict): P3 only checks a gate
      job's `uses:` line, so gutting
@@ -892,6 +893,9 @@ PAID_POD_LANE_TABLE: dict[str, str] = {
     "ci/scripts/runpod_gpu_howwell.sh": "gpu-howwell.yml",
     # The published cookbook notebooks on an L4, dispatched after a release.
     "ci/scripts/runpod_cookbook_published.sh": "cookbook-published-gpu.yml",
+    # Every recipe and page on real models over a tree's own builds, on an
+    # L4: the release-gating cookbook lane.
+    "ci/scripts/runpod_cookbook_gpu.sh": "cookbook-gpu.yml",
     # gpu-dev.sh IS deploy-capable (it can `up` a pod as well as `reap`
     # one), and its one real invoker, gpu-reap.yml, carries RUNPOD_API_KEY
     # at step scope to authenticate the reap call. The whole-file-scope
@@ -2871,7 +2875,25 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
                 f"P4: {PROVE_PRODUCER_WORKFLOW}'s matrix arch list {sorted(workflow_arches)} != "
                 f"shipped GENCODE_ARCHES {sorted(shipped_arches)}"
             )
-    return findings + _check_ci_summary_name(workflow_texts)
+    return findings + _check_ci_summary_name(workflow_texts) + _check_cookbook_job_name(workflow_texts)
+
+
+def _check_cookbook_job_name(workflow_texts: dict[str, str]) -> list[str]:
+    """`verdict.COOKBOOK_JOB` is the `name:` of a job in `cookbook-gpu.yml`,
+    the name the API reports for the measurement the release gate reads."""
+    text = workflow_texts.get(verdict.COOKBOOK_WORKFLOW)
+    if text is None:
+        return [f"P4: {verdict.COOKBOOK_WORKFLOW} is missing -- cannot verify verdict.COOKBOOK_JOB"]
+    stripped = drop_comment_lines(text)
+    jobs, err = jobs_or_fail(stripped)
+    if err is not None:
+        return [f"P4: {verdict.COOKBOOK_WORKFLOW}: {err}"]
+    lines = stripped.splitlines()
+    want = f"name: {verdict.COOKBOOK_JOB}"
+    if any(lines[i].startswith("    ") and lines[i].strip() == want
+           for start, end in jobs.values() for i in range(start, end)):
+        return []
+    return [f"P4: no job in {verdict.COOKBOOK_WORKFLOW} is named `{verdict.COOKBOOK_JOB}` (verdict.COOKBOOK_JOB)"]
 
 
 def _check_ci_summary_name(workflow_texts: dict[str, str]) -> list[str]:

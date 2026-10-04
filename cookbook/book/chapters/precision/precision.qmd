@@ -2,11 +2,6 @@
 title: "Storage precision: quantize the index, keep the answer — retrieve→rescore"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** a deployment-default `storage_precision` (`f32` / `f16` / `int8`) on the ANN
 sidecar index, set through `jammi.connect(..., config=...)` · the two-stage
 retrieve→rescore path (`k * oversample` quantized candidates, exact-`f32` re-ranked) ·
@@ -90,15 +85,15 @@ print(f"int8 rescore companion (.rawf32): {int8_bytes['rawf32']:,} bytes")
 claim(f"int8 at the default oversample keeps f32's recall@{K} to within a point",
       recall_int8 >= recall_f32 - 0.01, f"{recall_int8:.4f} against {recall_f32:.4f}")
 claim("an int8 graph is smaller than an f32 one", graph_ratio < 1.0, f"ratio {graph_ratio:.4f}")
-if SCALE is scale.Scale.FULL:
-    claim("at a real embedding width the vectors dominate the graph", graph_ratio < 0.5)
+claim("at a real embedding width the vectors dominate the graph", graph_ratio < 0.5,
+      f"ratio {graph_ratio:.4f}")
 ```
 
 The two-stage design at work: the graph a search traverses is small and lossy, but the
 *answer* is re-derived from exact vectors before it is returned. How much smaller depends
 on the vector width: a graph stores each vector and its links, and quantization shrinks
-only the vector — at a real embedding's hundreds of dimensions the vectors dominate and
-the graph falls to about a quarter; at the fixture encoder's 32 the links weigh as much.
+only the vector — at a real embedding's hundreds of dimensions the vectors dominate, and
+the graph falls to about a third of its `f32` size.
 
 ### The honest complication: the rescore companion is not free
 

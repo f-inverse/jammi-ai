@@ -218,7 +218,7 @@ fn write_json(dir: &Path, name: &str, value: &serde_json::Value) {
 
 fn write_tokenizer(dir: &Path) {
     std::fs::copy(
-        harness::cookbook_fixture("tiny_bert").join("tokenizer.json"),
+        harness::fixture("tiny_bert").join("tokenizer.json"),
         dir.join("tokenizer.json"),
     )
     .unwrap();

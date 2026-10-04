@@ -39,6 +39,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
+      lane: ci
       artifacts: server-cu12-x86_64-wheel
 
   proof:

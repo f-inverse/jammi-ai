@@ -2,11 +2,6 @@
 title: "Calibration & uncertainty — proper scores, ECE, sharpness, and the PIT"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `eval_calibration(shape="gaussian")` + a client-local PIT / reliability
 fold · **Background:** proper scoring rules (CRPS, NLL) [@gneiting2007; @matheson1976],
 the sharpness-subject-to-calibration paradigm [@gneiting2007sharpness], expected

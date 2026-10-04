@@ -163,7 +163,7 @@ fn assert_lora_site_name_vocabulary(what: &str, build: &dyn Fn(&[&str]) -> AnyEn
 #[test]
 fn bert_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
-    let dir = repo_root().join("cookbook/fixtures/tiny_bert");
+    let dir = repo_root().join("tests/fixtures/tiny_bert");
     let config: BertConfig =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let weights = dir.join("model.safetensors");
@@ -211,7 +211,7 @@ fn distilbert_lora_site_names_are_exactly_its_selectable_sites() {
 #[test]
 fn modernbert_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
-    let dir = repo_root().join("cookbook/fixtures/tiny_modernbert_classifier");
+    let dir = repo_root().join("tests/fixtures/tiny_modernbert_classifier");
     let config: ModernBertConfig =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let weights = dir.join("model.safetensors");
@@ -233,7 +233,7 @@ fn modernbert_lora_site_names_are_exactly_its_selectable_sites() {
 }
 
 fn open_clip_json() -> serde_json::Value {
-    let path = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_config.json");
+    let path = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_config.json");
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
@@ -241,7 +241,7 @@ fn open_clip_json() -> serde_json::Value {
 fn clip_text_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
     let config = ClipTextConfig::from_open_clip_config(&open_clip_json()).unwrap();
-    let weights = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_model.safetensors");
+    let weights = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_model.safetensors");
 
     let build = |targets: &[&str]| -> AnyEncoder {
         let t = Targets::new(targets);
@@ -261,7 +261,7 @@ fn clip_text_lora_site_names_are_exactly_its_selectable_sites() {
 fn open_clip_vision_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
     let config = OpenClipVisionConfig::from_open_clip_config(&open_clip_json()).unwrap();
-    let weights = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_model.safetensors");
+    let weights = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_model.safetensors");
 
     let build = |targets: &[&str]| -> AnyEncoder {
         let t = Targets::new(targets);
@@ -280,7 +280,7 @@ fn open_clip_vision_lora_site_names_are_exactly_its_selectable_sites() {
 #[test]
 fn htsat_lora_site_names_are_exactly_its_selectable_sites() {
     let device = Device::Cpu;
-    let dir = repo_root().join("cookbook/fixtures/htsat_clap_tiny");
+    let dir = repo_root().join("tests/fixtures/htsat_clap_tiny");
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     let config = HtsatAudioConfig::from_hf_clap_config(&json).unwrap();
@@ -310,7 +310,7 @@ fn both_open_clip_towers_report_one_shared_vocabulary() {
     let json = open_clip_json();
     let tcfg = ClipTextConfig::from_open_clip_config(&json).unwrap();
     let vcfg = OpenClipVisionConfig::from_open_clip_config(&json).unwrap();
-    let weights = repo_root().join("cookbook/fixtures/tiny_open_clip/open_clip_model.safetensors");
+    let weights = repo_root().join("tests/fixtures/tiny_open_clip/open_clip_model.safetensors");
 
     let t = Targets::new(&[]);
     let tvm = VarMap::new();
@@ -345,7 +345,7 @@ fn both_open_clip_towers_report_one_shared_vocabulary() {
 fn the_bert_family_vocabularies_are_pairwise_distinct() {
     let device = Device::Cpu;
 
-    let bert_dir = repo_root().join("cookbook/fixtures/tiny_bert");
+    let bert_dir = repo_root().join("tests/fixtures/tiny_bert");
     let bert_config: BertConfig =
         serde_json::from_str(&std::fs::read_to_string(bert_dir.join("config.json")).unwrap())
             .unwrap();
@@ -366,7 +366,7 @@ fn the_bert_family_vocabularies_are_pairwise_distinct() {
             .unwrap(),
     );
 
-    let mb_dir = repo_root().join("cookbook/fixtures/tiny_modernbert_classifier");
+    let mb_dir = repo_root().join("tests/fixtures/tiny_modernbert_classifier");
     let mb_config: ModernBertConfig =
         serde_json::from_str(&std::fs::read_to_string(mb_dir.join("config.json")).unwrap())
             .unwrap();

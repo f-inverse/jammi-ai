@@ -2,11 +2,6 @@
 title: "Change-data-capture on a trigger topic — publish, filtered subscribe, resume"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `register_topic` · `publish_topic` · `subscribe_collect`
 (`predicate` / `from_offset` / `replay_only` / `max_batches`) · `list_topics` ·
 **Background:** the offset-addressed, append-only commit log — Kafka-style publish →

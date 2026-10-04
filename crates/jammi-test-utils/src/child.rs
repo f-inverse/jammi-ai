@@ -5,8 +5,8 @@
 //! on the pipe's own kernel buffer surviving a chatty or long-lived child.
 //! [`DrainedChild::wait_bounded`] then waits for exit against a ceiling
 //! measured from either [`Epoch::Spawn`] or [`Epoch::Call`], performs a
-//! short, bounded "settle" (waiting for the reader threads to observe EOF,
-//! but never indefinitely — see "Precondition for a complete log"), and
+//! short "settle" (waiting for the reader threads to finish the child's
+//! output — see "Precondition for a complete log" for what bounds it), and
 //! reports the outcome as a [`Capture`].
 //!
 //! A `Capture` separates its outcome into four independent axes a caller
@@ -14,7 +14,7 @@
 //! `Capture::killed` (was the child forcibly terminated?), `Capture::hung`
 //! (was that termination a genuine hang, as opposed to racing a normal
 //! exit?), `Capture::complete` ([`Completeness`]; did the reader threads
-//! themselves reach a clean EOF before the settle bound?), and per-stream
+//! themselves read the child's whole output?), and per-stream
 //! truncation (`Capture::stdout_truncated`/`stderr_truncated`; did the
 //! retention cap drop bytes?). [`Capture::is_trustworthy`] is the single
 //! predicate that ANDs completeness and truncation together for a caller
@@ -83,20 +83,17 @@
 //!   to inspect via `Capture::status` directly, not a hang this driver
 //!   detected and terminated.
 //! - `Capture::complete` ([`Completeness`]) — the READER-THREAD axis only:
-//!   did both reader threads conclude `Eof` before the ~1 s settle bound
-//!   expired? On unix `Eof` is not necessarily a literal closed pipe: once
-//!   `wait_bounded` has reaped the child, a reader that finds the pipe idle
-//!   on one 50 ms poll concludes `Eof` for THAT CHILD's bytes, regardless
-//!   of whether some other process still holds the write end open (see
-//!   "Precondition for a complete log") — a foreign holder only produces
-//!   `SettleExpired` if it keeps writing with gaps shorter than that 50 ms
-//!   window; a foreign grandchild's own later bytes, in either case, are
-//!   never part of this child's evidence. `hung: false` and
-//!   `SettleExpired` can both be true together (a fast-writing foreign
-//!   holder), and so can `hung: true` and `Completeness::Complete` (a
-//!   killed child whose own readers conclude `Eof` the moment the confirmed
-//!   exit's next idle poll lands). It says nothing about the retention cap
-//!   — see the previous section.
+//!   did both reader threads read every byte the child wrote? On unix that
+//!   is decided by the bytes, not by a clock: once `wait_bounded` has reaped
+//!   the child, each reader reads exactly what its pipe holds at that point
+//!   and concludes `Eof` for THAT CHILD's bytes, whatever some other process
+//!   holding the write end does — stays silent or keeps writing (see
+//!   "Precondition for a complete log"). `SettleExpired` means a reader had
+//!   not finished when the settle bound expired, which on unix only a child
+//!   that was never reaped leaves possible. `hung: true` and
+//!   `Completeness::Complete` can both be true together (a killed child that
+//!   was reaped). It says nothing about the retention cap — see the
+//!   previous section.
 //! - `Capture::is_trustworthy()` — the single predicate a consumer should
 //!   gate a "this evidence is whole" decision on: `complete ==
 //!   Completeness::Complete` AND no `wait_error` AND neither stream was
@@ -126,13 +123,15 @@
 //! ever produce is already sitting in the pipe by the time `wait_bounded`
 //! confirms the exit. On unix this is the completeness mechanism itself,
 //! not an afterthought: each reader thread polls its fd (`libc::poll`, 50 ms
-//! timeout) rather than blocking in `read()`, and once `wait_bounded` has
-//! reaped the child, an empty poll means the reader concludes `Eof`
-//! immediately — it does NOT wait for the pipe to actually close, so
-//! **something else merely holding the write end open (without writing to
-//! it) does not delay completeness at all**, regardless of why that other
-//! holder has the fd. Two distinct things can put another fd on the same
-//! pipe:
+//! timeout) rather than blocking in `read()`, and once it observes that
+//! `wait_bounded` has reaped the child it asks the pipe how many bytes it
+//! holds (`FIONREAD`), reads exactly that many, and concludes `Eof`. A pipe
+//! is first in, first out, so those bytes contain every byte of the child's
+//! the reader had not yet read; the reader does NOT wait for the pipe to
+//! actually close, and **something else holding the write end open —
+//! silently or while writing to it — does not delay completeness at all**,
+//! regardless of why that other holder has the fd. Two distinct things can
+//! put another fd on the same pipe:
 //!
 //! 1. **An fd-inheriting grandchild.** A child that spawns a grandchild
 //!    without redirecting the grandchild's stdio inherits the pipe.
@@ -152,27 +151,17 @@
 //!    atomic there).
 //!
 //! What actually keeps completeness correct regardless of either cause is
-//! the poll-based reader above: a silent fd-holder from either cause is
-//! invisible to it (no `POLLIN` ever arrives from it, so the first empty
-//! poll after the confirmed exit ends the reader). The ONE case that still
-//! produces `Completeness::SettleExpired` is a holder that keeps *writing*,
-//! with gaps shorter than the reader's 50 ms poll timeout, after the target
-//! child exits — a live grandchild in a tight write loop, say — because that
-//! keeps `POLLIN` arriving before the reader ever sees an idle poll, so it
-//! keeps draining; a holder with LONGER gaps between writes (say, one line
-//! every 500 ms) instead presents an idle poll during one of those gaps and
-//! is indistinguishable from a finished stream, so it is `Complete` too, not
-//! `SettleExpired` — the mechanism cannot tell "paused" from "done" on any
-//! single poll, only "still actively streaming" from "not". For a genuinely
-//! tight writer, `finish_drained`'s settle bound (about 1 s) is what
-//! eventually gives up, a rarely-hit fallback rather than the primary
-//! mechanism. Either way `wait_bounded` still returns promptly
-//! with `hung == false` (never a hang), but `Capture::complete` reports
-//! `Completeness::SettleExpired` and the returned log can be missing
-//! whatever the other writer produces after the settle bound — honest,
-//! never `Completeness::Complete`. The non-unix fallback reader has none of
-//! this: it blocks in `read()` until an actual EOF, so both causes above
-//! still delay it there.
+//! that boundary: it is fixed by what the pipe holds when the reader
+//! observes the exit, not by how long the pipe then stays quiet, so neither
+//! a holder's silence nor its writing — nor how the scheduler interleaves it
+//! with the reader — can move it. The 50 ms poll timeout bounds only how
+//! soon a reader notices the exit. Whatever another writer put in the pipe
+//! before that point is captured alongside the child's bytes (a pipe cannot
+//! tell writers apart); nothing it writes after is read. The non-unix
+//! fallback reader has none of this: it blocks in `read()` until an actual
+//! EOF, so a holder from either cause delays it until `finish_drained`'s
+//! settle bound (about 1 s) gives up, leaving
+//! `Completeness::SettleExpired`.
 //!
 //! # The undrained differential
 //!
@@ -235,9 +224,9 @@ fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// racing `fork` would mis-inherit lands at an arbitrary, a-priori-unknown
 /// descriptor number in the *other* process's fd table — nothing in that
 /// process's own code (e.g. `eprintln!`, hardcoded to fd 2) ever writes to
-/// it, so the poll-based reader's "an idle fd is done" rule (see
-/// `spawn_reader`) already treats a mis-inherited-but-never-written-to fd as
-/// harmless regardless of whether this lock ran. A test that could write to
+/// it, and the reader's resident-bytes boundary (see `spawn_reader`) treats a
+/// mis-inherited fd as harmless regardless of whether this lock ran. A test
+/// that could write to
 /// that specific, unpredictable fd number would need to enumerate the
 /// process's own open descriptors, which this suite does not do.
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
@@ -323,30 +312,21 @@ enum ReaderOutcome {
 /// [`Completeness`] can distinguish a clean EOF from a read error.
 ///
 /// On unix, this polls `pipe`'s fd with a 50 ms timeout rather than blocking
-/// in `read()`: a reaped child cannot write again (process exit precedes
-/// `waitpid`/`try_wait` observing it, and all of the child's writes are
-/// already resident in the pipe by then), so once `child_exited` is set
-/// (by `DrainedChild::wait_bounded`, the instant it reaps the child) an empty
-/// poll means every byte this child will ever produce has already been read
-/// — the reader concludes `Eof` without waiting for an actual close-on-exec
-/// EOF, which an unrelated process holding an inherited pipe end (see the
-/// module doc's "Precondition for a complete log", cause 2) could delay
-/// indefinitely. A grandchild that keeps writing keeps `POLLIN` arriving, so
-/// this reader keeps draining it and never falsely concludes `Eof` — that
-/// case still relies on `finish_drained`'s bounded settle, now a rarely-hit
-/// fallback rather than the primary mechanism.
+/// in `read()`, so it notices `child_exited` (set by
+/// `DrainedChild::wait_bounded` the instant it reaps the child) even while
+/// another process holds the pipe open. A reaped child cannot write again
+/// (process exit precedes `waitpid`/`try_wait` observing it), so once the
+/// flag reads `true` every byte of the child's is either already read or
+/// resident in the pipe: the reader reads exactly the resident bytes
+/// ([`read_resident`]) and concludes `Eof` — without waiting for an actual
+/// close, which an unrelated holder of an inherited pipe end (see the module
+/// doc's "Precondition for a complete log") could delay indefinitely, and
+/// without reading anything such a holder writes afterward.
 ///
-/// `child_exited` is loaded **before** calling `poll`, not after it returns
-/// — loading it afterward would leave the interval between "poll observed
-/// nothing" and "we read the flag" unprotected: a child that writes its
-/// final line, exits, and is reaped inside that interval would have that
-/// poll's empty result (computed strictly before the write) paired with a
-/// newly-true flag, and the reader would conclude `Eof` having never
-/// actually re-checked the pipe after the write landed — silently dropping
-/// it. Loading the flag first instead guarantees that if it reads `true`,
-/// the `poll` call that follows runs strictly after the confirmed exit (and
-/// therefore strictly after every byte the child will ever write), so an
-/// empty result from *that* `poll` is genuinely final.
+/// The resident count is taken only after the flag reads `true`, on this
+/// same thread, so it is measured strictly after the confirmed exit and
+/// covers the child's final write however the child's last write, its exit
+/// and the reap interleave with this loop's polls.
 #[cfg(unix)]
 fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
     mut pipe: R,
@@ -355,10 +335,11 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
     outcome: Arc<Mutex<Option<ReaderOutcome>>>,
     child_exited: Arc<AtomicBool>,
     // Test-only hook, invoked exactly once, right after `poll` returns 0
-    // and BEFORE `exited_before_poll` is consulted -- lets a test pin the
-    // exact TOCTOU interleaving the fn doc above describes (child writes
-    // its final line, exits, and is reaped) deterministically instead of
-    // hoping wall-clock timing lands in that interval. Does not exist in
+    // and BEFORE the loop checks `child_exited` again -- lets a test pin the
+    // interleaving the fn doc above describes (the child writes its final
+    // line, exits, and is reaped between two of this loop's checks)
+    // deterministically instead of hoping wall-clock timing lands in that
+    // interval. Does not exist in
     // non-test builds: zero cost, no public API, and it cannot affect the
     // shipped driver's behavior even in a `cfg(test)` build of a consuming
     // crate, since it is private to this module and always `None` at both
@@ -368,9 +349,16 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
     thread::spawn(move || {
         let fd = pipe.as_raw_fd();
         let mut chunk = [0u8; 8192];
-        loop {
-            // See the fn doc: this MUST be read before `poll`, not after.
-            let exited_before_poll = child_exited.load(Ordering::SeqCst);
+        let record = |data: &[u8]| {
+            lock_or_recover(&buf).push(data);
+            if let Some(lb) = &last_byte {
+                *lock_or_recover(lb) = Some(Instant::now());
+            }
+        };
+        let ended = loop {
+            if child_exited.load(Ordering::SeqCst) {
+                break read_resident(&mut pipe, &mut chunk, record);
+            }
             let mut pollfd = libc::pollfd {
                 fd,
                 events: libc::POLLIN,
@@ -385,60 +373,82 @@ fn spawn_reader<R: Read + AsRawFd + Send + 'static>(
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                *lock_or_recover(&outcome) = Some(ReaderOutcome::Error(err.to_string()));
-                break;
+                break Err(err.to_string());
             }
             if ret == 0 {
                 #[cfg(test)]
                 if let Some(hook) = ready_hook.take() {
                     hook();
                 }
-                // Timed out: nothing available right now. Safe to conclude
-                // `Eof` only because the exit was already confirmed BEFORE
-                // this specific `poll` call ran (see the fn doc).
-                if exited_before_poll {
-                    *lock_or_recover(&outcome) = Some(ReaderOutcome::Eof);
-                    break;
-                }
                 continue;
             }
             let revents = pollfd.revents;
             if revents & libc::POLLIN != 0 {
                 match pipe.read(&mut chunk) {
-                    Ok(0) => {
-                        *lock_or_recover(&outcome) = Some(ReaderOutcome::Eof);
-                        break;
-                    }
-                    Ok(n) => {
-                        lock_or_recover(&buf).push(&chunk[..n]);
-                        if let Some(lb) = &last_byte {
-                            *lock_or_recover(lb) = Some(Instant::now());
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        *lock_or_recover(&outcome) = Some(ReaderOutcome::Error(e.to_string()));
-                        break;
-                    }
+                    Ok(0) => break Ok(()),
+                    Ok(n) => record(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => break Err(e.to_string()),
                 }
             } else if revents & libc::POLLERR != 0 {
-                *lock_or_recover(&outcome) = Some(ReaderOutcome::Error(
-                    "poll reported POLLERR on the pipe fd".to_string(),
-                ));
-                break;
+                break Err("poll reported POLLERR on the pipe fd".to_string());
             } else if revents & libc::POLLHUP != 0 {
                 // Peer closed with nothing left buffered (POLLIN would also
                 // be set if there were still bytes to drain) -- a real EOF.
-                *lock_or_recover(&outcome) = Some(ReaderOutcome::Eof);
-                break;
+                break Ok(());
             }
             // Any other spurious wakeup: loop and poll again.
-        }
+        };
+        *lock_or_recover(&outcome) = Some(match ended {
+            Ok(()) => ReaderOutcome::Eof,
+            Err(e) => ReaderOutcome::Error(e),
+        });
     })
 }
 
-/// Non-unix fallback: plain blocking `read()` to EOF, with no `poll`-based
-/// short-circuit on `child_exited` (that mechanism is unix-`poll`-specific).
+/// Read exactly the bytes resident in `pipe` now, handing each chunk to
+/// `record`, and no more: whatever another writer adds afterward is never
+/// waited for or read. Never blocks on a writer — the bytes it asks for are
+/// already in the pipe, and the calling reader thread is the pipe's only
+/// reader.
+#[cfg(unix)]
+fn read_resident<R: Read + AsRawFd>(
+    pipe: &mut R,
+    chunk: &mut [u8],
+    record: impl Fn(&[u8]),
+) -> Result<(), String> {
+    let mut remaining =
+        resident_bytes(pipe.as_raw_fd()).map_err(|e| format!("FIONREAD on the pipe fd: {e}"))?;
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        match pipe.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                record(&chunk[..n]);
+                remaining -= n;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// The number of bytes waiting in the pipe behind `fd` (`FIONREAD`).
+#[cfg(unix)]
+fn resident_bytes(fd: std::os::unix::io::RawFd) -> io::Result<usize> {
+    let mut resident: libc::c_int = 0;
+    // SAFETY: `FIONREAD` writes one `c_int` through its argument, which
+    // points at `resident`, a live stack local of exactly that type.
+    if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut resident as *mut libc::c_int) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(resident)
+        .map_err(|_| io::Error::other(format!("FIONREAD reported {resident} bytes")))
+}
+
+/// Non-unix fallback: plain blocking `read()` to EOF, with no resident-bytes
+/// boundary on `child_exited` (that mechanism needs `poll` and `FIONREAD`).
 /// This platform relies solely on `finish_drained`'s bounded settle for the
 /// cases the module doc's "Precondition for a complete log" describes.
 #[cfg(not(unix))]
@@ -448,8 +458,8 @@ fn spawn_reader<R: Read + Send + 'static>(
     last_byte: Option<Arc<Mutex<Option<Instant>>>>,
     outcome: Arc<Mutex<Option<ReaderOutcome>>>,
     _child_exited: Arc<AtomicBool>,
-    // See the unix `spawn_reader`'s doc -- this mechanism is unix-`poll`-
-    // specific, so the hook is accepted for call-site parity but unused.
+    // See the unix `spawn_reader`'s doc -- this mechanism is unix-specific,
+    // so the hook is accepted for call-site parity but unused.
     #[cfg(test)] _ready_hook: Option<Box<dyn FnOnce() + Send>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -487,10 +497,10 @@ struct Readers {
     stdout_outcome: Arc<Mutex<Option<ReaderOutcome>>>,
     stderr_outcome: Arc<Mutex<Option<ReaderOutcome>>>,
     /// Set by `wait_bounded` the instant it reaps the child (`try_wait`
-    /// returns `Some`), read by both reader threads on unix to conclude
-    /// `Eof` as soon as an empty poll follows a confirmed exit, rather than
-    /// waiting for an actual pipe close that an unrelated fd-holder could
-    /// delay indefinitely. See `spawn_reader`.
+    /// returns `Some`), read by both reader threads on unix to read what
+    /// their pipe then holds and conclude `Eof`, rather than waiting for an
+    /// actual pipe close that an unrelated fd-holder could delay
+    /// indefinitely. See `spawn_reader`.
     child_exited: Arc<AtomicBool>,
     stdout_handle: JoinHandle<()>,
     stderr_handle: JoinHandle<()>,
@@ -637,8 +647,8 @@ impl DrainedChild {
     ///
     /// - On a normal exit, `disposition` reports `hung: false` — even if a
     ///   kill was already issued for this same call (see "hung vs killed vs
-    ///   complete" in the module doc). Settles (waits up to ~1 s for both
-    ///   reader threads to observe EOF), snapshots, and returns.
+    ///   complete" in the module doc). Settles (waits for both reader
+    ///   threads to finish — see below), snapshots, and returns.
     /// - On the ceiling (or a `try_wait` error, which is treated the same
     ///   way rather than silently reported as a clean exit): kills the child
     ///   (`Capture::killed = true`) and reaps by polling `try_wait` for up to
@@ -649,9 +659,15 @@ impl DrainedChild {
     ///   recorded in `Capture::wait_error`. Then performs the same settle and
     ///   snapshots.
     ///
-    /// Bounded on both paths **for the drained driver**: at most `ceiling`
-    /// plus roughly 2 s (reap + settle) — see [`Completeness`] for what the
-    /// settle bound can leave incomplete. The `cfg(test)` undrained driver's
+    /// The settle waits for a reaped child's readers without a time bound on
+    /// unix — they read only what the pipe already holds, so nothing another
+    /// process does can hold them — and up to ~1 s otherwise (a child never
+    /// reaped still owns its pipes, and the non-unix reader blocks until
+    /// every holder closes). So the call is bounded on both paths **for the
+    /// drained driver**: at most `ceiling` plus roughly 2 s (reap + settle)
+    /// plus, on unix, the time to read what a reaped child left in its
+    /// pipes — see [`Completeness`] for what the settle bound can leave
+    /// incomplete. The `cfg(test)` undrained driver's
     /// exit path is *not* bounded this way: it calls `wait_with_output`,
     /// which itself blocks until EOF, so an fd-inheriting grandchild can hold
     /// it open indefinitely.
@@ -739,12 +755,18 @@ impl DrainedChild {
             stderr_handle,
         } = readers;
 
-        let settle_deadline = Instant::now() + Duration::from_secs(1);
+        // A reaped child's unix readers are certain to finish: they read
+        // only bytes already in the pipe (see `spawn_reader`), so waiting for
+        // them waits on those bytes, never on a clock or another process.
+        // Anywhere else a reader can be held indefinitely, so the wait is
+        // bounded.
+        let settle_deadline =
+            (!(cfg!(unix) && status.is_some())).then(|| Instant::now() + Duration::from_secs(1));
         loop {
             if stdout_handle.is_finished() && stderr_handle.is_finished() {
                 break;
             }
-            if Instant::now() >= settle_deadline {
+            if settle_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
@@ -754,7 +776,8 @@ impl DrainedChild {
         let stderr_done = stderr_handle.is_finished();
         // Unfinished readers are detached by necessity: joining one that has
         // not observed EOF would block past the settle bound just enforced
-        // above (the fd-inheriting-grandchild case). They keep running
+        // above (a child never reaped, or a non-unix reader an fd-inheriting
+        // grandchild holds open). They keep running
         // against their shared Arc<Mutex<..>> buffers, harmlessly, until the
         // pipe's last writer eventually closes it.
         let stdout_panic = join_if_finished(stdout_done, stdout_handle);
@@ -1033,22 +1056,19 @@ fn joined_or_none(errors: Vec<String>) -> Option<String> {
 /// section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completeness {
-    /// Both reader threads concluded `Eof` before the ~1 s settle bound
-    /// expired. On unix this is not necessarily a literal closed pipe: once
-    /// the child is confirmed reaped, an idle 50 ms poll is treated as
-    /// `Eof` for that child's own bytes (a reaped child cannot write
-    /// again). A foreign process that still holds the write end open, but
-    /// is not itself writing faster than that 50 ms window, is
-    /// indistinguishable from "done" on any single poll and lands here too
-    /// — see the module doc's "Precondition for a complete log".
+    /// Both reader threads concluded `Eof`. On unix this is not necessarily
+    /// a literal closed pipe: once the child is confirmed reaped, a reader
+    /// reads exactly the bytes then resident in its pipe and concludes `Eof`
+    /// for that child's own bytes (a reaped child cannot write again),
+    /// whatever a foreign holder of the write end does — see the module
+    /// doc's "Precondition for a complete log".
     Complete,
     /// At least one reader thread had not concluded `Eof` when the settle
-    /// bound expired — on unix this means it kept observing `POLLIN` (new
-    /// data) with gaps shorter than the 50 ms poll timeout even after the
-    /// target child was confirmed reaped: a foreign process (e.g. an
-    /// fd-inheriting grandchild) still ACTIVELY WRITING, not merely holding
-    /// the pipe open — a silent holder is folded into `Complete` instead
-    /// (see the module doc's "Precondition for a complete log"). The
+    /// bound expired. On unix only a child that was never reaped (a
+    /// `SIGKILL` reap give-up) leaves this possible, since a reaped child's
+    /// readers are always waited for; on other platforms a reader blocks in
+    /// `read()` until every holder of the write end closes it, so an
+    /// fd-inheriting grandchild that outlives the bound leaves this too. The
     /// unfinished thread(s) are left running, detached by necessity, until
     /// the pipe's last writer eventually closes it.
     SettleExpired,
@@ -1101,12 +1121,11 @@ pub struct Capture {
     /// Absolute stamp of when this `Capture` was constructed (post-settle).
     pub returned_at: Instant,
     /// The READER-THREAD completeness axis only: whether both reader
-    /// threads concluded `Eof` before the settle bound expired. On unix
-    /// this is synthesized from an idle poll after the child is confirmed
-    /// reaped, not a literal observed pipe close — see
-    /// [`Completeness::Complete`] for the exact boundary (a foreign holder
-    /// that writes slower than the 50 ms poll timeout is folded in here
-    /// too). `Completeness::Undrained` for a `Capture` from the `cfg(test)`
+    /// threads concluded `Eof`. On unix that means each read every byte
+    /// resident in its pipe when the child was confirmed reaped, not
+    /// necessarily that it observed the pipe close — see
+    /// [`Completeness::Complete`] for the exact boundary.
+    /// `Completeness::Undrained` for a `Capture` from the `cfg(test)`
     /// undrained driver. This does NOT account for the retention cap — a
     /// `Complete` capture can still be missing bytes the cap dropped; use
     /// [`Capture::is_trustworthy`] to gate on both axes at once.
@@ -1132,9 +1151,9 @@ impl Capture {
 
     /// The single predicate a consumer should gate a "this evidence is
     /// whole" decision on: both reader threads concluded `Eof`
-    /// (`complete == Completeness::Complete` — on unix, an idle 50 ms poll
-    /// after the child is confirmed reaped, not necessarily a literal
-    /// closed pipe; see [`Completeness::Complete`]), no OS-level error
+    /// (`complete == Completeness::Complete` — on unix, every byte resident
+    /// in the pipe when the child was confirmed reaped, not necessarily a
+    /// literal closed pipe; see [`Completeness::Complete`]), no OS-level error
     /// occurred while producing this `Capture` (`wait_error.is_none()`),
     /// and the retention cap did not drop any bytes from either stream
     /// (`stdout_truncated == 0 && stderr_truncated == 0`). `complete` alone
@@ -1142,10 +1161,10 @@ impl Capture {
     /// vs complete vs trustworthy" section) — a `Complete` capture can
     /// still be silently missing bytes the cap dropped from the middle of a
     /// long-running child's output, so a caller that only checks `complete`
-    /// can be fooled into trusting a truncated log. A live foreign writer
-    /// with gaps under 50 ms keeps a capture `SettleExpired` (never falsely
-    /// `Complete`), but a foreign grandchild's OWN later bytes are never
-    /// part of THIS child's evidence in the first place —
+    /// can be fooled into trusting a truncated log. A foreign process sharing
+    /// the pipe never makes a capture untrustworthy: what it writes before
+    /// the child's exit is observed is captured alongside the child's bytes
+    /// (a pipe cannot tell writers apart), and nothing after —
     /// `is_trustworthy()` says nothing about data anyone else produces on a
     /// shared fd.
     pub fn is_trustworthy(&self) -> bool {
@@ -1222,17 +1241,28 @@ pub fn render(buf: &[u8], truncated: u64, head_cap: usize) -> String {
 mod tests {
     use super::*;
     use std::env;
-    use std::io::Write;
+    use std::io::{BufRead, Write};
 
     /// Env var a spawning test sets on its self-exec'd child; read back as
     /// the very first statement of every spawning test (the dispatch guard,
     /// via `dispatch_if_child`).
     const CHILD_MODE_ENV: &str = "JAMMI_CHILD_MODE";
     /// Env var carrying the spawning test's own `--exact` path, so a child
-    /// running in `ChildMode::Grandchild`/`GrandchildWriting` can reuse it
-    /// for its own grandchild spawn (with `CHILD_MODE_ENV` overridden to
-    /// `ChildMode::Sleeper`/`WritingSleeper` respectively).
+    /// running in `ChildMode::GrandchildHolding`/`GrandchildStreaming` can
+    /// reuse it for its own grandchild spawn (with `CHILD_MODE_ENV`
+    /// overridden to `ChildMode::Holder`/`Streamer` respectively).
     const SELF_EXACT_ENV: &str = "JAMMI_SELF_EXACT";
+    /// What a grandchild prints on its stdout, piped back to the child, once
+    /// it is in place on the child's stderr; the child exits only after
+    /// reading it.
+    const GRANDCHILD_READY: &str = "GRANDCHILD-READY";
+    /// The child's own last stderr line in the grandchild tests: the
+    /// evidence that must come back whole whatever the grandchild does with
+    /// the pipe.
+    const CHILD_DONE: &str = "CHILD-DONE";
+    /// The line `ChildMode::Streamer` writes, without pause, to the pipe it
+    /// inherited.
+    const STREAMED_LINE: &str = "streamed";
 
     /// The self-exec'd child's behavior, selected by `JAMMI_CHILD_MODE`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1240,10 +1270,11 @@ mod tests {
         Flood,
         Wedge,
         Silent,
-        Grandchild,
-        GrandchildWriting,
+        GrandchildHolding,
+        GrandchildStreaming,
         Sleeper,
-        WritingSleeper,
+        Holder,
+        Streamer,
         PrintSleep,
     }
 
@@ -1253,10 +1284,11 @@ mod tests {
                 ChildMode::Flood => "flood",
                 ChildMode::Wedge => "wedge",
                 ChildMode::Silent => "silent",
-                ChildMode::Grandchild => "grandchild",
-                ChildMode::GrandchildWriting => "grandchild-writing",
+                ChildMode::GrandchildHolding => "grandchild-holding",
+                ChildMode::GrandchildStreaming => "grandchild-streaming",
                 ChildMode::Sleeper => "sleeper",
-                ChildMode::WritingSleeper => "writing-sleeper",
+                ChildMode::Holder => "holder",
+                ChildMode::Streamer => "streamer",
                 ChildMode::PrintSleep => "printsleep",
             }
         }
@@ -1266,10 +1298,11 @@ mod tests {
                 "flood" => ChildMode::Flood,
                 "wedge" => ChildMode::Wedge,
                 "silent" => ChildMode::Silent,
-                "grandchild" => ChildMode::Grandchild,
-                "grandchild-writing" => ChildMode::GrandchildWriting,
+                "grandchild-holding" => ChildMode::GrandchildHolding,
+                "grandchild-streaming" => ChildMode::GrandchildStreaming,
                 "sleeper" => ChildMode::Sleeper,
-                "writing-sleeper" => ChildMode::WritingSleeper,
+                "holder" => ChildMode::Holder,
+                "streamer" => ChildMode::Streamer,
                 "printsleep" => ChildMode::PrintSleep,
                 _ => return None,
             })
@@ -1295,10 +1328,11 @@ mod tests {
             ChildMode::Flood => flood_child(),
             ChildMode::Wedge => wedge_child(),
             ChildMode::Silent => std::process::exit(0),
-            ChildMode::Grandchild => grandchild_child(ChildMode::Sleeper),
-            ChildMode::GrandchildWriting => grandchild_child(ChildMode::WritingSleeper),
+            ChildMode::GrandchildHolding => grandchild_child(ChildMode::Holder),
+            ChildMode::GrandchildStreaming => grandchild_child(ChildMode::Streamer),
             ChildMode::Sleeper => sleeper_child(),
-            ChildMode::WritingSleeper => writing_sleeper_child(),
+            ChildMode::Holder => holder_child(),
+            ChildMode::Streamer => streamer_child(),
             ChildMode::PrintSleep => printsleep_child(),
         }
     }
@@ -1375,46 +1409,72 @@ mod tests {
     /// Spawns `current_exe()` in `grandchild_mode`, reusing this test's own
     /// `--exact` path (`SELF_EXACT_ENV`, set by `self_exec` on this very
     /// process) but overriding `CHILD_MODE_ENV` to `grandchild_mode` —
-    /// reusing the inherited mode would fork-bomb. The grandchild is spawned
-    /// without stdio redirection, so it inherits this process's
-    /// stdout/stderr (the pipes the grandparent `DrainedChild` is draining).
-    /// Exits 0 immediately, deliberately not waiting on the grandchild.
+    /// reusing the inherited mode would fork-bomb. The grandchild inherits
+    /// this process's stdin and stderr — stderr is the pipe the grandparent
+    /// `DrainedChild` is draining — while its stdout is piped back here:
+    /// this process waits for [`GRANDCHILD_READY`] on it, so the grandchild
+    /// is in place on the pipe before this child prints [`CHILD_DONE`] and
+    /// exits 0, never waiting on the grandchild itself.
     fn grandchild_child(grandchild_mode: ChildMode) -> ! {
         let exact = env::var(SELF_EXACT_ENV)
             .expect("grandchild mode requires SELF_EXACT_ENV set by self_exec");
-        let mut cmd = Command::new(env::current_exe().expect("current_exe for grandchild spawn"));
-        cmd.args(["--exact", &exact, "--nocapture", "--test-threads=1"]);
-        cmd.env(CHILD_MODE_ENV, grandchild_mode.as_str());
-        let _child = cmd.spawn().expect("spawn grandchild");
+        let mut grandchild =
+            Command::new(env::current_exe().expect("current_exe for grandchild spawn"))
+                .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+                .env(CHILD_MODE_ENV, grandchild_mode.as_str())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn grandchild");
+        let stdout = grandchild
+            .stdout
+            .take()
+            .expect("the grandchild's stdout is piped");
+        // libtest's own lines come first on that stdout, and the ready line
+        // may share a line with libtest's test-name prefix.
+        let ready = io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.contains(GRANDCHILD_READY));
+        assert!(
+            ready,
+            "the grandchild exited without printing {GRANDCHILD_READY}"
+        );
+        eprintln!("{CHILD_DONE}");
         std::process::exit(0);
     }
 
-    /// Sleeps 3 s (holding whatever stdio it inherited open, but never
-    /// writing to it) then exits 0. With the poll-based unix reader, merely
-    /// inheriting the pipe does not delay completeness — see
-    /// `writing_sleeper_child` for the shape that still does.
+    /// Sleeps 3 s, writing nothing, then exits 0 — the long-lived sibling of
+    /// the concurrent-spawn test.
     fn sleeper_child() -> ! {
         thread::sleep(Duration::from_secs(3));
         std::process::exit(0);
     }
 
-    /// Writes a short line every 10 ms for 2 s (200 lines), then exits —
-    /// unlike `sleeper_child`, this one actively produces new data on the
-    /// inherited pipe well past when its parent (the `grandchild`-mode
-    /// child) has already exited. The 10 ms gap is deliberately well under
-    /// `spawn_reader`'s 50 ms poll timeout: the poll-based unix reader only
-    /// concludes `Eof` on an EMPTY poll once the target child has exited, so
-    /// a writer with gaps shorter than the poll timeout never presents that
-    /// empty poll and the reader keeps draining it — a slower, intermittent
-    /// writer (e.g. one line every 500 ms) would instead let a single quiet
-    /// gap after the target's exit look exactly like a finished stream,
-    /// which is NOT the shape this test exists to pin.
-    fn writing_sleeper_child() -> ! {
-        for _ in 0..200 {
-            eprintln!("hb");
-            let _ = io::stderr().flush();
-            thread::sleep(Duration::from_millis(10));
-        }
+    /// Holds the stderr it inherited — the drained pipe — without ever
+    /// writing to it, until its stdin reaches EOF. The spawning test holds
+    /// the write end of that stdin, so the holder still holds the pipe when
+    /// the capture completes, by construction, and exits once the test lets
+    /// go.
+    fn holder_child() -> ! {
+        println!("{GRANDCHILD_READY}");
+        io::stdout().flush().expect("flush the ready line");
+        io::stdin()
+            .read_to_end(&mut Vec::new())
+            .expect("read the release pipe to EOF");
+        std::process::exit(0);
+    }
+
+    /// Writes [`STREAMED_LINE`] to the stderr it inherited — the drained
+    /// pipe — once, signals ready, then keeps writing it with no pause at
+    /// all, so the pipe is never quiet for any interval a reader could take
+    /// for the end of the stream. Stops at the first failed write, which is
+    /// the drained pipe's reader closing it.
+    fn streamer_child() -> ! {
+        let mut stderr = io::stderr();
+        writeln!(stderr, "{STREAMED_LINE}").expect("write the first streamed line");
+        println!("{GRANDCHILD_READY}");
+        io::stdout().flush().expect("flush the ready line");
+        while writeln!(stderr, "{STREAMED_LINE}").is_ok() {}
         std::process::exit(0);
     }
 
@@ -1761,30 +1821,37 @@ mod tests {
         assert!(cap.silence().is_none(), "{cap:?}");
     }
 
-    /// A grandchild that merely INHERITS the pipe (never writes to it) no
-    /// longer delays completeness on unix: the child here spawns a
-    /// `ChildMode::Sleeper` grandchild (inherits stdout/stderr, sleeps 3 s,
-    /// writes nothing) and exits immediately. Once `wait_bounded` reaps the
-    /// child, the poll-based reader sees an empty pipe and concludes `Eof`
-    /// on its own -- it does not wait for the grandchild to actually close
-    /// the fd -- so the capture is `Completeness::Complete` and
-    /// `is_trustworthy()`, not `SettleExpired`. The non-unix fallback reader
-    /// has no such short-circuit (it blocks in `read()` until an actual
-    /// EOF), so it still shows the `SettleExpired` shape there. See
-    /// `settle_expires_only_when_the_grandchild_keeps_writing` for the one
-    /// shape that still produces `SettleExpired` on unix too. The 2.5 s wall
-    /// bound (vs the grandchild's 3 s sleep) is generous enough to hold on
-    /// both platforms; on unix this returns in tens of ms in practice, not
-    /// near that bound.
+    /// A grandchild that holds the drained pipe without writing to it does
+    /// not delay completeness on unix. The child spawns a `ChildMode::Holder`
+    /// grandchild that inherits its stderr and holds it until this test
+    /// releases the grandchild's stdin — which it does only after
+    /// `wait_bounded` returns, so the pipe is still held when the capture
+    /// completes by construction, not by timing. Once `wait_bounded` reaps
+    /// the child, the reader reads what the pipe holds and concludes `Eof`
+    /// without waiting for the holder's close: the capture is
+    /// `Completeness::Complete`, `is_trustworthy()`, and carries the child's
+    /// own last line. A reader that waited for the pipe to close would never
+    /// return here. The non-unix fallback reader blocks in `read()` until an
+    /// actual EOF, so it shows the `SettleExpired` shape there.
     #[test]
-    fn settle_returns_within_bound_when_a_grandchild_holds_the_pipe() {
+    fn a_holding_grandchild_does_not_delay_completeness() {
         dispatch_if_child();
-        let exact = test_exact_path("settle_returns_within_bound_when_a_grandchild_holds_the_pipe");
-        let mut cmd = self_exec(&exact, ChildMode::Grandchild);
-        let started = Instant::now();
-        let child = DrainedChild::spawn(&mut cmd).expect("spawn grandchild-spawning child");
-        let cap = child.wait_bounded(Duration::from_secs(10), Epoch::Spawn);
-        let wall = started.elapsed();
+        let exact = test_exact_path("a_holding_grandchild_does_not_delay_completeness");
+        let (hold, mut release) = io::pipe().expect("the holder's release pipe");
+        let mut cmd = self_exec(&exact, ChildMode::GrandchildHolding);
+        cmd.stdin(hold);
+        let cap = DrainedChild::spawn(&mut cmd)
+            .expect("spawn grandchild-holding child")
+            .wait_bounded(Duration::from_secs(30), Epoch::Spawn);
+        // With `cmd`'s copy gone and the child reaped, only the holder has the
+        // read end of its release pipe, so this write lands only if the holder
+        // outlived the capture: the premise the assertions below rest on.
+        drop(cmd);
+        release
+            .write_all(b"\n")
+            .expect("the holder must still hold the pipe when the capture completes");
+        // The holder reaches EOF on its stdin and exits.
+        drop(release);
 
         assert!(!cap.hung, "{cap:?}");
         assert!(!cap.killed, "{cap:?}");
@@ -1793,55 +1860,67 @@ mod tests {
             assert_eq!(
                 cap.complete,
                 Completeness::Complete,
-                "a silent grandchild must not block completeness under the poll-based unix reader: {cap:?}"
+                "a silent holder of the pipe must not delay completeness: {cap:?}"
             );
             assert!(cap.is_trustworthy(), "{cap:?}");
+            assert!(
+                String::from_utf8_lossy(&cap.stderr).contains(CHILD_DONE),
+                "the child's own last line must be captured: {cap:?}"
+            );
         }
         #[cfg(not(unix))]
         {
             assert_eq!(cap.complete, Completeness::SettleExpired, "{cap:?}");
         }
-        assert!(
-            wall < Duration::from_millis(2500),
-            "settle should return well short of the grandchild's 3s sleep, got {wall:?}: {cap:?}"
-        );
-        eprintln!(
-            "settle_returns_within_bound_when_a_grandchild_holds_the_pipe: measured wall={wall:?} cap.elapsed={:?}",
-            cap.elapsed
-        );
     }
 
-    /// `Completeness::SettleExpired` still has a real oracle: a grandchild
-    /// that keeps WRITING after its parent (the `grandchild-writing`-mode
-    /// child) has already exited keeps `POLLIN` arriving, so the poll-based
-    /// unix reader keeps draining it and never falsely concludes `Eof` --
-    /// only `finish_drained`'s bounded settle (about 1 s) ends the wait,
-    /// leaving `Completeness::SettleExpired`. This is the one case the
-    /// poll-based reader does not (and should not) short-circuit: those bytes are genuinely
-    /// still arriving, so calling it anything but incomplete would be
-    /// dishonest.
+    /// A grandchild that keeps WRITING to the drained pipe after the child
+    /// exits does not delay completeness either, and costs the child none of
+    /// its own bytes. The `ChildMode::Streamer` grandchild writes its first
+    /// line before the child exits (the child waits for its ready signal)
+    /// and then writes without pause, so the pipe is never quiet for any
+    /// interval a reader could take for the end of the stream, however the
+    /// scheduler runs either process. The reader's boundary is the bytes
+    /// resident when it observes the child's exit — the child's last line
+    /// among them — so the capture is `Completeness::Complete`,
+    /// `is_trustworthy()`, and carries both the grandchild's first line and
+    /// the child's last. A reader that took a quiet interval for the end of
+    /// the stream would never return here. The streamer stops at its first
+    /// write after the reader closes the pipe, so nothing outlives the test.
     #[test]
-    fn settle_expires_only_when_the_grandchild_keeps_writing() {
+    fn a_streaming_grandchild_does_not_delay_completeness() {
         dispatch_if_child();
-        let exact = test_exact_path("settle_expires_only_when_the_grandchild_keeps_writing");
-        let mut cmd = self_exec(&exact, ChildMode::GrandchildWriting);
-        let started = Instant::now();
-        let child = DrainedChild::spawn(&mut cmd).expect("spawn grandchild-writing-spawning child");
-        let cap = child.wait_bounded(Duration::from_secs(10), Epoch::Spawn);
-        let wall = started.elapsed();
+        let exact = test_exact_path("a_streaming_grandchild_does_not_delay_completeness");
+        let mut cmd = self_exec(&exact, ChildMode::GrandchildStreaming);
+        let cap = DrainedChild::spawn(&mut cmd)
+            .expect("spawn grandchild-streaming child")
+            .wait_bounded(Duration::from_secs(30), Epoch::Spawn);
 
         assert!(!cap.hung, "{cap:?}");
         assert!(!cap.killed, "{cap:?}");
-        assert_eq!(
-            cap.complete,
-            Completeness::SettleExpired,
-            "a grandchild that keeps writing must still show up as incomplete: {cap:?}"
-        );
-        assert!(!cap.is_trustworthy(), "{cap:?}");
-        assert!(
-            wall < Duration::from_millis(2500),
-            "the settle bound must still cap the wait well short of the writing grandchild's 3s lifetime, got {wall:?}: {cap:?}"
-        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                cap.complete,
+                Completeness::Complete,
+                "a writer still streaming into the pipe must not delay completeness: {cap:?}"
+            );
+            assert!(cap.is_trustworthy(), "{cap:?}");
+            let stderr = String::from_utf8_lossy(&cap.stderr);
+            assert!(
+                stderr.contains(STREAMED_LINE),
+                "the grandchild streamed before the child exited, so its first line is \
+                 resident at the boundary: {cap:?}"
+            );
+            assert!(
+                stderr.contains(CHILD_DONE),
+                "the child's own last line must be captured: {cap:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(cap.complete, Completeness::SettleExpired, "{cap:?}");
+        }
     }
 
     /// The retention cap's own oracle: with the cap injected to head 1 MiB +
@@ -2072,16 +2151,16 @@ mod tests {
     /// arbitrary descriptor number in the sibling's own fd table that the
     /// sibling's code never targets, so it is only ever silently held, not
     /// written to, regardless of whether the lock ran. Nor does it
-    /// discriminate the poll-based reader's immunity to a silently-held
-    /// foreign fd (against a plain blocking-`read()` reader this same test
-    /// still passes, 30-100 runs) -- the CLOEXEC race this test tries to hit
-    /// is itself too rare
-    /// to reproduce reliably here, on either mechanism. The real oracle for
-    /// "a foreign process silently holding an inherited pipe end does not
-    /// block completeness" is `settle_returns_within_bound_when_a_grandchild_holds_the_pipe`,
-    /// which constructs that holding deterministically (via direct,
-    /// unredirected fd inheritance, not an accidental race) and does fail
-    /// against a blocking-read reader.
+    /// discriminate the reader's immunity to a silently-held foreign fd
+    /// (against a plain blocking-`read()` reader this same test still
+    /// passes, 30-100 runs) -- the CLOEXEC race this test tries to hit is
+    /// itself too rare to reproduce reliably here, on either mechanism. The
+    /// real oracle for "a foreign process silently holding an inherited pipe
+    /// end does not block completeness" is
+    /// `a_holding_grandchild_does_not_delay_completeness`, which constructs
+    /// that holding deterministically (via direct, unredirected fd
+    /// inheritance, not an accidental race) and does fail against a
+    /// blocking-read reader.
     #[test]
     fn concurrent_spawns_do_not_race_the_pipe_cloexec_window() {
         dispatch_if_child();
@@ -2114,28 +2193,22 @@ mod tests {
         assert!(flood_cap.is_trustworthy(), "{flood_cap:?}");
     }
 
-    /// The oracle for the reader's exit-observation ordering, pinned
-    /// deterministically rather than hoped for: drives `spawn_reader`
-    /// directly (bypassing `DrainedChild`/subprocesses entirely) with a
-    /// hand-controlled real pipe, using the `ready_hook` parameter to pause
-    /// the reader thread's loop EXACTLY between `poll` returning 0 and the
-    /// `exited_before_poll` decision. The hook then writes the final line,
-    /// closes the write end, and sets `child_exited` -- reproducing "the
-    /// child writes its final line, exits, and is reaped inside the
-    /// interval between poll-returned-0 and the flag read" on demand, on
-    /// every run, rather than relying on wall-clock alignment (a live
-    /// subprocess reproduction of this exact shape did not occur in 580
-    /// attempts -- the true window is narrower than timing alone can
-    /// reliably hit, which is why this test drives the mechanism directly).
+    /// The oracle for the reader's exit boundary, pinned deterministically
+    /// rather than hoped for: drives `spawn_reader` directly (bypassing
+    /// `DrainedChild`/subprocesses entirely) with a hand-controlled real
+    /// pipe, using the `ready_hook` parameter to act EXACTLY when the reader
+    /// has just found the pipe idle and has not yet checked `child_exited`
+    /// again. The hook then writes the final line, closes the write end, and
+    /// sets `child_exited` -- reproducing "the child writes its final line,
+    /// exits, and is reaped while the reader is idle" on demand, on every
+    /// run, rather than relying on wall-clock alignment.
     ///
-    /// Mutation: load `child_exited` AFTER `poll` (move the load in
-    /// `spawn_reader` below the `poll` call) and this test fails
-    /// deterministically, every time --
-    /// `complete_outcome=Some(Eof) has_final=false stderr=""`. With the
-    /// committed ordering it passes deterministically -- the flag was already
-    /// `false` when sampled
-    /// before this `poll` call, so the reader `continue`s and re-polls,
-    /// correctly observing the data the hook just wrote.
+    /// Mutation: conclude `Eof` on observing `child_exited` without reading
+    /// what the pipe holds, and this test fails deterministically, every
+    /// time -- `complete_outcome=Some(Eof) has_final=false stderr=""`. With
+    /// the committed boundary it passes deterministically: the reader
+    /// observes the flag, reads the resident final line, and only then
+    /// concludes `Eof`.
     #[cfg(unix)]
     #[test]
     fn exit_observed_then_the_final_bytes_are_still_read() {

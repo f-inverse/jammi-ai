@@ -2,11 +2,6 @@
 title: "Regression fine-tuning on a high-offset target"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `fine_tune(task="regression")` (the `regression_loss` objective) +
 `infer(task="regression")` · **Background:** heteroscedastic regression — the
 mean–variance Gaussian head [@nix1994], β-NLL [@seitzer2022], CRPS as a training

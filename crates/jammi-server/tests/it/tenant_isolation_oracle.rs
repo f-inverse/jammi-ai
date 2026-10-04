@@ -2750,10 +2750,7 @@ async fn assert_embedding_with_own_model_isolated() {
             .await
             .unwrap();
     }
-    let base = format!(
-        "local:{}",
-        jammi_test_utils::cookbook_fixture("tiny_bert").display()
-    );
+    let base = format!("local:{}", jammi_test_utils::fixture("tiny_bert").display());
     let tuned = engine
         .with_tenant_scoped(tenant_a(), |_scope| async {
             let job = engine

@@ -98,7 +98,7 @@ use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
 use jammi_ai::model::backend::{DeviceConfig, ModelBackend};
 use jammi_ai::model::tokenizer::{BatchEncoding, TokenizerWrapper};
-use jammi_ai::model::{LoadedModel, ModelId, ResolvedModel, TokenizerSource};
+use jammi_ai::model::{LoadedModel, ModelId, ResolvedModel};
 use jammi_ai::session::InferenceSession;
 use jammi_datafusion::ModelTask;
 use jammi_db::catalog::model_repo::RegisterModelParams;
@@ -197,7 +197,7 @@ fn project_to_pairs(pairs: &[IdTriplet]) -> Vec<(String, String)> {
 /// One (anchor, positive, negative) text triplet, keyed by a stable id — the
 /// shape both the train split and the held-out fixture are supplied in,
 /// regardless of which [`Objective`] this run trains. The committed held-out
-/// fixture (`cookbook/fixtures/finetune_heldout`) mines an
+/// fixture (`tests/fixtures/finetune_heldout`) mines an
 /// EXPLICIT negative per row (`heldout_ids.txt`'s
 /// `anchor_id\tpositive_id\tnegative_id` shape); [`Objective::Triplet`]
 /// consumes all three columns natively, [`Objective::Mnrl`] consumes only
@@ -481,9 +481,9 @@ fn loader_token_batches(
 /// they pass differs.
 #[derive(Debug, Clone)]
 pub struct FinetuneRunParams {
-    /// Directory holding `config.json` + `model.safetensors` (+ optionally
-    /// `tokenizer.json` — REQUIRED for the real `EncoderAdapters` target;
-    /// see this module's doc).
+    /// Directory holding `config.json` + `model.safetensors` (+ a tokenizer,
+    /// one of `jammi_ai::model::arch::TOKENIZER_CANDIDATES` — REQUIRED for the
+    /// real `EncoderAdapters` target; see this module's doc).
     pub model_dir: PathBuf,
     /// Which tower of `model_dir`'s checkpoint this run trains, and hence
     /// which of the two row vectors below carries this run's data (see
@@ -980,7 +980,7 @@ impl Checkpoint {
 /// The tokenizer requirement is scoped to [`Task::Text`]: only the
 /// text path turns rows into token ids. A media task's rows are already
 /// encoded images/clips the tower's own front end consumes, so demanding a
-/// `tokenizer.json` there would refuse every legitimate audio checkpoint
+/// tokenizer there would refuse every legitimate audio checkpoint
 /// (the committed `htsat_clap_tiny` fixture ships none, and needs none).
 fn load_base_model(
     checkpoint: &Checkpoint,
@@ -990,15 +990,15 @@ fn load_base_model(
 ) -> Result<Arc<LoadedModel>, Box<dyn std::error::Error + Send + Sync>> {
     let config_path = checkpoint.config_path.clone();
     let model_config = checkpoint.config_json.clone();
-    let tokenizer_path = model_dir.join("tokenizer.json");
-    let has_tokenizer = tokenizer_path.exists();
-    if task == Task::Text && !has_tokenizer {
+    let tokenizer = arch::tokenizer_source(model_dir);
+    if task == Task::Text && tokenizer.is_none() {
         return Err(format!(
-            "finetune-run: {} has no tokenizer.json — the EncoderAdapters training target \
-             requires a real tokenizer to turn the fixture's text pairs into token ids (this \
-             tier never falls back to synthetic ids the way finetune-step does, because a \
+            "finetune-run: {} has no tokenizer (none of {:?}) — the EncoderAdapters training \
+             target requires a real tokenizer to turn the fixture's text pairs into token ids \
+             (this tier never falls back to synthetic ids the way finetune-step does, because a \
              synthetic-id run would never touch the committed fixture's real text at all)",
-            model_dir.display()
+            model_dir.display(),
+            arch::TOKENIZER_CANDIDATES.map(|(name, _)| name)
         )
         .into());
     }
@@ -1029,7 +1029,7 @@ fn load_base_model(
         task: task.model_task(),
         config_path,
         weights_paths: vec![checkpoint.weights_path.clone()],
-        tokenizer: has_tokenizer.then_some(TokenizerSource::HuggingFaceJson(tokenizer_path)),
+        tokenizer,
         model_config,
         preprocessor_config,
         pooling_config,
@@ -2923,13 +2923,13 @@ mod tests {
         );
     }
 
-    /// `cookbook/fixtures/tiny_bert` — the SAME generic, committed fixture
+    /// `tests/fixtures/tiny_bert` — the SAME generic, committed fixture
     /// `finetune_run_smoke.rs` drives via the compiled CLI (BERT
     /// architecture, real tokenizer, no consumer shape), resolved relative
     /// to this crate's own manifest dir so this IN-PROCESS test needs no
     /// extra dev-dependency.
     fn tiny_bert_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_bert")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_bert")
     }
 
     /// The committed OpenCLIP fixture — `open_clip_config.json` +
@@ -2937,12 +2937,12 @@ mod tests {
     /// that hard-coded `config.json`/`model.safetensors` joins cannot see at
     /// all.
     fn tiny_open_clip_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/tiny_open_clip")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_open_clip")
     }
 
     /// The committed HF-CLAP audio fixture.
     fn htsat_clap_tiny_model_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../cookbook/fixtures/htsat_clap_tiny")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/htsat_clap_tiny")
     }
 
     /// Resolve a model dir through the ONE chain, panicking with the real
@@ -3182,7 +3182,7 @@ mod tests {
     /// second layer to restrict AWAY from).
     ///
     /// No committed HF-shaped DistilBERT fixture exists under
-    /// `cookbook/fixtures` (unlike `tiny_bert`), and this crate does not
+    /// `tests/fixtures` (unlike `tiny_bert`), and this crate does not
     /// invent a new committed fixture family to get one — this mirrors
     /// `jammi-encoders`' own `tests/it/distilbert.rs::write_synthetic_weights`
     /// exactly (same tensor names/prefix, same generic random content,
@@ -4719,7 +4719,7 @@ mod tests {
     fn refusal_site_names_are_selectors_that_really_train() {
         let distilbert_dir = write_synthetic_distilbert_model_dir(1);
         let modernbert_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_modernbert_local");
+            .join("../../tests/fixtures/tiny_modernbert_local");
         let cases: Vec<(PathBuf, Task)> = vec![
             (tiny_bert_model_dir(), Task::Text),
             (distilbert_dir.path().to_path_buf(), Task::Text),

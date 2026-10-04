@@ -669,7 +669,7 @@ async fn fine_tuned_record_without_a_location_refuses_to_resolve() {
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_dir = crate::common::fixture("tiny_bert");
     let base_id = format!("local:{}", base_dir.display());
 
     catalog
@@ -787,7 +787,7 @@ async fn fine_tuned_adapter_bundle_missing_file_refuses_as_typed_model_error() {
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_dir = crate::common::fixture("tiny_bert");
     let base_id = format!("local:{}", base_dir.display());
 
     let artifacts_root = dir.path().join("artifacts");
@@ -859,7 +859,7 @@ async fn fine_tuned_adapter_bundle_unpublished_refuses_as_typed_model_error() {
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_dir = crate::common::fixture("tiny_bert");
     let base_id = format!("local:{}", base_dir.display());
 
     let artifacts_root = dir.path().join("artifacts");
@@ -935,7 +935,7 @@ async fn fine_tuned_prefix_with_wrong_model_type_refuses_to_resolve() {
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_dir = crate::common::fixture("tiny_bert");
     let base_id = format!("local:{}", base_dir.display());
 
     catalog
@@ -991,7 +991,7 @@ async fn fine_tuned_adapter_bundle_corrupted_pointer_refuses_as_typed_model_erro
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_dir = crate::common::fixture("tiny_bert");
     let base_id = format!("local:{}", base_dir.display());
 
     catalog
@@ -1051,7 +1051,7 @@ async fn fine_tuned_adapter_bundle_permission_fault_is_not_a_typed_model_error()
 
     let dir = tempdir().unwrap();
     let catalog = Arc::new(Catalog::open(dir.path()).await.unwrap());
-    let base_dir = crate::common::cookbook_fixture("tiny_bert");
+    let base_dir = crate::common::fixture("tiny_bert");
     let base_id = format!("local:{}", base_dir.display());
 
     let artifacts_root = dir.path().join("artifacts");

@@ -1,9 +1,11 @@
 name: _proven-artifacts
 
-# Names the run whose artifacts a release promotes: the `ci.yml` run that
-# proved the tree being released (its most recent green `ci-summary`
-# measurement), once `ci/scripts/proven_artifacts.py` has confirmed it still
-# holds every artifact the caller names. A release compiles nothing: each
+# Names the run whose artifacts a release promotes: the run of the caller's
+# lane that proved the tree being released — `ci`, the `ci.yml` run whose
+# `ci-summary` is the most recent green measurement, for every build; or
+# `cookbook`, the `cookbook-gpu.yml` run that rendered the book on real models
+# — once `ci/scripts/proven_artifacts.py` has confirmed it still holds every
+# artifact the caller names. A release compiles nothing: each
 # promoting job downloads those artifacts by this run id
 # (`actions/download-artifact`'s `run-id`, with `actions: read`) and
 # publishes the bytes that run's checks exercised.
@@ -14,6 +16,10 @@ name: _proven-artifacts
 on:
   workflow_call:
     inputs:
+      lane:
+        description: "The lane whose run holds the artifacts: ci or cookbook."
+        type: string
+        required: true
       artifacts:
         description: "Space-separated names of the artifacts the release promotes."
         type: string
@@ -43,8 +49,9 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          LANE: ${{ inputs.lane }}
           ARTIFACTS: ${{ inputs.artifacts }}
         run: |
           set -euo pipefail
           tree="$(git rev-parse 'HEAD^{tree}')"
-          python3 ci/scripts/proven_artifacts.py --repo "$GITHUB_REPOSITORY" --tree "$tree" --artifacts "$ARTIFACTS" >> "$GITHUB_OUTPUT"
+          python3 ci/scripts/proven_artifacts.py --repo "$GITHUB_REPOSITORY" --tree "$tree" --lane "$LANE" --artifacts "$ARTIFACTS" >> "$GITHUB_OUTPUT"

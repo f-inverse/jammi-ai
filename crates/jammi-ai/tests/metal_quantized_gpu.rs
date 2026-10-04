@@ -492,27 +492,17 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn cookbook_fixture(name: &str) -> PathBuf {
-    workspace_root()
-        .join("cookbook")
-        .join("fixtures")
-        .join(name)
+fn fixture(name: &str) -> PathBuf {
+    workspace_root().join("tests").join("fixtures").join(name)
 }
 
 fn fixture_url(name: &str) -> String {
-    format!(
-        "file://{}",
-        workspace_root()
-            .join("tests")
-            .join("fixtures")
-            .join(name)
-            .display()
-    )
+    format!("file://{}", fixture(name).display())
 }
 
 fn write_tokenizer(dir: &Path) {
     std::fs::copy(
-        cookbook_fixture("tiny_bert").join("tokenizer.json"),
+        fixture("tiny_bert").join("tokenizer.json"),
         dir.join("tokenizer.json"),
     )
     .unwrap();

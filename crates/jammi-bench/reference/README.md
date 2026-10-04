@@ -518,7 +518,7 @@ torch sees no CUDA device is refused, never served on the CPU under a CUDA
 leg's name.
 
 `python3 torch_encode.py --dry-run` needs no checkpoint and no engine leg: it
-serves the repository's own `cookbook/fixtures/tiny_bert` through the same
+serves the repository's own `tests/fixtures/tiny_bert` through the same
 loader and code path over a small corpus it writes itself, two takes of each
 of two units. The venv needs `pyarrow` (and `usearch` for `--ann-index`)
 beside the packages above.

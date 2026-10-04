@@ -409,7 +409,7 @@ fn image_embedding_leg_runs_end_to_end_over_the_committed_producer() {
     );
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
-    let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");
+    let model_dir = repo_root().join("tests/fixtures/tiny_open_clip");
     let output = media_command(
         &model_dir,
         "image_embedding",
@@ -455,7 +455,7 @@ fn audio_embedding_leg_runs_end_to_end_over_the_committed_producer() {
     );
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
-    let model_dir = repo_root().join("cookbook/fixtures/htsat_clap_tiny");
+    let model_dir = repo_root().join("tests/fixtures/htsat_clap_tiny");
     let output = media_command(
         &model_dir,
         "audio_embedding",
@@ -519,7 +519,7 @@ fn text_embedding_leg_selects_the_clip_text_tower_of_the_same_checkpoint() {
 
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
-    let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");
+    let model_dir = repo_root().join("tests/fixtures/tiny_open_clip");
     let output = media_command(
         &model_dir,
         "text_embedding",
@@ -565,7 +565,7 @@ fn a_text_corpus_under_a_media_task_is_refused_by_the_cli() {
     .expect("write text jsonl");
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
-    let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");
+    let model_dir = repo_root().join("tests/fixtures/tiny_open_clip");
     let output = media_command(
         &model_dir,
         "image_embedding",
@@ -607,7 +607,7 @@ fn a_media_task_under_the_mnrl_objective_is_refused() {
     );
     let work_dir = tmp.path().join("work");
     std::fs::create_dir_all(&work_dir).expect("mkdir work");
-    let model_dir = repo_root().join("cookbook/fixtures/tiny_open_clip");
+    let model_dir = repo_root().join("tests/fixtures/tiny_open_clip");
     let output = media_command(
         &model_dir,
         "image_embedding",

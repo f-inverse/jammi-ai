@@ -7,7 +7,7 @@ reading that source directly, never guessed): one JSON object per line,
     {"anchor_id", "anchor_text", "positive_id", "positive_text",
      "negative_id", "negative_text"}
 
-the same field names the committed `cookbook/fixtures/finetune_heldout/
+the same field names the committed `tests/fixtures/finetune_heldout/
 heldout_pairs.jsonl` fixture uses, so this generator's output is a drop-in
 `--train-jsonl` (`Objective::Mnrl` projects to the (anchor, positive) pair
 and drops `negative_*`; this generator still emits `negative_*` so the file

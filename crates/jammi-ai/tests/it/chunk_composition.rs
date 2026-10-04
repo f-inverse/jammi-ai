@@ -86,7 +86,7 @@ fn corpus(n: usize) -> RecordBatch {
 }
 
 fn tiny_bert_model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 fn spec(source_id: &str, partitions: usize) -> InferenceSpec {
@@ -120,8 +120,7 @@ fn peak_rss_mib() -> Option<f64> {
 /// The real token count of every row, tokenised alone (no batch padding).
 fn real_tokens(texts: &StringArray) -> Vec<usize> {
     let tokenizer =
-        TokenizerWrapper::from_file(&common::cookbook_fixture("tiny_bert").join("tokenizer.json"))
-            .unwrap();
+        TokenizerWrapper::from_file(&common::fixture("tiny_bert").join("tokenizer.json")).unwrap();
     texts
         .iter()
         .map(|t| {

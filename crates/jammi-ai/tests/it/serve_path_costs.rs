@@ -180,7 +180,7 @@ fn write_corpus(dir: &std::path::Path, n: usize) -> String {
 }
 
 fn model() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 async fn session_over(

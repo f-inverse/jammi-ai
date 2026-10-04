@@ -2,14 +2,6 @@
 title: "Learn Jammi by running it"
 ---
 
-```{python}
-# | echo: false
-# The first line of every chapter: importing the cookbook applies the
-# determinism contract (single-threaded BLAS, tokenizers off, pinned seed,
-# and the CPU at the `small` scale) before any heavy native library is touched.
-import jammi_cookbook  # noqa: F401
-```
-
 Jammi is an embeddable AI engine: register data sources and query them with SQL,
 generate embeddings and search them, run and fine-tune models, and measure the
 results — in your own process, or against a server, through one API. This book
@@ -27,9 +19,12 @@ bottom. To run a chapter locally instead:
 pip install "jammi-ai[embedded]" "jammi-cookbook @ git+https://github.com/f-inverse/jammi-ai#subdirectory=cookbook/book"
 ```
 
-Chapters run at the `small` scale by default: committed fixtures and tiny
-encoders, on the CPU, in seconds to minutes. Setting `JAMMI_COOKBOOK_SCALE=full`
-runs the same code over the published datasets and real encoders, on a GPU.
+Every chapter runs real, pretrained models from the Hugging Face Hub, downloaded
+on first use. Chapters run at the `small` scale by default: small samples of the
+datasets and a compact text encoder. Most chapters take seconds to minutes on a
+CPU; the ones that fine-tune an encoder take from a quarter of an hour to a few
+hours on a CPU, and minutes on a GPU. Setting `JAMMI_COOKBOOK_SCALE=full` runs the
+same code over the published datasets and a larger text encoder, on a GPU.
 
 ## The path
 
@@ -52,9 +47,10 @@ capability deep and measure it.
 
 ## How it stays honest
 
-Every chapter ends in numbers it just measured, checked against values frozen
-from an earlier run, within a stated tolerance; a chapter whose measurement moves
-fails. Every chapter runs on every change to the engine it documents, and every
-notebook is also run nightly exactly as a reader runs it — installed from PyPI in
-a fresh runtime. The [API reference](chapters/api-reference.qmd) lists every
+Every chapter shows the numbers it just measured and checks the claims it teaches
+against them: an ordering, a bound or an equality the engine guarantees, so a claim
+holds on your machine as it does on ours, and a chapter whose claim fails stops
+and names it. Every chapter runs on every change to the engine it documents, and
+every notebook is also run nightly exactly as a reader runs it — installed from
+PyPI in a fresh runtime. The [API reference](chapters/api-reference.qmd) lists every
 verb the book calls.

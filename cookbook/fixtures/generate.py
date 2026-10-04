@@ -5,14 +5,17 @@ Produces:
 - `tiny_corpus.parquet`     — 20-row synthetic patent corpus (id, title,
   abstract, year, category, assignee_id)
 - `tiny_golden.json`        — relevance judgments for `eval_embeddings`
-- `tiny_labels.csv`         — per-row gold labels for `eval_inference`
-  classification
+- `tiny_labels.csv`         — each corpus row's subject, `physics` or
+  `biology`, which the federation chapter joins
 - `tiny_pairs.csv`          — contrastive text pairs for `fine_tune`
-- `tiny_ner_corpus.parquet` — 20-row generic PER/ORG sentence corpus for
-  `eval_inference` NER (id, text)
+- `tiny_reviews.parquet`    — 24 short product and service reviews (id, text)
+  for sentiment classification
+- `tiny_review_labels.csv`  — each review's gold sentiment, `POSITIVE` or
+  `NEGATIVE` — the label set of the stock SST-2 sentiment classifiers
+- `tiny_ner_corpus.parquet` — 20-row generic PER/ORG sentence corpus for the
+  `eval_inference_ner` recipe and the eval-channels chapter (id, text)
 - `tiny_ner_gold.csv`       — per-span gold entities for the NER corpus
-  (id, label, start, end), label set restricted to PER + ORG to match the
-  shipped `tiny_modernbert_ner` id2label
+  (id, label, start, end), people and organisations only
 - `tiny_image_corpus/`      — 20 synthetic 224x224 PNGs (geometric line
   drawings, 5 shape families) for the `image_search` recipe
 - `tiny_image_golden.json`  — query-image -> expected corpus-image top-K
@@ -151,11 +154,13 @@ def write_golden() -> None:
 
 
 def write_labels() -> None:
-    """Per-row classification labels for `eval_inference`.
+    """Each corpus row's subject, collapsed to two classes.
 
-    Two-class collapse (physics+chemistry → 'physics', biology+cs+engineering
-    → 'biology') keeps the label set inside the tiny_modernbert_classifier
-    fixture's vocabulary (which only knows 'physics' and 'biology').
+    Physics and chemistry → 'physics'; biology, cs and engineering →
+    'biology'. The federation chapter joins these labels to the corpus, and
+    the engine's classification-eval tests score their
+    `tiny_modernbert_classifier` test checkpoint against them, so the label
+    set stays inside that checkpoint's vocabulary ('physics' and 'biology').
     """
     label_map = {
         "physics": "physics",
@@ -169,6 +174,56 @@ def write_labels() -> None:
         writer.writerow(["id", "label"])
         for row in CORPUS:
             writer.writerow([row[0], label_map[row[4]]])
+
+
+REVIEWS: list[tuple[int, str, str]] = [
+    (1, "The headphones sound crisp and the battery lasts all week.", "POSITIVE"),
+    (2, "The zipper broke the second time I used the bag.", "NEGATIVE"),
+    (3, "Setup took two minutes and everything just worked.", "POSITIVE"),
+    (4, "Customer support kept me on hold for an hour and never solved the problem.", "NEGATIVE"),
+    (5, "A warm, funny film with a cast that clearly enjoyed every scene.", "POSITIVE"),
+    (6, "The plot dragged and the ending made no sense.", "NEGATIVE"),
+    (7, "Fresh bread, friendly staff, and fair prices. We will be back.", "POSITIVE"),
+    (8, "Our soup arrived cold and the waiter ignored us all evening.", "NEGATIVE"),
+    (9, "This blender crushes ice without any trouble.", "POSITIVE"),
+    (10, "The screen cracked within a week of normal use.", "NEGATIVE"),
+    (11, "Not bad at all, I would happily buy it again.", "POSITIVE"),
+    (12, "I wanted to like this keyboard, but half the keys stick.", "NEGATIVE"),
+    (13, "The hotel room was spotless and the view was stunning.", "POSITIVE"),
+    (14, "The room smelled of smoke and the shower barely worked.", "NEGATIVE"),
+    (15, "Fast delivery, sturdy packaging, and the shoes fit perfectly.", "POSITIVE"),
+    (16, "The jacket faded after one wash.", "NEGATIVE"),
+    (17, "The tutorial was clear, patient, and genuinely useful.", "POSITIVE"),
+    (18, "The app crashes every time I try to upload a photo.", "NEGATIVE"),
+    (19, "I was skeptical, but this vacuum is worth every penny.", "POSITIVE"),
+    (20, "Great, another update that deletes my saved settings.", "NEGATIVE"),
+    (21, "The concert was electric from the first song to the last.", "POSITIVE"),
+    (22, "Tickets were overpriced and the sound was muddy.", "NEGATIVE"),
+    (23, "Comfortable chair, and my back pain is finally gone.", "POSITIVE"),
+    (24, "Nothing about this phone case fits the phone it claims to fit.", "NEGATIVE"),
+]
+
+
+def write_reviews() -> None:
+    """Hand-written reviews and their gold sentiment for classification.
+
+    Balanced, twelve of each label, and not all easy: a negation ("Not bad at
+    all") and a sarcastic complaint ("Great, another update…") are the rows a
+    real sentiment model can get wrong, which is what makes its per-class
+    report worth reading.
+    """
+    pq.write_table(
+        pa.table({
+            "id": pa.array([r[0] for r in REVIEWS], type=pa.int64()),
+            "text": pa.array([r[1] for r in REVIEWS]),
+        }),
+        OUT / "tiny_reviews.parquet",
+    )
+    with (OUT / "tiny_review_labels.csv").open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "label"])
+        for row_id, _, label in REVIEWS:
+            writer.writerow([row_id, label])
 
 
 def write_pairs() -> None:
@@ -267,14 +322,17 @@ NER_CORPUS: list[tuple[int, str, list[tuple[str, int, int]]]] = [
 
 
 def write_ner_corpus() -> None:
-    """20-row generic PER/ORG sentence corpus for the NER eval recipe.
+    """20-row generic PER/ORG sentence corpus for the NER recipe and the
+    eval-channels chapter.
 
     Hand-authored sentences with deterministic byte offsets — re-run the
-    generator and `tiny_ner_corpus.parquet` reproduces bit-for-bit. The
-    label set is restricted to PER + ORG to match the shipped
-    `tiny_modernbert_ner` id2label (`O / B-PER / I-PER / B-ORG / I-ORG`);
-    introducing LOC would require retraining that model fixture and is
-    out of scope for the cookbook recipe.
+    generator and `tiny_ner_corpus.parquet` reproduces bit-for-bit. The gold
+    set labels people and organisations only: the types the engine's
+    `tiny_modernbert_ner` test checkpoint emits (`O / B-PER / I-PER / B-ORG /
+    I-ORG`), which its NER-eval tests score against this gold. A real tagger
+    such as the recipe's `dslim/bert-base-NER` also tags locations and a
+    miscellaneous class; the recipe shows those as spans the gold set never
+    asks about.
 
     All names and organizations are fictional / public-domain pop-culture
     references — no tenant or proprietary content lives in the OSS
@@ -607,6 +665,7 @@ def main() -> None:
     write_corpus()
     write_golden()
     write_labels()
+    write_reviews()
     write_pairs()
     write_ner_corpus()
     write_ner_gold()

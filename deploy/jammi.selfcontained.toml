@@ -1,7 +1,7 @@
 # Self-contained configuration for the `jammi-server` image variant.
 #
 # This config boots the server with zero external dependencies — no
-# mounted volume, no config bind-mount, no model download. It is baked
+# mounted volume, no config bind-mount. It is baked
 # into the `:selfcontained` image (see `Dockerfile`, `BAKE_SELFCONTAINED=1`)
 # at `/etc/jammi/jammi.toml`, the path the entrypoint already reads.
 #
@@ -13,10 +13,10 @@
 #     tables, and indices have a writable home without a provisioned
 #     volume. State is per-instance and does not survive a restart —
 #     which is what an embedding-only, request/response deployment wants.
-#   * The encoder is the `htsat_clap_tiny` cookbook fixture, baked into the
-#     image at `/opt/jammi/models/htsat_clap_tiny`. Clients pass it per request
-#     as `model_id = "local:/opt/jammi/models/htsat_clap_tiny"`; no network
-#     fetch, no Hub credentials.
+#   * Models are named per request: a Hub id is fetched on first use into
+#     the image's `HF_HOME` under `/tmp`; a deployment that must serve
+#     without network builds on the image, copies its checkpoint in, and
+#     names it `local:<path>`.
 #
 # The gRPC + Flight SQL surface (incl. EmbeddingService) binds 8081 and
 # the health side-channel binds 8080, both on 0.0.0.0 so the container
@@ -30,8 +30,7 @@ health_listen = "0.0.0.0:8080"
 # gRPC + Flight SQL + EmbeddingService, fronted by tonic-web for browser
 # and Cloudflare Worker (gRPC-Web) clients.
 flight_listen = "0.0.0.0:8081"
-# No preloaded models — the encoder is supplied per request as a
-# `local:` model id pointing at the baked fixture.
+# No preloaded models — each request names its model.
 preload_models = []
 
 # SQLite under `artifact_dir`. Single-instance, ephemeral, no external DB.

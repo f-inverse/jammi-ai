@@ -19,12 +19,12 @@ use arrow::array::{Array, StringArray};
 use arrow::datatypes::DataType;
 use jammi_db::error::JammiError;
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
-use jammi_test_utils::{cookbook_fixture, fixture, flight_statement, write_null_key_source};
+use jammi_test_utils::{fixture, flight_statement, write_null_key_source};
 
 use super::common::grpc::{start_engine_server, EngineServer};
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 /// Register the shipped patents parquet on the running engine in-process (the

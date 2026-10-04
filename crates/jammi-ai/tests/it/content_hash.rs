@@ -34,7 +34,7 @@ use tempfile::TempDir;
 use crate::common;
 
 fn tiny_bert_id() -> String {
-    format!("local:{}", common::cookbook_fixture("tiny_bert").display())
+    format!("local:{}", common::fixture("tiny_bert").display())
 }
 
 /// Write a `(id Int64 nullable, text Utf8)` Parquet file.

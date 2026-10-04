@@ -283,7 +283,7 @@ Any encoder model on HuggingFace Hub with safetensors weights. Supported archite
 - `answerdotai/ModernBERT-base` (768-dim)
 - `answerdotai/ModernBERT-large` (1024-dim)
 
-Or any local directory with `config.json` + `model.safetensors` + `tokenizer.json`. The architecture is detected automatically from `model_type` in config.json.
+Or any local directory with `config.json`, `model.safetensors` and a tokenizer (`tokenizer.json`, or a BERT checkpoint's `vocab.txt`; see [Use a Local Model Checkpoint](./local-models.md)). The architecture is detected automatically from `model_type` in config.json.
 
 Use a local model:
 

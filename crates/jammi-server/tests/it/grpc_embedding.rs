@@ -7,9 +7,9 @@
 //! embeddings. The unification is exercised across two modalities:
 //!
 //! * `AUDIO` over a synthetic three-tone WAV corpus encoded by the
-//!   `htsat_clap_tiny` real-key cookbook fixture.
+//!   `htsat_clap_tiny` real-key test fixture.
 //! * `TEXT` over the `patents.parquet` fixture's `abstract` column encoded by
-//!   the `tiny_bert` cookbook fixture.
+//!   the `tiny_bert` test fixture.
 //!
 //! Both are hermetic: the audio corpus is built in-process and both encoders
 //! are local fixtures (no network, no download). This pins the wire adapter's
@@ -35,7 +35,7 @@ use jammi_server::grpc::proto::embedding::{
     SearchRequest,
 };
 use jammi_server::grpc::session::SessionStore;
-use jammi_test_utils::{cookbook_fixture, fixture, test_config};
+use jammi_test_utils::{fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -43,11 +43,11 @@ use tokio::sync::oneshot;
 use super::common::grpc::{catalog_client, channel, ranked};
 
 fn htsat_clap_model_id() -> String {
-    format!("local:{}", cookbook_fixture("htsat_clap_tiny").display())
+    format!("local:{}", fixture("htsat_clap_tiny").display())
 }
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn patents_url() -> String {

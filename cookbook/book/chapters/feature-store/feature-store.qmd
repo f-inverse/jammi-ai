@@ -2,11 +2,6 @@
 title: "A mutable companion table — a feature store you federate into queries"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `create_mutable_table` · `list_mutable_tables` · `sql`
 (`INSERT` / `REPLACE INTO` / `UPDATE` / `DELETE` against `mutable.public.<name>`)
 · the federating `JOIN` · **Background:** the append-only result log vs mutable

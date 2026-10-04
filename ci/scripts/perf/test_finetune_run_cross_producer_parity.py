@@ -70,7 +70,7 @@ def run_identity_fields():
 
 REPO_ROOT = torch_venv.REPO_ROOT
 REFERENCE_DIR = REPO_ROOT / "crates" / "jammi-bench" / "reference"
-FIXTURES = REPO_ROOT / "cookbook" / "fixtures"
+FIXTURES = REPO_ROOT / "tests" / "fixtures"
 HELDOUT_PAIRS = FIXTURES / "finetune_heldout" / "heldout_pairs.jsonl"
 
 # One committed checkpoint per architecture the twin names tensors for.

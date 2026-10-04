@@ -5,16 +5,20 @@ use std::sync::{Arc, PoisonError, RwLock};
 use jammi_db::error::JammiError;
 
 use super::clip_bpe::load_open_clip_bpe;
+use super::wordpiece::load_wordpiece_vocab;
 
 type Result<T> = std::result::Result<T, JammiError>;
 
 /// Wraps the HuggingFace `tokenizers` crate with Jammi's batching conventions.
 ///
-/// Two source layouts are supported transparently:
+/// Three source layouts are supported transparently:
 ///   * HuggingFace `tokenizer.json` (any architecture) via [`Self::from_file`].
 ///   * OpenCLIP's native `bpe_simple_vocab_16e6.txt.gz` via
-///     [`Self::from_open_clip_bpe`] — used when an OpenCLIP repo ships the
-///     legacy vocab file instead of a converted `tokenizer.json`.
+///     [`Self::from_open_clip_bpe`] — used when an OpenCLIP repo ships its
+///     native vocab file instead of a converted `tokenizer.json`.
+///   * A BERT-family WordPiece `vocab.txt` (and its `tokenizer_config.json`)
+///     via [`Self::from_wordpiece_vocab`] — used when a checkpoint ships no
+///     converted `tokenizer.json`.
 ///
 /// Truncation is a property of the `tokenizers::Tokenizer` value, not of a
 /// call, so one tokenizer is held per truncation length this wrapper has
@@ -50,6 +54,13 @@ impl TokenizerWrapper {
     /// in the OpenCLIP text tower finds the EOT marker at the correct index.
     pub fn from_open_clip_bpe(path: &Path) -> Result<Self> {
         Ok(Self::from_tokenizer(load_open_clip_bpe(path)?))
+    }
+
+    /// Build a BERT WordPiece tokenizer from a checkpoint's `vocab.txt` and,
+    /// when it ships one, its `tokenizer_config.json`, with batch-longest
+    /// padding on the vocabulary's pad token.
+    pub fn from_wordpiece_vocab(vocab: &Path, config: Option<&Path>) -> Result<Self> {
+        Ok(Self::from_tokenizer(load_wordpiece_vocab(vocab, config)?))
     }
 
     /// Wrap an already-built tokenizer as it is: its padding and every other

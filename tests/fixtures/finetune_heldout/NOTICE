@@ -1,4 +1,4 @@
-finetune_heldout fixture (cookbook/fixtures/finetune_heldout/)
+finetune_heldout fixture (tests/fixtures/finetune_heldout/)
 
 This directory redistributes derived text from the Open Graph Benchmark
 "ogbn-arxiv" dataset: `heldout_pairs.jsonl` and `train_pairs.jsonl` carry

@@ -2,11 +2,6 @@
 title: "Asymmetric binary quantization: a per-dimension threshold recovers the bits a real embedding's own anisotropy collapses"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `storage_precision = "binary"`'s own coarse-code fit — a per-dimension
 threshold τ learned from the corpus (`sign(v − τ)`, median default), replacing the old
 fixed-`0` `sign(v)` — applied automatically, with no new config knob, through the same
@@ -43,9 +38,8 @@ therefore the final answer once rescore runs, is unaffected.
 
 The same corpus the two preceding chapters measure — the papers embedded once, held-out
 queries, the engine's exact search as ground truth. At `full` scale these are
-ModernBERT-base embeddings; at `small`, the random-weight fixture encoder's — which, measured
-below, is anisotropic too: mean-pooled transformer states share a common direction whether or
-not the weights were trained.
+ModernBERT-base embeddings; at `small`, a sentence encoder's (`all-MiniLM-L6-v2`), which,
+measured below, is anisotropic too.
 
 ```{python}
 import numpy as np
@@ -123,16 +117,22 @@ for name, (r1, r10) in no_rescore.items():
 ```
 
 ```{python}
-for name in ("median", "mean"):
-    claim(f"a {name} threshold recovers no-rescore recall the fixed-0 code loses",
-          no_rescore[name][1] > no_rescore["zero"][1],
-          f"recall@{K} {no_rescore[name][1]:.4f} against {no_rescore['zero'][1]:.4f}")
+if SCALE is scale.Scale.FULL:
+    for name in ("median", "mean"):
+        claim(f"a {name} threshold recovers no-rescore recall the fixed-0 code loses",
+              no_rescore[name][1] > no_rescore["zero"][1],
+              f"recall@{K} {no_rescore[name][1]:.4f} against {no_rescore['zero'][1]:.4f}")
 ```
 
-Both corpus-fit thresholds clear the fixed-`0` rule: the diagnosis is not a curiosity, it costs no-rescore recall, and centering recovers
-information the fixed rule threw away. Median is the engine's default because it splits every
-dimension exactly in half — the most information a bit can carry. Neither closes the gap to
-the exact answer: a 1-bit-per-dimension code is lossy, and that gap is what rescore closes.
+How much centering recovers depends on how many bits the fixed-`0` rule wastes. ModernBERT's
+shared direction sits on a large share of its dimensions, every one of them a dead bit at `0`,
+and both corpus-fit thresholds clear the fixed rule by a clear margin at `full` scale. A
+sentence encoder trained for retrieval, like the `small` scale's, spreads its shared
+direction thinly: only a handful of its dimensions collapse at `0`, so there is little for
+centering to win back, and the two codes rank about alike. Median is the engine's rule because
+it splits every dimension exactly in half, the most a bit can carry whatever the encoder.
+Neither threshold closes the gap to the exact answer: a 1-bit-per-dimension code is lossy, and
+that gap is what rescore closes.
 
 ## The engine's own code — reachable, with no separate knob
 

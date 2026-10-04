@@ -2,7 +2,7 @@
 //
 // These tests exercise the full path: InferenceSession → add_source → infer()
 // → RecordBatch with vectors. They use a tiny BERT fixture (32-dim, 1 layer)
-// checked into cookbook/fixtures/tiny_bert/ — no network access required.
+// checked into tests/fixtures/tiny_bert/ — no network access required.
 
 use crate::common;
 
@@ -21,11 +21,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 fn tiny_bert_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_bert"))
+    ModelSource::local(common::fixture("tiny_bert"))
 }
 
 fn tiny_modernbert_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_modernbert"))
+    ModelSource::local(common::fixture("tiny_modernbert"))
 }
 
 async fn session_with_patents() -> (Arc<InferenceSession>, TempDir) {
@@ -372,7 +372,7 @@ async fn e2e_systemic_forward_failure_propagates_from_embedding_pipeline() {
     // rather than silently persisting an empty "ready" embedding table or an
     // all-error relation.
     let (session, _dir) = session_with_patents().await;
-    let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model_id = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
 
     let err = session
         .generate_image_embeddings(
@@ -603,7 +603,7 @@ async fn embedding_vectors_are_semantically_meaningful_and_reproducible() {
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
-    let model = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
 
     // Encode four queries: two physics, one biology, and a repeat of the first
     let vec_physics_1 = session
@@ -728,10 +728,7 @@ async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
     let config = common::test_config(dir.path());
     let session = Arc::new(InferenceSession::new(config).await.unwrap());
 
-    let model = "local:".to_string()
-        + common::cookbook_fixture("tiny_modernbert")
-            .to_str()
-            .unwrap();
+    let model = "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap();
 
     let vec_a = session
         .encode_text_query(&model, "quantum computing in superconducting systems")
@@ -766,7 +763,7 @@ async fn e2e_modernbert_embedding_vectors_are_nonzero_and_reproducible() {
 // ─── Classification backend ─────────────────────────────────────────────────
 
 fn tiny_modernbert_classifier_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_modernbert_classifier"))
+    ModelSource::local(common::fixture("tiny_modernbert_classifier"))
 }
 
 #[tokio::test]
@@ -863,7 +860,7 @@ async fn e2e_classification_labels_match_id2label() {
 // ─── NER backend ─────────────────────────────────────────────────────────────
 
 fn tiny_modernbert_ner_source() -> ModelSource {
-    ModelSource::local(common::cookbook_fixture("tiny_modernbert_ner"))
+    ModelSource::local(common::fixture("tiny_modernbert_ner"))
 }
 
 #[tokio::test]

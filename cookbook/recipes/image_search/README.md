@@ -11,29 +11,14 @@ text `eval_embeddings` recipe.
 
 ## Model
 
-A **domain-specialized CLIP checkpoint** is a drop-in for the reference model
-when your corpus is technical drawings or diagrams rather than photographs — a
-generic CLIP has seen few of them, and a checkpoint tuned on that kind of
-imagery separates them far better. `patentclip/PatentCLIP_Vit_B` on the Hugging
-Face Hub is one such checkpoint:
-
-```bash
-JAMMI_IMAGE_MODEL=patentclip/PatentCLIP_Vit_B \
-    python cookbook/recipes/image_search/example.py
-```
-
-`patentclip/PatentCLIP_Vit_B` is pulled from the Hugging Face Hub on first use
-and produces **512-dim** L2-normalized embeddings. Any OpenCLIP-format model
-works the same way — OpenAI CLIP, LAION `CLIP-ViT-B-32-*`, EVA-CLIP, etc. — the
-encoder is auto-detected from the model's `open_clip_config.json`.
-
-By **default** (no env var) the recipe runs against the hermetic
-`cookbook/fixtures/tiny_open_clip` fixture so it runs offline in CI — about two
-seconds on a laptop, nearly all of it the tower-LoRA and refusal legs (the
-search-and-eval flow alone is a fraction of a second). That fixture has random
-weights, so its retrieval numbers are meaningless — it exercises the full
-pipeline, not model quality. Point `JAMMI_IMAGE_MODEL` at any real checkpoint
-for real numbers.
+The recipe runs LAION's CLIP ViT-B/32
+(`laion/CLIP-ViT-B-32-laion2B-s34B-b79K`, an OpenCLIP checkpoint with 512-dim
+L2-normalized embeddings), downloaded from the Hugging Face Hub on first use
+(about 600 MB) and cached. Any OpenCLIP-format checkpoint works the same way —
+OpenAI CLIP, other LAION sizes, EVA-CLIP, or one tuned on a domain's imagery,
+such as `patentclip/PatentCLIP_Vit_B` for technical drawings — the encoder is
+read from the checkpoint's `open_clip_config.json`. Change `MODEL` in the
+program to try one.
 
 ## API surface exercised
 
@@ -92,8 +77,6 @@ output) is handled inside the encoder per the model's `preprocess_cfg`.
   by `cookbook/fixtures/generate.py` — **no real-world imagery** (licensing).
 - `cookbook/fixtures/tiny_image_golden.json` — per-query → expected corpus IDs
   (same shape family).
-- `cookbook/fixtures/tiny_open_clip/` — tiny offline OpenCLIP fixture used as
-  the default CI model.
 
 ## Run it
 

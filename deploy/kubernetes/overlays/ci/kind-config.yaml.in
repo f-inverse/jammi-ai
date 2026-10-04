@@ -8,7 +8,7 @@ apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
     extraMounts:
-      - hostPath: ${GITHUB_WORKSPACE}/cookbook/fixtures/tiny_bert
+      - hostPath: ${GITHUB_WORKSPACE}/tests/fixtures/tiny_bert
         containerPath: /fixtures/tiny_bert
         readOnly: true
       - hostPath: ${GITHUB_WORKSPACE}/tests/fixtures/patents.parquet

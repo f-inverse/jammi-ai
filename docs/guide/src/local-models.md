@@ -29,6 +29,11 @@ the directory must exist there.
 - A config: `config.json` (or `open_clip_config.json` for OpenCLIP models).
 - Weights: `model.safetensors` (or `open_clip_model.safetensors`), or
   `model.gguf`.
+- For text, a tokenizer: a converted `tokenizer.json`; or, for a BERT-family
+  checkpoint that ships none, its WordPiece `vocab.txt` (with its
+  `tokenizer_config.json` when it has one), which the engine builds into the
+  same tokenizer `transformers` would; or OpenCLIP's
+  `bpe_simple_vocab_16e6.txt.gz`. The first present wins, in that order.
 
 `model.safetensors` wins, then `open_clip_model.safetensors`; `model.gguf` is
 considered only when neither is present — see [Quantized (GGUF)

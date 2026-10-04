@@ -2,7 +2,7 @@
 //! seam: driving the in-process [`Session`] yields the same results as
 //! calling [`InferenceSession`] directly. These tests run the real
 //! source → generate-embeddings → search pipeline over the patents fixture and
-//! the tiny BERT cookbook model through both paths and compare.
+//! the `tiny_bert` test model through both paths and compare.
 
 use std::sync::Arc;
 
@@ -34,7 +34,7 @@ async fn seed(session: &Arc<InferenceSession>) {
 }
 
 fn tiny_bert() -> String {
-    "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap()
+    "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap()
 }
 
 /// `Session::generate_embeddings(Text)` produces the same result table the

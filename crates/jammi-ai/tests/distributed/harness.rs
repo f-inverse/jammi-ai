@@ -776,7 +776,7 @@ pub fn training_pairs_url() -> String {
 pub fn tiny_bert_model() -> String {
     format!(
         "local:{}",
-        jammi_test_utils::cookbook_fixture("tiny_bert")
+        jammi_test_utils::fixture("tiny_bert")
             .to_str()
             .expect("utf8 tiny_bert path")
     )

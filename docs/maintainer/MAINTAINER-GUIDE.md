@@ -374,10 +374,11 @@ CatalogService.
 
 ### 1.5 The engine↔cookbook loop — the in-monorepo contract suite & staleness oracle
 
-The cookbook is a Quarto book inside this monorepo at `cookbook/book/`, wired into
-CI by `ci.yml`'s book jobs and published with each release by `pages.yml`. It is the discipline loop that makes
+The cookbook is a Quarto book inside this monorepo at `cookbook/book/`, checked by
+`ci.yml`'s `book-checks`, rendered on real models by the cookbook lane
+(`cookbook-gpu.yml`) and published with each release by `pages.yml`. It is the discipline loop that makes
 the cookbook the engine's executable acceptance suite: a feature is not done
-without **chapter + API-guard bump + golden-metric hold**.
+without **chapter + API-guard bump + its claims holding**.
 
 **The one-way edge (a guarded invariant, not a convention).** `cookbook/book/`
 consumes the engine; the engine never references `cookbook/book/`. This is
@@ -460,20 +461,26 @@ enforced by a dedicated CI gate, `cookbook-one-way` /
      proves each process shape. A cookbook script that no lane executes is not
      covered: add it to `RECIPES` in `tests/cookbook_smoke.py`.
 
-**How the loop closes in CI (the atomicity guarantee).** The book is tested
-against the engine commit it ships beside. `ci.yml`'s book jobs install the
-wheels that same run built (`.github/actions/install-jammi`: the client wheel and
-the native engine, `--force-reinstall --no-deps` over the unpinned `jammi-ai`
-dependency); `book-checks` runs `check_api_reference.py`, the shared-lib pytest
-suite including `test_closed_loop.py`, the no-deferral grep, and the citation
-check, and `book-render` renders the pages the change can move
-(`ci/scripts/select_render_chapters.py`), in parallel slices, every one live,
-checking its claims. When that selection is every page — a release's
-tree always is, its version bump changing `Cargo.toml` — `book` assembles the
-slices' renders into the whole book without executing anything again
-(Quarto's `_freeze/` records, written under the `assemble` profile,
-`cookbook/book/_quarto-assemble.yml`), and that artifact is what the release
-publishes. So a feature and its proof land atomically in one PR. What a reader installs is tested separately:
+**How the loop closes (the atomicity guarantee).** The book is tested against
+the engine commit it ships beside, in two places. `ci.yml` runs what needs no
+model, on every change: `book-checks` installs the wheels that same run built
+(`.github/actions/install-jammi`: the client wheel and the native engine,
+`--force-reinstall --no-deps` over the unpinned `jammi-ai` dependency) and runs
+`check_api_reference.py`, the shared-lib pytest suite including
+`test_closed_loop.py`, the no-deferral grep and the citation check, and the
+`guard` job's `check_cookbook_coverage.py` holds that every public verb has a
+runnable example. Every recipe and chapter runs real Hub models, so running
+them is a live test, and `ci.yml` stays hermetic: the cookbook lane
+(`.github/workflows/cookbook-gpu.yml`) installs the CUDA engine wheel, the
+client wheel, the CUDA server and the CLI of the `ci.yml` run that proved a
+tree on a rented L4 (`ci/scripts/runpod_cookbook_gpu.sh`), runs every recipe,
+renders every page under the `assemble` profile checking its claims, and
+assembles the whole book from those renders without executing anything again
+(Quarto's `_freeze/` records, `cookbook/book/_quarto-assemble.yml`). That
+artifact is what the release publishes, and the release gate requires the
+lane's green run over the released tree. Label a pull request `cookbook-gpu`
+when a reader would see its change; dispatch the lane before tagging a
+release. What a reader installs is tested separately:
 `.github/workflows/cookbook-published.yml` runs every notebook at the newest release
 tag, as published, in a fresh environment — the setup cell installs the release from
 PyPI — nightly on a CPU, and after a release on a RunPod L4 as well
@@ -2720,7 +2727,7 @@ outcome through the shared mechanism:
   same `&'static` on every later call — no new hand-declared static needed.
   `DispatchCounters::snapshot()` returns a `DispatchSnapshot { fused, eager }`
   (`Relaxed` atomics).
-- **`warn_fallback_once(op, predicate)`** — a `tracing::warn!` emitted at most
+- **`note_fallback_once(op, predicate)`** — a `tracing::info!` emitted at most
   once per process per `(op, predicate)` pair, so a fallback-heavy run does not
   spam.
 - **`admit(mode, op, predicate_name, predicate_holds, counters)`** is the single
@@ -2774,7 +2781,7 @@ is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
 device 0 exists, and fails naming the device when it cannot be opened.
 `--features golden-parity` runs in CI's hermetic `test` job
 (`.github/workflows/ci.yml`): its oracle is a committed PyTorch dump
-(`cookbook/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
+(`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary),
 never a network call or a torch install. `parity-test` needs a PyTorch
 environment and `live-gpu-tests` a GPU, which no hosted runner has: CI lints
 the `live-gpu-tests` surfaces (the `flash-attn-compile` job), and they run on
@@ -5347,9 +5354,8 @@ tarball and wheel (`_server.yml`, per manifest build and arch; the CUDA tarball 
 libraries through `ci/scripts/package_server_tarball.sh`), the `jammi` CLI for every release target
 (`_cli.yml`), the client wheel (`_client-wheel.yml`) and the TypeScript package (`ts-client`'s
 `npm pack`). Every check that runs one installs that build and compiles nothing:
-`test-python`, `cookbook` (every recipe plus the client's live suite), the book
-(`book-plan` selects the chapters the change can move, `book-checks`, `book-render` in up to four
-interleaved slices), `server-image-cuda` (the CUDA image packaged from the run's CUDA binary),
+`test-python`, `client-live` (the client's live-server suite), `book-checks`,
+`server-image-cuda` (the CUDA image packaged from the run's CUDA binary),
 and the `kube-smoke`/`compose-smoke` deploy shapes (their images packaged from the run's
 binaries). `.github/actions/install-jammi` and `stage-server-binaries` are the two ways a job
 takes a run's builds.
@@ -5436,11 +5442,13 @@ branch's tree, with nothing promoted. A version bump PR moves
 exact sibling pin the `lockstep versions` guard lists (`ci/scripts/check_lockstep_versions.py`), and
 rebuilds the cookbook notebooks (`python cookbook/book/scripts/build_notebooks.py`), which pin the
 release they install. On merge, **prove before tagging**: dispatch
-`.github/workflows/gpu-prove.yml` on the commit to be released (`--ref main` at the tip, or on the
-pushed tag once it exists) and wait for all four shipped arches to go green — **EVERY** release
-publishing job (all-or-nothing: not only the CUDA lanes) gates on the recorded verdicts of the
-released commit's tree rather than proving anything themselves: its GPU prove and its `ci.yml`
-summary (`ci/scripts/verdict.py require`, consumed via `_proof-required.yml`). A merge whose tree
+`.github/workflows/gpu-prove.yml` and `.github/workflows/cookbook-gpu.yml` on the commit to be
+released (`--ref main` at the tip, or on the pushed tag once it exists) and wait for all four
+shipped arches and the cookbook to go green — **EVERY** release publishing job (all-or-nothing: not
+only the CUDA lanes) gates on the recorded verdicts of the released commit's tree rather than
+proving anything themselves: its GPU prove, its `ci.yml` summary and its cookbook run, which
+renders the book the release publishes (`ci/scripts/verdict.py require`, consumed via
+`_proof-required.yml`). A merge whose tree
 its pull request's run already proved needs no wait for `main`'s run. A red leg is re-run by hand
 (`gh run rerun <run_id> --failed`) in that same run. The verdict check is CHECK-ONCE and FAIL-LOUD —
 no poll, no deadline: a tag push on a tree whose proof is not ALREADY green fails every release

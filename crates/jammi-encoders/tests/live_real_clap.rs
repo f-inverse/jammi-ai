@@ -46,7 +46,7 @@ const MIN_COS_REAL: f32 = 1.0 - 1e-5;
 
 fn real_fixture_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../cookbook/fixtures/htsat_clap_real")
+        .join("../../tests/fixtures/htsat_clap_real")
 }
 
 /// Minimum per-row cosine similarity (over the batch) between two `[B, D]`

@@ -776,7 +776,7 @@ async fn train_context_predictor_over_generated_embeddings() {
     // The real embedding path: encodes `text` with the tiny fixture model,
     // auto-registers the embedding model row (PK `name::version`), and records
     // the result table under the model's bare canonical name.
-    let model_id = "local:".to_string() + common::cookbook_fixture("tiny_bert").to_str().unwrap();
+    let model_id = "local:".to_string() + common::fixture("tiny_bert").to_str().unwrap();
     session
         .generate_text_embeddings(
             "fns",

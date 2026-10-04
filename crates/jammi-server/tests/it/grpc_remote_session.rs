@@ -17,7 +17,7 @@
 //! * **Tenant** — `bind_tenant` (async) over the wire is observed by a later
 //!   `tenant()` read; the binding is keyed by the client's session id.
 //!
-//! Hermetic: the encoder is the local `tiny_bert` cookbook fixture and the
+//! Hermetic: the encoder is the local `tiny_bert` test fixture and the
 //! corpus is the bundled `patents.parquet`; no live network, no download.
 
 use jammi_ai::SearchMethod;
@@ -35,7 +35,7 @@ use jammi_db::error::{IndexKind, JammiError, Missing};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_db::trigger::{DeliveredBatch, Predicate, TopicDefinition, TopicId, TriggerError};
 use jammi_db::AuditError;
-use jammi_test_utils::{cookbook_fixture, fixture, test_config};
+use jammi_test_utils::{fixture, test_config};
 use tonic::transport::Endpoint;
 
 use super::common::grpc::{
@@ -85,7 +85,7 @@ fn events_topic() -> TopicDefinition {
 }
 
 fn tiny_bert_model_id() -> String {
-    format!("local:{}", cookbook_fixture("tiny_bert").display())
+    format!("local:{}", fixture("tiny_bert").display())
 }
 
 fn patents_connection() -> SourceConnection {

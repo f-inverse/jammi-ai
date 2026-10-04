@@ -2,11 +2,6 @@
 title: "Binary (B1) storage precision: a 32× smaller vector payload, a rescore obligation that isn't optional"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** the fourth `storage_precision` — `binary` (usearch's `B1` scalar kind, one
 packed sign bit per dimension, searched by **Hamming** distance rather than cosine) —
 set through `jammi.connect(..., config=...)` · the same retrieve→rescore path `f16`/`int8`
@@ -123,7 +118,7 @@ claim("the graph file shrinks by less, because the links do not shrink with prec
 "Binary is 32× smaller" is true of the vectors inside the graph; the file shrinks by the
 measured, smaller factor above, because the links do not shrink at all. The smaller the
 vectors, the larger the links' share: at a real embedding's hundreds of dimensions the payload
-still dominates an `f32` graph, at the fixture encoder's 32 the links already weigh as much.
+still dominates an `f32` graph, but once each vector is 1 bit per dimension the links outweigh it.
 And, as for `int8`, a quantized table also writes the `.rawf32` rescore companion — the exact
 vectors, which do not shrink with `storage_precision` at all.
 

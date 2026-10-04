@@ -16,6 +16,7 @@ pub(crate) mod memo;
 pub(crate) mod oom;
 pub mod resolver;
 pub mod tokenizer;
+pub(crate) mod wordpiece;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,8 +67,9 @@ pub use jammi_datafusion::{ModelSource, ModelTask};
 /// Where the tokenizer for a resolved model lives, and what shape it is.
 ///
 /// Most checkpoints carry an HF-converted `tokenizer.json`; stock OpenCLIP
-/// repos instead ship the legacy gzipped BPE vocab. The resolver picks
-/// whichever is present and the loader dispatches on the variant.
+/// repos instead ship OpenCLIP's native gzipped BPE vocab, and many BERT-family
+/// checkpoints ship only a WordPiece `vocab.txt`. The resolver picks the first
+/// of those present, in that order, and the loader dispatches on the variant.
 #[derive(Debug, Clone)]
 pub enum TokenizerSource {
     /// HuggingFace-shape `tokenizer.json` (works for BERT-family, ModernBERT,
@@ -76,13 +78,39 @@ pub enum TokenizerSource {
     /// OpenCLIP-native `bpe_simple_vocab_16e6.txt.gz` — built directly into a
     /// BPE tokenizer at load time, no HF pre-conversion required.
     OpenClipBpe(std::path::PathBuf),
+    /// A WordPiece `vocab.txt`, built into the BERT tokenizer at load time and
+    /// configured by the checkpoint's `tokenizer_config.json` when it ships
+    /// one (casing, accent stripping, special tokens).
+    WordPiece {
+        vocab: std::path::PathBuf,
+        config: Option<std::path::PathBuf>,
+    },
 }
 
 impl TokenizerSource {
-    /// Filesystem path of the tokenizer artifact.
-    pub fn path(&self) -> &std::path::Path {
+    /// The source for `artifact`, a checkpoint's first-present tokenizer
+    /// candidate of `layout`; `config` is its `tokenizer_config.json`, which a
+    /// resolver looks for only when `layout.reads_config()`.
+    pub(crate) fn of(
+        layout: arch::TokenizerLayout,
+        artifact: std::path::PathBuf,
+        config: Option<std::path::PathBuf>,
+    ) -> Self {
+        match layout {
+            arch::TokenizerLayout::HuggingFaceJson => Self::HuggingFaceJson(artifact),
+            arch::TokenizerLayout::OpenClipBpe => Self::OpenClipBpe(artifact),
+            arch::TokenizerLayout::WordPiece => Self::WordPiece {
+                vocab: artifact,
+                config,
+            },
+        }
+    }
+
+    /// The artifact the loader builds the tokenizer from.
+    pub(crate) fn artifact(&self) -> &std::path::Path {
         match self {
             Self::HuggingFaceJson(p) | Self::OpenClipBpe(p) => p,
+            Self::WordPiece { vocab, .. } => vocab,
         }
     }
 }

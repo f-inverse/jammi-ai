@@ -2,13 +2,15 @@
 
 Every chapter runs its capability live. What it runs over is a scale:
 
-* ``small`` — the committed fixtures and the tiny fixture encoders, on the CPU.
-  Seconds per chapter; what CI renders and what a CPU Colab runtime runs.
-* ``full`` — the published datasets and real encoders, on a GPU. The optional
-  "at scale" run: the same chapter, the same code, over the data the book's
-  findings are about.
+* ``small`` — the committed small datasets and compact real encoders, on the
+  CPU. Minutes per chapter; what CI renders and what a CPU Colab runtime runs.
+* ``full`` — the published datasets and the larger encoders, on a GPU. The
+  optional "at scale" run: the same chapter, the same code, over the data the
+  book's findings are about.
 
-The chapter code is identical at both; only the data and the encoders differ.
+Both scales run pretrained encoders from the Hugging Face Hub (see
+``encoders``). The chapter code is identical at both; only the data and the
+text encoder differ.
 A claim only the full data can show is guarded by ``SCALE is Scale.FULL`` in the
 chapter, so a small run never claims a finding its fixtures cannot bear. Choose
 with ``JAMMI_COOKBOOK_SCALE`` (``small`` when unset).

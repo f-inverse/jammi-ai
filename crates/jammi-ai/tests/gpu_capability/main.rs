@@ -5,7 +5,7 @@
 //! whose ML correctness on GPU is unproven must not ship.
 //!
 //! The suite proves three properties, each over the engine's *real* fixtures
-//! (the cookbook `tiny_bert` encoder, `patents.parquet`, and the synthetic
+//! (the `tiny_bert` test encoder, `patents.parquet`, and the synthetic
 //! graph / meta-dataset fixtures the CPU suites already use):
 //!
 //! - **P1 — CPU↔GPU parity** for the verbs with a real GPU kernel. The *same*

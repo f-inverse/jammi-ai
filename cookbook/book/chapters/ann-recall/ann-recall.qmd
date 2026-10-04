@@ -2,11 +2,6 @@
 title: "Approximate search: how much recall does the index give up?"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `search` (approximate, through the HNSW sidecar
 [@malkov2020hnsw]) · `search(exact=True)` · `[embedding.ann] search_expansion` ·
 **Background:** approximate vs exact nearest-neighbour search and the
@@ -115,10 +110,10 @@ Recall climbs with the effort toward the exact answer. The queries-per-second
 column is measured on whatever machine renders this page, so its absolute
 values mean little — its shape is the cost side of the trade. The narrowest
 search visibly gives up neighbours; the default effort recovers most of them.
-How much any setting gives up depends on the geometry of the embeddings: the
-small fixture encoder packs every similarity into a narrow band, where many
-near-equal neighbours make the graph walk slip, while a trained encoder spreads
-them apart. The practitioner's rule: measure recall against
+How much any setting gives up depends on the geometry of the embeddings: an
+encoder that packs similarities into a narrow band leaves many near-equal
+neighbours for the graph walk to slip between, while one that spreads them apart
+gives it clear choices. The practitioner's rule: measure recall against
 `exact=True` on your own data, then pick the lowest effort that clears the bar
 your application needs.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a minimal ModernBERT classification model fixture for hermetic testing.
 
-Creates cookbook/fixtures/tiny_modernbert_classifier/ with:
+Creates tests/fixtures/tiny_modernbert_classifier/ with:
   - config.json      (ModernBERT config with classifier fields, hidden=32, 1 layer, 2 heads, vocab=256)
   - model.safetensors (random weights including head and classifier layers)
   - tokenizer.json    (minimal WordPiece tokenizer with 256-token vocab)
@@ -10,10 +10,8 @@ The model is ~20KB total — small enough to commit to the repo.
 It produces garbage predictions (random weights) but exercises the full
 ModernBertForSequenceClassification::load() → forward() → softmax pipeline.
 
-The fixture lives under cookbook/fixtures/ because the eval_inference
-cookbook recipe loads it as a local classifier; the in-crate classification
-tests consume the same on-disk artifact via
-`jammi_test_utils::cookbook_fixture("tiny_modernbert_classifier")`.
+The engine's integration tests load it offline via
+`jammi_test_utils::fixture("tiny_modernbert_classifier")`.
 """
 
 import json
@@ -27,7 +25,7 @@ OUT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
     "..",
-    "cookbook",
+    "tests",
     "fixtures",
     "tiny_modernbert_classifier",
 )

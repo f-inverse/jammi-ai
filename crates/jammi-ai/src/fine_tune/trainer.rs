@@ -7380,7 +7380,7 @@ mod test_fixtures {
     use jammi_datafusion::ModelSource;
     use jammi_datafusion::ModelTask;
 
-    /// Load the hermetic `tiny_bert` cookbook fixture through a real
+    /// Load the hermetic `tiny_bert` test fixture through a real
     /// `InferenceSession`'s model cache — the same resolve+backend-load path
     /// serving uses (see `ModelCache::load_owned_for_test`'s doc on
     /// `session.rs`'s equivalent seam). Real, but tiny and local: no network,
@@ -7390,7 +7390,7 @@ mod test_fixtures {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());
         let session = crate::session::InferenceSession::new(config).await.unwrap();
-        let source = ModelSource::Local(jammi_test_utils::cookbook_fixture("tiny_bert"));
+        let source = ModelSource::Local(jammi_test_utils::fixture("tiny_bert"));
         let guard = session
             .model_cache()
             .get_or_load(&source, ModelTask::TextEmbedding)
@@ -13782,7 +13782,7 @@ mod held_out_eval_tests {
 /// fabricated `true`.
 ///
 /// These tests build a REAL `EncoderAdapters` target — the smallest
-/// constructible one, the checked-in `cookbook/fixtures/tiny_modernbert` config +
+/// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
 /// weights also used by the `it` suite's `encoder_adapters` tests — and read the
 /// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
 /// never trusting `TrainingLoop::training_mode` as ground truth (that mirror
@@ -13813,7 +13813,7 @@ mod encoder_adapters_training_state_tests {
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
 
-    /// The repo-root `cookbook/fixtures/tiny_modernbert` dir — the same
+    /// The repo-root `tests/fixtures/tiny_modernbert` dir — the same
     /// smallest-constructible ModernBERT config + weights
     /// the `it` suite's `encoder_adapters` tests fine-tune end-to-end.
     /// `CARGO_MANIFEST_DIR` is `crates/jammi-ai`; `tests/fixtures` sits two
@@ -13825,7 +13825,7 @@ mod encoder_adapters_training_state_tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("cookbook")
+            .join("tests")
             .join("fixtures")
             .join("tiny_modernbert")
     }
@@ -14003,7 +14003,7 @@ mod encoder_adapters_training_state_tests {
 /// `training_mode` dispatch) rather than asserting on a fabricated number.
 ///
 /// Builds a real `TrainingTarget::EncoderAdapters` over the checked-in
-/// `htsat_clap_tiny` cookbook fixture (the same 4-stage HTSAT-Swin CLAP
+/// `htsat_clap_tiny` test fixture (the same 4-stage HTSAT-Swin CLAP
 /// audio tower the `it` suite's `tower_adapters::clap_audio_tower_adapter_
 /// trains_and_serves` fine-tunes end-to-end) and a real base model loaded
 /// through the SAME `ModelResolver` + `CandleBackend::load` pair the
@@ -14035,10 +14035,10 @@ mod media_front_end_wall_tests {
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder, TrainingResult};
 
-    /// The `cookbook/fixtures/htsat_clap_tiny` dir (config.json,
+    /// The `tests/fixtures/htsat_clap_tiny` dir (config.json,
     /// model.safetensors, preprocessor_config.json) — same fixture
     /// the `it` suite's `tower_adapters` tests use. `CARGO_MANIFEST_DIR` is
-    /// `crates/jammi-ai`; `cookbook/fixtures` sits two levels up, at the
+    /// `crates/jammi-ai`; `tests/fixtures` sits two levels up, at the
     /// workspace root.
     fn htsat_clap_tiny_dir() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14046,7 +14046,7 @@ mod media_front_end_wall_tests {
             .unwrap()
             .parent()
             .unwrap()
-            .join("cookbook")
+            .join("tests")
             .join("fixtures")
             .join("htsat_clap_tiny")
     }
@@ -14472,7 +14472,7 @@ mod encode_texts_bucketing_oracle {
     /// so the tokenizer's emitted token ids are valid inputs to the
     /// encoder's own embedding table. Mirrors
     /// `test_fixtures::tiny_bert`'s real model-cache load path, substituting
-    /// `tiny_modernbert_fixture_dir` for the cookbook `tiny_bert` fixture.
+    /// `tiny_modernbert_fixture_dir` for the `tiny_bert` fixture.
     async fn tiny_modernbert_base_model() -> Arc<LoadedModel> {
         let dir = tempfile::tempdir().unwrap();
         let config = jammi_test_utils::test_config(dir.path());

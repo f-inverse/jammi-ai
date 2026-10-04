@@ -2,11 +2,6 @@
 title: "Per-verb tenant isolation, on both transports — and the bring-your-own-auth seam"
 ---
 
-```{python}
-# | echo: false
-import jammi_cookbook
-```
-
 **Verbs:** `set_tenant` / `tenant_scope` across the tenant-scoped verb surface
 (`list_sources` · `describe_source` · `list_mutable_tables` · `list_topics` ·
 `list_channels` · `list_models` · `sql` · the `create_*` / `drop_*` verbs) ·
@@ -73,7 +68,7 @@ def isolation(db) -> dict:
         db.register_topic(f"tp_a_{run}", schema=pa.schema([("id", pa.int64())]))
         db.register_channel(f"ch_a_{run}", priority=5, columns=[("note", "Utf8")])
         db.add_source(f"pairs_{run}", url=str(fixtures.path("tiny_pairs.csv")), format="csv")
-        job = db.fine_tune(source=f"pairs_{run}", base_model=fixtures.model("tiny_bert"),
+        job = db.fine_tune(source=f"pairs_{run}", base_model="sentence-transformers/all-MiniLM-L6-v2",
                            columns=["text_a", "text_b", "score"], method="lora",
                            task="text_embedding", lora_rank=4, epochs=1)
         job.wait()

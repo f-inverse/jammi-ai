@@ -3,10 +3,10 @@
 
 use std::collections::HashSet;
 
-use jammi_test_utils::{cookbook_fixture, tiny_vocab_text};
+use jammi_test_utils::{fixture, tiny_vocab_text};
 
 fn tiny_bert_tokenizer() -> tokenizers::Tokenizer {
-    tokenizers::Tokenizer::from_file(cookbook_fixture("tiny_bert").join("tokenizer.json"))
+    tokenizers::Tokenizer::from_file(fixture("tiny_bert").join("tokenizer.json"))
         .expect("the tiny_bert fixture ships its tokenizer")
 }
 

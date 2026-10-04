@@ -38,6 +38,7 @@ GPU = vd.Requirement(
     vd.gpu_requirement().remedy,
 )
 CI = vd.ci_requirement()
+COOKBOOK = vd.cookbook_requirement()
 
 
 def gpu_job(arch: str, conclusion, completed_at, job_id: int = 1, html_url: str = "https://x/y"):
@@ -431,7 +432,8 @@ class CheckOnceSemanticsTest(unittest.TestCase):
 
 
 class ReleaseGateTest(unittest.TestCase):
-    """The release gate holds only when the tree's GPU prove AND its CI hold."""
+    """The release gate holds only when the tree's GPU prove, its CI and its
+    cookbook all hold."""
 
     def _both(self, ci_conclusion):
         w = World()
@@ -439,6 +441,35 @@ class ReleaseGateTest(unittest.TestCase):
         w.bind(run, jobs)
         w.bind(run_obj(2, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, ci_conclusion, "2026-01-01T00:00:00Z", 30)])
         return w
+
+    def _all(self, cookbook_conclusion):
+        w = self._both("success")
+        w.bind(
+            run_obj(3, workflow=vd.COOKBOOK_WORKFLOW),
+            [named_job(vd.COOKBOOK_JOB, cookbook_conclusion, "2026-01-01T00:00:00Z", 40)],
+        )
+        return w
+
+    def test_a_release_requires_the_gpu_prove_ci_and_the_cookbook(self):
+        self.assertEqual(
+            [r.workflow for r in vd.release_requirements()],
+            [vd.GPU_WORKFLOW, vd.CI_WORKFLOW, vd.COOKBOOK_WORKFLOW],
+        )
+
+    def test_every_lane_proven_passes(self):
+        rc, out, err = _require(self._all("success"), requirements=[GPU, CI, COOKBOOK])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(vd.COOKBOOK_JOB, out)
+
+    def test_gpu_and_ci_proven_but_no_cookbook_run_denies(self):
+        rc, _, err = _require(self._both("success"), requirements=[GPU, CI, COOKBOOK])
+        self.assertEqual(rc, 1)
+        self.assertIn(vd.COOKBOOK_WORKFLOW, err)
+
+    def test_a_red_cookbook_run_denies(self):
+        rc, _, err = _require(self._all("failure"), requirements=[GPU, CI, COOKBOOK])
+        self.assertEqual(rc, 1)
+        self.assertIn(vd.COOKBOOK_JOB, err)
 
     def test_gpu_and_ci_proven_passes(self):
         rc, out, err = _require(self._both("success"), requirements=[GPU, CI])

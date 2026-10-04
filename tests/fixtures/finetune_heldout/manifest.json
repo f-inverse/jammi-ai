@@ -12,8 +12,8 @@
   "n_train": 1372,
   "provenance": {
     "arxiv_subset_ids_sha256": "6d158e5f5f9284189ca8e9a3fcbc0169ffa1cd907c531e89d1155a4b251d7ec4",
-    "committed_subset_ids_file": "cookbook/fixtures/finetune_heldout/arxiv_subset_ids.txt",
-    "license": "ODC-BY 1.0 (Open Graph Benchmark); see cookbook/fixtures/finetune_heldout/NOTICE.",
+    "committed_subset_ids_file": "tests/fixtures/finetune_heldout/arxiv_subset_ids.txt",
+    "license": "ODC-BY 1.0 (Open Graph Benchmark); see tests/fixtures/finetune_heldout/NOTICE.",
     "produced_by": "same-subject supervised pair mining over the committed subset: sorted paper_id traversal, np.random.default_rng(seed) draws per anchor (positive, negative subject, negative within subject), title + '. ' + abstract clipped to 1500 chars",
     "source_titleabs": {
       "sha256": "7bce99ab3e1604277f12dd49f6e17a0d89867b29ea152f072c0e709ae0bc8ed7",

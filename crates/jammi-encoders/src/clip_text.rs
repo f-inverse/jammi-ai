@@ -1094,7 +1094,7 @@ mod tests {
 
         let device = Device::Cpu;
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../cookbook/fixtures/tiny_open_clip");
+            .join("../../tests/fixtures/tiny_open_clip");
         let raw = std::fs::read_to_string(dir.join("open_clip_config.json"))
             .expect("read tiny_open_clip config");
         let json: serde_json::Value = serde_json::from_str(&raw).expect("parse open_clip config");

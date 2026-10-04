@@ -27,7 +27,7 @@ CLI shape
 (a synthetic 4-train/2-heldout triplet set):
 
 ```
-jammi-bench finetune-run --model-dir cookbook/fixtures/tiny_bert --arm fused \
+jammi-bench finetune-run --model-dir tests/fixtures/tiny_bert --arm fused \
   --train-jsonl <synthetic 4-triplet train.jsonl> \
   --heldout-ids <synthetic 2-pair heldout_ids.txt> \
   --heldout-jsonl <synthetic 2-triplet heldout.jsonl> \

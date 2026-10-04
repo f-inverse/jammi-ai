@@ -75,68 +75,9 @@ use jammi_test_utils::child::{Capture, Completeness, DrainedChild, Epoch};
 /// Env var carrying the child's role. Absent ⇒ this process is the parent.
 const ROLE_ENV: &str = "JAMMI_FOREIGN_SQLITE_ROLE";
 
-/// Env var carrying the exact `--exact` path this process was invoked with,
-/// so [`Role::Grandchild`]'s body can reuse it when spawning its own
-/// grandchild — the parent's `run_child` sets this on every spawn, unused by
-/// every role except `Grandchild`.
-const SELF_EXACT_ENV: &str = "JAMMI_FOREIGN_SQLITE_SELF_EXACT";
-
-/// The [`ROLE_ENV`] value [`Role::Grandchild`]'s body spawns its OWN child
-/// with (the "grandchild-of-grandchild") — deliberately NOT a [`Role`]
-/// variant: it is never dispatched through `run_child`/`classify` (nothing in
-/// this harness spawns it directly; only `Role::Grandchild`'s body does), so
-/// it must never reach `Role::parse`'s unknown-text panic.
-/// [`dispatch_if_child`] checks for this exact value and runs
-/// [`run_grandchild_of_grandchild`] BEFORE `Role::parse` ever sees it.
-/// Grandchild's body sets this explicitly on its own spawn — never
-/// inheriting `ROLE_ENV`'s `"grandchild"` value, which would fork-bomb (each
-/// grandchild would spawn its own grandchild, forever). Which of the two
-/// shapes [`run_grandchild_of_grandchild`] runs is a further choice, carried
-/// by [`GRANDCHILD_MODE_ENV`].
-const GRANDCHILD_CHILD_ROLE_VALUE: &str = "sleeper";
-
-/// Env var carrying which grandchild-of-grandchild shape
-/// [`run_grandchild_of_grandchild`] runs — set by [`run_grandchild`] and read
-/// by [`Role::Grandchild`]'s own body (which forwards it onto its spawn) and
-/// then by the grandchild-of-grandchild itself.
-const GRANDCHILD_MODE_ENV: &str = "JAMMI_FOREIGN_SQLITE_GRANDCHILD_MODE";
-
-/// [`GRANDCHILD_MODE_ENV`] value: a continuous writer, one line every 10 ms
-/// for 3 s. The reader threads in `jammi_test_utils::child` are poll-based
-/// (`libc::poll`, 50 ms timeout) and conclude EOF on the first EMPTY poll
-/// after the target process (here, `Role::Grandchild` itself) is reaped — a
-/// holder that merely holds the pipe open does not delay completeness at
-/// all under that mechanism. Only a holder that keeps WRITING with gaps
-/// shorter than the 50 ms poll timeout keeps presenting `POLLIN`, so the
-/// reader never sees the empty poll and keeps draining: this is the
-/// `Completeness::SettleExpired` oracle. 10 ms is deliberately well under
-/// the 50 ms poll timeout. The repeated line is [`GRANDCHILD_SENTINEL`]
-/// itself (not a distinct "heartbeat" line): whichever prefix of these 300
-/// lines the reader captures before the settle bound expires, the LAST
-/// captured line is ALSO the sentinel — this is what builds the
-/// untrustworthy-AND-terminus-satisfied state
-/// `grandchild_capture_is_incomplete_not_survived` needs to actually oracle
-/// the ORDER `classify` checks trust vs terminus in (a distinct "heartbeat"
-/// line would leave the terminus unsatisfied regardless of that order,
-/// making the two orderings indistinguishable to that test).
-const GRANDCHILD_MODE_WRITING: &str = "writing";
-
-/// [`GRANDCHILD_MODE_ENV`] value: a silent holder that sleeps 3 s and writes
-/// nothing, then exits. Pins the boundary `jammi_test_utils::child` documents
-/// from the other side: under the poll-based reader, merely holding the
-/// inherited pipe open — without writing to it — does NOT produce
-/// `Completeness::SettleExpired`; the capture comes back `Complete` and
-/// `is_trustworthy()`.
-const GRANDCHILD_MODE_HOLDING: &str = "holding";
-
-/// [`Role::Grandchild`]'s sentinel line, in one place so [`Terminus`] and the
-/// synthetic body agree by construction.
-const GRANDCHILD_SENTINEL: &str = "[child] GRANDCHILD-DONE";
-
 /// Env var overriding [`Role::Flood`]'s line count (default 65536, exactly 4
 /// MiB, when absent) — parameterizes the EXISTING `Flood` role by an env var,
-/// the same shape [`GRANDCHILD_MODE_ENV`] already uses, so the
-/// retention-cap oracle can flood well past `DEFAULT_HEAD_CAP +
+/// so the retention-cap oracle can flood well past `DEFAULT_HEAD_CAP +
 /// DEFAULT_TAIL_CAP` (8 MiB) without a new role.
 const FLOOD_LINES_ENV: &str = "JAMMI_FOREIGN_SQLITE_FLOOD_LINES";
 
@@ -208,24 +149,11 @@ enum Role {
     /// `[child] phase:` marker AFTER it — the negative control for the
     /// ordering conjunct.
     PostMarker,
-    /// Synthetic: prints its sentinel and exits 0 immediately, but FIRST
-    /// spawns its own grandchild-of-grandchild (never a `Role` — see
-    /// [`GRANDCHILD_CHILD_ROLE_VALUE`]) without stdio redirection, so it
-    /// inherits stderr — the very pipe `DrainedChild` is draining. Which of
-    /// two shapes that spawned process takes is controlled by
-    /// [`GRANDCHILD_MODE_ENV`], set by [`run_grandchild`]: a continuous
-    /// writer produces `Completeness::SettleExpired` (the
-    /// [`Attempt::Incomplete`] oracle, `grandchild_capture_is_incomplete_not_survived`);
-    /// a silent holder produces `Completeness::Complete` (the
-    /// `is_trustworthy()` boundary, `holding_grandchild_capture_is_complete`)
-    /// — see [`GRANDCHILD_MODE_WRITING`]/[`GRANDCHILD_MODE_HOLDING`] for the
-    /// mechanism each exercises.
-    Grandchild,
 }
 
 impl Role {
     /// Every variant, for the round-trip/totality test.
-    const ALL: [Role; 11] = [
+    const ALL: [Role; 10] = [
         Role::Collide,
         Role::Keeper,
         Role::EngineChurn,
@@ -236,7 +164,6 @@ impl Role {
         Role::Mute,
         Role::Bannerless,
         Role::PostMarker,
-        Role::Grandchild,
     ];
 
     fn as_str(self) -> &'static str {
@@ -251,7 +178,6 @@ impl Role {
             Role::Mute => "mute",
             Role::Bannerless => "bannerless",
             Role::PostMarker => "postmarker",
-            Role::Grandchild => "grandchild",
         }
     }
 
@@ -260,10 +186,7 @@ impl Role {
     /// role text is a harness bug — a typo in a role literal — not a "fall
     /// through to the parent" case. Call sites read the env var first and only call `parse` when it
     /// is present (`.ok().map(|r| Role::parse(&r))`), so an ABSENT env var
-    /// still takes the parent path unchanged. The grandchild's own sleeper
-    /// sub-mode is checked (and dispatched) BEFORE this ever runs — see
-    /// [`dispatch_if_child`] — so `GRANDCHILD_CHILD_ROLE_VALUE` never
-    /// reaches here and never trips this panic.
+    /// still takes the parent path unchanged.
     fn parse(s: &str) -> Self {
         match s {
             "collide" => Role::Collide,
@@ -276,12 +199,11 @@ impl Role {
             "mute" => Role::Mute,
             "bannerless" => Role::Bannerless,
             "postmarker" => Role::PostMarker,
-            "grandchild" => Role::Grandchild,
             other => panic!("foreign-lib harness: unknown {ROLE_ENV}={other:?}"),
         }
     }
 
-    /// `Some` for the seven synthetic roles that branch to [`run_synthetic`]
+    /// `Some` for the six synthetic roles that branch to [`run_synthetic`]
     /// BEFORE the production prelude runs; `None` for the four production
     /// roles. Total over every variant.
     fn synthetic(self) -> Option<SyntheticKind> {
@@ -292,14 +214,13 @@ impl Role {
             Role::Mute => Some(SyntheticKind::Mute),
             Role::Bannerless => Some(SyntheticKind::Bannerless),
             Role::PostMarker => Some(SyntheticKind::PostMarker),
-            Role::Grandchild => Some(SyntheticKind::Grandchild),
             Role::Collide | Role::Keeper | Role::EngineChurn | Role::StaleRead => None,
         }
     }
 
     /// The terminus [`terminus_satisfied`] checks for this role. Total over
     /// every variant (asserted by
-    /// `role_round_trip_and_totality_covers_all_eleven_variants`).
+    /// `role_round_trip_and_totality_covers_all_ten_variants`).
     fn expected_terminus(self) -> Terminus {
         match self {
             Role::Collide
@@ -315,22 +236,13 @@ impl Role {
             // classified via `Capture::hung` before `terminus_satisfied` is
             // ever consulted. This arm exists only so the function is total.
             Role::Wedge => Terminus::SentinelExact("[child] WEDGE-UNREACHABLE"),
-            // Grandchild's sentinel and exit code are always its own,
-            // regardless of `GRANDCHILD_MODE_ENV` — this terminus is the
-            // SAME in both scenarios. What differs is whether `classify`
-            // ever reaches it: for the writing grandchild-of-grandchild the
-            // capture is untrustworthy (`SettleExpired`), so `classify`
-            // returns `Attempt::Incomplete` before this terminus is ever
-            // consulted; for the holding one the capture IS trustworthy, so
-            // this exact terminus decides `Attempt::Survived`.
-            Role::Grandchild => Terminus::SentinelExact(GRANDCHILD_SENTINEL),
         }
     }
 }
 
 /// What kind of synthetic body [`run_synthetic`] runs — a narrower type than
-/// [`Role`] so `run_synthetic`'s `match` is total over exactly the seven
-/// synthetic shapes, not all eleven roles.
+/// [`Role`] so `run_synthetic`'s `match` is total over exactly the six
+/// synthetic shapes, not all ten roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyntheticKind {
     Flood,
@@ -339,7 +251,6 @@ enum SyntheticKind {
     Mute,
     Bannerless,
     PostMarker,
-    Grandchild,
 }
 
 /// What [`terminus_satisfied`] checks for a role's exit-0 (or, for
@@ -795,9 +706,8 @@ fn synthetic_flood_line(n: u32) -> [u8; 64] {
 /// default is far past any undrained pipe's ~64 KiB capacity — the oracle for
 /// `DrainedChild` consumption in this harness; a caller can override the
 /// count via `FLOOD_LINES_ENV` (parameterizing the EXISTING role by an env
-/// var, the same shape `GRANDCHILD_MODE_ENV` already uses, rather than adding
-/// a new role) to flood well past the retention cap for the retention-cap
-/// oracle.
+/// var rather than adding a new role) to flood well past the retention cap
+/// for the retention-cap oracle.
 fn synthetic_flood() -> ! {
     let lines: u32 = std::env::var(FLOOD_LINES_ENV)
         .ok()
@@ -849,81 +759,13 @@ fn run_synthetic(kind: SyntheticKind) -> ! {
             eprintln!("[child] phase: zombie");
             std::process::exit(0);
         }
-        SyntheticKind::Grandchild => {
-            // Spawn the grandchild-of-grandchild WITHOUT stdio redirection:
-            // it inherits this process's stderr, the very pipe
-            // `DrainedChild` is draining. `ROLE_ENV` is explicitly
-            // OVERRIDDEN to `GRANDCHILD_CHILD_ROLE_VALUE` (never inherited as
-            // `"grandchild"` — that would fork-bomb); `GRANDCHILD_MODE_ENV`
-            // is forwarded unchanged, selecting which of the two shapes
-            // `run_grandchild_of_grandchild` runs.
-            let exact = std::env::var(SELF_EXACT_ENV).expect(
-                "Role::Grandchild requires SELF_EXACT_ENV, set by run_grandchild on every spawn",
-            );
-            let mode = std::env::var(GRANDCHILD_MODE_ENV).expect(
-                "Role::Grandchild requires GRANDCHILD_MODE_ENV (writing or holding), set by \
-                 run_grandchild on every spawn",
-            );
-            let mut cmd =
-                Command::new(std::env::current_exe().expect("current_exe for grandchild spawn"));
-            cmd.args(["--exact", &exact, "--nocapture", "--test-threads=1"])
-                .env(ROLE_ENV, GRANDCHILD_CHILD_ROLE_VALUE)
-                .env(GRANDCHILD_MODE_ENV, &mode);
-            let _grandchild_of_grandchild = cmd.spawn().expect("spawn grandchild-of-grandchild");
-            // This role's own sentinel — printed and exited immediately, so
-            // every byte of THIS process's output is already read by the
-            // time it exits. Whether the pipe then looks "still open" to the
-            // poll-based reader depends entirely on what the
-            // grandchild-of-grandchild does next (see `GRANDCHILD_MODE_ENV`'s
-            // two values).
-            eprintln!("{GRANDCHILD_SENTINEL}");
-            std::process::exit(0);
-        }
     }
 }
 
-/// [`GRANDCHILD_CHILD_ROLE_VALUE`]'s body: dispatches on [`GRANDCHILD_MODE_ENV`]
-/// to one of two shapes (see [`GRANDCHILD_MODE_WRITING`]/
-/// [`GRANDCHILD_MODE_HOLDING`] for the mechanism each exercises), panicking
-/// on any other value the same way [`Role::parse`] does. Self-terminating
-/// either way (3 s): nothing leaks across the suite even though nothing ever
-/// waits on this process directly (it is the harness's grandchild-of-
-/// grandchild, not its child).
-fn run_grandchild_of_grandchild() -> ! {
-    let mode = std::env::var(GRANDCHILD_MODE_ENV).unwrap_or_default();
-    if mode == GRANDCHILD_MODE_WRITING {
-        // The sentinel itself, repeated every 10 ms for 3 s (300 lines) —
-        // well under the poll-based reader's 50 ms poll timeout, so `POLLIN`
-        // keeps arriving and the reader never sees an empty poll while this
-        // process is still writing. See `GRANDCHILD_MODE_WRITING`'s doc for
-        // why the repeated line is the sentinel and not a distinct one.
-        for _ in 0..300 {
-            eprintln!("{GRANDCHILD_SENTINEL}");
-            let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::process::exit(0);
-    }
-    if mode == GRANDCHILD_MODE_HOLDING {
-        // Holds the inherited pipe open without ever writing to it. Under
-        // the poll-based reader, the first EMPTY poll after `Role::Grandchild`
-        // itself is reaped concludes EOF immediately — merely holding the fd
-        // open does not delay completeness at all.
-        std::thread::sleep(Duration::from_secs(3));
-        std::process::exit(0);
-    }
-    panic!("child.rs test harness: unknown {GRANDCHILD_MODE_ENV}={mode:?}");
-}
-
-/// The dispatch guard: every spawning test's first statement. Checks the
-/// grandchild-of-grandchild's own sentinel BEFORE [`Role::parse`] — it is
-/// never a [`Role`] (see [`GRANDCHILD_CHILD_ROLE_VALUE`]), so it must never
-/// reach `Role::parse`'s unknown-text panic. When [`ROLE_ENV`] is absent,
-/// this is a no-op and the test proceeds as the parent.
+/// The dispatch guard: every spawning test's first statement. When
+/// [`ROLE_ENV`] is absent, this is a no-op and the test proceeds as the
+/// parent.
 fn dispatch_if_child() {
-    if std::env::var(ROLE_ENV).as_deref() == Ok(GRANDCHILD_CHILD_ROLE_VALUE) {
-        run_grandchild_of_grandchild();
-    }
     if let Some(role) = std::env::var(ROLE_ENV).ok().map(|r| Role::parse(&r)) {
         child_main(role);
     }
@@ -1180,8 +1022,7 @@ fn child_main(role: Role) -> ! {
         | Role::Wedge
         | Role::Mute
         | Role::Bannerless
-        | Role::PostMarker
-        | Role::Grandchild => {
+        | Role::PostMarker => {
             unreachable!(
                 "synthetic roles return via run_synthetic before this match is ever reached"
             )
@@ -1229,7 +1070,7 @@ fn child_main(role: Role) -> ! {
 // ── Parent ──────────────────────────────────────────────────────────────────
 
 /// Outcome of one child run.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Attempt {
     Survived,
     /// No platform `libsqlite3` to collide with.
@@ -1257,21 +1098,17 @@ enum Attempt {
     /// panic in `drive_with` and the classification tests derive them the
     /// same way, via [`last_phase_marker`] and `Capture::silence`).
     Hung,
-    /// `!Capture::is_trustworthy()` — the capture's own evidence cannot be
-    /// trusted for a content-dependent classification, for any of the four
-    /// reasons that predicate ANDs together: the drained reader threads
-    /// never reached a clean EOF within the settle bound
-    /// (`complete != Completeness::Complete`, e.g. an fd-inheriting
-    /// grandchild, or `Completeness::Undrained`), an OS-level error occurred
-    /// while producing the capture (`wait_error.is_some()`), or the
-    /// retention cap dropped bytes from stdout or stderr
-    /// (`stdout_truncated`/`stderr_truncated != 0`). Distinct from
-    /// [`Attempt::Truncated`]: `Truncated` means the evidence IS trustworthy
-    /// but the class's own required line is missing; `Incomplete` means the
-    /// evidence itself is not fully collected/trustworthy, so no
-    /// content-dependent class (`Survived`/`Tripped`/`Stale`/`Corrupt`/
-    /// `NoForeignLib`) may ever be reported. Carries the reason text (see
-    /// [`incompleteness_reason`] for which of the four conditions it names).
+    /// The capture's own evidence cannot be trusted for a content-dependent
+    /// classification: the drained reader threads did not read the child's
+    /// whole output (`complete != Completeness::Complete`), or an OS-level
+    /// error occurred while producing the capture (`wait_error.is_some()`).
+    /// Retention-cap truncation is deliberately not one of the reasons — see
+    /// [`incompleteness_reason`]. Distinct from [`Attempt::Truncated`]:
+    /// `Truncated` means the evidence IS trustworthy but the class's own
+    /// required line is missing; `Incomplete` means the evidence itself is
+    /// not whole, so no content-dependent class (`Survived`/`Tripped`/
+    /// `Stale`/`Corrupt`/`NoForeignLib`) may ever be reported. Carries the
+    /// reason text [`incompleteness_reason`] gives.
     Incomplete(String),
 }
 
@@ -1389,11 +1226,8 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
     None
 }
 
-/// Classify a settled (non-hung) [`Capture`] into an [`Attempt`], applying the
-/// per-role terminus / per-code evidence check below. Any capture whose
-/// evidence is not fully trustworthy ([`incompleteness_reason`]) is
-/// classified [`Attempt::Incomplete`] instead of a content-dependent class,
-/// regardless of what its exit code would otherwise imply.
+/// Classify a settled [`Capture`] into an [`Attempt`]: a hang or a signal
+/// from the wait status alone, an exit code by [`classify_exit`].
 ///
 /// Scoring, by exit disposition:
 /// - exit 0 → [`Attempt::Survived`] iff [`terminus_satisfied`], else
@@ -1407,6 +1241,9 @@ fn incompleteness_reason(cap: &Capture) -> Option<String> {
 /// - any other exit code → [`Attempt::ExitCode`];
 /// - a signal death (`status.signal()`) → [`Attempt::Signal`];
 /// - `cap.hung` → [`Attempt::Hung`].
+///
+/// An exit 0/66/67/68/77 on a capture [`incompleteness_reason`] rejects is
+/// [`Attempt::Incomplete`] instead, whatever its stderr says.
 fn classify(cap: &Capture, role: Role) -> Attempt {
     // `hung` is `true` iff `wait_bounded` issued a `kill()` and the reaped
     // status is a signal death or a reap give-up. A self-inflicted crash (a
@@ -1419,67 +1256,57 @@ fn classify(cap: &Capture, role: Role) -> Attempt {
     if let Some(sig) = cap.status.and_then(|s| s.signal()) {
         return Attempt::Signal(sig);
     }
-    let has_tripped_line = |code: i32| {
-        last_nonempty_line(&cap.stderr)
-            .is_some_and(|l| l.starts_with(&format!("[child] TRIPPED({code}):")))
-    };
-    let incomplete = incompleteness_reason(cap);
     match cap.status.and_then(|s| s.code()) {
-        Some(0) => {
-            if let Some(reason) = incomplete {
-                return Attempt::Incomplete(reason);
-            }
-            if terminus_satisfied(&cap.stderr, role) {
-                Attempt::Survived
-            } else {
-                Attempt::Truncated { code: 0 }
-            }
-        }
-        Some(EXIT_TRIPPED) => {
-            if let Some(reason) = incomplete {
-                return Attempt::Incomplete(reason);
-            }
-            if has_tripped_line(EXIT_TRIPPED) {
-                Attempt::Tripped
-            } else {
-                Attempt::Truncated { code: EXIT_TRIPPED }
-            }
-        }
-        Some(EXIT_STALE) => {
-            if let Some(reason) = incomplete {
-                return Attempt::Incomplete(reason);
-            }
-            if has_tripped_line(EXIT_STALE) {
-                Attempt::Stale
-            } else {
-                Attempt::Truncated { code: EXIT_STALE }
-            }
-        }
-        Some(EXIT_CORRUPT) => {
-            if let Some(reason) = incomplete {
-                return Attempt::Incomplete(reason);
-            }
-            if has_tripped_line(EXIT_CORRUPT) {
-                Attempt::Corrupt
-            } else {
-                Attempt::Truncated { code: EXIT_CORRUPT }
-            }
-        }
-        Some(EXIT_NO_FOREIGN_LIB) => {
-            if let Some(reason) = incomplete {
-                return Attempt::Incomplete(reason);
-            }
-            if String::from_utf8_lossy(&cap.stderr).contains("[child] NO-FOREIGN-LIB:") {
-                Attempt::NoForeignLib
-            } else {
-                Attempt::Truncated {
-                    code: EXIT_NO_FOREIGN_LIB,
-                }
-            }
-        }
-        Some(other) => Attempt::ExitCode(other),
+        Some(code) => classify_exit(code, &cap.stderr, incompleteness_reason(cap), role),
         None => Attempt::ExitCode(-1),
     }
+}
+
+/// The [`Attempt`] exit `code` earns. Exit 0 and the four observation codes
+/// are classes decided by reading `stderr`; every other code is a harness
+/// fault reported as-is. `untrusted` — [`incompleteness_reason`] for the
+/// capture `stderr` came from — is checked once, after the code is known to
+/// be content-decided and before any content is read, so evidence that is
+/// not whole can never earn a content class however well it reads: it is
+/// [`Attempt::Incomplete`].
+fn classify_exit(code: i32, stderr: &[u8], untrusted: Option<String>, role: Role) -> Attempt {
+    let (class, evidence) = match code {
+        0 => (Attempt::Survived, Evidence::Terminus),
+        EXIT_TRIPPED => (Attempt::Tripped, Evidence::TrippedLine),
+        EXIT_STALE => (Attempt::Stale, Evidence::TrippedLine),
+        EXIT_CORRUPT => (Attempt::Corrupt, Evidence::TrippedLine),
+        EXIT_NO_FOREIGN_LIB => (Attempt::NoForeignLib, Evidence::NoForeignLibLine),
+        other => return Attempt::ExitCode(other),
+    };
+    if let Some(reason) = untrusted {
+        return Attempt::Incomplete(reason);
+    }
+    let evidenced = match evidence {
+        Evidence::Terminus => terminus_satisfied(stderr, role),
+        Evidence::TrippedLine => last_nonempty_line(stderr)
+            .is_some_and(|l| l.starts_with(&format!("[child] TRIPPED({code}):"))),
+        Evidence::NoForeignLibLine => {
+            String::from_utf8_lossy(stderr).contains("[child] NO-FOREIGN-LIB:")
+        }
+    };
+    if evidenced {
+        class
+    } else {
+        Attempt::Truncated { code }
+    }
+}
+
+/// What a content-decided exit code's stderr must show before the code earns
+/// its class in [`classify_exit`].
+#[derive(Debug, Clone, Copy)]
+enum Evidence {
+    /// The role's [`Terminus`] (exit 0).
+    Terminus,
+    /// A last non-empty line `[child] TRIPPED(<code>):`, as [`tripped_as`]
+    /// prints it (the three observation codes).
+    TrippedLine,
+    /// A `[child] NO-FOREIGN-LIB:` line anywhere (exit [`EXIT_NO_FOREIGN_LIB`]).
+    NoForeignLibLine,
 }
 
 /// What a whole arm observed across its attempts.
@@ -1519,38 +1346,14 @@ impl Summary {
 /// via [`DrainedChild`] (both streams drained on background threads while the
 /// child runs, so a chatty-but-healthy child is never mistaken for a hang and
 /// a killed child's progress is never discarded). Bounded by `ceiling` from [`Epoch::Spawn`].
-///
-/// [`SELF_EXACT_ENV`] is set unconditionally (`test_name`, the exact `--exact`
-/// path this spawn used) so [`Role::Grandchild`]'s body can reuse it for its
-/// own grandchild spawn; every other role ignores it.
 fn run_child(role: Role, test_name: &str, ceiling: Duration) -> (Attempt, Capture) {
     let exe = std::env::current_exe().expect("current test binary");
     let mut cmd = Command::new(exe);
     cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(ROLE_ENV, role.as_str())
-        .env(SELF_EXACT_ENV, test_name);
+        .env(ROLE_ENV, role.as_str());
     let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
     let cap = child.wait_bounded(ceiling, Epoch::Spawn);
     let attempt = classify(&cap, role);
-    (attempt, cap)
-}
-
-/// Like [`run_child`], specialized to [`Role::Grandchild`]: also sets
-/// [`GRANDCHILD_MODE_ENV`] to `mode` ([`GRANDCHILD_MODE_WRITING`] or
-/// [`GRANDCHILD_MODE_HOLDING`]), selecting which grandchild-of-grandchild
-/// shape the role's body spawns. The two `Role::Grandchild` oracles
-/// (`grandchild_capture_is_incomplete_not_survived`,
-/// `holding_grandchild_capture_is_complete`) are its only callers.
-fn run_grandchild(test_name: &str, ceiling: Duration, mode: &str) -> (Attempt, Capture) {
-    let exe = std::env::current_exe().expect("current test binary");
-    let mut cmd = Command::new(exe);
-    cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-        .env(ROLE_ENV, Role::Grandchild.as_str())
-        .env(SELF_EXACT_ENV, test_name)
-        .env(GRANDCHILD_MODE_ENV, mode);
-    let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
-    let cap = child.wait_bounded(ceiling, Epoch::Spawn);
-    let attempt = classify(&cap, Role::Grandchild);
     (attempt, cap)
 }
 
@@ -1563,7 +1366,6 @@ fn run_flood(test_name: &str, ceiling: Duration, lines: u32) -> (Attempt, Captur
     let mut cmd = Command::new(exe);
     cmd.args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(ROLE_ENV, Role::Flood.as_str())
-        .env(SELF_EXACT_ENV, test_name)
         .env(FLOOD_LINES_ENV, lines.to_string());
     let child = DrainedChild::spawn(&mut cmd).expect("spawn child");
     let cap = child.wait_bounded(ceiling, Epoch::Spawn);
@@ -1864,14 +1666,14 @@ fn the_stale_read_topology_neither_signals_nor_corrupts_the_file() {
 // ── Role machinery + synthetic-role classification ─────────────────────────
 
 /// `Role::parse`/`as_str`/`synthetic`/`expected_terminus` must round-trip and
-/// be total over every one of the eleven variants — the four production
-/// roles AND the seven synthetic ones (including [`Role::Grandchild`]).
+/// be total over every one of the ten variants — the four production roles
+/// AND the six synthetic ones.
 #[test]
-fn role_round_trip_and_totality_covers_all_eleven_variants() {
+fn role_round_trip_and_totality_covers_all_ten_variants() {
     assert_eq!(
         Role::ALL.len(),
-        11,
-        "the enumeration itself must list all eleven"
+        10,
+        "the enumeration itself must list all ten"
     );
     for role in Role::ALL {
         let s = role.as_str();
@@ -2043,127 +1845,52 @@ fn wedge_role_is_hung_with_its_last_phase_marker() {
     );
 }
 
-/// **The `Attempt::Incomplete` oracle — and the ONLY thing that makes it an
-/// oracle over the ORDER `classify` checks trust vs terminus in.**
-/// [`Role::Grandchild`] prints its sentinel and exits 0 IMMEDIATELY, but the
-/// grandchild-of-grandchild it spawned (inheriting stderr, in
-/// [`GRANDCHILD_MODE_WRITING`]) keeps re-printing that SAME sentinel line
-/// every 10 ms — well under the poll-based reader's 50 ms poll timeout — for
-/// 3 s, so `POLLIN` keeps arriving and the reader never sees an empty poll
-/// before `wait_bounded`'s ~1 s settle bound expires: `Capture::complete`
-/// comes back `SettleExpired` (untrustworthy) while `last_nonempty_line ==
-/// GRANDCHILD_SENTINEL` regardless of how many of the 300 repeats got
-/// captured before the settle gave up (terminus-satisfied). That combination
-/// — untrustworthy AND terminus-satisfied at once — is deliberate and
-/// load-bearing: a distinct one-off "heartbeat" line there would leave the
-/// terminus permanently unsatisfied,
-/// and a `classify` that checked terminus BEFORE the trust gate would still
-/// (coincidentally) return `Incomplete` via its terminus-failed fallback
-/// branch — the two orderings would be indistinguishable to this test, an
-/// untested branch masquerading as coverage. With the sentinel repeated,
-/// checking terminus first would find it SATISFIED and return `Survived` —
-/// exactly the false pass this gate exists to prevent — so this test reds
-/// under that reordering. Sibling:
-/// [`holding_grandchild_capture_is_complete`] pins the OTHER side of the
-/// completeness boundary — a grandchild-of-grandchild that only holds the
-/// pipe, never writing, does NOT produce `SettleExpired`.
-///
-/// No sub-ceiling wall-clock assertion: the 10 s ceiling is comfortably above
-/// both `wait_bounded`'s ~1 s settle bound and the 3 s writer, so this test
-/// exercises the settle-expiry path (not the ceiling-kill path) — the
-/// grandchild-of-grandchild is never killed, only outlasted; it
-/// self-terminates at 3 s regardless of this test's outcome, so nothing
-/// leaks across the suite.
+/// **The `Attempt::Incomplete` oracle: trust is checked before content.** For
+/// every content-decided exit code, a stderr that earns the code's class when
+/// the capture is whole earns [`Attempt::Incomplete`] — never that class —
+/// when it is not. Each stderr is checked to earn its class first, so a
+/// `classify_exit` that read content before the trust gate would score the
+/// untrusted case as that class and fail here.
 #[test]
-fn grandchild_capture_is_incomplete_not_survived() {
-    dispatch_if_child();
-    let (attempt, cap) =
-        run_grandchild(GUARD_TEST, Duration::from_secs(10), GRANDCHILD_MODE_WRITING);
-    assert_eq!(
-        last_nonempty_line(&cap.stderr).as_deref(),
-        Some(GRANDCHILD_SENTINEL),
-        "this oracle requires the captured state to be terminus-satisfied DESPITE being \
-         untrustworthy — otherwise it cannot distinguish the correct trust-gate-first order from \
-         a terminus-first reordering. Log:\n{}",
-        rendered_log(&cap)
-    );
-    let reason = match attempt {
-        Attempt::Incomplete(reason) => reason,
-        other => panic!(
-            "expected Incomplete, got {other:?} — an untrustworthy-but-terminus-satisfied capture \
-             must never be scored Survived (that is exactly a terminus-before-trust-gate ordering \
-             bug). Log:\n{}",
-            rendered_log(&cap)
+fn untrusted_evidence_is_incomplete_however_well_it_reads() {
+    let cases = [
+        (0, Role::Quiet, "[child] QUIET-DONE\n", Attempt::Survived),
+        (
+            EXIT_TRIPPED,
+            Role::Collide,
+            "[child] TRIPPED(66): typed refusal\n",
+            Attempt::Tripped,
         ),
-    };
-    assert_eq!(
-        cap.complete,
-        Completeness::SettleExpired,
-        "the mechanism this oracle exercises: the reader thread must not have observed an empty \
-         poll before the settle bound expired, because the grandchild-of-grandchild kept writing \
-         with gaps under the 50 ms poll timeout. Log:\n{}",
-        rendered_log(&cap)
-    );
-    assert!(
-        !cap.is_trustworthy(),
-        "SettleExpired must fail is_trustworthy() — the single predicate incompleteness_reason \
-         gates on: {cap:?}"
-    );
-    assert!(
-        reason.contains("SettleExpired"),
-        "the Incomplete reason must name SettleExpired: {reason}"
-    );
-    assert_eq!(
-        cap.status.and_then(|s| s.code()),
-        Some(0),
-        "Role::Grandchild itself exits 0 — the incompleteness is orthogonal to its exit code"
-    );
-    let diagnostic = incomplete_diagnostic(Role::Grandchild, 1, 1, &reason, &cap);
-    assert!(
-        diagnostic.contains(GRANDCHILD_SENTINEL),
-        "the sentinel's evidence IS retained (only the reader's EOF is late) — the formatted \
-         diagnostic must still carry it: {diagnostic}"
-    );
-    assert!(
-        diagnostic.contains("SettleExpired"),
-        "the formatted diagnostic must carry the reason: {diagnostic}"
-    );
-}
-
-/// **The `Completeness::Complete` boundary, from the other side.** Sibling to
-/// [`grandchild_capture_is_incomplete_not_survived`]: SAME role, SAME
-/// sentinel, SAME exit code — the only difference is that the
-/// grandchild-of-grandchild here ([`GRANDCHILD_MODE_HOLDING`]) merely holds
-/// the inherited pipe open for 3 s and never writes to it. Under the
-/// poll-based reader, the first EMPTY poll after `Role::Grandchild` itself is
-/// reaped concludes EOF immediately — a silent fd-holder does not delay
-/// completeness at all, regardless of why it still has the pipe open. That
-/// alone flips the outcome from `Incomplete` to `Survived`, pinning the exact
-/// boundary `jammi_test_utils::child` documents between "holding" and
-/// "writing".
-///
-/// No sub-ceiling wall-clock assertion: the settle here is expected to
-/// complete almost immediately (one 50 ms poll after `Role::Grandchild`
-/// reaps), well inside the 10 s ceiling; the holder self-terminates at 3 s
-/// regardless, so nothing leaks across the suite.
-#[test]
-fn holding_grandchild_capture_is_complete() {
-    dispatch_if_child();
-    let (attempt, cap) =
-        run_grandchild(GUARD_TEST, Duration::from_secs(10), GRANDCHILD_MODE_HOLDING);
-    assert!(
-        matches!(attempt, Attempt::Survived),
-        "expected Survived — merely holding the pipe (never writing) must not delay \
-         completeness under the poll-based reader, got {attempt:?}. Log:\n{}",
-        rendered_log(&cap)
-    );
-    assert_eq!(
-        cap.complete,
-        Completeness::Complete,
-        "a silent holder (no writes) must NOT produce SettleExpired: {cap:?}"
-    );
-    assert!(
-        cap.is_trustworthy(),
-        "a Complete, untruncated, error-free capture must be trustworthy: {cap:?}"
-    );
+        (
+            EXIT_STALE,
+            Role::StaleRead,
+            "[child] TRIPPED(67): stale read\n",
+            Attempt::Stale,
+        ),
+        (
+            EXIT_CORRUPT,
+            Role::Collide,
+            "[child] TRIPPED(68): database disk image is malformed\n",
+            Attempt::Corrupt,
+        ),
+        (
+            EXIT_NO_FOREIGN_LIB,
+            Role::Collide,
+            "[child] NO-FOREIGN-LIB: none found\n",
+            Attempt::NoForeignLib,
+        ),
+    ];
+    let reason = format!("capture incomplete ({:?})", Completeness::SettleExpired);
+    for (code, role, stderr, class) in cases {
+        assert_eq!(
+            classify_exit(code, stderr.as_bytes(), None, role),
+            class,
+            "exit {code}: {stderr:?} must earn its class when the capture is whole"
+        );
+        assert_eq!(
+            classify_exit(code, stderr.as_bytes(), Some(reason.clone()), role),
+            Attempt::Incomplete(reason.clone()),
+            "exit {code}: the same stderr from a capture that is not whole"
+        );
+    }
 }

@@ -34,7 +34,7 @@ fn cli_embed_then_search_returns_the_nearest_rows_as_json_lines() {
     let corpus = workspace_path("cookbook/fixtures/tiny_corpus.parquet");
     let model = format!(
         "local:{}",
-        workspace_path("cookbook/fixtures/tiny_bert").display()
+        workspace_path("tests/fixtures/tiny_bert").display()
     );
     let server = TestServer::spawn();
 

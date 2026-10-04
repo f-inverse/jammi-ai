@@ -212,7 +212,7 @@ pub fn fixture_url(name: &str) -> String {
     format!("file://{}", fixture(name).display())
 }
 
-/// Path to a `cookbook/fixtures/` fixture (e.g. the `tiny_bert/` encoder dir).
+/// Path to a `cookbook/fixtures/` data fixture (e.g. the `tiny_image_corpus/` dir).
 pub fn cookbook_fixture(name: &str) -> PathBuf {
     workspace_root()
         .join("cookbook")
@@ -220,13 +220,13 @@ pub fn cookbook_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// `local:` model id for a cookbook encoder fixture — the same id the cookbook
-/// recipes and the CPU `it` suite use for `tiny_bert`.
+/// `local:` model id for an encoder fixture under `tests/fixtures/` — the
+/// same id the CPU `it` suite uses for `tiny_bert`.
 pub fn local_model_id(fixture_name: &str) -> String {
-    format!("local:{}", cookbook_fixture(fixture_name).to_str().unwrap())
+    format!("local:{}", fixture(fixture_name).to_str().unwrap())
 }
 
-/// `file://` URL for a `cookbook/fixtures/` fixture, suitable for source
+/// `file://` URL for a `cookbook/fixtures/` data fixture, suitable for source
 /// registration (e.g. the `tiny_ner_corpus.parquet` corpus).
 pub fn cookbook_fixture_url(name: &str) -> String {
     format!("file://{}", cookbook_fixture(name).display())

@@ -33,7 +33,7 @@ use tempfile::TempDir;
 use crate::common;
 
 fn tiny_bert_id() -> String {
-    format!("local:{}", common::cookbook_fixture("tiny_bert").display())
+    format!("local:{}", common::fixture("tiny_bert").display())
 }
 
 /// Lexically distinct per row (a tiny random-init encoder collapses sentences
@@ -1428,7 +1428,7 @@ async fn stale_process_binding_does_not_lose_rows_on_compaction() {
 async fn model_drift_is_refused_before_any_allocation() {
     let dir = TempDir::new().unwrap();
     let model_dir = dir.path().join("model");
-    copy_dir(&common::cookbook_fixture("tiny_bert"), &model_dir);
+    copy_dir(&common::fixture("tiny_bert"), &model_dir);
     let root = dir.path().join("engine");
     std::fs::create_dir_all(&root).unwrap();
     let source_path = dir.path().join("src.parquet");
@@ -1983,7 +1983,7 @@ async fn describe_table_reads_the_recorded_materialization() {
     };
     assert_eq!(
         model.model_id,
-        common::cookbook_fixture("tiny_bert").display().to_string(),
+        common::fixture("tiny_bert").display().to_string(),
         "the canonical id is the checkpoint path"
     );
     match &model.run {

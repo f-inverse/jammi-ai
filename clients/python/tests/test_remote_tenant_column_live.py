@@ -27,7 +27,7 @@ from jammi.errors import InvalidArgument
 pytestmark = [pytest.mark.live_server, pytest.mark.embedded]
 
 REPO = Path(__file__).resolve().parents[3]
-TINY_BERT = f"local:{REPO / 'cookbook' / 'fixtures' / 'tiny_bert'}"
+TINY_BERT = f"local:{REPO / 'tests' / 'fixtures' / 'tiny_bert'}"
 
 TENANT_A = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9a"
 TENANT_B = "01906c83-d4c8-7e10-9c4f-3b6f7c5a8e9b"

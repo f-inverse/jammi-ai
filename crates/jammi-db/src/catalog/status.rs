@@ -24,11 +24,11 @@ pub enum ResultTableStatus {
 
 impl fmt::Display for ResultTableStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Building => write!(f, "building"),
-            Self::Ready => write!(f, "ready"),
-            Self::Failed => write!(f, "failed"),
-        }
+        f.pad(match self {
+            Self::Building => "building",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        })
     }
 }
 
@@ -78,7 +78,7 @@ impl ArtifactState {
 
 impl fmt::Display for ArtifactState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_db_str())
+        f.pad(self.as_db_str())
     }
 }
 
@@ -176,13 +176,13 @@ impl JobStatus {
 
 impl fmt::Display for JobStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Queued => write!(f, "queued"),
-            Self::Running => write!(f, "running"),
-            Self::Completed => write!(f, "completed"),
-            Self::Failed => write!(f, "failed"),
-            Self::Cancelled => write!(f, "cancelled"),
-        }
+        f.pad(match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        })
     }
 }
 
@@ -208,9 +208,9 @@ pub enum EvalRunStatus {
 
 impl fmt::Display for EvalRunStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Completed => write!(f, "completed"),
-        }
+        f.pad(match self {
+            Self::Completed => "completed",
+        })
     }
 }
 
@@ -237,10 +237,10 @@ pub enum ModelStatus {
 
 impl fmt::Display for ModelStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Registered => write!(f, "registered"),
-            Self::Loaded => write!(f, "loaded"),
-        }
+        f.pad(match self {
+            Self::Registered => "registered",
+            Self::Loaded => "loaded",
+        })
     }
 }
 
@@ -271,10 +271,10 @@ pub enum JobExecution {
 
 impl fmt::Display for JobExecution {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Queued => write!(f, "queued"),
-            Self::Inline => write!(f, "inline"),
-        }
+        f.pad(match self {
+            Self::Queued => "queued",
+            Self::Inline => "inline",
+        })
     }
 }
 

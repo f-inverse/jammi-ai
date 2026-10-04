@@ -54,11 +54,11 @@ fn root() -> PathBuf {
 }
 
 fn open_clip_dir() -> PathBuf {
-    root().join("cookbook/fixtures/tiny_open_clip")
+    root().join("tests/fixtures/tiny_open_clip")
 }
 
 fn htsat_dir() -> PathBuf {
-    root().join("cookbook/fixtures/htsat_clap_tiny")
+    root().join("tests/fixtures/htsat_clap_tiny")
 }
 
 fn open_clip_json() -> serde_json::Value {

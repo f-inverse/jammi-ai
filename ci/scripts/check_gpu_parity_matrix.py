@@ -375,7 +375,7 @@ PENDING: dict[Cell, str] = {
     Cell("DistilBert", "Classification"): _PENDING_REASON,
     # NER: generic over `forward_hidden` for all three BERT-family
     # architectures (no per-arch wrapper family the way Classification has);
-    # none is proven on GPU yet. cookbook/fixtures/tiny_modernbert_ner exists.
+    # none is proven on GPU yet. tests/fixtures/tiny_modernbert_ner exists.
     Cell("Bert", "Ner"): _PENDING_REASON,
     Cell("DistilBert", "Ner"): _PENDING_REASON,
     # Regression: generic over `forward_pooled` for every text architecture,

@@ -4,7 +4,7 @@
 //! pending→determined transition and "one record, two transports" parity:
 //!
 //! - **(i)** the SECOND f16 job submitted to the same process — after a prior
-//!   f16 job already burned the process-wide `(op, predicate)` warn dedup —
+//!   f16 job already burned the process-wide `(op, predicate)` notice dedup —
 //!   still gets ITS OWN determined report on ITS record
 //!   (`second_f16_job_in_process_still_reports_its_own_eager_ops`).
 //! - **(ii)** a positive-control job (f32, since this suite runs CPU-only)
@@ -51,10 +51,7 @@ use crate::common;
 /// the acceleration report at all — this suite needs an architecture the fused path
 /// is actually reachable on.
 fn tiny_modernbert_model() -> String {
-    "local:".to_string()
-        + common::cookbook_fixture("tiny_modernbert")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + common::fixture("tiny_modernbert").to_str().unwrap()
 }
 
 fn training_columns() -> Vec<String> {
@@ -213,10 +210,10 @@ fn expect_determined_report_fails_closed_on_pending_marker() {
 
 /// Control (i): the SECOND f16 job in this process — run after a
 /// first f16 job already fired (and dedup-suppressed) the per-process
-/// `tracing::warn` for `attention_block_fused`'s domain miss — still gets its
+/// `tracing::info` for `attention_block_fused`'s domain miss — still gets its
 /// OWN, independently-attributed `holds: false` on its OWN record. If the
 /// worker's report computation ever regressed to reading the process-lifetime
-/// `fallback_warnings_emitted()`/dedup state as ITS signal (rather than a
+/// `fallback_notices_emitted()`/dedup state as ITS signal (rather than a
 /// delta scoped to this job's own probe), the second job would see no new
 /// evidence and could wrongly default to "no misses".
 ///
@@ -302,7 +299,7 @@ async fn second_f16_job_in_process_still_reports_its_own_eager_ops() {
     );
 
     // Job 2: same process, same op, same f16 dtype — after job 1 already
-    // burned the process-wide warn dedup for exactly this (op, predicate).
+    // burned the process-wide notice dedup for exactly this (op, predicate).
     let job2 = session
         .fine_tune(
             "training",
@@ -657,10 +654,7 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
 /// difference (`head_dim == 64` vs `16`) is irrelevant to this test, which
 /// asserts the `flash` field, never `attention_block`.
 fn tiny_bert_head64_model() -> String {
-    "local:".to_string()
-        + common::cookbook_fixture("tiny_bert_head64")
-            .to_str()
-            .unwrap()
+    "local:".to_string() + common::fixture("tiny_bert_head64").to_str().unwrap()
 }
 
 /// The acceleration report's `flash` field for a BERT-family job.
@@ -814,7 +808,7 @@ fn ops_keys(report: &serde_json::Value) -> std::collections::BTreeSet<String> {
 ///
 /// **(d) the key set is deterministic per dtype class, regardless of process
 /// history.** The two f16 jobs run back to back in one process — the second
-/// after the first has already burned the process-wide warn dedup and already
+/// after the first has already burned the process-wide notice dedup and already
 /// populated every registry entry — and must produce IDENTICAL `ops` key
 /// sets. A key set derived from `jammi_kernels::admission::snapshot_all()`
 /// (which reflects only ops looked up at least once) could not guarantee
@@ -988,8 +982,8 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
 ///
 /// **Why the order f32, f16, f32, f32 and not just two jobs.** A
 /// `reason_for_registry_key` that read the process-lifetime
-/// `fallback_warnings_emitted()` list and took the most recent entry for the
-/// op would be wrong: that list is populated INSIDE `warn_fallback_once_with_message`'s
+/// `fallback_notices_emitted()` list and took the most recent entry for the
+/// op would be wrong: that list is populated INSIDE `note_fallback_once_with_message`'s
 /// `seen.insert((op, predicate))` guard (`crates/jammi-kernels/src/
 /// admission.rs`), so it records each `(op, predicate)` pair AT MOST ONCE per
 /// process. Jobs 1 and 2 each push a fresh pair and would read back
@@ -1001,14 +995,14 @@ async fn probed_ops_bind_to_the_real_registry_and_key_sets_are_dtype_determinist
 /// `dtype_f32_matching_between_qkv_and_mask_on_cpu` for an f32 backbone).
 ///
 /// Job 4 is the SAME-predicate repeat (the dedupe case the naive
-/// "before/after window over `fallback_warnings_emitted()`" fix cannot serve
+/// "before/after window over `fallback_notices_emitted()`" fix cannot serve
 /// either — that window is EMPTY for job 4, because the dedupe is upstream of
 /// the record). It must still carry its own predicate, never
 /// `reason_unavailable`.
 ///
 /// Every job must also keep `holds: false` — the bug was never about the
 /// determination, only about the verbatim key attached to it.
-// `jammi_kernels::admission`'s dispatch registries and its warn-dedup set are
+// `jammi_kernels::admission`'s dispatch registries and its notice-dedup set are
 // process-wide — same `#[serial]` rationale as the other tests in this file.
 #[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
@@ -1059,7 +1053,7 @@ async fn each_job_reports_its_own_miss_predicate_not_the_most_recent_different_o
             serde_json::json!(expected_reason),
             "{label}: the miss reason must be the verbatim predicate key THIS job's own probe \
              window recorded, never the most recent DIFFERENT predicate some earlier job left \
-             in the process-lifetime warn list, and never a \
+             in the process-lifetime notice list, and never a \
              placeholder for a miss that really did record a predicate. Report: {report}"
         );
     }
@@ -1856,10 +1850,7 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
     let job = session
         .fine_tune(
             "audio_triplets",
-            &("local:".to_string()
-                + common::cookbook_fixture("htsat_clap_tiny")
-                    .to_str()
-                    .unwrap()),
+            &("local:".to_string() + common::fixture("htsat_clap_tiny").to_str().unwrap()),
             &[
                 "anchor".to_string(),
                 "positive".to_string(),

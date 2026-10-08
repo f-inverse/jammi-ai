@@ -252,14 +252,15 @@ jobs:
           path: _site
 
 
-  # The pytest suite drives the two dists that ship in lockstep — the client
-  # wheel `jammi-ai` (import `jammi`) and the compiled engine
-  # `jammi-ai-native` (import `jammi_native`) this run built, which the client
-  # discovers as its `file://` backend — as a reader installs them.
+  # The pytest suite drives the two dists that ship in lockstep: the client
+  # `jammi-ai` (import `jammi`), from source with its generated stubs, as its
+  # own suites run it, and the compiled engine `jammi-ai-native` (import
+  # `jammi_native`) this run built, which the client discovers as its
+  # `file://` backend.
   test-python:
     name: Test (Python)
     runs-on: ubuntu-latest
-    needs: [ci-image, plan, native-wheel-linux-x86_64, client-wheel]
+    needs: [ci-image, plan, native-wheel-linux-x86_64]
     if: needs.plan.outputs.proven != 'true'
     container:
       image: ${{ needs.ci-image.outputs.cpu }}
@@ -268,6 +269,7 @@ jobs:
 
       - uses: ./.github/actions/install-jammi
         with:
+          client: source
           extra-pip-packages: pytest
 
       - name: Run pytest
@@ -293,7 +295,7 @@ jobs:
   # lane (`cookbook-gpu.yml`), never in this hermetic workflow.
   client-live:
     name: Python client against a live server
-    needs: [ci-image, plan, native-wheel-linux-x86_64, client-wheel, server-cpu-x86_64, cli-x86_64]
+    needs: [ci-image, plan, native-wheel-linux-x86_64, server-cpu-x86_64, cli-x86_64]
     if: needs.plan.outputs.proven != 'true'
     runs-on: ubuntu-latest
     container:
@@ -303,6 +305,7 @@ jobs:
 
       - uses: ./.github/actions/install-jammi
         with:
+          client: source
           binaries: "true"
 
       - name: Python client suite against a live server

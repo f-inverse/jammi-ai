@@ -48,7 +48,7 @@ no compatibility arms, no advisory lanes, logic in tested scripts rather than YA
   builds), `push-image-leg`, `merge-index`, `attest-image`, `setup-rust-host` (a bare runner's
   toolchain, protoc, sccache and mold, the last pinned by `.docker/pinned-tools.sh`) and
   `run-paid-lane` (the shared exit-code contract of every pod driver). `docker-publish` and its
-  compatibility defaults are gone; `install-jammi` installs the client wheel as a reader does.
+  compatibility defaults are gone; `install-jammi` installs the client wheel as a reader does, or the client's source with its generated stubs for its own suites.
 - **No speculative or dead surface.** `setup-rust-ci`'s unused `target` input, `gpu-howwell.yml`'s
   label trigger that could never run, the `secrets: inherit` every publisher handed a gate that
   reads none, and the second spelling of the Node version are gone. Every action is pinned by

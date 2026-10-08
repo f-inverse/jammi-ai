@@ -1,16 +1,24 @@
 name: install-jammi
 description: >
-  Installs the jammi surfaces a run built, as a reader does: a `.venv` at the
-  workspace root holding the client wheel `jammi-ai` (import `jammi`,
-  `_client-wheel.yml`), optionally the compiled engine `jammi-ai-native`
-  (import `jammi_native`, the Linux x86_64 wheel `_native-wheels.yml` built)
-  the client discovers as its `file://` backend, and optionally the
-  `jammi-server` and `jammi` binaries on PATH. Nothing here compiles: every
-  consumer runs the bytes its run built once. The venv's `bin` is put on PATH,
-  so later steps call `python`, `pip` and `pytest` directly. Runs after
+  Installs the jammi surfaces a run built: a `.venv` at the workspace root
+  holding the client `jammi-ai` (import `jammi`), optionally the compiled
+  engine `jammi-ai-native` (import `jammi_native`, the Linux x86_64 wheel
+  `_native-wheels.yml` built) the client discovers as its `file://` backend,
+  and optionally the `jammi-server` and `jammi` binaries on PATH. The client
+  is installed one of two ways, for two different consumers: `wheel`, the
+  wheel `_client-wheel.yml` built, as a reader installs it; or `source`, the
+  tree's `clients/python` in editable mode with its `dev` extra and generated
+  proto stubs, for the client's own suites, which run from that directory and
+  resolve `jammi` from it. Nothing here compiles the engine: every consumer
+  runs the bytes its run built once. The venv's `bin` is put on PATH, so
+  later steps call `python`, `pip` and `pytest` directly. Runs after
   `actions/checkout`.
 
 inputs:
+  client:
+    description: "\"wheel\" (the default) or \"source\"; see above."
+    required: false
+    default: "wheel"
   native:
     description: "\"true\" (the default) also installs the compiled engine wheel."
     required: false
@@ -33,7 +41,8 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+    - if: inputs.client == 'wheel'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: client-wheel
         path: ${{ runner.temp }}/jammi-dist/client
@@ -51,6 +60,7 @@ runs:
     - shell: bash
       working-directory: ${{ github.workspace }}
       env:
+        CLIENT: ${{ inputs.client }}
         NATIVE: ${{ inputs.native }}
         EXTRA_PIP: ${{ inputs.extra-pip-packages }}
         DIST: ${{ runner.temp }}/jammi-dist
@@ -59,11 +69,18 @@ runs:
         python3 -m venv .venv
         . .venv/bin/activate
         pip install --quiet --upgrade pip
-        wheels=("$DIST"/client/jammi_ai-*.whl)
-        if [ "$NATIVE" = true ]; then wheels+=("$DIST"/native/jammi_ai_native-*.whl); fi
+        case "$CLIENT" in
+          wheel) pip install --quiet "$DIST"/client/jammi_ai-*.whl ;;
+          source)
+            pip install --quiet -e 'clients/python[dev]'
+            make -C clients/python generate
+            ;;
+          *) echo "::error::install-jammi: client must be wheel or source, got '$CLIENT'" >&2; exit 1 ;;
+        esac
+        if [ "$NATIVE" = true ]; then pip install --quiet "$DIST"/native/jammi_ai_native-*.whl; fi
         # $EXTRA_PIP is a space-separated package list, split on purpose.
         # shellcheck disable=SC2086
-        pip install --quiet "${wheels[@]}" $EXTRA_PIP
+        if [ -n "$EXTRA_PIP" ]; then pip install --quiet $EXTRA_PIP; fi
         echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
         echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 

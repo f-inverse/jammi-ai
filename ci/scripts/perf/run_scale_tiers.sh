@@ -10,6 +10,8 @@
 # every push to `main`, and a release requires that run green on its tree.
 # The documented contract is docs/guide/src/performance-slos.md.
 #
+#   bash ci/scripts/perf/run_scale_tiers.sh [TIER...]   # every tier, or the named ones
+#
 # Expects a release-profile jammi-bench binary (the committed baselines are
 # release-profile numbers) at ./target/release/jammi-bench, overridable via
 # JAMMI_BENCH_BIN. Callers pin RAYON_NUM_THREADS=1 in the job env — the
@@ -48,10 +50,22 @@ fi
 # tier — what it gates
 #   train-scale               — fine-tune throughput + OOM control
 #   arxiv                     — held-out ANN-vs-exact recall over the committed corpus
-TIERS=(
+ALL_TIERS=(
   train-scale
   arxiv
 )
+# Every tier, or the tiers named as arguments (the teeth proof runs one).
+if [ "$#" -gt 0 ]; then
+  for tier in "$@"; do
+    case " ${ALL_TIERS[*]} " in
+      *" $tier "*) ;;
+      *) echo "::error::unknown tier '$tier' (one of: ${ALL_TIERS[*]})" >&2; exit 2 ;;
+    esac
+  done
+  TIERS=("$@")
+else
+  TIERS=("${ALL_TIERS[@]}")
+fi
 
 for tier in "${TIERS[@]}"; do
   echo "::group::${tier}"

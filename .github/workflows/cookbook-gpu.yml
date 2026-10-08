@@ -2,24 +2,24 @@ name: Cookbook on a GPU
 
 # Every recipe and every page of the book, run with the real Hugging Face Hub
 # models they teach with, over the builds a tree's CI made: the CUDA engine
-# wheel, the client wheel, the CUDA server and the CLI of the `ci.yml` run that
-# proved the tree, installed on a rented RunPod L4 (sm_89, the class of GPU a
+# wheel, the client wheel, the CUDA server and the CLI of the `build.yml` run
+# that proved the tree, installed on a rented RunPod L4 (sm_89, the class of GPU a
 # Colab reader gets) by `ci/scripts/runpod_cookbook_gpu.sh`. The run records
 # each page's execution and assembles the book a release publishes
 # (`cookbook-book`, which `pages.yml` deploys). The tree it measures is
 # recorded once (`subject`), and the pod checks out that same commit.
 #
-# Real models never run in `ci.yml`: it stays hermetic, and checks the
-# cookbook statically there. This lane is where a chapter's claims are checked
-# on real models. Off the merge path: GPU time costs money. It fires on the
+# Real models never run in `ci.yml` or `build.yml`: both stay hermetic, and
+# the book's static checks are `build.yml`'s. This lane is where a chapter's
+# claims are checked on real models. Off the merge path: GPU time costs money. It fires on the
 # `cookbook-gpu` pull-request label and on manual dispatch; no `push:` or
 # `workflow_call:` trigger, and nothing `uses:` it (`check_gpu_prove_once.py`'s
 # P7 rule). The label runs once the pull request's CI is green: the lane
-# installs that run's builds.
+# installs that tree's builds.
 #
 # The release gate requires it: every publisher's `_proof-required.yml` asks
-# for this lane's green measurement of the released tree, beside `ci.yml`'s
-# and `gpu-prove.yml`'s. Dispatch it before tagging a release
+# for this lane's green measurement of the released tree, beside `ci.yml`'s,
+# `build.yml`'s and `gpu-prove.yml`'s. Dispatch it before tagging a release
 # (`gh workflow run cookbook-gpu.yml --ref <branch holding the tree>`).
 
 on:
@@ -59,7 +59,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: native-cu12-wheel client-wheel server-cu12-x86_64-binary jammi-x86_64-unknown-linux-gnu
 
   cookbook:

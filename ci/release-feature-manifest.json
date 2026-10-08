@@ -7,7 +7,7 @@
     "the build it packages, the workflow job that promotes it, and the",
     "workflows that build it (which the feature-literal guard reads).",
     "",
-    "A build is compiled once per tree, in `ci.yml`, by the reusable workflow",
+    "A build is compiled once per tree, in `build.yml`, by the reusable workflow",
     "that defines it; every lane packages those bytes, and a release promotes",
     "the ones the run that proved its tree built. Two lanes of one build",
     "therefore cannot ship different features; a lane whose features must",

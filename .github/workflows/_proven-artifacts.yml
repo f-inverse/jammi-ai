@@ -1,8 +1,8 @@
 name: _proven-artifacts
 
 # Names the run whose artifacts a release promotes: the run of the caller's
-# lane that proved the tree being released — `ci`, the `ci.yml` run whose
-# `ci-summary` is the most recent green measurement, for every build; or
+# lane that proved the tree being released — `build`, the `build.yml` run
+# whose `build-summary` is the most recent green measurement, for every build; or
 # `cookbook`, the `cookbook-gpu.yml` run that rendered the book on real models
 # — once `ci/scripts/proven_artifacts.py` has confirmed it still holds every
 # artifact the caller names. A release compiles nothing: each
@@ -17,7 +17,7 @@ on:
   workflow_call:
     inputs:
       lane:
-        description: "The lane whose run holds the artifacts: ci or cookbook."
+        description: "The lane whose run holds the artifacts: build or cookbook."
         type: string
         required: true
       artifacts:

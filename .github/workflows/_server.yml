@@ -3,8 +3,8 @@ name: _server
 # Builds one `jammi-server` binary — a build of `ci/release-feature-manifest.json`
 # (`server-cpu` or `server-cu12`) on one arch — and packages it as that build's
 # release tarball and PyPI wheel. The one definition of how a server binary is
-# compiled and packaged: `ci.yml` calls it on every pull request and on
-# `main`, where its tests and image smokes use the binary, and a release
+# compiled and packaged: `build.yml` calls it on every pull request and on
+# `main`, where its consumers and image smokes use the binary, and a release
 # promotes the tarball, wheel and image the run that proved its tree built
 # (`_proven-artifacts.yml`). A container image never compiles: it packages
 # these bytes (`stage-server-binaries`).

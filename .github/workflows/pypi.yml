@@ -7,8 +7,8 @@ name: PyPI
 # (CPU, per arch) and `jammi-server-cu12`. `jammi-ai`'s `[embedded]` extra
 # pins `jammi-ai-native==X`, so the five ship together or not at all.
 #
-# It compiles nothing: `ci.yml` builds every wheel on every pull request and
-# on `main`, where a wheel that stops building or outgrows PyPI's per-file
+# It compiles nothing: `build.yml` builds every wheel on every pull request
+# and on `main`, where a wheel that stops building or outgrows PyPI's per-file
 # limit fails the change that caused it, and this workflow publishes the ones
 # the run that proved the tag's tree built — the bytes that run's Python
 # lanes, smokes and cookbook installed. The publish job is one matrix, one
@@ -42,7 +42,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: >-
         client-wheel
         wheels-native-linux-x86_64

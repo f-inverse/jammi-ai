@@ -1,8 +1,8 @@
 name: Pages
 
 # Deploys the documentation site of a `py-v*` release, behind the shared
-# release gate: the guide and API reference the `ci.yml` run that proved the
-# tree built (`docs`), and the book the `cookbook-gpu.yml` run that proved it
+# release gate: the guide and API reference the `build.yml` run that proved
+# the tree built (`docs`), and the book the `cookbook-gpu.yml` run that proved it
 # rendered on real models (`book`), so what a reader reads is what PyPI serves
 # and what each chapter's Colab badge installs. It compiles and renders
 # nothing. A dispatch on the tag redeploys the same site; a branch dispatch is
@@ -28,7 +28,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: docs-site
 
   book:

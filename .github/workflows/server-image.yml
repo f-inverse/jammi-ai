@@ -17,10 +17,10 @@ name: Server Image
 # is no branch arm and no manual refresh.
 #
 # Every image packages binaries it does not compile: the `jammi-server` and
-# `jammi` binaries the `ci.yml` run that proved the tree built (`artifacts`,
-# through `_proven-artifacts.yml`), laid out as the Dockerfile's `builder`
-# context (`stage-server-binaries`) — the same packaging `ci.yml`'s image
-# check and smokes run over those bytes. A branch dispatch is a rehearsal: it
+# `jammi` binaries the `build.yml` run that proved the tree built
+# (`artifacts`, through `_proven-artifacts.yml`), laid out as the Dockerfile's
+# `builder` context (`stage-server-binaries`) — the same packaging
+# `build.yml`'s image check and smokes run over those bytes. A branch dispatch is a rehearsal: it
 # resolves the branch tree's proving run and pushes nothing.
 #
 # The CPU variants are built one native leg per arch, each pushing only its
@@ -51,7 +51,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: >-
         server-cpu-x86_64-binary
         server-cpu-aarch64-binary

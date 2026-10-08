@@ -2,7 +2,7 @@ name: npm
 
 # Publishes `@f-inverse/jammi-client` (the TypeScript gRPC-web SDK) to npm on
 # the same `v*` tag that publishes the crates, behind the shared release
-# gate. It builds nothing: `ci.yml`'s `ts-client` job builds, tests and packs
+# gate. It builds nothing: `build.yml`'s `ts-client` job builds, tests and packs
 # the package on every pull request and on `main`, and this workflow
 # publishes the tarball the run that proved the tag's tree packed, through
 # npm's OIDC trusted publishing (no stored token). A dispatch on the tag
@@ -29,7 +29,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: ts-client-package
 
   proof:

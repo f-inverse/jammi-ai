@@ -4,9 +4,9 @@
 A release compiles nothing. Two lanes produce what it promotes, each measured
 by one job:
 
-  ci        `ci.yml` builds every artifact a tree ships once, through the
+  build     `build.yml` builds every artifact a tree ships once, through the
             reusable workflow that defines it, and every check of that run
-            that needs one installs that build (`ci-summary / assert`).
+            that needs one installs that build (`build-summary / assert`).
   cookbook  `cookbook-gpu.yml` renders the book over those builds, on real
             models, and assembles it (`Cookbook on RunPod`).
 
@@ -14,7 +14,7 @@ The run whose measuring job is the tree's most recent green measurement —
 `verdict.py`'s rule, the one the release gate requires — holds the bytes its
 checks exercised, and a publisher downloads them by that run's id.
 
-    proven_artifacts.py --repo R --tree T --lane ci|cookbook --artifacts "A B ..."
+    proven_artifacts.py --repo R --tree T --lane build|cookbook --artifacts "A B ..."
 
 prints `run=<id>` for `$GITHUB_OUTPUT` when T is proven by that lane and its
 run still holds every artifact named. It DENIES (exit 1), naming the remedy,
@@ -42,7 +42,7 @@ from github_api import API_BASE, ApiError, FetchFn  # noqa: E402
 # Each lane a release promotes from, by the requirement that measures it; every
 # one is measured by exactly one job, whose run holds the artifacts.
 LANES = {
-    "ci": verdict.ci_requirement,
+    "build": verdict.build_requirement,
     "cookbook": verdict.cookbook_requirement,
 }
 

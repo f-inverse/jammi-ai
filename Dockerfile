@@ -5,7 +5,8 @@
 # `builder-cuda=<dir>` for the CUDA image), where `<dir>/out` holds the
 # `jammi-server` and `jammi` binaries one build of
 # `ci/release-feature-manifest.json` produced — in CI, the ones `_server.yml`
-# and `_cli.yml` built (`stage-server-binaries` lays the directory out); by
+# and `_cli.yml` built in `build.yml` (`stage-server-binaries` lays the
+# directory out); by
 # hand, `ci/dev.sh cargo build --release ...` in the CI image, which links the
 # manylinux_2_28 floor the images' runtimes promise. There is one definition
 # of how a server binary is compiled, and it is not in this file.

@@ -9,6 +9,13 @@ workspace ships every publishable crate at the same
 The workflows are held to the engineering principles the code is: one definition of each thing,
 no compatibility arms, no advisory lanes, logic in tested scripts rather than YAML.
 
+- **One responsibility per workflow.** `ci.yml` is the merge gate: does the tree pass its hermetic
+  suite, its lints and its guards? `build.yml` is the release candidate: every artifact a release
+  promotes, compiled once, and run as a user runs it (the Python lanes, the client against a live
+  server, the image check, the deploy-shape smokes, the book's static checks). Each has its own
+  `plan`, its own summary and its own required check (`ci-summary / assert`, `build-summary /
+  assert`); a release requires both, beside the GPU prove and the cookbook, and promotes
+  `build.yml`'s artifacts.
 - **A container image compiles nothing.** The Dockerfile packages the `jammi-server` and `jammi`
   binaries `_server.yml` and `_cli.yml` built, through its `builder`/`builder-cuda` build contexts;
   its builder stages, the second definition of how a server binary is compiled, are gone. The

@@ -2,8 +2,9 @@ name: _cli
 
 # Builds the `jammi` CLI release binary for each target triple asked for and
 # packages it as its release tarball (`ci/scripts/package_release_bin.sh`).
-# The one definition of how the CLI is compiled: `ci.yml` calls it for every
-# target the tree ships, and a release promotes the tarballs that run built.
+# The one definition of how the CLI is compiled: `build.yml` calls it for
+# every target the tree ships, and a release promotes the tarballs that run
+# built.
 #
 # Artifact: `jammi-<target>`, the tarball `jammi-<version>-<target>.tar.gz`.
 

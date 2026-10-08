@@ -1,8 +1,9 @@
 name: _proof-required
 
 # The release gate every publisher calls: reads, for the tree of the commit
-# the caller promotes, whether the tree's three measurements are green —
-# `gpu-prove.yml` on every shipped CUDA arch, `ci.yml`'s summary job and
+# the caller promotes, whether the tree's four measurements are green —
+# `gpu-prove.yml` on every shipped CUDA arch, `ci.yml`'s summary job (the merge
+# gate), `build.yml`'s (the artifacts and their consumers) and
 # `cookbook-gpu.yml` (`ci/scripts/verdict.py require`, most recent measurement
 # wins) — and that the tag names the version the tree ships. A tree, never a
 # commit: the release tag names the merge `main` holds, whose tree the pull
@@ -36,7 +37,7 @@ jobs:
       - name: The tag names the version this tree ships
         run: bash ci/scripts/check_release_tag.sh "$GITHUB_REF_NAME"
 
-      - name: The tree's GPU-prove, CI and cookbook verdicts
+      - name: The tree's GPU-prove, CI, build and cookbook verdicts
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |

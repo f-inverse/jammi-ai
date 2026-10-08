@@ -7,8 +7,8 @@ name: Compose smoke (Shape B)
 # file, the image's env-only config resolution, and a restart's result
 # durability together. One leg per arch, each on its native runner.
 #
-# The image packages binaries it does not compile. `ci.yml` calls this with
-# its own run id, so the smoke runs the bytes that run built; the nightly and
+# The image packages binaries it does not compile. `build.yml` calls this
+# with its own run id, so the smoke runs the bytes that run built; the nightly and
 # a dispatch resolve the run that proved `main`'s tree (`_proven-artifacts.yml`)
 # and package those, catching drift with no code change at all — a runtime
 # base image's update, a Postgres patch release. The image is built with
@@ -40,7 +40,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: >-
         server-cpu-x86_64-binary
         server-cpu-aarch64-binary

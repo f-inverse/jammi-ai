@@ -4,13 +4,13 @@ the pull request that changes it — once — and a release publishes that build
 
 **Guarded property**:
 
-  1. `ci.yml` runs on every pull request with no `paths:` filter, and every
+  1. `build.yml` runs on every pull request with no `paths:` filter, and every
      wheel it builds — every local reusable workflow it calls whose build
      runs `maturin build`, the maturin action, `python -m build` or
      `wheel tags` — runs `ci/scripts/assert_wheel_size.sh`, so a wheel over
      PyPI's per-file limit fails the pull request that grew it;
   2. a workflow that publishes to PyPI publishes what `_proven-artifacts.yml`
-     resolves — the artifacts of the `ci.yml` run that proved the released
+     resolves — the artifacts of the `build.yml` run that proved the released
      tree — and compiles nothing itself, so the bytes published are the ones
      that run built and checked; and
   3. a publisher has no `pull_request` trigger of its own, so no pull request
@@ -20,7 +20,7 @@ PyPI refuses an oversized file at the tag's upload, after the other wheels of
 the same lockstep release are already published; without the first, the
 first run to see the size is that upload.
 
-**Universe**: `ci.yml`'s local reusable workflows, and the workflows under
+**Universe**: `build.yml`'s local reusable workflows, and the workflows under
 `.github/workflows/` with a `pypa/gh-action-pypi-publish` step. A build is
 everything a workflow reaches: the local reusable workflows and composite
 actions it uses (`uses: ./…`) and the `ci/scripts/*.sh` its `run:` lines and
@@ -49,7 +49,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = Path(".github/workflows")
-PROVING_WORKFLOW = WORKFLOWS / "ci.yml"
+PROVING_WORKFLOW = WORKFLOWS / "build.yml"
 SIZE_CHECK = "ci/scripts/assert_wheel_size.sh"
 PUBLISH_ACTION = "pypa/gh-action-pypi-publish"
 MATURIN_ACTION = "PyO3/maturin-action"
@@ -192,7 +192,7 @@ def findings(root: Path) -> list[str]:
             wheel_builds += 1
             if not build.checks_size():
                 out.append(
-                    f"{reusable.name}: builds a wheel `ci.yml` ships but never runs `{SIZE_CHECK}` — "
+                    f"{reusable.name}: builds a wheel `build.yml` ships but never runs `{SIZE_CHECK}` — "
                     "a wheel over PyPI's per-file limit would first fail at the tag's upload"
                 )
         if wheel_builds == 0:
@@ -216,12 +216,12 @@ def findings(root: Path) -> list[str]:
             )
         if build.compiles():
             out.append(
-                f"{name}: compiles at release — it must publish the bytes `ci.yml` built and checked, "
+                f"{name}: compiles at release — it must publish the bytes `build.yml` built and checked, "
                 "not a second build"
             )
         if pull_request_trigger(document)[0]:
             out.append(
-                f"{name}: has a `pull_request` trigger of its own — `ci.yml` builds its wheel "
+                f"{name}: has a `pull_request` trigger of its own — `build.yml` builds its wheel "
                 "on every pull request already, so a pull request would build it twice"
             )
     if publishers == 0:
@@ -294,7 +294,7 @@ def _self_test() -> int:
             "ci/scripts/assert_wheel_size.sh": "#!/usr/bin/env bash\n",
         }
         if proving is not None:
-            files[".github/workflows/ci.yml"] = proving
+            files[".github/workflows/build.yml"] = proving
         return _tree(files)
 
     cases = [
@@ -320,12 +320,12 @@ def _self_test() -> int:
             ["not what `_proven-artifacts.yml` resolves", "compiles at release"],
         ),
         (
-            "a ci.yml filtered by paths is refused",
+            "a build.yml filtered by paths is refused",
             tree(proving=proving.replace("  pull_request:\n", "  pull_request:\n            paths: [crates/**]\n")),
             ["no `paths:` filter"],
         ),
         (
-            "a ci.yml that builds no wheel is a finding",
+            "a build.yml that builds no wheel is a finding",
             tree(proving=proving.replace("uses: ./.github/workflows/_wheel.yml", "runs-on: ubuntu-latest\n            steps: []")),
             ["builds no wheel"],
         ),
@@ -335,7 +335,7 @@ def _self_test() -> int:
             ["build it twice"],
         ),
         (
-            "a tree with no ci.yml is a finding",
+            "a tree with no build.yml is a finding",
             tree(proving=None),
             ["is missing"],
         ),
@@ -346,7 +346,7 @@ def _self_test() -> int:
                     ".github/workflows/pypi.yml": publisher,
                     ".github/workflows/_proven-artifacts.yml": promotion,
                     ".github/workflows/_wheel.yml": wheel,
-                    ".github/workflows/ci.yml": proving,
+                    ".github/workflows/build.yml": proving,
                 }
             ),
             ["does not exist", "builds no wheel"],
@@ -355,7 +355,7 @@ def _self_test() -> int:
             "a tree with no publisher is a finding, not a pass",
             _tree(
                 {
-                    ".github/workflows/ci.yml": proving,
+                    ".github/workflows/build.yml": proving,
                     ".github/workflows/_wheel.yml": wheel,
                     "ci/scripts/build.sh": script,
                     "ci/scripts/assert_wheel_size.sh": "#!/usr/bin/env bash\n",
@@ -389,7 +389,7 @@ def main() -> int:
         print(f"::error::{finding}", file=sys.stderr)
     if found:
         return 1
-    print("wheel gates: every wheel ci.yml builds is size-checked on every pull request, and every PyPI publisher promotes that build")
+    print("wheel gates: every wheel build.yml builds is size-checked on every pull request, and every PyPI publisher promotes that build")
     return 0
 
 

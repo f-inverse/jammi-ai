@@ -4,7 +4,7 @@ name: _client-wheel
 # generated from `crates/jammi-wire/proto`, its hermetic tests run from
 # source, its import direction asserted, and the wheel built and checked
 # against PyPI's per-file limit. The one place the client is built and its
-# source tested: `ci.yml` calls it on every pull request and on `main`, and
+# source tested: `build.yml` calls it on every pull request and on `main`, and
 # every lane that needs the client installs this wheel (`install-jammi`);
 # `pypi.yml` publishes it.
 #

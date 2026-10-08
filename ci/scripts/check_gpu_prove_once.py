@@ -76,9 +76,10 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      line, the required-arch set the consumer derives
      (`check_gpu_parity_matrix.py`'s `GENCODE_ARCHES` parser) equals the
      workflow's own matrix `arch:` list — never a hand-typed list on either
-     side — `verdict.py`'s `CI_SUMMARY_JOB` is the job `ci.yml`'s
-     `ci-summary` call of `_summary.yml` reports (`<caller id> / <callee
-     job id>`, neither renamed by a `name:`), and `verdict.py`'s
+     side — `verdict.py`'s `CI_SUMMARY_JOB` and `BUILD_SUMMARY_JOB` are the jobs
+     `ci.yml`'s `ci-summary` and `build.yml`'s `build-summary` calls of
+     `_summary.yml` report (`<caller id> / <callee job id>`, neither renamed
+     by a `name:`), and `verdict.py`'s
      `COOKBOOK_JOB` is the `name:` of a job in `cookbook-gpu.yml`.
 
   P5 (the reusable actually consults the verdict): P3 only checks a gate
@@ -2891,7 +2892,12 @@ def check_p4(workflow_texts: dict[str, str], shipped_arches: set[str]) -> list[s
                 f"P4: {PROVE_PRODUCER_WORKFLOW}'s matrix arch list {sorted(workflow_arches)} != "
                 f"shipped GENCODE_ARCHES {sorted(shipped_arches)}"
             )
-    return findings + _check_ci_summary_name(workflow_texts) + _check_cookbook_job_name(workflow_texts)
+    return (
+        findings
+        + _check_summary_name(workflow_texts, verdict.CI_WORKFLOW, verdict.CI_SUMMARY_JOB, "CI_SUMMARY_JOB")
+        + _check_summary_name(workflow_texts, verdict.BUILD_WORKFLOW, verdict.BUILD_SUMMARY_JOB, "BUILD_SUMMARY_JOB")
+        + _check_cookbook_job_name(workflow_texts)
+    )
 
 
 def _check_cookbook_job_name(workflow_texts: dict[str, str]) -> list[str]:
@@ -2912,19 +2918,21 @@ def _check_cookbook_job_name(workflow_texts: dict[str, str]) -> list[str]:
     return [f"P4: no job in {verdict.COOKBOOK_WORKFLOW} is named `{verdict.COOKBOOK_JOB}` (verdict.COOKBOOK_JOB)"]
 
 
-def _check_ci_summary_name(workflow_texts: dict[str, str]) -> list[str]:
-    """`verdict.CI_SUMMARY_JOB` is `<caller job id> / <callee job id>`: the
-    name the API reports for `ci.yml`'s summary job, a job-level call of
+def _check_summary_name(
+    workflow_texts: dict[str, str], summary_workflow: str, summary_job: str, constant: str
+) -> list[str]:
+    """A verdict summary constant is `<caller job id> / <callee job id>`: the
+    name the API reports for the workflow's summary job, a job-level call of
     `_summary.yml`. Either side renamed by a `name:` would change it."""
-    caller_id, callee_id = (part.strip() for part in verdict.CI_SUMMARY_JOB.split("/"))
+    caller_id, callee_id = (part.strip() for part in summary_job.split("/"))
     findings: list[str] = []
     for workflow, job_id, want_uses in (
-        (verdict.CI_WORKFLOW, caller_id, "./.github/workflows/_summary.yml"),
+        (summary_workflow, caller_id, "./.github/workflows/_summary.yml"),
         ("_summary.yml", callee_id, None),
     ):
         text = workflow_texts.get(workflow)
         if text is None:
-            findings.append(f"P4: {workflow} is missing -- cannot verify verdict.CI_SUMMARY_JOB")
+            findings.append(f"P4: {workflow} is missing -- cannot verify verdict.{constant}")
             continue
         stripped = drop_comment_lines(text)
         jobs, err = jobs_or_fail(stripped)
@@ -2932,14 +2940,14 @@ def _check_ci_summary_name(workflow_texts: dict[str, str]) -> list[str]:
             findings.append(f"P4: {workflow}: {err}")
             continue
         if job_id not in jobs:
-            findings.append(f"P4: {workflow} has no job `{job_id}` (verdict.CI_SUMMARY_JOB names it)")
+            findings.append(f"P4: {workflow} has no job `{job_id}` (verdict.{constant} names it)")
             continue
         start, end = jobs[job_id]
         body = stripped.splitlines()[start:end]
         if any(re.match(r"^    name:", line) for line in body):
             findings.append(
                 f"P4: {workflow}'s job `{job_id}` carries a `name:`, so the API no longer reports "
-                f"verdict.CI_SUMMARY_JOB (`{verdict.CI_SUMMARY_JOB}`)"
+                f"verdict.{constant} (`{summary_job}`)"
             )
         if want_uses is not None and not any(
             line.strip() == f"uses: {want_uses}" for line in body

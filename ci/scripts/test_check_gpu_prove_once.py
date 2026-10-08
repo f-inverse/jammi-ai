@@ -352,6 +352,21 @@ def write_tree(root: Path, workflows: dict[str, str], manifest: dict) -> tuple[P
 
 # `ci.yml`'s summary call and `_summary.yml`'s job: the name the API reports
 # for it is `verdict.CI_SUMMARY_JOB` (P4).
+# `build.yml`'s summary call: the name the API reports for it is
+# `verdict.BUILD_SUMMARY_JOB` (P4).
+BUILD_SUMMARY_YML_GOOD = """\
+name: Build
+on:
+  pull_request:
+jobs:
+  build-summary:
+    needs: [client-wheel]
+    if: always()
+    uses: ./.github/workflows/_summary.yml
+    with:
+      needs_json: ${{ toJSON(needs) }}
+"""
+
 CI_SUMMARY_YML_GOOD = """\
 name: CI
 on:
@@ -408,6 +423,7 @@ def positive_workflows() -> dict[str, str]:
         "gpu-reap.yml": REAP_YML,
         "_proof-required.yml": PROOF_REQUIRED_YML_GOOD,
         "ci.yml": CI_SUMMARY_YML_GOOD,
+        "build.yml": BUILD_SUMMARY_YML_GOOD,
         "_summary.yml": SUMMARY_YML_GOOD,
         "server-image.yml": _server_image_yml(),
         "release-binaries.yml": _release_binaries_yml(),
@@ -2068,6 +2084,7 @@ def _p4(**overrides) -> list[str]:
     texts = {
         "gpu-prove.yml": PROVE_YML_GOOD,
         "ci.yml": CI_SUMMARY_YML_GOOD,
+        "build.yml": BUILD_SUMMARY_YML_GOOD,
         "_summary.yml": SUMMARY_YML_GOOD,
         "cookbook-gpu.yml": COOKBOOK_GPU_YML_GOOD,
     }
@@ -2100,6 +2117,25 @@ class P4CookbookJobNameTest(unittest.TestCase):
 
     def test_a_missing_workflow_fails(self):
         self.assertTrue(any("cookbook-gpu.yml is missing" in f for f in _p4(**{"cookbook-gpu.yml": None})))
+
+
+class P4BuildSummaryNameTest(unittest.TestCase):
+    """`verdict.BUILD_SUMMARY_JOB` is the name the API reports for `build.yml`'s
+    summary, held the same way as `ci.yml`'s."""
+
+    def test_the_constant_names_the_summary(self):
+        self.assertEqual(verdict.BUILD_SUMMARY_JOB, "build-summary / assert")
+
+    def test_a_renamed_caller_job_fails(self):
+        bad = BUILD_SUMMARY_YML_GOOD.replace("  build-summary:", "  summary:")
+        self.assertTrue(any("has no job `build-summary`" in f and "BUILD_SUMMARY_JOB" in f for f in _p4(**{"build.yml": bad})))
+
+    def test_a_display_name_on_the_caller_fails(self):
+        bad = BUILD_SUMMARY_YML_GOOD.replace("  build-summary:\n", "  build-summary:\n    name: Summary\n")
+        self.assertTrue(any("carries a `name:`" in f and "BUILD_SUMMARY_JOB" in f for f in _p4(**{"build.yml": bad})))
+
+    def test_a_missing_build_workflow_fails(self):
+        self.assertTrue(any("build.yml is missing" in f for f in _p4(**{"build.yml": None})))
 
 
 class P4CiSummaryNameTest(unittest.TestCase):

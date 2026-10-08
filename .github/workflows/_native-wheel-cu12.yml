@@ -3,8 +3,8 @@ name: _native-wheel-cu12
 # Builds the `jammi-ai-native-cu12` wheel — the embedded CUDA engine (the
 # manifest's `native-cu12` build) — through `ci/scripts/build_native_cu12_wheel.sh`,
 # which builds it in the CUDA image and checks it. The one definition of how
-# the CUDA native wheel is built: `ci.yml` calls it on every pull request and
-# on `main`; `pypi.yml` publishes what that run built.
+# the CUDA native wheel is built: `build.yml` calls it on every pull request
+# and on `main`; `pypi.yml` publishes what that run built.
 #
 # Artifact: `native-cu12-wheel`.
 

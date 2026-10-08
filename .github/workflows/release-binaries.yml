@@ -4,7 +4,7 @@ name: Release Binaries
 # the shared release gate: the `jammi` CLI for every target and the
 # `jammi-server` tarballs (the CPU build per arch; the CUDA build with the
 # runtime libraries it links and an `LD_LIBRARY_PATH` launcher,
-# `ci/scripts/package_server_tarball.sh`). It compiles nothing: `ci.yml`
+# `ci/scripts/package_server_tarball.sh`). It compiles nothing: `build.yml`
 # builds and packages every asset on every pull request and on `main`
 # (`_cli.yml`, `_server.yml`), and a release attaches the ones the run that
 # proved the tag's tree built (`_proven-artifacts.yml`), each with a
@@ -36,7 +36,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: >-
         jammi-x86_64-unknown-linux-gnu
         jammi-aarch64-unknown-linux-gnu

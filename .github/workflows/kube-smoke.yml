@@ -10,8 +10,8 @@ name: Kubernetes smoke (kind)
 # the restart: the overlay mounts `emptyDir` (that script's module doc draws
 # the boundary).
 #
-# The image packages binaries it does not compile: `ci.yml` calls this with
-# its own run id; the nightly and a dispatch resolve the run that proved
+# The image packages binaries it does not compile: `build.yml` calls this
+# with its own run id; the nightly and a dispatch resolve the run that proved
 # `main`'s tree (`_proven-artifacts.yml`). Built with `push: "false"` and
 # loaded into the runner's daemon, then into the cluster's node: no registry
 # is written, so this workflow is not a promotion (`check_gpu_prove_once.py`'s
@@ -46,7 +46,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: server-cpu-x86_64-binary jammi-x86_64-unknown-linux-gnu client-wheel
 
   kube-smoke:

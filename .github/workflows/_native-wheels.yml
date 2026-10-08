@@ -4,7 +4,7 @@ name: _native-wheels
 # (`jammi-python`, the manifest's `native-cpu` build), as maturin abi3 wheels
 # from `packaging/native/pyproject.toml` — for every platform asked for, and
 # checks each against what PyPI and its platform tag promise. The one
-# definition of how the native wheel is built: `ci.yml` calls it on every
+# definition of how the native wheel is built: `build.yml` calls it on every
 # pull request and on `main`, where the Python lanes install the Linux x86_64
 # wheel; `pypi.yml` publishes what that run built.
 #

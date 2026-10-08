@@ -1,12 +1,14 @@
 name: CI
 
-# Every pull request, whatever its base, and every push to `main`.
+# The merge gate: does the tree pass its hermetic suite, its lints and its
+# guards?
 #
-# A run proves a tree, never a commit. `plan` records the tree this run tests
+# Every pull request, whatever its base, and every push to `main`. A run
+# proves a tree, never a commit. `plan` records the tree this run tests
 # (`record-subject`) and asks whether a run already proved it
-# (`ci/scripts/verdict.py probe`): the merge of a pull request whose tree its
-# own run proved lands on `main` with that same tree. A proven tree's run
-# skips every job whose only work is executing tests (each carries
+# (`ci/scripts/verdict.py probe --lane ci`): the merge of a pull request whose
+# tree its own run proved lands on `main` with that same tree. A proven tree's
+# run skips every job whose only work is executing tests (each carries
 # `if: needs.plan.outputs.proven != 'true'`, and `ci-summary` counts a skipped
 # job as passed). Jobs that compile still run, because a run on `main` writes
 # the compile cache every pull request reads (`setup-rust-ci`); jobs whose
@@ -16,18 +18,12 @@ name: CI
 # gate, so a release — which requires this summary green on its tree
 # (`_proof-required.yml`) — carries both.
 #
-# Every artifact the tree ships is compiled here once, by the reusable
-# workflow that defines it (`_native-wheels.yml`, `_native-wheel-cu12.yml`,
-# `_server.yml`, `_cli.yml`, `_client-wheel.yml`), and every check that runs
-# one installs that build: the Python lanes, the live client suite, the image
-# check and the smokes compile nothing of their own. The cookbook lane
-# (`cookbook-gpu.yml`) installs the same builds on a GPU, and a release
-# promotes them.
-#
-# Nothing waits on work it does not consume: no job needs `check`, each
-# compile graph that would outlast the hermetic suite runs as a job of its
-# own, and an artifact is built per consumer set, so a job that installs the
-# Linux x86_64 wheel never waits on the macOS legs.
+# This workflow also builds the tree's CI images when the registry lacks
+# them; every other workflow on the same event waits for them
+# (`_ci-image.yml`). The tree's artifacts, and every check that installs
+# them, are `build.yml`'s. Nothing waits on work it does not consume: no job
+# needs `check`, and each compile graph that would outlast the hermetic
+# suite runs as a job of its own.
 on:
   push:
     branches: [main]
@@ -56,6 +52,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_ci-image.yml
 
+
   # This run builds the tree's images when the registry lacks them. Every
   # other workflow on the same push waits for these two jobs by their
   # `CI image (` name prefix (`ci_image.py`'s BUILDER_JOB_PREFIX). Reviewed
@@ -71,6 +68,7 @@ jobs:
     with:
       dockerfile: .docker/ci.Dockerfile
 
+
   # FROM the CPU image of the same tree, so after it.
   build-ci-image-cuda:
     name: CI image (CUDA)
@@ -82,6 +80,7 @@ jobs:
     uses: ./.github/workflows/_ci-base-image.yml
     with:
       dockerfile: .docker/ci-cuda.Dockerfile
+
 
   plan:
     name: Plan
@@ -102,7 +101,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TREE: ${{ steps.subject.outputs.tree }}
-        run: python3 ci/scripts/verdict.py probe --repo "$GITHUB_REPOSITORY" --tree "$TREE" | tee -a "$GITHUB_OUTPUT"
+        run: python3 ci/scripts/verdict.py probe --lane ci --repo "$GITHUB_REPOSITORY" --tree "$TREE" | tee -a "$GITHUB_OUTPUT"
+
 
   # ── Lint ───────────────────────────────────────────────────────────────────
   check:
@@ -128,6 +128,7 @@ jobs:
       - name: Clippy jammi-db --features postgres,mysql --all-targets (source-provider feature surface)
         run: cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings
 
+
   # Tests that need something a CI host lacks are compiled only under the
   # feature naming it, so `--all-targets` above never sees them. This job lints
   # the ones that need no CUDA toolchain; `clippy-cuda` lints the CUDA ones,
@@ -149,6 +150,7 @@ jobs:
           cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings
           cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings
           cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings
+
 
   # Compiles and lints every CUDA-gated surface with the CUDA toolkit and no
   # GPU: it proves the code builds, never that it computes the right numbers
@@ -201,6 +203,7 @@ jobs:
       - name: Clippy CUDA surfaces (nvcc, no GPU)
         run: ${{ matrix.cmd }}
 
+
   # Lints the Metal-gated surfaces. It cannot run them: a GitHub-hosted
   # macos-14 runner cannot construct a candle Metal device, so
   # `live-metal-tests` run on Apple-silicon hardware.
@@ -217,6 +220,7 @@ jobs:
           cargo clippy -p jammi-kernels --lib --tests --features live-metal-tests -- -D warnings
           cargo clippy -p jammi-lora --tests --features live-metal-tests -- -D warnings
           cargo clippy -p jammi-ai --test metal_quantized_gpu --features live-metal-tests -- -D warnings
+
 
   # ── The hermetic suite: build once, run in partitions ──────────────────────
   # One compile of the workspace's test graph, archived (`cargo nextest
@@ -251,6 +255,7 @@ jobs:
           retention-days: 1
           # The archive is zstd already.
           compression-level: 0
+
 
   # Each partition runs a slice of every test binary, each test in a process
   # of its own (`.config/nextest.toml`). The archive is extracted into the
@@ -296,6 +301,7 @@ jobs:
           path: target/nextest/ci/junit.xml
           retention-days: 30
 
+
   # The tests `unprivileged-tests` adds, run as an unprivileged account
   # (`ci/scripts/run_permission_fault_tests.sh`): this container runs as root,
   # and mode bits do not apply to root.
@@ -310,6 +316,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/setup-rust-ci
       - run: bash ci/scripts/run_permission_fault_tests.sh
+
 
   # The opt-in test features no default build compiles, each a small graph:
   # the cloud drivers' root-identity determinants (`storage-cloud`), and the
@@ -333,6 +340,7 @@ jobs:
       - name: Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)
         run: cargo test -p jammi-encoders --features golden-parity --test golden_parity
 
+
   # A real commit, on a rebuild, moves the sha `jammi-bench` bakes
   # (`ci/scripts/check_build_sha_tracks_head.sh`): the one leg of the build-sha
   # oracle that needs a real checkout, which this job's clone is and which is
@@ -349,6 +357,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-ci
       - run: bash ci/scripts/check_build_sha_tracks_head.sh
 
+
   # Live (hub) tests reach the network, so on a pull request they only
   # compile; a full-workspace `--no-run` graph of its own, apart from the
   # test archive (two such graphs in one `target/` exhausted a runner's disk).
@@ -364,6 +373,7 @@ jobs:
 
       - name: Compile-check live tests
         run: cargo test --workspace --exclude jammi-python --features live-hub-tests --no-run
+
 
   # The tests `live-hub-tests` adds, against the live model hub
   # (`ci/scripts/run_live_hub_tests.sh`): `main`-only, and a verdict like every
@@ -386,6 +396,7 @@ jobs:
           # > `HF_TOKEN` > the cache's own `token` file).
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: bash ci/scripts/run_live_hub_tests.sh
+
 
   # The candle-free client substrate — the wire transport (`jammi-wire`), the
   # control-plane client (`jammi-admin`), the data-plane client
@@ -415,6 +426,7 @@ jobs:
       - name: The standalone CLI pulls no ML deps and no jammi-ai
         run: bash ci/scripts/check_client_deps.sh cli
 
+
   # `--locked` with no private registry or source configured: a green build
   # proves the OSS edition is self-contained and its lockfile holds nothing
   # proprietary. `jammi-python` is built via maturin, not `cargo build`.
@@ -430,6 +442,7 @@ jobs:
 
       - name: Build the OSS workspace hermetically with no private source
         run: cargo build --workspace --exclude jammi-python --locked
+
 
   # `cargo deny` against `deny.toml`: the live RustSec advisory database, the
   # license allowlist, and the bans/sources lanes that formalise the engine's
@@ -465,77 +478,6 @@ jobs:
       - name: cargo deny --all-features (shipped-feature graph)
         run: cargo deny --all-features check bans advisories licenses sources
 
-  # `@f-inverse/jammi-client` is generated from `crates/jammi-wire/proto` by
-  # `buf generate` (in `npm run build`), type-checked, tested and packed: the
-  # tarball `npm.yml` publishes, at the Node version `clients/typescript/.nvmrc`
-  # pins for both.
-  ts-client:
-    name: TS client (@f-inverse/jammi-client)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: clients/typescript
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version-file: clients/typescript/.nvmrc
-
-      - name: Install
-        run: npm ci
-
-      - name: Build (generate + tsc)
-        run: npm run build
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Test (hermetic)
-        run: npm run test
-
-      # `--pack-destination` must exist: npm refuses a missing directory.
-      - name: Pack
-        run: |
-          mkdir -p "$RUNNER_TEMP/ts-client"
-          npm pack --pack-destination "$RUNNER_TEMP/ts-client"
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ts-client-package
-          path: ${{ runner.temp }}/ts-client/*.tgz
-
-  # The pytest suite drives the two dists that ship in lockstep — the client
-  # wheel `jammi-ai` (import `jammi`) and the compiled engine
-  # `jammi-ai-native` (import `jammi_native`) this run built, which the client
-  # discovers as its `file://` backend — as a reader installs them.
-  test-python:
-    name: Test (Python)
-    runs-on: ubuntu-latest
-    needs: [build-ci-image, native-wheel-linux-x86_64, client-wheel]
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: ./.github/actions/install-jammi
-        with:
-          extra-pip-packages: pytest
-
-      - name: Run pytest
-        run: pytest crates/jammi-python/tests -v
-
-      # The client tests that need the engine; the ones that also need a
-      # server run in `client-live`.
-      - name: Python client suite (with the embedded engine)
-        run: make -C clients/python test-embedded
-
-      - name: Run UAT shape-B/C Python scripts
-        run: |
-          for script in tests/uat/shape_b_*.py tests/uat/shape_c_*.py; do
-            echo "=== $script ==="
-            python3 "$script"
-          done
 
   # The `jammi-python` crate's Rust tests: built without `extension-module`,
   # they link libpython against the image's system interpreter — a test build,
@@ -552,6 +494,7 @@ jobs:
 
       - name: Rust tests (jammi-python)
         run: cargo test -p jammi-python --no-fail-fast
+
 
   # The backend-parameterised suites' Postgres arms: compiled only under
   # `live-postgres-tests`, each test against a database of its own on the
@@ -590,6 +533,7 @@ jobs:
             --features jammi-db/live-postgres-tests,jammi-server/live-postgres-tests \
             -E '(package(jammi-db) & (kind(lib) | binary(it))) | (package(jammi-server) & binary(it))'
 
+
   # The repository's guards (`ci/guards.toml`) and the tests of its own
   # scripts, through the runners a local check uses too
   # (`ci/dev.sh python3 ci/scripts/run_guards.py --base origin/main`). On a
@@ -615,6 +559,7 @@ jobs:
         run: python3 ci/scripts/run_guards.py ${{ github.event_name == 'pull_request' && '--base HEAD^1' || '' }}
       - name: Test the scripts
         run: python3 ci/scripts/run_script_tests.py ${{ github.event_name == 'pull_request' && '--base HEAD^1' || '' }}
+
 
   # Every Kubernetes kustomization renders valid manifests against the pinned
   # schema (`ci/scripts/check_kube_manifests.sh`, the kind smoke's own
@@ -642,6 +587,7 @@ jobs:
       - name: Every config mount carries the file its server reads
         run: python3 ci/scripts/check_kube_config_mounts.py
 
+
   # The one job that executes `.cargo/config.toml`'s aarch64 stanza on a real
   # aarch64 host outside any container (`ci/scripts/check_aarch64_floor.sh`):
   # every other proof of the `+fp16` floor and the mold link argument is
@@ -656,6 +602,7 @@ jobs:
       - uses: ./.github/actions/setup-rust-host
       - uses: ./.github/actions/setup-rust-ci
       - run: bash ci/scripts/check_aarch64_floor.sh
+
 
   # The maintainer guide's crate-dependency graph is generated from
   # `cargo build-graph`, extracted from real `cargo build` artifacts, so a
@@ -678,6 +625,7 @@ jobs:
         run: |
           git diff --exit-code -- docs/maintainer/MAINTAINER-GUIDE.md \
             || { echo "::error::docs/maintainer/MAINTAINER-GUIDE.md's dep-DAG block is stale: run 'python3 ci/scripts/gen_dep_dag.py' and commit the result"; exit 1; }
+
 
   # The performance gate, measured on `main`: every CPU-hermetic `*-scale`
   # tier against its committed floor (`ci/scripts/perf/run_scale_tiers.sh`;
@@ -716,6 +664,7 @@ jobs:
       - name: The rate gate bites
         run: bash ci/scripts/perf/check_rate_gate_bites.sh
 
+
   # The multi-process lanes over Postgres and the S3-class store: the claim,
   # chaos and ladder-rung legs `distributed.yml` defines.
   distributed:
@@ -726,241 +675,6 @@ jobs:
       actions: read
     uses: ./.github/workflows/distributed.yml
 
-  # ── The tree's artifacts, each compiled once ──────────────────────────────
-  # Through the definitions a release promotes from, so a wheel or binary that
-  # stops building, or a wheel that outgrows PyPI's per-file limit, fails the
-  # change that caused it. Compiling jobs: they run on a proven tree too, and
-  # `main`'s run writes the cache every pull request reads. Split per
-  # consumer set.
-  native-wheel-linux-x86_64:
-    name: Native wheel (Linux x86_64)
-    needs: build-ci-image
-    uses: ./.github/workflows/_native-wheels.yml
-    with:
-      platforms: linux-x86_64
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  native-wheels:
-    name: Native wheels
-    needs: build-ci-image
-    uses: ./.github/workflows/_native-wheels.yml
-    with:
-      platforms: linux-aarch64 macos-arm64 macos-x86_64
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  native-wheel-cu12:
-    name: Native wheel (CUDA)
-    needs: build-ci-image-cuda
-    uses: ./.github/workflows/_native-wheel-cu12.yml
-    with:
-      cuda-image: ${{ needs.build-ci-image-cuda.outputs.image }}
-
-  server-cpu-x86_64:
-    name: Server (CPU, x86_64)
-    needs: build-ci-image
-    uses: ./.github/workflows/_server.yml
-    with:
-      build: server-cpu
-      arch: x86_64
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  server-cpu-aarch64:
-    name: Server (CPU, aarch64)
-    needs: build-ci-image
-    uses: ./.github/workflows/_server.yml
-    with:
-      build: server-cpu
-      arch: aarch64
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  server-cu12:
-    name: Server (CUDA)
-    needs: [build-ci-image, build-ci-image-cuda]
-    uses: ./.github/workflows/_server.yml
-    with:
-      build: server-cu12
-      arch: x86_64
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-      cuda-image: ${{ needs.build-ci-image-cuda.outputs.image }}
-
-  cli-x86_64:
-    name: CLI (x86_64)
-    needs: build-ci-image
-    uses: ./.github/workflows/_cli.yml
-    with:
-      targets: x86_64-unknown-linux-gnu
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  cli-aarch64:
-    name: CLI (aarch64)
-    needs: build-ci-image
-    uses: ./.github/workflows/_cli.yml
-    with:
-      targets: aarch64-unknown-linux-gnu
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  # The macOS CLI nothing here runs: built so a release promotes it from the
-  # run that proved its tree, like every other asset.
-  cli-macos:
-    name: CLI (macOS)
-    needs: build-ci-image
-    uses: ./.github/workflows/_cli.yml
-    with:
-      targets: aarch64-apple-darwin
-      cpu-image: ${{ needs.build-ci-image.outputs.image }}
-
-  client-wheel:
-    name: Client wheel
-    uses: ./.github/workflows/_client-wheel.yml
-
-  # GPU runtime is not testable here; packaging the CUDA image from this
-  # run's CUDA binary proves its runtime stage assembles before a tag
-  # publishes it.
-  server-image-cuda:
-    name: Server image (CUDA)
-    needs: [server-cu12, cli-x86_64]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: ./.github/actions/stage-server-binaries
-        id: binaries
-        with:
-          server: server-cu12-x86_64-binary
-          cli: jammi-x86_64-unknown-linux-gnu
-          stage: builder-cuda
-
-      - uses: ./.github/actions/build-image
-        with:
-          build-args: |
-            RUNTIME_VARIANT=runtime-cuda
-          build-contexts: ${{ steps.binaries.outputs.build-context }}
-          # The CUDA runtime base publishes amd64 only.
-          platforms: linux/amd64
-          cache-scope: cu12
-
-  # ── The deploy shapes, over this run's binaries ───────────────────────────
-  kube-smoke:
-    needs: [server-cpu-x86_64, cli-x86_64, client-wheel]
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/kube-smoke.yml
-    with:
-      run-id: ${{ github.run_id }}
-
-  compose-smoke:
-    needs: [server-cpu-x86_64, server-cpu-aarch64, cli-x86_64, cli-aarch64, client-wheel]
-    permissions:
-      contents: read
-      actions: read
-    uses: ./.github/workflows/compose-smoke.yml
-    with:
-      run-id: ${{ github.run_id }}
-
-  # ── The Python client against a live server ────────────────────────────────
-  # The client's live-server suite, over this run's engine, server and CLI and
-  # the engine's test checkpoints (`tests/fixtures`). The cookbook's recipes
-  # and chapters run real Hub models, so they run on a GPU in the cookbook
-  # lane (`cookbook-gpu.yml`), never in this hermetic workflow.
-  client-live:
-    name: Python client against a live server
-    needs: [build-ci-image, native-wheel-linux-x86_64, client-wheel, server-cpu-x86_64, cli-x86_64]
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: ./.github/actions/install-jammi
-        with:
-          binaries: "true"
-
-      - name: Python client suite against a live server
-        run: make -C clients/python test-live
-
-  # ── The guide and the API reference ───────────────────────────────────────
-  # The guide, with every Rust example in it compiled and run against the
-  # workspace, and the rustdoc of every crate: built once per tree, as the
-  # site a release publishes (`pages.yml`), beside the book `cookbook-gpu.yml`
-  # renders.
-  docs:
-    name: Guide and API reference
-    needs: build-ci-image
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: ./.github/actions/setup-rust-ci
-
-      - name: Build the guide
-        run: mdbook build docs/guide
-
-      - name: Build the workspace the guide's examples link against
-        run: cargo build --workspace --exclude jammi-python --quiet
-
-      # mdbook compiles each example in a temp dir where rustup cannot find
-      # rust-toolchain.toml by walking up, so the example compiler is pinned
-      # to the workspace's.
-      - name: Test the guide's examples
-        run: |
-          RUSTUP_TOOLCHAIN="$(bash ci/scripts/rust_pin.sh)"
-          export RUSTUP_TOOLCHAIN
-          mdbook test docs/guide -L "${CARGO_TARGET_DIR:-target}/debug/deps"
-
-      - name: Build the API reference
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude jammi-python --no-deps
-
-      - name: Lay out the site
-        run: |
-          mkdir -p _site
-          cp -r docs/guide/book/. _site/
-          cp -r "${CARGO_TARGET_DIR:-target}/doc" _site/api
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: docs-site
-          path: _site
-
-  # ── The book ───────────────────────────────────────────────────────────────
-  # The book's checks that need no model: its API reference against the
-  # engine, its library's lint and unit tests, the no-deferral gate and its
-  # citations. Every chapter runs real Hub models, so the chapters render, and
-  # the book a release publishes is assembled, in the cookbook lane
-  # (`cookbook-gpu.yml`). Every public verb is run by a recipe or an executed
-  # chapter cell: the guard `ci/scripts/check_cookbook_coverage.py`.
-  book-checks:
-    name: Book (API reference, lint, unit tests, citations)
-    needs: [build-ci-image, native-wheel-linux-x86_64, client-wheel]
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.build-ci-image.outputs.image }}
-    defaults:
-      run:
-        working-directory: cookbook/book
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-
-      - uses: ./.github/actions/install-jammi
-
-      - name: Install the book
-        run: pip install -e '.[book,dev]'
-
-      - name: API reference matches the engine
-        run: python -m jammi.session_journal -- python scripts/check_api_reference.py
-
-      - name: Lint
-        run: ruff check jammi_cookbook scripts tests
-
-      - name: Shared-lib unit tests
-        run: pytest -q
-
-      - name: No-deferral gate
-        run: bash scripts/no_deferral_grep.sh
-
-      - name: No dangling citations
-        run: python -m jammi.session_journal -- python scripts/check_citations.py
 
   # ── Single rolled-up gate ──────────────────────────────────────────────────
   # The one check a branch-protection ruleset requires. It fails if any job
@@ -989,8 +703,6 @@ jobs:
       - clients
       - oss-only-build
       - dep-audit
-      - ts-client
-      - test-python
       - test-python-rust
       - test-pg
       - guard
@@ -999,22 +711,6 @@ jobs:
       - dep-dag
       - perf-gate
       - distributed
-      - native-wheel-linux-x86_64
-      - native-wheels
-      - native-wheel-cu12
-      - server-cpu-x86_64
-      - server-cpu-aarch64
-      - server-cu12
-      - cli-x86_64
-      - cli-aarch64
-      - cli-macos
-      - client-wheel
-      - server-image-cuda
-      - kube-smoke
-      - compose-smoke
-      - client-live
-      - docs
-      - book-checks
     if: always()
     uses: ./.github/workflows/_summary.yml
     with:

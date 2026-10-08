@@ -1,45 +1,27 @@
 name: _proof-required
 
-# Reusable "proof required" gate: EVERY release-publishing workflow calls this
-# instead of renting hardware itself (or, for a non-CUDA publisher, instead of
-# publishing on no evidence at all) — crates.io, npm, every PyPI dist, the
-# server image, the release binaries and the documentation site all gate on
-# the same recorded verdict. It asks the GitHub REST API, for the tree of the
-# commit THIS caller is promoting (`github.sha`), whether `gpu-prove.yml` has a
-# green measurement
-# for every shipped CUDA arch (`crates/jammi-kernels/build.rs` GENCODE_ARCHES)
-# AND `ci.yml`'s summary job is green (`ci/scripts/verdict.py require`, its
-# most-recent-measurement-wins rule). A tree, never a commit: the release tag
-# names the merge commit `main` holds, whose tree is the one its pull request's
-# run and the prove run measured.
+# The release gate every publisher calls: reads, for the tree of the commit
+# the caller promotes, whether the tree's four measurements are green —
+# `gpu-prove.yml` on every shipped CUDA arch, `ci.yml`'s summary job (the merge
+# gate), `build.yml`'s (the artifacts and their consumers) and
+# `cookbook-gpu.yml` (`ci/scripts/verdict.py require`, most recent measurement
+# wins) — and that the tag names the version the tree ships. A tree, never a
+# commit: the release tag names the merge `main` holds, whose tree the pull
+# request's run and the prove run measured.
 #
-# THE PROVE LANE IS NEVER STARTED FROM HERE -- see `gpu-prove.yml`'s own
-# header for the canonical statement of why. A dev dispatches `gpu-prove.yml`
-# by hand before tagging a release — see docs/maintainer/dev-gpu.md's "GPU
-# proof and the release gate" section and MAINTAINER-GUIDE.md's release
-# runbook. This job only READS the verdict already on record for the tree.
-#
-# CHECK ONCE, FAIL LOUD: `verdict.py` makes exactly one pass over the tree's
-# recorded runs and returns. There is no deadline, no poll, no grace window —
-# a run still in progress is invisible to the check, never a reason to wait.
-# A tag push on a tree whose proof is not ALREADY green fails every release
-# workflow immediately, by design: prove first, then tag, because a tag push
-# commits the version number. Fail-closed: a missing measurement, or a most
-# recent measurement that is not `success`, denies — this job's own result
-# becomes non-success and the caller's promoting job (gated on
-# `needs.<this job>.result == 'success'`) never runs: nothing promotes unproven.
-#
-# `timeout-minutes: 15` bounds a single REST lookup, not a wait. No
-# concurrency group: this job never rents anything, so nothing here can orphan
-# a pod or need serialization.
+# It starts nothing and waits for nothing: one pass over the recorded runs. A
+# tag on a tree whose proof is not already green fails every publisher at
+# once, because a tag push commits the version number: prove, then tag. A
+# missing measurement, or a most recent one that is not `success`, denies, and
+# the caller's promoting job (gated on `needs.<this job>.result == 'success'`)
+# never runs. `timeout-minutes` bounds the REST lookup, not a wait.
 
 on:
   workflow_call: {}
 
-# Least privilege: `actions: read` is what lets `verdict.py` list the tree's
-# subject artifacts and its runs' jobs via the GitHub REST API using the
-# ambient `GITHUB_TOKEN` — a called workflow cannot elevate beyond what it
-# declares here, regardless of what the caller itself grants.
+# `actions: read` lets `verdict.py` list the tree's subject artifacts and its
+# runs' jobs with the ambient token; a called workflow cannot widen beyond
+# what it declares here.
 permissions:
   contents: read
   actions: read
@@ -50,9 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Check the tree's GPU-prove and CI verdicts
+      - name: The tag names the version this tree ships
+        run: bash ci/scripts/check_release_tag.sh "$GITHUB_REF_NAME"
+
+      - name: The tree's GPU-prove, CI, build and cookbook verdicts
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |

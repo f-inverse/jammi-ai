@@ -305,10 +305,8 @@ hold. This overlay is validated by `kubeconform` only — CI has no GPU node.
 {{#include ../../../deploy/kubernetes/overlays/shape-d/jammi-compute.toml}}
 ```
 
-Both `:latest` tags are re-pointed by every `v*` release tag (never by a
-prerelease); the CPU `:latest` can additionally be re-pointed to the current
-`main` by a manual `build-and-push-main` dispatch. Pin an exact `:X.Y.Z`
-tag for reproducible GPU-node deploys.
+`:latest` on every image is the newest `v*` release and nothing else moves
+it. Pin an exact `:X.Y.Z` tag for reproducible GPU-node deploys.
 
 Very high scale, specialized GPU pools, and a split compliance posture
 (query tier vs. training tier on separate node pools / network policies)
@@ -432,6 +430,5 @@ tier can schedule onto either an amd64 or an arm64 node pool without a
 per-arch tag; `docker pull`/Kubernetes resolve the right member
 automatically. Shape D's GPU compute tier is unaffected by this: the CUDA
 image (`-cu12`) is `linux/amd64` only, so the GPU node pool stays amd64. The
-same CPU image name's self-contained tags (`:selfcontained`,
-`:selfcontained-sha-<sha>`) are also `linux/amd64` only — never schedule
-those onto an arm64 node pool.
+self-contained tags (`:selfcontained`, `:selfcontained-X.Y.Z`) are the same
+multi-arch index shape as the generic ones.

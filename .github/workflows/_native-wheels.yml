@@ -2,11 +2,11 @@ name: _native-wheels
 
 # Builds the `jammi-ai-native` wheels — the compiled embedded engine
 # (`jammi-python`, the manifest's `native-cpu` build), as maturin abi3 wheels
-# from `packaging/native/pyproject.toml` — for every platform it ships on, and
+# from `packaging/native/pyproject.toml` — for every platform asked for, and
 # checks each against what PyPI and its platform tag promise. The one
-# definition of how the native wheel is built: `ci.yml` calls it on every pull
-# request and on `main`, where the Python lanes and the cookbook install the
-# Linux x86_64 wheel; `pypi.yml` calls it to publish.
+# definition of how the native wheel is built: `build.yml` calls it on every
+# pull request and on `main`, where the Python lanes install the Linux x86_64
+# wheel; `pypi.yml` publishes what that run built.
 #
 # Artifact per platform: `wheels-native-<platform>`, for `linux-x86_64`,
 # `linux-aarch64`, `macos-arm64` and `macos-x86_64`. A caller asks for the
@@ -31,8 +31,8 @@ permissions:
   contents: read
 
 jobs:
-  # A matrix cannot be built from a raw string; `fromJson` needs a real JSON
-  # value. The one place a platform maps to its leg.
+  # `fromJson` needs a real JSON value; where a platform builds is
+  # `ci/scripts/build_matrix.py`'s to say.
   plan:
     name: Plan
     runs-on: ubuntu-latest
@@ -40,36 +40,14 @@ jobs:
       linux: ${{ steps.plan.outputs.linux }}
       macos: ${{ steps.plan.outputs.macos }}
     steps:
-      - name: Each platform's leg
-        id: plan
-        shell: bash
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: plan
         env:
           PLATFORMS: ${{ inputs.platforms }}
-        run: |
-          set -euo pipefail
-          linux=(); macos=()
-          for platform in $PLATFORMS; do
-            case "$platform" in
-              linux-x86_64) linux+=('{"arch":"x86_64","runner":"ubuntu-latest"}') ;;
-              linux-aarch64) linux+=('{"arch":"aarch64","runner":"ubuntu-24.04-arm"}') ;;
-              macos-arm64) macos+=('{"target":"aarch64-apple-darwin","artifact":"wheels-native-macos-arm64","assert_arch":"aarch64"}') ;;
-              # Cross-compiled on the Apple-silicon runner: the same artifact
-              # the Intel runner builds natively, at the arm64 runner's speed
-              # (Xcode's SDK targets both architectures). The Mach-O check
-              # holds the result to x86_64.
-              macos-x86_64) macos+=('{"target":"x86_64-apple-darwin","artifact":"wheels-native-macos-x86_64","assert_arch":"x86_64"}') ;;
-              *) echo "::error::unsupported platform '$platform'" >&2; exit 1 ;;
-            esac
-          done
-          if [ $(( ${#linux[@]} + ${#macos[@]} )) -eq 0 ]; then
-            echo "::error::no platforms given" >&2
-            exit 1
-          fi
-          echo "linux=[$(IFS=,; echo "${linux[*]}")]" >> "$GITHUB_OUTPUT"
-          echo "macos=[$(IFS=,; echo "${macos[*]}")]" >> "$GITHUB_OUTPUT"
+        run: python3 ci/scripts/build_matrix.py wheels --platforms "$PLATFORMS" | tee -a "$GITHUB_OUTPUT"
 
   linux:
-    name: Build native wheel (Linux, ${{ matrix.arch }})
+    name: Native wheel (Linux, ${{ matrix.arch }})
     needs: plan
     if: needs.plan.outputs.linux != '[]'
     strategy:
@@ -83,7 +61,7 @@ jobs:
       run:
         working-directory: packaging/native
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/setup-rust-ci
         with:
           # A wheel build, not the lint gate.
@@ -91,113 +69,83 @@ jobs:
 
       # maturin derives the wheel's platform tag (manylinux_2_28_<arch>) from
       # the container it runs in.
-      - name: Build native wheel
+      - name: Build the wheel
         run: maturin build --release --out dist
 
-      # The sufficient ABI floor assert, run against the cdylib INSIDE the
-      # built wheel (maturin never leaves a bare .so at a fixed path).
-      - name: Assert the GLIBC symbol-version floor (manylinux_2_28)
-        id: glibc-floor
+      # Built in a manylinux_2_28 container does not by itself prove the
+      # linked symbol versions stay at the floor, nor that the machine matches
+      # the arch the tag claims: both are read from the `.so` inside the wheel.
+      - name: The wheel's .so holds the GLIBC floor and the arch
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          wheel="$(ls dist/*.whl)"
           workdir="$(mktemp -d)"
-          python3 -m zipfile -e "$wheel" "$workdir"
+          python3 -m zipfile -e dist/*.whl "$workdir"
           so="$(find "$workdir" -name '*.so' -print -quit)"
-          if [ -z "$so" ]; then
-            echo "::error::no .so found inside $wheel -- cannot assert the GLIBC floor" >&2
-            exit 1
-          fi
+          test -n "$so" || { echo "::error::no .so inside the wheel" >&2; exit 1; }
           bash ../../ci/scripts/assert_glibc_floor.sh "$so" 2.28
-          echo "so_path=$so" >> "$GITHUB_OUTPUT"
+          bash ../../ci/scripts/assert_elf_machine.sh "$so" "$ARCH"
 
-      # Nothing else checks that the built `.so`'s machine matches the arch
-      # its platform tag claims.
-      - name: Assert the wheel's .so ELF machine matches the arch
-        run: bash ../../ci/scripts/assert_elf_machine.sh "${{ steps.glibc-floor.outputs.so_path }}" ${{ matrix.arch }}
-
-      - name: Assert the wheel fits PyPI's per-file limit
+      - name: The wheel fits PyPI's per-file limit
         run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-native-linux-${{ matrix.arch }}
           path: packaging/native/dist
 
   macos:
-    name: Build native wheel (macOS, ${{ matrix.target }})
+    name: Native wheel (macOS, ${{ matrix.target }})
     needs: plan
     if: needs.plan.outputs.macos != '[]'
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJson(needs.plan.outputs.macos) }}
-    # macos-14 is the baseline release-binaries.yml's macOS CLI builds on, so
-    # the CLI and the native wheels share one macOS floor.
     runs-on: macos-14
     defaults:
       run:
         working-directory: packaging/native
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
-      # `jammi-wire`'s `build.rs` compiles the `jammi.v1` protos with `protoc`
-      # on every build; the macOS runners do not ship it.
-      - name: Install protoc
-        run: brew install protobuf
-
-      # Read the pin rather than restate it. From the repository root, where
-      # `rust_pin.sh` reads `rust-toolchain.toml`; assigned on its own so a
-      # failed read stops the step instead of yielding an empty channel.
-      - name: Resolve the pinned Rust toolchain
-        id: rust-pin
-        shell: bash
-        working-directory: .
-        run: |
-          set -euo pipefail
-          channel="$(bash ci/scripts/rust_pin.sh)"
-          echo "channel=$channel" >> "$GITHUB_OUTPUT"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: ./.github/actions/setup-rust-host
         with:
-          toolchain: ${{ steps.rust-pin.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - uses: ./.github/actions/setup-rust-ci
         with:
           deny-warnings: false
 
-      - name: Build native wheel
+      - name: Build the wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           # `packaging/native/pyproject.toml`'s `[tool.maturin] manifest-path`
-          # resolves the crate, so no `--manifest-path` here.
+          # resolves the crate.
           working-directory: packaging/native
           args: --release --out dist
 
-      - name: Assert the wheel's .so Mach-O machine matches the target
+      - name: The wheel's .so is the target's machine
+        env:
+          ASSERT_ARCH: ${{ matrix.assert_arch }}
         run: |
           set -euo pipefail
-          wheel="$(ls dist/*.whl)"
           workdir="$(mktemp -d)"
-          python3 -m zipfile -e "$wheel" "$workdir"
+          python3 -m zipfile -e dist/*.whl "$workdir"
           so="$(find "$workdir" -name '*.so' -print -quit)"
-          if [ -z "$so" ]; then
-            echo "::error::no .so found inside $wheel -- cannot assert its Mach-O machine" >&2
-            exit 1
-          fi
-          bash ../../ci/scripts/assert_elf_machine.sh "$so" ${{ matrix.assert_arch }}
+          test -n "$so" || { echo "::error::no .so inside the wheel" >&2; exit 1; }
+          bash ../../ci/scripts/assert_elf_machine.sh "$so" "$ASSERT_ARCH"
 
-      - name: Assert the wheel fits PyPI's per-file limit
+      - name: The wheel fits PyPI's per-file limit
         run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: packaging/native/dist

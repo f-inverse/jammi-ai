@@ -294,7 +294,7 @@ SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
             reason=(
                 "GH-hosted macos-14 VMs cannot construct a candle 0.11 Metal "
                 "device (MTLResidencySetDescriptor absent; Device::new_metal "
-                "panics); ci.yml test-metal proves the "
+                "panics); ci.yml clippy-metal proves the "
                 "compile/lint surface only; execution proof exists on local "
                 "Apple-silicon runs (metal_parity 8/8 byte-exact, "
                 "metal_quantized_gpu 4/4 measured); a recurring execution lane "

@@ -30,8 +30,11 @@ commit fails.
 
 `check` holds the key's closure — a Dockerfile that copies a file, or declares
 a build argument, outside its image's inputs would make two different images
-share one tag — and the name every `ci.yml` job that builds an image carries,
-which `await` reads.
+share one tag — the name every `ci.yml` job that builds an image carries,
+which `await` reads, and the service images: every deploy file names a
+service by the name and tag of the digest `ci/service-images.env` pins, so a
+smoke that pulls the pin (`ci/scripts/pull_service_images.sh`) runs it under
+the deploy file's own name.
 """
 
 from __future__ import annotations
@@ -65,6 +68,9 @@ KEYED_BUILD_ARGS = frozenset({"BASE_IMAGE", "RUST_VERSION", "TARGETARCH"})
 # conclusions to stop early when a build fails.
 BUILDER_JOB_PREFIX = "CI image ("
 BUILDER_WORKFLOW = "ci.yml"
+# The deploy files that run a service image: each `image:` they name must be
+# the name and tag of a pinned reference.
+DEPLOY_SERVICE_FILES = ("deploy/docker-compose.yml", "deploy/kubernetes/overlays/ci/postgres.yaml")
 
 
 @dataclass(frozen=True)
@@ -175,6 +181,37 @@ _ARG_RE = re.compile(r"^\s*ARG\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<default>
 
 
 _JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_IMAGE_LINE_RE = re.compile(r"^\s*(?:-\s*)?image:\s*(?P<ref>\S+)\s*$")
+
+
+def service_names(root: Path = REPO_ROOT) -> dict[str, str]:
+    """`{name:tag: pinned ref}` for every pinned service image."""
+    pins = parse_env(root / SERVICE_IMAGES).values()
+    return {pin.split("@", 1)[0]: pin for pin in pins}
+
+
+def deploy_service_findings(root: Path = REPO_ROOT) -> list[str]:
+    """Every `image:` a deploy file names that is not the name:tag of a pinned
+    service image (the application's own image, named by a variable or a
+    registry path under the repository owner, is not a service)."""
+    names = service_names(root)
+    service_repos = {name.split(":", 1)[0] for name in names}
+    findings = []
+    for rel in DEPLOY_SERVICE_FILES:
+        for n, line in enumerate((root / rel).read_text().splitlines(), 1):
+            m = _IMAGE_LINE_RE.match(line)
+            if not m:
+                continue
+            image = m.group("ref")
+            repo = image.split("@", 1)[0].rsplit(":", 1)[0]
+            if repo not in service_repos:
+                continue
+            if image not in names:
+                findings.append(
+                    f"{rel}:{n}: names {image}, not the name and tag of the pinned service image "
+                    f"({', '.join(sorted(names))} in {SERVICE_IMAGES})"
+                )
+    return findings
 
 
 def builder_job_names(workflow_text: str) -> dict[str, str | None]:
@@ -211,7 +248,7 @@ def check(root: Path = REPO_ROOT) -> list[str]:
     """Findings: a file a Dockerfile copies, or a build argument it declares
     without a default, that its image's key does not cover; and a `ci.yml`
     image-building job whose name `await` would not recognise."""
-    findings: list[str] = []
+    findings: list[str] = deploy_service_findings(root)
     builders = builder_job_names((root / ".github" / "workflows" / BUILDER_WORKFLOW).read_text())
     if not builders:
         findings.append(f"{BUILDER_WORKFLOW} has no job that builds an image through _ci-base-image.yml")

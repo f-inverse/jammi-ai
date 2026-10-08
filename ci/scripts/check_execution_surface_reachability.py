@@ -76,8 +76,8 @@ not per-workflow — a workflow may carry DIFFERENT `paths:` lists under its
 specific tuple's origin path (its `ci/scripts/**` source file) before that
 trigger credits anything: a workflow whose `on:` block otherwise fires on
 the merge path but whose `paths:` allowlist can never match a change under
-`ci/scripts/**` (`devcontainer-image.yml`; `dep-dag.yml` and `image.yml`,
-whose only `ci/scripts/` entries are single literal files, never a glob
+`ci/scripts/**` (`devcontainer-image.yml`; `image.yml`,
+whose only `ci/scripts/` entry is a single literal file, never a glob
 covering the whole directory) would never actually RUN in response to an
 edit of `pod_seed_target.sh`/`runpod_gpu_prove.sh`, so crediting it as
 reachability is illusory regardless of what text happens to sit in its run
@@ -111,9 +111,8 @@ carrying `continue-on-error: true` (or any continue-on-error EXPRESSION
 other than this repo's own documented `${{ matrix.continue_on_error ==
 'true' }}` per-leg indirection, see below) is excluded too — a failure
 there provably does not gate anything. `ci.yml`'s `test-live` job
-(`if: github.ref == 'refs/heads/main'` + `continue-on-error: true`,
-explicitly excluded from `ci-summary`'s own required set by name) is
-exactly this shape: a whole-file text scan would credit its run body even
+(`if: github.ref == 'refs/heads/main'`, a `main`-only verdict) is the
+`if:` shape: a whole-file text scan would credit its run body even
 though nothing there can ever fail a merge.
 
 This repo's own `Guard` job matrix indirection (`cmd: <script>` fields
@@ -1481,9 +1480,7 @@ def _job_is_blocked(job: dict) -> bool:
     """Fail-closed: a job carrying ANY `if:` (this gate cannot evaluate
     arbitrary GH Actions expressions) or a `continue-on-error:` key at all
     is excluded wholesale, regardless of value — `ci.yml`'s own `test-live`
-    job (`if: github.ref == 'refs/heads/main'` + `continue-on-error: true`,
-    excluded from `ci-summary`'s own required set by name) is exactly this
-    shape."""
+    job (`if: github.ref == 'refs/heads/main'`) is exactly this shape."""
     return "if" in job or "continue-on-error" in job
 
 

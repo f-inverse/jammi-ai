@@ -162,7 +162,6 @@ def _gate_job(gate_name: str = "proof", tag_family: str = "v") -> str:
     permissions:
       contents: read
       actions: read
-    secrets: inherit
 """
 
 
@@ -234,25 +233,6 @@ jobs:
 """
 
 
-# The real-tree `image.yml` shape: one job moving the `:latest` alias, tabled
-# by its own row (`ci-image-latest`).
-IMAGE_YML = """\
-name: caller
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
-  latest:
-    if: github.ref_type != 'tag'
-    runs-on: ubuntu-latest
-    steps:
-      - run: docker buildx imagetools create -t ghcr.io/f-inverse/jammi-ai-ci:latest ghcr.io/f-inverse/jammi-ai-ci:ctx-0
-"""
-
-
 CI_BASE_IMAGE_YML = """\
 name: _ci-base-image
 
@@ -305,53 +285,44 @@ def _wf(tag_pattern: str, jobs_text: str) -> str:
 
 def _server_image_yml(
     cu12_if: str | None = None,
-    cpu_tag_if: str | None = None,
-    main_if: str = (
-        "github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'"
-    ),
-    selfcontained_if: str = (
-        "github.event_name == 'workflow_dispatch' && inputs.selfcontained && github.ref_type != 'tag'"
-    ),
-    merge_tag_if: str | None = None,
-    merge_main_if: str = "needs.build-and-push-main.result == 'success' && github.ref_type != 'tag'",
+    cpu_if: str | None = None,
+    merge_if: str | None = None,
 ) -> str:
+    """The real `server-image.yml` shape: the CUDA image and the CPU legs
+    gated directly on `proof`; the merge of the CPU legs chained off them."""
     jobs = (
         _gate_job("proof")
-        + _promoting_job("build-and-push-cu12", if_expr=cu12_if)
-        + _promoting_job("build-and-push", if_expr=cpu_tag_if)
-        + _ungated_job("build-and-push-main", main_if)
-        + _ungated_job("build-and-push-selfcontained", selfcontained_if)
-        # The two-arch CPU merge jobs -- `merge-cpu-tag` chains off
-        # `build-and-push` (itself direct-gated), `merge-cpu-main` is a
-        # second "none" row, same shape as `build-and-push-main` above.
-        + _promoting_job("merge-cpu-tag", gate_name="build-and-push", if_expr=merge_tag_if)
-        + _ungated_job("merge-cpu-main", merge_main_if)
+        + _promoting_job("push-cu12", if_expr=cu12_if)
+        + _promoting_job("push-cpu", if_expr=cpu_if)
+        + _promoting_job("merge-cpu", gate_name="push-cpu", if_expr=merge_if)
     )
     return _wf("v*", jobs)
+
+
+def _image_yml(latest_if: str = "github.ref_type != 'tag'") -> str:
+    """The real `image.yml` shape: one ungated (`gate_kind="none"`) job
+    moving the `:latest` alias, whose `if:` must carry the ref-type conjunct."""
+    return "name: caller\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\njobs:\n" + _ungated_job(
+        "latest", latest_if
+    ).replace(
+        "      - uses: actions/checkout@v4\n",
+        "      - run: docker buildx imagetools create -t ghcr.io/f-inverse/jammi-ai-ci:latest ghcr.io/f-inverse/jammi-ai-ci:ctx-0\n",
+    )
 
 
 def _release_binaries_yml(
-    cu12_if: str | None = None,
-    cli_if: str | None = None,
-    server_cpu_if: str | None = None,
-    raw_cu12_if_block: str | None = None,
-    raw_cu12_needs_block: str | None = None,
+    promote_if: str | None = None,
+    raw_if_block: str | None = None,
+    raw_needs_block: str | None = None,
 ) -> str:
-    jobs = (
-        _gate_job("proof")
-        + _promoting_job(
-            "server-cu12-promote", if_expr=cu12_if, raw_if_block=raw_cu12_if_block, raw_needs_block=raw_cu12_needs_block
-        )
-        + _promoting_job("promote-binaries", if_expr=cli_if)
-        + _promoting_job("server-cpu-promote", if_expr=server_cpu_if)
+    jobs = _gate_job("proof") + _promoting_job(
+        "promote", if_expr=promote_if, raw_if_block=raw_if_block, raw_needs_block=raw_needs_block
     )
     return _wf("v*", jobs)
 
 
-def _crates_yml(publish_if: str | None = None, github_release_if: str | None = None) -> str:
-    jobs = _gate_job("proof") + _promoting_job("publish", if_expr=publish_if) + _promoting_job(
-        "github-release", gate_name="publish", if_expr=github_release_if
-    )
+def _crates_yml(publish_if: str | None = None) -> str:
+    jobs = _gate_job("proof") + _promoting_job("publish", if_expr=publish_if)
     return _wf("v*", jobs)
 
 
@@ -381,6 +352,21 @@ def write_tree(root: Path, workflows: dict[str, str], manifest: dict) -> tuple[P
 
 # `ci.yml`'s summary call and `_summary.yml`'s job: the name the API reports
 # for it is `verdict.CI_SUMMARY_JOB` (P4).
+# `build.yml`'s summary call: the name the API reports for it is
+# `verdict.BUILD_SUMMARY_JOB` (P4).
+BUILD_SUMMARY_YML_GOOD = """\
+name: Build
+on:
+  pull_request:
+jobs:
+  build-summary:
+    needs: [client-wheel]
+    if: always()
+    uses: ./.github/workflows/_summary.yml
+    with:
+      needs_json: ${{ toJSON(needs) }}
+"""
+
 CI_SUMMARY_YML_GOOD = """\
 name: CI
 on:
@@ -437,18 +423,15 @@ def positive_workflows() -> dict[str, str]:
         "gpu-reap.yml": REAP_YML,
         "_proof-required.yml": PROOF_REQUIRED_YML_GOOD,
         "ci.yml": CI_SUMMARY_YML_GOOD,
+        "build.yml": BUILD_SUMMARY_YML_GOOD,
         "_summary.yml": SUMMARY_YML_GOOD,
         "server-image.yml": _server_image_yml(),
         "release-binaries.yml": _release_binaries_yml(),
         "crates.yml": _crates_yml(),
         "npm.yml": _npm_yml(),
         "_ci-base-image.yml": CI_BASE_IMAGE_YML,
-        "image.yml": IMAGE_YML,
+        "image.yml": _image_yml(),
         "pypi.yml": _simple_publish_yml(),
-        "pypi-client.yml": _simple_publish_yml(),
-        "pypi-server.yml": _simple_publish_yml(),
-        "pypi-server-cuda.yml": _simple_publish_yml(),
-        "pypi-native-cuda.yml": _simple_publish_yml(),
         "pages.yml": _wf(
             "py-v*", _gate_job("proof", tag_family="py-v") + _promoting_job("deploy", tag_family="py-v")
         ),
@@ -1551,14 +1534,14 @@ class PublishersCallingARentingReusableTest(unittest.TestCase):
             "_gpu-prove-gate.yml": gate_renting,
             "server-image.yml": publisher,
             "release-binaries.yml": publisher,
-            "pypi-server-cuda.yml": publisher,
+            "pypi.yml": publisher,
         }
         with tempfile.TemporaryDirectory() as td:
             wf_dir, manifest_path = write_tree(Path(td), workflows, MANIFEST_GOOD)
             findings = cgo.run_gate(wf_dir, manifest_path)
             self.assertTrue(findings)
             joined = "\n".join(findings)
-            for site in ("server-image.yml", "release-binaries.yml", "pypi-server-cuda.yml"):
+            for site in ("server-image.yml", "release-binaries.yml", "pypi.yml"):
                 self.assertIn(site, joined, f"{site} must be named among the findings")
             self.assertIn("_gpu-prove-gate.yml", joined)
 
@@ -1615,15 +1598,15 @@ class ManifestReconciliationTest(unittest.TestCase):
 
     def test_missing_workflow_file_fails(self):
         texts = _positive_texts()
-        del texts["pypi-server-cuda.yml"]
+        del texts["pypi.yml"]
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
-        self.assertTrue(any("pypi-server-cuda.yml is missing" in f for f in findings))
+        self.assertTrue(any("pypi.yml is missing" in f for f in findings))
 
 
 class PromotingIfTest(unittest.TestCase):
     def _p3_for(self, if_expr: str) -> list[str]:
         texts = _positive_texts()
-        texts["release-binaries.yml"] = _release_binaries_yml(cu12_if=if_expr)
+        texts["release-binaries.yml"] = _release_binaries_yml(promote_if=if_expr)
         return cgo.check_promotion_table(texts, MANIFEST_GOOD)
 
     def test_missing_result_success_conjunct_fails(self):
@@ -1661,14 +1644,14 @@ class PromotingIfTest(unittest.TestCase):
             "      needs.proof.result == 'success'\n"
         )
         texts = _positive_texts()
-        texts["release-binaries.yml"] = _release_binaries_yml(raw_cu12_if_block=raw_if_block)
+        texts["release-binaries.yml"] = _release_binaries_yml(raw_if_block=raw_if_block)
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertEqual(findings, [])
 
     def test_unterminated_block_fails_loud(self):
         raw_if_block = "    if: >-\n"
         texts = _positive_texts()
-        texts["release-binaries.yml"] = _release_binaries_yml(raw_cu12_if_block=raw_if_block)
+        texts["release-binaries.yml"] = _release_binaries_yml(raw_if_block=raw_if_block)
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(any("unterminated block" in f for f in findings))
 
@@ -1683,9 +1666,7 @@ class GateKindTest(unittest.TestCase):
         texts["release-binaries.yml"] = _wf(
             "v*",
             "  proof:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo not-the-reusable\n"
-            + _promoting_job("server-cu12-promote")
-            + _promoting_job("promote-binaries")
-            + _promoting_job("server-cpu-promote"),
+            + _promoting_job("promote"),
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(any("does not `uses: ./.github/workflows/_proof-required.yml`" in f for f in findings))
@@ -1701,16 +1682,16 @@ class GateKindTest(unittest.TestCase):
         original = cgo.PROMOTION_TABLE
         try:
             broken = dict(original)
-            broken["crates-github-release"] = cgo.PromotionRow(
-                "crates.yml", "github-release", "nonexistent-job", "chained"
+            broken["cpu-image-merge"] = cgo.PromotionRow(
+                "server-image.yml", "merge-cpu", "nonexistent-job", "chained"
             )
             cgo.PROMOTION_TABLE = broken
             texts = _positive_texts()
-            texts["crates.yml"] = texts["crates.yml"].replace(
-                "  github-release:\n    needs: [publish]",
-                "  github-release:\n    needs: [nonexistent-job]",
+            texts["server-image.yml"] = texts["server-image.yml"].replace(
+                "  merge-cpu:\n    needs: [push-cpu]",
+                "  merge-cpu:\n    needs: [nonexistent-job]",
             ).replace(
-                "needs.publish.result == 'success'", "needs.nonexistent-job.result == 'success'"
+                "needs.push-cpu.result == 'success'", "needs.nonexistent-job.result == 'success'"
             )
             findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         finally:
@@ -1723,36 +1704,30 @@ class GateKindTest(unittest.TestCase):
         # An `if:` that names NO ref restriction at all lacks the exact
         # `github.ref_type != 'tag'` conjunct.
         texts = _positive_texts()
-        texts["server-image.yml"] = _server_image_yml(main_if="startsWith(github.ref, 'refs/tags/v')")
+        texts["image.yml"] = _image_yml(latest_if="startsWith(github.ref, 'refs/heads/main')")
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
-            any("gate_kind='none'" in f and "build-and-push-main" in f for f in findings), findings
+            any("gate_kind='none'" in f and "latest" in f for f in findings), findings
         )
 
     def test_none_row_real_leak_shape_no_ref_restriction_at_all_fails(self):
-        # A `selfcontained_if` gated only on the dispatch input, with no ref
-        # restriction whatsoever, must FAIL: a `workflow_dispatch` against a
-        # `v*` tag ref with `selfcontained=true` would push this image
-        # entirely ungated.
+        # An `if:` gated only on the event, with no ref restriction
+        # whatsoever, must FAIL: a `workflow_dispatch` against a `v*` tag ref
+        # would move the alias entirely ungated.
         texts = _positive_texts()
-        texts["server-image.yml"] = _server_image_yml(
-            selfcontained_if="github.event_name == 'workflow_dispatch' && inputs.selfcontained"
-        )
+        texts["image.yml"] = _image_yml(latest_if="github.event_name == 'workflow_dispatch'")
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
-            any(
-                "gate_kind='none'" in f and "build-and-push-selfcontained" in f and "ref_type" in f
-                for f in findings
-            ),
+            any("gate_kind='none'" in f and "latest" in f and "ref_type" in f for f in findings),
             findings,
         )
 
     def test_none_row_missing_if_at_all_fails(self):
         texts = _positive_texts()
-        texts["server-image.yml"] = _server_image_yml(main_if="true")
+        texts["image.yml"] = _image_yml(latest_if="true")
         # A trivial `if: true` still has no `github.ref_type != 'tag'` conjunct.
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
-        self.assertTrue(any("build-and-push-main" in f for f in findings), findings)
+        self.assertTrue(any("latest" in f for f in findings), findings)
 
     def test_none_row_ungated_branch_only_if_passes(self):
         findings = cgo.check_promotion_table(_positive_texts(), MANIFEST_GOOD)
@@ -1767,9 +1742,7 @@ class GateKindTest(unittest.TestCase):
         texts["release-binaries.yml"] = _wf(
             "v*",
             "  proof:\n    uses: ./.github/workflows/_proof-required.yml\n"
-            + _promoting_job("server-cu12-promote")
-            + _promoting_job("promote-binaries")
-            + _promoting_job("server-cpu-promote"),
+            + _promoting_job("promote"),
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
@@ -1783,7 +1756,7 @@ class GateKindTest(unittest.TestCase):
         # no ref restriction at all would let the promotion run off any ref.
         texts = _positive_texts()
         texts["release-binaries.yml"] = _release_binaries_yml(
-            cu12_if="always() && needs.proof.result == 'success'"
+            promote_if="always() && needs.proof.result == 'success'"
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
@@ -1850,8 +1823,8 @@ class StepGatedTest(unittest.TestCase):
             "        if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'\n"
             "        run: npm publish --provenance --access public\n"
             "      - name: Sneak docker publish\n"
-            '        uses: "./.github/actions/docker-publish"\n'
-            "        with:\n          push: true\n",
+            '        uses: "./.github/actions/push-image-leg"\n'
+            "        with:\n          image: ghcr.io/x/y\n",
         )
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertTrue(
@@ -2111,6 +2084,7 @@ def _p4(**overrides) -> list[str]:
     texts = {
         "gpu-prove.yml": PROVE_YML_GOOD,
         "ci.yml": CI_SUMMARY_YML_GOOD,
+        "build.yml": BUILD_SUMMARY_YML_GOOD,
         "_summary.yml": SUMMARY_YML_GOOD,
         "cookbook-gpu.yml": COOKBOOK_GPU_YML_GOOD,
     }
@@ -2143,6 +2117,25 @@ class P4CookbookJobNameTest(unittest.TestCase):
 
     def test_a_missing_workflow_fails(self):
         self.assertTrue(any("cookbook-gpu.yml is missing" in f for f in _p4(**{"cookbook-gpu.yml": None})))
+
+
+class P4BuildSummaryNameTest(unittest.TestCase):
+    """`verdict.BUILD_SUMMARY_JOB` is the name the API reports for `build.yml`'s
+    summary, held the same way as `ci.yml`'s."""
+
+    def test_the_constant_names_the_summary(self):
+        self.assertEqual(verdict.BUILD_SUMMARY_JOB, "build-summary / assert")
+
+    def test_a_renamed_caller_job_fails(self):
+        bad = BUILD_SUMMARY_YML_GOOD.replace("  build-summary:", "  summary:")
+        self.assertTrue(any("has no job `build-summary`" in f and "BUILD_SUMMARY_JOB" in f for f in _p4(**{"build.yml": bad})))
+
+    def test_a_display_name_on_the_caller_fails(self):
+        bad = BUILD_SUMMARY_YML_GOOD.replace("  build-summary:\n", "  build-summary:\n    name: Summary\n")
+        self.assertTrue(any("carries a `name:`" in f and "BUILD_SUMMARY_JOB" in f for f in _p4(**{"build.yml": bad})))
+
+    def test_a_missing_build_workflow_fails(self):
+        self.assertTrue(any("build.yml is missing" in f for f in _p4(**{"build.yml": None})))
 
 
 class P4CiSummaryNameTest(unittest.TestCase):
@@ -2460,7 +2453,7 @@ class NeedsMultilineFormTest(unittest.TestCase):
     def test_multiline_needs_list_passes(self):
         raw_needs_block = "    needs:\n      - proof\n"
         texts = _positive_texts()
-        texts["release-binaries.yml"] = _release_binaries_yml(raw_cu12_needs_block=raw_needs_block)
+        texts["release-binaries.yml"] = _release_binaries_yml(raw_needs_block=raw_needs_block)
         findings = cgo.check_promotion_table(texts, MANIFEST_GOOD)
         self.assertEqual(findings, [])
 
@@ -2495,22 +2488,23 @@ class P6DiscoveryTest(unittest.TestCase):
         findings = cgo.check_p6_discovery({**_positive_texts(), "rogue-release.yml": rogue})
         self.assertTrue(any("sneak-release" in f for f in findings), findings)
 
-    def test_docker_publish_with_push_false_is_not_a_promotion(self):
-        # A build-only verification lane (push: "false") must never be
-        # flagged as an unlisted promotion job.
+    def test_build_image_is_not_a_promotion(self):
+        # A build-only verification lane (`build-image`, whose own
+        # build-push step carries `push: false`) must never be flagged as an
+        # unlisted promotion job.
         pr_lane = (
             "name: build-only\n\non:\n  push:\n    tags: [\"v*\"]\n  pull_request:\n\njobs:\n"
             "  build-only:\n    runs-on: ubuntu-latest\n    steps:\n"
-            "      - uses: ./.github/actions/docker-publish\n        with:\n          push: \"false\"\n"
+            "      - uses: ./.github/actions/build-image\n        with:\n          cache-scope: x\n"
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "build-only.yml": pr_lane})
         self.assertEqual(findings, [], findings)
 
-    def test_docker_publish_with_push_true_unlisted_fails(self):
+    def test_push_image_leg_unlisted_fails(self):
         rogue = (
             "name: rogue-image\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
             "  sneak-image:\n    runs-on: ubuntu-latest\n    steps:\n"
-            "      - uses: ./.github/actions/docker-publish\n        with:\n          push: \"true\"\n"
+            "      - uses: ./.github/actions/push-image-leg\n        with:\n          image: ghcr.io/x/y\n"
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "rogue-image.yml": rogue})
         self.assertTrue(any("sneak-image" in f for f in findings), findings)
@@ -2523,7 +2517,7 @@ class P6DiscoveryTest(unittest.TestCase):
         main_pusher = (
             "name: main-only\n\non:\n  push:\n    branches: [main]\n\njobs:\n"
             "  push-image:\n    runs-on: ubuntu-latest\n    steps:\n"
-            "      - uses: ./.github/actions/docker-publish\n        with:\n          push: \"true\"\n"
+            "      - uses: ./.github/actions/push-image-leg\n        with:\n          image: ghcr.io/x/y\n"
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "main-only.yml": main_pusher})
         self.assertTrue(
@@ -2588,7 +2582,7 @@ class PrimitivePatternShapesTest(unittest.TestCase):
         self.assertTrue(any("sneak" in f for f in findings), findings)
 
     def test_bare_docker_build_push_action_unquoted_true_unlisted_fails(self):
-        # No docker-publish composite in between -- a job that calls
+        # No composite in between -- a job that calls
         # docker/build-push-action DIRECTLY with an unquoted `push: true`.
         rogue = (
             "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
@@ -2877,8 +2871,8 @@ class LocalCompositeActionResolutionTest(unittest.TestCase):
     `action.yml`'s own steps EXAMINED through the same readers, never keyed
     on a hand-named action list -- ANY local composite action whose own body
     invokes a primitive is caught. Uses a synthetic `_ACTIONS_DIR` (never the real
-    `.github/actions/`, which `docker-publish`/`release-upload` fixtures
-    elsewhere in this file already exercise for real)."""
+    `.github/actions/`, which the `push-image-leg`/`build-image`/`release-upload`
+    fixtures elsewhere in this file already exercise for real)."""
 
     def _with_synthetic_actions_dir(self, actions: dict[str, str]):
         """`actions`: {name: action.yml text}. Returns a context manager
@@ -2893,12 +2887,49 @@ class LocalCompositeActionResolutionTest(unittest.TestCase):
             (action_dir / "action.yml").write_text(text, encoding="utf-8")
         return tmp, mock.patch.object(cgo, "_ACTIONS_DIR", root)
 
+    def _composite_with_push(self, push: str) -> str:
+        return (
+            "name: imager\nruns:\n  using: composite\n  steps:\n"
+            "    - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8\n"
+            f"      with:\n        push: {push}\n"
+        )
+
+    def _rogue_calling(self, action: str, with_push: str | None = None) -> str:
+        extra = f"        with:\n          push: {with_push}\n" if with_push is not None else ""
+        return (
+            "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
+            "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - uses: ./.github/actions/{action}\n" + extra
+        )
+
+    def test_composite_whose_own_push_is_literally_true_is_promoting(self):
+        tmp, patcher = self._with_synthetic_actions_dir({"imager": self._composite_with_push("true")})
+        with tmp, patcher:
+            findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": self._rogue_calling("imager")})
+        self.assertTrue(any("sneak" in f and "push: true" in f for f in findings), findings)
+
+    def test_composite_whose_own_push_is_literally_false_is_never_promoting_whatever_the_caller_says(self):
+        tmp, patcher = self._with_synthetic_actions_dir({"imager": self._composite_with_push("false")})
+        with tmp, patcher:
+            findings = cgo.check_p6_discovery(
+                {**_positive_texts(), "rogue.yml": self._rogue_calling("imager", with_push='"true"')}
+            )
+        self.assertEqual([f for f in findings if "rogue.yml" in f], [])
+
+    def test_composite_whose_push_is_an_expression_is_refused_by_name(self):
+        tmp, patcher = self._with_synthetic_actions_dir({"imager": self._composite_with_push("${{ inputs.push }}")})
+        with tmp, patcher:
+            findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": self._rogue_calling("imager")})
+        self.assertTrue(
+            any("rogue.yml" in f and "neither literally true nor literally false" in f for f in findings), findings
+        )
+
     def test_local_composite_action_running_docker_push_unlisted_fails(self):
         # The RED fixture: a local composite action whose body runs
         # `docker push` via a plain `run:` command (never docker/build-
         # push-action, never a hand-named path) -- invisible to the
         # deleted name-keyed regex, which only ever recognised the two
-        # literal paths `docker-publish`/`release-upload`.
+        # literal paths it once recognised.
         action_yml = (
             "name: sneaky-pusher\nruns:\n  using: composite\n  steps:\n"
             "    - name: Push it\n      shell: bash\n"
@@ -3263,14 +3294,14 @@ class UsesReadFromTheParsedDocumentTest(unittest.TestCase):
         mine = [f for f in findings if "summary-caller.yml" in f]
         self.assertEqual(mine, [])
 
-    # -- step-level action matching (docker-publish / release-upload),
+    # -- step-level action matching (push-image-leg / release-upload),
     # local and cross-repo, read from the parsed step scalar. -------------
     def test_quoted_double_docker_publish_push_true_unlisted_fails(self):
         rogue = (
             "name: rogue\n\non:\n  push:\n    tags: [\"v*\"]\n\njobs:\n"
             "  sneak:\n    runs-on: ubuntu-latest\n    steps:\n"
-            '      - uses: "./.github/actions/docker-publish"\n'
-            "        with:\n          push: true\n"
+            '      - uses: "./.github/actions/push-image-leg"\n'
+            "        with:\n          image: ghcr.io/x/y\n"
         )
         findings = cgo.check_p6_discovery({**_positive_texts(), "rogue.yml": rogue})
         self.assertTrue(any("sneak" in f for f in findings), findings)
@@ -3410,7 +3441,7 @@ class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
             '    name: "uses: ./.github/workflows/_proof-required.yml"\n'
             "    if: startsWith(github.ref, 'refs/tags/v')\n"
             "    uses: ./.github/workflows/_evil.yml\n"
-            "    secrets: inherit\n" + _step_gated_job("publish", "proof", "Publish"),
+            + _step_gated_job("publish", "proof", "Publish"),
         )
         texts["_evil.yml"] = (
             "name: evil\n\non:\n  workflow_call:\n\njobs:\n"
@@ -3428,7 +3459,7 @@ class GateJobExemptionAndNameExemptedFilesAreScannedTest(unittest.TestCase):
             '    name: "uses: ./.github/workflows/_proof-required.yml"\n'
             "    if: startsWith(github.ref, 'refs/tags/v')\n"
             "    uses: ./.github/workflows/_evil.yml\n"
-            "    secrets: inherit\n" + _step_gated_job("publish", "proof", "Publish"),
+            + _step_gated_job("publish", "proof", "Publish"),
         )
         texts["_evil.yml"] = (
             "name: evil\n\non:\n  workflow_call:\n\njobs:\n"

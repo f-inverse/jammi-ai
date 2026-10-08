@@ -1,24 +1,28 @@
 name: install-jammi
 description: >
-  Installs the jammi surfaces a run built, the way a user would: a `.venv` at
-  the workspace root holding the base client `jammi-ai` (import `jammi`) and
-  the compiled `jammi-ai-native` engine (import `jammi_native`, the Linux
-  x86_64 wheel `_native-wheels.yml` built), and optionally the `jammi-server`
-  and `jammi` binaries on PATH. Nothing here compiles: every consumer runs the
-  bytes its run built once. Later steps re-activate the venv themselves
-  (`. .venv/bin/activate`). Must run AFTER `actions/checkout@v4` (a local-path
-  composite).
+  Installs the jammi surfaces a run built: a `.venv` at the workspace root
+  holding the client `jammi-ai` (import `jammi`), optionally the compiled
+  engine `jammi-ai-native` (import `jammi_native`, the Linux x86_64 wheel
+  `_native-wheels.yml` built) the client discovers as its `file://` backend,
+  and optionally the `jammi-server` and `jammi` binaries on PATH. The client
+  is installed one of two ways, for two different consumers: `wheel`, the
+  wheel `_client-wheel.yml` built, as a reader installs it; or `source`, the
+  tree's `clients/python` in editable mode with its `dev` extra and generated
+  proto stubs, for the client's own suites, which run from that directory and
+  resolve `jammi` from it. Nothing here compiles the engine: every consumer
+  runs the bytes its run built once. The venv's `bin` is put on PATH, so
+  later steps call `python`, `pip` and `pytest` directly. Runs after
+  `actions/checkout`.
 
 inputs:
   client:
-    description: >
-      "source" (the default) installs the client from `clients/python` in
-      editable mode, with its dev extra and generated proto stubs — the shape
-      a suite testing the client's own source needs. "wheel" then installs
-      the client wheel `_client-wheel.yml` built over it — the shape a reader
-      installs.
+    description: "\"wheel\" (the default) or \"source\"; see above."
     required: false
-    default: "source"
+    default: "wheel"
+  native:
+    description: "\"true\" (the default) also installs the compiled engine wheel."
+    required: false
+    default: "true"
   binaries:
     description: >
       "true" also puts the run's CPU `jammi-server` (`server-cpu`, x86_64) and
@@ -37,47 +41,51 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/download-artifact@v4
-      with:
-        name: wheels-native-linux-x86_64
-        path: ${{ runner.temp }}/jammi-dist/native
-        run-id: ${{ inputs.run-id }}
-        github-token: ${{ inputs.run-id != '' && github.token || '' }}
-
     - if: inputs.client == 'wheel'
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: client-wheel
         path: ${{ runner.temp }}/jammi-dist/client
         run-id: ${{ inputs.run-id }}
         github-token: ${{ inputs.run-id != '' && github.token || '' }}
 
-    - name: Install the client and the native engine
-      shell: bash
+    - if: inputs.native == 'true'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      with:
+        name: wheels-native-linux-x86_64
+        path: ${{ runner.temp }}/jammi-dist/native
+        run-id: ${{ inputs.run-id }}
+        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+
+    - shell: bash
+      working-directory: ${{ github.workspace }}
       env:
         CLIENT: ${{ inputs.client }}
+        NATIVE: ${{ inputs.native }}
         EXTRA_PIP: ${{ inputs.extra-pip-packages }}
         DIST: ${{ runner.temp }}/jammi-dist
       run: |
         set -euo pipefail
-        case "$CLIENT" in
-          source | wheel) ;;
-          *) echo "::error::install-jammi: client must be source or wheel, got '$CLIENT'" >&2; exit 1 ;;
-        esac
         python3 -m venv .venv
         . .venv/bin/activate
-        pip install --upgrade pip
-        # $EXTRA_PIP is deliberately unquoted: a space-separated package list.
-        if [ -n "$EXTRA_PIP" ]; then pip install $EXTRA_PIP; fi
-        pip install -e 'clients/python[dev]'
-        make -C clients/python generate
-        pip install --force-reinstall --no-deps "$DIST"/native/jammi_ai_native-*.whl
-        if [ "$CLIENT" = wheel ]; then
-          pip install --force-reinstall --no-deps "$DIST"/client/jammi_ai-*.whl
-        fi
+        pip install --quiet --upgrade pip
+        case "$CLIENT" in
+          wheel) pip install --quiet "$DIST"/client/jammi_ai-*.whl ;;
+          source)
+            pip install --quiet -e 'clients/python[dev]'
+            make -C clients/python generate
+            ;;
+          *) echo "::error::install-jammi: client must be wheel or source, got '$CLIENT'" >&2; exit 1 ;;
+        esac
+        if [ "$NATIVE" = true ]; then pip install --quiet "$DIST"/native/jammi_ai_native-*.whl; fi
+        # $EXTRA_PIP is a space-separated package list, split on purpose.
+        # shellcheck disable=SC2086
+        if [ -n "$EXTRA_PIP" ]; then pip install --quiet $EXTRA_PIP; fi
+        echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+        echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
     - if: inputs.binaries == 'true'
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: server-cpu-x86_64-binary
         path: ${{ runner.temp }}/jammi-bin
@@ -85,15 +93,14 @@ runs:
         github-token: ${{ inputs.run-id != '' && github.token || '' }}
 
     - if: inputs.binaries == 'true'
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: jammi-x86_64-unknown-linux-gnu
         path: ${{ runner.temp }}/jammi-dist/cli
         run-id: ${{ inputs.run-id }}
         github-token: ${{ inputs.run-id != '' && github.token || '' }}
 
-    - name: Put jammi-server and jammi on PATH
-      if: inputs.binaries == 'true'
+    - if: inputs.binaries == 'true'
       shell: bash
       env:
         BIN: ${{ runner.temp }}/jammi-bin

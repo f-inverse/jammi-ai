@@ -204,6 +204,12 @@ run = "python3 ci/scripts/check_distributed_legs.py"
 why = "Every distributed test runs in exactly one leg of distributed.yml; none is compiled and never run."
 
 [[guard]]
+name = "no consumer names"
+run = "python3 ci/scripts/check_no_consumer_names.py"
+why = "The engine names no consumer: no governance verb enters the public surface in a change, and no consumer or philosophy leak token is anywhere in the tree (the mechanical half of the discipline test; symbol-index's syn parse is the oracle)."
+needs = ["cargo", "full-history"]
+
+[[guard]]
 name = "workflow validity"
 run = "bash ci/scripts/check_workflows.sh"
 why = "Every workflow parses as GitHub parses it: jobs, needs, expressions and action inputs resolve."

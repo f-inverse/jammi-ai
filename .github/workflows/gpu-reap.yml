@@ -1,23 +1,13 @@
 name: GPU reap (RunPod orphans)
 
 # Terminates RunPod pods this repo rented that have outlived their own
-# deadline.
-#
-# Every pod carries a deadline in its entrypoint, armed before anything else
-# the container does (`_rp_entrypoint_setup`, `runpod_lib.sh`) — a multi-host
-# lane's fleet is ordinary pods, each with its own. This sweep is the
-# independent backstop for the case that deadline never got armed — a pod
-# whose container died early, or a host that stopped reporting.
-#
-# It is a SEPARATE workflow on purpose. The sweep also runs at the top of
-# every paid lane's driver, but that only helps when a lane runs; the prove
-# lane spent four consecutive nights failing at deploy without cleaning
-# anything. A backstop that only works when the thing it backs up is healthy
-# is not a backstop.
-#
-# It fails the run when it cannot enumerate the account's pods: "could not
-# check" must never be reported as "nothing to clean up" — that is how a
-# guard silently stops guarding.
+# deadline. Every pod carries a deadline in its entrypoint, armed before
+# anything else the container does (`_rp_entrypoint_setup`, `runpod_lib.sh`);
+# this sweep is the independent backstop for the deadline that never got
+# armed — a pod whose container died early, or a host that stopped reporting.
+# A separate workflow on purpose: the sweep also runs at the top of every paid
+# lane's driver, which only helps when a lane runs. It fails when it cannot
+# enumerate the account's pods: "could not check" is never "nothing to clean".
 
 on:
   schedule:
@@ -26,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       force_hours:
-        description: "Force-reap every jammi pod older than this many hours (leave empty to honour each pod's own deadline)."
+        description: "Force-reap every jammi pod older than this many hours (empty honours each pod's own deadline)."
         type: string
         required: false
 
@@ -43,9 +33,10 @@ jobs:
       group: gpu-reap
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Reap
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-        run: bash ci/scripts/gpu-dev.sh reap ${{ inputs.force_hours }}
+          FORCE_HOURS: ${{ inputs.force_hours }}
+        run: bash ci/scripts/gpu-dev.sh reap $FORCE_HOURS

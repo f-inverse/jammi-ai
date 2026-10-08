@@ -2,30 +2,25 @@ name: Cookbook on a GPU
 
 # Every recipe and every page of the book, run with the real Hugging Face Hub
 # models they teach with, over the builds a tree's CI made: the CUDA engine
-# wheel, the client wheel, the CUDA server and the CLI of the `ci.yml` run that
-# proved the tree, installed on a rented RunPod L4 (sm_89, the class of GPU a
+# wheel, the client wheel, the CUDA server and the CLI of the `build.yml` run
+# that proved the tree, installed on a rented RunPod L4 (sm_89, the class of GPU a
 # Colab reader gets) by `ci/scripts/runpod_cookbook_gpu.sh`. The run records
 # each page's execution and assembles the book a release publishes
-# (`cookbook-book`, which `pages.yml` deploys).
+# (`cookbook-book`, which `pages.yml` deploys). The tree it measures is
+# recorded once (`subject`), and the pod checks out that same commit.
 #
-# Real models never run in `ci.yml`: it stays hermetic, and checks the cookbook
-# statically there (every public surface has a runnable example, the notebooks
-# match their sources, the book's library passes its tests). This lane is where
-# a chapter's claims are checked on real models.
+# Real models never run in `ci.yml` or `build.yml`: both stay hermetic, and
+# the book's static checks are `build.yml`'s. This lane is where a chapter's
+# claims are checked on real models. Off the merge path: GPU time costs money. It fires on the
+# `cookbook-gpu` pull-request label and on manual dispatch; no `push:` or
+# `workflow_call:` trigger, and nothing `uses:` it (`check_gpu_prove_once.py`'s
+# P7 rule). The label runs once the pull request's CI is green: the lane
+# installs that tree's builds.
 #
-# Off the merge path and never started by another workflow: GPU time costs
-# money. It fires on the `cookbook-gpu` pull-request label (opt-in for a change
-# a reader would see) and on manual dispatch. No `push:`/`workflow_call:`
-# trigger and nothing `uses:` it (`check_gpu_prove_once.py`'s P7 rule). The
-# label runs once the pull request's CI is green: the lane installs that run's
-# builds.
-#
-# The release gate requires it: every release publisher's
-# `_proof-required.yml` asks `ci/scripts/verdict.py require` for this lane's
-# green measurement of the released tree, beside `ci.yml`'s and
-# `gpu-prove.yml`'s. Dispatch it before tagging a release
-# (MAINTAINER-GUIDE.md's release runbook): gh workflow run cookbook-gpu.yml
-# --ref <branch holding the tree>.
+# The release gate requires it: every publisher's `_proof-required.yml` asks
+# for this lane's green measurement of the released tree, beside `ci.yml`'s,
+# `build.yml`'s and `gpu-prove.yml`'s. Dispatch it before tagging a release
+# (`gh workflow run cookbook-gpu.yml --ref <branch holding the tree>`).
 
 on:
   workflow_dispatch:
@@ -36,17 +31,18 @@ permissions:
   contents: read
 
 jobs:
-  # The tree this run measures: the release gate finds a tree's cookbook runs
-  # through it.
   subject:
     if: github.event_name != 'pull_request' || github.event.label.name == 'cookbook-gpu'
     runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.subject.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/record-subject
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: subject
+        uses: ./.github/actions/record-subject
 
-  # The tree's CI images (`_ci-image.yml`): the job runs in the CPU image, which
-  # carries quarto and ssh; the pod runs the CUDA image.
+  # The job runs in the CPU image, which carries quarto; the pod runs the
+  # CUDA image.
   ci-image:
     if: github.event_name != 'pull_request' || github.event.label.name == 'cookbook-gpu'
     permissions:
@@ -56,7 +52,6 @@ jobs:
     with:
       await: cpu cuda
 
-  # The builds to install: those of the `ci.yml` run that proved this tree.
   artifacts:
     if: github.event_name != 'pull_request' || github.event.label.name == 'cookbook-gpu'
     permissions:
@@ -64,7 +59,7 @@ jobs:
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: native-cu12-wheel client-wheel server-cu12-x86_64-binary jammi-x86_64-unknown-linux-gnu
 
   cookbook:
@@ -78,10 +73,8 @@ jobs:
       contents: read
       # Downloads the builds from the proving run, not this one.
       actions: read
-    # On the job, never cancelled: cancelling SIGKILLs the runner before the
-    # driver's EXIT trap terminates the pod it rented (`gpu-prove.yml`'s
-    # concurrency comment has the whole account). Job level, because the label
-    # trigger fires for every label and a skipped job never enters the group.
+    # Job level and never cancelled: a cancel SIGKILLs the runner before the
+    # driver's EXIT trap terminates the pod it rented.
     concurrency:
       group: cookbook-gpu-${{ github.ref }}
       cancel-in-progress: false
@@ -90,54 +83,36 @@ jobs:
     # assemble.
     timeout-minutes: 280
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/download-artifact@v4
+      - name: The builds to install, from the proving run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: native-cu12-wheel
-          path: ${{ runner.temp }}/artifacts/native
-          run-id: ${{ needs.artifacts.outputs.run }}
-          github-token: ${{ github.token }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: client-wheel
-          path: ${{ runner.temp }}/artifacts/client
-          run-id: ${{ needs.artifacts.outputs.run }}
-          github-token: ${{ github.token }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: server-cu12-x86_64-binary
-          path: ${{ runner.temp }}/artifacts/server
-          run-id: ${{ needs.artifacts.outputs.run }}
-          github-token: ${{ github.token }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: jammi-x86_64-unknown-linux-gnu
-          path: ${{ runner.temp }}/artifacts/cli
+          pattern: "{native-cu12-wheel,client-wheel,server-cu12-x86_64-binary,jammi-x86_64-unknown-linux-gnu}"
+          path: ${{ runner.temp }}/artifacts
           run-id: ${{ needs.artifacts.outputs.run }}
           github-token: ${{ github.token }}
 
-      # A `75` exit is no capacity (SUPPLY_CONSTRAINT): the job stays red,
-      # nothing was measured, and the step below names the cause.
-      - name: Run every recipe and render every page on an L4
-        id: run
+      # The driver reads `native/`, `client/`, `server/` and `cli/`.
+      - name: Lay the builds out by part
+        env:
+          ARTIFACTS: ${{ runner.temp }}/artifacts
+        run: |
+          set -euo pipefail
+          cd "$ARTIFACTS"
+          mv native-cu12-wheel native && mv client-wheel client
+          mv server-cu12-x86_64-binary server && mv jammi-x86_64-unknown-linux-gnu cli
+
+      - uses: ./.github/actions/run-paid-lane
+        with:
+          driver: ci/scripts/runpod_cookbook_gpu.sh
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
-          PROVE_EXPECT_SHA: ${{ github.sha }}
+          PROVE_EXPECT_SHA: ${{ needs.subject.outputs.commit }}
           ARTIFACTS: ${{ runner.temp }}/artifacts
           FREEZE_OUT: cookbook/book/_freeze
-        run: |
-          set +e
-          bash ci/scripts/runpod_cookbook_gpu.sh
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit "$rc"
-
-      - name: Annotate a capacity failure
-        if: always() && steps.run.outputs.rc == '75'
-        run: echo "::warning::The cookbook lane FAILED for capacity — no L4 or RTX 4090 on RunPod (SUPPLY_CONSTRAINT), not a code regression. Nothing was measured; re-run once capacity returns."
 
       # A whole-book render under the `assemble` profile reads each page's
       # recorded execution and executes nothing; a page without a record fails
@@ -146,7 +121,7 @@ jobs:
         working-directory: cookbook/book
         run: quarto render --profile assemble
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cookbook-book
           path: cookbook/book/_book

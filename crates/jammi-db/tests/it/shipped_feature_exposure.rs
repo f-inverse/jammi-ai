@@ -29,12 +29,12 @@
 //!      measured on cargo-deny 0.20.2, it is `error[unexpected-keys]` and rejects the WHOLE
 //!      config. This test never parses `deny.toml`'s prose — it generates the expected line and
 //!      checks the file contains that exact line, byte for byte.
-//!   4. The Dockerfile's two `ARG CARGO_FEATURES` declarations (the CPU and CUDA builder
-//!      stages) carry NO default, and each builder stage's own `RUN` instruction carries the
-//!      `${CARGO_FEATURES:?...}` required-argument guard — a literal line scan (the Dockerfile
-//!      is not YAML or JSON, so there is no real structured parser for it in this crate's
-//!      dependency set) over an HONESTLY STATED, narrow universe: two fixed marker strings,
-//!      never a general feature-literal sweep.
+//!   4. The Dockerfile compiles nothing and takes no feature list: it packages the binaries
+//!      the `builder` / `builder-cuda` build contexts hold, which `_server.yml` compiled from
+//!      the manifest — a literal line scan (the Dockerfile is not YAML or JSON, so there is no
+//!      real structured parser for it in this crate's dependency set) over an HONESTLY STATED,
+//!      narrow universe: two marker strings and the `COPY --from=` instructions, never a
+//!      general feature-literal sweep.
 //!
 //! A feature literal placed in a workflow scalar — a `build-args:` value, a
 //! `--features=<list>` or `-F <list>` invocation, an input default, a matrix value — is
@@ -317,57 +317,45 @@ fn families_carrying_excludes_a_family_missing_the_feature() {
 }
 
 // ---------------------------------------------------------------------------
-// The Dockerfile arm: a literal line scan over an HONESTLY STATED, narrow
-// universe (two fixed marker strings) -- the Dockerfile is not YAML or
-// JSON, so there is no real structured parser for it available here.
+// The Dockerfile arm: a literal line scan over an honestly stated, narrow
+// universe -- the Dockerfile is not YAML or JSON, so there is no structured
+// parser for it here.
 // ---------------------------------------------------------------------------
 
-/// Every line beginning (after leading whitespace) with `ARG CARGO_FEATURES`, as
-/// `(1-indexed line number, the line's own trimmed text)`.
-fn dockerfile_cargo_features_arg_lines(text: &str) -> Vec<(usize, String)> {
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| line.trim_start().starts_with("ARG CARGO_FEATURES"))
-        .map(|(i, line)| (i + 1, line.trim().to_string()))
-        .collect()
-}
-
+/// The Dockerfile packages binaries and compiles nothing: there is one
+/// definition of how a server binary is compiled (`_server.yml`, from the
+/// manifest's `cargo_features`), and a container image takes that binary
+/// from the `builder` / `builder-cuda` build contexts. A `cargo build` or a
+/// `CARGO_FEATURES` argument in the Dockerfile would be a second definition,
+/// free to drift from the manifest.
 #[test]
-fn dockerfile_cargo_features_arg_carries_no_default() {
+fn dockerfile_compiles_nothing_and_packages_the_build_contexts() {
     let root = workspace_root();
     let text = read_to_string(&root.join("Dockerfile"));
-    let declarations = dockerfile_cargo_features_arg_lines(&text);
-    assert_eq!(
-        declarations.len(),
-        2,
-        "expected exactly two `ARG CARGO_FEATURES` declarations (the CPU and CUDA builder \
-         stages), found {}: {:?}",
-        declarations.len(),
-        declarations
+    let code: Vec<(usize, &str)> = text
+        .lines()
+        .enumerate()
+        .map(|(i, line)| (i + 1, line.trim()))
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let offending: Vec<String> = code
+        .iter()
+        .filter(|(_, line)| line.contains("cargo build") || line.contains("CARGO_FEATURES"))
+        .map(|(n, line)| format!("Dockerfile:{n}: {line}"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "the Dockerfile compiles nothing and takes no feature list; found {offending:?}"
     );
-    for (lineno, line) in &declarations {
-        assert_eq!(
-            line, "ARG CARGO_FEATURES",
-            "Dockerfile:{lineno}: `ARG CARGO_FEATURES` must carry NO default (a bare \
-             declaration) -- found `{line}`. A default masks a missing/mistyped \
-             --build-arg, building successfully with the wrong feature list instead of \
-             failing loudly at the RUN step's own required-argument guard."
+    for stage in ["builder", "builder-cuda"] {
+        let copies = code
+            .iter()
+            .filter(|(_, line)| line.starts_with(&format!("COPY --from={stage} ")))
+            .count();
+        assert!(
+            copies >= 2,
+            "the Dockerfile copies `jammi-server` and `jammi` from the `{stage}` build context; \
+             found {copies} `COPY --from={stage}` instructions"
         );
     }
-}
-
-#[test]
-fn dockerfile_cargo_features_run_carries_the_required_guard() {
-    let root = workspace_root();
-    let text = read_to_string(&root.join("Dockerfile"));
-    let guard = "${CARGO_FEATURES:?";
-    let guard_count = text.matches(guard).count();
-    assert_eq!(
-        guard_count, 2,
-        "expected the `{guard}...}}` required-argument guard exactly twice in the Dockerfile \
-         (once per builder stage's own RUN instruction: the CPU stage and the CUDA stage), \
-         found {guard_count} -- an absent or removed guard lets a `docker build` with no \
-         `--build-arg CARGO_FEATURES=...` proceed with an EMPTY feature list instead of \
-         failing loudly"
-    );
 }

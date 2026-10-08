@@ -267,7 +267,7 @@ and they land on different machines.
 needs `nccl.h` and the `libnccl.so` development symlink on disk — a pod, a
 laptop with a local toolkit, and CI alike. The CUDA toolkit package does not
 carry NCCL; the CUDA CI image installs it separately
-(`.docker/ci-cuda.Dockerfile`), and `ci.yml`'s `flash-attn-compile` job asserts
+(`.docker/ci-cuda.Dockerfile`), and `ci.yml`'s `clippy-cuda` job asserts
 it before its first clippy step, so a run on an image without the package reds
 on a one-line preflight instead of on a `cannot find -lnccl` deep in a link.
 
@@ -277,7 +277,7 @@ CUDA-shipping artifact answers for that soname its own way:
 
 | artifact | how `libnccl.so.2` gets there |
 | --- | --- |
-| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by `ci/scripts/bundle_cuda_libs.sh`'s derivation: `libnccl.so.2` is a member of the binary's own transitive `DT_NEEDED` closure (resolved under the CUDA 12.6 toolkit then `/usr/lib64`, `/usr/lib64` being where this image's `libnccl` RPM installs), so it is staged the same way every other closure member is — no name is listed by hand. `release-binaries.yml`'s `server-cu12-build` step also asserts the real loader resolves it (and every other bundled member) from `lib/`, not from a host copy |
+| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by `ci/scripts/bundle_cuda_libs.sh`'s derivation: `libnccl.so.2` is a member of the binary's own transitive `DT_NEEDED` closure (resolved under the CUDA 12.6 toolkit then `/usr/lib64`, `/usr/lib64` being where this image's `libnccl` RPM installs), so it is staged the same way every other closure member is — no name is listed by hand. `_server.yml`'s tarball packaging (`ci/scripts/package_server_tarball.sh`) also asserts the real loader resolves it (and every other bundled member) from `lib/`, not from a host copy |
 | `jammi-server-cu12` wheel | the `nvidia-nccl-cu12` dependency; the console script puts `nvidia/nccl/lib/` on `LD_LIBRARY_PATH`, and `verify_link_set.py` fails the build if a needed library is unclassified, or if it extracts no `DT_NEEDED` entries at all |
 | `jammi-ai-server` CUDA image | nothing to do: the `nvidia/cuda:12.6.3-runtime-ubi8` base installs `libnccl-2.23.4-1+cuda12.6` itself (its own image config's `NV_LIBNCCL_PACKAGE`) — the same build the CI image and the wheel pin |
 

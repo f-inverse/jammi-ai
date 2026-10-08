@@ -1,26 +1,16 @@
 name: GPU how-well (RunPod)
 
-# Runs the fine-tune how-well A/B on a real NVIDIA A100 (sm_80)
-# via an ephemeral RunPod pod — `ci/scripts/perf/finetune_run_ab.sh` driving
+# Runs the fine-tune how-well A/B on a real NVIDIA A100 (sm_80) via an
+# ephemeral RunPod pod — `ci/scripts/perf/finetune_run_ab.sh` driving
 # `jammi-bench finetune-run` per (rung, seed, take) against the committed
-# tests/fixtures/finetune_heldout/ fixture, judged (leg premises, identity,
-# the lr=0 control, the paired sign test and equivalence test) by
-# `jammi-bench ladder train-run` as the torch edge of that ladder.
+# `tests/fixtures/finetune_heldout/` fixture, judged by `jammi-bench ladder
+# train-run` as the torch edge of that ladder. Off the merge path, dispatch
+# only: every input is a deliberate choice an operator makes per run, and the
+# A/B is never a standing nightly. Needs a `model_dir` naming a checkpoint the
+# target pod has already provisioned (`runpod_gpu_howwell.sh`'s own doc).
 #
-# Off the merge path, same discipline gpu-prove.yml's own header states — GPU
-# minutes cost money and A100 capacity is intermittent. Fires on: the
-# `run-howwell` PR label (opt-in per PR) and manual dispatch ONLY — NO
-# schedule: the A/B is operator-triggered, never a standing nightly run.
-# Needs the `RUNPOD_API_KEY` repo secret and a `model_dir` naming a
-# checkpoint the target pod has already provisioned (this workflow does not
-# provision one itself — see `runpod_gpu_howwell.sh`'s own doc for why that
-# stays a separate, pod-seed-owned concern).
-#
-# Merge-path CI checks only ever validate COMMITTED artifacts (the shape
-# `check_cuda_run_artifacts.py` gives the clip and kernel artifacts) —
-# this workflow itself, and the RunPod run it drives, never sit on that
-# path; the committed calibration/A-B artifacts are what a merge-path gate
-# validates, not a re-execution of this workflow.
+# The committed calibration and A/B artifacts are what a merge-path gate
+# validates (`check_cuda_run_artifacts.py`), never a re-execution of this lane.
 
 on:
   workflow_dispatch:
@@ -29,38 +19,32 @@ on:
         description: "Checkpoint directory on the target pod (config.json + model.safetensors + tokenizer.json)."
         required: true
         type: string
+      objective:
+        description: "mnrl or triplet: the probe's objective."
+        required: true
+        type: choice
+        options: [mnrl, triplet]
       seeds:
-        description: "Comma-separated seed list (default: the pre-registered 12-seed gate set)."
+        description: "Comma-separated seed list (the pre-registered 12-seed gate set by default)."
         required: false
         type: string
         default: "1,2,3,4,5,6,7,8,9,10,11,12"
-      objective:
-        description: "mnrl or triplet — the probe's objective. Required, with no default: the choice is made deliberately on every dispatch."
-        required: true
-        type: string
       pods:
-        description: "Pods to spread the seeds over, one share each (default: 1). Above 1 the shares run at once, the legs are merged and judged once."
+        description: "Pods to spread the seeds over, one share each; above 1 the shares run at once and the legs are merged and judged once."
         required: false
-        type: string
-        default: "1"
+        type: number
+        default: 1
       lr0_seeds:
-        description: "Comma-separated lr=0 control seeds (default: '1,2'): an arm that cannot learn must fail the learning-happened premise. Clearing this field leaves the torch edge without its control; the ladder then refuses the run unless the control was waived."
+        description: "Comma-separated lr=0 control seeds: an arm that cannot learn must fail the learning-happened premise. Cleared, the ladder refuses the torch edge unless the control was waived."
         required: false
         type: string
         default: "1,2"
-  pull_request:
-    types: [labeled]
 
-# Least privilege: this lane only reads the checkout; the RunPod side is
-# driven by the RUNPOD_API_KEY secret, not the GitHub token.
 permissions:
   contents: read
 
 jobs:
-  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
-  # the tree defines, never the one `main` last had.
   ci-image:
-    if: github.event_name != 'pull_request' || github.event.label.name == 'run-howwell'
     permissions:
       contents: read
       actions: read
@@ -71,107 +55,28 @@ jobs:
   gpu-howwell:
     name: how-well A/B on RunPod A100 (sm_80)
     needs: ci-image
-    # Label event only runs for the `run-howwell` label; dispatch always
-    # runs. Mirrors gpu-prove.yml's own `run-gpu` gate exactly, one label
-    # name over.
-    if: github.event_name != 'pull_request' || github.event.label.name == 'run-howwell'
     runs-on: ubuntu-latest
-    # Concurrency is on the JOB, not the workflow, and never cancels — the
-    # SAME $187-orphan lesson gpu-prove.yml's own comment records: cancelling
-    # SIGKILLs the runner before its EXIT trap can terminate the rented pod.
     concurrency:
       group: gpu-howwell-${{ github.ref }}
       cancel-in-progress: false
-    # This workflow sources runpod_lib.sh's own RP_TIMEOUT default directly
-    # (never runpod_gpu_prove.sh's export, which raises that default to 100m
-    # for the prove lane specifically) -- its own derivation, not a mirror of
-    # gpu-prove.yml's: RP_TIMEOUT (50m, library default) plus up to
-    # 4 deploy candidates (a100's own candidate-list length) at
-    # RP_SSH_WAIT_SECS (600s) each = 40m worst case, well under this ceiling.
+    # RP_TIMEOUT (50m, the library default) plus up to 4 deploy candidates at
+    # RP_SSH_WAIT_SECS (600s) each.
     timeout-minutes: 100
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # workflow_dispatch's own `model_dir`/`objective` inputs are required
-      # at the trigger level; the `pull_request: types: [labeled]` path
-      # carries no inputs at all, so a label-triggered run needs
-      # HOWWELL_MODEL_DIR/HOWWELL_OBJECTIVE set some other way (a repo
-      # variable, or dispatch is used instead) — this step refuses loudly
-      # rather than silently defaulting either one (a placeholder path a
-      # real pod would never have, or an unstated mnrl-vs-triplet choice the
-      # probe's selection must always be deliberate about).
-      - name: Resolve HOWWELL_MODEL_DIR / HOWWELL_OBJECTIVE / HOWWELL_LR0_SEEDS
-        id: resolve
-        run: |
-          MODEL_DIR="${{ github.event.inputs.model_dir }}"
-          if [ -z "$MODEL_DIR" ]; then
-            echo "::error::model_dir is required — set it via workflow_dispatch's own input (a run-howwell PR-label trigger carries no inputs and cannot supply one)."
-            exit 1
-          fi
-          echo "model_dir=$MODEL_DIR" >> "$GITHUB_OUTPUT"
-
-          OBJECTIVE="${{ github.event.inputs.objective }}"
-          if [ -z "$OBJECTIVE" ]; then
-            echo "::error::objective is required — set it via workflow_dispatch's own input (a run-howwell PR-label trigger carries no inputs and cannot supply one)."
-            exit 1
-          fi
-          echo "objective=$OBJECTIVE" >> "$GITHUB_OUTPUT"
-
-          # workflow_dispatch's own `lr0_seeds` input carries a
-          # pre-registered default ("1,2") baked into this workflow's schema
-          # above, so it is empty only when an operator EXPLICITLY clears it.
-          # The ladder refuses (INVALID) the torch edge with no control unless
-          # `--waive-control` is passed, which this workflow does not
-          # forward, so clearing this field makes the run INVALID by design
-          # rather than silently skipping the control.
-          #
-          # The ELSE branch is unreachable on every trigger the `on:` block
-          # admits: a `pull_request: types: [labeled]` trigger carries NO
-          # workflow_dispatch inputs, so `model_dir` and `objective` above
-          # refuse first. It is a defensive refusal for any trigger added
-          # to `on:` without this step being revisited.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            LR0_SEEDS="${{ github.event.inputs.lr0_seeds }}"
-          else
-            echo "::error::lr0_seeds has no source on this trigger (belt-and-braces — every trigger this workflow's own on: block currently admits either takes the workflow_dispatch branch above, or has already refused on the missing model_dir/objective inputs before reaching this line) — use workflow_dispatch so the pre-registered lr=0 RED control (or a deliberate, visible opt-out) can actually be selected."
-            exit 1
-          fi
-          echo "lr0_seeds=$LR0_SEEDS" >> "$GITHUB_OUTPUT"
-
-      - name: Run the how-well A/B on a real A100
-        id: howwell
+      - uses: ./.github/actions/run-paid-lane
+        with:
+          driver: ci/scripts/runpod_gpu_howwell.sh
+          evidence: .gpu-pull/how-well/
+          evidence-name: how-well-${{ github.run_id }}
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
-          GIT_REF: ${{ github.head_ref || github.ref_name }}
-          HOWWELL_MODEL_DIR: ${{ steps.resolve.outputs.model_dir }}
-          HOWWELL_SEEDS: ${{ github.event.inputs.seeds || '1,2,3,4,5,6,7,8,9,10,11,12' }}
-          HOWWELL_OBJECTIVE: ${{ steps.resolve.outputs.objective }}
-          HOWWELL_LR0_SEEDS: ${{ steps.resolve.outputs.lr0_seeds }}
-          HOWWELL_PODS: ${{ github.event.inputs.pods || '1' }}
-        run: |
-          set +e
-          bash ci/scripts/runpod_gpu_howwell.sh
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit $rc
-
-      - name: Annotate a capacity failure
-        if: always() && steps.howwell.outputs.rc == '75'
-        run: echo "::warning::how-well A/B FAILED for capacity — no A100 on RunPod (SUPPLY_CONSTRAINT), not a code/statistical regression. The run stays red (nothing was proven); re-run once capacity returns."
-
-      # runpod_gpu_howwell.sh rsyncs the ladder verdict and its legs to
-      # .gpu-pull/how-well/ before the pod is torn down; this step makes
-      # that local pull retrievable from the CI run too (a human still
-      # decides which run(s) get committed under a crate's own artifacts/
-      # tree; this keeps the bytes from being lost once the runner is
-      # recycled).
-      - name: Upload how-well artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: how-well-artifact-${{ github.run_id }}
-          path: .gpu-pull/how-well/
-          if-no-files-found: warn
-          retention-days: 14
+          GIT_REF: ${{ github.ref_name }}
+          HOWWELL_MODEL_DIR: ${{ inputs.model_dir }}
+          HOWWELL_SEEDS: ${{ inputs.seeds }}
+          HOWWELL_OBJECTIVE: ${{ inputs.objective }}
+          HOWWELL_LR0_SEEDS: ${{ inputs.lr0_seeds }}
+          HOWWELL_PODS: ${{ inputs.pods }}

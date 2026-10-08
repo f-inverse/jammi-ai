@@ -1,0 +1,101 @@
+name: run-paid-lane
+description: >
+  Runs a driver that rents a RunPod pod (`ci/scripts/runpod_*.sh`) and reads
+  its exit code as the lane's verdict, the contract every driver shares
+  through `runpod_lib.sh`: 75 no capacity, 76 the inactivity watchdog cut a
+  hung leg, 77 the pod checked out a different tree, 97 a rented host is not
+  the shape asked for, 124 the session budget cut a leg. Every one leaves the
+  lane red and is annotated by name, so a provider condition is never read as
+  a regression. A capacity exit is retried up to `max-attempts` times. The
+  evidence the driver pulled back is uploaded: required when the lane
+  measured (exit 0), as whatever exists otherwise. The caller passes the
+  driver's environment (`RUNPOD_API_KEY`, `RP_IMAGE`, …) as this step's `env`.
+
+inputs:
+  driver:
+    description: "The driver script, e.g. ci/scripts/runpod_gpu_prove.sh."
+    required: true
+  max-attempts:
+    description: "Attempts on a no-capacity exit (75); one by default."
+    required: false
+    default: "1"
+  evidence:
+    description: "The directory the driver pulls its evidence into; empty uploads nothing."
+    required: false
+    default: ""
+  evidence-name:
+    description: "The artifact name for the evidence."
+    required: false
+    default: ""
+
+outputs:
+  rc:
+    description: "The driver's exit code."
+    value: ${{ steps.run.outputs.rc }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        DRIVER: ${{ inputs.driver }}
+        MAX_ATTEMPTS: ${{ inputs.max-attempts }}
+      run: |
+        set +e
+        attempt=1
+        while :; do
+          bash "$DRIVER"
+          rc=$?
+          if [ "$rc" -ne 75 ] || [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+            echo "rc=$rc" >> "$GITHUB_OUTPUT"
+            exit "$rc"
+          fi
+          echo "::warning::no capacity (attempt $attempt/$MAX_ATTEMPTS); retrying in 300s"
+          sleep 300
+          attempt=$((attempt + 1))
+        done
+
+    - if: always() && steps.run.outputs.rc == '75'
+      shell: bash
+      run: >-
+        echo "::warning::FAILED for capacity -- the provider had no device of the kind asked for
+        (SUPPLY_CONSTRAINT); nothing was measured and the lane stays red. Re-run once capacity
+        returns."
+    - if: always() && steps.run.outputs.rc == '76'
+      shell: bash
+      run: >-
+        echo "::warning::FAILED for inactivity -- the watchdog killed a leg that made no progress
+        for RP_INACTIVITY with a gating group unresolved, a hang rather than a capacity condition.
+        Read the log for the group that went silent."
+    - if: always() && steps.run.outputs.rc == '77'
+      shell: bash
+      run: >-
+        echo "::warning::FAILED for wrong tree -- the pod's PROVE_SHA disagreed with
+        PROVE_EXPECT_SHA, or none was observed; nothing was measured at the expected commit.
+        Re-run once the ref is stable."
+    - if: always() && steps.run.outputs.rc == '97'
+      shell: bash
+      run: >-
+        echo "::error::FAILED before building -- a rented host is not the shape asked for (GPU
+        count, compute capability, networking or placement). Not a regression."
+    - if: always() && steps.run.outputs.rc == '124'
+      shell: bash
+      run: >-
+        echo "::error::CUT by its own session budget (RP_TIMEOUT) with a gating group unresolved.
+        Raising the budget is a cost decision."
+
+    - if: always() && inputs.evidence != '' && steps.run.outputs.rc == '0'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.evidence-name }}
+        path: ${{ inputs.evidence }}
+        if-no-files-found: error
+        retention-days: 14
+    - if: always() && inputs.evidence != '' && steps.run.outputs.rc != '0'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.evidence-name }}
+        path: ${{ inputs.evidence }}
+        if-no-files-found: ignore
+        retention-days: 14

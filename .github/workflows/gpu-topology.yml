@@ -20,18 +20,12 @@ name: GPU topology (RunPod)
 #     (ii) sweep-only (every terminate fails): each pod bills to its TTL,
 #          then gpu-reap.yml's 6-hourly sweep: 4 x $4.00 x (4 + 6) h = $160.00.
 #
-# Off the merge path, and never in an automated workflow's critical path: it
-# fires on the `run-topology` PR label (opt-in per PR) and manual dispatch —
-# deliberately NO `push:` and NO `workflow_call:` trigger, and no workflow may
-# `uses:` it. `ci/scripts/check_gpu_prove_once.py`'s paid-pod-lane rule pins
-# this `on:` block and this workflow's exclusive ownership of the driver.
-# Needs the `RUNPOD_API_KEY` repo secret.
-#
-# Nothing gates a release on this lane: the release verdict is
-# `gpu-prove.yml`'s. This lane produces EVIDENCE — `topology.json`, which a
-# human reviews and commits under `crates/jammi-kernels/artifacts/cuda-runs/`,
-# where `ci/scripts/check_cuda_run_artifacts.py`'s `topology` kind is the
-# schema gate for it.
+# Off the merge path: the `run-topology` label or a dispatch; no `push:` or
+# `workflow_call:` trigger, and nothing `uses:` it (`check_gpu_prove_once.py`'s
+# paid-pod-lane rule). Nothing gates a release on this lane: it produces
+# evidence — `topology.json`, which a human reviews and commits under
+# `crates/jammi-kernels/artifacts/cuda-runs/`, where
+# `check_cuda_run_artifacts.py`'s `topology` kind is its schema gate.
 
 on:
   workflow_dispatch:
@@ -39,7 +33,7 @@ on:
       gpu_types:
         description: >-
           Candidate GPU types in preference order, `|`-separated RunPod
-          gpuTypeIds (each must map to sm_80/86/89/90). Empty = the driver's
+          gpuTypeIds (each must map to sm_80/86/89/90). Empty: the driver's
           default list.
         required: false
         default: ""
@@ -50,8 +44,6 @@ permissions:
   contents: read
 
 jobs:
-  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
-  # the tree defines, never the one `main` last had.
   ci-image:
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-topology'
     permissions:
@@ -66,67 +58,28 @@ jobs:
     needs: ci-image
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-topology'
     runs-on: ubuntu-latest
-    # Job-level and never cancelling: a cancel SIGKILLs the runner, the EXIT
-    # trap that terminates both pods never runs, and they bill to their TTL.
     concurrency:
       group: gpu-topology-${{ github.ref }}
       cancel-in-progress: false
-    # Above the driver's own budget, so a job-timeout kill (another trap
-    # bypass) never fires first: the fleet's readiness window
-    # (RP_SSH_WAIT_SECS, 20m) + host 0's session (RP_TIMEOUT, 120m) + host 1
-    # and both fleet phases (~30m) + 20m for the candidate walk and runner
-    # overhead = 190m, inside the pods' 4h TTL.
+    # Above the driver's own budget, so a job-timeout kill never fires first:
+    # the fleet's readiness window (RP_SSH_WAIT_SECS, 20m) + host 0's session
+    # (RP_TIMEOUT, 120m) + host 1 and both fleet phases (~30m) + 20m for the
+    # candidate walk and runner overhead, inside the pods' 4h TTL.
     timeout-minutes: 190
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Exit codes are the driver's contract (its header): 75 no co-located
-      # capacity, 76 inactivity kill, 77 wrong tree, 97 a host is not the
-      # shape asked for, 124 budget cut. Every one leaves the lane RED; the
-      # annotations below name which. One attempt per run: a retry is a
-      # second rental search, a cost decision for a human.
-      - name: Prove every topology on a two-host RunPod fleet
-        id: topology
+      # One attempt per run: a retry is a second rental search, a cost
+      # decision for a human.
+      - uses: ./.github/actions/run-paid-lane
+        with:
+          driver: ci/scripts/runpod_gpu_topology.sh
+          evidence: .gpu-pull/gpu-topology/
+          evidence-name: gpu-topology-${{ github.run_id }}
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
           PROVE_EXPECT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          GPU_TYPES_INPUT: ${{ inputs.gpu_types }}
-        run: |
-          set +e
-          [ -z "$GPU_TYPES_INPUT" ] || export TOPOLOGY_GPU_TYPES="$GPU_TYPES_INPUT"
-          bash ci/scripts/runpod_gpu_topology.sh
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit "$rc"
-
-      - name: Annotate a capacity failure
-        if: always() && steps.topology.outputs.rc == '75'
-        run: echo "::warning::GPU topology FAILED for capacity — no candidate GPU type had two co-located 2-GPU pods within the rate ceiling. Not a code regression; nothing was proven. Re-run once capacity returns, or dispatch with other gpu_types."
-
-      - name: Annotate an inactivity-watchdog kill
-        if: always() && steps.topology.outputs.rc == '76'
-        run: echo "::warning::GPU topology FAILED for inactivity — a host session made no progress for RP_INACTIVITY with a gating group unresolved. A hung collective is what this lane exists to surface; read the group name in the log."
-
-      - name: Annotate a wrong-tree failure
-        if: always() && steps.topology.outputs.rc == '77'
-        run: echo "::warning::GPU topology FAILED for wrong tree — a host's PROVE_SHA disagreed with PROVE_EXPECT_SHA. Nothing was proven at the expected commit; re-run once the ref is stable."
-
-      - name: Annotate a wrong-shape failure
-        if: always() && steps.topology.outputs.rc == '97'
-        run: echo "::error::GPU topology FAILED before building — a rented host is not the shape asked for (GPU count, compute capability, Global Networking, or co-placement in one data center). Not a code regression."
-
-      - name: Annotate a budget cut
-        if: always() && steps.topology.outputs.rc == '124'
-        run: echo "::error::GPU topology was CUT by its own RP_TIMEOUT with a gating group unresolved. Raising RP_TIMEOUT/RP_TTL_HOURS raises the header's bound and is a deliberate cost decision."
-
-      - name: Upload the pulled topology evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-topology-${{ github.run_id }}
-          path: .gpu-pull/gpu-topology/
-          if-no-files-found: warn
-          retention-days: 14
+          TOPOLOGY_GPU_TYPES: ${{ inputs.gpu_types }}

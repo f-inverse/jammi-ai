@@ -38,6 +38,7 @@ GPU = vd.Requirement(
     vd.gpu_requirement().remedy,
 )
 CI = vd.ci_requirement()
+BUILD = vd.build_requirement()
 COOKBOOK = vd.cookbook_requirement()
 
 
@@ -444,22 +445,31 @@ class ReleaseGateTest(unittest.TestCase):
 
     def _all(self, cookbook_conclusion):
         w = self._both("success")
+        w.bind(run_obj(4, workflow=vd.BUILD_WORKFLOW), [named_job(vd.BUILD_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z", 50)])
         w.bind(
             run_obj(3, workflow=vd.COOKBOOK_WORKFLOW),
             [named_job(vd.COOKBOOK_JOB, cookbook_conclusion, "2026-01-01T00:00:00Z", 40)],
         )
         return w
 
-    def test_a_release_requires_the_gpu_prove_ci_and_the_cookbook(self):
+    def test_a_release_requires_the_gpu_prove_ci_the_build_and_the_cookbook(self):
         self.assertEqual(
             [r.workflow for r in vd.release_requirements()],
-            [vd.GPU_WORKFLOW, vd.CI_WORKFLOW, vd.COOKBOOK_WORKFLOW],
+            [vd.GPU_WORKFLOW, vd.CI_WORKFLOW, vd.BUILD_WORKFLOW, vd.COOKBOOK_WORKFLOW],
         )
 
     def test_every_lane_proven_passes(self):
-        rc, out, err = _require(self._all("success"), requirements=[GPU, CI, COOKBOOK])
+        rc, out, err = _require(self._all("success"), requirements=[GPU, CI, BUILD, COOKBOOK])
         self.assertEqual(rc, 0, err)
         self.assertIn(vd.COOKBOOK_JOB, out)
+        self.assertIn(vd.BUILD_SUMMARY_JOB, out)
+
+    def test_gpu_ci_and_cookbook_proven_but_no_build_run_denies(self):
+        w = self._both("success")
+        w.bind(run_obj(3, workflow=vd.COOKBOOK_WORKFLOW), [named_job(vd.COOKBOOK_JOB, "success", "2026-01-01T00:00:00Z", 40)])
+        rc, _, err = _require(w, requirements=[GPU, CI, BUILD, COOKBOOK])
+        self.assertEqual(rc, 1)
+        self.assertIn(vd.BUILD_WORKFLOW, err)
 
     def test_gpu_and_ci_proven_but_no_cookbook_run_denies(self):
         rc, _, err = _require(self._both("success"), requirements=[GPU, CI, COOKBOOK])
@@ -497,9 +507,9 @@ class ProbeTest(unittest.TestCase):
     """`ci.yml`'s plan asks whether its tree is already proven. It never fails
     the run: an unreadable record means the run measures again."""
 
-    def _probe(self, fetch):
+    def _probe(self, fetch, lane="ci"):
         out, err = io.StringIO(), io.StringIO()
-        rc = vd.probe(repo=REPO, tree=TREE, fetch=fetch, token="tok", out=out, err=err)
+        rc = vd.probe(repo=REPO, tree=TREE, lane=lane, fetch=fetch, token="tok", out=out, err=err)
         return rc, out.getvalue(), err.getvalue()
 
     def test_a_proven_tree_reads_proven(self):
@@ -516,6 +526,16 @@ class ProbeTest(unittest.TestCase):
         _, out, err = self._probe(w.fetch)
         self.assertEqual(out.split(), ["proven=true"])
         self.assertIn("run 9", err)
+
+    def test_the_build_lane_reads_its_own_summary(self):
+        w = World()
+        w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
+        _, out, _ = self._probe(w.fetch, lane="build")
+        self.assertEqual(out.split(), ["proven=false"])
+        w.bind(run_obj(8, workflow=vd.BUILD_WORKFLOW), [named_job(vd.BUILD_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
+        _, out, err = self._probe(w.fetch, lane="build")
+        self.assertEqual(out.split(), ["proven=true"])
+        self.assertIn("run 8", err)
 
     def test_an_unmeasured_tree_reads_unproven(self):
         rc, out, _ = self._probe(World().fetch)

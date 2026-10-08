@@ -33,7 +33,7 @@ jobs:
     with:
       await: cpu cuda
 
-  # A reviewed UNGATED promotion (`check_gpu_prove_once.py`'s table): it moves
+  # A reviewed ungated promotion (`check_gpu_prove_once.py`'s table): it moves
   # a development alias on a merge to `main`, never a release artifact, and
   # its `if:` keeps a `workflow_dispatch` on a tag ref from reaching it.
   latest:
@@ -50,7 +50,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Point :latest at main's images
         env:

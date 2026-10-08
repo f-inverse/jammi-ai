@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Publishes the workspace crates to crates.io in topological dependency order
-# (invoked from crates.yml's `publish` job with CARGO_REGISTRY_TOKEN set from
-# the trusted-publishing OIDC exchange, and INPUT_VERSION carrying the manual
-# dispatch's version input — empty on a tag push).
+# (invoked from crates.yml's `publish` job on a `v*` tag ref, with
+# CARGO_REGISTRY_TOKEN set from the trusted-publishing exchange
+# `ci/scripts/crates_io_token.sh` makes).
 set -euo pipefail
 
 # Publish in topological dependency order. Each entry must come
@@ -112,20 +112,11 @@ retry_transient() {
   done
 }
 
-# Derive the version from the tag ref (v0.13.0 -> 0.13.0) — the publish job
-# only runs on `v*` tag refs, push or dispatch-on-tag alike.
-VERSION="${GITHUB_REF_NAME#v}"
-
-# VERSION drives the presence probes and index waits below, but `cargo
-# publish` publishes whatever the checked-out workspace says — so a VERSION
-# that disagrees with the workspace would key every idempotence probe on the
-# wrong quantity (reading "already published" and skipping real work,
-# green). A tag that drifted from the workspace version is refused here.
-workspace_version="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
-if [ -z "$workspace_version" ] || [ "$VERSION" != "$workspace_version" ]; then
-  echo "::error::VERSION '${VERSION}' (from the dispatch input or tag ref) does not match the workspace version '${workspace_version}' this checkout would publish — refusing" >&2
-  exit 1
-fi
+# The version the tag names, which `check_release_tag.sh` holds equal to the
+# workspace's: VERSION drives the presence probes and index waits below, while
+# `cargo publish` ships whatever the checkout says, so a drifted tag would key
+# every idempotence probe on the wrong quantity.
+VERSION="$(bash "$(dirname "${BASH_SOURCE[0]}")/check_release_tag.sh" "$GITHUB_REF_NAME")"
 
 # The crates.io sparse index lags `cargo publish` by seconds-to-minutes:
 # after publishing crate X, a dependent crate Y's publish reads the index

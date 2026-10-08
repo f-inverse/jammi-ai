@@ -3,8 +3,8 @@ name: _native-wheel-cu12
 # Builds the `jammi-ai-native-cu12` wheel — the embedded CUDA engine (the
 # manifest's `native-cu12` build) — through `ci/scripts/build_native_cu12_wheel.sh`,
 # which builds it in the CUDA image and checks it. The one definition of how
-# the CUDA native wheel is built: `ci.yml` calls it on every pull request and
-# on `main`; `pypi-native-cuda.yml` calls it to publish.
+# the CUDA native wheel is built: `build.yml` calls it on every pull request
+# and on `main`; `pypi.yml` publishes what that run built.
 #
 # Artifact: `native-cu12-wheel`.
 
@@ -21,20 +21,18 @@ permissions:
 
 jobs:
   build:
-    name: Build jammi-ai-native-cu12 (manylinux_2_28_x86_64)
+    name: Native wheel (CUDA, manylinux_2_28_x86_64)
     runs-on: ubuntu-latest
     container:
       image: ${{ inputs.cuda-image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: false
 
       # `flash-attn` builds its kernels from the vendored CUTLASS submodule.
       - name: Init the CUTLASS submodule
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
+        run: git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass
 
       - uses: ./.github/actions/setup-rust-ci
         with:
@@ -43,7 +41,7 @@ jobs:
       - name: Build and check the wheel
         run: bash ci/scripts/build_native_cu12_wheel.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-cu12-wheel
           path: packaging/native-cu12/dist/

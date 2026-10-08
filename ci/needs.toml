@@ -89,4 +89,3 @@ provide = "cargo fetch --locked"
 probe = "test \"$(git rev-parse --is-shallow-repository)\" = false"
 provide = "git fetch --quiet --unshallow origin"
 
-# ------------------------------------------------- the product's own shape

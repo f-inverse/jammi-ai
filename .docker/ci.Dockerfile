@@ -8,6 +8,11 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# A job in this image checks out as one uid and runs as another, and git
+# refuses a repository another user owns. Every checkout here is the job's
+# own ephemeral one, so every directory is trusted, system-wide, once.
+RUN git config --system --add safe.directory '*'
+
 # Platform SQLite runtime (`/lib64/libsqlite3.so.0`). The foreign-SQLite-library
 # harness (`crates/jammi-db/tests/it/sqlite_foreign_library.rs`) `dlopen`s it to
 # get a SECOND SQLite library instance in one process alongside the statically
@@ -90,7 +95,6 @@ RUN set -eu; \
       amd64) \
         printf '%s\n' \
           'PROTOC_ARCH=linux-x86_64' \
-          'MOLD_ARCH=x86_64-linux' \
           'SCCACHE_ARCH=x86_64-unknown-linux-musl' \
           'QUARTO_ARCH=linux-amd64' \
           > /etc/ci-arch-env \
@@ -98,7 +102,6 @@ RUN set -eu; \
       arm64) \
         printf '%s\n' \
           'PROTOC_ARCH=linux-aarch_64' \
-          'MOLD_ARCH=aarch64-linux' \
           'SCCACHE_ARCH=aarch64-unknown-linux-musl' \
           'QUARTO_ARCH=linux-arm64' \
           > /etc/ci-arch-env \
@@ -117,12 +120,6 @@ RUN . /etc/ci-arch-env \
         -o /tmp/protoc.zip \
     && unzip /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
     && rm /tmp/protoc.zip
-
-# mold linker for faster linking
-ARG MOLD_VERSION=2.35.1
-RUN . /etc/ci-arch-env \
-    && curl -fsSL "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${MOLD_ARCH}.tar.gz" \
-    | tar -xz --strip-components=1 -C /usr/local
 
 # Rust toolchain (manylinux ships no Rust).
 #
@@ -172,10 +169,11 @@ RUN . /etc/ci-arch-env \
         | tar -xz -C /opt \
     && ln -s "/opt/quarto-${QUARTO_VERSION}/bin/quarto" /usr/local/bin/quarto
 
-# The third-party tools the guard lanes run, installed from the one script
+# The third-party tools the lanes run -- the linker every Linux target links
+# with, and the guard lanes' tools -- installed from the one script
 # that pins them (version and per-arch checksum). A bare runner, or an image
 # built before a pin moved, provides them through the same script; here they
 # are baked so a CI run fetches none of them.
 COPY pinned-tools.sh /tmp/pinned-tools.sh
-RUN bash /tmp/pinned-tools.sh actionlint kustomize kubeconform cargo-nextest cargo-deny build-graph \
+RUN bash /tmp/pinned-tools.sh mold actionlint kustomize kubeconform cargo-nextest cargo-deny build-graph \
     && rm -rf /tmp/pinned-tools.sh /usr/local/cargo/registry /usr/local/cargo/git

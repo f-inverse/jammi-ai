@@ -1,22 +1,17 @@
 name: Pages
 
+# Deploys the documentation site of a `py-v*` release, behind the shared
+# release gate: the guide and API reference the `build.yml` run that proved
+# the tree built (`docs`), and the book the `cookbook-gpu.yml` run that proved it
+# rendered on real models (`book`), so what a reader reads is what PyPI serves
+# and what each chapter's Colab badge installs. It compiles and renders
+# nothing. A dispatch on the tag redeploys the same site; a branch dispatch is
+# a rehearsal that lays the site out and deploys nothing.
+
 on:
   push:
     tags: ["py-v*"]
-  # Manual re-run to finish a release whose deploy was interrupted: run the
-  # dispatch ON the `py-v*` tag (the deploy job is tag-guarded; deploying the
-  # same site again is idempotent). A branch dispatch is a rehearsal: it
-  # resolves the branch tree's proving run, lays out its site, and deploys
-  # nothing.
   workflow_dispatch:
-
-# The documentation site describes a release: the guide, the API reference
-# and the cookbook book of the tree a `py-v*` tag names, so what a reader
-# reads is what PyPI serves them and what each chapter's Colab badge
-# installs. It compiles and renders nothing: `ci.yml` builds the guide and
-# the API reference (`docs`), `cookbook-gpu.yml` renders and assembles the
-# book on real models, and this workflow publishes what the runs that proved
-# the tag's tree built.
 
 # A deploy in flight is never cancelled; a later tag's waits behind it.
 concurrency:
@@ -27,17 +22,13 @@ permissions:
   contents: read
 
 jobs:
-  # What this release publishes: the guide and API reference the `ci.yml` run
-  # that proved the released tree built, and the book the `cookbook-gpu.yml`
-  # run that proved it rendered. On a branch dispatch, the rehearsal: the same
-  # lookups over the branch's tree.
   docs:
     permissions:
       contents: read
       actions: read
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      lane: ci
+      lane: build
       artifacts: docs-site
 
   book:
@@ -51,16 +42,11 @@ jobs:
 
   proof:
     name: Proof required
-    # Any `py-v*` TAG ref requires the release tree's recorded GPU-prove and CI
-    # verdicts before the site is deployed: every release publisher gates on
-    # the same verdict, all-or-nothing, so the site never describes a release
-    # the package indexes refused.
     if: startsWith(github.ref, 'refs/tags/py-v')
     uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
-    secrets: inherit
 
   # The guide at the root, the API reference under `api/`, the book under
   # `cookbook/`: the paths the guide, the README and every notebook link to.
@@ -69,33 +55,30 @@ jobs:
     needs: [docs, book]
     runs-on: ubuntu-latest
     permissions:
-      # Downloads from the proving run, not this one.
       actions: read
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: docs-site
           path: _site
           run-id: ${{ needs.docs.outputs.run }}
           github-token: ${{ github.token }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: cookbook-book
           path: _site/cookbook
           run-id: ${{ needs.book.outputs.run }}
           github-token: ${{ github.token }}
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: _site
 
   deploy:
     name: Deploy to GitHub Pages
-    # Deploys ONLY from a `py-v*` tag ref whose tree's proof is green. PURE
-    # conjunction (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.site.result == 'success' && needs.proof.result == 'success'
     needs: [site, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.site.result == 'success' && needs.proof.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -104,6 +87,5 @@ jobs:
       pages: write
       id-token: write
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

@@ -1,175 +1,35 @@
 # syntax=docker/dockerfile:1.7
 
-# Runtime variant selector for the final image. This MUST be a GLOBAL arg (declared before the
-# first FROM) so it is in scope for the `FROM ${RUNTIME_VARIANT}` selector at the bottom:
-#   runtime-generic        (default) — operator-supplied config + volume (CPU)
-#   runtime-selfcontained  — standalone, baked config, no volume (e.g. Cloudflare Containers) (CPU)
-#   runtime-cuda           — CUDA build: GPU-accelerated inference, NVIDIA runtime base
+# The `jammi-server` container images. Every image packages binaries it does
+# not compile: a build passes `--build-context builder=<dir>` (or
+# `builder-cuda=<dir>` for the CUDA image), where `<dir>/out` holds the
+# `jammi-server` and `jammi` binaries one build of
+# `ci/release-feature-manifest.json` produced — in CI, the ones `_server.yml`
+# and `_cli.yml` built in `build.yml` (`stage-server-binaries` lays the
+# directory out); by
+# hand, `ci/dev.sh cargo build --release ...` in the CI image, which links the
+# manylinux_2_28 floor the images' runtimes promise. There is one definition
+# of how a server binary is compiled, and it is not in this file.
 #
-# CUDA lives only on the server image. The CPU variants build on the generic
-# CI base (`jammi-ai-ci`) and a distroless runtime; the CUDA variant builds on the CUDA CI
-# base (`jammi-ai-ci-cuda`, which carries the CUDA 12.6 toolkit + CUDA_COMPUTE_CAP=80) and a
-# CUDA runtime base that ships `libcudart` for candle's cudarc backend. Each runtime stage
-# copies from the builder it needs, so the single `RUNTIME_VARIANT` selector still resolves
-# the whole image — no Dockerfile fork.
+# The runtime variant is selected by the global `RUNTIME_VARIANT` argument:
+#   runtime-generic        (default) operator-supplied config + a mounted volume (CPU)
+#   runtime-selfcontained  a baked config; boots with no config and no volume (CPU)
+#   runtime-cuda           candle's CUDA backend on an NVIDIA runtime base
 ARG RUNTIME_VARIANT=runtime-generic
 
-# GLOBAL args (declared before the first FROM, same rule this file already
-# states for RUNTIME_VARIANT above): a bare `docker build` (no `--build-arg`
-# at all -- `deploy-server.md`'s documented commands) builds on the `:latest`
-# alias `image.yml` keeps on `main`'s CI images; CI passes the tree's own
-# content-tagged CI images (`_ci-image.yml`), so every leg of one release
-# build shares the toolchain its tree defines.
-#
-# BASE_IMAGE feeds the very next FROM (immediately below, the first FROM in
-# this file) so this single declaration -- default AND all -- is already in
-# scope for it; a Dockerfile MUST NOT redeclare `ARG BASE_IMAGE` a second
-# time before that FROM. A bare `ARG BASE_IMAGE` with no `=value` there would
-# be a second pre-first-FROM declaration of the same name, and BuildKit
-# resolves a FROM's base name against the LAST such declaration -- a
-# no-default second one silently blanks the default from the line above,
-# even for a build whose target stage never depends on `builder` (BuildKit
-# resolves every stage's FROM name up front, before dead-stage pruning, so a
-# blank base name here fails any build that never even reaches this stage).
-# BASE_IMAGE_CUDA, by contrast, feeds `builder-cuda`'s FROM below, which is
-# NOT the first FROM in the file -- a pre-FROM global ARG does not cross a
-# FROM boundary, so BASE_IMAGE_CUDA is correctly redeclared (bare, no
-# `=value`) right before that later FROM, inside the `builder` stage's span,
-# where it is the FIRST and only redeclaration of that name and safely
-# reimports the default set here.
-ARG BASE_IMAGE=ghcr.io/f-inverse/jammi-ai-ci:latest
-ARG BASE_IMAGE_CUDA=ghcr.io/f-inverse/jammi-ai-ci-cuda:latest
-
-# ---- builder ----
-# The CI base image carries the full Rust toolchain (the `rust-toolchain.toml`
-# pin, protoc, mold, sccache). It is a multi-arch index (linux/amd64 +
-# linux/arm64); each puller's own container runtime selects the manifest
-# matching its own host arch.
-#
-# What the runtime stages take from a builder is `/out`: the stripped
-# `jammi-server` and `jammi`, plus an empty `jammi-data/` (the CPU builder
-# only). That layout is the stage's whole contract, so a build can replace
-# the stage with binaries already compiled: CI passes
-# `--build-context builder=<dir>` (or `builder-cuda=<dir>`), where `<dir>/out`
-# holds the binaries its run built through `_server.yml` and `_cli.yml`, and
-# BuildKit uses that directory instead of building the stage
-# (https://docs.docker.com/reference/cli/docker/buildx/build/#build-context).
-# A plain `docker build` compiles them here.
-FROM ${BASE_IMAGE} AS builder
-
-# Redeclared HERE (post-FROM), same rule the CUDA stage's own
-# `CARGO_FEATURES` follows below: a pre-FROM global ARG does not cross a
-# `FROM` boundary. NO DEFAULT (#507): a bare `docker build` with this
-# build-arg omitted must fail LOUDLY at the RUN step's own `:?` guard
-# below, never silently build a plausible-but-wrong feature list — the
-# fail-OPEN behavior an empty/absent build-arg had before (a mistyped or
-# missing `--build-arg CARGO_FEATURES=...` still built successfully) is
-# exactly the #507 defect this closes. `server-image.yml`'s CPU image
-# jobs pass this from `ci/release-feature-manifest.json`'s `server-cpu`
-# build via `jq`.
-ARG CARGO_FEATURES
-
-WORKDIR /workspace
-COPY . .
-
-# BuildKit cache mounts keep the cargo registry and target dir
-# warm between image builds — a cold first build is ~30 minutes;
-# a warm rebuild is ~3 minutes. The `target/` mount is sharded by
-# the workspace name so concurrent builds don't fight over the
-# same lock file.
-# Build both binaries the runtime needs: `jammi-server` (the long-running
-# server, the image entrypoint) and `jammi` (the strict gRPC-client CLI, shipped
-# for admin verbs — `sources`/`query`/… — against the running server in the same
-# image). One `cargo build` compiles the workspace once for both.
-# `--features` applies to the server (which owns the broker + cloud-driver
-# flags); the strict-client CLI carries no such features, so it builds plain.
-# `jammi-server/` prefixes every feature name, same `awk` transform the CUDA
-# builder stage below uses, so `CARGO_FEATURES` is a plain comma-separated
-# feature-name list (matching the manifest's own `cargo_features` array)
-# rather than a second, pre-prefixed copy this Dockerfile would have to keep
-# in sync by hand.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/workspace/target,sharing=locked \
-    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's server-cpu build) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
-    && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
-    && cargo build --release \
-        --package jammi-server --bin jammi-server \
-        --features "${features}" \
-    && cargo build --release --package jammi-cli --bin jammi \
-    && mkdir -p /out \
-    && cp target/release/jammi-server target/release/jammi /out/ \
-    && strip /out/jammi-server /out/jammi
-
-# An empty directory the distroless runtime can COPY --chown into place as the
-# writable artifact dir — distroless has no shell to `mkdir` at runtime.
-RUN mkdir -p /out/jammi-data
-
-# ---- builder: cuda ----
-# The CUDA CI base extends `jammi-ai-ci` with the CUDA 12.6 toolkit (nvcc), GCC 13
-# (CUDA 12.6 supports GCC ≤ 13.2), and `CUDA_COMPUTE_CAP=80`. Its output is the
-# CPU builder's `/out` contract, without `jammi-data/`. `candle-core/cuda` reads CUDA_COMPUTE_CAP
-# at build time to target the GPU architecture; CC/CXX/PATH for nvcc are baked into the base.
-# `--platform=linux/amd64` is explicit here (never implicit native-runner
-# behavior): the CUDA base publishes amd64 only, so an arm builder fails
-# loudly instead of silently emulating.
-ARG BASE_IMAGE_CUDA
-FROM --platform=linux/amd64 ${BASE_IMAGE_CUDA} AS builder-cuda
-
-# Redeclared HERE (post-FROM) rather than only as a global arg above: a
-# pre-FROM global ARG does not cross a `FROM` boundary, so this stage needs
-# its own declaration to see a `--build-arg CARGO_FEATURES=...` value. NO
-# DEFAULT (#507, same fix as the CPU builder stage above): a bare `docker
-# build` — no `--build-arg` at all — must fail LOUDLY at the RUN step's own
-# `:?` guard below rather than silently building a plausible-but-wrong
-# feature list (the old default masked exactly a missing/mistyped
-# `--build-arg`, which built successfully anyway). `server-image.yml`'s CUDA
-# jobs pass the manifest-derived (`ci/release-feature-manifest.json`, build
-# `server-cu12`) feature list explicitly via this build-arg.
-ARG CARGO_FEATURES
-
-WORKDIR /workspace
-COPY . .
-
-# Same cache-mount strategy as the CPU builder. The delta is `--features`,
-# which (per CARGO_FEATURES above) at minimum pulls in candle's CUDA backend
-# (compiled for compute capability 80 — PTX, forward-compatible via JIT to
-# 8.6/8.9/9.0) and, when the published lane's manifest includes it, the
-# vendored FlashAttention-2 kernels (`flash-attn`, needs the CUTLASS
-# submodule already present in the build context). Both binaries are built so the GPU image carries
-# the admin `jammi` CLI too. `jammi-server/` prefixes every feature name so
-# `jammi-cli`'s own build (no `--features`) is unaffected by the arg's value.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/workspace/target,sharing=locked \
-    : "${CARGO_FEATURES:?CARGO_FEATURES build-arg is required (see ci/release-feature-manifest.json's server-cu12 build) -- pass --build-arg CARGO_FEATURES=<comma-separated cargo feature list>}" \
-    && features="$(printf '%s' "${CARGO_FEATURES}" | awk -F',' '{out=""; for(i=1;i<=NF;i++){out = out (i>1?",":"") "jammi-server/" $i} print out}')" \
-    && cargo build --release \
-        --package jammi-server --bin jammi-server \
-        --features "${features}" \
-    && cargo build --release --package jammi-cli --bin jammi \
-    && mkdir -p /out \
-    && cp target/release/jammi-server target/release/jammi /out/ \
-    && strip /out/jammi-server /out/jammi
-
 # ---- runtime base ----
-# Distroless `cc` ships glibc and libstdc++ (Rust binaries linked
-# against the system C++ runtime via tonic + tokio's syscall layer
-# expect both). Image size lands ~50MB with a stripped binary.
-#
-# This base is shared by the two CPU variants and carries both binaries plus the
-# turnkey `jammi-server` entrypoint. The generic variant (`runtime-generic`)
-# boots zero-config (local SQLite catalog under `/var/lib/jammi`) and accepts an
-# operator config via `--config`. The self-contained variant
-# (`runtime-selfcontained`) bakes a config so it boots standalone on a runtime
-# that provides neither a config nor a volume (e.g. Cloudflare Containers). The CUDA variant
-# (`runtime-cuda`) has its own NVIDIA runtime base below — distroless ships no
-# CUDA libraries.
+# Distroless `cc` ships glibc and libstdc++ (the binaries link the system C++
+# runtime through tonic and tokio's syscall layer). Shared by the two CPU
+# variants: both binaries and the turnkey `jammi-server` entrypoint. The
+# generic variant boots zero-config (local SQLite catalog under
+# `/var/lib/jammi`) and accepts an operator config via `--config`; the
+# self-contained variant bakes a config so it boots on a runtime that provides
+# neither a config nor a volume.
 FROM gcr.io/distroless/cc-debian12 AS runtime-base
 
-# Bring just the stripped binaries across — none of the source tree,
-# cargo registry, or toolchain follow into the final image. Both the
-# long-running `jammi-server` (the entrypoint) and the strict-client `jammi` CLI
-# ship: the CLI's admin verbs (`sources`, `query`, …) run against the server in
-# the same image (`jammi --target grpc://… …`).
+# The `builder` context's `out/`: the stripped `jammi-server` (the entrypoint)
+# and the strict-client `jammi` CLI, whose admin verbs run against the server
+# in the same image (`jammi --target grpc://… …`).
 COPY --from=builder /out/jammi-server /usr/local/bin/jammi-server
 COPY --from=builder /out/jammi /usr/local/bin/jammi
 
@@ -177,159 +37,111 @@ COPY --from=builder /out/jammi /usr/local/bin/jammi
 EXPOSE 8080 8081
 
 # Turnkey: `docker run <image>` runs `jammi-server serve`, which resolves its
-# config through the SAME chain the binary uses everywhere else — `--config`
-# (not passed here), `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`,
-# the platform config dir, finally `JammiConfig::default()` (local SQLite
-# catalog, in-memory broker, all tiers). `WORKDIR /` (set explicitly below,
-# since distroless never sets one) makes `./jammi.toml` mean `/jammi.toml` —
-# a bind mount at that path outranks a baked `/etc/jammi/jammi.toml` (see the
-# self-contained stage below) by this documented order.
-# `docker run <image> --config /etc/jammi/jammi.toml` overrides the default
-# `CMD` (still `serve`, the implicit default subcommand — `--config` is a
-# top-level flag `serve` also accepts, so no `serve` keyword is required).
+# config through the same chain the binary uses everywhere else — `--config`,
+# `JAMMI_CONFIG`, `./jammi.toml`, `/etc/jammi/jammi.toml`, the platform config
+# dir, finally `JammiConfig::default()`. `WORKDIR /` (distroless sets none)
+# makes `./jammi.toml` mean `/jammi.toml`: a bind mount there outranks a baked
+# `/etc/jammi/jammi.toml` by this order. `docker run <image> --config
+# /etc/jammi/jammi.toml` overrides the default `CMD` (`--config` is a
+# top-level flag `serve` accepts, so no `serve` keyword is required).
 WORKDIR /
 ENTRYPOINT ["/usr/local/bin/jammi-server"]
 CMD ["serve"]
 
 # ---- runtime: generic (default) ----
-# The turnkey CPU server image: `docker run <image>` runs `jammi-server serve`
-# with zero config (no baked file, no bind mount — the resolution chain falls
-# through to `JammiConfig::default()`). Operators can still supply their own
-# config — `docker run <image> --config /etc/jammi/jammi.toml` — and mount a
-# volume / bind mount at `/var/lib/jammi`.
 FROM runtime-base AS runtime-generic
 
-# Explicit, not merely inherited from runtime-base: every runtime stage
-# states its own boot command so a reader never has to chase an inherited
-# default across a `FROM` boundary to know what `docker run <image>` does.
+# Every runtime stage states its own boot command, so a reader never chases
+# an inherited default across a `FROM`.
 CMD ["serve"]
 
 # Persistent state: catalog DB, model weights, indices, and the Hugging Face
-# Hub cache (`HF_HOME`, set below). Zero-config `jammi-server` writes its
-# SQLite catalog here via JAMMI_ARTIFACT_DIR (set below), so the directory
-# must be writable by the nonroot user (uid 65532) even when no volume is
-# mounted — `--chown` makes the baked directory writable; a mounted named
-# volume inherits its ownership, and a bind mount must be `chown 65532:65532`.
+# Hub cache (`HF_HOME`, below). Zero-config `jammi-server` writes its SQLite
+# catalog here, so the directory must be writable by the nonroot user (uid
+# 65532) even with no volume mounted: the `builder` context's empty
+# `out/jammi-data/` is copied in with that ownership (distroless has no shell
+# to `mkdir`). A named volume inherits it; a bind mount must be
+# `chown 65532:65532`.
 COPY --from=builder --chown=65532:65532 /out/jammi-data /var/lib/jammi
 VOLUME ["/var/lib/jammi"]
 
-# Point zero-config `jammi-server` at the declared volume rather than the user's
-# XDG data dir (which is unwritable for uid 65532 on this base). An operator
-# config's `artifact_dir` still wins when passed via `--config`.
+# Point zero-config `jammi-server` at the declared volume rather than the
+# user's XDG data dir (unwritable for uid 65532 here). An operator config's
+# `artifact_dir` still wins through `--config`.
 ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
 
-# esc-096: `HubSource`'s cache-root fallback (`[models] hub_cache_dir` >
-# `HF_HOME` > the platform home directory) would otherwise fall through to
-# the home-directory arm here, and this distroless nonroot user has no
-# writable (indeed no) `HOME` (see the CUDA stage's `CUDA_CACHE_PATH` comment
-# below for the same fact) — resolving to a typed config error rather than a
-# panic, but still not a usable cache. Point the Hub cache at the same
-# persistent volume so a model pulled once survives a restart.
+# `HubSource`'s cache-root fallback (`[models] hub_cache_dir` > `HF_HOME` >
+# the home directory) would otherwise reach the home-directory arm, and the
+# nonroot user has no writable `HOME`. The same volume, so a model pulled
+# once survives a restart.
 ENV HF_HOME=/var/lib/jammi/hf
 
 USER nonroot:nonroot
 
 # ---- runtime: self-contained ----
-# Boots with zero external config and no mounted volume: the baked
-# config (`deploy/jammi.selfcontained.toml`) points `artifact_dir`
-# under `/tmp`, the only path the distroless nonroot user can write
-# without a provisioned volume. Models are named per request: a Hub
-# id is fetched on first use into `HF_HOME` below, and a deployment
-# that must serve without network builds `FROM` this stage, copies its
-# checkpoint in, and names it `local:<path>`.
-#
-# No `VOLUME` here — declaring one on a runtime that provides no
-# volume just yields an anonymous mount the deploy can't reach.
+# Boots with zero external config and no mounted volume: the baked config
+# (`deploy/jammi.selfcontained.toml`) points `artifact_dir` under `/tmp`, the
+# only path the nonroot user can write without a provisioned volume. Models
+# are named per request: a Hub id is fetched on first use into `HF_HOME`, and
+# a deployment that must serve without network builds `FROM` this stage,
+# copies its checkpoint in, and names it `local:<path>`. No `VOLUME`: on a
+# runtime that provides none, a declared volume is an anonymous mount the
+# deploy cannot reach.
 FROM runtime-base AS runtime-selfcontained
 
 COPY deploy/jammi.selfcontained.toml /etc/jammi/jammi.toml
 
-# The Hub cache lives under `/tmp` with the rest of this stage's state: like
-# `runtime-generic`, the stage provides no `HOME` for the nonroot user, and
-# `/tmp` is its only writable root (matching the baked
-# `artifact_dir = "/tmp/jammi"`).
+# Under `/tmp` with the rest of this stage's state, the one writable root.
 ENV HF_HOME=/tmp/jammi/hf
 
 USER nonroot:nonroot
 
-# Boot with no `--config` at all: `serve`'s resolution chain (`JAMMI_CONFIG`,
-# `./jammi.toml` == `/jammi.toml` under this stage's `WORKDIR /`,
-# `/etc/jammi/jammi.toml`, the platform config dir, finally the built-in
-# defaults) finds the file baked above at `/etc/jammi/jammi.toml` on its
-# third step — the same chain `runtime-generic` walks, just with one more
-# candidate present on disk. A bind-mounted `/jammi.toml`, or `JAMMI_CONFIG`
-# pointing at a mounted config file elsewhere, would each outrank it (both
-# precede `./jammi.toml` in the chain above).
+# No `--config`: `serve`'s resolution chain finds the file baked above at
+# `/etc/jammi/jammi.toml`; a bind-mounted `/jammi.toml` or `JAMMI_CONFIG`
+# outranks it.
 CMD ["serve"]
 
 # ---- runtime: cuda ----
-# GPU runtime base. `nvidia/cuda:*-runtime-ubi8` ships `libcudart` (and the rest of the
-# CUDA runtime libraries candle's cudarc backend dlopen's) on a glibc-2.28 UBI8 userland —
-# matching the manylinux_2_28 / AlmaLinux 8 lineage the CUDA CI base built the binary
-# against, so the binary's glibc symbols resolve. The `-runtime-` (not `-devel-`) image
-# carries the shared libraries without the toolkit, keeping the image lean.
-#
-# GPU access at run time requires the NVIDIA Container Toolkit on the host
-# (`docker run --gpus all …`); set `gpu.device = 0` in jammi.toml (or `JAMMI_GPU__DEVICE=0`).
-# This path is GPU-only at runtime and is NOT exercised in CI (no GPU on CI runners) — the
-# Dockerfile compiling is the CI gate; GPU inference is verified out-of-band.
-# `--platform=linux/amd64` explicit, same loud-failure rule as `builder-cuda`
-# above: the CUDA runtime base is amd64-only.
+# `nvidia/cuda:*-runtime-ubi8` ships `libcudart` and the rest of the CUDA
+# runtime libraries candle's cudarc backend dlopens, on a glibc-2.28 UBI8
+# userland — the manylinux_2_28 / AlmaLinux 8 lineage the CUDA CI image built
+# the binary against, so its glibc symbols resolve. The `-runtime-` image
+# carries the shared libraries without the toolkit. GPU access at run time
+# needs the NVIDIA Container Toolkit on the host (`docker run --gpus all`).
+# `--platform=linux/amd64` is explicit: the base is amd64 only, so an arm
+# builder fails loudly instead of emulating.
 FROM --platform=linux/amd64 nvidia/cuda:12.6.3-runtime-ubi8 AS runtime-cuda
 
-# Bring both stripped CUDA-build binaries across from the CUDA builder: the
-# long-running `jammi-server` (the entrypoint) and the strict-client `jammi` CLI
-# (admin verbs against the running server).
 COPY --from=builder-cuda /out/jammi-server /usr/local/bin/jammi-server
 COPY --from=builder-cuda /out/jammi /usr/local/bin/jammi
 
-# Health side-channel on 8080, gRPC + Flight SQL on 8081.
 EXPOSE 8080 8081
 
-# UBI8 has no pre-provisioned `nonroot` user; create one with the same uid (65532) the
-# distroless variants use so volume-ownership guidance stays identical across images.
-# Provision `/var/lib/jammi` owned by that user so zero-config `jammi-server` can
-# write its SQLite catalog there even when no volume is mounted.
+# UBI8 has no `nonroot` user; the same uid (65532) the distroless variants
+# use, so volume-ownership guidance is identical across images.
 RUN groupadd --gid 65532 nonroot \
     && useradd --uid 65532 --gid 65532 --home-dir /home/nonroot --create-home nonroot \
     && mkdir -p /var/lib/jammi /var/lib/jammi/.nv-cache \
     && chown -R 65532:65532 /var/lib/jammi
 
-# Persistent state: catalog DB, model weights, indices, and the Hugging Face
-# Hub cache (`HF_HOME`, below).
 VOLUME ["/var/lib/jammi"]
 USER 65532:65532
 
-# Point zero-config `jammi-server` at the declared volume rather than the user's
-# XDG data dir. An operator config's `artifact_dir` still wins via `--config`.
 ENV JAMMI_ARTIFACT_DIR=/var/lib/jammi
 
-# esc-096: same reasoning as `CUDA_CACHE_PATH` right below — `HOME` is unset
-# at runtime for uid 65532 here despite `useradd --create-home` having
-# provisioned one at image-build time, so `HubSource`'s `directories::BaseDirs`
-# fallback would resolve nothing. Point the Hub cache at the same persistent
-# volume so a model pulled once survives a restart.
+# `HOME` is unset at run time for uid 65532 despite `--create-home`, so
+# `HubSource`'s home-directory fallback resolves nothing: the same volume.
 ENV HF_HOME=/var/lib/jammi/hf
 
-# Persist the CUDA JIT (PTX→SASS) compute cache on the data volume. The image
-# ships single-arch PTX at CUDA_COMPUTE_CAP=80, so on an sm_80 device it loads
-# natively, but on 8.6/8.9/9.0 the driver JIT-compiles the PTX at first model
-# load. The container runs as uid 65532 whose default cache dir (`$HOME/.nv`) is
-# not writable here (HOME is unset, so it resolves under `/`), which would silently
-# disable the cache and re-JIT on every start. Pointing it at the writable,
-# persistent volume amortizes the one-time JIT across restarts.
+# The CUDA JIT (PTX→SASS) cache on the data volume: the image ships
+# single-arch PTX at CUDA_COMPUTE_CAP=80, so on 8.6/8.9/9.0 the driver JITs it
+# at first model load, and uid 65532's default cache dir (`$HOME/.nv`) is not
+# writable here. The volume amortises the JIT across restarts.
 ENV CUDA_CACHE_PATH=/var/lib/jammi/.nv-cache
 
-# Turnkey: `docker run --gpus all <image>` runs `jammi-server serve` with zero
-# config (local SQLite catalog, in-memory broker, all tiers; GPU via the cuda
-# build) — same resolution chain and `WORKDIR /` as the CPU variants above.
-# `docker run --gpus all <image> --config /etc/jammi/jammi.toml` overrides it.
 WORKDIR /
 ENTRYPOINT ["/usr/local/bin/jammi-server"]
 CMD ["serve"]
 
 # ---- final ----
-# Resolve the variant chosen by the global `RUNTIME_VARIANT` arg at the top of this file
-# (`--build-arg RUNTIME_VARIANT=runtime-selfcontained` to bake the standalone config;
-#  `--build-arg RUNTIME_VARIANT=runtime-cuda` for the GPU server image).
 FROM ${RUNTIME_VARIANT}

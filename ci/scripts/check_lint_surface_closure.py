@@ -59,10 +59,10 @@ warm local registry cache already provides, no build)
    the two halves agree — every `cargo clippy ... -D warnings` line in
    the merge-path corpus is hosted by `ci.yml`, whose `pull_request:
    branches: [main]` trigger carries no `paths:` filter at all. That
-   premise is about the CORPUS, never about the repo: `crates.yml:56`
-   carries a `cargo clippy --workspace --all-targets -- -D warnings` line
-   too, and it is absent from the corpus because that workflow is
-   `push:`-tags/`workflow_dispatch`-only and so never merge-path at all.
+   premise is about the CORPUS, never about the repo: a `cargo clippy
+   --workspace --all-targets -- -D warnings` line in a `push:`-tags or
+   `workflow_dispatch`-only workflow would be absent from the corpus, since
+   that workflow is never merge-path at all.
 3. Every `cargo clippy ... -D warnings` (or `--deny warnings`) line in that
    corpus is parsed (`parse_clippy_lane`) into its crate scope
    (`-p`/`--workspace`/`--exclude`), its feature selection

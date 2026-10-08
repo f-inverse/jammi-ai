@@ -160,9 +160,8 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      # The real tags, the commit tag first: the immutable one the merge
-      # re-reads and attests. `latest=false`: the moving tag is the policy's
-      # own `raw` entry, never metadata-action's default.
+      # `latest=false`: the moving tag is the policy's own `raw` entry, never
+      # metadata-action's default.
       - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         id: meta
         with:
@@ -170,15 +169,21 @@ jobs:
           flavor: latest=false
           tags: ${{ steps.variant.outputs.tags }}
 
-      # The commit tag metadata-action resolved, with each arch's suffix.
-      - name: The per-arch sources
-        id: sources
+      # The commit tag first — the immutable one the merge re-reads and
+      # attests — then every other tag; its per-arch legs are the sources.
+      - name: The merge's tags and its per-arch sources
+        id: merge
         env:
+          VARIANT: ${{ matrix.variant }}
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          immutable="$(head -n1 <<< "$TAGS")"
+          immutable="$IMAGE:$(bash ci/scripts/image_tags.sh "$VARIANT" --commit-tag "$GITHUB_SHA")"
           {
+            echo "tags<<EOF"
+            echo "$immutable"
+            grep -vx -- "$immutable" <<< "$TAGS"
+            echo "EOF"
             echo "sources<<EOF"
             echo "${immutable}-amd64"
             echo "${immutable}-arm64"
@@ -189,8 +194,8 @@ jobs:
         with:
           image: ${{ env.IMAGE }}
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          sources: ${{ steps.sources.outputs.sources }}
+          tags: ${{ steps.merge.outputs.tags }}
+          sources: ${{ steps.merge.outputs.sources }}
           attest: "true"
 
   push-cu12:

@@ -32,12 +32,13 @@ D1="sha256:$(printf '1%.0s' {1..64})"; D2="sha256:$(printf '2%.0s' {1..64})"
 fails=0
 check() { if [ "$1" = "$2" ]; then echo "ok   $3"; else echo "FAIL $3: expected [$1] got [$2]"; fails=$((fails+1)); fi; }
 reset() { rm -f "$STUB_DIR"/digest.* "$STUB_DIR"/inspect-broken "$STUB_DIR"/create-fails "$STUB_DIR"/index-after.json "$STUB_LOG"; echo "$good" > "$STUB_DIR/index.json"; }
-run() { set +e; out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?; set -e; }
+# One invocation: stdout alone in $stdout, both streams in $out.
+run() { set +e; stdout="$(bash "$SCRIPT" "$@" 2>"$work/stderr")"; rc=$?; set -e; out="$stdout"$'\n'"$(cat "$work/stderr")"; }
 
 reset; echo "$D1" > "$STUB_DIR/digest.img_sha"; echo "$D2" > "$STUB_DIR/digest.img_latest"
 run --platforms linux/amd64,linux/arm64 --tag img:sha --tag img:latest -- img:sha-amd64 img:sha-arm64
 check 0 "$rc" "a good merge succeeds"
-check "digest=$D1" "$(tail -n1 <<<"$out")" "prints the immutable tag's digest"
+check "digest=$D1" "$stdout" "stdout is exactly the immutable tag's digest line (GITHUB_OUTPUT takes nothing else)"
 check "$(printf '%s\n' dry create)" "$(grep -o 'create --dry-run\|create -t' "$STUB_LOG" | sed 's/create --dry-run/dry/; s/create -t/create/' | uniq)" "dry-runs before it creates"
 
 reset; echo "$one_arch" > "$STUB_DIR/index.json"

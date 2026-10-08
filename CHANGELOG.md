@@ -48,9 +48,10 @@ no compatibility arms, no advisory lanes, logic in tested scripts rather than YA
   commit. The consumer-name guard is a guard in `ci/guards.toml`; the smokes run the digest-pinned
   Postgres under the deploy files' own name, which `ci_image.py check` holds.
 
-Releasing after this change: register the PyPI trusted publisher of `jammi-ai`,
-`jammi-ai-native-cu12`, `jammi-server` and `jammi-server-cu12` to the workflow `pypi.yml`
-(environment `pypi`), where `jammi-ai-native`'s already is.
+Releasing after this change: PyPI's token exchange matches the publishing workflow's filename,
+and four projects (`jammi-ai`, `jammi-ai-native-cu12`, `jammi-server`, `jammi-server-cu12`) last
+published from files this change removes. Before the next `py-v*` tag, a project owner confirms on
+pypi.org that each lists the publisher `pypi.yml`, environment `pypi`, and adds it where missing.
 
 The cookbook runs real models. A newcomer who opened the quickstart asked "how does quantum
 computing work?" and got back a paper on chiral amines, because every recipe and chapter ran a

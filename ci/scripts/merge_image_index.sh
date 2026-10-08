@@ -11,8 +11,9 @@
 #     --tag IMAGE:TAG [--tag IMAGE:TAG ...] -- SOURCE...
 #
 # The first `--tag` is the immutable one (a content or commit tag): it is the
-# tag re-read after the push, and the digest printed as `digest=<sha256>` for
-# `$GITHUB_OUTPUT` is the one it resolves to.
+# tag re-read after the push, and the digest it resolves to is the one line
+# on stdout, `digest=<sha256>`, for `$GITHUB_OUTPUT`; every other line is
+# progress, on stderr.
 #
 # Failure arms, each named:
 #   - the dry-run index's platform set differs from --platforms: nothing pushed;
@@ -41,7 +42,7 @@ check="$(dirname "${BASH_SOURCE[0]}")/check_merged_index_platforms.sh"
 tag_args=()
 for t in "${tags[@]}"; do tag_args+=(-t "$t"); done
 
-docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" | bash "$check" "$platforms"
+docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" | bash "$check" "$platforms" >&2
 
 # A digest, or empty for a tag that does not exist yet; any other failure
 # refuses the promotion.
@@ -68,10 +69,10 @@ previous_digest() {
 declare -A previous
 for t in "${tags[@]}"; do
   previous["$t"]="$(previous_digest "$t")"
-  if [ -z "${previous[$t]}" ]; then echo "$t: first publish"; else echo "$t: currently ${previous[$t]}"; fi
+  if [ -z "${previous[$t]}" ]; then echo "$t: first publish" >&2; else echo "$t: currently ${previous[$t]}" >&2; fi
 done
 
-docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
+docker buildx imagetools create "${tag_args[@]}" "${sources[@]}" >&2
 
 immutable="${tags[0]}"
 set +e
@@ -84,7 +85,7 @@ if [ "$rc" -ne 0 ]; then
 fi
 [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
   || { echo "::error::$immutable re-read as '$digest', not a digest -- whether the merge landed is unknown; verify by hand" >&2; exit 1; }
-if ! docker buildx imagetools inspect "$immutable" --format '{{json .Manifest}}' | bash "$check" "$platforms"; then
+if ! docker buildx imagetools inspect "$immutable" --format '{{json .Manifest}}' | bash "$check" "$platforms" >&2; then
   echo "::error::the pushed index under $immutable is wrong; restore each tag to its own previous digest:" >&2
   for t in "${tags[@]}"; do
     if [ -n "${previous[$t]}" ]; then

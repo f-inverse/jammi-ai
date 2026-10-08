@@ -97,6 +97,23 @@ provide() {
       at_pin "$v" cargo-build-graph build-graph --version && return
       cargo install build-graph --version "$v" --locked
       ;;
+    # The linker `.cargo/config.toml` names for every Linux target; its
+    # `bin/` and `lib/` unpack under /usr/local as the release lays them out.
+    mold)
+      v=2.35.1
+      at_pin "$v" mold --version && return
+      declare -A sum=(
+        [amd64]=e58ff420ba4b034222a3519227a142a1aef4915f6feea1ecc42006d1e0b85111
+        [arm64]=4d06acf1d7f92a495c0bea0cbdb3a827ee65b004771cab3cf8a7acc280f80c13
+      )
+      declare -A machine=([amd64]=x86_64 [arm64]=aarch64)
+      local tmp
+      tmp="$(mktemp -d)"
+      curl -fsSL "https://github.com/rui314/mold/releases/download/v${v}/mold-${v}-${machine[$arch]}-linux.tar.gz" -o "$tmp/mold.tar.gz"
+      echo "${sum[$arch]}  $tmp/mold.tar.gz" | sha256sum -c --quiet -
+      tar -xzf "$tmp/mold.tar.gz" --strip-components=1 -C /usr/local
+      rm -rf "$tmp"
+      ;;
     *) echo "no pin for tool '$1'" >&2; exit 1 ;;
   esac
 }

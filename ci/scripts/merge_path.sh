@@ -12,14 +12,11 @@
 #   guards   the guards this change can affect (`ci/guards.toml`) and the
 #            script tests it can affect, through the same runners ci.yml's
 #            `guard` job calls
-#   index    ci.yml's `symbol-index-gates` steps (the guards that build a
-#            workspace crate), each step's `run:` block executed WHOLE (a
-#            multi-line guard split into lines is never evaluated)
 #   tests    the hermetic suite under nextest and its doctests (ci.yml
 #            `test-build` + `test`, which split the same suite across
-#            runners), the permission-fault lane, the storage-cloud and
-#            golden-parity lanes, and the Postgres lane (ci.yml
-#            `test-permission-fault`, `test-lanes`, `test-pg`)
+#            runners), the permission-fault lane, the opt-in feature lanes
+#            and the Postgres lane (ci.yml `test-permission-fault`,
+#            `test-opt-in`, `test-pg`)
 #
 # Refuses to run when HEAD is the base (nothing to check — every diff-scoped
 # gate would be vacuously green) or the tree is dirty (the gates read
@@ -156,7 +153,7 @@ PY
 # ---------------------------------------------------------------- coverage
 # Which ci.yml jobs this runner covers, printed up front so "green" is never
 # read as "every job".
-COVERED_JOBS="check clippy-gated docs test-build test test-permission-fault test-lanes test-pg guard symbol-index-gates"
+COVERED_JOBS="check clippy-gated docs test-build test test-permission-fault test-opt-in test-pg guard"
 python3 - "$COVERED_JOBS" <<'PY'
 import sys, yaml
 ci = yaml.safe_load(open('.github/workflows/ci.yml'))
@@ -196,31 +193,6 @@ if stage_wanted guards; then
   run guards "run_script_tests.py --base $BASE_REF" python3 ci/scripts/run_script_tests.py --base "$BASE_SHA"
 fi
 
-# ---------------------------------------------------------------- index
-if stage_wanted index; then
-  INDEX_DIR="$LOG_DIR/index-steps"
-  rm -rf "$INDEX_DIR"; mkdir -p "$INDEX_DIR"
-  python3 - "$INDEX_DIR" <<'PY'
-import os, sys, yaml
-ci = yaml.safe_load(open('.github/workflows/ci.yml'))
-n = 0
-for st in ci['jobs']['symbol-index-gates'].get('steps', []):
-    run = st.get('run')
-    if not run:
-        continue
-    n += 1
-    with open(os.path.join(sys.argv[1], f"{n:02d}.step"), 'w') as out:
-        out.write((st.get('name') or run.strip().split('\n')[0]) + '\n')
-        out.write(run)
-print(f"merge_path: {n} steps read from ci.yml symbol-index-gates (each run as one block)")
-PY
-  for step in "$INDEX_DIR"/*.step; do
-    name="$(head -n1 "$step")"
-    body="$(tail -n +2 "$step")"
-    run_sh index "$name" "$body"
-  done
-fi
-
 # ---------------------------------------------------------------- tests
 if stage_wanted tests && [ "$SKIP_TESTS" = 0 ]; then
   # CI archives this suite once and runs it in partitions; here it is one run.
@@ -228,12 +200,11 @@ if stage_wanted tests && [ "$SKIP_TESTS" = 0 ]; then
     cargo nextest run --profile ci --workspace --exclude jammi-python
   run_sh tests "doctests" "$(ci_step test-build 'Doctests')"
   run_sh tests "storage-cloud lane" \
-    "$(ci_step test-lanes 'Run tests (storage-cloud lane — root-identity determinants)')"
+    "$(ci_step test-opt-in 'Run tests (storage-cloud lane — root-identity determinants)')"
   run_sh tests "jammi-encoders golden-parity" \
-    "$(ci_step test-lanes 'Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)')"
-  printf 'skip  [tests] build-sha hermeticity (CI only: it commits to the checkout)\n'
-  run_sh tests "permission-fault tests (unprivileged account)" \
-    "$(ci_step test-permission-fault 'Permission-fault tests (unprivileged account)')"
+    "$(ci_step test-opt-in 'Test jammi-encoders --features golden-parity (CPU-only, PyTorch reference committed)')"
+  printf 'skip  [tests] build-sha oracle (CI only: it commits to the checkout)\n'
+  run tests "permission-fault tests (unprivileged account)" bash ci/scripts/run_permission_fault_tests.sh
   if [ -n "${JAMMI_TEST_PG_URL:-}" ]; then
     run_sh tests "Postgres lane" "$(ci_step test-pg 'Run Postgres tests')"
   elif [ "$SKIP_PG" = 1 ]; then

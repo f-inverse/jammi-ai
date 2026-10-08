@@ -25,16 +25,14 @@ FROM --platform=linux/amd64 ${BASE_IMAGE}
 # above carries both halves, so they ride in the SAME `dnf install` call under
 # the same `install_weak_deps=False` discipline as the toolkit.
 #
-# Those link surfaces, exactly — only ONE of the three is a docker build:
+# Those link surfaces, exactly:
 #   * `_server.yml` builds the `server-cu12` binary with this image as its
 #     job `container:`, linking DIRECTLY inside it with `cargo build --release
-#     -p jammi-server` — for `ci.yml` on every change, and for
-#     `pypi-server-cuda.yml` and `release-binaries.yml` at a release.
+#     -p jammi-server` — on every change; `pypi.yml`, `release-binaries.yml`
+#     and `server-image.yml` promote that build at a release (the CUDA image
+#     packages the binary and links nothing).
 #   * `_native-wheel-cu12.yml` builds the CUDA native wheel the same way,
 #     through `ci/scripts/build_native_cu12_wheel.sh`.
-#   * `server-image.yml`'s release leg builds through the top-level
-#     `Dockerfile`'s `builder-cuda` stage with `docker buildx`; that stage's
-#     own `FROM` is this image.
 # The RunPod GPU lanes run this same image as well (`ci/scripts/runpod_lib.sh`'s
 # `RP_IMAGE`, the tree's CUDA CI image), so the pod-side link surface is
 # covered by this same rebuild.

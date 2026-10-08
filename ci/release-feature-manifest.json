@@ -13,18 +13,23 @@
     "therefore cannot ship different features; a lane whose features must",
     "differ needs a build of its own.",
     "",
-    "Every compile site reads `.builds.<build>.cargo_features` with `jq`",
-    "rather than carrying a copy: `.github/workflows/_server.yml` for the",
-    "server binaries, and the Dockerfile's builder stages through their",
-    "`CARGO_FEATURES` argument. Each native wheel's `pyproject.toml` must",
-    "list exactly its build's features",
-    "(`crates/jammi-db/tests/it/shipped_feature_exposure.rs`).",
+    "The one compile site, `.github/workflows/_server.yml`, reads",
+    "`.builds.<build>.cargo_features` with `jq` rather than carrying a copy; a",
+    "container image packages the binary that site built and compiles",
+    "nothing. Each native wheel's `pyproject.toml` must list exactly its",
+    "build's features (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`).",
     "`ci/scripts/check_flash_attn_closure.py` asserts, for every build that",
     "carries `capabilities`, that `capabilities.flash_compiled` matches",
     "whether its `cargo_features` reach `jammi-kernels/flash-attn` in the",
     "workspace feature graph. `ci/scripts/runpod_gpu_prove.sh` compiles with",
     "the `server-cu12` list and derives the `jammi-ai`-applicable subset by",
     "subtracting `server_only_cargo_features`.",
+    "",
+    "`wheel_verifies_link_set` states, per server build, whether its wheel's",
+    "runtime link set is verified against the wheel's dependency wheels",
+    "(`packaging/<build>/verify_link_set.py`): true where the libraries arrive",
+    "as dependency wheels, false where the binary links only what manylinux",
+    "promises.",
     "",
     "Adding a shipped artifact is a lane naming its build; adding a build is",
     "an entry under `builds` and the lanes that package it.",
@@ -34,7 +39,7 @@
     "`capabilities.fused_op_admission` vs `capabilities.internal_subkernels`:",
     "these are TWO DIFFERENT PROOF MECHANISMS, not one list split by",
     "convenience, and they are the ONLY two a capability block may carry.",
-    "Every op named across them appears in EXACTLY ONE — `ci/scripts/",
+    "Every op named across them appears in EXACTLY ONE \u2014 `ci/scripts/",
     "check_release_manifest.py` enforces that, that neither category is",
     "present but EMPTY, that no capability key outside the closed set below",
     "appears at all, and that every build's `capabilities` block is identical",
@@ -45,17 +50,17 @@
     "`fused_op_admission` is ONLY ops",
     "`crates/jammi-ai/tests/gpu_capability/capability_surface.rs` can attribute",
     "to a real `jammi_kernels::admission::{admit,admit_cascade}` dispatch-",
-    "registry key — that test reads THIS key (via `capabilities.",
+    "registry key \u2014 that test reads THIS key (via `capabilities.",
     "fused_op_admission`) and, for each op it maps, asserts a real",
     "registry-counter DELTA around a live forward + backward + optimizer step",
-    "on a real CUDA device — a Fused dispatch that genuinely fired, not a",
+    "on a real CUDA device \u2014 a Fused dispatch that genuinely fired, not a",
     "completed-run inference. Two entries (`softmax`, `rope`) are structurally",
     "UNREACHABLE under `JAMMI_KERNELS_STRICT=1` through ModernBERT's attention",
-    "path once `attention_block_fused` admits — see that test's own",
-    "`STRICT_UNREACHABLE_OPS` doc — so the test logs them informationally",
+    "path once `attention_block_fused` admits \u2014 see that test's own",
+    "`STRICT_UNREACHABLE_OPS` doc \u2014 so the test logs them informationally",
     "rather than asserting `Holds`; they stay listed here (removing them would",
     "misrepresent them as never covered by fused-kernel authoring, which is",
-    "false — they DO have real registry keys, just not an independently",
+    "false \u2014 they DO have real registry keys, just not an independently",
     "provable Strict-mode run through this attention path) but a manifest",
     "consumer must not read every `fused_op_admission` entry as \"asserted",
     "Holds\" without also reading that test's own per-op caveats.",
@@ -72,23 +77,23 @@
     "fails loudly instead of going silently unprobed. `adamw_step` is the",
     "optimizer-step member of this category: it admits under",
     "`adamw_step_fused` (`crates/jammi-ai/src/fine_tune/adamw.rs`'s `admit`",
-    "call), F32 ONLY — proven by the `capability_surface` probe's own real",
+    "call), F32 ONLY \u2014 proven by the `capability_surface` probe's own real",
     "optimizer step, which is exactly why that probe runs backward + one AdamW",
     "step rather than a forward alone.",
     "",
     "`internal_subkernels` is the DIFFERENT mechanism: an op with real CUDA",
     "kernels and dispatch arms that is launched DIRECTLY by an admitted PARENT",
-    "op and has no `admit()`/`admit_cascade()` call of its own —",
+    "op and has no `admit()`/`admit_cascade()` call of its own \u2014",
     "`rope_positions` (launched bare as `crate::cuda::rope_positions::cuda_fwd`",
     "from the flash-attention op) and `scaled_cast_add` (constructed bare as",
     "`ScaledCastAdd::new` in `low_rank_residual_linear`'s epilogue). Each entry",
-    "names its `parent` and its `launch_site` — by FILE, never a line number,",
+    "names its `parent` and its `launch_site` \u2014 by FILE, never a line number,",
     "so the citation does not rot on an unrelated edit. Such an op is proven by",
     "(1) compiling in this build and (2) its PARENT's admitted dispatch",
     "being OBSERVED: a registry delta on the parent's key under",
     "`JAMMI_KERNELS_STRICT=1` in the `capability_surface` probe. The parent",
     "cannot have dispatched Fused without running the sub-kernel it launches",
-    "unconditionally. NEVER by a counter of its own — there is none. A",
+    "unconditionally. NEVER by a counter of its own \u2014 there is none. A",
     "consumer must therefore read an entry here as neither \"unreachable\" NOR",
     "\"independently admitted\": it is reached exactly when its parent is, and",
     "carries no admission decision of its own to report. `parent` names the",
@@ -103,8 +108,8 @@
     "\"it compiled\", which is not a capability a consumer can act on, and a",
     "category holding exactly that is an empty proof slot the next unwired",
     "kernel gets filed into instead of being decided. Such a kernel is either",
-    "WIRED — given a real dispatch site, which lands it in",
-    "`fused_op_admission` — or DELETED, in the same unit as its authoring. The",
+    "WIRED \u2014 given a real dispatch site, which lands it in",
+    "`fused_op_admission` \u2014 or DELETED, in the same unit as its authoring. The",
     "decision is a measurement against a threshold fixed BEFORE the numbers are",
     "seen, not a judgement call at review time; see `crates/jammi-kernels/",
     "artifacts/cuda-runs/2026-09-01-axpy-census-bdeb80c-a100-pcie.json` for the",
@@ -129,9 +134,7 @@
     "block by rule. `crates/jammi-db/tests/it/shipped_feature_exposure.rs`",
     "covers the rest: every shipped family is a lane, each native wheel's",
     "`pyproject.toml` builds exactly its build's features, the generated",
-    "`deny.toml` exposure line, and the Dockerfile arm (both `ARG",
-    "CARGO_FEATURES` declarations carry no default, and each builder stage's",
-    "`RUN` carries the `${CARGO_FEATURES:?...}` required-argument guard)."
+    "`deny.toml` exposure line."
   ],
   "builds": {
     "server-cpu": {
@@ -141,7 +144,8 @@
         "mysql",
         "postgres",
         "storage-cloud"
-      ]
+      ],
+      "wheel_verifies_link_set": false
     },
     "server-cu12": {
       "_doc": "The CUDA `jammi-server` binary (x86_64 Linux). The CUDA tarball, PyPI wheel and container image each package it.",
@@ -185,7 +189,8 @@
             "launch_site": "crates/jammi-kernels/src/ops/low_rank_residual_linear.rs"
           }
         }
-      }
+      },
+      "wheel_verifies_link_set": true
     },
     "native-cpu": {
       "_doc": "The embedded CPU engine (`jammi-python`), built by maturin from `packaging/native/pyproject.toml`, whose `[tool.maturin] features` beyond `extension-module` must equal this list (`crates/jammi-db/tests/it/shipped_feature_exposure.rs`). Linux x86_64/aarch64 and macOS.",
@@ -245,32 +250,32 @@
     "cu12-tarball": {
       "_doc": "The self-contained CUDA `jammi-server` tarball: the binary, the CUDA runtime `.so`s it links, and an `LD_LIBRARY_PATH` launcher.",
       "build": "server-cu12",
-      "workflow": ".github/workflows/release-binaries.yml:server-cu12-promote, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/release-binaries.yml:promote, built by .github/workflows/_server.yml"
     },
     "cu12-wheel": {
       "_doc": "The `jammi-server-cu12` PyPI wheel.",
       "build": "server-cu12",
-      "workflow": ".github/workflows/pypi-server-cuda.yml:publish, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_server.yml"
     },
     "cu12-image": {
       "_doc": "The `jammi-ai-server-cu12` container image (the Dockerfile's `runtime-cuda` stage).",
       "build": "server-cu12",
-      "workflow": ".github/workflows/server-image.yml:build-and-push-cu12, packaging the binary .github/workflows/_server.yml builds"
+      "workflow": ".github/workflows/server-image.yml:push-cu12, packaging the binary .github/workflows/_server.yml builds"
     },
     "cpu-tarball": {
       "_doc": "The CPU `jammi-server` tarball, x86_64 and aarch64 Linux.",
       "build": "server-cpu",
-      "workflow": ".github/workflows/release-binaries.yml:server-cpu-promote, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/release-binaries.yml:promote, built by .github/workflows/_server.yml"
     },
     "cpu-wheel": {
       "_doc": "The `jammi-server` PyPI wheel (CPU), x86_64 and aarch64.",
       "build": "server-cpu",
-      "workflow": ".github/workflows/pypi-server.yml:publish, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_server.yml"
     },
     "cpu-image": {
-      "_doc": "The `jammi-ai-server` container image (the Dockerfile's `runtime-generic`/`runtime-selfcontained` stages).",
+      "_doc": "The `jammi-ai-server` container image, its `generic` and `selfcontained` variants (the Dockerfile's `runtime-generic`/`runtime-selfcontained` stages).",
       "build": "server-cpu",
-      "workflow": ".github/workflows/server-image.yml:build-and-push, packaging the binary .github/workflows/_server.yml builds; the image smokes .github/workflows/kube-smoke.yml and .github/workflows/compose-smoke.yml build the same image"
+      "workflow": ".github/workflows/server-image.yml:push-cpu, packaging the binary .github/workflows/_server.yml builds; the image smokes .github/workflows/kube-smoke.yml and .github/workflows/compose-smoke.yml package the same binary"
     },
     "native-cpu-wheel": {
       "_doc": "The `jammi-ai-native` PyPI wheel (the embedded CPU engine).",
@@ -280,7 +285,7 @@
     "native-cu12-wheel": {
       "_doc": "The `jammi-ai-native-cu12` PyPI wheel (the embedded CUDA engine).",
       "build": "native-cu12",
-      "workflow": ".github/workflows/pypi-native-cuda.yml:publish, built by .github/workflows/_native-wheel-cu12.yml"
+      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_native-wheel-cu12.yml"
     }
   },
   "server_only_cargo_features": {
@@ -311,8 +316,8 @@
       "test` invocation with NO `--features` flag at all -- canonicalizes to an",
       "empty feature list). `ci/scripts/prove_surface.py` computes, for a",
       "declared pair, `expected(crate, kind) = (this file's own",
-      "`builds.server-cu12.cargo_features` ∩ crate's OWN `[features]` table",
-      "keys) ∪ (this entry's `prove_only`, iff kind == test)` -- read",
+      "`builds.server-cu12.cargo_features` \u2229 crate's OWN `[features]` table",
+      "keys) \u222a (this entry's `prove_only`, iff kind == test)` -- read",
       "hermetically via stdlib `tomllib`, never a second hardcoded copy of a",
       "crate's feature list. `check_flash_attn_closure.py` asserts SET EQUALITY",
       "between THIS declared pair set and the script's own invocations (one",

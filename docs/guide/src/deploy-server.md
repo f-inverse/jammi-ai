@@ -540,15 +540,18 @@ The OSS server ships as two public Docker images on GHCR:
 - `ghcr.io/f-inverse/jammi-ai-server` — **CPU**, built from a distroless base.
 - `ghcr.io/f-inverse/jammi-ai-server-cu12` — **CUDA**, for GPU-accelerated inference (see [GPU serving](#gpu-serving)).
 
-The generic CPU tags (`:latest`, `:X.Y.Z`, `:X.Y`, and their `sha-<sha>`
-equivalents) are multi-arch image indexes: `linux/amd64` and `linux/arm64`,
-so `docker pull`/`docker run` resolves the right member for the host's
-architecture automatically. The self-contained CPU tags
-(`:selfcontained`, `:selfcontained-sha-<sha>`) and the CUDA (`-cu12`) tags
-are `linux/amd64` only, pushed under the same CPU image name in the
-self-contained case.
+Every image is published by a `v*` release tag and by nothing else, under
+one tag scheme: `:X.Y.Z`, `:X.Y`, `:sha-<sha>`, and `:latest`, which is the
+newest release. The CPU image ships two variants of the same binary: the
+generic tags above, and the self-contained tags (`:selfcontained`,
+`:selfcontained-X.Y.Z`, `:selfcontained-X.Y`, `:selfcontained-sha-<sha>`),
+which bake a config so the server boots on a runtime that provides neither a
+config nor a volume. Both CPU variants are multi-arch image indexes,
+`linux/amd64` and `linux/arm64`, so `docker pull`/`docker run` resolves the
+right member for the host's architecture; the CUDA (`-cu12`) tags are
+`linux/amd64` only.
 
-Both run as the nonroot user (uid `65532`), expose the same `8080` / `8081` ports the local binary listens on, and share the same tag scheme (`:latest`, `:X.Y.Z`, `:X.Y`). Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image, and bind both published ports to `127.0.0.1`: the server itself performs no authentication (see [The identity seam](#the-identity-seam)), so publishing to every interface would expose an unauthenticated admin surface to the host's whole network — a terminator or reverse proxy that itself binds a public interface is what a deployment fronts these loopback-bound ports with.
+Both images run as the nonroot user (uid `65532`) and expose the same `8080` / `8081` ports the local binary listens on. The image entrypoint is `jammi-server`, so `docker run <image>` brings up the server with **zero config** — a local SQLite catalog, the in-memory broker, and every service tier, no TOML required. The `jammi` admin CLI also ships in the image for running verbs against the server. The examples below use the CPU image, and bind both published ports to `127.0.0.1`: the server itself performs no authentication (see [The identity seam](#the-identity-seam)), so publishing to every interface would expose an unauthenticated admin surface to the host's whole network — a terminator or reverse proxy that itself binds a public interface is what a deployment fronts these loopback-bound ports with.
 
 ```bash
 # Turnkey: zero config, no TOML.
@@ -601,7 +604,7 @@ catalog and broker.
 
 ### GPU serving
 
-The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. Both `:latest` tags are re-pointed by every `v*` release tag (never by a prerelease); the CPU `:latest` can additionally be re-pointed to the current `main` by a manual `build-and-push-main` dispatch — pin an exact `:X.Y.Z` tag for a reproducible GPU-node deploy:
+The `jammi-ai-server-cu12` image builds with candle's CUDA backend on an NVIDIA CUDA 12.6 runtime base, so `libcudart` and the rest of the CUDA runtime libraries are present in the image. It carries the same turnkey `jammi` CLI as the CPU image. Run it on a host with the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/) and pass `--gpus all`. `:latest` is the newest release; pin an exact `:X.Y.Z` tag for a reproducible GPU-node deploy:
 
 ```bash
 # Turnkey: zero config, GPU inference.
@@ -629,30 +632,43 @@ Set `gpu.device = 0` in `jammi.toml` (or `JAMMI_GPU__DEVICE=0`) to select the CU
 
 The CPU image ignores GPU config and runs inference on the CPU.
 
-### Building from source
+### Building an image yourself
 
-The Dockerfile lives at the workspace root and uses BuildKit cache mounts for the cargo registry and target directory. The cargo features a build compiles in are required, never defaulted; the published images use the release manifest's lists:
+The Dockerfile at the workspace root packages binaries; it compiles nothing.
+There is one definition of how a `jammi-server` binary is compiled — the
+`_server.yml` workflow, in the CI image, with the cargo features
+`ci/release-feature-manifest.json` lists for the build — and a published
+image packages the binary the CI run that proved the release built. To build
+an image from your own checkout, compile the same way, in the CI image
+(`ci/dev.sh` runs it on any host with Docker, and the manylinux_2_28 floor it
+links is what the runtime images promise), lay the binaries out as the
+`builder` build context, and point the Dockerfile at it:
 
 ```bash
-# CPU image (default).
-DOCKER_BUILDKIT=1 docker build -t jammi-ai-server:dev -f Dockerfile \
-  --build-arg CARGO_FEATURES="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)" .
+# The CPU binaries, with the manifest's feature list.
+features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
+ci/dev.sh cargo build --release -p jammi-server --bin jammi-server --features "$features"
+ci/dev.sh cargo build --release -p jammi-cli --bin jammi
 
-# CUDA image — selected by the RUNTIME_VARIANT build-arg.
-DOCKER_BUILDKIT=1 docker build -t jammi-ai-server-cu12:dev -f Dockerfile \
-  --build-arg RUNTIME_VARIANT=runtime-cuda \
-  --build-arg CARGO_FEATURES="$(jq -r '.builds["server-cu12"].cargo_features | join(",")' ci/release-feature-manifest.json)" .
+# The builder context: `<dir>/out/jammi-server`, `<dir>/out/jammi`, and (CPU
+# images) an empty `<dir>/out/jammi-data/`.
+mkdir -p /tmp/builder/out/jammi-data
+cp target/release/jammi-server target/release/jammi /tmp/builder/out/
+
+# The CPU image (default), or the self-contained variant.
+docker build -t jammi-ai-server:dev --build-context builder=/tmp/builder .
+docker build -t jammi-ai-server:dev-selfcontained --build-arg RUNTIME_VARIANT=runtime-selfcontained --build-context builder=/tmp/builder .
+
+# The CUDA image: the `server-cu12` build, compiled in the CUDA CI image
+# (`ci/dev.sh` with `JAMMI_CI_IMAGE` naming it), as the `builder-cuda` context.
+docker build -t jammi-ai-server-cu12:dev --build-arg RUNTIME_VARIANT=runtime-cuda --build-context builder-cuda=/tmp/builder-cuda .
 ```
-
-Cold builds take ~30 minutes (the workspace is large); warm builds with cache hits land at ~3 minutes. The CUDA build additionally compiles candle's CUDA kernels, so its cold build is longer.
-
-To package binaries you have already built, replace the builder stage with a directory holding them: `<dir>/out/jammi-server`, `<dir>/out/jammi`, and (for the CPU images) an empty `<dir>/out/jammi-data/`, then pass `--build-context builder=<dir>` (`builder-cuda=<dir>` for the CUDA image) and no `CARGO_FEATURES`. This is how the published images are made: they package the binaries the CI run that proved the release built.
 
 ### Supply chain: SBOM, provenance, attestations
 
-Every image `server-image.yml` pushes to GHCR — the CPU `:latest` / `:X.Y.Z`
-tags, the CUDA `-cu12` tags, and the dispatch-only `:selfcontained` build —
-carries a `docker/build-push-action` SPDX SBOM and `mode=max` build
+Every image `server-image.yml` pushes to GHCR — each CPU variant's per-arch
+legs and their merged indexes, and the CUDA `-cu12` image — carries a
+`docker/build-push-action` SPDX SBOM and `mode=max` build
 provenance attached to the image manifest, plus a Sigstore-signed
 [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
 attestation published to the repository's attestation store for the exact
@@ -664,8 +680,9 @@ gh attestation verify oci://ghcr.io/f-inverse/jammi-ai-server@sha256:<digest> \
   --repo f-inverse/jammi-ai
 ```
 
-CI checks both of these, in two separate steps, on every push job:
-`ci/scripts/assert_image_attestations.sh` asserts (via `docker buildx
+CI checks both of these on every push and every merge, before the job is
+green (the `attest-image` action, which every published digest goes
+through): `ci/scripts/assert_image_attestations.sh` asserts (via `docker buildx
 imagetools inspect`) that the pushed digest's own OCI index carries BOTH a
 non-empty SBOM and a non-empty provenance attestation manifest; a positively
 empty accessor fails the job immediately rather than falling back to a
@@ -676,9 +693,8 @@ manifest list, `linux/amd64` + `linux/arm64`) requires the per-platform map,
 its key set checked for exact equality against the index's platform set, so
 an attestation covering only one of the merged legs — the other landed
 unattested — fails the job by name, rather than passing because *some*
-platform was attested. A single-platform push (the CUDA `-cu12` tags, the
-dispatch-only `:selfcontained` build, and each per-arch `sha-<sha>-<arch>`
-leg before it is merged) instead requires the FLAT predicate object buildx
+platform was attested. A single-platform push (the CUDA `-cu12` tags, and
+each per-arch `sha-<sha>-<arch>` leg before it is merged) instead requires the FLAT predicate object buildx
 actually emits for a single platform — `{"SLSA":{...}}` / `{"SPDX":{...}}`
 — since that flat object and the per-platform map are structurally
 indistinguishable by key inspection alone (both are "a non-empty object of
@@ -686,7 +702,6 @@ non-empty objects"); the index's platform count is what breaks the tie. A
 separate `gh attestation verify oci://... --bundle-from-oci` step then
 verifies the Sigstore-signed bundle `attest-build-provenance` published as
 an OCI referrer — the check above never touches that bundle.
-The smokes' own builds (`compose-smoke` and `kube-smoke`: `load: true`,
-loaded into the runner's daemon, never pushed) carry neither: `sbom` and `provenance` are
-explicitly `false` there, since the stock Docker exporter a `load` build
-uses cannot carry attestations.
+The smokes' own builds (`compose-smoke` and `kube-smoke`, loaded into the
+runner's daemon and never pushed) carry neither: nothing is published for an
+attestation to vouch for.

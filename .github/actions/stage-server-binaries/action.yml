@@ -4,8 +4,8 @@ description: >
   `jammi` CLI from `_cli.yml` — as the Dockerfile's builder-stage output
   (`<dir>/out/jammi-server`, `<dir>/out/jammi`, and, for the CPU builder, an
   empty `<dir>/out/jammi-data/`), so an image build packages them through
-  `docker-publish`'s `build-contexts: builder=<dir>` instead of compiling
-  them again. Must run AFTER `actions/checkout@v4` (a local-path composite).
+  an image action's `build-contexts: builder=<dir>` instead of compiling
+  them again. Runs after `actions/checkout`.
 
 inputs:
   server:
@@ -27,20 +27,20 @@ inputs:
 
 outputs:
   build-context:
-    description: "The `build-contexts` line for `docker-publish`: `<stage>=<dir>`."
+    description: "The `build-contexts` line for `build-image` or `push-image-leg`: `<stage>=<dir>`."
     value: ${{ steps.layout.outputs.build-context }}
 
 runs:
   using: composite
   steps:
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: ${{ inputs.server }}
         path: ${{ runner.temp }}/server-binaries/server
         run-id: ${{ inputs.run-id }}
         github-token: ${{ inputs.run-id != '' && github.token || '' }}
 
-    - uses: actions/download-artifact@v4
+    - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
         name: ${{ inputs.cli }}
         path: ${{ runner.temp }}/server-binaries/cli

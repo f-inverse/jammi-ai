@@ -1,39 +1,27 @@
 name: Compose smoke (Shape B)
 
-# Packages the CPU `jammi-ai-server` image, brings up
+# Packages the CPU `jammi-ai-server` image from proven binaries, brings up
 # `deploy/docker-compose.yml` (Shape B: server + one Postgres serving as
-# catalog and broker) with the CI fixture-mount override, and drives it with a
-# remote Python client (`tests/compose/shape_b_remote.py`) — proving the
-# compose file, the image's env-only config resolution, and a restart's
-# result durability together, not any one of them in isolation.
+# catalog and broker) with the CI fixture-mount override, and drives it with
+# the client wheel (`tests/compose/shape_b_remote.py`) — proving the compose
+# file, the image's env-only config resolution, and a restart's result
+# durability together. One leg per arch, each on its native runner.
 #
-# Where the image's binaries come from is the one difference between its two
-# callers:
-#   * `ci.yml` calls it on every pull request and on `main` with `prebuilt`:
-#     each arch's image packages the `jammi-server` and `jammi` binaries that
-#     run built (`_server.yml`, `_cli.yml`), through the Dockerfile's
-#     builder-stage contract, so the smoke costs the stack's start-up, not a
-#     compile, and the run's summary carries the result.
-#   * The nightly (catching drift with no code change at all — a base-image
-#     CVE fix, a dependency bump) and a dispatch build the image the way a
-#     self-hoster's `docker build .` does, compiling the binaries in the
-#     Dockerfile's own builder stage.
-#
-# No GHCR credentials are ever touched here: the composite build below runs
-# with `push: "false"` — a `docker load` into the runner's own daemon, never
-# a registry write — so this workflow needs no `packages: write` permission
-# and is not a promotion primitive (`check_gpu_prove_once.py`'s P6 rule
-# reads `push:` values other than a literal `false` as a promotion
-# candidate; this workflow's literal `"false"` is deliberately exempt).
+# The image packages binaries it does not compile. `ci.yml` calls this with
+# its own run id, so the smoke runs the bytes that run built; the nightly and
+# a dispatch resolve the run that proved `main`'s tree (`_proven-artifacts.yml`)
+# and package those, catching drift with no code change at all — a runtime
+# base image's update, a Postgres patch release. The image is built with
+# `push: "false"` and loaded into the runner's own daemon: no registry is
+# written, so this workflow is not a promotion (`check_gpu_prove_once.py`'s
+# P6 rule reads that literal).
 
 on:
   workflow_call:
     inputs:
-      prebuilt:
-        description: >
-          Package the binaries the calling run built (`server-cpu-<arch>-binary`,
-          `jammi-<arch>-unknown-linux-gnu`) instead of compiling them.
-        type: boolean
+      run-id:
+        description: "The run whose binaries and client wheel the image packages."
+        type: string
         required: true
   schedule:
     # 03:00 UTC nightly.
@@ -44,149 +32,121 @@ permissions:
   contents: read
 
 jobs:
-  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
-  # and this run waits until they exist.
-  ci-image:
+  # A top-level run: the binaries of the run that proved this tree.
+  artifacts:
+    if: inputs.run-id == ''
     permissions:
       contents: read
       actions: read
-    uses: ./.github/workflows/_ci-image.yml
+    uses: ./.github/workflows/_proven-artifacts.yml
     with:
-      await: cpu
+      lane: ci
+      artifacts: >-
+        server-cpu-x86_64-binary
+        server-cpu-aarch64-binary
+        jammi-x86_64-unknown-linux-gnu
+        jammi-aarch64-unknown-linux-gnu
+        client-wheel
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: plan
+        run: python3 ci/scripts/build_matrix.py images --platforms linux/amd64,linux/arm64 | tee -a "$GITHUB_OUTPUT"
 
   compose-smoke:
     name: Compose smoke (Shape B, ${{ matrix.arch }})
-    needs: [ci-image]
+    needs: [artifacts, plan]
+    if: always() && needs.plan.result == 'success' && (inputs.run-id != '' || needs.artifacts.result == 'success')
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            target_arch: x86_64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            target_arch: aarch64
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RUN_ID: ${{ inputs.run-id || needs.artifacts.outputs.run }}
+      JAMMI_IMAGE: jammi-ai-server:smoke
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Generate the ephemeral compose env (job-wide)
+      # Compose interpolates `${JAMMI_AUDIT_MASTER_KEY:?…}` on every
+      # subcommand, so the key is job-wide. Synthetic, for this throwaway
+      # stack.
+      - name: Generate the ephemeral compose key
         run: |
-          set -euo pipefail
-          # Compose interpolates `${JAMMI_AUDIT_MASTER_KEY:?…}` against every
-          # subcommand this job runs, not just "up" — `ps -q`, `logs`,
-          # `down -v`, and the smoke script's own `docker compose restart`
-          # all fail the same "required variable ... is missing a value"
-          # unless the key is in the environment for the whole job. Generate
-          # it once here and export it via `$GITHUB_ENV` so every later step
-          # (including the ones the Python script subprocesses) inherits it.
-          # A synthetic key for this ephemeral, throwaway compose stack —
-          # never a real deployment secret.
           key="$(openssl rand -hex 32)"
           echo "::add-mask::${key}"
           echo "JAMMI_AUDIT_MASTER_KEY=${key}" >> "$GITHUB_ENV"
-          echo "JAMMI_IMAGE=jammi-ai-server:pr" >> "$GITHUB_ENV"
 
-      - name: Stage the run's binaries as the builder stage
-        id: binaries
-        if: inputs.prebuilt
-        uses: ./.github/actions/stage-server-binaries
-        with:
-          server: server-cpu-${{ matrix.target_arch }}-binary
-          cli: jammi-${{ matrix.target_arch }}-unknown-linux-gnu
-          stage: builder
-
-      # Compiling instead: `ci/release-feature-manifest.json`'s `server-cpu`
-      # build is the single source of truth for the Dockerfile's
-      # `CARGO_FEATURES` build-arg (required — no default).
-      - name: Read release feature list (ci/release-feature-manifest.json)
-        id: manifest
-        if: ${{ !inputs.prebuilt }}
+      - name: The arch's binary names
+        id: arch
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          set -euo pipefail
-          features="$(jq -r '.builds["server-cpu"].cargo_features | join(",")' ci/release-feature-manifest.json)"
-          if [ -z "$features" ]; then
-            echo "::error::ci/release-feature-manifest.json produced an empty server-cpu cargo_features list" >&2
-            exit 1
-          fi
-          {
-            echo "build-args<<EOF"
-            echo "BASE_IMAGE=${{ needs.ci-image.outputs.cpu }}"
-            echo "CARGO_FEATURES=$features"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          case "$ARCH" in amd64) echo "target=x86_64" ;; arm64) echo "target=aarch64" ;; esac >> "$GITHUB_OUTPUT"
 
-      - name: Build the CPU image (load, no push)
-        uses: ./.github/actions/docker-publish
+      - uses: ./.github/actions/stage-server-binaries
+        id: binaries
         with:
-          push: "false"
-          load: "true"
-          local-tag: jammi-ai-server:pr
-          build-args: ${{ steps.manifest.outputs.build-args }}
+          server: server-cpu-${{ steps.arch.outputs.target }}-binary
+          cli: jammi-${{ steps.arch.outputs.target }}-unknown-linux-gnu
+          stage: builder
+          run-id: ${{ env.RUN_ID }}
+
+      # Native: the arm64 leg loads a real arm64 image, never an emulated one.
+      - uses: ./.github/actions/build-image
+        with:
+          load-tag: ${{ env.JAMMI_IMAGE }}
           build-contexts: ${{ steps.binaries.outputs.build-context }}
-          # No `platforms` input -- native (the default, per this action's
-          # own doc): each leg's own runner arch is what buildx builds, so
-          # the arm64 leg loads a real arm64 image, never an emulated one
-          # (`load: true` is single-platform by design).
-          # The docker exporter (what `load: true` uses) cannot carry
-          # attestations on a stock daemon — belt-and-braces: build-push-
-          # action already omits default provenance when `load: true`, and
-          # `sbom: false` is the one that actually matters here.
-          sbom: "false"
-          provenance: "false"
-          cache-scope: cpu-${{ matrix.arch }}
+          cache-scope: cpu-generic-${{ matrix.arch }}
+
+      - name: The pinned service images, under the names the compose file uses
+        run: bash ci/scripts/pull_service_images.sh
 
       - name: Bring up Shape B (server + Postgres)
-        run: |
-          set -euo pipefail
-          docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait
+        run: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait
 
-      - name: Assert the running container is the image this job built
+      - name: The running container is the image this job built
         run: |
           set -euo pipefail
           built_id="$(docker image inspect --format '{{.Id}}' "$JAMMI_IMAGE")"
           container_id="$(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml ps -q jammi-server)"
           running_id="$(docker inspect --format '{{.Image}}' "$container_id")"
-          if [ "$built_id" != "$running_id" ]; then
-            echo "::error::running container's image ($running_id) is not the image this job built ($built_id) -- a pulled :latest cannot pass this smoke" >&2
-            exit 1
-          fi
-          echo "running container image matches the built image: $built_id"
+          [ "$built_id" = "$running_id" ] \
+            || { echo "::error::the running container's image ($running_id) is not the image this job built ($built_id)" >&2; exit 1; }
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
-      # `grpcio-tools` (needed to regenerate the proto stubs) lives in the
-      # `dev` extra, mirroring ci.yml's `py-client` job.
-      - name: Install clients/python (dev extra) + generate stubs
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          pip install -e 'clients/python[dev]'
-          make -C clients/python generate
+      - uses: ./.github/actions/install-jammi
+        with:
+          native: "false"
+          run-id: ${{ env.RUN_ID }}
 
       - name: Run the remote Shape B smoke script
         run: python3 tests/compose/shape_b_remote.py
 
-      # The two-mode shutdown's RELEASE arm on the shipped image: SIGINT
-      # hands the in-flight job's lease back (Postgres row: lease NULL,
-      # releases = 1), the process exits 0, `restart: unless-stopped` brings
-      # it back and its worker reclaims the row (attempts = 2).
+      # The two-mode shutdown's RELEASE arm on the shipped image: SIGINT hands
+      # the in-flight job's lease back, the process exits 0,
+      # `restart: unless-stopped` brings it back and its worker reclaims the row.
       - name: Run the Shape B release smoke script (RELEASE via SIGINT)
         run: python3 tests/compose/shape_b_release.py
 
-      - name: Assert the Postgres catalog was exercised at runtime
+      - name: The Postgres catalog was exercised at runtime
         run: |
           set -euo pipefail
-          catalog_count="$(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml exec -T postgres \
+          count="$(docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.ci.yml exec -T postgres \
             psql -U jammi -d jammi -tAc 'select count(*) from sources')"
-          echo "postgres catalog sources row count: ${catalog_count}"
-          if [ "${catalog_count}" -lt 1 ]; then
-            echo "::error::expected at least 1 row in the Postgres 'sources' table after shape_b_remote.py's add_source call, got ${catalog_count} -- the compose file's JAMMI_CATALOG__POSTGRES__URL is not actually backing the catalog" >&2
-            exit 1
-          fi
+          echo "postgres catalog sources rows: ${count}"
+          [ "${count}" -ge 1 ] \
+            || { echo "::error::no row in the Postgres 'sources' table after add_source: the compose file's JAMMI_CATALOG__POSTGRES__URL is not backing the catalog" >&2; exit 1; }
 
       - name: Dump compose logs on failure
         if: failure()

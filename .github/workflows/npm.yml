@@ -1,37 +1,28 @@
 name: npm
 
-# Publishes @f-inverse/jammi-client (the TypeScript gRPC-web SDK) to npm, in LOCKSTEP with
-# the engine: the same `v*` release tag that drives the crates.io / PyPI publish.
-# It runs ONLY on a release tag push — never on a PR or a branch push — so a
-# merge to `main` cannot publish. It builds nothing: `ci.yml`'s TS client job
-# builds, tests and packs the package on every pull request and on `main`, and
-# this workflow publishes the tarball the run that proved the tag's tree packed.
+# Publishes `@f-inverse/jammi-client` (the TypeScript gRPC-web SDK) to npm on
+# the same `v*` tag that publishes the crates, behind the shared release
+# gate. It builds nothing: `ci.yml`'s `ts-client` job builds, tests and packs
+# the package on every pull request and on `main`, and this workflow
+# publishes the tarball the run that proved the tag's tree packed, through
+# npm's OIDC trusted publishing (no stored token). A dispatch on the tag
+# finishes an interrupted release (a version already on npm is skipped); a
+# branch dispatch is a rehearsal: it resolves the branch tree's proving run
+# and its package, and publishes nothing.
+
 on:
   push:
     tags: ["v*"]
-  # Manual re-run to finish a release whose publish step was interrupted: run
-  # the dispatch ON the `v*` tag (the publish step is tag-guarded; it also
-  # no-ops if the version is already on npm). A branch dispatch is a
-  # rehearsal: it resolves the branch tree's proving run and its package.
-  # No `version` input: `npm publish` publishes whatever the package's own
-  # package.json says, so an input could only key the idempotence probe on a
-  # DIFFERENT version than the one being published — a stale input would read
-  # "already on npm" and skip the real publish, green. The probe below is
-  # keyed on the package itself; the tag-vs-package verify step pins the rest.
   workflow_dispatch:
 
 concurrency:
   group: release-npm
   cancel-in-progress: false
 
-# Least privilege at the workflow level; the publish job widens to
-# `id-token: write` (npm OIDC trusted publishing) per job.
 permissions:
   contents: read
 
 jobs:
-  # The package this release publishes: the one the `ci.yml` run that proved
-  # the released tree packed.
   artifacts:
     permissions:
       contents: read
@@ -43,92 +34,62 @@ jobs:
 
   proof:
     name: Proof required
-    # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
-    # requires the release commit's already-recorded GPU-prove verdict
-    # before the package is published (every release publisher gates on the
-    # prove verdict, all-or-nothing, not only the CUDA lanes). The tag guard (not an event guard) is what
-    # keeps the promotion arm proven: an event-keyed guard would let a
-    # dispatch publish unproven. A branch dispatch skips this job entirely
-    # (it never needed a verdict for its build-and-test dry run).
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
-    secrets: inherit
 
   publish:
     name: Publish to npm
-    # `needs: [artifacts, proof]` alone would make this job skip on a branch
-    # dispatch, where `proof` above never runs at all — breaking the "branch
-    # dispatch is a rehearsal" contract this workflow's header states.
-    # `if: always()` keeps the download and the version check unconditional;
-    # the actual publish gating lives on the "Publish" step below, whose
-    # `if:` is a PURE conjunction of the tag guard and the prove verdict.
+    # `if: always()` keeps the rehearsal's download and resolution on a branch
+    # dispatch, where `proof` never runs; the publish itself is gated on the
+    # "Publish" step.
     needs: [artifacts, proof]
     if: always() && needs.artifacts.result == 'success'
     runs-on: ubuntu-latest
     permissions:
-      # `id-token: write` authenticates the publish via npm OIDC Trusted
-      # Publishing (no stored `NPM_TOKEN`) and mints the signed provenance
-      # attestation; `contents: read` is the checkout default; `actions:
-      # read` downloads the package from the proving run. The npm package
-      # `@f-inverse/jammi-client` registers this repo + workflow as a trusted
-      # publisher (the npm analogue of the PyPI/crates.io trusted publishers).
       contents: read
+      # npm OIDC trusted publishing and its provenance attestation.
       id-token: write
+      # Downloads from the proving run, not this one.
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "22.23.1"
+          node-version-file: clients/typescript/.nvmrc
           registry-url: "https://registry.npmjs.org"
 
       # npm's OIDC trusted publishing needs npm >= 11.5.1.
       - name: Upgrade npm (OIDC trusted publishing)
         run: npm install -g npm@11.18.0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ts-client-package
           path: package
           run-id: ${{ needs.artifacts.outputs.run }}
           github-token: ${{ github.token }}
 
+      # Absolute: npm reads a relative `dir/file.tgz` as a GitHub `owner/repo`
+      # shorthand.
       - name: The package and its version
         id: package
-        shell: bash
         run: |
           set -euo pipefail
-          # Absolute: npm reads a relative `dir/file.tgz` as a GitHub
-          # `owner/repo` shorthand and tries to clone it; a path from the
-          # root is only ever a file.
           tarball="$(ls "$PWD"/package/*.tgz)"
           version="$(tar -xzOf "$tarball" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
           echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # The publish's own package resolution, on every dispatch: a branch
-      # rehearsal skips `Publish`, so this is where a tarball npm cannot
-      # resolve fails, before a release does.
+      # npm's own resolution of the tarball, on every dispatch: a rehearsal
+      # fails here, before a release does.
       - name: npm resolves the promoted tarball
         env:
           TARBALL: ${{ steps.package.outputs.tarball }}
         run: npm pack --dry-run "$TARBALL"
-
-      - name: Verify tag matches package version
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          VERSION: ${{ steps.package.outputs.version }}
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF#refs/tags/v}"
-          if [ "$tag" != "$VERSION" ]; then
-            echo "Tag v$tag does not match @f-inverse/jammi-client version $VERSION"
-            exit 1
-          fi
 
       - name: Publish
         if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success'
@@ -138,8 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           if npm view "@f-inverse/jammi-client@${VERSION}" version >/dev/null 2>&1; then
-            echo "@f-inverse/jammi-client ${VERSION} already on npm — skipping"
+            echo "@f-inverse/jammi-client ${VERSION} is already on npm"
           else
-            echo "Publishing @f-inverse/jammi-client ${VERSION}"
             npm publish "$TARBALL" --provenance --access public
           fi

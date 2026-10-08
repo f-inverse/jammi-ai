@@ -1,41 +1,41 @@
 name: PyPI
 
+# Publishes every Python dist to PyPI on a `py-v*` tag, in lockstep at the
+# workspace version: the pure-Python client `jammi-ai` (import `jammi`), the
+# embedded engine `jammi-ai-native` (per platform) and `jammi-ai-native-cu12`
+# (the same `jammi_native` module on CUDA), and the servers `jammi-server`
+# (CPU, per arch) and `jammi-server-cu12`. `jammi-ai`'s `[embedded]` extra
+# pins `jammi-ai-native==X`, so the five ship together or not at all.
+#
+# It compiles nothing: `ci.yml` builds every wheel on every pull request and
+# on `main`, where a wheel that stops building or outgrows PyPI's per-file
+# limit fails the change that caused it, and this workflow publishes the ones
+# the run that proved the tag's tree built — the bytes that run's Python
+# lanes, smokes and cookbook installed. The publish job is one matrix, one
+# PyPI project per leg: PyPI's trusted publisher for each project is
+# registered to THIS file (`pypi.yml`, environment `pypi`), and a publish
+# from inside a reusable workflow can never satisfy both the OIDC token's
+# claim and the attestation's (`_server.yml`'s header).
+#
+# A dispatch on the tag finishes an interrupted release (PyPI refuses a
+# re-upload of an existing version, so a re-run is idempotent); a branch
+# dispatch is a rehearsal that resolves the branch tree's proving run and
+# publishes nothing.
+
 on:
   push:
     tags: ["py-v*"]
-  # Manual re-run to finish a release whose publish was interrupted: run the
-  # dispatch ON the `py-v*` tag (the publish job is tag-guarded; PyPI rejects
-  # a re-upload of an existing version, so re-running the tag is idempotent).
-  # A branch dispatch is a rehearsal: it resolves the branch tree's proving
-  # run and its wheels, and publishes nothing.
   workflow_dispatch:
 
-# This workflow ships the `jammi-ai-native` dist — the compiled engine (maturin
-# abi3 wheels, per-platform). It compiles nothing: `ci.yml` builds the wheels
-# on every pull request and on `main` (`_native-wheels.yml`), where a wheel
-# that stops building or outgrows PyPI's per-file limit fails the change that
-# caused it, and this workflow publishes the ones the run that proved the
-# tag's tree built — the bytes that run's Python lanes, cookbook and book
-# installed. The tree pins the version (maturin reads the crate's
-# `version.workspace`). The pure-Python base client `jammi-ai` (import
-# `jammi`) is published from `clients/python` by `pypi-client.yml` on the SAME
-# `py-v*` tag, so the two ship in lockstep at the shared workspace version.
-
-# Serialize per ref, never cancel: a publish in flight must finish (PyPI
-# uploads are not resumable), matching the other release lanes.
+# Serialize per ref, never cancel: a PyPI upload is not resumable.
 concurrency:
   group: pypi-${{ github.ref }}
   cancel-in-progress: false
 
-# Least privilege at the workflow level; the publish job widens to
-# `id-token: write` (PyPI trusted publishing) per job.
 permissions:
   contents: read
 
 jobs:
-  # What this release publishes: the artifacts the `ci.yml` run that proved
-  # the released tree built — nothing compiles here. On a branch dispatch,
-  # the rehearsal: the same lookup over the branch's tree.
   artifacts:
     permissions:
       contents: read
@@ -43,33 +43,43 @@ jobs:
     uses: ./.github/workflows/_proven-artifacts.yml
     with:
       lane: ci
-      artifacts: wheels-native-linux-x86_64 wheels-native-linux-aarch64 wheels-native-macos-arm64 wheels-native-macos-x86_64
-
-  # Windows wheel disabled: usearch 2.24.0 uses POSIX mmap APIs
-  # (MAP_FAILED) that MSVC does not support.
+      artifacts: >-
+        client-wheel
+        wheels-native-linux-x86_64
+        wheels-native-linux-aarch64
+        wheels-native-macos-arm64
+        wheels-native-macos-x86_64
+        native-cu12-wheel
+        server-cpu-x86_64-wheel
+        server-cpu-aarch64-wheel
+        server-cu12-x86_64-wheel
 
   proof:
     name: Proof required
-    # Any `py-v*` TAG ref — a tag push, or a recovery dispatch run on the
-    # tag — requires the release commit's already-recorded GPU-prove
-    # verdict before the native wheel is published (every release publisher
-    # gates on the prove verdict, all-or-nothing, not only the CUDA lanes).
     if: startsWith(github.ref, 'refs/tags/py-v')
     uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
-    secrets: inherit
 
   publish:
-    name: Publish to PyPI
-    # Publishes ONLY from a `py-v*` tag ref (tag push, or a dispatch run on
-    # the tag) whose commit's GPU-prove verdict is green — see the
-    # workflow_dispatch comment above. Without the guard a branch dispatch
-    # could first-publish an untagged, unreleased build, which PyPI cannot
-    # undo. PURE conjunction (no `||`).
-    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
+    name: Publish ${{ matrix.project }}
     needs: [artifacts, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/py-v') && needs.artifacts.result == 'success' && needs.proof.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: jammi-ai
+            pattern: client-wheel
+          - project: jammi-ai-native
+            pattern: wheels-native-*
+          - project: jammi-ai-native-cu12
+            pattern: native-cu12-wheel
+          - project: jammi-server
+            pattern: server-cpu-*-wheel
+          - project: jammi-server-cu12
+            pattern: server-cu12-x86_64-wheel
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -77,15 +87,16 @@ jobs:
       # Downloads from the proving run, not this one.
       actions: read
     steps:
-      - uses: actions/download-artifact@v4
+      # One leg uploads every wheel of its project together: a release with
+      # one platform missing is worse than a failed release.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: wheels-native-*
+          pattern: ${{ matrix.pattern }}
           merge-multiple: true
           path: dist
           run-id: ${{ needs.artifacts.outputs.run }}
           github-token: ${{ github.token }}
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
         with:
           packages-dir: dist

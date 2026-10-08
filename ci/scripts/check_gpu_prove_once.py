@@ -35,12 +35,11 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      is structurally sound. A `"direct"` row's gate job must `uses:
      ./.github/workflows/_proof-required.yml`; a `"chained"` row's gate
      job must itself be some OTHER row's promoting job in the SAME workflow
-     (e.g. `crates.yml`'s `github-release` chains off `publish`, which is
+     (e.g. `server-image.yml`'s `merge-cpu` chains off `push-cpu`, which is
      itself a `"direct"` row); a `"none"` row is a reviewed, deliberately
      UNGATED promotion (e.g. `ci.yml`'s `build-ci-image`, which builds the
-     tree's content-tagged CI image, or `server-image.yml`'s manual
-     `:latest` refresh on a `workflow_dispatch` against `main` -- neither is
-     ever a release-tag promotion) and must structurally prove it
+     tree's content-tagged CI image -- never a release-tag promotion) and
+     must structurally prove it
      can NEVER fire on a release tag ref: its job `if:` must be a PURE
      top-level conjunction containing the EXACT conjunct
      `github.ref_type != 'tag'` (a `refs/tags/`-substring-absence check
@@ -111,9 +110,12 @@ as fixtures that must FAIL, never a grep for one known-bad string):
      `docker/build-push-
      action` — any `push:` value that is not literally `false`/`"false"`,
      including an unquoted `true`, `'true'`, or any `${{ }}` expression —
-     `./.github/actions/docker-publish` and its cross-repo form under the
-     SAME push rule, `./.github/actions/release-upload` and its cross-repo
-     form, `ci/scripts/publish_crates.sh`, `docker buildx imagetools create`
+     a LOCAL composite action whose own steps reach a primitive (resolved
+     and examined, never named by hand: a composite's build-push step
+     decides `push:` itself — literally `false` is never a promotion,
+     literally `true` always is, and any other spelling is refused by
+     name), a cross-repo action in the same shape (unexaminable, refused),
+     `ci/scripts/publish_crates.sh`, `docker buildx imagetools create`
      (never bare `imagetools` -- `imagetools inspect` is a read-only
      assertion, not a promotion) must be listed as SOME row's
      `(workflow, promoting_job)` in `PROMOTION_TABLE`. FAIL-CLOSED, NO
@@ -315,7 +317,7 @@ class PromotionRow:
         `if:` conjunct names it directly.
       - `"chained"`: `gate_job` is ANOTHER row's `promoting_job` in the
         SAME workflow (already itself gated, directly or chained) — e.g.
-        `crates.yml`'s `github-release` chains off `publish`.
+        `server-image.yml`'s `merge-cpu` chains off `push-cpu`.
       - `"none"`: a reviewed, deliberately UNGATED promotion (e.g.
         the tree's CI images `ci.yml` builds — never a release tag
         promotion). `gate_job` is `None`; P3
@@ -356,28 +358,17 @@ class PromotionRow:
 # publishing job with no row here fails by name instead of going unnoticed.
 PROMOTION_TABLE: dict[str, PromotionRow] = {
     # ---- CUDA lanes (also the ci/release-feature-manifest.json CUDA lanes) ----
-    "cu12-image": PromotionRow("server-image.yml", "build-and-push-cu12", "proof", "direct"),
-    "cu12-tarball": PromotionRow("release-binaries.yml", "server-cu12-promote", "proof", "direct"),
-    "cu12-wheel": PromotionRow("pypi-server-cuda.yml", "publish", "proof", "direct", tag_family="py-v"),
-    # ---- server-image.yml's other arms ----
-    "cpu-image-tag": PromotionRow("server-image.yml", "build-and-push", "proof", "direct"),
-    "cpu-image-main": PromotionRow(
-        "server-image.yml", "build-and-push-main", None, "none"
-    ),  # manual :latest refresh via workflow_dispatch on main (server-image.yml carries no
-    # push: branches: trigger, so this never fires on a mere merge) -- never a release tag promotion.
-    # ---- server-image.yml's two-arch CPU merge jobs: `docker buildx
-    # imagetools create` merges the two per-arch immutable sources into the
-    # real tags -- itself a promotion, distinct from the per-arch legs above,
-    # which push only their own `sha-<sha>-<arch>` tag (never a real tag).
-    "cpu-image-merge-tag": PromotionRow(
-        "server-image.yml", "merge-cpu-tag", "build-and-push", "chained"
-    ),  # chained off build-and-push (itself direct-gated by proof) -- same tag-family conjunct.
-    "cpu-image-merge-main": PromotionRow(
-        "server-image.yml", "merge-cpu-main", None, "none"
-    ),  # deliberately UNGATED, same as cpu-image-main above -- never a release tag promotion.
-    "cpu-image-selfcontained": PromotionRow(
-        "server-image.yml", "build-and-push-selfcontained", None, "none"
-    ),  # manual dispatch-only opt-in image (Cloudflare Containers) -- never a release tag promotion.
+    "cu12-image": PromotionRow("server-image.yml", "push-cu12", "proof", "direct"),
+    "cu12-tarball": PromotionRow("release-binaries.yml", "promote", "proof", "direct"),
+    # `pypi.yml`'s one matrix job publishes every Python dist; the two CUDA
+    # wheels are the manifest's names for it.
+    "cu12-wheel": PromotionRow("pypi.yml", "publish", "proof", "direct", tag_family="py-v"),
+    "native-cu12-wheel": PromotionRow("pypi.yml", "publish", "proof", "direct", tag_family="py-v"),
+    # ---- the CPU server image: per-arch legs (each pushing only its own
+    # immutable `sha-<sha>-<arch>` tag) gated directly, and the merge that
+    # moves the real tags chained off them with the same tag-family conjunct.
+    "cpu-image-legs": PromotionRow("server-image.yml", "push-cpu", "proof", "direct"),
+    "cpu-image-merge": PromotionRow("server-image.yml", "merge-cpu", "push-cpu", "chained"),
     # ---- the tree's CI images. `ci.yml`'s `build-ci-image`/`build-ci-image-
     # cuda` each carry a job-level `uses:` to the LOCAL reusable `_ci-base-
     # image.yml` (whose `build-and-push` job pushes the tree's content-tagged
@@ -388,21 +379,12 @@ PROMOTION_TABLE: dict[str, PromotionRow] = {
     "ci-image-cpu": PromotionRow("ci.yml", "build-ci-image", None, "none"),
     "ci-image-cuda": PromotionRow("ci.yml", "build-ci-image-cuda", None, "none"),
     "ci-image-latest": PromotionRow("image.yml", "latest", None, "none"),
-    # ---- release-binaries.yml's remaining lanes ----
-    "cli-binaries": PromotionRow("release-binaries.yml", "promote-binaries", "proof", "direct"),
-    "server-cpu-tarball": PromotionRow("release-binaries.yml", "server-cpu-promote", "proof", "direct"),
+    # ---- the release assets: one matrix job over every tarball ----
+    "release-assets": PromotionRow("release-binaries.yml", "promote", "proof", "direct"),
     # ---- crates.io ----
     "crates-publish": PromotionRow("crates.yml", "publish", "proof", "direct"),
-    "crates-github-release": PromotionRow("crates.yml", "github-release", "publish", "chained"),
     # ---- npm ----
     "npm-publish": PromotionRow("npm.yml", "publish", "proof", "direct", step_name="Publish"),
-    # ---- PyPI (lockstep "py-v*" tag family) ----
-    "native-wheel": PromotionRow("pypi.yml", "publish", "proof", "direct", tag_family="py-v"),
-    "client-wheel": PromotionRow("pypi-client.yml", "publish", "proof", "direct", tag_family="py-v"),
-    "server-cpu-wheel": PromotionRow("pypi-server.yml", "publish", "proof", "direct", tag_family="py-v"),
-    "native-cu12-wheel": PromotionRow(
-        "pypi-native-cuda.yml", "publish", "proof", "direct", tag_family="py-v"
-    ),
     # ---- the documentation site (GitHub Pages), deployed per "py-v*" release ----
     "pages-site": PromotionRow("pages.yml", "deploy", "proof", "direct", tag_family="py-v"),
 }
@@ -438,7 +420,7 @@ REVIEWED_NONPUBLISHING_LOCAL_REUSABLES: frozenset[str] = frozenset(
         # actions: read`), uploads nothing, publishes nothing.
         "_proven-artifacts.yml",
         # The image smokes `ci.yml` calls with its run's binaries: each
-        # `docker-publish` use carries `push: "false"` (a `docker load` into
+        # builds through `build-image` (`push: false`, a `docker load` into
         # the runner's own daemon), never a registry write.
         "kube-smoke.yml",
         "compose-smoke.yml",
@@ -1971,22 +1953,55 @@ class _ActionStructure:
     """The result of examining ONE local composite action's own
     `runs.steps:`. `unconditional_primitive`: the display name of an
     `_SIMPLE_PRIMITIVE_PATTERNS` match found anywhere in this action's
-    OWN steps (or a nested local action it itself calls) -- unconditional
-    because these markers carry no `push:`-shaped build-only mode.
-    `wraps_docker_build_push`: `True` when one of this action's OWN steps
-    itself `uses: docker/build-push-action` -- the CALLER of THIS action
-    decides promotion via ITS OWN `with.push` (this module cannot resolve
-    an inner `${{ inputs.push }}` expression against the outer caller's
-    value any other way; `release-upload`'s real shape needs no such
-    resolution -- its own `gh release create`/`upload` commands are
-    unconditional `run:` text, caught directly as `unconditional_
-    primitive` with no special-casing by name)."""
+    OWN steps (or a nested local action it itself calls), or of a
+    `docker/build-push-action` step whose own `push:` is literally true
+    -- a composite decides its own push (`build-image` says `false`,
+    `push-image-leg` says `true`), so a caller's `with:` never enters the
+    decision. A build-push step spelled any other way -- an expression, a
+    missing key -- is a NAMED refusal (`WorkflowLoadError`), never a
+    guess in either direction."""
 
     unconditional_primitive: str | None
-    wraps_docker_build_push: bool
 
 
 _MAX_LOCAL_ACTION_DEPTH = 10
+
+_GITHUB_TRUE_BARE_SPELLINGS = frozenset({"true", "True", "TRUE"})
+
+
+def _composed_action_step_push_node(text: str, step_index: int) -> "exec_mod.yaml.Node | None":
+    """The COMPOSED (pre-construction) scalar node of `runs.steps[i].with.push`
+    in a composite action document, or `None` when that path is absent --
+    the same raw-spelling discipline `_composed_step_push_node` holds a
+    workflow step to."""
+    try:
+        root = exec_mod.yaml.compose(text, Loader=exec_mod.yaml.SafeLoader)
+    except exec_mod.yaml.YAMLError:
+        return None
+
+    def child(node, key):
+        if not isinstance(node, exec_mod.yaml.MappingNode):
+            return None
+        for key_node, value_node in node.value:
+            if isinstance(key_node, exec_mod.yaml.ScalarNode) and key_node.value == key:
+                return value_node
+        return None
+
+    steps = child(child(root, "runs"), "steps")
+    if not isinstance(steps, exec_mod.yaml.SequenceNode) or step_index >= len(steps.value):
+        return None
+    return child(child(steps.value[step_index], "with"), "push")
+
+
+def _push_raw_is_true_spelling(push_node: "exec_mod.yaml.Node | None") -> bool:
+    """`True` exactly when `push_node` spells one of GitHub Actions' own
+    boolean-true forms: bare `true`/`True`/`TRUE`, or the quoted string
+    `"true"`/`'true'` -- the twin of `_step_push_raw_is_false_spelling`."""
+    if push_node is None or not isinstance(push_node, exec_mod.yaml.ScalarNode):
+        return False
+    if push_node.style in ("'", '"'):
+        return push_node.value == "true"
+    return push_node.value in _GITHUB_TRUE_BARE_SPELLINGS
 
 
 def _composite_action_structure(
@@ -2032,9 +2047,8 @@ def _composite_action_structure(
         memo[action_name] = (None, refusal)
         raise refusal
     unconditional: str | None = None
-    wraps = False
     refusal_messages: list[str] = []
-    for step in steps:
+    for index, step in enumerate(steps):
         if unconditional is None:
             step_text = "\n".join(_step_scalar_values(step))
             for label, pattern in _SIMPLE_PRIMITIVE_PATTERNS:
@@ -2045,7 +2059,15 @@ def _composite_action_structure(
         if not isinstance(uses, str):
             continue
         if _DOCKER_BUILD_PUSH_ACTION_RE.search(uses):
-            wraps = True
+            push_node = _composed_action_step_push_node(text, index)
+            if _push_raw_is_true_spelling(push_node):
+                if unconditional is None:
+                    unconditional = "docker/build-push-action (push: true)"
+            elif not _step_push_raw_is_false_spelling(push_node):
+                refusal_messages.append(
+                    f"step {step.get('name')!r} uses docker/build-push-action with a push: that is "
+                    "neither literally true nor literally false -- a composite decides its own push"
+                )
         cross_target = _cross_repo_action_target(uses)
         if cross_target is not None:
             refusal_messages.append(
@@ -2070,7 +2092,7 @@ def _composite_action_structure(
         combined = WorkflowLoadError(f"local action {action_name!r} reaches {detail}")
         memo[action_name] = (None, combined)
         raise combined
-    structure = _ActionStructure(unconditional, wraps)
+    structure = _ActionStructure(unconditional)
     memo[action_name] = (structure, None)
     return structure
 
@@ -2228,12 +2250,6 @@ def _step_invokes_publish_primitive(
         structure = _composite_action_structure(local_action, _action_memo, 1)
         if structure.unconditional_primitive is not None:
             return f"{structure.unconditional_primitive} (via action {local_action})"
-        if structure.wraps_docker_build_push:
-            return (
-                f"./.github/actions/{local_action} (push != false)"
-                if _step_push_is_promoting(step_node, push_node)
-                else None
-            )
         return None
     cross_action = _cross_repo_action_target(uses)
     if cross_action is not None:

@@ -10,19 +10,19 @@ name: GPU perf A/B (RunPod)
 # slow direction is RED; in the fast direction RED_FOR_INVESTIGATION —
 # investigated, never assumed favourable.
 #
-# Off the merge path: a label-triggered PR run and a dispatch upload the
-# verdict as an artifact for a human to read; neither is a required check.
-# `aa_null: true` builds the parent a third time in place of this checkout,
-# so every side is one revision and the reading is the instrument's own null.
+# Off the merge path: a `run-gpu-perf-ab` label or a dispatch uploads the
+# verdict for a human to read; neither is a required check. `aa_null` builds
+# the parent a third time in place of this checkout, so every side is one
+# revision and the reading is the instrument's own null.
 
 on:
   workflow_dispatch:
     inputs:
       aa_null:
-        description: "Every side the parent sha: the instrument's own null. 'true' or 'false' (default false: this checkout against its merge-base)."
+        description: "Every side the parent sha: the instrument's own null."
         required: false
-        type: string
-        default: "false"
+        type: boolean
+        default: false
   pull_request:
     types: [labeled]
 
@@ -30,8 +30,6 @@ permissions:
   contents: read
 
 jobs:
-  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
-  # the tree defines, never the one `main` last had.
   ci-image:
     if: github.event_name != 'pull_request' || github.event.label.name == 'run-gpu-perf-ab'
     permissions:
@@ -51,40 +49,29 @@ jobs:
       cancel-in-progress: false
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Run the encode revision edge on a real A100
-        id: perfab
+      - uses: ./.github/actions/run-paid-lane
+        id: lane
+        with:
+          driver: ci/scripts/runpod_gpu_perf_ab.sh
+          evidence: .gpu-pull/gpu-perf-ab/
+          evidence-name: gpu-perf-ab-${{ github.run_id }}
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           GIT_REF: ${{ github.head_ref || github.ref_name }}
-          GPU_PERF_AB_AA_NULL: ${{ github.event.inputs.aa_null == 'true' && '1' || '0' }}
-        run: |
-          set +e
-          bash ci/scripts/runpod_gpu_perf_ab.sh
-          rc=$?
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
-          exit $rc
+          GPU_PERF_AB_AA_NULL: ${{ inputs.aa_null && '1' || '0' }}
 
-      - name: Annotate a capacity failure
-        if: always() && steps.perfab.outputs.rc == '75'
-        run: echo "::warning::gpu-perf-ab found nothing to compare (no capacity, no idle GPU, no parent-side build, or HEAD is its own merge-base) — not a verdict. Re-run once the condition clears."
-
-      - name: Annotate a non-GREEN verdict
-        if: always() && steps.perfab.outputs.rc == '1'
-        run: echo "::error::gpu-perf-ab's ladder verdict is not GREEN — RED (slower than the base by more than the rung's noise band), RED_FOR_INVESTIGATION (faster by more than the band — investigated, never assumed favourable), or INVALID (a refusal named in the verdict's causes). Read ladder_verdict.json in the uploaded artifact."
-
-      - name: Annotate a usage/infra error
-        if: always() && steps.perfab.outputs.rc == '2'
-        run: echo "::error::gpu-perf-ab hit a usage/infra error (exit 2) — a clone, checkout or fetch failure, or an unresolved sha; see the run log."
-
-      - name: Upload the ladder verdict and legs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu-perf-ab-artifact-${{ github.run_id }}
-          path: .gpu-pull/gpu-perf-ab/
-          if-no-files-found: warn
-          retention-days: 14
+      # The driver's own verdict codes, beyond the shared ones.
+      - if: always() && steps.lane.outputs.rc == '1'
+        run: >-
+          echo "::error::the ladder verdict is not GREEN -- RED (slower than the base by more
+          than the rung's noise band), RED_FOR_INVESTIGATION (faster by more than the band), or
+          INVALID (a refusal named in the verdict's causes). Read ladder_verdict.json in the
+          uploaded evidence."
+      - if: always() && steps.lane.outputs.rc == '2'
+        run: >-
+          echo "::error::a usage or infrastructure error (exit 2) -- a clone, checkout or fetch
+          failure, or an unresolved sha; see the run log."

@@ -1,65 +1,50 @@
 name: Server Image
 
-# Publishes the OSS `jammi-server` container image to GHCR. Triggered
-# on every `v*` tag (which matches the workspace's release tagging
-# scheme) and on workflow_dispatch for one-off builds.
+# Publishes the `jammi-server` container images to GHCR on a `v*` release tag
+# (or a recovery dispatch on that tag), behind the shared release gate:
 #
-# Three images are published from this workflow:
-#   * the generic CPU image `jammi-ai-server` (`:latest`, `:vX.Y.Z`, …) —
-#     operator-supplied config + mounted volume; published on tags and dispatch.
-#   * the self-contained CPU image (`jammi-ai-server:selfcontained`, `:sha-…`) —
-#     baked config, boots standalone on a runtime that provides no config or
-#     volume (Cloudflare Containers). Published on
-#     dispatch when `selfcontained=true`, always from the dispatched
-#     ref (so it carries whatever the default branch has, incl.
-#     EmbeddingService) — it is never gated on a tag.
-#   * the CUDA image `jammi-ai-server-cu12` (`:latest`, `:vX.Y.Z`, …) —
-#     GPU-accelerated inference, same tag scheme as the CPU image, published
-#     on the same `v*` tags. CUDA lives only on the server image.
-#     GPU *runtime* is not testable in CI (no GPU on CI runners); `ci.yml`
-#     packages the CUDA image from its run's CUDA binary on every pull
-#     request, so a CUDA image that stops building fails before a tag.
+#   * `jammi-ai-server`, the CPU image, two variants of one binary — `generic`
+#     (operator-supplied config, a mounted volume) and `selfcontained` (a baked
+#     config, boots with no config and no volume) — each a linux/amd64 +
+#     linux/arm64 index;
+#   * `jammi-ai-server-cu12`, the CUDA image, linux/amd64 (its runtime base
+#     has no arm64 build).
 #
-# Every image here packages binaries it does not compile: the `jammi-server`
-# and `jammi` binaries the `ci.yml` run that proved the tree built
-# (`artifacts`, through `_proven-artifacts.yml`), laid out as the
-# Dockerfile's builder stage (`stage-server-binaries`) — the same packaging
-# `ci.yml`'s image checks and smokes run over those bytes. The Dockerfile's
-# own builder stage is the self-hoster's `docker build .` path, which the
-# nightly smokes keep checked.
+# One tag policy for every image (`ci/scripts/image_tags.sh`): `:X.Y.Z`,
+# `:X.Y`, `:sha-<sha>` and `:latest` (the newest release; a tag is only ever
+# pushed for a release), the self-contained variant's under its own name
+# (`selfcontained-X.Y.Z`, …, `selfcontained`). Nothing else moves a tag: there
+# is no branch arm and no manual refresh.
 #
-# The CI images (`ghcr.io/f-inverse/jammi-ai-ci` and `-ci-cuda`) are a
-# different artifact: the toolchain layers builds run in, built by `ci.yml`;
-# `jammi-ai-server` / `-cu12` are the runtime images users `docker pull`.
+# Every image packages binaries it does not compile: the `jammi-server` and
+# `jammi` binaries the `ci.yml` run that proved the tree built (`artifacts`,
+# through `_proven-artifacts.yml`), laid out as the Dockerfile's `builder`
+# context (`stage-server-binaries`) — the same packaging `ci.yml`'s image
+# check and smokes run over those bytes. A branch dispatch is a rehearsal: it
+# resolves the branch tree's proving run and pushes nothing.
+#
+# The CPU variants are built one native leg per arch, each pushing only its
+# immutable `sha-<sha>-<arch>` tag, then merged into the real tags
+# (`merge-index`, verify-then-promote). Every pushed digest is attested and
+# verified before its job is green (`attest-image`).
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
-    inputs:
-      selfcontained:
-        description: "Also build+push the self-contained image (:selfcontained)"
-        type: boolean
-        default: false
 
 concurrency:
   group: server-image-${{ github.ref }}
   cancel-in-progress: false
 
-# Least privilege at the workflow level; the push jobs widen to
-# `packages: write` (GHCR) per job.
 permissions:
   contents: read
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/jammi-ai-server
-  IMAGE_NAME_CU12: ${{ github.repository_owner }}/jammi-ai-server-cu12
+  IMAGE: ghcr.io/${{ github.repository_owner }}/jammi-ai-server
+  IMAGE_CU12: ghcr.io/${{ github.repository_owner }}/jammi-ai-server-cu12
 
 jobs:
-  # The binaries every image here packages: the ones the `ci.yml` run that
-  # proved this tree built.
   artifacts:
     permissions:
       contents: read
@@ -74,708 +59,178 @@ jobs:
         jammi-x86_64-unknown-linux-gnu
         jammi-aarch64-unknown-linux-gnu
 
-  # CPU image, main-branch arm: pushed from the default branch (`latest` +
-  # sha) via a `workflow_dispatch` run on `main` only -- this workflow
-  # carries NO `push: branches:` trigger (unlike `image.yml`,
-  # which does), so this arm never fires automatically on a
-  # mere merge; it is a manual `:latest`/`:sha-...` refresh. This arm is
-  # UNGATED: it never promotes a `v*`/semver tag (see `build-and-push`
-  # below for that) — the GPU-prove gate applies to a
-  # RELEASE tag, not to this manual refresh. Never runs on pull_request
-  # (PRs must not push to GHCR).
-  #
-  # Matrixed over arch (native runner per arch, no QEMU -- same shape
-  # `_ci-base-image.yml` uses). Each leg pushes ONLY its own immutable
-  # `sha-<sha>-<arch>` tag; `merge-cpu-main` below is the ONLY job that
-  # ever moves the real `latest`/`sha-<sha>` tags this arm publishes.
-  build-and-push-main:
-    # `&& github.ref_type != 'tag'`:
-    # a `gate_kind='none'` row must structurally PROVE it can never fire on
-    # a release tag ref, never merely happen to never mention one --
-    # `check_gpu_prove_once.py`'s P3 rule pins this exact conjunct.
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.ref_type != 'tag'
-    needs: [artifacts]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            target_arch: x86_64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            target_arch: aarch64
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-      # Sigstore-signed provenance/SBOM attestation for the digest this job
-      # pushes: `id-token: write` mints the OIDC token attest-build-
-      # provenance exchanges for a Sigstore signing cert; `attestations:
-      # write` lets it publish the attestation to the repo's attestation
-      # store and (push-to-registry) to GHCR alongside the image. Only a
-      # job that actually pushes gets these.
-      id-token: write
-      attestations: write
-      # Downloads the proven binaries from their run.
-      actions: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # The binaries the `ci.yml` run that proved this tree built
-      # (`artifacts`), laid out as the Dockerfile's builder stage: the
-      # image packages them and compiles nothing.
-      - name: Stage the proven binaries
-        id: binaries
-        uses: ./.github/actions/stage-server-binaries
-        with:
-          server: server-cpu-${{ matrix.target_arch }}-binary
-          cli: jammi-${{ matrix.target_arch }}-unknown-linux-gnu
-          stage: builder
-          run-id: ${{ needs.artifacts.outputs.run }}
-
-      - uses: ./.github/actions/docker-publish
-        id: publish
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # The leg pushes ONLY its own immutable `sha-<sha>-<arch>` tag
-          # -- never `latest`, never a bare `sha-<sha>` -- so `merge-cpu-
-          # main` below is the ONLY job that ever moves a real
-          # (consumer-facing) tag.
-          tags-spec: |
-            type=sha,format=long
-          tag-suffix: ${{ matrix.arch }}
-          build-contexts: ${{ steps.binaries.outputs.build-context }}
-          platforms: linux/${{ matrix.arch }}
-          cache-scope: cpu-${{ matrix.arch }}
-          push: "true"
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
-
-      - name: Assert BuildKit provenance + SBOM are in the image index
-        shell: bash
-        env:
-          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
-        run: bash ci/scripts/assert_image_attestations.sh
-
-      # `assert_image_attestations.sh` above only proves BuildKit wrote
-      # attestation manifests into the image's own OCI index -- it never
-      # touches the Sigstore bundle the `attest-build-provenance` step just
-      # published as an OCI referrer (`push-to-registry: true`). Verify that
-      # bundle for real: `--bundle-from-oci` fetches it from the registry
-      # (GHCR login already happened above) rather than the GitHub API, and
-      # `--owner` pins the signing identity to this org.
-      - name: Verify the Sigstore attestation bundle (gh attestation verify)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
-
-  # Merges `build-and-push-main`'s two per-arch immutable sources
-  # (`sha-<sha>-amd64`, `sha-<sha>-arm64`) into the real `latest`/`sha-<sha>`
-  # tags -- the ONLY job that ever moves them for this arm. `gate_kind`
-  # "none": deliberately UNGATED (never a release-tag promotion), proven
-  # structurally by the exact `github.ref_type != 'tag'` conjunct
-  # (`check_gpu_prove_once.py` P3). Verify-then-promote, same shape as
-  # `_ci-base-image.yml`'s `merge-manifest`: dry-run the merge and assert
-  # the resulting index's platform set BEFORE pushing anything.
-  merge-cpu-main:
-    needs: [build-and-push-main]
-    if: always() && needs.build-and-push-main.result == 'success' && github.ref_type != 'tag'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      # Re-run metadata-action with the unsuffixed tag rule this arm
-      # publishes, so `latest` moves the same way a single-arch push would
-      # move it -- naming the multi-arch index.
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,format=long
-
-      - name: Merge the per-arch sources into the real tags
-        shell: bash
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          SHA_TAG: sha-${{ github.sha }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          sources=("${IMAGE}:${SHA_TAG}-amd64" "${IMAGE}:${SHA_TAG}-arm64")
-          tag_args=()
-          tags=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            tag_args+=(-t "$tag")
-            tags+=("$tag")
-          done <<< "$TAGS"
-
-          docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
-            | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
-
-          # Capture the PRE-CREATE digest of EVERY tag this merge is about
-          # to move -- not only the immutable `sha-<sha>` tag -- because if
-          # the post-push confirm fails, a correct restore needs each
-          # tag's OWN previous digest: `latest` / `{{version}}` /
-          # `{{major}}.{{minor}}` are never guaranteed to have shared one
-          # digest with the sha tag before this merge landed, so restoring
-          # every tag to the sha tag's old digest would re-point tags onto
-          # a digest that was never theirs. Same not-found-vs-any-other-
-          # failure split as `_ci-base-image.yml`'s `promote` step
-          # (:345-378), applied to EACH tag independently: a genuine first
-          # publish of that one tag has nothing to restore to; any other
-          # read failure for any one tag means this step cannot even
-          # confirm what it would be overwriting.
-          declare -A previous_digests
-          for t in "${tags[@]}"; do
-            set +e
-            prev_digest="$(docker buildx imagetools inspect "$t" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-main-inspect-stderr.txt)"
-            inspect_rc=$?
-            set -e
-            inspect_stderr="$(cat /tmp/merge-cpu-main-inspect-stderr.txt)"
-            if [ "$inspect_rc" -ne 0 ]; then
-              if [[ "$inspect_stderr" == *"${t}: not found"* ]]; then
-                previous_digests["$t"]=""
-                echo "pre-create digest read: ${t} does not exist yet (first publish) -- nothing to restore to"
-              else
-                echo "::error::pre-create digest read for ${t} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
-                exit 1
-              fi
-            elif [[ ! "$prev_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::pre-create digest read for ${t} succeeded but returned an unexpected value ('$prev_digest', not a sha256 digest) -- refusing to promote" >&2
-              exit 1
-            else
-              previous_digests["$t"]="$prev_digest"
-            fi
-          done
-
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-
-          # Re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
-          # $TAGS -- the digest this step attests, and the digest the
-          # attestation checks below verify, must be the one the merge
-          # itself just wrote, not whatever a later push re-points a
-          # mutable tag to.
-          #
-          # Two DIFFERENT failures, two different messages -- same split as
-          # `_ci-base-image.yml`'s "Confirm the pushed index" step
-          # (:381-406): the re-inspect ITSELF failing (or returning
-          # something that does not even shape-match a digest) means
-          # whether the merge landed is UNKNOWN, so a restore command
-          # printed there could overwrite a GOOD merge with a stale
-          # digest -- that arm never prints one. Only a re-inspect that
-          # SUCCEEDS, with a shape-valid digest, whose CONTENT then fails
-          # the platform check is a confirmed-landed-wrong result, and
-          # only THAT arm prints a restore command -- naming every tag
-          # this merge wrote ($TAGS via `tags`), not only the immutable
-          # sha tag, since `imagetools create` above moved all of them.
-          set +e
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-main-confirm-stderr.txt)"
-          confirm_inspect_rc=$?
-          set -e
-          confirm_stderr="$(cat /tmp/merge-cpu-main-confirm-stderr.txt)"
-
-          if [ "$confirm_inspect_rc" -ne 0 ]; then
-            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} failed ($confirm_stderr) -- whether the merge landed is unknown, so do NOT restore: a restore now could overwrite a GOOD merge with a stale digest; verify manually first" >&2
-            exit 1
-          fi
-
-          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$digest', not a sha256 digest) -- whether the merge landed is unknown, so do NOT restore: verify manually first" >&2
-            exit 1
-          fi
-
-          if ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
-              | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
-            echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; restoring each tag requires its OWN previous digest, never the sha tag's, since this merge moved them independently:" >&2
-            for restore_tag in "${tags[@]}"; do
-              restore_digest="${previous_digests[$restore_tag]}"
-              if [ -n "$restore_digest" ]; then
-                echo "::error::  restore ${restore_tag}: docker buildx imagetools create -t ${restore_tag} ${IMAGE}@${restore_digest}" >&2
-              else
-                echo "::error::  first publish of ${restore_tag}: nothing to restore" >&2
-              fi
-            done
-            exit 1
-          fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-        id: merge
-
-      - name: Attest build provenance (the merged index)
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.merge.outputs.digest }}
-          push-to-registry: true
-
-      # Every push job in this workflow runs both checks below against its
-      # own pushed digest; this merge job verifies the merged index it
-      # attested above, so `deploy-server.md`'s "on every push job" claim
-      # holds with no "attested, not verified" gap.
-      - name: Assert BuildKit provenance + SBOM are in the image index
-        shell: bash
-        env:
-          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
-        run: bash ci/scripts/assert_image_attestations.sh
-
-      - name: Verify the Sigstore attestation bundle (gh attestation verify)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
-
-  # CPU image, tag arm: pushed from `v*` tag refs (semver tags) only — a tag
-  # push, or a recovery dispatch run on the tag — behind the shared
-  # GPU-prove verdict (every release publisher gates on the prove verdict,
-  # all-or-nothing, not only the CUDA lanes). Split from the main-branch arm above so the ungated manual
-  # `:latest` refresh is never blocked by, or conflated with, a
-  # release-tag promotion's gate.
-  #
-  # Matrixed over arch, same shape as `build-and-push-main` above. Each leg
-  # pushes ONLY its own immutable `sha-<sha>-<arch>` tag; `merge-cpu-
-  # tag` below is the ONLY job that ever moves the real semver/`sha-<sha>`
-  # tags this arm publishes.
-  build-and-push:
-    needs: [proof, artifacts]
-    # `always()` (for the proof interaction) bypasses the DEFAULT implicit
-    # "all needs succeeded" gate -- so `artifacts`' own success must be
-    # re-asserted explicitly here too, or a failed lookup would let this job
-    # run anyway with no binaries to package.
-    if: always() && github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.artifacts.result == 'success'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-            target_arch: x86_64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            target_arch: aarch64
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-      # See build-and-push-main's identical comment: only a pushing job gets these.
-      id-token: write
-      attestations: write
-      # Downloads the proven binaries from their run.
-      actions: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # The binaries the `ci.yml` run that proved this tree built
-      # (`artifacts`), laid out as the Dockerfile's builder stage: the
-      # image packages them and compiles nothing.
-      - name: Stage the proven binaries
-        id: binaries
-        uses: ./.github/actions/stage-server-binaries
-        with:
-          server: server-cpu-${{ matrix.target_arch }}-binary
-          cli: jammi-${{ matrix.target_arch }}-unknown-linux-gnu
-          stage: builder
-          run-id: ${{ needs.artifacts.outputs.run }}
-
-      - uses: ./.github/actions/docker-publish
-        id: publish
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags-spec: |
-            type=sha,format=long
-          tag-suffix: ${{ matrix.arch }}
-          build-contexts: ${{ steps.binaries.outputs.build-context }}
-          platforms: linux/${{ matrix.arch }}
-          cache-scope: cpu-${{ matrix.arch }}
-          push: "true"
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
-
-      - name: Assert BuildKit provenance + SBOM are in the image index
-        shell: bash
-        env:
-          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
-        run: bash ci/scripts/assert_image_attestations.sh
-
-      # See build-and-push-main's identical comment: the assert step above
-      # never verifies the Sigstore OCI-referrer bundle `attest-build-
-      # provenance` just published.
-      - name: Verify the Sigstore attestation bundle (gh attestation verify)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
-
-  # Merges `build-and-push`'s two per-arch immutable sources into the real
-  # semver/`sha-<sha>` tags -- the ONLY job that ever moves them for this
-  # arm. `gate_kind` "chained": gated off `build-and-push` itself (already
-  # gated by `proof`, direct), carrying the SAME tag-family conjunct
-  # (`check_gpu_prove_once.py` P3). Verify-then-promote, same shape as
-  # `merge-cpu-main` above.
-  merge-cpu-tag:
-    needs: [build-and-push]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build-and-push.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
-        id: meta
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long
-
-      - name: Merge the per-arch sources into the real tags
-        id: merge
-        shell: bash
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          SHA_TAG: sha-${{ github.sha }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          sources=("${IMAGE}:${SHA_TAG}-amd64" "${IMAGE}:${SHA_TAG}-arm64")
-          tag_args=()
-          tags=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            tag_args+=(-t "$tag")
-            tags+=("$tag")
-          done <<< "$TAGS"
-
-          docker buildx imagetools create --dry-run "${tag_args[@]}" "${sources[@]}" \
-            | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"
-
-          # Capture the PRE-CREATE digest of EVERY tag this merge is about
-          # to move -- not only the immutable `sha-<sha>` tag -- because if
-          # the post-push confirm fails, a correct restore needs each
-          # tag's OWN previous digest: `{{version}}` / `{{major}}.{{minor}}`
-          # / the sha tag are never guaranteed to have shared one digest
-          # before this merge landed, so restoring every tag to the sha
-          # tag's old digest would re-point tags onto a digest that was
-          # never theirs. Same not-found-vs-any-other-failure split as
-          # `_ci-base-image.yml`'s `promote` step (:345-378), applied to
-          # EACH tag independently: a genuine first publish of that one
-          # tag has nothing to restore to; any other read failure for any
-          # one tag means this step cannot even confirm what it would be
-          # overwriting.
-          declare -A previous_digests
-          for t in "${tags[@]}"; do
-            set +e
-            prev_digest="$(docker buildx imagetools inspect "$t" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-tag-inspect-stderr.txt)"
-            inspect_rc=$?
-            set -e
-            inspect_stderr="$(cat /tmp/merge-cpu-tag-inspect-stderr.txt)"
-            if [ "$inspect_rc" -ne 0 ]; then
-              if [[ "$inspect_stderr" == *"${t}: not found"* ]]; then
-                previous_digests["$t"]=""
-                echo "pre-create digest read: ${t} does not exist yet (first publish) -- nothing to restore to"
-              else
-                echo "::error::pre-create digest read for ${t} failed with something other than a not-found result -- refusing to promote: $inspect_stderr" >&2
-                exit 1
-              fi
-            elif [[ ! "$prev_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::pre-create digest read for ${t} succeeded but returned an unexpected value ('$prev_digest', not a sha256 digest) -- refusing to promote" >&2
-              exit 1
-            else
-              previous_digests["$t"]="$prev_digest"
-            fi
-          done
-
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-
-          # Re-read the IMMUTABLE `sha-<sha>` tag, not a mutable tag off
-          # $TAGS -- the digest this step attests, and the digest the
-          # attestation checks below verify, must be the one the merge
-          # itself just wrote, not whatever a later push re-points a
-          # mutable tag to.
-          #
-          # Two DIFFERENT failures, two different messages -- same split as
-          # `_ci-base-image.yml`'s "Confirm the pushed index" step
-          # (:381-406): the re-inspect ITSELF failing (or returning
-          # something that does not even shape-match a digest) means
-          # whether the merge landed is UNKNOWN, so a restore command
-          # printed there could overwrite a GOOD merge with a stale
-          # digest -- that arm never prints one. Only a re-inspect that
-          # SUCCEEDS, with a shape-valid digest, whose CONTENT then fails
-          # the platform check is a confirmed-landed-wrong result, and
-          # only THAT arm prints a restore command -- naming every tag
-          # this merge wrote ($TAGS via `tags`), not only the immutable
-          # sha tag, since `imagetools create` above moved all of them.
-          set +e
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{.Manifest.Digest}}' 2>/tmp/merge-cpu-tag-confirm-stderr.txt)"
-          confirm_inspect_rc=$?
-          set -e
-          confirm_stderr="$(cat /tmp/merge-cpu-tag-confirm-stderr.txt)"
-
-          if [ "$confirm_inspect_rc" -ne 0 ]; then
-            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} failed ($confirm_stderr) -- whether the merge landed is unknown, so do NOT restore: a restore now could overwrite a GOOD merge with a stale digest; verify manually first" >&2
-            exit 1
-          fi
-
-          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::post-push re-read of ${IMAGE}:${SHA_TAG} succeeded but returned an unexpected value ('$digest', not a sha256 digest) -- whether the merge landed is unknown, so do NOT restore: verify manually first" >&2
-            exit 1
-          fi
-
-          if ! docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .Manifest}}' \
-              | bash ci/scripts/check_merged_index_platforms.sh "linux/amd64,linux/arm64"; then
-            echo "::error::post-push confirm failed for ${IMAGE}:${SHA_TAG} -- the re-read merged index landed but is wrong; restoring each tag requires its OWN previous digest, never the sha tag's, since this merge moved them independently:" >&2
-            for restore_tag in "${tags[@]}"; do
-              restore_digest="${previous_digests[$restore_tag]}"
-              if [ -n "$restore_digest" ]; then
-                echo "::error::  restore ${restore_tag}: docker buildx imagetools create -t ${restore_tag} ${IMAGE}@${restore_digest}" >&2
-              else
-                echo "::error::  first publish of ${restore_tag}: nothing to restore" >&2
-              fi
-            done
-            exit 1
-          fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Attest build provenance (the merged index)
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.merge.outputs.digest }}
-          push-to-registry: true
-
-      # Every push job in this workflow runs both checks below against its
-      # own pushed digest; this merge job verifies the merged index it
-      # attested above, so `deploy-server.md`'s "on every push job" claim
-      # holds with no "attested, not verified" gap.
-      - name: Assert BuildKit provenance + SBOM are in the image index
-        shell: bash
-        env:
-          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}
-        run: bash ci/scripts/assert_image_attestations.sh
-
-      - name: Verify the Sigstore attestation bundle (gh attestation verify)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.merge.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
-
-  # Self-contained variant: opt-in, dispatch-only. Builds the
-  # `runtime-selfcontained` stage (baked config) from the
-  # dispatched ref and pushes `:selfcontained` + a `:sha-<sha>` tag.
-  # Independent of the tag-triggered generic publish above. Packages the
-  # SAME `server-cpu` binary the generic CPU image does (the dispatched
-  # tree's, from the run that proved it), so it never carries a CUDA
-  # feature.
-  build-and-push-selfcontained:
-    # `&& github.ref_type != 'tag'`: without a ref-type restriction, a
-    # workflow_dispatch run against a `v*` tag ref with
-    # `selfcontained=true` would push this image entirely ungated (this row is
-    # gate_kind='none' by design, so it never even had a GPU-prove verdict
-    # to bypass). `check_gpu_prove_once.py`'s P3 rule pins the exact
-    # conjunct `github.ref_type != 'tag'` on every gate_kind='none' row.
-    if: github.event_name == 'workflow_dispatch' && inputs.selfcontained && github.ref_type != 'tag'
-    needs: [artifacts]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      # See build-and-push-main's identical comment: only a pushing job gets these.
-      id-token: write
-      attestations: write
-      # Downloads the proven binaries from their run.
-      actions: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # The binaries the `ci.yml` run that proved this tree built
-      # (`artifacts`), laid out as the Dockerfile's builder stage: the
-      # image packages them and compiles nothing.
-      - name: Stage the proven binaries
-        id: binaries
-        uses: ./.github/actions/stage-server-binaries
-        with:
-          server: server-cpu-x86_64-binary
-          cli: jammi-x86_64-unknown-linux-gnu
-          stage: builder
-          run-id: ${{ needs.artifacts.outputs.run }}
-
-      - uses: ./.github/actions/docker-publish
-        id: publish
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags-spec: |
-            type=raw,value=selfcontained
-            type=sha,prefix=selfcontained-,format=long
-          build-args: |
-            RUNTIME_VARIANT=runtime-selfcontained
-          # Cloudflare Containers (this variant's runtime) is amd64-only
-          # -- no arm leg, no merge job, no row. Explicit, never implicit
-          # native-runner behavior, so a future runner-arch change fails
-          # loudly instead of silently shipping an arm64 image nothing can
-          # run (same loud-failure property the CUDA base already has).
-          build-contexts: ${{ steps.binaries.outputs.build-context }}
-          platforms: linux/amd64
-          push: "true"
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
-
-      - name: Assert BuildKit provenance + SBOM are in the image index
-        shell: bash
-        env:
-          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}
-        run: bash ci/scripts/assert_image_attestations.sh
-
-      # See build-and-push-main's identical comment: the assert step above
-      # never verifies the Sigstore OCI-referrer bundle `attest-build-
-      # provenance` just published.
-      - name: Verify the Sigstore attestation bundle (gh attestation verify)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.publish.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci
-
-  # CUDA image `jammi-ai-server-cu12`: pushed from `v*` tag refs only (tag
-  # push, or a recovery dispatch run on the tag), always behind the shared
-  # GPU-prove verdict. Builds the `runtime-cuda` stage (candle CUDA backend
-  # + NVIDIA runtime base) and pushes the same tag scheme as the CPU image.
-  # GPU runtime is not tested on the CI runner itself — `proof` below
-  # reads the commit's already-recorded proof (a dev dispatches
-  # `gpu-prove.yml` by hand before tagging; see docs/maintainer/dev-gpu.md);
-  # `ci.yml`'s `server-image-cuda` packages the CUDA image from its run's
-  # CUDA binary on every change, before any tag lands.
   proof:
     name: Proof required
-    # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
-    # requires the release commit's already-recorded GPU-prove verdict
-    # before the CUDA image is promoted. The tag guard (not an event guard)
-    # is what keeps every promotion arm proven: an event-keyed guard would
-    # let a dispatch push an unproven image.
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
-    secrets: inherit
 
-  build-and-push-cu12:
-    # build → proof → promote: the CUDA image pushes ONLY from a `v*` tag
-    # ref (push, or a recovery dispatch run on the tag) whose commit already
-    # carries a green GPU-prove verdict. A branch dispatch never pushes this
-    # image — the `latest`/semver tag scheme is a promotion, and an unproven
-    # promotion arm is exactly what this gate exists to make
-    # unrepresentable. (`ci.yml`'s `server-image-cuda` keeps the CUDA image
-    # building on every change.) The `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_
-    # once.py`'s P3 rule asserts this shape holds for every CUDA promotion
-    # job in the tree.
+  # The CPU image's legs: variant x arch, each pushing its own immutable
+  # commit tag. The runner follows the arch and the tag policy is
+  # `ci/scripts/image_tags.sh`'s (`ci/scripts/build_matrix.py`).
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - id: plan
+        run: python3 ci/scripts/build_matrix.py images --platforms linux/amd64,linux/arm64 --cross variant=generic,selfcontained | tee -a "$GITHUB_OUTPUT"
+
+  push-cpu:
+    name: Push ${{ matrix.variant }} (${{ matrix.arch }})
+    needs: [plan, proof, artifacts]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.plan.result == 'success' && needs.proof.result == 'success' && needs.artifacts.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: The arch's binary names and the leg's tag
+        id: leg
+        env:
+          ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          case "$ARCH" in amd64) target=x86_64 ;; arm64) target=aarch64 ;; esac
+          {
+            echo "target=$target"
+            echo "tags<<EOF"
+            bash ci/scripts/image_tags.sh "$VARIANT" --immutable
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/stage-server-binaries
+        id: binaries
+        with:
+          server: server-cpu-${{ steps.leg.outputs.target }}-binary
+          cli: jammi-${{ steps.leg.outputs.target }}-unknown-linux-gnu
+          stage: builder
+          run-id: ${{ needs.artifacts.outputs.run }}
+
+      - uses: ./.github/actions/push-image-leg
+        with:
+          image: ${{ env.IMAGE }}
+          tags-spec: ${{ steps.leg.outputs.tags }}
+          tag-suffix: ${{ matrix.arch }}
+          build-args: |
+            RUNTIME_VARIANT=runtime-${{ matrix.variant }}
+          build-contexts: ${{ steps.binaries.outputs.build-context }}
+          platforms: ${{ matrix.platform }}
+          cache-scope: cpu-${{ matrix.variant }}-${{ matrix.arch }}
+
+  merge-cpu:
+    name: Merge ${{ matrix.variant }}
+    needs: [push-cpu]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.push-cpu.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [generic, selfcontained]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: The variant's tags and its per-arch sources
+        id: variant
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            bash ci/scripts/image_tags.sh "$VARIANT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The real tags, the commit tag first: the immutable one the merge
+      # re-reads and attests. `latest=false`: the moving tag is the policy's
+      # own `raw` entry, never metadata-action's default.
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: ${{ steps.variant.outputs.tags }}
+
+      # The commit tag metadata-action resolved, with each arch's suffix.
+      - name: The per-arch sources
+        id: sources
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          immutable="$(head -n1 <<< "$TAGS")"
+          {
+            echo "sources<<EOF"
+            echo "${immutable}-amd64"
+            echo "${immutable}-arm64"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/merge-index
+        with:
+          image: ${{ env.IMAGE }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          sources: ${{ steps.sources.outputs.sources }}
+          attest: "true"
+
+  push-cu12:
+    name: Push CUDA image
     needs: [proof, artifacts]
-    # See build-and-push's identical comment: `always()` needs resolve-
-    # base's success re-asserted explicitly too.
     if: always() && startsWith(github.ref, 'refs/tags/v') && needs.proof.result == 'success' && needs.artifacts.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      # See build-and-push-main's identical comment: only a pushing job gets these.
       id-token: write
       attestations: write
-      # Downloads the proven binaries from their run.
       actions: read
-
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # The binaries the `ci.yml` run that proved this tree built
-      # (`artifacts`), laid out as the Dockerfile's builder-cuda stage: the
-      # image packages them and compiles nothing.
-      - name: Stage the proven binaries
+      - uses: ./.github/actions/stage-server-binaries
         id: binaries
-        uses: ./.github/actions/stage-server-binaries
         with:
           server: server-cu12-x86_64-binary
           cli: jammi-x86_64-unknown-linux-gnu
           stage: builder-cuda
           run-id: ${{ needs.artifacts.outputs.run }}
 
-      - uses: ./.github/actions/docker-publish
-        id: publish
+      - name: The image's tags
+        id: tags
+        run: |
+          set -euo pipefail
+          {
+            echo "tags<<EOF"
+            bash ci/scripts/image_tags.sh cuda
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/push-image-leg
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
-          tags-spec: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long
+          image: ${{ env.IMAGE_CU12 }}
+          tags-spec: ${{ steps.tags.outputs.tags }}
           build-args: |
             RUNTIME_VARIANT=runtime-cuda
-          # The CUDA runtime base has no arm64 build (no NVIDIA GPU target
-          # for it); explicit, same
-          # loud-failure property as the self-contained image above.
           build-contexts: ${{ steps.binaries.outputs.build-context }}
           platforms: linux/amd64
-          push: "true"
           cache-scope: cu12
-
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
-
-      - name: Assert BuildKit provenance + SBOM are in the image index
-        shell: bash
-        env:
-          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}@${{ steps.publish.outputs.digest }}
-        run: bash ci/scripts/assert_image_attestations.sh
-
-      # See build-and-push-main's identical comment: the assert step above
-      # never verifies the Sigstore OCI-referrer bundle `attest-build-
-      # provenance` just published.
-      - name: Verify the Sigstore attestation bundle (gh attestation verify)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh attestation verify "oci://${{ env.REGISTRY }}/${{ env.IMAGE_NAME_CU12 }}@${{ steps.publish.outputs.digest }}" --owner ${{ github.repository_owner }} --bundle-from-oci

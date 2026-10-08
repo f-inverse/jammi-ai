@@ -1,12 +1,12 @@
 # Self-contained configuration for the `jammi-server` image variant.
 #
 # This config boots the server with zero external dependencies — no
-# mounted volume, no config bind-mount. It is baked
-# into the `:selfcontained` image (see `Dockerfile`, `BAKE_SELFCONTAINED=1`)
+# mounted volume, no config bind-mount. It is baked into the
+# `:selfcontained` image (the `Dockerfile`'s `runtime-selfcontained` stage)
 # at `/etc/jammi/jammi.toml`, the path the entrypoint already reads.
 #
-# It targets a serverless runtime (Cloudflare Containers) where the
-# filesystem is ephemeral and the distroless nonroot user (uid 65532)
+# It targets a runtime that provides neither a config nor a volume, where
+# the filesystem is ephemeral and the distroless nonroot user (uid 65532)
 # cannot write outside `/tmp`:
 #
 #   * `artifact_dir` lives under `/tmp` so the SQLite catalog, mutable
@@ -27,8 +27,8 @@ artifact_dir = "/tmp/jammi"
 [server]
 # HTTP side-channel: `/healthz`, `/readyz`, `/metrics`.
 health_listen = "0.0.0.0:8080"
-# gRPC + Flight SQL + EmbeddingService, fronted by tonic-web for browser
-# and Cloudflare Worker (gRPC-Web) clients.
+# gRPC + Flight SQL + EmbeddingService, fronted by tonic-web for gRPC-Web
+# clients (a browser, an edge isolate).
 flight_listen = "0.0.0.0:8081"
 # No preloaded models — each request names its model.
 preload_models = []

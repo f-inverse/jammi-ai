@@ -2,15 +2,14 @@ name: Cookbook as published
 
 # The cookbook notebooks as a reader runs them: each notebook at a release tag,
 # in a fresh environment, setup cell included, so it installs that release from
-# PyPI and the cookbook from the tag (cookbook/book/scripts/run_published_notebooks.py).
-# The cookbook lane (cookbook-gpu.yml) runs the chapter sources against the
+# PyPI and the cookbook from the tag (`cookbook/book/scripts/run_published_notebooks.py`).
+# The cookbook lane (`cookbook-gpu.yml`) runs the chapter sources against the
 # builds a tree's CI made; only this lane sees what a reader gets from PyPI.
 #
 # Nightly against the newest `py-v*` tag on a CPU, because what a reader
 # installs changes after the tag (a dependency release, a package index
 # refusing a wheel). After a release, dispatch it on the release's tag, and
-# cookbook-published-gpu.yml too: the same notebooks on a GPU host, where the
-# setup cell installs the CUDA wheels.
+# `cookbook-published-gpu.yml` too.
 
 on:
   schedule:
@@ -36,7 +35,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: tag
         env:
           REQUESTED: ${{ inputs.tag }}
@@ -76,18 +75,20 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           sparse-checkout: cookbook/book/scripts
       - name: Check out the notebooks at ${{ needs.resolve.outputs.tag }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           path: published
           sparse-checkout: cookbook/notebooks
       - name: Run the notebooks as published
+        env:
+          SHARD: ${{ matrix.shard }}
         run: >
           python cookbook/book/scripts/run_published_notebooks.py
           --notebooks published/cookbook/notebooks
-          --shard ${{ matrix.shard }}/8
+          --shard "$SHARD/8"
           --work "$RUNNER_TEMP/notebooks"

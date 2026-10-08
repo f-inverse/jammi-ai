@@ -7,18 +7,14 @@ name: _ci-base-image
 # definition of how an image is built. `ci.yml` calls it once per image; a tag
 # the registry already holds is the same image, so `plan` skips the build.
 #
-# Multi-arch shape: `build-and-push` is a matrix over the image's platforms,
-# one NATIVE runner per platform (`linux/amd64` -> `ubuntu-latest`,
-# `linux/arm64` -> `ubuntu-24.04-arm`; no QEMU — a QEMU-emulated Rust
-# toolchain build is an order of magnitude slower and has hung before). Each
-# leg pushes only `<tag>-<arch>`; `merge-manifest` merges the legs into
-# `<tag>`, the one reference consumers pull, after dry-running the merge and
-# asserting the resulting index's platform set — verify, then promote.
+# One native runner per platform (`ci/scripts/build_matrix.py`), never QEMU.
+# Each leg pushes only `<tag>-<arch>`; `merge-manifest` merges the legs into
+# `<tag>`, the one reference consumers pull, through the same
+# verify-then-promote every published image uses (`merge-index`).
 #
-# Two runs that build the same tag at once (two pull requests whose image
-# inputs are the same) push equivalent images: the same Dockerfile over the
-# same inputs, every base pinned by digest. The later merge wins the tag, and
-# either image is the tree's.
+# Two runs that build the same tag at once push equivalent images: the same
+# Dockerfile over the same inputs, every base pinned by digest. The later
+# merge wins the tag, and either image is the tree's.
 
 on:
   workflow_call:
@@ -37,57 +33,42 @@ permissions:
   packages: write
 
 jobs:
-  # Whether the tag needs building, and the platform -> runner/arch matrix
-  # `build-and-push` consumes (a matrix cannot be built from a raw string;
-  # `fromJson` needs a real JSON array). The SINGLE place that map lives:
-  # `merge-manifest` reads the arch list back out of this job's output.
   plan:
     runs-on: ubuntu-latest
     outputs:
-      image: ${{ steps.plan.outputs.image }}
-      platforms: ${{ steps.plan.outputs.platforms }}
-      build: ${{ steps.plan.outputs.build }}
-      matrix: ${{ steps.plan.outputs.matrix }}
+      image: ${{ steps.describe.outputs.ref }}
+      platforms: ${{ steps.describe.outputs.platforms }}
+      build: ${{ steps.built.outputs.build }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Is the tag built, and the per-platform build matrix
-        id: plan
-        shell: bash
+      - id: describe
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
+        run: python3 ci/scripts/ci_image.py describe --dockerfile "$DOCKERFILE" | tee -a "$GITHUB_OUTPUT"
+
+      - id: matrix
+        env:
+          PLATFORMS: ${{ steps.describe.outputs.platforms }}
+        run: python3 ci/scripts/build_matrix.py images --platforms "$PLATFORMS" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Is the tag built
+        id: built
+        env:
+          IMAGE: ${{ steps.describe.outputs.ref }}
         run: |
           set -euo pipefail
-          described="$(python3 ci/scripts/ci_image.py describe --dockerfile "$DOCKERFILE")"
-          image="$(sed -n 's/^ref=//p' <<< "$described")"
-          platforms_csv="$(sed -n 's/^platforms=//p' <<< "$described")"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "platforms=$platforms_csv" >> "$GITHUB_OUTPUT"
-          if docker buildx imagetools inspect "$image" >/dev/null 2>/tmp/inspect-stderr.txt; then
+          if docker buildx imagetools inspect "$IMAGE" >/dev/null 2>/tmp/inspect-stderr.txt; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "$image is built"
+            echo "$IMAGE is built"
           elif grep -q "not found" /tmp/inspect-stderr.txt; then
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "$image is not built yet"
+            echo "$IMAGE is not built yet"
           else
-            echo "::error::reading $image failed: $(cat /tmp/inspect-stderr.txt)" >&2
+            echo "::error::reading $IMAGE failed: $(cat /tmp/inspect-stderr.txt)" >&2
             exit 1
           fi
-          IFS=',' read -ra platforms <<< "$platforms_csv"
-          entries=()
-          for platform in "${platforms[@]}"; do
-            case "$platform" in
-              linux/amd64) runner=ubuntu-latest; arch=amd64 ;;
-              linux/arm64) runner=ubuntu-24.04-arm; arch=arm64 ;;
-              *)
-                echo "::error::unsupported platform: '$platform' (expected linux/amd64 or linux/arm64)" >&2
-                exit 1
-                ;;
-            esac
-            entries+=("{\"platform\":\"$platform\",\"runner\":\"$runner\",\"arch\":\"$arch\"}")
-          done
-          matrix="{\"include\":[$(IFS=,; echo "${entries[*]}")]}"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     needs: [plan]
@@ -99,27 +80,22 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # The buildx `docker-container` driver is required for the attestation
-      # manifest `merge-manifest`'s assertion below depends on: the default
-      # `docker` driver builds without buildx at all and emits a plain v2
-      # manifest with NO `unknown/unknown` provenance referrer, which would
-      # silently fail that assertion. Load-bearing, not cosmetic.
+      # The `docker-container` driver is what emits the attestation manifest
+      # the merge's platform assertion reads; the default driver omits it.
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
-      # The base this arch builds FROM and the toolchain pin, each a key
-      # input: the build context is `.docker/`, so `rust-toolchain.toml`
-      # cannot be COPYed in and arrives as a build-arg instead.
+      # The build context is `.docker/`, so the base this arch builds FROM and
+      # the toolchain pin arrive as build arguments.
       - name: The image's build arguments on this arch
         id: args
-        shell: bash
         env:
           DOCKERFILE: ${{ inputs.dockerfile }}
           ARCH: ${{ matrix.arch }}
@@ -138,17 +114,10 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           build-args: ${{ steps.args.outputs.args }}
-          # Only the per-arch leg: `merge-manifest` is the one job that
-          # produces the reference consumers pull.
+          # Only the per-arch leg: `merge-manifest` produces the reference
+          # consumers pull.
           tags: ${{ needs.plan.outputs.image }}-${{ matrix.arch }}
 
-  # Verify-then-promote: the merge is DRY-RUN first and its resulting index
-  # asserted against the requested platform set BEFORE anything is pushed —
-  # `imagetools create --dry-run` prints the same top-level index JSON
-  # `imagetools inspect --format '{{json .Manifest}}'` returns on a
-  # multi-platform tag, so the identical assertion script runs against both.
-  # Only after that passes does the pushing `imagetools create` run, followed
-  # by one re-inspect of the pushed tag to confirm it matched the dry run.
   merge-manifest:
     needs: [plan, build-and-push]
     if: needs.plan.outputs.build == 'true'
@@ -157,61 +126,24 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: The per-arch sources
-        shell: bash
+        id: sources
         env:
           IMAGE: ${{ needs.plan.outputs.image }}
           MATRIX_JSON: ${{ needs.plan.outputs.matrix }}
         run: |
           set -euo pipefail
-          archs_json="$(jq -r '.include[].arch' <<< "$MATRIX_JSON")" || {
-            echo "::error::failed to read .include[].arch out of plan's matrix JSON" >&2
-            exit 1
-          }
-          mapfile -t archs <<< "$archs_json"
-          if [ "${#archs[@]}" -eq 0 ] || [ -z "${archs[0]}" ]; then
-            echo "::error::plan's matrix JSON yielded zero archs -- refusing to compute an empty source list" >&2
-            exit 1
-          fi
-          : > /tmp/ci-base-image-sources.txt
-          for arch in "${archs[@]}"; do
-            echo "${IMAGE}-${arch}" >> /tmp/ci-base-image-sources.txt
-          done
+          {
+            echo "sources<<EOF"
+            jq -r --arg image "$IMAGE" '.include[].arch | "\($image)-\(.)"' <<< "$MATRIX_JSON"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Dry-run the merge and assert the resulting index BEFORE promoting anything
-        shell: bash
-        env:
-          IMAGE: ${{ needs.plan.outputs.image }}
-          PLATFORMS: ${{ needs.plan.outputs.platforms }}
-        run: |
-          set -euo pipefail
-          mapfile -t sources < /tmp/ci-base-image-sources.txt
-          docker buildx imagetools create --dry-run -t "$IMAGE" "${sources[@]}" \
-            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"
-
-      - name: Promote -- create the merged index
-        shell: bash
-        env:
-          IMAGE: ${{ needs.plan.outputs.image }}
-        run: |
-          set -euo pipefail
-          mapfile -t sources < /tmp/ci-base-image-sources.txt
-          docker buildx imagetools create -t "$IMAGE" "${sources[@]}"
-
-      - name: Confirm the pushed index
-        shell: bash
-        env:
-          IMAGE: ${{ needs.plan.outputs.image }}
-          PLATFORMS: ${{ needs.plan.outputs.platforms }}
-        run: |
-          set -euo pipefail
-          docker buildx imagetools inspect "$IMAGE" --format '{{json .Manifest}}' \
-            | bash ci/scripts/check_merged_index_platforms.sh "$PLATFORMS"
+      - uses: ./.github/actions/merge-index
+        with:
+          image: ${{ needs.plan.outputs.image }}
+          platforms: ${{ needs.plan.outputs.platforms }}
+          tags: ${{ needs.plan.outputs.image }}
+          sources: ${{ steps.sources.outputs.sources }}

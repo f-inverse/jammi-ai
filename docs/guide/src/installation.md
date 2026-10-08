@@ -67,10 +67,8 @@ its own (see [The identity seam](./deploy-server.md#the-identity-seam)),
 so a loopback bind keeps the unauthenticated admin surface off the host's
 public network until a terminator or reverse proxy is put in front of it.
 
-Both `:latest` tags are re-pointed by every `v*` release tag (never by a
-prerelease); the CPU `:latest` can additionally be re-pointed to the current
-`main` by a manual `build-and-push-main` dispatch. Pin an exact `:X.Y.Z`
-tag for a reproducible pull.
+`:latest` on every image is the newest `v*` release and nothing else moves
+it. Pin an exact `:X.Y.Z` tag for a reproducible pull.
 
 That runs `jammi-server` with zero config. See
 [Deploy as a Server](./deploy-server.md#gpu-serving) for GPU configuration and

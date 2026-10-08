@@ -3,8 +3,8 @@ name: Cookbook as published (GPU)
 # The cookbook notebooks at a release tag, as a reader on a GPU runtime runs
 # them: on a RunPod L4 (sm_89, the class of GPU a Colab reader gets), each in a
 # fresh environment whose setup cell installs the CUDA wheels from PyPI
-# (ci/scripts/runpod_cookbook_published.sh). The CPU lane is
-# cookbook-published.yml. Dispatched by hand after a release: it rents a pod.
+# (`ci/scripts/runpod_cookbook_published.sh`). The CPU lane is
+# `cookbook-published.yml`. Dispatched by hand after a release: it rents a pod.
 
 on:
   workflow_dispatch:
@@ -22,8 +22,6 @@ permissions:
   contents: read
 
 jobs:
-  # The tree's CUDA CI image (`_ci-image.yml`): the pod runs the environment
-  # the tree defines, never the one `main` last had.
   ci-image:
     permissions:
       contents: read
@@ -38,7 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
       # Before renting the pod: every place a notebook installs from serves
       # the release, or the run would fail install by install.
       - name: The release is installable
@@ -46,11 +45,13 @@ jobs:
           TAG: ${{ inputs.tag }}
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 ci/scripts/release_installable.py --tag "$TAG"
-      - name: Run the notebooks as published on an L4
+
+      - uses: ./.github/actions/run-paid-lane
+        with:
+          driver: ci/scripts/runpod_cookbook_published.sh
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RP_IMAGE: ${{ needs.ci-image.outputs.cuda }}
           GIT_REPO: https://github.com/${{ github.repository }}.git
           DRIVER_REF: ${{ github.sha }}
           NOTEBOOKS_TAG: ${{ inputs.tag }}
-        run: bash ci/scripts/runpod_cookbook_published.sh

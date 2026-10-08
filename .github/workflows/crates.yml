@@ -1,25 +1,23 @@
 name: Crates
 
+# Publishes the workspace crates to crates.io on a `v*` tag, behind the shared
+# release gate: the tree's recorded verdicts and the tag's version
+# (`_proof-required.yml`). `ci/scripts/publish_crates.sh` is the publish
+# program: topological order, the per-crate already-published guard, the
+# sparse-index wait; this workflow mints its token and supplies its
+# environment. A dispatch on the tag finishes an interrupted release; a
+# branch dispatch runs nothing but the image wait, since a crates.io publish
+# is irreversible and only a tag may first-publish a version.
+
 on:
   push:
     tags: ["v*"]
-  # Manual re-run to finish a release whose publish step was interrupted (e.g.
-  # a runner ran out of disk mid-publish): run the dispatch ON the `v*` tag —
-  # the publish job is tag-guarded, the version derives from the tag ref, and
-  # the per-crate "already on crates.io" guard skips whatever already landed.
-  # No `version` input: `cargo publish` ships the checked-out workspace, so an
-  # input could only key the idempotence probes on a different quantity than
-  # what publishes (publish_crates.sh cross-checks and would refuse anyway).
-  # A branch dispatch runs validate + perf-gate as a dry run and stops there.
   workflow_dispatch:
 
 concurrency:
   group: release
   cancel-in-progress: false
 
-# Least privilege at the workflow level; the publish job widens to
-# `id-token: write` (crates.io trusted publishing) and `github-release` to
-# `contents: write` per job.
 permissions:
   contents: read
 
@@ -27,8 +25,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The tree's CI images (`_ci-image.yml`), by content: `ci.yml` builds them,
-  # and this run waits until they exist.
+  # The tree's CI image: `cargo publish` verifies each crate builds, in the
+  # toolchain the tree defines.
   ci-image:
     permissions:
       contents: read
@@ -37,242 +35,41 @@ jobs:
     with:
       await: cpu
 
-  validate:
-    name: Validate
-    needs: ci-image
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.ci-image.outputs.cpu }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
-
-      - name: Verify tag matches workspace version
-        # Any `v*` tag ref — a tag push, or a recovery dispatch run on the
-        # tag — must pass this; only a branch run (which can never publish,
-        # see the publish job's tag guard) skips it.
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          tag="${GITHUB_REF#refs/tags/v}"
-          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          if [ "$tag" != "$version" ]; then
-            echo "Tag v$tag does not match workspace version $version"
-            exit 1
-          fi
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      # `jammi-python` is built via maturin, not workspace cargo — its
-      # `extension-module` feature is opt-in so the bare workspace test
-      # lane would fail to link `-lpython3.x` on the manylinux CI image.
-      # The crate is exercised end-to-end by the `Test (Python)` job in
-      # `ci.yml` (which also runs `cargo test -p jammi-python` against
-      # the venv's interpreter).
-      - name: Run tests
-        run: cargo test --workspace --exclude jammi-python
-
-  perf-gate:
-    name: Performance regression gate (release-blocking)
-    needs: ci-image
-    runs-on: ubuntu-latest
-    container:
-      image: ${{ needs.ci-image.outputs.cpu }}
-    # The release tag is the authoritative same-box-ish performance gate: a
-    # structural throughput regression (a path that went quadratic, a serialized
-    # parallel section, a dropped fast path) SHOULD block a release. Each
-    # `*-scale` tier maps its measured-rate-vs-committed-floor verdict (and its
-    # determinism-digest check) to the process exit code, so a regression exits
-    # non-zero and reds this job — and because `publish` needs it, the crates
-    # never ship. This is the gated half; the nightly `perf.yml` lane is
-    # the non-blocking early-warning half. The documented contract (the verb ×
-    # baseline × threshold × reference-box SLO table) is
-    # `docs/guide/src/performance-slos.md`.
-    env:
-      # Pin Rayon to one thread so the measured rate reflects the engine's
-      # per-core code path, not the runner's core count — the posture the
-      # committed baselines were emitted under.
-      RAYON_NUM_THREADS: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ci
-
-      - name: Build the bench harness (release)
-        # The committed baselines are release-profile numbers; the rate gate
-        # only means anything against a release build.
-        #
-        # JAMMI_BUILD_SHA is pre-set here because this build runs inside the
-        # container job: build.rs's compile-time `git rev-parse HEAD` fallback
-        # hits git's "dubious ownership" refusal in a container, so without an
-        # override it bakes build_sha="unknown" — which run_scale_tiers.sh's
-        # provenance cross-check then correctly refuses to run tiers
-        # against. `github.sha` is exactly 40 lowercase hex, the one shape
-        # build.rs's own input-edge validation accepts verbatim (see the doc
-        # comment at the top of crates/jammi-bench/build.rs) — never a
-        # `-dirty` suffix.
-        env:
-          JAMMI_BUILD_SHA: ${{ github.sha }}
-        run: cargo build -p jammi-bench --release
-
-      # The tier list is stated once, in the shared script (also the nightly
-      # early-warning lane's list — perf.yml); a red names the regressed tier
-      # via its ::group:: header in the log.
-      - name: Run the CPU-hermetic scale tiers (measured-rate gate)
-        run: bash ci/scripts/perf/run_scale_tiers.sh
-
   proof:
     name: Proof required
-    # Any `v*` TAG ref — a tag push, or a recovery dispatch run on the tag —
-    # requires the release commit's already-recorded GPU-prove verdict
-    # before ANY crate is published (every release publisher gates on the
-    # prove verdict, all-or-nothing, not only the CUDA lanes). The tag guard (not an event guard) is what
-    # keeps every promotion arm proven: an event-keyed guard would let a
-    # dispatch publish unproven.
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/_proof-required.yml
     permissions:
       contents: read
       actions: read
-    secrets: inherit
 
   publish:
     name: Publish to crates.io
-    # A release ships only if the workspace validates, the performance gate
-    # holds, AND the commit's GPU-prove verdict is green — a structural perf
-    # regression, or a commit that was never proven, blocks the tag.
-    # Publishes ONLY from a `v*` tag ref (tag push, or a recovery dispatch run
-    # on the tag — crates.io publishes are irreversible, so a branch dispatch
-    # must never be able to first-publish an untagged workspace). A branch
-    # dispatch runs validate + perf-gate as a dry run and stops here. The
-    # `if:` is a PURE conjunction (no `||`) — `check_gpu_prove_once.py`'s
-    # PROMOTION_TABLE rule asserts this shape holds for every promotion job
-    # in the tree.
-    needs: [ci-image, validate, perf-gate, proof]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.validate.result == 'success' && needs.perf-gate.result == 'success' && needs.proof.result == 'success'
+    needs: [ci-image, proof]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.ci-image.result == 'success' && needs.proof.result == 'success'
     runs-on: ubuntu-latest
     container:
       image: ${{ needs.ci-image.outputs.cpu }}
     environment: crates-io
     permissions:
+      # The trusted-publishing token exchange (`ci/scripts/crates_io_token.sh`).
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/setup-rust-ci
 
-      # Trusted-publishing auth exchanges a short-lived GitHub OIDC token for a
-      # crates.io API token. Retrying this exchange is unconditionally safe —
-      # a failed or repeated token exchange creates no state on crates.io — so
-      # a blind bounded retry (no output classification needed) is correct
-      # here, unlike the publish step below. GitHub Actions has no construct
-      # to loop a `uses:` step in place (and no way for a later `run:` step to
-      # read an earlier `uses:` step's console output to classify its
-      # failure), so the bounded attempts are unrolled explicitly: each
-      # subsequent attempt is gated on the previous one having failed, and the
-      # resolution step below picks whichever attempt produced a token.
-      - name: Authenticate with crates.io (attempt 1)
-        id: auth1
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - name: Mint the crates.io token
+        id: token
+        run: bash ci/scripts/crates_io_token.sh mint
 
-      - name: Back off before crates.io auth retry
-        if: steps.auth1.outcome == 'failure'
-        run: sleep 2
-
-      - name: Authenticate with crates.io (attempt 2)
-        id: auth2
-        if: steps.auth1.outcome == 'failure'
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Back off before crates.io auth retry (2)
-        if: steps.auth2.outcome == 'failure'
-        run: sleep 4
-
-      - name: Authenticate with crates.io (attempt 3)
-        id: auth3
-        if: steps.auth2.outcome == 'failure'
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Back off before crates.io auth retry (3)
-        if: steps.auth3.outcome == 'failure'
-        run: sleep 8
-
-      - name: Authenticate with crates.io (attempt 4)
-        id: auth4
-        if: steps.auth3.outcome == 'failure'
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Back off before crates.io auth retry (4)
-        if: steps.auth4.outcome == 'failure'
-        run: sleep 16
-
-      - name: Authenticate with crates.io (attempt 5)
-        id: auth5
-        if: steps.auth4.outcome == 'failure'
-        continue-on-error: true
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
-
-      - name: Resolve crates.io auth token
-        id: auth
-        run: |
-          set -euo pipefail
-          for token in \
-            "${{ steps.auth1.outputs.token }}" \
-            "${{ steps.auth2.outputs.token }}" \
-            "${{ steps.auth3.outputs.token }}" \
-            "${{ steps.auth4.outputs.token }}" \
-            "${{ steps.auth5.outputs.token }}"; do
-            if [ -n "$token" ]; then
-              echo "::add-mask::$token"
-              echo "token=$token" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "::error::crates.io auth failed after 5 attempts" >&2
-          exit 1
-
-      # The whole publish program (topo order, transient-retry classification,
-      # sparse-index wait, per-crate presence guard) lives in
-      # ci/scripts/publish_crates.sh; this step only supplies the env it needs.
       - name: Publish crates
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-          # The script derives the version from the tag ref (v0.13.0 ->
-          # 0.13.0; this job only runs on `v*` tag refs) and cross-checks it
-          # against the workspace Cargo.toml, refusing on mismatch — the
-          # idempotence probes can never be keyed on a version other than
-          # the one `cargo publish` would ship.
+          CARGO_REGISTRY_TOKEN: ${{ steps.token.outputs.token }}
         run: bash ci/scripts/publish_crates.sh
 
-  github-release:
-    name: GitHub Release
-    needs: publish
-    # Any `v*` tag ref — `publish` above is tag-guarded (and itself gates on
-    # the GPU-prove verdict), so a recovery dispatch run on the tag reaches
-    # here with the same tag ref a push has, and the recovery creates the
-    # release too instead of publishing crates while leaving the release
-    # missing. `publish` already transitively gates this job on the prove
-    # verdict via `needs.publish.result == 'success'`; the explicit conjunct
-    # here (rather than relying on the implicit needs-success default) reads
-    # uniformly with every other promotion job's `if:` in the tree.
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.publish.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      # `release-binaries.yml`'s legs create the release themselves before
-      # uploading their assets, so by the time the crates.io publish finishes the
-      # release usually already exists. Create it only if missing — otherwise
-      # no-op — so whoever wins the race creates it and this job tolerates it.
-      - name: Create release if missing
+      - name: Revoke the crates.io token
+        if: always() && steps.token.outputs.token != ''
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes
+          CARGO_REGISTRY_TOKEN: ${{ steps.token.outputs.token }}
+        run: bash ci/scripts/crates_io_token.sh revoke

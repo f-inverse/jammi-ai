@@ -1,0 +1,60 @@
+name: merge-index
+description: >
+  Merges per-arch image sources into one multi-arch index under real tags,
+  verify-then-promote (`ci/scripts/merge_image_index.sh`), and, for a
+  published image, attests and verifies the merged digest. The one definition
+  of an index promotion: the tree's CI image and every published server image
+  merge through it. Needs `packages: write`; with `attest: "true"`, also
+  `id-token: write` and `attestations: write`.
+
+inputs:
+  image:
+    description: "The image, e.g. ghcr.io/f-inverse/jammi-ai-server."
+    required: true
+  platforms:
+    description: "The platform set the merged index must hold, comma-separated."
+    required: true
+  tags:
+    description: "The tags to create, one per line; the first is the immutable one whose digest is reported."
+    required: true
+  sources:
+    description: "The per-arch sources to merge, one per line."
+    required: true
+  attest:
+    description: "\"true\" for a published image: attest and verify the merged digest."
+    required: false
+    default: "false"
+
+outputs:
+  digest:
+    description: "The merged index's digest."
+    value: ${{ steps.merge.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    - id: merge
+      shell: bash
+      env:
+        PLATFORMS: ${{ inputs.platforms }}
+        TAGS: ${{ inputs.tags }}
+        SOURCES: ${{ inputs.sources }}
+      run: |
+        set -euo pipefail
+        args=()
+        while IFS= read -r tag; do [ -n "$tag" ] && args+=(--tag "$tag"); done <<< "$TAGS"
+        sources=()
+        while IFS= read -r source; do [ -n "$source" ] && sources+=("$source"); done <<< "$SOURCES"
+        bash ci/scripts/merge_image_index.sh --platforms "$PLATFORMS" "${args[@]}" -- "${sources[@]}" | tee -a "$GITHUB_OUTPUT"
+
+    - if: inputs.attest == 'true'
+      uses: ./.github/actions/attest-image
+      with:
+        image: ${{ inputs.image }}
+        digest: ${{ steps.merge.outputs.digest }}

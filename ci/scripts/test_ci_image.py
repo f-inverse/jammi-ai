@@ -31,7 +31,7 @@ class ScratchTree:
     def __enter__(self) -> Path:
         self._dir = tempfile.TemporaryDirectory()
         root = Path(self._dir.name)
-        for rel in {*CPU.inputs, *CUDA.inputs, ci_image.SERVICE_IMAGES, ".github/workflows/ci.yml"}:
+        for rel in {*CPU.inputs, *CUDA.inputs, ci_image.SERVICE_IMAGES, ".github/workflows/ci.yml", *ci_image.DEPLOY_SERVICE_FILES}:
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ci_image.REPO_ROOT / rel, root / rel)
         return root
@@ -282,3 +282,23 @@ class FailedBuilderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeployServiceImages(unittest.TestCase):
+    def test_the_real_deploy_files_name_the_pinned_services(self):
+        self.assertEqual(ci_image.deploy_service_findings(), [])
+
+    def test_a_drifted_tag_is_named(self):
+        with ScratchTree() as root:
+            compose = root / "deploy/docker-compose.yml"
+            compose.write_text(compose.read_text().replace("image: postgres:16", "image: postgres:17"))
+            findings = ci_image.deploy_service_findings(root)
+            self.assertEqual(len(findings), 1)
+            self.assertIn("docker-compose.yml", findings[0])
+            self.assertIn("postgres:17", findings[0])
+
+    def test_the_application_image_is_not_a_service(self):
+        with ScratchTree() as root:
+            compose = root / "deploy/docker-compose.yml"
+            compose.write_text(compose.read_text().replace("image: postgres:16", "image: postgres:16@sha256:" + "0" * 64))
+            self.assertEqual(ci_image.deploy_service_findings(root), [])

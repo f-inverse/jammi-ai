@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Inflate one committed same-box rate baseline 100x, in place.
 
-The teeth-proof half of the workflow-layer rate gate (perf.yml): with the named
+The teeth-proof half of the workflow-layer rate gate (`ci.yml`'s `perf-gate`,
+`ci/scripts/perf/check_rate_gate_bites.sh`): with the named
 baseline rate inflated 100x the derived floor (`baseline * (1 - 0.30)`) is
 unreachable, so the tier MUST exit non-zero — proving the exit-code gate is
 wired through, not decorative. The caller perturbs an ephemeral CI checkout

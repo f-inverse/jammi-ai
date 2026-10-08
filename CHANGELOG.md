@@ -6,6 +6,52 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
+The workflows are held to the engineering principles the code is: one definition of each thing,
+no compatibility arms, no advisory lanes, logic in tested scripts rather than YAML.
+
+- **A container image compiles nothing.** The Dockerfile packages the `jammi-server` and `jammi`
+  binaries `_server.yml` and `_cli.yml` built, through its `builder`/`builder-cuda` build contexts;
+  its builder stages, the second definition of how a server binary is compiled, are gone. The
+  nightly smokes package the binaries of the run that proved `main`'s tree (`_proven-artifacts.yml`)
+  instead of compiling their own.
+- **One tag policy, one arm, for every published image.** `server-image.yml` publishes on a `v*`
+  tag and nothing else: the CPU image's `generic` and `selfcontained` variants, each a two-arch
+  index merged by the one verify-then-promote definition (`merge-index`,
+  `ci/scripts/merge_image_index.sh`), and the CUDA image; `:latest` is the newest release. The
+  manual `:latest` refresh arm and the dispatch-only self-contained push are gone. Every pushed
+  digest is attested and verified by `attest-image` before its job is green.
+- **One publisher per registry.** The five PyPI workflows are one `pypi.yml` with a leg per
+  project; `release-binaries.yml` attaches every asset through one matrix; `crates.yml` is the
+  gate and the publish (`validate`, `perf-gate` and `github-release` are gone: the tree's verdict
+  is `ci.yml`'s, and `release-upload` creates the release). Every publisher's gate also holds the
+  tag to the version the tree ships (`ci/scripts/check_release_tag.sh`).
+- **`main` measures what only `main` measures, as verdicts.** The performance gate runs on every
+  push to `main` (`ci.yml`'s `perf-gate`, with a proof that it bites) and the live hub tests join
+  the summary; `perf.yml` and `continue-on-error` are gone. The dep-DAG freshness check is a
+  `ci.yml` job, not a path-filtered workflow.
+- **The prove lane proves the tree it records.** `gpu-prove.yml`'s pod checks out the commit
+  `record-subject` read, as the cookbook lane does, so a label-triggered run never records a merge
+  tree while proving a branch head.
+- **Workflow logic lives in `ci/scripts`**, with tests: the permission-fault lane, the live hub
+  lane, the build-sha oracle, the aarch64 floor oracle, the Kubernetes manifest check, the kind
+  image-identity assertion, the index merge, the crates.io token exchange, the build-arg check and
+  the service-image pull. `ci/scripts/build_matrix.py` is the one map from an architecture to its
+  runner. The CI image trusts every checkout system-wide, so no job spells `safe.directory`.
+- **Composite actions with one responsibility each:** `build-image` (verification and smoke
+  builds), `push-image-leg`, `merge-index`, `attest-image`, `setup-rust-host` (a bare runner's
+  toolchain, protoc, sccache and mold, the last pinned by `.docker/pinned-tools.sh`) and
+  `run-paid-lane` (the shared exit-code contract of every pod driver). `docker-publish` and its
+  compatibility defaults are gone; `install-jammi` installs the client wheel as a reader does.
+- **No speculative or dead surface.** `setup-rust-ci`'s unused `target` input, `gpu-howwell.yml`'s
+  label trigger that could never run, the `secrets: inherit` every publisher handed a gate that
+  reads none, and the second spelling of the Node version are gone. Every action is pinned by
+  commit. The consumer-name guard is a guard in `ci/guards.toml`; the smokes run the digest-pinned
+  Postgres under the deploy files' own name, which `ci_image.py check` holds.
+
+Releasing after this change: register the PyPI trusted publisher of `jammi-ai`,
+`jammi-ai-native-cu12`, `jammi-server` and `jammi-server-cu12` to the workflow `pypi.yml`
+(environment `pypi`), where `jammi-ai-native`'s already is.
+
 The cookbook runs real models. A newcomer who opened the quickstart asked "how does quantum
 computing work?" and got back a paper on chiral amines, because every recipe and chapter ran a
 random-weight encoder so it could run offline; the book taught the API and never showed the

@@ -1,0 +1,61 @@
+name: build-image
+description: >
+  Builds a container image without publishing it: a verification build, or a
+  build loaded into the runner's own daemon under `load-tag` for a smoke that
+  must run the exact image it built. Never logs in to a registry, never
+  pushes, and carries no attestation (nothing is published for one to vouch
+  for). Runs after `actions/checkout`.
+
+inputs:
+  file:
+    description: "The Dockerfile."
+    required: false
+    default: "Dockerfile"
+  context:
+    description: "The build context."
+    required: false
+    default: "."
+  build-args:
+    description: "`KEY=VALUE` lines for `docker build`; every value non-empty."
+    required: false
+    default: ""
+  build-contexts:
+    description: "Named build contexts (`name=path` lines), e.g. the `builder` directory `stage-server-binaries` lays out."
+    required: false
+    default: ""
+  platforms:
+    description: "The platform to build for; empty builds the runner's own."
+    required: false
+    default: ""
+  cache-scope:
+    description: "The GitHub Actions layer-cache scope this build shares."
+    required: true
+  load-tag:
+    description: "When set, `docker load` the image into the runner's daemon under this tag."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        BUILD_ARGS: ${{ inputs.build-args }}
+      run: bash ci/scripts/check_build_args.sh <<< "$BUILD_ARGS"
+
+    - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+    - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        platforms: ${{ inputs.platforms }}
+        push: false
+        load: ${{ inputs.load-tag != '' }}
+        tags: ${{ inputs.load-tag }}
+        build-args: ${{ inputs.build-args }}
+        build-contexts: ${{ inputs.build-contexts }}
+        sbom: false
+        provenance: false
+        cache-from: type=gha,scope=${{ inputs.cache-scope }}
+        cache-to: type=gha,mode=max,scope=${{ inputs.cache-scope }}

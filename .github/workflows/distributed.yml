@@ -69,7 +69,7 @@ jobs:
     container:
       image: ${{ needs.ci-image.outputs.cpu }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/setup-rust-ci
 
       # The harness spawns `jammi-server` worker processes and resolves the
@@ -93,13 +93,13 @@ jobs:
               --test distributed --archive-file "/tmp/distributed-$crate.tar.zst"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: distributed-jammi-ai
           path: /tmp/distributed-jammi-ai.tar.zst
           retention-days: 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: distributed-jammi-bench
           path: /tmp/distributed-jammi-bench.tar.zst
@@ -169,10 +169,10 @@ jobs:
       # workers all reach it on localhost; its endpoint, bucket and credentials
       # enter the environment from `ci/scripts/s3_test_store.sh env`.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Cache the pinned S3 store binary
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: /opt/s3-test-store
           key: s3-test-store-${{ hashFiles('ci/scripts/s3_test_store.sh') }}
@@ -208,7 +208,7 @@ jobs:
           done
           [ "$missing" -eq 0 ] || exit 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: distributed-${{ matrix.crate }}
           path: /tmp/distributed
@@ -222,12 +222,13 @@ jobs:
         shell: bash
         env:
           TESTS: ${{ matrix.tests }}
+          CRATE: ${{ matrix.crate }}
         run: |
           set -euo pipefail
           filter=""
           for t in $TESTS; do filter="${filter:+$filter | }test($t)"; done
           cargo nextest run --profile distributed \
-            --archive-file "/tmp/distributed/distributed-${{ matrix.crate }}.tar.zst" \
+            --archive-file "/tmp/distributed/distributed-$CRATE.tar.zst" \
             --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" \
             -E "$filter"
           junit=target/nextest/distributed/junit.xml
@@ -236,6 +237,7 @@ jobs:
               || { echo "::error::filter '$t' ran no test"; exit 1; }
           done
 
+      # Absent when the store never started, which the step then says.
       - name: S3 store log (on failure)
         if: failure()
-        run: cat /tmp/s3-test-store/.log || true
+        run: cat /tmp/s3-test-store/.log

@@ -1,11 +1,12 @@
 name: release-upload
 description: >
-  Attaches a packaged asset to the GitHub release of the `v*` tag this run is
-  on, creating the release when no leg has yet (every leg and every
-  publisher creates it the same way, so none waits on another), with a
-  bounded retry on the upload. The tag ref is the only release identity: an
-  asset on release vX was built from vX's tree. Runs after
-  `actions/checkout`, on a tag ref, in a job granted `contents: write`.
+  Attests a packaged asset's provenance over its exact bytes and attaches it
+  to the GitHub release of the `v*` tag this run is on, creating the release
+  when no asset has yet (every asset creates it the same way, so none waits
+  on another), with a bounded retry on the upload. The tag ref is the only
+  release identity: an asset on release vX was built from vX's tree. Runs
+  after `actions/checkout`, on a tag ref, in a job granted `contents: write`,
+  `id-token: write` and `attestations: write`.
 
 inputs:
   asset:
@@ -15,6 +16,10 @@ inputs:
 runs:
   using: composite
   steps:
+    - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: ${{ inputs.asset }}
+
     - shell: bash
       env:
         GH_TOKEN: ${{ github.token }}

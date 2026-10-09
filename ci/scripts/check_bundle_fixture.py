@@ -4,7 +4,7 @@ with NO environment-variable escape.
 
 `ci/scripts/fixtures/cu12_loader_report_real.txt` (arm 1a, DETECTION) must
 hold the VERBATIM `ldd` report `package_server_tarball.sh` captures (run by
-`_server.yml` for the CUDA build) from the real cu12 `jammi-server` binary and
+ci.yml's `server` lane for the CUDA build) from the real cu12 `jammi-server` binary and
 its real staged `lib/` (the build container: CUDA toolkit present, NVIDIA
 driver absent — see that run's `cu12-loader-report` artifact and this
 fixture's own header).
@@ -79,7 +79,7 @@ def check(fixture: Path) -> int:
             f"{fixture} is still the provisional '{MARKER}' placeholder. "
             f"The {arm} arm's own \"a correct REAL stage passes\" property is "
             "unproven until the real report -- captured by "
-            f"_server.yml's CUDA build in any ci.yml run and uploaded as its "
+            f"the server lane's CUDA build in any ci.yml run and uploaded as its "
             f"'{artifact}' workflow artifact -- replaces this placeholder "
             "as its own commit. No environment variable escapes this check.",
             file=sys.stderr,

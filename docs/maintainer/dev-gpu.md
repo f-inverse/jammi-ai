@@ -277,7 +277,7 @@ CUDA-shipping artifact answers for that soname its own way:
 
 | artifact | how `libnccl.so.2` gets there |
 | --- | --- |
-| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by `ci/scripts/bundle_cuda_libs.sh`'s derivation: `libnccl.so.2` is a member of the binary's own transitive `DT_NEEDED` closure (resolved under the CUDA 12.6 toolkit then `/usr/lib64`, `/usr/lib64` being where this image's `libnccl` RPM installs), so it is staged the same way every other closure member is — no name is listed by hand. `_server.yml`'s tarball packaging (`ci/scripts/package_server_tarball.sh`) also asserts the real loader resolves it (and every other bundled member) from `lib/`, not from a host copy |
+| `jammi-server-cu12` tarball | staged into the tarball's `lib/` by `ci/scripts/bundle_cuda_libs.sh`'s derivation: `libnccl.so.2` is a member of the binary's own transitive `DT_NEEDED` closure (resolved under the CUDA 12.6 toolkit then `/usr/lib64`, `/usr/lib64` being where this image's `libnccl` RPM installs), so it is staged the same way every other closure member is — no name is listed by hand. The `server` lane's tarball packaging (`ci/scripts/package_server_tarball.sh`) also asserts the real loader resolves it (and every other bundled member) from `lib/`, not from a host copy |
 | `jammi-server-cu12` wheel | the `nvidia-nccl-cu12` dependency; the console script puts `nvidia/nccl/lib/` on `LD_LIBRARY_PATH`, and `verify_link_set.py` fails the build if a needed library is unclassified, or if it extracts no `DT_NEEDED` entries at all |
 | `jammi-ai-server` CUDA image | nothing to do: the `nvidia/cuda:12.6.3-runtime-ubi8` base installs `libnccl-2.23.4-1+cuda12.6` itself (its own image config's `NV_LIBNCCL_PACKAGE`) — the same build the CI image and the wheel pin |
 
@@ -413,11 +413,10 @@ Three guards, in order of when they act:
 1. **The workflow never cancels a run that rents hardware.** Concurrency on
    `gpu-prove.yml` sits on the *job* (so a run whose job is skipped by the
    label gate never enters the group) and sets `cancel-in-progress: false`.
-   Superseded runs queue instead of dying mid-rent. `_proof-required.yml`
-   — the reusable EVERY release-publishing workflow calls to read the
-   commit's already-recorded verdict — never rents anything and carries no
-   concurrency group at all; there is nothing there for a superseded run to
-   orphan.
+   Superseded runs queue instead of dying mid-rent. The `proof` job EVERY
+   release workflow renders to read the commit's already-recorded verdict
+   never rents anything and carries no concurrency group of its own; there
+   is nothing there for a superseded run to orphan.
 
 2. **A deadline armed inside the pod's own entrypoint**, before the container
    does anything else — including its package install, which reaches the network
@@ -559,16 +558,16 @@ answer is `down` then `up <arch> --ref <ref>`: a boot, for a tree you can trust.
 (matrixed over every shipped CUDA arch) via the same shared primitive
 (`ci/scripts/runpod_lib.sh`). It is **never in the critical path of an
 automated workflow**: its only triggers are the `run-gpu` PR label, the
-nightly cron, and manual dispatch — it never fires on a push or a tag, and no
-other workflow may `uses:` it (`ci/scripts/check_gpu_prove_once.py` pins
-both by name).
+nightly cron, and manual dispatch — it never fires on a push or a tag
+(`ci/scripts/lanes.py` refuses a lane that rents hardware on any other
+trigger; the cron is the workflow's reviewed `paid-cron`).
 
 EVERY release-publishing workflow — CUDA and non-CUDA alike: the server
 image, the release binaries, the cu12 wheel, AND crates.io, npm, the native
 wheel, the pure-Python client, the CPU server wheel — gates its promotion on
 the **summary** of a prove run already on record for the commit it is
-promoting, not on a fresh rental of its own: `_proof-required.yml` calls
-`ci/scripts/verdict.py require`, which asks the GitHub API whether, over the
+promoting, not on a fresh rental of its own: every release workflow's rendered
+`proof` job calls `ci/scripts/verdict.py require`, which asks the GitHub API whether, over the
 runs that recorded that commit's tree as their subject, every shipped arch's
 prove job, `ci.yml`'s summary job and `cookbook-gpu.yml`'s cookbook job — every
 recipe and page on real models, over the tree's own builds, on an L4 — most
@@ -649,11 +648,9 @@ from its own route table (`rp_fleet_iface_lines`).
 A name filter matching zero tests is a failure by name, never a pass.
 
 **Triggers.** The `run-topology` PR label and manual dispatch — never a push,
-never `workflow_call`, never a schedule, and no workflow may `uses:` it.
-`ci/scripts/check_gpu_prove_once.py`'s P7/P8 rules pin this for every renting
-lane, over a driver set *derived* from `runpod_lib.sh`'s renting closure
-(`_rp_deploy_payload`, `rp_fleet_pod_create`), with `PAID_POD_LANE_TABLE` as
-the completeness assertion. Nothing about a release depends on this lane.
+never a schedule. `ci/scripts/lanes.py` holds every lane that needs `runpod`
+to a label, a dispatch or a reviewed `paid-cron`. Nothing about a release
+depends on this lane.
 
 **Cost bound (human-approved).** `4 GPUs × TOPOLOGY_MAX_GPU_RATE ($4.00) ×
 RP_TTL_HOURS (4)` = **$64.00** a run when the EXIT trap terminates both pods;

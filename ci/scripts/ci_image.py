@@ -5,33 +5,35 @@ service images they run beside, each named by what defines it.
     python3 ci/scripts/ci_image.py refs              # KEY=VALUE lines, for $GITHUB_OUTPUT
     python3 ci/scripts/ci_image.py describe --dockerfile F            # one image: ref, tag, platforms
     python3 ci/scripts/ci_image.py build-args --dockerfile F --arch A # its build arguments on arch A
+    python3 ci/scripts/ci_image.py built --dockerfile F               # build=true|false: the registry lacks its tag
     python3 ci/scripts/ci_image.py check             # every Dockerfile reads only its key's inputs
     python3 ci/scripts/ci_image.py await --repo R --head-sha S IMAGE...
 
 How an image is built is defined here once: `describe` and `build-args` are
-what `_ci-base-image.yml` builds from, and what `ci/dev.sh --build-image` builds
-from locally.
+what ci.yml's image lanes build from (`ci/lanes.toml`), and what
+`ci/dev.sh --build-image` builds from locally. The lanes carry each image's
+reference as a literal: `ci/scripts/lanes.py` renders it from `refs`, so a
+change to an image's inputs re-renders the workflows that run in it.
 
 An image's tag is `ctx-<hash>` over exactly what defines it: its Dockerfile,
 every file it copies, the base it builds FROM (pinned by digest in
 `.docker/base-images.env`), the toolchain pin it receives as RUST_VERSION, and
-the recipe that builds it — `_ci-base-image.yml` and this file, whose
-`build_args` decide what reaches the build. The CUDA image builds FROM the
+the recipe that builds it, this file, whose `build_args` decide what reaches
+the build. The CUDA image builds FROM the
 CPU image, so its key folds in the CPU key. A tag therefore names one
 environment: the same tree always runs in the same image, and a pull request
 that changes an image is tested in the image it defines — never in the one
 `main` had.
 
-`ci.yml` builds a tree's images when the registry lacks them (`_ci-base-image.yml`
-skips a build whose tag exists). Every other workflow starts beside it on the
+`ci.yml` builds a tree's images when the registry lacks them (`built` says
+whether a tag exists). Every other workflow starts beside it on the
 same push and `await`s them: it polls the registry until each image exists,
 and stops early, naming the failed job, when `ci.yml`'s build for the same head
 commit fails.
 
 `check` holds the key's closure — a Dockerfile that copies a file, or declares
 a build argument, outside its image's inputs would make two different images
-share one tag — the name every `ci.yml` job that builds an image carries,
-which `await` reads, and the service images: every deploy file names a
+share one tag — and the service images: every deploy file names a
 service by the name and tag of the digest `ci/service-images.env` pins, so a
 smoke that pulls the pin (`ci/scripts/pull_service_images.sh`) runs it under
 the deploy file's own name.
@@ -64,8 +66,9 @@ DOCKER_CONTEXT = ".docker"
 # CPU image, RUST_VERSION from `rust-toolchain.toml`) or is buildx's own
 # per-platform TARGETARCH.
 KEYED_BUILD_ARGS = frozenset({"BASE_IMAGE", "RUST_VERSION", "TARGETARCH"})
-# The prefix of `ci.yml`'s image-building jobs' names; `await` reads their
-# conclusions to stop early when a build fails.
+# The prefix of `ci.yml`'s image-building jobs' names (`ci/lanes.toml` holds
+# every builder to it); `await` reads their conclusions to stop early when a
+# build fails.
 BUILDER_JOB_PREFIX = "CI image ("
 BUILDER_WORKFLOW = "ci.yml"
 # The deploy files that run a service image: each `image:` they name must be
@@ -83,8 +86,8 @@ class Image:
     base: str | None  # the image this one builds FROM, when it is one of ours
 
 
-# The recipe every image is built by: an edit to either changes every tag.
-RECIPE = (".github/workflows/_ci-base-image.yml", "ci/scripts/ci_image.py")
+# The recipe every image is built by: an edit to it changes every tag.
+RECIPE = ("ci/scripts/ci_image.py",)
 
 
 IMAGES = {
@@ -168,19 +171,16 @@ def build_args(image: Image, arch: str, root: Path = REPO_ROOT) -> dict[str, str
 
 
 def refs(root: Path = REPO_ROOT) -> dict[str, str]:
-    """Every reference the tree's lanes run in or beside."""
-    return {
-        "cpu": ref(IMAGES["cpu"], root),
-        "cuda": ref(IMAGES["cuda"], root),
-        "postgres": parse_env(root / SERVICE_IMAGES)["POSTGRES"],
-    }
+    """Every reference the tree's lanes run in or beside: the two CI images,
+    and every pinned service image by its lower-cased key."""
+    services = {key.lower(): value for key, value in parse_env(root / SERVICE_IMAGES).items()}
+    return {"cpu": ref(IMAGES["cpu"], root), "cuda": ref(IMAGES["cuda"], root), **services}
 
 
 _COPY_RE = re.compile(r"^\s*(COPY|ADD)\s+(?P<rest>.+)$", re.IGNORECASE)
 _ARG_RE = re.compile(r"^\s*ARG\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*(?P<default>=.*)?$", re.IGNORECASE)
 
 
-_JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
 _IMAGE_LINE_RE = re.compile(r"^\s*(?:-\s*)?image:\s*(?P<ref>\S+)\s*$")
 
 
@@ -214,50 +214,10 @@ def deploy_service_findings(root: Path = REPO_ROOT) -> list[str]:
     return findings
 
 
-def builder_job_names(workflow_text: str) -> dict[str, str | None]:
-    """`{job id: name}` of every job whose job-level `uses:` is
-    `_ci-base-image.yml`."""
-    jobs: dict[str, str | None] = {}
-    current: str | None = None
-    name: str | None = None
-    builds = False
-
-    def close():
-        if current is not None and builds:
-            jobs[current] = name
-
-    in_jobs = False
-    for line in workflow_text.splitlines():
-        if line.rstrip() == "jobs:":
-            in_jobs = True
-            continue
-        if not in_jobs:
-            continue
-        if m := _JOB_KEY_RE.match(line):
-            close()
-            current, name, builds = m.group(1), None, False
-        elif line.startswith("    name:"):
-            name = line.split(":", 1)[1].strip().strip("'\"")
-        elif line.strip() == "uses: ./.github/workflows/_ci-base-image.yml" and line.startswith("    uses:"):
-            builds = True
-    close()
-    return jobs
-
-
 def check(root: Path = REPO_ROOT) -> list[str]:
     """Findings: a file a Dockerfile copies, or a build argument it declares
-    without a default, that its image's key does not cover; and a `ci.yml`
-    image-building job whose name `await` would not recognise."""
+    without a default, that its image's key does not cover."""
     findings: list[str] = deploy_service_findings(root)
-    builders = builder_job_names((root / ".github" / "workflows" / BUILDER_WORKFLOW).read_text())
-    if not builders:
-        findings.append(f"{BUILDER_WORKFLOW} has no job that builds an image through _ci-base-image.yml")
-    for job, name in builders.items():
-        if not (name or "").startswith(BUILDER_JOB_PREFIX):
-            findings.append(
-                f"{BUILDER_WORKFLOW}: job `{job}` builds an image but is named {name!r}, not "
-                f"`{BUILDER_JOB_PREFIX}...` -- every other workflow's wait would miss its failure"
-            )
     for image in IMAGES.values():
         for n, line in enumerate((root / image.dockerfile).read_text().splitlines(), 1):
             where = f"{image.dockerfile}:{n}"
@@ -283,6 +243,22 @@ def check(root: Path = REPO_ROOT) -> list[str]:
 
 
 ExistsFn = Callable[[str], tuple[bool, str]]
+
+
+def built(image_ref: str, exists: "ExistsFn", out=sys.stdout, err=sys.stderr) -> int:
+    """`build=false` when the registry holds `image_ref`, `build=true` when it
+    reports the tag missing; any other answer fails, naming it."""
+    found, error = exists(image_ref)
+    if found:
+        print("build=false", file=out)
+        print(f"{image_ref} is built", file=err)
+        return 0
+    if "not found" in error:
+        print("build=true", file=out)
+        print(f"{image_ref} is not built yet", file=err)
+        return 0
+    print(f"::error::reading {image_ref} failed: {error}", file=err)
+    return 1
 
 
 def registry_has(image_ref: str) -> tuple[bool, str]:
@@ -368,6 +344,8 @@ def main(argv: list[str]) -> int:
     ba = sub.add_parser("build-args")
     ba.add_argument("--dockerfile", required=True)
     ba.add_argument("--arch", required=True, choices=["amd64", "arm64"])
+    bu = sub.add_parser("built")
+    bu.add_argument("--dockerfile", required=True)
     aw = sub.add_parser("await")
     aw.add_argument("--repo", required=True)
     aw.add_argument("--head-sha", required=True, help="The head commit ci.yml's run for this push tests.")
@@ -386,6 +364,8 @@ def main(argv: list[str]) -> int:
         for key, value in build_args(image_for(args.dockerfile), args.arch).items():
             print(f"{key}={value}")
         return 0
+    if args.command == "built":
+        return built(ref(image_for(args.dockerfile)), registry_has)
     if args.command == "check":
         findings = check()
         for f in findings:

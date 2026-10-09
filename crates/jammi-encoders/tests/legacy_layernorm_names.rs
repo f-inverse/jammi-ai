@@ -14,7 +14,7 @@
 //! first place -- the perturbation only guards this TEST's own oracle, not a real
 //! code-path ambiguity).
 //!
-//! No network, no GPU, no `parity-test`/`golden-parity`/`live-hub-tests` feature.
+//! No network, no GPU, no `live-hub-tests` feature.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

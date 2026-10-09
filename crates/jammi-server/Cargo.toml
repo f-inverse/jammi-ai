@@ -88,8 +88,8 @@ metal = ["jammi-ai/metal"]
 # By-name passthrough to `jammi-ai`'s own `flash-attn` feature — the ONE
 # forwarding link `ci/scripts/check_flash_attn_closure.py` exempts under
 # `jammi-server --all-features` (a verified 1:1 spec match, not "any leak is
-# fine"): the CUDA release lanes (`release-binaries.yml`'s `server-cu12`,
-# `pypi.yml`, `server-image.yml`'s CUDA image) opt this feature
+# fine"): the CUDA release lanes (the `server-cu12` tarball, wheel and
+# container image) opt this feature
 # IN explicitly via `ci/release-feature-manifest.json`'s per-lane
 # `cargo_features` list — it is never reachable from `cuda`/`default` alone.
 flash-attn = ["jammi-ai/flash-attn"]

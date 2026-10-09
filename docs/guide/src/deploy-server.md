@@ -636,7 +636,7 @@ The CPU image ignores GPU config and runs inference on the CPU.
 
 The Dockerfile at the workspace root packages binaries; it compiles nothing.
 There is one definition of how a `jammi-server` binary is compiled — the
-`_server.yml` workflow, in the CI image, with the cargo features
+`server` lane of `ci.yml`, in the CI image, with the cargo features
 `ci/release-feature-manifest.json` lists for the build — and a published
 image packages the binary the CI run that proved the release built. To build
 an image from your own checkout, compile the same way, in the CI image
@@ -666,7 +666,7 @@ docker build -t jammi-ai-server-cu12:dev --build-arg RUNTIME_VARIANT=runtime-cud
 
 ### Supply chain: SBOM, provenance, attestations
 
-Every image `server-image.yml` pushes to GHCR — each CPU variant's per-arch
+Every image `release.yml` pushes to GHCR — each CPU variant's per-arch
 legs and their merged indexes, and the CUDA `-cu12` image — carries a
 `docker/build-push-action` SPDX SBOM and `mode=max` build
 provenance attached to the image manifest, plus a Sigstore-signed

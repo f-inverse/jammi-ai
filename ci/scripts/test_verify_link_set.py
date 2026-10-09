@@ -14,7 +14,7 @@ classification honest in the directions it could over-reach.
 
 The PASS fixture is the measured `DT_NEEDED` list of the binary the check
 actually runs on (the `server-cu12` build's `jammi-server`, which
-`_server.yml` compiles), read off that binary's artifact in run 34717957779 —
+ci.yml's `server` lane compiles), read off that binary's artifact in run 34717957779 —
 not a hand-written approximation of it.
 
 Hermetic: no readelf, no binary, no network. `needed_libs` is replaced by a

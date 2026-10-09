@@ -26,6 +26,10 @@
 # Only a lane that denies warnings counts, and only in a job that runs on every
 # pull request touching the row's crate. An empty or missing registry is a FAIL.
 
+# The PyO3 crate, a workspace member outside `default-members`: only the
+# workspace-wide lane reaches it (`--workspace` with no `--exclude`).
+jammi-python    -                                       all-targets
+
 # Host-resource test features (see `crates/jammi-test-resources`).
 jammi-ai        live-gpu-tests,live-gpu-gang-tests      all-targets
 jammi-ai        unprivileged-tests                      all-targets
@@ -43,6 +47,10 @@ jammi-bench     live-gpu-tests,flash-attn               all-targets
 # "flash-attn")`, so it needs a lane with and a lane without it.
 jammi-encoders  live-gpu-tests,!flash-attn              all-targets
 jammi-encoders  live-flash-oracle-tests                 all-targets
+
+# The tests that reach the live model hub, run on main only (`test-live`).
+jammi-ai        live-hub-tests                          all-targets
+jammi-encoders  live-hub-tests                          all-targets
 
 # The SQLx source-provider adapters.
 jammi-db        postgres,mysql                          all-targets

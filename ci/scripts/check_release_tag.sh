@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A release tag names the version the checkout ships: `vX.Y.Z` or `py-vX.Y.Z`
 # equals `[workspace.package] version` in Cargo.toml. Every publisher runs this
-# on its tag ref before promoting anything (`_proof-required.yml`), and the
+# on its tag ref before promoting anything (every release workflow's `proof` job), and the
 # crates.io publish keys its idempotence probes on the same version.
 #
 #   bash ci/scripts/check_release_tag.sh TAG

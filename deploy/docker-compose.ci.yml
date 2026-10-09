@@ -1,5 +1,5 @@
 # CI-only override for the `compose-smoke` workflow (`.github/workflows/
-# compose-smoke.yml`): bind-mounts the bundled tiny fixtures the smoke's
+# `compose-smoke` lane): bind-mounts the bundled tiny fixtures the smoke's
 # remote script (`tests/compose/shape_b_remote.py`) reads, and pins
 # `jammi-server` to the image the workflow already built + `docker load`ed
 # via `JAMMI_IMAGE` — never a fresh build, never a registry pull. No

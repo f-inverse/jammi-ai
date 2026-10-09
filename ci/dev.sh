@@ -19,7 +19,7 @@
 # belongs to THIS run alone: Postgres is a sidecar on the run's own network,
 # removed when the run exits; the S3-class store runs inside the run's
 # container from the pinned binary `ci/scripts/s3_test_store.sh` defines (the
-# same definition `distributed.yml` and a GPU pod use) — two runs never share
+# same definition the distributed lane and a GPU pod use) — two runs never share
 # a catalog or a bucket, and nothing a run starts outlives it.
 #
 #   --with pg[,s3]         the backends a live lane needs (Postgres 16; the
@@ -27,7 +27,7 @@
 #   --scratch NAME         build into the volume jammi-dev-target-NAME instead
 #                          of the shared one, and remove it on exit
 #   --build-image          build this tree's CPU CI image for the host's arch
-#                          first, the way `_ci-base-image.yml` builds a leg —
+#                          first, the way ci.yml's image lanes build a leg —
 #                          for a tree whose image `ci.yml` has not built yet
 #   --gc                   remove every jammi-dev-* container, network and
 #                          volume that is not one of the kept caches, and every

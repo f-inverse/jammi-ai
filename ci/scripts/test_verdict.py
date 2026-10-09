@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for `verdict.py` (check-once, fail-loud).
 
-Pure Python, no network: every test drives the real `require()`/`probe()`/
+Pure Python, no network: every test drives the real `require()`/
 `evaluate()`/`bound_runs()`/`collect_measurements()` entry points against an
 injected fake `fetch` — never a hand-rolled stand-in for the verdict logic.
 
@@ -11,8 +11,7 @@ DENIES, individually; the positive record set PASSES and prints run/job ids;
 the recency/revocation rule (a later red measurement revokes an earlier
 green, by `completed_at` with a run-id tiebreak); check-once semantics (a run
 still in progress is invisible — it never delays or satisfies the check);
-pagination; that any HTTP/JSON error DENIES the release gate; and that the
-plan's probe reads an unreadable record as "measure again", never as proven.
+pagination; and that any HTTP/JSON error DENIES the release gate.
 
 Run directly: `python3 ci/scripts/test_verdict.py`
 """
@@ -34,16 +33,15 @@ TREE = "a" * 40
 ARCHES = ["sm_80", "sm_86"]
 GPU = vd.Requirement(
     vd.GPU_WORKFLOW,
-    tuple(vd.GPU_JOB_TEMPLATE.format(arch=a) for a in ARCHES),
+    tuple(vd.GPU_JOB_TEMPLATE.format(sm=a) for a in ARCHES),
     vd.gpu_requirement().remedy,
 )
 CI = vd.ci_requirement()
-BUILD = vd.build_requirement()
 COOKBOOK = vd.cookbook_requirement()
 
 
 def gpu_job(arch: str, conclusion, completed_at, job_id: int = 1, html_url: str = "https://x/y"):
-    return named_job(vd.GPU_JOB_TEMPLATE.format(arch=arch), conclusion, completed_at, job_id, html_url)
+    return named_job(vd.GPU_JOB_TEMPLATE.format(sm=arch), conclusion, completed_at, job_id, html_url)
 
 
 def named_job(name: str, conclusion, completed_at, job_id: int = 1, html_url: str = "https://x/y"):
@@ -445,31 +443,27 @@ class ReleaseGateTest(unittest.TestCase):
 
     def _all(self, cookbook_conclusion):
         w = self._both("success")
-        w.bind(run_obj(4, workflow=vd.BUILD_WORKFLOW), [named_job(vd.BUILD_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z", 50)])
         w.bind(
             run_obj(3, workflow=vd.COOKBOOK_WORKFLOW),
             [named_job(vd.COOKBOOK_JOB, cookbook_conclusion, "2026-01-01T00:00:00Z", 40)],
         )
         return w
 
-    def test_a_release_requires_the_gpu_prove_ci_the_build_and_the_cookbook(self):
+    def test_a_release_requires_the_gpu_prove_ci_and_the_cookbook(self):
         self.assertEqual(
             [r.workflow for r in vd.release_requirements()],
-            [vd.GPU_WORKFLOW, vd.CI_WORKFLOW, vd.BUILD_WORKFLOW, vd.COOKBOOK_WORKFLOW],
+            [vd.GPU_WORKFLOW, vd.CI_WORKFLOW, vd.COOKBOOK_WORKFLOW],
         )
 
+    def test_the_job_names_are_the_lane_tables(self):
+        self.assertEqual(vd.CI_SUMMARY_JOB, "ci-summary")
+        self.assertIn("{sm}", vd.GPU_JOB_TEMPLATE)
+        self.assertNotIn("{", vd.COOKBOOK_JOB)
+
     def test_every_lane_proven_passes(self):
-        rc, out, err = _require(self._all("success"), requirements=[GPU, CI, BUILD, COOKBOOK])
+        rc, out, err = _require(self._all("success"), requirements=[GPU, CI, COOKBOOK])
         self.assertEqual(rc, 0, err)
         self.assertIn(vd.COOKBOOK_JOB, out)
-        self.assertIn(vd.BUILD_SUMMARY_JOB, out)
-
-    def test_gpu_ci_and_cookbook_proven_but_no_build_run_denies(self):
-        w = self._both("success")
-        w.bind(run_obj(3, workflow=vd.COOKBOOK_WORKFLOW), [named_job(vd.COOKBOOK_JOB, "success", "2026-01-01T00:00:00Z", 40)])
-        rc, _, err = _require(w, requirements=[GPU, CI, BUILD, COOKBOOK])
-        self.assertEqual(rc, 1)
-        self.assertIn(vd.BUILD_WORKFLOW, err)
 
     def test_gpu_and_ci_proven_but_no_cookbook_run_denies(self):
         rc, _, err = _require(self._both("success"), requirements=[GPU, CI, COOKBOOK])
@@ -501,63 +495,6 @@ class ReleaseGateTest(unittest.TestCase):
     def test_a_skipped_summary_is_no_measurement(self):
         rc, _, _ = _require(self._both("skipped"), requirements=[CI])
         self.assertEqual(rc, 1)
-
-
-class ProbeTest(unittest.TestCase):
-    """`ci.yml`'s plan asks whether its tree is already proven. It never fails
-    the run: an unreadable record means the run measures again."""
-
-    def _probe(self, fetch, lane="ci"):
-        out, err = io.StringIO(), io.StringIO()
-        rc = vd.probe(repo=REPO, tree=TREE, lane=lane, fetch=fetch, token="tok", out=out, err=err)
-        return rc, out.getvalue(), err.getvalue()
-
-    def test_a_proven_tree_reads_proven(self):
-        w = World()
-        w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
-        rc, out, err = self._probe(w.fetch)
-        self.assertEqual((rc, out.split()), (0, ["proven=true"]))
-        self.assertIn("run 7", err)
-
-    def test_the_proving_run_is_the_most_recent_measurement(self):
-        w = World()
-        w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
-        w.bind(run_obj(9, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-02T00:00:00Z")])
-        _, out, err = self._probe(w.fetch)
-        self.assertEqual(out.split(), ["proven=true"])
-        self.assertIn("run 9", err)
-
-    def test_the_build_lane_reads_its_own_summary(self):
-        w = World()
-        w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
-        _, out, _ = self._probe(w.fetch, lane="build")
-        self.assertEqual(out.split(), ["proven=false"])
-        w.bind(run_obj(8, workflow=vd.BUILD_WORKFLOW), [named_job(vd.BUILD_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
-        _, out, err = self._probe(w.fetch, lane="build")
-        self.assertEqual(out.split(), ["proven=true"])
-        self.assertIn("run 8", err)
-
-    def test_an_unmeasured_tree_reads_unproven(self):
-        rc, out, _ = self._probe(World().fetch)
-        self.assertEqual((rc, out.strip()), (0, "proven=false"))
-
-    def test_a_red_summary_reads_unproven(self):
-        w = World()
-        w.bind(run_obj(7, workflow=vd.CI_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "failure", "2026-01-01T00:00:00Z")])
-        self.assertEqual(self._probe(w.fetch)[1].strip(), "proven=false")
-
-    def test_an_unreadable_record_reads_unproven_with_a_warning(self):
-        def fetch(url, token):
-            raise RuntimeError("simulated transport failure")
-
-        rc, out, err = self._probe(fetch)
-        self.assertEqual((rc, out.strip()), (0, "proven=false"))
-        self.assertIn("::warning::", err)
-
-    def test_a_gpu_prove_run_never_proves_the_ci_tree(self):
-        w = World()
-        w.bind(run_obj(7, workflow=vd.GPU_WORKFLOW), [named_job(vd.CI_SUMMARY_JOB, "success", "2026-01-01T00:00:00Z")])
-        self.assertEqual(self._probe(w.fetch)[1].strip(), "proven=false")
 
 
 class PaginationTest(unittest.TestCase):

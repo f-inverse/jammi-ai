@@ -78,14 +78,6 @@ cuda = ["jammi-kernels/cuda"]
 # reference — see `FLASH_COMPILED`'s doc for why that would fail to compile
 # with this feature off).
 flash-attn = ["jammi-kernels/flash-attn"]
-# Enables tests/parity.rs which depends on candle-transformers as a numerical
-# oracle for the Bert frozen forward pass.
-parity-test = []
-# Enables tests/golden_parity.rs, which checks the HTSAT-Swin CLAP audio tower
-# against committed per-boundary golden activations (dumped from PyTorch
-# transformers by tests/fixtures/generate_htsat_clap.py). Needs no torch and no
-# network — the goldens are committed binaries.
-golden-parity = []
 # Enables tests/live_real_clap.rs, which downloads the REAL
 # `laion/clap-htsat-fused` checkpoint from the HF Hub and asserts the HTSAT-Swin
 # tower reproduces its audio embedding on the committed pinned input. Live: makes

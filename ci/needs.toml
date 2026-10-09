@@ -16,6 +16,22 @@ provide = "python3 -m pip install --user --quiet tokenizers"
 probe = "command -v actionlint"
 provide = "bash .docker/pinned-tools.sh actionlint"
 
+[need.shellcheck]
+probe = "command -v shellcheck"
+provide = "bash .docker/pinned-tools.sh shellcheck"
+
+[need.kustomize]
+probe = "command -v kustomize"
+provide = "bash .docker/pinned-tools.sh kustomize"
+
+[need.kubeconform]
+probe = "command -v kubeconform"
+provide = "bash .docker/pinned-tools.sh kubeconform"
+
+[need.build-graph]
+probe = "command -v cargo-build-graph"
+provide = "bash .docker/pinned-tools.sh build-graph"
+
 [need.safetensors]
 probe = "python3 -c 'import safetensors'"
 provide = "python3 -m pip install --user --quiet safetensors"

@@ -30,7 +30,7 @@
 //!      config. This test never parses `deny.toml`'s prose — it generates the expected line and
 //!      checks the file contains that exact line, byte for byte.
 //!   4. The Dockerfile compiles nothing and takes no feature list: it packages the binaries
-//!      the `builder` / `builder-cuda` build contexts hold, which `_server.yml` compiled from
+//!      the `builder` / `builder-cuda` build contexts hold, which ci.yml's `server` lane compiled from
 //!      the manifest — a literal line scan (the Dockerfile is not YAML or JSON, so there is no
 //!      real structured parser for it in this crate's dependency set) over an HONESTLY STATED,
 //!      narrow universe: two marker strings and the `COPY --from=` instructions, never a
@@ -38,7 +38,7 @@
 //!
 //! A feature literal placed in a workflow scalar — a `build-args:` value, a
 //! `--features=<list>` or `-F <list>` invocation, an input default, a matrix value — is
-//! refused by `ci/scripts/check_workflow_feature_literals.py`, which parses every release
+//! refused by `ci/scripts/lanes.py`, which reads every release
 //! workflow (and every local reusable workflow and composite action it reaches) and decides
 //! by value over the whole document; each build site reads its build's list with a
 //! `jq -r '.builds["<build>"].cargo_features | ...'` invocation.
@@ -323,7 +323,7 @@ fn families_carrying_excludes_a_family_missing_the_feature() {
 // ---------------------------------------------------------------------------
 
 /// The Dockerfile packages binaries and compiles nothing: there is one
-/// definition of how a server binary is compiled (`_server.yml`, from the
+/// definition of how a server binary is compiled (ci.yml's `server` lane, from the
 /// manifest's `cargo_features`), and a container image takes that binary
 /// from the `builder` / `builder-cuda` build contexts. A `cargo build` or a
 /// `CARGO_FEATURES` argument in the Dockerfile would be a second definition,

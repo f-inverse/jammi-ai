@@ -2,19 +2,21 @@ name: install-jammi
 description: >
   Installs the jammi surfaces a run built: a `.venv` at the workspace root
   holding the client `jammi-ai` (import `jammi`), optionally the compiled
-  engine `jammi-ai-native` (import `jammi_native`, the Linux x86_64 wheel
-  `_native-wheels.yml` built) the client discovers as its `file://` backend,
-  and optionally the `jammi-server` and `jammi` binaries on PATH. The client
-  is installed one of two ways, for two different consumers: `wheel`, the
-  wheel `_client-wheel.yml` built, as a reader installs it; or `source`, the
-  tree's `clients/python` in editable mode with its `dev` extra and generated
-  proto stubs, for the client's own suites, which run from that directory and
-  resolve `jammi` from it. Nothing here compiles the engine: every consumer
-  runs the bytes its run built once. The venv's `bin` is put on PATH, so
-  later steps call `python`, `pip` and `pytest` directly. Runs after
-  `actions/checkout`.
+  engine `jammi-ai-native` (import `jammi_native`, the Linux x86_64 wheel)
+  the client discovers as its `file://` backend, and optionally the
+  `jammi-server` and `jammi` binaries on PATH. The client is installed one of
+  two ways, for two different consumers: `wheel`, the client wheel the run
+  built, as a reader installs it; or `source`, the tree's `clients/python` in
+  editable mode with its `dev` extra and generated proto stubs, for the
+  client's own suites, which run from that directory. Nothing here compiles
+  the engine: every consumer runs the bytes a run built once. The venv's
+  `bin` is put on PATH, so later steps call `python`, `pip` and `pytest`
+  directly. Runs after `actions/checkout`.
 
 inputs:
+  run-id:
+    description: "The run that built the artifacts."
+    required: true
   client:
     description: "\"wheel\" (the default) or \"source\"; see above."
     required: false
@@ -33,10 +35,6 @@ inputs:
     description: "Extra pip packages installed into the venv (space-separated), e.g. pytest."
     required: false
     default: ""
-  run-id:
-    description: "The run that built the artifacts; empty (the default) is this run."
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -47,7 +45,7 @@ runs:
         name: client-wheel
         path: ${{ runner.temp }}/jammi-dist/client
         run-id: ${{ inputs.run-id }}
-        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+        github-token: ${{ github.token }}
 
     - if: inputs.native == 'true'
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -55,7 +53,7 @@ runs:
         name: wheels-native-linux-x86_64
         path: ${{ runner.temp }}/jammi-dist/native
         run-id: ${{ inputs.run-id }}
-        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+        github-token: ${{ github.token }}
 
     - shell: bash
       working-directory: ${{ github.workspace }}
@@ -78,9 +76,9 @@ runs:
           *) echo "::error::install-jammi: client must be wheel or source, got '$CLIENT'" >&2; exit 1 ;;
         esac
         if [ "$NATIVE" = true ]; then pip install --quiet "$DIST"/native/jammi_ai_native-*.whl; fi
-        # $EXTRA_PIP is a space-separated package list, split on purpose.
-        # shellcheck disable=SC2086
-        if [ -n "$EXTRA_PIP" ]; then pip install --quiet $EXTRA_PIP; fi
+        # A space-separated package list, split on purpose.
+        read -ra extra <<< "$EXTRA_PIP"
+        if [ "${#extra[@]}" -gt 0 ]; then pip install --quiet "${extra[@]}"; fi
         echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
         echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
 
@@ -90,7 +88,7 @@ runs:
         name: server-cpu-x86_64-binary
         path: ${{ runner.temp }}/jammi-bin
         run-id: ${{ inputs.run-id }}
-        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+        github-token: ${{ github.token }}
 
     - if: inputs.binaries == 'true'
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -98,7 +96,7 @@ runs:
         name: jammi-x86_64-unknown-linux-gnu
         path: ${{ runner.temp }}/jammi-dist/cli
         run-id: ${{ inputs.run-id }}
-        github-token: ${{ inputs.run-id != '' && github.token || '' }}
+        github-token: ${{ github.token }}
 
     - if: inputs.binaries == 'true'
       shell: bash
@@ -107,9 +105,9 @@ runs:
         DIST: ${{ runner.temp }}/jammi-dist
       run: |
         set -euo pipefail
-        tar -xzf "$(ls "$DIST"/cli/jammi-*.tar.gz)" -C "$BIN" jammi
+        bash ci/scripts/unpack_cli.sh "$DIST/cli" "$BIN"
         # Artifacts do not preserve the exec bit.
-        chmod +x "$BIN/jammi-server" "$BIN/jammi"
+        chmod +x "$BIN/jammi-server"
         echo "$BIN" >> "$GITHUB_PATH"
         {
           echo "JAMMI_SERVER_BIN=$BIN/jammi-server"

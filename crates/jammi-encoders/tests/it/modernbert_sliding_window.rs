@@ -17,7 +17,7 @@
 //! **Why this runs in the default lane.** It is the regression test for a
 //! silent-wrong-output defect. The goldens are committed and need neither torch
 //! nor a network, so there is nothing to gate behind a feature — and the repo's
-//! two existing parity harnesses (`parity-test`, `golden-parity`) are referenced
+//! two existing parity harnesses (`tests/parity.rs`, `tests/golden_parity.rs`) are referenced
 //! by no CI workflow, which is precisely the failure mode to avoid here.
 //!
 //! The generator asserts its own discriminating power on every regeneration: a

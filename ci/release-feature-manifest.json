@@ -7,13 +7,13 @@
     "the build it packages, the workflow job that promotes it, and the",
     "workflows that build it (which the feature-literal guard reads).",
     "",
-    "A build is compiled once per tree, in `build.yml`, by the reusable workflow",
+    "A build is compiled once per tree, in `ci.yml`, by the lane that defines it",
     "that defines it; every lane packages those bytes, and a release promotes",
     "the ones the run that proved its tree built. Two lanes of one build",
     "therefore cannot ship different features; a lane whose features must",
     "differ needs a build of its own.",
     "",
-    "The one compile site, `.github/workflows/_server.yml`, reads",
+    "The one compile site, `ci.yml`'s `server` lane (`ci/lanes.toml`), reads",
     "`.builds.<build>.cargo_features` with `jq` rather than carrying a copy; a",
     "container image packages the binary that site built and compiles",
     "nothing. Each native wheel's `pyproject.toml` must list exactly its",
@@ -250,42 +250,42 @@
     "cu12-tarball": {
       "_doc": "The self-contained CUDA `jammi-server` tarball: the binary, the CUDA runtime `.so`s it links, and an `LD_LIBRARY_PATH` launcher.",
       "build": "server-cu12",
-      "workflow": ".github/workflows/release-binaries.yml:promote, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/release.yml:release-binaries, built by .github/workflows/ci.yml:server"
     },
     "cu12-wheel": {
       "_doc": "The `jammi-server-cu12` PyPI wheel.",
       "build": "server-cu12",
-      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/pypi.yml:publish-pypi, built by .github/workflows/ci.yml:server, packaged by ci.yml:server-wheel"
     },
     "cu12-image": {
       "_doc": "The `jammi-ai-server-cu12` container image (the Dockerfile's `runtime-cuda` stage).",
       "build": "server-cu12",
-      "workflow": ".github/workflows/server-image.yml:push-cu12, packaging the binary .github/workflows/_server.yml builds"
+      "workflow": ".github/workflows/release.yml:server-image-cuda, packaging the binary .github/workflows/ci.yml:server builds"
     },
     "cpu-tarball": {
       "_doc": "The CPU `jammi-server` tarball, x86_64 and aarch64 Linux.",
       "build": "server-cpu",
-      "workflow": ".github/workflows/release-binaries.yml:promote, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/release.yml:release-binaries, built by .github/workflows/ci.yml:server"
     },
     "cpu-wheel": {
       "_doc": "The `jammi-server` PyPI wheel (CPU), x86_64 and aarch64.",
       "build": "server-cpu",
-      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_server.yml"
+      "workflow": ".github/workflows/pypi.yml:publish-pypi, built by .github/workflows/ci.yml:server, packaged by ci.yml:server-wheel"
     },
     "cpu-image": {
       "_doc": "The `jammi-ai-server` container image, its `generic` and `selfcontained` variants (the Dockerfile's `runtime-generic`/`runtime-selfcontained` stages).",
       "build": "server-cpu",
-      "workflow": ".github/workflows/server-image.yml:push-cpu, packaging the binary .github/workflows/_server.yml builds; the image smokes .github/workflows/kube-smoke.yml and .github/workflows/compose-smoke.yml package the same binary"
+      "workflow": ".github/workflows/release.yml:server-image-cpu, packaging the binary .github/workflows/ci.yml:server builds; the image smokes ci.yml:kube-smoke and ci.yml:compose-smoke package the same binary"
     },
     "native-cpu-wheel": {
       "_doc": "The `jammi-ai-native` PyPI wheel (the embedded CPU engine).",
       "build": "native-cpu",
-      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_native-wheels.yml"
+      "workflow": ".github/workflows/pypi.yml:publish-pypi, built by .github/workflows/ci.yml:native-wheels"
     },
     "native-cu12-wheel": {
       "_doc": "The `jammi-ai-native-cu12` PyPI wheel (the embedded CUDA engine).",
       "build": "native-cu12",
-      "workflow": ".github/workflows/pypi.yml:publish, built by .github/workflows/_native-wheel-cu12.yml"
+      "workflow": ".github/workflows/pypi.yml:publish-pypi, built by .github/workflows/ci.yml:native-wheel-cu12"
     }
   },
   "server_only_cargo_features": {

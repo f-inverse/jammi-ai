@@ -4,7 +4,7 @@
 # asserted before anything is pushed, every tag's previous digest is read
 # first, and after the push the immutable first tag is re-read and asserted
 # again. The one definition of an index promotion: the tree's CI image
-# (`_ci-base-image.yml`) and every published server image (`server-image.yml`)
+# (ci.yml's image lanes) and every published server image (release.yml)
 # merge through it.
 #
 #   bash ci/scripts/merge_image_index.sh --platforms linux/amd64,linux/arm64 \

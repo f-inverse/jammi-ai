@@ -1,12 +1,12 @@
 name: setup-rust-host
 description: >
   The Rust toolchain on a bare hosted runner, at the pin `rust-toolchain.toml`
-  names, with what a build on that host needs beside it: on macOS, protoc and
-  sccache (`.cargo/config.toml` names sccache as every target's rustc wrapper);
-  on Linux, mold, the linker that file names for every Linux target, at the pin
-  `.docker/pinned-tools.sh` holds. A job in the CI image needs none of this;
-  this is for the macOS legs and the one Linux job that must read
-  `.cargo/config.toml` outside any container. Run `setup-rust-ci` after it.
+  names, with what a build on that host needs beside it, every tool at the
+  pin `.docker/pinned-tools.sh` holds: on macOS, protoc and sccache
+  (`.cargo/config.toml` names sccache as every target's rustc wrapper); on
+  Linux, mold, the linker that file names for every Linux target. A job in
+  the CI image needs none of this; this is for the macOS legs. Run
+  `setup-rust-ci` after it.
 
 inputs:
   targets:
@@ -22,6 +22,24 @@ runs:
       shell: bash
       run: echo "channel=$(bash ci/scripts/rust_pin.sh)" >> "$GITHUB_OUTPUT"
 
+    # The runner image may carry a toolchain of the same version, installed
+    # under its own profile: rustup then refuses the components
+    # `rust-toolchain.toml` names as conflicts with files already there. The
+    # pinned toolchain is installed fresh, never inherited from the image.
+    - name: Remove the runner image's copy of the pinned toolchain
+      shell: bash
+      env:
+        CHANNEL: ${{ steps.pin.outputs.channel }}
+      run: |
+        set -euo pipefail
+        # A host with no rustup has no toolchain to remove; the next step installs both.
+        command -v rustup >/dev/null || exit 0
+        # A here-string, not a pipe: under pipefail, `grep -q` exiting at its
+        # first match SIGPIPEs the writer and reads as absent.
+        if grep -qF "$CHANNEL-" <<< "$(rustup toolchain list)"; then
+          rustup toolchain uninstall "$CHANNEL"
+        fi
+
     # The ref is inert: the toolchain installed is the `toolchain:` input.
     - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       with:
@@ -31,7 +49,7 @@ runs:
     - name: protoc and sccache (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew install protobuf sccache
+      run: sudo bash .docker/pinned-tools.sh protoc sccache
 
     - name: mold (Linux)
       if: runner.os == 'Linux'

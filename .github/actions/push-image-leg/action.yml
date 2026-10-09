@@ -1,11 +1,12 @@
 name: push-image-leg
 description: >
   Builds one image for one platform and pushes it to GHCR with its SBOM and
-  build provenance, attests the pushed digest with a Sigstore bundle, and
-  verifies both before the step is green. The one definition of a published
-  image push: every server image leg goes through it. Runs after
-  `actions/checkout`, in a job granted `packages: write`, `id-token: write`
-  and `attestations: write`.
+  build provenance; for a published image, also attests the pushed digest
+  with a Sigstore bundle and verifies both before the step is green. The one
+  definition of an image push: every server image leg and every CI image leg
+  goes through it. Runs after `actions/checkout`, in a job granted
+  `packages: write` (and, with `attest`, `id-token: write` and
+  `attestations: write`).
 
 inputs:
   image:
@@ -17,8 +18,16 @@ inputs:
   tag-suffix:
     description: >
       A per-arch leg's suffix (`amd64`/`arm64`): every tag it pushes carries
-      `-<suffix>`, so a leg never moves a real tag — the merge does. Empty for
+      `-<suffix>`, so a leg never moves a real tag; the merge does. Empty for
       a single-platform image that pushes its real tags itself.
+    required: false
+    default: ""
+  context:
+    description: "The build context."
+    required: false
+    default: "."
+  file:
+    description: "The Dockerfile; empty is the context's own."
     required: false
     default: ""
   build-args:
@@ -33,8 +42,13 @@ inputs:
     description: "The one platform this leg builds."
     required: true
   cache-scope:
-    description: "The GitHub Actions layer-cache scope this build shares."
-    required: true
+    description: "The GitHub Actions layer-cache scope this build shares; empty uses no layer cache (a CI image would evict every compile cache)."
+    required: false
+    default: ""
+  attest:
+    description: "\"true\" (the default) attests and verifies the pushed digest: a published image. \"false\" for a CI environment image."
+    required: false
+    default: "true"
 
 outputs:
   digest:
@@ -49,6 +63,8 @@ runs:
         BUILD_ARGS: ${{ inputs.build-args }}
       run: bash ci/scripts/check_build_args.sh <<< "$BUILD_ARGS"
 
+    # The `docker-container` driver is what emits the attestation manifest
+    # the merge's platform assertion reads; the default driver omits it.
     - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
     - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -72,7 +88,8 @@ runs:
     - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
       id: build
       with:
-        context: .
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
         platforms: ${{ inputs.platforms }}
         push: true
         tags: ${{ steps.meta.outputs.tags }}
@@ -81,10 +98,11 @@ runs:
         build-contexts: ${{ inputs.build-contexts }}
         sbom: true
         provenance: mode=max
-        cache-from: type=gha,scope=${{ inputs.cache-scope }}
-        cache-to: type=gha,mode=max,scope=${{ inputs.cache-scope }}
+        cache-from: ${{ inputs.cache-scope != '' && format('type=gha,scope={0}', inputs.cache-scope) || '' }}
+        cache-to: ${{ inputs.cache-scope != '' && format('type=gha,mode=max,scope={0}', inputs.cache-scope) || '' }}
 
-    - uses: ./.github/actions/attest-image
+    - if: inputs.attest == 'true'
+      uses: ./.github/actions/attest-image
       with:
         image: ${{ inputs.image }}
         digest: ${{ steps.build.outputs.digest }}

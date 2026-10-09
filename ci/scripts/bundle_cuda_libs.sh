@@ -655,7 +655,7 @@ bundle_assert_staged() {
 #       are different strengths of the same argument, and neither stands in
 #       for the other:
 #         (1a) DETECTION, THE PACKAGING (`package_server_tarball.sh`, run by
-#              `_server.yml` in the CUDA container, as root) runs
+#              ci.yml's `server` lane in the CUDA container, as root) runs
 #              the REAL loader (`LD_LIBRARY_PATH=<lib> ldd <binary>`) against
 #              the REAL staged binary and pipes that real report through THIS
 #              SAME parser — `bundle_verify_loader_resolution`, the

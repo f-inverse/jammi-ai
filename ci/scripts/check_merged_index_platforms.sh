@@ -3,7 +3,7 @@
 # Asserts that a `docker buildx imagetools` manifest-list JSON carries
 # EXACTLY a requested platform set, plus at least one `unknown/unknown`
 # attestation-referrer entry per platform. Gates the promotion of a
-# consumer-facing tag: `_ci-base-image.yml`'s `merge-manifest` job runs this
+# consumer-facing tag: ci.yml's `image-cpu-merge` job runs this
 # TWICE per invocation -- once against a `docker buildx imagetools create
 # --dry-run`'s output BEFORE anything is pushed (a failing assertion here
 # means `:latest`/`sha-<sha>` never moves), and once more against
@@ -62,7 +62,7 @@ _assert() {
 
 # Four fixtures, hermetic (no docker, no network): the two PASS shapes and
 # the two FAIL shapes production actually hits, plus the single-platform
-# shape image.yml's one-arch `build-cuda` job exercises. Each asserts the
+# shape the one-arch CUDA image merge exercises. Each asserts the
 # EXACT exit code `_assert` returns, never just "did it print something".
 _self_test() {
   local failures=0

@@ -21,8 +21,8 @@ inputs:
     default: "true"
   no-sccache:
     description: >
-      "true" skips the sccache backend, for a lane that disables the compiler
-      wrapper and never compiles (`cargo deny`).
+      "true" skips the sccache backend and clears the rustc wrapper, for a
+      lane that never compiles (`cargo deny`).
     required: false
     default: "false"
 
@@ -39,7 +39,11 @@ runs:
         REF: ${{ github.ref }}
       run: |
         set -euo pipefail
-        if [ "$NO_SCCACHE" != "true" ]; then
+        if [ "$NO_SCCACHE" = "true" ]; then
+          # `.cargo/config.toml` names sccache as the rustc wrapper; a lane
+          # that never compiles turns it off here rather than at every call.
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+        else
           # sccache refuses to start its server when its storage check fails
           # (SCCACHE_IGNORE_SERVER_IO_ERROR covers compile responses only), so
           # an unavailable Actions cache would fail every cargo call. Start it

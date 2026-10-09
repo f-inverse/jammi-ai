@@ -23,7 +23,7 @@
 # image, all three CUDA lanes and both embedded-engine wheels
 # (`jammi-ai-native`, `jammi-ai-native-cu12`), every one of which builds
 # `storage-cloud`, `postgres` and `mysql`; see
-# `.github/workflows/pypi.yml`, `release-binaries.yml`, `Dockerfile`,
+# `.github/workflows/pypi.yml`, `release.yml`, `Dockerfile`,
 # `packaging/native*/pyproject.toml` and `ci/release-feature-manifest.json`).
 # A copyleft license, a git
 # source, a second engine line or an advisory hiding behind an optional
@@ -73,7 +73,7 @@ ignore = [
     # with no `--features` at all — is advisory-clean without them. That is
     # NOT the shipped posture of every OTHER family: the CPU PyPI wheel and
     # CPU tarball (`.github/workflows/pypi.yml`,
-    # `release-binaries.yml`: `storage-cloud`), the CPU container image
+    # `release.yml`: `storage-cloud`), the CPU container image
     # (`Dockerfile`: `--features jammi-server/storage-cloud`), and all three
     # CUDA lanes (`ci/release-feature-manifest.json`: `cargo_features` include
     # `storage-cloud`) all build these features

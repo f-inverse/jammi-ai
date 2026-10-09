@@ -9,23 +9,20 @@ job's most recent measurement is a success. A tree is what a run proves, never
 a commit: a pull request's run tests its merge commit, the merge lands on `main`
 as another commit with the same tree, and a release tags a third.
 
-Two questions are asked of it:
+One question is asked of it:
 
-    require --repo R --tree T   The release gate (`_proof-required.yml`): T's GPU
-                                prove (`gpu-prove.yml`, one job per shipped CUDA
-                                arch), T's CI (`ci.yml`'s summary job, the merge
-                                gate), T's build (`build.yml`'s summary job, the
-                                artifacts and their consumers) and T's cookbook
-                                (`cookbook-gpu.yml`, every recipe and page on
-                                real models) all hold. A missing or red
-                                measurement DENIES, each naming its remedy.
-    probe --lane ci|build       Whether T's lane already holds, as
-          --repo R --tree T     `proven=true|false` for `$GITHUB_OUTPUT`, with a
-                                notice naming the run whose summary is that
-                                measurement. The lane's `plan` skips its test
-                                executions on a proven T. An unreadable answer is
-                                `proven=false` with a warning, so a run measures
-                                T again.
+    require --repo R --tree T   The release gate (every release workflow's
+                                `proof` job): T's GPU prove (`gpu-prove.yml`,
+                                one job per shipped CUDA arch), T's CI
+                                (`ci.yml`'s summary job: the lints, the
+                                hermetic suite, the artifacts and their
+                                consumers) and T's cookbook (`cookbook-gpu.yml`,
+                                every recipe and page on real models) all
+                                hold. A missing or red measurement DENIES,
+                                each naming its remedy.
+
+The job names are the lane table's (`ci/lanes.toml`), read through
+`ci/scripts/lanes.py`, so producer and consumer never drift.
 
 ## The rule (most-recent-measurement-wins, check once)
 
@@ -33,9 +30,8 @@ A measurement of a required job is a COMPLETED, non-`skipped` conclusion of
 the job named exactly so, taken from the LATEST ATTEMPT of that job
 (`filter=latest`, so a `gh run rerun --failed` supersedes a stale attempt in
 place) in a run of the requirement's workflow bound to T. `skipped` is not a
-measurement: a run that found T already proven skips, and measured nothing. A
-job that has not completed contributes no measurement — it is never a reason
-to wait.
+measurement. A job that has not completed contributes no measurement — it is
+never a reason to wait.
 
 When a job's latest attempt is still in progress, `filter=latest` would hide an
 earlier, already-completed attempt of the same run, including a red one; that
@@ -63,28 +59,23 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "ci" / "scripts"))
 import check_gpu_parity_matrix as gpu_parity_matrix  # noqa: E402
 import github_api  # noqa: E402
+import lanes  # noqa: E402
 from github_api import API_BASE, ApiError, FetchFn  # noqa: E402
 
 SUBJECT_ARTIFACT = "subject-{tree}"
 SUCCESS = "success"  # exact string equality only -- never a substring/prefix check.
 
-CI_WORKFLOW = "ci.yml"
-# The one job whose success holds every other `ci.yml` job's, pinned against
-# `ci.yml`'s `ci-summary` call of `_summary.yml` by `check_gpu_prove_once.py`'s
-# P4 rule.
-CI_SUMMARY_JOB = "ci-summary / assert"
-BUILD_WORKFLOW = "build.yml"
-# The one job whose success holds every artifact and every consumer of them,
-# pinned the same way against `build.yml`'s `build-summary` call.
-BUILD_SUMMARY_JOB = "build-summary / assert"
-GPU_WORKFLOW = "gpu-prove.yml"
-# Pinned against `gpu-prove.yml`'s own matrix `name:` line by
-# `check_gpu_prove_once.py`'s P4 rule, so producer and consumer never drift.
-GPU_JOB_TEMPLATE = "GPU prove on RunPod ({arch})"
-COOKBOOK_WORKFLOW = "cookbook-gpu.yml"
-# The one job that runs every recipe and page and assembles the book, pinned
-# against `cookbook-gpu.yml`'s job `name:` by the same P4 rule.
-COOKBOOK_JOB = "Cookbook on RunPod"
+_TABLE = lanes.load()
+CI_WORKFLOW = _TABLE.workflows["ci"].file
+# The one job whose success holds every other `ci.yml` job's: the rendered
+# summary, named by the renderer.
+CI_SUMMARY_JOB = lanes.SUMMARY_LANE
+GPU_WORKFLOW = _TABLE.workflows["gpu-prove"].file
+# The prove lane's job name, one per shipped CUDA arch (`{sm}` is the leg).
+GPU_JOB_TEMPLATE = _TABLE.lanes["gpu-prove"].name
+COOKBOOK_WORKFLOW = _TABLE.workflows["cookbook-gpu"].file
+# The one job that runs every recipe and page and assembles the book.
+COOKBOOK_JOB = _TABLE.lanes["cookbook"].name
 
 
 @dataclass(frozen=True)
@@ -124,23 +115,11 @@ def ci_requirement() -> Requirement:
     )
 
 
-def build_requirement() -> Requirement:
-    return Requirement(
-        BUILD_WORKFLOW,
-        (BUILD_SUMMARY_JOB,),
-        f"no {BUILD_WORKFLOW} run has measured this tree: a pull request or a push to main runs it",
-    )
-
-
-# The lanes a plan probes, by the name its workflow passes.
-PROBE_LANES = {"ci": ci_requirement, "build": build_requirement}
-
-
 def gpu_requirement() -> Requirement:
     arches = sorted(gpu_parity_matrix.load_shipped_cuda_silicon())
     return Requirement(
         GPU_WORKFLOW,
-        tuple(GPU_JOB_TEMPLATE.format(arch=a) for a in arches),
+        tuple(GPU_JOB_TEMPLATE.format(sm=a) for a in arches),
         f"dispatch the prove lane: gh workflow run {GPU_WORKFLOW} --ref <tag-or-branch-holding-the-tree>, "
         "wait for green, then re-run this workflow's failed jobs. Prove first, then tag.",
     )
@@ -157,9 +136,8 @@ def cookbook_requirement() -> Requirement:
 
 
 def release_requirements() -> list[Requirement]:
-    """What a release requires of its tree: the GPU prove, CI, the build and
-    the cookbook."""
-    return [gpu_requirement(), ci_requirement(), build_requirement(), cookbook_requirement()]
+    """What a release requires of its tree: the GPU prove, CI and the cookbook."""
+    return [gpu_requirement(), ci_requirement(), cookbook_requirement()]
 
 
 def bound_runs(fetch: FetchFn, token: str, repo: str, workflow: str, tree: str) -> list[dict]:
@@ -298,42 +276,16 @@ def require(
     return 1 if denied else 0
 
 
-def probe(
-    *, repo: str, tree: str, lane: str, fetch: FetchFn, token: str, out=sys.stdout, err=sys.stderr
-) -> int:
-    """`proven=true` when `tree`'s `lane` already holds, `proven=false`
-    otherwise. Never fails: an unreadable record means the run measures
-    again."""
-    requirement = PROBE_LANES[lane]()
-    try:
-        verdict = check_once(fetch, token, repo, requirement, tree)
-    except ApiError as e:
-        print(f"::warning::verdict: {e} -- this run measures tree {tree} again", file=err)
-        print("proven=false", file=out)
-        return 0
-    print(f"proven={'true' if verdict.ok else 'false'}", file=out)
-    if verdict.ok:
-        (job,) = requirement.jobs
-        m = verdict.proofs[job]
-        print(f"::notice::tree {tree} is proven by run {m.run_id} ({m.html_url})", file=err)
-    return 0
-
-
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("question", choices=["require", "probe"])
+    ap.add_argument("question", choices=["require"])
     ap.add_argument("--repo", required=True, help="owner/repo")
     ap.add_argument("--tree", required=True, help="The git tree id the verdict is about.")
-    ap.add_argument("--lane", choices=sorted(PROBE_LANES), help="probe: the lane whose plan asks.")
     args = ap.parse_args(argv)
-    if (args.question == "probe") != (args.lane is not None):
-        ap.error("--lane is for probe, and probe needs it")
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         print("::error::verdict: GITHUB_TOKEN is not set", file=sys.stderr)
         return 1
-    if args.question == "probe":
-        return probe(repo=args.repo, tree=args.tree, lane=args.lane, fetch=github_api.default_fetch, token=token)
     return require(
         repo=args.repo,
         tree=args.tree,

@@ -257,7 +257,7 @@ SiliconAccountingEntry = ProvenBy | Deferred
 # targets. Every CUDA artifact promotion (server image, release
 # binaries, cu12 wheel) gates on that SAME recorded verdict, proven once per
 # tree and shared (`ci/scripts/verdict.py`, consumed via
-# `_proof-required.yml`), never a second rental of its own.
+# every release workflow's `proof` job), never a second rental of its own.
 SILICON_ACCOUNTING: list[tuple[str, SiliconAccountingEntry]] = [
     (
         "sm_80",

@@ -2,9 +2,8 @@
 //! reproduces `candle_transformers::models::bert::BertModel` byte-for-byte
 //! within F32 noise tolerance.
 //!
-//! Gated behind the `parity-test` feature so the default `cargo test` stays
+//! Hermetic: the oracle is the committed `tiny_bert` fixture, so it runs with the default `cargo test`.
 //! free of any candle-transformers runtime dependency.
-#![cfg(feature = "parity-test")]
 
 use std::path::PathBuf;
 

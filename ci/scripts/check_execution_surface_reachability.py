@@ -11,7 +11,7 @@ auto-seed — a leg reds the WHOLE seed the moment its own tuple regresses.
 `gpu-prove.yml` — `workflow_dispatch` / `pull_request: types: [labeled]` /
 nightly `schedule`, NEVER a trigger that fires on every PR-to-main or
 push-to-main, and never `push:`/`workflow_call:`-able either
-(`check_gpu_prove_once.py`'s P1 rule pins this by name); every CUDA release
+(`ci/scripts/lanes.py` refuses any other trigger on a lane that rents hardware); every CUDA release
 lane consumes its already-recorded verdict instead of invoking it a second
 time — see the allowlist's own notes) carries a byte-identical twin of
 several of those same tuples.
@@ -76,7 +76,7 @@ not per-workflow — a workflow may carry DIFFERENT `paths:` lists under its
 specific tuple's origin path (its `ci/scripts/**` source file) before that
 trigger credits anything: a workflow whose `on:` block otherwise fires on
 the merge path but whose `paths:` allowlist can never match a change under
-`ci/scripts/**` (`devcontainer-image.yml`; `image.yml`,
+`ci/scripts/**` (a path-filtered workflow,
 whose only `ci/scripts/` entry is a single literal file, never a glob
 covering the whole directory) would never actually RUN in response to an
 edit of `pod_seed_target.sh`/`runpod_gpu_prove.sh`, so crediting it as
@@ -1093,7 +1093,7 @@ def discover_suspicious_lines(repo_root: Path) -> list[str]:
 # `ci/scripts` tree that reads an `on:` block down to its top-level trigger
 # KEYS (never the fuller `parse_on_block_or_fail` field shape below, which
 # stays a separate, Rule-1-specific reader over the SAME parsed document) —
-# `check_gpu_prove_once.py`'s P1, P5, P6, P7 and its `--read-on-block` CLI
+# `ci/scripts/lanes.py`'s paid-lane and publisher rules, and this gate's own
 # (which `test_gpu_topology_lane.sh` shells out to) all import this
 # function, never a second, independently-drifting copy. Every value this
 # module derives from a workflow's `on:` block -- the trigger set here, and
@@ -1792,7 +1792,7 @@ def require_pyyaml_or_exit(prefix: str, exit_code: int = 2) -> int | None:
     named "gate prerequisite missing: PyYAML" line under `prefix` --
     never a finding, never a pass, never a Python traceback -- and returns
     `exit_code`. Every gate built on this module's shared loader
-    (`check_lint_surface_closure.py`, `check_gpu_prove_once.py`, and this
+    (`check_lint_surface_closure.py`, `check_lint_surface_closure.py`'s host rule, and this
     module's own `main`) calls this FIRST, before dispatching `--self-test`
     or ANY other argv-driven behavior: a missing install reads as ONE
     prerequisite failure, never as however many "cannot examine" findings
@@ -2751,7 +2751,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
         failures.append(f'self-test FAILED: a quoted "pull_request": trigger is not classified as merge-path: {_reason}')
 
     # --- `read_top_level_on_block`/`parse_on_block`: the shared `on:`-block
-    # readers `check_gpu_prove_once.py`'s P1, P5, P6, P7 and its
+    # readers `ci/scripts/lanes.py`'s rules and its
     # `--read-on-block` CLI all import (and `check_lint_surface_closure.py`,
     # via `parse_on_block`). Both derive from ONE parse of the document
     # (`load_workflow_text`), so they can no longer disagree with each
@@ -2923,7 +2923,7 @@ def self_test() -> int:  # noqa: C901 - a flat sequence of independent RED-mutan
     # The P6-shape end-to-end case (a flow-style `jobs:` mapping whose real
     # publisher job is not the last entry must never read as `[]`/
     # no-finding while crediting a DIFFERENT job with the missing job's own
-    # text) is covered in `test_check_gpu_prove_once.py`'s own suite, which
+    # text) is covered by `ci/scripts/lanes.py --self-test`, which
     # owns `check_p6_discovery` -- not re-derived here. The "reusable
     # this delegates into but cannot examine is a finding, never `{}`"
     # property is ALSO owned there (`check_p6_discovery` is the only

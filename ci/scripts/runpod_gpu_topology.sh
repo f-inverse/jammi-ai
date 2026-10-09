@@ -68,7 +68,7 @@
 #
 # TRIGGERS: `.github/workflows/gpu-topology.yml` only — the `run-topology` PR
 # label and manual dispatch. Never `push:`, never `workflow_call:`; nothing may
-# `uses:` that workflow (`check_gpu_prove_once.py` P7/P8).
+# `uses:` that workflow (`ci/scripts/lanes.py`'s paid-lane rule).
 #
 # Exit 0 = every gating group passed; 75 = no co-located capacity for any
 # candidate (neutral provider condition, still RED at the workflow level); 76 =

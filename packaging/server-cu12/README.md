@@ -20,8 +20,8 @@ required (only an NVIDIA driver on the host). This package and `jammi-server`
 ## The release tarball
 
 `jammi-server-cu12-<version>-x86_64-unknown-linux-gnu.tar.gz` (built by
-`.github/workflows/_server.yml` on every change and attached to the release by
-`release-binaries.yml`) ships the
+ci.yml's `server` lane on every change and attached to the release by
+`release.yml`) ships the
 same binary as this wheel, packaged as a self-contained directory with a
 launcher instead of a console script: it bundles the CUDA runtime shared
 libraries the binary links, derived from the binary's own transitive

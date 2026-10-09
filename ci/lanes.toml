@@ -1,0 +1,1082 @@
+# The lanes CI runs. `ci/scripts/lanes.py render` writes every workflow under
+# `.github/workflows/` and `docs/maintainer/ci.md` from this table; the guard
+# `lanes rendered` holds them equal to it. A lane is a command with four typed
+# properties -- host, needs, when, and what it produces or consumes -- and
+# nothing a job spells beyond its own steps is written here: the renderer
+# derives the runner, container, services, edges, condition, permissions,
+# checkout, toolchain, artifact transfer, release gate and summary, and refuses
+# a table that says what CI cannot be (`python3 ci/scripts/lanes.py --self-test`
+# lists the refusals).
+#
+#   [workflow.<id>]   a file: its triggers (pr, main, schedule, dispatch,
+#                     label:<name>, tag:<prefix>), its cron, its dispatch inputs,
+#                     and the doc that heads the rendered file.
+#   [artifact.<name>] a build product by name and path; `{field}` in a name is
+#                     filled from a lane's legs.
+#   [action.<alias>]  a third-party action pinned once, used as `uses = "@alias"`.
+#   [lane.<id>]       why, workflow(s), name, when (a subset of the workflow's
+#                     triggers; default all), host (cpu-image, cuda-image, ubuntu,
+#                     macos, colab), arch, rust (true, "release", "no-sccache"),
+#                     needs, timeout, after, produces, consumes, env, outputs,
+#                     checkout, publishes ("release", "ci-image", "alias"),
+#                     environment, dir, legs, steps.
+#
+# Steps: `{run = ...}`, `{uses = ...}`, `{upload = "<artifact>"}`,
+# `{download = "<artifact>", path = ...}`; each may carry name, id, env, if,
+# when (a trigger, rendered as the step's `if`), dir, shell. `{image:cpu}`,
+# `{image:cuda}` (the tree's CI images), `{image:cpu-repo}`/`{image:cpu-tag}`
+# and `{artifact-run}` (the run whose artifacts this lane installs) are
+# filled by the renderer.
+
+# ============================================================================= workflows
+
+[workflow.ci]
+name = "CI"
+on = ["pr", "main"]
+cancel-superseded = true
+doc = """
+The merge gate and the release candidate: every pull request, and every push
+to main. Does the tree pass its lints, its hermetic suite, its backend arms
+and its guards; does every artifact a release promotes build, and run as a
+user runs it. A pull request's run measures the tree; main's run compiles
+what writes the shared cache (setup-rust-ci writes only on main), builds the
+artifacts a release promotes, and measures what only main measures: the live
+hub tests and the performance gate. Branch protection requires `ci-summary`
+and an up-to-date branch, so the tree main holds is the tree a run proved.
+
+The tree's CI images are built here when the registry lacks them (the
+`CI image (...)` jobs); every other workflow waits for them."""
+
+[workflow.nightly]
+name = "Nightly"
+on = ["schedule", "dispatch"]
+cron = "17 3 * * *"
+doc = """
+What drifts with no change to the tree: the deploy shapes over the binaries
+of the run that proved main's tree (a runtime base image's update, a service
+patch release), the distributed lanes over main again, and the cookbook as a
+reader installs it from PyPI."""
+[workflow.nightly.inputs.tag]
+description = "cookbook-published: the py-vX.Y.Z release to run the notebooks at (empty: the newest)."
+type = "string"
+required = false
+default = ""
+
+[workflow.gpu-prove]
+name = "GPU prove (RunPod)"
+on = ["label:run-gpu", "dispatch", "schedule"]
+cron = "47 3 * * *"
+paid-cron = true
+doc = """
+The gated GPU suites on real NVIDIA hardware, one rented pod per shipped CUDA
+arch (`crates/jammi-kernels/build.rs` GENCODE_ARCHES): the served GPU proof
+and the engine-core correctness suite, built at the image's baked compute
+capability and run on the device. Every release gates on this lane's recorded
+verdict for the tree it promotes (`verdict.py require`), never on a fresh
+rental: prove, then tag. A dispatch on a tag ref gets the release budget --
+three attempts on a capacity exit and the matching timeout. Never cancelled:
+a cancel SIGKILLs the runner before the driver's EXIT trap returns the pod."""
+
+[workflow.gpu-howwell]
+name = "GPU how-well (RunPod)"
+on = ["dispatch"]
+doc = """
+The fine-tune how-well A/B on a rented A100: `ci/scripts/perf/finetune_run_ab.sh`
+driving `jammi-bench finetune-run` per (rung, seed, take) against the
+committed held-out fixture, judged by `jammi-bench ladder train-run`. Every
+input is a choice an operator makes per run; the committed artifacts are what
+the merge path validates (`check_cuda_run_artifacts.py`)."""
+[workflow.gpu-howwell.inputs.model_dir]
+description = "Checkpoint directory on the target pod (config.json + model.safetensors + tokenizer.json)."
+type = "string"
+required = true
+[workflow.gpu-howwell.inputs.objective]
+description = "mnrl or triplet: the probe's objective."
+type = "choice"
+required = true
+options = ["mnrl", "triplet"]
+[workflow.gpu-howwell.inputs.seeds]
+description = "Comma-separated seed list (the pre-registered 12-seed gate set by default)."
+type = "string"
+required = false
+default = "1,2,3,4,5,6,7,8,9,10,11,12"
+[workflow.gpu-howwell.inputs.pods]
+description = "Pods to spread the seeds over, one share each; above 1 the shares run at once and the legs are merged and judged once."
+type = "number"
+required = false
+default = 1
+[workflow.gpu-howwell.inputs.lr0_seeds]
+description = "Comma-separated lr=0 control seeds: an arm that cannot learn must fail the learning-happened premise. Cleared, the ladder refuses the torch edge unless the control was waived."
+type = "string"
+required = false
+default = "1,2"
+
+[workflow.gpu-perf-ab]
+name = "GPU perf A/B (RunPod)"
+on = ["label:run-gpu-perf-ab", "dispatch"]
+doc = """
+The `encode` ladder's revision edge on a rented A100: `ci/scripts/perf/gpu_inference_ab.sh`
+builds this checkout's merge-base with main twice (base, and rebuilt as the
+A/A null) and this checkout once, runs `jammi-bench encode-step --cuda 0` on
+each, and the ladder judges the revised cost against the wider of the rung's
+noise band and the A/A band. The verdict is uploaded for a human; nothing
+gates on it."""
+[workflow.gpu-perf-ab.inputs.aa_null]
+description = "Every side the parent sha: the instrument's own null."
+type = "boolean"
+required = false
+default = false
+
+[workflow.gpu-topology]
+name = "GPU topology (RunPod)"
+on = ["label:run-topology", "dispatch"]
+doc = """
+The fine-tune gang on real GPUs at every topology the engine lays a job out
+as -- one host with one GPU, one host with two (in one process, and as two
+processes), two hosts with two each -- under the inline and NCCL transports,
+through the product path. Driven by `ci/scripts/runpod_gpu_topology.sh`.
+
+COST BOUND (human-approved), from the driver's own defaults
+(`ci/scripts/test_gpu_topology_lane.sh` re-derives them and fails when this
+header and the mechanism disagree): 2 hosts x 2 GPUs x TOPOLOGY_MAX_GPU_RATE
+($4.00/GPU/h, refused above it before any create) x RP_TTL_HOURS (4 h, baked
+into each pod's own entrypoint):
+  (i) terminate-succeeds: 4 x $4.00 x 4 h = $64.00 per run (ceiling).
+  (ii) sweep-only (every terminate fails): each pod bills to its TTL, then
+       gpu-reap.yml's 6-hourly sweep: 4 x $4.00 x (4 + 6) h = $160.00.
+
+Nothing gates on this lane: it produces `topology.json`, which a human
+reviews and commits under `crates/jammi-kernels/artifacts/cuda-runs/`."""
+[workflow.gpu-topology.inputs.gpu_types]
+description = "Candidate GPU types in preference order, `|`-separated RunPod gpuTypeIds (each must map to sm_80/86/89/90). Empty: the driver's default list."
+type = "string"
+required = false
+default = ""
+
+[workflow.gpu-reap]
+name = "GPU reap (RunPod orphans)"
+on = ["schedule", "dispatch"]
+cron = "23 */6 * * *"
+paid-cron = true
+doc = """
+Terminates RunPod pods this repository rented that have outlived their own
+deadline: the backstop for a deadline that never got armed (a container that
+died early, a host that stopped reporting). It fails when it cannot enumerate
+the account's pods: "could not check" is never "nothing to clean"."""
+[workflow.gpu-reap.inputs.force_hours]
+description = "Force-reap every jammi pod older than this many hours (empty honours each pod's own deadline)."
+type = "string"
+required = false
+default = ""
+
+[workflow.cookbook-gpu]
+name = "Cookbook on a GPU"
+on = ["label:cookbook-gpu", "dispatch"]
+doc = """
+Every recipe and every page of the book, run with the real Hub models they
+teach with, over the builds of the ci.yml run that proved the tree: the CUDA
+engine wheel, the client wheel, the CUDA server and the CLI, installed on a
+rented L4 (the class of GPU a Colab reader gets). The run records each page's
+execution and assembles the book a release publishes. Every release gates on
+this lane's recorded verdict for the tree it promotes: dispatch it before
+tagging."""
+
+[workflow.cookbook-published-gpu]
+name = "Cookbook as published (GPU)"
+on = ["dispatch"]
+doc = """
+The cookbook notebooks at a release tag, as a reader on a GPU runtime runs
+them: on a rented L4, each in a fresh environment whose setup cell installs
+the CUDA wheels from PyPI. The CPU lane is nightly.yml's. Dispatched by hand
+after a release."""
+[workflow.cookbook-published-gpu.inputs.tag]
+description = "Release tag to run (py-vX.Y.Z)."
+type = "string"
+required = true
+
+[workflow.crates]
+name = "Crates"
+on = ["tag:v", "dispatch"]
+group = "release"
+doc = """
+Publishes the workspace crates to crates.io on a `v*` tag, behind the release
+gate. `ci/scripts/publish_crates.sh` is the publish program: topological
+order, the per-crate already-published guard, the sparse-index wait. A
+dispatch on the tag finishes an interrupted release; crates.io's trusted
+publisher is registered to this file."""
+
+[workflow.npm]
+name = "npm"
+on = ["tag:v", "dispatch"]
+doc = """
+Publishes `@f-inverse/jammi-client` to npm on the `v*` tag that publishes the
+crates, behind the release gate, through npm's OIDC trusted publishing
+(registered to this file). It builds nothing: the tarball is the one the run
+that proved the tag's tree packed."""
+
+[workflow.pypi]
+name = "PyPI"
+on = ["tag:py-v", "dispatch"]
+doc = """
+Publishes every Python dist to PyPI on a `py-v*` tag, in lockstep at the
+workspace version: the client `jammi-ai`, the embedded engine `jammi-ai-native`
+per platform and `jammi-ai-native-cu12`, and the servers `jammi-server` per
+arch and `jammi-server-cu12`. It compiles nothing: every wheel is the one the
+run that proved the tag's tree built and held to PyPI's per-file limit. One
+leg per PyPI project, each project's trusted publisher registered to this
+file and the `pypi` environment. A dispatch on the tag finishes an
+interrupted release (PyPI refuses a re-upload, so a re-run is idempotent)."""
+
+[workflow.release]
+name = "Release"
+on = ["tag:v", "dispatch"]
+doc = """
+The GitHub release of a `v*` tag, behind the release gate: the prebuilt
+binaries attached with a provenance attestation over the exact bytes, and the
+`jammi-server` container images pushed to GHCR -- the CPU image's `generic`
+and `selfcontained` variants, one native leg per arch merged into the real
+tags by the one verify-then-promote definition (`merge-index`), and the CUDA
+image -- every pushed digest attested and verified. One tag policy
+(`ci/scripts/image_tags.sh`): `:X.Y.Z`, `:X.Y`, `:sha-<sha>`, `:latest`.
+Every image packages binaries the proving run built and compiles nothing."""
+
+[workflow.pages]
+name = "Pages"
+on = ["tag:py-v", "dispatch"]
+group = "pages"
+doc = """
+The documentation site of a `py-v*` release, behind the release gate: the
+guide and API reference the proving ci.yml run built, and the book the
+cookbook lane rendered on real models, so what a reader reads is what PyPI
+serves and what each chapter's Colab badge installs."""
+
+# ============================================================================= artifacts
+
+[artifact.hermetic-tests]
+path = "target/hermetic.tar.zst"
+retention = 1
+compression = 0
+[artifact."hermetic-timings-{partition}"]
+path = "target/nextest/ci/junit.xml"
+retention = 30
+[artifact.distributed-jammi-ai]
+path = "/tmp/distributed-jammi-ai.tar.zst"
+retention = 1
+[artifact.distributed-jammi-bench]
+path = "/tmp/distributed-jammi-bench.tar.zst"
+retention = 1
+[artifact.docs-site]
+path = "_site"
+[artifact."wheels-native-{dist}"]
+path = "packaging/native/dist"
+[artifact.native-cu12-wheel]
+path = "packaging/native-cu12/dist/"
+[artifact."{build}-{target}-binary"]
+path = "target/release/jammi-server"
+[artifact."{build}-{target}-tarball"]
+path = "${{ steps.tarball.outputs.asset }}"
+[artifact."{build}-{target}-wheel"]
+path = "packaging/${{ matrix.build }}/dist/"
+[artifact.cu12-loader-report]
+path = "cu12_loader_report_real.txt"
+[artifact.cu12-jail-report]
+path = "cu12_jail_report_real.txt"
+[artifact."jammi-{triple}"]
+path = "${{ steps.package.outputs.asset }}"
+[artifact.client-wheel]
+path = "clients/python/dist/"
+[artifact.ts-client-package]
+path = "${{ runner.temp }}/ts-client/*.tgz"
+[artifact.cookbook-book]
+path = "cookbook/book/_book"
+
+# ============================================================================= actions
+
+[action]
+checkout = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0"
+upload-artifact = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2"
+download-artifact = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0"
+cache = "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0"
+setup-python = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0"
+setup-node = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0"
+kind = "helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0"
+upload-pages-artifact = "actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1"
+deploy-pages = "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5"
+pypi-publish = "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)"
+
+# ============================================================================= ci: the tree's environment
+
+[lane.subject]
+why = "Records the tree this run measures, so a verdict follows the tree a run tested and never a commit."
+host = "ubuntu"
+outputs = { commit = "steps.subject.outputs.commit" }
+steps = [{ id = "subject", uses = "./.github/actions/record-subject" }]
+
+[lane.image-cpu]
+why = "The tree's CPU CI image, one native leg per platform, built when the registry lacks its content tag."
+name = "CI image (CPU, {arch})"
+host = "ubuntu"
+needs = ["ghcr"]
+publishes = "ci-image"
+legs = [{ arch = "amd64" }, { arch = "arm64" }]
+steps = [
+  { id = "built", run = "python3 ci/scripts/ci_image.py built --dockerfile .docker/ci.Dockerfile | tee -a \"$GITHUB_OUTPUT\"" },
+  { if = "steps.built.outputs.build == 'true'", id = "args", env = { ARCH = "${{ matrix.arch }}" }, run = "{ echo 'args<<EOF'; python3 ci/scripts/ci_image.py build-args --dockerfile .docker/ci.Dockerfile --arch \"$ARCH\"; echo EOF; } >> \"$GITHUB_OUTPUT\"" },
+  { if = "steps.built.outputs.build == 'true'", uses = "./.github/actions/push-image-leg", with = { image = "{image:cpu-repo}", context = ".docker", file = ".docker/ci.Dockerfile", tags-spec = "type=raw,value={image:cpu-tag}", tag-suffix = "${{ matrix.arch }}", build-args = "${{ steps.args.outputs.args }}", platforms = "${{ matrix.platform }}", attest = "false" } },
+]
+
+[lane.image-cpu-merge]
+why = "Merges the CPU image's per-arch legs into the one reference every lane pulls, verify-then-promote."
+name = "CI image (CPU, merge)"
+host = "ubuntu"
+needs = ["ghcr"]
+publishes = "ci-image"
+after = ["image-cpu"]
+steps = [
+  { id = "built", run = "python3 ci/scripts/ci_image.py built --dockerfile .docker/ci.Dockerfile | tee -a \"$GITHUB_OUTPUT\"" },
+  { if = "steps.built.outputs.build == 'true'", uses = "./.github/actions/merge-index", with = { image = "{image:cpu-repo}", platforms = "linux/amd64,linux/arm64", tags = "{image:cpu}", sources = "{image:cpu}-amd64\n{image:cpu}-arm64\n" } },
+]
+
+[lane.image-cuda]
+why = "The tree's CUDA CI image, FROM the CPU image of the same tree, built when the registry lacks its content tag."
+name = "CI image (CUDA, {arch})"
+host = "ubuntu"
+needs = ["ghcr"]
+publishes = "ci-image"
+after = ["image-cpu-merge"]
+legs = [{ arch = "amd64" }]
+steps = [
+  { id = "built", run = "python3 ci/scripts/ci_image.py built --dockerfile .docker/ci-cuda.Dockerfile | tee -a \"$GITHUB_OUTPUT\"" },
+  { if = "steps.built.outputs.build == 'true'", id = "args", env = { ARCH = "${{ matrix.arch }}" }, run = "{ echo 'args<<EOF'; python3 ci/scripts/ci_image.py build-args --dockerfile .docker/ci-cuda.Dockerfile --arch \"$ARCH\"; echo EOF; } >> \"$GITHUB_OUTPUT\"" },
+  { if = "steps.built.outputs.build == 'true'", uses = "./.github/actions/push-image-leg", with = { image = "{image:cuda-repo}", context = ".docker", file = ".docker/ci-cuda.Dockerfile", tags-spec = "type=raw,value={image:cuda-tag}", tag-suffix = "${{ matrix.arch }}", build-args = "${{ steps.args.outputs.args }}", platforms = "${{ matrix.platform }}", attest = "false" } },
+]
+
+[lane.image-cuda-merge]
+why = "Promotes the CUDA image's leg to its one reference through the same merge every image goes through."
+name = "CI image (CUDA, merge)"
+host = "ubuntu"
+needs = ["ghcr"]
+publishes = "ci-image"
+after = ["image-cuda"]
+steps = [
+  { id = "built", run = "python3 ci/scripts/ci_image.py built --dockerfile .docker/ci-cuda.Dockerfile | tee -a \"$GITHUB_OUTPUT\"" },
+  { if = "steps.built.outputs.build == 'true'", uses = "./.github/actions/merge-index", with = { image = "{image:cuda-repo}", platforms = "linux/amd64", tags = "{image:cuda}", sources = "{image:cuda}-amd64\n" } },
+]
+
+[lane.image-latest]
+why = "Points the CI images' `:latest` alias, which the devcontainer builds FROM, at main's tree."
+when = ["main"]
+host = "ubuntu"
+needs = ["ghcr"]
+publishes = "alias"
+after = ["image-cuda-merge"]
+steps = [
+  { uses = "./.github/actions/merge-index", with = { image = "{image:cpu-repo}", platforms = "linux/amd64,linux/arm64", tags = "{image:cpu-repo}:latest", sources = "{image:cpu}\n" } },
+  { uses = "./.github/actions/merge-index", with = { image = "{image:cuda-repo}", platforms = "linux/amd64", tags = "{image:cuda-repo}:latest", sources = "{image:cuda}\n" } },
+]
+
+[lane.devcontainer-image]
+why = "The devcontainer image builds; it is never published."
+when = ["pr"]
+host = "ubuntu"
+steps = [{ uses = "./.github/actions/build-image", with = { file = ".devcontainer/Dockerfile", context = ".devcontainer", cache-scope = "devcontainer" } }]
+
+# ============================================================================= ci: lint
+
+[lane.fmt-clippy]
+why = "The workspace is formatted and lints clean, with the SQLx source-provider surface nothing else on the merge path compiles."
+name = "Format & Lint"
+rust = true
+steps = [
+  { name = "Check formatting", run = "cargo fmt --all -- --check" },
+  { name = "Clippy", run = "cargo clippy --workspace --all-targets -- -D warnings" },
+  { name = "Clippy jammi-db postgres,mysql", run = "cargo clippy -p jammi-db --features postgres,mysql --all-targets -- -D warnings" },
+]
+
+[lane.clippy-gated]
+why = "Every test surface compiled only under a feature naming a host resource, or the live hub, lints clean (`check_lint_surface_closure.py` asserts every gated surface has a lane)."
+name = "Clippy (gated: {surface})"
+rust = true
+legs = [
+  { surface = "jammi-ai host resources", cmd = "cargo clippy -p jammi-ai --all-targets --features unprivileged-tests,live-distributed-tests -- -D warnings" },
+  { surface = "jammi-db host resources", cmd = "cargo clippy -p jammi-db --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks,live-s3-tests,live-gcs-tests,live-azure-tests,live-r2-tests -- -D warnings" },
+  { surface = "jammi-server host resources", cmd = "cargo clippy -p jammi-server --all-targets --features unprivileged-tests,live-postgres-tests,test-hooks -- -D warnings" },
+  { surface = "jammi-bench fleet", cmd = "cargo clippy -p jammi-bench --tests --features live-distributed-tests -- -D warnings" },
+  { surface = "jammi-ai live hub", cmd = "cargo clippy -p jammi-ai --all-targets --features live-hub-tests -- -D warnings" },
+  { surface = "jammi-encoders live hub", cmd = "cargo clippy -p jammi-encoders --all-targets --features live-hub-tests -- -D warnings" },
+]
+steps = [{ run = "${{ matrix.cmd }}" }]
+
+[lane.clippy-cuda]
+why = "Every CUDA-gated surface compiles and lints under nvcc with no device, one leg per feature graph; `flash-attn` stays unreachable from `cuda`, so jammi-ai is linted without it."
+name = "Clippy (CUDA: {crate})"
+host = "cuda-image"
+rust = true
+needs = ["cutlass", "nccl"]
+legs = [
+  { crate = "jammi-kernels", cmd = "cargo clippy -p jammi-kernels --all-targets --features live-gpu-tests,flash-attn -- -D warnings" },
+  { crate = "jammi-encoders flash-oracle", cmd = "cargo clippy -p jammi-encoders --all-targets --features live-flash-oracle-tests -- -D warnings" },
+  { crate = "jammi-encoders", cmd = "cargo clippy -p jammi-encoders --all-targets --features live-gpu-tests -- -D warnings" },
+  { crate = "jammi-lora", cmd = "cargo clippy -p jammi-lora --all-targets --features live-gpu-tests -- -D warnings" },
+  { crate = "jammi-bench", cmd = "cargo clippy -p jammi-bench --all-targets --features live-gpu-tests,flash-attn -- -D warnings" },
+  { crate = "jammi-ai", cmd = "cargo clippy -p jammi-ai --all-targets --features live-gpu-tests,live-gpu-gang-tests -- -D warnings" },
+  { crate = "jammi-server", cmd = "cargo clippy -p jammi-server --tests --features live-gpu-tests,live-gpu-gang-tests -- -D warnings" },
+]
+steps = [{ run = "${{ matrix.cmd }}" }]
+
+[lane.clippy-metal]
+why = "The Metal-gated surfaces lint clean; a hosted macOS runner cannot construct a Metal device, so they run on Apple-silicon hardware."
+name = "Clippy (Metal)"
+host = "macos"
+rust = true
+steps = [
+  { run = "cargo clippy -p jammi-kernels --lib --tests --features live-metal-tests -- -D warnings\ncargo clippy -p jammi-lora --tests --features live-metal-tests -- -D warnings\ncargo clippy -p jammi-ai --test metal_quantized_gpu --features live-metal-tests -- -D warnings\n" },
+]
+
+# ============================================================================= ci: the hermetic suite
+
+[lane.test-build]
+why = "Compiles the hermetic test graph once, locked, and archives it for the partitions, which compile nothing; nextest runs no doctests, so they run here."
+name = "Test (hermetic) build"
+rust = true
+produces = ["hermetic-tests"]
+steps = [
+  { name = "Build the hermetic test archive", run = "cargo nextest archive --workspace --exclude jammi-python --locked --archive-file target/hermetic.tar.zst" },
+  { name = "Doctests", when = "pr", run = "cargo test --workspace --exclude jammi-python --doc" },
+]
+
+[lane.test]
+why = "Runs a slice of every hermetic test binary from the archive, each test in a process of its own; eight slices end near the slowest test's floor."
+name = "Test (hermetic) ({partition}/8)"
+when = ["pr"]
+consumes = ["hermetic-tests"]
+produces = ["hermetic-timings-{partition}"]
+legs = [{ partition = 1 }, { partition = 2 }, { partition = 3 }, { partition = 4 }, { partition = 5 }, { partition = 6 }, { partition = 7 }, { partition = 8 }]
+steps = [
+  { download = "hermetic-tests", path = "/tmp/hermetic" },
+  { name = "Run the partition", env = { PARTITION = "${{ matrix.partition }}" }, run = "cargo nextest run --profile ci --archive-file /tmp/hermetic/hermetic.tar.zst --workspace-remap \"$GITHUB_WORKSPACE\" --extract-to \"$GITHUB_WORKSPACE\" --partition \"slice:$PARTITION/8\"" },
+  { upload = "hermetic-timings-{partition}", if = "always()" },
+]
+
+[lane.test-permission-fault]
+why = "The tests `unprivileged-tests` adds run as an account mode bits apply to; the image runs as root."
+name = "Test (permission faults)"
+when = ["pr"]
+rust = true
+steps = [{ run = "bash ci/scripts/run_permission_fault_tests.sh" }]
+
+[lane.test-storage-cloud]
+why = "The cloud drivers' root-identity determinants, compiled only under the shipped `storage-cloud` graph."
+name = "Test (storage-cloud)"
+when = ["pr"]
+rust = true
+steps = [{ run = "cargo test -p jammi-db --features storage-cloud --lib -- catalog::instance storage::builder" }]
+
+[lane.test-python-rust]
+why = "The `jammi-python` crate's Rust tests link libpython against the image's interpreter, outside the archive maturin would build."
+name = "Test (Python, Rust)"
+when = ["pr"]
+rust = true
+steps = [{ run = "cargo test -p jammi-python --no-fail-fast" }]
+
+[lane.test-pg]
+why = "The backend-parameterised suites' Postgres arms, each test on a database of its own, four at a time (the server's connection budget)."
+name = "Test (Postgres)"
+when = ["pr"]
+rust = true
+needs = ["postgres"]
+steps = [
+  { run = "cargo nextest run --profile postgres -p jammi-db -p jammi-server --features jammi-db/live-postgres-tests,jammi-server/live-postgres-tests -E '(package(jammi-db) & (kind(lib) | binary(it))) | (package(jammi-server) & binary(it))'" },
+]
+
+[lane.test-live]
+why = "The tests `live-hub-tests` adds, against the live model hub: a verdict main measures, so a hub outage reds main until it is measured again."
+name = "Test (live)"
+when = ["main"]
+rust = true
+needs = ["hub-token"]
+steps = [{ run = "bash ci/scripts/run_live_hub_tests.sh" }]
+
+[lane.perf-gate]
+why = "Every CPU-hermetic `*-scale` tier against its committed floor, and a proof the gate bites: measured on main only, because a hosted runner's throughput jitters and a per-PR rate gate would flap."
+name = "Performance gate (main)"
+when = ["main"]
+rust = true
+env = { RAYON_NUM_THREADS = "1" }
+steps = [
+  { name = "Build the bench harness (release)", env = { JAMMI_BUILD_SHA = "${{ github.sha }}" }, run = "cargo build -p jammi-bench --release" },
+  { name = "Run the CPU-hermetic scale tiers", run = "bash ci/scripts/perf/run_scale_tiers.sh" },
+  { name = "The rate gate bites", run = "bash ci/scripts/perf/check_rate_gate_bites.sh" },
+]
+
+# ============================================================================= ci + nightly: the distributed lanes
+
+[lane.distributed-build]
+why = "Compiles the `jammi-server` the distributed harness spawns, with the S3 driver its workers publish through, and archives each crate's distributed test binary with it."
+name = "Distributed build"
+workflow = ["ci", "nightly"]
+rust = true
+produces = ["distributed-jammi-ai", "distributed-jammi-bench"]
+steps = [
+  { name = "Build the jammi-server binary", run = "cargo build -p jammi-server --bin jammi-server --features storage-s3" },
+  { name = "Archive the distributed test binaries", run = "for crate in jammi-ai jammi-bench; do\n  cargo nextest archive --profile distributed -p \"$crate\" --features live-distributed-tests --test distributed --archive-file \"/tmp/distributed-$crate.tar.zst\"\ndone\n" },
+]
+
+[lane.distributed]
+why = "N worker processes claiming from a shared Postgres catalog and S3-class store: the fleet-safety claims, the SIGKILL crash windows and the ladder's fleet rungs, one leg per what decides its outcome (`check_distributed_legs.py` holds every distributed test to exactly one leg)."
+name = "Distributed: {display}"
+workflow = ["ci", "nightly"]
+when = ["pr", "schedule", "dispatch"]
+needs = ["postgres", "s3"]
+consumes = ["distributed-jammi-ai", "distributed-jammi-bench"]
+legs = [
+  { name = "deterministic", display = "claim correctness", crate = "jammi-ai", tests = "one_job_n_workers_exactly_one_wins mixed_tenant_queue_completes_each_under_its_own_scope rendezvous_placed_search_over_real_worker_processes" },
+  { name = "chaos", display = "SIGKILL crash windows", crate = "jammi-ai", tests = "killed_worker_job_is_reclaimed_and_completed_once crash_between_publish_and_finalize_commits_only_the_winner artifact_written_on_worker_is_readable_by_a_different_client killed_peer_job_is_reclaimed_and_completed_by_a_new_gang killed_coordinator_job_is_reclaimed_and_completed_by_a_new_gang" },
+  { name = "rungs", display = "ladder rungs on a fleet", crate = "jammi-bench", tests = "every_train_run_rung_publishes_the_same_adapter every_predictor_train_run_rung_publishes_the_same_predictor" },
+]
+steps = [
+  { download = "distributed-${{ matrix.crate }}", path = "/tmp/distributed" },
+  { name = "Run the leg", env = { TESTS = "${{ matrix.tests }}", CRATE = "${{ matrix.crate }}" }, run = "read -ra tests <<< \"$TESTS\"\nbash ci/scripts/run_distributed_leg.sh \"/tmp/distributed/distributed-$CRATE.tar.zst\" \"${tests[@]}\"\n" },
+  { name = "S3 store log (on failure)", if = "failure()", run = "cat /tmp/s3-test-store/.log" },
+]
+
+# ============================================================================= ci: guards and audits
+
+[lane.guard]
+why = "The repository's guards (`ci/guards.toml`) and the tests of its own scripts, through the runners a local check uses too; a pull request runs what its diff can affect, main runs them all."
+name = "Guards"
+rust = true
+needs = ["full-history", "kubeconform"]
+env = { BASE = "${{ github.event_name == 'pull_request' && 'HEAD^1' || '' }}" }
+steps = [
+  { name = "Run the guards", run = "python3 ci/scripts/run_guards.py ${BASE:+--base \"$BASE\"}" },
+  { name = "Test the scripts", run = "python3 ci/scripts/run_script_tests.py ${BASE:+--base \"$BASE\"}" },
+]
+
+[lane.dep-audit]
+why = "`cargo deny` over the default and the shipped-feature graphs: the live advisory database, the license allowlist, and the bans and sources that formalise the engine's one-way dependency direction."
+name = "Guard (dependency audit)"
+rust = "no-sccache"
+steps = [
+  { run = "cargo deny check advisories licenses bans sources" },
+  { run = "cargo deny --all-features check bans advisories licenses sources" },
+]
+
+# ============================================================================= ci: the artifacts a release promotes
+
+[lane.native-wheels]
+why = "The `jammi-ai-native` wheels, maturin abi3 builds of the embedded engine for every platform, each held to the GLIBC floor, the machine its tag claims and PyPI's per-file limit."
+name = "Native wheel ({dist})"
+rust = "release"
+needs = ["python", "maturin"]
+dir = "packaging/native"
+produces = ["wheels-native-{dist}"]
+legs = [
+  { dist = "linux-x86_64", arch = "amd64", assert_arch = "x86_64", target_flag = "", glibc = "2.28" },
+  { dist = "linux-aarch64", arch = "arm64", assert_arch = "aarch64", target_flag = "", glibc = "2.28" },
+  { dist = "macos-arm64", host = "macos", assert_arch = "aarch64", rust_target = "aarch64-apple-darwin", target_flag = "--target aarch64-apple-darwin", glibc = "" },
+  { dist = "macos-x86_64", host = "macos", assert_arch = "x86_64", rust_target = "x86_64-apple-darwin", target_flag = "--target x86_64-apple-darwin", glibc = "" },
+]
+steps = [
+  { name = "Build the wheel", env = { TARGET_FLAG = "${{ matrix.target_flag }}" }, run = "# $TARGET_FLAG is a flag and its value, split on purpose.\nread -ra target <<< \"$TARGET_FLAG\"\nmaturin build --release --out dist \"${target[@]}\"\n" },
+  { name = "The wheel's .so holds the GLIBC floor and the machine", env = { ASSERT_ARCH = "${{ matrix.assert_arch }}", GLIBC = "${{ matrix.glibc }}" }, run = "bash ../../ci/scripts/assert_wheel_so.sh dist/*.whl \"$ASSERT_ARCH\" \"$GLIBC\"" },
+  { name = "The wheel fits PyPI's per-file limit", run = "bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl" },
+]
+
+[lane.native-wheel-cu12]
+why = "The `jammi-ai-native-cu12` wheel, the embedded CUDA engine, built and checked by `ci/scripts/build_native_cu12_wheel.sh` in the CUDA image."
+name = "Native wheel (CUDA)"
+host = "cuda-image"
+rust = "release"
+needs = ["cutlass"]
+produces = ["native-cu12-wheel"]
+steps = [{ run = "bash ci/scripts/build_native_cu12_wheel.sh" }]
+
+[lane.server]
+why = "One `jammi-server` binary per manifest build and arch, its features read from `ci/release-feature-manifest.json`, stripped, held to the GLIBC floor and the machine, and packaged as its release tarball (a CUDA build bundles its runtime libraries and leaves its loader and jail reports)."
+name = "Server ({build}, {target})"
+rust = "release"
+produces = ["{build}-{target}-binary", "{build}-{target}-tarball"]
+legs = [
+  { build = "server-cpu", arch = "amd64", cuda = false },
+  { build = "server-cpu", arch = "arm64", cuda = false },
+  { build = "server-cu12", arch = "amd64", host = "cuda-image", cuda = true },
+]
+steps = [
+  { name = "Init the CUTLASS submodule (flash-attn builds its kernels from it)", if = "matrix.cuda", run = "git submodule update --init --depth 1 crates/jammi-kernels/third_party/cutlass" },
+  { name = "Build jammi-server (release)", env = { BUILD = "${{ matrix.build }}" }, run = "features=\"$(jq -r --arg b \"$BUILD\" '.builds[$b].cargo_features | join(\",\")' ci/release-feature-manifest.json)\"\ntest -n \"$features\" || { echo \"::error::ci/release-feature-manifest.json declares no cargo_features for build '$BUILD'\" >&2; exit 1; }\ncargo build --release -p jammi-server --bin jammi-server --features \"$features\"\n" },
+  { name = "Strip the binary", run = "strip target/release/jammi-server" },
+  { name = "The binary holds the GLIBC floor and the machine", env = { ARCH = "${{ matrix.target }}" }, run = "bash ci/scripts/assert_glibc_floor.sh target/release/jammi-server 2.28\nbash ci/scripts/assert_elf_machine.sh target/release/jammi-server \"$ARCH\"\n" },
+  { upload = "{build}-{target}-binary" },
+  { name = "Package the release tarball", id = "tarball", env = { BUILD = "${{ matrix.build }}", ARCH = "${{ matrix.target }}" }, run = "bash ci/scripts/package_server_tarball.sh \"$BUILD\" \"$ARCH\"" },
+  { upload = "{build}-{target}-tarball" },
+  { upload = "cu12-loader-report", if = "always() && matrix.cuda" },
+  { upload = "cu12-jail-report", if = "always() && matrix.cuda" },
+]
+
+[lane.server-wheel]
+why = "Each server binary as its PyPI wheel, relabelled to the platform the binary requires, its runtime link set verified against the wheel's dependency wheels where the manifest says so, and held to PyPI's per-file limit."
+name = "Server wheel ({build}, {target})"
+consumes = ["{build}-{target}-binary"]
+produces = ["{build}-{target}-wheel"]
+legs = [
+  { build = "server-cpu", arch = "amd64" },
+  { build = "server-cpu", arch = "arm64" },
+  { build = "server-cu12", arch = "amd64" },
+]
+steps = [
+  { download = "{build}-{target}-binary", path = "artifact" },
+  { name = "Build the wheel", env = { BUILD = "${{ matrix.build }}", PLATFORM_TAG = "manylinux_2_28_${{ matrix.target }}" }, run = "bash ci/scripts/build_server_wheel.sh \"$BUILD\" artifact/jammi-server \"$PLATFORM_TAG\"" },
+  { name = "The wheel fits PyPI's per-file limit", env = { BUILD = "${{ matrix.build }}" }, run = "bash ci/scripts/assert_wheel_size.sh \"packaging/$BUILD\"/dist/*.whl" },
+]
+
+[lane.cli]
+why = "The `jammi` CLI release binary for every target the tree ships, packaged as its release tarball."
+name = "CLI ({triple})"
+rust = "release"
+produces = ["jammi-{triple}"]
+legs = [
+  { triple = "x86_64-unknown-linux-gnu", arch = "amd64" },
+  { triple = "aarch64-unknown-linux-gnu", arch = "arm64" },
+  { triple = "aarch64-apple-darwin", host = "macos", rust_target = "aarch64-apple-darwin" },
+]
+steps = [
+  { name = "Build jammi (release)", run = "cargo build --release -p jammi-cli --bin jammi" },
+  { name = "Package", id = "package", env = { TARGET = "${{ matrix.triple }}" }, run = "bash ci/scripts/package_release_bin.sh jammi \"$TARGET\"" },
+]
+
+[lane.client-wheel]
+why = "The pure-Python client `jammi-ai`: its proto stubs generated, its hermetic tests run from source, its import direction asserted, and the wheel built and held to PyPI's per-file limit."
+name = "Client wheel"
+dir = "clients/python"
+produces = ["client-wheel"]
+steps = [
+  { name = "A venv, as a reader installs it", run = "python3 -m venv .venv\necho \"$PWD/.venv/bin\" >> \"$GITHUB_PATH\"\n" },
+  { name = "Install from source and generate the stubs", run = "pip install --quiet --upgrade pip\npip install --quiet -e '.[dev]' build\nmake generate\n" },
+  { name = "Test (hermetic)", run = "make test" },
+  { name = "The client imports with no engine", run = "python3 - <<'PY'\nimport sys, jammi\nbad = [m for m in sys.modules if m == \"jammi_native\" or m.startswith(\"jammi_native.\")]\nassert not bad, f\"import jammi eagerly pulled jammi_native: {bad}\"\nPY\n" },
+  { name = "Build the wheel", run = "python -m build --wheel --outdir dist" },
+  { name = "The wheel fits PyPI's per-file limit", run = "bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl" },
+]
+
+[lane.ts-client]
+why = "`@f-inverse/jammi-client` generated from the proto, type-checked, tested and packed: the tarball npm.yml publishes, at the Node version `.nvmrc` pins."
+name = "TS client"
+host = "ubuntu"
+needs = ["node"]
+dir = "clients/typescript"
+produces = ["ts-client-package"]
+steps = [
+  { run = "npm ci" },
+  { run = "npm run build" },
+  { run = "npm run typecheck" },
+  { run = "npm run test" },
+  { name = "Pack", run = "mkdir -p \"$RUNNER_TEMP/ts-client\"\nnpm pack --pack-destination \"$RUNNER_TEMP/ts-client\"\n" },
+]
+
+[lane.docs]
+why = "The guide, with every Rust example in it compiled and run against the workspace, and the rustdoc of every crate, laid out as the site a release publishes."
+name = "Guide and API reference"
+rust = true
+produces = ["docs-site"]
+steps = [
+  { name = "Build the guide", run = "mdbook build docs/guide" },
+  { name = "Build the workspace the guide's examples link against", run = "cargo build --workspace --exclude jammi-python --quiet" },
+  { name = "Test the guide's examples", run = "RUSTUP_TOOLCHAIN=\"$(bash ci/scripts/rust_pin.sh)\" mdbook test docs/guide -L \"${CARGO_TARGET_DIR:-target}/debug/deps\"" },
+  { name = "Build the API reference", run = "RUSTDOCFLAGS=\"-D warnings\" cargo doc --workspace --exclude jammi-python --no-deps" },
+  { name = "Lay out the site", run = "mkdir -p _site\ncp -r docs/guide/book/. _site/\ncp -r \"${CARGO_TARGET_DIR:-target}/doc\" _site/api\n" },
+]
+
+# ============================================================================= ci: the artifacts, run as a user runs them
+
+[lane.test-python]
+why = "The pytest suite over the two dists that ship in lockstep: the client from source with its generated stubs, and the compiled engine this run built as its `file://` backend."
+name = "Test (Python)"
+when = ["pr"]
+consumes = ["wheels-native-linux-x86_64"]
+steps = [
+  { uses = "./.github/actions/install-jammi", with = { client = "source", extra-pip-packages = "pytest", run-id = "{artifact-run}" } },
+  { run = "pytest crates/jammi-python/tests -v" },
+  { name = "Python client suite (with the embedded engine)", run = "make -C clients/python test-embedded" },
+  { name = "The UAT shape-B/C Python scripts", run = "for script in tests/uat/shape_b_*.py tests/uat/shape_c_*.py; do\n  echo \"=== $script\"\n  python3 \"$script\"\ndone\n" },
+]
+
+[lane.client-live]
+why = "The client's live-server suite over this run's engine, server and CLI, against the engine's test checkpoints."
+name = "Python client against a live server"
+when = ["pr"]
+consumes = ["wheels-native-linux-x86_64", "server-cpu-x86_64-binary", "jammi-x86_64-unknown-linux-gnu"]
+steps = [
+  { uses = "./.github/actions/install-jammi", with = { client = "source", binaries = "true", run-id = "{artifact-run}" } },
+  { run = "make -C clients/python test-live" },
+]
+
+[lane.book-checks]
+why = "The book's checks that need no model: its API reference against the engine, its library's lint and unit tests, the no-deferral gate and its citations; the chapters run on real models in the cookbook lane."
+name = "Book (static checks)"
+when = ["pr"]
+consumes = ["wheels-native-linux-x86_64", "client-wheel"]
+dir = "cookbook/book"
+steps = [
+  { uses = "./.github/actions/install-jammi", with = { run-id = "{artifact-run}" } },
+  { name = "Install the book", run = "pip install -e '.[book,dev]'" },
+  { name = "API reference matches the engine", run = "python -m jammi.session_journal -- python scripts/check_api_reference.py" },
+  { name = "Lint", run = "ruff check jammi_cookbook scripts tests" },
+  { name = "Shared-lib unit tests", run = "pytest -q" },
+  { name = "No-deferral gate", run = "bash scripts/no_deferral_grep.sh" },
+  { name = "No dangling citations", run = "python -m jammi.session_journal -- python scripts/check_citations.py" },
+]
+
+[lane.server-image-cuda-check]
+why = "The CUDA image's runtime stage assembles from this run's CUDA binary before a tag publishes it; the GPU runtime itself is not testable here."
+name = "Server image (CUDA) assembles"
+when = ["pr"]
+host = "ubuntu"
+consumes = ["server-cu12-x86_64-binary", "jammi-x86_64-unknown-linux-gnu"]
+steps = [
+  { id = "binaries", uses = "./.github/actions/stage-server-binaries", with = { server = "server-cu12-x86_64-binary", cli = "jammi-x86_64-unknown-linux-gnu", stage = "builder-cuda", run-id = "{artifact-run}" } },
+  { uses = "./.github/actions/build-image", with = { build-args = "RUNTIME_VARIANT=runtime-cuda\n", build-contexts = "${{ steps.binaries.outputs.build-context }}", platforms = "linux/amd64", cache-scope = "cu12" } },
+]
+
+[lane.compose-smoke]
+why = "Shape B: the CPU image packaged from the run's binaries, `deploy/docker-compose.yml` brought up with the CI fixture overlay and driven by the client wheel, with a restart's result durability; one leg per arch on its native runner."
+name = "Compose smoke (Shape B, {arch})"
+workflow = ["ci", "nightly"]
+when = ["pr", "schedule", "dispatch"]
+host = "ubuntu"
+needs = ["audit-key", "python"]
+consumes = ["server-cpu-{target}-binary", "jammi-{triple}", "client-wheel"]
+env = { JAMMI_IMAGE = "jammi-ai-server:smoke", COMPOSE_FILE = "deploy/docker-compose.yml:deploy/docker-compose.ci.yml" }
+legs = [
+  { arch = "amd64", triple = "x86_64-unknown-linux-gnu" },
+  { arch = "arm64", triple = "aarch64-unknown-linux-gnu" },
+]
+steps = [
+  { id = "binaries", uses = "./.github/actions/stage-server-binaries", with = { server = "server-cpu-${{ matrix.target }}-binary", cli = "jammi-${{ matrix.triple }}", stage = "builder", run-id = "{artifact-run}" } },
+  { uses = "./.github/actions/build-image", with = { load-tag = "${{ env.JAMMI_IMAGE }}", build-contexts = "${{ steps.binaries.outputs.build-context }}", cache-scope = "cpu-generic-${{ matrix.arch }}" } },
+  { name = "The pinned service images, under the names the compose file uses", run = "bash ci/scripts/pull_service_images.sh" },
+  { name = "Bring up Shape B (server + Postgres)", run = "docker compose up --wait" },
+  { name = "The running container is the image this job built", run = "bash ci/scripts/assert_compose_image_identity.sh \"$JAMMI_IMAGE\" jammi-server" },
+  { uses = "./.github/actions/install-jammi", with = { native = "false", run-id = "{artifact-run}" } },
+  { name = "The remote Shape B smoke", run = "python3 tests/compose/shape_b_remote.py" },
+  { name = "The Shape B release smoke (RELEASE via SIGINT)", run = "python3 tests/compose/shape_b_release.py" },
+  { name = "The Postgres catalog was exercised at runtime", run = "bash ci/scripts/assert_catalog_exercised.sh docker compose exec -T postgres" },
+  { name = "Compose logs (on failure)", if = "failure()", run = "docker compose logs" },
+  { name = "Tear down", if = "always()", run = "docker compose down -v" },
+]
+
+[lane.kube-smoke]
+why = "Shape C: the CPU image packaged from the run's binaries, loaded into a kind cluster, `deploy/kubernetes/overlays/ci` applied and driven by the client wheel through a rollout restart; one amd64 leg, the arm64 image being proven by the compose smoke."
+name = "Kubernetes smoke (kind, amd64)"
+workflow = ["ci", "nightly"]
+when = ["pr", "schedule", "dispatch"]
+host = "ubuntu"
+needs = ["audit-key", "python", "kubeconform"]
+consumes = ["server-cpu-x86_64-binary", "jammi-x86_64-unknown-linux-gnu", "client-wheel"]
+env = { JAMMI_IMAGE = "jammi-ai-server:smoke", KUBECONFORM_CACHE = "${{ github.workspace }}/.kubeconform-cache" }
+steps = [
+  { id = "binaries", uses = "./.github/actions/stage-server-binaries", with = { server = "server-cpu-x86_64-binary", cli = "jammi-x86_64-unknown-linux-gnu", stage = "builder", run-id = "{artifact-run}" } },
+  { uses = "./.github/actions/build-image", with = { load-tag = "${{ env.JAMMI_IMAGE }}", build-contexts = "${{ steps.binaries.outputs.build-context }}", cache-scope = "cpu-generic-amd64" } },
+  { name = "The ci overlay is valid against the pinned schema, before it is applied", run = "bash ci/scripts/check_kube_manifests.sh deploy/kubernetes/overlays/ci" },
+  { name = "Render the kind cluster config", run = "envsubst < deploy/kubernetes/overlays/ci/kind-config.yaml.in > \"$RUNNER_TEMP/kind-config.yaml\"" },
+  { uses = "@kind", with = { node_image = "kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d", kubectl_version = "v1.34.11", cluster_name = "kind", config = "${{ runner.temp }}/kind-config.yaml" } },
+  { name = "The pinned service images, under the names the overlay uses", id = "services", run = "{ echo 'images<<EOF'; bash ci/scripts/pull_service_images.sh; echo EOF; } >> \"$GITHUB_OUTPUT\"" },
+  { name = "Load the built server image and the service images into kind", env = { SERVICE_IMAGES = "${{ steps.services.outputs.images }}" }, run = "read -ra services <<< \"$(tr '\\n' ' ' <<< \"$SERVICE_IMAGES\")\"\nkind load docker-image \"$JAMMI_IMAGE\" \"${services[@]}\" --name kind\n" },
+  { name = "Create the namespace and the Secret", run = "kubectl create namespace jammi-ci\nkubectl -n jammi-ci create secret generic jammi-server-secrets \\\n  --from-literal=JAMMI_AUDIT_MASTER_KEY=\"$JAMMI_AUDIT_MASTER_KEY\" \\\n  --from-literal=JAMMI_CATALOG__POSTGRES__URL=postgres://jammi:jammi@postgres:5432/jammi \\\n  --from-literal=JAMMI_BROKER__POSTGRES__URL=postgres://jammi:jammi@postgres:5432/jammi\n" },
+  { name = "Apply the ci overlay", run = "kustomize build deploy/kubernetes/overlays/ci | kubectl apply -f -" },
+  { name = "Wait for postgres and jammi-server to roll out", run = "kubectl -n jammi-ci rollout status statefulset/postgres --timeout=300s\nkubectl -n jammi-ci rollout status deploy/jammi-server --timeout=300s\n" },
+  { name = "Every pod runs the image this job built", run = "bash ci/scripts/assert_kind_image_identity.sh \"$JAMMI_IMAGE\" jammi-ci app=jammi-server" },
+  { uses = "./.github/actions/install-jammi", with = { native = "false", run-id = "{artifact-run}" } },
+  { name = "The remote Kubernetes smoke (port-forward + rollout restart)", run = "python3 tests/compose/shape_c_kube_remote.py" },
+  { name = "The Postgres catalog was exercised at runtime", run = "bash ci/scripts/assert_catalog_exercised.sh kubectl -n jammi-ci exec statefulset/postgres --" },
+  { name = "Pod state and logs (on failure)", if = "failure()", run = "kubectl -n jammi-ci get pods -o wide\nkubectl -n jammi-ci describe pod -l app=jammi-server\nkubectl -n jammi-ci logs -l app=jammi-server --tail=-1 --all-containers\n" },
+  { name = "Delete the kind cluster", if = "always()", run = "kind delete cluster --name kind" },
+]
+
+# ============================================================================= nightly: the cookbook as published (CPU)
+
+[lane.cookbook-published-tag]
+why = "Resolves the release tag the notebooks run at, and refuses, naming what is missing, until PyPI, crates.io, npm and the GitHub release all serve it."
+name = "Resolve the release tag"
+workflow = "nightly"
+host = "ubuntu"
+outputs = { tag = "steps.tag.outputs.tag" }
+steps = [
+  { id = "tag", env = { REQUESTED = "${{ inputs.tag }}" }, run = "bash ci/scripts/resolve_release_tag.sh \"$REQUESTED\" | tee -a \"$GITHUB_OUTPUT\"" },
+  { name = "The release is installable", env = { TAG = "${{ steps.tag.outputs.tag }}", GITHUB_TOKEN = "${{ github.token }}" }, run = "python3 ci/scripts/release_installable.py --tag \"$TAG\"" },
+]
+
+[lane.cookbook-published]
+why = "Every published notebook at the release tag, in a fresh environment with nothing installed, setup cell included: what a reader gets from PyPI, in eight shards."
+name = "Cookbook as published (CPU, {shard}/8)"
+workflow = "nightly"
+host = "colab"
+after = ["cookbook-published-tag"]
+timeout = 180
+legs = [{ shard = 1 }, { shard = 2 }, { shard = 3 }, { shard = 4 }, { shard = 5 }, { shard = 6 }, { shard = 7 }, { shard = 8 }]
+steps = [
+  { name = "Check out the notebooks at the tag", uses = "@checkout", with = { ref = "${{ needs.cookbook-published-tag.outputs.tag }}", path = "published", sparse-checkout = "cookbook/notebooks" } },
+  { name = "Run the notebooks as published", env = { SHARD = "${{ matrix.shard }}" }, run = "python cookbook/book/scripts/run_published_notebooks.py --notebooks published/cookbook/notebooks --shard \"$SHARD/8\" --work \"$RUNNER_TEMP/notebooks\"" },
+]
+
+# ============================================================================= the paid GPU lanes
+
+[lane.gpu-prove-subject]
+why = "Records the tree this run proves; every leg checks out that same commit, so the subject names the tree the pod built."
+name = "Subject"
+workflow = "gpu-prove"
+host = "ubuntu"
+outputs = { commit = "steps.subject.outputs.commit" }
+steps = [{ id = "subject", uses = "./.github/actions/record-subject" }]
+
+[lane.gpu-prove]
+why = "One rented device per shipped CUDA arch runs the gated GPU suites at the image's baked compute capability; a dispatch on a tag ref gets three attempts on a capacity exit."
+name = "GPU prove on RunPod ({sm})"
+workflow = "gpu-prove"
+host = "ubuntu"
+needs = ["runpod"]
+after = ["gpu-prove-subject"]
+timeout = "${{ github.ref_type == 'tag' && 355 || 190 }}"
+legs = [{ sm = "sm_80" }, { sm = "sm_86" }, { sm = "sm_89" }, { sm = "sm_90" }]
+steps = [
+  { uses = "./.github/actions/run-paid-lane", with = { driver = "ci/scripts/runpod_gpu_prove.sh", max-attempts = "${{ github.ref_type == 'tag' && 3 || 1 }}" }, env = { RP_IMAGE = "{image:cuda}", GPU_PROVE_ARCH = "${{ matrix.sm }}", PROVE_EXPECT_SHA = "${{ needs.gpu-prove-subject.outputs.commit }}" } },
+]
+
+[lane.gpu-howwell]
+why = "The how-well A/B on a rented A100, every input an operator's choice; its evidence is uploaded for the committed artifacts a merge-path guard validates."
+name = "how-well A/B on RunPod A100 (sm_80)"
+workflow = "gpu-howwell"
+host = "ubuntu"
+needs = ["runpod"]
+timeout = 100
+steps = [
+  { uses = "./.github/actions/run-paid-lane", with = { driver = "ci/scripts/runpod_gpu_howwell.sh", evidence = ".gpu-pull/how-well/", evidence-name = "how-well-${{ github.run_id }}" }, env = { RP_IMAGE = "{image:cuda}", GIT_REF = "${{ github.ref_name }}", HOWWELL_MODEL_DIR = "${{ inputs.model_dir }}", HOWWELL_SEEDS = "${{ inputs.seeds }}", HOWWELL_OBJECTIVE = "${{ inputs.objective }}", HOWWELL_LR0_SEEDS = "${{ inputs.lr0_seeds }}", HOWWELL_PODS = "${{ inputs.pods }}" } },
+]
+
+[lane.gpu-perf-ab]
+why = "The encode revision edge on a rented A100: the verdict is uploaded for a human, and the driver's own exit codes are named."
+name = "encode revision edge on RunPod A100 (sm_80)"
+workflow = "gpu-perf-ab"
+host = "ubuntu"
+needs = ["runpod"]
+timeout = 180
+steps = [
+  { id = "lane", uses = "./.github/actions/run-paid-lane", with = { driver = "ci/scripts/runpod_gpu_perf_ab.sh", evidence = ".gpu-pull/gpu-perf-ab/", evidence-name = "gpu-perf-ab-${{ github.run_id }}" }, env = { RP_IMAGE = "{image:cuda}", GIT_REF = "${{ github.head_ref || github.ref_name }}", GPU_PERF_AB_AA_NULL = "${{ inputs.aa_null && '1' || '0' }}" } },
+  { if = "always() && steps.lane.outputs.rc == '1'", run = "echo \"::error::the ladder verdict is not GREEN: RED (slower than the base by more than the rung's noise band), RED_FOR_INVESTIGATION (faster by more than the band), or INVALID (a refusal named in the verdict's causes). Read ladder_verdict.json in the uploaded evidence.\"" },
+  { if = "always() && steps.lane.outputs.rc == '2'", run = "echo \"::error::a usage or infrastructure error (exit 2): a clone, checkout or fetch failure, or an unresolved sha; see the run log.\"" },
+]
+
+[lane.gpu-topology]
+why = "The fine-tune gang at every topology on a rented two-host fleet; one attempt per run, because a retry is a second rental search and a cost decision for a human."
+name = "GPU topology on RunPod (1x1, 1x2, 2 processes, 2 hosts x 2)"
+workflow = "gpu-topology"
+host = "ubuntu"
+needs = ["runpod"]
+timeout = 190
+steps = [
+  { uses = "./.github/actions/run-paid-lane", with = { driver = "ci/scripts/runpod_gpu_topology.sh", evidence = ".gpu-pull/gpu-topology/", evidence-name = "gpu-topology-${{ github.run_id }}" }, env = { RP_IMAGE = "{image:cuda}", GIT_REF = "${{ github.head_ref || github.ref_name }}", PROVE_EXPECT_SHA = "${{ github.event.pull_request.head.sha || github.sha }}", TOPOLOGY_GPU_TYPES = "${{ inputs.gpu_types }}" } },
+]
+
+[lane.gpu-reap]
+why = "Terminates the pods this repository rented that outlived their own deadline; two sweeps never overlap."
+name = "Terminate orphaned RunPod pods"
+workflow = "gpu-reap"
+host = "ubuntu"
+needs = ["runpod"]
+timeout = 10
+steps = [{ env = { FORCE_HOURS = "${{ inputs.force_hours }}" }, run = "read -ra hours <<< \"$FORCE_HOURS\"\nbash ci/scripts/gpu-dev.sh reap \"${hours[@]}\"\n" }]
+
+[lane.cookbook-subject]
+why = "Records the tree this run renders the book over; the pod checks out that same commit."
+name = "Subject"
+workflow = "cookbook-gpu"
+host = "ubuntu"
+outputs = { commit = "steps.subject.outputs.commit" }
+steps = [{ id = "subject", uses = "./.github/actions/record-subject" }]
+
+[lane.cookbook]
+why = "Every recipe and page on real Hub models over the proving run's builds, on a rented L4; the whole-book assembly then reads each page's record and executes nothing."
+name = "Cookbook on RunPod"
+workflow = "cookbook-gpu"
+needs = ["runpod"]
+after = ["cookbook-subject"]
+consumes = ["native-cu12-wheel", "client-wheel", "server-cu12-x86_64-binary", "jammi-x86_64-unknown-linux-gnu"]
+produces = ["cookbook-book"]
+timeout = 280
+steps = [
+  { download = "native-cu12-wheel", path = "${{ runner.temp }}/artifacts/native" },
+  { download = "client-wheel", path = "${{ runner.temp }}/artifacts/client" },
+  { download = "server-cu12-x86_64-binary", path = "${{ runner.temp }}/artifacts/server" },
+  { download = "jammi-x86_64-unknown-linux-gnu", path = "${{ runner.temp }}/artifacts/cli" },
+  { uses = "./.github/actions/run-paid-lane", with = { driver = "ci/scripts/runpod_cookbook_gpu.sh" }, env = { RP_IMAGE = "{image:cuda}", PROVE_EXPECT_SHA = "${{ needs.cookbook-subject.outputs.commit }}", ARTIFACTS = "${{ runner.temp }}/artifacts", FREEZE_OUT = "cookbook/book/_freeze" } },
+  { name = "Assemble the book", dir = "cookbook/book", run = "quarto render --profile assemble" },
+]
+
+[lane.cookbook-published-gpu]
+why = "Every published notebook at the release tag on a rented L4, in a fresh environment installing the CUDA wheels from PyPI, after the release is installable everywhere."
+name = "GPU (RunPod L4)"
+workflow = "cookbook-published-gpu"
+host = "ubuntu"
+needs = ["runpod"]
+timeout = 300
+steps = [
+  { name = "The release is installable", env = { TAG = "${{ inputs.tag }}", GITHUB_TOKEN = "${{ github.token }}" }, run = "python3 ci/scripts/release_installable.py --tag \"$TAG\"" },
+  { uses = "./.github/actions/run-paid-lane", with = { driver = "ci/scripts/runpod_cookbook_published.sh" }, env = { RP_IMAGE = "{image:cuda}", DRIVER_REF = "${{ github.sha }}", NOTEBOOKS_TAG = "${{ inputs.tag }}" } },
+]
+
+# ============================================================================= the release lanes
+
+[lane.publish-crates]
+why = "Publishes the crates in topological order with a token minted and revoked around the publish; `cargo publish` verifies each crate builds, in the tree's own image."
+name = "Publish to crates.io"
+workflow = "crates"
+when = ["tag:v"]
+rust = true
+needs = ["oidc"]
+publishes = "release"
+environment = { name = "crates-io" }
+steps = [
+  { name = "Mint the crates.io token", id = "token", run = "bash ci/scripts/crates_io_token.sh mint" },
+  { name = "Publish crates", env = { CARGO_REGISTRY_TOKEN = "${{ steps.token.outputs.token }}" }, run = "bash ci/scripts/publish_crates.sh" },
+  { name = "Revoke the crates.io token", if = "always() && steps.token.outputs.token != ''", env = { CARGO_REGISTRY_TOKEN = "${{ steps.token.outputs.token }}" }, run = "bash ci/scripts/crates_io_token.sh revoke" },
+]
+
+[lane.publish-npm]
+why = "Publishes the packed tarball through npm's OIDC trusted publishing with provenance; a version already on npm is skipped, so a re-run is idempotent."
+name = "Publish to npm"
+workflow = "npm"
+when = ["tag:v"]
+host = "ubuntu"
+needs = ["oidc", "node"]
+publishes = "release"
+consumes = ["ts-client-package"]
+steps = [
+  { download = "ts-client-package", path = "package" },
+  { name = "Publish", run = "bash ci/scripts/publish_npm.sh \"$PWD\"/package/*.tgz" },
+]
+
+[lane.publish-pypi]
+why = "One leg per PyPI project uploads every wheel of that project together: a release with one platform missing is worse than a failed release."
+name = "Publish {project}"
+workflow = "pypi"
+when = ["tag:py-v"]
+host = "ubuntu"
+needs = ["oidc"]
+publishes = "release"
+environment = { name = "pypi" }
+checkout = false
+consumes = ["client-wheel", "wheels-native-linux-x86_64", "wheels-native-linux-aarch64", "wheels-native-macos-arm64", "wheels-native-macos-x86_64", "native-cu12-wheel", "server-cpu-x86_64-wheel", "server-cpu-aarch64-wheel", "server-cu12-x86_64-wheel"]
+legs = [
+  { project = "jammi-ai", pattern = "client-wheel" },
+  { project = "jammi-ai-native", pattern = "wheels-native-*" },
+  { project = "jammi-ai-native-cu12", pattern = "native-cu12-wheel" },
+  { project = "jammi-server", pattern = "server-cpu-*-wheel" },
+  { project = "jammi-server-cu12", pattern = "server-cu12-x86_64-wheel" },
+]
+steps = [
+  { uses = "@download-artifact", with = { pattern = "${{ matrix.pattern }}", merge-multiple = true, path = "dist", run-id = "{artifact-run}", github-token = "${{ github.token }}" } },
+  { uses = "@pypi-publish", with = { packages-dir = "dist" } },
+]
+
+[lane.release-binaries]
+why = "Attaches each prebuilt asset to the GitHub release with a provenance attestation over the exact bytes; whichever asset arrives first creates the release."
+name = "Attach {artifact}"
+workflow = "release"
+when = ["tag:v"]
+host = "ubuntu"
+needs = ["release-write", "attest"]
+publishes = "release"
+consumes = ["jammi-x86_64-unknown-linux-gnu", "jammi-aarch64-unknown-linux-gnu", "jammi-aarch64-apple-darwin", "server-cpu-x86_64-tarball", "server-cpu-aarch64-tarball", "server-cu12-x86_64-tarball"]
+legs = [
+  { artifact = "jammi-x86_64-unknown-linux-gnu" },
+  { artifact = "jammi-aarch64-unknown-linux-gnu" },
+  { artifact = "jammi-aarch64-apple-darwin" },
+  { artifact = "server-cpu-x86_64-tarball" },
+  { artifact = "server-cpu-aarch64-tarball" },
+  { artifact = "server-cu12-x86_64-tarball" },
+]
+steps = [
+  { download = "${{ matrix.artifact }}", path = "." },
+  { name = "The one asset the artifact holds", id = "asset", run = "assets=(*.tar.gz)\n[ \"${#assets[@]}\" -eq 1 ] || { echo \"::error::expected one tarball, found: ${assets[*]}\" >&2; exit 1; }\necho \"asset=${assets[0]}\" >> \"$GITHUB_OUTPUT\"\n" },
+  { uses = "./.github/actions/release-upload", with = { asset = "${{ steps.asset.outputs.asset }}" } },
+]
+
+[lane.server-image-cpu]
+why = "The CPU image's variant x arch legs, each packaging the proving run's binaries and pushing only its own immutable commit tag, attested and verified."
+name = "Push {variant} ({arch})"
+workflow = "release"
+when = ["tag:v"]
+host = "ubuntu"
+needs = ["ghcr", "attest"]
+publishes = "release"
+consumes = ["server-cpu-{target}-binary", "jammi-{triple}"]
+env = { IMAGE = "ghcr.io/${{ github.repository_owner }}/jammi-ai-server" }
+legs = [
+  { variant = "generic", arch = "amd64", triple = "x86_64-unknown-linux-gnu" },
+  { variant = "generic", arch = "arm64", triple = "aarch64-unknown-linux-gnu" },
+  { variant = "selfcontained", arch = "amd64", triple = "x86_64-unknown-linux-gnu" },
+  { variant = "selfcontained", arch = "arm64", triple = "aarch64-unknown-linux-gnu" },
+]
+steps = [
+  { name = "The leg's tag", id = "leg", env = { VARIANT = "${{ matrix.variant }}" }, run = "{ echo 'tags<<EOF'; bash ci/scripts/image_tags.sh \"$VARIANT\" --immutable; echo EOF; } >> \"$GITHUB_OUTPUT\"" },
+  { id = "binaries", uses = "./.github/actions/stage-server-binaries", with = { server = "server-cpu-${{ matrix.target }}-binary", cli = "jammi-${{ matrix.triple }}", stage = "builder", run-id = "{artifact-run}" } },
+  { uses = "./.github/actions/push-image-leg", with = { image = "${{ env.IMAGE }}", tags-spec = "${{ steps.leg.outputs.tags }}", tag-suffix = "${{ matrix.arch }}", build-args = "RUNTIME_VARIANT=runtime-${{ matrix.variant }}\n", build-contexts = "${{ steps.binaries.outputs.build-context }}", platforms = "${{ matrix.platform }}", cache-scope = "cpu-${{ matrix.variant }}-${{ matrix.arch }}" } },
+]
+
+[lane.server-image-cpu-merge]
+why = "Merges each CPU variant's per-arch legs into the real tags through the one verify-then-promote definition, and attests the merged digest."
+name = "Merge {variant}"
+workflow = "release"
+when = ["tag:v"]
+host = "ubuntu"
+needs = ["ghcr", "attest"]
+publishes = "release"
+after = ["server-image-cpu"]
+env = { IMAGE = "ghcr.io/${{ github.repository_owner }}/jammi-ai-server" }
+legs = [{ variant = "generic" }, { variant = "selfcontained" }]
+steps = [
+  { name = "The variant's tag policy", id = "policy", env = { VARIANT = "${{ matrix.variant }}" }, run = "{ echo 'tags<<EOF'; bash ci/scripts/image_tags.sh \"$VARIANT\"; echo EOF; } >> \"$GITHUB_OUTPUT\"" },
+  { uses = "./.github/actions/merge-index", with = { image = "${{ env.IMAGE }}", platforms = "linux/amd64,linux/arm64", tags-spec = "${{ steps.policy.outputs.tags }}", variant = "${{ matrix.variant }}", attest = "true" } },
+]
+
+[lane.server-image-cuda]
+why = "The CUDA image, one amd64 leg (its runtime base publishes no arm64), packaging the proving run's CUDA binary under the one tag policy, attested and verified."
+name = "Push CUDA image"
+workflow = "release"
+when = ["tag:v"]
+host = "ubuntu"
+needs = ["ghcr", "attest"]
+publishes = "release"
+consumes = ["server-cu12-x86_64-binary", "jammi-x86_64-unknown-linux-gnu"]
+env = { IMAGE = "ghcr.io/${{ github.repository_owner }}/jammi-ai-server-cu12" }
+steps = [
+  { id = "binaries", uses = "./.github/actions/stage-server-binaries", with = { server = "server-cu12-x86_64-binary", cli = "jammi-x86_64-unknown-linux-gnu", stage = "builder-cuda", run-id = "{artifact-run}" } },
+  { name = "The image's tags", id = "tags", run = "{ echo 'tags<<EOF'; bash ci/scripts/image_tags.sh cuda; echo EOF; } >> \"$GITHUB_OUTPUT\"" },
+  { uses = "./.github/actions/push-image-leg", with = { image = "${{ env.IMAGE }}", tags-spec = "${{ steps.tags.outputs.tags }}", build-args = "RUNTIME_VARIANT=runtime-cuda\n", build-contexts = "${{ steps.binaries.outputs.build-context }}", platforms = "linux/amd64", cache-scope = "cu12" } },
+]
+
+[lane.site]
+why = "Lays out the site: the guide at the root, the API reference under `api/`, the book under `cookbook/`, the paths the guide, the README and every notebook link to."
+name = "Lay out the site"
+workflow = "pages"
+host = "ubuntu"
+checkout = false
+consumes = ["docs-site", "cookbook-book"]
+steps = [
+  { download = "docs-site", path = "_site", from = "ci" },
+  { download = "cookbook-book", path = "_site/cookbook", from = "cookbook-gpu" },
+  { uses = "@upload-pages-artifact", with = { path = "_site" } },
+]
+
+[lane.deploy-pages]
+why = "Deploys the laid-out site to GitHub Pages; the `github-pages` environment admits only `py-v*` tags."
+name = "Deploy to GitHub Pages"
+workflow = "pages"
+when = ["tag:py-v"]
+host = "ubuntu"
+needs = ["pages"]
+publishes = "release"
+after = ["site"]
+checkout = false
+environment = { name = "github-pages", url = "${{ steps.deployment.outputs.page_url }}" }
+steps = [{ id = "deployment", uses = "@deploy-pages" }]

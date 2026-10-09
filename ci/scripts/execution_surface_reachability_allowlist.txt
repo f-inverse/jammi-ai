@@ -21,16 +21,11 @@
 # invoked from exactly ONE workflow, `gpu-prove.yml`
 # (`workflow_dispatch` / `pull_request: types: [labeled]` / an
 # allow-listed nightly `schedule` — deliberately no `push:`/`workflow_call:`
-# trigger and no workflow may `uses:` it, `check_gpu_prove_once.py`'s P1
-# rule pins this by name; the cron itself is a reviewed
-# `PAID_LANE_CRON_ALLOWLIST` entry, P8 — any OTHER paid pod lane picking up
-# a `schedule:` trigger is a finding until a human adds it there, naming its
-# own never-vacuous arm). Every CUDA release lane (`server-image.yml`,
-# `release-binaries.yml`, `pypi.yml` — each calls
-# `_proof-required.yml` DIRECTLY; `_server.yml` carries no gate at
-# all, only the build/package steps) instead consumes that commit's
-# already-recorded verdict through `_proof-required.yml` — a hermetic
-# API read, never a second invocation of this driver script.
+# trigger; `ci/scripts/lanes.py` refuses a lane that rents hardware on any
+# trigger but a label, a dispatch or its workflow's reviewed `paid-cron`).
+# Every CUDA release lane (`release.yml`, `pypi.yml`) instead consumes that
+# commit's already-recorded verdict through its rendered `proof` job — a
+# hermetic API read, never a second invocation of this driver script.
 # NOT merge-path: `gpu-prove.yml`'s own triggers are label/dispatch/
 # an allow-listed schedule only, and it is never `push:`-triggered by a tag
 # either (a dev dispatches it by hand before tagging). The residual
@@ -142,9 +137,8 @@ cargo build --release -p jammi-bench --features cuda,jammi-encoders/flash-attn -
 # need two real CUDA devices in one box and NCCL, which no hermetic runner
 # has and no single-GPU lane can stand in for. Its one invoker is
 # `.github/workflows/gpu-topology.yml` (the `run-topology` PR label and
-# manual dispatch — deliberately no `push:`/`workflow_call:`/`schedule:`
-# trigger, and nothing may `uses:` it; `check_gpu_prove_once.py`'s P7/P8
-# rules pin that `on:` block by name). Each live group refuses a zero-test
+# manual dispatch — deliberately no `push:` or `schedule:` trigger;
+# `ci/scripts/lanes.py`'s paid-lane rule holds that `on:` block). Each live group refuses a zero-test
 # filter match, so no row here waives a vacuous pass. ---
 cargo test -p jammi-ai --features cuda,live-gpu-gang-tests --test gpu_capability --no-run	runpod_gpu_topology.sh's `topology-build` group — compiles the NCCL transport's device tests ahead of the `one-host-device` run; ci.yml's CUDA clippy lane lints the same surface.
 cargo test -p jammi-server --features cuda,live-gpu-gang-tests --test it --no-run	runpod_gpu_topology.sh's `topology-build` group — compiles the served topology tests ahead of the `one-host-product` run; ci.yml's CUDA clippy lane lints the same surface.

@@ -2,7 +2,7 @@
 Python client over the wire, and prove a restart does not lose an existing
 result.
 
-Run by `.github/workflows/compose-smoke.yml` AFTER `docker compose -f
+Run by the `compose-smoke` lane (ci.yml, nightly.yml) AFTER `docker compose -f
 deploy/docker-compose.yml -f deploy/docker-compose.ci.yml up --wait` has
 brought the stack up healthy. Deliberately outside `tests/uat/` — ci.yml's
 `test-python` job globs `tests/uat/shape_b_*.py` / `tests/uat/shape_c_*.py`
@@ -19,7 +19,7 @@ Postgres-backed volume, so it must survive byte-for-byte). See
 `remote_smoke.py`'s own module doc for what `run()` actually proves: a
 runtime oracle on `get_server_info().broker`, an exact self-hit search, and
 (via the callback here) result durability across the restart. The workflow
-(`.github/workflows/compose-smoke.yml`) queries the Postgres container
+(the `compose-smoke` lane) queries the Postgres container
 directly after this script exits, as the matching runtime oracle for the
 catalog side.
 

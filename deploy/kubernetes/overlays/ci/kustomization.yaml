@@ -11,7 +11,7 @@ resources:
   - postgres.yaml
 
 # The kind smoke never pulls from a registry: it loads the image the
-# workflow built (`kube-smoke.yml`'s `JAMMI_IMAGE`, `jammi-ai-server:smoke`)
+# lane built (`kube-smoke`'s `JAMMI_IMAGE`, `jammi-ai-server:smoke`)
 # into the kind cluster, and this pins the tag kustomize rewrites the base
 # Deployment to reference.
 images:

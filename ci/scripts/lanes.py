@@ -72,7 +72,7 @@ PERMISSION_NEEDS = {
     "pages": {"pages": "write", "id-token": "write"},
     "actions-read": {"actions": "read"},
 }
-PROVISION_NEEDS = ("postgres", "s3", "cutlass", "nccl", "kubeconform", "full-history", "hub-token", "runpod", "audit-key", "python", "node")
+PROVISION_NEEDS = ("postgres", "s3", "cutlass", "nccl", "kubeconform", "full-history", "hub-token", "runpod", "audit-key", "python", "maturin", "node")
 NEEDS = (*PERMISSION_NEEDS, *PROVISION_NEEDS)
 # Step text that publishes: allowed only in a lane that declares what it promotes.
 PUBLISH_PRIMITIVES = (
@@ -468,6 +468,8 @@ def validate(table: Table, root: Path | None = None) -> list[str]:
                     out.append(f"{w}: a release build spells features ({m.group(0).strip()!r}); it reads ci/release-feature-manifest.json")
         if "python" in lane.needs and lane.host not in BARE_HOSTS and not any(l.get("host") in BARE_HOSTS for l in lane.legs):
             out.append(f"{w}: the CI image carries Python; `python` is for a bare host")
+        if "maturin" in lane.needs and "python" not in lane.needs:
+            out.append(f"{w}: maturin on a bare host installs into the interpreter `python` provides; name both")
         if lane.host == "cuda-image" and lane.arch != "amd64":
             out.append(f"{w}: the CUDA image is amd64 only")
         if "s3" in lane.needs and "postgres" not in lane.needs:
@@ -860,6 +862,10 @@ def _steps(table: Table, lane: Lane, refs: dict[str, str], mixed: bool) -> list[
         steps.append({"name": "The image carries NCCL (header + link library)", "run": "rpm -q libnccl libnccl-devel && test -e /usr/include/nccl.h && test -e /usr/lib64/libnccl.so"})
     if "python" in lane.needs:
         steps.append(_bare({"uses": _action(table, "setup-python"), "with": {"python-version": PYTHON}}, bare_if))
+    if "maturin" in lane.needs:
+        # The CI image carries maturin; a bare host takes the pip release of
+        # the same version into the interpreter setup-python put on PATH.
+        steps.append(_bare({"name": "maturin at its pin", "run": "bash .docker/pinned-tools.sh maturin"}, bare_if))
     if "node" in lane.needs:
         steps.append({"uses": _action(table, "setup-node"), "with": {"node-version-file": "clients/typescript/.nvmrc", "registry-url": "https://registry.npmjs.org"}})
     if lane.rust:

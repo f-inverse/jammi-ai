@@ -100,7 +100,7 @@ jobs:
 
   # The tree's CUDA CI image, FROM the CPU image of the same tree, built when the registry lacks its content tag.
   image-cuda:
-    name: CI image (CUDA, amd64)
+    name: CI image (CUDA, ${{ matrix.arch }})
     needs:
       - image-cpu-merge
     runs-on: ubuntu-latest
@@ -710,6 +710,9 @@ jobs:
         with:
           python-version: '3.12'
       - if: ${{ matrix.bare }}
+        name: maturin at its pin
+        run: bash .docker/pinned-tools.sh maturin
+      - if: ${{ matrix.bare }}
         uses: ./.github/actions/setup-rust-host
         with:
           targets: ${{ matrix.rust_target }}
@@ -964,9 +967,14 @@ jobs:
         working-directory: clients/python
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: A venv, as a reader installs it
+        run: |
+          python3 -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Install from source and generate the stubs
         run: |
-          python3 -m pip install --quiet -e '.[dev]' build
+          pip install --quiet --upgrade pip
+          pip install --quiet -e '.[dev]' build
           make generate
       - name: Test (hermetic)
         run: make test
@@ -978,7 +986,7 @@ jobs:
           assert not bad, f"import jammi eagerly pulled jammi_native: {bad}"
           PY
       - name: Build the wheel
-        run: python3 -m build --wheel --outdir dist
+        run: python -m build --wheel --outdir dist
       - name: The wheel fits PyPI's per-file limit
         run: bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

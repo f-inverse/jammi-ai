@@ -339,7 +339,7 @@ steps = [
 
 [lane.image-cuda]
 why = "The tree's CUDA CI image, FROM the CPU image of the same tree, built when the registry lacks its content tag."
-name = "CI image (CUDA, amd64)"
+name = "CI image (CUDA, {arch})"
 host = "ubuntu"
 needs = ["ghcr"]
 publishes = "ci-image"
@@ -568,7 +568,7 @@ steps = [
 why = "The `jammi-ai-native` wheels, maturin abi3 builds of the embedded engine for every platform, each held to the GLIBC floor, the machine its tag claims and PyPI's per-file limit."
 name = "Native wheel ({dist})"
 rust = "release"
-needs = ["python"]
+needs = ["python", "maturin"]
 dir = "packaging/native"
 produces = ["wheels-native-{dist}"]
 legs = [
@@ -651,10 +651,11 @@ name = "Client wheel"
 dir = "clients/python"
 produces = ["client-wheel"]
 steps = [
-  { name = "Install from source and generate the stubs", run = "python3 -m pip install --quiet -e '.[dev]' build\nmake generate\n" },
+  { name = "A venv, as a reader installs it", run = "python3 -m venv .venv\necho \"$PWD/.venv/bin\" >> \"$GITHUB_PATH\"\n" },
+  { name = "Install from source and generate the stubs", run = "pip install --quiet --upgrade pip\npip install --quiet -e '.[dev]' build\nmake generate\n" },
   { name = "Test (hermetic)", run = "make test" },
   { name = "The client imports with no engine", run = "python3 - <<'PY'\nimport sys, jammi\nbad = [m for m in sys.modules if m == \"jammi_native\" or m.startswith(\"jammi_native.\")]\nassert not bad, f\"import jammi eagerly pulled jammi_native: {bad}\"\nPY\n" },
-  { name = "Build the wheel", run = "python3 -m build --wheel --outdir dist" },
+  { name = "Build the wheel", run = "python -m build --wheel --outdir dist" },
   { name = "The wheel fits PyPI's per-file limit", run = "bash ../../ci/scripts/assert_wheel_size.sh dist/*.whl" },
 ]
 

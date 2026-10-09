@@ -712,6 +712,7 @@ jobs:
       - if: ${{ matrix.bare }}
         name: maturin at its pin
         run: bash .docker/pinned-tools.sh maturin
+        working-directory: ${{ github.workspace }}
       - if: ${{ matrix.bare }}
         uses: ./.github/actions/setup-rust-host
         with:

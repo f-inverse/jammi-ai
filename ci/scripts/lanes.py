@@ -892,6 +892,12 @@ def _steps(table: Table, lane: Lane, refs: dict[str, str], mixed: bool) -> list[
         ]
     if "audit-key" in lane.needs:
         steps.append({"name": "An ephemeral audit master key for this throwaway stack", "run": 'key="$(openssl rand -hex 32)"\necho "::add-mask::$key"\necho "JAMMI_AUDIT_MASTER_KEY=$key" >> "$GITHUB_ENV"\n'})
+    # What the renderer provisions runs from the workspace root; a lane's
+    # `dir` is where its own steps run.
+    if lane.dir:
+        for st in steps:
+            if "run" in st:
+                st["working-directory"] = "${{ github.workspace }}"
     uploaded: set[str] = set()
     for step in lane.steps:
         steps.append(_step(table, lane, step, refs))

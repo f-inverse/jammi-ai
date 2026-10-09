@@ -1,7 +1,7 @@
 """Compose smoke (Shape B): RELEASE via SIGINT, then the restarted container
 reclaims the released job.
 
-Run by `.github/workflows/compose-smoke.yml` AFTER `shape_b_remote.py`, against
+Run by the `compose-smoke` lane (ci.yml, nightly.yml) AFTER `shape_b_remote.py`, against
 the same `docker compose -f deploy/docker-compose.yml -f
 deploy/docker-compose.ci.yml` stack. It proves the two-mode shutdown's fast
 arm end to end on the shipped image, against the Postgres catalog:

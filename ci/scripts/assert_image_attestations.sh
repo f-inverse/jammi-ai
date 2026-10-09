@@ -3,7 +3,7 @@
 # Asserts a pushed image digest carries both a provenance attestation and an
 # SBOM attestation, and -- when the index is multi-platform -- that BOTH
 # attestations actually cover every platform the index carries, not just
-# some of them. Shared by every push job in server-image.yml so the
+# some of them. Shared by every image push in release.yml so the
 # assertion logic lives in exactly one place instead of four copies drifting
 # independently.
 #

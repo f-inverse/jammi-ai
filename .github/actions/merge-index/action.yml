@@ -3,8 +3,13 @@ description: >
   Merges per-arch image sources into one multi-arch index under real tags,
   verify-then-promote (`ci/scripts/merge_image_index.sh`), and, for a
   published image, attests and verifies the merged digest. The one definition
-  of an index promotion: the tree's CI image and every published server image
-  merge through it. Needs `packages: write`; with `attest: "true"`, also
+  of an index promotion: the tree's CI images, the devcontainer's `:latest`
+  alias and every published server image merge through it. The tags are
+  either listed (`tags`, the first being the immutable one whose digest is
+  reported) or expanded from a tag policy (`tags-spec` and `variant`, through
+  `docker/metadata-action`, the immutable commit tag first). The sources are
+  either listed (`sources`) or the immutable tag's per-arch legs, one per
+  platform. Needs `packages: write`; with `attest: "true"`, also
   `id-token: write` and `attestations: write`.
 
 inputs:
@@ -15,11 +20,21 @@ inputs:
     description: "The platform set the merged index must hold, comma-separated."
     required: true
   tags:
-    description: "The tags to create, one per line; the first is the immutable one whose digest is reported."
-    required: true
+    description: "The tags to create, one per line, the first immutable; empty expands `tags-spec`."
+    required: false
+    default: ""
+  tags-spec:
+    description: "`docker/metadata-action`'s `tags:` block, with `variant`."
+    required: false
+    default: ""
+  variant:
+    description: "The `ci/scripts/image_tags.sh` variant whose commit tag is the immutable one (with `tags-spec`)."
+    required: false
+    default: ""
   sources:
-    description: "The per-arch sources to merge, one per line."
-    required: true
+    description: "The per-arch sources to merge, one per line; empty merges `<immutable tag>-<arch>` per platform."
+    required: false
+    default: ""
   attest:
     description: "\"true\" for a published image: attest and verify the merged digest."
     required: false
@@ -39,12 +54,52 @@ runs:
         username: ${{ github.actor }}
         password: ${{ github.token }}
 
+    # `latest=false`: the moving tag is the policy's own `raw` entry, never
+    # metadata-action's default.
+    - if: inputs.tags-spec != ''
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+      id: meta
+      with:
+        images: ${{ inputs.image }}
+        flavor: latest=false
+        tags: ${{ inputs.tags-spec }}
+
+    - id: plan
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        PLATFORMS: ${{ inputs.platforms }}
+        TAGS: ${{ inputs.tags }}
+        SPEC_TAGS: ${{ steps.meta.outputs.tags }}
+        VARIANT: ${{ inputs.variant }}
+        SOURCES: ${{ inputs.sources }}
+      run: |
+        set -euo pipefail
+        if [ -n "$TAGS" ] && [ -n "$SPEC_TAGS" ]; then
+          echo "::error::merge-index: pass tags or tags-spec, not both" >&2; exit 1
+        fi
+        if [ -n "$SPEC_TAGS" ]; then
+          # The commit tag first, the immutable one the merge re-reads and
+          # attests, then every other tag of the policy.
+          immutable="$IMAGE:$(bash ci/scripts/image_tags.sh "$VARIANT" --commit-tag "$GITHUB_SHA")"
+          TAGS="$(printf '%s\n%s\n' "$immutable" "$(grep -vx -- "$immutable" <<< "$SPEC_TAGS")")"
+        fi
+        [ -n "$TAGS" ] || { echo "::error::merge-index: no tags to create" >&2; exit 1; }
+        if [ -z "$SOURCES" ]; then
+          first="$(head -n1 <<< "$TAGS")"
+          SOURCES="$(tr ',' '\n' <<< "$PLATFORMS" | sed "s#^linux/#$first-#")"
+        fi
+        {
+          echo "tags<<EOF"; echo "$TAGS"; echo "EOF"
+          echo "sources<<EOF"; echo "$SOURCES"; echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
     - id: merge
       shell: bash
       env:
         PLATFORMS: ${{ inputs.platforms }}
-        TAGS: ${{ inputs.tags }}
-        SOURCES: ${{ inputs.sources }}
+        TAGS: ${{ steps.plan.outputs.tags }}
+        SOURCES: ${{ steps.plan.outputs.sources }}
       run: |
         set -euo pipefail
         args=()

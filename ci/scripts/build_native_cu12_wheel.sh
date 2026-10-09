@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the `jammi-ai-native-cu12` wheel and check the extension it carries.
 #
-# One recipe for every place the wheel is built: `_native-wheel-cu12.yml`
+# One recipe for every place the wheel is built: ci.yml's `native-wheel-cu12` lane
 # (in the CUDA CI image, on every change; `pypi.yml` publishes that build)
 # and a GPU pod verifying it (`docs/maintainer/dev-gpu.md`). Needs the CUDA toolkit, the
 # CUTLASS submodule (`flash-attn`) and maturin; writes the wheel to

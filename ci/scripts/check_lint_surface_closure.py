@@ -107,10 +107,10 @@ deleting the registry from being the way around it.
 
 That last clause is a determinant of its own, and it is the one a
 trigger-only notion of "merge path" misses. A workflow can qualify under
-Rule 1a and still never see the PR that breaks the lint: `image.yml`
-is `push:`-to-main-only (no `pull_request` trigger at all), and
-`devcontainer-image.yml`'s `pull_request` trigger is filtered to
-`.devcontainer/**` and its own file. The jammi-ai live-gpu lane moved into either would satisfy
+Rule 1a and still never see the PR that breaks the lint: a workflow that
+is `push:`-to-main-only (no `pull_request` trigger at all), or one whose
+`pull_request` trigger is filtered to paths that list no crate. The jammi-ai
+live-gpu lane moved into either would satisfy
 its row while a PR editing only
 `crates/jammi-ai/**` ran neither, which is the fail-open this row exists to
 prevent. So a row is credited only by a lane whose HOSTING workflow carries
@@ -134,8 +134,8 @@ exists for: with every `-p jammi-ai` lane filtered out of the real corpus
 corpus every real row must read SATISFIED. It runs the host-workflow
 mutations end-to-end as well, through the real workflow parser: a copy of
 `.github/workflows/` with that step's `run:` line MOVED out of `ci.yml`
-into a synthetic job in `image.yml` (push-to-main + `paths:`), and the
-same move into `devcontainer-image.yml` (a `pull_request` whose `paths:`
+into a synthetic push-to-main-only workflow, and the
+same move into a synthetic workflow (a `pull_request` whose `paths:`
 list no crate), must each read UNSATISFIED, while the
 same copy with nothing moved reads SATISFIED — so the mutation's verdict
 cannot be an artefact of copying the workflows.
@@ -283,7 +283,7 @@ class PrTriggerLane:
 class LaneOrigin:
     """The workflow that hosts a parsed lane, with the `pull_request`-to-main
     triggers it fires on. `pr_lanes == ()` means the hosting workflow has NO
-    qualifying `pull_request`-to-main trigger at all (`image.yml`'s
+    qualifying `pull_request`-to-main trigger at all (a `push:`-only workflow's
     `push:`-to-main-only shape) — such a host can never be credited for a
     registry row, whatever its `paths:` say."""
 
@@ -729,29 +729,6 @@ def find_missing_required_lanes(
 # turn, re-run both other halves of the gate, and see whether either goes
 # red -- on every invocation, over the CURRENT lane corpus, so the answer
 # tracks lanes as they are added, moved, or deleted.
-# A lane reported as undetectable-on-loss SOLELY because ANOTHER,
-# reviewed lane -- still present -- provides byte-identical redundant
-# coverage for the same crate scope/features/target-selection is a
-# residual a registry row structurally cannot close: ANY row the
-# narrower lane would satisfy is, by the same features/selection, ALSO
-# satisfied by the wider one, so removing either alone never changes
-# either row's satisfaction. Recorded here rather than hidden (never a
-# silent skip -- see `find_unprotected_lanes`'s own NOTE line, printed
-# every run): each entry names BOTH exact raw invocations; a change to
-# EITHER text (a rewritten flag, a moved crate) falls straight back out
-# of this set and the pair is judged unprotected again until re-reviewed.
-REVIEWED_REDUNDANT_LANE_PAIRS: frozenset[frozenset[str]] = frozenset(
-    {
-        frozenset(
-            {
-                "cargo clippy --workspace --all-targets -- -D warnings",
-                "cargo clippy -p jammi-wire -p jammi-admin -p jammi-client --all-targets -- -D warnings",
-            }
-        ),
-    }
-)
-
-
 def find_unprotected_lanes(
     lanes: list[ClippyLane],
     feature_maps: dict[str, dict[str, list[str]]],
@@ -759,24 +736,21 @@ def find_unprotected_lanes(
     required: list[RequiredLane],
     exec_mod,
     crate_dirs: dict[str, tuple[str, ...]],
-) -> tuple[list[str], list[str]]:
-    """(fail_findings, reviewed_notes). A lane is a candidate when its
-    deletion changes NEITHER `find_gaps`'s own result NOR `find_missing_
-    required_lanes`'s own result -- i.e. no other closure in this gate
-    would ever notice losing it. Each candidate lane is removed from a
-    COPY of `lanes` (identity, `is`, so two textually-identical lines at
-    different workflow lines are still distinguished) and both other
-    closures are recomputed against the SAME `targets`/`required` this
-    run already computed -- no cargo re-invocation, no re-scan of the
-    workflow tree; this is pure set arithmetic over the already-
-    discovered corpus, costing nothing beyond what `main` already
-    computed. A candidate whose ONLY surviving cover is a `REVIEWED_
-    REDUNDANT_LANE_PAIRS` partner is downgraded to `reviewed_notes`
-    (still printed, never a FAIL) rather than `fail_findings`."""
+) -> list[str]:
+    """The findings. A lane is unprotected when its deletion changes NEITHER
+    `find_gaps`'s own result NOR `find_missing_required_lanes`'s own result --
+    i.e. no other closure in this gate would ever notice losing it. Each
+    candidate lane is removed from a COPY of `lanes` (identity, `is`, so two
+    textually-identical lines at different workflow lines are still
+    distinguished) and both other closures are recomputed against the SAME
+    `targets`/`required` this run already computed -- no cargo re-invocation,
+    no re-scan of the workflow tree; pure set arithmetic over the already-
+    discovered corpus. Two lanes that cover one surface redundantly are
+    both unprotected: a registry row names the surface each uniquely
+    protects, or one of them goes."""
     base_gaps = set(find_gaps(targets, lanes, feature_maps))
     base_missing = set(find_missing_required_lanes(required, lanes, feature_maps, exec_mod, crate_dirs))
-    fail_findings: list[str] = []
-    reviewed_notes: list[str] = []
+    findings: list[str] = []
     for i, lane in enumerate(lanes):
         without = lanes[:i] + lanes[i + 1 :]
         gaps_without = set(find_gaps(targets, without, feature_maps))
@@ -784,25 +758,13 @@ def find_unprotected_lanes(
         if gaps_without != base_gaps or missing_without != base_missing:
             continue
         host = lane.origin.workflow if lane.origin is not None else "<no recorded host workflow>"
-        reviewed_partner = next(
-            (o.raw for o in without if frozenset({lane.raw, o.raw}) in REVIEWED_REDUNDANT_LANE_PAIRS),
-            None,
-        )
-        if reviewed_partner is not None:
-            reviewed_notes.append(
-                f"NOTE (reviewed, not a FAIL): {host}: `{lane.raw}` is undetectable-on-loss only "
-                f"because `{reviewed_partner}` (still present) provides byte-identical redundant "
-                f"coverage for the same surface -- a {REQUIRED_LANES_PATH.name} row cannot separate "
-                "them (see that file's own header); reviewed and accepted."
-            )
-            continue
-        fail_findings.append(
+        findings.append(
             f"{host}: `{lane.raw}` is undetectable-on-loss -- deleting it changes neither the "
             "cargo-metadata closure (find_gaps) nor the required-lane registry's own "
             "satisfaction (find_missing_required_lanes). Add a "
             f"{REQUIRED_LANES_PATH.name} row naming the surface it uniquely protects."
         )
-    return sorted(set(fail_findings)), sorted(set(reviewed_notes))
+    return sorted(set(findings))
 
 
 # --------------------------------------------------------------------------- #
@@ -824,6 +786,14 @@ _SYNTHETIC_JOB = """
       - name: Clippy jammi-ai live-gpu surfaces (moved by the self-test)
         run: {tuple_text}
 """
+#: The host shapes the move controls below exercise, synthetic so the self-test
+#: never depends on a real workflow keeping a shape no lane needs: a workflow
+#: with no `pull_request` trigger at all, and one whose `pull_request` is
+#: filtered to paths that list no crate.
+_SYNTHETIC_HOSTS = {
+    "push-only.yml": "name: push-only\non:\n  push:\n    branches: [main]\njobs:\n",
+    "paths-filtered.yml": "name: paths-filtered\non:\n  pull_request:\n    paths:\n      - '.devcontainer/**'\njobs:\n",
+}
 
 
 def _corpus_with_step_moved(exec_mod, moved_to: str | None, remove_from_ci: bool) -> list[ClippyLane]:
@@ -856,13 +826,7 @@ def _corpus_with_step_moved(exec_mod, moved_to: str | None, remove_from_ci: bool
             ci.write_text(text.replace(hosting[0] + "\n", "", 1), encoding="utf-8")
         if moved_to is not None:
             host = dst / moved_to
-            assert host.is_file(), f"self-test FAILED: no such workflow to move the step into: {moved_to}"
-            host.write_text(
-                host.read_text(encoding="utf-8").rstrip("\n")
-                + "\n"
-                + _SYNTHETIC_JOB.format(tuple_text=_MOVED_STEP_TUPLE),
-                encoding="utf-8",
-            )
+            host.write_text(_SYNTHETIC_HOSTS[moved_to] + _SYNTHETIC_JOB.format(tuple_text=_MOVED_STEP_TUPLE), encoding="utf-8")
         lanes, _findings = lanes_from_workflows(exec_mod, root)
         return lanes
 
@@ -1006,11 +970,8 @@ def self_test() -> int:
         ".github/workflows -- the mutation controls below would prove nothing"
     )
     for host, why in (
-        ("image.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
-        (
-            "devcontainer-image.yml",
-            "a workflow whose `pull_request` `paths:` list no crate",
-        ),
+        ("push-only.yml", "a `push:`-to-main-only workflow (no `pull_request` trigger at all)"),
+        ("paths-filtered.yml", "a workflow whose `pull_request` `paths:` list no crate"),
     ):
         moved = _corpus_with_step_moved(exec_mod, host, True)
         assert not required_lane_is_present(
@@ -1040,19 +1001,19 @@ def self_test() -> int:
         assert probe is not None
         return probe
 
-    filtered_origin = origin_of("devcontainer-image.yml")
-    assert len(filtered_origin.pr_lanes) == 1 and filtered_origin.pr_lanes[0].paths, (
-        "self-test FAILED: devcontainer-image.yml no longer carries a paths-filtered "
-        "`pull_request` trigger, so the control above tests something else now"
-    )
-    assert origin_of("image.yml").pr_lanes == (), (
-        "self-test FAILED: image.yml now has a `pull_request`-to-main trigger, so the "
-        "push-only control above tests something else now"
-    )
-    assert not lane_runs_on_pr_touching_crate(
-        exec_mod, probe_in(filtered_origin), "jammi-ai", crate_dirs
-    ), "self-test FAILED: devcontainer-image.yml's paths were read as admitting crates/jammi-ai/**"
     with tempfile.TemporaryDirectory() as td:
+        for name, text in _SYNTHETIC_HOSTS.items():
+            (Path(td) / name).write_text(text + "  {}\n")
+        filtered_origin = origin_of("paths-filtered.yml", Path(td))
+        assert len(filtered_origin.pr_lanes) == 1 and filtered_origin.pr_lanes[0].paths, (
+            "self-test FAILED: the paths-filtered control carries no paths-filtered `pull_request` trigger"
+        )
+        assert origin_of("push-only.yml", Path(td)).pr_lanes == (), (
+            "self-test FAILED: the push-only control has a `pull_request`-to-main trigger"
+        )
+        assert not lane_runs_on_pr_touching_crate(
+            exec_mod, probe_in(filtered_origin), "jammi-ai", crate_dirs
+        ), "self-test FAILED: the paths-filtered control's paths were read as admitting crates/jammi-ai/**"
         (Path(td) / "crates-filtered.yml").write_text(
             "on:\n  pull_request:\n    branches: [main]\n    paths: ['crates/**']\njobs: {}\n"
         )
@@ -1182,8 +1143,7 @@ def self_test() -> int:
         "cargo clippy -p jammi-cli --all-targets -- -D warnings", origin=UNFILTERED_PR_ORIGIN
     )
     assert lonely_lane is not None
-    fails, notes = find_unprotected_lanes([lonely_lane], feature_maps, [], [], exec_mod, crate_dirs)
-    assert notes == [], f"self-test FAILED: a lone, unreviewed lane produced a NOTE instead of a FAIL: {notes}"
+    fails = find_unprotected_lanes([lonely_lane], feature_maps, [], [], exec_mod, crate_dirs)
     assert any("jammi-cli" in f for f in fails), (
         f"self-test FAILED: a lane covering no required-features target and no registry row was "
         f"not reported unprotected: {fails}"
@@ -1198,10 +1158,7 @@ def self_test() -> int:
         "cargo clippy --workspace --all-targets -- -D warnings", origin=UNFILTERED_PR_ORIGIN
     )
     assert wide_lane is not None
-    fails2, notes2 = find_unprotected_lanes(
-        [lonely_lane, wide_lane], feature_maps, [], [], exec_mod, crate_dirs
-    )
-    assert notes2 == [], f"self-test FAILED: an unreviewed redundant pair produced a NOTE: {notes2}"
+    fails2 = find_unprotected_lanes([lonely_lane, wide_lane], feature_maps, [], [], exec_mod, crate_dirs)
     assert any("jammi-cli" in f for f in fails2), (
         "self-test FAILED: with two lanes covering the SAME crate/selection redundantly, NEITHER "
         f"is reported unprotected (removing either alone changes nothing): {fails2}"
@@ -1210,58 +1167,25 @@ def self_test() -> int:
     # A registry row that the lonely lane satisfies clears the finding --
     # closure (b), the row-based remedy.
     cli_row = RequiredLane("jammi-cli", (), (), "all-targets", 0)
-    fails3, notes3 = find_unprotected_lanes(
-        [lonely_lane], feature_maps, [], [cli_row], exec_mod, crate_dirs
-    )
-    assert fails3 == [] and notes3 == [], (
-        f"self-test FAILED: a registry row the lonely lane satisfies did not clear the finding: "
-        f"fails={fails3} notes={notes3}"
+    fails3 = find_unprotected_lanes([lonely_lane], feature_maps, [], [cli_row], exec_mod, crate_dirs)
+    assert fails3 == [], (
+        f"self-test FAILED: a registry row the lonely lane satisfies did not clear the finding: {fails3}"
     )
 
     # A cargo-metadata-required target the lonely lane covers clears the
     # finding too -- closure (a), `find_gaps`'s own mechanism.
     cli_target = GatedTarget(crate="jammi-cli", target="synthetic", kind="lib", required_features=())
-    fails4, notes4 = find_unprotected_lanes(
-        [lonely_lane], feature_maps, [cli_target], [], exec_mod, crate_dirs
-    )
-    assert fails4 == [] and notes4 == [], (
-        f"self-test FAILED: a required-features target the lonely lane covers did not clear the "
-        f"finding: fails={fails4} notes={notes4}"
+    fails4 = find_unprotected_lanes([lonely_lane], feature_maps, [cli_target], [], exec_mod, crate_dirs)
+    assert fails4 == [], (
+        f"self-test FAILED: a required-features target the lonely lane covers did not clear the finding: {fails4}"
     )
 
-    # A REVIEWED redundant pair (the real committed pair) downgrades to a
-    # NOTE, never a FAIL -- and the reviewed set is matched by EXACT raw
-    # text, so a rewritten partner (even a single added space) falls back
-    # OUT of the reviewed set and reddens again.
-    reviewed_a, reviewed_b = sorted(next(iter(REVIEWED_REDUNDANT_LANE_PAIRS)))
-    lane_a = parse_clippy_lane(reviewed_a, origin=UNFILTERED_PR_ORIGIN)
-    lane_b = parse_clippy_lane(reviewed_b, origin=UNFILTERED_PR_ORIGIN)
-    assert lane_a is not None and lane_b is not None
-    fails5, notes5 = find_unprotected_lanes([lane_a, lane_b], feature_maps, [], [], exec_mod, crate_dirs)
-    assert fails5 == [], f"self-test FAILED: the reviewed pair produced a FAIL, not a NOTE: {fails5}"
-    assert len(notes5) == 2, f"self-test FAILED: the reviewed pair should produce one NOTE per side: {notes5}"
-    rewritten = parse_clippy_lane(reviewed_a + " ", origin=UNFILTERED_PR_ORIGIN)
-    assert rewritten is not None and rewritten.raw != reviewed_a
-    fails6, notes6 = find_unprotected_lanes([rewritten, lane_b], feature_maps, [], [], exec_mod, crate_dirs)
-    assert any("jammi-wire" in f or "workspace" in f for f in fails6), (
-        f"self-test FAILED: a REWRITTEN partner (no longer exact-matching the reviewed pair) must "
-        f"fall back to a real FAIL, not stay silently reviewed: fails={fails6} notes={notes6}"
-    )
-
-    # The real tree's own two reviewed-pair lanes must each appear in
-    # `reviewed_notes`, never in `fail_findings`, when run against the
-    # REAL corpus/targets/registry -- the control that proves the
-    # synthetic legs above match production, not a toy shape.
+    # Against the REAL corpus/targets/registry, no lane is unprotected: the
+    # control that proves the synthetic legs above match production.
     real_targets = feature_gated_targets(metadata)
     real_required = load_required_lanes()
-    real_fails, real_notes = find_unprotected_lanes(
-        lanes, feature_maps, real_targets, real_required, exec_mod, crate_dirs
-    )
+    real_fails = find_unprotected_lanes(lanes, feature_maps, real_targets, real_required, exec_mod, crate_dirs)
     assert real_fails == [], f"self-test FAILED: the real tree has an unprotected clippy lane: {real_fails}"
-    assert len(real_notes) == 2, (
-        f"self-test FAILED: the real tree's reviewed-redundant pair should produce exactly two "
-        f"NOTE lines (one per side), got {len(real_notes)}: {real_notes}"
-    )
 
     print("self-test: ok")
     return 0
@@ -1337,9 +1261,7 @@ def main(argv: list[str]) -> int:
         tag = "MISSING" if r in missing else "OK"
         print(f"lint-surface-closure[required-lane {r}]: {tag}")
 
-    unprotected, reviewed_notes = find_unprotected_lanes(lanes, feature_maps, targets, required, exec_mod, crate_dirs)
-    for note in reviewed_notes:
-        print(f"lint-surface-closure: {note}")
+    unprotected = find_unprotected_lanes(lanes, feature_maps, targets, required, exec_mod, crate_dirs)
 
     # All three halves are reported before returning: a run that stops at
     # the first finding hides the others, and a reader fixing one would

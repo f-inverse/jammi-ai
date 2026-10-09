@@ -31,7 +31,7 @@ code — a regression exits non-zero — which is what the CI lanes assert.
 | Lane | Trigger | Blocking? | Purpose |
 |------|---------|-----------|---------|
 | `ci.yml` (workspace tests) | every PR | **yes** | Gates a *property* of the mechanism: `committed_baseline_gates_with_teeth` proves the committed baseline is a well-formed, generously-thresholded gate that can fail. It does **not** re-measure the rate on the contended PR runner. |
-| `ci.yml` (`perf-gate`) | every push to `main` | **yes** | Runs every `*-scale` tier's measured-rate gate, and proves the gate bites (`ci/scripts/perf/check_rate_gate_bites.sh`). A structural regression reds `main`'s run, and every release requires that run green on its tree (`_proof-required.yml`), so it blocks every publisher. `main` only: a hosted runner's throughput jitters with its neighbours, and a per-PR rate gate would flap; a red on `main` is measured again by re-running it. |
+| `ci.yml` (`perf-gate`) | every push to `main` | **yes** | Runs every `*-scale` tier's measured-rate gate, and proves the gate bites (`ci/scripts/perf/check_rate_gate_bites.sh`). A structural regression reds `main`'s run, and every release requires that run green on its tree (every release workflow's `proof` job), so it blocks every publisher. `main` only: a hosted runner's throughput jitters with its neighbours, and a per-PR rate gate would flap; a red on `main` is measured again by re-running it. |
 
 ## The gated targets
 

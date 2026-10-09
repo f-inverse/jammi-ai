@@ -131,7 +131,7 @@ got="$(in_driver 'echo "$RP_GPU_COUNT"')"
 check "T4 the lane rents two GPUs per host" '[ "$got" = 2 ]'
 
 # --- T5 ---------------------------------------------------------------------
-keys="$(python3 "$DIR/check_gpu_prove_once.py" --read-on-block "$WORKFLOW" | sort | tr '\n' ' ')"
+keys="$(python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1])); print("\n".join(d.get("on", d.get(True)).keys()))' "$WORKFLOW" | sort | tr '\n' ' ')"
 check "T5 gpu-topology.yml triggers only on dispatch and the PR label" '[ "$keys" = "pull_request workflow_dispatch " ]'
 
 # --- T6 ---------------------------------------------------------------------

@@ -5,7 +5,7 @@
 # wheels of the same lockstep release are already up; this fails the wheel's
 # own build instead, on the PR that grew it. One script holds the limit, so
 # every workflow that publishes a wheel checks the same number
-# (`ci/scripts/check_wheel_gates.py` holds that each one does).
+# (`ci/scripts/lanes.py` refuses a lane that builds a wheel without it).
 #
 # The size is read with `wc -c`, which the Linux and the macOS wheel legs
 # both have (`stat`'s size flag differs between them).

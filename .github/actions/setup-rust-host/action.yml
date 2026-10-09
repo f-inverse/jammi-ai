@@ -1,12 +1,12 @@
 name: setup-rust-host
 description: >
   The Rust toolchain on a bare hosted runner, at the pin `rust-toolchain.toml`
-  names, with what a build on that host needs beside it: on macOS, protoc and
-  sccache (`.cargo/config.toml` names sccache as every target's rustc wrapper);
-  on Linux, mold, the linker that file names for every Linux target, at the pin
-  `.docker/pinned-tools.sh` holds. A job in the CI image needs none of this;
-  this is for the macOS legs and the one Linux job that must read
-  `.cargo/config.toml` outside any container. Run `setup-rust-ci` after it.
+  names, with what a build on that host needs beside it, every tool at the
+  pin `.docker/pinned-tools.sh` holds: on macOS, protoc, sccache
+  (`.cargo/config.toml` names sccache as every target's rustc wrapper) and
+  maturin; on Linux, mold, the linker that file names for every Linux
+  target. A job in the CI image needs none of this; this is for the macOS
+  legs. Run `setup-rust-ci` after it.
 
 inputs:
   targets:
@@ -31,7 +31,13 @@ runs:
     - name: protoc and sccache (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew install protobuf sccache
+      run: sudo bash .docker/pinned-tools.sh protoc sccache
+
+    # Into the interpreter setup-python put on PATH, as the runner user.
+    - name: maturin (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: bash .docker/pinned-tools.sh maturin
 
     - name: mold (Linux)
       if: runner.os == 'Linux'

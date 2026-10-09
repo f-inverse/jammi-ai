@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The S3-class store every live lane runs against — one definition, used by
-# `ci/dev.sh --with s3`, `distributed.yml`, and a GPU pod alike.
+# `ci/dev.sh --with s3`, the distributed lane, and a GPU pod alike.
 #
 # The store is versitygw (Apache-2.0, https://github.com/versity/versitygw):
 # a stateless S3 gateway over a POSIX directory, one static binary per

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for `ci_image.py`: the content keys, their closure check, and the
-wait for `ci.yml`'s build. Pure Python, no network, no registry: the key
-tests run over a scratch tree, the wait over injected fakes.
+"""Tests for `ci_image.py`: the content keys, their closure check, the
+registry question `built` asks, and the wait for `ci.yml`'s build. Pure
+Python, no network, no registry: the key tests run over a scratch tree, the
+registry answers are injected fakes.
 
 Run directly: `python3 ci/scripts/test_ci_image.py`
 """
@@ -31,7 +32,7 @@ class ScratchTree:
     def __enter__(self) -> Path:
         self._dir = tempfile.TemporaryDirectory()
         root = Path(self._dir.name)
-        for rel in {*CPU.inputs, *CUDA.inputs, ci_image.SERVICE_IMAGES, ".github/workflows/ci.yml", *ci_image.DEPLOY_SERVICE_FILES}:
+        for rel in {*CPU.inputs, *CUDA.inputs, ci_image.SERVICE_IMAGES, *ci_image.DEPLOY_SERVICE_FILES}:
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ci_image.REPO_ROOT / rel, root / rel)
         return root
@@ -80,9 +81,10 @@ class ContentKeyTest(unittest.TestCase):
 
     def test_refs_name_every_reference_a_lane_uses(self):
         got = ci_image.refs()
-        self.assertEqual(set(got), {"cpu", "cuda", "postgres"})
+        self.assertEqual(set(got), {"cpu", "cuda", "postgres", "colab"})
         self.assertTrue(got["cpu"].endswith(":" + ci_image.tag(CPU)))
-        self.assertRegex(got["postgres"], r"@sha256:[0-9a-f]{64}$", "the service image is pinned by digest")
+        for service in ("postgres", "colab"):
+            self.assertRegex(got[service], r"@sha256:[0-9a-f]{64}$", f"the {service} image is pinned by digest")
 
 
 class BuildDefinitionTest(unittest.TestCase):
@@ -156,36 +158,22 @@ class CheckTest(unittest.TestCase):
             self.assertEqual(ci_image.check(root), [])
 
 
-class BuilderNameTest(unittest.TestCase):
-    CI = """\
-name: CI
-on:
-  pull_request:
-jobs:
-  ci-image:
-    uses: ./.github/workflows/_ci-image.yml
-  build-ci-image:
-    name: CI image (CPU)
-    needs: ci-image
-    uses: ./.github/workflows/_ci-base-image.yml
-  check:
-    name: Format & Lint
-    runs-on: ubuntu-latest
-"""
+class BuiltTest(unittest.TestCase):
+    def _built(self, found: bool, error: str = ""):
+        out, err = io.StringIO(), io.StringIO()
+        rc = ci_image.built("img:a", lambda r: (found, error), out=out, err=err)
+        return rc, out.getvalue().strip(), err.getvalue()
 
-    def test_the_real_builders_carry_the_prefix(self):
-        names = ci_image.builder_job_names((ci_image.REPO_ROOT / ".github/workflows/ci.yml").read_text())
-        self.assertEqual(set(names), {"build-ci-image", "build-ci-image-cuda"})
-        self.assertTrue(all(n.startswith(ci_image.BUILDER_JOB_PREFIX) for n in names.values()))
+    def test_a_present_tag_needs_no_build(self):
+        self.assertEqual(self._built(True)[:2], (0, "build=false"))
 
-    def test_only_jobs_that_call_the_builder_are_builders(self):
-        self.assertEqual(ci_image.builder_job_names(self.CI), {"build-ci-image": "CI image (CPU)"})
+    def test_a_missing_tag_needs_a_build(self):
+        self.assertEqual(self._built(False, "img:a: not found")[:2], (0, "build=true"))
 
-    def test_a_builder_named_otherwise_is_a_finding(self):
-        with ScratchTree() as root:
-            (root / ".github/workflows/ci.yml").write_text(self.CI.replace("CI image (CPU)", "Build image"))
-            findings = ci_image.check(root)
-            self.assertTrue(any("named 'Build image'" in f for f in findings), findings)
+    def test_any_other_registry_answer_fails_naming_it(self):
+        rc, out, err = self._built(False, "unauthorized: authentication required")
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("unauthorized", err)
 
 
 class AwaitTest(unittest.TestCase):

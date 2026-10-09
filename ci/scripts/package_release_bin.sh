@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Packages one release binary into the versioned tarball asset the release
-# lanes upload (release-binaries.yml): reads the workspace version from
+# lane attaches (release.yml's `release-binaries`): reads the workspace version from
 # Cargo.toml, asserts the binary was actually built for the triple it claims
 # and, for a `*-linux-gnu` triple, that it links no GLIBC symbol above the
 # manylinux_2_28 floor (beside the machine assert, so a bare-runner build
@@ -34,8 +34,8 @@ bin_path="target/release/${bin}"
 # arch -- a mismatched leg (wrong runner, wrong cross-target) fails here,
 # before packaging, rather than shipping a binary that cannot exec on the
 # host its filename promises. Delegates to the shared
-# `assert_elf_machine.sh` -- the same script `_server.yml`'s binary job
-# and `_native-wheels.yml`'s legs call, so every leg
+# `assert_elf_machine.sh` -- the same script ci.yml's `server` and
+# `native-wheels` lanes call, so every leg
 # that stamps an architecture onto an artifact runs one identical check
 # instead of a per-caller reimplementation.
 case "$triple" in

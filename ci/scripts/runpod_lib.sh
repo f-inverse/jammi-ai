@@ -1454,7 +1454,7 @@ PY
 # tests exits 0 with "running 0 tests ... test result: ok" printed to its
 # log — a false green a leg with no proof must never read as a pass (the
 # same never-vacuous doctrine `runpod_gpu_prove.sh`'s
-# `capability-surface-proof` group and `check_gpu_prove_once.py` state for
+# `capability-surface-proof` group and the lane table state for
 # the prove lane). Factored out so this ONE check text exists once, never
 # re-typed per leg — a caller drops it into its own remote heredoc via a
 # bare `$(...)` command substitution (never `\$(...)`; see this function's
@@ -1532,7 +1532,7 @@ PY
 }
 
 # POST /v2/pods — the RENTING ROOT for the fleet (`RENTING_ROOTS` in
-# `check_gpu_prove_once.py`; its P7 closure/derivation scan is seeded from
+# `ci/scripts/lanes.py`'s paid-lane rule; its derivation scan is seeded from
 # this name). $1=gpuTypeId $2=dataCenterId $3=host index. Prints the new
 # pod's id on success; a 201 body with no id, or an unparseable one, is a
 # named refusal.
@@ -2548,7 +2548,7 @@ rp_run_remote_watched() {
     fi
     if [ "$prove_sha_seen" != "1" ] && [ "$rc" -eq 0 ]; then
       # Absence-with-a-claimed-success is a failure, same doctrine as
-      # check_gpu_prove_once.py's P1 zero-producers rule: identity was
+      # the lane table's one-producer rule: identity was
       # never asserted, so this leg proved nothing about the tree it ran on even though it reports success.
       _rrw_wrong_tree_diag ""
       rm -f "$out"

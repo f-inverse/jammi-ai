@@ -36,10 +36,10 @@ class World(tv.World):
         super().__init__()
         self.uploads: dict[int, list[dict]] = {}
 
-    def build_run(self, run_id: int, conclusion: str, completed_at: str, uploads=WHEELS, expired=()):
+    def ci_run(self, run_id: int, conclusion: str, completed_at: str, uploads=WHEELS, expired=()):
         self.bind(
-            tv.run_obj(run_id, workflow=vd.BUILD_WORKFLOW),
-            [tv.named_job(vd.BUILD_SUMMARY_JOB, conclusion, completed_at, html_url=f"https://x/{run_id}")],
+            tv.run_obj(run_id, workflow=vd.CI_WORKFLOW),
+            [tv.named_job(vd.CI_SUMMARY_JOB, conclusion, completed_at, html_url=f"https://x/{run_id}")],
         )
         self.uploads[run_id] = [{"name": n, "expired": n in expired} for n in uploads]
 
@@ -60,7 +60,7 @@ class World(tv.World):
         return super().fetch(url, token)
 
 
-def _resolve(world: World, names=WHEELS, lane="build"):
+def _resolve(world: World, names=WHEELS, lane="ci"):
     out, err = io.StringIO(), io.StringIO()
     rc = pa.resolve(
         repo=tv.REPO, tree=tv.TREE, lane=lane, names=list(names), fetch=world.fetch, token="tok", out=out, err=err
@@ -71,14 +71,14 @@ def _resolve(world: World, names=WHEELS, lane="build"):
 class ResolveTest(unittest.TestCase):
     def test_a_proven_tree_names_its_run(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
         rc, out, _ = _resolve(w)
         self.assertEqual((rc, out.split()), (0, ["run=7"]))
 
     def test_the_most_recent_measurement_is_the_source(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z")
-        w.build_run(9, "success", "2026-01-02T00:00:00Z")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
+        w.ci_run(9, "success", "2026-01-02T00:00:00Z")
         rc, out, _ = _resolve(w)
         self.assertEqual((rc, out.split()), (0, ["run=9"]))
         self.assertTrue(any(c.endswith("/actions/runs/9/artifacts") or "/actions/runs/9/artifacts?" in c for c in w.fetch_calls))
@@ -86,26 +86,26 @@ class ResolveTest(unittest.TestCase):
     def test_an_unmeasured_tree_denies(self):
         rc, out, err = _resolve(World())
         self.assertEqual((rc, out), (1, ""))
-        self.assertIn("has no build.yml run", err)
+        self.assertIn("has no ci.yml run", err)
 
     def test_a_red_most_recent_measurement_denies(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z")
-        w.build_run(9, "failure", "2026-01-02T00:00:00Z")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
+        w.ci_run(9, "failure", "2026-01-02T00:00:00Z")
         rc, out, err = _resolve(w)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("'failure' (run=9", err)
 
     def test_an_absent_artifact_denies_by_name(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z", uploads=WHEELS[:1])
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z", uploads=WHEELS[:1])
         rc, out, err = _resolve(w)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn(f"no artifact {WHEELS[1]!r}", err)
 
     def test_an_expired_artifact_denies_with_the_remedy(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z", expired=WHEELS[:1])
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z", expired=WHEELS[:1])
         rc, out, err = _resolve(w)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("has expired", err)
@@ -113,14 +113,14 @@ class ResolveTest(unittest.TestCase):
 
     def test_an_empty_request_denies(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
         rc, _, err = _resolve(w, names=[])
         self.assertEqual(rc, 1)
         self.assertIn("no artifact named", err)
 
     def test_an_unreadable_record_denies(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
         w.fail_urls.add(f"{pa.API_BASE}/repos/{tv.REPO}/actions/runs/7/artifacts?per_page={pa.github_api.PER_PAGE}&page=1")
         rc, out, err = _resolve(w)
         self.assertEqual((rc, out), (1, ""))
@@ -134,15 +134,15 @@ class LaneTest(unittest.TestCase):
 
     def test_the_cookbook_lane_names_its_own_run(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z")
         w.cookbook_run(8, "success", "2026-01-01T01:00:00Z")
-        rc, out, _ = _resolve(w, names=["cookbook-book"], lane="cookbook")
+        rc, out, _ = _resolve(w, names=["cookbook-book"], lane="cookbook-gpu")
         self.assertEqual((rc, out.split()), (0, ["run=8"]))
 
-    def test_a_build_run_never_proves_the_cookbook_lane(self):
+    def test_a_ci_run_never_proves_the_cookbook_lane(self):
         w = World()
-        w.build_run(7, "success", "2026-01-01T00:00:00Z", uploads=["cookbook-book"])
-        rc, out, err = _resolve(w, names=["cookbook-book"], lane="cookbook")
+        w.ci_run(7, "success", "2026-01-01T00:00:00Z", uploads=["cookbook-book"])
+        rc, out, err = _resolve(w, names=["cookbook-book"], lane="cookbook-gpu")
         self.assertEqual((rc, out), (1, ""))
         self.assertIn(f"has no {vd.COOKBOOK_WORKFLOW} run", err)
 

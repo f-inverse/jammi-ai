@@ -2,7 +2,7 @@
 from a REMOTE Python client over a `kubectl port-forward`, and prove a
 rollout restart still shares the catalog and broker with the old pod.
 
-Run by `.github/workflows/kube-smoke.yml` AFTER `kustomize build
+Run by the `kube-smoke` lane (ci.yml, nightly.yml) AFTER `kustomize build
 deploy/kubernetes/overlays/ci | kubectl apply -f -` has been rolled out and
 `kubectl rollout status` reports the Deployment ready.
 
@@ -31,7 +31,7 @@ new pod starts with an EMPTY local index, and the new pod's
 gone. `durable_after_restart` (the Compose driver's callback) would fail
 here by construction; that is why this driver passes
 `shared_catalog_after_restart` instead. The workflow
-(`.github/workflows/kube-smoke.yml`) queries the Postgres StatefulSet
+(the `kube-smoke` lane) queries the Postgres StatefulSet
 directly after this script exits, as the matching runtime oracle for the
 catalog side.
 

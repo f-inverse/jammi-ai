@@ -5,9 +5,9 @@
 # tag -- rather than trusting the runner label / container image the binary
 # happened to be built on. One script so every leg that stamps an
 # architecture runs the identical check instead of a per-caller
-# reimplementation: `package_release_bin.sh`, `_server.yml`'s binary job
+# reimplementation: `package_release_bin.sh`, ci.yml's `server` lane
 # (the server wheel's `--platform-tag` relabel trusts the arch it asserts),
-# and `_native-wheels.yml`'s legs, run against the `.so` unzipped out of the
+# and its `native-wheels` legs, run against the `.so` unzipped out of the
 # maturin wheel.
 #
 # Usage:

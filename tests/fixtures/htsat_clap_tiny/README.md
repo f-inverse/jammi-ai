@@ -55,5 +55,5 @@ frame count is not load-bearing.
 ## Run the parity harness
 
 ```bash
-cargo test -p jammi-encoders --features golden-parity --test golden_parity
+cargo test -p jammi-encoders --test golden_parity
 ```

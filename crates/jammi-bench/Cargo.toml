@@ -118,7 +118,7 @@ name = "finetune_step_padded_cuda"
 path = "tests/finetune_step_padded_cuda.rs"
 required-features = ["live-gpu-tests"]
 
-# The distributed lane's leg (`distributed.yml`): spawns fleets against the
+# The distributed lane's leg (ci.yml, nightly.yml): spawns fleets against the
 # lane's Postgres and S3-class store.
 [[test]]
 name = "distributed"

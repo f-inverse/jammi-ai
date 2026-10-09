@@ -137,17 +137,6 @@ run = "python3 ci/scripts/check_release_manifest.py"
 why = "The release lanes describe one capability surface, each op classified by exactly one proof mechanism."
 
 [[guard]]
-name = "release workflow feature literals"
-run = "python3 ci/scripts/check_workflow_feature_literals.py"
-why = "A release workflow takes jammi-server's cargo features from the release manifest and spells none itself."
-
-[[guard]]
-name = "wheel gates"
-run = "python3 ci/scripts/check_wheel_gates.py"
-why = "Every workflow that publishes to PyPI builds its wheel, and checks it against PyPI's per-file limit, on the pull request that changes what the wheel is built from."
-needs = ["pyyaml"]
-
-[[guard]]
 name = "cu12 tarball fixture"
 run = "python3 ci/scripts/check_bundle_fixture.py"
 why = "The committed cu12 loader report is the real build's, never a provisional stand-in."
@@ -173,13 +162,6 @@ when = ["perf", "rig"]
 # ------------------------------------------------------------ the GPU rig
 
 [[guard]]
-name = "gpu prove once"
-run = "python3 ci/scripts/check_gpu_prove_once.py"
-why = "A release commit is GPU-proven once per shipped architecture, and every release publisher waits on that verdict."
-when = ["rig"]
-needs = ["pyyaml"]
-
-[[guard]]
 name = "execution-surface reachability"
 run = "python3 ci/scripts/check_execution_surface_reachability.py"
 why = "Every cargo invocation a fresh pod's seed runs also runs on the merge path, so a pod is never the first place it fails."
@@ -201,7 +183,7 @@ when = ["perf"]
 [[guard]]
 name = "distributed legs"
 run = "python3 ci/scripts/check_distributed_legs.py"
-why = "Every distributed test runs in exactly one leg of distributed.yml; none is compiled and never run."
+why = "Every distributed test runs in exactly one leg of the distributed lane; none is compiled and never run."
 
 [[guard]]
 name = "no consumer names"
@@ -210,10 +192,42 @@ why = "The engine names no consumer: no governance verb enters the public surfac
 needs = ["cargo", "full-history"]
 
 [[guard]]
+name = "lanes rendered"
+run = "python3 ci/scripts/lanes.py check"
+why = "Every workflow is what ci/lanes.toml renders, and the table says nothing CI cannot be: a paid lane off the merge path, a publisher behind the proof, every secret and artifact declared."
+
+[[guard]]
 name = "workflow validity"
 run = "bash ci/scripts/check_workflows.sh"
-why = "Every workflow parses as GitHub parses it: jobs, needs, expressions and action inputs resolve."
-needs = ["actionlint"]
+why = "Every workflow parses as GitHub parses it (jobs, needs, expressions and action inputs resolve) and every `run:` block passes shellcheck."
+needs = ["actionlint", "shellcheck"]
+
+[[guard]]
+name = "kubernetes manifests"
+run = "bash ci/scripts/check_kube_manifests.sh deploy/kubernetes/base deploy/kubernetes/overlays/shape-d deploy/kubernetes/overlays/ci && python3 ci/scripts/check_kube_config_mounts.py"
+why = "Every kustomization renders valid manifests against the pinned schema, and every config mount carries the file its server reads."
+needs = ["kustomize", "kubeconform"]
+
+[[guard]]
+name = "dep-DAG freshness"
+run = "python3 ci/scripts/gen_dep_dag.py && git diff --exit-code -- docs/maintainer/MAINTAINER-GUIDE.md"
+why = "The maintainer guide's crate-dependency graph is what the compiler links: generated from real build artifacts, so a stale committed block reds the change that staled it."
+when = ["cargo-graph"]
+needs = ["cargo", "build-graph"]
+
+[[guard]]
+name = "client substrate boundary"
+run = "bash ci/scripts/check_client_deps.sh substrate"
+why = "The candle-free client substrate (jammi-wire, jammi-admin, jammi-client) pulls no ML stack, read from each package's own isolated build."
+when = ["cargo-graph"]
+needs = ["cargo", "jq"]
+
+[[guard]]
+name = "CLI boundary"
+run = "bash ci/scripts/check_client_deps.sh cli"
+why = "The standalone `jammi` CLI pulls no ML stack and no jammi-ai edge: a strict control-plane client."
+when = ["cargo-graph"]
+needs = ["cargo", "jq"]
 
 [[guard]]
 name = "GPU test placement"
@@ -228,5 +242,5 @@ why = "Every serial_test key is a nextest test group or process-local, and every
 [[guard]]
 name = "CI image key closure"
 run = "python3 ci/scripts/ci_image.py check"
-why = "A CI image's content tag covers every file its Dockerfile copies and every build argument it takes, and ci.yml's image builders carry the name every other workflow waits on."
+why = "A CI image's content tag covers every file its Dockerfile copies and every build argument it takes, and every deploy file names a service by its pinned image's own name."
 when = ["rig"]

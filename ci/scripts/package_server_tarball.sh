@@ -21,7 +21,7 @@
 #                beside it, the real reports a maintainer refreshes
 #                `ci/scripts/fixtures/` from.
 #
-# Runs in the image the build compiled in (`_server.yml`'s binary job): the
+# Runs in the image the build compiled in (ci.yml's `server` lane): the
 # CUDA arm stages libraries from the toolkit that image carries.
 #
 # Usage: package_server_tarball.sh <build> <arch>

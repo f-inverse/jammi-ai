@@ -1,7 +1,7 @@
 //! Golden-reference parity harness for the HTSAT-Swin CLAP audio tower.
 //!
 //! `candle-transformers` has no CLAP/Swin/HTSAT module, so this port has no
-//! in-Candle reference to parity-test against (unlike `tests/parity.rs`, which
+//! in-Candle reference to test parity against (unlike `tests/parity.rs`, which
 //! checks `jammi_encoders::Bert` against `candle-transformers`). Instead the
 //! oracle is a set of committed per-boundary golden activations dumped from the
 //! real PyTorch `transformers` `ClapAudioModelWithProjection` by
@@ -9,17 +9,13 @@
 //! asserted against its golden boundary, so a divergence localizes to the unit
 //! that produced it.
 //!
-//! Gated behind the `golden-parity` feature so the default `cargo test` stays
-//! free of the committed-golden machinery. The goldens are committed binaries;
-//! the feature needs no torch and makes no network call.
+//! The goldens are committed binaries: no torch, no network.
 //!
 //! Two tolerance metrics back the boundary assertions: max-abs for
 //! large-magnitude intermediates, and cosine for the final L2-normalized
 //! embedding (whose unnormalized norm is small enough that max-abs is
 //! dishonest). `goldens_are_self_consistent` checks the committed goldens'
 //! internal consistency independently of any tower.
-#![cfg(feature = "golden-parity")]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 

@@ -721,6 +721,14 @@ def _summary_job(job_ids: list[str]) -> dict:
     }
 
 
+def _rental_group(lane: Lane) -> str:
+    """The concurrency group a paid lane rents under: one rental per leg per
+    ref. GitHub holds one pending job per group and cancels any other, so legs
+    sharing a group would cancel each other before they start."""
+    keys = sorted({k for leg in lane.legs for k in _leg_fields(lane, leg)})
+    return "-".join([lane.id, *(f"${{{{ matrix.{k} }}}}" for k in keys), "${{ github.ref }}"])
+
+
 def render_job(table: Table, wf: Workflow, lane: Lane, refs: dict[str, str], has_await: bool) -> dict:
     job: dict = {}
     if lane.name != lane.id:
@@ -760,7 +768,7 @@ def render_job(table: Table, wf: Workflow, lane: Lane, refs: dict[str, str], has
     if perms != {"contents": "read"}:
         job["permissions"] = perms
     if "runpod" in lane.needs:
-        job["concurrency"] = {"group": f"{lane.id}-${{{{ github.ref }}}}", "cancel-in-progress": False}
+        job["concurrency"] = {"group": _rental_group(lane), "cancel-in-progress": False}
     if lane.timeout:
         job["timeout-minutes"] = lane.timeout
     if lane.legs:
@@ -1220,6 +1228,12 @@ def self_test() -> int:
         failures.append(f"a release lane waits on the proof and the proving run: {rel['jobs']['pub']}")
     if "always()" in str(rel["jobs"]["pub"]):
         failures.append("a release lane never carries always()")
+    paid = parse(base + '\n[lane.legged]\nwhy = "W."\nworkflow = "paid"\nneeds = ["runpod"]\nlegs = [{ sm = "sm_80" }, { sm = "sm_90" }]\nsteps = [{run = "x"}]\n')
+    jobs = render_workflow(paid, paid.workflows["paid"], fake_refs)["jobs"]
+    if jobs["legged"]["concurrency"]["group"] != "legged-${{ matrix.sm }}-${{ github.ref }}":
+        failures.append(f"each leg of a paid lane rents under a group of its own: {jobs['legged']['concurrency']}")
+    if jobs["paid-ok"]["concurrency"]["group"] != "paid-ok-${{ github.ref }}":
+        failures.append(f"a paid lane with no legs rents under one group per ref: {jobs['paid-ok']['concurrency']}")
     text = emit(dict(rel))
     if "${{ secrets." in text:
         failures.append("a rendered release workflow reads no secret")

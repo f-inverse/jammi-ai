@@ -56,7 +56,7 @@ jobs:
     if: (github.event_name == 'pull_request' && github.event.label.name == 'run-gpu') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     concurrency:
-      group: gpu-prove-${{ github.ref }}
+      group: gpu-prove-${{ matrix.sm }}-${{ github.ref }}
       cancel-in-progress: false
     timeout-minutes: ${{ github.ref_type == 'tag' && 355 || 190 }}
     strategy:

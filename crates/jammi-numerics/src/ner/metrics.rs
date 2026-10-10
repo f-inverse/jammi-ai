@@ -1,12 +1,12 @@
 //! Entity-level NER evaluation metrics with strict matching (label +
-//! boundaries must match). Operates on the single [`Entity`] type from
-//! [`crate::ner::types`].
+//! boundaries must match): a predicted [`Entity`]'s [`Span`] against the gold
+//! spans of its row.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ner::types::Entity;
+use crate::ner::types::{Entity, Span};
 
 /// Entity-level NER metrics: strict matching (label + boundaries must match).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,12 +27,10 @@ pub struct TypeMetrics {
 }
 
 impl NerMetrics {
-    /// Compute entity-level metrics from predicted and gold entity sets.
-    ///
-    /// Each input is a list of (entities_for_row) across all rows. Entity
-    /// equality ignores `text` and `confidence` (see [`Entity`]) so the
-    /// match condition is strict on `(label, start, end)`.
-    pub fn compute(predicted: &[Vec<Entity>], gold: &[Vec<Entity>]) -> Self {
+    /// Compute entity-level metrics from each row's predicted entities and
+    /// gold spans: a prediction matches when its span equals a gold span on
+    /// `(label, start, end)`.
+    pub fn compute(predicted: &[Vec<Entity>], gold: &[Vec<Span>]) -> Self {
         assert_eq!(predicted.len(), gold.len());
 
         let mut total_tp = 0usize;
@@ -44,22 +42,22 @@ impl NerMetrics {
         let mut type_fn: HashMap<String, usize> = HashMap::new();
 
         for (pred_row, gold_row) in predicted.iter().zip(gold.iter()) {
-            let pred_set: HashSet<&Entity> = pred_row.iter().collect();
-            let gold_set: HashSet<&Entity> = gold_row.iter().collect();
+            let pred_set: HashSet<Span> = pred_row.iter().map(Entity::span).collect();
+            let gold_set: HashSet<&Span> = gold_row.iter().collect();
 
-            for entity in &pred_set {
-                if gold_set.contains(entity) {
+            for span in &pred_set {
+                if gold_set.contains(span) {
                     total_tp += 1;
-                    *type_tp.entry(entity.label.clone()).or_default() += 1;
+                    *type_tp.entry(span.label.clone()).or_default() += 1;
                 } else {
                     total_fp += 1;
-                    *type_fp.entry(entity.label.clone()).or_default() += 1;
+                    *type_fp.entry(span.label.clone()).or_default() += 1;
                 }
             }
-            for entity in &gold_set {
-                if !pred_set.contains(entity) {
+            for span in gold_set {
+                if !pred_set.contains(span) {
                     total_fn += 1;
-                    *type_fn.entry(entity.label.clone()).or_default() += 1;
+                    *type_fn.entry(span.label.clone()).or_default() += 1;
                 }
             }
         }

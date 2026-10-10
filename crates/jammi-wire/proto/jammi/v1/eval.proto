@@ -242,7 +242,16 @@ message NerMetrics {
   map<string, TypeMetrics> per_type = 4;
 }
 
-// A named-entity span. Mirrors `jammi_numerics::ner::Entity`.
+// A gold named-entity span: a label over a byte range. Mirrors
+// `jammi_numerics::ner::Span`.
+message Span {
+  string label = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+}
+
+// A named entity a model predicted: its span, the text it covers, and the
+// model's confidence. Mirrors `jammi_numerics::ner::Entity`.
 message Entity {
   string label = 1;
   uint64 start = 2;
@@ -271,7 +280,7 @@ message PerRecordPrediction {
   message Ner {
     string record_id = 1;
     repeated Entity predicted = 2;
-    repeated Entity gold = 3;
+    repeated Span gold = 3;
   }
   oneof prediction {
     Classification classification = 1;

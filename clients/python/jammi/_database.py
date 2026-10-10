@@ -512,8 +512,13 @@ def _inference_aggregate_to_dict(agg: eval_pb2.InferenceAggregate) -> Dict[str, 
     raise BackendError("InferenceEvalReport carried no aggregate")
 
 
+def _span_to_dict(s: eval_pb2.Span) -> Dict[str, Any]:
+    """Project a wire gold `Span` into the embed wheel's span dict."""
+    return {"label": s.label, "start": s.start, "end": s.end}
+
+
 def _entity_to_dict(e: eval_pb2.Entity) -> Dict[str, Any]:
-    """Project a wire `Entity` span into the embed wheel's entity dict."""
+    """Project a wire predicted `Entity` into the embed wheel's entity dict."""
     return {
         "label": e.label,
         "start": e.start,
@@ -546,7 +551,7 @@ def _per_record_prediction_to_dict(
             "task": "ner",
             "record_id": n.record_id,
             "predicted": [_entity_to_dict(e) for e in n.predicted],
-            "gold": [_entity_to_dict(e) for e in n.gold],
+            "gold": [_span_to_dict(s) for s in n.gold],
         }
     raise BackendError("PerRecordPrediction carried no prediction")
 

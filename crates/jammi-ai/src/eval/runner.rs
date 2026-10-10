@@ -21,7 +21,7 @@ use jammi_wire::eval::report::{
 use jammi_wire::request::{CompareEvalRequest, EmbeddingEvalRequest};
 
 use jammi_numerics::classification::ClassificationMetrics;
-use jammi_numerics::ner::{Entity, NerMetrics};
+use jammi_numerics::ner::{Entity, NerMetrics, Span};
 use jammi_numerics::retrieval::RetrievalMetrics;
 
 use super::golden::{
@@ -412,7 +412,7 @@ impl<'a> EvalRunner<'a> {
 
                 let mut per_record: Vec<PerRecordPrediction> = Vec::new();
                 let mut aligned_predicted: Vec<Vec<Entity>> = Vec::new();
-                let mut aligned_gold: Vec<Vec<Entity>> = Vec::new();
+                let mut aligned_gold: Vec<Vec<Span>> = Vec::new();
                 for batch in &results {
                     let ids = super::golden::extract_string_column(batch, "_row_id")?;
                     let statuses = super::golden::extract_string_column(batch, "_status")?;

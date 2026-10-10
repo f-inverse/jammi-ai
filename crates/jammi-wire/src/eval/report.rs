@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use jammi_numerics::classification::ClassificationResult;
-use jammi_numerics::ner::{Entity, NerMetrics};
+use jammi_numerics::ner::{Entity, NerMetrics, Span};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 // The bootstrap / rank-sum kernels are pulled in only where significance is
 // *computed* — the local engine's `eval_compare`. The significance *types*
@@ -105,7 +105,7 @@ pub enum PerRecordPrediction {
     Ner {
         record_id: String,
         predicted: Vec<Entity>,
-        gold: Vec<Entity>,
+        gold: Vec<Span>,
     },
 }
 
@@ -1081,7 +1081,7 @@ mod projection_fixture_tests {
 
     use super::*;
     use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
-    use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
+    use jammi_numerics::ner::{Entity, NerMetrics, Span, TypeMetrics};
     use jammi_numerics::retrieval::AggregateMetrics;
 
     const FIXTURE: &str = concat!(
@@ -1215,12 +1215,10 @@ mod projection_fixture_tests {
                     text: "Alice".into(),
                     confidence: 0.5,
                 }],
-                gold: vec![Entity {
+                gold: vec![Span {
                     label: "PER".into(),
                     start: 0,
                     end: 5,
-                    text: String::new(),
-                    confidence: 0.0,
                 }],
             }],
         }

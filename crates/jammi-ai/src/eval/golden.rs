@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use jammi_db::error::{JammiError, Result};
-use jammi_numerics::ner::Entity;
+use jammi_numerics::ner::Span;
 pub use jammi_numerics::retrieval::RelevanceJudgment;
 
 /// The input for a retrieval query — text, image bytes, or audio bytes.
@@ -51,12 +51,10 @@ pub struct ClassificationGolden {
 /// A loaded NER golden dataset: row `id` → gold entity-span set.
 ///
 /// One CSV/parquet row per entity span — multiple spans on the same `id`
-/// are grouped into the same `Vec<Entity>` by [`load_ner_golden_from_batches`].
-/// `text` is empty and `confidence` is `0.0` for gold rows; the metric's
-/// strict equality on `(label, start, end)` ignores both fields.
+/// are grouped into the same `Vec<Span>` by [`load_ner_golden_from_batches`].
 #[derive(Debug)]
 pub struct NerGolden {
-    pub entities: HashMap<String, Vec<Entity>>,
+    pub entities: HashMap<String, Vec<Span>>,
 }
 
 /// Returns true if `actual` is compatible with `expected` for golden schema validation.
@@ -281,10 +279,9 @@ pub fn ensure_column_int64(schema: &Schema, name: &str) -> Result<()> {
 /// to a string id internally), `label` (Utf8), `start` (any integer
 /// width), and `end` (any integer width). Each row contributes one entity
 /// span to `entities[id]`; multiple rows sharing an `id` accumulate into
-/// the same span vector. `text` is left empty and `confidence` is `0.0`,
-/// which the metric ignores via [`Entity`]'s custom equality.
+/// the same span vector.
 pub fn load_ner_golden_from_batches(batches: &[arrow::array::RecordBatch]) -> Result<NerGolden> {
-    let mut entities: HashMap<String, Vec<Entity>> = HashMap::new();
+    let mut entities: HashMap<String, Vec<Span>> = HashMap::new();
 
     for batch in batches {
         let ids = extract_string_column(batch, "id")?;
@@ -293,13 +290,10 @@ pub fn load_ner_golden_from_batches(batches: &[arrow::array::RecordBatch]) -> Re
         let ends = extract_usize_column(batch, "end")?;
 
         for (((id, label), start), end) in ids.into_iter().zip(labels).zip(starts).zip(ends) {
-            entities.entry(id).or_default().push(Entity {
-                label,
-                start,
-                end,
-                text: String::new(),
-                confidence: 0.0,
-            });
+            entities
+                .entry(id)
+                .or_default()
+                .push(Span { label, start, end });
         }
     }
 
@@ -307,8 +301,8 @@ pub fn load_ner_golden_from_batches(batches: &[arrow::array::RecordBatch]) -> Re
 }
 
 /// Extract an integer column as `usize`, rejecting negative values with a
-/// schema-named error. NER spans index byte offsets (`Entity::start`,
-/// `Entity::end`), which the metric kernel models as `usize`.
+/// schema-named error. NER spans index byte offsets (`Span::start`,
+/// `Span::end`), which the metric kernel models as `usize`.
 fn extract_usize_column(batch: &arrow::array::RecordBatch, column: &str) -> Result<Vec<usize>> {
     use arrow::array::{
         Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -488,10 +482,6 @@ mod tests {
         assert_eq!(row_two[0].label, "PER");
         assert_eq!(row_two[0].start, 4);
         assert_eq!(row_two[0].end, 11);
-        // Gold rows leave `text` empty and `confidence` zero — the metric
-        // ignores both fields via the `Entity` custom equality.
-        assert!(row_two[0].text.is_empty());
-        assert_eq!(row_two[0].confidence, 0.0);
     }
 
     #[test]

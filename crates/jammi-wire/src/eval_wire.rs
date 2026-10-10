@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use jammi_db::catalog::eval_repo::PerQueryEvalRecord;
 use jammi_db::error::JammiError;
 use jammi_numerics::classification::{ClassMetrics, ClassificationResult};
-use jammi_numerics::ner::{Entity, NerMetrics, TypeMetrics};
+use jammi_numerics::ner::{Entity, NerMetrics, Span, TypeMetrics};
 use jammi_numerics::retrieval::{AggregateMetrics, QueryMetrics};
 use tonic::Status;
 
@@ -236,6 +236,16 @@ impl From<&Entity> for pb::Entity {
             end: e.end as u64,
             text: e.text.clone(),
             confidence: e.confidence,
+        }
+    }
+}
+
+impl From<&Span> for pb::Span {
+    fn from(s: &Span) -> Self {
+        pb::Span {
+            label: s.label.clone(),
+            start: s.start as u64,
+            end: s.end as u64,
         }
     }
 }
@@ -556,6 +566,16 @@ impl From<pb::Entity> for Entity {
             end: e.end as usize,
             text: e.text,
             confidence: e.confidence,
+        }
+    }
+}
+
+impl From<pb::Span> for Span {
+    fn from(s: pb::Span) -> Self {
+        Span {
+            label: s.label,
+            start: s.start as usize,
+            end: s.end as usize,
         }
     }
 }

@@ -2790,6 +2790,7 @@ mod tests {
                 .iter()
                 .map(|row| vec![(0, 0); row.len()])
                 .collect(),
+            word_ids: input_ids.iter().map(|row| vec![None; row.len()]).collect(),
             input_ids,
             attention_masks,
             seq_len,

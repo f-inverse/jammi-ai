@@ -14,7 +14,7 @@ serialization of `crates/jammi-wire/src/eval/report.rs`:
     the baseline table, `significance` for an unpairable run) — report.rs
     carries no `skip_serializing_if`.
 
-The oracle is the committed golden fixture
+The oracle is the committed fixture
 `tests/fixtures/eval_report_projection.json`, generated from the Rust side and
 pinned there by `report.rs::projection_fixture_tests` — so the Rust test locks
 the fixture to the serde types, and this test locks the Python helpers to the
@@ -118,8 +118,9 @@ def test_classification_report_projection_flattens_the_task_tag():
 
 
 def test_ner_report_projection_flattens_the_task_tag():
-    """The NER oneof flattens to `{"task": "ner", …}` with full entity spans —
-    including the gold record's empty `text` / zero `confidence`."""
+    """The NER oneof flattens to `{"task": "ner", …}`: each predicted entity
+    with its text and confidence, each gold span as the label and offsets it
+    states."""
     report = eval_pb2.InferenceEvalReport(
         aggregate=eval_pb2.InferenceAggregate(
             ner=eval_pb2.NerMetrics(
@@ -142,7 +143,7 @@ def test_ner_report_projection_flattens_the_task_tag():
                             label="PER", start=0, end=5, text="Alice", confidence=0.5
                         )
                     ],
-                    gold=[eval_pb2.Entity(label="PER", start=0, end=5)],
+                    gold=[eval_pb2.Span(label="PER", start=0, end=5)],
                 )
             )
         ],

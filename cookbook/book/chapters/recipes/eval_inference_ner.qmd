@@ -129,9 +129,13 @@ print(f"{len(per_record)} rows scored; the first: {per_record[0]}")
 
 The tagger knows four types — people, organisations, locations and a
 miscellaneous class — while this gold set labels only people and companies,
-so some disagreements are the model naming something the gold set never
-asks about, and some are a boundary drawn differently. Each line is one span
+so most disagreements are a name the model types differently than the gold
+set does, and a few are a boundary drawn differently. Each line is one span
 the two sets do not share; offsets are bytes into the row's text.
+
+A tagger labels subword tokens, but the engine decodes words: each word takes
+its first subtoken's label, so a predicted entity is always one or more whole
+words, never a fragment of one.
 
 ```{python}
 texts = {str(r["id"]): r["text"].encode() for r in
@@ -149,6 +153,19 @@ for entry in per_record:
         for label, start, end in sorted(only):
             print(f"  row {entry['record_id']:>2}  {side:<15} {label:<5} {text[start:end].decode()!r}")
 
+
+
+def on_word_boundaries(text: bytes, start: int, end: int) -> bool:
+    return (start == 0 or not text[start - 1 : start].isalnum()) and (
+        end == len(text) or not text[end : end + 1].isalnum()
+    )
+
+
+assert all(
+    on_word_boundaries(texts[entry["record_id"]], e["start"], e["end"])
+    for entry in per_record
+    for e in entry["predicted"]
+), "every predicted entity starts and ends on a word boundary"
 assert aggregate["f1"] > 0.7, "a trained entity tagger finds most people and companies"
 ```
 

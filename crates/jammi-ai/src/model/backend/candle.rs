@@ -2372,36 +2372,40 @@ impl CandleModel {
 
             for (batch_idx, &orig_idx) in valid.iter().enumerate() {
                 let token_logits = &logits_vec[batch_idx];
-                let offsets = &encoding.offsets[batch_idx];
-                let mask = &encoding.attention_masks[batch_idx];
+                let row = jammi_numerics::ner::TokenizedRow {
+                    offsets: &encoding.offsets[batch_idx],
+                    word_ids: &encoding.word_ids[batch_idx],
+                    attention_mask: &encoding.attention_masks[batch_idx],
+                };
 
                 match jammi_numerics::ner::decode_bio_spans(
                     token_logits,
-                    offsets,
-                    mask,
+                    &row,
                     id2label,
                     &texts[orig_idx],
                 ) {
                     Ok(entities) => {
                         all_entities_json[orig_idx] =
-                            serde_json::to_string(&entities).unwrap_or_else(|_| "[]".to_string());
+                            serde_json::to_string(&entities).map_err(|e| {
+                                JammiError::Inference(format!(
+                                    "NER row {orig_idx}: entities did not serialize: {e}"
+                                ))
+                            })?;
                     }
-                    // `decode_bio_spans`' only error today is a non-finite
-                    // (NaN/±inf) token logit — the model diverged or the
-                    // checkpoint is corrupt, never a per-row INPUT fault (the
-                    // row's text is already known-valid: empty/null text was
-                    // filtered before the forward ran, above). The `_status`
-                    // channel's contract (see `InferenceRunner::run_chunks` in
-                    // runner.rs) reserves per-row `_status = error` for a bad
-                    // INPUT, never "the model is broken" — so this is a
-                    // batch-level typed failure, propagated exactly like any
-                    // other systemic non-OOM forward failure, naming the
-                    // offending row.
+                    // `decode_bio_spans` refuses a non-finite (NaN/±inf) token
+                    // logit — the model diverged or the checkpoint is corrupt —
+                    // and a span off the text's character boundaries — the
+                    // tokenizer's offsets disagree with the text. Neither is a
+                    // per-row INPUT fault (the row's text is already
+                    // known-valid: empty/null text was filtered before the
+                    // forward ran, above). The `_status` channel's contract
+                    // (see `InferenceRunner::run_chunks` in runner.rs) reserves
+                    // per-row `_status = error` for a bad INPUT, never "the
+                    // model is broken" — so this is a batch-level typed
+                    // failure, propagated exactly like any other systemic
+                    // non-OOM forward failure, naming the offending row.
                     Err(e) => {
-                        return Err(JammiError::Inference(format!(
-                            "NER row {orig_idx}: non-finite logits — model diverged or \
-                             checkpoint corrupt ({e})"
-                        )));
+                        return Err(JammiError::Inference(format!("NER row {orig_idx}: {e}")));
                     }
                 }
             }

@@ -18,7 +18,7 @@ use jammi_db::config::{JammiConfig, PreloadEntry};
 use jammi_db::source::{FileFormat, SourceConnection, SourceType};
 use jammi_server::grpc::proto::job::job_service_client::JobServiceClient;
 use jammi_server::grpc::proto::job::ListWorkersRequest;
-use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
+use jammi_server::runtime::{Server, ServerError, ShutdownOutcome};
 use jammi_test_utils::{fixture, fixture_url, test_config};
 use tokio::sync::watch;
 
@@ -44,7 +44,7 @@ struct Served {
 }
 
 async fn serve(cfg: JammiConfig) -> Served {
-    let server = OssServer::new(cfg).await.expect("OssServer::new");
+    let server = Server::new(cfg).await.expect("Server::new");
     let session = server.session();
     let bound = server.bind().await.expect("bind");
     let flight_addr = bound.flight_addr();

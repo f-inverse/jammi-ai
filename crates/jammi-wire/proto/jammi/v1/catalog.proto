@@ -38,7 +38,7 @@ import "jammi/v1/embedding.proto";
 // scope, like every other verb here; `all = true` requests the cross-tenant
 // admin pass and is gated at this wire boundary ONLY by a deployment-supplied
 // admin authorizer — the engine's shipped default refuses every `all = true`
-// request, so an OSS deployment that wires nothing cannot accidentally expose
+// request, so a deployment that wires nothing cannot accidentally expose
 // it. That authorizer decision is mechanism, not policy: it decides WHO may
 // run the pass, never what the pass does.
 //

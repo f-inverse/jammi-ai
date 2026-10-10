@@ -47,7 +47,6 @@ from .errors import (
     JammiError,
     NoEmbeddedEngineError,
     NotSupportedOnBackend,
-    PlatformNotInstalledError,
     JobCancelled,
     TrainingError,
 )
@@ -82,7 +81,6 @@ __all__ = [
     "InvalidArgument",
     "NotSupportedOnBackend",
     "NoEmbeddedEngineError",
-    "PlatformNotInstalledError",
     "JobCancelled",
     "TrainingError",
     "BackendError",
@@ -210,56 +208,16 @@ _EMBEDDED_ONLY = (
     "PerQueryAudit",
 )
 
-# The generic extension slot. An out-of-package plug-in registers an entry point
-# under a role name in this group; whatever registers as `platform` surfaces as
-# `jammi.platform`. The base names no specific consumer or dist — only the group
-# and the role — so the plug-in stays out of the `jammi` namespace (no PEP 420
-# split), discovered on demand exactly like the native engine.
-_EXTENSION_GROUP = "jammi.extensions"
-
-
-def _load_extension(role: str) -> Optional[object]:
-    """Discover and load the extension registered as `role`, or ``None``.
-
-    A one-line indirection behind `__getattr__` so a test can substitute the
-    discovery without a really-installed entry point. `importlib.metadata` and
-    the entry point's `.load()` both run HERE, never at module load, so
-    `import jammi` stays extension-free — the same lazy-discovery discipline the
-    native engine follows in `connect()`.
-    """
-    from importlib.metadata import entry_points
-
-    found = entry_points()
-    # 3.10+ `entry_points()` returns a selectable view; 3.9 returns a group→list
-    # mapping. Feature-detect rather than pin a floor above `requires-python`.
-    group = (
-        found.select(group=_EXTENSION_GROUP)
-        if hasattr(found, "select")
-        else found.get(_EXTENSION_GROUP, [])
-    )
-    for ep in group:
-        if ep.name == role:
-            return ep.load()
-    return None
-
-
 def __getattr__(name: str) -> object:
-    """Resolve `jammi`'s optional, out-of-package surfaces on first access.
+    """Resolve an embedded-only value-type (`PerQueryAudit`, …) on first access.
 
-    Two families resolve here so neither is imported at module load — the reason
-    `import jammi` stays BOTH native-free and extension-free (the client-import
-    guard the conformance lane pins):
-
-    * an embedded-only value-type (`PerQueryAudit`, …): probe the engine with
-      `find_spec` — the same idiom `connect()` uses — and import it from
-      `jammi_native` only when the `[embedded]` extra is present, else a truthful
-      :class:`NoEmbeddedEngineError` naming the attribute and the extra;
-    * ``platform``: the plug-in registered under the generic `jammi.extensions`
-      entry-point group, loaded on first access, else a truthful
-      :class:`PlatformNotInstalledError` pointing at its SDK.
-
-    Any other name is genuinely absent — raise :class:`AttributeError` so normal
-    attribute semantics (and `hasattr`) hold.
+    Probe the engine with `find_spec` — the same idiom `connect()` uses — and
+    import the type from `jammi_native` only when the `[embedded]` extra is
+    present, else a truthful :class:`NoEmbeddedEngineError` naming the attribute
+    and the extra. Nothing is imported at module load, which is why `import
+    jammi` stays native-free (the client-import guard the conformance lane
+    pins). Any other name is genuinely absent — raise :class:`AttributeError`
+    so normal attribute semantics (and `hasattr`) hold.
     """
     if name in _EMBEDDED_ONLY:
         from importlib.util import find_spec
@@ -270,15 +228,10 @@ def __getattr__(name: str) -> object:
         import jammi_native
 
         return getattr(jammi_native, name)
-    if name == "platform":
-        extension = _load_extension("platform")
-        if extension is None:
-            raise PlatformNotInstalledError()
-        return extension
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list:
     """Include the lazily-resolved names so introspection / tab-completion see
-    the embedded-only types and `platform` alongside the eagerly-bound surface."""
-    return sorted({*globals(), *_EMBEDDED_ONLY, "platform"})
+    the embedded-only types alongside the eagerly-bound surface."""
+    return sorted({*globals(), *_EMBEDDED_ONLY})

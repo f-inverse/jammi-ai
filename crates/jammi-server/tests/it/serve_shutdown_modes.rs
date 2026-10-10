@@ -34,7 +34,7 @@ use jammi_server::grpc::proto::job::{JobStatusRequest, ListWorkersRequest, Submi
 use jammi_server::grpc::proto::training::{FineTuneConfig, FineTuneMethod, FineTuneSpec};
 use jammi_server::grpc::proto::trigger::trigger_service_client::TriggerServiceClient;
 use jammi_server::grpc::proto::trigger::{SubscribeRequest, TopicName};
-use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
+use jammi_server::runtime::{Server, ServerError, ShutdownOutcome};
 use jammi_test_utils::{fixture, fixture_url, test_config};
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -72,7 +72,7 @@ fn server_config(dir: &Path, timing: Timing, worker_enabled: bool) -> JammiConfi
     cfg
 }
 
-/// A full `OssServer` serving through `serve_with_signals`, with the two
+/// A full `Server` serving through `serve_with_signals`, with the two
 /// signal watches in the test's hands.
 struct Served {
     session: Arc<InferenceSession>,
@@ -155,7 +155,7 @@ async fn serve(dir: &Path, timing: Timing) -> Served {
 }
 
 async fn serve_with_config(cfg: JammiConfig) -> Served {
-    let server = OssServer::new(cfg).await.expect("OssServer::new");
+    let server = Server::new(cfg).await.expect("Server::new");
     let session = server.session();
     let metrics = server.metrics();
     let bound = server.bind().await.expect("bind");
@@ -836,7 +836,7 @@ async fn released_server_never_finalizes_the_aborted_job() {
 async fn bound_server_holds_the_worker_guard_when_worker_enabled() {
     for enabled in [true, false] {
         let dir = TempDir::new().unwrap();
-        let server = OssServer::new(server_config(dir.path(), DEFAULT_TIMING, enabled))
+        let server = Server::new(server_config(dir.path(), DEFAULT_TIMING, enabled))
             .await
             .unwrap();
         let bound = server.bind().await.unwrap();

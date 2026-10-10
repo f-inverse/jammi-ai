@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""The mechanical half of the discipline test: flag platform pull leaking into the engine.
+"""The mechanical half of the discipline test: flag domain pull leaking into the engine.
 
 Jammi is an engine of generic primitives that **names no consumer** and owns
 *mechanism*, not *governance* (the model-catalog boundary: the
-registry mechanism — list/describe/delete — is open-core; lifecycle governance —
-promote/retire/approve — is platform-owned, lives in the consumer's repo). This
+registry mechanism — list/describe/delete — is the engine's; lifecycle governance —
+promote/retire/approve — is consumer-owned, lives in the consumer's repo). This
 gate is the cheap, generic backstop behind human review; it asserts a class,
 never a bug-signature, and it hardcodes **no consumer name** —
 that would itself name a consumer inside the engine repo.
@@ -14,10 +14,10 @@ It has no proper names of its own. It uses only GENERIC patterns:
   1. **Governance-verb-stem tripwire (diff-scoped).** In the change under review
      (`git diff <base>...HEAD` over `crates/`), any NEW `pub` identifier whose
      leading stem is a governance verb (promote / retire / register / approve /
-     gate / stage / transition) is surfaced. Governance is platform-owned, so a
+     gate / stage / transition) is surfaced. Governance is consumer-owned, so a
      newly-public governance verb on the engine's API surface is a smell to
      confirm. Scoped to the diff because these stems already have legitimate
-     open-core uses in the tree (source/UDF *registration*; benchmark SLO
+     engine uses in the tree (source/UDF *registration*; benchmark SLO
      *gates*) — the tripwire questions what a change *adds*, and a human confirms
      it is mechanism, not governance. Advisory. Resolved against the REAL
      `symbol-index` `syn` parse (`ci/tools/symbol-index`), cross-referenced
@@ -31,7 +31,7 @@ It has no proper names of its own. It uses only GENERIC patterns:
      philosophy calls out as boundary breaks: a raw-embedding `get_vector` verb
      (embeddings are consumed through `search`), an audit/lifecycle wrapper
      `LifecycleTable`, and actor/signature governance hooks `record_actor` /
-     `sign_with`. These are specific enough to carry no open-core meaning, so a
+     `sign_with`. These are specific enough to carry no engine meaning, so a
      whole-tree hit is a real leak. Advisory.
 
   3. **Out-of-band denylist (optional, never committed).** If a gitignored local
@@ -676,9 +676,9 @@ def check_governance_tripwire(rows: list[AllowlistRow]) -> tuple[list[str], list
             continue
         findings.append(
             f"ADVISORY: new public identifier `{ident}` in `{file_path}` has governance-verb "
-            f"stem `{verb}` — confirm it is open-core MECHANISM "
-            "(list/describe/delete/federation), not platform GOVERNANCE "
-            "(governance is platform-owned). If a human has already ruled this "
+            f"stem `{verb}` — confirm it is engine MECHANISM "
+            "(list/describe/delete/federation), not consumer GOVERNANCE "
+            "(governance is consumer-owned). If a human has already ruled this "
             f"mechanism, add a reviewed row to {ALLOWLIST_PATH.name} citing the ruling — "
             "never rename a correct identifier to dodge this tripwire."
         )

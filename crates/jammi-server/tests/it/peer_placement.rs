@@ -4,7 +4,7 @@
 //! one shared local `artifact_dir` (a valid stand-in for a shared
 //! `result_root`: both instances read the same `file://` bundles in place).
 //! Instance B is a `[server] peer_bind` server started through the production
-//! `OssServer` path; instance A is `InferenceSession::open_with_placement` with
+//! `Server` path; instance A is `InferenceSession::open_with_placement` with
 //! a placement that maps chosen segments to B (or to a dead port), over the
 //! `GrpcPeerTransport` the session's store builder wires.
 //!

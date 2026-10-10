@@ -153,7 +153,7 @@ impl<'a> EmbeddingPipeline<'a> {
     ///
     /// `cache` opts into memoization. Embeddings anchor their source as
     /// [`AnchorKind::UnpinnedAtInstant`](jammi_db::store::manifest::AnchorKind::UnpinnedAtInstant)
-    /// — a raw source has no version surface in open-core — so an `Use` request
+    /// — a raw source has no version surface — so an `Use` request
     /// is honestly **always** a miss (`probe_cache` short-circuits any unpinned
     /// anchor): the cache is off here until sources expose a version surface. The
     /// returned [`CacheOutcome`] is therefore always `Computed`; the probe still

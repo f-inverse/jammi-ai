@@ -143,7 +143,7 @@ struct KillableHost {
 
 impl KillableHost {
     /// `install_dialer`: `true` for a `Peer` coordinator (the one statement
-    /// `OssServer::bind` performs beside the gang listener); `false` for a
+    /// `Server::bind` performs beside the gang listener); `false` for a
     /// `Local` in-process claimant, which never dials.
     async fn start(
         fleet: &Fleet,

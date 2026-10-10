@@ -82,7 +82,7 @@ fn server_config_validation() {
 
     // Two ephemeral (`:0`) requests are allowed even though the strings match:
     // the kernel assigns each bind a distinct free port, so they never collide.
-    // This is what lets the OSS server bind both surfaces on `:0` for tests and
+    // This is what lets the server bind both surfaces on `:0` for tests and
     // ephemeral deployments.
     let ephemeral = ServerConfig {
         health_listen: "127.0.0.1:0".into(),

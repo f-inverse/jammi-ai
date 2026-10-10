@@ -10,7 +10,7 @@ target/
 .cargo/
 .claude/
 
-# Python toolchain output and venv state — the OSS server is a
+# Python toolchain output and venv state — the server is a
 # Rust binary; nothing from these directories belongs in the
 # build context.
 **/__pycache__/

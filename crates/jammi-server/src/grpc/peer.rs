@@ -1,7 +1,7 @@
 //! `PeerService` — the segment OWNER side of the distributed data plane.
 //!
 //! Served only on the internal `[server] peer_bind` listener (see
-//! [`crate::runtime::OssServer::bind`]) — never on the public gRPC + Flight SQL
+//! [`crate::runtime::Server::bind`]) — never on the public gRPC + Flight SQL
 //! listener, never wrapped by the tenant-binding layer, never advertised by
 //! `GetServerInfo`. A replica is an owner iff `peer_bind` is set.
 //!

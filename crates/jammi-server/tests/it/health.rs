@@ -192,7 +192,7 @@ async fn metrics_reflects_counter_increments() {
 // `jammi_jobs_running{kind}` sampled from the catalog every `[worker]
 // metrics_sample_secs` on a dedicated task, `jammi_worker_jobs_in_flight`,
 // `jammi_worker_claim_loop_up`, and `jammi_lease_heartbeat_age_seconds` —
-// scraped off a full `OssServer`.
+// scraped off a full `Server`.
 // ---------------------------------------------------------------------------
 
 mod gauges {
@@ -208,7 +208,7 @@ mod gauges {
     use jammi_db::config::{JammiConfig, WorkerKinds};
     use jammi_db::source::{FileFormat, SourceConnection, SourceType};
     use jammi_db::store::CachePolicy;
-    use jammi_server::runtime::{OssServer, ServerError, ShutdownOutcome};
+    use jammi_server::runtime::{Server, ServerError, ShutdownOutcome};
     use jammi_test_utils::{fixture, fixture_url, test_config};
     use tokio::sync::watch;
 
@@ -226,7 +226,7 @@ mod gauges {
     }
 
     async fn serve(cfg: JammiConfig) -> Served {
-        let server = OssServer::new(cfg).await.expect("OssServer::new");
+        let server = Server::new(cfg).await.expect("Server::new");
         let session = server.session();
         let bound = server.bind().await.expect("bind");
         let health_addr = bound.health_addr();

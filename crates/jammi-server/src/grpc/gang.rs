@@ -96,7 +96,7 @@
 //! `test-hooks` lane can assert every determinant was actually DECIDED.
 //!
 //! Served only on the internal `[server] peer_bind` listener, mounted beside
-//! `PeerService` (`OssServer::bind`) — never on the public listener, never
+//! `PeerService` (`Server::bind`) — never on the public listener, never
 //! wrapped by the tenant-binding layer.
 
 use std::pin::Pin;
@@ -348,7 +348,7 @@ impl GangServer {
 
     /// `test-hooks` only: a cheaply cloneable [`GangRefusalHandle`] onto this
     /// `GangServer`'s own refusal-reason state. `GangServiceServer::new`
-    /// (tonic's generated wrapper, `runtime.rs`'s `OssServer::bind`) takes
+    /// (tonic's generated wrapper, `runtime.rs`'s `Server::bind`) takes
     /// `GangServer` BY VALUE, so nothing outside this module ever keeps a
     /// reference to the mounted instance itself — a test harness driving
     /// `RunRank` over the real `peer_bind` listener calls this BEFORE

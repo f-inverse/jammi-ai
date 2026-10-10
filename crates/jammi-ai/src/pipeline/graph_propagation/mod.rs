@@ -753,8 +753,8 @@ impl InferenceSession {
     /// Resolve the input anchor for the edge relation a propagation reads — the
     /// second input alongside the embedding table. A `NeighborGraph` edge source
     /// is an immutable result table, pinned by its content digest
-    /// (`ResultDigest`); a `Registered` external source has no version surface in
-    /// open-core, so it is anchored as `UnpinnedAtInstant` — honest about the
+    /// (`ResultDigest`); a `Registered` external source has no version surface,
+    /// so it is anchored as `UnpinnedAtInstant` — honest about the
     /// reproducibility gap rather than fabricating a pin.
     ///
     /// Resolves through [`jammi_db::store::ResultStore::pin_current_version`]

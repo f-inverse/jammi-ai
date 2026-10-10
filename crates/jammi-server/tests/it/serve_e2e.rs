@@ -1,4 +1,4 @@
-//! End-to-end test for `OssServer::run` — boot the full binary in
+//! End-to-end test for `Server::run` — boot the full binary in
 //! process with a temporary SQLite config, drive a gRPC call, an
 //! `EmbeddingService/Search`, and a Flight SQL roundtrip against
 //! `:flight_listen`, hit the HTTP side-channel on `:health_listen`, and
@@ -23,7 +23,7 @@ use jammi_server::grpc::proto::embedding::search_request::Query as SearchQuery;
 use jammi_server::grpc::proto::embedding::{GenerateEmbeddingsRequest, Modality, SearchRequest};
 use jammi_server::grpc::proto::eval::eval_service_client::EvalServiceClient;
 use jammi_server::grpc::proto::eval::EvalEmbeddingsRequest;
-use jammi_server::runtime::OssServer;
+use jammi_server::runtime::Server;
 use jammi_test_utils::{fixture, test_config};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
@@ -141,8 +141,8 @@ async fn oss_server_serves_healthz_and_drives_live_metrics() {
     // bound handle. The listeners are held live from bind through serve, so
     // neither port is released for a concurrent test process to steal — and the
     // reported ports are the real ones the kernel assigned, not a config `:0`.
-    let server = OssServer::new(cfg).await.expect("OssServer::new");
-    let bound = server.bind().await.expect("OssServer::bind");
+    let server = Server::new(cfg).await.expect("Server::new");
+    let bound = server.bind().await.expect("Server::bind");
     let server_health_addr = bound.health_addr();
     let server_flight_addr = bound.flight_addr();
 

@@ -49,7 +49,7 @@ pub use crate::database::PyDatabase;
 /// Re-export of the underlying inference session type. External Rust
 /// consumers need to name this to receive the `Arc<InferenceSession>`
 /// returned by [`PyDatabase::session_arc`] and share schema-upgrade lock,
-/// trigger broker, catalog cache, and tenant binding with the OSS
+/// trigger broker, catalog cache, and tenant binding with
 /// `jammi.EmbeddedBackend`.
 pub use jammi_ai::session::InferenceSession;
 

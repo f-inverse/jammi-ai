@@ -335,8 +335,7 @@ def write_ner_corpus() -> None:
     asks about.
 
     All names and organizations are fictional / public-domain pop-culture
-    references — no tenant or proprietary content lives in the OSS
-    cookbook tree.
+    references.
     """
     table = pa.table({
         "id": pa.array([r[0] for r in NER_CORPUS], type=pa.int64()),

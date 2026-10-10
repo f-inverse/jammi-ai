@@ -154,7 +154,7 @@ impl Fleet {
 }
 
 /// A coordinator host: an engine with the production member dialer
-/// installed (the one statement `OssServer::bind` performs beside the gang
+/// installed (the one statement `Server::bind` performs beside the gang
 /// listener) and a `MemberRoot` (`peer_advertise` set; the address is never
 /// dialed — a coordinator lists no `workers` row, so no other coordinator
 /// ever assigns it a rank).

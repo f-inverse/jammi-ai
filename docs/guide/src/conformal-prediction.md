@@ -11,11 +11,10 @@ distribution, and *any* sample size. No retraining: a calibration pass and an
 empirical quantile. Deterministic given the calibration set, which is the audit
 property.
 
-The serving primitive lives in the open engine because a calibrated set is a
-serving output — it must work with no license. The *operationalization* of the
-guarantee — rolling coverage monitoring, coverage-SLA gating, and managed
-recalibration under drift — is a governed concern provided by the
-[Jammi platform](./introduction.md), built on this same primitive.
+A calibrated set is a serving output, so the engine serves it. Operating the
+guarantee over time — monitoring coverage on a rolling window, gating on a
+coverage target, recalibrating under drift — is policy a deployment builds on
+this primitive and the coverage functions below.
 
 ## The one assumption
 
@@ -186,8 +185,8 @@ let _contrib = contribution(&[
 ## Verifying coverage
 
 The realised coverage and mean set size of a labelled batch are pure functions
-in `jammi-numerics` — the same functions the platform's coverage monitor calls
-on a rolling window:
+in `jammi-numerics` — the functions a coverage monitor calls on a rolling
+window:
 
 ```rust,no_run
 # extern crate jammi_numerics;
@@ -202,10 +201,10 @@ let efficiency = mean_set_size(&sizes)?;  // smaller is sharper
 # Ok(()) }
 ```
 
-## What lives in the platform, not here
+## What the engine leaves to the deployment
 
-This is the serving primitive only. The governed layer — a rolling
-realised-vs-nominal **coverage monitor** with drift detection and online
-adaptation, a **coverage-SLA gate**, and **managed recalibration** under shift —
-is provided by the Jammi platform. It consumes this primitive and the OSS
-coverage function; it is not part of the open engine.
+This is the serving primitive. A rolling realised-vs-nominal **coverage
+monitor** with drift detection, a **coverage gate**, and **recalibration**
+under shift are policies over it: each decides *when* to act, which the engine
+does not. A deployment builds them from `conformalize*` and the coverage
+functions above.

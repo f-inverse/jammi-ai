@@ -53,7 +53,7 @@
 //! tonic's own `.max_decoding_message_size(limits.max_message_bytes)` — the
 //! public chain's services in `crate::runtime::assemble_grpc_chain`, and
 //! the internal `peer_bind` listener's `PeerService` and `GangService` in
-//! `crate::runtime::OssServer::bind` — off the ONE `[server.limits]` value,
+//! `crate::runtime::Server::bind` — off the ONE `[server.limits]` value,
 //! so the invariant quantifies over listeners, not over the public chain
 //! alone: a message of exactly `max_message_bytes` encoded bytes decodes on
 //! any of them, and one of `max_message_bytes + 1` is refused naming that
@@ -99,7 +99,7 @@
 //! below). It carries no per-RPC stream budget of its own here, though: it
 //! never actually reaches [`MethodClassLayer`] in production —
 //! `GangService` is mounted only on the internal `[server] peer_bind`
-//! listener, which `crate::runtime::OssServer::bind` builds deliberately
+//! listener, which `crate::runtime::Server::bind` builds deliberately
 //! LAYER-FREE (no `[server.limits]` stack, no tenant layer — see that
 //! module's own doc, "no `[server.limits]` stack — its clients are
 //! coordinators (I-PEER)"). [`MethodClass::call`] still classifies its path

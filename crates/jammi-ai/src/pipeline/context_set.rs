@@ -909,7 +909,7 @@ impl InferenceSession {
         // candidate source, value columns, aggregator, self-exclusion, or split)
         // hash differently. There is no single source result table the batch
         // derives from, so the input is the source itself, which has no version
-        // surface in open-core → `UnpinnedAtInstant` (honest, not a fabricated
+        // surface → `UnpinnedAtInstant` (honest, not a fabricated
         // pin).
         let descriptor = jammi_db::store::manifest::ProducingDescriptor::ContextSet {
             encoder_id: "jammi:context-set".to_string(),

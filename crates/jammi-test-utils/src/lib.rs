@@ -2,6 +2,12 @@
 
 pub mod child;
 pub mod fleet;
+
+/// The echo service tests mount on the engine's gRPC chain the way a
+/// downstream mounts its own services: it reports what a call carried.
+pub mod echo {
+    tonic::include_proto!("jammi.test.echo");
+}
 pub mod meta_dataset;
 pub mod source_universe;
 
@@ -289,7 +295,7 @@ pub fn unique_suffix() -> String {
 /// floor: both hand out a port from the kernel's ephemeral range, the same
 /// range every outgoing `connect()` this test process makes (Postgres,
 /// the S3 store) draws its local port from, so the port can be taken by a client
-/// socket before the child binds it ("failed to bind OSS server listeners:
+/// socket before the child binds it ("failed to bind server listeners:
 /// Address already in use"). Ports come from a range BELOW every platform's
 /// ephemeral floor (Linux 32768, macOS 49152), verified bindable at pick
 /// time, and never handed out twice by this process.

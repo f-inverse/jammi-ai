@@ -87,7 +87,7 @@ pub async fn run(
     // The materialization contract: the join's typed parameters as the producing
     // description, the environment the process that ran the join reports, and a
     // read-time anchor for BOTH input relations. A registered source exposes no
-    // as-of/version surface in open-core, so each is honestly recorded as
+    // as-of/version surface, so each is honestly recorded as
     // `UnpinnedAtInstant` rather than a fabricated pin.
     let descriptor = descriptor_for(spine, facts, spec);
     let now = chrono::Utc::now().to_rfc3339();

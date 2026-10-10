@@ -1819,7 +1819,7 @@ attest:
    transport-neutral manifest mirrors), a `MaterializationEnv` with an **empty model
    set** (the join runs no model), and a read-time `InputAnchor::unpinned_at_instant`
    for **both** relations. **Honesty invariant:** a registered source exposes no
-   as-of/version surface in open-core, so each input is recorded `UnpinnedAtInstant`
+   as-of/version surface, so each input is recorded `UnpinnedAtInstant`
    (the read instant only) rather than a fabricated pin — which is exactly why the
    cookbook's clean as-of training set verifies as `MatchWithUnpinnedInputs`, not
    `Match`.
@@ -2011,7 +2011,7 @@ decides whether a hit is even *possible*:
 
 - **`infer`** (`crates/jammi-ai/src/session.rs`, `InferenceSession::infer`) and
   **`EmbeddingPipeline::run`** (`crates/jammi-ai/src/pipeline/embedding.rs`) anchor their
-  sole input — a *raw source* — as `UnpinnedAtInstant`, because an open-core source has no
+  sole input — a *raw source* — as `UnpinnedAtInstant`, because a raw source has no
   version surface. So a `Use` request is **honestly always a miss** (`probe_cache`
   short-circuits any unpinned anchor) and the outcome is always `Computed`. **The probe
   still runs** so the surface is uniform and the off-ness is provable, not hidden. This is
@@ -2250,7 +2250,7 @@ CachePolicy::Use { … probe_cache_record(&def_hash, &inputs) … return Reused 
 calls the producer with `CachePolicy::Bypass` and the matching `*_from_manifest`
 reverse-mappers. Anchor immutable result-table inputs as `ResultDigest` (cacheable) and raw
 sources as `UnpinnedAtInstant` (honestly never a hit). Do **not** add a scheduler or a
-staleness→recompute loop — that is the platform's, not the engine's
+staleness→recompute loop — when to recompute is the caller's policy, not the engine's
 (`crates/jammi-ai/src/pipeline/recompute.rs`).
 
 ### 2.5 Encoders (`jammi-encoders`)
@@ -3386,12 +3386,12 @@ describing a removed surface.
   advertised (`as_wire`) == mounted.** Whether a process *runs* the job claim loop it
   accepts is the separate `[worker] enabled` runtime key (§3.5,
   `docs/guide/src/operability.md`), never a tier and never a build feature.
-- **`OssServer` / `serve_grpc_chain`** — `crates/jammi-server/src/runtime.rs` (the
-  `OssServer` struct and `serve_grpc_chain` fn). Single Tonic chain shared by production
+- **`Server` / `serve_grpc_chain`** — `crates/jammi-server/src/runtime.rs` (the
+  `Server` struct and `serve_grpc_chain` fn). Single Tonic chain shared by production
   and tests. Mounts Flight SQL + `CatalogService` + `JobService` always; engine-backed
   services when `engine.is_some()`; tier-gated `Eval`/`Trigger`. `ChainParts::worker`
   spawns the embedded `JobWorker` claim loop
-  iff `[worker] enabled`. **`OssServer::new` calls `InferenceSession::open` (not
+  iff `[worker] enabled`. **`Server::new` calls `InferenceSession::open` (not
   `new`)** so the `annotate` UDTF is registered for Flight SQL.
 - **Session/tenant boundary** — `crates/jammi-server/src/grpc/session.rs`:
   `SESSION_HEADER`, `SessionStore` (in-process `HashMap<SessionId, Option<TenantId>>`),
@@ -3409,7 +3409,7 @@ describing a removed surface.
   Result<(), Status>`, unlike the `async_trait` `TenantResolver`): a local
   metadata check, not an I/O round-trip. `CatalogServer::new`'s 4th parameter,
   threaded from `GrpcChain.admin_authorizer: Option<Arc<dyn AdminAuthorizer>>`
-  (`runtime.rs`'s `build_grpc_chain` — the OSS binary's shipped default,
+  (`runtime.rs`'s `build_grpc_chain` — the binary's shipped default,
   `None` — and `:1020`'s `assemble_grpc_chain` exhaustive destructure;
   `flight.rs`'s `serve_flight_with_catalog_service` passes `None`). Shipped
   default `None` refuses EVERY `all = true` request with `PERMISSION_DENIED`
@@ -3430,7 +3430,7 @@ Proto: `crates/jammi-wire/proto/jammi/v1/gang.proto`, `service GangService`
 with one bidi RPC, `RunRank(stream RankControl) returns (stream RankEvent)`.
 Handler: `crates/jammi-server/src/grpc/gang.rs`, `GangServer::run_rank`.
 Mounted beside `PeerServiceServer` on the internal `[server] peer_bind`
-listener only (`crates/jammi-server/src/runtime.rs`, `OssServer::bind`) —
+listener only (`crates/jammi-server/src/runtime.rs`, `Server::bind`) —
 never on the public listener, never wrapped by `TenantResolverLayer`; the
 public listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`
 (`GANG_LISTENER_ALLOWLIST`, `crates/jammi-server/tests/it/tenant_isolation_oracle.rs`).
@@ -3672,7 +3672,7 @@ ultimately decided — the same shape `jammi_peer_requests_total{rpc}` uses for
 duration_secs` (`LeaseIntervals::lease()`) is the held session's park bound
 and, doubled, `fresh_instance`'s liveness margin; `[lease] heartbeat_secs`
 (`LeaseIntervals::heartbeat()`) is the re-verification cadence and the
-longest a `ClaimProbe` is waited on — both read once at `OssServer::bind`
+longest a `ClaimProbe` is waited on — both read once at `Server::bind`
 and passed into `GangServer::new`.
 
 ### 2.8b Gang membership substrate (`instances.peer_addr`/`result_root`)
@@ -3948,7 +3948,7 @@ folding byte-for-byte what `Local` folds — are
 **The decode cap on every listener.** `[server.limits] max_message_bytes`
 bounds every listener's inbound decode: the public chain's services in
 `assemble_grpc_chain` and the `peer_bind` listener's `PeerService` and
-`GangService` in `OssServer::bind` (`crates/jammi-server/src/runtime.rs`)
+`GangService` in `Server::bind` (`crates/jammi-server/src/runtime.rs`)
 carry the same per-service `max_decoding_message_size`, and the
 coordinator's client is the third site. Stated in `encoded_len()` terms and
 pinned (`crates/jammi-server/tests/it/gang_rounds.rs`): a frame of exactly
@@ -4024,7 +4024,7 @@ than `world − 1` is `ShortListed`, never a smaller gang: no substitution);
 (5) dispatch — per assigned member, `Catalog::peer_addr_of(instance_id)`
 then the installed `MemberDialer` (`HostAdmission::member_dialer`, the
 engine's one transport seam; `jammi-server` installs `gang_rounds::GangDialer`
-over `dial_member` beside the gang listener in `OssServer::bind`) with the
+over `dial_member` beside the gang listener in `Server::bind`) with the
 `Assign { job_id, attempt, rank, world, coordinator_instance_id }`; a member
 that does not admit (`Unavailable` for a busy slot, a job-row refusal, a
 transport error) ends THIS attempt (every session admitted so far is ended)
@@ -5068,7 +5068,7 @@ auto-available to every encoder.)
 ### 4.9 Workspace / build / release
 
 - **New crate:** `crates/<name>/Cargo.toml` with `version.workspace = true`; add to `members`
-  (and `default-members` if a shippable OSS crate); `[workspace.dependencies]` entry pinned to
+  (and `default-members` if a shippable crate); `[workspace.dependencies]` entry pinned to
   the exact version + `path`; insert into the publish topological order in
   `ci/scripts/publish_crates.sh` after every dep; if it ships to PyPI/npm, add its manifest to
   `ci/scripts/check_lockstep_versions.py`.
@@ -5366,8 +5366,8 @@ ci/scripts/run_guards.py --base origin/main` runs the guards a change can affect
 
 **CI guard contracts:**
 - **`ci/scripts/check_dep_direction.py`** BFS-walks the normal-dependency closure of
-  `default-members`; flags any crate whose source is non-crates.io (git/private registry) or
-  prefixed `jammi-enterprise`. dev/build deps are not walked.
+  `default-members`; flags any crate whose source is not crates.io (git, a path outside the
+  workspace, a private registry). dev/build deps are not walked.
 - **Candle-free boundary** (the `client substrate boundary` and `CLI boundary` guards): isolated per-package build of
   `jammi-wire`/`jammi-admin`/`jammi-client`, grep the compiler-artifact stream for
   `candle*|hf-hub|symphonia|tokenizers`; plus `jammi-cli` carries no `jammi-ai` edge. (On the isolated

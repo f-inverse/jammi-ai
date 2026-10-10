@@ -130,7 +130,7 @@ impl InferenceSession {
 
     /// Build a session behind an `Arc` with the compound-query SQL functions
     /// registered (`annotate`, …). This is the canonical constructor for any
-    /// long-lived shared session — the embedded `Database`, the OSS server, and
+    /// long-lived shared session — the embedded `Database`, the server, and
     /// the `Jammi::open` local arm — so the in-process `sql` surface and the
     /// Flight SQL lane both expose the same SQL functions. Sessions that never
     /// run compound SQL (short-lived CLI commands) can still use the plain
@@ -993,7 +993,7 @@ impl InferenceSession {
         self.inner.config()
     }
 
-    /// Shared handle to the engine's tenant binding. The OSS server's
+    /// Shared handle to the engine's tenant binding. The server's
     /// Flight SQL `TenantBoundProvider` updates this for the duration of
     /// each query so the analyzer rule scopes rows to the bound tenant.
     pub fn tenant_binding_arc(&self) -> jammi_db::tenant_scope::TenantBinding {

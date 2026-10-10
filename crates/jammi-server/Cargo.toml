@@ -1,6 +1,6 @@
 [package]
 name = "jammi-server"
-description = "OSS Jammi server binary: Arrow Flight SQL, SessionService, TriggerService, and health/metrics endpoints"
+description = "The Jammi server binary: Arrow Flight SQL, the typed gRPC services, and health/metrics endpoints"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -70,7 +70,7 @@ reqwest.workspace = true
 # `jammi-ai`'s own `telemetry-otlp` feature (same precedent as `cuda`/
 # `metal`/`flash-attn` below). Default-on: every published `jammi-server`
 # binary and image carries it, so `[observability] otlp_endpoint` works with
-# no rebuild -- the OSS engine's "emit vendor-neutral, the stack is yours"
+# no rebuild -- the engine's "emit vendor-neutral, the stack is yours"
 # line (philosophy.md) applies to traces the same way it already does to
 # `/metrics` and structured logs. `--no-default-features` (or explicitly
 # `--features -telemetry-otlp`, which cargo does not support removing a

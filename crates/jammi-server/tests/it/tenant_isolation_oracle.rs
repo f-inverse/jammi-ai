@@ -64,11 +64,9 @@ use tempfile::{tempdir, TempDir};
 // ---------------------------------------------------------------------------
 
 /// Prefix of every package in the compiled `jammi.v1` wire surface — the frozen
-/// contract, which may exceed what a given build mounts (a contract-only
-/// service like `jammi.v1.lifecycle` is in the descriptor yet served by no OSS
-/// handler; it is accounted for on the control-plane allowlist). The descriptor
-/// also carries `google.*` / `arrow.*` imports; only `jammi.v1.*` services
-/// define the engine's own rpc surface, so the bind scopes to them.
+/// contract. The descriptor also carries `google.*` / `arrow.*` imports; only
+/// `jammi.v1.*` services define the engine's own rpc surface, so the bind
+/// scopes to them.
 const WIRE_PACKAGE_PREFIX: &str = "jammi.v1";
 
 /// Decode [`FILE_DESCRIPTOR_SET`] into the set of `Service/Method` paths every
@@ -126,20 +124,6 @@ const CONTROL_PLANE_ALLOWLIST: &[(&str, &str)] = &[
     // only the one-shot construction-time pass, which is not an RPC.
     // `PruneJobs` is tenant-scoped exactly like every other job RPC and is
     // covered by a case below, not allowlisted.
-    // Lifecycle/auth contract — defined in the shared `jammi.v1` wire
-    // descriptor so the candle-free `jammi-admin` / CLI client can call a
-    // PLATFORM server that implements them, but NOT served by the OSS engine:
-    // `assemble_grpc_chain` mounts no `LifecycleService`, so an OSS server
-    // answers UNIMPLEMENTED. They touch no tenant-scoped row here because there
-    // is no handler here at all — the platform implementation owns their auth +
-    // governance semantics (and their own isolation proof), off in the platform
-    // repo. They appear in the descriptor (which is the frozen contract, not the
-    // per-build mount set), so they must be accounted for; being defined-but-
-    // unmounted is exactly why they are allowlisted rather than cased.
-    ("LifecycleService", "ApplyLicense"),
-    ("LifecycleService", "Bootstrap"),
-    ("LifecycleService", "Login"),
-    ("LifecycleService", "Status"),
 ];
 
 /// Rpcs served ONLY on the internal `[server] peer_bind` listener — the first
@@ -3569,7 +3553,7 @@ async fn peer_service_is_unimplemented_on_the_public_listener() {
 
 /// The PUBLIC listener answers `UNIMPLEMENTED` for `/jammi.v1.gang.GangService/*`:
 /// `GangServiceServer` is mounted only on the internal `peer_bind` `Routes`
-/// (`OssServer::bind`), beside `PeerServiceServer`, and is never added to the
+/// (`Server::bind`), beside `PeerServiceServer`, and is never added to the
 /// public `Routes`. This is the invariant that makes
 /// [`GANG_LISTENER_ALLOWLIST`] sound — a tenant-bearing caller cannot reach
 /// the gang admission handler through the public tenant layer, and on the

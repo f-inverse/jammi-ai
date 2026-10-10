@@ -2751,7 +2751,7 @@ impl JammiConfig {
         // Reject an out-of-domain `[server.limits]` knob (a zero
         // `max_message_bytes`, a per-connection budget over the global one, a
         // zero timeout) at load time, naming the offending key, rather than
-        // at server startup deep inside `OssServer::new`.
+        // at server startup deep inside `Server::new`.
         config.server.limits.validate()?;
         // Reject an out-of-domain `[observability]` knob (a `sample_ratio`
         // outside `[0.0, 1.0]`, including NaN, or a malformed/non-http(s)

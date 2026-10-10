@@ -372,7 +372,7 @@ pub struct HostAdmission {
     registry: Arc<InstanceRegistration>,
     /// How a coordinator on this host reaches a gang member's `RunRank`
     /// installed ONCE by the process that mounts
-    /// the gang listener (`jammi-server`'s `OssServer::bind`, with
+    /// the gang listener (`jammi-server`'s `Server::bind`, with
     /// `gang_rounds::dial_member` behind it — the engine crate owns no
     /// transport), absent in a library process, which therefore cannot
     /// coordinate a `Peer` gang and says so as an assembly outcome

@@ -609,8 +609,8 @@ fn write_image_triplets_with_one_corrupt_cell(dir: &Path) -> PathBuf {
 /// `&self.float_outputs[0]` read, `job.wait()` still returns an `Err` (the
 /// all-zero placeholder trains the head into a NaN loss within a few steps,
 /// tripping the trainer's own divergence guard), but its message is the
-/// divergence guard's ("Training diverged: loss was NaN or >100 for 3
-/// consecutive batches"), not the corrupt row's own decode failure.
+/// divergence guard's ("training diverged: the loss was NaN or above
+/// 100 for 3 consecutive batches"), not the corrupt row's own decode failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn project_frozen_embedding_refuses_a_corrupt_group_item_instead_of_training_it() {
     let dir = TempDir::new().unwrap();

@@ -3542,9 +3542,14 @@ impl TrainingLoop {
         if diverged {
             self.divergence_count += 1;
             if self.divergence_count >= 3 {
-                return Err(JammiError::FineTune(
-                    "Training diverged: loss was NaN or >100 for 3 consecutive batches".into(),
-                ));
+                // The step size the caller chose is what moves a run past a
+                // finite loss, so the refusal is the caller's to change.
+                return Err(JammiError::InvalidArgument {
+                    argument: "learning_rate".into(),
+                    reason: "training diverged: the loss was NaN or above 100 for 3 consecutive \
+                             batches"
+                        .into(),
+                });
             }
             return Ok(());
         }

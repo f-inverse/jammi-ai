@@ -6,54 +6,12 @@ workspace ships every publishable crate at the same
 
 ## [Unreleased]
 
-Every workflow is rendered from one typed table. `ci/lanes.toml` names each lane CI runs by
-four properties -- the host it runs on, what it needs of that host, when it runs, and what it
-produces or consumes -- and `ci/scripts/lanes.py` renders every file under `.github/workflows/`
-and the page `docs/maintainer/ci.md` from it. The renderer derives what a job used to spell by
-hand (runner, container, services, edges, condition, permissions, checkout, toolchain, artifact
-transfer, the release gate and the summary) and refuses a table that says what CI cannot be: a
-paid lane on a pull request, a publisher off a tag, a secret a lane never declared, an artifact
-nothing builds, a wheel never held to PyPI's limit, a release build spelling features the
-manifest owns. A workflow is never edited by hand.
+## [0.55.0] - 2026-10-10
 
-- **One merge gate.** `ci.yml` is both the merge gate and the release candidate: the lints, the
-  hermetic suite, the backend arms, the guards, every artifact a release promotes and every
-  artifact run as a user runs it, on every pull request; `main`'s run compiles what writes the
-  shared cache, builds the artifacts, and measures the live hub tests and the performance gate.
-  `ci-summary` is the one required check, beside an up-to-date branch; the proven-tree probe and
-  its conditions are gone, because an up-to-date branch proves the merged tree by construction.
-- **Fourteen rendered workflows, no reusable ones.** `nightly.yml` (the deploy shapes over the
-  proving run's binaries, the distributed lanes, the cookbook as published), one file per paid
-  GPU lane, and one per release registry (`crates.yml`, `npm.yml`, `pypi.yml`, `release.yml` for
-  the GitHub release's binaries and images, `pages.yml`). Every image reference is a literal the
-  renderer fills from the tree, so no job resolves it at run time.
-- **What was not a property of the product is gone.** The bare-host aarch64 floor oracle, the
-  `--locked` build of the workspace (`--locked` rides on the test archive), the compile-check of
-  the live hub tests (a clippy leg), the duplicate lint and tests of the client crates (their
-  boundary scripts are guards), the `golden-parity` and `parity-test` features that only kept two
-  hermetic oracle suites out of the default `cargo test`, the per-job plan jobs that computed
-  matrices at run time, and the path-filtered devcontainer and `:latest` workflows (lanes of
-  `ci.yml`). The build-sha oracle is a script test over a clone.
-- **A guard that held a hand-written shape is the renderer's rule.** The prove-once, wheel-gate
-  and feature-literal guards are gone; their properties are refusals of the table. The
-  Kubernetes manifest check, the dep-DAG freshness and the client boundaries are guards, not
-  jobs. Shellcheck now lints every `run:` block through actionlint, and is pinned in the CI
-  image.
-- **Every pin in one place.** The macOS legs install protoc, sccache and maturin from
-  `.docker/pinned-tools.sh` at the image's own versions; the reader-shaped Python image the
-  published notebooks run in is digest-pinned in `ci/service-images.env`; the test-Postgres
-  credentials, the Python version and the arch-to-runner map are the renderer's constants.
-- **Scripts for what was inline.** `run_distributed_leg.sh`, `require_distributed_backends.sh`,
-  `assert_wheel_so.sh`, `build_server_wheel.sh`, `assert_compose_image_identity.sh`,
-  `assert_catalog_exercised.sh`, `resolve_release_tag.sh`, `publish_npm.sh` and `unpack_cli.sh`.
-  `merge-index` expands a tag policy itself; `push-image-leg` builds the CI images too;
-  `release-upload` attests the asset it attaches.
-
-Releasing after this change: PyPI's token exchange matches the publishing workflow's filename.
-`pypi.yml` keeps its name; before the next `py-v*` tag, a project owner confirms on pypi.org that
-each of `jammi-ai`, `jammi-ai-native`, `jammi-ai-native-cu12`, `jammi-server` and
-`jammi-server-cu12` lists the publisher `pypi.yml`, environment `pypi`. Branch protection on
-`main` requires `ci-summary` and an up-to-date branch (`build-summary / assert` no longer exists).
+A newcomer's first query returns the right answer: every recipe and chapter of the cookbook
+runs a pretrained model from the Hugging Face Hub, where 0.54.0's ran random-weight encoders
+that taught the API and never showed the engine work. And every workflow CI runs is rendered
+from one typed lane table.
 
 The cookbook runs real models. A newcomer who opened the quickstart asked "how does quantum
 computing work?" and got back a paper on chiral amines, because every recipe and chapter ran a
@@ -106,6 +64,55 @@ found two engine gaps a reader would have hit with the first popular model they 
 - **The CLI's tables line up.** The catalog's status and backend enums ignored a format width, so
   `jammi models list` ran its columns together; `jammi mutable create` no longer prints
   `indexes=[[]]` for a table without an index.
+
+Every workflow is rendered from one typed table. `ci/lanes.toml` names each lane CI runs by
+four properties -- the host it runs on, what it needs of that host, when it runs, and what it
+produces or consumes -- and `ci/scripts/lanes.py` renders every file under `.github/workflows/`
+and the page `docs/maintainer/ci.md` from it. The renderer derives what a job used to spell by
+hand (runner, container, services, edges, condition, permissions, checkout, toolchain, artifact
+transfer, the release gate and the summary) and refuses a table that says what CI cannot be: a
+paid lane on a pull request, a publisher off a tag, a secret a lane never declared, an artifact
+nothing builds, a wheel never held to PyPI's limit, a release build spelling features the
+manifest owns. A workflow is never edited by hand.
+
+- **One merge gate.** `ci.yml` is both the merge gate and the release candidate: the lints, the
+  hermetic suite, the backend arms, the guards, every artifact a release promotes and every
+  artifact run as a user runs it, on every pull request; `main`'s run compiles what writes the
+  shared cache, builds the artifacts, and measures the live hub tests and the performance gate.
+  `ci-summary` is the one required check, beside an up-to-date branch; the proven-tree probe and
+  its conditions are gone, because an up-to-date branch proves the merged tree by construction.
+- **Fourteen rendered workflows, no reusable ones.** `nightly.yml` (the deploy shapes over the
+  proving run's binaries, the distributed lanes, the cookbook as published), one file per paid
+  GPU lane, and one per release registry (`crates.yml`, `npm.yml`, `pypi.yml`, `release.yml` for
+  the GitHub release's binaries and images, `pages.yml`). Every image reference is a literal the
+  renderer fills from the tree, so no job resolves it at run time.
+- **What was not a property of the product is gone.** The bare-host aarch64 floor oracle, the
+  `--locked` build of the workspace (`--locked` rides on the test archive), the compile-check of
+  the live hub tests (a clippy leg), the duplicate lint and tests of the client crates (their
+  boundary scripts are guards), the `golden-parity` and `parity-test` features that only kept two
+  hermetic oracle suites out of the default `cargo test`, the per-job plan jobs that computed
+  matrices at run time, and the path-filtered devcontainer and `:latest` workflows (lanes of
+  `ci.yml`). The build-sha oracle is a script test over a clone.
+- **A guard that held a hand-written shape is the renderer's rule.** The prove-once, wheel-gate
+  and feature-literal guards are gone; their properties are refusals of the table. The
+  Kubernetes manifest check, the dep-DAG freshness and the client boundaries are guards, not
+  jobs. Shellcheck now lints every `run:` block through actionlint, and is pinned in the CI
+  image.
+- **Every pin in one place.** The macOS legs install protoc, sccache and maturin from
+  `.docker/pinned-tools.sh` at the image's own versions; the reader-shaped Python image the
+  published notebooks run in is digest-pinned in `ci/service-images.env`; the test-Postgres
+  credentials, the Python version and the arch-to-runner map are the renderer's constants.
+- **Scripts for what was inline.** `run_distributed_leg.sh`, `require_distributed_backends.sh`,
+  `assert_wheel_so.sh`, `build_server_wheel.sh`, `assert_compose_image_identity.sh`,
+  `assert_catalog_exercised.sh`, `resolve_release_tag.sh`, `publish_npm.sh` and `unpack_cli.sh`.
+  `merge-index` expands a tag policy itself; `push-image-leg` builds the CI images too;
+  `release-upload` attests the asset it attaches.
+
+Releasing after this change: PyPI's token exchange matches the publishing workflow's filename.
+`pypi.yml` keeps its name; before the next `py-v*` tag, a project owner confirms on pypi.org that
+each of `jammi-ai`, `jammi-ai-native`, `jammi-ai-native-cu12`, `jammi-server` and
+`jammi-server-cu12` lists the publisher `pypi.yml`, environment `pypi`. Branch protection on
+`main` requires `ci-summary` and an up-to-date branch (`build-summary / assert` no longer exists).
 
 ## [0.54.0] - 2026-10-03
 

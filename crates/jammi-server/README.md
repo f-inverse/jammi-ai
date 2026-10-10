@@ -37,7 +37,7 @@ docker run --rm \
 
 # Liveness
 curl http://localhost:8080/healthz
-# {"status":"ok","version":"0.54.0"}
+# {"status":"ok","version":"0.55.0"}
 
 # Readiness
 curl http://localhost:8080/readyz

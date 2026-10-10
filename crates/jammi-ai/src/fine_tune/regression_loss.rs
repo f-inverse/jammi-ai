@@ -89,7 +89,7 @@ use serde::{Deserialize, Serialize};
 /// shape: z-scored loss, de-standardise at serve. The scaler is the one transform
 /// shared by both ends and is persisted with the head.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct TargetScaler {
+pub struct TargetScaler {
     /// Mean of all training targets, μ_y. The zero-init head emits this.
     mean: f64,
     /// Standard deviation of all training targets, σ_y, floored at [`STD_FLOOR`].

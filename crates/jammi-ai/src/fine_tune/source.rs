@@ -66,22 +66,9 @@ pub struct StreamedSet {
     /// invent one of its own — `decode::LabelVocabulary`'s own doc), so this
     /// is cloned into each `TrainingSetStream::open` call
     /// (`TrainingLoop::open_streamed_source`) rather than re-derived from a
-    /// second whole-table scan every time. [`Self::num_classes`] is the
-    /// derived count the classification head is sized from — carrying the
-    /// full vocabulary here is a strict superset of "carry `num_classes`":
-    /// the count is always recoverable from it, never the reverse.
+    /// second whole-table scan every time; its labels size the classification
+    /// head and name its outputs ([`TrainingSource::class_labels`]).
     pub(crate) label_vocab: Option<LabelVocabulary>,
-}
-
-impl StreamedSet {
-    /// The classification head's output width — `None` for every
-    /// non-classification task, `Some(vocab.num_classes())` otherwise. The
-    /// SAME quantity the eager path's `TrainingFormat::Classification {
-    /// num_classes }` carries, computed from the identical whole-table
-    /// vocabulary.
-    pub(crate) fn num_classes(&self) -> Option<usize> {
-        self.label_vocab.as_ref().map(LabelVocabulary::num_classes)
-    }
 }
 
 /// What a [`super::trainer::TrainingLoop::run`] call trains from: an
@@ -101,6 +88,18 @@ pub enum TrainingSource {
 }
 
 impl TrainingSource {
+    /// A classification source's labels in class-index order — the head's
+    /// output width and the names serving gives its columns; `None` for
+    /// every other task. A `Resident` loader and a `Streamed` set build them
+    /// with the one [`LabelVocabulary::from_labels`], so the two agree.
+    pub(crate) fn class_labels(&self) -> Option<&[String]> {
+        match self {
+            Self::Resident(loader) => loader.label_vocab(),
+            Self::Streamed(streamed) => streamed.label_vocab.as_ref(),
+        }
+        .map(LabelVocabulary::labels)
+    }
+
     /// The same source for ANOTHER rank of an in-process gang
     /// (`worker.rs`'s local fan-out): a `Resident` loader is replicated
     /// over the same rows ([`TrainingDataLoader::replicate`]); a `Streamed`

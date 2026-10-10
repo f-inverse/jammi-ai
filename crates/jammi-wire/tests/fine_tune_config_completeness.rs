@@ -12,8 +12,8 @@
 //! producer itself is touched.
 
 use jammi_wire::fine_tune::{
-    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig,
-    HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss, Warmup,
+    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, EncoderTraining,
+    FineTuneConfig, HardNegativeConfig, LoraInitMode, LrSchedule, RegressionLoss, Warmup,
 };
 
 /// Every field of [`FineTuneConfig`] is bound below — no `..` — over the
@@ -42,10 +42,8 @@ fn every_field_of_fine_tune_config_is_named_and_checked_against_the_default() {
         warmup,
         lr_schedule,
         early_stopping_metric,
-        target_modules,
-        layers_to_transform,
+        encoder,
         use_rslora,
-        rank_pattern,
         init_lora_weights,
         backbone_dtype,
         weight_decay,
@@ -74,10 +72,15 @@ fn every_field_of_fine_tune_config_is_named_and_checked_against_the_default() {
     assert_eq!(warmup, Warmup::Fraction(0.1));
     assert_eq!(lr_schedule, LrSchedule::CosineDecay);
     assert_eq!(early_stopping_metric, EarlyStoppingMetric::ValLoss);
-    assert_eq!(target_modules, Vec::<String>::new());
-    assert_eq!(layers_to_transform, None::<Vec<usize>>);
+    assert_eq!(
+        encoder,
+        EncoderTraining::Adapted {
+            target_modules: Vec::new(),
+            layers_to_transform: None,
+            rank_pattern: std::collections::HashMap::new(),
+        }
+    );
     assert!(!use_rslora);
-    assert!(rank_pattern.is_empty());
     assert_eq!(init_lora_weights, LoraInitMode::ZerosB);
     assert_eq!(backbone_dtype, ComputePrecision::F32);
     assert_eq!(weight_decay, 0.01);
@@ -116,10 +119,12 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
         warmup: Warmup::Steps(50),
         lr_schedule: LrSchedule::LinearDecay,
         early_stopping_metric: EarlyStoppingMetric::TrainLoss,
-        target_modules: vec!["query".to_string(), "value".to_string()],
-        layers_to_transform: Some(vec![0, 1, 2]),
+        encoder: EncoderTraining::Adapted {
+            target_modules: vec!["query".to_string(), "value".to_string()],
+            layers_to_transform: Some(vec![0, 1, 2]),
+            rank_pattern: std::collections::HashMap::from([("query".to_string(), 16)]),
+        },
         use_rslora: true,
-        rank_pattern: std::collections::HashMap::from([("query".to_string(), 16)]),
         init_lora_weights: LoraInitMode::Gaussian,
         backbone_dtype: ComputePrecision::BF16,
         weight_decay: 0.05,
@@ -154,10 +159,8 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
         warmup,
         lr_schedule,
         early_stopping_metric,
-        target_modules,
-        layers_to_transform,
+        encoder,
         use_rslora,
-        rank_pattern,
         init_lora_weights,
         backbone_dtype,
         weight_decay,
@@ -187,15 +190,14 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
     assert_eq!(lr_schedule, LrSchedule::LinearDecay);
     assert_eq!(early_stopping_metric, EarlyStoppingMetric::TrainLoss);
     assert_eq!(
-        target_modules,
-        vec!["query".to_string(), "value".to_string()]
+        encoder,
+        EncoderTraining::Adapted {
+            target_modules: vec!["query".to_string(), "value".to_string()],
+            layers_to_transform: Some(vec![0, 1, 2]),
+            rank_pattern: std::collections::HashMap::from([("query".to_string(), 16)]),
+        }
     );
-    assert_eq!(layers_to_transform, Some(vec![0, 1, 2]));
     assert!(use_rslora);
-    assert_eq!(
-        rank_pattern,
-        std::collections::HashMap::from([("query".to_string(), 16)])
-    );
     assert_eq!(init_lora_weights, LoraInitMode::Gaussian);
     assert_eq!(backbone_dtype, ComputePrecision::BF16);
     assert_eq!(weight_decay, 0.05);
@@ -233,10 +235,8 @@ fn every_field_holds_a_non_default_value_and_survives_a_clone() {
             warmup,
             lr_schedule,
             early_stopping_metric,
-            target_modules,
-            layers_to_transform,
+            encoder,
             use_rslora,
-            rank_pattern,
             init_lora_weights,
             backbone_dtype,
             weight_decay,

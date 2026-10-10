@@ -136,7 +136,7 @@ async fn run_and_capture_adapter_bytes(tag: &str, seed: u64) -> Vec<u8> {
 
     let (catalog, dir) = claimed_loop_env(tag).await;
 
-    let mut tl = TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+    let mut tl = TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
         .job_id(tag.to_string())
         .catalog(Arc::clone(&catalog))
         .artifact_dir(dir.path().to_path_buf())
@@ -206,7 +206,7 @@ async fn seeded_init_is_reproducible_and_seed_sensitive() {
             ..Default::default()
         };
         let head = build_projection_head(8, &cfg, &varmap, &vb).unwrap();
-        let w = TrainingTarget::ProjectionHead { head }
+        let w = TrainingTarget::FrozenEncoder { head }
             .named_trainable_weights()
             .unwrap();
         let a: Vec<f32> = w["projection.lora_a"]

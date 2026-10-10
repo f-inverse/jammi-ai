@@ -260,6 +260,54 @@ impl Default for HardNegativeConfig {
     }
 }
 
+/// Where a fine-tune's LoRA adapters train.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EncoderTraining {
+    /// LoRA inside the encoder: trainable low-rank updates beside the frozen
+    /// weights of the selected linears, as LoRA describes (Hu et al., 2022).
+    /// A task that needs a head (classification, regression) trains it over
+    /// the adapted encoder's pooled output.
+    Adapted {
+        /// The sites, named as PEFT's `target_modules` names them: a site
+        /// name or a suffix of one, or `all-linear` for every site. Empty
+        /// selects the architecture's defaults: its attention block's query
+        /// and value projections, or the fused projection that holds them.
+        #[serde(default)]
+        target_modules: Vec<String>,
+        /// Only these 0-based encoder layers. `None` (default) = every layer.
+        #[serde(default)]
+        layers_to_transform: Option<Vec<usize>>,
+        /// Per-site rank overrides keyed by site-name substring, e.g.
+        /// `{"query": 16, "value": 4}`. Empty uses `lora_rank` everywhere.
+        #[serde(default)]
+        rank_pattern: HashMap<String, usize>,
+    },
+    /// The encoder trains frozen: a LoRA head over its pooled output carries
+    /// the whole adaptation. Cheaper per step, and the only choice for an
+    /// architecture the engine has no LoRA sites for.
+    Frozen,
+}
+
+impl EncoderTraining {
+    /// LoRA at `target_modules` in every encoder layer, at the request's
+    /// `lora_rank` everywhere.
+    pub fn adapted(target_modules: Vec<String>) -> Self {
+        Self::Adapted {
+            target_modules,
+            layers_to_transform: None,
+            rank_pattern: HashMap::new(),
+        }
+    }
+}
+
+impl Default for EncoderTraining {
+    /// LoRA inside the encoder at the architecture's default sites.
+    fn default() -> Self {
+        Self::adapted(Vec::new())
+    }
+}
+
 /// Configuration for a fine-tuning job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -313,32 +361,14 @@ pub struct FineTuneConfig {
     #[serde(default)]
     pub early_stopping_metric: EarlyStoppingMetric,
 
-    // ── Encoder-adapters fields (LoRA injected inside the encoder) ─────────
-    /// Layer name suffixes that receive LoRA adapters (PEFT `target_modules`).
-    ///
-    /// Empty = train a projection head on top of the frozen base model.
-    /// Non-empty = inject LoRA into the encoder's internal linears at the
-    /// listed sites and train those.
-    /// `["all-linear"]` = every linear layer.
-    /// Model-specific examples: `["query", "value"]` for BERT/RoBERTa;
-    /// `["q_lin", "v_lin"]` for DistilBERT; `["Wqkv"]` for ModernBERT.
+    /// Where the LoRA adapters train: inside the encoder (the default), or in
+    /// a head over a frozen encoder. See [`EncoderTraining`].
     #[serde(default)]
-    pub target_modules: Vec<String>,
-
-    /// Only apply LoRA to these 0-based encoder layer indices.
-    /// `None` (default) = all layers.
-    #[serde(default)]
-    pub layers_to_transform: Option<Vec<usize>>,
+    pub encoder: EncoderTraining,
 
     /// Use rank-stabilized scaling: `alpha / sqrt(rank)` instead of `alpha / rank`.
     #[serde(default)]
     pub use_rslora: bool,
-
-    /// Per-module rank overrides keyed by module-name substring.
-    /// E.g. `{"query": 16, "value": 4}` overrides the global `lora_rank` for
-    /// matching modules. An empty map uses `lora_rank` everywhere.
-    #[serde(default)]
-    pub rank_pattern: HashMap<String, usize>,
 
     /// Initialization strategy for the LoRA A (and optionally B) matrix.
     #[serde(default)]
@@ -537,10 +567,8 @@ impl Default for FineTuneConfig {
             warmup: Warmup::default(),
             lr_schedule: LrSchedule::CosineDecay,
             early_stopping_metric: EarlyStoppingMetric::ValLoss,
-            target_modules: Vec::new(),
-            layers_to_transform: None,
+            encoder: EncoderTraining::default(),
             use_rslora: false,
-            rank_pattern: HashMap::new(),
             init_lora_weights: jammi_lora::LoraInitMode::ZerosB,
             backbone_dtype: jammi_numerics::ComputePrecision::F32,
             weight_decay: 0.01,

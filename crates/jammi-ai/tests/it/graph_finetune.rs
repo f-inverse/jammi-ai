@@ -1569,6 +1569,12 @@ async fn fine_tune_graph_end_to_end_completes() {
     let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
         .expect("default worker intervals are valid");
 
+    // A frozen encoder trains only the head, whose bytes the pin below
+    // fingerprints per architecture.
+    let train = jammi_ai::fine_tune::FineTuneConfig {
+        encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
+        ..train
+    };
     let job = session
         .fine_tune_graph(&sources, &model, sample, Some(train))
         .await

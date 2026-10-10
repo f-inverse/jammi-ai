@@ -295,25 +295,22 @@ async fn byte_identical_model_dirs_produce_the_identical_content_digest() {
 
 // ── The fine-tune adapter pair folds into the digest ──
 
-/// Write a `ProjectionHead`-flavoured `adapter_config.json` +
-/// `adapter.safetensors` pair at `dir`. The weights carry a single `marker`
-/// tensor — not `projection.lora_a`/`lora_b` — so `CandleBackend::load`
-/// treats the adapter as present-but-inert (no projection/distribution head
-/// keys to wire up) and loads exactly like the unadapted base model
-/// numerically; only the adapter FILES' presence/bytes are under test here,
-/// mirroring `model::backend::candle::digest_fingerprint_tests`'
-/// `write_projection_adapter` (an independent copy: this crate cannot
-/// construct `jammi_ai::fine_tune::target::ProjectionHeadConfig` directly —
-/// two of its fields are `pub(crate)` to `jammi_ai` — so the adapter's
-/// on-disk JSON shape is reproduced literally instead).
-fn write_projection_adapter(dir: &Path, marker_value: f32) {
+/// Write a frozen-encoder `adapter_config.json` + `adapter.safetensors` pair
+/// at `dir` for the base model at `model_dir`: an embedding head whose
+/// `projection` layer is inert (`lora_b` zero, so the head serves the base's
+/// pooled output unchanged) and whose `lora_a` carries `marker_value`. Only
+/// the adapter FILES' presence/bytes are under test here, mirroring
+/// `model::backend::candle::digest_fingerprint_tests`' `write_projection_adapter`.
+fn write_projection_adapter(dir: &Path, model_dir: &Path, marker_value: f32) {
     std::fs::create_dir_all(dir).unwrap();
     let cfg_json = serde_json::json!({
-        "adapter_type": "projection_head",
-        "lora_rank": 4,
-        "lora_alpha": 8.0,
-        "use_rslora": false,
-        "head_layers": []
+        "encoder": "frozen",
+        "head": {
+            "lora_rank": 4,
+            "lora_alpha": 8.0,
+            "use_rslora": false,
+            "output": { "kind": "embedding" }
+        }
     });
     std::fs::write(
         dir.join("adapter_config.json"),
@@ -321,13 +318,22 @@ fn write_projection_adapter(dir: &Path, marker_value: f32) {
     )
     .unwrap();
 
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json")).unwrap())
+            .unwrap();
+    let hidden = config["hidden_size"].as_u64().unwrap() as usize;
     let device = candle_core::Device::Cpu;
-    let mut weights: std::collections::HashMap<String, candle_core::Tensor> =
-        std::collections::HashMap::new();
-    weights.insert(
-        "marker".to_string(),
-        candle_core::Tensor::new(&[marker_value], &device).unwrap(),
-    );
+    let weights: std::collections::HashMap<String, candle_core::Tensor> = [
+        (
+            "projection.lora_a".to_string(),
+            candle_core::Tensor::full(marker_value, (4, hidden), &device).unwrap(),
+        ),
+        (
+            "projection.lora_b".to_string(),
+            candle_core::Tensor::zeros((hidden, 4), candle_core::DType::F32, &device).unwrap(),
+        ),
+    ]
+    .into();
     candle_core::safetensors::save(&weights, dir.join("adapter.safetensors")).unwrap();
 }
 
@@ -377,7 +383,7 @@ async fn adapter_weights_byte_mutation_changes_content_digest() {
     let dir = tmp.path().join("model");
     build_local_model_dir(&dir, Some(&mean_pooling_config()));
     let adapter_dir = tmp.path().join("adapter");
-    write_projection_adapter(&adapter_dir, 1.0);
+    write_projection_adapter(&adapter_dir, &dir, 1.0);
 
     let model_before = resolve_and_load_with_adapter(&dir, &adapter_dir).await;
     let digest_before = model_before

@@ -2559,7 +2559,7 @@ staleness→recompute loop — that is the platform's, not the engine's
   only shape-affecting fields; **run-time-only fields (`lora_dropout`, `init_mode`) are
   deliberately not persisted**. Higher-level `SavedAdapter`
   (`crates/jammi-ai/src/fine_tune/target.rs`) is the on-disk discriminator between
-  `ProjectionHead` and `EncoderAdapters` targets.
+  `FrozenEncoder` and `AdaptedEncoder` targets.
 - **Adapter identity: `model_type` + `tower`, one meaning each** —
   `crates/jammi-lora/src/adapter.rs` (the `AdapterConfig` struct and the `Tower` enum).
   `model_type` is the base ARCHITECTURE id as the shared predicate spells it:
@@ -2586,9 +2586,12 @@ staleness→recompute loop — that is the platform's, not the engine's
 
   See §5's "site-name strings are a persistence ABI" gotcha before renaming any of them.
 - **`TrainingTarget`** — `crates/jammi-ai/src/fine_tune/target.rs` (the `TrainingTarget`
-  enum): `ProjectionHead { head: LoraModel }` or `EncoderAdapters(...)`. Uniform trainer
-  surface (`trainable_params`, `set_training`, `named_trainable_weights`, `load_weights`,
-  dropout positions, `saved_adapter`).
+  enum): `FrozenEncoder { head: LoraModel }` or `AdaptedEncoder(...)` (LoRA inside the
+  encoder, and the task's head when it has one). Uniform trainer surface
+  (`trainable_params`, `set_training`, `named_trainable_weights`, `load_weights`, dropout
+  positions, `saved_adapter`). A head's layers are `HeadLayer`s, named by the
+  `HeadOutput` they serve; the trainer builds them and serving's `ServedHead` rebuilds
+  them from that one definition.
 - **`TrainingFormat::MediaTriplet` — one media shape, keyed by TASK** —
   `crates/jammi-ai/src/fine_tune/data.rs` (the `TrainingFormat` enum): `anchor`,
   `positive`, `negative` columns carrying encoded binary blobs — audio clips
@@ -3997,7 +4000,7 @@ complete. Rank 0 alone persists the acceleration report. **Every rank's model is
 with its own dropout seed** (`run_fine_tune_blocking`): `RankContext::dropout_seed(config.seed)`
 — rank 0 (and the single rank) is the identity, so W=1 is byte-unchanged — goes to the
 `_for_rank` head builders (`fine_tune/lora.rs`) and to `LoraBuildConfig::dropout_seed` for an
-encoder-adapters target, while the A/B init seed stays `config.seed` on every rank: the ranks
+adapted-encoder target, while the A/B init seed stays `config.seed` on every rank: the ranks
 start from byte-identical adapter weights and draw distinct masks (DESIGN.md §4). The
 `test-hooks` record `training_test_hooks::rank_targets_for` captures each rank's dropout seed,
 its head layers' `dropout_run_seed`s and a pre-step weight digest, and the fan-out oracle

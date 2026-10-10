@@ -658,15 +658,12 @@ pub fn build_training_data_loader(
                 }
             }
             let vocab = LabelVocabulary::from_labels(labels.iter().map(String::as_str));
-            let num_classes = vocab.num_classes();
-            let mut indexed_rows = Vec::with_capacity(texts.len());
-            for (text, label) in texts.into_iter().zip(labels) {
-                indexed_rows.push((text, vocab.index_of(&label)?));
-            }
-            Ok(TrainingDataLoader::from_classification(
-                indexed_rows,
-                num_classes,
-            ))
+            let indexed_rows = texts
+                .into_iter()
+                .zip(labels)
+                .map(|(text, label)| Ok((text, vocab.index_of(&label)?)))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(TrainingDataLoader::from_classification(indexed_rows, vocab))
         }
     }
 }
@@ -762,6 +759,8 @@ fn build_media_triplet_loader(
 /// label set.
 #[derive(Debug, Clone)]
 pub struct LabelVocabulary {
+    /// The distinct labels, sorted: a label's position is its class index.
+    labels: Vec<String>,
     label_to_idx: std::collections::HashMap<String, u32>,
 }
 
@@ -771,18 +770,28 @@ impl LabelVocabulary {
     /// the caller's iteration order never affects the result.
     pub fn from_labels<'a>(labels: impl Iterator<Item = &'a str>) -> Self {
         let sorted: std::collections::BTreeSet<&str> = labels.collect();
-        let label_to_idx = sorted
-            .into_iter()
+        let labels: Vec<String> = sorted.into_iter().map(str::to_string).collect();
+        let label_to_idx = labels
+            .iter()
             .enumerate()
-            .map(|(i, l)| (l.to_string(), i as u32))
+            .map(|(i, l)| (l.clone(), i as u32))
             .collect();
-        Self { label_to_idx }
+        Self {
+            labels,
+            label_to_idx,
+        }
     }
 
     /// The number of distinct labels — `TrainingFormat::Classification`'s
     /// `num_classes`, and the classification head's output width.
     pub fn num_classes(&self) -> usize {
-        self.label_to_idx.len()
+        self.labels.len()
+    }
+
+    /// The labels in class-index order: the name of each column a
+    /// classification head's output carries.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
     }
 
     /// The class index for `label`, typed-refused when `label` was never

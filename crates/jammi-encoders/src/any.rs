@@ -197,7 +197,7 @@ pub enum AnyEncoder {
     /// four times the next-largest variant, and an unboxed payload would
     /// make EVERY `AnyEncoder` — including a small BERT one — carry that
     /// footprint. The same reasoning `jammi-ai`'s own `TrainingTarget`
-    /// applies to its `EncoderAdapters` payload.
+    /// applies to its `AdaptedEncoder` payload.
     Htsat(Box<HtsatAudio>),
 }
 

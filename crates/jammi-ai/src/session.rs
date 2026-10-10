@@ -1726,6 +1726,9 @@ impl InferenceSession {
     }
 
     /// Build a SELECT query for the key + content columns from a source table.
+    /// Each column is selected once, wherever it appears: a key that is also
+    /// a content column (a table keyed by its own text) is one column the
+    /// plan reads by name in both roles.
     pub(crate) fn build_source_query(
         &self,
         source_id: &str,
@@ -1733,9 +1736,13 @@ impl InferenceSession {
         key_column: &str,
         content_columns: &[String],
     ) -> String {
-        let all_columns: Vec<&str> = std::iter::once(key_column)
-            .chain(content_columns.iter().map(|s| s.as_str()))
-            .collect();
+        let mut all_columns: Vec<&str> = Vec::with_capacity(content_columns.len() + 1);
+        for column in std::iter::once(key_column).chain(content_columns.iter().map(String::as_str))
+        {
+            if !all_columns.contains(&column) {
+                all_columns.push(column);
+            }
+        }
         let select_list = all_columns
             .iter()
             .map(|c| quote_ident(c))

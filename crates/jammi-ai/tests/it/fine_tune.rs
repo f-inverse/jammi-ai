@@ -518,6 +518,9 @@ async fn bert_fine_tuned_adapter_serves_cold_after_restart() {
                 epochs: 2,
                 batch_size: 8,
                 lora_rank: 4,
+                // Two epochs over a handful of rows move the encoder's own
+                // LoRA past the comparison floor at this rate.
+                learning_rate: 5e-3,
                 warmup: Warmup::Steps(0),
                 ..Default::default()
             }),
@@ -1642,7 +1645,7 @@ async fn training_divergence_detection() {
         .expect("the queued job is claimable");
 
     let mut training_loop = TrainingLoopBuilder::new(
-        jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head: model },
+        jammi_ai::fine_tune::target::TrainingTarget::FrozenEncoder { head: model },
         varmap,
         FineTuneConfig {
             epochs: 5,
@@ -1774,7 +1777,7 @@ async fn training_early_stopping_triggers() {
         .expect("the queued job is claimable");
 
     let mut training_loop = TrainingLoopBuilder::new(
-        jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head: model },
+        jammi_ai::fine_tune::target::TrainingTarget::FrozenEncoder { head: model },
         varmap,
         FineTuneConfig {
             epochs: 100, // high — should stop well before this
@@ -3306,7 +3309,7 @@ async fn training_bails_when_lease_lost_mid_run() {
     let cancel = Arc::new(AtomicBool::new(true));
 
     let mut training_loop = TrainingLoopBuilder::new(
-        jammi_ai::fine_tune::target::TrainingTarget::ProjectionHead { head },
+        jammi_ai::fine_tune::target::TrainingTarget::FrozenEncoder { head },
         varmap,
         FineTuneConfig {
             epochs: 5,
@@ -3591,5 +3594,127 @@ async fn a_resume_with_no_epoch_left_finalizes_the_run_it_resumed() {
             .unwrap_or_else(|| {
                 panic!("epoch {epoch}'s checkpoint, written by attempt 1, is published")
             });
+    }
+}
+
+/// A classification fine-tune serves the classes it trained: its head names
+/// the served label column and every score, on an adapted and on a frozen
+/// encoder alike, and the served labels fit the rows it trained on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_classification_fine_tune_serves_the_classes_it_trained() {
+    use arrow::array::{Array, StringArray};
+    use jammi_ai::fine_tune::{EarlyStoppingMetric, EncoderTraining};
+
+    let truth: std::collections::HashMap<String, String> =
+        std::fs::read_to_string(jammi_test_utils::fixture("training_labels.csv"))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let (text, label) = line.rsplit_once(',').unwrap();
+                (text.to_string(), label.to_string())
+            })
+            .collect();
+
+    for encoder in [EncoderTraining::default(), EncoderTraining::Frozen] {
+        let dir = TempDir::new().unwrap();
+        let session = Arc::new(
+            InferenceSession::new(common::test_config(dir.path()))
+                .await
+                .unwrap(),
+        );
+        session
+            .add_source(
+                "labels",
+                SourceType::File,
+                SourceConnection {
+                    url: Some(common::fixture_url("training_labels.csv")),
+                    format: Some(FileFormat::Csv),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let _worker = jammi_ai::fine_tune::worker::EmbeddedWorker::spawn(&session)
+            .expect("default worker intervals are valid");
+        let job = session
+            .fine_tune(
+                "labels",
+                &tiny_bert_model(),
+                &["text".to_string(), "label".to_string()],
+                FineTuneMethod::Lora,
+                ModelTask::Classification,
+                Some(FineTuneConfig {
+                    epochs: 20,
+                    batch_size: 4,
+                    learning_rate: 1e-2,
+                    warmup: Warmup::Steps(0),
+                    lr_schedule: LrSchedule::Constant,
+                    validation_fraction: 0.0,
+                    early_stopping_metric: EarlyStoppingMetric::TrainLoss,
+                    encoder: encoder.clone(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        job.wait().await.unwrap();
+
+        let batches = session
+            .infer(
+                "labels",
+                &ModelSource::parse(job.model_id()),
+                ModelTask::Classification,
+                &["text".to_string()],
+                "text",
+                jammi_db::store::CachePolicy::Bypass,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{encoder:?}: the fine-tuned classifier serves: {e}"))
+            .0;
+        let column = |batch: &arrow::record_batch::RecordBatch, name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let mut correct = 0;
+        let mut served = 0;
+        for batch in &batches {
+            let (keys, labels, scores) = (
+                column(batch, "_row_id"),
+                column(batch, "label"),
+                column(batch, "all_scores_json"),
+            );
+            for row in 0..batch.num_rows() {
+                assert!(labels.is_valid(row), "{encoder:?}: row {row} failed");
+                let named: std::collections::BTreeSet<String> = serde_json::from_str::<
+                    serde_json::Map<String, serde_json::Value>,
+                >(scores.value(row))
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+                assert_eq!(
+                    named,
+                    ["biology", "physics"].map(String::from).into(),
+                    "{encoder:?}: the scores name the trained classes"
+                );
+                served += 1;
+                correct += usize::from(truth[keys.value(row)] == labels.value(row));
+            }
+        }
+        assert_eq!(served, truth.len(), "{encoder:?}: every row is served");
+        // An untrained head serves every row the first class — half these
+        // balanced rows — and a head served under the wrong labels fewer.
+        let accuracy = correct as f64 / served as f64;
+        println!("{encoder:?}: training-row accuracy {accuracy}");
+        assert!(
+            accuracy >= 0.75,
+            "{encoder:?}: the served labels fit the training rows (accuracy {accuracy})"
+        );
     }
 }

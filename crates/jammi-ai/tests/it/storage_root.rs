@@ -389,7 +389,7 @@ async fn artifact_written_on_host_a_is_loadable_on_host_b() {
         ("adapter.safetensors".to_string(), Bytes::from(buf.clone())),
         (
             "adapter_config.json".to_string(),
-            Bytes::from_static(b"{\"adapter_type\":\"projection_head\"}"),
+            Bytes::from_static(b"{\"encoder\":\"frozen\"}"),
         ),
     ];
     let catalog_dir = TempDir::new().unwrap();

@@ -2,7 +2,7 @@
 
 > **Measured companion:** for the long-form, executed-and-measured Python treatment, see [The Cookbook → Fine-Tuning Methods](https://f-inverse.github.io/jammi-ai/cookbook/chapters/finetune-methods/finetune-methods.html).
 
-Train LoRA adapters on your data to improve embedding quality for your domain. The base model stays frozen — only a small projection layer is trained and saved.
+Train LoRA adapters on your data to improve embedding quality for your domain. The base model's weights stay frozen: LoRA trains small low-rank updates beside the encoder's attention projections, and a classification or regression task trains a head over the encoder's pooled output. Only the adapters and the head are saved.
 
 ## Prepare training data
 
@@ -138,7 +138,8 @@ let job = session.fine_tune(
 | `warmup` | `Fraction(0.1)` | Linear warmup from 0 to base LR: `Warmup::Fraction(f)` of the run's steps, or `Warmup::Steps(n)` (Python: `warmup_fraction` or `warmup_steps`) |
 | `lr_schedule` | CosineDecay | Decay after warmup: Constant, CosineDecay, LinearDecay |
 | `embedding_loss` | auto | CoSent (pairs+scores), Triplet, MultipleNegativesRanking |
-| `backbone_dtype` | f32 | Frozen-backbone dtype: f32, f16, or bf16 (bf16 requires CUDA). Applies only when `target_modules` is non-empty (encoder-adapters) — see [Memory](#memory) |
+| `encoder` | `Adapted`, default sites | Where LoRA trains: `EncoderTraining::Adapted` inside the encoder, or `EncoderTraining::Frozen` for a head over the frozen encoder only (Python: `encoder="adapted"` / `"frozen"`) — see [Where the adapters train](#where-the-adapters-train) |
+| `backbone_dtype` | f32 | Frozen-backbone dtype: f32, f16, or bf16 (bf16 requires CUDA). Applies only to an adapted encoder — see [Memory](#memory) |
 
 ## Use the fine-tuned model
 
@@ -300,24 +301,40 @@ stray top-level `cache` key in a `jobs.spec` row (the row is engine-written
 from an already-decoded spec, so this only arises from a hand-edited row) is
 refused at deserialize with an error naming the field, never silently dropped.
 
-## Encoder-adapters fine-tuning (PEFT-style adapter injection)
+## Where the adapters train
 
-The default flow above trains a single low-rank **projection head** sitting *outside* the frozen encoder. For higher capacity at the same parameter budget, Jammi also supports **encoder adapters** — LoRA injected into named linear layers *inside* the encoder stack, matching the PEFT convention.
+A fine-tune trains its encoder one of two ways:
 
-Switch to encoder adapters by populating `target_modules` on `FineTuneConfig`:
+- **Adapted** (the default) — LoRA inside the encoder: trainable low-rank
+  updates beside the frozen weights of the selected linear layers, as LoRA
+  describes and PEFT places them. With no `target_modules`, the adapters go on
+  the architecture's attention query and value projections — the fused
+  projection that holds them where the architecture fuses them (see the table
+  below).
+- **Frozen** — the encoder trains not at all: a LoRA projection head over its
+  pooled output carries the whole adaptation. Cheaper per step, and the only
+  choice for an architecture Jammi has no LoRA sites for.
+
+A classification or regression task always trains a head over the pooled
+output — a `classifier` or a `distribution` layer after a `projection` — on
+either encoder; serving applies the same layers in the same order.
+
+Name the sites with `target_modules`, or train a frozen encoder:
 
 ```rust,no_run
 # extern crate jammi_ai;
-# use jammi_ai::fine_tune::FineTuneConfig;
-# fn make() -> FineTuneConfig {
-let config = FineTuneConfig {
-    lora_rank: 8,
-    lora_alpha: 16.0,
-    // Inject LoRA into BERT's attention query and value projections.
-    target_modules: vec!["query".to_string(), "value".to_string()],
+# use jammi_ai::fine_tune::{EncoderTraining, FineTuneConfig};
+# fn make() -> (FineTuneConfig, FineTuneConfig) {
+let adapted = FineTuneConfig {
+    // LoRA on BERT's attention query and value projections.
+    encoder: EncoderTraining::adapted(vec!["query".to_string(), "value".to_string()]),
     ..Default::default()
 };
-# config }
+let frozen = FineTuneConfig {
+    encoder: EncoderTraining::Frozen,
+    ..Default::default()
+};
+# (adapted, frozen) }
 ```
 
 ```python
@@ -327,7 +344,7 @@ job = db.fine_tune(
     columns=["text_a", "text_b", "score"],
     method="lora",
     task="text_embedding",
-    target_modules=["query", "value"],
+    target_modules=["query", "value"],   # or encoder="frozen"
 )
 ```
 
@@ -335,15 +352,15 @@ job = db.fine_tune(
 
 Pick `target_modules` per the architecture you're fine-tuning:
 
-| Architecture | Task | Common target_modules |
-|---|---|---|
-| BERT / RoBERTa / CamemBERT / XLM-RoBERTa | text | `["query", "value"]` (recommended) or `["query", "key", "value", "dense"]` |
-| DistilBERT | text | `["q_lin", "v_lin"]` or `["q_lin", "k_lin", "v_lin", "out_lin"]` |
-| ModernBERT | text | `["Wqkv", "Wo"]` (fused QKV + output) |
-| OpenCLIP text tower | `text_embedding` | `["in_proj", "out_proj"]` (attention) or `["in_proj", "out_proj", "c_fc", "c_proj"]` |
-| OpenCLIP vision tower | `image_embedding` | the same four names |
-| HTSAT-CLAP audio tower | `audio_embedding` | `["query", "value"]` or `["query", "key", "value", "attention_output", "intermediate_dense", "output_dense"]`; plus `["reduction"]` (patch-merging) and `["linear1", "linear2"]` (projection head) |
-| Any encoder | any | `["all-linear"]` — every linear layer gets an adapter (largest capacity) |
+| Architecture | Task | Default sites | Other common target_modules |
+|---|---|---|---|
+| BERT / RoBERTa / CamemBERT / XLM-RoBERTa | text | `["query", "value"]` | `["query", "key", "value", "dense"]` |
+| DistilBERT | text | `["q_lin", "v_lin"]` | `["q_lin", "k_lin", "v_lin", "out_lin"]` |
+| ModernBERT | text | `["Wqkv"]` (fused QKV) | `["Wqkv", "Wo"]` |
+| OpenCLIP text tower | `text_embedding` | `["in_proj"]` (fused QKV) | `["in_proj", "out_proj"]` or `["in_proj", "out_proj", "c_fc", "c_proj"]` |
+| OpenCLIP vision tower | `image_embedding` | `["in_proj"]` | the same names |
+| HTSAT-CLAP audio tower | `audio_embedding` | `["query", "value"]` | `["query", "key", "value", "attention_output", "intermediate_dense", "output_dense"]`; plus `["reduction"]` (patch-merging) and `["linear1", "linear2"]` (projection head) |
+| Any encoder | any | — | `["all-linear"]` — every linear layer gets an adapter (largest capacity) |
 
 Names match the trailing module-name segment in the HuggingFace weight layout. Suffix matching is the rule, so `"query"` matches `"attention.self.query"`.
 
@@ -386,7 +403,7 @@ your data's concern; the triplet loss only separates whatever pairs you supply.
 
 ### Layer ranges and per-module ranks
 
-Two optional refinements:
+Two optional refinements, both fields of `EncoderTraining::Adapted`:
 
 - **`layers_to_transform`** — restrict injection to specific 0-based layer indices. `None` (default) applies to every layer.
 - **`rank_pattern`** — override `lora_rank` for individual modules. Keys are substring matches against the module name; values are the override rank.
@@ -401,7 +418,7 @@ that belongs to no layer.
 
 ```rust,no_run
 # extern crate jammi_ai;
-# use jammi_ai::fine_tune::FineTuneConfig;
+# use jammi_ai::fine_tune::{EncoderTraining, FineTuneConfig};
 # fn make() -> FineTuneConfig {
 let mut rank_pattern = std::collections::HashMap::new();
 rank_pattern.insert("query".to_string(), 16);  // higher capacity on Q
@@ -409,9 +426,11 @@ rank_pattern.insert("value".to_string(), 4);   // lower on V
 
 let config = FineTuneConfig {
     lora_rank: 8,                                     // default rank
-    target_modules: vec!["query".into(), "value".into()],
-    layers_to_transform: Some(vec![6, 7, 8, 9, 10, 11]), // top half only
-    rank_pattern,
+    encoder: EncoderTraining::Adapted {
+        target_modules: vec!["query".into(), "value".into()],
+        layers_to_transform: Some(vec![6, 7, 8, 9, 10, 11]), // top half only
+        rank_pattern,
+    },
     ..Default::default()
 };
 # config }
@@ -420,92 +439,78 @@ let config = FineTuneConfig {
 ### On-disk artifact
 
 Every fine-tuned model writes `adapter.safetensors` plus an
-`adapter_config.json` whose `adapter_type` tag discriminates between the two
-adapter shapes Jammi produces.
-
-Encoder-adapters example:
+`adapter_config.json`, whose `encoder` tag says how the encoder trained. An
+adapted encoder records its adapters, and the head when the task trained one:
 
 ```json
 {
-  "adapter_type": "encoder_adapters",
-  "model_type": "bert",
-  "lora_rank": 8,
-  "lora_alpha": 16.0,
-  "use_rslora": false,
-  "target_modules": ["query", "value"],
-  "layers_to_transform": [6, 7, 8, 9, 10, 11],
-  "rank_pattern": {"query": 16, "value": 4},
-  "backbone_dtype": "f32"
+  "encoder": "adapted",
+  "adapters": {
+    "model_type": "bert",
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "use_rslora": false,
+    "target_modules": ["query", "value"],
+    "layers_to_transform": [6, 7, 8, 9, 10, 11],
+    "rank_pattern": {"query": 16, "value": 4},
+    "backbone_dtype": "f32"
+  },
+  "head": {
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "use_rslora": false,
+    "output": {"kind": "classes", "labels": ["cs.AI", "cs.LG", "math.ST"]}
+  }
 }
 ```
 
-Projection-head example:
+A frozen encoder records only its head:
 
 ```json
 {
-  "adapter_type": "projection_head",
-  "lora_rank": 8,
-  "lora_alpha": 16.0,
-  "head_layers": ["projection"]
+  "encoder": "frozen",
+  "head": {
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "use_rslora": false,
+    "output": {"kind": "embedding"}
+  }
 }
 ```
 
-`model_type` records the base architecture the adapter was trained on — one of
+A head's `output` says what it emits, and so which layers it applies: an
+`embedding` head is a `projection`; a `classes` head adds a `classifier` and
+names its labels in class-index order; a `distribution` head adds a
+`distribution` layer and records the scaler and form that de-standardise its
+output.
+
+`model_type` records the base architecture the adapters were trained on — one of
 `bert`, `distilbert`, `modernbert`, `open_clip` (an OpenCLIP checkpoint, which ships no
-`model_type` field of its own) or `clap_audio_model`.
+`model_type` field of its own) or `clap_audio_model`. An OpenCLIP or CLAP adapter
+carries one extra key, `tower`, naming the tower it installs on (`"text"`,
+`"vision"` or `"audio"`); a text architecture's adapter has one tower and carries
+no `tower` key.
 
-A checkpoint that holds more than one tower carries one extra key, `tower`, naming which
-one the adapter installs on:
-
-```json
-{
-  "adapter_type": "encoder_adapters",
-  "model_type": "open_clip",
-  "lora_rank": 8,
-  "lora_alpha": 16.0,
-  "use_rslora": false,
-  "target_modules": ["in_proj", "out_proj"],
-  "layers_to_transform": null,
-  "rank_pattern": {},
-  "backbone_dtype": "f32",
-  "tower": "vision"
-}
-```
-
-The key is written only when it applies: a single-tower adapter's
-`adapter_config.json` carries no `tower` key at all.
-
-The Candle inference backend reads `adapter_config.json` on model load and
-dispatches on `adapter_type`: `encoder_adapters` rebuilds the encoder with
-frozen backbone weights plus the LoRA A/B from `adapter.safetensors`;
-`projection_head` loads the saved projection weights as a `LoraLinear`
-applied after pooling.
-
-Before any of that, the backend checks the adapter and the base agree on
-**architecture family**: an `open_clip` adapter on a CLAP base, a `clap_audio_model`
-adapter on a BERT base, or a `tower` the base checkpoint does not have, is refused with a
-typed error rather than loaded onto whatever the base happens to be. On an OpenCLIP base
-the adapted tower is rebuilt with the adapter's weights and the sibling tower is rebuilt
-frozen at the same backbone precision — a fine-tuned model has one identity and one
-precision.
+The Candle inference backend reads `adapter_config.json` on model load: it
+rebuilds an adapted encoder from the frozen backbone weights plus the LoRA A/B
+from `adapter.safetensors`, and rebuilds the head's layers to apply, in order,
+after pooling.
 
 ### When to use each
 
-- **Projection head** — fastest training, smallest artifact, lowest memory.
-  The default when `target_modules` is empty. Best for adapting embedding
-  direction without changing per-token attention behaviour.
-- **Encoder adapters** — higher representational ceiling per adapter
-  parameter; required if the task needs to reshape attention behaviour
-  (e.g. a domain where the base attention pattern mismatches the query
-  distribution). Costs a slightly slower forward pass since the LoRA path
-  runs per layer.
+- **Adapted** (the default) — the encoder's own attention adapts to your
+  data, which is what moves retrieval quality. Costs a slower step than a
+  frozen encoder, since gradients flow through every layer.
+- **Frozen** — fastest training, smallest artifact, lowest memory, and any
+  architecture. The head can only re-map the frozen encoder's embedding, so
+  it moves quality far less than adapting the encoder.
 
-### QLoRA (encoder adapters over a quantized base)
+### QLoRA (an adapted encoder over a quantized base)
 
 `base_model` accepts a GGUF checkpoint (see [Quantized (GGUF)
 checkpoints](./local-models.md#quantized-gguf-checkpoints)) the same way it
 accepts a safetensors checkpoint. When the resolved base is `model.gguf`, an
-encoder-adapters job trains its LoRA A/B matrices over the frozen quantized
+adapted-encoder job trains its LoRA A/B matrices over the frozen quantized
 backbone automatically — the base artifact selects this, not a separate flag
 or config field. The quantized weights themselves are never trained (LoRA
 never updates a frozen base, quantized or dense); only the low-rank adapters
@@ -533,10 +538,9 @@ at full precision unless you opt into a lower-precision dtype; the trained
 LoRA A/B matrices always stay `f32` regardless of `backbone_dtype`, for
 numerical stability.
 
-`backbone_dtype` only takes effect on the **encoder-adapters** arm
-(`target_modules` non-empty) — the projection-head arm (the default, empty
-`target_modules`) never re-dtypes the frozen backbone, so `bf16` is not an
-available remedy there.
+`backbone_dtype` only takes effect on an **adapted** encoder — a frozen
+encoder never re-dtypes its backbone, so `bf16` is not an available remedy
+there.
 
 This guidance applies to the **fine-tune training kinds** (embedding and
 classification training), and only when the failure's own error text carries
@@ -547,17 +551,17 @@ guidance; and a `ContextPredictor` training run carries no OOM guidance at
 all (it doesn't route through this classifier).
 
 When it applies, the job's terminal error is rewritten to name the exact
-`batch_size`, `max_seq_length`, and (on the encoder-adapters arm)
+`batch_size`, `max_seq_length`, and (on the adapted-encoder arm)
 `backbone_dtype` it ran with, and suggests remedies in the order they're
 cheapest to try:
 
-- **Encoder adapters:** (1) `backbone_dtype: bf16` — substantially reduces
+- **Adapted encoder:** (1) `backbone_dtype: bf16` — substantially reduces
   memory on this arm. Requires a CUDA device; a `bf16` backbone on a
   non-CUDA device is refused before training starts, rather than silently
   falling back to `f32`. (2) A smaller `batch_size`, or trade batch size for
   `gradient_accumulation_steps` to hold the same effective batch size while
   shrinking the per-step activation memory. (3) A smaller `max_seq_length`.
-- **Projection head (default):** `backbone_dtype` does not apply and is
+- **Frozen encoder:** `backbone_dtype` does not apply and is
   omitted from the message — the message says so outright. (1) A smaller
   `batch_size`, or trade batch size for `gradient_accumulation_steps`. (2) A
   smaller `max_seq_length`.

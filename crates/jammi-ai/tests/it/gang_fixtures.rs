@@ -39,7 +39,8 @@ pub(crate) fn pairs() -> Vec<(String, String)> {
 }
 
 /// The gang oracle's config: two epochs, per-rank batch 2, no dropout,
-/// no validation split, a fixed seed.
+/// no validation split, a fixed seed, and a frozen encoder — the target the
+/// reference gang builds directly (a projection head over the frozen base).
 pub(crate) fn gang_config(epochs: usize) -> FineTuneConfig {
     gang_config_with_dropout(epochs, 0.0)
 }
@@ -60,6 +61,7 @@ pub(crate) fn gang_config_with_dropout(epochs: usize, lora_dropout: f64) -> Fine
         early_stopping_metric: EarlyStoppingMetric::TrainLoss,
         early_stopping_patience: 10_000,
         learning_rate: 1e-4,
+        encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
         ..Default::default()
     }
 }
@@ -193,7 +195,7 @@ pub(crate) async fn reference_rank0_adapter_bytes(
             let head = build_projection_head_for_rank(hidden, &config, &varmap, &vb, dropout_seed)
                 .unwrap();
             let mut training_loop =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(Device::Cpu)
                     .job_id(job_id)
                     .catalog(catalog)

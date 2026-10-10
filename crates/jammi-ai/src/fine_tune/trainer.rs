@@ -33,7 +33,7 @@ use super::resume::{
     RESUME_STATE_SCHEMA_VERSION,
 };
 use super::role::RunnerRole;
-use super::target::TrainingTarget;
+use super::target::{HeadOutput, TrainingTarget};
 use super::{EarlyStoppingMetric, FineTuneConfig, LrSchedule};
 use crate::model::LoadedModel;
 use jammi_datafusion::ModelTask;
@@ -55,7 +55,7 @@ fn per_micro_batch_host_read_count() -> u64 {
     PER_MICRO_BATCH_HOST_READ_COUNT.load(Ordering::Relaxed)
 }
 
-/// Test-only call counter for `encode_texts`'s `EncoderAdapters` branch
+/// Test-only call counter for `encode_texts`'s `AdaptedEncoder` branch
 /// reaching [`tokenize_and_bucket`] — in training AND evaluation mode.
 /// Padding is deliberately output-invariant, so a caller cannot tell from
 /// `encode_texts`'s pooled `[rows, hidden]` output whether a batch was
@@ -318,11 +318,11 @@ pub struct TrainingResult {
     /// The run metrics JSON the worker writes alongside the terminal status.
     pub metrics_json: String,
     /// The wall spent in the media front end during TRAINING, on the
-    /// `EncoderAdapters` target ONLY. `Duration::ZERO` by construction for a
-    /// text task and for a `ProjectionHead` target of any modality — see
+    /// `AdaptedEncoder` target ONLY. `Duration::ZERO` by construction for a
+    /// text task and for a `FrozenEncoder` target of any modality — see
     /// below for why the latter is never measured, not merely small.
     ///
-    /// Declared boundary (`EncoderAdapters` only): the wall around the
+    /// Declared boundary (`AdaptedEncoder` only): the wall around the
     /// `image_encoder_input` / `audio_encoder_input` calls inside
     /// `TrainingLoop::encode_media` — decode + preprocess INCLUDING the
     /// device tensor build (H2D upload) that `preprocess_image_batch` /
@@ -332,14 +332,14 @@ pub struct TrainingResult {
     /// is true (eval passes through `evaluate_held_out` are excluded, so
     /// this is a subset of the trainer's training wall).
     ///
-    /// A `ProjectionHead` target's media encode
-    /// (`TrainingLoop::project_frozen_embedding`) never advances this field,
+    /// A `FrozenEncoder` target's media encode
+    /// (`TrainingLoop::frozen_pooled`) never advances this field,
     /// on any modality: that path has no seam between decode/preprocess and
     /// the frozen base's tower forward — they are one combined call — so
     /// there is no front-end-only quantity to time there. Charging the
     /// combined call to a field documented as front-end-only would give it a
     /// SECOND, incompatible meaning: a consumer computing
-    /// `residual = wall − front_end − busy` on a `ProjectionHead` job would
+    /// `residual = wall − front_end − busy` on a `FrozenEncoder` job would
     /// double-subtract the tower forward and land on a large negative
     /// "residual" mislabelled as overlap. Reporting zero here is honest;
     /// reporting the mixed number would not be.
@@ -773,7 +773,7 @@ pub fn rank_dropout_seed(base_seed: u64, rank: u32) -> u64 {
 pub struct TrainingLoop {
     target: TrainingTarget,
     /// Provides the tokenizer for both target variants, plus the frozen
-    /// forward path consumed by [`TrainingTarget::ProjectionHead`]. `None`
+    /// forward path consumed by [`TrainingTarget::FrozenEncoder`]. `None`
     /// is only valid when the data loader yields pre-built tensor batches
     /// (`is_precomputed()` is `true`) — used by trainer-internals tests.
     base_model: Option<Arc<LoadedModel>>,
@@ -803,7 +803,7 @@ pub struct TrainingLoop {
     ///
     /// `true` at [`TrainingLoopBuilder::build`] is ENFORCED, not assumed: a
     /// target does not necessarily start in training mode
-    /// (`TrainingTarget::EncoderAdapters`'s `ModernBert` body is built with
+    /// (`TrainingTarget::AdaptedEncoder`'s `ModernBert` body is built with
     /// `training: false`; only the injected `LoraLinear` adapters start
     /// `true`). `build` calls [`TrainingLoop::set_training`]`(true)` on the
     /// freshly assembled loop before returning it, which recurses through the
@@ -817,10 +817,16 @@ pub struct TrainingLoop {
     divergence_count: usize,
     /// Fixed, dataset-level target standardiser for the regression path, derived
     /// once from all training targets at the start of [`Self::run`]. `None` until
-    /// the run computes it (and for every non-regression target). It maps each
-    /// regression loss into a z-space the zero-initialised head can reach, while
-    /// the head itself stays in raw space — so serving needs no de-standardisation.
+    /// the run computes it (and for every non-regression target). The head
+    /// trains against z-scored targets, a space its zero-initialised layers
+    /// can reach; serving de-standardises the head's output with this scaler,
+    /// persisted in the head's [`HeadOutput::Distribution`].
     target_scaler: Option<TargetScaler>,
+    /// A classification run's labels in class-index order, read off the
+    /// training source at the start of [`Self::run`]; `None` for every other
+    /// task. Persisted in the head's [`HeadOutput::Classes`], where serving
+    /// names each output column by them.
+    class_labels: Option<Vec<String>>,
     /// The task this run trains for. It is the DISCRIMINATOR for the media
     /// paths: a `MediaTriplet` chunk carries three binary columns whose
     /// modality the columns themselves cannot express (an encoded WAV and an
@@ -1054,7 +1060,7 @@ impl TrainingLoopBuilder {
     }
 
     /// Set the base model. Required for text-data training (supplies the
-    /// tokenizer and, for `ProjectionHead` targets, the frozen forward
+    /// tokenizer and, for `FrozenEncoder` targets, the frozen forward
     /// pass).
     pub fn base_model(mut self, model: Arc<LoadedModel>) -> Self {
         self.base_model = Some(model);
@@ -1144,6 +1150,7 @@ impl TrainingLoopBuilder {
             training_mode: false,
             divergence_count: 0,
             target_scaler: None,
+            class_labels: None,
             task: self.task,
             device: self.device,
             cancel: self.cancel,
@@ -1162,7 +1169,7 @@ impl TrainingLoopBuilder {
         };
         // Enforce, not assume, that a freshly built loop starts in training
         // mode (see `training_mode`'s own doc). This recurses through the WHOLE target via
-        // `TrainingTarget::set_training`, so an `EncoderAdapters` target's
+        // `TrainingTarget::set_training`, so an `AdaptedEncoder` target's
         // encoder body (constructed `training: false` — only its injected
         // LoRA adapters start `true`) is switched into training mode here
         // too, not just the mirror.
@@ -1190,7 +1197,7 @@ impl TrainingLoopBuilder {
 /// varied held-out split, and the padded positions are fully masked either
 /// way (`encode_texts_output_is_bucket_invariant_at_the_real_call_site`).
 ///
-/// Factored out of `TrainingLoop::encode_texts`'s `EncoderAdapters` branch
+/// Factored out of `TrainingLoop::encode_texts`'s `AdaptedEncoder` branch
 /// so a unit test, and a caller reproducing a pass's batches, drive the
 /// PRODUCTION tokenize-and-pad step directly without duplicating the
 /// decision.
@@ -1369,6 +1376,7 @@ impl TrainingLoop {
             Streamed(Box<super::source::StreamedSet>),
         }
 
+        self.class_labels = source.class_labels().map(<[String]>::to_vec);
         let mut source = match source {
             TrainingSource::Resident(loader) => {
                 let (train_loader, val_loader) = loader.split(self.config.validation_fraction);
@@ -2271,13 +2279,9 @@ impl TrainingLoop {
         // Save the final adapter — both target variants persist their
         // trainable weights alongside a `SavedAdapter` metadata JSON.
         let final_weights = self.target.named_trainable_weights()?;
-        // The form is persisted exactly when the scaler is — both are the
-        // regression head's de-standardisation state. A non-regression head has
-        // no scaler and no form, so its adapter config round-trips unchanged.
-        let regression_form = self.target_scaler.map(|_| self.regression_form());
         let saved = self
             .target
-            .saved_adapter(&self.config, self.target_scaler, regression_form);
+            .saved_adapter(&self.config, self.head_output())?;
         jammi_lora::save_adapter(&checkpoint_dir, &final_weights, &saved)
             .map_err(|e| JammiError::FineTune(format!("Save adapter: {e}")))?;
         self.phase_wall.checkpoints += final_adapter_started.elapsed();
@@ -2667,14 +2671,14 @@ impl TrainingLoop {
         Ok(loss_val)
     }
 
-    /// Encode a slice of texts into a `[batch, hidden]` embedding tensor,
+    /// Encode a slice of texts into a `[batch, hidden]` embedding tensor:
+    /// the encoder's pooled output, through the head's `projection` when the
+    /// target trains a head ([`Self::project`]). The pooled output is
     /// dispatched on the active [`TrainingTarget`]:
     ///
-    /// - `ProjectionHead`: run the texts through the frozen base model to
-    ///   produce pooled embeddings, then project through the head's first
-    ///   LoRA layer (shared with the audio path via
-    ///   [`Self::project_frozen_embedding`]).
-    /// - `EncoderAdapters`: tokenize the texts via the base model's tokenizer,
+    /// - `FrozenEncoder`: run the texts through the frozen base model
+    ///   (shared with the media path via [`Self::frozen_pooled`]).
+    /// - `AdaptedEncoder`: tokenize the texts via the base model's tokenizer,
     ///   then forward through the LoRA-injected encoder directly (the encoder
     ///   does its own pooling and normalisation).
     fn encode_texts(&self, texts: &[String]) -> Result<Tensor> {
@@ -2694,19 +2698,19 @@ impl TrainingLoop {
         // the counts vector).
         if texts.is_empty() {
             let hidden = match &self.target {
-                TrainingTarget::ProjectionHead { .. } => base.description().embedding_dim(),
-                TrainingTarget::EncoderAdapters(state) => state.encoder.hidden_size(),
+                TrainingTarget::FrozenEncoder { .. } => base.description().embedding_dim(),
+                TrainingTarget::AdaptedEncoder(state) => state.encoder.hidden_size(),
             };
             return Tensor::zeros((0, hidden), DType::F32, &self.device)
                 .map_err(|e| JammiError::FineTune(format!("encode_texts: empty batch: {e}")));
         }
-        match &self.target {
-            TrainingTarget::ProjectionHead { .. } => {
+        let pooled = match &self.target {
+            TrainingTarget::FrozenEncoder { .. } => {
                 let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                 let arr = Arc::new(StringArray::from(text_refs)) as ArrayRef;
-                self.project_frozen_embedding(base, arr, ModelTask::TextEmbedding)
+                self.frozen_pooled(base, arr, ModelTask::TextEmbedding)?
             }
-            TrainingTarget::EncoderAdapters(state) => {
+            TrainingTarget::AdaptedEncoder(state) => {
                 let encoder = &state.encoder;
                 let tokenizer = base
                     .tokenizer()
@@ -2755,18 +2759,19 @@ impl TrainingLoop {
                 self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward(&input_ids, &attention_mask)
-                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
+                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))?
             }
-        }
+        };
+        self.project(pooled)
     }
 
-    /// How many encoder forwards this loop has run on an `EncoderAdapters`
+    /// How many encoder forwards this loop has run on an `AdaptedEncoder`
     /// target, over its whole life: every training step's joined forward
     /// AND every validation or held-out forward — the multiplier a fused-
     /// kernel profile's positive-proof equation (`fused + eager == calls x
     /// forwards`, `jammi_encoders::FusibleSiteCensus`) needs, since every
     /// forward takes the same admission decisions whatever the mode. `0`
-    /// on a `ProjectionHead` target, whose frozen base model serves through
+    /// on a `FrozenEncoder` target, whose frozen base model serves through
     /// the inference backend.
     pub fn encoder_forwards(&self) -> u64 {
         self.encoder_forwards.get()
@@ -2782,11 +2787,12 @@ impl TrainingLoop {
     /// that submits images under `task=audio_embedding` gets a typed decode
     /// refusal rather than a confidently wrong spectrogram.
     ///
-    /// Two targets, one shape:
-    /// - `ProjectionHead`: the frozen base model owns the whole front end
+    /// Two targets, one shape — the pooled output, through the head's
+    /// `projection` when the target trains a head ([`Self::project`]):
+    /// - `FrozenEncoder`: the frozen base model owns the whole front end
     ///   (decode → resample → log-mel / pad-resize-normalize → tower
-    ///   forward), and the head projects its pooled output. Unchanged.
-    /// - `EncoderAdapters`: the LoRA-wrapped tower is forwarded DIRECTLY, so
+    ///   forward).
+    /// - `AdaptedEncoder`: the LoRA-wrapped tower is forwarded DIRECTLY, so
     ///   this method owns the front end — the SAME `audio_preprocess` /
     ///   `image_preprocess` functions the serving path
     ///   (`CandleModel::forward_audio_embedding` /
@@ -2798,22 +2804,22 @@ impl TrainingLoop {
             .base_model
             .as_ref()
             .ok_or_else(|| JammiError::FineTune("encode_media requires a base model".into()))?;
-        match &self.target {
-            TrainingTarget::ProjectionHead { .. } => {
+        let pooled = match &self.target {
+            TrainingTarget::FrozenEncoder { .. } => {
                 let refs: Vec<&[u8]> = items.iter().map(|c| c.as_slice()).collect();
                 let arr = Arc::new(BinaryArray::from(refs)) as ArrayRef;
                 // The frozen base owns decode/preprocess AND the tower
                 // forward as one combined call here, with no seam between
-                // them to time separately — unlike the `EncoderAdapters` arm
+                // them to time separately — unlike the `AdaptedEncoder` arm
                 // below, whose decode/preprocess call is genuinely disjoint
                 // from its tower forward. Timing this combined call would
                 // mix "front end" and "forward" under the one field
                 // `media_front_end_wall` documents as front-end-only, which
                 // is worse than reporting nothing: NOT accumulated here (see
                 // that field's own doc).
-                self.project_frozen_embedding(base, arr, self.task)
+                self.frozen_pooled(base, arr, self.task)?
             }
-            TrainingTarget::EncoderAdapters(state) => {
+            TrainingTarget::AdaptedEncoder(state) => {
                 let encoder = &state.encoder;
                 let started = Instant::now();
                 let input = match self.task {
@@ -2831,9 +2837,10 @@ impl TrainingLoop {
                 self.encoder_forwards.set(self.encoder_forwards.get() + 1);
                 encoder
                     .forward_input(&input.as_input())
-                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))
+                    .map_err(|e| JammiError::FineTune(format!("Encoder forward: {e}")))?
             }
-        }
+        };
+        self.project(pooled)
     }
 
     /// Add `elapsed` to `self.media_front_end_wall` — but only while this
@@ -2885,7 +2892,7 @@ impl TrainingLoop {
 
         let frontend = base.backend_model()?.audio_frontend().ok_or_else(|| {
             JammiError::FineTune(
-                "Encoder-adapters audio training requires the base model's CLAP \
+                "Adapted-encoder audio training requires the base model's CLAP \
                  feature-extractor geometry (preprocessor_config.json); the loaded base \
                  model carries none"
                     .into(),
@@ -3008,41 +3015,57 @@ impl TrainingLoop {
     /// layer. Shared by the text, image and audio projection-head paths — the
     /// only difference between modalities is the Arrow array type and the
     /// `ModelTask`, both supplied by the caller.
-    fn project_frozen_embedding(
+    fn frozen_pooled(
         &self,
         base: &Arc<LoadedModel>,
         content: ArrayRef,
         task: ModelTask,
     ) -> Result<Tensor> {
-        let head = match &self.target {
-            TrainingTarget::ProjectionHead { head } => head,
-            TrainingTarget::EncoderAdapters(_) => {
-                return Err(JammiError::FineTune(
-                    "project_frozen_embedding is only valid for a projection-head target".into(),
-                ))
-            }
-        };
         let output = base
             .backend_model()?
             .forward(&[content], task)
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
         // A corrupt training item is a refusal, not a row to skip: reject the
         // whole group on the lowest-index failed row rather than silently
-        // training the projection head on the all-zero placeholder the
-        // backend substitutes for a decode/preprocess failure. Called BEFORE
-        // reading `shapes[0]` below, so an empty-`shapes` producer is refused
-        // by `all_rows_or_err` itself, not an index-out-of-bounds panic on
+        // training the head on the all-zero placeholder the backend
+        // substitutes for a decode/preprocess failure. Called BEFORE reading
+        // `shapes[0]` below, so an empty-`shapes` producer is refused by
+        // `all_rows_or_err` itself, not an index-out-of-bounds panic on
         // `shapes[0]`.
         let flat = output
             .all_rows_or_err()
             .map_err(|e| JammiError::FineTune(format!("Encode: {e}")))?;
         let (n, dim) = output.shapes[0];
-        let raw = Tensor::from_vec(flat.to_vec(), (n, dim), &self.device)
-            .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))?;
-        head.layers[0]
-            .1
-            .forward(&raw)
-            .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}")))
+        Tensor::from_vec(flat.to_vec(), (n, dim), &self.device)
+            .map_err(|e| JammiError::FineTune(format!("Encode tensor: {e}")))
+    }
+
+    /// The head's `projection` over a pooled output — the embedding an
+    /// embedding task trains and the head's task layer reads — or the pooled
+    /// output itself for a target that trains no head. Serving folds the same
+    /// layers in the same order (`crate::model::backend::candle::ServedHead`).
+    fn project(&self, pooled: Tensor) -> Result<Tensor> {
+        match self.target.head() {
+            Some(head) => head.layers[0]
+                .1
+                .forward(&pooled)
+                .map_err(|e| JammiError::FineTune(format!("LoRA projection: {e}"))),
+            None => Ok(pooled),
+        }
+    }
+
+    /// The head's task layer — a classifier's or a distribution head's — over
+    /// projected embeddings; `what` names the task in the refusal a target
+    /// without one gets.
+    fn task_layer(&self, embeddings: &Tensor, what: &str) -> Result<Tensor> {
+        let (_, layer) = self
+            .target
+            .head()
+            .and_then(|head| head.layers.get(1))
+            .ok_or_else(|| JammiError::FineTune(format!("this target trains no {what} head")))?;
+        layer
+            .forward(embeddings)
+            .map_err(|e| JammiError::FineTune(format!("LoRA {what} head: {e}")))
     }
 
     /// Encode a text chunk into a `TrainingBatch` ready for loss computation.
@@ -3200,6 +3223,23 @@ impl TrainingLoop {
         }
     }
 
+    /// What this run's head outputs mean: its classes for a classification
+    /// run, its distribution's de-standardisation for a regression run, an
+    /// embedding otherwise. A run is one task, so at most one of
+    /// `class_labels` and `target_scaler` is set.
+    fn head_output(&self) -> HeadOutput {
+        match (&self.class_labels, self.target_scaler) {
+            (Some(labels), _) => HeadOutput::Classes {
+                labels: labels.clone(),
+            },
+            (None, Some(scaler)) => HeadOutput::Distribution {
+                scaler,
+                form: self.regression_form(),
+            },
+            (None, None) => HeadOutput::Embedding,
+        }
+    }
+
     /// The predictive distribution form this run's regression head emits, read
     /// off the configured objective: `Pinball` trains the quantile head over the
     /// configured levels; every other arm trains the parametric Gaussian head.
@@ -3227,8 +3267,8 @@ impl TrainingLoop {
     /// Apply the distributional regression head to projected embeddings,
     /// producing the head's RAW `(batch, k)` z-space output — the parameter the
     /// LoRA layer actually learns, with **no** de-standardisation. Mirrors
-    /// [`Self::classify`]: only a `ProjectionHead` target with a second (head)
-    /// layer can regress.
+    /// [`Self::classify`]: the head's `distribution` layer, over either
+    /// encoder.
     ///
     /// The training loss scores this z-output directly against a z-scored target
     /// (`embed_chunk` z-scores the target via [`TargetScaler::standardize_value`]),
@@ -3238,18 +3278,7 @@ impl TrainingLoop {
     /// affine and the inference adapter's σ scaling — so this method is the single
     /// raw-head forward shared by training, determinism, and resume.
     fn head_forward(&self, embeddings: &Tensor) -> Result<Tensor> {
-        match &self.target {
-            TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
-                .1
-                .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA regression head: {e}"))),
-            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
-                "No regression head in projection target".into(),
-            )),
-            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
-                "Regression with encoder adapters is not supported".into(),
-            )),
-        }
+        self.task_layer(embeddings, "regression")
     }
 
     /// Accumulate cosine similarity stats from a triplet batch for epoch-level
@@ -3957,24 +3986,10 @@ impl TrainingLoop {
         matryoshka_sum_per_example(&self.config.matryoshka_dims, embeddings, objective)
     }
 
-    /// Apply the classification head to projected embeddings.
-    ///
-    /// Only the `ProjectionHead` target supports classification training,
-    /// and only when the head was built with both a projection and a
-    /// classifier layer (i.e. `head.layers.len() > 1`).
+    /// Apply the classification head to projected embeddings: the head's
+    /// `classifier` layer, over either encoder.
     fn classify(&self, embeddings: &Tensor) -> Result<Tensor> {
-        match &self.target {
-            TrainingTarget::ProjectionHead { head } if head.layers.len() > 1 => head.layers[1]
-                .1
-                .forward(embeddings)
-                .map_err(|e| JammiError::FineTune(format!("LoRA classifier: {e}"))),
-            TrainingTarget::ProjectionHead { .. } => Err(JammiError::FineTune(
-                "No classification head in projection target".into(),
-            )),
-            TrainingTarget::EncoderAdapters(_) => Err(JammiError::FineTune(
-                "Classification with encoder adapters is not supported".into(),
-            )),
-        }
+        self.task_layer(embeddings, "classification")
     }
 
     /// Cross-entropy loss for classification.
@@ -4872,10 +4887,9 @@ impl TrainingLoop {
             ),
             _ => None,
         };
-        let regression_form = self.target_scaler.map(|_| self.regression_form());
         let saved = self
             .target
-            .saved_adapter(&self.config, self.target_scaler, regression_form);
+            .saved_adapter(&self.config, self.head_output())?;
         let (moments, step_t) = Self::capture_moments_by_name(optimizer, optim_param_names)?;
         // A real collective call every rank takes part in — see this
         // function's own doc and `Self::save_epoch_checkpoint`'s rank-0-only
@@ -6885,7 +6899,7 @@ mod host_read_discipline {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("host-read-oracle-job".into())
             .catalog(catalog)
@@ -7158,7 +7172,7 @@ mod ner_loss_ignore_index {
         let config = FineTuneConfig::default();
         let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
         let (catalog, dir) = super::test_fixtures::claimed_job("ner-loss-ignore-index").await;
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("ner-loss-ignore-index".into())
             .catalog(catalog)
@@ -7520,7 +7534,7 @@ mod gradcache_last_step_oracle {
                     .unwrap(),
             );
             let mut loop_ =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device.clone())
                     .job_id("gradcache-last-step-job".into())
                     .catalog(catalog)
@@ -7712,7 +7726,7 @@ mod streamed_whole_set_arm_refusal_oracle {
                     .unwrap(),
             );
             let mut loop_ =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id("streamed-mining-job".into())
                     .catalog(catalog)
@@ -7848,7 +7862,7 @@ mod last_step_run_harness {
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
             let mut builder = TrainingLoopBuilder::new(
-                TrainingTarget::ProjectionHead { head },
+                TrainingTarget::FrozenEncoder { head },
                 varmap.clone(),
                 config.clone(),
             )
@@ -8202,7 +8216,7 @@ mod gang_lockstep_oracle {
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
             let builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
                     .catalog(catalog)
@@ -8313,7 +8327,7 @@ mod gang_lockstep_oracle {
             let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
             let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
             let builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
                     .catalog(catalog)
@@ -8613,7 +8627,7 @@ mod runner_role_and_agreement_oracle {
                 }
             };
             let mut builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device)
                     .job_id(tag.clone())
                     .catalog(Arc::clone(&catalog))
@@ -8768,7 +8782,7 @@ mod runner_role_and_agreement_oracle {
                 let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
                 let head = build_projection_head(HIDDEN, &config, &varmap, &vb).unwrap();
                 let mut builder = TrainingLoopBuilder::new(
-                    TrainingTarget::ProjectionHead { head },
+                    TrainingTarget::FrozenEncoder { head },
                     varmap,
                     config,
                 )
@@ -8969,7 +8983,7 @@ mod gang_determinism_oracle {
             let head = build_projection_head_for_rank(HIDDEN, &config, &varmap, &vb, dropout_seed)
                 .unwrap();
             let mut builder =
-                TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+                TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                     .device(device.clone())
                     .job_id(job_id.clone())
                     .catalog(Arc::clone(&durable.catalog))
@@ -10081,7 +10095,7 @@ mod loss_curve_metrics {
 /// a `VarMap` head + scaler and call the loss functions directly), these oracles
 /// drive the **actual production dispatch** a real `db.fine_tune(task=regression)`
 /// exercises: a [`TrainingLoop`] built by the production [`TrainingLoopBuilder`],
-/// holding a real [`TrainingTarget::ProjectionHead`] regression head assembled by
+/// holding a real [`TrainingTarget::FrozenEncoder`] regression head assembled by
 /// the production [`build_distribution_head`], with its [`TargetScaler`] reduced
 /// from the training targets exactly as `TrainingLoop::run` does — then each step
 /// runs the head forward through the production `TrainingLoop::regress`
@@ -10136,7 +10150,7 @@ mod standardization_contract {
     const WIDE: [f32; 9] = [6.0, 13.0, 20.0, 27.0, 34.0, 41.0, 48.0, 55.0, 68.0];
 
     /// Build a real production [`TrainingLoop`] over a regression
-    /// [`TrainingTarget::ProjectionHead`] (projection + distribution head of the
+    /// [`TrainingTarget::FrozenEncoder`] (projection + distribution head of the
     /// given width), with its [`TargetScaler`] reduced from `targets` exactly as
     /// `TrainingLoop::run` does. The infra (catalog/job/worker/artifact_dir) is the
     /// production builder's required plumbing — the dispatch we exercise
@@ -10194,7 +10208,7 @@ mod standardization_contract {
             .expect("queued job is claimable");
 
         let mut loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -11915,7 +11929,7 @@ mod standardization_contract {
 /// This module instead drives the **production forward dispatch**, the same way
 /// the `standardization_contract` oracle above drives `regress` → `compute_loss`:
 /// every step runs the projection layer's `forward` (the production
-/// `project_frozen_embedding` step — drawing the projection dropout mask),
+/// `frozen_pooled` + `project` step — drawing the projection dropout mask),
 /// `regress` (the distribution head's `forward` — drawing the distribution
 /// dropout mask, then `TargetScaler::destandardize`), and the production
 /// `compute_loss` → AdamW step. So the adapter genuinely TRAINS off zero-init and
@@ -11988,7 +12002,7 @@ mod determinism_through_forward {
     }
 
     /// Build a real production [`TrainingLoop`] over a regression
-    /// [`TrainingTarget::ProjectionHead`] (projection + 2-wide Gaussian head),
+    /// [`TrainingTarget::FrozenEncoder`] (projection + 2-wide Gaussian head),
     /// seeded at `seed`, with its [`TargetScaler`] reduced from `targets` exactly
     /// as `TrainingLoop::run` does. Goes through the production builder so nothing
     /// about the head/scaler wiring is synthetic.
@@ -12042,7 +12056,7 @@ mod determinism_through_forward {
             .expect("queued job is claimable");
 
         let mut loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -12059,8 +12073,8 @@ mod determinism_through_forward {
     /// Borrow the projection-head [`LoraModel`] out of a built loop's target.
     fn head_of(loop_: &TrainingLoop) -> &LoraModel {
         match &loop_.target {
-            TrainingTarget::ProjectionHead { head } => head,
-            _ => unreachable!("regression_loop builds a ProjectionHead target"),
+            TrainingTarget::FrozenEncoder { head } => head,
+            _ => unreachable!("regression_loop builds a FrozenEncoder target"),
         }
     }
 
@@ -12068,7 +12082,7 @@ mod determinism_through_forward {
     /// return the saved `adapter.safetensors` bytes plus the trained weights map.
     ///
     /// Each step is the exact production chain a `db.fine_tune(task=regression)`
-    /// runs per batch: projection `forward` (the `project_frozen_embedding` step,
+    /// runs per batch: projection `forward` (the `frozen_pooled` + `project` step,
     /// drawing the projection dropout mask) → `head_forward` (distribution head
     /// `forward`, drawing its dropout mask, the raw z-output) → production
     /// `compute_loss` against the z-scored target → backward → AdamW. The adapter
@@ -12095,7 +12109,7 @@ mod determinism_through_forward {
 
         let mut opt = AdamW::new(varmap.all_vars(), ParamsAdamW::default()).unwrap();
         for _ in 0..STEPS {
-            // PRODUCTION projection forward (== `project_frozen_embedding`): the
+            // PRODUCTION projection forward (== `frozen_pooled` + `project`): the
             // base-model pooled output `feats` shifted by the projection LoRA. This
             // draws the projection layer's seeded dropout mask.
             let proj = head_of(&loop_).layers[0].1.forward(&feats).unwrap();
@@ -12112,11 +12126,10 @@ mod determinism_through_forward {
         }
 
         let weights = loop_.target.named_trainable_weights().unwrap();
-        let saved = loop_.target.saved_adapter(
-            &loop_.config,
-            loop_.target_scaler,
-            Some(loop_.regression_form()),
-        );
+        let saved = loop_
+            .target
+            .saved_adapter(&loop_.config, loop_.head_output())
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         jammi_lora::save_adapter(dir.path(), &weights, &saved).unwrap();
         let bytes = std::fs::read(dir.path().join("adapter.safetensors")).unwrap();
@@ -12219,13 +12232,12 @@ mod resume_invariant {
 
     use bytes::Bytes;
     use candle_core::{DType, Device, Tensor};
-    use candle_nn::{Linear, VarBuilder, VarMap};
+    use candle_nn::{VarBuilder, VarMap};
 
     use jammi_db::storage::{StorageRegistry, StorageUrl};
     use jammi_db::store::ArtifactStore;
 
     use super::super::data::TrainingBatch;
-    use super::super::lora::LoraModel;
     use super::super::regression_loss::TargetScaler;
     use super::super::resume::{load_bundle, RestoredCheckpoint};
     use super::super::target::TrainingTarget;
@@ -12273,40 +12285,12 @@ mod resume_invariant {
         Tensor::from_vec(vals, (n, HIDDEN), device).unwrap()
     }
 
-    /// One seeded LoRA layer (`ZerosB` init + seeded dropout) at `vb.pp(name)`,
-    /// registered into `varmap` — the production `build_head_layer` shape.
-    fn lora_layer(
-        out: usize,
-        in_: usize,
-        config: &FineTuneConfig,
-        varmap: &VarMap,
-        vb: &VarBuilder,
-        name: &str,
-    ) -> jammi_lora::LoraLinear {
-        let base = Linear::new(
-            Tensor::zeros((out, in_), DType::F32, vb.device()).unwrap(),
-            None,
-        );
-        jammi_lora::LoraLinear::new(
-            base,
-            config.lora_rank,
-            config.lora_alpha,
-            config.use_rslora,
-            jammi_lora::LoraInitMode::ZerosB,
-            Some(config.lora_dropout as f32),
-            config.seed,
-            varmap,
-            &vb.pp(name),
-        )
-        .unwrap()
-    }
-
-    /// A regression `ProjectionHead` with THREE LoRA layers (R1: enough that the
-    /// optimizer's `all_vars()` HashMap order is non-trivially permuted, so a
-    /// positional moment serialization would load the wrong param's moments). The
-    /// `distribution` head stays at index 1 so `TrainingLoop::regress` reads it.
-    /// All three layers are exercised and trained by `step_epoch` below.
-    async fn build_three_layer_loop(
+    /// A regression `FrozenEncoder` over the production distribution head
+    /// (`projection` + `distribution`, four trainable tensors: enough that the
+    /// optimizer's `all_vars()` HashMap order differs between two loops, so a
+    /// positional moment serialization would load the wrong param's moments).
+    /// Both layers are exercised and trained by `step_epoch` below.
+    async fn build_regression_loop(
         seed: u64,
         targets: &Tensor,
         device: &Device,
@@ -12317,17 +12301,8 @@ mod resume_invariant {
         let config = resume_config(seed);
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-
-        let projection = lora_layer(HIDDEN, HIDDEN, &config, &varmap, &vb, "projection");
-        let distribution = lora_layer(2, HIDDEN, &config, &varmap, &vb, "distribution");
-        let aux = lora_layer(HIDDEN, HIDDEN, &config, &varmap, &vb, "aux");
-        let head = LoraModel {
-            layers: vec![
-                ("projection".into(), projection),
-                ("distribution".into(), distribution),
-                ("aux".into(), aux),
-            ],
-        };
+        let head =
+            super::super::lora::build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
@@ -12369,7 +12344,7 @@ mod resume_invariant {
             .expect("queued job is claimable");
 
         let mut builder = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -12386,24 +12361,15 @@ mod resume_invariant {
         (loop_, varmap)
     }
 
-    fn head_of(loop_: &TrainingLoop) -> &LoraModel {
-        match &loop_.target {
-            TrainingTarget::ProjectionHead { head } => head,
-            _ => unreachable!("three-layer loop builds a ProjectionHead target"),
-        }
-    }
-
-    /// One production training step over all three LoRA layers — the exact chain
-    /// `TrainingLoop::run`'s production path runs per batch: projection forward,
-    /// the aux forward, the distribution forward (`head_forward`, the raw z-output),
+    /// One production training step over both head layers — the exact chain
+    /// `TrainingLoop::run`'s production path runs per batch: the projection
+    /// (`project`), the distribution forward (`head_forward`, the raw z-output),
     /// production `compute_loss` against the z-scored target, backward, AdamW step.
     /// Dropout masks are drawn on every forward, advancing each layer's seeded
     /// stream.
     fn step_epoch(loop_: &TrainingLoop, opt: &mut AdamW, feats: &Tensor, targets: &Tensor) {
-        let head = head_of(loop_);
-        let proj = head.layers[0].1.forward(feats).unwrap();
-        let aux = head.layers[2].1.forward(&proj).unwrap();
-        let head_out = loop_.head_forward(&aux).unwrap();
+        let proj = loop_.project(feats.clone()).unwrap();
+        let head_out = loop_.head_forward(&proj).unwrap();
         // Z-score the target with the resumed scaler (persisted across crash/resume),
         // exactly as `embed_chunk` does in production.
         let z_target = {
@@ -12542,8 +12508,7 @@ mod resume_invariant {
 
         // ── Reference ──────────────────────────────────────────────────────────
         let (mut ref_loop, ref_varmap) =
-            build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job")
-                .await;
+            build_regression_loop(42, &targets, &device, Arc::clone(&store), None, "ref-job").await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
         for _ in 0..K {
             step_epoch(&ref_loop, &mut ref_opt, &feats, &targets);
@@ -12583,7 +12548,7 @@ mod resume_invariant {
 
         // ── Crashed ────────────────────────────────────────────────────────────
         let (mut crash_loop, crash_varmap) =
-            build_three_layer_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
+            build_regression_loop(42, &targets, &device, Arc::clone(&store), None, "crash-job")
                 .await;
         let (mut crash_opt, crash_names) = build_opt(&crash_varmap, &crash_loop);
         for _ in 0..K {
@@ -12652,7 +12617,7 @@ mod resume_invariant {
         let perturbed = Tensor::from_vec(vec![0.0f32; n], (n,), &device).unwrap();
 
         // ── Resumed ──────────────────────────────────────────────────────────────
-        let (resume_loop, resume_varmap) = build_three_layer_loop(
+        let (resume_loop, resume_varmap) = build_regression_loop(
             42,
             &perturbed,
             &device,
@@ -12748,7 +12713,7 @@ mod resume_invariant {
         let store = file_store();
 
         let (mut ref_loop, ref_varmap) =
-            build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
+            build_regression_loop(7, &targets, &device, Arc::clone(&store), None, "wo-ref-job")
                 .await;
         let (mut ref_opt, ref_names) = build_opt(&ref_varmap, &ref_loop);
         for _ in 0..K {
@@ -12784,7 +12749,7 @@ mod resume_invariant {
         // BROKEN resume: nothing restored — the loop starts over from its
         // seed's initial weights, zero moments and stream positions at 0.
         let (wo_loop, wo_varmap) =
-            build_three_layer_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
+            build_regression_loop(7, &targets, &device, Arc::clone(&store), None, "wo-job").await;
         assert_ne!(
             weight_bytes(&wo_loop.target.named_trainable_weights().unwrap()),
             weight_bytes(&bundle.weights),
@@ -12823,8 +12788,7 @@ mod resume_invariant {
         let store = file_store();
 
         let (mut src_loop, src_varmap) =
-            build_three_layer_loop(11, &targets, &device, Arc::clone(&store), None, "src-job")
-                .await;
+            build_regression_loop(11, &targets, &device, Arc::clone(&store), None, "src-job").await;
         let (mut src_opt, src_names) = build_opt(&src_varmap, &src_loop);
         for _ in 0..K {
             step_epoch(&src_loop, &mut src_opt, &feats, &targets);
@@ -12853,8 +12817,7 @@ mod resume_invariant {
         .unwrap();
 
         let (mut loop_, varmap) =
-            build_three_layer_loop(23, &targets, &device, Arc::clone(&store), None, "dst-job")
-                .await;
+            build_regression_loop(23, &targets, &device, Arc::clone(&store), None, "dst-job").await;
         let (mut opt, _) = build_opt(&varmap, &loop_);
         for _ in 0..K {
             step_epoch(&loop_, &mut opt, &feats, &targets);
@@ -12921,7 +12884,7 @@ mod resume_invariant {
 
         // Run A: K steps, then one more training step.
         let (a_loop, a_varmap) =
-            build_three_layer_loop(99, &targets, &device, Arc::clone(&store), None, "val-a").await;
+            build_regression_loop(99, &targets, &device, Arc::clone(&store), None, "val-a").await;
         let (mut a_opt, _) = build_opt(&a_varmap, &a_loop);
         for _ in 0..K {
             step_epoch(&a_loop, &mut a_opt, &feats, &targets);
@@ -12933,19 +12896,15 @@ mod resume_invariant {
         // training step. `set_training` is `&mut`, so take the head out by value
         // through a fresh binding.
         let (mut b_loop, b_varmap) =
-            build_three_layer_loop(99, &targets, &device, Arc::clone(&store), None, "val-b").await;
+            build_regression_loop(99, &targets, &device, Arc::clone(&store), None, "val-b").await;
         let (mut b_opt, _) = build_opt(&b_varmap, &b_loop);
         for _ in 0..K {
             step_epoch(&b_loop, &mut b_opt, &feats, &targets);
         }
         // A validation pass: dropout off → no mask draws, the stream is untouched.
         b_loop.target.set_training(false);
-        {
-            let head = head_of(&b_loop);
-            let proj = head.layers[0].1.forward(&feats).unwrap();
-            let aux = head.layers[2].1.forward(&proj).unwrap();
-            let _ = b_loop.head_forward(&aux).unwrap();
-        }
+        let proj = b_loop.project(feats.clone()).unwrap();
+        b_loop.head_forward(&proj).unwrap();
         b_loop.target.set_training(true);
         step_epoch(&b_loop, &mut b_opt, &feats, &targets);
         let w_b = b_loop.target.named_trainable_weights().unwrap();
@@ -13013,10 +12972,7 @@ mod resume_invariant {
         let config = resume_config(42);
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let projection = lora_layer(4, 4, &config, &varmap, &vb, "projection");
-        let head = LoraModel {
-            layers: vec![("projection".into(), projection)],
-        };
+        let head = super::super::lora::build_projection_head(4, &config, &varmap, &vb).unwrap();
 
         catalog
             .register_model(jammi_db::catalog::model_repo::RegisterModelParams {
@@ -13064,7 +13020,7 @@ mod resume_invariant {
         let loader = TrainingDataLoader::from_precomputed(vec![batch]);
 
         let mut zombie =
-            TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+            TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
                 .device(device.clone())
                 .job_id(job.into())
                 .catalog(Arc::clone(&catalog))
@@ -13148,7 +13104,7 @@ mod held_out_eval_tests {
     const NUM_CLASSES: usize = 3;
 
     /// A minimal real [`TrainingLoop`] over a `Pairs`/MNRL-shaped
-    /// `ProjectionHead` — mirrors `host_read_discipline::minimal_loop`. The
+    /// `FrozenEncoder` — mirrors `host_read_discipline::minimal_loop`. The
     /// held-out seam's `Pairs` path never touches `self.target`, so a bare,
     /// unclaimed catalog is enough (`evaluate_held_out`/`compute_loss` never
     /// reach the catalog either).
@@ -13159,7 +13115,7 @@ mod held_out_eval_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("held-out-pairs-job".into())
             .catalog(catalog)
@@ -13494,7 +13450,7 @@ mod held_out_eval_tests {
     }
 
     /// A minimal real [`TrainingLoop`] over a `Classification`-shaped
-    /// `ProjectionHead` with seeded dropout ON (`lora_dropout > 0.0`) — the
+    /// `FrozenEncoder` with seeded dropout ON (`lora_dropout > 0.0`) — the
     /// no-RNG-perturbation fixture needs a target whose forward path
     /// actually draws a dropout mask when training, unlike the dropout-free
     /// `Pairs` fixture above.
@@ -13509,7 +13465,7 @@ mod held_out_eval_tests {
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
         let loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap.clone(),
             config,
         )
@@ -13774,14 +13730,14 @@ mod held_out_eval_tests {
 }
 
 /// A target does not necessarily start in training mode:
-/// `TrainingTarget::EncoderAdapters`'s `ModernBert` body is constructed
+/// `TrainingTarget::AdaptedEncoder`'s `ModernBert` body is constructed
 /// `training: false` (only the injected `LoraLinear` adapters start `true`),
 /// so a `training_mode: true` mirror written at [`TrainingLoopBuilder::build`]
 /// without driving the target would make every restore path
 /// (`with_dropout_disabled`, the mining and GradCache brackets) read a
 /// fabricated `true`.
 ///
-/// These tests build a REAL `EncoderAdapters` target — the smallest
+/// These tests build a REAL `AdaptedEncoder` target — the smallest
 /// constructible one, the checked-in `tests/fixtures/tiny_modernbert` config +
 /// weights also used by the `it` suite's `encoder_adapters` tests — and read the
 /// encoder's own [`jammi_encoders::ModernBert::is_training`] getter directly,
@@ -13809,7 +13765,7 @@ mod encoder_adapters_training_state_tests {
     use jammi_lora::{AdapterConfig, LoraBuildConfig, LoraInitMode};
 
     use super::super::data::TrainingDataLoader;
-    use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
+    use super::super::target::{AdaptedEncoderTarget, TrainingTarget};
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder};
 
@@ -13830,7 +13786,7 @@ mod encoder_adapters_training_state_tests {
             .join("tiny_modernbert")
     }
 
-    /// Build a real `TrainingTarget::EncoderAdapters` over the tiny-ModernBERT
+    /// Build a real `TrainingTarget::AdaptedEncoder` over the tiny-ModernBERT
     /// fixture, with LoRA injected into `Wqkv`/`Wo` (ModernBERT's fused
     /// attention linears — the same pair the `encoder_adapters` tests use)
     /// and dropout ON, so a real `LoraLinear` dropout gate is exercised
@@ -13871,13 +13827,14 @@ mod encoder_adapters_training_state_tests {
             .build(&[weights.as_path()], &model_config, device, varmap)
             .expect("tiny_modernbert fixture must build");
 
-        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder: AnyEncoder::ModernBert(encoder),
             adapter_cfg,
+            head: None,
         }))
     }
 
-    /// A minimal real `TrainingLoop` over the `EncoderAdapters` target above.
+    /// A minimal real `TrainingLoop` over the `AdaptedEncoder` target above.
     async fn minimal_encoder_adapters_loop(device: &Device) -> TrainingLoop {
         let varmap = VarMap::new();
         let target = build_encoder_adapters_target(device, &varmap);
@@ -13886,7 +13843,7 @@ mod encoder_adapters_training_state_tests {
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
         TrainingLoopBuilder::new(target, varmap, FineTuneConfig::default())
             .device(device.clone())
-            .job_id("encoder-adapters-training-state-job".into())
+            .job_id("adapted-encoder-training-state-job".into())
             .catalog(catalog)
             .artifact_dir(dir_path)
             .build()
@@ -13897,12 +13854,12 @@ mod encoder_adapters_training_state_tests {
     /// (the mirror under test) — by reaching through the real `AnyEncoder`.
     fn real_encoder_is_training(loop_: &TrainingLoop) -> bool {
         match &loop_.target {
-            TrainingTarget::EncoderAdapters(state) => match &state.encoder {
+            TrainingTarget::AdaptedEncoder(state) => match &state.encoder {
                 AnyEncoder::ModernBert(mb) => mb.is_training(),
                 _ => panic!("fixture must build an AnyEncoder::ModernBert"),
             },
-            TrainingTarget::ProjectionHead { .. } => {
-                panic!("fixture must build an EncoderAdapters target")
+            TrainingTarget::FrozenEncoder { .. } => {
+                panic!("fixture must build an AdaptedEncoder target")
             }
         }
     }
@@ -13918,7 +13875,7 @@ mod encoder_adapters_training_state_tests {
         let loop_ = minimal_encoder_adapters_loop(&device).await;
         assert!(
             real_encoder_is_training(&loop_),
-            "TrainingLoopBuilder::build must switch an EncoderAdapters target's \
+            "TrainingLoopBuilder::build must switch an AdaptedEncoder target's \
              encoder body into training mode, not just its injected LoRA adapters"
         );
         assert!(
@@ -13967,7 +13924,7 @@ mod encoder_adapters_training_state_tests {
 
     /// (c) The real-encoder analog of
     /// `held_out_eval_tests::seam_on_a_non_training_trainer_leaves_it_non_training`: on an
-    /// `EncoderAdapters` target explicitly placed in eval mode, a REFUSED
+    /// `AdaptedEncoder` target explicitly placed in eval mode, a REFUSED
     /// `evaluate_held_out` call (the leading "empty held-out set" check, fired
     /// before any forward) must not flip the encoder body back into training
     /// mode as a side effect.
@@ -14002,13 +13959,13 @@ mod encoder_adapters_training_state_tests {
 /// never derived — these tests exercise the real mechanism (`encode_media`'s
 /// `training_mode` dispatch) rather than asserting on a fabricated number.
 ///
-/// Builds a real `TrainingTarget::EncoderAdapters` over the checked-in
+/// Builds a real `TrainingTarget::AdaptedEncoder` over the checked-in
 /// `htsat_clap_tiny` test fixture (the same 4-stage HTSAT-Swin CLAP
 /// audio tower the `it` suite's `tower_adapters::clap_audio_tower_adapter_
 /// trains_and_serves` fine-tunes end-to-end) and a real base model loaded
 /// through the SAME `ModelResolver` + `CandleBackend::load` pair the
 /// production worker path uses — needed here only so `encode_media`'s
-/// `EncoderAdapters` arm has a real `audio_frontend()` (CLAP fusion
+/// `AdaptedEncoder` arm has a real `audio_frontend()` (CLAP fusion
 /// front-end geometry) to preprocess through; the base model's own tower
 /// forward is never invoked on this target.
 #[cfg(test)]
@@ -14031,7 +13988,7 @@ mod media_front_end_wall_tests {
     use jammi_datafusion::ModelTask;
 
     use super::super::data::TrainingDataLoader;
-    use super::super::target::{EncoderAdaptersTarget, TrainingTarget};
+    use super::super::target::{AdaptedEncoderTarget, TrainingTarget};
     use super::super::FineTuneConfig;
     use super::{TrainingLoop, TrainingLoopBuilder, TrainingResult};
 
@@ -14116,10 +14073,10 @@ mod media_front_end_wall_tests {
         )
     }
 
-    /// Build a real `TrainingTarget::EncoderAdapters` over a freshly built
+    /// Build a real `TrainingTarget::AdaptedEncoder` over a freshly built
     /// `AnyEncoder::Htsat` tower (LoRA injected into `query`/`value`, the
     /// Swin blocks' attention sites) plus the base model's `audio_frontend`
-    /// — the two pieces `encode_media`'s `EncoderAdapters` arm needs for the
+    /// — the two pieces `encode_media`'s `AdaptedEncoder` arm needs for the
     /// audio task.
     fn build_htsat_encoder_adapters_target(device: &Device, varmap: &VarMap) -> TrainingTarget {
         let fixture = htsat_clap_tiny_dir();
@@ -14161,9 +14118,10 @@ mod media_front_end_wall_tests {
             )
             .expect("htsat_clap_tiny fixture must build a real HtsatAudio tower");
 
-        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder: AnyEncoder::Htsat(Box::new(tower)),
             adapter_cfg,
+            head: None,
         }))
     }
 
@@ -14179,7 +14137,7 @@ mod media_front_end_wall_tests {
         )])
     }
 
-    /// A minimal real `TrainingLoop` over the HTSAT `EncoderAdapters` target,
+    /// A minimal real `TrainingLoop` over the HTSAT `AdaptedEncoder` target,
     /// driven by a data loader that is EITHER precomputed tensors (a text
     /// run that never touches `encode_media`) or the one-row audio loader
     /// above, matching the shape `TrainingLoopBuilder`'s own doc calls the
@@ -14213,7 +14171,7 @@ mod media_front_end_wall_tests {
     }
 
     /// (a) mechanism, end to end through the real `run`: a media
-    /// `EncoderAdapters` run reports a positive `media_front_end_wall`
+    /// `AdaptedEncoder` run reports a positive `media_front_end_wall`
     /// strictly under the run's own total wall (the front end is one part
     /// of a training step, not the whole of it — the tower forward,
     /// backward, and optimizer step all cost real wall too), and a text run
@@ -14235,12 +14193,12 @@ mod media_front_end_wall_tests {
             })
             .await
             .unwrap()
-            .expect("the audio EncoderAdapters run must complete");
+            .expect("the audio AdaptedEncoder run must complete");
         let total_wall = started.elapsed();
 
         assert!(
             result.media_front_end_wall > Duration::ZERO,
-            "a media EncoderAdapters run must report a positive media_front_end_wall"
+            "a media AdaptedEncoder run must report a positive media_front_end_wall"
         );
         assert!(
             result.media_front_end_wall < total_wall,
@@ -14265,7 +14223,7 @@ mod media_front_end_wall_tests {
             &vb,
         )
         .unwrap();
-        let text_target = TrainingTarget::ProjectionHead { head };
+        let text_target = TrainingTarget::FrozenEncoder { head };
         let text_batch = super::super::data::TrainingBatch::Contrastive {
             embeddings_a: candle_core::Tensor::ones((1, 4), DType::F32, &device).unwrap(),
             embeddings_b: candle_core::Tensor::ones((1, 4), DType::F32, &device).unwrap(),
@@ -14345,7 +14303,7 @@ mod media_front_end_wall_tests {
         );
     }
 
-    /// (c) the `ProjectionHead` arm of `encode_media` never advances the
+    /// (c) the `FrozenEncoder` arm of `encode_media` never advances the
     /// accumulator, on a real audio forward, even while `training_mode` is
     /// true. That arm's decode/preprocess and tower forward are one
     /// combined call with no seam to time in isolation, so timing it would
@@ -14354,7 +14312,7 @@ mod media_front_end_wall_tests {
     /// above, that the arm does not accumulate rather than merely happening
     /// to report zero on this input.
     #[tokio::test(flavor = "multi_thread")]
-    async fn encode_media_projection_head_arm_never_advances_the_accumulator() {
+    async fn encode_media_frozen_encoder_arm_never_advances_the_accumulator() {
         use arrow::array::{ArrayRef, BinaryArray};
         use candle_nn::VarBuilder;
 
@@ -14365,7 +14323,7 @@ mod media_front_end_wall_tests {
 
         // Probe the frozen base's own pooled-output width for
         // `AudioEmbedding` so the projection head's input dim matches it
-        // exactly — the SAME width `project_frozen_embedding` forwards
+        // exactly — the SAME width `frozen_pooled` returns
         // through at test time.
         let probe_arr = Arc::new(BinaryArray::from(vec![clip.as_slice()])) as ArrayRef;
         let probe = base_model
@@ -14388,7 +14346,7 @@ mod media_front_end_wall_tests {
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
         let mut loop_ = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap,
             FineTuneConfig {
                 epochs: 1,
@@ -14412,11 +14370,11 @@ mod media_front_end_wall_tests {
         assert_eq!(loop_.media_front_end_wall.get(), Duration::ZERO);
         loop_
             .encode_media(std::slice::from_ref(&clip))
-            .expect("encode_media must succeed on the ProjectionHead arm");
+            .expect("encode_media must succeed on the FrozenEncoder arm");
         assert_eq!(
             loop_.media_front_end_wall.get(),
             Duration::ZERO,
-            "the ProjectionHead arm of encode_media must never advance \
+            "the FrozenEncoder arm of encode_media must never advance \
              media_front_end_wall, even while training_mode is true — it \
              has no seam between decode/preprocess and the tower forward \
              to time in isolation"
@@ -14427,7 +14385,7 @@ mod media_front_end_wall_tests {
 /// A production-call-site oracle for sequence-length bucketing.
 ///
 /// `jammi_numerics::ShapeLadder`'s and `BatchEncoding::pad_to`'s own unit
-/// tests never drive [`TrainingLoop::encode_texts`]'s `EncoderAdapters`
+/// tests never drive [`TrainingLoop::encode_texts`]'s `AdaptedEncoder`
 /// branch, the ONLY production call site (via this file's own
 /// `tokenize_and_bucket`, its sole caller), so an unwired call site would
 /// pass them. This module covers the call site:
@@ -14458,7 +14416,7 @@ mod encode_texts_bucketing_oracle {
     use jammi_datafusion::ModelTask;
 
     // The tests below all call into `tokenize_and_bucket` (directly, or
-    // indirectly via `TrainingLoop::encode_texts`'s `EncoderAdapters`
+    // indirectly via `TrainingLoop::encode_texts`'s `AdaptedEncoder`
     // branch), which increments the process-wide
     // `BUCKETED_TOKENIZE_CALLS` test-only counter (c) reads. `cargo test`
     // runs tests in parallel threads within the SAME process, so an
@@ -14468,7 +14426,7 @@ mod encode_texts_bucketing_oracle {
 
     /// Real `LoadedModel` (the `base_model` `encode_texts` reads its
     /// tokenizer from) for the SAME `tiny_modernbert` fixture the
-    /// `EncoderAdapters` target below is built from — shared vocab/config,
+    /// `AdaptedEncoder` target below is built from — shared vocab/config,
     /// so the tokenizer's emitted token ids are valid inputs to the
     /// encoder's own embedding table. Mirrors
     /// `test_fixtures::tiny_bert`'s real model-cache load path, substituting
@@ -14512,7 +14470,7 @@ mod encode_texts_bucketing_oracle {
     }
 
     /// (a) The production oracle: calling `tokenize_and_bucket` — the exact
-    /// helper `TrainingLoop::encode_texts`'s `EncoderAdapters` branch calls,
+    /// helper `TrainingLoop::encode_texts`'s `AdaptedEncoder` branch calls,
     /// its only caller — against a real tokenizer must return rows extended
     /// to the ladder, strictly wider than the batch's own
     /// natural (tokenizer `BatchLongest`) width.
@@ -14637,7 +14595,7 @@ mod encode_texts_bucketing_oracle {
     }
 
     /// (b) Output-invariance at the REAL call site: [`TrainingLoop::encode_
-    /// texts`]'s `EncoderAdapters` branch, driven end-to-end through a real
+    /// texts`]'s `AdaptedEncoder` branch, driven end-to-end through a real
     /// `TrainingLoop`, must produce the same pooled output as an
     /// independently-built forward pass over the batch's own NATURAL
     /// (unbucketed) width.
@@ -14691,9 +14649,9 @@ mod encode_texts_bucketing_oracle {
         let varmap2 = VarMap::new();
         let target2 = build_encoder_adapters_target(&device, &varmap2);
         let encoder2 = match &target2 {
-            TrainingTarget::EncoderAdapters(state) => &state.encoder,
-            TrainingTarget::ProjectionHead { .. } => {
-                unreachable!("build_encoder_adapters_target always builds EncoderAdapters")
+            TrainingTarget::AdaptedEncoder(state) => &state.encoder,
+            TrainingTarget::FrozenEncoder { .. } => {
+                unreachable!("build_encoder_adapters_target always builds AdaptedEncoder")
             }
         };
         let tokenizer = tokenizer_of(&base_model);
@@ -14735,7 +14693,7 @@ mod encode_texts_bucketing_oracle {
         }
     }
 
-    /// (c) Every mode pads to the ladder: `encode_texts`'s `EncoderAdapters`
+    /// (c) Every mode pads to the ladder: `encode_texts`'s `AdaptedEncoder`
     /// branch reaches [`super::tokenize_and_bucket`] while
     /// `self.training_mode` is `true` AND while it is `false` (the state
     /// `evaluate`/`evaluate_held_out` run in), proven via the process-wide
@@ -15107,7 +15065,7 @@ mod decomposition_oracle_tests {
     /// it, while legitimate summation-order noise does not flake it.
     const REL_TOL: f64 = 1e-5;
 
-    /// A minimal real [`TrainingLoop`] over a `ProjectionHead` target, for the
+    /// A minimal real [`TrainingLoop`] over a `FrozenEncoder` target, for the
     /// four objectives whose loss functions never touch `self.target` (they
     /// operate directly on the batch's already-embedded tensors): MNRL/Pairs,
     /// MNRL/Triplet, Triplet-margin, Contrastive/CosineMse.
@@ -15118,7 +15076,7 @@ mod decomposition_oracle_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-job".into())
             .catalog(catalog)
@@ -15128,7 +15086,7 @@ mod decomposition_oracle_tests {
     }
 
     /// A minimal real [`TrainingLoop`] over a classification-shaped
-    /// `ProjectionHead` (projection + classifier layers) — Classification's
+    /// `FrozenEncoder` (projection + classifier layers) — Classification's
     /// loss DOES route through `self.target` (`Self::classify`).
     async fn minimal_classification_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
         let varmap = VarMap::new();
@@ -15137,7 +15095,7 @@ mod decomposition_oracle_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-cls-job".into())
             .catalog(catalog)
@@ -15284,7 +15242,7 @@ mod decomposition_oracle_tests {
     /// into.
     const MATRYOSHKA_HIDDEN: usize = 4;
 
-    /// A minimal real [`TrainingLoop`] over a `ProjectionHead` target sized
+    /// A minimal real [`TrainingLoop`] over a `FrozenEncoder` target sized
     /// for the matryoshka oracle ([`MATRYOSHKA_HIDDEN`]-wide embeddings)
     /// rather than [`minimal_loop`]'s fixed [`HIDDEN`].
     async fn minimal_matryoshka_loop(device: &Device, config: FineTuneConfig) -> TrainingLoop {
@@ -15294,7 +15252,7 @@ mod decomposition_oracle_tests {
         let dir = tempfile::tempdir().unwrap();
         let dir_path = dir.keep();
         let catalog = Arc::new(jammi_db::catalog::Catalog::open(&dir_path).await.unwrap());
-        TrainingLoopBuilder::new(TrainingTarget::ProjectionHead { head }, varmap, config)
+        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
             .device(device.clone())
             .job_id("decomp-oracle-matryoshka-job".into())
             .catalog(catalog)

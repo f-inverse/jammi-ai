@@ -414,10 +414,13 @@ impl ModelDescription {
         let DescribedBacking::Local(local) = &self.backing else {
             return None;
         };
-        match local.saved_adapter.as_ref().map(|adapter| &adapter.config) {
-            Some(crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg)) => {
-                cfg.regression_form.as_ref()
-            }
+        match local
+            .saved_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.config.head())
+            .map(|head| &head.output)
+        {
+            Some(crate::fine_tune::target::HeadOutput::Distribution { form, .. }) => Some(form),
             _ => None,
         }
     }

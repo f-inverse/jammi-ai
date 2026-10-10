@@ -1,5 +1,5 @@
 //! End-to-end integration tests for the
-//! [`TrainingTarget::EncoderAdapters`](jammi_ai::fine_tune::target::TrainingTarget::EncoderAdapters)
+//! [`TrainingTarget::AdaptedEncoder`](jammi_ai::fine_tune::target::TrainingTarget::AdaptedEncoder)
 //! flavour of fine-tuning: LoRA injected into the encoder's internal
 //! attention/FFN linears.
 //!
@@ -100,8 +100,10 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
                 lora_rank: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
-                // Non-empty target_modules triggers the encoder-adapters target.
-                target_modules: vec!["query".to_string(), "value".to_string()],
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "query".to_string(),
+                    "value".to_string(),
+                ]),
                 ..Default::default()
             }),
         )
@@ -109,7 +111,7 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
         .unwrap();
     job.wait().await.unwrap();
 
-    // Walk back through the saved adapter and confirm the encoder-adapters
+    // Walk back through the saved adapter and confirm the adapted-encoder
     // discriminator + the persisted target modules / rank.
     let adapter_dir = adapter_dir_for_model(&session, job.model_id()).await;
     let cfg_path = adapter_dir.join("adapter_config.json");
@@ -119,10 +121,10 @@ async fn encoder_adapters_bert_writes_adapter_marker() {
     );
     let cfg_str = std::fs::read_to_string(&cfg_path).unwrap();
     let saved: jammi_ai::fine_tune::target::SavedAdapter = serde_json::from_str(&cfg_str).unwrap();
-    let cfg = match saved {
-        jammi_ai::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => *cfg,
-        other => panic!("expected EncoderAdapters variant, got {other:?}"),
-    };
+    let cfg = saved
+        .adapters()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected encoder adapters, got {saved:?}"));
 
     assert_eq!(cfg.model_type, "bert");
     assert_eq!(
@@ -159,7 +161,10 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
                 // ModernBERT-specific targets: fused QKV + output projection.
-                target_modules: vec!["Wqkv".to_string(), "Wo".to_string()],
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "Wqkv".to_string(),
+                    "Wo".to_string(),
+                ]),
                 ..Default::default()
             }),
         )
@@ -172,10 +177,10 @@ async fn encoder_adapters_modernbert_writes_adapter_marker() {
         &std::fs::read_to_string(adapter_dir.join("adapter_config.json")).unwrap(),
     )
     .unwrap();
-    let cfg = match saved {
-        jammi_ai::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => *cfg,
-        other => panic!("expected EncoderAdapters variant, got {other:?}"),
-    };
+    let cfg = saved
+        .adapters()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected encoder adapters, got {saved:?}"));
 
     assert_eq!(cfg.model_type, "modernbert");
     assert_eq!(
@@ -211,7 +216,10 @@ async fn encoder_adapters_changes_embeddings_versus_base() {
                 learning_rate: 1e-3,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
-                target_modules: vec!["query".to_string(), "value".to_string()],
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "query".to_string(),
+                    "value".to_string(),
+                ]),
                 ..Default::default()
             }),
         )
@@ -236,6 +244,6 @@ async fn encoder_adapters_changes_embeddings_versus_base() {
         .fold(0.0f32, f32::max);
     assert!(
         max_abs_diff > 1e-6,
-        "encoder-adapters fine-tune should shift the embedding (max |Δ| = {max_abs_diff})"
+        "adapted-encoder fine-tune should shift the embedding (max |Δ| = {max_abs_diff})"
     );
 }

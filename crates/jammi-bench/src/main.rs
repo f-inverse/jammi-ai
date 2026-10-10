@@ -698,7 +698,7 @@ enum Command {
     /// Boxed (`clippy::large_enum_variant`): this variant's field count
     /// alone (every `FinetuneRunParams` knob is a CLI flag) makes it far
     /// the largest `Command` payload — boxing, not a blanket `#[allow]`,
-    /// mirrors `jammi_ai::fine_tune::target::TrainingTarget::EncoderAdapters`'s
+    /// mirrors `jammi_ai::fine_tune::target::TrainingTarget::AdaptedEncoder`'s
     /// own fix for the identical lint (see that variant's doc).
     FinetuneRun(Box<FinetuneRunArgs>),
     /// The environment that places one shape-d role on one box, as

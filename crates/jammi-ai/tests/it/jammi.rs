@@ -176,15 +176,16 @@ fn training_columns() -> Vec<String> {
     ]
 }
 
-/// The cheapest real fine-tune shape: one epoch of the projection-head arm
-/// (`target_modules` empty), which is enough for a job to be claimed and to
-/// leave `queued` — the only property these tests read off it.
+/// The cheapest real fine-tune shape: one epoch over a frozen encoder, which
+/// is enough for a job to be claimed and to leave `queued` — the only
+/// property these tests read off it.
 fn cheap_fine_tune_config() -> FineTuneConfig {
     FineTuneConfig {
         epochs: 1,
         batch_size: 4,
         warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
+        encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
         ..Default::default()
     }
 }

@@ -110,9 +110,9 @@ fn start_request() -> SubmitJobRequest {
             task: ModelTask::TextEmbedding as i32,
         })),
         base_model: tiny_bert_model_id(),
-        // Defaults: projection head (empty target_modules), 3 epochs. The tiny
-        // fixture + 32-dim model keep this within the engine's own fine-tune
-        // test runtime.
+        // Defaults: an adapted encoder at the architecture's default sites, 3
+        // epochs. The tiny fixture + 32-dim model keep this within the
+        // engine's own fine-tune test runtime.
         config: None,
         idempotency_key: String::new(),
         // Unset (`0`) rank count: the single-rank job every one of these

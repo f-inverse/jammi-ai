@@ -81,7 +81,7 @@ async fn session_with_training_data() -> (Arc<InferenceSession>, TempDir) {
     (session, dir)
 }
 
-/// A fast encoder-adapters config (`backbone_dtype` only takes effect on this
+/// A fast adapted-encoder config (`backbone_dtype` only takes effect on this
 /// arm) at the given precision.
 fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
     FineTuneConfig {
@@ -90,7 +90,10 @@ fn encoder_adapters_config(backbone_dtype: ComputePrecision) -> FineTuneConfig {
         lora_rank: 4,
         warmup: jammi_ai::fine_tune::Warmup::Steps(0),
         lr_schedule: LrSchedule::Constant,
-        target_modules: vec!["Wqkv".to_string(), "Wo".to_string()],
+        encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+            "Wqkv".to_string(),
+            "Wo".to_string(),
+        ]),
         backbone_dtype,
         ..Default::default()
     }
@@ -578,22 +581,22 @@ async fn embedded_and_raw_transports_produce_the_same_report_shape() {
     );
 }
 
-/// No fabricated reason: the projection-head arm (`target_modules` empty —
-/// `backbone_dtype` never takes effect there) never builds an encoder to
+/// No fabricated reason: the frozen-encoder arm (`backbone_dtype` never
+/// takes effect there) never builds an encoder to
 /// probe at all, so its report must never claim
 /// `"reason": "probe_forward_failed"` for a probe that was NEVER attempted.
 /// `flash_compiled_device_reason`'s compiled/device short-circuits are checked FIRST regardless
 /// (`"cuda_not_compiled"` on this CPU-only scoped-gate build — legitimately true, and cheaper to
 /// state than "no probe" when flash could never hold here either way), so THIS
 /// test's own build can only prove the fabricated value is ABSENT, not that
-/// the honest `"no_encoder_to_probe_projection_head_arm"` reason is reached
+/// the honest `"no_encoder_to_probe_frozen_encoder"` reason is reached
 /// (that needs `cuda` compiled AND a real CUDA device — see
 /// `flash_report_no_probe_attempted`'s doc). `ops` must be empty regardless
 /// (never a fabricated per-op measurement for an arm that built no
 /// dtype-typed encoder).
 #[serial(acceleration_report)]
 #[tokio::test(flavor = "multi_thread")]
-async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
+async fn frozen_encoder_arm_reports_no_probe_attempted_not_a_fabricated_failure() {
     let (session, _dir) = session_with_training_data().await;
     let _worker = EmbeddedWorker::spawn(&session).expect("default worker intervals are valid");
 
@@ -609,8 +612,9 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
                 batch_size: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
-                // target_modules left empty (the default): the projection-head
-                // arm, which never builds an encoder to probe.
+                // A frozen encoder: the arm that never builds an encoder to
+                // probe.
+                encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
                 ..Default::default()
             }),
         )
@@ -622,18 +626,18 @@ async fn projection_head_arm_reports_no_probe_attempted_not_a_fabricated_failure
     assert_eq!(
         report["ops"],
         serde_json::json!({}),
-        "the projection-head arm builds no encoder to probe — ops must be empty, got: {report}"
+        "the frozen-encoder arm builds no encoder to probe — ops must be empty, got: {report}"
     );
     assert_ne!(
         report["flash"]["reason"],
         serde_json::json!("probe_forward_failed"),
-        "the projection-head arm never attempts a probe at all — it must never claim the \
+        "the frozen-encoder arm never attempts a probe at all — it must never claim the \
          probe-was-attempted-and-failed reason, got: {report}"
     );
     if cfg!(feature = "cuda") && report["device"] == serde_json::json!("cuda") {
         assert_eq!(
             report["flash"]["reason"],
-            serde_json::json!("no_encoder_to_probe_projection_head_arm"),
+            serde_json::json!("no_encoder_to_probe_frozen_encoder"),
             "on a real CUDA device the honest no-probe-attempted reason must appear, got: \
              {report}"
         );
@@ -681,7 +685,7 @@ fn tiny_bert_head64_model() -> String {
 /// device-level short-circuit fires first for every architecture — so it
 /// proves the one thing THIS build can prove: a BERT-family job produces a
 /// well-formed, honestly-labelled `flash: {holds: false, reason: ..}` at all,
-/// through the SAME encoder-adapters path the ModernBERT tests above already
+/// through the SAME adapted-encoder path the ModernBERT tests above already
 /// cover, and that this build's device-level reason is never overridden by a
 /// fabricated `"flash_transport_not_wired"` it cannot actually observe.
 #[serial(acceleration_report)]
@@ -703,10 +707,13 @@ async fn bert_family_job_reports_flash_decline_honestly() {
                 lora_rank: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 lr_schedule: LrSchedule::Constant,
-                // Non-empty target_modules: the encoder-adapters arm, which
-                // DOES build an encoder and run the acceleration probe (unlike the
-                // projection-head arm covered above).
-                target_modules: vec!["query".to_string(), "value".to_string()],
+                // The adapted-encoder arm, which DOES build an encoder and run
+                // the acceleration probe (unlike the frozen-encoder arm covered
+                // above).
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "query".to_string(),
+                    "value".to_string(),
+                ]),
                 backbone_dtype: ComputePrecision::F32,
                 ..Default::default()
             }),
@@ -1803,7 +1810,7 @@ async fn completed_job_with_a_swallowed_report_write_is_never_left_pending() {
     );
 }
 
-/// A MEDIA encoder-adapters job's acceleration report is a real measurement,
+/// A MEDIA adapted-encoder job's acceleration report is a real measurement,
 /// not a probe failure.
 ///
 /// A probe that hand-built a `[1, 4]` token-id batch and called
@@ -1866,9 +1873,12 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
                 lr_schedule: LrSchedule::Constant,
                 validation_fraction: 0.0,
                 early_stopping_metric: jammi_ai::fine_tune::EarlyStoppingMetric::TrainLoss,
-                // Non-empty target_modules: the encoder-adapters arm, the only
-                // one that builds an encoder and runs the acceleration probe.
-                target_modules: vec!["query".to_string(), "value".to_string()],
+                // The adapted-encoder arm, the only one that builds an encoder
+                // and runs the acceleration probe.
+                encoder: jammi_ai::fine_tune::EncoderTraining::adapted(vec![
+                    "query".to_string(),
+                    "value".to_string(),
+                ]),
                 backbone_dtype: ComputePrecision::F32,
                 ..Default::default()
             }),
@@ -1883,7 +1893,7 @@ async fn media_encoder_adapters_job_probes_its_own_modality() {
         .unwrap_or_else(|| panic!("ops must be an object, got: {report}"));
     assert!(
         !ops.is_empty(),
-        "an audio encoder-adapters job's probe must DRIVE a real forward through the \
+        "an audio adapted-encoder job's probe must DRIVE a real forward through the \
          audio tower and measure at least one instrumented op — an empty ops map here \
          means the probe never ran the tower at all, got: {report}"
     );

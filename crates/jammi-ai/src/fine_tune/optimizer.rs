@@ -674,7 +674,7 @@ pub fn canonical_reduce(
 /// adapter, an unpopulated `GradStore`), or a batch whose loss legitimately
 /// never routes through any of these `Var`s by DESIGN (e.g.
 /// `TrainingBatch::Contrastive`'s `contrastive_loss` scores raw precomputed
-/// embeddings directly, never through a `ProjectionHead`'s LoRA layers — a
+/// embeddings directly, never through a `FrozenEncoder`'s LoRA layers — a
 /// real, common shape across this crate's own step-counting/schedule test
 /// oracles, never a bug in those tests). Since a hard refusal here would
 /// break every one of those legitimate call sites, this is a COUNTED FACT
@@ -700,7 +700,7 @@ pub fn clip_and_step(
         // route through EVERY trainable `Var` for a given batch — e.g. `TrainingBatch::
         // Contrastive`'s `contrastive_loss` scores raw precomputed
         // embeddings directly, never through `TrainingTarget::
-        // ProjectionHead`'s LoRA layers, so its trainable Vars carry no
+        // FrozenEncoder`'s LoRA layers, so its trainable Vars carry no
         // gradient by DESIGN, not by bug (`ft_correctness_sweep.rs`'s
         // step-counting oracles, `ft_determinism.rs`, and
         // `encoder_adapters.rs` all exercise exactly this shape). The

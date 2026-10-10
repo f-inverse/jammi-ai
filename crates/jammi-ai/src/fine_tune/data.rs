@@ -224,7 +224,7 @@ pub enum TextChunk {
     /// One batch of MEDIA triplets. Each element is one encoded blob —
     /// audio clip or image, per the job's task — which the training loop
     /// runs through that modality's front end and then the tower (LoRA
-    /// inside it, for an encoder-adapters run) or the frozen tower plus the
+    /// inside it, for an adapted-encoder run) or the frozen tower plus the
     /// LoRA projection head, exactly as the text path does for
     /// [`TextChunk::Triplet`].
     MediaTriplet {
@@ -292,6 +292,10 @@ enum LoaderData {
 pub struct TrainingDataLoader {
     format: TrainingFormat,
     data: LoaderData,
+    /// A classification loader's label vocabulary, `None` for every other
+    /// format: the names of the classes its rows' indices count, shared
+    /// read-only by both halves of a [`Self::split`] and every replica.
+    label_vocab: Option<std::sync::Arc<super::decode::LabelVocabulary>>,
     /// The eager collected batches' pool reservation, held for this loader's
     /// own lifetime — `None` for every loader that never
     /// went through a pool-accounted collect (every `from_*` constructor
@@ -356,6 +360,7 @@ impl TrainingDataLoader {
                 LoaderData::TextRows(rows) => LoaderData::TextRows(rows.clone()),
                 LoaderData::Precomputed(batches) => LoaderData::Precomputed(batches.clone()),
             },
+            label_vocab: self.label_vocab.clone(),
             reservation: None,
         }
     }
@@ -373,21 +378,35 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
 
-    /// Create a loader from classification rows (text + integer label).
-    pub fn from_classification(rows: Vec<(String, u32)>, num_classes: usize) -> Self {
+    /// Create a loader from classification rows (text + class index into
+    /// `vocab`).
+    pub fn from_classification(
+        rows: Vec<(String, u32)>,
+        vocab: super::decode::LabelVocabulary,
+    ) -> Self {
         Self {
-            format: TrainingFormat::Classification { num_classes },
+            format: TrainingFormat::Classification {
+                num_classes: vocab.num_classes(),
+            },
             data: LoaderData::TextRows(
                 rows.into_iter()
                     .map(|(text, label)| TrainingRow::Classification { text, label })
                     .collect(),
             ),
+            label_vocab: Some(std::sync::Arc::new(vocab)),
             reservation: None,
         }
+    }
+
+    /// A classification loader's label vocabulary; `None` for every other
+    /// format.
+    pub(crate) fn label_vocab(&self) -> Option<&super::decode::LabelVocabulary> {
+        self.label_vocab.as_deref()
     }
 
     /// Create a loader from NER rows (text + JSON entity spans).
@@ -402,6 +421,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -418,6 +438,7 @@ impl TrainingDataLoader {
                     .map(|(text, target)| TrainingRow::Regression { text, target })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -435,6 +456,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -453,6 +475,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -525,6 +548,7 @@ impl TrainingDataLoader {
         Ok(Self {
             format: TrainingFormat::in_batch(has_negatives),
             data: LoaderData::TextRows(rows),
+            label_vocab: None,
             reservation: None,
         })
     }
@@ -548,6 +572,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -565,6 +590,7 @@ impl TrainingDataLoader {
                     })
                     .collect(),
             ),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -577,6 +603,7 @@ impl TrainingDataLoader {
         Self {
             format: TrainingFormat::Contrastive,
             data: LoaderData::Precomputed(batches),
+            label_vocab: None,
             reservation: None,
         }
     }
@@ -660,40 +687,35 @@ impl TrainingDataLoader {
     /// ```
     pub fn split(self, fraction: f64) -> (TrainingDataLoader, TrainingDataLoader) {
         let train_reservation = self.reservation.as_ref().map(|r| r.split(r.size()));
-        match self.data {
+        let (train, val) = match self.data {
             LoaderData::TextRows(mut rows) => {
-                let train_count = split_index(rows.len(), fraction);
-                let val_rows = rows.split_off(train_count);
-                (
-                    TrainingDataLoader {
-                        format: self.format,
-                        data: LoaderData::TextRows(rows),
-                        reservation: train_reservation,
-                    },
-                    TrainingDataLoader {
-                        format: self.format,
-                        data: LoaderData::TextRows(val_rows),
-                        reservation: None,
-                    },
-                )
+                let val_rows = rows.split_off(split_index(rows.len(), fraction));
+                (LoaderData::TextRows(rows), LoaderData::TextRows(val_rows))
             }
             LoaderData::Precomputed(mut batches) => {
-                let train_count = split_index(batches.len(), fraction);
-                let val_batches = batches.split_off(train_count);
+                let val_batches = batches.split_off(split_index(batches.len(), fraction));
                 (
-                    TrainingDataLoader {
-                        format: self.format,
-                        data: LoaderData::Precomputed(batches),
-                        reservation: train_reservation,
-                    },
-                    TrainingDataLoader {
-                        format: self.format,
-                        data: LoaderData::Precomputed(val_batches),
-                        reservation: None,
-                    },
+                    LoaderData::Precomputed(batches),
+                    LoaderData::Precomputed(val_batches),
                 )
             }
-        }
+        };
+        // Both halves index one vocabulary: a validation row's class index
+        // means what a training row's does.
+        (
+            TrainingDataLoader {
+                format: self.format,
+                data: train,
+                label_vocab: self.label_vocab.clone(),
+                reservation: train_reservation,
+            },
+            TrainingDataLoader {
+                format: self.format,
+                data: val,
+                label_vocab: self.label_vocab,
+                reservation: None,
+            },
+        )
     }
 
     /// Indices of rows in this loader (for testing split logic).

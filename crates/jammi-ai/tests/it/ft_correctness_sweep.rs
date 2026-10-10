@@ -103,7 +103,7 @@ async fn oracle_epochs_honored_exactly_precomputed() {
         let (catalog, dir) = claimed_loop_env(&tag).await;
 
         let mut tl = TrainingLoopBuilder::new(
-            TrainingTarget::ProjectionHead { head },
+            TrainingTarget::FrozenEncoder { head },
             varmap,
             FineTuneConfig {
                 epochs,
@@ -177,7 +177,7 @@ async fn oracle_steps_equal_epochs_times_ceil_batches_over_grad_accum() {
     let (catalog, dir) = claimed_loop_env(tag).await;
 
     let mut tl = TrainingLoopBuilder::new(
-        TrainingTarget::ProjectionHead { head },
+        TrainingTarget::FrozenEncoder { head },
         varmap,
         FineTuneConfig {
             epochs: EPOCHS,
@@ -255,7 +255,7 @@ async fn oracle_grad_accum_partial_window_step_accounting() {
     let (catalog, dir) = claimed_loop_env(tag).await;
 
     let mut tl = TrainingLoopBuilder::new(
-        TrainingTarget::ProjectionHead { head },
+        TrainingTarget::FrozenEncoder { head },
         varmap,
         FineTuneConfig {
             epochs: EPOCHS,
@@ -336,7 +336,7 @@ fn oracle_compute_lr_goes_negative_past_horizon() {
 }
 
 // NOTE on learning-rate honoring: the precomputed loader path feeds tensors
-// straight to the loss WITHOUT routing through the trainable ProjectionHead
+// straight to the loss WITHOUT routing through the trainable FrozenEncoder head
 // (the head is applied only on the text-encoding path), so a precomputed run
 // produces no weight delta regardless of LR — it cannot probe LR honoring.
 // LR honoring is already pinned directly by `compute_lr` (see the `lr_schedule_*`

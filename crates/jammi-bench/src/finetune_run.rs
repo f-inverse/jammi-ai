@@ -84,7 +84,7 @@ use jammi_ai::fine_tune::source::TrainingSource;
 use jammi_ai::fine_tune::spec::{
     admit_training_spec, submit_admitted_training, TrainingCommon, TrainingSpec, DEFAULT_WORLD_SIZE,
 };
-use jammi_ai::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
+use jammi_ai::fine_tune::target::{AdaptedEncoderTarget, TrainingTarget};
 use jammi_ai::fine_tune::trainer::{
     tokenize_and_bucket, AppliedLearningRate, KernelDispatchCount, KernelDispatches, TrainingLoop,
     TrainingLoopBuilder,
@@ -92,7 +92,8 @@ use jammi_ai::fine_tune::trainer::{
 use jammi_ai::fine_tune::training_job::fine_tuned_model_id;
 use jammi_ai::fine_tune::worker::{artifact_files_digest, published_artifact_digest};
 use jammi_ai::fine_tune::{
-    EarlyStoppingMetric, EmbeddingLoss, FineTuneConfig, FineTuneMethod, LrSchedule, Warmup,
+    EarlyStoppingMetric, EmbeddingLoss, EncoderTraining, FineTuneConfig, FineTuneMethod,
+    LrSchedule, Warmup,
 };
 use jammi_ai::model::arch::{self, EncoderFamily};
 use jammi_ai::model::backend::candle::CandleBackend;
@@ -483,7 +484,7 @@ fn loader_token_batches(
 pub struct FinetuneRunParams {
     /// Directory holding `config.json` + `model.safetensors` (+ a tokenizer,
     /// one of `jammi_ai::model::arch::TOKENIZER_CANDIDATES` — REQUIRED for the
-    /// real `EncoderAdapters` target; see this module's doc).
+    /// real `AdaptedEncoder` target; see this module's doc).
     pub model_dir: PathBuf,
     /// Which tower of `model_dir`'s checkpoint this run trains, and hence
     /// which of the two row vectors below carries this run's data (see
@@ -964,8 +965,8 @@ impl Checkpoint {
     }
 }
 
-/// Build the frozen base model this run's `EncoderAdapters` target needs —
-/// ONLY for its TOKENIZER (`TrainingLoop::encode_texts`'s `EncoderAdapters`
+/// Build the frozen base model this run's `AdaptedEncoder` target needs —
+/// ONLY for its TOKENIZER (`TrainingLoop::encode_texts`'s `AdaptedEncoder`
 /// branch reads `base.tokenizer`, never `base`'s own forward; see that
 /// method's doc). Constructed via the REAL `CandleBackend::load` public
 /// trait method — the same backend a serving `InferenceSession` loads
@@ -993,7 +994,7 @@ fn load_base_model(
     let tokenizer = arch::tokenizer_source(model_dir);
     if task == Task::Text && tokenizer.is_none() {
         return Err(format!(
-            "finetune-run: {} has no tokenizer (none of {:?}) — the EncoderAdapters training \
+            "finetune-run: {} has no tokenizer (none of {:?}) — the adapted-encoder training \
              target requires a real tokenizer to turn the fixture's text pairs into token ids \
              (this tier never falls back to synthetic ids the way finetune-step does, because a \
              synthetic-id run would never touch the committed fixture's real text at all)",
@@ -1254,7 +1255,7 @@ fn build_encoder_adapters(
     // `ModernBert::builder().build(..)` /
     // `Bert::builder().build(..)` construct a FRESH encoder in EVAL mode
     // (`training: false` at construction — see each builder's own `build`)
-    // — a plain `TrainingTarget::EncoderAdapters(..)` wrap of that fresh
+    // — a plain `TrainingTarget::AdaptedEncoder(..)` wrap of that fresh
     // encoder therefore drives every forward through the EVAL attention
     // path, and `ModernBertAttention::forward`'s `self.training` gate never
     // reaches `forward_training_attention` at all, so the fused
@@ -1263,7 +1264,7 @@ fn build_encoder_adapters(
     // from a bug that always runs eval. `TrainingLoop::run()` itself never
     // calls `set_training(true)` for the ordinary (non-GradCache)
     // per-batch path either (only `mine_hard_negatives`/`run_gradcache_epoch`
-    // do, and neither applies to `EncoderAdapters`), so this call is NOT
+    // do, and neither applies to `AdaptedEncoder`), so this call is NOT
     // redundant with anything the trainer does — mirrors
     // `finetune_step.rs`'s own `build_fixture`'s `encoder.set_training(true)`
     // call EXACTLY, so this tier's fresh-per-epoch build starts from the
@@ -1387,10 +1388,12 @@ fn base_config(params: &FinetuneRunParams) -> FineTuneConfig {
         warmup: Warmup::Steps(params.warmup_steps),
         lr_schedule: params.lr_schedule,
         early_stopping_metric: params.early_stopping_metric,
-        target_modules: params.target_modules.clone(),
-        layers_to_transform: params.layers_to_transform.clone(),
+        encoder: EncoderTraining::Adapted {
+            target_modules: params.target_modules.clone(),
+            layers_to_transform: params.layers_to_transform.clone(),
+            rank_pattern: HashMap::new(),
+        },
         use_rslora: false,
-        rank_pattern: HashMap::new(),
         // The THIRD site `--lora-init` reaches: the
         // `FineTuneConfig` the trainer itself carries. `build_encoder_adapters`
         // above is what actually initializes this tier's weights, so this
@@ -1976,9 +1979,10 @@ impl RunContext {
             Task::Text => Some(encoder.max_seq_length().map_err(sendify)?),
             Task::Image | Task::Audio => None,
         };
-        let target = TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        let target = TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder,
             adapter_cfg,
+            head: None,
         }));
         let training_loop = TrainingLoopBuilder::new(target, varmap.clone(), self.config.clone())
             .applied_learning_rate(params.applied_learning_rate)

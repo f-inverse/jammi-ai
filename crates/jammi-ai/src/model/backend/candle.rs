@@ -22,6 +22,7 @@ use super::open_clip_text::OpenClipTextForward;
 use super::rows::{content_row_count, TextRows};
 use super::{DeviceConfig, ModelBackend};
 use crate::fine_tune::classifier::SeqClassifier;
+use crate::fine_tune::target::{HeadConfig, HeadOutput};
 use crate::inference::{arrow_to_audio, arrow_to_images, audio_preprocess, image_preprocess};
 use crate::model::arch::EncoderFamily;
 use crate::model::tokenizer::{BatchEncoding, TokenizerWrapper};
@@ -578,23 +579,11 @@ pub struct CandleModel {
     pub tokenizer: Option<TokenizerWrapper>,
     /// Device the model weights reside on (CPU, CUDA, or Metal).
     pub device: Device,
-    /// Projection head applied after pooling on models fine-tuned via the
-    /// `ProjectionHead` training target. `None` for base models and for
-    /// models fine-tuned via the `EncoderAdapters` target (those carry
-    /// their LoRA inside the encoder, not on top of it).
-    pub projection_head: Option<jammi_lora::LoraLinear>,
-    /// The regression `distribution` head layer (`hidden → output_dim`), reloaded
-    /// for a `ModelTask::Regression` fine-tune. This is the layer the trainer's
-    /// `regress` applies to the pooled embedding (NOT `projection_head`), so
-    /// serving applies it to reproduce the trained `(mean, raw_std)` / quantile
-    /// output. `None` for every non-regression head.
-    distribution_head: Option<jammi_lora::LoraLinear>,
-    /// De-standardising affine for a regression head, reloaded from the adapter
-    /// config. The regression head learns z-space parameters and emits a raw,
-    /// outcome-unit distribution after this affine; serving applies the same
-    /// affine the trainer did, so the served mean/quantiles carry the target
-    /// offset. `None` for every non-regression head.
-    regression_scaler: Option<crate::fine_tune::regression_loss::TargetScaler>,
+    /// The fine-tuned head over the pooled output, when the saved adapter
+    /// carries one — an embedding fine-tune over a frozen encoder, or any
+    /// classification or regression fine-tune. `None` for a base model and
+    /// for an embedding fine-tune whose LoRA lives inside the encoder.
+    head: Option<ServedHead>,
     /// Label index → label string mapping for classification/NER models.
     id2label: Option<HashMap<u32, String>>,
     /// Token-level classifier for NER models (applied per token, no pooling).
@@ -602,6 +591,137 @@ pub struct CandleModel {
     /// Every kernel admission decision this model's forwards have taken —
     /// see [`Self::kernel_admission`].
     kernel_admission: std::sync::Mutex<jammi_kernels::admission::AdmissionLedger>,
+}
+
+/// A fine-tuned head over an encoder's pooled output, rebuilt from its saved
+/// layers: serving applies the layers the trainer trained, in the order it
+/// applied them, so a served output is the trained one.
+pub(crate) struct ServedHead {
+    /// The head's layers, in [`HeadOutput::layers`] order.
+    layers: Vec<jammi_lora::LoraLinear>,
+    output: HeadOutput,
+}
+
+impl ServedHead {
+    /// Rebuild the head `config` describes from the adapter's tensors, each
+    /// layer over its [`crate::fine_tune::target::HeadLayer::base`] at the
+    /// LoRA scaling it trained at. The first layer must read a
+    /// `pooled_width`-wide pooled output.
+    fn load(
+        config: &HeadConfig,
+        adapter_file: &std::path::Path,
+        pooled_width: usize,
+        device: &Device,
+        model_id: &str,
+    ) -> Result<Self> {
+        let refuse = |message: String| JammiError::Model {
+            model_id: model_id.to_string(),
+            message,
+        };
+        let weights = candle_core::safetensors::load(adapter_file, device)
+            .map_err(|e| refuse(format!("Load adapter: {e}")))?;
+        let layers = config
+            .output
+            .layers()
+            .iter()
+            .map(|layer| {
+                let tensor = |suffix: &str| {
+                    let key = format!("{}.{suffix}", layer.name());
+                    weights
+                        .get(&key)
+                        .cloned()
+                        .ok_or_else(|| refuse(format!("the adapter's head has no `{key}` tensor")))
+                };
+                let (lora_a, lora_b) = (tensor("lora_a")?, tensor("lora_b")?);
+                let input = lora_a
+                    .dims2()
+                    .map_err(|e| refuse(format!("{}.lora_a shape: {e}", layer.name())))?
+                    .1;
+                let out = lora_b
+                    .dims2()
+                    .map_err(|e| refuse(format!("{}.lora_b shape: {e}", layer.name())))?
+                    .0;
+                let base = layer
+                    .base(out, input, device)
+                    .map_err(|e| refuse(format!("{} base: {e}", layer.name())))?;
+                jammi_lora::LoraLinear::from_loaded(
+                    base,
+                    lora_a,
+                    lora_b,
+                    config.lora_alpha,
+                    config.use_rslora,
+                )
+                .map_err(|e| refuse(format!("{} LoRA scaling: {e}", layer.name())))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reads = layers
+            .first()
+            .map(|layer| layer.lora_a.dims2().map(|(_, input)| input))
+            .transpose()
+            .map_err(|e| refuse(format!("head input width: {e}")))?;
+        if reads != Some(pooled_width) {
+            return Err(refuse(format!(
+                "the adapter's head reads a {reads:?}-wide input, but the encoder pools to \
+                 {pooled_width}"
+            )));
+        }
+        if let HeadOutput::Classes { labels } = &config.output {
+            let columns = layers
+                .last()
+                .map(|layer| layer.lora_b.dims2().map(|(out, _)| out));
+            if !matches!(columns, Some(Ok(width)) if width == labels.len()) {
+                return Err(refuse(format!(
+                    "the adapter's classifier emits {columns:?} columns for {} labels",
+                    labels.len()
+                )));
+            }
+        }
+        Ok(Self {
+            layers,
+            output: config.output.clone(),
+        })
+    }
+
+    /// The head's `projection` over the pooled output: the served embedding
+    /// of every fine-tuned head, and for a task head the representation its
+    /// task layer reads.
+    fn embed(&self, pooled: &Tensor) -> Result<Tensor> {
+        self.layers[0]
+            .forward(pooled)
+            .map_err(|e| JammiError::Inference(format!("Head projection: {e}")))
+    }
+
+    /// Every layer of the head over the pooled output, in order: the task
+    /// output a classification or regression head was trained to emit.
+    fn forward(&self, pooled: &Tensor) -> Result<Tensor> {
+        self.layers
+            .iter()
+            .try_fold(pooled.clone(), |x, layer| layer.forward(&x))
+            .map_err(|e| JammiError::Inference(format!("Head forward: {e}")))?
+            .to_dtype(DType::F32)
+            .map_err(|e| JammiError::Inference(format!("Head output dtype cast: {e}")))
+    }
+
+    /// The class names a classification head's output columns carry.
+    fn classes(&self) -> Option<&[String]> {
+        match &self.output {
+            HeadOutput::Classes { labels } => Some(labels),
+            _ => None,
+        }
+    }
+
+    /// A regression head's de-standardising scaler and distribution form.
+    fn distribution(
+        &self,
+    ) -> Option<(
+        &crate::fine_tune::regression_loss::TargetScaler,
+        &jammi_datafusion::inference::adapter::DistributionForm,
+    )> {
+        match &self.output {
+            HeadOutput::Distribution { scaler, form } => Some((scaler, form)),
+            _ => None,
+        }
+    }
 }
 
 /// Mean-pool the `[batch, seq, hidden]` tensor along seq using
@@ -1622,7 +1742,7 @@ impl CandleModel {
     /// `preprocessor_config.json` at load time. `None` for every non-audio
     /// model.
     ///
-    /// Exposed so an encoder-adapters AUDIO fine-tune runs
+    /// Exposed so an adapted-encoder AUDIO fine-tune runs
     /// the byte→spectrogram front end through the SAME geometry the serving
     /// path uses. The trainer forwards the LoRA-wrapped tower directly rather
     /// than through `forward_audio_embedding`, so without this accessor it
@@ -1665,7 +1785,10 @@ impl CandleModel {
     /// affine the backend already applies. The mean/quantile columns carry σ_y in
     /// their affine at the backend; only the post-softplus σ needs σ_y here.
     pub(crate) fn regression_std_scale(&self) -> Option<f32> {
-        self.regression_scaler.as_ref().map(|s| s.std() as f32)
+        self.head
+            .as_ref()
+            .and_then(ServedHead::distribution)
+            .map(|(scaler, _)| scaler.std() as f32)
     }
 
     /// TEST-ONLY non-vacuity seam: zero the trained regression distribution
@@ -1683,8 +1806,13 @@ impl CandleModel {
     /// only mutates a per-test owned model, never a cached/shared one.
     #[doc(hidden)]
     pub fn zero_distribution_head_for_test(&mut self) {
-        if let Some(head) = self.distribution_head.as_mut() {
-            head.lora_b = head
+        if let Some(layer) = self
+            .head
+            .as_mut()
+            .filter(|head| head.distribution().is_some())
+            .and_then(|head| head.layers.last_mut())
+        {
+            layer.lora_b = layer
                 .lora_b
                 .zeros_like()
                 .expect("zeros_like on a loaded LoRA B tensor is infallible");
@@ -1771,7 +1899,7 @@ impl CandleModel {
                 // non-classification tower's hidden states would then be
                 // decoded as class probabilities. Refuse the kind mismatch
                 // before any row is tokenised.
-                if !self.text_forward()?.is_classification_head() {
+                if !self.classifies()? {
                     return Err(classification_kind_mismatch_refusal());
                 }
                 self.prepare_text(content, task)
@@ -1939,23 +2067,22 @@ impl CandleModel {
     /// so the backend head stays in the unconstrained space the proper-scoring
     /// objective trained it in.
     ///
-    /// A regression head is a fine-tuned projection head over the frozen
-    /// encoder — the same serving shape classification fine-tunes use — so a
-    /// base checkpoint with no such head cannot serve this task. That is a typed
+    /// A regression head is a fine-tuned head over the encoder's pooled output —
+    /// the same serving shape classification fine-tunes use — so a base
+    /// checkpoint with no such head cannot serve this task. That is a typed
     /// capability error, not a silent wrong output.
     fn forward_regression(&self, input: PreparedInput) -> Result<BackendOutput> {
-        // The regression `distribution` head — the `hidden → output_dim` layer
-        // the trainer's `regress` applies to the pooled embedding. It is the
-        // authoritative regression head; `projection_head` (a hidden→hidden layer)
-        // is the trained projection that regression does NOT apply on the forward
-        // path, so serving must use `distribution_head` to match training.
-        let head = self.distribution_head.as_ref().ok_or_else(|| {
-            JammiError::Inference(
-                "Regression inference needs a fine-tuned distributional head; \
-                 this model carries none. Fine-tune a ModelTask::Regression head first."
-                    .into(),
-            )
-        })?;
+        let (head, (scaler, form)) = self
+            .head
+            .as_ref()
+            .and_then(|head| Some((head, head.distribution()?)))
+            .ok_or_else(|| {
+                JammiError::Inference(
+                    "Regression inference needs a fine-tuned distributional head; \
+                     this model carries none. Fine-tune a ModelTask::Regression head first."
+                        .into(),
+                )
+            })?;
         let num_rows = input.len();
         if num_rows == 0 {
             return Ok(BackendOutput {
@@ -1992,55 +2119,32 @@ impl CandleModel {
             });
         };
 
-        // Pool through the frozen encoder, then apply the distributional head —
-        // the same pooled-embedding → projection-head shape the embedding and
-        // classification fine-tunes use. The head emits the raw distribution
-        // parameters; the `DistributionAdapter` maps `raw_std` to a positive
-        // served std.
+        // Pool through the encoder, then apply the whole head — its projection
+        // and its distribution layer, as the trainer did. The head emits the
+        // raw distribution parameters; the `DistributionAdapter` maps `raw_std`
+        // to a positive served std.
         let pooled = self.text_forward()?.forward_pooled(
             &input_ids,
             &attention_mask,
             &encoding,
             &self.device,
         )?;
-        let params = head
-            .forward(&pooled)
-            .map_err(|e| JammiError::Inference(format!("Regression head forward: {e}")))?;
-        let params = if params.dtype() == DType::F32 {
-            params
-        } else {
-            params
-                .to_dtype(DType::F32)
-                .map_err(|e| JammiError::Inference(format!("Regression head dtype cast: {e}")))?
-        };
-        // De-standardise the raw head output with the affine the trainer carried
-        // on the head: the mean column (Gaussian) or every quantile column maps
-        // `μ_y + σ_y·z`, so the served distribution carries the target offset. A
-        // base/no-scaler head leaves the output untouched. The σ column stays raw
-        // here — the loss trained it in z-space (σ_z), so the `DistributionAdapter`
-        // turns it into a positive served std via softplus AND scales it by σ_y
-        // (`σ_y·softplus(raw)`), the σ-axis half of the de-standardise contract.
+        let params = head.forward(&pooled)?;
+        // De-standardise the raw head output with the affine the trainer
+        // persisted with the head: the mean column (Gaussian) or every quantile
+        // column maps `μ_y + σ_y·z`, so the served distribution carries the
+        // target offset. The σ column stays raw here — the loss trained it in
+        // z-space (σ_z), so the `DistributionAdapter` turns it into a positive
+        // served std via softplus AND scales it by σ_y (`σ_y·softplus(raw)`),
+        // the σ-axis half of the de-standardise contract.
         //
         // The gaussian-vs-quantile choice dispatches on the persisted
         // `DistributionForm`, the authoritative signal the head was trained for —
         // never on head width, which cannot tell a 2-level quantile head from a
-        // Gaussian one (both are width 2). The scaler and the form are persisted
-        // together, so a scaler without a form is an inconsistent saved head, not
-        // a case to paper over with a width guess.
-        let params = if let Some(scaler) = self.regression_scaler.as_ref() {
-            let form = self.description.regression_form().ok_or_else(|| {
-                JammiError::Inference(
-                    "regression head carries a de-standardising scaler but no distribution form \
-                     (the persisted head is inconsistent)"
-                        .into(),
-                )
-            })?;
-            scaler
-                .destandardize(&params, form)
-                .map_err(|e| JammiError::Inference(format!("Regression de-standardise: {e}")))?
-        } else {
-            params
-        };
+        // Gaussian one (both are width 2).
+        let params = scaler
+            .destandardize(&params, form)
+            .map_err(|e| JammiError::Inference(format!("Regression de-standardise: {e}")))?;
         let rows = params
             .to_vec2::<f32>()
             .map_err(|e| JammiError::Inference(format!("Regression head to vec: {e}")))?;
@@ -2091,13 +2195,13 @@ impl CandleModel {
         )
     }
 
-    /// Apply the trained projection head, if one was loaded.
-    fn project(&self, embedded: Tensor) -> Result<Tensor> {
-        match &self.projection_head {
-            Some(head) => head
-                .forward(&embedded)
-                .map_err(|e| JammiError::Inference(format!("Projection head: {e}"))),
-            None => Ok(embedded),
+    /// The served embedding of a pooled output: the fine-tuned head's
+    /// projection when the model carries a head, the pooled output itself
+    /// otherwise — the representation the trainer's `project` produced.
+    fn project(&self, pooled: Tensor) -> Result<Tensor> {
+        match &self.head {
+            Some(head) => head.embed(&pooled),
+            None => Ok(pooled),
         }
     }
 
@@ -2153,7 +2257,7 @@ impl CandleModel {
         let embedded = match payload {
             Payload::Image { pixel_values } => {
                 let output = vision.forward_image(&pixel_values)?;
-                Some(self.l2_normalize(&output)?)
+                Some(self.project(self.l2_normalize(&output)?)?)
             }
             Payload::Empty => None,
             Payload::Text { .. } | Payload::Audio { .. } => {
@@ -2184,10 +2288,9 @@ impl CandleModel {
                 // The CLAP audio tower emits L2-normalized embeddings directly
                 // (like the text tower), so no further normalization is
                 // applied — unlike the vision tower whose raw output is
-                // normalized here. The projection head is a post-pool
-                // transform on the shared-latent embedding, so an audio
-                // fine-tune trained as a projection head shifts audio
-                // embeddings exactly as a text fine-tune shifts text
+                // normalized here. A fine-tuned head's projection is a
+                // post-pool transform on the shared-latent embedding, so it
+                // shifts audio embeddings exactly as it shifts text and image
                 // embeddings.
                 let normalized = audio.forward_audio(&input_features, &is_longer)?;
                 Some(self.project(normalized)?)
@@ -2202,10 +2305,60 @@ impl CandleModel {
         self.embedding_output(&valid, row_status, row_errors, embedded)
     }
 
-    fn forward_classification(&self, input: PreparedInput) -> Result<BackendOutput> {
+    /// Whether this model emits class scores: a fine-tuned classification
+    /// head over its pooled output, or a checkpoint classification wrapper.
+    fn classifies(&self) -> Result<bool> {
+        Ok(self
+            .head
+            .as_ref()
+            .is_some_and(|head| head.classes().is_some())
+            || self.text_forward()?.is_classification_head())
+    }
+
+    /// Class probabilities `[batch, classes]` for prepared text, and the name
+    /// of each class column: a fine-tuned head's softmax over its own labels,
+    /// or the checkpoint classifier's (softmax already applied) over its
+    /// `id2label`.
+    fn class_probabilities(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: &Tensor,
+        encoding: &BatchEncoding,
+    ) -> Result<(Tensor, Vec<String>)> {
+        let text = self.text_forward()?;
+        if let Some((head, labels)) = self
+            .head
+            .as_ref()
+            .and_then(|head| Some((head, head.classes()?)))
+        {
+            let pooled = text.forward_pooled(input_ids, attention_mask, encoding, &self.device)?;
+            let probs = candle_nn::ops::softmax_last_dim(&head.forward(&pooled)?)
+                .map_err(|e| JammiError::Inference(format!("Class softmax: {e}")))?;
+            return Ok((probs, labels.to_vec()));
+        }
         let id2label = self.id2label.as_ref().ok_or_else(|| {
             JammiError::Inference("No id2label mapping for classification model".into())
         })?;
+        let probs = text
+            .forward_hidden(input_ids, attention_mask, encoding, &self.device)?
+            .to_dtype(DType::F32)
+            .map_err(|e| JammiError::Inference(format!("Logits dtype cast: {e}")))?;
+        let classes = probs
+            .dims2()
+            .map_err(|e| JammiError::Inference(format!("Class scores shape: {e}")))?
+            .1;
+        let labels = (0..classes)
+            .map(|idx| {
+                id2label
+                    .get(&(idx as u32))
+                    .cloned()
+                    .unwrap_or_else(|| format!("LABEL_{idx}"))
+            })
+            .collect();
+        Ok((probs, labels))
+    }
+
+    fn forward_classification(&self, input: PreparedInput) -> Result<BackendOutput> {
         let num_rows = input.len();
         if num_rows == 0 {
             // The float head is one confidence score per row (width 1), the
@@ -2241,24 +2394,11 @@ impl CandleModel {
             ..
         } = payload
         {
-            // Forward pass returns (batch, num_classes) with softmax applied
-            let logits = self.text_forward()?.forward_hidden(
-                &input_ids,
-                &attention_mask,
-                &encoding,
-                &self.device,
-            )?;
-
-            let logits_f32 = if logits.dtype() == DType::F32 {
-                logits
-            } else {
-                logits
-                    .to_dtype(DType::F32)
-                    .map_err(|e| JammiError::Inference(format!("Logits dtype cast: {e}")))?
-            };
-            let probs = logits_f32
+            let (probs, labels) =
+                self.class_probabilities(&input_ids, &attention_mask, &encoding)?;
+            let probs = probs
                 .to_vec2::<f32>()
-                .map_err(|e| JammiError::Inference(format!("Logits to vec failed: {e}")))?;
+                .map_err(|e| JammiError::Inference(format!("Class scores to vec failed: {e}")))?;
 
             for (batch_idx, &orig_idx) in valid.iter().enumerate() {
                 let row_probs = &probs[batch_idx];
@@ -2270,29 +2410,21 @@ impl CandleModel {
                     .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .unwrap_or((0, &0.0));
 
-                let label = id2label
-                    .get(&(max_idx as u32))
-                    .cloned()
-                    .unwrap_or_else(|| format!("LABEL_{max_idx}"));
-
-                // Build JSON of all scores, keys sorted by label: `id2label` is
-                // a `HashMap`, and a `serde_json::Map` keeps insertion order
-                // whenever any dependency enables `preserve_order`, so the
-                // order is fixed here rather than left to either map type.
-                let scores_map: serde_json::Map<String, serde_json::Value> = id2label
+                // Every class's score, keys sorted by label: a
+                // `serde_json::Map` keeps insertion order whenever any
+                // dependency enables `preserve_order`, so the order is fixed
+                // here rather than left to the map type.
+                let scores_map: serde_json::Map<String, serde_json::Value> = labels
                     .iter()
-                    .map(|(&idx, name)| {
-                        let score = row_probs.get(idx as usize).copied().unwrap_or(0.0);
-                        (name.clone(), serde_json::Value::from(score))
-                    })
+                    .zip(row_probs)
+                    .map(|(name, &score)| (name.clone(), serde_json::Value::from(score)))
                     .collect::<std::collections::BTreeMap<_, _>>()
                     .into_iter()
                     .collect();
-                let scores_json = serde_json::Value::Object(scores_map).to_string();
 
                 all_confidences[orig_idx] = max_val;
-                all_labels[orig_idx] = label;
-                all_scores_json[orig_idx] = scores_json;
+                all_labels[orig_idx] = labels[max_idx].clone();
+                all_scores_json[orig_idx] = serde_json::Value::Object(scores_map).to_string();
             }
         }
 
@@ -2597,12 +2729,9 @@ fn gguf_backbone_shape(
     Ok(Some((arch, num_layers)))
 }
 
-/// The saved fine-tune adapter `resolved` carries, if any. Both flavours of
-/// `SavedAdapter` share the same on-disk layout (`adapter.safetensors` plus
-/// `adapter_config.json` with the `adapter_type` discriminator); the
-/// variant is the type-level switch that decides whether to wire LoRA
-/// inside the encoder or leave it as an external projection head applied
-/// post-pool.
+/// The saved fine-tune adapter `resolved` carries, if any: `adapter.safetensors`
+/// plus `adapter_config.json`, whose `encoder` tag says whether LoRA wires
+/// inside the encoder, and whose head, when it has one, applies post-pool.
 ///
 /// `resolved.adapter_path` is `Some` only via the fine-tuned-model
 /// catalog-lookup path (`ModelResolver::try_catalog_lookup`), which sets it
@@ -2664,12 +2793,10 @@ impl ModelBackend for CandleBackend {
         // `backbone_dtype` (a training-time choice); with no adapter, the
         // backbone follows the configured inference precision. This is the
         // precision the materialization contract folds into the identity.
-        let compute_precision = match saved_adapter.as_ref().map(|adapter| &adapter.config) {
-            Some(crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg)) => {
-                cfg.backbone_dtype
-            }
-            _ => configured_precision,
-        };
+        let compute_precision = saved_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.config.adapters())
+            .map_or(configured_precision, |cfg| cfg.backbone_dtype);
         // Normalize DistilBERT config fields to standard BERT names — the
         // SAME normalization authority `gguf::gguf_num_layers` routes
         // through, so a DistilBERT config.json (whose only geometry fields
@@ -2843,20 +2970,26 @@ impl ModelBackend for CandleBackend {
                     .collect()
             });
 
-        let is_classification = resolved.task == ModelTask::Classification && id2label.is_some();
-        let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
-
-        // The saved adapter, read once when the model was described: the
-        // variant is the type-level switch that decides whether to wire
-        // LoRA inside the encoder or leave it as an external projection
-        // head applied post-pool.
+        // The saved adapter, read once when the model was described: its
+        // encoder adapters are wired inside the encoder, its head applies
+        // post-pool.
         let saved_adapter = local.saved_adapter.as_ref();
-        let encoder_adapter = saved_adapter.and_then(|adapter| match &adapter.config {
-            crate::fine_tune::target::SavedAdapter::EncoderAdapters(cfg) => {
-                Some(((**cfg).clone(), adapter.weights.as_path()))
-            }
-            crate::fine_tune::target::SavedAdapter::ProjectionHead(_) => None,
+        let encoder_adapter = saved_adapter.and_then(|adapter| {
+            adapter
+                .config
+                .adapters()
+                .map(|cfg| (cfg.clone(), adapter.weights.as_path()))
         });
+        // A fine-tuned classification head classifies over the plain pooled
+        // encoder, so the checkpoint's own classifier wrapper is built only
+        // for a model without one.
+        let fine_tuned_classifier = saved_adapter
+            .and_then(|adapter| adapter.config.head())
+            .is_some_and(|head| matches!(head.output, HeadOutput::Classes { .. }));
+        let is_classification = resolved.task == ModelTask::Classification
+            && !fine_tuned_classifier
+            && id2label.is_some();
+        let is_ner = resolved.task == ModelTask::Ner && id2label.is_some();
         // Adapter IDENTITY validation, at the one seam where
         // the saved adapter is read.
         //
@@ -2868,25 +3001,20 @@ impl ModelBackend for CandleBackend {
         //    adapter on a BERT one, is a cross-family mismatch: without this
         //    check it would resolve and load, then get silently DISCARDED —
         //    the fine-tuning dropped with no signal, serving the unadapted
-        //    base under the fine-tuned model's id.
-        //    `EncoderFamily::from_adapter_model_type` maps every legacy/alias
-        //    text id onto `Bert` on purpose (see its doc), so this refusal
-        //    fires only on genuine cross-family mismatches and never on an
-        //    already-shipped BERT-family adapter.
+        //    base under the fine-tuned model's id. An id no family writes is
+        //    refused the same way.
         //
         // 2. Does the base actually HAVE the tower the adapter names? A
         //    `vision` adapter on a single-tower text checkpoint has nowhere to
-        //    install. `tower: None` (an adapter that names no tower) is
-        //    accepted everywhere; the multi-tower arms below
-        //    additionally require it to be present, because "which of two
-        //    towers" has no defensible default.
+        //    install, and an OpenCLIP adapter that names no tower has no
+        //    defensible default between two (`EncoderFamily::has_tower`).
         if let Some((cfg, _)) = &encoder_adapter {
             // `None` means the architecture itself is one this backend has no
             // loader for; the branch below refuses by name, which is strictly
             // more informative than anything this check could add.
             if let Some(base) = base_family {
                 let adapter_family = EncoderFamily::from_adapter_model_type(&cfg.model_type);
-                if adapter_family != base {
+                if adapter_family != Some(base) {
                     return Err(JammiError::Model {
                         model_id: resolved.model_id.0.clone(),
                         message: format!(
@@ -3313,38 +3441,21 @@ impl ModelBackend for CandleBackend {
 
         let dimensions = &local.dimensions;
 
-        // Load the post-pool projection head, if the saved adapter is one.
-        // Encoder-adapters are installed inside `text` above via the encoder
-        // builder's `.lora(...)` + `.adapter(Some(...))` calls.
-        let (projection_head, distribution_head, regression_scaler) = match saved_adapter
-            .map(|adapter| (&adapter.config, adapter.weights.as_path()))
-        {
-            Some((crate::fine_tune::target::SavedAdapter::ProjectionHead(cfg), weights_path)) => {
-                (
-                    load_projection_head(
-                        weights_path,
-                        cfg.lora_alpha,
-                        cfg.use_rslora,
-                        &device,
-                        dimensions,
-                        &resolved.model_id.0,
-                    )?,
-                    // The `distribution` layer is present only for a
-                    // regression head; `load_distribution_head` returns `None`
-                    // for embedding/classification/NER projection heads.
-                    load_distribution_head(
-                        weights_path,
-                        cfg.lora_alpha,
-                        cfg.use_rslora,
-                        &device,
-                        dimensions,
-                        &resolved.model_id.0,
-                    )?,
-                    cfg.target_scaler,
+        // The saved adapter's head, applied post-pool; its encoder adapters
+        // were installed inside `text` above via the encoder builder's
+        // `.lora(...)` + `.adapter(Some(...))` calls.
+        let head = saved_adapter
+            .and_then(|adapter| Some((adapter.config.head()?, adapter.weights.as_path())))
+            .map(|(config, weights_path)| {
+                ServedHead::load(
+                    config,
+                    weights_path,
+                    dimensions.hidden_size,
+                    &device,
+                    &resolved.model_id.0,
                 )
-            }
-            _ => (None, None, None),
-        };
+            })
+            .transpose()?;
 
         // Load NER token classifier if this is a NER model
         let ner_classifier = if is_ner {
@@ -3407,9 +3518,7 @@ impl ModelBackend for CandleBackend {
             audio_frontend,
             tokenizer,
             device,
-            projection_head,
-            distribution_head,
-            regression_scaler,
+            head,
             id2label,
             ner_classifier,
             kernel_admission: std::sync::Mutex::default(),
@@ -3588,123 +3697,6 @@ fn tokens_to_tensor(vecs: &[Vec<u32>], device: &Device) -> Result<Tensor> {
     let cols = vecs.first().map_or(0, |v| v.len());
     let flat: Vec<u32> = vecs.iter().flatten().copied().collect();
     Tensor::from_vec(flat, (rows, cols), device).map_err(|e| JammiError::Inference(e.to_string()))
-}
-
-/// Load the projection head from `adapter_file` using the alpha (and
-/// rSLoRA flag) recorded in the adapter's saved config — `use_rslora` must
-/// be the persisted training-time choice
-/// ([`crate::fine_tune::target::ProjectionHeadConfig::use_rslora`]), never a
-/// fixed default: rSLoRA scales by `alpha / sqrt(rank)` instead of `alpha /
-/// rank`, so serving a rSLoRA-trained adapter at the vanilla scaling
-/// silently shrinks its contribution by `1/sqrt(rank)`. Returns
-/// `Some(LoraLinear)` keyed at `projection.lora_a` / `projection.lora_b`, or
-/// `None` if the projection keys are absent (the adapter was a
-/// classifier/NER head with no embedding projection — that case does not
-/// produce a post-pool projection).
-fn load_projection_head(
-    adapter_file: &std::path::Path,
-    lora_alpha: f64,
-    use_rslora: bool,
-    device: &Device,
-    dimensions: &crate::model::ModelDimensions,
-    model_id: &str,
-) -> jammi_db::error::Result<Option<jammi_lora::LoraLinear>> {
-    let adapter_weights =
-        candle_core::safetensors::load(adapter_file, device).map_err(|e| JammiError::Model {
-            model_id: model_id.to_string(),
-            message: format!("Load adapter: {e}"),
-        })?;
-
-    let hidden_size = dimensions.hidden_size;
-    let identity = Tensor::eye(hidden_size, DType::F32, device).map_err(|e| JammiError::Model {
-        model_id: model_id.to_string(),
-        message: format!("Identity weight: {e}"),
-    })?;
-    let base_linear = candle_nn::Linear::new(identity, None);
-
-    let lora_a = match adapter_weights.get("projection.lora_a") {
-        Some(t) => t.clone(),
-        None => return Ok(None),
-    };
-    let lora_b = match adapter_weights.get("projection.lora_b") {
-        Some(t) => t.clone(),
-        None => return Ok(None),
-    };
-
-    let lora =
-        jammi_lora::LoraLinear::from_loaded(base_linear, lora_a, lora_b, lora_alpha, use_rslora)
-            .map_err(|e| JammiError::Model {
-                model_id: model_id.to_string(),
-                message: format!("projection LoRA scaling: {e}"),
-            })?;
-    Ok(Some(lora))
-}
-
-/// Reload the regression `distribution` head layer — the `hidden → output_dim`
-/// LoRA layer that maps the pooled encoder embedding to the raw distribution
-/// parameters (`(mean, raw_std)` for Gaussian, one per level for quantile). This
-/// is the layer the trainer's `regress` applies to the pooled embedding (it uses
-/// `head.layers[1]`, the distribution layer — NOT the `projection` layer), so
-/// serving must apply the same one to reproduce the trained output shape.
-///
-/// `use_rslora` must be the persisted training-time choice — see
-/// [`load_projection_head`]'s doc for why a fixed default silently mis-scales
-/// a rSLoRA-trained adapter.
-///
-/// Its zeros base spans `output_dim → hidden_size`; `output_dim` is recovered
-/// from the persisted `distribution.lora_b` row count (B is `output_dim × rank`),
-/// so the served head width matches the trained head without re-deriving it from
-/// the form. Returns `None` when the adapter carries no `distribution` layer
-/// (i.e. it is not a regression head).
-fn load_distribution_head(
-    adapter_file: &std::path::Path,
-    lora_alpha: f64,
-    use_rslora: bool,
-    device: &Device,
-    dimensions: &crate::model::ModelDimensions,
-    model_id: &str,
-) -> jammi_db::error::Result<Option<jammi_lora::LoraLinear>> {
-    let adapter_weights =
-        candle_core::safetensors::load(adapter_file, device).map_err(|e| JammiError::Model {
-            model_id: model_id.to_string(),
-            message: format!("Load adapter: {e}"),
-        })?;
-
-    let lora_a = match adapter_weights.get("distribution.lora_a") {
-        Some(t) => t.clone(),
-        None => return Ok(None),
-    };
-    let lora_b = match adapter_weights.get("distribution.lora_b") {
-        Some(t) => t.clone(),
-        None => return Ok(None),
-    };
-
-    // `output_dim` = rows of B (`output_dim × rank`). The base is the trained
-    // head's `zeros(output_dim, hidden_size)`; the learned signal lives entirely
-    // in the LoRA A/B factors, exactly as at train time.
-    let output_dim = lora_b
-        .dims2()
-        .map_err(|e| JammiError::Model {
-            model_id: model_id.to_string(),
-            message: format!("distribution.lora_b shape: {e}"),
-        })?
-        .0;
-    let hidden_size = dimensions.hidden_size;
-    let base = Tensor::zeros((output_dim, hidden_size), DType::F32, device).map_err(|e| {
-        JammiError::Model {
-            model_id: model_id.to_string(),
-            message: format!("distribution head base: {e}"),
-        }
-    })?;
-    let base_linear = candle_nn::Linear::new(base, None);
-
-    let lora =
-        jammi_lora::LoraLinear::from_loaded(base_linear, lora_a, lora_b, lora_alpha, use_rslora)
-            .map_err(|e| JammiError::Model {
-                model_id: model_id.to_string(),
-                message: format!("distribution LoRA scaling: {e}"),
-            })?;
-    Ok(Some(lora))
 }
 
 /// A panic payload folded to a human-readable string. `std::panic::
@@ -4023,13 +4015,131 @@ fn gpu_unavailable(gpu_device: i32, require_gpu: bool) -> Result<Device> {
     Ok(Device::Cpu)
 }
 
-/// `load_projection_head` must apply the *persisted* rSLoRA choice,
-/// not a fixed default. Every quantity here is measured through the
-/// production `load_projection_head` — writing a real adapter.safetensors to
-/// a tempdir, loading it, and reading the actual forward-pass magnitude —
-/// never asserted against a hand-derived formula alone.
+/// Serving rebuilds a trained head and applies every layer the trainer
+/// applied, in order: a classification head serves its `classifier` over its
+/// `projection`, a regression head its `distribution` over its `projection` —
+/// never the task layer over the bare pooled output.
 #[cfg(test)]
-mod projection_head_rslora_tests {
+mod served_head_tests {
+    use super::*;
+    use crate::fine_tune::target::TrainingTarget;
+    use crate::fine_tune::FineTuneConfig;
+    use candle_nn::{VarBuilder, VarMap};
+
+    const HIDDEN: usize = 8;
+
+    /// A deterministic, nonzero `(rows, cols)` tensor.
+    fn ramp(rows: usize, cols: usize, scale: f64, device: &Device) -> Tensor {
+        Tensor::arange(0f32, (rows * cols) as f32, device)
+            .unwrap()
+            .reshape((rows, cols))
+            .unwrap()
+            .affine(scale, -0.05)
+            .unwrap()
+    }
+
+    /// Train-shaped `target` with every layer's B set nonzero, persisted
+    /// through the production writer with `output`, rebuilt through
+    /// `ServedHead::load`, and checked against the trainer's own layer chain.
+    fn assert_served_matches_trained(
+        build: impl Fn(&FineTuneConfig, &VarMap, &VarBuilder) -> crate::fine_tune::lora::LoraModel,
+        output: HeadOutput,
+    ) -> ServedHead {
+        let device = Device::Cpu;
+        let config = FineTuneConfig {
+            lora_rank: 4,
+            lora_dropout: 0.0,
+            ..Default::default()
+        };
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut head = build(&config, &varmap, &vb);
+        for (i, (_, layer)) in head.layers.iter_mut().enumerate() {
+            let (out, rank) = layer.lora_b.dims2().unwrap();
+            let b = ramp(out, rank, 0.01 * (i + 1) as f64, &device);
+            layer.load_weights(None, Some(&b)).unwrap();
+        }
+        let x = ramp(3, HIDDEN, 0.02, &device);
+        let projected = head.layers[0].1.forward(&x).unwrap();
+        let trained = head.layers[1].1.forward(&projected).unwrap();
+        let skipped = head.layers[1].1.forward(&x).unwrap();
+
+        let target = TrainingTarget::FrozenEncoder { head };
+        let saved = target.saved_adapter(&config, output).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        jammi_lora::save_adapter(
+            dir.path(),
+            &target.named_trainable_weights().unwrap(),
+            &saved,
+        )
+        .unwrap();
+        let served = ServedHead::load(
+            saved.head().unwrap(),
+            &dir.path().join("adapter.safetensors"),
+            HIDDEN,
+            &device,
+            "served-head-test",
+        )
+        .unwrap();
+
+        let diff = |a: &Tensor, b: &Tensor| {
+            (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+        let out = served.forward(&x).unwrap();
+        assert!(diff(&out, &trained) < 1e-6, "served ≠ trained");
+        assert!(
+            diff(&out, &skipped) > 1e-4,
+            "the projection is inert here, so this test cannot tell it was applied"
+        );
+        served
+    }
+
+    #[test]
+    fn a_served_classifier_applies_its_projection_and_names_its_classes() {
+        let labels = vec!["biology".to_string(), "chemistry".into(), "physics".into()];
+        let served = assert_served_matches_trained(
+            |config, varmap, vb| {
+                crate::fine_tune::lora::build_classification_head(HIDDEN, 3, config, varmap, vb)
+                    .unwrap()
+            },
+            HeadOutput::Classes {
+                labels: labels.clone(),
+            },
+        );
+        assert_eq!(served.classes(), Some(labels.as_slice()));
+    }
+
+    #[test]
+    fn a_served_regression_head_applies_its_projection() {
+        let scaler = crate::fine_tune::TargetScaler::from_mean_std(2017.0, 2.0);
+        let served = assert_served_matches_trained(
+            |config, varmap, vb| {
+                crate::fine_tune::lora::build_distribution_head(HIDDEN, 2, config, varmap, vb)
+                    .unwrap()
+            },
+            HeadOutput::Distribution {
+                scaler,
+                form: jammi_datafusion::inference::adapter::DistributionForm::Gaussian,
+            },
+        );
+        assert!(served.distribution().is_some());
+    }
+}
+
+/// `ServedHead::load` must apply the *persisted* rSLoRA choice, not a fixed
+/// default. Every quantity here is measured through the production
+/// `ServedHead::load` — writing a real adapter.safetensors to a tempdir,
+/// loading it, and reading the actual forward-pass magnitude — never
+/// asserted against a hand-derived formula alone.
+#[cfg(test)]
+mod served_head_rslora_tests {
     use super::*;
     use candle_core::safetensors;
     use std::collections::HashMap;
@@ -4037,9 +4147,9 @@ mod projection_head_rslora_tests {
     /// Build a one-`projection`-layer adapter file with `lora_a`/`lora_b`
     /// filled with ones (so the LoRA delta on an all-ones input is a known,
     /// nonzero constant — `hidden * rank`), load it through the production
-    /// `load_projection_head` with the given `use_rslora`, and return the
-    /// scaling factor `load_projection_head` actually applied (back-derived
-    /// from the base-identity forward-pass delta, not asserted directly).
+    /// `ServedHead::load` with the given `use_rslora`, and return the
+    /// scaling factor it actually applied (back-derived from the
+    /// base-identity forward-pass delta, not asserted directly).
     fn served_scaling(rank: usize, alpha: f64, use_rslora: bool) -> f64 {
         let device = Device::Cpu;
         let hidden = 4usize;
@@ -4053,17 +4163,15 @@ mod projection_head_rslora_tests {
         let path = dir.path().join("adapter.safetensors");
         safetensors::save(&weights, &path).unwrap();
 
-        let dims = crate::model::ModelDimensions {
-            hidden_size: hidden,
-            num_layers: 1,
-            num_attention_heads: 1,
-            intermediate_size: hidden,
+        let config = HeadConfig {
+            lora_rank: rank,
+            lora_alpha: alpha,
+            use_rslora,
+            output: HeadOutput::Embedding,
         };
-        let lora = load_projection_head(&path, alpha, use_rslora, &device, &dims, "rslora-test")
-            .unwrap()
-            .expect("adapter carries a projection layer");
+        let head = ServedHead::load(&config, &path, hidden, &device, "rslora-test").unwrap();
         let x = Tensor::ones((1, hidden), DType::F32, &device).unwrap();
-        let out = lora.forward(&x).unwrap();
+        let out = head.embed(&x).unwrap();
         let out_v: Vec<Vec<f32>> = out.to_vec2().unwrap();
         // base is identity, so `out - x = scaling * (hidden * rank)` (see
         // this fn's doc for the ones-filled A/B derivation).
@@ -4591,9 +4699,7 @@ mod ner_nonfinite_logit_tests {
             audio_frontend: None,
             tokenizer: Some(tokenizer),
             device,
-            projection_head: None,
-            distribution_head: None,
-            regression_scaler: None,
+            head: None,
             id2label: Some(id2label),
             ner_classifier: Some(ner_classifier),
             kernel_admission: std::sync::Mutex::default(),
@@ -4741,23 +4847,23 @@ mod digest_fingerprint_tests {
         }
     }
 
-    /// Write a valid `ProjectionHead`-flavoured `adapter_config.json` +
-    /// `adapter.safetensors` pair at `dir`. The weights carry a single
-    /// `marker` tensor — neither `projection.lora_a`/`lora_b` nor
-    /// `distribution.lora_a`/`lora_b`, so `load_projection_head` /
-    /// `load_distribution_head` both return `Ok(None)` and
-    /// `CandleBackend::load` succeeds as an ordinary (adapter-inert) load —
-    /// the adapter's FILES are still digested/fingerprinted, which is all
-    /// these tests need; a `ProjectionHead` adapter with no matching keys
-    /// needs no `target_modules`/LoRA-shape knowledge of `tiny_bert` at all.
+    /// Write a valid frozen-encoder `adapter_config.json` +
+    /// `adapter.safetensors` pair at `dir`: an embedding head whose
+    /// `projection` layer is inert (`lora_b` zero, so the head serves
+    /// `tiny_bert`'s pooled output unchanged) and whose `lora_a` carries
+    /// `marker_value` — so `CandleBackend::load` succeeds as an ordinary
+    /// load and the adapter's FILES are digested/fingerprinted, which is all
+    /// these tests need.
     fn write_projection_adapter(dir: &std::path::Path, marker_value: f32) {
         std::fs::create_dir_all(dir).unwrap();
         let cfg_json = serde_json::json!({
-            "adapter_type": "projection_head",
-            "lora_rank": 4,
-            "lora_alpha": 8.0,
-            "use_rslora": false,
-            "head_layers": []
+            "encoder": "frozen",
+            "head": {
+                "lora_rank": 4,
+                "lora_alpha": 8.0,
+                "use_rslora": false,
+                "output": { "kind": "embedding" }
+            }
         });
         std::fs::write(
             dir.join("adapter_config.json"),
@@ -4765,12 +4871,23 @@ mod digest_fingerprint_tests {
         )
         .unwrap();
 
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(jammi_test_utils::fixture("tiny_bert").join("config.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        let hidden = config["hidden_size"].as_u64().unwrap() as usize;
         let device = Device::Cpu;
-        let mut weights: HashMap<String, Tensor> = HashMap::new();
-        weights.insert(
-            "marker".to_string(),
-            Tensor::new(&[marker_value], &device).unwrap(),
-        );
+        let weights: HashMap<String, Tensor> = HashMap::from([
+            (
+                "projection.lora_a".to_string(),
+                Tensor::full(marker_value, (4, hidden), &device).unwrap(),
+            ),
+            (
+                "projection.lora_b".to_string(),
+                Tensor::zeros((hidden, 4), DType::F32, &device).unwrap(),
+            ),
+        ]);
         candle_core::safetensors::save(&weights, dir.join("adapter.safetensors")).unwrap();
     }
 

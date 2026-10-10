@@ -378,6 +378,30 @@ def _regression_loss_message(
     )
 
 
+def _set_encoder(
+    config: training_pb2.FineTuneConfig,
+    encoder: Optional[str],
+    target_modules: Optional[List[str]],
+) -> None:
+    """Set the config's encoder arm: ``"adapted"`` trains LoRA inside the
+    encoder at `target_modules` (the architecture's default sites when
+    omitted), ``"frozen"`` trains only a head over the frozen encoder. Neither
+    given leaves the arm unset, which the engine reads as an adapted encoder
+    at its default sites."""
+    if encoder not in (None, "adapted", "frozen"):
+        raise ValueError(f"Unknown encoder {encoder!r}. Use 'adapted' or 'frozen'.")
+    if encoder == "frozen":
+        if target_modules is not None:
+            raise ValueError(
+                "target_modules names the sites of an adapted encoder; a frozen "
+                "encoder trains none"
+            )
+        config.frozen.SetInParent()
+    elif encoder == "adapted" or target_modules is not None:
+        config.adapted.SetInParent()
+        config.adapted.target_modules.extend(target_modules or [])
+
+
 def build_fine_tune_config(
     *,
     lora_rank: Optional[int],
@@ -393,6 +417,7 @@ def build_fine_tune_config(
     warmup_fraction: Optional[float],
     gradient_accumulation_steps: Optional[int],
     triplet_margin: Optional[float],
+    encoder: Optional[str],
     target_modules: Optional[List[str]],
     early_stopping_metric: Optional[str],
     backbone_dtype: Optional[str],
@@ -456,8 +481,7 @@ def build_fine_tune_config(
         config.warmup_fraction = warmup_fraction
     if gradient_accumulation_steps is not None:
         config.gradient_accumulation_steps = gradient_accumulation_steps
-    if target_modules is not None:
-        config.target_modules.extend(target_modules)
+    _set_encoder(config, encoder, target_modules)
     if early_stopping_metric is not None:
         try:
             config.early_stopping_metric = _EARLY_STOPPING_METRIC[early_stopping_metric]
@@ -581,6 +605,7 @@ def build_fine_tune_request(
     warmup_fraction: Optional[float] = None,
     gradient_accumulation_steps: Optional[int] = None,
     triplet_margin: Optional[float] = None,
+    encoder: Optional[str] = None,
     target_modules: Optional[List[str]] = None,
     early_stopping_metric: Optional[str] = None,
     backbone_dtype: Optional[str] = None,
@@ -643,6 +668,7 @@ def build_fine_tune_request(
         warmup_fraction=warmup_fraction,
         gradient_accumulation_steps=gradient_accumulation_steps,
         triplet_margin=triplet_margin,
+        encoder=encoder,
         target_modules=target_modules,
         early_stopping_metric=early_stopping_metric,
         backbone_dtype=backbone_dtype,
@@ -712,6 +738,7 @@ def build_fine_tune_graph_request(
     warmup_steps: Optional[int] = None,
     warmup_fraction: Optional[float] = None,
     gradient_accumulation_steps: Optional[int] = None,
+    encoder: Optional[str] = None,
     target_modules: Optional[List[str]] = None,
     backbone_dtype: Optional[str] = None,
     weight_decay: Optional[float] = None,
@@ -791,6 +818,7 @@ def build_fine_tune_graph_request(
         warmup_fraction=warmup_fraction,
         gradient_accumulation_steps=gradient_accumulation_steps,
         triplet_margin=triplet_margin,
+        encoder=encoder,
         target_modules=target_modules,
         early_stopping_metric=early_stopping_metric,
         backbone_dtype=backbone_dtype,

@@ -182,6 +182,7 @@ use crate::model::hub::HubSource;
 use crate::pipeline::graph_neighbourhood::EdgeSourceRef;
 use crate::session::InferenceSession;
 use jammi_datafusion::ModelSource;
+use jammi_wire::fine_tune::EncoderTraining;
 use jammi_wire::proto::gang::{bind, AbortReason, Assign, Bind, InlineTransport, NcclTransport};
 
 // Lease timing is configured per deployment via `[lease]` in `JammiConfig` (the
@@ -6691,27 +6692,26 @@ impl From<JammiError> for WorkerJobError {
 /// this function's output is durable and caller-facing). A non-OOM error
 /// passes through byte-identical.
 ///
-/// The echoed config and the remedies both differ by adapter shape, because
-/// `backbone_dtype` only takes effect on the encoder-adapters arm:
-/// `build_encoder_adapters` — reached only when `config.target_modules` is
-/// non-empty — is the sole caller of [`validate_backbone_precision`] and
-/// `compute_precision_to_dtype`. The projection-head arm (`target_modules`
-/// empty, the default) loads the frozen backbone but never re-dtypes it, so
-/// `backbone_dtype` is omitted from the echoed config entirely on that arm
-/// (never echoed and then disclaimed), and recommending `backbone_dtype:
-/// bf16` there would be dead advice.
+/// The echoed config and the remedies both differ by encoder training,
+/// because `backbone_dtype` only takes effect on an adapted encoder:
+/// `build_encoder_adapters` — reached only for
+/// [`EncoderTraining::Adapted`] — is the sole caller of
+/// [`validate_backbone_precision`] and `compute_precision_to_dtype`. A frozen
+/// encoder's backbone loads but is never re-dtyped, so `backbone_dtype` is
+/// omitted from the echoed config entirely on that arm (never echoed and then
+/// disclaimed), and recommending `backbone_dtype: bf16` there would be dead
+/// advice.
 ///
-/// - **Encoder adapters** (`target_modules` non-empty): config echo includes
-///   `backbone_dtype`; (1) `backbone_dtype: bf16` first — substantially
-///   reduces the frozen backbone's weight and activation residency; bf16
-///   requires CUDA, refused before training starts if unmet (see
-///   [`validate_backbone_precision`]); (2) a smaller `batch_size`, or trade
-///   batch size for `gradient_accumulation_steps`; (3) a smaller
+/// - **Adapted encoder**: config echo includes `backbone_dtype`; (1)
+///   `backbone_dtype: bf16` first — substantially reduces the frozen
+///   backbone's weight and activation residency; bf16 requires CUDA, refused
+///   before training starts if unmet (see [`validate_backbone_precision`]);
+///   (2) a smaller `batch_size`, or trade batch size for
+///   `gradient_accumulation_steps`; (3) a smaller `max_seq_length`.
+/// - **Frozen encoder**: config echo omits `backbone_dtype`; the message
+///   states outright that it does not apply; (1) a smaller `batch_size`, or
+///   trade batch size for `gradient_accumulation_steps`; (2) a smaller
 ///   `max_seq_length`.
-/// - **Projection head** (`target_modules` empty): config echo omits
-///   `backbone_dtype`; the message states outright that it does not apply;
-///   (1) a smaller `batch_size`, or trade batch size for
-///   `gradient_accumulation_steps`; (2) a smaller `max_seq_length`.
 ///
 /// The headline names the mechanism only as strongly as the matched text
 /// supports: this function never threads through which device the job
@@ -6729,17 +6729,16 @@ fn classify_training_oom(config: &FineTuneConfig, e: JammiError) -> JammiError {
     } else {
         "out of memory (device or host)"
     };
-    // The echoed config is arm-appropriate, not echo-then-disclaim: the
-    // projection-head arm never reads `backbone_dtype` for anything, so it
-    // is simply absent from the echo rather than named and then immediately
-    // disclaimed.
-    let (config_echo, remedies) = if config.target_modules.is_empty() {
+    // The echoed config is arm-appropriate, not echo-then-disclaim: a frozen
+    // encoder never reads `backbone_dtype` for anything, so it is simply
+    // absent from the echo rather than named and then immediately disclaimed.
+    let (config_echo, remedies) = if matches!(config.encoder, EncoderTraining::Frozen) {
         (
             format!(
                 "batch_size={}, max_seq_length={}",
                 config.batch_size, config.max_seq_length
             ),
-            "backbone_dtype does not apply to projection-head runs. Try, in order: \
+            "backbone_dtype does not apply to a frozen encoder. Try, in order: \
              (1) a smaller batch_size, or trade batch size for \
              gradient_accumulation_steps; (2) a smaller max_seq_length."
                 .to_string(),
@@ -7270,7 +7269,7 @@ pub mod training_test_hooks {
     /// One rank's target as built by `run_fine_tune_blocking`, before any
     /// step: the dropout seed it was given, each head layer's own dropout
     /// Philox seed (`LoraLinear::dropout_run_seed`; empty for an
-    /// encoder-adapters target, whose per-site seeds are not enumerable
+    /// adapted-encoder target, whose per-site seeds are not enumerable
     /// through `AnyEncoder`), and a SHA-256 over the trainable weights in
     /// canonical name order.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7293,14 +7292,15 @@ pub mod training_test_hooks {
         target: &crate::fine_tune::target::TrainingTarget,
     ) -> jammi_db::error::Result<()> {
         use sha2::Digest;
-        let layer_dropout_seeds = match target {
-            crate::fine_tune::target::TrainingTarget::ProjectionHead { head } => head
-                .layers
-                .iter()
-                .map(|(_, layer)| layer.dropout_run_seed())
-                .collect(),
-            crate::fine_tune::target::TrainingTarget::EncoderAdapters(_) => Vec::new(),
-        };
+        let layer_dropout_seeds = target
+            .head()
+            .into_iter()
+            .flat_map(|head| {
+                head.layers
+                    .iter()
+                    .map(|(_, layer)| layer.dropout_run_seed())
+            })
+            .collect();
         let weights = target.named_trainable_weights()?;
         let mut names: Vec<&String> = weights.keys().collect();
         names.sort();
@@ -8072,8 +8072,8 @@ struct RunFineTuneParams {
 }
 
 /// Run LoRA fine-tuning in a blocking context, checking `cancel` at every epoch
-/// boundary. Reconstructs the training target (projection head or encoder
-/// adapters) and drives the trainer. The loop trains and persists the adapter
+/// boundary. Reconstructs the training target (a frozen or an adapted encoder,
+/// and its head) and drives the trainer. The loop trains and persists the adapter
 /// but writes no terminal status — the worker registers the output model and
 /// runs the lease-guarded finalize after this returns. Returns the
 /// [`crate::fine_tune::trainer::TrainingResult`] (adapter path + run metrics)
@@ -8123,125 +8123,91 @@ fn run_fine_tune_blocking(
     let varmap = VarMap::new();
     let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-    let target = if config.target_modules.is_empty() {
-        let head = if task == ModelTask::Classification {
-            // `num_classes` from the SAME source: a `Resident` loader's
-            // `TrainingFormat::Classification { num_classes }` (built from
-            // the eager `BTreeSet` pass), or a `Streamed` source's
-            // `StreamedSet::num_classes()` (built from the worker's own
-            // whole-table vocabulary sweep) — both are the identical
-            // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
-            // doc), so the head is sized identically either way.
-            let num_classes = match &training_source {
-                crate::fine_tune::source::TrainingSource::Resident(loader) => {
-                    match loader.format() {
-                        crate::fine_tune::data::TrainingFormat::Classification { num_classes } => {
-                            num_classes
-                        }
-                        _ => {
-                            return Err(JammiError::FineTune(
-                                "Classification task requires classification training data \
-                                 format"
-                                    .into(),
-                            ))
-                        }
-                    }
-                }
-                crate::fine_tune::source::TrainingSource::Streamed(streamed) => {
-                    streamed.num_classes().ok_or_else(|| {
-                        JammiError::FineTune(
-                            "Classification task requires classification training data format"
-                                .into(),
-                        )
-                    })?
-                }
-            };
-            crate::fine_tune::lora::build_classification_head_for_rank(
+    let target = match config.encoder {
+        EncoderTraining::Frozen => {
+            let head = build_task_head(TaskHeadParams {
+                task,
                 hidden_size,
-                num_classes,
-                &config,
-                &varmap,
-                &vb,
+                encoder: &config.encoder,
+                source: &training_source,
+                config: &config,
+                varmap: &varmap,
+                vb: &vb,
                 dropout_seed,
-            )?
-        } else if task == ModelTask::Regression {
-            let output_dim = match config.regression_loss.unwrap_or_default() {
-                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
-                _ => 2,
-            };
-            crate::fine_tune::lora::build_distribution_head_for_rank(
-                hidden_size,
-                output_dim,
-                &config,
-                &varmap,
-                &vb,
+            })?
+            .ok_or_else(|| {
+                JammiError::FineTune("a frozen encoder trains a head for every task".into())
+            })?;
+            // `backbone_dtype` never takes effect on this arm (see
+            // `validate_backbone_precision`'s doc), so there is no encoder to
+            // probe fused-op admission against — the report still names the
+            // resolved device + compiled capabilities, with an empty
+            // `ops`/honest "no probe attempted" `flash` reason (never a
+            // fabricated per-op measurement for an arm that never ran one —
+            // see `flash_report_no_probe_attempted`'s doc).
+            compute_and_persist_acceleration_report(
+                &catalog,
+                &job_id,
+                &worker_id,
+                attempt,
+                role,
+                &device,
+                config.backbone_dtype,
+                None,
+                None,
+            );
+            crate::fine_tune::target::TrainingTarget::FrozenEncoder { head }
+        }
+        EncoderTraining::Adapted { .. } => {
+            let (mut encoder, adapter_cfg) = build_encoder_adapters(BuildEncoderAdaptersParams {
+                base_model_id: &base_model,
+                catalog: &catalog,
+                artifact_store: &artifact_store,
+                config: &config,
+                task,
+                varmap: &varmap,
+                device: &device,
+                hub: &hub,
                 dropout_seed,
-            )?
-        } else {
-            crate::fine_tune::lora::build_projection_head_for_rank(
-                hidden_size,
-                &config,
-                &varmap,
-                &vb,
+            })?;
+            let head = build_task_head(TaskHeadParams {
+                task,
+                hidden_size: encoder.hidden_size(),
+                encoder: &config.encoder,
+                source: &training_source,
+                config: &config,
+                varmap: &varmap,
+                vb: &vb,
                 dropout_seed,
-            )?
-        };
-        // `backbone_dtype` never takes effect on this arm (see
-        // `validate_backbone_precision`'s doc), so there is no encoder to probe
-        // fused-op admission against — the report still names the resolved
-        // device + compiled capabilities, with an empty `ops`/honest "no probe
-        // attempted" `flash` reason (never a fabricated per-op measurement for
-        // an arm that never ran one — see `flash_report_no_probe_attempted`'s
-        // doc).
-        compute_and_persist_acceleration_report(
-            &catalog,
-            &job_id,
-            &worker_id,
-            attempt,
-            role,
-            &device,
-            config.backbone_dtype,
-            None,
-            None,
-        );
-        crate::fine_tune::target::TrainingTarget::ProjectionHead { head }
-    } else {
-        let (mut encoder, adapter_cfg) = build_encoder_adapters(BuildEncoderAdaptersParams {
-            base_model_id: &base_model,
-            catalog: &catalog,
-            artifact_store: &artifact_store,
-            config: &config,
-            task,
-            varmap: &varmap,
-            device: &device,
-            hub: &hub,
-            dropout_seed,
-        })?;
-        // Right after `build_encoder_adapters` (which calls
-        // `validate_backbone_precision` and materialises the real, dtype-typed
-        // encoder) and BEFORE the training loop's first step — the earliest
-        // point a per-job admission determination is both possible (the real
-        // encoder exists) and cheap (nothing has trained yet). `&varmap` is the
-        // SAME `VarMap` `build_encoder_adapters` registered the LoRA A/B
-        // trainable vars into — the probe's backward+optimizer step
-        // (`run_backward_and_optimizer_probe`) snapshots and restores it.
-        compute_and_persist_acceleration_report(
-            &catalog,
-            &job_id,
-            &worker_id,
-            attempt,
-            role,
-            &device,
-            config.backbone_dtype,
-            Some(&varmap),
-            Some(&mut encoder),
-        );
-        crate::fine_tune::target::TrainingTarget::EncoderAdapters(Box::new(
-            crate::fine_tune::target::EncoderAdaptersTarget {
-                encoder,
-                adapter_cfg,
-            },
-        ))
+            })?;
+            // Right after `build_encoder_adapters` (which calls
+            // `validate_backbone_precision` and materialises the real,
+            // dtype-typed encoder) and BEFORE the training loop's first step —
+            // the earliest point a per-job admission determination is both
+            // possible (the real encoder exists) and cheap (nothing has
+            // trained yet). `&varmap` is the SAME `VarMap` `build_encoder_adapters`
+            // registered the LoRA A/B trainable vars into — the probe's
+            // backward+optimizer step (`run_backward_and_optimizer_probe`)
+            // snapshots and restores it.
+            compute_and_persist_acceleration_report(
+                &catalog,
+                &job_id,
+                &worker_id,
+                attempt,
+                role,
+                &device,
+                config.backbone_dtype,
+                Some(&varmap),
+                Some(&mut encoder),
+            );
+            crate::fine_tune::target::TrainingTarget::AdaptedEncoder(Box::new(
+                crate::fine_tune::target::AdaptedEncoderTarget {
+                    encoder,
+                    adapter_cfg,
+                    head,
+                },
+            ))
+        }
     };
 
     // Discover the job's newest complete epoch checkpoint. If one exists (a
@@ -8313,6 +8279,94 @@ fn run_fine_tune_blocking(
     // faulted never reaches here; its transport is aborted instead.
     training_loop.close_gang(call)?;
     Ok(trained)
+}
+
+/// [`build_task_head`]'s inputs, grouped so the call takes a single
+/// argument.
+struct TaskHeadParams<'a> {
+    task: ModelTask,
+    /// Width of the pooled output the head reads.
+    hidden_size: usize,
+    encoder: &'a EncoderTraining,
+    source: &'a crate::fine_tune::source::TrainingSource,
+    config: &'a FineTuneConfig,
+    varmap: &'a candle_nn::VarMap,
+    vb: &'a candle_nn::VarBuilder<'a>,
+    dropout_seed: u64,
+}
+
+/// The head a fine-tune trains over the encoder's pooled output: a
+/// classification task's `projection` and `classifier`, a regression task's
+/// `projection` and `distribution`, whichever way the encoder trains — the
+/// classes and the distribution exist only in the head. An embedding task's
+/// `projection` exists only over a frozen encoder, where it carries the whole
+/// adaptation; an adapted encoder's own pooled output is the embedding, so it
+/// trains no head (`None`).
+fn build_task_head(
+    params: TaskHeadParams<'_>,
+) -> Result<Option<crate::fine_tune::lora::LoraModel>> {
+    let TaskHeadParams {
+        task,
+        hidden_size,
+        encoder,
+        source,
+        config,
+        varmap,
+        vb,
+        dropout_seed,
+    } = params;
+    let head = match task {
+        ModelTask::Classification => {
+            // `num_classes` from the SAME source: a `Resident` loader's
+            // `TrainingFormat::Classification { num_classes }` (built from the
+            // eager `BTreeSet` pass), or a `Streamed` source's
+            // `StreamedSet::num_classes()` (built from the worker's own
+            // whole-table vocabulary sweep) — both are the identical
+            // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
+            // doc), so the head is sized identically either way.
+            let num_classes = source
+                .class_labels()
+                .map(|labels| labels.len())
+                .ok_or_else(|| {
+                    JammiError::FineTune(
+                        "Classification task requires classification training data format".into(),
+                    )
+                })?;
+            crate::fine_tune::lora::build_classification_head_for_rank(
+                hidden_size,
+                num_classes,
+                config,
+                varmap,
+                vb,
+                dropout_seed,
+            )?
+        }
+        ModelTask::Regression => {
+            let output_dim = match config.regression_loss.unwrap_or_default() {
+                crate::fine_tune::RegressionLoss::Pinball => config.quantile_levels.len(),
+                _ => 2,
+            };
+            crate::fine_tune::lora::build_distribution_head_for_rank(
+                hidden_size,
+                output_dim,
+                config,
+                varmap,
+                vb,
+                dropout_seed,
+            )?
+        }
+        _ => match encoder {
+            EncoderTraining::Frozen => crate::fine_tune::lora::build_projection_head_for_rank(
+                hidden_size,
+                config,
+                varmap,
+                vb,
+                dropout_seed,
+            )?,
+            EncoderTraining::Adapted { .. } => return Ok(None),
+        },
+    };
+    Ok(Some(head))
 }
 
 /// Fetch and load the checkpoint a resume of the job restores, if any: the
@@ -8454,7 +8508,7 @@ fn validate_backbone_precision(
 // dropout-mask RNG draw is NOT undone — see that doc's own disclosure).
 // `flash` degrades to a compiled/device-level fact (`cuda_not_compiled` /
 // `flash_not_compiled` / `device_is_cpu_or_metal_not_cuda` /
-// `no_encoder_to_probe_projection_head_arm`) whenever the cascade admission
+// `no_encoder_to_probe_frozen_encoder`) whenever the cascade admission
 // path cannot even be reached, or no encoder was built to probe at all
 // (distinct from a probe that WAS attempted and failed); a
 // reached-but-declined cascade reads its verbatim predicate key back out of
@@ -8589,7 +8643,7 @@ fn flash_compiled_device_reason(device: &candle_core::Device) -> Option<serde_js
 }
 
 /// The `"flash"` field for an arm that ran NO probe at all — no encoder was
-/// ever built to probe (the projection-head arm: `backbone_dtype` never
+/// ever built to probe (the frozen-encoder arm: `backbone_dtype` never
 /// takes effect there, so [`probe_acceleration`] never reaches a forward
 /// call). Distinct from [`flash_report`]'s `"probe_forward_failed"`, which
 /// means a probe WAS attempted and its forward pass errored: passing
@@ -8597,7 +8651,7 @@ fn flash_compiled_device_reason(device: &candle_core::Device) -> Option<serde_js
 /// probe failed" for a probe that was never attempted.
 fn flash_report_no_probe_attempted(device: &candle_core::Device) -> serde_json::Value {
     flash_compiled_device_reason(device).unwrap_or_else(
-        || serde_json::json!({"holds": false, "reason": "no_encoder_to_probe_projection_head_arm"}),
+        || serde_json::json!({"holds": false, "reason": "no_encoder_to_probe_frozen_encoder"}),
     )
 }
 
@@ -8752,7 +8806,7 @@ fn run_backward_and_optimizer_probe(varmap: &candle_nn::VarMap, output: &candle_
 /// (see [`run_backward_and_optimizer_probe`]) — when `encoder`/`varmap` are
 /// both `Some`, and builds the `ops` map + `flash` field from the
 /// before/after dispatch-registry delta. Either is `None` on the
-/// projection-head arm (`backbone_dtype` never takes effect there — see
+/// frozen-encoder arm (`backbone_dtype` never takes effect there — see
 /// `validate_backbone_precision`'s doc): `ops` is then empty and `flash`
 /// reports the honest "no probe was ever attempted" reason
 /// ([`flash_report_no_probe_attempted`]) — never a fabricated per-op
@@ -8899,7 +8953,7 @@ fn build_acceleration_report_json(
 /// Computes and persists this attempt's acceleration report. Runs
 /// synchronously inside the blocking training thread
 /// (`run_fine_tune_blocking`), right after the device is resolved and (on the
-/// encoder-adapters arm) right after `validate_backbone_precision` /
+/// adapted-encoder arm) right after `validate_backbone_precision` /
 /// `build_encoder_adapters` return — before the training loop's first step,
 /// so a status poll mid-training finds a `"determined"` report rather than
 /// the submission-time `"pending"` marker for this run's whole lifetime
@@ -8947,7 +9001,7 @@ fn compute_and_persist_acceleration_report(
     ));
 }
 
-/// Construct an encoder-adapters target: load the frozen backbone weights from
+/// Construct an adapted-encoder target: load the frozen backbone weights from
 /// the catalog artifact path, wrap the configured target modules with LoRA, and
 /// return both the resulting encoder and the persisted adapter metadata that
 /// pairs with the trained tensors on disk.
@@ -9155,10 +9209,31 @@ fn build_encoder_adapters(
              (base model '{base_model_id}'); supported: bert, roberta, camembert, \
              xlm-roberta, distilbert, modernbert, an OpenCLIP checkpoint \
              (open_clip_config.json with model_cfg), or an HF-CLAP audio checkpoint \
-             (clap_audio_model). Leave `target_modules` empty to train a projection \
-             head on a frozen backbone instead."
+             (clap_audio_model). `encoder=\"frozen\"` trains a head over any \
+             backbone instead."
         ))
     })?;
+    let EncoderTraining::Adapted {
+        target_modules,
+        layers_to_transform,
+        rank_pattern,
+    } = &config.encoder
+    else {
+        return Err(JammiError::FineTune(
+            "encoder adapters are built only for an adapted encoder".into(),
+        ));
+    };
+    // An empty request trains the family's default sites — PEFT's own
+    // placement; a named list trains exactly the sites it selects.
+    let target_modules: Vec<String> = if target_modules.is_empty() {
+        family
+            .default_lora_sites()
+            .iter()
+            .map(|site| site.to_string())
+            .collect()
+    } else {
+        target_modules.clone()
+    };
 
     // The string the two GGUF lookups below still key on (`GgufArchitecture`
     // and, through `gguf_num_layers`, the DistilBERT field normalization),
@@ -9203,13 +9278,13 @@ fn build_encoder_adapters(
     };
 
     let lora = jammi_lora::LoraBuildConfig {
-        target_modules: &config.target_modules,
-        layers_to_transform: &config.layers_to_transform,
+        target_modules: &target_modules,
+        layers_to_transform,
         lora_rank: config.lora_rank,
         lora_alpha: config.lora_alpha,
         use_rslora: config.use_rslora,
         lora_dropout,
-        rank_pattern: &config.rank_pattern,
+        rank_pattern,
         init_mode: config.init_lora_weights,
         seed: config.seed,
         dropout_seed,
@@ -9418,9 +9493,9 @@ fn build_encoder_adapters(
 
     // A selector that matched NOTHING is a hard refusal, not a run.
     //
-    // This arm is reached only when `config.target_modules` is non-empty (see
-    // `classify_training_oom`'s doc for that split), so an encoder with zero
-    // trainable `Var`s here means the caller ASKED for adapters and got none.
+    // This arm is reached only for an adapted encoder, whose sites are the
+    // request's or the family's defaults, so an encoder with zero trainable
+    // `Var`s here means the caller ASKED for adapters and got none.
     // Nothing downstream notices: candle's backward pass differentiates only
     // through `is_variable()` nodes, so `loss.backward()` populates an empty
     // `GradStore`; `optimizer::clip_and_step` treats an EMPTY `trainable_vars`
@@ -9430,7 +9505,7 @@ fn build_encoder_adapters(
     // model id. A typo'd selector must fail the job instead — the same
     // conclusion `jammi-bench`'s own training tier reached
     // (`finetune_run.rs`'s zero-trainable refusal), installed here at the one
-    // seam every encoder-adapters job passes through.
+    // seam every adapted-encoder job passes through.
     //
     // TWO producers land here and the message must not blame the wrong one:
     // `target_modules` matching no site on THIS tower's vocabulary, or a
@@ -9449,7 +9524,7 @@ fn build_encoder_adapters(
             Some(Tower::Audio) => "audio",
             None => family.towers(),
         };
-        let restriction = match &config.layers_to_transform {
+        let restriction = match layers_to_transform {
             Some(layers) => format!(" restricted to layers {layers:?}"),
             None => String::new(),
         };
@@ -9461,7 +9536,7 @@ fn build_encoder_adapters(
              exactly or as a suffix of it (so 'query' selects 'attention.self.query' on a \
              BERT-family tower, whose sites are named by their full dotted checkpoint \
              path), and 'all-linear' selects every site.{}",
-            config.target_modules,
+            target_modules,
             family.adapter_model_type(),
             encoder.lora_site_names(),
             if restriction.is_empty() {
@@ -10302,7 +10377,7 @@ mod tests {
         );
     }
 
-    /// The encoder-adapters arm (`target_modules` non-empty): a CUDA
+    /// The adapted-encoder arm: a CUDA
     /// OOM-shaped failure is rewritten to name the config that OOM'd and the
     /// remedies to try, in order — `backbone_dtype: bf16` first (bf16
     /// actually takes effect here), then a smaller
@@ -10311,7 +10386,7 @@ mod tests {
     #[test]
     fn classify_training_oom_encoder_adapters_arm_leads_with_bf16() {
         let config = FineTuneConfig {
-            target_modules: vec!["query".into(), "value".into()],
+            encoder: EncoderTraining::adapted(vec!["query".into(), "value".into()]),
             ..FineTuneConfig::default() // batch_size=8, max_seq_length=512, backbone_dtype=f32
         };
         let raw = JammiError::FineTune(
@@ -10338,7 +10413,7 @@ mod tests {
         );
         assert!(
             msg.contains("backbone_dtype: bf16"),
-            "first remedy on the encoder-adapters arm must be the bf16 backbone, got: {msg}"
+            "first remedy on the adapted-encoder arm must be the bf16 backbone, got: {msg}"
         );
         assert!(
             msg.contains("bf16 requires CUDA"),
@@ -10358,15 +10433,17 @@ mod tests {
         );
     }
 
-    /// The projection-head arm (`target_modules` empty, the default):
-    /// `backbone_dtype` never takes effect there (only `build_encoder_adapters`
-    /// re-dtypes the backbone, and it is reached only for a non-empty
-    /// `target_modules`), so the remedy list must NOT suggest `backbone_dtype:
-    /// bf16` — that would be dead advice on this arm. The message says so
-    /// outright.
+    /// The frozen-encoder arm: `backbone_dtype` never takes effect there
+    /// (only `build_encoder_adapters` re-dtypes the backbone, and it is
+    /// reached only for an adapted encoder), so the remedy list must NOT
+    /// suggest `backbone_dtype: bf16` — that would be dead advice on this
+    /// arm. The message says so outright.
     #[test]
-    fn classify_training_oom_projection_head_arm_omits_bf16() {
-        let config = FineTuneConfig::default(); // target_modules empty
+    fn classify_training_oom_frozen_encoder_arm_omits_bf16() {
+        let config = FineTuneConfig {
+            encoder: EncoderTraining::Frozen,
+            ..FineTuneConfig::default()
+        };
         let raw = JammiError::FineTune(
             "Encoder forward: cuda error: CUDA_ERROR_OUT_OF_MEMORY: out of memory".into(),
         );
@@ -10380,14 +10457,14 @@ mod tests {
         assert!(
             !msg.contains("backbone_dtype="),
             "the echoed config must be arm-appropriate — backbone_dtype is never echoed \
-             (and then disclaimed) on the projection-head arm, got: {msg}"
+             (and then disclaimed) on the frozen-encoder arm, got: {msg}"
         );
         assert!(
             !msg.contains("backbone_dtype: bf16"),
-            "bf16 is inert on the projection-head arm — must not be suggested, got: {msg}"
+            "bf16 is inert on the frozen-encoder arm — must not be suggested, got: {msg}"
         );
         assert!(
-            msg.contains("backbone_dtype does not apply to projection-head runs"),
+            msg.contains("backbone_dtype does not apply to a frozen encoder"),
             "must say outright why bf16 is absent, got: {msg}"
         );
         assert!(
@@ -10521,11 +10598,11 @@ mod tests {
     }
 
     /// End-to-end: a CUDA-OOM-shaped failure from the blocking trainer, on the
-    /// default (projection-head) config, drives the job to a terminal
+    /// frozen-encoder config, drives the job to a terminal
     /// `failed` status whose `error_message` (what `jammi train status` /
     /// Python `job.status()` read) carries the classified guidance — not the
     /// raw driver string, and without the inert `backbone_dtype: bf16`
-    /// suggestion the default arm cannot act on. Mirrors
+    /// suggestion the frozen-encoder arm cannot act on. Mirrors
     /// `panicking_training_job_lands_failed_with_recorded_error`'s pipeline,
     /// substituting `classify_training_error` for the plain `classify` call
     /// `train_fine_tune` makes on this arm.
@@ -10571,10 +10648,12 @@ mod tests {
             .expect("the queued job is claimable");
 
         let cancel = Arc::new(AtomicBool::new(false));
-        // The engine defaults (batch 8, seq 512, backbone F32, empty
-        // target_modules => projection-head arm) that OOM on an L4 24GB card
-        // at inference-side defaults.
-        let config = FineTuneConfig::default();
+        // The engine defaults (batch 8, seq 512, backbone F32) on a frozen
+        // encoder, which OOM on an L4 24GB card at inference-side defaults.
+        let config = FineTuneConfig {
+            encoder: EncoderTraining::Frozen,
+            ..FineTuneConfig::default()
+        };
 
         // Run the worker's blocking wrapper over a trainer that raises a raw
         // CUDA driver OOM, then take the same terminal-classification branch
@@ -10605,10 +10684,10 @@ mod tests {
         let msg = failed_job_message(&error);
         assert!(
             msg.contains("batch_size=8")
-                && msg.contains("backbone_dtype does not apply to projection-head runs")
+                && msg.contains("backbone_dtype does not apply to a frozen encoder")
                 && !msg.contains("backbone_dtype: bf16"),
             "the classified OOM guidance must reach the terminal message, without the \
-             inert bf16 remedy on the default (projection-head) arm, got: {msg}"
+             inert bf16 remedy on the frozen-encoder arm, got: {msg}"
         );
 
         // The worker records the failure as the job's terminal status, under the
@@ -10633,7 +10712,7 @@ mod tests {
             job.error
                 .as_deref()
                 .is_some_and(|m| m.contains("batch_size=8")
-                    && m.contains("backbone_dtype does not apply to projection-head runs")),
+                    && m.contains("backbone_dtype does not apply to a frozen encoder")),
             "`jammi train status` / job.status() must surface the classified OOM \
              guidance from the catalog's error, got {:?}",
             job.error
@@ -11218,7 +11297,7 @@ mod tests {
     /// nothing else that could differ between two runs of it.
     fn probe_job_config(lora_dropout: f64) -> FineTuneConfig {
         FineTuneConfig {
-            target_modules: vec!["query".to_string(), "value".to_string()],
+            encoder: EncoderTraining::adapted(vec!["query".to_string(), "value".to_string()]),
             lora_rank: 2,
             lora_dropout,
             seed: 7,
@@ -11301,34 +11380,43 @@ mod tests {
             .collect()
     }
 
-    /// `encoder` as the `EncoderAdapters` target a job of
+    /// `encoder` as the `AdaptedEncoder` target a job of
     /// [`probe_job_config`] trains, its adapter metadata derived from that
     /// same config.
     fn probe_job_target(
         encoder: jammi_encoders::AnyEncoder,
         config: &FineTuneConfig,
     ) -> crate::fine_tune::target::TrainingTarget {
-        use crate::fine_tune::target::{EncoderAdaptersTarget, TrainingTarget};
+        use crate::fine_tune::target::{AdaptedEncoderTarget, TrainingTarget};
 
+        let EncoderTraining::Adapted {
+            target_modules,
+            layers_to_transform,
+            rank_pattern,
+        } = &config.encoder
+        else {
+            panic!("the probe job adapts its encoder");
+        };
         let adapter_cfg = jammi_lora::AdapterConfig::from_build(
             "bert",
             &jammi_lora::LoraBuildConfig {
-                target_modules: &config.target_modules,
-                layers_to_transform: &config.layers_to_transform,
+                target_modules,
+                layers_to_transform,
                 lora_rank: config.lora_rank,
                 lora_alpha: config.lora_alpha,
                 use_rslora: config.use_rslora,
                 lora_dropout: Some(config.lora_dropout as f32),
-                rank_pattern: &config.rank_pattern,
+                rank_pattern,
                 init_mode: config.init_lora_weights,
                 seed: config.seed,
                 dropout_seed: config.seed,
             },
             config.backbone_dtype,
         );
-        TrainingTarget::EncoderAdapters(Box::new(EncoderAdaptersTarget {
+        TrainingTarget::AdaptedEncoder(Box::new(AdaptedEncoderTarget {
             encoder,
             adapter_cfg,
+            head: None,
         }))
     }
 
@@ -11600,7 +11688,7 @@ mod tests {
         let hub = test_hub_source();
         tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
-                target_modules,
+                encoder: EncoderTraining::adapted(target_modules),
                 ..FineTuneConfig::default()
             };
             let varmap = candle_nn::VarMap::new();
@@ -11708,6 +11796,7 @@ mod tests {
     /// use `FineTuneConfig::default()`.
     async fn build_encoder_adapters_for_dir(
         dir: &std::path::Path,
+        task: ModelTask,
         target_modules: Vec<String>,
     ) -> Result<(jammi_encoders::AnyEncoder, jammi_lora::AdapterConfig)> {
         let catalog_dir = tempfile::tempdir().unwrap();
@@ -11718,7 +11807,7 @@ mod tests {
 
         tokio::task::spawn_blocking(move || {
             let training_config = FineTuneConfig {
-                target_modules,
+                encoder: EncoderTraining::adapted(target_modules),
                 lora_dropout: 0.0,
                 ..FineTuneConfig::default()
             };
@@ -11730,7 +11819,7 @@ mod tests {
                 artifact_store: &artifact_store,
                 config: &training_config,
                 dropout_seed: training_config.seed,
-                task: ModelTask::TextEmbedding,
+                task,
                 varmap: &varmap,
                 device: &device,
                 hub: &hub,
@@ -11738,6 +11827,50 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// An adapted encoder that names no sites trains its architecture's
+    /// defaults: every family's `default_lora_sites` selects real sites on
+    /// its tower, so the job trains parameters rather than refusing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_family_trains_its_default_sites() {
+        let assert_defaults = |encoder: &jammi_encoders::AnyEncoder,
+                               cfg: &jammi_lora::AdapterConfig| {
+            let family =
+                crate::model::arch::EncoderFamily::from_adapter_model_type(&cfg.model_type)
+                    .expect("the worker writes a family id");
+            assert_eq!(
+                cfg.target_modules,
+                family.default_lora_sites(),
+                "{family:?}"
+            );
+            assert!(
+                !encoder.trainable_params().is_empty(),
+                "{family:?} trains nothing"
+            );
+        };
+        for (fixture, task) in [
+            ("tiny_bert", ModelTask::TextEmbedding),
+            ("tiny_modernbert", ModelTask::TextEmbedding),
+            ("tiny_open_clip", ModelTask::TextEmbedding),
+            ("tiny_open_clip", ModelTask::ImageEmbedding),
+            ("htsat_clap_tiny", ModelTask::AudioEmbedding),
+        ] {
+            let (encoder, cfg) = build_encoder_adapters_for_dir(
+                &jammi_test_utils::fixture(fixture),
+                task,
+                Vec::new(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{fixture} {task}: {e}"));
+            assert_defaults(&encoder, &cfg);
+        }
+        let (tensors, config, matmul_weights) = distilbert_gguf_fixture(&candle_core::Device::Cpu);
+        let (encoder, cfg) =
+            build_encoder_adapters_gguf("distilbert", tensors, config, matmul_weights, Vec::new())
+                .await
+                .unwrap();
+        assert_defaults(&encoder, &cfg);
     }
 
     /// Deterministic additive-offset perturbation (no unseeded RNG) — every tensor is shifted by a fixed nonzero offset, keeping
@@ -11789,11 +11922,12 @@ mod tests {
         reference_forward: &[f32],
         phase: &str,
     ) {
-        let (encoder, adapter_cfg) = build_encoder_adapters_for_dir(dir, target_modules)
-            .await
-            .unwrap_or_else(|e| {
-                panic!("phase {phase}: build_encoder_adapters must succeed, got: {e}")
-            });
+        let (encoder, adapter_cfg) =
+            build_encoder_adapters_for_dir(dir, ModelTask::TextEmbedding, target_modules)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("phase {phase}: build_encoder_adapters must succeed, got: {e}")
+                });
         assert!(
             matches!(encoder, jammi_encoders::AnyEncoder::Bert(_)),
             "phase {phase}: expected a Bert encoder built from the safetensors arm"
@@ -11864,10 +11998,13 @@ mod tests {
             serde_json::to_string(&config).unwrap(),
         )
         .unwrap();
-        let (reference_encoder, _) =
-            build_encoder_adapters_for_dir(&ref_dir, target_modules.clone())
-                .await
-                .unwrap();
+        let (reference_encoder, _) = build_encoder_adapters_for_dir(
+            &ref_dir,
+            ModelTask::TextEmbedding,
+            target_modules.clone(),
+        )
+        .await
+        .unwrap();
         let reference_forward = deterministic_bert_forward(&reference_encoder, &device);
 
         // The dual-format directory under test — safetensors starts (and

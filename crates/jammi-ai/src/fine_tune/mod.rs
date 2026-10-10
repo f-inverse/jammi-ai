@@ -75,8 +75,13 @@ pub fn media_front_end_pool_threads() -> usize {
 // converters satisfy the orphan rule). It is re-exported here at its original
 // paths so the engine's training modules and SDK consumers reach it as
 // `jammi_ai::fine_tune::*`.
+/// The de-standardising affine a regression head persists with
+/// ([`target::HeadOutput::Distribution`]).
+#[cfg(feature = "local")]
+pub use regression_loss::TargetScaler;
+
 pub use jammi_wire::fine_tune::{
-    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, ExampleLoss,
-    FineTuneConfig, FineTuneMethod, HardNegativeConfig, HeldOutLoss, LoraInitMode, LrSchedule,
-    RegressionLoss, Warmup, DEFAULT_MAX_SEQ_LENGTH,
+    ClassificationLoss, ComputePrecision, EarlyStoppingMetric, EmbeddingLoss, EncoderTraining,
+    ExampleLoss, FineTuneConfig, FineTuneMethod, HardNegativeConfig, HeldOutLoss, LoraInitMode,
+    LrSchedule, RegressionLoss, Warmup, DEFAULT_MAX_SEQ_LENGTH,
 };

@@ -31,32 +31,15 @@ use crate::fine_tune::{session_with_training_data, tiny_bert_model};
 /// enough to train in milliseconds on CPU, at a given `backbone_dtype` and
 /// `cache` policy.
 ///
-/// **Deliberately stays on the PLAIN projection-head arm (`target_modules`
-/// empty) for every `backbone_dtype`, including non-`F32`.** `backbone_dtype`
-/// only takes effect (`validate_backbone_precision`/`compute_precision_to_dtype`)
-/// on the ENCODER-ADAPTERS arm (`target_modules` non-empty — `worker.rs`'s
-/// own module doc), so an `F16` leg through THAT arm would genuinely
-/// exercise the cast — but it is not the shape this fn uses, for an
-/// executed reason: reusing `acceleration_report.rs`'s own
-/// `encoder_adapters_config`/`tiny_modernbert` shape for an F16 CPU job
-/// that must actually COMPLETE (publish a `materialization.json` this
-/// suite reads back) reproducibly diverges here — "Training diverged: loss
-/// was NaN or >100 for 3 consecutive batches" — over one epoch on this
-/// tiny fixture, with both `CosineDecay` and `Constant` schedules tried.
-/// `acceleration_report.rs`'s OWN f16 tests are explicitly "tolerant of
-/// EITHER terminal outcome" for exactly this reason (their oracle is the
-/// PRE-training acceleration report, written before divergence could ever
-/// happen) — a test that needs a PUBLISHED artifact cannot adopt that
-/// tolerance, since a failed job publishes nothing to read back at all.
-///
-/// This is still the right input for THIS suite's own oracle: the kernel-admission-profile fold
-/// under test (`render_kernel_admission_profile`'s `dtype` argument) reads
-/// `common.config.backbone_dtype` UNCONDITIONALLY of which arm trains — so
-/// `backbone_dtype: F16` here is exactly the value production's own fold
-/// reads, even on an arm that ignores it for the forward math. What this
-/// fn does NOT prove — and does not claim to — is that the encoder-adapters
-/// arm's own F16-on-CPU numerics are stable; that is `acceleration_report.rs`'s
-/// concern, with its own, correctly-tolerant oracle.
+/// **Deliberately trains a frozen encoder for every `backbone_dtype`,
+/// including non-`F32`.** `backbone_dtype` only takes effect
+/// (`validate_backbone_precision`/`compute_precision_to_dtype`) on an adapted
+/// encoder, where the cast is genuinely exercised — but the kernel-admission
+/// profile fold under test (`render_kernel_admission_profile`'s `dtype`
+/// argument) reads `common.config.backbone_dtype` UNCONDITIONALLY of which
+/// arm trains, so `backbone_dtype: F16` here is exactly the value
+/// production's own fold reads. The adapted arm's F16 numerics are
+/// `acceleration_report.rs`'s concern.
 fn spec_with_backbone_dtype(
     cache: CachePolicy,
     backbone_dtype: jammi_numerics::ComputePrecision,
@@ -78,6 +61,7 @@ fn spec_with_backbone_dtype(
                 lora_rank: 4,
                 warmup: jammi_ai::fine_tune::Warmup::Steps(0),
                 backbone_dtype,
+                encoder: jammi_ai::fine_tune::EncoderTraining::Frozen,
                 ..Default::default()
             },
             world_size: jammi_ai::fine_tune::spec::DEFAULT_WORLD_SIZE,
@@ -716,7 +700,7 @@ async fn kernel_admission_profile_names_a_real_disabled_op_and_moves_the_definit
 
 /// A REAL `F16`-backbone fine-tune
 /// (`spec_with_backbone_dtype` — see its own doc for why this stays on the
-/// plain arm rather than the encoder-adapters arm `acceleration_report.rs`
+/// plain arm rather than the adapted-encoder arm `acceleration_report.rs`
 /// uses) has its `DefinitionHash` MOVE under
 /// `JAMMI_KERNELS_DISABLE=cast_scale_f16_f32` — the key its OWN dtype
 /// resolves, per `cast_scale`'s two dtype-branching entries

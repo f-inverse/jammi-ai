@@ -14,7 +14,7 @@ paired significance test).
 [The case study](../learn/learn.qmd) fine-tunes the encoder over the declared citation graph and measures one
 gain. This chapter asks the question a practitioner asks next: **of the
 fine-tuning methods the engine exposes, which should I reach for?** The task is
-fixed — same-subject retrieval over the papers, scored against the papers' same-subject golden — and
+fixed — same-subject retrieval over the papers, scored against the papers' same-subject ground truth — and
 the *method* varies: the contrastive loss, hard-negative mining, the Matryoshka
 nesting, and, for contrast, the declared-citation graph fine-tune. Every method
 is the same short LoRA run on the same base encoder over the same supervision,
@@ -36,7 +36,7 @@ EPOCHS = {scale.Scale.SMALL: 2, scale.Scale.FULL: 3}[SCALE]
 db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 arxiv = datasets.arxiv(db, SCALE)
 raw = keystone.embed(db, arxiv, SCALE)
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 ```
 
 ## The supervision
@@ -142,14 +142,14 @@ methods["graph"] = keystone.fine_tune_on_graph(
 
 ## The measurement
 
-One `eval_compare` scores the base and every method on the same golden, and
+One `eval_compare` scores the base and every method on the same ground truth, and
 reports each method's difference from the base with a paired significance
 test over the queries.
 
 ```{python}
 compared = db.eval_compare(
     embedding_tables=[raw, *methods.values()], source=arxiv.papers,
-    golden_source=golden, k=10,
+    ground_truth=truth, k=10,
 )
 base = compared["per_table"][0]["embedding_eval"]["aggregate"]["precision_at_k"]
 results = {}
@@ -213,7 +213,7 @@ widths = [width, width // 2, width // 4]
 served = {name: [embedded(models[name], w) for w in widths] for name in ("mnrl", "matryoshka")}
 by_width = db.eval_compare(
     embedding_tables=[table for tables in served.values() for table in tables],
-    source=arxiv.papers, golden_source=golden, k=10,
+    source=arxiv.papers, ground_truth=truth, k=10,
 )
 scores = iter(e["embedding_eval"]["aggregate"]["precision_at_k"] for e in by_width["per_table"])
 prefix = {name: dict(zip(widths, scores)) for name in served}

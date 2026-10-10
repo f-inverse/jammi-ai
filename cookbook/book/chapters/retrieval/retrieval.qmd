@@ -13,7 +13,7 @@ Retrieval quality is usually reported as one number per embedding table. This ch
 the question a practitioner asks: **given dense embeddings, a lexical scorer, and
 a graph-propagated variant, which retriever — and which fusion — should I reach
 for?** The task is fixed (same-subject retrieval over the papers, asked by title,
-scored against an embedding-independent same-subject golden) and the *retriever* varies.
+scored against an embedding-independent same-subject ground truth) and the *retriever* varies.
 
 ```{python}
 import math
@@ -33,11 +33,11 @@ db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 arxiv = datasets.arxiv(db, SCALE)
 raw = keystone.embed(db, arxiv, SCALE)
 propagated = keystone.propagate(db, arxiv, raw)
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 
 relevant: dict[str, set[str]] = defaultdict(set)
 query_text: dict[str, str] = {}
-for g in db.sql(f"SELECT query_id, query_text, relevant_id FROM {golden}").to_pylist():
+for g in db.sql(f"SELECT query_id, query_text, relevant_id FROM {truth}").to_pylist():
     relevant[g["query_id"]].add(g["relevant_id"])
     query_text[g["query_id"]] = g["query_text"]
 queries = sorted(relevant)
@@ -65,7 +65,7 @@ def dense(table: str):
 
 
 def per_query(ranked: dict[str, list[str]]) -> np.ndarray:
-    """Each query's precision@10 and nDCG@10 against the same-subject golden,
+    """Each query's precision@10 and nDCG@10 against the same-subject relevance judgments,
     one row per query in ``queries`` order."""
     rows = []
     for q in queries:

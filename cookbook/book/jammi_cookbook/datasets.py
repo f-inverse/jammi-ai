@@ -143,26 +143,26 @@ def time_split(papers: pa.Table) -> dict[str, list[str]]:
     return split
 
 
-def same_label_golden(
+def same_label_relevance(
     db, rows: list[dict], *, key: str, label: str, text: str, queries: int, name: str
 ) -> str:
-    """Register a retrieval golden where a row's relevant rows are the other
+    """Register retrieval ground truth where a row's relevant rows are the other
     rows sharing its ``label`` — a target independent of any embedding, so an
     embedding that retrieves it better is better, not circular. The first
     ``queries`` rows (in key order) whose label has at least five members are
-    the queries, each asked by its ``text``. Returns the golden's source name.
+    the queries, each asked by its ``text``. Returns the ground truth's source name.
     """
     members: dict[str, list[str]] = {}
     for r in rows:
         members.setdefault(r[label], []).append(r[key])
     asked = [r for r in sorted(rows, key=lambda r: r[key]) if len(members[r[label]]) >= 5]
-    golden = [
+    truth = [
         {"query_id": q[key], "query_text": q[text], "relevant_id": other}
         for q in asked[:queries]
         for other in members[q[label]]
         if other != q[key]
     ]
-    url = _cached_parquet(pa.Table.from_pylist(golden), f"goldens/{name}")
+    url = _cached_parquet(pa.Table.from_pylist(truth), f"truths/{name}")
     db.add_source(name, url=url, format="parquet")
     return f"{name}.public.{name}"
 

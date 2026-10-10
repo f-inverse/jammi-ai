@@ -149,15 +149,15 @@ async function verbSurface(c: JammiClient): Promise<void> {
     const embEval: EmbeddingEvalReport = await c.eval.evalEmbeddings({
       sourceId: "s1",
       embeddingTable: "emb_s1",
-      goldenSource: "gold",
+      groundTruth: "gold",
     });
     expectTypeOf(embEval.evalRunId).toBeString();
     await c.eval.evalPerQuery({ evalRunId: "run-1" });
-    await c.eval.evalInference({ modelId: "m", sourceId: "s1", goldenSource: "gold" });
-    await c.eval.evalCompare({ sourceId: "s1", goldenSource: "gold" });
+    await c.eval.evalInference({ modelId: "m", sourceId: "s1", groundTruth: "gold" });
+    await c.eval.evalCompare({ sourceId: "s1", groundTruth: "gold" });
     const calib: CalibrationEvalReport = await c.eval.evalCalibration({
       sourceId: "s1",
-      goldenSource: "gold",
+      groundTruth: "gold",
       shape: CalibrationShape.GAUSSIAN,
     });
     expectTypeOf(calib.evalRunId).toBeString();

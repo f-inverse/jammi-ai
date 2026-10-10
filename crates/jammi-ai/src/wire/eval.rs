@@ -49,7 +49,7 @@ pub fn eval_embeddings_from_bytes(body: &[u8]) -> Result<EmbeddingEvalRequest, S
 }
 
 /// Decode a [`pb::EvalEmbeddingsRequest`] into the engine's
-/// [`EmbeddingEvalRequest`]. The required `source_id` / `golden_source` are
+/// [`EmbeddingEvalRequest`]. The required `source_id` / `ground_truth` are
 /// validated at decode; the `embedding_table` empty-string sentinel resolves to
 /// `None`; the `k` cap widens to the engine's `usize`; the cohort tags rebuild
 /// through the shared [`cohorts_from_proto`]; and the method through the
@@ -61,13 +61,13 @@ pub fn eval_embeddings_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    if req.golden_source.is_empty() {
-        return Err(Status::invalid_argument("golden_source is required"));
+    if req.ground_truth.is_empty() {
+        return Err(Status::invalid_argument("ground_truth is required"));
     }
     Ok(EmbeddingEvalRequest {
         source_id: req.source_id,
         embedding_table: optional(req.embedding_table),
-        golden_source: req.golden_source,
+        ground_truth: req.ground_truth,
         k: req.k as usize,
         cohorts: cohorts_from_proto(req.cohorts),
         method: search_method_from_proto(req.method),
@@ -104,7 +104,7 @@ pub fn eval_per_query_from_proto(req: pb::EvalPerQueryRequest) -> Result<String,
 
 /// The decoded inference-eval target a `EvalInference` request carries. The
 /// engine method (`Session::eval_inference`) takes the model, the source, the
-/// content columns, the decoded [`EvalTask`], the golden source, and the label
+/// content columns, the decoded [`EvalTask`], the ground-truth source, and the label
 /// column separately, so the decode returns them as a struct the binding
 /// destructures.
 pub struct EvalInferenceArgs {
@@ -112,7 +112,7 @@ pub struct EvalInferenceArgs {
     pub source_id: String,
     pub columns: Vec<String>,
     pub task: EvalTask,
-    pub golden_source: String,
+    pub ground_truth: String,
     pub label_column: String,
 }
 
@@ -129,7 +129,7 @@ pub fn eval_inference_from_bytes(body: &[u8]) -> Result<EvalInferenceArgs, Statu
 }
 
 /// Decode a [`pb::EvalInferenceRequest`] into the engine [`EvalInferenceArgs`].
-/// The required identity fields (`model_id` / `source_id` / `golden_source` /
+/// The required identity fields (`model_id` / `source_id` / `ground_truth` /
 /// `label_column`) and a non-empty `columns` list are validated at decode, and
 /// the task resolves through the shared [`EvalTaskFromWire`] conversion (an
 /// unspecified or unknown task is rejected) — matching the gRPC handler's edge
@@ -143,8 +143,8 @@ pub fn eval_inference_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    if req.golden_source.is_empty() {
-        return Err(Status::invalid_argument("golden_source is required"));
+    if req.ground_truth.is_empty() {
+        return Err(Status::invalid_argument("ground_truth is required"));
     }
     if req.label_column.is_empty() {
         return Err(Status::invalid_argument("label_column is required"));
@@ -157,7 +157,7 @@ pub fn eval_inference_from_proto(
         source_id: req.source_id,
         columns: req.columns,
         task: EvalTaskFromWire::try_from(req.task)?.0,
-        golden_source: req.golden_source,
+        ground_truth: req.ground_truth,
         label_column: req.label_column,
     })
 }
@@ -177,7 +177,7 @@ pub fn eval_compare_from_bytes(body: &[u8]) -> Result<CompareEvalRequest, Status
 }
 
 /// Decode a [`pb::EvalCompareRequest`] into the engine's [`CompareEvalRequest`].
-/// The required `source_id` / `golden_source` are validated at decode, and
+/// The required `source_id` / `ground_truth` are validated at decode, and
 /// `embedding_tables` must name at least two tables (one baseline and one to
 /// compare against it) — matching the gRPC handler's edge checks. The `k` cap
 /// widens to the engine's `usize`, and the method decodes as a search's.
@@ -185,8 +185,8 @@ pub fn eval_compare_from_proto(req: pb::EvalCompareRequest) -> Result<CompareEva
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    if req.golden_source.is_empty() {
-        return Err(Status::invalid_argument("golden_source is required"));
+    if req.ground_truth.is_empty() {
+        return Err(Status::invalid_argument("ground_truth is required"));
     }
     if req.embedding_tables.len() < 2 {
         return Err(Status::invalid_argument(
@@ -196,7 +196,7 @@ pub fn eval_compare_from_proto(req: pb::EvalCompareRequest) -> Result<CompareEva
     Ok(CompareEvalRequest {
         embedding_tables: req.embedding_tables,
         source_id: req.source_id,
-        golden_source: req.golden_source,
+        ground_truth: req.ground_truth,
         k: req.k as usize,
         method: search_method_from_proto(req.method),
     })
@@ -206,11 +206,11 @@ pub fn eval_compare_from_proto(req: pb::EvalCompareRequest) -> Result<CompareEva
 
 /// The decoded calibration-eval target a `EvalCalibration` request carries. The
 /// engine method (`InferenceSession::eval_calibration`) takes the source, the
-/// golden source, the decoded [`EvalCalibrationShape`], and the cohort map
+/// ground-truth source, the decoded [`EvalCalibrationShape`], and the cohort map
 /// separately, so the decode returns them as a struct the binding destructures.
 pub struct EvalCalibrationArgs {
     pub source_id: String,
-    pub golden_source: String,
+    pub ground_truth: String,
     pub shape: EvalCalibrationShape,
     pub cohorts: Cohorts,
 }
@@ -228,7 +228,7 @@ pub fn eval_calibration_from_bytes(body: &[u8]) -> Result<EvalCalibrationArgs, S
 }
 
 /// Decode a [`pb::EvalCalibrationRequest`] into the engine
-/// [`EvalCalibrationArgs`]. The required `source_id` / `golden_source` are
+/// [`EvalCalibrationArgs`]. The required `source_id` / `ground_truth` are
 /// validated at decode; the predictive shape resolves through the shared
 /// [`calibration_shape_from_proto`] (an unspecified shape is rejected — it cannot
 /// select the columns or scoring family); and the cohort tags rebuild through the
@@ -239,12 +239,12 @@ pub fn eval_calibration_from_proto(
     if req.source_id.is_empty() {
         return Err(Status::invalid_argument("source_id is required"));
     }
-    if req.golden_source.is_empty() {
-        return Err(Status::invalid_argument("golden_source is required"));
+    if req.ground_truth.is_empty() {
+        return Err(Status::invalid_argument("ground_truth is required"));
     }
     Ok(EvalCalibrationArgs {
         source_id: req.source_id,
-        golden_source: req.golden_source,
+        ground_truth: req.ground_truth,
         shape: calibration_shape_from_proto(req.shape)?,
         cohorts: cohorts_from_proto(req.cohorts),
     })

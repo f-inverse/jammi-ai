@@ -31,7 +31,7 @@ under one on a GPU.
 - `Session.generate_embeddings(*, source, model, columns, key, modality="audio")`
 - `Session.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
-- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
+- `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
 - `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", target_modules=[...], ...)` → `TrainingJob`
 - `Session.describe_model(model_id)` → `dict | None`
 
@@ -69,9 +69,9 @@ the encoder per the model's `preprocessor_config.json` feature-extractor
 geometry. The audio column may also hold file-path strings instead of inline
 bytes.
 
-## Golden source shape (audio mode)
+## Ground-truth source shape (audio mode)
 
-`eval_embeddings` switches to audio-query mode when the golden source carries a
+`eval_embeddings` switches to audio-query mode when the ground-truth source carries a
 `query_audio` (binary) column instead of `query_text` / `query_image`:
 
 | column        | type   | example                          |
@@ -87,7 +87,7 @@ bytes.
   a held-out query clip per family under `queries/`. Synthesised
   programmatically by `cookbook/fixtures/generate.py` — **no recorded audio**
   (licensing).
-- `cookbook/fixtures/tiny_audio_golden.json` — per-query → expected corpus IDs
+- `cookbook/fixtures/tiny_audio_relevance.json` — per-query → expected corpus IDs
   (same timbre family).
 
 ## Run it

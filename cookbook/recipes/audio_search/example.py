@@ -81,14 +81,14 @@ print(f"top-{results.num_rows} for q_sine: {results.column('clip_id').to_pylist(
 # %% [markdown]
 # ## Measure retrieval quality
 #
-# The golden set holds a held-out query clip per family and the corpus clips
+# The ground truth holds a held-out query clip per family and the corpus clips
 # of that family. A `query_audio` (binary) column is what switches
 # `eval_embeddings` to audio queries. Each family has four clips in the
 # corpus, so a random ranking would recall one in four at k=5.
 
 # %%
 query_ids, query_audios, relevant_ids = [], [], []
-for q in json.loads(fixtures.path("tiny_audio_golden.json").read_text()):
+for q in json.loads(fixtures.path("tiny_audio_relevance.json").read_text()):
     audio_bytes = (AUDIO_CORPUS_DIR / q["query_audio"]).read_bytes()
     for rid in q["relevant_ids"]:
         query_ids.append(q["query_id"])
@@ -102,11 +102,11 @@ pq.write_table(
             "relevant_id": pa.array(relevant_ids, type=pa.utf8()),
         }
     ),
-    home / "golden.parquet",
+    home / "truth.parquet",
 )
-db.add_source("golden", url=str(home / "golden.parquet"), format="parquet")
+db.add_source("truth", url=str(home / "truth.parquet"), format="parquet")
 
-base_metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
+base_metrics = db.eval_embeddings(source="corpus", ground_truth="truth.public.truth", k=5)
 for key in METRICS:
     value = base_metrics["aggregate"][key]
     assert 0.0 <= value <= 1.0, f"{key} out of range: {value}"
@@ -179,7 +179,7 @@ print(f"fine-tuned audio model: {tuned_model}")
 db.generate_embeddings(
     source="corpus", model=tuned_model, columns=["audio"], key="clip_id", modality="audio"
 )
-tuned_metrics = db.eval_embeddings(source="corpus", golden_source="golden.public.golden", k=5)
+tuned_metrics = db.eval_embeddings(source="corpus", ground_truth="truth.public.truth", k=5)
 for key in METRICS:
     value = tuned_metrics["aggregate"][key]
     assert 0.0 <= value <= 1.0, f"tuned {key} out of range: {value}"

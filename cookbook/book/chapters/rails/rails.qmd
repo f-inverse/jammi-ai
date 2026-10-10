@@ -159,13 +159,13 @@ equality the engine defines — so it holds on any host, at either scale, on any
 GPU. A frozen number would only say what one machine measured once.
 
 The engine does the measuring too. Tier 01's same-subject retrieval number,
-here, is the engine's own `eval_embeddings`: it encodes each golden query with
+here, is the engine's own `eval_embeddings`: it encodes each ground-truth query with
 the model that produced the table, searches the table, and scores the result.
 
 ```{python}
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 report = db.eval_embeddings(
-    source=arxiv.papers, embedding_table=embeddings, golden_source=golden, k=10
+    source=arxiv.papers, embedding_table=embeddings, ground_truth=truth, k=10
 )
 precision = report["aggregate"]["precision_at_k"]
 print(f"tier01 precision@10: {precision:.3f}")

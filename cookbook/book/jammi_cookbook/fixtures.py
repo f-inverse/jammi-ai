@@ -1,4 +1,4 @@
-"""The cookbook's fixtures: the small corpora, label sets and golden sets every
+"""The cookbook's fixtures: the small corpora, label sets and ground truth every
 recipe and chapter runs on. The models they run are real checkpoints on the
 Hugging Face Hub, fetched on first use; nothing here is a model.
 

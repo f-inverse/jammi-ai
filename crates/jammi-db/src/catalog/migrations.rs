@@ -251,6 +251,10 @@ const MIGRATIONS: &[(&str, MigrationSql)] = &[
         "047_drop_compute_cluster_state",
         MigrationSql::Same(schema::MIGRATION_047_DROP_COMPUTE_CLUSTER_STATE),
     ),
+    (
+        "048_eval_runs_ground_truth",
+        MigrationSql::Same(schema::MIGRATION_048_EVAL_RUNS_GROUND_TRUTH),
+    ),
 ];
 
 const APPLIED_MIGRATIONS_DDL: &str = r#"

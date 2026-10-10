@@ -441,7 +441,7 @@ async fn delete_blocked_by_eval_run_pk_edge(backend: BackendKind) {
         eval_type: "embedding".into(),
         model_id: Some(pk),
         source_id: "src".into(),
-        golden_source: "golden".into(),
+        ground_truth: "truth".into(),
         k: Some(10),
         metrics_json: "{}".into(),
         status: "completed".into(),

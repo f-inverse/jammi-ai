@@ -1421,7 +1421,7 @@ impl PyDatabase {
     /// eval-embeddings paths share one request assembly and one decode seam
     /// (`jammi_ai::wire::eval_embeddings_from_bytes`). Returns a dict with
     /// `aggregate` (mean over all queries) and `per_query` (one record per
-    /// golden-set query) keys — byte-identical to the report the kwargs surface
+    /// ground truth query) keys — byte-identical to the report the kwargs surface
     /// produced. A malformed or invalid body raises `ValueError`.
     fn _eval_embeddings_proto(&self, py: Python<'_>, proto_bytes: &[u8]) -> PyResult<Py<PyAny>> {
         self.check_open()?;
@@ -1486,7 +1486,7 @@ impl PyDatabase {
                 &args.source_id,
                 &args.columns,
                 args.task,
-                &args.golden_source,
+                &args.ground_truth,
                 &args.label_column,
             ),
         )
@@ -1530,7 +1530,7 @@ impl PyDatabase {
             &self.runtime,
             self.session.eval_calibration(
                 &args.source_id,
-                &args.golden_source,
+                &args.ground_truth,
                 args.shape,
                 &args.cohorts,
             ),

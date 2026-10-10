@@ -112,8 +112,8 @@ def search_rows(target_dir: str, *, corpus_url: str, config: Path | None) -> lis
         return [(row["_row_id"], round(row["similarity"], 6)) for row in hits]
 
 
-golden = search_rows(tempfile.mkdtemp(), corpus_url=str(CORPUS), config=None)
-print(f"top-5 over local disk: {golden}")
+truth = search_rows(tempfile.mkdtemp(), corpus_url=str(CORPUS), config=None)
+print(f"top-5 over local disk: {truth}")
 ```
 
 ## Run it against the bucket
@@ -134,7 +134,7 @@ from_s3 = search_rows(
     str(cloud), corpus_url=f"s3://{BUCKET}/sources/tiny_corpus.parquet", config=config
 )
 print(f"top-5 over s3://{BUCKET}: {from_s3}")
-assert from_s3 == golden, f"the S3 run ranked differently: {from_s3} vs {golden}"
+assert from_s3 == truth, f"the S3 run ranked differently: {from_s3} vs {truth}"
 ```
 
 ## The results are in the bucket

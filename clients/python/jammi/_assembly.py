@@ -245,7 +245,7 @@ _CALIBRATION_SHAPE = {
 }
 
 # Inference-eval task string → the wire `EvalTask` enum, matching the engine's
-# `EvalTask` parse (the two inference tasks that carry golden labels).
+# `EvalTask` parse (the two inference tasks that carry ground-truth labels).
 _EVAL_TASK = {
     "classification": eval_pb2.EvalTask.EVAL_TASK_CLASSIFICATION,
     "ner": eval_pb2.EvalTask.EVAL_TASK_NER,
@@ -1765,7 +1765,7 @@ def build_register_topic_request(
 def build_eval_embeddings_request(
     *,
     source: str,
-    golden_source: str,
+    ground_truth: str,
     embedding_table: Optional[str] = None,
     k: int = 10,
     cohorts: Optional[Dict[str, Dict[str, str]]] = None,
@@ -1777,8 +1777,8 @@ def build_eval_embeddings_request(
 
     `embedding_table` names the result table to evaluate; `None` resolves the
     source's most recent embedding table (the empty-string wire sentinel).
-    `golden_source` addresses the golden relevance set by full catalog path or
-    bare name. `cohorts` optionally maps a golden-set `query_id` to an opaque
+    `ground_truth` addresses the relevance judgments by full catalog path or
+    bare name. `cohorts` optionally maps a ground truth `query_id` to an opaque
     `{key: value}` segment map persisted with that query's per-query metrics.
     `oversample` / `exact` rank each query as they rank a search: `exact`
     scores every vector, so the report measures the embedding with no index
@@ -1786,7 +1786,7 @@ def build_eval_embeddings_request(
     """
     request = eval_pb2.EvalEmbeddingsRequest(
         source_id=source,
-        golden_source=golden_source,
+        ground_truth=ground_truth,
         k=k,
     )
     _set_search_method(request.method, oversample=oversample, exact=exact)
@@ -1816,14 +1816,14 @@ def build_eval_inference_request(
     source: str,
     columns: List[str],
     task: str,
-    golden_source: str,
+    ground_truth: str,
     label_column: str,
 ) -> eval_pb2.EvalInferenceRequest:
     """Assemble the `EvalInferenceRequest` for an inference-quality eval from the
     binding's flat kwargs.
 
     `task` is `"classification"` or `"ner"`, mapped to the wire `EvalTask` enum
-    (an unknown token raises `ValueError`). `golden_source` addresses the golden
+    (an unknown token raises `ValueError`). `ground_truth` addresses the ground truth
     labels by full catalog path or bare name, with `label_column` naming the
     gold-label column. The same request the embed binding submits in-process.
     """
@@ -1838,7 +1838,7 @@ def build_eval_inference_request(
         source_id=source,
         columns=list(columns),
         task=task_value,
-        golden_source=golden_source,
+        ground_truth=ground_truth,
         label_column=label_column,
     )
 
@@ -1847,7 +1847,7 @@ def build_eval_compare_request(
     *,
     embedding_tables: List[str],
     source: str,
-    golden_source: str,
+    ground_truth: str,
     k: int = 10,
     oversample: Optional[int] = None,
     exact: bool = False,
@@ -1856,15 +1856,15 @@ def build_eval_compare_request(
     comparison from the binding's flat kwargs.
 
     `embedding_tables` names at least two result tables (the first is the
-    baseline, each subsequent one is compared against it). `golden_source`
-    addresses the golden set by full catalog path or bare name. `oversample` /
+    baseline, each subsequent one is compared against it). `ground_truth`
+    addresses the ground truth by full catalog path or bare name. `oversample` /
     `exact` rank every table's queries as `build_eval_embeddings_request`'s do.
     The same request the embed binding submits in-process.
     """
     request = eval_pb2.EvalCompareRequest(
         embedding_tables=list(embedding_tables),
         source_id=source,
-        golden_source=golden_source,
+        ground_truth=ground_truth,
         k=k,
     )
     _set_search_method(request.method, oversample=oversample, exact=exact)
@@ -1874,7 +1874,7 @@ def build_eval_compare_request(
 def build_eval_calibration_request(
     *,
     source: str,
-    golden_source: str,
+    ground_truth: str,
     shape: str,
     cohorts: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> eval_pb2.EvalCalibrationRequest:
@@ -1883,7 +1883,7 @@ def build_eval_calibration_request(
 
     `shape` is `"gaussian"` or `"sample"`, mapped to the wire `CalibrationShape`
     enum (an unknown token raises `ValueError`) — it selects which columns are
-    read and which family scores. `golden_source` pairs a held-out predictive
+    read and which family scores. `ground_truth` pairs a held-out predictive
     distribution with its realised outcome. `cohorts` optionally maps a
     `record_id` to an opaque `{key: value}` segment map persisted with that
     record's per-record scores. The same request the embed binding submits
@@ -1897,7 +1897,7 @@ def build_eval_calibration_request(
         ) from None
     request = eval_pb2.EvalCalibrationRequest(
         source_id=source,
-        golden_source=golden_source,
+        ground_truth=ground_truth,
         shape=shape_value,
     )
     for record_id, tags in (cohorts or {}).items():

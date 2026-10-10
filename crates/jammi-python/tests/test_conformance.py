@@ -171,7 +171,7 @@ _PIPELINE_VERBS = {
 }
 
 
-# The evaluation verbs. They DO hit the wire: the model and the golden data
+# The evaluation verbs. They DO hit the wire: the model and the ground-truth data
 # both live in the engine, so the compute runs where the data is
 # (`EvalService`) and only the typed report crosses the wire. The embedded
 # `Database` runs them in the compiled engine; the client's `RemoteDatabase`
@@ -2182,14 +2182,14 @@ def test_import_jammi_is_native_free_then_lazily_loads_the_engine(tmp_path):
 # message is the single source of truth for that shape, so this pin asserts each
 # REMOTE projection's key-structure reconciles with its proto message's LIVE
 # descriptor (identity, plus a small DECLARED set of renames / oneof-tags / dropped
-# fields) — NOT against a hand-authored golden. A proto field added or removed
+# fields) — NOT against a hand-authored truth. A proto field added or removed
 # then forces the projection (or the declared delta) to change, so the two
 # projection paths, both anchored to the proto, cannot drift from each other.
 #
 # This is the honest FLOOR: true per-VALUE equality on real data is
 # covered by the Rust it-suite (`grpc_remote_session.rs` / `grpc_remote_compute.rs`,
 # the embedded/remote parity anchor) and — for the three eval reports — by the
-# Rust-serde-GENERATED golden the client's `tests/test_eval_projection.py` locks,
+# Rust-serde-GENERATED truth the client's `tests/test_eval_projection.py` locks,
 # not hermetically constructible in Python (the native links no tonic/proto, so
 # there is no in-process Python value-parity oracle to stand up here).
 # ---------------------------------------------------------------------------

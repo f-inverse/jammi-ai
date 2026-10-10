@@ -236,7 +236,7 @@ fn draw_retrieval_golden(
 }
 
 /// A synthetic classification golden: predicted and actual label vectors.
-struct ClassificationGolden {
+struct ClassificationTruth {
     predicted: Vec<String>,
     actual: Vec<String>,
 }
@@ -247,7 +247,7 @@ struct ClassificationGolden {
 /// The actual label is uniform over the classes; the prediction matches it ~75%
 /// of the time and is a uniform wrong class otherwise — a realistic confusion
 /// pattern so accuracy and macro-F1 are non-degenerate folds (neither 0 nor 1).
-fn draw_classification_golden(seed: u64, n: usize, n_classes: usize) -> ClassificationGolden {
+fn draw_classification_golden(seed: u64, n: usize, n_classes: usize) -> ClassificationTruth {
     let mut rng = Lcg::new(seed);
     let mut predicted = Vec::with_capacity(n);
     let mut actual = Vec::with_capacity(n);
@@ -266,7 +266,7 @@ fn draw_classification_golden(seed: u64, n: usize, n_classes: usize) -> Classifi
         };
         predicted.push(format!("c{pred}"));
     }
-    ClassificationGolden { predicted, actual }
+    ClassificationTruth { predicted, actual }
 }
 
 /// The folded retrieval aggregate at a given query count: drive the engine's

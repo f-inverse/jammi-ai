@@ -259,12 +259,12 @@ embedded from its [structure alone](./graph-structure.md) instead.
 ## Did it work? The circularity check
 
 To confirm declared edges actually helped (and that you did not just re-learn the
-base metric), evaluate on a **held-out golden set** — see [Did Structure Help? A
+base metric), evaluate on a **held-out ground truth** — see [Did Structure Help? A
 Graph-ML Evaluation Recipe](./graph-ml-eval.md):
 
 1. Build two supervision graphs over the same nodes — one from **declared**
    edges, one from **S9-similarity** edges.
-2. `fine_tune_graph` each; hold out a golden relevance set.
+2. `fine_tune_graph` each; hold out a relevance judgments.
 3. `eval_embeddings` the base model vs each fine-tune, with a paired
    significance test.
 4. Expect the **declared-edge** model to beat the base significantly, and the

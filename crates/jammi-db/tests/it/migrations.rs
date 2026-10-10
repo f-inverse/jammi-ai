@@ -66,6 +66,7 @@ const EXPECTED_MIGRATION_NAMES: &[&str] = &[
     "045_result_table_producer",
     "046_job_ranks",
     "047_drop_compute_cluster_state",
+    "048_eval_runs_ground_truth",
 ];
 
 async fn open_sqlite_backend(path: &std::path::Path) -> std::sync::Arc<SqliteBackend> {

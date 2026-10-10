@@ -53,17 +53,17 @@ def evaluate(db) -> dict:
     arxiv = datasets.arxiv(db, SCALE)
     raw = keystone.embed(db, arxiv, SCALE)
     propagated = keystone.propagate(db, arxiv, raw)
-    golden = keystone.subject_golden(db, arxiv)
+    truth = keystone.subject_relevance(db, arxiv)
     era = {pid: name for name, ids in arxiv.split.items() for pid in ids}
-    queries = db.sql(f"SELECT DISTINCT query_id FROM {golden}").column(0).to_pylist()
+    queries = db.sql(f"SELECT DISTINCT query_id FROM {truth}").column(0).to_pylist()
 
     retrieval = db.eval_embeddings(
-        source=arxiv.papers, golden_source=golden, embedding_table=raw, k=10,
+        source=arxiv.papers, ground_truth=truth, embedding_table=raw, k=10,
         cohorts={q: {"era": era[q]} for q in queries},
     )
     per_query = db.eval_per_query(retrieval["eval_run_id"])
     compared = db.eval_compare(
-        embedding_tables=[raw, propagated], source=arxiv.papers, golden_source=golden, k=10,
+        embedding_tables=[raw, propagated], source=arxiv.papers, ground_truth=truth, k=10,
     )
 
     db.add_source("reviews", url=fixtures.url("tiny_reviews.parquet"), format="parquet")
@@ -71,14 +71,14 @@ def evaluate(db) -> dict:
     classification = db.eval_inference(
         model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", source="reviews",
         columns=["text"], task="classification",
-        golden_source="labels.public.tiny_review_labels", label_column="label",
+        ground_truth="labels.public.tiny_review_labels", label_column="label",
     )
     db.add_source("ner_corpus", url=fixtures.url("tiny_ner_corpus.parquet"), format="parquet")
     db.add_source("ner_gold", url=fixtures.url("tiny_ner_gold.csv"), format="csv")
     ner = db.eval_inference(
         model="dslim/bert-base-NER", source="ner_corpus",
         columns=["text"], task="ner",
-        golden_source="ner_gold.public.tiny_ner_gold", label_column="label",
+        ground_truth="ner_gold.public.tiny_ner_gold", label_column="label",
     )
 
     a, b = TENANTS
@@ -124,7 +124,7 @@ print(f"evaluated in process and at {server.endpoint}")
 
 Retrieval quality of the raw embeddings, overall and by cohort. The engine
 never interprets a cohort tag; it carries each query's tags on its per-query
-record, so a slice is a group-by over those records. The golden asks its first
+record, so a slice is a group-by over those records. The ground truth asks its first
 200 papers by id, so which eras those queries fall in is a property of the
 scale's paper set — the slice reports the eras the queries carry:
 

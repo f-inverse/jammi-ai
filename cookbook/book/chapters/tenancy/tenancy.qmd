@@ -160,7 +160,7 @@ claim("a source with no discriminator is globally readable: A reads every one of
 
 The consequence worth measuring directly: the **same recipe** run under each tenant
 gives that tenant its own answer, over only its own rows. The recipe is the book's
-retrieval measurement — embed the papers, build the same-subject golden, and
+retrieval measurement — embed the papers, build the same-subject ground truth, and
 score it with `eval_embeddings` — run once inside each tenant's scope. Each embedding
 table is built from, and each search reads, only the rows the discriminator lets that
 tenant see; an unscoped session sees none of them.
@@ -175,12 +175,12 @@ def scoped_precision(tenant_id: str) -> tuple[float, int, int]:
             source="papers_tagged", model=encoders.text(SCALE),
             columns=["title", "abstract"], key="paper_id",
         )
-        golden = datasets.same_label_golden(
+        truth = datasets.same_label_relevance(
             db, rows, key="paper_id", label="subject", text="title", queries=100,
-            name=f"golden_{tenant_id[:8]}",
+            name=f"truth_{tenant_id[:8]}",
         )
         report = db.eval_embeddings(
-            source="papers_tagged", golden_source=golden, embedding_table=embedded, k=10,
+            source="papers_tagged", ground_truth=truth, embedding_table=embedded, k=10,
         )
     return report["aggregate"]["precision_at_k"], len(rows), len(report["per_query"])
 

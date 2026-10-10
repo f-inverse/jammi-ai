@@ -23,7 +23,7 @@ db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
 # %%
 db.add_source("corpus", url=str(fixtures.path("tiny_ner_corpus.parquet")), format="parquet")
-db.add_source("golden", url=str(fixtures.path("tiny_ner_gold.csv")), format="csv")
+db.add_source("truth", url=str(fixtures.path("tiny_ner_gold.csv")), format="csv")
 
 # %% [markdown]
 # ## Run the model and score it
@@ -39,7 +39,7 @@ metrics = db.eval_inference(
     source="corpus",
     columns=["text"],
     task="ner",
-    golden_source="golden.public.tiny_ner_gold",
+    ground_truth="truth.public.tiny_ner_gold",
     label_column="label",
 )
 

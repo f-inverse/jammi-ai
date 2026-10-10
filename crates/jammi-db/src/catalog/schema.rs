@@ -2209,3 +2209,10 @@ pub(super) const MIGRATION_047_DROP_COMPUTE_CLUSTER_STATE: &str = r#"
 DROP TABLE compute_executors;
 DROP TABLE compute_jobs;
 "#;
+
+/// Migration 048: an eval run records the source holding its ground truth —
+/// the relevance judgments, labels or outcomes it scored against — under the
+/// name the eval verbs give that argument.
+pub(super) const MIGRATION_048_EVAL_RUNS_GROUND_TRUTH: &str = r#"
+ALTER TABLE eval_runs RENAME COLUMN golden_source TO ground_truth;
+"#;

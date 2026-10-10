@@ -1198,7 +1198,7 @@ mod tests {
             },
             JammiError::Inference("encode_query forward: shape mismatch".into()),
             JammiError::FineTune("checkpoint epoch 3 diverged".into()),
-            JammiError::Eval("golden NER fixture row 7 mismatch".into()),
+            JammiError::Eval("truth NER fixture row 7 mismatch".into()),
             JammiError::Gpu("no CUDA device visible".into()),
             JammiError::Backend("vLLM returned HTTP 503".into()),
             JammiError::Tenant("nil UUID is not a valid tenant".into()),

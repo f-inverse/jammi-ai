@@ -723,7 +723,7 @@ impl Session {
 
     // --- eval ------------------------------------------------------------
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     pub async fn eval_embeddings(
         &self,
         request: EmbeddingEvalRequest,
@@ -736,14 +736,14 @@ impl Session {
         self.engine.eval_per_query(eval_run_id).await
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     pub async fn eval_inference(
         &self,
         model_id: &str,
         source_id: &str,
         columns: &[String],
         task: EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<InferenceEvalReport> {
         self.engine
@@ -752,7 +752,7 @@ impl Session {
                 source_id,
                 columns,
                 task,
-                golden_source,
+                ground_truth,
                 label_column,
             )
             .await

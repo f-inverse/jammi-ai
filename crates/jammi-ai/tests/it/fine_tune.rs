@@ -1034,11 +1034,9 @@ fn audio_corpus_by_family() -> std::collections::BTreeMap<String, Vec<(String, V
 }
 
 /// Write the corpus as a `(clip_id, audio)` Parquet table for embedding +
-/// eval, and a held-out `(query_id, query_audio, relevant_id)` golden table
+/// eval, and a held-out `(query_id, query_audio, relevant_id)` ground-truth table
 /// where each query clip is relevant to the *other* clips in its family.
-fn write_audio_corpus_and_golden(
-    dir: &std::path::Path,
-) -> (std::path::PathBuf, std::path::PathBuf) {
+fn write_audio_corpus_and_truth(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     use arrow::array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
@@ -1081,7 +1079,7 @@ fn write_audio_corpus_and_golden(
     w.write(&corpus_batch).unwrap();
     w.close().unwrap();
 
-    // Golden: each clip is a query; its relevant docs are its same-family
+    // Truth: each clip is a query; its relevant docs are its same-family
     // siblings (excluding itself). Audio-query mode is triggered by the
     // binary `query_audio` column.
     let mut query_ids: Vec<String> = Vec::new();
@@ -1099,13 +1097,13 @@ fn write_audio_corpus_and_golden(
             }
         }
     }
-    let golden_schema = Arc::new(Schema::new(vec![
+    let truth_schema = Arc::new(Schema::new(vec![
         Field::new("query_id", DataType::Utf8, false),
         Field::new("query_audio", DataType::Binary, false),
         Field::new("relevant_id", DataType::Utf8, false),
     ]));
-    let golden_batch = RecordBatch::try_new(
-        golden_schema.clone(),
+    let truth_batch = RecordBatch::try_new(
+        truth_schema.clone(),
         vec![
             Arc::new(StringArray::from(
                 query_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -1122,17 +1120,17 @@ fn write_audio_corpus_and_golden(
         ],
     )
     .unwrap();
-    let golden_path = dir.join("audio_golden.parquet");
+    let truth_path = dir.join("audio_relevance.parquet");
     let mut w = ArrowWriter::try_new(
-        std::fs::File::create(&golden_path).unwrap(),
-        golden_schema,
+        std::fs::File::create(&truth_path).unwrap(),
+        truth_schema,
         None,
     )
     .unwrap();
-    w.write(&golden_batch).unwrap();
+    w.write(&truth_batch).unwrap();
     w.close().unwrap();
 
-    (corpus_path, golden_path)
+    (corpus_path, truth_path)
 }
 
 /// Write an `(anchor, positive, negative)` audio-triplet Parquet table: for
@@ -1196,14 +1194,14 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
         .expect("default worker intervals are valid");
     let model = htsat_clap_model();
 
-    // Triplet source (audio bytes), corpus, and golden.
+    // Triplet source (audio bytes), corpus, and truth.
     let triplets_path = write_audio_triplets(dir.path());
-    let (corpus_path, golden_path) = write_audio_corpus_and_golden(dir.path());
+    let (corpus_path, truth_path) = write_audio_corpus_and_truth(dir.path());
 
     for (name, path) in [
         ("audio_triplets", &triplets_path),
         ("audio_corpus", &corpus_path),
-        ("audio_golden", &golden_path),
+        ("audio_relevance", &truth_path),
     ] {
         session
             .add_source(
@@ -1297,12 +1295,12 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
         .unwrap()
         .0;
 
-    // Eval audio→audio retrieval for both, against the held-out golden set.
+    // Eval audio→audio retrieval for both, against the held-out ground truth.
     let base_metrics = session
         .eval_embeddings(common::retrieval_eval(
             "audio_corpus",
             Some(&base_rec.table_name),
-            "audio_golden.public.audio_golden",
+            "audio_relevance.public.audio_relevance",
             5,
         ))
         .await
@@ -1311,7 +1309,7 @@ async fn audio_projection_head_fine_tune_changes_embeddings() {
         .eval_embeddings(common::retrieval_eval(
             "audio_corpus",
             Some(&ft_rec.table_name),
-            "audio_golden.public.audio_golden",
+            "audio_relevance.public.audio_relevance",
             5,
         ))
         .await
@@ -1845,13 +1843,13 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
         .await
         .unwrap();
 
-    // Register golden relevance dataset for evaluation
+    // Register ground-truth relevance dataset for evaluation
     session
         .add_source(
-            "golden_rel",
+            "truth_rel",
             SourceType::File,
             SourceConnection {
-                url: Some(common::fixture_url("golden_relevance.csv")),
+                url: Some(common::fixture_url("relevance.csv")),
                 format: Some(FileFormat::Csv),
                 ..Default::default()
             },
@@ -1917,23 +1915,23 @@ async fn fine_tuned_model_produces_measurably_different_search_quality() {
         .unwrap()
         .0;
 
-    // Eval base embeddings against golden relevance
+    // Eval base embeddings against ground-truth relevance
     let base_metrics = session
         .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&base_rec.table_name),
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await
         .unwrap();
 
-    // Eval fine-tuned embeddings against golden relevance
+    // Eval fine-tuned embeddings against ground-truth relevance
     let ft_metrics = session
         .eval_embeddings(common::retrieval_eval(
             "patents",
             Some(&ft_rec.table_name),
-            "golden_rel.public.golden_relevance",
+            "truth_rel.public.relevance",
             10,
         ))
         .await

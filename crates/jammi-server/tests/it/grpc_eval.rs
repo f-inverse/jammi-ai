@@ -2,17 +2,17 @@
 //!
 //! An in-process Tonic server hosts the gRPC chain including the `EvalService`.
 //! A client registers the `patents.parquet` corpus and the
-//! `golden_relevance.csv` golden set, generates embeddings with the local
+//! `relevance.csv` ground truth, generates embeddings with the local
 //! `tiny_bert` encoder (all through the engine-backed services on one shared
 //! session), then drives the eval verbs:
 //!
 //! * `EvalEmbeddings` → an `EmbeddingEvalReport` with a recorded run id, an
-//!   aggregate, and one per-query record per golden query.
+//!   aggregate, and one per-query record per ground-truth query.
 //! * `EvalPerQuery` → the persisted per-query rows for that run.
 //! * `EvalCompare` → a baseline + one delta entry for a self-comparison (every
 //!   delta zero).
 //!
-//! Hermetic: the encoder is a local fixture and the corpus + golden set are
+//! Hermetic: the encoder is a local fixture and the corpus + ground truth are
 //! shipped fixtures. A tenant-scoped `EvalEmbeddings` is covered too.
 
 use jammi_server::grpc::proto::catalog::catalog_service_client::CatalogServiceClient;
@@ -31,7 +31,7 @@ use tonic::codegen::Body;
 
 use super::common::grpc::{channel, start_engine_server, with_session, EngineServer, TENANT_A};
 
-const GOLDEN_SOURCE: &str = "golden_rel.public.golden_relevance";
+const GROUND_TRUTH: &str = "truth_rel.public.relevance";
 
 fn tiny_bert_model_id() -> String {
     format!("local:{}", fixture("tiny_bert").display())
@@ -41,18 +41,18 @@ fn patents_url() -> String {
     format!("file://{}", fixture("patents.parquet").display())
 }
 
-fn golden_url() -> String {
-    format!("file://{}", fixture("golden_relevance.csv").display())
+fn truth_url() -> String {
+    format!("file://{}", fixture("relevance.csv").display())
 }
 
-/// Register the patents corpus + golden relevance CSV (control plane) and
+/// Register the patents corpus + ground-truth relevance CSV (control plane) and
 /// generate one embedding table over `abstract` (data plane). Returns the
 /// generated table name. Both clients share one transport (and, for the
 /// tenant-scoped test, one session-header interceptor), so the source
 /// registration and the embedding compute run under the same tenant scope.
 /// Generic over the client transport so the plain-channel tests and the
 /// interceptor-wrapped tenant test share one body.
-async fn embed_patents_and_golden<T>(
+async fn embed_patents_and_truth<T>(
     mut catalog: CatalogServiceClient<T>,
     mut embedding: EmbeddingServiceClient<T>,
 ) -> String
@@ -76,16 +76,16 @@ where
         .expect("add patents");
     catalog
         .add_source(AddSourceRequest {
-            source_id: "golden_rel".into(),
+            source_id: "truth_rel".into(),
             source_kind: SourceKind::File as i32,
             connection: Some(SourceConnection {
-                url: golden_url(),
+                url: truth_url(),
                 format: FileFormat::Csv as i32,
                 tenant_column: None,
             }),
         })
         .await
-        .expect("add golden");
+        .expect("add truth");
     embedding
         .generate_embeddings(GenerateEmbeddingsRequest {
             source_id: "patents".into(),
@@ -105,7 +105,7 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_embeddings_and_per_query_over_the_wire() {
     let server: EngineServer = start_engine_server().await;
-    let table = embed_patents_and_golden(
+    let table = embed_patents_and_truth(
         CatalogServiceClient::new(channel(server.addr).await),
         EmbeddingServiceClient::new(channel(server.addr).await),
     )
@@ -116,7 +116,7 @@ async fn eval_embeddings_and_per_query_over_the_wire() {
         .eval_embeddings(EvalEmbeddingsRequest {
             source_id: "patents".into(),
             embedding_table: table,
-            golden_source: GOLDEN_SOURCE.into(),
+            ground_truth: GROUND_TRUTH.into(),
             k: 10,
             cohorts: HashMap::new(),
             tenant_id: String::new(),
@@ -139,7 +139,7 @@ async fn eval_embeddings_and_per_query_over_the_wire() {
     }
     assert!(
         !report.per_query.is_empty(),
-        "one per-query record per golden query"
+        "one per-query record per ground-truth query"
     );
     let first = &report.per_query[0];
     assert!(
@@ -181,7 +181,7 @@ async fn eval_embeddings_and_per_query_over_the_wire() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eval_compare_self_comparison_has_zero_deltas_over_the_wire() {
     let server = start_engine_server().await;
-    let table = embed_patents_and_golden(
+    let table = embed_patents_and_truth(
         CatalogServiceClient::new(channel(server.addr).await),
         EmbeddingServiceClient::new(channel(server.addr).await),
     )
@@ -192,7 +192,7 @@ async fn eval_compare_self_comparison_has_zero_deltas_over_the_wire() {
         .eval_compare(EvalCompareRequest {
             embedding_tables: vec![table.clone(), table],
             source_id: "patents".into(),
-            golden_source: GOLDEN_SOURCE.into(),
+            ground_truth: GROUND_TRUTH.into(),
             k: 10,
             tenant_id: String::new(),
             method: None,
@@ -256,14 +256,14 @@ async fn eval_embeddings_under_a_tenant_scope_over_the_wire() {
         CatalogServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
     let scoped_embedding =
         EmbeddingServiceClient::with_interceptor(channel(server.addr).await, session_iface.clone());
-    let table = embed_patents_and_golden(scoped_catalog, scoped_embedding).await;
+    let table = embed_patents_and_truth(scoped_catalog, scoped_embedding).await;
 
     let mut client = EvalServiceClient::with_interceptor(channel(server.addr).await, session_iface);
     let report = client
         .eval_embeddings(EvalEmbeddingsRequest {
             source_id: "patents".into(),
             embedding_table: table,
-            golden_source: GOLDEN_SOURCE.into(),
+            ground_truth: GROUND_TRUTH.into(),
             k: 10,
             cohorts: HashMap::new(),
             tenant_id: String::new(),

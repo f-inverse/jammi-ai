@@ -27,7 +27,7 @@ db = jammi.connect(f"file://{tempfile.mkdtemp()}")
 
 # %%
 db.add_source("reviews", url=str(fixtures.path("tiny_reviews.parquet")), format="parquet")
-db.add_source("golden", url=str(fixtures.path("tiny_review_labels.csv")), format="csv")
+db.add_source("truth", url=str(fixtures.path("tiny_review_labels.csv")), format="csv")
 
 # %% [markdown]
 # ## Run the classifier and score it
@@ -42,7 +42,7 @@ metrics = db.eval_inference(
     source="reviews",
     columns=["text"],
     task="classification",
-    golden_source="golden.public.tiny_review_labels",
+    ground_truth="truth.public.tiny_review_labels",
     label_column="label",
 )
 

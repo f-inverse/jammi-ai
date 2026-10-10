@@ -1511,7 +1511,7 @@ async fn assert_eval_run_isolated() {
         eval_type: "embedding".into(),
         model_id: Some(pk),
         source_id: "src_a".into(),
-        golden_source: "golden".into(),
+        ground_truth: "truth".into(),
         k: Some(10),
         metrics_json: "{}".into(),
         status: "completed".into(),

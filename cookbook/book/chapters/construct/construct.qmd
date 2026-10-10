@@ -118,12 +118,12 @@ precision\@10 — ask with a paper's title, count how many of the ten papers
 retrieved share its subject. The relevance target is the subject label, never
 the embedding similarity, so it is a fair baseline that tiers 02–03 must *beat*.
 The engine measures it: `eval_embeddings` encodes each query with the model
-that produced the table, searches the table, and scores against the golden.
+that produced the table, searches the table, and scores against the ground truth.
 
 ```{python}
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 report = db.eval_embeddings(
-    source=arxiv.papers, embedding_table=embeddings, golden_source=golden, k=10
+    source=arxiv.papers, embedding_table=embeddings, ground_truth=truth, k=10
 )
 precision = report["aggregate"]["precision_at_k"]
 print(f"tier01 precision@10 (raw embeddings): {precision:.3f}")

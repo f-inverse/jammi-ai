@@ -15,7 +15,7 @@
 //! The full circularity claim ("declared-edge supervision yields a
 //! *statistically significant* held-out gain, while k-NN-similarity-only
 //! supervision yields a
-//! *near-zero* gain") needs real training on a real golden set and a paired
+//! *near-zero* gain") needs real training on a real ground truth and a paired
 //! significance test — too heavy for a bounded hermetic test. What is
 //! demonstrated here, deterministically:
 //! - the sampler tracks edge provenance and separates declared from similarity
@@ -31,7 +31,7 @@
 //! 1. Build two supervision graphs over the same nodes: one from declared edges
 //!    (hierarchy/crosswalk/citation/confirmed pairs), one from `neighbor_graph`
 //!    k-NN edges.
-//! 2. `fine_tune_graph` each into a model; hold out a golden relevance set.
+//! 2. `fine_tune_graph` each into a model; hold out a relevance judgments.
 //! 3. `eval_embeddings` base vs each fine-tune at k; paired bootstrap / t-test.
 //! 4. Assert the declared-edge gain is significant and the similarity-edge gain
 //!    is near-zero — the degenerate feedback loop, measured.

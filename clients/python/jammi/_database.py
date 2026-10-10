@@ -2569,11 +2569,11 @@ class RemoteDatabase:
 
     # --- Evaluation verbs (EvalService) -------------------------------------------
     #
-    # The eval family measures model quality against golden data held in the
+    # The eval family measures model quality against ground-truth data held in the
     # engine, so the compute runs where the data is and only the typed report
     # crosses the wire. Each verb returns the same nested dict the embed
     # `Database` produces (the engine's serde report shape), so a caller reads
-    # the same keys on both transports. A `golden_source` is an unquoted
+    # the same keys on both transports. A `ground_truth` is an unquoted
     # relation reference — a bare name or the full catalog path
     # `<source>.public.<table>`.
 
@@ -2581,23 +2581,23 @@ class RemoteDatabase:
         self,
         *,
         source: str,
-        golden_source: str,
+        ground_truth: str,
         embedding_table: Optional[str] = None,
         k: int = 10,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Dict[str, Any]:
-        """Evaluate embedding retrieval quality against a golden relevance set.
+        """Evaluate embedding retrieval quality against a relevance judgments.
 
         Returns the same nested dict the embed `Database` produces:
         ``eval_run_id``, ``aggregate`` (mean ``recall_at_k`` /
         ``precision_at_k`` / ``mrr`` / ``ndcg`` over all queries), and
-        ``per_query`` (one record per golden-set query). ``embedding_table``
+        ``per_query`` (one record per ground-truth query). ``embedding_table``
         names the result table to evaluate; ``None`` resolves the source's most
-        recent embedding table. ``golden_source`` addresses the golden set by
+        recent embedding table. ``ground_truth`` addresses the ground truth by
         its full catalog path (``<source>.public.<table>``) or bare name.
-        ``cohorts`` optionally maps a golden-set ``query_id`` to an opaque
+        ``cohorts`` optionally maps a ground truth ``query_id`` to an opaque
         ``{key: value}`` segment map, persisted with that query's per-query
         metrics (read back via :meth:`eval_per_query`). ``oversample`` / ``exact`` rank each query as they rank a :meth:`search`:
         ``exact=True`` scores every vector, so the report measures the embedding
@@ -2606,7 +2606,7 @@ class RemoteDatabase:
         """
         request = build_eval_embeddings_request(
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             embedding_table=embedding_table,
             k=k,
             cohorts=cohorts,
@@ -2648,16 +2648,16 @@ class RemoteDatabase:
         source: str,
         columns: List[str],
         task: str,
-        golden_source: str,
+        ground_truth: str,
         label_column: str,
     ) -> Dict[str, Any]:
-        """Evaluate inference quality against golden labels.
+        """Evaluate inference quality against ground-truth labels.
 
         Returns the same nested dict the embed `Database` produces:
         ``aggregate`` (task-shaped, tagged by ``"task"``) and ``per_record``
         (one tagged record per predicted/gold pair). ``task`` is
-        ``"classification"`` or ``"ner"``; ``golden_source`` addresses the
-        golden labels by full catalog path (``<source>.public.<table>``) or
+        ``"classification"`` or ``"ner"``; ``ground_truth`` addresses the
+        ground-truth labels by full catalog path (``<source>.public.<table>``) or
         bare name, with ``label_column`` naming the gold-label column. Maps to
         `EvalService.EvalInference`.
         """
@@ -2666,7 +2666,7 @@ class RemoteDatabase:
             source=source,
             columns=columns,
             task=task,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             label_column=label_column,
         )
         resp = self._call(self._eval.EvalInference, request)
@@ -2677,26 +2677,26 @@ class RemoteDatabase:
         *,
         embedding_tables: List[str],
         source: str,
-        golden_source: str,
+        ground_truth: str,
         k: int = 10,
         oversample: Optional[int] = None,
         exact: bool = False,
     ) -> Dict[str, Any]:
-        """Compare multiple embedding tables side-by-side against one golden set.
+        """Compare multiple embedding tables side-by-side against one ground truth.
 
         Returns the same nested dict the embed `Database` produces: a
         ``per_table`` list whose first entry is the baseline (``delta: None``)
         and whose subsequent entries carry a ``delta`` against it (per-metric
         absolute/relative deltas plus paired ``significance``, ``None`` when
-        the runs share no query to pair on). ``golden_source`` addresses the
-        golden set by full catalog path (``<source>.public.<table>``) or bare
+        the runs share no query to pair on). ``ground_truth`` addresses the
+        ground truth by full catalog path (``<source>.public.<table>``) or bare
         name. ``oversample`` / ``exact`` rank every table's queries as
         :meth:`eval_embeddings` ranks them. Maps to `EvalService.EvalCompare`.
         """
         request = build_eval_compare_request(
             embedding_tables=embedding_tables,
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             k=k,
             oversample=oversample,
             exact=exact,
@@ -2708,12 +2708,12 @@ class RemoteDatabase:
         self,
         *,
         source: str,
-        golden_source: str,
+        ground_truth: str,
         shape: str,
         cohorts: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Evaluate whether a predictor's uncertainty is honest against a held-out
-        golden set pairing a predictive distribution with its realised outcome.
+        ground truth pairing a predictive distribution with its realised outcome.
 
         Returns the same nested dict the embed `Database` produces: ``aggregate``
         (``crps`` / ``nll`` / ``adaptive_ece`` / ``sharpness`` / ``coverage`` /
@@ -2722,7 +2722,7 @@ class RemoteDatabase:
         """
         request = build_eval_calibration_request(
             source=source,
-            golden_source=golden_source,
+            ground_truth=ground_truth,
             shape=shape,
             cohorts=cohorts,
         )

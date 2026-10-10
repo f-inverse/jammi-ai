@@ -88,13 +88,13 @@ random_graph = keystone.fine_tune_on_graph(
 ## The measurement rail: which graph supervises the metric?
 
 One `eval_compare` over all four tables — the base encoder first, so every
-other entry carries its delta against it — on tier 01's same-subject golden.
+other entry carries its delta against it — on tier 01's same-subject ground truth.
 
 ```{python}
-golden = keystone.subject_golden(db, arxiv)
+truth = keystone.subject_relevance(db, arxiv)
 compared = db.eval_compare(
     embedding_tables=[base, declared, similarity, random_graph],
-    source=arxiv.papers, golden_source=golden, k=10,
+    source=arxiv.papers, ground_truth=truth, k=10,
 )
 arms = ["base", "declared", "similarity", "random"]
 precision, gain = {}, {}

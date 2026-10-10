@@ -25,7 +25,7 @@ program to try one.
 - `Session.generate_embeddings(*, source, model, columns, key, modality="image")`
 - `Session.encode_query(*, model, query, modality="image")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
-- `Session.eval_embeddings(*, source, golden_source, model=None, k=10)`
+- `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
 - `Session.fine_tune(*, source, base_model, columns, method, task="image_embedding", target_modules=[...], ...)` → `TrainingJob`
 - `Session.describe_model(model_id)` → `dict | None`
 
@@ -58,9 +58,9 @@ submitted and lists the tower's real names.
 Preprocessing (pad-to-square, no center crop, normalization, L2-normalized
 output) is handled inside the encoder per the model's `preprocess_cfg`.
 
-## Golden source shape (image mode)
+## Ground-truth source shape (image mode)
 
-`eval_embeddings` switches to image-query mode when the golden source carries a
+`eval_embeddings` switches to image-query mode when the ground-truth source carries a
 `query_image` (binary) column instead of `query_text`:
 
 | column        | type   | example                          |
@@ -75,7 +75,7 @@ output) is handled inside the encoder per the model's `preprocess_cfg`.
   families (circle / triangle / square / hexagon / grating), 4 per family, plus
   a held-out query image per family under `queries/`. Rendered programmatically
   by `cookbook/fixtures/generate.py` — **no real-world imagery** (licensing).
-- `cookbook/fixtures/tiny_image_golden.json` — per-query → expected corpus IDs
+- `cookbook/fixtures/tiny_image_relevance.json` — per-query → expected corpus IDs
   (same shape family).
 
 ## Run it

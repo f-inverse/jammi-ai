@@ -2,7 +2,7 @@
 # One-way guard for the in-repo book (cookbook/book/).
 #
 # The book consumes the engine; the engine never consumes the book. The engine
-# crates legitimately depend on the engine-owned cookbook/fixtures/ (golden
+# crates legitimately depend on the engine-owned cookbook/fixtures/ (truth
 # fixtures, audio preprocessors, e2e inputs) — that edge stays. But no crate may
 # reference the book subtree at cookbook/book/: that would invert the dependency
 # direction (engine depending on its own proof). This fails, naming the offender,

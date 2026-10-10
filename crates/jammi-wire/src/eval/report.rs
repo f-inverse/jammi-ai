@@ -31,7 +31,7 @@ pub struct EmbeddingEvalReport {
     pub eval_run_id: String,
     /// Mean metrics across all queries.
     pub aggregate: AggregateMetrics,
-    /// One record per query, in golden-set order.
+    /// One record per query, in ground truth order.
     pub per_query: Vec<PerQueryRecord>,
 }
 
@@ -45,7 +45,7 @@ pub struct EmbeddingEvalReport {
 /// `_jammi_eval_per_query`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerQueryRecord {
-    /// `query_id` from the golden source (the join key).
+    /// `query_id` from the ground-truth source (the join key).
     pub query_id: String,
     pub metrics: QueryMetrics,
     /// Recall at multiple cutoffs as `(k, recall@k)` pairs, in ascending k.
@@ -1064,7 +1064,7 @@ mod calibration_tests {
 #[cfg(test)]
 mod projection_fixture_tests {
     //! Pin the serde dict shape of every eval report against the committed
-    //! golden fixture `tests/fixtures/eval_report_projection.json`.
+    //! committed fixture `tests/fixtures/eval_report_projection.json`.
     //!
     //! The fixture is the contract a thin client's report projection
     //! reproduces (the Python client's projection helpers are asserted against

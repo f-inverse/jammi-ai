@@ -794,18 +794,18 @@ pub async fn submit_and_claim(
 }
 
 /// An approximate retrieval evaluation of `source_id`'s `embedding_table` (its
-/// most-recent table when `None`) against `golden_source` at cutoff `k`, with
+/// most-recent table when `None`) against `ground_truth` at cutoff `k`, with
 /// no cohort tags.
 pub fn retrieval_eval(
     source_id: &str,
     embedding_table: Option<&str>,
-    golden_source: &str,
+    ground_truth: &str,
     k: usize,
 ) -> jammi_ai::EmbeddingEvalRequest {
     jammi_ai::EmbeddingEvalRequest {
         source_id: source_id.into(),
         embedding_table: embedding_table.map(Into::into),
-        golden_source: golden_source.into(),
+        ground_truth: ground_truth.into(),
         k,
         cohorts: Default::default(),
         method: jammi_ai::SearchMethod::default(),
@@ -813,17 +813,17 @@ pub fn retrieval_eval(
 }
 
 /// An approximate comparison of `embedding_tables` (the baseline first) over
-/// `source_id` against `golden_source` at cutoff `k`.
+/// `source_id` against `ground_truth` at cutoff `k`.
 pub fn compare_eval(
     embedding_tables: &[String],
     source_id: &str,
-    golden_source: &str,
+    ground_truth: &str,
     k: usize,
 ) -> jammi_ai::CompareEvalRequest {
     jammi_ai::CompareEvalRequest {
         embedding_tables: embedding_tables.to_vec(),
         source_id: source_id.into(),
-        golden_source: golden_source.into(),
+        ground_truth: ground_truth.into(),
         k,
         method: jammi_ai::SearchMethod::default(),
     }

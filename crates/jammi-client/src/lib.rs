@@ -646,7 +646,7 @@ impl DataClient {
 
     // --- eval ------------------------------------------------------------
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     pub async fn eval_embeddings(
         &self,
         request: EmbeddingEvalRequest,
@@ -654,7 +654,7 @@ impl DataClient {
         let EmbeddingEvalRequest {
             source_id,
             embedding_table,
-            golden_source,
+            ground_truth,
             k,
             cohorts,
             method,
@@ -664,7 +664,7 @@ impl DataClient {
             .eval_embeddings(eval_pb::EvalEmbeddingsRequest {
                 source_id,
                 embedding_table: embedding_table.unwrap_or_default(),
-                golden_source,
+                ground_truth,
                 k: k as u32,
                 cohorts: cohorts_to_proto(&cohorts),
                 tenant_id: String::new(),
@@ -690,14 +690,14 @@ impl DataClient {
         Ok(resp.records.into_iter().map(Into::into).collect())
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     pub async fn eval_inference(
         &self,
         model_id: &str,
         source_id: &str,
         columns: &[String],
         task: EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<InferenceEvalReport> {
         let resp = self
@@ -707,7 +707,7 @@ impl DataClient {
                 source_id: source_id.to_string(),
                 columns: columns.to_vec(),
                 task: eval_task_to_proto(task) as i32,
-                golden_source: golden_source.to_string(),
+                ground_truth: ground_truth.to_string(),
                 label_column: label_column.to_string(),
                 tenant_id: String::new(),
             })
@@ -722,7 +722,7 @@ impl DataClient {
         let CompareEvalRequest {
             embedding_tables,
             source_id,
-            golden_source,
+            ground_truth,
             k,
             method,
         } = request;
@@ -731,7 +731,7 @@ impl DataClient {
             .eval_compare(eval_pb::EvalCompareRequest {
                 embedding_tables,
                 source_id,
-                golden_source,
+                ground_truth,
                 k: k as u32,
                 tenant_id: String::new(),
                 method: jammi_wire::search_method_to_proto(method),

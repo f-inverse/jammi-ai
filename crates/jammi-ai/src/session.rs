@@ -2291,9 +2291,9 @@ impl InferenceSession {
     // Evaluation
     // =====================================================================
 
-    /// Evaluate embedding quality against golden relevance judgments.
+    /// Evaluate embedding quality against ground-truth relevance judgments.
     ///
-    /// The request's `cohorts` map a golden-set `query_id` to an opaque
+    /// The request's `cohorts` map a ground truth `query_id` to an opaque
     /// `{key: value}` segment map persisted alongside that query's per-query
     /// metrics (`_jammi_eval_per_query`); its `method` ranks each query as a
     /// search's does.
@@ -2314,14 +2314,14 @@ impl InferenceSession {
         self.catalog().get_eval_per_query(eval_run_id).await
     }
 
-    /// Evaluate inference quality against golden labels.
+    /// Evaluate inference quality against ground-truth labels.
     pub async fn eval_inference(
         &self,
         model_id: &str,
         source_id: &str,
         columns: &[String],
         task: crate::eval::EvalTask,
-        golden_source: &str,
+        ground_truth: &str,
         label_column: &str,
     ) -> Result<crate::eval::InferenceEvalReport> {
         EvalRunner { session: self }
@@ -2330,7 +2330,7 @@ impl InferenceSession {
                 source_id,
                 columns,
                 task,
-                golden_source,
+                ground_truth,
                 label_column,
             )
             .await
@@ -2346,7 +2346,7 @@ impl InferenceSession {
 
     /// Evaluate whether a predictor's uncertainty is honest.
     ///
-    /// `golden_source` is a held-out set pairing a predictive distribution with
+    /// `ground_truth` is a held-out set pairing a predictive distribution with
     /// its realised `outcome`; `shape` selects the predictor's output family
     /// (parametric Gaussian or ensemble) and the columns read. `cohorts` maps a
     /// `record_id` to an opaque `{key: value}` segment map persisted alongside
@@ -2356,12 +2356,12 @@ impl InferenceSession {
     pub async fn eval_calibration(
         &self,
         source_id: &str,
-        golden_source: &str,
+        ground_truth: &str,
         shape: crate::eval::EvalCalibrationShape,
         cohorts: &std::collections::HashMap<String, std::collections::BTreeMap<String, String>>,
     ) -> Result<crate::eval::CalibrationEvalReport> {
         EvalRunner { session: self }
-            .eval_calibration(source_id, golden_source, shape, cohorts)
+            .eval_calibration(source_id, ground_truth, shape, cohorts)
             .await
     }
 }

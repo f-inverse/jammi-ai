@@ -1924,7 +1924,7 @@ report. Read-only, like its sibling: it never acts on a verdict.
 verdict mapped to the proto oneof via `match_verdict_to_proto`,
 `crates/jammi-wire/src/catalog.rs`) and Python `Database::verify_materialization`
 (`crates/jammi-python/src/database.rs`). The chapter freezes the full four-verdict matrix
-as committed golden contracts.
+as committed ground truth contracts.
 
 > **Invariant (belongs in §5):** the `definition_hash` is not bit-reproducible when a
 > producer's inputs include non-bit-reproducible content (e.g. CPU embeddings) — the
@@ -2772,11 +2772,11 @@ model's output is bit-identical across the mode toggle. Outside its own domain
 a seam falls back to the eager composition, counted — a domain miss is one
 code path in every mode, never a second one.
 
-**The eval doctrine: parity/golden lanes.** `jammi-encoders` carries two
+**The eval doctrine: parity/ground truth lanes.** `jammi-encoders` carries two
 hermetic oracle suites in the default `cargo test` — `tests/parity.rs`, whose
 oracle is `candle-transformers` over the committed `tiny_bert` fixture, and
 `tests/golden_parity.rs`, whose oracle is a committed PyTorch dump
-(`tests/fixtures/htsat_clap_tiny/goldens.safetensors`, a tracked binary) —
+(`tests/fixtures/htsat_clap_tiny/truths.safetensors`, a tracked binary) —
 never a network call or a torch install. `jammi-kernels/tests/cuda_parity.rs`
 is `required-features = ["live-gpu-tests"]`: it is compiled only where CUDA
 device 0 exists, and fails naming the device when it cannot be opened;
@@ -4993,7 +4993,7 @@ default in `crates/jammi-db/src/index/sidecar.rs`.)
    compiler forces a match arm in every method, including `modality`, `forward_input`,
    `probe_input` and `dtype`.
 4. Tests: `crates/jammi-encoders/tests/it/foo.rs` + register in
-   `crates/jammi-encoders/tests/it/main.rs`; add a golden/parity fixture if one exists.
+   `crates/jammi-encoders/tests/it/main.rs`; add a ground truth/parity fixture if one exists.
 5. Wire into the parent crate (same PR): an `EncoderFamily` variant plus its
    `from_config` / `from_adapter_model_type` / `adapter_model_type` / `has_tower` /
    `towers` arms in `crates/jammi-ai/src/model/arch.rs` (§2.7) — that module, not a

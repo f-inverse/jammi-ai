@@ -144,7 +144,7 @@ pub struct LexicalSearchRequest {
     pub select: Vec<String>,
 }
 
-/// An embedding table's retrieval evaluation: each golden query encoded by the
+/// An embedding table's retrieval evaluation: each ground-truth query encoded by the
 /// table's model and ranked against the table, the ranking scored against the
 /// query's relevant rows.
 pub struct EmbeddingEvalRequest {
@@ -153,8 +153,8 @@ pub struct EmbeddingEvalRequest {
     /// Which embedding table of the source. `None` selects the source's
     /// most-recent ready table.
     pub embedding_table: Option<String>,
-    /// The golden relevance source, a bare name or `<source>.public.<table>`.
-    pub golden_source: String,
+    /// The ground-truth relevance source, a bare name or `<source>.public.<table>`.
+    pub ground_truth: String,
     /// Retrieval cutoff.
     pub k: usize,
     /// Opaque per-query tags, `query_id → {key: value}`, stored with each
@@ -166,15 +166,15 @@ pub struct EmbeddingEvalRequest {
     pub method: SearchMethod,
 }
 
-/// Several embedding tables evaluated on one golden set: the first is the
+/// Several embedding tables evaluated on one ground truth: the first is the
 /// baseline, and every other carries its per-metric delta against it.
 pub struct CompareEvalRequest {
     /// The tables compared, the baseline first. At least two.
     pub embedding_tables: Vec<String>,
     /// Source the tables embed.
     pub source_id: String,
-    /// The golden relevance source, a bare name or `<source>.public.<table>`.
-    pub golden_source: String,
+    /// The ground-truth relevance source, a bare name or `<source>.public.<table>`.
+    pub ground_truth: String,
     /// Retrieval cutoff.
     pub k: usize,
     /// How every table's rankings are computed.

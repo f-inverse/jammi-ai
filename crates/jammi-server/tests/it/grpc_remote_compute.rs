@@ -12,7 +12,7 @@
 //!
 //! * **Round-trip parity** — the same call through either transport returns the
 //!   same result against the same engine, on realistic inputs (the `tiny_bert`
-//!   test encoder over the shipped `patents` corpus, a real golden set, a
+//!   test encoder over the shipped `patents` corpus, a real ground truth, a
 //!   real mutable-table definition, a real channel).
 //! * **Error parity** — a real failure returns the *same*
 //!   `JammiError` variant + fields from both transports. The mutable case is
@@ -22,7 +22,7 @@
 //!   and the remote transport rebuilds that exact nested variant.
 //!
 //! Hermetic: local fixtures only (the `tiny_bert` encoder, the bundled
-//! `patents.parquet`, `golden_relevance.csv`); no live network, no download.
+//! `patents.parquet`, `relevance.csv`); no live network, no download.
 
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ fn file_connection(name: &str, format: FileFormat) -> SourceConnection {
     }
 }
 
-const GOLDEN_SOURCE: &str = "golden_rel.public.golden_relevance";
+const GROUND_TRUTH: &str = "truth_rel.public.relevance";
 
 /// Connect a `DataClient` to the in-process server.
 async fn remote(server: &EngineServer) -> DataClient {
@@ -84,19 +84,19 @@ async fn add_patents(session: &Session) {
         .expect("add patents");
 }
 
-/// Register patents + the golden relevance set and generate one embedding table
+/// Register patents + the relevance judgments and generate one embedding table
 /// over `abstract` so the eval verbs have a real run to evaluate. Returns the
 /// generated table name.
-async fn embed_patents_and_golden(session: &Session) -> String {
+async fn embed_patents_and_truth(session: &Session) -> String {
     add_patents(session).await;
     session
         .add_source(
-            "golden_rel",
+            "truth_rel",
             SourceType::File,
-            file_connection("golden_relevance.csv", FileFormat::Csv),
+            file_connection("relevance.csv", FileFormat::Csv),
         )
         .await
-        .expect("add golden");
+        .expect("add truth");
     session
         .generate_embeddings(jammi_ai::local_session::EmbeddingRequest {
             source_id: "patents".to_string(),
@@ -190,7 +190,7 @@ fn retrieval_eval() -> EmbeddingEvalRequest {
     EmbeddingEvalRequest {
         source_id: "patents".into(),
         embedding_table: None,
-        golden_source: GOLDEN_SOURCE.into(),
+        ground_truth: GROUND_TRUTH.into(),
         k: 10,
         cohorts: Default::default(),
         method: SearchMethod::default(),
@@ -202,7 +202,7 @@ fn compare_eval(tables: &[String]) -> CompareEvalRequest {
     CompareEvalRequest {
         embedding_tables: tables.to_vec(),
         source_id: "patents".into(),
-        golden_source: GOLDEN_SOURCE.into(),
+        ground_truth: GROUND_TRUTH.into(),
         k: 10,
         method: SearchMethod::default(),
     }
@@ -213,7 +213,7 @@ async fn remote_eval_round_trips_like_local() {
     let server = start_engine_server().await;
     let remote = remote(&server).await;
     let local = local(&server);
-    let table = embed_patents_and_golden(&local).await;
+    let table = embed_patents_and_truth(&local).await;
 
     let remote_report = remote
         .eval_embeddings(retrieval_eval())

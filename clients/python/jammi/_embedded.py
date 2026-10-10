@@ -52,6 +52,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
+from . import _conformal
 from ._capability import Capability
 from .errors import NotSupportedOnBackend
 from ._sessions import register as _register_session
@@ -450,6 +451,10 @@ class EmbeddedBackend:
         )
 
     # --- Stateless conformal / RRF numerics (computed in-process) ---------------
+    #
+    # The conformal verbs hold no session: they are `jammi_native` module
+    # functions over the engine's `ConformalModel`, so they answer on a closed
+    # database exactly as the remote transport's client-side ones do.
 
     def conformalize(
         self,
@@ -460,15 +465,22 @@ class EmbeddedBackend:
         alpha: float,
         score: Optional[str] = None,
         raps_params: Optional[Tuple[float, int]] = None,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[List[int]]:
         """Conformalize a classification predictor into prediction sets."""
-        return self._native.conformalize(
+        import jammi_native
+
+        return jammi_native.conformalize(
             calibration,
             true_labels,
             test,
             alpha=alpha,
-            score=score,
-            raps_params=raps_params,
+            score=_conformal.score_family(score),
+            raps_params=raps_params if raps_params is not None else (0.0, 1),
+            scheme=(groups, test_groups, weights, test_weights),
         )
 
     def conformalize_interval(
@@ -478,10 +490,20 @@ class EmbeddedBackend:
         test_predictions: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize an absolute-residual regression predictor into intervals."""
-        return self._native.conformalize_interval(
-            predictions, observed, test_predictions, alpha=alpha
+        import jammi_native
+
+        return jammi_native.conformalize_interval(
+            predictions,
+            observed,
+            test_predictions,
+            alpha=alpha,
+            scheme=(groups, test_groups, weights, test_weights),
         )
 
     def conformalize_cqr(
@@ -493,10 +515,22 @@ class EmbeddedBackend:
         test_upper: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize a CQR predictor into adaptive-width intervals."""
-        return self._native.conformalize_cqr(
-            lower, upper, observed, test_lower, test_upper, alpha=alpha
+        import jammi_native
+
+        return jammi_native.conformalize_cqr(
+            lower,
+            upper,
+            observed,
+            test_lower,
+            test_upper,
+            alpha=alpha,
+            scheme=(groups, test_groups, weights, test_weights),
         )
 
     def rrf_fuse(

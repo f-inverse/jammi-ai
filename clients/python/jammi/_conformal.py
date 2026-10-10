@@ -5,8 +5,9 @@ and test scores, observed targets, ranked id lists). The remote engine holds
 none of their inputs, so a gRPC hop would only ship data the caller already has;
 they are a *client/local numeric utility*, not a server round-trip. This module
 is the pure-Python peer of the embedded engine's `predict/conformal.rs` and
-`query/rrf.rs`, reproducing the SAME finite-sample quantile, score families, and
-fusion order so the two transports agree byte-for-byte on shared inputs.
+`query/rrf.rs`, reproducing the SAME finite-sample quantile, score families,
+calibration schemes (marginal, Mondrian, weighted), and fusion order so the two
+transports agree byte-for-byte on shared inputs.
 
 The conformal guarantee: under exchangeability of calibration and serving data,
 the emitted sets/intervals carry marginal coverage `>= 1 - alpha` for any
@@ -18,6 +19,8 @@ is the empirical `⌈(n+1)(1-alpha)⌉` quantile applied at serving time.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
+from itertools import accumulate
 from typing import List, Optional, Sequence, Tuple
 
 # Cormack's default `k_rrf` (SIGIR 2009). Robust across [40, 80]; damps the
@@ -57,6 +60,110 @@ def finite_sample_quantile(scores: Sequence[float], alpha: float) -> float:
         return math.inf
     # Ascending sort; 1-based rank to 0-based index.
     return sorted(scores)[rank - 1]
+
+
+def _validate_weights(weights: Sequence[float]) -> None:
+    """Likelihood ratios must each be finite and non-negative."""
+    if any(w < 0.0 or not math.isfinite(w) for w in weights):
+        raise ValueError(
+            "weighted conformal weights must be finite and non-negative"
+        )
+
+
+class _WeightedScores:
+    """Calibration scores ascending, each with the running total of the weights
+    up to and including it — what a weighted threshold walks (Tibshirani et al.
+    2019). The engine's ``WeightedScores``, step for step."""
+
+    def __init__(self, scores: Sequence[float], weights: Sequence[float]) -> None:
+        if not scores:
+            raise ValueError("conformal calibration requires at least one score")
+        if any(math.isnan(s) for s in scores):
+            raise ValueError("conformal calibration scores must be finite")
+        _validate_weights(weights)
+        pairs = sorted(zip(scores, weights), key=lambda pair: pair[0])
+        self._sorted = [score for score, _ in pairs]
+        self._cumulative = list(accumulate(weight for _, weight in pairs))
+
+    def threshold(self, test_weight: float, alpha: float) -> float:
+        """The smallest score whose cumulative weight reaches
+        ``(1 - alpha)(Σw + w_test)``, or ``+inf`` when the calibration mass
+        cannot — the test point's own weight sits at +inf."""
+        _validate_weights([test_weight])
+        total = self._cumulative[-1] + test_weight
+        if total <= 0.0:
+            raise ValueError("weighted conformal requires a positive total weight")
+        reached = bisect_left(self._cumulative, (1.0 - alpha) * total)
+        return self._sorted[reached] if reached < len(self._sorted) else math.inf
+
+
+def _thresholds(
+    cal_scores: Sequence[float],
+    test_rows: int,
+    alpha: float,
+    groups: Optional[Sequence[str]],
+    test_groups: Optional[Sequence[str]],
+    weights: Optional[Sequence[float]],
+    test_weights: Optional[Sequence[float]],
+) -> List[float]:
+    """The threshold each test row is held to under the calibration scheme its
+    arguments name: one marginal quantile; one per cohort (``groups`` with
+    ``test_groups``, a cohort unseen at calibration held to the pooled
+    quantile); or one per test row's likelihood ratio (``weights`` with
+    ``test_weights``)."""
+    marginal = groups is None and test_groups is None
+    unweighted = weights is None and test_weights is None
+    if marginal and unweighted:
+        return [finite_sample_quantile(cal_scores, alpha)] * test_rows
+    if groups is not None and test_groups is not None and unweighted:
+        _one_per_row("cohort", len(groups), len(cal_scores))
+        _one_per_test_row(len(test_groups), test_rows)
+        _validate_alpha(alpha)
+        by_group: dict = {}
+        for score, group in zip(cal_scores, groups):
+            by_group.setdefault(group, []).append(score)
+        quantiles = {
+            group: finite_sample_quantile(scores, alpha)
+            for group, scores in by_group.items()
+        }
+        pooled = finite_sample_quantile(cal_scores, alpha)
+        return [quantiles.get(group, pooled) for group in test_groups]
+    if weights is not None and test_weights is not None and marginal:
+        _one_per_row("weight", len(weights), len(cal_scores))
+        _one_per_test_row(len(test_weights), test_rows)
+        _validate_alpha(alpha)
+        calibration = _WeightedScores(cal_scores, weights)
+        return [calibration.threshold(w, alpha) for w in test_weights]
+    raise ValueError(
+        "conformal takes `groups` with `test_groups`, or `weights` with "
+        "`test_weights`, and not both"
+    )
+
+
+def _one_per_row(what: str, given: int, rows: int) -> None:
+    if given != rows:
+        raise ValueError(
+            f"conformal needs one {what} per calibration row: {given} for {rows} rows"
+        )
+
+
+def _one_per_test_row(given: int, rows: int) -> None:
+    if given != rows:
+        raise ValueError(
+            f"conformal needs one entry per test row: {given} for {rows} rows"
+        )
+
+
+def score_family(score: Optional[str]) -> str:
+    """The classification score family a verb's ``score`` names (default
+    ``"aps"``)."""
+    family = (score or "aps").lower()
+    if family not in ("lac", "aps", "raps"):
+        raise ValueError(
+            f"unknown classification conformal score '{score}', "
+            "expected 'lac', 'aps', or 'raps'"
+        )
+    return family
 
 
 def _aps_cumulative_mass(
@@ -152,6 +259,10 @@ def conformalize(
     alpha: float,
     score: Optional[str] = None,
     raps_params: Optional[Tuple[float, int]] = None,
+    groups: Optional[Sequence[str]] = None,
+    test_groups: Optional[Sequence[str]] = None,
+    weights: Optional[Sequence[float]] = None,
+    test_weights: Optional[Sequence[float]] = None,
 ) -> List[List[int]]:
     """Conformalize a classification predictor into prediction sets.
 
@@ -165,18 +276,21 @@ def conformalize(
     or ``"raps"`` (regularized APS). For ``"raps"``, ``raps_params`` is the
     ``(lambda, k_reg)`` pair — the penalty weight and the 1-based rank past
     which it applies; ignored by ``"lac"``/``"aps"`` and defaulting to
-    ``(0.0, 1)``. The calibration set must be disjoint from both the training
-    set and ``test`` — reusing test points inflates coverage. Pure and
-    deterministic: identical inputs yield identical sets.
+    ``(0.0, 1)``.
+
+    ``groups`` with ``test_groups`` calibrates one quantile per cohort
+    (Mondrian, group-conditional coverage): ``groups[i]`` is calibration row
+    ``i``'s cohort and ``test_groups[j]`` test row ``j``'s; a cohort unseen at
+    calibration is held to the pooled quantile. ``weights`` with
+    ``test_weights`` are likelihood ratios ``dP_test/dP_cal`` for a known
+    covariate shift (weighted conformal, Tibshirani et al. 2019): each test
+    row's own ratio sets its threshold. The calibration set must be disjoint
+    from both the training set and ``test`` — reusing test points inflates
+    coverage. Pure and deterministic: identical inputs yield identical sets.
 
     Returns one list of admitted class indices per row of ``test``.
     """
-    family = (score or "aps").lower()
-    if family not in ("lac", "aps", "raps"):
-        raise ValueError(
-            f"unknown classification conformal score '{score}', "
-            "expected 'lac', 'aps', or 'raps'"
-        )
+    family = score_family(score)
     reg = raps_params if raps_params is not None else (0.0, 1)
     if len(calibration) != len(true_labels):
         raise ValueError(
@@ -191,8 +305,10 @@ def conformalize(
         _true_label_score(probs, label, family, reg)
         for probs, label in zip(calibration, true_labels)
     ]
-    q = finite_sample_quantile(cal_scores, alpha)
-    return [_admit_classes(row, family, q, reg) for row in test]
+    thresholds = _thresholds(
+        cal_scores, len(test), alpha, groups, test_groups, weights, test_weights
+    )
+    return [_admit_classes(row, family, q, reg) for row, q in zip(test, thresholds)]
 
 
 def conformalize_interval(
@@ -201,14 +317,20 @@ def conformalize_interval(
     test_predictions: Sequence[float],
     *,
     alpha: float,
+    groups: Optional[Sequence[str]] = None,
+    test_groups: Optional[Sequence[str]] = None,
+    weights: Optional[Sequence[float]] = None,
+    test_weights: Optional[Sequence[float]] = None,
 ) -> List[Tuple[float, float]]:
     """Conformalize an absolute-residual regression predictor into intervals.
 
     The calibration nonconformity is ``|y - ŷ|`` over the ``predictions`` /
     ``observed`` held-out pairs; the finite-sample quantile ``q̂`` then yields
     the constant-width interval ``[ŷ - q̂, ŷ + q̂]`` around each
-    ``test_predictions`` point, with marginal coverage ``>= 1 - alpha``. The
-    calibration set must be disjoint from the training set and the test points.
+    ``test_predictions`` point, with marginal coverage ``>= 1 - alpha``.
+    ``groups``/``test_groups`` and ``weights``/``test_weights`` calibrate as in
+    :func:`conformalize`. The calibration set must be disjoint from the training
+    set and the test points.
 
     Returns one ``(lower, upper)`` tuple per test row.
     """
@@ -224,8 +346,10 @@ def conformalize_interval(
     _ensure_finite(predictions, "predictions")
     _ensure_finite(observed, "observations")
     cal_scores = [abs(y - yhat) for yhat, y in zip(predictions, observed)]
-    q = finite_sample_quantile(cal_scores, alpha)
-    return [(p - q, p + q) for p in test_predictions]
+    thresholds = _thresholds(
+        cal_scores, len(test_predictions), alpha, groups, test_groups, weights, test_weights
+    )
+    return [(p - q, p + q) for p, q in zip(test_predictions, thresholds)]
 
 
 def conformalize_cqr(
@@ -236,6 +360,10 @@ def conformalize_cqr(
     test_upper: Sequence[float],
     *,
     alpha: float,
+    groups: Optional[Sequence[str]] = None,
+    test_groups: Optional[Sequence[str]] = None,
+    weights: Optional[Sequence[float]] = None,
+    test_weights: Optional[Sequence[float]] = None,
 ) -> List[Tuple[float, float]]:
     """Conformalize a Conformalized Quantile Regression predictor into intervals.
 
@@ -243,8 +371,10 @@ def conformalize_cqr(
     ``lower`` / ``upper`` quantile estimates and ``observed`` targets; the
     finite-sample quantile ``q̂`` then yields the adaptive-width interval
     ``[q_lo - q̂, q_hi + q̂]`` around each ``test_lower`` / ``test_upper`` band,
-    so width tracks the predictor's local uncertainty. The calibration set must
-    be disjoint from the training set and the test points.
+    so width tracks the predictor's local uncertainty.
+    ``groups``/``test_groups`` and ``weights``/``test_weights`` calibrate as in
+    :func:`conformalize`. The calibration set must be disjoint from the training
+    set and the test points.
 
     Returns one ``(lower, upper)`` tuple per test row.
     """
@@ -267,8 +397,12 @@ def conformalize_cqr(
     cal_scores = [
         max(lo - y, y - hi) for lo, hi, y in zip(lower, upper, observed)
     ]
-    q = finite_sample_quantile(cal_scores, alpha)
-    return [(lo - q, hi + q) for lo, hi in zip(test_lower, test_upper)]
+    thresholds = _thresholds(
+        cal_scores, len(test_lower), alpha, groups, test_groups, weights, test_weights
+    )
+    return [
+        (lo - q, hi + q) for lo, hi, q in zip(test_lower, test_upper, thresholds)
+    ]
 
 
 def rrf_fuse(

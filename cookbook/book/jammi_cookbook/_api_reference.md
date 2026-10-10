@@ -72,7 +72,7 @@ A registered file source is queried as `<source>.public.<table>`
 
 - `db.train_context_predictor(source, *, key_column, task_column, value_column, architecture="attncnp", output="gaussian", objective="crps", context_k=32, hidden_dim=64, num_heads=4, num_layers=2, levels=None, beta=0.5, epochs=100, learning_rate=0.005, grad_clip=1.0, test_task_fraction=0.2, min_task_count=4, seed=0, model_id=None, idempotency_key="") -> Job` — `architecture ∈ {"cnp","attncnp","tnp"}`; `output ∈ {"gaussian","quantile"}`; `objective ∈ {"crps","nll","betanll"}`. Returns a `Job`; `job.output_model_id` after `job.wait()` is the predictor id.
 - `db.predict_with_context_predictor(model_id, *, source, target_key, split=None, edge_source=None, edge_src_column=None, edge_dst_column=None, edge_type_column=None, edge_weight_column=None, edge_hops=None, edge_fanout=None, edge_direction=None, edge_types=None, min_weight=None, hybrid_ann_k=None) -> dict` — gaussian: `{"kind","mean","std"}`; quantile: `{"kind","levels"}`; plus `"source"` and `"context_ref"`. **The declared-edge params make this graph-conditioned — the tier-04 BYOG surface.**
-- Conformal (**marginal only** in Python, by design): `db.conformalize(calibration, true_labels, test, *, alpha, score=None, raps_params=None) -> list[list[int]]` (`score ∈ {"lac","aps","raps"}`); `db.conformalize_interval(predictions, observed, test_predictions, *, alpha) -> list[(float,float)]`; `db.conformalize_cqr(lower, upper, observed, test_lower, test_upper, *, alpha) -> list[(float,float)]`.
+- Conformal: `db.conformalize(calibration, true_labels, test, *, alpha, score=None, raps_params=None, groups=None, test_groups=None, weights=None, test_weights=None) -> list[list[int]]` (`score ∈ {"lac","aps","raps"}`); `db.conformalize_interval(predictions, observed, test_predictions, *, alpha, groups=…, test_groups=…, weights=…, test_weights=…) -> list[(float,float)]`; `db.conformalize_cqr(lower, upper, observed, test_lower, test_upper, *, alpha, groups=…, test_groups=…, weights=…, test_weights=…) -> list[(float,float)]`. Marginal by default; `groups` with `test_groups` is Mondrian (one quantile per cohort, the pooled one for a cohort unseen at calibration); `weights` with `test_weights` is weighted conformal (likelihood ratios `dP_test/dP_cal`, each test row's own ratio setting its threshold).
 - Calibration eval (R2): `db.eval_calibration(*, source, ground_truth, shape, cohorts=None) -> dict` — `shape ∈ {"gaussian","sample"}`; returns `aggregate` (CRPS/NLL/adaptive_ece/sharpness/coverage), `per_cohort`, `per_record`. `ground_truth` resolves in the engine's default catalog, so pass the **fully-qualified path** `"<source>.public.<source>"`, not the bare source id (the bare id raises `table not found`). For `"gaussian"` the ground-truth table carries `record_id, mean, sd, outcome`.
 
 ## Model catalog (control plane)
@@ -121,8 +121,5 @@ descriptor** for their output table; these verbs then reason over that descripto
 
 ## Not available in Python (do not call)
 
-- `search_by_id` — use `search` with a fetched vector.
-- Standalone Mondrian / weighted conformal — not in the OSS Python surface. The
-  tier-04 graph-aware repair is computed **inline in the notebook** (~10 lines of
-  numpy); a productionized, governed cohort surface is out of scope. OSS Python
-  exposes only the **marginal** `conformalize*` surface.
+- `search_by_id` — the Rust name; in Python, `search(source, row_key=…, k=…)` is the
+  query-by-example form.

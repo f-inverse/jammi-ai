@@ -22,10 +22,10 @@
 //!   with [`ClassScore::Lac`], scored by `coverage` over whether the prediction
 //!   set held the true class.
 //! * **Absolute-residual regression** (`conformalize_interval`):
-//!   [`ConformalModel::regression`] with [`IntervalScore::AbsoluteResidual`],
-//!   scored by `interval_coverage`.
-//! * **CQR regression** (`conformalize_cqr`): [`ConformalModel::regression`] with
-//!   [`IntervalScore::Cqr`], scored by `interval_coverage`.
+//!   [`ConformalModel::regression`] over [`Estimates::Points`], scored by
+//!   `interval_coverage`.
+//! * **CQR regression** (`conformalize_cqr`): [`ConformalModel::regression`] over
+//!   [`Estimates::Bands`], scored by `interval_coverage`.
 //!
 //! A regression in the engine's quantile (e.g. dropping the `(n+1)` finite-sample
 //! correction — the documented under-coverage failure) moves the measured
@@ -46,7 +46,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use jammi_ai::predict::conformal::{ClassScore, ConformalModel, IntervalScore};
+use jammi_ai::predict::conformal::{
+    Calibration, ClassScore, ConformalModel, Estimate, Estimates, TestPoint,
+};
 use jammi_numerics::calibration::{coverage, interval_coverage};
 
 use crate::report::{ConformalPoint, ConformalTier, CoverageGate, Measurement};
@@ -342,49 +344,88 @@ pub fn classification_coverage(
     let cal = draw_classification(CLS_CAL_SEED, cal_rows, n_classes);
     let test = draw_classification(CLS_TEST_SEED, test_rows, n_classes);
 
-    let model = ConformalModel::classification(&cal.probs, &cal.labels, ClassScore::Lac, alpha)?;
+    let model = ConformalModel::classification(
+        &cal.probs,
+        &cal.labels,
+        ClassScore::Lac,
+        &Calibration::Marginal,
+        alpha,
+    )?;
     let hits: Vec<bool> = test
         .probs
         .iter()
         .zip(test.labels.iter())
-        .map(|(row, &y)| Ok(model.predict_set(row, None)?.contains(&y)))
+        .map(|(row, &y)| {
+            Ok(model
+                .predict_set(row, TestPoint::Exchangeable)?
+                .contains(&y))
+        })
         .collect::<Result<Vec<bool>, Box<dyn std::error::Error>>>()?;
     Ok(coverage(&hits)?)
 }
 
-/// Measure regression marginal coverage at calibration size `cal_rows` for the
-/// given [`IntervalScore`]: calibrate the engine's [`ConformalModel`] over the
-/// calibration split, emit each test row's interval, and score the fraction
-/// covered via the engine's [`interval_coverage`].
-pub fn regression_coverage(
+/// Measure absolute-residual marginal coverage at calibration size `cal_rows`:
+/// the regressor serves its point predictions.
+pub fn absolute_residual_coverage(
     cal_rows: usize,
     test_rows: usize,
     alpha: f64,
-    score: IntervalScore,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    regression_coverage(
+        cal_rows,
+        test_rows,
+        alpha,
+        |split| Estimates::Points(&split.predictions),
+        |split, i| Estimate::Point(split.predictions[i]),
+    )
+}
+
+/// Measure CQR marginal coverage at calibration size `cal_rows`: the regressor
+/// serves its quantile bands.
+pub fn cqr_coverage(
+    cal_rows: usize,
+    test_rows: usize,
+    alpha: f64,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    regression_coverage(
+        cal_rows,
+        test_rows,
+        alpha,
+        |split| Estimates::Bands {
+            lower: &split.lower,
+            upper: &split.upper,
+        },
+        |split, i| Estimate::Band {
+            lower: split.lower[i],
+            upper: split.upper[i],
+        },
+    )
+}
+
+/// Calibrate the engine's [`ConformalModel`] over the calibration split on the
+/// estimates `estimates` selects, emit each test row's interval from the
+/// estimate `estimate` selects, and score the fraction covered via the engine's
+/// [`interval_coverage`].
+fn regression_coverage(
+    cal_rows: usize,
+    test_rows: usize,
+    alpha: f64,
+    estimates: impl Fn(&RegressionSplit) -> Estimates<'_>,
+    estimate: impl Fn(&RegressionSplit, usize) -> Estimate,
 ) -> Result<f64, Box<dyn std::error::Error>> {
     let cal = draw_regression(REG_CAL_SEED, cal_rows, alpha);
     let test = draw_regression(REG_TEST_SEED, test_rows, alpha);
-
     let model = ConformalModel::regression(
-        &cal.predictions,
-        &cal.lower,
-        &cal.upper,
+        estimates(&cal),
         &cal.observed,
-        score,
+        &Calibration::Marginal,
         alpha,
     )?;
-
-    // For absolute-residual the interval is built from the point prediction; for
-    // CQR it is built from the lower/upper quantile estimates. `predict_interval`
-    // ignores the irrelevant argument for each score, so pass all three.
-    let mut lower = Vec::with_capacity(test_rows);
-    let mut upper = Vec::with_capacity(test_rows);
-    for i in 0..test.observed.len() {
-        let (lo, hi) =
-            model.predict_interval(test.predictions[i], test.lower[i], test.upper[i], None)?;
-        lower.push(lo);
-        upper.push(hi);
-    }
+    let (lower, upper): (Vec<f64>, Vec<f64>) = (0..test.observed.len())
+        .map(|i| model.predict_interval(estimate(&test, i), TestPoint::Exchangeable))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
     Ok(interval_coverage(&lower, &upper, &test.observed)?)
 }
 
@@ -409,13 +450,8 @@ pub fn run(spec: &ConformalSpec) -> Result<ConformalTier, Box<dyn std::error::Er
     let mut points = Vec::with_capacity(spec.points.len());
     for sp in &spec.points {
         let cls = classification_coverage(sp.cal_rows, spec.test_rows, spec.n_classes, spec.alpha)?;
-        let abs_res = regression_coverage(
-            sp.cal_rows,
-            spec.test_rows,
-            spec.alpha,
-            IntervalScore::AbsoluteResidual,
-        )?;
-        let cqr = regression_coverage(sp.cal_rows, spec.test_rows, spec.alpha, IntervalScore::Cqr)?;
+        let abs_res = absolute_residual_coverage(sp.cal_rows, spec.test_rows, spec.alpha)?;
+        let cqr = cqr_coverage(sp.cal_rows, spec.test_rows, spec.alpha)?;
         points.push(ConformalPoint {
             cal_rows: sp.cal_rows,
             test_rows: spec.test_rows,
@@ -456,9 +492,8 @@ pub fn rebuild_spec(
     let mut points = Vec::with_capacity(cal_sizes.len());
     for &cal_rows in cal_sizes {
         let cls = classification_coverage(cal_rows, test_rows, n_classes, alpha)?;
-        let abs_res =
-            regression_coverage(cal_rows, test_rows, alpha, IntervalScore::AbsoluteResidual)?;
-        let cqr = regression_coverage(cal_rows, test_rows, alpha, IntervalScore::Cqr)?;
+        let abs_res = absolute_residual_coverage(cal_rows, test_rows, alpha)?;
+        let cqr = cqr_coverage(cal_rows, test_rows, alpha)?;
         let derive = |m: f64| FloorPair {
             measured: m,
             floor: (m - FLOOR_MARGIN).max(0.0),

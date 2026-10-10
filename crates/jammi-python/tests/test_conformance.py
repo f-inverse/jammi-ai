@@ -884,8 +884,8 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
     """The client's pure-Python conformal / RRF numerics produce output EQUAL to
     the embedded engine's on shared fixtures. Both are computed locally (no
     server), so this asserts the two implementations reproduce the same
-    finite-sample quantile, score families, interval construction, and fusion
-    order — the byte-identical agreement the compute-to-data split requires.
+    finite-sample quantile, score families, calibration schemes, interval
+    construction, and fusion order — the byte-identical agreement the compute-to-data split requires.
 
     Hermetic: the embedded side opens a local engine (`file://`); the client side
     runs entirely in process. No server is contacted by either."""
@@ -938,6 +938,29 @@ def test_numeric_verbs_compute_identically_across_wheels(tmp_path):
         ) == remote.conformalize_cqr(
             lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25
         )
+
+        # Mondrian and weighted calibration, on every verb: one cohort or
+        # likelihood ratio per calibration row and per test row.
+        schemes = (
+            {"groups": ["a", "b", "a", "b", "a"], "test_groups": ["a", "c"]},
+            {"weights": [0.5, 2.0, 1.0, 1.5, 0.25], "test_weights": [1.0, 3.0]},
+        )
+        for scheme in schemes:
+            assert local.conformalize(
+                calibration, true_labels, test[:2], alpha=0.2, score="aps", **scheme
+            ) == remote.conformalize(
+                calibration, true_labels, test[:2], alpha=0.2, score="aps", **scheme
+            ), scheme
+            assert local.conformalize_interval(
+                predictions, observed, test_predictions, alpha=0.25, **scheme
+            ) == remote.conformalize_interval(
+                predictions, observed, test_predictions, alpha=0.25, **scheme
+            ), scheme
+            assert local.conformalize_cqr(
+                lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25, **scheme
+            ) == remote.conformalize_cqr(
+                lower, upper, cqr_observed, test_lower, test_upper, alpha=0.25, **scheme
+            ), scheme
 
         # Reciprocal-rank fusion, default and explicit k_rrf.
         ranked_lists = [["a", "b", "c"], ["c", "a", "d"], ["b", "d", "a"]]

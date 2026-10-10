@@ -24,11 +24,12 @@ use candle_nn::{VarBuilder, VarMap};
 use tempfile::TempDir;
 
 use jammi_ai::pipeline::context_predictor::{
-    ConformalLevers, ContextPredictorTrainConfig, ContextServeOptions, EpisodeBatch,
-    GaussianObjective, PredictiveHead, SampledEpisodes,
+    ContextPredictorTrainConfig, ContextServeOptions, EpisodeBatch, GaussianObjective,
+    PredictiveHead, SampledEpisodes,
 };
 use jammi_ai::pipeline::context_set::ContextSourceKind;
 use jammi_ai::pipeline::parallel_train::{train_loop, ParallelTrainConfig};
+use jammi_ai::predict::{Calibration, TestPoint};
 use jammi_ai::session::InferenceSession;
 use jammi_ai::SearchMethod;
 use jammi_datafusion::ModelTask;
@@ -870,7 +871,7 @@ async fn conformal_indicators(
             .predict_with_context_predictor(served, key)
             .await
             .unwrap();
-        let (lo, hi) = wrap.interval(&dist, None).unwrap();
+        let (lo, hi) = wrap.interval(&dist, TestPoint::Exchangeable).unwrap();
         covered.push(*y >= lo && *y <= hi);
     }
     covered
@@ -1032,7 +1033,7 @@ async fn conformal_wrap_hits_nominal_coverage_across_seeds() {
         let eval = targets_of(eval_tasks);
 
         let wrap = session
-            .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
+            .calibrate_context_predictor_conformal(&served, &cal, alpha, Calibration::Marginal)
             .await
             .unwrap();
         // Pool this seed's per-point indicators into the cross-seed sample rather
@@ -1121,7 +1122,7 @@ async fn conformal_restores_coverage_the_raw_band_loses() {
     let raw_cov = raw_hits as f64 / eval.len() as f64;
 
     let wrap = session
-        .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
+        .calibrate_context_predictor_conformal(&served, &cal, alpha, Calibration::Marginal)
         .await
         .unwrap();
     let conf_cov = conformal_coverage(&session, &served, &wrap, &eval).await;
@@ -1341,13 +1342,13 @@ async fn predict_provenanced_carries_source_and_context_keys() {
     assert_eq!(bare, prov.distribution);
 }
 
-/// The conformal levers are *applied*, never *chosen*: marginal (the default)
-/// always serves; a caller-supplied Mondrian cohort or weights route to the
-/// group-conditional / weighted conformal constructors; and a cohort/point length
+/// A calibration scheme is *applied*, never *chosen*: marginal always serves;
+/// caller-supplied Mondrian cohorts or weights calibrate group-conditional /
+/// weighted thresholds; and a cohort/point length
 /// mismatch is a typed error, never a silent misalignment. The engine never
 /// self-selects a cohort.
 #[tokio::test(flavor = "multi_thread")]
-async fn conformal_levers_apply_and_never_self_select() {
+async fn conformal_calibration_schemes_apply_and_never_self_select() {
     let alpha = 0.2_f64;
     let rows = linear_tasks(16, 24, 31);
     let (session, _dir) = session_with_meta_dataset(&rows).await;
@@ -1385,10 +1386,10 @@ async fn conformal_levers_apply_and_never_self_select() {
 
     // Marginal: serves with no cohort (the engine self-selects nothing).
     let marginal = session
-        .calibrate_context_predictor_conformal(&served, &cal, alpha, ConformalLevers::Marginal)
+        .calibrate_context_predictor_conformal(&served, &cal, alpha, Calibration::Marginal)
         .await
         .unwrap();
-    let (lo, hi) = marginal.interval(&dist, None).unwrap();
+    let (lo, hi) = marginal.interval(&dist, TestPoint::Exchangeable).unwrap();
     assert!(lo <= hi, "the marginal wrap always serves an interval");
 
     // Mondrian: one caller-supplied cohort per calibration point; serves for a
@@ -1401,11 +1402,11 @@ async fn conformal_levers_apply_and_never_self_select() {
             &served,
             &cal,
             alpha,
-            ConformalLevers::Mondrian { groups },
+            Calibration::Mondrian { groups },
         )
         .await
         .unwrap();
-    let (lo_m, hi_m) = mondrian.interval(&dist, Some("a")).unwrap();
+    let (lo_m, hi_m) = mondrian.interval(&dist, TestPoint::Group("a")).unwrap();
     assert!(
         lo_m <= hi_m,
         "the Mondrian wrap serves an interval for a governance-supplied cohort"
@@ -1418,11 +1419,11 @@ async fn conformal_levers_apply_and_never_self_select() {
             &served,
             &cal,
             alpha,
-            ConformalLevers::Weighted { weights },
+            Calibration::Weighted { weights },
         )
         .await
         .unwrap();
-    let (lo_w, hi_w) = weighted.interval(&dist, None).unwrap();
+    let (lo_w, hi_w) = weighted.interval(&dist, TestPoint::Weight(1.0)).unwrap();
     assert!(lo_w <= hi_w, "the weighted wrap serves an interval");
 
     // A cohort/point length mismatch is rejected, not silently misaligned.
@@ -1431,7 +1432,7 @@ async fn conformal_levers_apply_and_never_self_select() {
             &served,
             &cal,
             alpha,
-            ConformalLevers::Mondrian {
+            Calibration::Mondrian {
                 groups: vec!["only-one".to_string()],
             },
         )

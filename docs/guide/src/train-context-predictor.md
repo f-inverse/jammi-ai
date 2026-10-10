@@ -187,24 +187,26 @@ quantile head wraps with CQR over its lower/upper quantiles.
 # extern crate tokio;
 # use std::sync::Arc;
 # use jammi_ai::session::InferenceSession;
-# use jammi_ai::pipeline::context_predictor::{ConformalLevers, ServedContextPredictor};
+# use jammi_ai::pipeline::context_predictor::ServedContextPredictor;
+# use jammi_ai::predict::{Calibration, TestPoint};
 # async fn ex(
 #     session: &Arc<InferenceSession>,
 #     served: &ServedContextPredictor,
 #     held_out: &[(String, f64)], // (target_key, observed y), tasks disjoint from training
 # ) -> jammi_db::error::Result<()> {
 // Calibrate at 90% nominal coverage on the held-out set. `Marginal` is plain
-// split-conformal; governance may instead supply a Mondrian cohort or weights.
+// split-conformal; a caller may instead supply Mondrian cohorts or weights.
 let wrap = session
-    .calibrate_context_predictor_conformal(served, held_out, 0.1, ConformalLevers::Marginal)
+    .calibrate_context_predictor_conformal(served, held_out, 0.1, Calibration::Marginal)
     .await?;
 
-// Serving: turn a prediction into a coverage-guaranteed interval. The optional
-// group is the test point's Mondrian cohort (`None` for a marginal wrap).
+// Serving: turn a prediction into a coverage-guaranteed interval. The test point
+// brings what the calibration reads: nothing for a marginal wrap, its cohort
+// for a Mondrian one, its likelihood ratio for a weighted one.
 let dist = session
     .predict_with_context_predictor(served, "US-7654321")
     .await?;
-let (lower, upper) = wrap.interval(&dist, None)?;
+let (lower, upper) = wrap.interval(&dist, TestPoint::Exchangeable)?;
 # let _ = (lower, upper);
 # Ok(()) }
 ```

@@ -1,4 +1,5 @@
 mod audit;
+mod conformal;
 mod convert;
 mod database;
 mod ephemeral;
@@ -63,6 +64,9 @@ pub use jammi_ai::session::InferenceSession;
 #[pymodule]
 fn jammi_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open_local, m)?)?;
+    m.add_function(wrap_pyfunction!(conformal::conformalize, m)?)?;
+    m.add_function(wrap_pyfunction!(conformal::conformalize_interval, m)?)?;
+    m.add_function(wrap_pyfunction!(conformal::conformalize_cqr, m)?)?;
     m.add_class::<PyDatabase>()?;
     m.add_class::<crate::database::PyTenantScope>()?;
     m.add_class::<PyJob>()?;

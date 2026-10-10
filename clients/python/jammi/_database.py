@@ -3024,6 +3024,10 @@ class RemoteDatabase:
         alpha: float,
         score: Optional[str] = None,
         raps_params: Optional[Tuple[float, int]] = None,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[List[int]]:
         """Conformalize a classification predictor into prediction sets.
 
@@ -3036,8 +3040,11 @@ class RemoteDatabase:
 
         ``score`` selects the nonconformity family — ``"lac"``, ``"aps"``
         (default), or ``"raps"``; for ``"raps"``, ``raps_params`` is the
-        ``(lambda, k_reg)`` pair (default ``(0.0, 1)``). Same algorithm and
-        output as the embedded engine's ``conformalize``.
+        ``(lambda, k_reg)`` pair (default ``(0.0, 1)``). ``groups`` with
+        ``test_groups`` calibrates one quantile per cohort (Mondrian);
+        ``weights`` with ``test_weights`` are likelihood ratios for a known
+        covariate shift (weighted conformal). Same algorithm and output as the
+        embedded engine's ``conformalize``.
         """
         return _conformal.conformalize(
             calibration,
@@ -3046,6 +3053,10 @@ class RemoteDatabase:
             alpha=alpha,
             score=score,
             raps_params=raps_params,
+            groups=groups,
+            test_groups=test_groups,
+            weights=weights,
+            test_weights=test_weights,
         )
 
     def conformalize_interval(
@@ -3055,6 +3066,10 @@ class RemoteDatabase:
         test_predictions: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize an absolute-residual regression predictor into intervals.
 
@@ -3062,11 +3077,18 @@ class RemoteDatabase:
         ``test_predictions`` are caller-supplied arrays not held by the engine,
         so no gRPC hop is made. The calibration nonconformity ``|y - ŷ|`` yields
         the finite-sample quantile ``q̂``, giving ``[ŷ - q̂, ŷ + q̂]`` per test
-        point. Same algorithm and output as the embedded engine's
-        ``conformalize_interval``.
+        point; the calibration schemes are ``conformalize``'s. Same algorithm and
+        output as the embedded engine's ``conformalize_interval``.
         """
         return _conformal.conformalize_interval(
-            predictions, observed, test_predictions, alpha=alpha
+            predictions,
+            observed,
+            test_predictions,
+            alpha=alpha,
+            groups=groups,
+            test_groups=test_groups,
+            weights=weights,
+            test_weights=test_weights,
         )
 
     def conformalize_cqr(
@@ -3078,6 +3100,10 @@ class RemoteDatabase:
         test_upper: Sequence[float],
         *,
         alpha: float,
+        groups: Optional[Sequence[str]] = None,
+        test_groups: Optional[Sequence[str]] = None,
+        weights: Optional[Sequence[float]] = None,
+        test_weights: Optional[Sequence[float]] = None,
     ) -> List[Tuple[float, float]]:
         """Conformalize a Conformalized Quantile Regression predictor into intervals.
 
@@ -3085,11 +3111,21 @@ class RemoteDatabase:
         targets, and test bands are caller-supplied arrays the engine never
         holds, so no wire hop is made. The calibration nonconformity
         ``max(q_lo - y, y - q_hi)`` yields the finite-sample quantile ``q̂``,
-        giving the adaptive-width ``[q_lo - q̂, q_hi + q̂]`` per test row. Same
-        algorithm and output as the embedded engine's ``conformalize_cqr``.
+        giving the adaptive-width ``[q_lo - q̂, q_hi + q̂]`` per test row; the
+        calibration schemes are ``conformalize``'s. Same algorithm and output as
+        the embedded engine's ``conformalize_cqr``.
         """
         return _conformal.conformalize_cqr(
-            lower, upper, observed, test_lower, test_upper, alpha=alpha
+            lower,
+            upper,
+            observed,
+            test_lower,
+            test_upper,
+            alpha=alpha,
+            groups=groups,
+            test_groups=test_groups,
+            weights=weights,
+            test_weights=test_weights,
         )
 
     def rrf_fuse(

@@ -12,10 +12,12 @@
 //!
 //! # The pieces
 //!
-//! * A `NonconformityScore` is the one task-specific piece: it maps a
-//!   predictor output and a candidate label to a real number, larger when the
-//!   label conforms *less* to the prediction. Calibration scores its held-out
-//!   examples at their *true* label.
+//! * A nonconformity score is the one task-specific piece: it maps a predictor
+//!   output and a candidate label to a real number, larger when the label
+//!   conforms *less* to the prediction. Calibration scores its held-out
+//!   examples at their *true* label. A classifier picks its score family
+//!   ([`ClassScore`]); a regressor's follows from what it estimates
+//!   ([`Estimates`]).
 //! * [`finite_sample_quantile`] takes the calibration scores and `alpha` to the
 //!   conformal threshold `q̂` — the `⌈(n+1)(1-alpha)⌉`-th smallest score. The
 //!   `(n+1)` correction is what makes the guarantee *exact* rather than merely
@@ -24,26 +26,25 @@
 //!   admits every label whose nonconformity is `<= q̂` — a set for
 //!   classification, an interval for regression.
 //!
-//! # Shift-robust score inputs (serving levers, not policy)
+//! # Calibration under known structure
 //!
-//! Two variants of the quantile accept *known* structure so a governance layer
-//! can correct for it: [`finite_sample_quantile_weighted`] applies importance
-//! weights (weighted conformal, Tibshirani et al. 2019) under covariate shift,
-//! and the Mondrian construction ([`ConformalModel::classification_mondrian`] /
-//! [`ConformalModel::regression_mondrian`]) keeps a per-cohort quantile keyed on
-//! a group column (group-conditional coverage). The primitive *applies* the
-//! weights and the grouping; it does **not** decide when shift has occurred or
-//! which cohorts matter — that judgment is governance, not a serving output.
+//! A [`Calibration`] says how the calibration rows pool into the threshold a
+//! serving row is held to. `Marginal` pools them all. `Mondrian` keeps one
+//! quantile per cohort (group-conditional coverage), and a serving row names its
+//! cohort. `Weighted` applies importance weights under a known covariate shift
+//! (weighted conformal, Tibshirani et al. 2019), and a serving row brings its own
+//! weight, which sets its threshold. The primitive *applies* the grouping and the
+//! weights; it does **not** decide when shift has occurred or which cohorts
+//! matter.
 //!
 //! # The guarantee's one assumption
 //!
-//! Coverage holds **iff** calibration and serving data are exchangeable. Under
-//! distribution drift it degrades silently (Barber et al. 2023). This primitive
-//! names that loudly and supplies the weighted / Mondrian levers; *detecting*
-//! drift and *adapting* online is a governed concern built atop this primitive,
-//! not part of it. The calibration source is a distinct argument from train and
-//! test — reusing test points to calibrate inflates coverage, so the three-way
-//! split is the caller's contract.
+//! Coverage holds **iff** calibration and serving data are exchangeable (within
+//! a cohort, or after reweighting). Under drift it degrades silently (Barber et
+//! al. 2023); *detecting* drift and *adapting* online are policies a caller
+//! builds on this primitive, not part of it. The calibration source is a
+//! distinct argument from train and test — reusing test points to calibrate
+//! inflates coverage, so the three-way split is the caller's contract.
 
 use std::collections::BTreeMap;
 
@@ -84,17 +85,96 @@ pub enum ClassScore {
     },
 }
 
-/// Regression nonconformity score families.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntervalScore {
-    /// Absolute-residual conformal: nonconformity is `|y - ŷ|`, yielding a
+/// A regression predictor's estimates over the calibration rows; what it
+/// estimates decides its nonconformity score.
+#[derive(Debug, Clone, Copy)]
+pub enum Estimates<'a> {
+    /// Point estimates `ŷ`, scored by the absolute residual `|y - ŷ|`: a
     /// constant-width interval `[ŷ - q̂, ŷ + q̂]`. Distribution-free but
     /// non-adaptive — uninformative under heteroscedasticity.
-    AbsoluteResidual,
-    /// Conformalized Quantile Regression (Romano et al. 2019): nonconformity is
-    /// `max(q_lo - y, y - q_hi)` over a predictor's lower/upper quantile
-    /// estimates, yielding an *adaptive*-width interval `[q_lo - q̂, q_hi + q̂]`.
-    Cqr,
+    Points(&'a [f64]),
+    /// Lower/upper quantile estimates, scored by Conformalized Quantile
+    /// Regression (Romano et al. 2019), `max(q_lo - y, y - q_hi)`: an
+    /// *adaptive*-width interval `[q_lo - q̂, q_hi + q̂]`.
+    Bands {
+        /// The lower quantile estimate per row.
+        lower: &'a [f64],
+        /// The upper quantile estimate per row.
+        upper: &'a [f64],
+    },
+}
+
+/// One serving row's estimate, in the form its model was calibrated on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Estimate {
+    /// A point estimate `ŷ`, for a model calibrated on [`Estimates::Points`].
+    Point(f64),
+    /// A quantile band, for a model calibrated on [`Estimates::Bands`].
+    Band {
+        /// The lower quantile estimate.
+        lower: f64,
+        /// The upper quantile estimate.
+        upper: f64,
+    },
+}
+
+/// How the calibration rows pool into the threshold a serving row is held to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Calibration {
+    /// One threshold over every calibration row: marginal coverage under
+    /// exchangeability.
+    Marginal,
+    /// One threshold per cohort (Mondrian, group-conditional coverage):
+    /// `groups[i]` is calibration row `i`'s cohort. A serving row names its
+    /// cohort; one unseen at calibration is held to the pooled threshold. The
+    /// principled approximation to conditional coverage — full per-input
+    /// coverage is provably impossible distribution-free.
+    Mondrian {
+        /// The cohort of each calibration row, in calibration order.
+        groups: Vec<String>,
+    },
+    /// Importance-weighted (Tibshirani et al. 2019) for a known covariate shift:
+    /// `weights[i]` is the likelihood ratio `dP_test/dP_cal` at calibration row
+    /// `i`. A serving row brings its own ratio, which sets its threshold — see
+    /// [`finite_sample_quantile_weighted`].
+    Weighted {
+        /// The likelihood ratio of each calibration row, in calibration order.
+        weights: Vec<f64>,
+    },
+}
+
+/// What a serving row brings beyond its prediction, matching the
+/// [`Calibration`] its model was built with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TestPoint<'a> {
+    /// A row exchangeable with the calibration rows ([`Calibration::Marginal`]).
+    Exchangeable,
+    /// A row of this cohort ([`Calibration::Mondrian`]).
+    Group(&'a str),
+    /// A row with this likelihood ratio `dP_test/dP_cal`
+    /// ([`Calibration::Weighted`]).
+    Weight(f64),
+}
+
+impl Calibration {
+    /// Refuse a cohort or weight list that is not one per calibration row.
+    pub fn check_rows(&self, rows: usize) -> Result<()> {
+        match self {
+            Self::Marginal => Ok(()),
+            Self::Mondrian { groups } => one_per_row("groups", "cohort", groups.len(), rows),
+            Self::Weighted { weights } => one_per_row("weights", "weight", weights.len(), rows),
+        }
+    }
+}
+
+fn one_per_row(argument: &str, what: &str, given: usize, rows: usize) -> Result<()> {
+    if given == rows {
+        return Ok(());
+    }
+    Err(JammiError::InvalidArgument {
+        argument: argument.into(),
+        reason: format!("conformal needs one {what} per calibration row: {given} for {rows} rows"),
+    })
 }
 
 /// The conformal threshold: the `⌈(n+1)(1-alpha)⌉`-th smallest calibration
@@ -108,21 +188,11 @@ pub enum IntervalScore {
 /// requested level is unattainable from this few points and the threshold is
 /// `+∞` (every label admitted) — conservative, never silently wrong.
 ///
-/// Returns `Inference` when `scores` is empty or `alpha` is not in `(0, 1)`.
+/// Returns `InvalidArgument` when `scores` is empty or holds a NaN, or `alpha`
+/// is not in `(0, 1)`.
 pub fn finite_sample_quantile(scores: &[f64], alpha: f64) -> Result<Threshold> {
     validate_alpha(alpha)?;
-    if scores.is_empty() {
-        return Err(JammiError::InvalidArgument {
-            argument: "calibration".into(),
-            reason: "conformal calibration requires at least one score".into(),
-        });
-    }
-    if scores.iter().any(|s| s.is_nan()) {
-        return Err(JammiError::InvalidArgument {
-            argument: "calibration".into(),
-            reason: "conformal calibration scores must be finite".into(),
-        });
-    }
+    validate_scores(scores)?;
     let n = scores.len();
     // rank = ⌈(n+1)(1-alpha)⌉, a 1-based order statistic index.
     let rank = ((n + 1) as f64 * (1.0 - alpha)).ceil() as usize;
@@ -139,20 +209,18 @@ pub fn finite_sample_quantile(scores: &[f64], alpha: f64) -> Result<Threshold> {
 /// Importance-weighted conformal threshold (weighted conformal prediction,
 /// Tibshirani et al. 2019).
 ///
-/// Under a *known* covariate shift, each calibration point carries an
-/// importance weight `w_i = dP_test/dP_cal(x_i) >= 0`. The threshold is the
-/// smallest score `s_(k)` whose normalized cumulative weight reaches
-/// `1 - alpha`, where the normalization includes a point mass at `+∞` for the
-/// test point itself (its weight folds into the denominator), recovering the
-/// `(n+1)`-style correction. With equal weights this reduces exactly to
-/// [`finite_sample_quantile`].
+/// Under a *known* covariate shift, calibration row `i` carries the likelihood
+/// ratio `w_i = dP_test/dP_cal(x_i) >= 0` and the test point its own `w_test`.
+/// The threshold is the `1 - alpha` quantile of the mixture placing mass
+/// `w_i / (Σw + w_test)` on each calibration score and `w_test / (Σw + w_test)`
+/// at `+∞`: the smallest score whose cumulative weight reaches
+/// `(1 - alpha)(Σw + w_test)`, or `+∞` when the calibration mass cannot. The
+/// test weight is what makes the threshold row-specific; with every weight one
+/// this is exactly [`finite_sample_quantile`].
 ///
-/// The primitive *applies* the supplied weights; deciding that a shift occurred
-/// and estimating the weights is governance, not a serving output.
-///
-/// Returns `Inference` when the lengths disagree, `scores` is empty, any weight
-/// is negative or non-finite, all weights are zero, or `alpha` is not in
-/// `(0, 1)`.
+/// Returns `InvalidArgument` when the lengths disagree, `scores` is empty or
+/// holds a NaN, any weight is negative or non-finite, the total weight is zero,
+/// or `alpha` is not in `(0, 1)`.
 pub fn finite_sample_quantile_weighted(
     scores: &[f64],
     weights: &[f64],
@@ -160,295 +228,260 @@ pub fn finite_sample_quantile_weighted(
     alpha: f64,
 ) -> Result<Threshold> {
     validate_alpha(alpha)?;
-    if scores.len() != weights.len() {
-        return Err(JammiError::Inference(format!(
-            "weighted conformal: {} scores but {} weights",
-            scores.len(),
-            weights.len()
-        )));
-    }
-    if scores.is_empty() {
-        return Err(JammiError::InvalidArgument {
-            argument: "calibration".into(),
-            reason: "weighted conformal requires at least one score".into(),
-        });
-    }
-    if scores.iter().any(|s| s.is_nan()) {
-        return Err(JammiError::InvalidArgument {
-            argument: "calibration".into(),
-            reason: "weighted conformal scores must be finite".into(),
-        });
-    }
-    if weights.iter().any(|&w| w < 0.0 || !w.is_finite()) {
-        return Err(JammiError::InvalidArgument {
-            argument: "weights".into(),
-            reason: "weighted conformal weights must be finite and non-negative".into(),
-        });
-    }
-    if test_weight < 0.0 || !test_weight.is_finite() {
-        return Err(JammiError::InvalidArgument {
-            argument: "weights".into(),
-            reason: "weighted conformal test weight must be finite and non-negative".into(),
-        });
-    }
-    let total: f64 = weights.iter().sum::<f64>() + test_weight;
-    if total <= 0.0 {
-        return Err(JammiError::InvalidArgument {
-            argument: "weights".into(),
-            reason: "weighted conformal requires positive total weight".into(),
-        });
-    }
-
-    // Sort (score, weight) by ascending score, then walk the normalized
-    // cumulative weight. The test point's weight sits at +∞ in the mixture, so
-    // the calibration mass alone need only reach 1 - alpha for a finite
-    // threshold; otherwise the +∞ point mass carries the remainder.
-    let mut paired: Vec<(f64, f64)> = scores
-        .iter()
-        .copied()
-        .zip(weights.iter().copied())
-        .collect();
-    paired.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-    let target = 1.0 - alpha;
-    let mut cumulative = 0.0;
-    for (score, weight) in paired {
-        cumulative += weight / total;
-        if cumulative >= target {
-            return Ok(score);
-        }
-    }
-    // The calibration mass never reached 1 - alpha; the +∞ point mass does.
-    Ok(f64::INFINITY)
+    one_per_row("weights", "weight", weights.len(), scores.len())?;
+    WeightedScores::new(scores, weights)?.threshold(test_weight, alpha)
 }
 
 /// A calibrated conformal predictor: thresholds plus the score family that
 /// produced them.
 ///
-/// Built by [`ConformalModel::classification`] / [`ConformalModel::regression`]
-/// (one marginal threshold) or their `_mondrian` / `_weighted` siblings, then
-/// queried with [`ConformalModel::predict_set`] (classification) or
-/// [`ConformalModel::predict_interval`] (regression). The model is a value: the
-/// same calibration set produces byte-identical thresholds and therefore
-/// byte-identical sets across runs.
+/// Built by [`ConformalModel::classification`] or
+/// [`ConformalModel::regression`], then queried with
+/// [`ConformalModel::predict_set`] or [`ConformalModel::predict_interval`]. The
+/// model is a value: the same calibration set produces byte-identical
+/// thresholds and therefore byte-identical sets across runs.
 #[derive(Debug, Clone)]
 pub struct ConformalModel {
     /// The nominal miscoverage level the thresholds target.
     alpha: f64,
-    /// The calibrated thresholds and the score family they belong to.
-    kind: ModelKind,
+    /// The score family the thresholds belong to.
+    family: Family,
+    /// The calibrated thresholds, pooled as the [`Calibration`] said.
+    thresholds: Thresholds,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Family {
+    Classes(ClassScore),
+    Points,
+    Bands,
 }
 
 #[derive(Debug, Clone)]
-enum ModelKind {
-    Classification {
-        score: ClassScore,
-        /// Marginal threshold, or per-group thresholds under Mondrian. The
-        /// empty-key `""` entry, when present, is the marginal fallback for a
-        /// group unseen at calibration time.
-        thresholds: BTreeMap<String, Threshold>,
+enum Thresholds {
+    Marginal(Threshold),
+    Mondrian {
+        by_group: BTreeMap<String, Threshold>,
+        /// The threshold over every row, for a cohort unseen at calibration.
+        pooled: Threshold,
     },
-    Regression {
-        score: IntervalScore,
-        thresholds: BTreeMap<String, Threshold>,
-    },
+    Weighted(WeightedScores),
 }
 
-/// The marginal group key — a single bucket holding the one global threshold.
-const MARGINAL_KEY: &str = "";
+impl Thresholds {
+    fn calibrate(scores: &[f64], calibration: &Calibration, alpha: f64) -> Result<Self> {
+        validate_alpha(alpha)?;
+        calibration.check_rows(scores.len())?;
+        match calibration {
+            Calibration::Marginal => Ok(Self::Marginal(finite_sample_quantile(scores, alpha)?)),
+            Calibration::Mondrian { groups } => mondrian(scores, groups, alpha),
+            Calibration::Weighted { weights } => {
+                Ok(Self::Weighted(WeightedScores::new(scores, weights)?))
+            }
+        }
+    }
+
+    /// The threshold one serving row is held to.
+    fn at(&self, point: TestPoint<'_>, alpha: f64) -> Result<Threshold> {
+        match (self, point) {
+            (Self::Marginal(q), TestPoint::Exchangeable) => Ok(*q),
+            (Self::Mondrian { by_group, pooled }, TestPoint::Group(group)) => {
+                Ok(by_group.get(group).copied().unwrap_or(*pooled))
+            }
+            (Self::Weighted(calibration), TestPoint::Weight(weight)) => {
+                calibration.threshold(weight, alpha)
+            }
+            (thresholds, point) => Err(JammiError::InvalidArgument {
+                argument: "test_point".into(),
+                reason: format!(
+                    "a {} calibration serves a row by {}, not {point:?}",
+                    thresholds.name(),
+                    thresholds.serves_by()
+                ),
+            }),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Marginal(_) => "marginal",
+            Self::Mondrian { .. } => "Mondrian",
+            Self::Weighted(_) => "weighted",
+        }
+    }
+
+    fn serves_by(&self) -> &'static str {
+        match self {
+            Self::Marginal(_) => "no cohort or weight",
+            Self::Mondrian { .. } => "its cohort",
+            Self::Weighted(_) => "its likelihood ratio",
+        }
+    }
+}
+
+/// Calibration scores in ascending order, each with the running total of the
+/// weights up to and including it — what a weighted threshold walks.
+#[derive(Debug, Clone)]
+struct WeightedScores {
+    sorted: Vec<f64>,
+    cumulative: Vec<f64>,
+}
+
+impl WeightedScores {
+    /// `weights` holds one weight per score; the caller has checked the lengths.
+    fn new(scores: &[f64], weights: &[f64]) -> Result<Self> {
+        validate_scores(scores)?;
+        validate_weights(weights)?;
+        let mut paired: Vec<(f64, f64)> = scores
+            .iter()
+            .copied()
+            .zip(weights.iter().copied())
+            .collect();
+        paired.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (sorted, cumulative) = paired
+            .into_iter()
+            .scan(0.0, |running, (score, weight)| {
+                *running += weight;
+                Some((score, *running))
+            })
+            .unzip();
+        Ok(Self { sorted, cumulative })
+    }
+
+    fn threshold(&self, test_weight: f64, alpha: f64) -> Result<Threshold> {
+        validate_weights(&[test_weight])?;
+        // `new` refuses an empty calibration, so a last running total exists.
+        let total = self.cumulative.last().copied().unwrap_or(0.0) + test_weight;
+        if total <= 0.0 {
+            return Err(JammiError::InvalidArgument {
+                argument: "weights".into(),
+                reason: "weighted conformal requires a positive total weight".into(),
+            });
+        }
+        let target = (1.0 - alpha) * total;
+        let reached = self.cumulative.partition_point(|&mass| mass < target);
+        // The calibration mass never reached `target`; the test point's mass at
+        // +∞ carries the rest.
+        Ok(self.sorted.get(reached).copied().unwrap_or(f64::INFINITY))
+    }
+}
+
+/// One threshold per cohort over that cohort's scores alone, plus the pooled
+/// threshold over every score for a cohort unseen at calibration. `groups`
+/// holds one cohort per score; the caller has checked the lengths.
+fn mondrian(scores: &[f64], groups: &[String], alpha: f64) -> Result<Thresholds> {
+    let mut by_group: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for (score, group) in scores.iter().zip(groups) {
+        by_group.entry(group.as_str()).or_default().push(*score);
+    }
+    let by_group = by_group
+        .into_iter()
+        .map(|(group, group_scores)| {
+            Ok((
+                group.to_string(),
+                finite_sample_quantile(&group_scores, alpha)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok(Thresholds::Mondrian {
+        by_group,
+        pooled: finite_sample_quantile(scores, alpha)?,
+    })
+}
 
 impl ConformalModel {
-    /// Calibrate a marginal classification predictor.
+    /// Calibrate a classification predictor.
     ///
-    /// `calibration` holds one row of per-class probabilities per held-out
+    /// `probabilities` holds one row of per-class probabilities per held-out
     /// example, `true_labels[i]` is the index of the realised class for row
     /// `i`, and `score` selects the nonconformity family. Every probability row
     /// must have the same length (the class count) and every true label must
     /// index into it.
     pub fn classification(
-        calibration: &[Vec<f64>],
+        probabilities: &[Vec<f64>],
         true_labels: &[usize],
         score: ClassScore,
+        calibration: &Calibration,
         alpha: f64,
     ) -> Result<Self> {
-        let scores = classification_scores(calibration, true_labels, score)?;
-        let q = finite_sample_quantile(&scores, alpha)?;
+        let scores = classification_scores(probabilities, true_labels, score)?;
         Ok(Self {
             alpha,
-            kind: ModelKind::Classification {
-                score,
-                thresholds: BTreeMap::from([(MARGINAL_KEY.to_string(), q)]),
-            },
+            family: Family::Classes(score),
+            thresholds: Thresholds::calibrate(&scores, calibration, alpha)?,
         })
     }
 
-    /// Calibrate a Mondrian (group-conditional) classification predictor.
-    ///
-    /// `groups[i]` is the cohort key for calibration row `i`; a per-cohort
-    /// quantile is taken over that cohort's scores alone, so each group carries
-    /// its own threshold. At serving time [`ConformalModel::predict_set`] picks
-    /// the threshold for the row's group; a group unseen at calibration time
-    /// falls back to the pooled marginal threshold.
-    ///
-    /// This is the principled approximation to conditional coverage (full
-    /// per-input coverage is provably impossible distribution-free). The
-    /// primitive *applies* the grouping; *choosing* which cohorts to condition
-    /// on is governance.
-    pub fn classification_mondrian(
-        calibration: &[Vec<f64>],
-        true_labels: &[usize],
-        groups: &[String],
-        score: ClassScore,
-        alpha: f64,
-    ) -> Result<Self> {
-        let all = classification_scores(calibration, true_labels, score)?;
-        let thresholds = mondrian_thresholds(&all, groups, alpha)?;
-        Ok(Self {
-            alpha,
-            kind: ModelKind::Classification { score, thresholds },
-        })
-    }
-
-    /// Calibrate an importance-weighted classification predictor for a known
-    /// covariate shift.
-    ///
-    /// `weights[i]` is the importance weight `dP_test/dP_cal` of calibration row
-    /// `i`. The threshold is the weighted conformal quantile
-    /// ([`finite_sample_quantile_weighted`]) with a unit test-point weight; pass
-    /// a representative test weight when one is known.
-    pub fn classification_weighted(
-        calibration: &[Vec<f64>],
-        true_labels: &[usize],
-        weights: &[f64],
-        score: ClassScore,
-        alpha: f64,
-    ) -> Result<Self> {
-        let scores = classification_scores(calibration, true_labels, score)?;
-        let q = finite_sample_quantile_weighted(&scores, weights, 1.0, alpha)?;
-        Ok(Self {
-            alpha,
-            kind: ModelKind::Classification {
-                score,
-                thresholds: BTreeMap::from([(MARGINAL_KEY.to_string(), q)]),
-            },
-        })
-    }
-
-    /// The prediction set for one classification row.
-    ///
-    /// `probabilities` is the per-class predictive distribution; `group` selects
-    /// the Mondrian cohort (`None` uses the marginal threshold). The returned
-    /// class indices are exactly those whose nonconformity is `<= q̂`, in
-    /// ascending order. An empty set never occurs at a finite, attainable level;
-    /// a full set is the honest signal that the input is hard or the model is
-    /// miscalibrated.
-    pub fn predict_set(&self, probabilities: &[f64], group: Option<&str>) -> Result<Vec<usize>> {
-        let ModelKind::Classification { score, thresholds } = &self.kind else {
+    /// The prediction set for one classification row: the class indices whose
+    /// nonconformity at `probabilities` is `<= q̂`, in ascending order. An empty
+    /// set never occurs at a finite, attainable level; a full set is the honest
+    /// signal that the input is hard or the model is miscalibrated.
+    pub fn predict_set(&self, probabilities: &[f64], at: TestPoint<'_>) -> Result<Vec<usize>> {
+        let Family::Classes(score) = self.family else {
             return Err(JammiError::InvalidArgument {
                 argument: "model".into(),
                 reason: "predict_set called on a regression conformal model".into(),
             });
         };
-        let q = lookup_threshold(thresholds, group)?;
-        admit_classes(probabilities, *score, q)
+        admit_classes(probabilities, score, self.thresholds.at(at, self.alpha)?)
     }
 
-    /// Calibrate a marginal regression predictor.
-    ///
-    /// For [`IntervalScore::AbsoluteResidual`], `predictions` are point
-    /// estimates `ŷ` and `lower`/`upper` are ignored (pass empty). For
-    /// [`IntervalScore::Cqr`], `lower`/`upper` are the predictor's lower/upper
-    /// quantile estimates and `predictions` is ignored. `observed[i]` is the
-    /// realised target `y`.
+    /// Calibrate a regression predictor on its `estimates` of the realised
+    /// targets `observed`.
     pub fn regression(
-        predictions: &[f64],
-        lower: &[f64],
-        upper: &[f64],
+        estimates: Estimates<'_>,
         observed: &[f64],
-        score: IntervalScore,
+        calibration: &Calibration,
         alpha: f64,
     ) -> Result<Self> {
-        let scores = regression_scores(predictions, lower, upper, observed, score)?;
-        let q = finite_sample_quantile(&scores, alpha)?;
+        let (family, scores) = regression_scores(estimates, observed)?;
         Ok(Self {
             alpha,
-            kind: ModelKind::Regression {
-                score,
-                thresholds: BTreeMap::from([(MARGINAL_KEY.to_string(), q)]),
-            },
-        })
-    }
-
-    /// Calibrate a Mondrian (group-conditional) regression predictor. See
-    /// [`ConformalModel::classification_mondrian`] for the cohort semantics.
-    pub fn regression_mondrian(
-        predictions: &[f64],
-        lower: &[f64],
-        upper: &[f64],
-        observed: &[f64],
-        groups: &[String],
-        score: IntervalScore,
-        alpha: f64,
-    ) -> Result<Self> {
-        let all = regression_scores(predictions, lower, upper, observed, score)?;
-        let thresholds = mondrian_thresholds(&all, groups, alpha)?;
-        Ok(Self {
-            alpha,
-            kind: ModelKind::Regression { score, thresholds },
-        })
-    }
-
-    /// Calibrate an importance-weighted regression predictor for a known
-    /// covariate shift. See [`ConformalModel::classification_weighted`].
-    pub fn regression_weighted(
-        predictions: &[f64],
-        lower: &[f64],
-        upper: &[f64],
-        observed: &[f64],
-        weights: &[f64],
-        score: IntervalScore,
-        alpha: f64,
-    ) -> Result<Self> {
-        let scores = regression_scores(predictions, lower, upper, observed, score)?;
-        let q = finite_sample_quantile_weighted(&scores, weights, 1.0, alpha)?;
-        Ok(Self {
-            alpha,
-            kind: ModelKind::Regression {
-                score,
-                thresholds: BTreeMap::from([(MARGINAL_KEY.to_string(), q)]),
-            },
+            family,
+            thresholds: Thresholds::calibrate(&scores, calibration, alpha)?,
         })
     }
 
     /// The prediction interval `[lower, upper]` for one regression row.
-    ///
-    /// For [`IntervalScore::AbsoluteResidual`] pass the point estimate as
-    /// `prediction` (the quantile bounds are ignored); for
-    /// [`IntervalScore::Cqr`] pass the lower/upper quantile estimates (the point
-    /// estimate is ignored). `group` selects the Mondrian cohort.
-    pub fn predict_interval(
-        &self,
-        prediction: f64,
-        lower_quantile: f64,
-        upper_quantile: f64,
-        group: Option<&str>,
-    ) -> Result<(f64, f64)> {
-        let ModelKind::Regression { score, thresholds } = &self.kind else {
-            return Err(JammiError::InvalidArgument {
+    pub fn predict_interval(&self, estimate: Estimate, at: TestPoint<'_>) -> Result<(f64, f64)> {
+        let q = || self.thresholds.at(at, self.alpha);
+        match (self.family, estimate) {
+            (Family::Points, Estimate::Point(y)) => {
+                let q = q()?;
+                Ok((y - q, y + q))
+            }
+            (Family::Bands, Estimate::Band { lower, upper }) => {
+                let q = q()?;
+                Ok((lower - q, upper + q))
+            }
+            (Family::Classes(_), _) => Err(JammiError::InvalidArgument {
                 argument: "model".into(),
                 reason: "predict_interval called on a classification conformal model".into(),
-            });
-        };
-        let q = lookup_threshold(thresholds, group)?;
-        Ok(match score {
-            IntervalScore::AbsoluteResidual => (prediction - q, prediction + q),
-            IntervalScore::Cqr => (lower_quantile - q, upper_quantile + q),
-        })
+            }),
+            (family, estimate) => Err(JammiError::InvalidArgument {
+                argument: "estimate".into(),
+                reason: format!(
+                    "a model calibrated on {} serves {}, not {estimate:?}",
+                    family.estimates(),
+                    family.estimates()
+                ),
+            }),
+        }
     }
 
     /// The nominal miscoverage level these thresholds target.
     pub fn alpha(&self) -> f64 {
         self.alpha
+    }
+}
+
+impl Family {
+    fn estimates(self) -> &'static str {
+        match self {
+            Self::Classes(_) => "class probabilities",
+            Self::Points => "point estimates",
+            Self::Bands => "quantile bands",
+        }
     }
 }
 
@@ -463,81 +496,60 @@ fn validate_alpha(alpha: f64) -> Result<()> {
     Ok(())
 }
 
-/// Look up the threshold for a (possibly grouped) prediction.
-///
-/// A marginal model carries one threshold under the empty key. A Mondrian model
-/// carries a threshold per group and a pooled marginal fallback under the empty
-/// key for groups unseen at calibration time.
-fn lookup_threshold(thresholds: &BTreeMap<String, Threshold>, group: Option<&str>) -> Result<f64> {
-    match group {
-        Some(g) => Ok(thresholds
-            .get(g)
-            .copied()
-            .or_else(|| thresholds.get(MARGINAL_KEY).copied())
-            .unwrap_or(f64::INFINITY)),
-        None => thresholds.get(MARGINAL_KEY).copied().ok_or_else(|| {
-            JammiError::Inference(
-                "marginal threshold requested from a Mondrian model with no pooled fallback".into(),
-            )
-        }),
+/// Validate a calibration score slice: non-empty and free of NaN (a NaN would
+/// silently corrupt the rank).
+fn validate_scores(scores: &[f64]) -> Result<()> {
+    if scores.is_empty() {
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "conformal calibration requires at least one score".into(),
+        });
     }
+    if scores.iter().any(|s| s.is_nan()) {
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "conformal calibration scores must be finite".into(),
+        });
+    }
+    Ok(())
 }
 
-/// Partition scores by group key and take the finite-sample quantile within
-/// each, plus a pooled marginal fallback under [`MARGINAL_KEY`].
-fn mondrian_thresholds(
-    scores: &[f64],
-    groups: &[String],
-    alpha: f64,
-) -> Result<BTreeMap<String, Threshold>> {
-    if scores.len() != groups.len() {
-        return Err(JammiError::Inference(format!(
-            "Mondrian conformal: {} scores but {} group keys",
-            scores.len(),
-            groups.len()
-        )));
+/// Validate likelihood ratios: each finite and non-negative.
+fn validate_weights(weights: &[f64]) -> Result<()> {
+    if weights.iter().any(|&w| w < 0.0 || !w.is_finite()) {
+        return Err(JammiError::InvalidArgument {
+            argument: "weights".into(),
+            reason: "weighted conformal weights must be finite and non-negative".into(),
+        });
     }
-    let mut by_group: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
-    for (score, group) in scores.iter().zip(groups.iter()) {
-        by_group.entry(group.as_str()).or_default().push(*score);
-    }
-    let mut thresholds = BTreeMap::new();
-    for (group, group_scores) in by_group {
-        thresholds.insert(
-            group.to_string(),
-            finite_sample_quantile(&group_scores, alpha)?,
-        );
-    }
-    // Pooled fallback for groups unseen at calibration time.
-    thresholds.insert(
-        MARGINAL_KEY.to_string(),
-        finite_sample_quantile(scores, alpha)?,
-    );
-    Ok(thresholds)
+    Ok(())
 }
 
 /// Nonconformity scores of the calibration rows at their *true* class.
 fn classification_scores(
-    calibration: &[Vec<f64>],
+    probabilities: &[Vec<f64>],
     true_labels: &[usize],
     score: ClassScore,
 ) -> Result<Vec<f64>> {
-    if calibration.len() != true_labels.len() {
-        return Err(JammiError::Inference(format!(
-            "classification conformal: {} probability rows but {} labels",
-            calibration.len(),
-            true_labels.len()
-        )));
+    if probabilities.len() != true_labels.len() {
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: format!(
+                "classification conformal: {} probability rows but {} labels",
+                probabilities.len(),
+                true_labels.len()
+            ),
+        });
     }
-    if calibration.is_empty() {
+    if probabilities.is_empty() {
         return Err(JammiError::InvalidArgument {
             argument: "calibration".into(),
             reason: "classification conformal requires at least one calibration row".into(),
         });
     }
-    calibration
+    probabilities
         .iter()
-        .zip(true_labels.iter())
+        .zip(true_labels)
         .map(|(probs, &label)| true_label_score(probs, label, score))
         .collect()
 }
@@ -613,61 +625,57 @@ fn admit_classes(probs: &[f64], score: ClassScore, q: f64) -> Result<Vec<usize>>
     }
 }
 
-/// Nonconformity scores for the regression calibration rows.
-fn regression_scores(
-    predictions: &[f64],
-    lower: &[f64],
-    upper: &[f64],
-    observed: &[f64],
-    score: IntervalScore,
-) -> Result<Vec<f64>> {
-    match score {
-        IntervalScore::AbsoluteResidual => {
+/// Nonconformity scores for the regression calibration rows, and the family
+/// their estimates belong to.
+fn regression_scores(estimates: Estimates<'_>, observed: &[f64]) -> Result<(Family, Vec<f64>)> {
+    if observed.is_empty() {
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "regression conformal requires at least one calibration row".into(),
+        });
+    }
+    ensure_finite(observed, "observations")?;
+    match estimates {
+        Estimates::Points(predictions) => {
             if predictions.len() != observed.len() {
-                return Err(JammiError::Inference(format!(
-                    "absolute-residual conformal: {} predictions but {} observations",
-                    predictions.len(),
-                    observed.len()
-                )));
-            }
-            if predictions.is_empty() {
                 return Err(JammiError::InvalidArgument {
                     argument: "calibration".into(),
-                    reason: "regression conformal requires at least one calibration row".into(),
+                    reason: format!(
+                        "absolute-residual conformal: {} predictions but {} observations",
+                        predictions.len(),
+                        observed.len()
+                    ),
                 });
             }
             ensure_finite(predictions, "predictions")?;
-            ensure_finite(observed, "observations")?;
-            Ok(predictions
+            let scores = predictions
                 .iter()
-                .zip(observed.iter())
+                .zip(observed)
                 .map(|(&yhat, &y)| (y - yhat).abs())
-                .collect())
+                .collect();
+            Ok((Family::Points, scores))
         }
-        IntervalScore::Cqr => {
+        Estimates::Bands { lower, upper } => {
             if lower.len() != observed.len() || upper.len() != observed.len() {
-                return Err(JammiError::Inference(format!(
-                    "CQR conformal: {} lower / {} upper quantiles but {} observations",
-                    lower.len(),
-                    upper.len(),
-                    observed.len()
-                )));
-            }
-            if observed.is_empty() {
                 return Err(JammiError::InvalidArgument {
                     argument: "calibration".into(),
-                    reason: "regression conformal requires at least one calibration row".into(),
+                    reason: format!(
+                        "CQR conformal: {} lower / {} upper quantiles but {} observations",
+                        lower.len(),
+                        upper.len(),
+                        observed.len()
+                    ),
                 });
             }
             ensure_finite(lower, "lower quantiles")?;
             ensure_finite(upper, "upper quantiles")?;
-            ensure_finite(observed, "observations")?;
-            Ok(lower
+            let scores = lower
                 .iter()
-                .zip(upper.iter())
-                .zip(observed.iter())
+                .zip(upper)
+                .zip(observed)
                 .map(|((&lo, &hi), &y)| (lo - y).max(y - hi))
-                .collect())
+                .collect();
+            Ok((Family::Bands, scores))
         }
     }
 }
@@ -786,7 +794,12 @@ mod tests {
         let hits: Vec<bool> = probs
             .iter()
             .zip(labels.iter())
-            .map(|(row, &y)| model.predict_set(row, None).unwrap().contains(&y))
+            .map(|(row, &y)| {
+                model
+                    .predict_set(row, TestPoint::Exchangeable)
+                    .unwrap()
+                    .contains(&y)
+            })
             .collect();
         jammi_numerics::calibration::coverage(&hits).unwrap()
     }
@@ -801,9 +814,14 @@ mod tests {
             let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 2000, n_classes);
             let (test_probs, test_labels) = synthetic_classification(&mut rng, 4000, n_classes);
 
-            let model =
-                ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Lac, alpha)
-                    .unwrap();
+            let model = ConformalModel::classification(
+                &cal_probs,
+                &cal_labels,
+                ClassScore::Lac,
+                &Calibration::Marginal,
+                alpha,
+            )
+            .unwrap();
             let cov = classification_coverage(&model, &test_probs, &test_labels);
             // The guarantee is coverage >= 1 - alpha; allow finite-sample slack
             // on both sides around the nominal level.
@@ -870,13 +888,19 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(99);
         let n_classes = 6;
         let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 3000, n_classes);
-        let model =
-            ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, 0.1).unwrap();
+        let model = ConformalModel::classification(
+            &cal_probs,
+            &cal_labels,
+            ClassScore::Aps,
+            &Calibration::Marginal,
+            0.1,
+        )
+        .unwrap();
 
         let easy = vec![0.9, 0.04, 0.02, 0.02, 0.01, 0.01];
         let hard = vec![0.25, 0.22, 0.20, 0.15, 0.10, 0.08];
-        let easy_set = model.predict_set(&easy, None).unwrap();
-        let hard_set = model.predict_set(&hard, None).unwrap();
+        let easy_set = model.predict_set(&easy, TestPoint::Exchangeable).unwrap();
+        let hard_set = model.predict_set(&hard, TestPoint::Exchangeable).unwrap();
         assert!(
             hard_set.len() > easy_set.len(),
             "APS set should grow on the harder input: easy={} hard={}",
@@ -910,9 +934,14 @@ mod tests {
             let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 3000, n_classes);
             let (test_probs, _) = synthetic_classification(&mut rng, 1000, n_classes);
 
-            let aps =
-                ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, alpha)
-                    .unwrap();
+            let aps = ConformalModel::classification(
+                &cal_probs,
+                &cal_labels,
+                ClassScore::Aps,
+                &Calibration::Marginal,
+                alpha,
+            )
+            .unwrap();
             let raps = ConformalModel::classification(
                 &cal_probs,
                 &cal_labels,
@@ -920,6 +949,7 @@ mod tests {
                     lambda: 1.0,
                     k_reg: 2,
                 },
+                &Calibration::Marginal,
                 alpha,
             )
             .unwrap();
@@ -927,7 +957,7 @@ mod tests {
             let sizes = |model: &ConformalModel| -> f64 {
                 test_probs
                     .iter()
-                    .map(|p| model.predict_set(p, None).unwrap().len() as f64)
+                    .map(|p| model.predict_set(p, TestPoint::Exchangeable).unwrap().len() as f64)
                     .sum::<f64>()
                     / test_probs.len() as f64
             };
@@ -965,15 +995,30 @@ mod tests {
             upper.push(band);
             observed.push(y);
         }
-        let model =
-            ConformalModel::regression(&[], &lower, &upper, &observed, IntervalScore::Cqr, 0.1)
-                .unwrap();
+        let model = ConformalModel::regression(
+            Estimates::Bands {
+                lower: &lower,
+                upper: &upper,
+            },
+            &observed,
+            &Calibration::Marginal,
+            0.1,
+        )
+        .unwrap();
 
         // Evaluate width in two regimes.
         for x in [1.0_f64, 9.0_f64] {
             let sd = 0.2 + 0.5 * x;
             let band = 1.2816 * sd;
-            let (lo, hi) = model.predict_interval(0.0, -band, band, None).unwrap();
+            let (lo, hi) = model
+                .predict_interval(
+                    Estimate::Band {
+                        lower: -band,
+                        upper: band,
+                    },
+                    TestPoint::Exchangeable,
+                )
+                .unwrap();
             if x < 5.0 {
                 widths_low.push(hi - lo);
             } else {
@@ -994,11 +1039,9 @@ mod tests {
         let cal_pred = vec![0.0; n];
         let cal_obs: Vec<f64> = (0..n).map(|_| dist.sample(&mut rng)).collect();
         let model = ConformalModel::regression(
-            &cal_pred,
-            &[],
-            &[],
+            Estimates::Points(&cal_pred),
             &cal_obs,
-            IntervalScore::AbsoluteResidual,
+            &Calibration::Marginal,
             0.1,
         )
         .unwrap();
@@ -1006,7 +1049,11 @@ mod tests {
         let test_obs: Vec<f64> = (0..4000).map(|_| dist.sample(&mut rng)).collect();
         let (lower, upper): (Vec<f64>, Vec<f64>) = test_obs
             .iter()
-            .map(|_| model.predict_interval(0.0, 0.0, 0.0, None).unwrap())
+            .map(|_| {
+                model
+                    .predict_interval(Estimate::Point(0.0), TestPoint::Exchangeable)
+                    .unwrap()
+            })
             .unzip();
         let cov =
             jammi_numerics::calibration::interval_coverage(&lower, &upper, &test_obs).unwrap();
@@ -1053,14 +1100,19 @@ mod tests {
             }
         }
 
-        let model =
-            ConformalModel::classification_mondrian(&probs, &labels, &groups, ClassScore::Lac, 0.1)
-                .unwrap();
+        let model = ConformalModel::classification(
+            &probs,
+            &labels,
+            ClassScore::Lac,
+            &Calibration::Mondrian { groups },
+            0.1,
+        )
+        .unwrap();
 
         // The hard cohort's threshold must exceed the easy cohort's.
         let test = vec![0.4, 0.2, 0.2, 0.1, 0.1];
-        let set_a = model.predict_set(&test, Some("a")).unwrap();
-        let set_b = model.predict_set(&test, Some("b")).unwrap();
+        let set_a = model.predict_set(&test, TestPoint::Group("a")).unwrap();
+        let set_b = model.predict_set(&test, TestPoint::Group("b")).unwrap();
         assert!(
             set_b.len() >= set_a.len(),
             "harder Mondrian cohort should not yield smaller sets: a={} b={}",
@@ -1106,14 +1158,21 @@ mod tests {
         let (cal_probs, cal_labels) = synthetic_classification(&mut rng, 1000, 5);
         let (test_probs, _) = synthetic_classification(&mut rng, 200, 5);
 
-        let model_a =
-            ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, 0.1).unwrap();
-        let model_b =
-            ConformalModel::classification(&cal_probs, &cal_labels, ClassScore::Aps, 0.1).unwrap();
+        let calibrate = || {
+            ConformalModel::classification(
+                &cal_probs,
+                &cal_labels,
+                ClassScore::Aps,
+                &Calibration::Marginal,
+                0.1,
+            )
+            .unwrap()
+        };
+        let (model_a, model_b) = (calibrate(), calibrate());
         for row in &test_probs {
             assert_eq!(
-                model_a.predict_set(row, None).unwrap(),
-                model_b.predict_set(row, None).unwrap()
+                model_a.predict_set(row, TestPoint::Exchangeable).unwrap(),
+                model_b.predict_set(row, TestPoint::Exchangeable).unwrap()
             );
         }
     }
@@ -1121,29 +1180,155 @@ mod tests {
     #[test]
     fn predict_rejects_cross_kind_calls() {
         let model = ConformalModel::regression(
-            &[0.0, 1.0],
-            &[],
-            &[],
+            Estimates::Points(&[0.0, 1.0]),
             &[0.1, 0.9],
-            IntervalScore::AbsoluteResidual,
+            &Calibration::Marginal,
             0.1,
         )
         .unwrap();
-        assert!(model.predict_set(&[0.5, 0.5], None).is_err());
+        assert!(model
+            .predict_set(&[0.5, 0.5], TestPoint::Exchangeable)
+            .is_err());
+        // A point-estimate model is not handed a quantile band.
+        let band = Estimate::Band {
+            lower: 0.0,
+            upper: 1.0,
+        };
+        assert!(model
+            .predict_interval(band, TestPoint::Exchangeable)
+            .is_err());
 
         let model = ConformalModel::classification(
             &[vec![0.6, 0.4], vec![0.3, 0.7]],
             &[0, 1],
             ClassScore::Lac,
+            &Calibration::Marginal,
             0.1,
         )
         .unwrap();
-        assert!(model.predict_interval(0.0, 0.0, 0.0, None).is_err());
+        assert!(model
+            .predict_interval(Estimate::Point(0.0), TestPoint::Exchangeable)
+            .is_err());
     }
 
     #[test]
     fn rejects_out_of_range_label_and_nan_probabilities() {
         assert!(true_label_score(&[0.5, 0.5], 2, ClassScore::Lac).is_err());
         assert!(true_label_score(&[f64::NAN, 0.5], 0, ClassScore::Lac).is_err());
+    }
+
+    #[test]
+    fn weighted_threshold_follows_the_test_points_own_weight() {
+        // Twenty unit-weight calibration scores 1..=20 at alpha = 0.2: a unit test
+        // weight puts the target at 0.8 * 21 = 16.8, the 17th score. A heavier
+        // test point holds more mass at +∞, so the calibration scores must reach
+        // further: weight 5 puts the target at 0.8 * 25 = 20.0, the 20th score.
+        let scores: Vec<f64> = (1..=20).map(f64::from).collect();
+        let model = ConformalModel::regression(
+            Estimates::Points(&[0.0; 20]),
+            &scores,
+            &Calibration::Weighted {
+                weights: vec![1.0; 20],
+            },
+            0.2,
+        )
+        .unwrap();
+        let width = |weight| {
+            let (lo, hi) = model
+                .predict_interval(Estimate::Point(0.0), TestPoint::Weight(weight))
+                .unwrap();
+            (hi - lo) / 2.0
+        };
+        assert_eq!(width(1.0), 17.0);
+        assert_eq!(width(5.0), 20.0);
+        // Weight 6: target 0.8 * 26 = 20.8 exceeds the whole calibration mass.
+        assert!(width(6.0).is_infinite());
+    }
+
+    #[test]
+    fn exact_weights_restore_what_a_score_aligned_shift_breaks() {
+        // A covariate x drives the score upward; the calibration set keeps each row
+        // with probability π(x) = 1/(1+e^{2x}), leaning it toward easy rows, and
+        // the likelihood ratio 1/π is known exactly. Coverage is an expectation
+        // over the calibration draw, so it is averaged over draws.
+        let mut rng = StdRng::seed_from_u64(7);
+        let covariate = NormalDraw::new(0.0, 1.0).unwrap();
+        let noise = NormalDraw::new(0.0, 0.5).unwrap();
+        let ratio = |x: f64| 1.0 + (2.0 * x).exp();
+        let alpha = 0.1;
+        let draws = 300;
+        let (mut marginal, mut weighted) = (0.0, 0.0);
+        for _ in 0..draws {
+            let mut x_cal = Vec::new();
+            for _ in 0..400 {
+                let x = covariate.sample(&mut rng);
+                if rng.gen_range(0.0..1.0) < 1.0 / ratio(x) {
+                    x_cal.push(x);
+                }
+            }
+            let x_test: Vec<f64> = (0..400).map(|_| covariate.sample(&mut rng)).collect();
+            let cal: Vec<f64> = x_cal.iter().map(|x| x + noise.sample(&mut rng)).collect();
+            let test: Vec<f64> = x_test.iter().map(|x| x + noise.sample(&mut rng)).collect();
+
+            let q = finite_sample_quantile(&cal, alpha).unwrap();
+            let weights: Vec<f64> = x_cal.iter().map(|&x| ratio(x)).collect();
+            let calibration = WeightedScores::new(&cal, &weights).unwrap();
+            let rows = test.len() as f64;
+            marginal += test.iter().filter(|&&s| s <= q).count() as f64 / rows;
+            weighted += test
+                .iter()
+                .zip(&x_test)
+                .filter(|&(&s, &x)| s <= calibration.threshold(ratio(x), alpha).unwrap())
+                .count() as f64
+                / rows;
+        }
+        let (marginal, weighted) = (marginal / draws as f64, weighted / draws as f64);
+        // The guarantee is a floor: heavy weights leave few effective calibration
+        // rows, and the test row's mass at +∞ makes the weighted pass conservative.
+        assert!(marginal < 1.0 - alpha - 0.1, "marginal coverage {marginal}");
+        assert!(
+            (1.0 - alpha..1.0 - alpha + 0.05).contains(&weighted),
+            "weighted coverage {weighted}"
+        );
+    }
+
+    #[test]
+    fn unit_weights_reproduce_the_marginal_threshold_exactly() {
+        let mut rng = StdRng::seed_from_u64(31);
+        for n in [5, 9, 30, 101] {
+            let scores: Vec<f64> = (0..n).map(|_| rng.gen_range(0.0..3.0)).collect();
+            for alpha in [0.05, 0.1, 0.2, 0.5] {
+                let marginal = finite_sample_quantile(&scores, alpha).unwrap();
+                let weighted =
+                    finite_sample_quantile_weighted(&scores, &vec![1.0; n], 1.0, alpha).unwrap();
+                assert_eq!(marginal, weighted, "n={n} alpha={alpha}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_test_point_must_match_its_calibration() {
+        let probs = vec![vec![0.6, 0.4], vec![0.3, 0.7], vec![0.8, 0.2]];
+        let labels = [0, 1, 0];
+        let calibrate = |calibration: Calibration| {
+            ConformalModel::classification(&probs, &labels, ClassScore::Lac, &calibration, 0.4)
+                .unwrap()
+        };
+        let row = [0.5, 0.5];
+        let marginal = calibrate(Calibration::Marginal);
+        assert!(marginal.predict_set(&row, TestPoint::Group("a")).is_err());
+        let mondrian = calibrate(Calibration::Mondrian {
+            groups: vec!["a".into(), "b".into(), "a".into()],
+        });
+        assert!(mondrian.predict_set(&row, TestPoint::Exchangeable).is_err());
+        // A cohort unseen at calibration is held to the pooled threshold.
+        assert_eq!(
+            mondrian.predict_set(&row, TestPoint::Group("c")).unwrap(),
+            marginal.predict_set(&row, TestPoint::Exchangeable).unwrap()
+        );
+        let weighted = calibrate(Calibration::Weighted {
+            weights: vec![1.0; 3],
+        });
+        assert!(weighted.predict_set(&row, TestPoint::Exchangeable).is_err());
     }
 }

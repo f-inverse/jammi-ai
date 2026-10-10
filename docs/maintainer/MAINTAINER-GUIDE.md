@@ -1629,13 +1629,13 @@ and the served Hybrid arm is reachable via the serve-source reconstruction.
 The conformal wrap is `ConformalContextPredictor`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs`) = a calibrated `ConformalModel`
 (split-conformal) + the served `DistributionForm`.
-`ConformalContextPredictor::interval(prediction, group)` turns one served
+`ConformalContextPredictor::interval(prediction, at)` turns one served
 distribution into a coverage-guaranteed `[lower, upper]`: a Gaussian head wraps with
 **AbsoluteResidual** centred on the predictive mean; a quantile head wraps with
 **CQR** over its served quantile bounds. It is constructed by
 `InferenceSession::calibrate_context_predictor_conformal` on a **held-out**
-calibration set, with `ConformalLevers` (`Marginal`/`Mondrian`/`Weighted`) — the
-engine *applies* the chosen lever, never *chooses* one.
+calibration set, with a `Calibration` (`Marginal`/`Mondrian`/`Weighted`) — the
+engine *applies* the chosen scheme, never *chooses* one.
 
 **Wiring status — DORMANT.** `ConformalContextPredictor`,
 `calibrate_context_predictor_conformal`, and `.interval(...)` have **no non-test
@@ -4644,18 +4644,18 @@ uses the **provenanced** form, not the bare `predict_with_context_predictor`. (d
 error, never a silent identity de-standardisation.
 
 **Where `predict/conformal.rs` feeds — and its wiring status.**
-`crates/jammi-ai/src/predict/conformal.rs` (`ConformalModel`; `ConformalModel::regression` /
-`_mondrian` / `_weighted`; `predict_interval`; `IntervalScore::AbsoluteResidual|Cqr`) is the
+`crates/jammi-ai/src/predict/conformal.rs` (`ConformalModel::classification` / `regression`
+under a `Calibration`; `predict_set` / `predict_interval` at a `TestPoint`; `Estimates::Points`
+⇒ absolute residual, `Estimates::Bands` ⇒ CQR) is the
 distribution-free coverage primitive. It is **not on the `Predict` data-flow above** — the gRPC
 handler returns the raw distribution and the response proto has no interval field. The
 served-predictor conformal bridge is a *separate* surface: `ConformalContextPredictor`
 (`crates/jammi-ai/src/pipeline/context_predictor.rs`) + its calibrator
 `InferenceSession::calibrate_context_predictor_conformal`, which re-runs
 `predict_with_context_predictor` over a held-out `(target_key, observed_y)` calibration set,
-picks the `IntervalScore` from the head form — `Gaussian ⇒ AbsoluteResidual`, `Quantile ⇒ Cqr` —
-and feeds `ConformalModel::regression{,_mondrian,_weighted}` under the caller-chosen
-`ConformalLevers`. Serving an interval is then `ConformalContextPredictor::interval(dist,
-group)`.
+picks the `Estimates` from the head form — `Gaussian ⇒ Points`, `Quantile ⇒ Bands` — and
+feeds `ConformalModel::regression` under the caller-chosen `Calibration`. Serving an interval
+is then `ConformalContextPredictor::interval(dist, at)`.
 
 - **`calibrate_context_predictor_conformal` / `ConformalContextPredictor::interval`: DORMANT**
   from every runtime serving path. Their only callers are integration tests
@@ -4665,13 +4665,14 @@ group)`.
   `ServedContextPredictor`; it does not — the wrap exists but is unwired into any served verb.
 - **`ConformalModel` (the primitive): CALLER-DRIVEN.** Its only *runtime-reachable* callers are
   the `jammi-python` embed utilities `conformalize` (classification, via
-  `ConformalModel::classification`) / `conformalize_interval` (`ConformalModel::regression` +
-  `AbsoluteResidual`) / `conformalize_cqr` (`ConformalModel::regression` + `Cqr`)
-  (`crates/jammi-python/src/database.rs`), each constructing a `ConformalModel` per call from
+  `ConformalModel::classification`) / `conformalize_interval` (`ConformalModel::regression` over
+  `Estimates::Points`) / `conformalize_cqr` (over `Estimates::Bands`)
+  (`crates/jammi-python/src/conformal.rs`), each constructing a `ConformalModel` per call from
   caller-supplied calibration arrays and returning a set (`conformalize`) or intervals (the other
-  two). These are standalone PyO3 methods, not part of the `Predict` (context-predictor) path, and
-  have **no gRPC peer** — the conformal primitive is exposed only embedded, for the caller to
-  invoke directly. Its *other* in-crate caller is the DORMANT
+  two). These are `jammi_native` module functions — they hold no session — not part of the
+  `Predict` (context-predictor) path, and have **no gRPC peer**: the remote transport computes
+  the same verbs client-side in `clients/python/jammi/_conformal.py`, which
+  `test_numeric_verbs_compute_identically_across_wheels` holds equal to these. Its *other* in-crate caller is the DORMANT
   `calibrate_context_predictor_conformal` bridge above, which is test-only. (`evidence/conformal.rs`
   references the primitive only in rustdoc, not a call.)
 

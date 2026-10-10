@@ -68,7 +68,7 @@ use crate::pipeline::context_set::{
 };
 use crate::pipeline::graph_neighbourhood::EdgeGather;
 use crate::pipeline::parallel_train::{train_loop, ParallelTrainConfig, ParallelTrainReport};
-use crate::predict::conformal::{ConformalModel, IntervalScore};
+use crate::predict::conformal::{Calibration, ConformalModel, Estimate, Estimates, TestPoint};
 use crate::session::InferenceSession;
 use jammi_datafusion::inference::adapter::distribution::{DistributionAdapter, DistributionForm};
 use jammi_datafusion::inference::adapter::OutputAdapter;
@@ -1818,59 +1818,33 @@ impl ConformalContextPredictor {
     ///
     /// A Gaussian head wraps with absolute-residual conformal centred on the
     /// predictive mean; a quantile head wraps with CQR over its lower/upper
-    /// served quantiles — the score family the calibration chose. `group` is the
-    /// test target's cohort for a Mondrian (group-conditional) wrap — supplied by
-    /// governance, `None` for a marginal wrap; the engine never derives it.
+    /// served quantiles — the score family the calibration chose. `at` is what
+    /// the test target brings for the wrap's [`Calibration`]: its cohort under
+    /// Mondrian, its likelihood ratio under weighting — supplied by the caller;
+    /// the engine never derives it.
     pub fn interval(
         &self,
         prediction: &PredictedDistribution,
-        group: Option<&str>,
+        at: TestPoint<'_>,
     ) -> Result<(f64, f64)> {
-        match &self.form {
-            DistributionForm::Gaussian => {
-                self.conformal
-                    .predict_interval(prediction.point_estimate() as f64, 0.0, 0.0, group)
-            }
+        let estimate = match &self.form {
+            DistributionForm::Gaussian => Estimate::Point(prediction.point_estimate() as f64),
             DistributionForm::Quantile { .. } => {
-                let (lo, hi) =
+                let (lower, upper) =
                     prediction
                         .quantile_bounds()
                         .ok_or_else(|| JammiError::InvalidArgument {
                             argument: "conformal".into(),
                             reason: "CQR conformal wrap requires a quantile-head prediction".into(),
                         })?;
-                self.conformal
-                    .predict_interval(0.0, lo as f64, hi as f64, group)
+                Estimate::Band {
+                    lower: lower as f64,
+                    upper: upper as f64,
+                }
             }
-        }
+        };
+        self.conformal.predict_interval(estimate, at)
     }
-}
-
-/// The conformal calibration lever a caller / governance supplies. The engine
-/// **applies** the chosen lever; it never **chooses** one. `Marginal` is the
-/// default and always serves; `Mondrian`/`Weighted` route to the group-
-/// conditional / importance-weighted [`ConformalModel`] constructors with
-/// caller-supplied cohorts / weights (one per calibration point).
-///
-/// Graph-assembled context can break the exchangeability split-conformal
-/// *marginal* coverage assumes; the levers are the honest repair — but *which*
-/// cohort or weights, and *whether* to apply them, is governance's call:
-/// choosing the cohorts is governance, not a serving output. The engine surfaces the `source` fact
-/// and applies what it is told.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConformalLevers {
-    /// Plain marginal split-conformal (the default; always serves).
-    Marginal,
-    /// Group-conditional (Mondrian): one cohort key per calibration point.
-    Mondrian {
-        /// Cohort key per calibration point, in calibration order.
-        groups: Vec<String>,
-    },
-    /// Importance-weighted: one weight per calibration point (NAPS / Barber).
-    Weighted {
-        /// Non-negative weight per calibration point, in calibration order.
-        weights: Vec<f64>,
-    },
 }
 
 impl InferenceSession {
@@ -1886,18 +1860,17 @@ impl InferenceSession {
     /// [`ConformalModel`] — it does not modify the conformal primitive, only
     /// feeds it.
     ///
-    /// `levers` is the caller / governance choice of marginal (the default,
-    /// which always serves), Mondrian (group-conditional), or weighted
-    /// (importance-weighted) calibration — *applied* here, never *chosen* here.
-    /// Graph-assembled context can break exchangeability; supplying a cohort or
-    /// weights is the honest repair, but the choice is governance's, not the
-    /// engine's.
+    /// `scheme` is the caller's choice of marginal, Mondrian (group-conditional),
+    /// or weighted calibration — *applied* here, never *chosen* here, with one
+    /// cohort or weight per calibration target. Graph-assembled context can
+    /// break exchangeability; supplying cohorts or weights is the honest repair,
+    /// but the choice is the caller's.
     pub async fn calibrate_context_predictor_conformal(
         self: &Arc<Self>,
         served: &ServedContextPredictor,
         calibration: &[(String, f64)],
         alpha: f64,
-        levers: ConformalLevers,
+        scheme: Calibration,
     ) -> Result<ConformalContextPredictor> {
         if calibration.is_empty() {
             return Err(JammiError::InvalidArgument {
@@ -1905,35 +1878,9 @@ impl InferenceSession {
                 reason: "conformal calibration requires at least one held-out target".into(),
             });
         }
-        // A supplied lever carries one cohort / weight per calibration point;
-        // a length mismatch is a typed error, never a silent misalignment.
-        match &levers {
-            ConformalLevers::Marginal => {}
-            ConformalLevers::Mondrian { groups } if groups.len() == calibration.len() => {}
-            ConformalLevers::Weighted { weights } if weights.len() == calibration.len() => {}
-            ConformalLevers::Mondrian { groups } => {
-                return Err(JammiError::InvalidArgument {
-                    argument: "cohorts".into(),
-                    reason: format!(
-                        "Mondrian conformal needs one cohort per calibration point: \
-                     {} cohorts vs {} points",
-                        groups.len(),
-                        calibration.len()
-                    ),
-                })
-            }
-            ConformalLevers::Weighted { weights } => {
-                return Err(JammiError::InvalidArgument {
-                    argument: "weights".into(),
-                    reason: format!(
-                        "weighted conformal needs one weight per calibration point: \
-                     {} weights vs {} points",
-                        weights.len(),
-                        calibration.len()
-                    ),
-                })
-            }
-        }
+        // Checked before the forwards run, so a misaligned cohort or weight list
+        // costs nothing.
+        scheme.check_rows(calibration.len())?;
 
         let mut predictions = Vec::with_capacity(calibration.len());
         let mut lower = Vec::with_capacity(calibration.len());
@@ -1958,37 +1905,17 @@ impl InferenceSession {
             observed.push(*y);
         }
 
-        let score = match &served.form {
-            DistributionForm::Gaussian => IntervalScore::AbsoluteResidual,
-            DistributionForm::Quantile { .. } => IntervalScore::Cqr,
+        // The head form decides which estimates carry signal: point estimates for
+        // a Gaussian head (absolute residual), quantile bounds for a quantile
+        // head (CQR).
+        let estimates = match &served.form {
+            DistributionForm::Gaussian => Estimates::Points(&predictions),
+            DistributionForm::Quantile { .. } => Estimates::Bands {
+                lower: &lower,
+                upper: &upper,
+            },
         };
-        // The score family decides which arrays carry signal (point estimates for
-        // absolute-residual, quantile bounds for CQR); the lever decides which
-        // existing `ConformalModel` constructor those feed. `Marginal` reproduces the plain
-        // split-conformal interval exactly.
-        let conformal = match &levers {
-            ConformalLevers::Marginal => {
-                ConformalModel::regression(&predictions, &lower, &upper, &observed, score, alpha)?
-            }
-            ConformalLevers::Mondrian { groups } => ConformalModel::regression_mondrian(
-                &predictions,
-                &lower,
-                &upper,
-                &observed,
-                groups,
-                score,
-                alpha,
-            )?,
-            ConformalLevers::Weighted { weights } => ConformalModel::regression_weighted(
-                &predictions,
-                &lower,
-                &upper,
-                &observed,
-                weights,
-                score,
-                alpha,
-            )?,
-        };
+        let conformal = ConformalModel::regression(estimates, &observed, &scheme, alpha)?;
 
         Ok(ConformalContextPredictor {
             conformal,

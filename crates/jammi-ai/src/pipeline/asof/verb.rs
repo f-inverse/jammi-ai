@@ -43,9 +43,10 @@ pub async fn run(
     // Each side sorted into the merge's required order; an empty `by` is a single
     // global group, which the temporal sort alone orders. The tie-break column
     // lives only on the facts side, so only the right sort carries it.
-    let spine_sorted = sort_for_merge(spine_plan, &spec.left.by, &spec.left.time, None)?;
+    let spine_sorted = sort_for_merge(spine_plan, "spine", &spec.left.by, &spec.left.time, None)?;
     let facts_sorted = sort_for_merge(
         facts_plan,
+        "facts",
         &spec.right.by,
         &spec.right.time,
         tie_break_column(&spec.tie_break),
@@ -128,18 +129,21 @@ async fn scan_relation(
         .context()
         .sql(&format!("SELECT * FROM {relation}"))
         .await
-        .map_err(|e| JammiError::Other(format!("asof_join scan of '{source_id}' failed: {e}")))?;
+        .map_err(|e| JammiError::from(e.context(format!("asof_join scan of '{source_id}'"))))?;
     df.create_physical_plan()
         .await
-        .map_err(|e| JammiError::Other(format!("asof_join scan plan for '{source_id}': {e}")))
+        .map_err(|e| JammiError::from(e.context(format!("asof_join scan plan for '{source_id}'"))))
 }
 
 /// Wrap a child scan in a [`SortExec`] ordering it by (`by`..., `time`[,
 /// tie-break]) ascending — the order [`AsofJoinExec`]'s single-pointer merge
 /// requires. Ascending on the tie-break column places the maximal value of a
-/// coincident-time run last, where the merge reads it as the winner.
+/// coincident-time run last, where the merge reads it as the winner. `side`
+/// (`spine` or `facts`) names the caller's arguments a column it lacks came
+/// from.
 fn sort_for_merge(
     plan: Arc<dyn ExecutionPlan>,
+    side: &str,
     by: &[String],
     time: &str,
     tie_break: Option<&str>,
@@ -151,23 +155,29 @@ fn sort_for_merge(
     };
     let mut exprs: Vec<PhysicalSortExpr> = Vec::with_capacity(by.len() + 2);
     for key in by {
-        let expr = col(key, schema.as_ref())
-            .map_err(|e| JammiError::Other(format!("asof_join sort key '{key}': {e}")))?;
+        let expr = col(key, schema.as_ref()).map_err(|e| JammiError::InvalidArgument {
+            argument: format!("{side}_by"),
+            reason: e.to_string(),
+        })?;
         exprs.push(PhysicalSortExpr { expr, options });
     }
-    let time_expr = col(time, schema.as_ref())
-        .map_err(|e| JammiError::Other(format!("asof_join time key '{time}': {e}")))?;
+    let time_expr = col(time, schema.as_ref()).map_err(|e| JammiError::InvalidArgument {
+        argument: format!("{side}_time"),
+        reason: e.to_string(),
+    })?;
     exprs.push(PhysicalSortExpr {
         expr: time_expr,
         options,
     });
     if let Some(secondary) = tie_break {
-        let expr = col(secondary, schema.as_ref())
-            .map_err(|e| JammiError::Other(format!("asof_join tie-break '{secondary}': {e}")))?;
+        let expr = col(secondary, schema.as_ref()).map_err(|e| JammiError::InvalidArgument {
+            argument: "tie_break_column".into(),
+            reason: e.to_string(),
+        })?;
         exprs.push(PhysicalSortExpr { expr, options });
     }
     let ordering = LexOrdering::new(exprs)
-        .ok_or_else(|| JammiError::Other("asof_join requires a temporal sort key".into()))?;
+        .ok_or_else(|| JammiError::Internal("an as-of sort without its time key".into()))?;
     Ok(Arc::new(SortExec::new(ordering, plan)))
 }
 

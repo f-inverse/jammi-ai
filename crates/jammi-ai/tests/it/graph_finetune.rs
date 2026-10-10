@@ -203,7 +203,7 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     };
     let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
     let loader = TrainingDataLoader::from_graph(&sampler).unwrap();
-    assert!(matches!(loader.format(), TrainingFormat::Triplet));
+    assert_eq!(loader.format(), Some(TrainingFormat::Triplet));
     let (anchors, positives, negatives) = loader.in_batch_negative_texts().unwrap();
     assert_eq!(anchors.len(), positives.len());
     assert!(
@@ -220,7 +220,7 @@ fn from_graph_loader_threads_pairs_and_triplet_shapes() {
     };
     let sampler = GraphSampler::build(nodes, edges, cfg).unwrap();
     let loader = TrainingDataLoader::from_graph(&sampler).unwrap();
-    assert!(matches!(loader.format(), TrainingFormat::Pairs));
+    assert_eq!(loader.format(), Some(TrainingFormat::Pairs));
     let (_, _, negatives) = loader.in_batch_negative_texts().unwrap();
     assert!(
         negatives.is_none(),

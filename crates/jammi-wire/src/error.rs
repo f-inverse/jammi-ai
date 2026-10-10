@@ -47,16 +47,18 @@
 //! reconstruct, so they carry structured details ([`pb::MutableTableErrorDetail`]
 //! — which nests an engine-owned [`pb::BackendErrorDetail`] for its `Backend`
 //! arm — and [`pb::ChannelCatalogErrorDetail`]) and cross the wire faithfully —
-//! never a fold. The only variants that fold into `other`
+//! never a fold. The only variants that fold into `remote`
 //! are the genuinely-foreign `#[from]` ones whose inner error cannot cross a
 //! process boundary (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`,
-//! `Trigger`, `Storage`, and the lone [`BackendError::Sqlx`] nested under
-//! `MutableTable`): they reconstruct as [`JammiError::Other`] (or, for `Sqlx`, a
-//! backend-detail string arm) carrying the faithful `Display` string — the
-//! genuine limit, not a lossy guess.
+//! `Storage`, and the lone [`BackendError::Sqlx`] nested under `MutableTable`):
+//! they reconstruct as [`JammiError::Remote`] (or, for `Sqlx`, a backend-detail
+//! string arm) carrying the faithful `Display` string under the class the
+//! status code names — the genuine limit, not a lossy guess.
 
 use jammi_db::catalog::channel_repo::{ChannelCatalogError, ChannelColumnType};
-use jammi_db::error::{IndexKind, JammiError, Missing, NonUniqueScan, NotRefreshableReason};
+use jammi_db::error::{
+    ErrorClass, IndexKind, JammiError, Missing, NonUniqueScan, NotRefreshableReason,
+};
 use jammi_db::store::mutable::{MutableTableError, MutableTableId};
 use jammi_db::trigger::TriggerError;
 use jammi_db::BackendError;
@@ -270,16 +272,39 @@ impl From<&JammiError> for pb::JammiErrorDetail {
                 limit_bytes: *limit_bytes,
                 detail: detail.clone(),
             }),
+            JammiError::InvalidArgument { argument, reason } => {
+                Variant::InvalidArgument(pb::InvalidArgumentError {
+                    argument: argument.clone(),
+                    reason: reason.clone(),
+                })
+            }
+            JammiError::Internal(message) => Variant::Internal(pb::StringError {
+                message: message.clone(),
+            }),
+            JammiError::ResultTableExists { table } => {
+                Variant::ResultTableExists(pb::ResultTableExistsError {
+                    table: table.clone(),
+                })
+            }
+            JammiError::AnnIndex(message) => Variant::AnnIndex(pb::StringError {
+                message: message.clone(),
+            }),
+            JammiError::Trigger(e) => Variant::Trigger(e.into()),
             // The fold reaches ONLY the genuinely-foreign `#[from]` variants
-            // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`,
-            // `Storage`) and the existing `Other`: every owned-shape variant —
-            // and `MutableTable`, whose engine-owned inner error reconstructs
-            // faithfully above — has an explicit arm. A foreign source error
-            // cannot cross a process boundary, so it reconstructs as
-            // `JammiError::Other` carrying the faithful `Display` string — the
+            // (`Io`, `BackendDriver`, `Toml`, `Json`, `DataFusion`, `Storage`)
+            // and `Remote` itself: every owned-shape variant has an explicit
+            // arm. A foreign source error cannot cross a process boundary, so
+            // it reconstructs as `JammiError::Remote` carrying the faithful
+            // `Display` string under the class its status code names — the
             // genuine fidelity limit. `to_string()` is that string.
-            other => Variant::Other(pb::StringError {
-                message: other.to_string(),
+            JammiError::Io(_)
+            | JammiError::BackendDriver(_)
+            | JammiError::Toml(_)
+            | JammiError::Json(_)
+            | JammiError::DataFusion(_)
+            | JammiError::Storage(_)
+            | JammiError::Remote { .. } => Variant::Remote(pb::StringError {
+                message: err.to_string(),
             }),
         };
         pb::JammiErrorDetail {
@@ -289,15 +314,24 @@ impl From<&JammiError> for pb::JammiErrorDetail {
 }
 
 /// Reconstruct the engine error from the wire detail. The inverse of the
-/// encode above; `message` is the enclosing `Status`'s own message, threaded
-/// in so a detail whose `variant` is unset (a peer built against a NEWER
-/// contract that added a variant this build's codegen does not know — an
-/// "unknown oneof", NOT the "no detail at all" case [`error_from_status`]
-/// handles separately) reconstructs as [`JammiError::Other`] carrying that
-/// faithful message, never the empty string a bare `String::new()` would
-/// silently substitute. Decode is total either way.
-fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> JammiError {
+/// encode above; `class` and `message` are the enclosing `Status`'s own code
+/// (as its [`ErrorClass`]) and message, threaded in so a detail whose
+/// `variant` is unset (a peer built against a NEWER contract that added a
+/// variant this build's codegen does not know — an "unknown oneof", NOT the
+/// "no detail at all" case [`error_from_status`] handles separately)
+/// reconstructs as [`JammiError::Remote`] carrying that faithful message and
+/// class, never the empty string a bare `String::new()` would silently
+/// substitute. Decode is total either way.
+fn jammi_error_from_detail(
+    detail: pb::JammiErrorDetail,
+    class: ErrorClass,
+    message: &str,
+) -> JammiError {
     use pb::jammi_error_detail::Variant;
+    let remote = || JammiError::Remote {
+        class,
+        message: message.to_string(),
+    };
     match detail.variant {
         Some(Variant::Source(e)) => JammiError::Source {
             source_id: e.source_id,
@@ -310,10 +344,9 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
         Some(Variant::AmbiguousAsofMatch(e)) => {
             JammiError::AmbiguousAsofMatch { instant: e.instant }
         }
-        Some(Variant::NotFound(e)) => match missing_from_detail(e) {
-            Some(missing) => JammiError::NotFound(missing),
-            None => JammiError::Other(message.to_string()),
-        },
+        Some(Variant::NotFound(e)) => missing_from_detail(e)
+            .map(JammiError::NotFound)
+            .unwrap_or_else(remote),
         Some(Variant::ModelReferenced(e)) => JammiError::ModelReferenced {
             model_id: e.model_id,
             referenced_by: e.referenced_by,
@@ -381,14 +414,15 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             version: e.version,
         },
         // An unknown `reason` / `scan` token (a newer peer) reconstructs as
-        // `Other` carrying the Status message, the same total-decode stance
-        // as the unknown-oneof arm — never a fabricated token.
+        // `Remote` carrying the Status message and class, the same
+        // total-decode stance as the unknown-oneof arm — never a fabricated
+        // token.
         Some(Variant::NotRefreshable(e)) => match NotRefreshableReason::parse(&e.reason) {
             Some(reason) => JammiError::NotRefreshable {
                 table: e.table,
                 reason,
             },
-            None => JammiError::Other(message.to_string()),
+            None => remote(),
         },
         Some(Variant::DefinitionDrift(e)) => JammiError::DefinitionDrift {
             table: e.table,
@@ -402,7 +436,7 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
                 keys: e.keys.into_iter().map(|k| (k.key, k.count)).collect(),
                 total: e.total,
             },
-            None => JammiError::Other(message.to_string()),
+            None => remote(),
         },
         Some(Variant::Unavailable(e)) => JammiError::Unavailable {
             resource: e.resource,
@@ -415,12 +449,23 @@ fn jammi_error_from_detail(detail: pb::JammiErrorDetail, message: &str) -> Jammi
             limit_bytes: e.limit_bytes,
             detail: e.detail,
         },
-        Some(Variant::Other(e)) => JammiError::Other(e.message),
+        Some(Variant::InvalidArgument(e)) => JammiError::InvalidArgument {
+            argument: e.argument,
+            reason: e.reason,
+        },
+        Some(Variant::Internal(e)) => JammiError::Internal(e.message),
+        Some(Variant::ResultTableExists(e)) => JammiError::ResultTableExists { table: e.table },
+        Some(Variant::AnnIndex(e)) => JammiError::AnnIndex(e.message),
+        Some(Variant::Trigger(e)) => JammiError::Trigger(trigger_error_from_detail(e, message)),
+        Some(Variant::Remote(e)) => JammiError::Remote {
+            class,
+            message: e.message,
+        },
         // The unknown-oneof case: `message` is the enclosing `Status`'s
         // own text, so the reconstructed error still carries the real fault
-        // description even though this build cannot recover which specific
-        // variant a newer peer set.
-        None => JammiError::Other(message.to_string()),
+        // description and class even though this build cannot recover which
+        // specific variant a newer peer set.
+        None => remote(),
     }
 }
 
@@ -508,7 +553,7 @@ impl From<&MutableTableError> for pb::MutableTableErrorDetail {
 /// `Status`'s own text (see [`jammi_error_from_detail`]'s doc): a detail with
 /// no variant set (an unknown oneof — a peer built against a newer contract)
 /// reconstructs as `Schema(message)` — kept inside the engine-owned taxonomy
-/// rather than escaping to `Other`, but carrying the real fault text instead
+/// rather than escaping to `Remote`, but carrying the real fault text instead
 /// of a fabricated empty string.
 fn mutable_table_error_from_detail(
     detail: pb::MutableTableErrorDetail,
@@ -595,7 +640,7 @@ impl From<&ChannelCatalogError> for pb::ChannelCatalogErrorDetail {
 /// `message` is the enclosing `Status`'s own text (see
 /// [`jammi_error_from_detail`]'s doc): a detail with no variant set (an
 /// unknown oneof) reconstructs as `NotRegistered(message)` — kept inside the
-/// channel-catalog taxonomy rather than escaping to `Other`, carrying the
+/// channel-catalog taxonomy rather than escaping to `Remote`, carrying the
 /// real fault text instead of a fabricated empty string.
 fn channel_catalog_error_from_detail(
     detail: pb::ChannelCatalogErrorDetail,
@@ -1003,12 +1048,17 @@ pub fn attach_error_detail(code: Code, message: String, err: &JammiError) -> Sta
 /// Reconstruct the engine error a server attached to a [`Status`]. When the
 /// status carries a decodable [`pb::JammiErrorDetail`] the exact variant is
 /// rebuilt; otherwise (no detail, or undecodable bytes) the status `message`
-/// stands in as [`JammiError::Other`] — the faithful fallback, since a status
-/// without a Jammi detail is by construction not an engine `JammiError`.
+/// stands in as [`JammiError::Remote`] under the class its code names — the
+/// faithful fallback, since a status without a Jammi detail is by
+/// construction not an engine `JammiError`.
 pub fn error_from_status(status: &Status) -> JammiError {
+    let class = code_class(status.code());
     match extract_detail::<pb::JammiErrorDetail>(status) {
-        Some(detail) => jammi_error_from_detail(detail, status.message()),
-        None => JammiError::Other(status.message().to_string()),
+        Some(detail) => jammi_error_from_detail(detail, class, status.message()),
+        None => JammiError::Remote {
+            class,
+            message: status.message().to_string(),
+        },
     }
 }
 
@@ -1064,10 +1114,30 @@ pub fn status_code(err: &JammiError) -> Code {
     class_code(err.class())
 }
 
-/// The status code of an [`ErrorClass`](jammi_db::error::ErrorClass): one code
-/// per class.
-pub fn class_code(class: jammi_db::error::ErrorClass) -> Code {
-    use jammi_db::error::ErrorClass;
+/// The [`ErrorClass`] a status code reports — the inverse of [`class_code`]
+/// over the codes it sends, and the nearest class for a code only another
+/// service sends: a deadline is a dependency that did not answer in time, an
+/// unimplemented method or out-of-range value a request this service cannot
+/// serve, a missing credential the caller's to supply.
+pub fn code_class(code: Code) -> ErrorClass {
+    match code {
+        Code::InvalidArgument | Code::OutOfRange | Code::Unimplemented => {
+            ErrorClass::InvalidArgument
+        }
+        Code::NotFound => ErrorClass::NotFound,
+        Code::AlreadyExists => ErrorClass::AlreadyExists,
+        Code::FailedPrecondition => ErrorClass::FailedPrecondition,
+        Code::PermissionDenied | Code::Unauthenticated => ErrorClass::PermissionDenied,
+        Code::Aborted => ErrorClass::Aborted,
+        Code::Cancelled => ErrorClass::Cancelled,
+        Code::ResourceExhausted => ErrorClass::ResourceExhausted,
+        Code::Unavailable | Code::DeadlineExceeded => ErrorClass::Unavailable,
+        Code::Ok | Code::Unknown | Code::Internal | Code::DataLoss => ErrorClass::Internal,
+    }
+}
+
+/// The status code of an [`ErrorClass`]: one code per class.
+pub fn class_code(class: ErrorClass) -> Code {
     match class {
         ErrorClass::InvalidArgument => Code::InvalidArgument,
         ErrorClass::NotFound => Code::NotFound,
@@ -1089,7 +1159,7 @@ mod tests {
     /// Send an error through the full Status round-trip a real server/client
     /// pair uses (`attach_error_detail` → encode → decode → `error_from_status`).
     fn round_trip(err: &JammiError) -> JammiError {
-        let status = attach_error_detail(Code::Internal, err.to_string(), err);
+        let status = attach_error_detail(status_code(err), err.to_string(), err);
         error_from_status(&status)
     }
 
@@ -1151,7 +1221,11 @@ mod tests {
             | JammiError::Unavailable { .. }
             | JammiError::EmptyTrainingSet { .. }
             | JammiError::ResourcesExhausted { .. }
-            | JammiError::Other(_) => {}
+            | JammiError::InvalidArgument { .. }
+            | JammiError::Internal(_)
+            | JammiError::ResultTableExists { .. }
+            | JammiError::AnnIndex(_)
+            | JammiError::Remote { .. } => {}
         }
     }
 
@@ -1292,7 +1366,20 @@ mod tests {
                 limit_bytes: 67_108_864,
                 detail: "greedy(used: 10.0 MB, pool_size: 64.0 MB)".into(),
             },
-            JammiError::Other("an error with no more specific shape".into()),
+            JammiError::InvalidArgument {
+                argument: "format".into(),
+                reason: "unknown file format 'xlsx'".into(),
+            },
+            JammiError::Internal("a segment set with no segment".into()),
+            JammiError::ResultTableExists {
+                table: "papers_2024".into(),
+            },
+            JammiError::AnnIndex("USearch search: out of memory".into()),
+            JammiError::Trigger(TriggerError::TopicNotFound("orders".into())),
+            JammiError::Remote {
+                class: jammi_db::error::ErrorClass::FailedPrecondition,
+                message: "a condition only a peer of another build names".into(),
+            },
         ]
     }
 
@@ -1320,25 +1407,32 @@ mod tests {
     }
 
     /// The genuinely-foreign `#[from]` variants carry an inner error that cannot
-    /// cross a process boundary, so they reconstruct as `JammiError::Other`
-    /// carrying the faithful `Display` string — the genuine fidelity limit. `Io`
-    /// is the representative case; the fold is identical for the rest
-    /// (`BackendDriver`, `Toml`, `Json`, `DataFusion`, `Trigger`, `Storage`).
+    /// cross a process boundary, so they reconstruct as `JammiError::Remote`
+    /// carrying the faithful `Display` string and their class — the genuine
+    /// fidelity limit. `Io` is the representative case; the fold is identical
+    /// for the rest (`BackendDriver`, `Toml`, `Json`, `DataFusion`, `Storage`).
     /// `MutableTable` is deliberately NOT in this set — it reconstructs
     /// faithfully (see `mutable_table_variant_round_trips_faithfully`).
     #[test]
-    fn foreign_source_variant_folds_to_other_with_faithful_display() {
+    fn foreign_source_variant_folds_to_remote_with_its_class_and_display() {
         let io = JammiError::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "model.safetensors not found",
         ));
         let display = io.to_string();
         match round_trip(&io) {
-            JammiError::Other(message) => assert_eq!(
-                message, display,
-                "the foreign-source fold carries the faithful Display string"
-            ),
-            other => panic!("a foreign-source variant must fold to Other, got {other:?}"),
+            JammiError::Remote { class, message } => {
+                assert_eq!(
+                    message, display,
+                    "the fold carries the faithful Display string"
+                );
+                assert_eq!(
+                    class,
+                    jammi_db::error::ErrorClass::NotFound,
+                    "and the class"
+                );
+            }
+            other => panic!("a foreign-source variant must fold to Remote, got {other:?}"),
         }
     }
 
@@ -1348,10 +1442,10 @@ mod tests {
     /// field number no `JammiErrorDetail` variant ever uses, so prost's
     /// decoder skips it rather than erroring, leaving `variant: None`
     /// exactly like a real cross-version drift would) -- must reconstruct
-    /// as `JammiError::Other` carrying the enclosing `Status`'s own message
-    /// verbatim, never `Other(String::new())` discarding it.
+    /// as `JammiError::Remote` carrying the enclosing `Status`'s own message
+    /// verbatim and the class its code names.
     #[test]
-    fn unknown_oneof_variant_reconstructs_other_carrying_the_status_message_not_empty() {
+    fn unknown_oneof_variant_reconstructs_remote_carrying_the_status_message_and_class() {
         /// A shadow message sharing NO field number with `pb::JammiErrorDetail`'s
         /// oneof (1-29, minus the reserved 15) -- decoding its bytes AS a
         /// `JammiErrorDetail` therefore always leaves `variant` unset, the
@@ -1375,14 +1469,16 @@ mod tests {
         );
 
         let peer_message = "the real fault text a newer peer attached";
-        let status = attach_detail(Code::Internal, peer_message.to_string(), &detail);
+        let status = attach_detail(Code::FailedPrecondition, peer_message.to_string(), &detail);
         match error_from_status(&status) {
-            JammiError::Other(message) => assert_eq!(
-                message, peer_message,
-                "an unknown oneof variant must reconstruct JammiError::Other carrying the \
-                 Status's own message, never an empty string"
-            ),
-            other => panic!("expected JammiError::Other, got {other:?}"),
+            JammiError::Remote { class, message } => {
+                assert_eq!(
+                    message, peer_message,
+                    "the Status's own message, never empty"
+                );
+                assert_eq!(class, jammi_db::error::ErrorClass::FailedPrecondition);
+            }
+            other => panic!("expected JammiError::Remote, got {other:?}"),
         }
     }
 
@@ -1470,7 +1566,7 @@ mod tests {
     }
 
     /// `JammiError::MutableTable` is engine-owned and reconstructs faithfully —
-    /// it must NOT fold to `Other`. Every `MutableTableError` variant (including
+    /// it must NOT fold to `Remote`. Every `MutableTableError` variant (including
     /// the id-carrying `NotFound`/`AlreadyExists`, the payload-free
     /// `NoOrderColumn`, and the nested engine-owned `Backend`) round-trips to
     /// the identical variant and `Display` after the full Status round-trip. The
@@ -1521,7 +1617,7 @@ mod tests {
             match (&err, &back) {
                 (JammiError::MutableTable(_), JammiError::MutableTable(_)) => {}
                 other => panic!(
-                    "MutableTable must reconstruct as itself, never fold to Other: {other:?}"
+                    "MutableTable must reconstruct as itself, never fold to Remote: {other:?}"
                 ),
             }
             assert_eq!(
@@ -1533,7 +1629,7 @@ mod tests {
     }
 
     /// `JammiError::ChannelCatalog` is engine-owned and reconstructs faithfully —
-    /// it must NOT fold to `Other`. Every `ChannelCatalogError` variant (the two
+    /// it must NOT fold to `Remote`. Every `ChannelCatalogError` variant (the two
     /// string-carrying ids and the two struct variants carrying canonical
     /// PascalCase type tokens) round-trips to the identical variant and `Display`
     /// after the full Status round-trip. The contiguous "cannot redeclare as
@@ -1564,7 +1660,7 @@ mod tests {
             match (&err, &back) {
                 (JammiError::ChannelCatalog(_), JammiError::ChannelCatalog(_)) => {}
                 other => panic!(
-                    "ChannelCatalog must reconstruct as itself, never fold to Other: {other:?}"
+                    "ChannelCatalog must reconstruct as itself, never fold to Remote: {other:?}"
                 ),
             }
             assert_eq!(

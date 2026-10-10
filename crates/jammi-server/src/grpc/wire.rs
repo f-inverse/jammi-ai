@@ -222,8 +222,8 @@ mod tests {
     }
 
     /// `JobAttemptSuperseded`/`JobCancelled` must round-trip as their typed
-    /// variant across the wire, never fold into the lossy
-    /// `JammiError::Other`: `map_engine_error` classifies them with the
+    /// variant across the wire, never fold into the message-only
+    /// `JammiError::Remote`: `map_engine_error` classifies them with the
     /// right gRPC `Code` (`Aborted`/`Cancelled`), and `attach_error_detail`'s
     /// `pb::JammiErrorDetail::from(&JammiError)` carries a dedicated arm for
     /// each, so a remote client's `error_from_status` reconstructs the typed

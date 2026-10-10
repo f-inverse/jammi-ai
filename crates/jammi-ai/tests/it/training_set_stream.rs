@@ -733,11 +733,14 @@ async fn f3_a_label_seen_only_in_the_validation_suffix_is_still_counted() {
         ModelTask::Classification,
     )
     .unwrap();
-    let eager_num_classes = match eager.format() {
-        jammi_ai::fine_tune::data::TrainingFormat::Classification { num_classes } => num_classes,
-        other => panic!("expected Classification, got {other:?}"),
-    };
-    assert_eq!(vocab.num_classes(), eager_num_classes);
+    assert_eq!(
+        eager.format(),
+        Some(jammi_ai::fine_tune::data::TrainingFormat::Classification)
+    );
+    let eager_labels = eager
+        .class_labels()
+        .expect("a classification loader names its classes");
+    assert_eq!(vocab.labels(), eager_labels);
 }
 
 /// P3: the streamed read completes under a session pool sized at the 64 MiB

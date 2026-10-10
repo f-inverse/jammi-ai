@@ -94,10 +94,9 @@ impl TrainingSource {
     /// with the one [`LabelVocabulary::from_labels`], so the two agree.
     pub(crate) fn class_labels(&self) -> Option<&[String]> {
         match self {
-            Self::Resident(loader) => loader.label_vocab(),
-            Self::Streamed(streamed) => streamed.label_vocab.as_ref(),
+            Self::Resident(loader) => loader.class_labels(),
+            Self::Streamed(streamed) => streamed.label_vocab.as_ref().map(LabelVocabulary::labels),
         }
-        .map(LabelVocabulary::labels)
     }
 
     /// The same source for ANOTHER rank of an in-process gang

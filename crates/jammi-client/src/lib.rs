@@ -181,21 +181,16 @@ impl DataClient {
         let info = client
             .execute(query.to_string(), None)
             .await
-            .map_err(|e| JammiError::Other(format!("flight sql execute: {e}")))?;
+            .map_err(flight_error)?;
 
         let mut batches = Vec::new();
         for endpoint in info.endpoint {
-            let ticket = endpoint
-                .ticket
-                .ok_or_else(|| JammiError::Other("flight sql endpoint carried no ticket".into()))?;
-            let stream = client
-                .do_get(ticket)
-                .await
-                .map_err(|e| JammiError::Other(format!("flight sql do_get: {e}")))?;
-            let endpoint_batches: Vec<RecordBatch> = stream
-                .try_collect()
-                .await
-                .map_err(|e| JammiError::Other(format!("flight sql stream: {e}")))?;
+            let ticket = endpoint.ticket.ok_or_else(|| {
+                JammiError::Internal("flight sql endpoint carried no ticket".into())
+            })?;
+            let stream = client.do_get(ticket).await.map_err(flight_error)?;
+            let endpoint_batches: Vec<RecordBatch> =
+                stream.try_collect().await.map_err(flight_error)?;
             batches.extend(endpoint_batches);
         }
         Ok(batches)
@@ -1771,5 +1766,16 @@ mod model_result_cache_outcome_tests {
             }
             other => panic!("expected a Model result, got {other:?}"),
         }
+    }
+}
+
+/// The engine error a Flight SQL call failed with: the server's own error,
+/// reconstructed from the status it sent ([`jammi_wire::error_from_status`]) —
+/// an unreachable server is a status too — or a stream this client could not
+/// decode.
+fn flight_error(e: arrow_flight::error::FlightError) -> JammiError {
+    match e {
+        arrow_flight::error::FlightError::Tonic(status) => jammi_wire::error_from_status(&status),
+        other => JammiError::Internal(format!("flight sql: {other}")),
     }
 }

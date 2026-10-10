@@ -46,7 +46,9 @@ impl<'a> EvalRunner<'a> {
             .await?
             .map(|m| m.catalog_pk)
             .ok_or_else(|| {
-                JammiError::Eval(format!("Model '{model_name}' not registered in catalog"))
+                JammiError::NotFound(jammi_db::error::Missing::Model {
+                    model_id: model_name.to_string(),
+                })
             })
     }
 
@@ -565,7 +567,7 @@ impl<'a> EvalRunner<'a> {
                     let outcomes = super::ground_truth::extract_f64_column(batch, "outcome")?;
                     for ((id, draws_json), &outcome) in ids.iter().zip(&draws_col).zip(&outcomes) {
                         let draws: Vec<f64> = serde_json::from_str(draws_json).map_err(|e| {
-                            JammiError::Eval(format!(
+                            JammiError::Internal(format!(
                                 "calibration draws JSON parse failed for record {id}: {e}"
                             ))
                         })?;

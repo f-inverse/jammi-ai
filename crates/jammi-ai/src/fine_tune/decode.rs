@@ -105,7 +105,7 @@ pub(crate) fn extract_string_column(col: &dyn arrow::array::Array) -> Option<Vec
 /// defense, not the primary one.
 fn refuse_null_cell(col: &dyn arrow::array::Array, column: &str) -> Result<()> {
     if let Some(i) = (0..col.len()).find(|&i| col.is_null(i)) {
-        return Err(JammiError::FineTune(format!(
+        return Err(column_error(format!(
             "'{column}' has a NULL cell at row {i}: a declared triplet format must carry an \
              explicit value for every row, never silently read as whatever an unchecked \
              null-slot read on this column type happens to return"
@@ -367,7 +367,7 @@ impl DetectedFormat {
             // `num_classes` is a function of the rows and the tag discards it
             // (see `format_tag`), so every value names the same tag; the zero
             // is a neutral placeholder that never leaves this expression.
-            Self::Classification => TrainingFormat::Classification { num_classes: 0 }.format_tag(),
+            Self::Classification => TrainingFormat::Classification.format_tag(),
             Self::Regression => TrainingFormat::Regression.format_tag(),
         }
     }
@@ -416,7 +416,7 @@ pub(crate) fn detect_training_format(
         // A `task=regression` request with no usable `target` column is a typed
         // error here, never a fall-through to classification.
         if !has_regression {
-            return Err(JammiError::FineTune(format!(
+            return Err(column_error(format!(
                 "task=regression needs a string 'text' column and a numeric 'target' column, \
                  but the projected columns are {col_names:?}. (Classification's string 'label' \
                  is distinct: name the numeric outcome column 'target'.)"
@@ -426,7 +426,7 @@ pub(crate) fn detect_training_format(
     } else if has_classification {
         Ok(DetectedFormat::Classification)
     } else {
-        Err(JammiError::FineTune(format!(
+        Err(column_error(format!(
             "Cannot detect training format from columns: {col_names:?}. \
              Expected contrastive (text_a, text_b, score), triplet (anchor, positive, negative), \
              pairs (anchor, positive), classification (text, label), or regression \
@@ -459,20 +459,18 @@ pub fn build_training_data_loader(
             for batch in batches {
                 let a_col = batch
                     .column_by_name("text_a")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
+                    .ok_or_else(|| column_error("Missing column 'text_a'"))?;
                 let b_col = batch
                     .column_by_name("text_b")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
+                    .ok_or_else(|| column_error("Missing column 'text_b'"))?;
                 let s_col = batch
                     .column_by_name("score")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
+                    .ok_or_else(|| column_error("Missing column 'score'"))?;
 
-                let a_vals = extract_string_column(a_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune("'text_a' is not a string column".into())
-                })?;
-                let b_vals = extract_string_column(b_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune("'text_b' is not a string column".into())
-                })?;
+                let a_vals = extract_string_column(a_col.as_ref())
+                    .ok_or_else(|| column_error("'text_a' is not a string column"))?;
+                let b_vals = extract_string_column(b_col.as_ref())
+                    .ok_or_else(|| column_error("'text_b' is not a string column"))?;
                 let s_arr = s_col
                     .as_any()
                     .downcast_ref::<arrow::array::Float64Array>()
@@ -487,7 +485,7 @@ pub fn build_training_data_loader(
                             .downcast_ref::<arrow::array::Float32Array>()
                             .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
                     })
-                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
+                    .ok_or_else(|| column_error("'score' is not a float column"))?;
 
                 for (i, &score) in s_arr.iter().enumerate().take(batch.num_rows()) {
                     rows.push((a_vals[i].clone(), b_vals[i].clone(), score));
@@ -511,7 +509,7 @@ pub fn build_training_data_loader(
                     .column_by_name("anchor")
                     .and_then(|c| extract_string_column(c.as_ref()))
                     .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                        column_error(format!(
                         "Missing/invalid 'anchor' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
@@ -522,7 +520,7 @@ pub fn build_training_data_loader(
                     .column_by_name("positive")
                     .and_then(|c| extract_string_column(c.as_ref()))
                     .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                        column_error(format!(
                         "Missing/invalid 'positive' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
@@ -530,7 +528,7 @@ pub fn build_training_data_loader(
                     ))
                     })?;
                 let negative_col = batch.column_by_name("negative").ok_or_else(|| {
-                    JammiError::FineTune(format!(
+                    column_error(format!(
                         "Missing/invalid 'negative' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
@@ -539,7 +537,7 @@ pub fn build_training_data_loader(
                 })?;
                 refuse_null_cell(negative_col.as_ref(), "negative")?;
                 let neg_vals = extract_string_column(negative_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune(format!(
+                    column_error(format!(
                         "Missing/invalid 'negative' column: task {task} expects text columns; for \
                          image/audio triplets submit task=image_embedding/audio_embedding. \
                          Batch schema: [{}]",
@@ -573,7 +571,7 @@ pub fn build_training_data_loader(
                     .column_by_name("anchor")
                     .and_then(|c| extract_string_column(c.as_ref()))
                     .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                        column_error(format!(
                         "Missing/invalid 'anchor' column: task {task} expects text columns, and \
                          this source has the anchor/positive PAIR shape, which is read as text \
                          for every task. Image/audio training reads encoded media bytes only \
@@ -587,7 +585,7 @@ pub fn build_training_data_loader(
                     .column_by_name("positive")
                     .and_then(|c| extract_string_column(c.as_ref()))
                     .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                        column_error(format!(
                             "Missing/invalid 'positive' column: task {task} expects text columns, \
                          and this source has the anchor/positive PAIR shape, which is read as \
                          text for every task. Image/audio training reads encoded media bytes \
@@ -614,12 +612,12 @@ pub fn build_training_data_loader(
                 let text_vals = batch
                     .column_by_name("text")
                     .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                    .ok_or_else(|| column_error("Missing/invalid 'text' column"))?;
                 let target_col = batch
                     .column_by_name("target")
-                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+                    .ok_or_else(|| column_error("Missing 'target' column"))?;
                 let target_vals = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                    JammiError::FineTune(match e {
+                    column_error(match e {
                         NumericColumnError::NotNumeric => format!(
                             "regression 'target' is not a numeric column (its Arrow type is {})",
                             target_col.data_type()
@@ -647,11 +645,11 @@ pub fn build_training_data_loader(
                 let text_vals = batch
                     .column_by_name("text")
                     .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                    .ok_or_else(|| column_error("Missing/invalid 'text' column"))?;
                 let label_vals = batch
                     .column_by_name("label")
                     .and_then(|c| extract_string_column(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+                    .ok_or_else(|| column_error("Missing/invalid 'label' column"))?;
                 for i in 0..batch.num_rows() {
                     texts.push(text_vals[i].clone());
                     labels.push(label_vals[i].clone());
@@ -691,7 +689,7 @@ fn build_media_triplet_loader(
             .column_by_name("anchor")
             .and_then(|c| extract_binary_column(c.as_ref()))
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
+                column_error(format!(
                     "Missing/invalid binary 'anchor' column for media triplets (task \
                      {task}). Batch schema: [{}]",
                     schema_info()
@@ -701,14 +699,14 @@ fn build_media_triplet_loader(
             .column_by_name("positive")
             .and_then(|c| extract_binary_column(c.as_ref()))
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
+                column_error(format!(
                     "Missing/invalid binary 'positive' column for media triplets (task \
                      {task}). Batch schema: [{}]",
                     schema_info()
                 ))
             })?;
         let negative_col = batch.column_by_name("negative").ok_or_else(|| {
-            JammiError::FineTune(format!(
+            column_error(format!(
                 "Missing/invalid binary 'negative' column for media triplets (task {task}). \
                  Batch schema: [{}]",
                 schema_info()
@@ -722,7 +720,7 @@ fn build_media_triplet_loader(
         // one does.
         refuse_null_cell(negative_col.as_ref(), "negative")?;
         let neg_vals = extract_binary_column(negative_col.as_ref()).ok_or_else(|| {
-            JammiError::FineTune(format!(
+            column_error(format!(
                 "Missing/invalid binary 'negative' column for media triplets (task {task}). \
                  Batch schema: [{}]",
                 schema_info()
@@ -782,8 +780,8 @@ impl LabelVocabulary {
         }
     }
 
-    /// The number of distinct labels — `TrainingFormat::Classification`'s
-    /// `num_classes`, and the classification head's output width.
+    /// The number of distinct labels — the classification head's output
+    /// width.
     pub fn num_classes(&self) -> usize {
         self.labels.len()
     }
@@ -802,7 +800,7 @@ impl LabelVocabulary {
     /// invariant violation rather than a caller input error.
     pub(crate) fn index_of(&self, label: &str) -> Result<u32> {
         self.label_to_idx.get(label).copied().ok_or_else(|| {
-            JammiError::FineTune(format!(
+            JammiError::Internal(format!(
                 "label '{label}' is not in the vocabulary the whole-table pass built — the \
                  vocabulary sweep and the per-step decode disagree about the table's contents"
             ))
@@ -883,7 +881,7 @@ impl ChunkAccumulator {
             }),
             DetectedFormat::Classification => {
                 if vocab.is_none() {
-                    return Err(JammiError::FineTune(
+                    return Err(JammiError::Internal(
                         "classification needs a whole-table label vocabulary before a per-step \
                          chunk can assign class indices — build one via `LabelVocabulary::\
                          from_labels` over the WHOLE table first"
@@ -1015,7 +1013,7 @@ impl<'a> DecodedBatch<'a> {
                 .column_by_name(name)
                 .and_then(|c| string_cells(c.as_ref()))
                 .ok_or_else(|| {
-                    JammiError::FineTune(format!(
+                    column_error(format!(
                         "Missing/invalid '{name}' column: task {task} expects text columns. \
                          Batch schema: [{}]",
                         schema_info()
@@ -1027,7 +1025,7 @@ impl<'a> DecodedBatch<'a> {
                 .column_by_name(name)
                 .and_then(|c| binary_cells(c.as_ref()))
                 .ok_or_else(|| {
-                    JammiError::FineTune(format!(
+                    column_error(format!(
                         "Missing/invalid binary '{name}' column for media triplets (task \
                          {task}). Batch schema: [{}]",
                         schema_info()
@@ -1038,19 +1036,17 @@ impl<'a> DecodedBatch<'a> {
             DetectedFormat::Contrastive => {
                 let a_col = batch
                     .column_by_name("text_a")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_a'".into()))?;
+                    .ok_or_else(|| column_error("Missing column 'text_a'"))?;
                 let b_col = batch
                     .column_by_name("text_b")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'text_b'".into()))?;
+                    .ok_or_else(|| column_error("Missing column 'text_b'"))?;
                 let s_col = batch
                     .column_by_name("score")
-                    .ok_or_else(|| JammiError::FineTune("Missing column 'score'".into()))?;
-                let texts_a = string_cells(a_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune("'text_a' is not a string column".into())
-                })?;
-                let texts_b = string_cells(b_col.as_ref()).ok_or_else(|| {
-                    JammiError::FineTune("'text_b' is not a string column".into())
-                })?;
+                    .ok_or_else(|| column_error("Missing column 'score'"))?;
+                let texts_a = string_cells(a_col.as_ref())
+                    .ok_or_else(|| column_error("'text_a' is not a string column"))?;
+                let texts_b = string_cells(b_col.as_ref())
+                    .ok_or_else(|| column_error("'text_b' is not a string column"))?;
                 let scores = s_col
                     .as_any()
                     .downcast_ref::<arrow::array::Float64Array>()
@@ -1065,7 +1061,7 @@ impl<'a> DecodedBatch<'a> {
                             .downcast_ref::<arrow::array::Float32Array>()
                             .map(|arr| (0..arr.len()).map(|i| arr.value(i)).collect())
                     })
-                    .ok_or_else(|| JammiError::FineTune("'score' is not a float column".into()))?;
+                    .ok_or_else(|| column_error("'score' is not a float column"))?;
                 DecodedBatch::Contrastive {
                     texts_a,
                     texts_b,
@@ -1098,12 +1094,12 @@ impl<'a> DecodedBatch<'a> {
                 let texts = batch
                     .column_by_name("text")
                     .and_then(|c| string_cells(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                    .ok_or_else(|| column_error("Missing/invalid 'text' column"))?;
                 let target_col = batch
                     .column_by_name("target")
-                    .ok_or_else(|| JammiError::FineTune("Missing 'target' column".into()))?;
+                    .ok_or_else(|| column_error("Missing 'target' column"))?;
                 let targets = extract_numeric_column(target_col.as_ref()).map_err(|e| {
-                    JammiError::FineTune(match e {
+                    column_error(match e {
                         NumericColumnError::NotNumeric => format!(
                             "regression 'target' is not a numeric column (its Arrow type is {})",
                             target_col.data_type()
@@ -1124,11 +1120,11 @@ impl<'a> DecodedBatch<'a> {
                 let texts = batch
                     .column_by_name("text")
                     .and_then(|c| string_cells(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'text' column".into()))?;
+                    .ok_or_else(|| column_error("Missing/invalid 'text' column"))?;
                 let labels = batch
                     .column_by_name("label")
                     .and_then(|c| string_cells(c.as_ref()))
-                    .ok_or_else(|| JammiError::FineTune("Missing/invalid 'label' column".into()))?;
+                    .ok_or_else(|| column_error("Missing/invalid 'label' column"))?;
                 DecodedBatch::Classification { texts, labels }
             }
         })
@@ -1248,7 +1244,7 @@ impl<'a> DecodedBatch<'a> {
                 },
             ) => {
                 let vocab = vocab.ok_or_else(|| {
-                    JammiError::FineTune(
+                    JammiError::Internal(
                         "DecodedBatch::append: a Classification accumulator with no vocabulary — \
                          ChunkAccumulator::new_for already refuses building one without a \
                          vocabulary, so this is an internal invariant violation, never a caller \
@@ -1296,7 +1292,7 @@ pub(crate) fn check_schema_matches_format(
     for name in text_columns {
         let field = schema
             .field_with_name(name)
-            .map_err(|_| JammiError::FineTune(format!("Missing column '{name}'")))?;
+            .map_err(|_| column_error(format!("Missing column '{name}'")))?;
         if matches!(
             field.data_type(),
             arrow::datatypes::DataType::Binary
@@ -1304,7 +1300,7 @@ pub(crate) fn check_schema_matches_format(
                 | arrow::datatypes::DataType::BinaryView
                 | arrow::datatypes::DataType::FixedSizeBinary(_)
         ) {
-            return Err(JammiError::FineTune(format!(
+            return Err(column_error(format!(
                 "'{name}' is a binary column but task {task} expects text; for image/audio \
                  triplets submit task=image_embedding/audio_embedding"
             )));
@@ -1314,14 +1310,14 @@ pub(crate) fn check_schema_matches_format(
         for name in ["anchor", "positive", "negative"] {
             let field = schema
                 .field_with_name(name)
-                .map_err(|_| JammiError::FineTune(format!("Missing column '{name}'")))?;
+                .map_err(|_| column_error(format!("Missing column '{name}'")))?;
             if !matches!(
                 field.data_type(),
                 arrow::datatypes::DataType::Binary
                     | arrow::datatypes::DataType::LargeBinary
                     | arrow::datatypes::DataType::BinaryView
             ) {
-                return Err(JammiError::FineTune(format!(
+                return Err(column_error(format!(
                     "Missing/invalid binary '{name}' column for media triplets (task {task})"
                 )));
             }
@@ -1330,7 +1326,7 @@ pub(crate) fn check_schema_matches_format(
     if matches!(detected, DetectedFormat::Regression) {
         let field = schema
             .field_with_name("target")
-            .map_err(|_| JammiError::FineTune("Missing 'target' column".into()))?;
+            .map_err(|_| column_error("Missing 'target' column"))?;
         if matches!(
             field.data_type(),
             arrow::datatypes::DataType::Utf8
@@ -1342,7 +1338,7 @@ pub(crate) fn check_schema_matches_format(
                 | arrow::datatypes::DataType::Boolean
                 | arrow::datatypes::DataType::Null
         ) {
-            return Err(JammiError::FineTune(format!(
+            return Err(column_error(format!(
                 "regression 'target' is not a numeric column (its Arrow type is {})",
                 field.data_type()
             )));
@@ -1358,6 +1354,15 @@ pub(crate) fn numeric_target_column(detected: DetectedFormat) -> Option<&'static
     match detected {
         DetectedFormat::Regression => Some("target"),
         _ => None,
+    }
+}
+
+/// The caller's training columns — their names, types or values — do not fit
+/// the format the task reads.
+pub(crate) fn column_error(reason: impl Into<String>) -> JammiError {
+    JammiError::InvalidArgument {
+        argument: "columns".into(),
+        reason: reason.into(),
     }
 }
 

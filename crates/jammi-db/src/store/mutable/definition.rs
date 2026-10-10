@@ -286,7 +286,7 @@ impl MutableTableError {
             // Lost a race with another writer: re-running the statement
             // selects against the new rows.
             Self::WriteConflict { .. } => ErrorClass::Aborted,
-            Self::Backend(_) => ErrorClass::Internal,
+            Self::Backend(e) => e.class(),
         }
     }
 }

@@ -423,7 +423,10 @@ async fn materialize_context_rejects_duplicate_target_keys() {
         )
         .await
         .expect_err("a target key must be unique in a context table");
-    assert!(err.to_string().contains("duplicate target key"));
+    assert!(
+        matches!(err, jammi_db::error::JammiError::InvalidArgument { ref argument, .. } if argument == "rows"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -590,11 +593,13 @@ async fn materialize_context_rejects_a_key_column_on_an_unreachable_source() {
         .await
         .expect_err("an unreachable source cannot confirm a declared key column");
 
-    let msg = err.to_string();
     assert!(
-        msg.contains("Key column check") && msg.contains("ghost") && msg.contains("id"),
-        "the error must say the check could not resolve the source, and name \
-         both the source and the key column, got: {msg}"
+        matches!(
+            &err,
+            jammi_db::error::JammiError::NotFound(jammi_db::error::Missing::Source { source_id })
+                if source_id == "ghost"
+        ),
+        "an unresolvable source is NotFound, naming it: {err:?}"
     );
 }
 

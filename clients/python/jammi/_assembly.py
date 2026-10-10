@@ -86,7 +86,6 @@ _FILE_FORMAT = {
     "json": catalog_pb2.FileFormat.FILE_FORMAT_JSON,
     "jsonl": catalog_pb2.FileFormat.FILE_FORMAT_JSONL,
     "ndjson": catalog_pb2.FileFormat.FILE_FORMAT_JSONL,
-    "avro": catalog_pb2.FileFormat.FILE_FORMAT_AVRO,
 }
 
 # URL scheme → wire `SourceKind` for a database source. Mirrors the engine's

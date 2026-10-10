@@ -122,73 +122,45 @@ pub async fn create_listing_table(
 
     let table_url = ListingTableUrl::parse(url.as_str())?;
 
-    let (df_format, default_ext): (
-        Arc<dyn datafusion::datasource::file_format::FileFormat>,
-        &str,
-    ) = match format {
-        FileFormat::Parquet => (
-            Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default()),
-            ".parquet",
-        ),
-        FileFormat::Csv => (
-            Arc::new(datafusion::datasource::file_format::csv::CsvFormat::default()),
-            ".csv",
-        ),
-        FileFormat::Json => (
-            Arc::new(datafusion::datasource::file_format::json::JsonFormat::default()),
-            ".json",
-        ),
-        FileFormat::JsonLines => (
-            // DataFusion's `JsonFormat` is already line-delimited, so this
-            // shares the same reader as `FileFormat::Json`. The `".jsonl"`
-            // here is a PLACEHOLDER that satisfies this match's `&str`
-            // return type only — it is never actually read as a value: with
-            // no override, the adaptive branch below resolves `.jsonl`/
-            // `.ndjson` itself and never consults `default_ext`; with an
-            // override, the override always wins over `unwrap_or`'s
-            // (eagerly evaluated but discarded) default. The adaptive branch
-            // owns the true default for this format; this arm's `&str` is
-            // dead weight kept only for the match's uniform return type.
-            Arc::new(datafusion::datasource::file_format::json::JsonFormat::default()),
-            ".jsonl",
-        ),
-        FileFormat::Avro => return Err(JammiError::Config("Avro not yet supported".into())),
+    let df_format: Arc<dyn datafusion::datasource::file_format::FileFormat> = match format {
+        FileFormat::Parquet => {
+            Arc::new(datafusion::datasource::file_format::parquet::ParquetFormat::default())
+        }
+        FileFormat::Csv => Arc::new(datafusion::datasource::file_format::csv::CsvFormat::default()),
+        // DataFusion's `JsonFormat` reads line-delimited JSON, so the two
+        // JSON formats share it and differ only in the files they list.
+        FileFormat::Json | FileFormat::JsonLines => {
+            Arc::new(datafusion::datasource::file_format::json::JsonFormat::default())
+        }
     };
 
-    // `adaptive` marks whether THIS call resolved `.jsonl`/`.ndjson` itself
-    // (vs. being told the extension by the caller or the per-format table
-    // above) — the sole source of truth `resolved_for_persistence` below
-    // derives from, so "what was served" and "what gets pinned" are
-    // constructed from the SAME `ext` value and cannot spell differently.
-    let (ext, files, adaptive): (&str, Vec<ObjectMeta>, bool) =
-        if matches!(format, FileFormat::JsonLines) && file_extension.is_none() {
-            let jsonl_files =
-                list_matching_files(session, driver.as_ref(), &table_url, ".jsonl").await?;
-            if !jsonl_files.is_empty() {
-                (".jsonl", jsonl_files, true)
-            } else {
-                let ndjson_files =
-                    list_matching_files(session, driver.as_ref(), &table_url, ".ndjson").await?;
-                if ndjson_files.is_empty() {
-                    return Err(JammiError::Config(format!(
-                        "no files matched extension '.jsonl' or '.ndjson' under '{url}' — the \
-                         source would register with no schema and no rows"
-                    )));
-                }
-                (".ndjson", ndjson_files, true)
-            }
-        } else {
-            let ext = file_extension.unwrap_or(default_ext);
-            let files = list_matching_files(session, driver.as_ref(), &table_url, ext).await?;
-            if files.is_empty() {
-                return Err(JammiError::Config(format!(
-                    "no files matched extension '{ext}' under '{url}' — the source would \
-                     register with no schema and no rows"
-                )));
-            }
-            (ext, files, false)
-        };
-    let resolved_for_persistence = adaptive.then(|| ext.to_string());
+    // The extensions the listing tries, in order: the caller's override
+    // alone, or the format's own ([`FileFormat::extensions`]). The first that
+    // matches any file is the one served.
+    let candidates: Vec<&str> = match file_extension {
+        Some(ext) => vec![ext],
+        None => format.extensions().to_vec(),
+    };
+    let mut served = None;
+    for candidate in &candidates {
+        let files = list_matching_files(session, driver.as_ref(), &table_url, candidate).await?;
+        if !files.is_empty() {
+            served = Some((*candidate, files));
+            break;
+        }
+    }
+    let (ext, files) = served.ok_or_else(|| JammiError::InvalidArgument {
+        argument: "url".into(),
+        reason: format!(
+            "no files matched extension {} under '{url}' — the source would register with no \
+             schema and no rows",
+            candidates.join(" or ")
+        ),
+    })?;
+    // A choice among several extensions is pinned: the extension served is
+    // the one every later build from the catalog row lists, so a file of the
+    // other spelling added later never flips which files the source serves.
+    let resolved_for_persistence = (candidates.len() > 1).then(|| ext.to_string());
 
     let schema = df_format.infer_schema(session, &driver, &files).await?;
 

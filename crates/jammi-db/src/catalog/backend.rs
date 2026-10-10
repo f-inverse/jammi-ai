@@ -985,6 +985,28 @@ pub enum BackendError {
     Sqlx(#[source] std::sync::Arc<sqlx::Error>),
 }
 
+impl BackendError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]).
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::Unavailable(_) => ErrorClass::Unavailable,
+            // The backend asked for the transaction to run again: a retry
+            // from a fresh read can succeed.
+            Self::Retry(_) => ErrorClass::Aborted,
+            // The state refuses the write: a row the write collides with, or
+            // a live writer it must wait for.
+            Self::Constraint { .. } | Self::Busy(_) => ErrorClass::FailedPrecondition,
+            Self::TenantMismatch { .. } => ErrorClass::PermissionDenied,
+            Self::Execution(_)
+            | Self::Migration(_)
+            | Self::TypeConversion { .. }
+            | Self::DomainViolation { .. }
+            | Self::Sqlx(_) => ErrorClass::Internal,
+        }
+    }
+}
+
 /// Ceiling on the post-`close` drain. Reaching it means a connection never
 /// finished closing; the drain gives up and warns rather than hanging the
 /// caller's shutdown forever.

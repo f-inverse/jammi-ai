@@ -162,7 +162,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use jammi_db::config::LimitsConfig;
-use jammi_db::error::JammiError;
 use pin_project::pin_project;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Sleep;
@@ -235,15 +234,8 @@ pub const DRAINING_MESSAGE: &str = "server draining";
 pub const MESSAGE_SIZE_LABEL: &str = "message_size";
 
 /// Build a refused [`Response`]: a [`tonic::Status`] carrying `code` and
-/// `message`, with the typed wire detail attached via
-/// [`jammi_wire::attach_error_detail`] — reusing [`JammiError::Config`] to
-/// carry the message. A limits refusal has no dedicated `JammiError` variant
-/// of its own (widening that shared enum for a mechanism-only wire
-/// annotation is outside this module's reach); the client-observable `code`,
-/// `message`, and `bound` label are what a caller actually reads and matches
-/// on, and those cross the wire faithfully either way. The response is then
-/// stamped with `bound` so [`RefusalStatusLayer`] counts it under the right
-/// label.
+/// `message` ([`limits_status`]), stamped with `bound` so
+/// [`RefusalStatusLayer`] counts it under the right label.
 fn refuse<ResBody: Default>(code: Code, message: String, bound: RefusedBound) -> Response<ResBody> {
     let status = limits_status(code, message);
     let mut response = status.into_http::<ResBody>();
@@ -251,15 +243,15 @@ fn refuse<ResBody: Default>(code: Code, message: String, bound: RefusedBound) ->
     response
 }
 
-/// Build the [`Status`] a limits refusal or timeout carries, with the typed
-/// wire detail attached exactly like every other refusal in this module
-/// (reusing [`JammiError::Config`] — see [`refuse`]'s doc for why). Shared so
-/// [`refuse`]'s edge refusal and [`PermitBody::Deadlined`]'s mid-stream
-/// timeout trailer both carry the SAME typed annotation a decoding client
-/// reads identically whichever path fired.
+/// Build the [`Status`] a limits refusal or timeout carries: its code and
+/// message, and no engine detail — the server's admission refused the call
+/// before any engine verb ran, so a decoding client reads it by its code
+/// ([`jammi_wire::error_from_status`] gives a `JammiError::Remote` of the
+/// code's class). Shared so [`refuse`]'s edge refusal and
+/// [`PermitBody::Deadlined`]'s mid-stream timeout trailer carry the same
+/// status whichever path fired.
 fn limits_status(code: Code, message: String) -> Status {
-    let engine_err = JammiError::Config(message.clone());
-    jammi_wire::attach_error_detail(code, message, &engine_err)
+    Status::new(code, message)
 }
 
 /// The message [`PermitBody::Deadlined`] closes a header-less stream with once

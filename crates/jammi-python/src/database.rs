@@ -138,7 +138,7 @@ impl PyDatabase {
         })
     }
 
-    /// `Err` (the same typed `BackendError` [`PyDatabase::close`] raises for
+    /// `Err` (the same typed `FailedPrecondition` [`PyDatabase::close`] raises for
     /// every later call) once `close()` has run; `Ok(())` otherwise. Every
     /// pymethod but `close()` and `attach`'s target `job` calls this
     /// first, so a caller who keeps using a handle after `close()` gets a
@@ -146,9 +146,10 @@ impl PyDatabase {
     /// state the worker/session were left in.
     fn check_open(&self) -> PyResult<()> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(to_pyerr(JammiError::Catalog(
+            return Err(crate::error::client_error(
+                "FailedPrecondition",
                 "Database is closed".to_string(),
-            )));
+            ));
         }
         Ok(())
     }
@@ -2049,13 +2050,7 @@ fn context_source_tag(kind: ContextSourceKind) -> &'static str {
 }
 
 fn parse_file_format(s: &str) -> PyResult<FileFormat> {
-    // A bad format token is unambiguously a caller argument error, so surface it
-    // as `InvalidArgument` — matching the remote client, which rejects an unknown
-    // format client-side as the same class. The `FileFormat` parse error is the
-    // generic `JammiError::Other`, which would otherwise land in the backend
-    // bucket, so the classification is pinned here at the caller-facing seam.
-    s.parse::<FileFormat>()
-        .map_err(|e| crate::error::client_error("InvalidArgument", e.to_string()))
+    s.parse::<FileFormat>().map_err(crate::error::to_pyerr)
 }
 
 /// Parse a classification conformal score family from its snake-case name.

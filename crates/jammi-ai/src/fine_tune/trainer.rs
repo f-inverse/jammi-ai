@@ -2714,7 +2714,10 @@ impl TrainingLoop {
                 let encoder = &state.encoder;
                 let tokenizer = base
                     .tokenizer()
-                    .ok_or_else(|| JammiError::FineTune("No tokenizer in base model".into()))?;
+                    .ok_or_else(|| JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: "No tokenizer in base model".into(),
+                    })?;
 
                 // `AnyEncoder::max_seq_length` refuses on a media tower
                 // (no token-sequence capacity exists there, and every
@@ -2901,11 +2904,12 @@ impl TrainingLoop {
 
         // Serving's guard, applied at the training edge too: the
         // feature-extractor's mel-filter count IS the tower's input contract.
-        let num_mel_bins = encoder.num_mel_bins().map_err(|e| {
-            JammiError::FineTune(format!(
-                "Audio training needs the tower's num_mel_bins: {e}"
-            ))
-        })?;
+        let num_mel_bins = encoder
+            .num_mel_bins()
+            .map_err(|e| JammiError::InvalidArgument {
+                argument: "base_model".into(),
+                reason: format!("Audio training needs the tower's num_mel_bins: {e}"),
+            })?;
         if frontend.n_mels != num_mel_bins {
             return Err(JammiError::FineTune(format!(
                 "Audio feature-extractor feature_size ({}) does not match the tower's \
@@ -2949,8 +2953,9 @@ impl TrainingLoop {
     ) -> Result<jammi_encoders::OwnedEncoderInput> {
         use crate::inference::image_preprocess;
 
-        let geometry = |what: &str, e: jammi_encoders::EncoderError| {
-            JammiError::FineTune(format!("Image training needs the tower's {what}: {e}"))
+        let geometry = |what: &str, e: jammi_encoders::EncoderError| JammiError::InvalidArgument {
+            argument: "base_model".into(),
+            reason: format!("Image training needs the tower's {what}: {e}"),
         };
         let side = encoder
             .image_size()
@@ -3189,11 +3194,6 @@ impl TrainingLoop {
                     labels: labels_tensor,
                 })
             }
-            TextChunk::Ner { .. } => Err(JammiError::FineTune(
-                "NER fine-tuning is not yet available. \
-                 Token-level training requires sequence-level encoding."
-                    .into(),
-            )),
             TextChunk::Regression { texts, targets } => {
                 let proj = encode(texts)?;
                 // Score in standardized (z) space: the head emits its RAW z-output
@@ -3679,10 +3679,6 @@ impl TrainingLoop {
             super::data::TrainingBatch::Classification { logits, labels } => {
                 self.cross_entropy_loss(logits, labels)
             }
-            super::data::TrainingBatch::Ner {
-                hidden_states,
-                labels,
-            } => self.ner_loss(hidden_states, labels),
             super::data::TrainingBatch::Regression { input, target } => {
                 self.regression_loss(input, target)
             }
@@ -3714,10 +3710,7 @@ impl TrainingLoop {
     /// variant's own doc). `Regression` gathers `input` — already `Self::
     /// head_forward`'s output (`Self::encode_chunk`'s `Regression` arm runs
     /// it before this function ever sees the batch) — and the targets, the
-    /// SAME rule, not a special case. `Ner` stays refused, exactly
-    /// as [`Self::compute_loss`] itself refuses it; this function never
-    /// reaches a `Ner` batch in production (`Self::encode_chunk` never
-    /// builds one).
+    /// SAME rule, not a special case.
     ///
     /// **Why this closes the W× gradient hazard.** [`super::collective::
     /// Collective::all_gather`]'s own contract: only the calling rank's own
@@ -3790,7 +3783,6 @@ impl TrainingLoop {
                 let target = rank_ctx.all_gather(call, target, counts)?;
                 self.compute_loss(&TrainingBatch::Regression { input, target })
             }
-            TrainingBatch::Ner { .. } => self.compute_loss(batch),
         }
     }
 
@@ -3826,12 +3818,10 @@ impl TrainingLoop {
     /// log-sum-exp ordering ([`pairwise_ordering_loss`]) — there is no row
     /// `i` whose loss is independent of every other row, so inventing a
     /// per-row split would not be a decomposition of the real objective, it
-    /// would be a different number scored under a different name. `Ner`
-    /// (token-level; this seam has not chosen a per-example convention for
-    /// it) and `Regression` (the distributional head — a different
-    /// objective family) are typed refusals for
-    /// the same reason: a fabricated decomposition is worse than an honest
-    /// refusal.
+    /// would be a different number scored under a different name.
+    /// `Regression` (the distributional head — a different objective family)
+    /// is a typed refusal for the same reason: a fabricated decomposition is
+    /// worse than an honest refusal.
     fn compute_loss_per_example(&self, batch: &super::data::TrainingBatch) -> Result<Vec<f64>> {
         match batch {
             super::data::TrainingBatch::Pairs { anchors, positives } => self
@@ -3897,11 +3887,6 @@ impl TrainingLoop {
             super::data::TrainingBatch::Classification { logits, labels } => {
                 cross_entropy_per_row(logits, labels)
             }
-            super::data::TrainingBatch::Ner { .. } => Err(JammiError::FineTune(
-                "evaluate_held_out: NER's natural unit is a token, not a held-out example — \
-                 this seam does not define a per-example convention for NER in v1."
-                    .into(),
-            )),
             super::data::TrainingBatch::Regression { .. } => Err(JammiError::FineTune(
                 "evaluate_held_out: Regression trains a different distributional-head \
                  objective family; this seam defines no per-example held-out decomposition \
@@ -3996,91 +3981,6 @@ impl TrainingLoop {
     fn cross_entropy_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
         candle_nn::loss::cross_entropy(logits, labels)
             .map_err(|e| JammiError::FineTune(format!("Cross-entropy loss: {e}")))
-    }
-
-    /// Token-level cross-entropy loss for NER with `ignore_index=-100`
-    /// semantics: positions whose original label is `-100` contribute
-    /// **nothing** to the loss value or the gradient, and the mean is taken
-    /// over the non-ignored positions only (not `batch * seq_len`). This
-    /// matches PyTorch's `torch.nn.CrossEntropyLoss(ignore_index=-100)`
-    /// under the default `reduction="mean"`, whose docs specify that the
-    /// mean divides by the count of targets that are *not* `ignore_index`
-    /// (<https://docs.pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html>).
-    ///
-    /// Candle's `cross_entropy` has no `ignore_index` argument, so this
-    /// gathers the non-ignored rows with [`Tensor::index_select`] *before*
-    /// calling it, rather than clamping `-100` to a valid class and masking
-    /// the loss value afterwards. That distinction matters for the
-    /// gradient, not just the value: because the ignored rows never enter
-    /// the cross-entropy computation graph, candle's `index_select`
-    /// backward (`grads.or_insert` zero-fills the full-shape gradient, then
-    /// `index_add`s only into the selected rows — see
-    /// `candle_core::backprop`) leaves the ignored rows' gradient at an
-    /// *exact* `0.0`. A "compute-then-multiply-by-zero-mask" formulation
-    /// would only get a value of `0.0` for those rows in the forward pass;
-    /// the backward pass would still evaluate (and could still overflow to
-    /// `inf`/`NaN`) the per-row cross-entropy term before the zero multiply,
-    /// which is not exactness, only smallness.
-    ///
-    /// If every position in the batch is ignored, this returns a `0.0`
-    /// scalar loss (no rows to select, hence no gradient contribution),
-    /// matching PyTorch's handling of an all-`ignore_index` batch under
-    /// `reduction="mean"` (returning `0` rather than propagating a `0/0`
-    /// `NaN`).
-    fn ner_loss(&self, logits: &Tensor, labels: &Tensor) -> Result<Tensor> {
-        let (batch, seq_len, num_labels) = logits
-            .dims3()
-            .map_err(|e| JammiError::FineTune(format!("NER logits dims: {e}")))?;
-
-        // Flatten to (batch*seq_len, num_labels) and (batch*seq_len,)
-        let flat_logits = logits
-            .reshape((batch * seq_len, num_labels))
-            .map_err(|e| JammiError::FineTune(format!("NER flatten logits: {e}")))?;
-        let flat_labels = labels
-            .reshape(batch * seq_len)
-            .map_err(|e| JammiError::FineTune(format!("NER flatten labels: {e}")))?;
-
-        // Read labels to the host to build the keep-list: -100 marks a
-        // position to exclude entirely, per ignore_index=-100 semantics.
-        let label_values = flat_labels
-            .to_dtype(candle_core::DType::I64)
-            .map_err(|e| JammiError::FineTune(format!("NER labels i64: {e}")))?
-            .to_vec1::<i64>()
-            .map_err(|e| JammiError::FineTune(format!("NER labels to_vec1: {e}")))?;
-
-        let mut keep_indices: Vec<u32> = Vec::with_capacity(label_values.len());
-        let mut keep_labels: Vec<u32> = Vec::with_capacity(label_values.len());
-        for (idx, &label) in label_values.iter().enumerate() {
-            if label != -100 {
-                keep_indices.push(idx as u32);
-                keep_labels.push(label as u32);
-            }
-        }
-
-        if keep_indices.is_empty() {
-            // Every position ignored: match PyTorch's CrossEntropyLoss
-            // (reduction="mean") returning 0.0 rather than a NaN 0/0 mean.
-            return Tensor::zeros((), logits.dtype(), logits.device())
-                .map_err(|e| JammiError::FineTune(format!("NER all-ignored zero loss: {e}")));
-        }
-
-        let n_keep = keep_indices.len();
-        let device = flat_logits.device();
-        let index_tensor = Tensor::from_vec(keep_indices, n_keep, device)
-            .map_err(|e| JammiError::FineTune(format!("NER keep indices: {e}")))?;
-        let label_tensor = Tensor::from_vec(keep_labels, n_keep, device)
-            .map_err(|e| JammiError::FineTune(format!("NER keep labels: {e}")))?;
-
-        // Gather only the non-ignored rows before computing cross-entropy so
-        // the ignored rows never enter the graph (see the doc comment above
-        // for why this, not a zero-mask multiply, makes their gradient
-        // exactly 0.0).
-        let selected_logits = flat_logits
-            .index_select(&index_tensor, 0)
-            .map_err(|e| JammiError::FineTune(format!("NER index_select logits: {e}")))?;
-
-        candle_nn::loss::cross_entropy(&selected_logits, &label_tensor)
-            .map_err(|e| JammiError::FineTune(format!("NER cross-entropy: {e}")))
     }
 
     /// Triplet loss: `max(0, cos(anchor, negative) - cos(anchor, positive) + margin)`.
@@ -4462,7 +4362,7 @@ impl TrainingLoop {
     ///   [`super::data::TrainingDataLoader::len`]), so the row-level check
     ///   happens per batch, as rows are actually produced.
     /// - A batch kind `Self::compute_loss_per_example` does not support
-    ///   (CoSENT/AnglE/NER/Regression — see that method's doc).
+    ///   (CoSENT/AnglE/Regression — see that method's doc).
     /// - A non-finite per-example loss: refused rather than folded into the
     ///   mean, because a NaN example silently dropped or silently averaged
     ///   in would corrupt every downstream paired-sign-test cell with no
@@ -4490,10 +4390,10 @@ impl TrainingLoop {
     /// other batch kind this seam supports (`Triplet` margin,
     /// `Contrastive`/`CosineMse`, `Classification`) scores each row
     /// independently of every other row in the batch: genuinely ZERO
-    /// in-batch negatives, not an approximation of MNRL's count. `Ner` and
-    /// `Regression` are typed refusals earlier in
-    /// `compute_loss_per_example` and never reach here in a successful call;
-    /// they fold to `0` for an exhaustive match rather than a wildcard.
+    /// in-batch negatives, not an approximation of MNRL's count. `Regression`
+    /// is a typed refusal earlier in `compute_loss_per_example` and never
+    /// reaches here in a successful call; it folds to `0` for an exhaustive
+    /// match rather than a wildcard.
     fn in_batch_negatives_for(
         &self,
         batch: &super::data::TrainingBatch,
@@ -4509,7 +4409,6 @@ impl TrainingLoop {
             },
             super::data::TrainingBatch::Contrastive { .. }
             | super::data::TrainingBatch::Classification { .. }
-            | super::data::TrainingBatch::Ner { .. }
             | super::data::TrainingBatch::Regression { .. } => 0,
         }
     }
@@ -5283,9 +5182,9 @@ fn split_complex(emb: &Tensor) -> Result<(Tensor, Tensor)> {
         .dim(1)
         .map_err(|e| JammiError::FineTune(format!("complex dim: {e}")))?;
     if hidden % 2 != 0 {
-        return Err(JammiError::FineTune(format!(
+        return Err(JammiError::InvalidArgument { argument: "embedding_loss".into(), reason: format!(
             "AnglE requires an even embedding dimension to split into real/imaginary halves, got {hidden}"
-        )));
+        ) });
     }
     let half = hidden / 2;
     let re = emb
@@ -5601,7 +5500,6 @@ fn batch_row_count(batch: &super::data::TrainingBatch) -> Result<usize> {
         super::data::TrainingBatch::Pairs { anchors, .. } => dim0(anchors),
         super::data::TrainingBatch::Triplet { anchor, .. } => dim0(anchor),
         super::data::TrainingBatch::Classification { logits, .. } => dim0(logits),
-        super::data::TrainingBatch::Ner { hidden_states, .. } => dim0(hidden_states),
         super::data::TrainingBatch::Regression { input, .. } => dim0(input),
     }
 }
@@ -5664,7 +5562,7 @@ fn matryoshka_sum(
     let mut total: Option<Tensor> = None;
     for &dim in dims {
         if dim > full_dim {
-            return Err(JammiError::FineTune(format!(
+            return Err(JammiError::Config(format!(
                 "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
             )));
         }
@@ -5709,7 +5607,7 @@ fn matryoshka_sum_per_example(
     let mut total: Option<Vec<f64>> = None;
     for &dim in dims {
         if dim > full_dim {
-            return Err(JammiError::FineTune(format!(
+            return Err(JammiError::Config(format!(
                 "matryoshka_dims entry {dim} exceeds the embedding width {full_dim}"
             )));
         }
@@ -6241,7 +6139,7 @@ mod tests {
         let scores = Tensor::new(&[1.0f32], &device).unwrap();
         let err = angle_loss(&odd, &odd, &scores).unwrap_err();
         assert!(
-            matches!(err, JammiError::FineTune(ref m) if m.contains("even embedding dimension")),
+            matches!(err, JammiError::InvalidArgument { ref reason, .. } if reason.contains("even embedding dimension")),
             "expected an even-dimension error, got {err:?}"
         );
     }
@@ -6410,7 +6308,7 @@ mod tests {
         let objective = |dims: Vec<Tensor>| mnrl_loss(&dims[0], &dims[1], None, 20.0, true);
         let err = matryoshka_sum(&[8], &[&anchor, &positive], &objective).unwrap_err();
         assert!(
-            matches!(err, JammiError::FineTune(ref m) if m.contains("exceeds the embedding width")),
+            matches!(err, JammiError::Config(ref m) if m.contains("exceeds the embedding width")),
             "expected an oversized-dim error, got {err:?}"
         );
     }
@@ -7135,244 +7033,6 @@ mod host_read_discipline {
             clip_before + 1,
             "clip_and_step's cadence-gated grad-norm read (optimizer::SYNC_READ_COUNT) must \
              also fire exactly once for this call"
-        );
-    }
-}
-
-/// `ner_loss`'s `ignore_index=-100` semantics: positions labelled `-100` are
-/// excluded from the loss, never clamped to a valid class and run through
-/// an unmasked `cross_entropy`. Nothing in-repo constructs a
-/// `TrainingBatch::Ner` (`encode_chunk` refuses `TextChunk::Ner`), but the
-/// path is publicly reachable via `TrainingDataLoader::from_precomputed`,
-/// which is what these tests drive it through, exactly as a caller who
-/// bypasses `encode_chunk` and hand-builds a `TrainingBatch::Ner` batch
-/// would.
-#[cfg(test)]
-mod ner_loss_ignore_index {
-    use candle_core::{DType, Device, Tensor, Var};
-    use candle_nn::VarBuilder;
-    use candle_nn::VarMap;
-
-    use super::super::data::{TextChunk, TrainingBatch, TrainingDataLoader};
-    use super::super::lora::build_distribution_head;
-    use super::super::target::TrainingTarget;
-    use super::super::FineTuneConfig;
-    use super::TrainingLoopBuilder;
-    use jammi_db::error::JammiError;
-
-    const HIDDEN: usize = 4;
-
-    /// A minimal real [`super::TrainingLoop`], mirroring
-    /// `host_read_discipline::minimal_loop`: `ner_loss`/`compute_loss`
-    /// never touch the catalog, so an empty, unclaimed-by-anything-else
-    /// catalog registered under its own tag is enough.
-    async fn minimal_loop(device: &Device) -> super::TrainingLoop {
-        let varmap = VarMap::new();
-        let vb = VarBuilder::from_varmap(&varmap, DType::F32, device);
-        let config = FineTuneConfig::default();
-        let head = build_distribution_head(HIDDEN, 2, &config, &varmap, &vb).unwrap();
-        let (catalog, dir) = super::test_fixtures::claimed_job("ner-loss-ignore-index").await;
-        TrainingLoopBuilder::new(TrainingTarget::FrozenEncoder { head }, varmap, config)
-            .device(device.clone())
-            .job_id("ner-loss-ignore-index".into())
-            .catalog(catalog)
-            .artifact_dir(dir.path().to_path_buf())
-            .build()
-            .unwrap()
-    }
-
-    /// Build a `(1, 2, 3)` logits `Var` whose position-1 (the ignored row,
-    /// label `-100`) is `pos1`, and whose position-0 (label `0`) is fixed
-    /// across callers so batches only ever differ at the ignored row.
-    fn logits_var(device: &Device, pos1: [f32; 3]) -> Var {
-        Var::from_tensor(&Tensor::new(&[[[0.0f32, 0.0, 0.0], pos1]], device).unwrap()).unwrap()
-    }
-
-    fn ner_labels(device: &Device) -> Tensor {
-        // label 0 at position 0, ignore_index -100 at position 1.
-        Tensor::new(&[[0i64, -100i64]], device).unwrap()
-    }
-
-    /// Round-trip a `TrainingBatch::Ner` through the PUBLIC
-    /// `TrainingDataLoader::from_precomputed` / `batches()` API (rather than
-    /// calling `compute_loss` on a hand-held batch directly), so the masking is
-    /// verified through the same public surface an out-of-tree caller who
-    /// hand-builds a `TrainingBatch::Ner` batch would use.
-    fn round_trip_through_precomputed(batch: TrainingBatch) -> TrainingBatch {
-        let loader = TrainingDataLoader::from_precomputed(vec![batch]);
-        let mut batches = loader.batches(1).unwrap();
-        assert_eq!(batches.len(), 1);
-        batches.remove(0).unwrap()
-    }
-
-    /// Two `Ner` batches identical except at the ignored (label `-100`)
-    /// position must produce bit-identical losses AND an exactly-zero,
-    /// finite gradient at that position's logits.
-    ///
-    /// Mutation: clamping `-100 -> 0` and running UNMASKED cross-entropy
-    /// over all positions makes batch A's (`pos1 = [0,0,0]`) and batch B's
-    /// (`pos1 = [0,0,8]`, a confident wrong prediction against the clamped
-    /// label `0`) losses differ by *far* more than 0.1 — the ignored row's
-    /// huge cross-entropy term leaks straight into the mean. Masking the
-    /// ignored row out before `cross_entropy` runs makes the two losses
-    /// depend only on the (identical) position-0 row, so they are
-    /// bit-identical, and `index_select`'s backward gives the ignored row's
-    /// gradient an exact `0.0` (see `ner_loss`'s doc comment for why that is
-    /// exact, not merely small).
-    #[test]
-    fn ignored_position_does_not_move_the_loss_or_the_gradient() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let labels = ner_labels(&device);
-        let var_a = logits_var(&device, [0.0, 0.0, 0.0]);
-        let var_b = logits_var(&device, [0.0, 0.0, 8.0]);
-
-        let batch_a = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: var_a.as_tensor().clone(),
-            labels: labels.clone(),
-        });
-        let batch_b = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: var_b.as_tensor().clone(),
-            labels: labels.clone(),
-        });
-
-        let loss_a = loop_.compute_loss(&batch_a).unwrap();
-        let loss_b = loop_.compute_loss(&batch_b).unwrap();
-        let loss_a_val: f32 = loss_a.to_scalar().unwrap();
-        let loss_b_val: f32 = loss_b.to_scalar().unwrap();
-
-        // CONTROL 1 (finite-guard FIRST): a NaN must fail this control
-        // outright, before any comparison — never fake either color.
-        assert!(
-            loss_a_val.is_finite() && loss_b_val.is_finite(),
-            "loss_a={loss_a_val} loss_b={loss_b_val} must both be finite before comparing them"
-        );
-
-        // Bit-identical scalars, checked via the raw bit pattern
-        // (not merely `abs(a - b) < eps`) — the ignored row must contribute
-        // NOTHING, not just something small.
-        assert_eq!(
-            loss_a_val.to_bits(),
-            loss_b_val.to_bits(),
-            "loss_a={loss_a_val} loss_b={loss_b_val} must be bit-identical: they differ only at \
-             the ignore_index=-100 position, which must not move the loss at all"
-        );
-
-        // The ignored row's gradient is EXACTLY 0.0 and finite.
-        let grads = loss_a.backward().unwrap();
-        let grad_a = grads.get(&var_a).expect("logits var must have a gradient");
-        let grad_rows = grad_a.to_vec3::<f32>().unwrap();
-        let ignored_row = grad_rows[0][1].clone();
-        assert!(
-            ignored_row.iter().all(|g| g.is_finite()),
-            "ignored row's gradient must be finite: {ignored_row:?}"
-        );
-        assert_eq!(
-            ignored_row.as_slice(),
-            [0.0f32, 0.0, 0.0],
-            "ignored (label=-100) row's gradient must be EXACTLY zero, got {ignored_row:?}"
-        );
-    }
-
-    /// POSITIVE CONTROL against an over-broad fix: with no `-100` label at
-    /// all (`labels = [0, 1]`), the masked path must select every row and
-    /// therefore agree with plain unmasked `cross_entropy` to bit-equality
-    /// — a fix that (say) always dropped the last position, or scaled the
-    /// mean by the wrong denominator, would show up here even though
-    /// nothing is actually ignored.
-    #[test]
-    fn no_ignored_positions_matches_unmasked_cross_entropy_bit_exactly() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let logits = Tensor::new(&[[[1.0f32, 0.2, -0.5], [0.1, 2.0, 0.3]]], &device).unwrap();
-        let labels = Tensor::new(&[[0i64, 1i64]], &device).unwrap();
-        let batch = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: logits.clone(),
-            labels,
-        });
-
-        let masked_loss = loop_.compute_loss(&batch).unwrap();
-        let masked_val: f32 = masked_loss.to_scalar().unwrap();
-
-        let flat_logits = logits.reshape((2, 3)).unwrap();
-        let flat_labels = Tensor::new(&[0u32, 1u32], &device).unwrap();
-        let unmasked_loss = candle_nn::loss::cross_entropy(&flat_logits, &flat_labels).unwrap();
-        let unmasked_val: f32 = unmasked_loss.to_scalar().unwrap();
-
-        // CONTROL 1 (finite-guard FIRST).
-        assert!(
-            masked_val.is_finite() && unmasked_val.is_finite(),
-            "masked={masked_val} unmasked={unmasked_val} must both be finite before comparing"
-        );
-
-        assert_eq!(
-            masked_val.to_bits(),
-            unmasked_val.to_bits(),
-            "with no ignore_index=-100 labels, the masked path (selects every row) must match \
-             plain cross_entropy bit-for-bit: masked={masked_val} unmasked={unmasked_val}"
-        );
-    }
-
-    /// All-ignored batch: PyTorch's `CrossEntropyLoss(reduction="mean")`
-    /// returns `0.0` (not a `0/0` NaN) when every target equals
-    /// `ignore_index`; `ner_loss` must match that rather than propagating a
-    /// NaN into training.
-    #[test]
-    fn all_ignored_batch_returns_zero_not_nan() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let logits = Tensor::new(&[[[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]], &device).unwrap();
-        let labels = Tensor::new(&[[-100i64, -100i64]], &device).unwrap();
-        let batch = round_trip_through_precomputed(TrainingBatch::Ner {
-            hidden_states: logits,
-            labels,
-        });
-
-        let loss = loop_.compute_loss(&batch).unwrap();
-        let val: f32 = loss.to_scalar().unwrap();
-        assert!(
-            val.is_finite(),
-            "all-ignored loss must be finite, got {val}"
-        );
-        assert_eq!(val, 0.0, "all-ignored loss must be exactly 0.0, got {val}");
-    }
-
-    /// NON-BUG GOLDEN: fixing `ner_loss`'s masking must not be mistaken for
-    /// enabling end-to-end NER training. `encode_chunk` still refuses
-    /// `TextChunk::Ner` with its typed error — the only in-repo way to
-    /// reach `TrainingBatch::Ner` remains the precomputed test seam.
-    #[test]
-    fn encode_chunk_still_refuses_text_chunk_ner() {
-        let device = Device::Cpu;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let loop_ = rt.block_on(minimal_loop(&device));
-
-        let chunk = TextChunk::Ner {
-            texts: vec!["Alice works at Acme.".into()],
-            entities_json: vec!["[]".into()],
-        };
-        let err = loop_.encode_chunk(&chunk).err().unwrap();
-        assert!(
-            matches!(err, JammiError::FineTune(ref m) if m.contains("NER fine-tuning is not yet available")),
-            "encode_chunk must still refuse TextChunk::Ner with its typed error, got {err:?}"
         );
     }
 }
@@ -10115,7 +9775,7 @@ mod loss_curve_metrics {
 /// pipeline-private episode/predictor machinery unreachable from this module, so
 /// it stays where its dependencies live; both surfaces are pinned, together).
 ///
-/// Heads 1–5 (CoSENT / MNRL / Triplet / Classification-CE / NER-CE) are
+/// Heads 1–4 (CoSENT / MNRL / Triplet / Classification-CE) are
 /// offset-INVARIANT by construction (cosine / softmax / class-index), carry no
 /// `TargetScaler`, and are deliberately excluded from
 /// [`super::target::StandardizableHead`] — so this oracle asserts nothing for them.
@@ -15024,7 +14684,7 @@ mod encode_texts_bucketing_oracle {
 /// every objective this seam supports (MNRL over `Pairs`, MNRL over a
 /// `Triplet` batch, Triplet-margin, Classification, Contrastive/CosineMse —
 /// the same five arms [`TrainingLoop::compute_loss_per_example`]'s own doc
-/// enumerates as supported; `CoSENT`/`AnglE`/`Ner`/`Regression` are typed
+/// enumerates as supported; `CoSENT`/`AnglE`/`Regression` are typed
 /// refusals there, not decompositions, so they have no oracle here).
 ///
 /// Mutation: adding a constant to each row `mnrl_loss_per_example` returns

@@ -1565,22 +1565,15 @@ impl InferenceSession {
     ) -> Result<(String, Vec<RecordBatch>, jammi_db::store::CacheOutcome)> {
         // Validate content columns are not empty
         if content_columns.is_empty() {
-            return Err(JammiError::Inference(
-                "At least one content column is required".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "columns".into(),
+                reason: "At least one content column is required".into(),
+            });
         }
 
         let table_name = self.find_table_name(source_id).await?;
         let query = self.build_source_query(source_id, &table_name, key_column, content_columns);
-
-        let df = self.inner.context().sql(&query).await.map_err(|e| {
-            JammiError::Inference(format!("Failed to scan source '{source_id}': {e}"))
-        })?;
-
-        let input_plan = df
-            .create_physical_plan()
-            .await
-            .map_err(|e| JammiError::Inference(format!("Failed to create scan plan: {e}")))?;
+        let input_plan = self.plan_source_query(&query).await?;
         // Describe the model for the schema and the definition: its width,
         // its regression head's form, and the identity the environment
         // records. Nothing is loaded here — the executing process
@@ -1766,6 +1759,29 @@ impl InferenceSession {
         )
     }
 
+    /// Plan a [`Self::build_source_query`] scan. A key or content column the
+    /// source does not have, or of a type the scan cannot read, is the caller's
+    /// `columns` argument; any other failure is the classifier's to name.
+    pub(crate) async fn plan_source_query(
+        &self,
+        query: &str,
+    ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        fn scan_error(e: datafusion::error::DataFusionError) -> JammiError {
+            use datafusion::error::DataFusionError;
+            match e.find_root() {
+                DataFusionError::SchemaError(..) | DataFusionError::Plan(_) => {
+                    JammiError::InvalidArgument {
+                        argument: "columns".into(),
+                        reason: e.to_string(),
+                    }
+                }
+                _ => JammiError::from(e),
+            }
+        }
+        let df = self.inner.context().sql(query).await.map_err(scan_error)?;
+        df.create_physical_plan().await.map_err(scan_error)
+    }
+
     /// The first table a source serves, resolved through the catalog's
     /// `sources` row ([`JammiSession::source_table_names`]) — a source
     /// registered on any replica resolves here, and a missing one is
@@ -1776,8 +1792,9 @@ impl InferenceSession {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                JammiError::Inference(format!("No tables found in source '{source_id}'"))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "source".into(),
+                reason: format!("No tables found in source '{source_id}'"),
             })
     }
 
@@ -1962,7 +1979,6 @@ impl InferenceSession {
         config: Option<FineTuneConfig>,
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
-        config.validate()?;
 
         let spec = TrainingSpec::FineTune {
             source: source.to_string(),
@@ -2017,7 +2033,6 @@ impl InferenceSession {
             cache,
         } = request;
         let config = config.unwrap_or_default();
-        config.validate()?;
 
         let spec = TrainingSpec::FineTune {
             source,
@@ -2191,9 +2206,9 @@ impl InferenceSession {
             .get_model(&canonical_name)
             .await?
             .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Base model '{canonical_name}' not registered in catalog"
-                ))
+                JammiError::NotFound(jammi_db::error::Missing::Model {
+                    model_id: canonical_name.clone(),
+                })
             })?
             .catalog_pk)
     }
@@ -2223,8 +2238,6 @@ impl InferenceSession {
         config: Option<FineTuneConfig>,
     ) -> Result<TrainingJob> {
         let config = config.unwrap_or_default();
-        config.validate()?;
-        sample_config.validate_for_training()?;
 
         // The job record's `source` field records the node source — the model is
         // fine-tuned on that source's text, the edges only supervise the pairing.

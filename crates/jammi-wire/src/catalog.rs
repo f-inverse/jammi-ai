@@ -121,7 +121,6 @@ fn file_format_to_proto(format: Option<FileFormat>) -> pb::FileFormat {
         Some(FileFormat::Csv) => pb::FileFormat::Csv,
         Some(FileFormat::Json) => pb::FileFormat::Json,
         Some(FileFormat::JsonLines) => pb::FileFormat::Jsonl,
-        Some(FileFormat::Avro) => pb::FileFormat::Avro,
         None => pb::FileFormat::Unspecified,
     }
 }
@@ -143,7 +142,6 @@ fn file_format_from_proto(format: i32) -> Result<Option<FileFormat>, Status> {
         Ok(pb::FileFormat::Csv) => Ok(Some(FileFormat::Csv)),
         Ok(pb::FileFormat::Json) => Ok(Some(FileFormat::Json)),
         Ok(pb::FileFormat::Jsonl) => Ok(Some(FileFormat::JsonLines)),
-        Ok(pb::FileFormat::Avro) => Ok(Some(FileFormat::Avro)),
         Ok(pb::FileFormat::Unspecified) => Ok(None),
         Err(_) => Err(Status::invalid_argument(format!(
             "unknown FileFormat value {format} — this looks like version skew \
@@ -636,7 +634,6 @@ mod tests {
             FileFormat::Csv,
             FileFormat::Json,
             FileFormat::JsonLines,
-            FileFormat::Avro,
         ] {
             let encoded = file_format_to_proto(Some(format.clone()));
             let decoded = file_format_from_proto(encoded as i32)

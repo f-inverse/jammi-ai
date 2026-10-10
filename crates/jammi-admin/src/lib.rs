@@ -568,12 +568,7 @@ impl CatalogClient {
     pub async fn list_topics(&self) -> std::result::Result<Vec<TopicDefinition>, TriggerError> {
         let resp = self
             .client()
-            .list_topics(ListTopicsRequest {
-                page_size: 0,
-                page_token: String::new(),
-                // Tenant scope rides on the session header, not the body.
-                tenant_id: String::new(),
-            })
+            .list_topics(ListTopicsRequest {})
             .await
             .map_err(|s| trigger_error_from_status(&s))?
             .into_inner();
@@ -669,7 +664,7 @@ impl CatalogClient {
         }
         id.parse()
             .map(Some)
-            .map_err(|e| JammiError::Tenant(format!("invalid tenant id from server: {e}")))
+            .map_err(|e| JammiError::Internal(format!("invalid tenant id from server: {e}")))
     }
 }
 

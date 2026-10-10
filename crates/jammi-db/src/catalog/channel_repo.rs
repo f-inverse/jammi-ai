@@ -134,9 +134,10 @@ impl ChannelColumnType {
             DataType::Int64 => Ok(Self::Int64),
             DataType::Utf8 => Ok(Self::Utf8),
             DataType::Boolean => Ok(Self::Boolean),
-            other => Err(JammiError::Catalog(format!(
-                "unsupported channel column type: {other:?}"
-            ))),
+            other => Err(JammiError::InvalidArgument {
+                argument: "columns".into(),
+                reason: format!("unsupported channel column type: {other:?}"),
+            }),
         }
     }
 
@@ -794,7 +795,9 @@ mod tests {
     #[test]
     fn from_arrow_rejects_unsupported_type() {
         let err = ChannelColumnType::from_arrow(&DataType::UInt16).unwrap_err();
-        assert!(matches!(err, JammiError::Catalog(_)));
+        assert!(
+            matches!(err, JammiError::InvalidArgument { ref argument, .. } if argument == "columns")
+        );
     }
 
     #[test]

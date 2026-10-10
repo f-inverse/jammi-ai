@@ -645,7 +645,7 @@ fn edges_to_batch(edges: Vec<Edge>, schema: SchemaRef) -> Result<RecordBatch> {
             Arc::new(similarity),
         ],
     )
-    .map_err(|e| JammiError::Other(format!("Edge RecordBatch build: {e}")))
+    .map_err(|e| JammiError::Internal(format!("Edge RecordBatch build: {e}")))
 }
 
 #[cfg(test)]

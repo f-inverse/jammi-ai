@@ -144,7 +144,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
             .await
             .expect_err(name);
         assert!(
-            matches!(per_verb, JammiError::Config(_)),
+            matches!(per_verb, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
             "{name}: the refusal must be typed, got {per_verb:?}"
         );
         assert!(
@@ -162,7 +162,7 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
             Err(e) => e,
         };
         assert!(
-            matches!(generic, JammiError::Config(_)),
+            matches!(generic, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
             "{name}: the generic entrance must refuse the same way, got {generic:?}"
         );
         assert_eq!(
@@ -199,7 +199,10 @@ async fn every_unservable_rank_count_is_refused_at_both_submit_entrances() {
         ),
     ] {
         let error = wide.run_training_spec(spec.clone()).await.expect_err(name);
-        assert!(matches!(error, JammiError::Config(_)), "{name}: {error:?}");
+        assert!(
+            matches!(error, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
+            "{name}: {error:?}"
+        );
         assert!(error.to_string().contains(expected), "{name}: got {error}");
         let generic = match wide.enqueue(JobSpec::from(spec), 0).await {
             Ok(handle) => panic!(
@@ -358,7 +361,10 @@ async fn the_serialized_request_entrance_carries_the_count_to_the_same_edge() {
         .run_training_spec(decoded)
         .await
         .expect_err("a two-rank job on a serveable world of one is unservable");
-    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert!(
+        matches!(error, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
+        "{error:?}"
+    );
     assert_eq!(
         job_count(&session).await,
         before,
@@ -456,7 +462,10 @@ fn a_count_past_the_serveable_world_is_refused_from_configuration_alone() {
     let error = narrow
         .admit(&spec_with_world_size(2))
         .expect_err("two ranks on a serveable world of one");
-    assert!(matches!(error, JammiError::Config(_)), "{error:?}");
+    assert!(
+        matches!(error, JammiError::InvalidArgument { ref argument, .. } if argument == "world_size"),
+        "{error:?}"
+    );
     assert!(
         error.to_string().contains("[distributed] max_world_size"),
         "the refusal names the knob that bounds it: {error}"
@@ -597,8 +606,8 @@ async fn an_invalid_context_predictor_config_is_refused_through_the_real_edge() 
         .await
         .expect_err("an invalid predictor config must be refused, never enqueued");
     assert!(
-        matches!(error, JammiError::FineTune(_)),
-        "the refusal must be typed, got {error:?}"
+        matches!(error, JammiError::Config(_)),
+        "an invalid configuration value is the caller's to fix, got {error:?}"
     );
     assert!(
         error.to_string().contains("context_k"),

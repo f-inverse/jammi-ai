@@ -359,7 +359,7 @@ pub fn clip_gradients(
     // caller (or `FineTuneConfig`'s deserialization, which does not validate
     // this field's finiteness) to pre-filter it.
     if !max_norm.is_finite() {
-        return Err(JammiError::FineTune(format!(
+        return Err(JammiError::Config(format!(
             "GradClip: max_norm must be finite, got {max_norm}"
         )));
     }

@@ -1453,20 +1453,16 @@ pub(crate) async fn materialize_graph_training_set(
         let ids = batch
             .column_by_name(&sources.id_column)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "node id column '{}' is not text",
-                    sources.id_column
-                ))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("node id column '{}' is not text", sources.id_column),
             })?;
         let texts = batch
             .column_by_name(&sources.text_column)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "node text column '{}' is not text",
-                    sources.text_column
-                ))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("node text column '{}' is not text", sources.text_column),
             })?;
         for (id, text) in ids.into_iter().zip(texts) {
             nodes.push(TextNode::new(id, text));
@@ -1492,14 +1488,16 @@ pub(crate) async fn materialize_graph_training_set(
         let srcs = batch
             .column_by_name(src_name)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!("edge src column '{src_name}' is not text"))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("edge src column '{src_name}' is not text"),
             })?;
         let dsts = batch
             .column_by_name(dst_name)
             .and_then(|c| extract_string_column(c.as_ref()))
-            .ok_or_else(|| {
-                JammiError::FineTune(format!("edge dst column '{dst_name}' is not text"))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "sources".into(),
+                reason: format!("edge dst column '{dst_name}' is not text"),
             })?;
         for (src, dst) in srcs.into_iter().zip(dsts) {
             edges.push(GraphEdge {
@@ -3040,10 +3038,9 @@ impl JobWorker {
                         .map_err(WorkerJobError::from)?
                         .map(|manifest| manifest.artifact.0)
                         .ok_or_else(|| {
-                            WorkerJobError::from(JammiError::FineTune(format!(
-                                "training set '{}' has no materialization manifest",
-                                table.table_name()
-                            )))
+                            WorkerJobError::from(JammiError::MissingManifest {
+                                table: table.table_name().to_string(),
+                            })
                         })?
                 };
                 // The training-set identity pair a `Peer` gang's members
@@ -5389,12 +5386,14 @@ async fn bind_training_source(
         // reports come from one classifier, so a mismatch is a broken
         // engine invariant rather than a caller error — and it must be
         // loud: it would mean two formats sharing one definition hash.
-        if loader.format().format_tag() != detected.format_tag() {
-            return Err(JammiError::Other(format!(
-                "training set was committed as format '{}' but its loader reports '{}': the \
-                 column classifier and the loader disagree",
+        let loaded = loader
+            .format()
+            .map(crate::fine_tune::data::TrainingFormat::format_tag);
+        if loaded != Some(detected.format_tag()) {
+            return Err(JammiError::Internal(format!(
+                "training set was committed as format '{}' but its loader reports {loaded:?}: \
+                 the column classifier and the loader disagree",
                 detected.format_tag(),
-                loader.format().format_tag()
             )));
         }
         return Ok(crate::fine_tune::source::TrainingSource::Resident(loader));
@@ -8136,7 +8135,7 @@ fn run_fine_tune_blocking(
                 dropout_seed,
             })?
             .ok_or_else(|| {
-                JammiError::FineTune("a frozen encoder trains a head for every task".into())
+                JammiError::Internal("a frozen encoder trains a head for every task".into())
             })?;
             // `backbone_dtype` never takes effect on this arm (see
             // `validate_backbone_precision`'s doc), so there is no encoder to
@@ -8317,20 +8316,18 @@ fn build_task_head(
     } = params;
     let head = match task {
         ModelTask::Classification => {
-            // `num_classes` from the SAME source: a `Resident` loader's
-            // `TrainingFormat::Classification { num_classes }` (built from the
-            // eager `BTreeSet` pass), or a `Streamed` source's
-            // `StreamedSet::num_classes()` (built from the worker's own
-            // whole-table vocabulary sweep) — both are the identical
+            // The class count from the source's own vocabulary: a `Resident`
+            // loader's (built from the eager pass) or a `Streamed` source's
+            // (built from the worker's whole-table sweep) — both the identical
             // sorted-label-set enumeration (`decode::LabelVocabulary`'s own
             // doc), so the head is sized identically either way.
             let num_classes = source
                 .class_labels()
                 .map(|labels| labels.len())
-                .ok_or_else(|| {
-                    JammiError::FineTune(
-                        "Classification task requires classification training data format".into(),
-                    )
+                .ok_or_else(|| JammiError::InvalidArgument {
+                    argument: "columns".into(),
+                    reason: "Classification task requires classification training data format"
+                        .into(),
                 })?;
             crate::fine_tune::lora::build_classification_head_for_rank(
                 hidden_size,
@@ -9083,7 +9080,9 @@ fn build_encoder_adapters(
     let model_record = tokio::runtime::Handle::current()
         .block_on(catalog.get_model(&catalog_model_id))?
         .ok_or_else(|| {
-            JammiError::FineTune(format!("Base model '{base_model_id}' not in catalog"))
+            JammiError::NotFound(jammi_db::error::Missing::Model {
+                model_id: base_model_id.to_string(),
+            })
         })?;
 
     let artifact_dir: std::path::PathBuf = match &model_record.location {
@@ -9103,7 +9102,7 @@ fn build_encoder_adapters(
             } else {
                 path.parent()
                     .ok_or_else(|| {
-                        JammiError::FineTune(format!(
+                        JammiError::Internal(format!(
                             "Cannot determine model dir from location '{p}'"
                         ))
                     })?
@@ -9151,13 +9150,13 @@ fn build_encoder_adapters(
                 weights
                     .parent()
                     .ok_or_else(|| {
-                        JammiError::FineTune(
+                        JammiError::Internal(
                             "Cannot determine model dir from HF hub cache path".into(),
                         )
                     })?
                     .to_path_buf()
             } else {
-                return Err(JammiError::FineTune(format!(
+                return Err(JammiError::Internal(format!(
                     "Base model '{base_model_id}' has no location in catalog"
                 )));
             }
@@ -9180,16 +9179,24 @@ fn build_encoder_adapters(
         })?,
         None => {
             let config_path = arch::config_candidates(&artifact_dir).ok_or_else(|| {
-                JammiError::FineTune(format!(
-                    "Cannot find {} or {} for base model at {artifact_dir:?}",
-                    arch::CONFIG_CANDIDATE_NAMES[0],
-                    arch::CONFIG_CANDIDATE_NAMES[1],
-                ))
+                JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!(
+                        "Cannot find {} or {} for base model at {artifact_dir:?}",
+                        arch::CONFIG_CANDIDATE_NAMES[0],
+                        arch::CONFIG_CANDIDATE_NAMES[1],
+                    ),
+                }
             })?;
-            let text = std::fs::read_to_string(&config_path)
-                .map_err(|e| JammiError::FineTune(format!("Cannot read {config_path:?}: {e}")))?;
-            serde_json::from_str(&text)
-                .map_err(|e| JammiError::FineTune(format!("Cannot parse {config_path:?}: {e}")))?
+            let text =
+                std::fs::read_to_string(&config_path).map_err(|e| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!("Cannot read {config_path:?}: {e}"),
+                })?;
+            serde_json::from_str(&text).map_err(|e| JammiError::InvalidArgument {
+                argument: "base_model".into(),
+                reason: format!("Cannot parse {config_path:?}: {e}"),
+            })?
         }
     };
 
@@ -9219,7 +9226,7 @@ fn build_encoder_adapters(
         rank_pattern,
     } = &config.encoder
     else {
-        return Err(JammiError::FineTune(
+        return Err(JammiError::Internal(
             "encoder adapters are built only for an adapted encoder".into(),
         ));
     };
@@ -9249,12 +9256,14 @@ fn build_encoder_adapters(
     // the identical chain `ModelResolver::resolve_local` walks, so a fine-tune
     // and an inference load of the same directory can never read different
     // weights.
-    let weights_path = arch::weights_candidates(&artifact_dir).ok_or_else(|| {
-        JammiError::FineTune(format!(
-            "No weights found at {artifact_dir:?} (need one of {:?})",
-            arch::WEIGHTS_CANDIDATE_NAMES
-        ))
-    })?;
+    let weights_path =
+        arch::weights_candidates(&artifact_dir).ok_or_else(|| JammiError::InvalidArgument {
+            argument: "base_model".into(),
+            reason: format!(
+                "No weights found at {artifact_dir:?} (need one of {:?})",
+                arch::WEIGHTS_CANDIDATE_NAMES
+            ),
+        })?;
     let gguf_weights_path = artifact_dir.join(arch::GGUF_WEIGHTS_FILENAME);
     let is_gguf = weights_path.ends_with(arch::GGUF_WEIGHTS_FILENAME);
     if is_gguf
@@ -9328,11 +9337,10 @@ fn build_encoder_adapters(
         // fine-tune outright.
         let num_layers =
             crate::model::backend::gguf::gguf_num_layers(dispatch_model_type, &model_config)
-                .ok_or_else(|| {
-                    JammiError::FineTune(
-                        "GGUF load requires num_hidden_layers (or num_layers) in config.json"
-                            .into(),
-                    )
+                .ok_or_else(|| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: "GGUF load requires num_hidden_layers (or num_layers) in config.json"
+                        .into(),
                 })?;
         Some(
             crate::model::backend::gguf::load_gguf_backbone(
@@ -9364,7 +9372,10 @@ fn build_encoder_adapters(
         // ---- OpenCLIP text tower -------------------------------------
         (EncoderFamily::OpenClip, ModelTask::TextEmbedding) => {
             let text_config = jammi_encoders::ClipTextConfig::from_open_clip_config(&model_config)
-                .map_err(|e| JammiError::FineTune(format!("Parse OpenCLIP text config: {e}")))?;
+                .map_err(|e| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!("Parse OpenCLIP text config: {e}"),
+                })?;
             let tower = jammi_encoders::ClipText::builder()
                 .lora(lora)
                 .backbone_dtype(backbone_dtype)
@@ -9379,8 +9390,9 @@ fn build_encoder_adapters(
         (EncoderFamily::OpenClip, ModelTask::ImageEmbedding) => {
             let vision_config =
                 jammi_encoders::OpenClipVisionConfig::from_open_clip_config(&model_config)
-                    .map_err(|e| {
-                        JammiError::FineTune(format!("Parse OpenCLIP vision config: {e}"))
+                    .map_err(|e| JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse OpenCLIP vision config: {e}"),
                     })?;
             let tower = jammi_encoders::OpenClipVisionTransformer::builder()
                 .lora(lora)
@@ -9395,7 +9407,10 @@ fn build_encoder_adapters(
         // ---- HF-CLAP HTSAT audio tower -------------------------------
         (EncoderFamily::ClapAudio, ModelTask::AudioEmbedding) => {
             let audio_config = jammi_encoders::HtsatAudioConfig::from_hf_clap_config(&model_config)
-                .map_err(|e| JammiError::FineTune(format!("Parse CLAP audio config: {e}")))?;
+                .map_err(|e| JammiError::InvalidArgument {
+                    argument: "base_model".into(),
+                    reason: format!("Parse CLAP audio config: {e}"),
+                })?;
             let tower = jammi_encoders::HtsatAudio::builder()
                 .lora(lora)
                 .backbone_dtype(backbone_dtype)
@@ -9429,7 +9444,10 @@ fn build_encoder_adapters(
         (EncoderFamily::DistilBert, _) => {
             let distilbert_config: jammi_encoders::DistilBertConfig =
                 serde_json::from_value(model_config.clone()).map_err(|e| {
-                    JammiError::FineTune(format!("Parse DistilBert config.json: {e}"))
+                    JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse DistilBert config.json: {e}"),
+                    }
                 })?;
             let mut builder = jammi_encoders::DistilBert::builder()
                 .lora(lora)
@@ -9451,7 +9469,10 @@ fn build_encoder_adapters(
         (EncoderFamily::ModernBert, _) => {
             let modernbert_config: jammi_encoders::ModernBertConfig =
                 serde_json::from_value(model_config.clone()).map_err(|e| {
-                    JammiError::FineTune(format!("Parse ModernBert config.json: {e}"))
+                    JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse ModernBert config.json: {e}"),
+                    }
                 })?;
             let mut builder = jammi_encoders::ModernBert::builder()
                 .lora(lora)
@@ -9472,8 +9493,12 @@ fn build_encoder_adapters(
         }
         (EncoderFamily::Bert, _) => {
             let bert_config: jammi_encoders::BertConfig =
-                serde_json::from_value(model_config.clone())
-                    .map_err(|e| JammiError::FineTune(format!("Parse Bert config.json: {e}")))?;
+                serde_json::from_value(model_config.clone()).map_err(|e| {
+                    JammiError::InvalidArgument {
+                        argument: "base_model".into(),
+                        reason: format!("Parse Bert config.json: {e}"),
+                    }
+                })?;
             let mut builder = jammi_encoders::Bert::builder()
                 .lora(lora)
                 .backbone_dtype(backbone_dtype);
@@ -10808,7 +10833,7 @@ mod tests {
         let loader =
             build_training_data_loader(&[batch], &regression_cols(), ModelTask::Regression)
                 .unwrap();
-        assert!(matches!(loader.format(), TrainingFormat::Regression));
+        assert_eq!(loader.format(), Some(TrainingFormat::Regression));
         assert_eq!(loader.len(), 3);
         assert_eq!(
             loader.regression_targets().unwrap(),
@@ -10890,10 +10915,11 @@ mod tests {
         let batch = ArrowBatch::try_new(schema, vec![text, label]).unwrap();
         let cols = vec!["text".to_string(), "label".to_string()];
         let loader = build_training_data_loader(&[batch], &cols, ModelTask::TextEmbedding).unwrap();
-        assert!(matches!(
-            loader.format(),
-            TrainingFormat::Classification { num_classes: 2 }
-        ));
+        assert_eq!(loader.format(), Some(TrainingFormat::Classification));
+        assert_eq!(
+            loader.class_labels(),
+            Some(["x".to_string(), "y".to_string()].as_slice())
+        );
     }
 
     /// A null target is rejected with a typed error citing the row — never

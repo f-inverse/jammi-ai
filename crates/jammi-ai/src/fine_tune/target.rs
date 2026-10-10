@@ -474,7 +474,7 @@ impl HeadLayer {
 ///
 /// The heads this enum deliberately *excludes* are offset-**invariant** by
 /// construction: CoSENT / MNRL / Triplet score cosine angles, Classification-CE
-/// / NER-CE score a softmax over class indices — none carry a continuous offset,
+/// scores a softmax over class indices — none carry a continuous offset,
 /// so none needs (or gets) a [`TargetScaler`]. Adding one of them to this enum
 /// would be a category error; the union is exactly the four distributional
 /// heads.

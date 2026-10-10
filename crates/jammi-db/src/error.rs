@@ -506,9 +506,47 @@ pub enum JammiError {
         detail: String,
     },
 
-    /// Catch-all for errors that don't fit another variant.
-    #[error("{0}")]
-    Other(String),
+    /// An argument a verb cannot act on: malformed, out of range, or naming
+    /// something the request cannot ask for — including text the caller wrote
+    /// for the engine to plan (a SQL statement, a filter predicate) that does
+    /// not plan. `argument` names it as the verb spells it.
+    #[error("invalid argument `{argument}`: {reason}")]
+    InvalidArgument {
+        /// The argument, as the verb names it.
+        argument: String,
+        /// What is wrong with it.
+        reason: String,
+    },
+
+    /// A `CREATE TABLE … AS` named a result table that already exists, and
+    /// did not say `IF NOT EXISTS`.
+    #[error("result table `{table}` already exists")]
+    ResultTableExists {
+        /// The table the statement named.
+        table: String,
+    },
+
+    /// A fault in the engine itself: a state its own construction rules out —
+    /// a broken invariant, an artifact it wrote that it cannot read back.
+    /// Never a condition the caller can change.
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    /// ANN (USearch) sidecar build, persistence, or query failure.
+    #[error("ANN index error: {0}")]
+    AnnIndex(String),
+
+    /// An error a remote peer reported by its class and message alone: one
+    /// whose own shape cannot cross a process boundary (an I/O, DataFusion or
+    /// storage error), or one a peer of another build added. The class it
+    /// crossed the wire with is kept, so it is the same condition here.
+    #[error("{message}")]
+    Remote {
+        /// The class the peer reported.
+        class: ErrorClass,
+        /// The peer's message.
+        message: String,
+    },
 }
 
 /// The condition an engine error reports, whatever transport carries it: the
@@ -579,7 +617,8 @@ impl JammiError {
             // Data-shape faults of the caller's input.
             | Self::InvalidKey { .. }
             | Self::NonUniqueKey { .. }
-            | Self::EmptyTrainingSet { .. } => ErrorClass::InvalidArgument,
+            | Self::EmptyTrainingSet { .. }
+            | Self::InvalidArgument { .. } => ErrorClass::InvalidArgument,
             // An absent row is a NotFound, never the bad-argument `Source` /
             // `Model` fault; a manifest or version that cannot be served is
             // an absent resource too.
@@ -593,6 +632,7 @@ impl JammiError {
             | Self::SourceBusy { .. }
             | Self::NotRefreshable { .. }
             | Self::DefinitionDrift { .. } => ErrorClass::FailedPrecondition,
+            Self::ResultTableExists { .. } => ErrorClass::AlreadyExists,
             // The strict tenant arm refused the write — the code a
             // forged-tenant read is refused with elsewhere.
             Self::TenantMismatch { .. } => ErrorClass::PermissionDenied,
@@ -612,6 +652,16 @@ impl JammiError {
             Self::MutableTable(e) => e.class(),
             Self::ChannelCatalog(e) => e.class(),
             Self::Trigger(e) => e.class(),
+            Self::Storage(e) => e.class(),
+            Self::BackendDriver(e) => e.class(),
+            Self::Remote { class, .. } => *class,
+            // The configuration the operator wrote does not parse.
+            Self::Toml(_) => ErrorClass::InvalidArgument,
+            Self::Io(e) => match e.kind() {
+                std::io::ErrorKind::NotFound => ErrorClass::NotFound,
+                std::io::ErrorKind::PermissionDenied => ErrorClass::PermissionDenied,
+                _ => ErrorClass::Internal,
+            },
             // Engine-side faults: a broken invariant, an unreadable artifact,
             // a failed computation or an I/O failure underneath.
             Self::Catalog(_)
@@ -619,18 +669,15 @@ impl JammiError {
             | Self::FineTune(_)
             | Self::Gpu(_)
             | Self::Backend(_)
-            | Self::Io(_)
-            | Self::BackendDriver(_)
-            | Self::Toml(_)
             | Self::Json(_)
             | Self::DataFusion(_)
             | Self::ChannelAssembly(_)
             | Self::Lexical(_)
-            | Self::Storage(_)
             | Self::IncompatibleFormat { .. }
             | Self::DependencyCycle { .. }
             | Self::NotRecomputable { .. }
-            | Self::Other(_) => ErrorClass::Internal,
+            | Self::Internal(_)
+            | Self::AnnIndex(_) => ErrorClass::Internal,
         }
     }
 }

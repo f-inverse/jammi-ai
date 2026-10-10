@@ -237,8 +237,10 @@ impl RankAdmission {
         self.serveable_world
     }
 
-    /// Admit `spec`, or refuse with a typed [`JammiError::Config`] naming the
-    /// bound it crosses.
+    /// Admit `spec`, or refuse naming the bound it crosses: a rank count the
+    /// request cannot ask for is [`JammiError::InvalidArgument`] on
+    /// `world_size`, a collective this build cannot reach is
+    /// [`JammiError::Config`].
     ///
     /// The refusals, each of which would otherwise become a job that fails
     /// on a worker rather than at the caller:
@@ -278,19 +280,24 @@ impl RankAdmission {
         let world_size = common.world_size;
 
         if world_size == 0 {
-            return Err(JammiError::Config(
-                "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)"
-                    .into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason:
+                    "world_size must be >= 1 (1 is the single-rank job; 0 has no rank to run on)"
+                        .into(),
+            });
         }
         if world_size > self.serveable_world {
-            return Err(JammiError::Config(format!(
-                "world_size = {world_size} exceeds the serveable world of {} (the wider of \
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason: format!(
+                    "world_size = {world_size} exceeds the serveable world of {} (the wider of \
                  [worker] local_ranks and [distributed] max_world_size): raise local_ranks for a \
                  gang on this host's devices, max_world_size on every coordinator for a gang \
                  across the fleet, or submit a smaller rank count",
-                self.serveable_world
-            )));
+                    self.serveable_world
+                ),
+            });
         }
         if self.collective.requires_cuda() && !self.cuda_build {
             return Err(JammiError::Config(format!(
@@ -300,18 +307,24 @@ impl RankAdmission {
             )));
         }
         if world_size > 1 && common.config.cached {
-            return Err(JammiError::Config(format!(
-                "world_size = {world_size} cannot be combined with GradCache (`cached`): the \
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason: format!(
+                    "world_size = {world_size} cannot be combined with GradCache (`cached`): the \
                  cached objective's second pass is over the WHOLE batch on one rank, so a \
                  gang would not compute the objective this config asks for"
-            )));
+                ),
+            });
         }
         if world_size > 1 && common.config.hard_negatives.mine {
-            return Err(JammiError::Config(format!(
-                "world_size = {world_size} cannot be combined with hard-negative mining \
+            return Err(JammiError::InvalidArgument {
+                argument: "world_size".into(),
+                reason: format!(
+                    "world_size = {world_size} cannot be combined with hard-negative mining \
                  (`hard_negatives.mine`): the miner retrieves from this process's own index, \
                  so each rank would mine a different negative pool"
-            )));
+                ),
+            });
         }
         Ok(())
     }
@@ -393,8 +406,9 @@ pub fn admit_training_spec(
     spec: TrainingSpec,
 ) -> Result<AdmittedTrainingSpec> {
     match &spec {
-        TrainingSpec::FineTune { common, .. } => {
+        TrainingSpec::FineTune { common, task, .. } => {
             common.config.validate()?;
+            ensure_fine_tunable(*task)?;
         }
         TrainingSpec::GraphFineTune {
             common,
@@ -410,6 +424,27 @@ pub fn admit_training_spec(
     }
     RankAdmission::from_config(config).admit(&spec)?;
     Ok(AdmittedTrainingSpec(spec))
+}
+
+/// The tasks a fine-tune trains: an encoder's embedding of text, images or
+/// audio, or a classification or regression head over its pooled output. A
+/// token-level task is served from a checkpoint that ships its own token
+/// classifier, and is refused here before any row is written.
+fn ensure_fine_tunable(task: ModelTask) -> Result<()> {
+    match task {
+        ModelTask::TextEmbedding
+        | ModelTask::ImageEmbedding
+        | ModelTask::AudioEmbedding
+        | ModelTask::Classification
+        | ModelTask::Regression => Ok(()),
+        ModelTask::Ner => Err(JammiError::InvalidArgument {
+            argument: "task".into(),
+            reason: "ner is served from a token-classification checkpoint, not fine-tuned; a \
+                     fine-tune trains text, image or audio embeddings, classification or \
+                     regression"
+                .into(),
+        }),
+    }
 }
 
 /// The catalog's durable record of a [`submit_admitted_training`] call --

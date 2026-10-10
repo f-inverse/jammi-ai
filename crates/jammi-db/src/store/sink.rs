@@ -295,7 +295,7 @@ pub fn filter_ok_and_extract_vectors(
             .column_by_name(name)
             .ok_or_else(|| JammiError::Inference(format!("Missing {name}")))?;
         arrow::compute::take(column.as_ref(), &indices, None)
-            .map_err(|e| JammiError::Other(format!("Arrow take: {e}")))
+            .map_err(|e| JammiError::Internal(format!("Arrow take: {e}")))
     };
     let filtered_row_ids = take("_row_id")?;
     let filtered_source = take("_source")?;
@@ -306,7 +306,7 @@ pub fn filter_ok_and_extract_vectors(
             Some(_) => {
                 let taken = take(crate::store::schema::CONTENT_HASH_COLUMN)?;
                 arrow::compute::cast(&taken, &DataType::Utf8)
-                    .map_err(|e| JammiError::Other(format!("Arrow cast _content_hash: {e}")))?
+                    .map_err(|e| JammiError::Internal(format!("Arrow cast _content_hash: {e}")))?
             }
             None => crate::store::content_hash::null_hash_column(indices.len()),
         };
@@ -326,7 +326,7 @@ pub fn filter_ok_and_extract_vectors(
             filtered_hash,
         ],
     )
-    .map_err(|e| JammiError::Other(format!("RecordBatch build: {e}")))?;
+    .map_err(|e| JammiError::Internal(format!("RecordBatch build: {e}")))?;
 
     let row_ids: Vec<String> = filtered_row_ids
         .as_any()

@@ -198,17 +198,17 @@ impl PredictiveHead {
     fn validate(&self) -> Result<()> {
         if let PredictiveHead::Quantile { levels } = self {
             if levels.is_empty() {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "Quantile head requires at least one level".into(),
                 ));
             }
             if levels.iter().any(|&q| !(0.0..1.0).contains(&q)) {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "Quantile levels must lie strictly in (0, 1)".into(),
                 ));
             }
             if levels.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "Quantile levels must be strictly ascending".into(),
                 ));
             }
@@ -288,18 +288,18 @@ impl ContextPredictorTrainConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         self.head.validate()?;
         if self.context_k == 0 {
-            return Err(JammiError::FineTune("context_k must be at least 1".into()));
+            return Err(JammiError::Config("context_k must be at least 1".into()));
         }
         if self.epochs == 0 {
-            return Err(JammiError::FineTune("epochs must be at least 1".into()));
+            return Err(JammiError::Config("epochs must be at least 1".into()));
         }
         if !(0.0..1.0).contains(&self.test_task_fraction) || self.test_task_fraction <= 0.0 {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "test_task_fraction must lie strictly in (0, 1)".into(),
             ));
         }
         if self.min_task_count < 2 {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "min_task_count must be at least 2 (one task each for train and test)".into(),
             ));
         }
@@ -308,7 +308,7 @@ impl ContextPredictorTrainConfig {
             ContextArchitecture::AttnCnp | ContextArchitecture::Tnp
         ) && (self.num_heads == 0 || !self.hidden_dim.is_multiple_of(self.num_heads))
         {
-            return Err(JammiError::FineTune(format!(
+            return Err(JammiError::Config(format!(
                 "num_heads ({}) must be non-zero and divide hidden_dim ({})",
                 self.num_heads, self.hidden_dim
             )));
@@ -719,7 +719,9 @@ impl InferenceSession {
                 .await?;
         }
         let registered = self.catalog().get_model(model_id).await?.ok_or_else(|| {
-            JammiError::FineTune(format!("Base model '{model_id}' not registered in catalog"))
+            JammiError::NotFound(jammi_db::error::Missing::Model {
+                model_id: model_id.to_string(),
+            })
         })?;
         Ok(Some(registered.catalog_pk))
     }
@@ -1305,7 +1307,9 @@ impl InferenceSession {
         options: ContextServeOptions,
     ) -> Result<ServedContextPredictor> {
         let record = self.catalog().get_model(model_id).await?.ok_or_else(|| {
-            JammiError::Catalog(format!("context predictor '{model_id}' not found"))
+            JammiError::NotFound(jammi_db::error::Missing::Model {
+                model_id: model_id.to_string(),
+            })
         })?;
         // Unlike a fine-tuned id, a context-predictor id is caller-chosen and carries
         // no reserved prefix `ModelResolver::try_catalog_lookup` can cross-check
@@ -1432,10 +1436,13 @@ impl InferenceSession {
             })?
             .get();
         if serve_dim != feature_dim {
-            return Err(JammiError::Inference(format!(
-                "context predictor '{model_id}' was trained on feature_dim {feature_dim} but \
+            return Err(JammiError::InvalidArgument {
+                argument: "source".into(),
+                reason: format!(
+                    "context predictor '{model_id}' was trained on feature_dim {feature_dim} but \
                  serving source '{source_id}' has dimension {serve_dim}"
-            )));
+                ),
+            });
         }
 
         let device = crate::model::backend::candle::select_device(self.device_config())?;
@@ -1614,11 +1621,12 @@ impl InferenceSession {
             .await?
             .into_iter()
             .next()
-            .ok_or_else(|| {
-                JammiError::Inference(format!(
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "targets".into(),
+                reason: format!(
                     "target '{target_key}' has no stored vector in '{}'",
                     pin.table_name()
-                ))
+                ),
             })?;
 
         let mut request =
@@ -1824,11 +1832,13 @@ impl ConformalContextPredictor {
                     .predict_interval(prediction.point_estimate() as f64, 0.0, 0.0, group)
             }
             DistributionForm::Quantile { .. } => {
-                let (lo, hi) = prediction.quantile_bounds().ok_or_else(|| {
-                    JammiError::Inference(
-                        "CQR conformal wrap requires a quantile-head prediction".into(),
-                    )
-                })?;
+                let (lo, hi) =
+                    prediction
+                        .quantile_bounds()
+                        .ok_or_else(|| JammiError::InvalidArgument {
+                            argument: "conformal".into(),
+                            reason: "CQR conformal wrap requires a quantile-head prediction".into(),
+                        })?;
                 self.conformal
                     .predict_interval(0.0, lo as f64, hi as f64, group)
             }
@@ -1890,9 +1900,10 @@ impl InferenceSession {
         levers: ConformalLevers,
     ) -> Result<ConformalContextPredictor> {
         if calibration.is_empty() {
-            return Err(JammiError::Inference(
-                "conformal calibration requires at least one held-out target".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "calibration".into(),
+                reason: "conformal calibration requires at least one held-out target".into(),
+            });
         }
         // A supplied lever carries one cohort / weight per calibration point;
         // a length mismatch is a typed error, never a silent misalignment.
@@ -1901,20 +1912,26 @@ impl InferenceSession {
             ConformalLevers::Mondrian { groups } if groups.len() == calibration.len() => {}
             ConformalLevers::Weighted { weights } if weights.len() == calibration.len() => {}
             ConformalLevers::Mondrian { groups } => {
-                return Err(JammiError::Inference(format!(
-                    "Mondrian conformal needs one cohort per calibration point: \
+                return Err(JammiError::InvalidArgument {
+                    argument: "cohorts".into(),
+                    reason: format!(
+                        "Mondrian conformal needs one cohort per calibration point: \
                      {} cohorts vs {} points",
-                    groups.len(),
-                    calibration.len()
-                )))
+                        groups.len(),
+                        calibration.len()
+                    ),
+                })
             }
             ConformalLevers::Weighted { weights } => {
-                return Err(JammiError::Inference(format!(
-                    "weighted conformal needs one weight per calibration point: \
+                return Err(JammiError::InvalidArgument {
+                    argument: "weights".into(),
+                    reason: format!(
+                        "weighted conformal needs one weight per calibration point: \
                      {} weights vs {} points",
-                    weights.len(),
-                    calibration.len()
-                )))
+                        weights.len(),
+                        calibration.len()
+                    ),
+                })
             }
         }
 
@@ -1927,11 +1944,13 @@ impl InferenceSession {
             match &served.form {
                 DistributionForm::Gaussian => predictions.push(dist.point_estimate() as f64),
                 DistributionForm::Quantile { .. } => {
-                    let (lo, hi) = dist.quantile_bounds().ok_or_else(|| {
-                        JammiError::Inference(
-                            "CQR calibration requires a quantile-head prediction".into(),
-                        )
-                    })?;
+                    let (lo, hi) =
+                        dist.quantile_bounds()
+                            .ok_or_else(|| JammiError::InvalidArgument {
+                                argument: "conformal".into(),
+                                reason: "CQR calibration requires a quantile-head prediction"
+                                    .into(),
+                            })?;
                     lower.push(lo as f64);
                     upper.push(hi as f64);
                 }

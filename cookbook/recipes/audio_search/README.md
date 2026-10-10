@@ -32,7 +32,7 @@ under one on a GPU.
 - `Session.encode_query(*, model, query, modality="audio")` → `list[float]`
 - `Session.search(source, *, query, k, filter=None, select=None)` → `pyarrow.Table`
 - `Session.eval_embeddings(*, source, ground_truth, model=None, k=10)`
-- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", target_modules=[...], ...)` → `TrainingJob`
+- `Session.fine_tune(*, source, base_model, columns, method, task="audio_embedding", encoder="frozen" | target_modules=[...], ...)` → `TrainingJob`
 - `Session.describe_model(model_id)` → `dict | None`
 
 ### Audio triplet schema (fine-tune input)
@@ -48,13 +48,14 @@ loader to read the three columns as encoded audio rather than text.
 
 ### Audio-tower LoRA sites
 
-`target_modules` names sites on **this** architecture. An **empty** list means
-"no tower sites" and selects the projection-head mode instead. The HTSAT-Swin
-audio tower offers `query`, `key`, `value`, `attention_output`,
+A fine-tune adapts the tower by default, at its attention `query` and `value`
+projections; `target_modules` names other sites on **this** architecture, and
+`encoder="frozen"` trains only a projection head over the frozen tower. The
+HTSAT-Swin audio tower offers `query`, `key`, `value`, `attention_output`,
 `intermediate_dense`, `output_dense`, `reduction`, `linear1` and `linear2`;
 `all-linear` selects every one. A selector matches a site name exactly or as a
-suffix of it. A **non-empty** list matching nothing fails the job with a message
-that echoes what you submitted and lists the tower's real names.
+suffix of it. A list matching nothing fails the job with a message that echoes
+what you submitted and lists the tower's real names.
 
 ## Input schema
 

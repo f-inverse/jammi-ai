@@ -50,13 +50,13 @@ message RpcStatus {
 // engine-owned (every field reconstructs), so they carry their own structured
 // detail (`MutableTableErrorDetail`, `ChannelCatalogErrorDetail`) and
 // reconstruct faithfully — the same standard the owned-shape variants meet. The
-// only variants folded into `other` are the genuinely-foreign `#[from]` ones whose inner error
+// only variants folded into `remote` are the genuinely-foreign `#[from]` ones whose inner error
 // cannot cross a process boundary (`Io`/`std::io::Error`,
-// `BackendDriver`/`Toml`/`Json`/`DataFusion`/`Trigger`/`Storage`): they
-// reconstruct as `JammiError::Other` carrying the faithful `Display` string —
-// the genuine fidelity limit, not a lossy guess. Faithfulness is a property of
-// the error type, so the mapping covers the whole enum, not only one verb
-// surface.
+// `BackendDriver`/`Toml`/`Json`/`DataFusion`/`Storage`) and `Remote` itself: they reconstruct as
+// `JammiError::Remote` carrying the faithful `Display` string and the class
+// the status code names — the genuine fidelity limit, not a lossy guess.
+// Faithfulness is a property of the error type, so the mapping covers the
+// whole enum, not only one verb surface.
 message JammiErrorDetail {
   oneof variant {
     SourceError source = 1;
@@ -67,7 +67,6 @@ message JammiErrorDetail {
     StringError config = 6;
     StringError eval = 7;
     StringError tenant = 8;
-    StringError other = 9;
     StringError fine_tune = 10;
     StringError gpu = 11;
     StringError backend = 12;
@@ -130,6 +129,24 @@ message JammiErrorDetail {
     // several facts at a matched instant and was given no tie-break column.
     // Maps to `INVALID_ARGUMENT`.
     AmbiguousAsofMatchError ambiguous_asof_match = 50;
+    // `JammiError::InvalidArgument { argument, reason }` — an argument a verb
+    // cannot act on. Maps to `INVALID_ARGUMENT`.
+    InvalidArgumentError invalid_argument = 51;
+    // `JammiError::Internal(String)` — a broken engine invariant. Maps to
+    // `INTERNAL`.
+    StringError internal = 52;
+    // `JammiError::AnnIndex(String)` — an ANN sidecar fault. Maps to
+    // `INTERNAL`.
+    StringError ann_index = 53;
+    // `JammiError::Remote { class, message }`, and every variant whose inner
+    // error cannot cross a process boundary: its message, under the status
+    // code that names its class.
+    StringError remote = 54;
+    // `JammiError::Trigger(TriggerError)` — the trigger stream's own detail,
+    // as its verbs attach it.
+    TriggerErrorDetail trigger = 55;
+    // `JammiError::ResultTableExists { table }`. Maps to `ALREADY_EXISTS`.
+    ResultTableExistsError result_table_exists = 56;
   }
   // Retired tags and names are reserved: the wire surface must never reuse a
   // retired field number or name, so a peer built against either contract
@@ -137,12 +154,12 @@ message JammiErrorDetail {
   // older peer decoding a payload that sets a variant it does not know (a
   // retired tag, or one a newer contract added after this peer was built)
   // sees `variant` unset. `error_from_status` reconstructs THAT case as
-  // `JammiError::Other` carrying the enclosing `Status`'s message verbatim --
-  // the peer keeps the fault's text even though it cannot keep the fault's
-  // specific shape, never a fabricated empty string.
-  reserved 15, 18, 42, 43, 44, 45, 46;
-  reserved "model_retired", "model_not_found", "source_not_found", "device_kind_unheld",
-    "placed_attempt_fan_out", "unheld", "executor_lost";
+  // `JammiError::Remote` carrying the enclosing `Status`'s message verbatim
+  // and the class its code names -- the peer keeps the fault's text and
+  // condition even though it cannot keep the fault's specific shape.
+  reserved 9, 15, 18, 42, 43, 44, 45, 46;
+  reserved "other", "model_retired", "model_not_found", "source_not_found",
+    "device_kind_unheld", "placed_attempt_fan_out", "unheld", "executor_lost";
 }
 
 // `JammiError::RowGone { table }`. A building-row compare-and-set matched no
@@ -490,9 +507,20 @@ message TenantMismatch {
 
 // A `JammiError` variant carrying a single human-readable string (`Inference`,
 // `Catalog`, `Config`, `Eval`, `Tenant`, `FineTune`, `Gpu`, `Backend`,
-// `ChannelAssembly`, `Other`).
+// `ChannelAssembly`, `Lexical`, `Internal`, `AnnIndex`, `Remote`).
 message StringError {
   string message = 1;
+}
+
+// `JammiError::ResultTableExists { table }`.
+message ResultTableExistsError {
+  string table = 1;
+}
+
+// `JammiError::InvalidArgument { argument, reason }`.
+message InvalidArgumentError {
+  string argument = 1;
+  string reason = 2;
 }
 
 // `JammiError::Source { source_id, message }`.

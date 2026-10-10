@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn a_non_caller_fault_still_classifies_as_a_backend_error() {
         assert_eq!(
-            jammi_error_class(&JammiError::Other("disk on fire".to_string())),
+            jammi_error_class(&JammiError::Internal("disk on fire".to_string())),
             status_class(Code::Internal),
         );
     }

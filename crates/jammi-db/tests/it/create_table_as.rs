@@ -132,8 +132,9 @@ async fn a_create_table_without_a_query_is_refused_typed() {
         .await
         .expect_err("a result table is what a query produced; there are no empty ones");
     assert!(
-        matches!(err, JammiError::Schema { ref table, .. } if table == "empty_rows"),
-        "expected the typed Schema refusal naming the table, got {err:?}"
+        matches!(err, JammiError::InvalidArgument { ref argument, ref reason }
+            if argument == "sql" && reason.contains("`empty_rows`")),
+        "expected the sql refusal naming the table, got {err:?}"
     );
     assert!(session
         .catalog()
@@ -161,9 +162,9 @@ async fn a_create_table_as_over_a_query_that_cannot_replay_is_refused_typed() {
         .await
         .expect_err("a recursive query renders to no SQL the engine can re-plan");
     assert!(
-        matches!(err, JammiError::Schema { ref table, ref actual, .. }
-            if table == "lineage" && actual.contains("RecursiveQuery")),
-        "expected the typed Schema refusal naming the table and the node, got {err:?}"
+        matches!(err, JammiError::InvalidArgument { ref argument, ref reason }
+            if argument == "sql" && reason.contains("`lineage`") && reason.contains("RecursiveQuery")),
+        "expected the sql refusal naming the table and the node, got {err:?}"
     );
     assert!(session
         .catalog()
@@ -256,7 +257,8 @@ async fn a_replacement_refused_at_planning_leaves_the_old_table_readable() {
         .await
         .expect_err("a query that cannot replay refuses at planning");
     assert!(
-        matches!(err, JammiError::Schema { ref table, .. } if table == "recent"),
+        matches!(err, JammiError::InvalidArgument { ref argument, ref reason }
+            if argument == "sql" && reason.contains("`recent`")),
         "got {err:?}"
     );
 

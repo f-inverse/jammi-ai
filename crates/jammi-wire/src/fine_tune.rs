@@ -55,9 +55,10 @@ impl std::str::FromStr for FineTuneMethod {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "lora" => Ok(Self::Lora),
-            other => Err(jammi_db::error::JammiError::FineTune(format!(
-                "Unknown fine-tuning method '{other}'. Supported: lora"
-            ))),
+            other => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "method".into(),
+                reason: format!("Unknown fine-tuning method '{other}'. Supported: lora"),
+            }),
         }
     }
 }
@@ -588,34 +589,34 @@ impl FineTuneConfig {
         use jammi_db::error::JammiError;
 
         if self.lora_rank == 0 {
-            return Err(JammiError::FineTune("lora_rank must be > 0".into()));
+            return Err(JammiError::Config("lora_rank must be > 0".into()));
         }
         if let Warmup::Fraction(fraction) = self.warmup {
             if !(0.0..1.0).contains(&fraction) {
-                return Err(JammiError::FineTune(format!(
+                return Err(JammiError::Config(format!(
                     "warmup fraction must be in [0, 1), got {fraction}"
                 )));
             }
         }
         if self.lora_alpha <= 0.0 {
-            return Err(JammiError::FineTune("lora_alpha must be > 0".into()));
+            return Err(JammiError::Config("lora_alpha must be > 0".into()));
         }
         if !(0.0..1.0).contains(&self.lora_dropout) {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "lora_dropout must be in [0.0, 1.0)".into(),
             ));
         }
         if self.learning_rate <= 0.0 {
-            return Err(JammiError::FineTune("learning_rate must be > 0".into()));
+            return Err(JammiError::Config("learning_rate must be > 0".into()));
         }
         if self.epochs == 0 {
-            return Err(JammiError::FineTune("epochs must be > 0".into()));
+            return Err(JammiError::Config("epochs must be > 0".into()));
         }
         if self.batch_size == 0 {
-            return Err(JammiError::FineTune("batch_size must be > 0".into()));
+            return Err(JammiError::Config("batch_size must be > 0".into()));
         }
         if self.gradient_accumulation_steps == 0 {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "gradient_accumulation_steps must be > 0".into(),
             ));
         }
@@ -625,18 +626,18 @@ impl FineTuneConfig {
         // of non-finite tuning parameter. `0.0` (disable) and any finite
         // value stay legal.
         if !self.max_grad_norm.is_finite() {
-            return Err(JammiError::FineTune(format!(
+            return Err(JammiError::Config(format!(
                 "max_grad_norm must be finite, got {}",
                 self.max_grad_norm
             )));
         }
         if !(0.0..1.0).contains(&self.validation_fraction) {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "validation_fraction must be in [0.0, 1.0)".into(),
             ));
         }
         if self.early_stopping_patience == 0 {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "early_stopping_patience must be > 0".into(),
             ));
         }
@@ -658,31 +659,31 @@ impl FineTuneConfig {
         }
         if self.hard_negatives.mine {
             if self.hard_negatives.k == 0 {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "hard_negatives.k must be > 0 when mining is enabled".into(),
                 ));
             }
             if self.hard_negatives.refresh_every == 0 {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "hard_negatives.refresh_every must be > 0 when mining is enabled".into(),
                 ));
             }
         }
         if self.matryoshka_dims.contains(&0) {
-            return Err(JammiError::FineTune(
+            return Err(JammiError::Config(
                 "matryoshka_dims entries must all be > 0".into(),
             ));
         }
         if let Some(RegressionLoss::BetaNll { beta }) = self.regression_loss {
             if !(0.0..=1.0).contains(&beta) {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "regression_loss BetaNll beta must be in [0.0, 1.0]".into(),
                 ));
             }
         }
         if matches!(self.regression_loss, Some(RegressionLoss::Pinball)) {
             if self.quantile_levels.is_empty() {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "Pinball regression loss requires at least one quantile level".into(),
                 ));
             }
@@ -691,12 +692,12 @@ impl FineTuneConfig {
                 .iter()
                 .any(|&q| !(0.0..1.0).contains(&q) || q <= 0.0)
             {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "quantile_levels must lie strictly in (0, 1)".into(),
                 ));
             }
             if self.quantile_levels.windows(2).any(|w| w[1] <= w[0]) {
-                return Err(JammiError::FineTune(
+                return Err(JammiError::Config(
                     "quantile_levels must be strictly ascending".into(),
                 ));
             }

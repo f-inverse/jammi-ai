@@ -263,11 +263,7 @@ async fn register_topic_then_list_then_drop() {
     );
 
     let topics = client
-        .list_topics(ListTopicsRequest {
-            page_size: 0,
-            page_token: String::new(),
-            tenant_id: String::new(),
-        })
+        .list_topics(ListTopicsRequest {})
         .await
         .expect("list topics")
         .into_inner();
@@ -286,11 +282,7 @@ async fn register_topic_then_list_then_drop() {
         .expect("drop topic");
 
     let after = client
-        .list_topics(ListTopicsRequest {
-            page_size: 0,
-            page_token: String::new(),
-            tenant_id: String::new(),
-        })
+        .list_topics(ListTopicsRequest {})
         .await
         .expect("list topics after drop")
         .into_inner();

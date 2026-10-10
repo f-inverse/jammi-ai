@@ -29,14 +29,13 @@ use std::io::{self, IsTerminal};
 
 use jammi_db::config::JammiConfig;
 use jammi_db::error::Result;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// A server's log level when neither `[logging] level` nor `RUST_LOG` names
-/// one: a daemon logs its operations.
-const LOG_DEFAULT: LevelFilter = LevelFilter::INFO;
+/// A server's log filter when neither `[logging] level` nor `RUST_LOG` names
+/// one: a daemon logs its operations, and its dependencies' with them.
+const LOG_DEFAULT: &str = "info";
 
 /// Install the global tracing subscriber from the engine config.
 ///

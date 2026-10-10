@@ -444,13 +444,15 @@ impl InferenceSession {
     /// through `exclude_key`. A pure-edge context over a free-vector query has no
     /// anchor and is a typed error, not a silent empty gather.
     fn edge_anchor<'a>(&self, request: &'a ContextRequest) -> Result<&'a str> {
-        request.exclude_key.as_deref().ok_or_else(|| {
-            JammiError::Other(
-                "declared-edge context requires the target's row key (exclude_key) as the \
-                 gather anchor"
+        request
+            .exclude_key
+            .as_deref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "exclude_key".into(),
+                reason: "a declared-edge context gathers around the target's row key, so it \
+                         needs one"
                     .into(),
-            )
-        })
+            })
     }
 
     /// Pool the stored vectors of `context_keys` from `pin`'s embedding
@@ -488,7 +490,7 @@ impl InferenceSession {
             .state()
             .udaf(aggregator.udaf_name())
             .map_err(|e| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "Context pool: UDAF '{}' not registered: {e}",
                     aggregator.udaf_name()
                 ))
@@ -501,17 +503,17 @@ impl InferenceSession {
         let pooled = ctx
             .read_table(provider)
             .map_err(|e| {
-                JammiError::Other(format!("Context pool: resolve '{}': {e}", pin.table_name()))
+                JammiError::from(e.context(format!("Context pool: resolve '{}'", pin.table_name())))
             })?
             // Typed IN-list over the keys — the arbitrary row keys are bound
             // values, never interpolated into SQL text.
             .filter(col("_row_id").in_list(keys, false))
-            .map_err(|e| JammiError::Other(format!("Context pool: filter: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Context pool: filter")))?
             .aggregate(vec![], vec![pool_udaf.call(vec![col("vector")])])
-            .map_err(|e| JammiError::Other(format!("Context pool: aggregate: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Context pool: aggregate")))?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Context pool: collect: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("Context pool: collect")))?;
 
         extract_single_vector(&pooled, pin.table_name())
     }
@@ -539,7 +541,7 @@ impl InferenceSession {
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let key_col = table.key_column.as_deref().ok_or_else(|| {
-            JammiError::Other(format!(
+            JammiError::Internal(format!(
                 "Context split: source '{source_id}' embedding table has no key column"
             ))
         })?;
@@ -578,10 +580,10 @@ impl InferenceSession {
                 actual: e.to_string(),
             })?
             .filter(col("_context_key").in_list(keys, false))
-            .map_err(|e| JammiError::Other(format!("Context split: filter: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Context split: filter")))?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Context split: collect: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("Context split: collect")))?;
 
         let qualifying = collect_keys(&batches, "_context_key");
         Ok(context_keys
@@ -612,7 +614,7 @@ impl InferenceSession {
             .resolve_embedding_table(source_id, embedding_table)
             .await?;
         let key_col = table.key_column.as_deref().ok_or_else(|| {
-            JammiError::Other(format!(
+            JammiError::Internal(format!(
                 "Context hydrate: source '{source_id}' embedding table has no key column"
             ))
         })?;
@@ -637,12 +639,12 @@ impl InferenceSession {
                  FROM \"{source_id}\".public.\"{source_table}\""
             ))
             .await
-            .map_err(|e| JammiError::Other(format!("Context hydrate: scan: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Context hydrate: scan")))?
             .filter(col("_context_key").in_list(keys, false))
-            .map_err(|e| JammiError::Other(format!("Context hydrate: filter: {e}")))?
+            .map_err(|e| JammiError::from(e.context("Context hydrate: filter")))?
             .collect()
             .await
-            .map_err(|e| JammiError::Other(format!("Context hydrate: collect: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("Context hydrate: collect")))?;
 
         Ok(order_by_keys(batches, context_keys))
     }
@@ -794,21 +796,14 @@ impl InferenceSession {
         source_id: &str,
         column: &str,
     ) -> Result<()> {
-        let source_table = self.find_table_name(source_id).await.map_err(|e| {
-            JammiError::Other(format!(
-                "Key column check: resolving source '{source_id}' to confirm \
-                 key_column '{column}': {e}"
-            ))
-        })?;
+        let source_table = self.find_table_name(source_id).await?;
         let df = self
             .context()
             .sql(&format!(
                 "SELECT * FROM \"{source_id}\".public.\"{source_table}\" LIMIT 0"
             ))
             .await
-            .map_err(|e| {
-                JammiError::Other(format!("Key column check: schema introspection: {e}"))
-            })?;
+            .map_err(|e| JammiError::from(e.context("Key column check: schema introspection")))?;
         let fields = df.schema();
         if fields.fields().iter().any(|f| f.name() == column) {
             return Ok(());
@@ -849,9 +844,10 @@ impl InferenceSession {
     ///
     /// A declared `key_column` is checked against the source before anything is
     /// written: a name the source does not have is [`JammiError::Schema`], and a
-    /// source this session cannot reach — so the name can be neither confirmed
-    /// nor refuted — is [`JammiError::Other`]. Both fail closed; `None` declares
-    /// no origin key and is checked against nothing.
+    /// source this session cannot resolve — so the name can be neither confirmed
+    /// nor refuted — is the error that says why (an absent source is
+    /// [`JammiError::NotFound`]). Both fail closed; `None` declares no origin key
+    /// and is checked against nothing.
     pub async fn materialize_context(
         &self,
         context: MaterializedContext<'_>,
@@ -861,9 +857,10 @@ impl InferenceSession {
         // batch must not carry two pooled vectors for the same target.
         let seen: BTreeSet<&str> = context.rows.iter().map(|(k, _)| k.as_str()).collect();
         if seen.len() != context.rows.len() {
-            return Err(JammiError::Other(
-                "materialize_context: duplicate target key in context rows".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "rows".into(),
+                reason: "two context rows share a target key; each target is one row".into(),
+            });
         }
 
         let recipe = context.recipe;

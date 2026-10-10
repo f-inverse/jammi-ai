@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use jammi_ai::telemetry::fmt_layer;
 use jammi_db::config::LoggingConfig;
 use tracing::callsite::Callsite as _;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -54,12 +53,8 @@ fn an_enabled_query_that_emits_nothing_never_drops_the_next_event() {
     // The host's composition: `jammi-server`'s `telemetry::install` and
     // `jammi-python`'s `build_tracing_layers` both hand the registry a
     // `Vec<Box<dyn Layer<Registry>>>` holding this formatter.
-    let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![fmt_layer(
-        &logging,
-        LevelFilter::INFO,
-        move || sink.clone(),
-        false,
-    )];
+    let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
+        vec![fmt_layer(&logging, "info", move || sink.clone(), false)];
     tracing_subscriber::registry().with(layers).init();
 
     let rejected = tracing::callsite! {

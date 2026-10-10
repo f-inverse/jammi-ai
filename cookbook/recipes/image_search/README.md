@@ -42,9 +42,10 @@ tells the loader to read the three columns as encoded images rather than text.
 
 ### Vision-tower LoRA sites
 
-`target_modules` names sites on **this** architecture. The OpenCLIP towers
-offer `in_proj` (fused QKV), `out_proj`, `c_fc` and `c_proj`; `all-linear`
-selects every one. A selector matches a site name exactly or as a suffix of it.
+A fine-tune adapts the tower by default, at its fused QKV projection `in_proj`;
+`target_modules` names other sites on **this** architecture. The OpenCLIP
+towers offer `in_proj`, `out_proj`, `c_fc` and `c_proj`; `all-linear` selects
+every one. A selector matches a site name exactly or as a suffix of it.
 A list matching **nothing** fails the job with a message that echoes what you
 submitted and lists the tower's real names.
 

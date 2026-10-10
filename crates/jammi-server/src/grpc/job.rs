@@ -100,7 +100,7 @@ impl JobServer {
     /// [`map_engine_error`] uses) so a remote caller reconstructs the exact
     /// `JammiError::Catalog` variant the embedded surface would raise for
     /// the same lookup — a `Status::not_found` built from a bare string
-    /// would instead decode as the lossy `JammiError::Other` fallback.
+    /// would instead decode as the message-only `JammiError::Remote` fallback.
     async fn read_job(&self, tenant: Option<TenantId>, job_id: &str) -> Result<JobRecord, Status> {
         let record = scoped(&self.session, tenant, || {
             self.session.catalog().get_job(job_id)
@@ -139,17 +139,13 @@ impl JobService for JobServer {
         // `Catalog::submit_job_deduped` asserts the same bound again
         // (defence in depth) for every OTHER caller of that entry point.
         if idempotency_key.len() > jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES {
-            let message = format!(
-                "idempotency_key exceeds the maximum length \
-                 (MAX_IDEMPOTENCY_KEY_BYTES = {} bytes)",
-                jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES
-            );
-            let engine_err = JammiError::Config(message.clone());
-            return Err(jammi_wire::attach_error_detail(
-                tonic::Code::InvalidArgument,
-                message,
-                &engine_err,
-            ));
+            return Err(map_engine_error(JammiError::InvalidArgument {
+                argument: "idempotency_key".into(),
+                reason: format!(
+                    "exceeds the maximum length of {} bytes",
+                    jammi_db::catalog::jobs_repo::MAX_IDEMPOTENCY_KEY_BYTES
+                ),
+            }));
         }
 
         let spec = training_spec_from_proto(req)?;

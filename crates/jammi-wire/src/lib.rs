@@ -83,7 +83,7 @@ pub use embedding::{
 };
 pub use error::{
     attach_audit_detail, attach_error_detail, attach_trigger_detail, audit_error_from_status,
-    class_code, error_from_status, status_code, trigger_error_from_status,
+    class_code, code_class, error_from_status, status_code, trigger_error_from_status,
 };
 pub use eval_wire::{
     calibration_shape_from_proto, calibration_shape_to_proto, cohorts_from_proto, cohorts_to_proto,

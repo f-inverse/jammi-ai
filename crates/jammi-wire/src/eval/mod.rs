@@ -53,9 +53,10 @@ impl std::str::FromStr for EvalCalibrationShape {
         match s {
             "gaussian" => Ok(Self::Gaussian),
             "sample" => Ok(Self::Sample),
-            other => Err(jammi_db::error::JammiError::Other(format!(
-                "Unknown calibration shape '{other}'. Expected: gaussian, sample"
-            ))),
+            other => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "calibration_shape".into(),
+                reason: format!("unknown calibration shape '{other}'; expected gaussian or sample"),
+            }),
         }
     }
 }
@@ -83,9 +84,10 @@ impl std::str::FromStr for EvalTask {
         match s {
             "classification" => Ok(Self::Classification),
             "ner" => Ok(Self::Ner),
-            other => Err(jammi_db::error::JammiError::Other(format!(
-                "Unknown eval task '{other}'. Expected: classification, ner"
-            ))),
+            other => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: format!("unknown eval task '{other}'; expected classification or ner"),
+            }),
         }
     }
 }

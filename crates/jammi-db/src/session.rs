@@ -225,7 +225,7 @@ impl JammiSession {
             )
             .build_arc()
             .map_err(|e| {
-                JammiError::Config(format!("failed to build the session's runtime env: {e}"))
+                JammiError::Internal(format!("failed to build the session's runtime env: {e}"))
             })?;
 
         // Build a base context to get the default state, then layer in

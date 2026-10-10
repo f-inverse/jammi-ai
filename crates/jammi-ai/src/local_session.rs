@@ -363,13 +363,16 @@ impl Session {
             (Modality::Audio, QueryInput::Bytes(bytes)) => {
                 self.engine.encode_audio_query(model_id, &bytes).await
             }
-            (modality, _) => Err(jammi_db::error::JammiError::Inference(format!(
-                "encode_query: {modality:?} requires {} input",
-                match modality {
-                    Modality::Text => "text",
-                    Modality::Image | Modality::Audio => "bytes",
-                }
-            ))),
+            (modality, _) => Err(jammi_db::error::JammiError::InvalidArgument {
+                argument: "query".into(),
+                reason: format!(
+                    "encode_query: {modality:?} requires {} input",
+                    match modality {
+                        Modality::Text => "text",
+                        Modality::Image | Modality::Audio => "bytes",
+                    }
+                ),
+            }),
         }
     }
 
@@ -991,10 +994,13 @@ impl Session {
 pub(crate) fn single_column<'a>(columns: &'a [String], modality: &str) -> Result<&'a str> {
     match columns {
         [single] => Ok(single.as_str()),
-        _ => Err(jammi_db::error::JammiError::Inference(format!(
-            "{modality} embeddings take exactly one content column, got {}",
-            columns.len()
-        ))),
+        _ => Err(jammi_db::error::JammiError::InvalidArgument {
+            argument: "columns".into(),
+            reason: format!(
+                "{modality} embeddings take exactly one content column, got {}",
+                columns.len()
+            ),
+        }),
     }
 }
 

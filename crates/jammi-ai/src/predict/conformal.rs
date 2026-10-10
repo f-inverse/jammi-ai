@@ -112,14 +112,16 @@ pub enum IntervalScore {
 pub fn finite_sample_quantile(scores: &[f64], alpha: f64) -> Result<Threshold> {
     validate_alpha(alpha)?;
     if scores.is_empty() {
-        return Err(JammiError::Inference(
-            "conformal calibration requires at least one score".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "conformal calibration requires at least one score".into(),
+        });
     }
     if scores.iter().any(|s| s.is_nan()) {
-        return Err(JammiError::Inference(
-            "conformal calibration scores must be finite".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "conformal calibration scores must be finite".into(),
+        });
     }
     let n = scores.len();
     // rank = ⌈(n+1)(1-alpha)⌉, a 1-based order statistic index.
@@ -166,30 +168,35 @@ pub fn finite_sample_quantile_weighted(
         )));
     }
     if scores.is_empty() {
-        return Err(JammiError::Inference(
-            "weighted conformal requires at least one score".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "weighted conformal requires at least one score".into(),
+        });
     }
     if scores.iter().any(|s| s.is_nan()) {
-        return Err(JammiError::Inference(
-            "weighted conformal scores must be finite".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "weighted conformal scores must be finite".into(),
+        });
     }
     if weights.iter().any(|&w| w < 0.0 || !w.is_finite()) {
-        return Err(JammiError::Inference(
-            "weighted conformal weights must be finite and non-negative".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "weights".into(),
+            reason: "weighted conformal weights must be finite and non-negative".into(),
+        });
     }
     if test_weight < 0.0 || !test_weight.is_finite() {
-        return Err(JammiError::Inference(
-            "weighted conformal test weight must be finite and non-negative".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "weights".into(),
+            reason: "weighted conformal test weight must be finite and non-negative".into(),
+        });
     }
     let total: f64 = weights.iter().sum::<f64>() + test_weight;
     if total <= 0.0 {
-        return Err(JammiError::Inference(
-            "weighted conformal requires positive total weight".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "weights".into(),
+            reason: "weighted conformal requires positive total weight".into(),
+        });
     }
 
     // Sort (score, weight) by ascending score, then walk the normalized
@@ -337,9 +344,10 @@ impl ConformalModel {
     /// miscalibrated.
     pub fn predict_set(&self, probabilities: &[f64], group: Option<&str>) -> Result<Vec<usize>> {
         let ModelKind::Classification { score, thresholds } = &self.kind else {
-            return Err(JammiError::Inference(
-                "predict_set called on a regression conformal model".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "predict_set called on a regression conformal model".into(),
+            });
         };
         let q = lookup_threshold(thresholds, group)?;
         admit_classes(probabilities, *score, q)
@@ -426,9 +434,10 @@ impl ConformalModel {
         group: Option<&str>,
     ) -> Result<(f64, f64)> {
         let ModelKind::Regression { score, thresholds } = &self.kind else {
-            return Err(JammiError::Inference(
-                "predict_interval called on a classification conformal model".into(),
-            ));
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "predict_interval called on a classification conformal model".into(),
+            });
         };
         let q = lookup_threshold(thresholds, group)?;
         Ok(match score {
@@ -446,9 +455,10 @@ impl ConformalModel {
 /// Validate a miscoverage level lies in the open interval `(0, 1)`.
 fn validate_alpha(alpha: f64) -> Result<()> {
     if !(alpha > 0.0 && alpha < 1.0) {
-        return Err(JammiError::Inference(format!(
-            "conformal alpha must lie in (0, 1), got {alpha}"
-        )));
+        return Err(JammiError::InvalidArgument {
+            argument: "alpha".into(),
+            reason: format!("conformal alpha must lie in (0, 1), got {alpha}"),
+        });
     }
     Ok(())
 }
@@ -520,9 +530,10 @@ fn classification_scores(
         )));
     }
     if calibration.is_empty() {
-        return Err(JammiError::Inference(
-            "classification conformal requires at least one calibration row".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "classification conformal requires at least one calibration row".into(),
+        });
     }
     calibration
         .iter()
@@ -535,10 +546,13 @@ fn classification_scores(
 fn true_label_score(probs: &[f64], label: usize, score: ClassScore) -> Result<f64> {
     validate_probabilities(probs)?;
     if label >= probs.len() {
-        return Err(JammiError::Inference(format!(
-            "true label {label} out of range for {} classes",
-            probs.len()
-        )));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: format!(
+                "true label {label} out of range for {} classes",
+                probs.len()
+            ),
+        });
     }
     Ok(match score {
         ClassScore::Lac => 1.0 - probs[label],
@@ -617,9 +631,10 @@ fn regression_scores(
                 )));
             }
             if predictions.is_empty() {
-                return Err(JammiError::Inference(
-                    "regression conformal requires at least one calibration row".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "calibration".into(),
+                    reason: "regression conformal requires at least one calibration row".into(),
+                });
             }
             ensure_finite(predictions, "predictions")?;
             ensure_finite(observed, "observations")?;
@@ -639,9 +654,10 @@ fn regression_scores(
                 )));
             }
             if observed.is_empty() {
-                return Err(JammiError::Inference(
-                    "regression conformal requires at least one calibration row".into(),
-                ));
+                return Err(JammiError::InvalidArgument {
+                    argument: "calibration".into(),
+                    reason: "regression conformal requires at least one calibration row".into(),
+                });
             }
             ensure_finite(lower, "lower quantiles")?;
             ensure_finite(upper, "upper quantiles")?;
@@ -661,14 +677,16 @@ fn regression_scores(
 /// not a normalized distribution — but a NaN would silently corrupt the rank.
 fn validate_probabilities(probs: &[f64]) -> Result<()> {
     if probs.is_empty() {
-        return Err(JammiError::Inference(
-            "classification conformal requires at least one class probability".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "classification conformal requires at least one class probability".into(),
+        });
     }
     if probs.iter().any(|p| p.is_nan()) {
-        return Err(JammiError::Inference(
-            "classification conformal probabilities must be finite".into(),
-        ));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: "classification conformal probabilities must be finite".into(),
+        });
     }
     Ok(())
 }
@@ -676,9 +694,10 @@ fn validate_probabilities(probs: &[f64]) -> Result<()> {
 /// Reject non-finite values in a regression input slice.
 fn ensure_finite(values: &[f64], what: &str) -> Result<()> {
     if values.iter().any(|v| !v.is_finite()) {
-        return Err(JammiError::Inference(format!(
-            "regression conformal {what} must be finite"
-        )));
+        return Err(JammiError::InvalidArgument {
+            argument: "calibration".into(),
+            reason: format!("regression conformal {what} must be finite"),
+        });
     }
     Ok(())
 }

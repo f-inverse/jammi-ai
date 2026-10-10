@@ -152,9 +152,9 @@ db.add_source("triplets", url=str(home / "audio_triplets.parquet"), format="parq
 # %% [markdown]
 # ## Adapt it cheaply: a head on a frozen tower
 #
-# With no `target_modules`, fine-tuning trains a projection head on top of the
-# frozen audio tower: cheap, and the tower is untouched. Re-embedding the
-# corpus with the tuned model and evaluating again compares the two.
+# `encoder="frozen"` trains a projection head on top of the frozen audio
+# tower: cheap, and the tower is untouched. Re-embedding the corpus with the
+# tuned model and evaluating again compares the two.
 
 # %%
 job = db.fine_tune(
@@ -163,6 +163,7 @@ job = db.fine_tune(
     columns=["anchor", "positive", "negative"],
     method="lora",
     task="audio_embedding",
+    encoder="frozen",
     lora_rank=4,
     learning_rate=1e-3,
     epochs=8,
@@ -209,11 +210,11 @@ assert max_abs_diff > 1e-4, (
 # %% [markdown]
 # ## Adapt the tower itself
 #
-# A non-empty `target_modules` puts LoRA inside the HTSAT-Swin tower, on the
-# same triplets: `query` and `value` are the Swin blocks' attention
-# projections, `linear1` the audio projection's first linear. The tower's own
-# representation moves — more capacity for a domain the base checkpoint never
-# saw, at more compute. The adapted model registers under the audio task, and
+# By default a fine-tune puts LoRA inside the tower itself — on the Swin
+# blocks' attention `query` and `value` projections when it names no sites.
+# Here `target_modules` names them, plus `linear1`, the audio projection's
+# first linear, on the same triplets. The tower's own representation moves —
+# more capacity for a domain the base checkpoint never saw, at more compute. The adapted model registers under the audio task, and
 # the same query encodes differently through it: an adapter that trained but
 # was dropped at serve time would leave the two vectors identical.
 

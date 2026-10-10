@@ -277,7 +277,7 @@ impl RawVectorCompanion {
         // an assert: the write never lands.
         let width = dimensions.max(1);
         if !vectors.len().is_multiple_of(width) {
-            return Err(JammiError::Other(format!(
+            return Err(JammiError::AnnIndex(format!(
                 "rescore companion buffer holds {} f32 values, not a whole multiple of dimensions {width} — refusing to write a misaligned companion file",
                 vectors.len()
             )));
@@ -327,7 +327,7 @@ impl RawVectorCompanion {
 fn reserve(index: &usearch::Index, rows: usize, contexts: usize) -> Result<()> {
     index
         .reserve_capacity_and_threads(rows, contexts)
-        .map_err(|e| JammiError::Other(format!("USearch reserve: {e}")))
+        .map_err(|e| JammiError::AnnIndex(format!("USearch reserve: {e}")))
 }
 
 /// Sidecar ANN index backed by USearch, with a Jammi-owned `_row_id` mapping
@@ -453,7 +453,7 @@ impl SidecarIndex {
         let found = self
             .index
             .export(key, &mut out)
-            .map_err(|e| JammiError::Other(format!("USearch get: {e}")))?;
+            .map_err(|e| JammiError::AnnIndex(format!("USearch get: {e}")))?;
         if found == 0 {
             return Ok(None);
         }
@@ -487,7 +487,7 @@ impl SidecarIndex {
                 Ok(vectors.get(start..end).map(<[f32]>::to_vec))
             }
             (None, None) if self.storage_precision.needs_rescore() => {
-                Err(JammiError::Other(format!(
+                Err(JammiError::AnnIndex(format!(
                     "get_exact: quantized index ({:?}) has no rescore companion and no \
                      in-memory exact-vector buffer for '{row_id}' — refusing to fall back to \
                      USearch's lossy reconstruction",
@@ -504,14 +504,14 @@ impl SidecarIndex {
         // Save USearch index
         let usearch_path = base_path.with_extension("usearch");
         let usearch_path_str = usearch_path.to_str().ok_or_else(|| {
-            JammiError::Other(format!(
+            JammiError::AnnIndex(format!(
                 "USearch save: index path is not valid UTF-8: {}",
                 usearch_path.display()
             ))
         })?;
         self.index
             .save(usearch_path_str)
-            .map_err(|e| JammiError::Other(format!("USearch save: {e}")))?;
+            .map_err(|e| JammiError::AnnIndex(format!("USearch save: {e}")))?;
 
         // Save rowmap: version (u32 LE) + entries (len_u32 LE + UTF-8 bytes)
         let rowmap_path = base_path.with_extension("rowmap");
@@ -659,7 +659,7 @@ impl SidecarIndex {
             file.read_exact(&mut buf)?;
             row_map.push(
                 String::from_utf8(buf)
-                    .map_err(|e| JammiError::Other(format!("Invalid UTF-8 in rowmap: {e}")))?,
+                    .map_err(|e| JammiError::AnnIndex(format!("Invalid UTF-8 in rowmap: {e}")))?,
             );
         }
 
@@ -675,18 +675,18 @@ impl SidecarIndex {
             &AnnIndexConfig::default(),
             manifest.scalar_kind,
         ))
-        .map_err(|e| JammiError::Other(format!("USearch index creation for load: {e}")))?;
+        .map_err(|e| JammiError::AnnIndex(format!("USearch index creation for load: {e}")))?;
 
         let usearch_path = base_path.with_extension("usearch");
         let usearch_path_str = usearch_path.to_str().ok_or_else(|| {
-            JammiError::Other(format!(
+            JammiError::AnnIndex(format!(
                 "USearch load: index path is not valid UTF-8: {}",
                 usearch_path.display()
             ))
         })?;
         index
             .load(usearch_path_str)
-            .map_err(|e| JammiError::Other(format!("USearch load: {e}")))?;
+            .map_err(|e| JammiError::AnnIndex(format!("USearch load: {e}")))?;
 
         if ann.search_expansion != 0 {
             index.change_expansion_search(ann.search_expansion);
@@ -719,7 +719,7 @@ impl SidecarIndex {
         let (binary_threshold, threshold_kind) =
             if manifest.scalar_kind == StoragePrecision::Binary && !row_map.is_empty() {
                 let kind = manifest.binary_threshold_kind.ok_or_else(|| {
-                    JammiError::Other(
+                    JammiError::AnnIndex(
                         "ann-manifest: a Binary sidecar's manifest is missing \
                          binary_threshold_kind — torn or pre-threshold-fix bundle"
                             .into(),
@@ -729,7 +729,7 @@ impl SidecarIndex {
                 let bytes = std::fs::read(&threshold_path)?;
                 let threshold: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
                 if threshold.len() != dimensions {
-                    return Err(JammiError::Other(format!(
+                    return Err(JammiError::AnnIndex(format!(
                         "ann-threshold: expected {dimensions} τ values, found {}",
                         threshold.len()
                     )));
@@ -801,7 +801,7 @@ impl SidecarIndex {
             // corpus rows were bulk-inserted with.
             StoragePrecision::Binary => {
                 let threshold = self.binary_threshold.as_deref().ok_or_else(|| {
-                    JammiError::Other(
+                    JammiError::AnnIndex(
                         "Binary search: no threshold τ available — index has not been built or \
                          loaded"
                             .into(),
@@ -819,7 +819,7 @@ impl SidecarIndex {
                 Some(_) => self.index.filtered_search(query, actual_k, admitted),
             },
         }
-        .map_err(|e| JammiError::Other(format!("USearch search: {e}")))?;
+        .map_err(|e| JammiError::AnnIndex(format!("USearch search: {e}")))?;
 
         Ok(matches
             .keys
@@ -874,7 +874,7 @@ impl SidecarBuilder {
         precision: StoragePrecision,
     ) -> Result<Self> {
         let index = usearch::Index::new(&index_options(dimensions, ann, precision))
-            .map_err(|e| JammiError::Other(format!("USearch index creation: {e}")))?;
+            .map_err(|e| JammiError::AnnIndex(format!("USearch index creation: {e}")))?;
         Ok(Self {
             dimensions,
             index,
@@ -888,7 +888,7 @@ impl SidecarBuilder {
     /// Take the next row, keyed after every row before it.
     pub fn add(&mut self, row_id: &str, vector: &[f32]) -> Result<()> {
         if vector.len() != self.dimensions {
-            return Err(JammiError::Other(format!(
+            return Err(JammiError::AnnIndex(format!(
                 "Vector dimension mismatch: expected {}, got {}",
                 self.dimensions,
                 vector.len()
@@ -937,7 +937,7 @@ impl SidecarBuilder {
                 ),
                 None => index.add(key as u64, vector),
             }
-            .map_err(|e| JammiError::Other(format!("USearch add: {e}")))?;
+            .map_err(|e| JammiError::AnnIndex(format!("USearch add: {e}")))?;
         }
         // Every search holds a context of its own while it runs, so the
         // built graph gets one per thread the host runs at once, as a loaded

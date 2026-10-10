@@ -31,10 +31,12 @@ use crate::error::to_pyerr;
 use crate::job::PyJob;
 use crate::model_task::PyModelTask;
 
-/// The embedded engine's log level when neither `[logging] level` nor
+/// The embedded engine's log filter when neither `[logging] level` nor
 /// `RUST_LOG` names one: a library inside the caller's process reports what
-/// needs their attention and is otherwise quiet.
-const LOG_DEFAULT: tracing::level_filters::LevelFilter = tracing::level_filters::LevelFilter::WARN;
+/// needs their attention and is otherwise quiet. Only the engine's own crates
+/// speak: a dependency's failure reaches the caller as the engine's typed
+/// error or per-row outcome, never as the dependency's own log line.
+const LOG_DEFAULT: &str = "off,jammi=warn";
 
 /// The `_NativeDatabase` pyclass: the low-level embedded engine handle. The
 /// user-facing surface is the thin Python wrapper (`jammi._embedded.EmbeddedBackend`)

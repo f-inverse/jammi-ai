@@ -111,7 +111,7 @@ impl DeletionMask {
                 )),
             ],
         )
-        .map_err(|e| JammiError::Other(format!("deletes: build batch: {e}")))?;
+        .map_err(|e| JammiError::Internal(format!("deletes: build batch: {e}")))?;
         let mut writer = ObjectParquetWriter::open(handle, schema).await?;
         writer.write_batch(&batch).await?;
         writer.close().await?;

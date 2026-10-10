@@ -127,6 +127,8 @@ MAX_RECEIVE_MESSAGE_LENGTH = 64 * 1024 * 1024
 # The leaf class each typed engine error detail raises — the same class the
 # embedded engine raises for that error, so one `except` holds on both transports.
 _DETAIL_CLASS = {
+    "fine_tune": TrainingError,
+    "job_cancelled": JobCancelled,
     "invalid_key": InvalidKey,
     "non_unique_key": NonUniqueKey,
     "no_query_encoder": NoQueryEncoder,

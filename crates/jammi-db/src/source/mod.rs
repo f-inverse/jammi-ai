@@ -7,7 +7,6 @@ pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod registry;
-pub mod retry;
 pub mod schema_provider;
 // Note: SQLite external source via datafusion-table-providers is not supported
 // because DTP's rusqlite version conflicts with our catalog's rusqlite (different
@@ -67,8 +66,20 @@ pub enum FileFormat {
     /// caller up front disables the fallback from the start and is honoured
     /// literally.
     JsonLines,
-    /// Apache Avro binary format.
-    Avro,
+}
+
+impl FileFormat {
+    /// The file extensions a source of this format lists, in the order they
+    /// are tried: JSON lines are spelled `.jsonl` or `.ndjson`, whichever the
+    /// directory holds; every other format has one.
+    pub fn extensions(&self) -> &'static [&'static str] {
+        match self {
+            Self::Parquet => &[".parquet"],
+            Self::Csv => &[".csv"],
+            Self::Json => &[".json"],
+            Self::JsonLines => &[".jsonl", ".ndjson"],
+        }
+    }
 }
 
 impl std::fmt::Display for FileFormat {
@@ -78,7 +89,6 @@ impl std::fmt::Display for FileFormat {
             Self::Csv => write!(f, "csv"),
             Self::Json => write!(f, "json"),
             Self::JsonLines => write!(f, "jsonl"),
-            Self::Avro => write!(f, "avro"),
         }
     }
 }
@@ -91,10 +101,12 @@ impl std::str::FromStr for FileFormat {
             "csv" => Ok(Self::Csv),
             "json" => Ok(Self::Json),
             "jsonl" | "ndjson" => Ok(Self::JsonLines),
-            "avro" => Ok(Self::Avro),
-            other => Err(crate::error::JammiError::Other(format!(
-                "Unknown file format '{other}'. Expected: parquet, csv, json, jsonl, avro"
-            ))),
+            other => Err(crate::error::JammiError::InvalidArgument {
+                argument: "format".into(),
+                reason: format!(
+                    "unknown file format '{other}'; expected parquet, csv, json or jsonl"
+                ),
+            }),
         }
     }
 }
@@ -218,7 +230,7 @@ impl SourceDefinition {
                 connection: SourceConnection::parse(url, format)?,
             }),
             (None, None) => Err(crate::error::JammiError::Config(format!(
-                "`{url}` names a file, which needs a format (parquet, csv, json, jsonl, avro); a \
+                "`{url}` names a file, which needs a format (parquet, csv, json, jsonl); a \
                  database source is a `postgres://` or `mysql://` URL"
             ))),
         }
@@ -248,7 +260,6 @@ mod tests {
             FileFormat::Csv,
             FileFormat::Json,
             FileFormat::JsonLines,
-            FileFormat::Avro,
         ] {
             let rendered = format.to_string();
             let parsed = FileFormat::from_str(&rendered).expect("canonical format parses");
@@ -279,7 +290,6 @@ mod tests {
         assert!(err.contains("parquet"));
         assert!(err.contains("csv"));
         assert!(err.contains("json"));
-        assert!(err.contains("avro"));
     }
 
     #[test]

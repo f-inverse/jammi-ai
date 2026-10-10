@@ -152,12 +152,13 @@ db.add_source("triplets", url=str(home / "image_triplets.parquet"), format="parq
 # %% [markdown]
 # ## Adapt the vision tower
 #
-# A non-empty `target_modules` puts LoRA inside the vision transformer itself:
-# `in_proj` is its fused query-key-value projection and `c_fc` the MLP's first
-# linear, so the tower's own representation moves. (The audio recipe shows the
-# other mode: an empty list trains a projection head on a frozen tower.) The
-# adapted model is registered under the image task, so `search` resolves it as
-# an image encoder.
+# A fine-tune puts LoRA inside the vision transformer itself — on its fused
+# query-key-value projection `in_proj` when it names no sites. Here
+# `target_modules` adds `c_fc`, the MLP's first linear, so more of the tower's
+# own representation moves. (The audio recipe also shows `encoder="frozen"`,
+# which trains a projection head on a frozen tower instead.) The adapted model
+# is registered under the image task, so `search` resolves it as an image
+# encoder.
 
 # %%
 job = db.fine_tune(

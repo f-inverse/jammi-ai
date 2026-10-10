@@ -807,9 +807,9 @@ async fn remote_create_and_drop_mutable_table_round_trips_like_local() {
             remote_b.to_string(),
             "the nested Backend error crosses the wire intact"
         ),
-        (_, JammiError::Other(_)) => {
+        (_, JammiError::Remote { .. }) => {
             panic!(
-                "REGRESSION: the nested MutableTable(Backend) error folded to Other over the wire"
+                "REGRESSION: the nested MutableTable(Backend) error folded to Remote over the wire"
             )
         }
         other => panic!("remote did not reconstruct MutableTable(Backend) faithfully: {other:?}"),
@@ -880,8 +880,8 @@ async fn remote_mutable_table_reserved_name_reconstructs_faithfully_not_as_other
             local_msg, remote_msg,
             "the InvalidId message crosses the wire intact"
         ),
-        (_, JammiError::Other(_)) => panic!(
-            "REGRESSION: the MutableTable error folded to Other over the wire — the fold is not closed"
+        (_, JammiError::Remote { .. }) => panic!(
+            "REGRESSION: the MutableTable error folded to Remote over the wire — the fold is not closed"
         ),
         other => panic!("remote did not reconstruct MutableTable::InvalidId faithfully: {other:?}"),
     }

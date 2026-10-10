@@ -101,6 +101,28 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// The condition this error reports ([`crate::error::ErrorClass`]): a URL
+    /// or scheme the caller named, an absent object, a store that refused the
+    /// deployment's credentials, or a fault of the store or of bytes the
+    /// engine wrote.
+    pub fn class(&self) -> crate::error::ErrorClass {
+        use crate::error::ErrorClass;
+        match self {
+            Self::InvalidUrl { .. } | Self::SchemeNotEnabled { .. } => ErrorClass::InvalidArgument,
+            // Credentials, bucket or region the deployment must fix.
+            Self::DriverInit { .. } => ErrorClass::FailedPrecondition,
+            Self::NotFound { .. } | Self::NotPublished { .. } => ErrorClass::NotFound,
+            // A store that refused the deployment's credentials; any other
+            // driver fault names no condition the caller can change.
+            Self::Io { source, .. } => match source.as_ref() {
+                object_store::Error::PermissionDenied { .. }
+                | object_store::Error::Unauthenticated { .. } => ErrorClass::PermissionDenied,
+                _ => ErrorClass::Internal,
+            },
+            Self::Layout { .. } | Self::NotLicensed { .. } => ErrorClass::Internal,
+        }
+    }
+
     /// Classify a bare `object_store::Error` raised at `path`: a miss is
     /// [`StorageError::NotFound`], anything else [`StorageError::Io`]. The one
     /// place a driver error becomes a `StorageError`.

@@ -1060,7 +1060,7 @@ impl InferenceSession {
             .rfind(|record| record.status == "ready")
             .map(|record| record.table_name)
             .ok_or_else(|| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "recompute: no ready table found for source '{source_id}' model '{model_id}' \
                      after replay"
                 ))
@@ -1354,13 +1354,15 @@ fn read_row_id_column(batch: &arrow::array::RecordBatch, table: &str) -> Result<
     use arrow::array::Array;
     let col = batch
         .column_by_name("_row_id")
-        .ok_or_else(|| JammiError::Other(format!("table '{table}' has no _row_id column")))?;
+        .ok_or_else(|| JammiError::Internal(format!("table '{table}' has no _row_id column")))?;
     let casted = arrow::compute::cast(col, &arrow::datatypes::DataType::Utf8)
-        .map_err(|e| JammiError::Other(format!("cast _row_id of '{table}' to Utf8: {e}")))?;
+        .map_err(|e| JammiError::Internal(format!("cast _row_id of '{table}' to Utf8: {e}")))?;
     let strings = casted
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| JammiError::Other(format!("_row_id of '{table}' is not a string column")))?;
+        .ok_or_else(|| {
+            JammiError::Internal(format!("_row_id of '{table}' is not a string column"))
+        })?;
     Ok((0..strings.len())
         .map(|i| strings.value(i).to_string())
         .collect())

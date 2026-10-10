@@ -406,7 +406,7 @@ impl InferenceSession {
                     })?;
                 Ok((record, cache_outcome))
             }
-            crate::jobs::JobResult::Model { .. } => Err(JammiError::Other(format!(
+            crate::jobs::JobResult::Model { .. } => Err(JammiError::Internal(format!(
                 "{verb}: run_now returned a training JobResult for a compute spec"
             ))),
         }
@@ -444,7 +444,7 @@ impl InferenceSession {
         let dimensions = table
             .dimensions()
             .ok_or_else(|| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "propagate_embeddings: embedding table '{}' carries no dimensions",
                     table.table_name
                 ))
@@ -640,7 +640,7 @@ impl InferenceSession {
         let plan = relation
             .create_physical_plan()
             .await
-            .map_err(|e| JammiError::Other(format!("graph propagation: adjacency plan: {e}")))?;
+            .map_err(|e| JammiError::from(e.context("graph propagation: adjacency plan")))?;
         self.write_working_table(ctx, source_id, plan, Some(adjacency_order()))
             .await
     }
@@ -797,7 +797,9 @@ impl InferenceSession {
         let held = ctx
             .sql(&format!("SELECT * FROM {relation} LIMIT 0"))
             .await
-            .map_err(|e| JammiError::Other(format!("source '{source_id}': schema read: {e}")))?;
+            .map_err(|e| {
+                JammiError::from(e.context(format!("source '{source_id}': schema read")))
+            })?;
         match columns
             .into_iter()
             .find(|column| held.schema().field_with_unqualified_name(column).is_err())
@@ -826,7 +828,9 @@ impl InferenceSession {
         ctx: &QueryContext,
         edge_source: &EdgeSourceRef,
     ) -> Result<(DataFrame, bool)> {
-        let scan_error = |e| JammiError::Other(format!("propagate: edge scan: {e}"));
+        let scan_error = |e: datafusion::error::DataFusionError| {
+            JammiError::from(e.context("propagate: edge scan"))
+        };
         match edge_source {
             EdgeSourceRef::NeighborGraph { table_name } => {
                 // neighbor_graph tables register as the bare literal

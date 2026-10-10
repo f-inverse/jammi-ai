@@ -1984,7 +1984,7 @@ impl ResultStore {
             .inner()
             .catalog(&catalog_opts.default_catalog)
             .ok_or_else(|| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "default catalog '{}' is not registered on the session context",
                     catalog_opts.default_catalog
                 ))
@@ -1994,7 +1994,9 @@ impl ResultStore {
                 &catalog_opts.default_schema,
                 Arc::clone(&self.result_schema) as Arc<dyn SchemaProvider>,
             )
-            .map_err(|e| JammiError::Other(format!("install result-table schema provider: {e}")))?;
+            .map_err(|e| {
+                JammiError::Internal(format!("install result-table schema provider: {e}"))
+            })?;
         Ok(())
     }
 
@@ -2199,7 +2201,7 @@ impl ResultStore {
         if errored.is_empty() {
             Ok(())
         } else {
-            Err(JammiError::Other(format!(
+            Err(JammiError::Internal(format!(
                 "reclaim: {} object delete(s) failed for '{name}': {errored:?}",
                 errored.len()
             )))
@@ -2316,7 +2318,7 @@ impl ResultStore {
         self.write_materialization_sidecar(url, &manifest).await?;
 
         let anchors_json = serde_json::to_string(&manifest.input_anchors)
-            .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
+            .map_err(|e| JammiError::Internal(format!("serialise input anchors: {e}")))?;
         Ok((manifest, anchors_json))
     }
 
@@ -3026,7 +3028,7 @@ impl ResultStore {
                     }
                 }
                 let anchors_json = serde_json::to_string(&manifest.input_anchors)
-                    .map_err(|e| JammiError::Other(format!("serialise input anchors: {e}")))?;
+                    .map_err(|e| JammiError::Internal(format!("serialise input anchors: {e}")))?;
                 let promoted = self
                     .catalog
                     .promote_result_table_with_manifest(
@@ -4318,7 +4320,7 @@ impl ResultStore {
     ) -> Result<SegmentId> {
         let precision = building.storage_precision();
         if index.storage_precision() != precision {
-            return Err(JammiError::Other(format!(
+            return Err(JammiError::Internal(format!(
                 "append_segment: index built at {:?} but table '{}' is persisted at {:?} — \
                  a segment must match its table's precision",
                 index.storage_precision(),
@@ -4401,7 +4403,7 @@ impl ResultStore {
     ) -> Result<SegmentId> {
         let precision = version.storage_precision();
         if index.storage_precision() != precision {
-            return Err(JammiError::Other(format!(
+            return Err(JammiError::Internal(format!(
                 "append_segment_for_version: index built at {:?} but table '{}' is persisted at \
                  {:?} — a segment must match its table's precision",
                 index.storage_precision(),
@@ -4496,7 +4498,7 @@ impl ResultStore {
             .await?
         {
             let url = StorageUrl::parse(&seg.index_path).map_err(|e| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "purge_segments_for_version: table '{table_name}' segment {} has an \
                      unparseable index_path '{}': {e}",
                     seg.segment_id, seg.index_path
@@ -4576,7 +4578,7 @@ impl ResultStore {
         let mut errored = BTreeSet::new();
         for seg in self.catalog.list_index_segments(&cas.table).await? {
             let url = StorageUrl::parse(&seg.index_path).map_err(|e| {
-                JammiError::Other(format!(
+                JammiError::Internal(format!(
                     "purge_segments: table '{}' segment {} has an unparseable index_path \
                      '{}': {e}",
                     cas.table, seg.segment_id, seg.index_path
@@ -4827,7 +4829,7 @@ impl ResultStore {
                     let float_arr = v
                         .as_any()
                         .downcast_ref::<arrow::array::Float32Array>()
-                        .ok_or_else(|| JammiError::Other("Vector not Float32".into()))?;
+                        .ok_or_else(|| JammiError::Internal("Vector not Float32".into()))?;
                     let vec: Vec<f32> = (0..float_arr.len()).map(|j| float_arr.value(j)).collect();
                     builder.add(row_id, &vec)?;
                 }
@@ -5337,7 +5339,7 @@ impl ResultStore {
 
         let partition_count = plan.output_partitioning().partition_count();
         if partition_count != 1 {
-            return Err(JammiError::Other(format!(
+            return Err(JammiError::Internal(format!(
                 "training set over '{source_id}': the single-partition derivation left the \
                  write plan at {partition_count} output partition(s); expected exactly one — \
                  an engine invariant broke between the derivation and the physical plan"
@@ -5382,7 +5384,7 @@ fn parse_owner(table: &ResultTableRecord) -> Result<Option<TenantId>> {
         .map(TenantId::from_str)
         .transpose()
         .map_err(|e| {
-            JammiError::Other(format!(
+            JammiError::Internal(format!(
                 "result table '{}': invalid tenant_id: {e}",
                 table.table_name
             ))

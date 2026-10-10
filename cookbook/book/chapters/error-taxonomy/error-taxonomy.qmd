@@ -3,7 +3,8 @@ title: "The error taxonomy — each failure names its cause"
 ---
 
 **Verbs:** `register_channel` · `add_channel_columns` · `list_channels` ·
-`search` · `lexical_search` · `describe_table` · `jammi.errors` · **Background:** a typed error vocabulary — a failure with a known
+`search` · `lexical_search` · `describe_table` · `sql` · `infer` · `fine_tune` ·
+`add_source` · `jammi.errors` · **Background:** a typed error vocabulary — a failure with a known
 cause names it, as a gRPC status code on the wire [@grpcstatuscodes] and as a
 Python class in the client, so a caller branches on the cause instead of parsing
 a message · **Checked:** parity (each failure raises the same class in process and
@@ -168,6 +169,76 @@ claim("and a table never built, or a query over one no source holds, is NotFound
       served_missing["describe a table never built"][0] == "NotFound"
       and served_missing["query a table the source does not hold"][0] == "NotFound")
 ```
+
+## Arguments the engine checks
+
+A malformed argument is an `InvalidArgument` wherever the engine first reads it,
+and the message names the argument. A SQL statement that does not parse, a
+column a verb names that its source does not hold, a fine-tuning value out of
+range and a file format no reader knows each raise it — before any model loads,
+in process and from a server alike.
+
+```{python}
+from jammi_cookbook import encoders, scale
+
+MODEL = encoders.text(scale.current())
+
+
+def malformed(db) -> dict:
+    with db.tenant_scope(str(uuid.uuid4())):
+        db.add_source("corpus", url=fixtures.url("tiny_corpus.parquet"), format="parquet")
+        refused = {}
+        for name, action in {
+            "a statement that does not parse": lambda: db.sql(
+                "SELEC title FROM corpus.public.tiny_corpus"),
+            "infer over a column the source lacks": lambda: db.infer(
+                source="corpus", model=MODEL, columns=["abstract"], task="text_embedding",
+                key="id"),
+            "fine-tune at a learning rate of zero": lambda: db.fine_tune(
+                source="corpus", base_model=MODEL, columns=["title", "content"],
+                method="lora", learning_rate=0.0),
+            "a file format no reader knows": lambda: db.add_source(
+                "sheet", url=fixtures.url("tiny_labels.csv"), format="xlsx"),
+        }.items():
+            try:
+                action()
+            except InvalidArgument as raised:
+                code = getattr(raised, "code", None)
+                refused[name] = (type(raised).__name__, code.name if code else None, str(raised))
+        return refused
+
+
+with jammi.connect(f"file://{tempfile.mkdtemp()}") as db:
+    local_malformed = malformed(db)
+with LiveServer(tempfile.mkdtemp()) as server, jammi.connect(server.endpoint) as db:
+    served_malformed = malformed(db)
+
+for name, (cls, code, message) in served_malformed.items():
+    print(f"{name:<40}{local_malformed[name][0]:<18}{cls:<18}{code}")
+    print(f"    {message[:140]}")
+```
+
+```{python}
+claim("each malformed argument is refused on both transports",
+      local_malformed.keys() == served_malformed.keys() == {
+          "a statement that does not parse",
+          "infer over a column the source lacks",
+          "fine-tune at a learning rate of zero",
+          "a file format no reader knows",
+      })
+claim("as InvalidArgument in process and from a server, carried as INVALID_ARGUMENT",
+      all(local_malformed[name][0] == "InvalidArgument" and cls == "InvalidArgument"
+          and code in (None, "INVALID_ARGUMENT")
+          for name, (cls, code, _) in served_malformed.items()))
+claim("and the message names what was wrong",
+      "learning_rate" in served_malformed["fine-tune at a learning rate of zero"][2]
+      and "abstract" in served_malformed["infer over a column the source lacks"][2]
+      and "xlsx" in served_malformed["a file format no reader knows"][2])
+```
+
+The client rejects an unknown file format itself, before any request leaves
+it, so that refusal carries no status code. It raises the same class the
+engine raises.
 
 ## Bridge note
 

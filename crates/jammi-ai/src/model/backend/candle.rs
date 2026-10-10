@@ -238,9 +238,11 @@ fn pool_via(hidden: &Tensor, attention_mask: &Tensor, strategy: Pooling) -> Resu
 /// seam every such call passes through, rather than assumed unreachable by
 /// a doc comment nothing enforces.
 fn classification_pooling_refusal() -> JammiError {
-    JammiError::Inference(
-        "model was loaded for classification; text-embedding pooling is not defined for it".into(),
-    )
+    JammiError::InvalidArgument {
+        argument: "task".into(),
+        reason: "model was loaded for classification; text-embedding pooling is not defined for it"
+            .into(),
+    }
 }
 
 /// The [`CandleTextForward::resolved_pooling`] every classification
@@ -268,11 +270,13 @@ fn classification_resolved_pooling() -> Option<Pooling> {
 /// reach `to_vec2::<f32>()` over a raw `[batch, seq_len, hidden_size]`
 /// hidden-states tensor and die with an opaque candle rank error.
 fn classification_kind_mismatch_refusal() -> JammiError {
-    JammiError::Inference(
-        "model was not loaded for classification; this warm entry's text forward pass does not \
+    JammiError::InvalidArgument {
+        argument: "task".into(),
+        reason:
+            "model was not loaded for classification; this warm entry's text forward pass does not \
          produce classification logits"
-            .into(),
-    )
+                .into(),
+    }
 }
 
 /// BERT-family forward pass (bert, roberta, camembert, xlm-roberta). Carries
@@ -1824,7 +1828,10 @@ impl CandleModel {
     fn text_forward(&self) -> Result<&dyn CandleTextForward> {
         self.text
             .as_deref()
-            .ok_or_else(|| JammiError::Inference("No text model loaded for this task".into()))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: "No text model loaded for this task".into(),
+            })
     }
 
     /// The cost of every row of `content` under `task`: its length along the
@@ -1873,12 +1880,16 @@ impl CandleModel {
     /// Tokenise `texts` at the text tower's own truncation, at the batch's
     /// natural width.
     fn encode(&self, texts: &[&str]) -> Result<BatchEncoding> {
-        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
-            JammiError::Inference(format!(
-                "No tokenizer loaded for this model: its checkpoint ships none of {:?}",
-                crate::model::arch::TOKENIZER_CANDIDATES.map(|(name, _)| name)
-            ))
-        })?;
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "No tokenizer loaded for this model: its checkpoint ships none of {:?}",
+                    crate::model::arch::TOKENIZER_CANDIDATES.map(|(name, _)| name)
+                ),
+            })?;
         tokenizer.encode_batch(texts, Some(self.text_forward()?.max_sequence_length()))
     }
 
@@ -1933,9 +1944,13 @@ impl CandleModel {
     }
 
     fn prepare_image(&self, content: &[ArrayRef]) -> Result<PreparedInput> {
-        let vision = self.vision.as_deref().ok_or_else(|| {
-            JammiError::Inference("No vision model loaded for image embedding".into())
-        })?;
+        let vision = self
+            .vision
+            .as_deref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: "No vision model loaded for image embedding".into(),
+            })?;
         // A corrupt row's decode failure marks only THAT row's status; the
         // rest of the chunk still embeds
         // (`docs/guide/src/generate-image-embeddings.md`'s per-row
@@ -1971,21 +1986,32 @@ impl CandleModel {
     }
 
     fn prepare_audio(&self, content: &[ArrayRef]) -> Result<PreparedInput> {
-        let audio = self.audio.as_deref().ok_or_else(|| {
-            JammiError::Inference("No audio model loaded for audio embedding".into())
-        })?;
-        let frontend = self.audio_frontend.as_ref().ok_or_else(|| {
-            JammiError::Inference("No audio feature-extractor config loaded".into())
-        })?;
+        let audio = self
+            .audio
+            .as_deref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: "No audio model loaded for audio embedding".into(),
+            })?;
+        let frontend = self
+            .audio_frontend
+            .as_ref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "No audio feature-extractor config loaded".into(),
+            })?;
         // The front-end's mel-filter count must match the tower's input
         // contract; a mismatch is a misconfigured preprocessor_config.json.
         if frontend.n_mels != audio.num_mel_bins() {
-            return Err(JammiError::Inference(format!(
-                "Audio feature-extractor feature_size ({}) does not match the tower's \
+            return Err(JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!(
+                    "Audio feature-extractor feature_size ({}) does not match the tower's \
                  num_mel_bins ({})",
-                frontend.n_mels,
-                audio.num_mel_bins()
-            )));
+                    frontend.n_mels,
+                    audio.num_mel_bins()
+                ),
+            });
         }
         let rows = MediaRows::of(arrow_to_audio(content)?, "Null or missing audio input");
         let payload = if rows.decoded.is_empty() {
@@ -2076,12 +2102,11 @@ impl CandleModel {
             .head
             .as_ref()
             .and_then(|head| Some((head, head.distribution()?)))
-            .ok_or_else(|| {
-                JammiError::Inference(
-                    "Regression inference needs a fine-tuned distributional head; \
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "Regression inference needs a fine-tuned distributional head; \
                      this model carries none. Fine-tune a ModelTask::Regression head first."
-                        .into(),
-                )
+                    .into(),
             })?;
         let num_rows = input.len();
         if num_rows == 0 {
@@ -2244,9 +2269,13 @@ impl CandleModel {
     }
 
     fn forward_image_embedding(&self, input: PreparedInput) -> Result<BackendOutput> {
-        let vision = self.vision.as_deref().ok_or_else(|| {
-            JammiError::Inference("No vision model loaded for image embedding".into())
-        })?;
+        let vision = self
+            .vision
+            .as_deref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: "No vision model loaded for image embedding".into(),
+            })?;
         let PreparedInput {
             valid,
             row_status,
@@ -2270,9 +2299,13 @@ impl CandleModel {
     }
 
     fn forward_audio_embedding(&self, input: PreparedInput) -> Result<BackendOutput> {
-        let audio = self.audio.as_deref().ok_or_else(|| {
-            JammiError::Inference("No audio model loaded for audio embedding".into())
-        })?;
+        let audio = self
+            .audio
+            .as_deref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "task".into(),
+                reason: "No audio model loaded for audio embedding".into(),
+            })?;
         let PreparedInput {
             valid,
             row_status,
@@ -2336,9 +2369,13 @@ impl CandleModel {
                 .map_err(|e| JammiError::Inference(format!("Class softmax: {e}")))?;
             return Ok((probs, labels.to_vec()));
         }
-        let id2label = self.id2label.as_ref().ok_or_else(|| {
-            JammiError::Inference("No id2label mapping for classification model".into())
-        })?;
+        let id2label = self
+            .id2label
+            .as_ref()
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "No id2label mapping for classification model".into(),
+            })?;
         let probs = text
             .forward_hidden(input_ids, attention_mask, encoding, &self.device)?
             .to_dtype(DType::F32)
@@ -2443,10 +2480,17 @@ impl CandleModel {
         let id2label = self
             .id2label
             .as_ref()
-            .ok_or_else(|| JammiError::Inference("No id2label mapping for NER model".into()))?;
-        let ner_classifier = self.ner_classifier.as_ref().ok_or_else(|| {
-            JammiError::Inference("No token classifier loaded for NER model".into())
-        })?;
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: "No id2label mapping for NER model".into(),
+            })?;
+        let ner_classifier =
+            self.ner_classifier
+                .as_ref()
+                .ok_or_else(|| JammiError::InvalidArgument {
+                    argument: "model".into(),
+                    reason: "No token classifier loaded for NER model".into(),
+                })?;
         let num_rows = input.len();
         if num_rows == 0 {
             // NER carries no float head at all (entities are serialized as
@@ -3587,12 +3631,18 @@ fn clap_frontend_from_preprocessor(
     let u = |key: &str| -> Result<u64> {
         prep.get(key)
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| JammiError::Inference(format!("missing integer field '{key}'")))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!("missing integer field '{key}'"),
+            })
     };
     let f = |key: &str| -> Result<f64> {
         prep.get(key)
             .and_then(|v| v.as_f64())
-            .ok_or_else(|| JammiError::Inference(format!("missing numeric field '{key}'")))
+            .ok_or_else(|| JammiError::InvalidArgument {
+                argument: "model".into(),
+                reason: format!("missing numeric field '{key}'"),
+            })
     };
     let config = audio_preprocess::ClapFrontendConfig {
         n_mels: u("feature_size")? as usize,
